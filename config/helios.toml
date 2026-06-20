@@ -14,6 +14,10 @@ lan_ifaces = ["eth1"]
 ike_peers = ["203.0.113.10"]
 mode = "fail-closed"    # kill-switch ; "fail-open" pour le mode dégradé (déconseillé)
 
+[api]
+enabled = true
+bind = "127.0.0.1:8080"   # écoute sur localhost uniquement ; changer pour 0.0.0.0:8080 si accès LAN
+
 [update]
 enabled = false
 check_interval_secs = 3600

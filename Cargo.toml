@@ -5,6 +5,7 @@ members = [
     "crates/helios-vici",
     "crates/helios-firewall",
     "crates/helios-update",
+    "crates/helios-api",
     "crates/heliosd",
 ]
 
@@ -36,8 +37,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+mime_guess = "2"
 
 helios-core = { path = "crates/helios-core" }
+helios-api = { path = "crates/helios-api" }
 helios-vici = { path = "crates/helios-vici" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }

@@ -1,18 +1,22 @@
 //! Orchestration : câblage VICI <-> machine à états <-> pare-feu <-> OTA.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
-use helios_core::{Config, Connection, TunnelEvent, TunnelState};
+use helios_core::{
+    Config, Connection, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelEvent, TunnelState,
+};
 use helios_firewall::{DryRunBackend, FirewallBackend};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
 use helios_vici::{Message, ViciClient};
-use tokio::time;
+use tokio::{
+    sync::{broadcast, mpsc, RwLock},
+    time,
+};
 use tracing::{error, info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Choisit le backend pare-feu selon le mode et les features compilées.
 fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     if dry_run {
         return Box::new(DryRunBackend);
@@ -28,7 +32,6 @@ fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     }
 }
 
-/// Choisit le canal de mise à jour selon le mode.
 fn update_channel(config: &Config) -> Box<dyn UpdateChannel> {
     if config.general.dry_run {
         Box::new(DryRunChannel::new(VERSION))
@@ -38,70 +41,118 @@ fn update_channel(config: &Config) -> Box<dyn UpdateChannel> {
     }
 }
 
+/// Met à jour l'état partagé, émet un événement WebSocket et applique le pare-feu.
+async fn transition(
+    shared: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+    new_state: TunnelState,
+    fw: &dyn FirewallBackend,
+    policy: &FirewallPolicy,
+) -> anyhow::Result<()> {
+    *shared.write().await = new_state;
+    let _ = event_tx.send(HeliosEvent::StateChanged { state: new_state });
+    fw.apply(policy, new_state).await.context("application du pare-feu")?;
+    Ok(())
+}
+
 /// Boucle principale du daemon.
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(
+    config: Config,
+    shared_state: Arc<RwLock<TunnelState>>,
+    event_tx: broadcast::Sender<HeliosEvent>,
+    mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
+) -> anyhow::Result<()> {
     let policy = config.firewall_policy();
     let fw = firewall_backend(config.general.dry_run);
 
-    // 1. Fail-closed AVANT tout contact réseau : on verrouille d'abord.
-    fw.engage_kill_switch(&policy)
-        .await
-        .context("engagement initial du kill-switch")?;
-    let mut state = TunnelState::Down;
-    info!("kill-switch engagé, état initial : {state:?}");
+    // 1. Fail-closed AVANT tout contact réseau.
+    transition(&shared_state, &event_tx, TunnelState::Down, fw.as_ref(), &policy).await?;
+    info!("kill-switch engagé, démarrage en fail-closed");
 
-    // 2. Montée du tunnel.
-    if config.general.dry_run {
-        state = simulate_bringup(fw.as_ref(), &policy, state).await?;
-    } else {
-        state = bring_up_real(&config, fw.as_ref(), state).await?;
-    }
+    // 2. Montée initiale du tunnel.
+    do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
 
-    // 3. Vérification périodique des mises à jour.
+    // 3. OTA.
     if config.update.enabled {
         spawn_update_loop(update_channel(&config), config.update.check_interval_secs);
     }
 
-    // 4. Attente d'un signal d'arrêt. On NE désactive PAS le kill-switch en
-    //    sortant : rester fail-closed est plus sûr qu'ouvrir le trafic.
-    info!("heliosd opérationnel (état {state:?}). Ctrl-C pour quitter.");
-    tokio::signal::ctrl_c().await.ok();
-    info!("arrêt demandé : le kill-switch reste engagé (fail-closed)");
+    // 4. Boucle principale : commandes de l'UI ou signal d'arrêt.
+    let state_str = format!("{:?}", *shared_state.read().await);
+    info!("heliosd opérationnel (état {state_str}). Ctrl-C pour quitter.");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("arrêt demandé : kill-switch maintenu (fail-closed)");
+                break;
+            }
+            cmd = cmd_rx.recv() => match cmd {
+                Some(OrchestratorCmd::Connect) => {
+                    info!("connexion demandée via l'interface web");
+                    do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
+                }
+                Some(OrchestratorCmd::Disconnect) => {
+                    info!("déconnexion demandée via l'interface web");
+                    transition(&shared_state, &event_tx, TunnelState::Down, fw.as_ref(), &policy).await?;
+                }
+                None => break,
+            }
+        }
+    }
     Ok(())
 }
 
-/// Simule un cycle de vie complet sur WSL2 pour exercer la chaîne d'orchestration.
-async fn simulate_bringup(
+async fn do_connect(
+    config: &Config,
+    shared: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
-    policy: &helios_core::FirewallPolicy,
-    mut state: TunnelState,
-) -> anyhow::Result<TunnelState> {
-    info!("[dry-run] simulation de la montée du tunnel");
-    for event in [
-        TunnelEvent::StartRequested,
-        TunnelEvent::IkeEstablished,
-        TunnelEvent::ChildUp,
-    ] {
-        state = state.on(event).context("transition d'état")?;
-        info!("événement {event:?} -> état {state:?}");
-        fw.apply(policy, state).await.context("application pare-feu")?;
+    policy: &FirewallPolicy,
+) -> anyhow::Result<()> {
+    if config.general.dry_run {
+        simulate_bringup(shared, event_tx, fw, policy).await
+    } else {
+        bring_up_real(config, shared, event_tx, fw, policy).await
     }
-    Ok(state)
 }
 
-/// Montée réelle via charon (VICI). Exécutée sur la machine dédiée.
+async fn simulate_bringup(
+    shared: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+    fw: &dyn FirewallBackend,
+    policy: &FirewallPolicy,
+) -> anyhow::Result<()> {
+    info!("[dry-run] simulation de la montée du tunnel");
+    let mut state = *shared.read().await;
+    // Repart de Down si nécessaire.
+    if state != TunnelState::Down {
+        state = TunnelState::Down;
+    }
+    for event in [TunnelEvent::StartRequested, TunnelEvent::IkeEstablished, TunnelEvent::ChildUp] {
+        state = state.on(event).context("transition d'état")?;
+        info!("événement {event:?} -> état {state:?}");
+        transition(shared, event_tx, state, fw, policy).await?;
+    }
+    Ok(())
+}
+
 async fn bring_up_real(
     config: &Config,
+    shared: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
-    mut state: TunnelState,
-) -> anyhow::Result<TunnelState> {
+    policy: &FirewallPolicy,
+) -> anyhow::Result<()> {
     let mut client = ViciClient::connect(&config.vici.socket)
         .await
         .with_context(|| format!("connexion VICI sur {}", config.vici.socket))?;
     info!("connecté à charon via {}", config.vici.socket);
 
+    let mut state = TunnelState::Down;
     for conn in &config.connections {
         state = state.on(TunnelEvent::StartRequested)?;
+        transition(shared, event_tx, state, fw, policy).await?;
+
         load_connection(&mut client, conn).await?;
         match initiate(&mut client, conn).await {
             Ok(()) => {
@@ -113,15 +164,11 @@ async fn bring_up_real(
                 state = state.on(TunnelEvent::Error)?;
             }
         }
-        fw.apply(&config.firewall_policy(), state).await?;
+        transition(shared, event_tx, state, fw, policy).await?;
     }
-    Ok(state)
+    Ok(())
 }
 
-/// Construit et envoie un `load-conn` pour une connexion.
-///
-/// La proposition IKE porte l'échange hybride post-quantique
-/// (ex. `..._ke1_mlkem768`) ; charon poussera les SA correspondantes dans XFRM.
 async fn load_connection(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<()> {
     let child = Message::new()
         .list("esp_proposals", &[conn.esp_proposal.as_str()])
@@ -139,8 +186,7 @@ async fn load_connection(client: &mut ViciClient, conn: &Connection) -> anyhow::
     }
     body = body.section("children", Message::new().section(&conn.name, child));
 
-    let payload = Message::new().section(&conn.name, body);
-    let reply = client.request("load-conn", payload).await?;
+    let reply = client.request("load-conn", Message::new().section(&conn.name, body)).await?;
     if reply.get_str("success") == Some("no") {
         anyhow::bail!(
             "load-conn `{}` refusé : {}",
@@ -152,9 +198,7 @@ async fn load_connection(client: &mut ViciClient, conn: &Connection) -> anyhow::
 }
 
 async fn initiate(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<()> {
-    let payload = Message::new()
-        .kv("child", &conn.name)
-        .kv("timeout", "-1");
+    let payload = Message::new().kv("child", &conn.name).kv("timeout", "-1");
     let reply = client.request("initiate", payload).await?;
     if reply.get_str("success") == Some("no") {
         anyhow::bail!(
@@ -168,7 +212,6 @@ async fn initiate(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<
 
 fn spawn_update_loop(channel: Box<dyn UpdateChannel>, interval_secs: u64) {
     tokio::spawn(async move {
-        // Confirme le boot courant pour empêcher un rollback RAUC intempestif.
         if let Err(e) = channel.confirm_boot().await {
             warn!("confirmation du boot impossible : {e}");
         }
@@ -190,14 +233,13 @@ fn spawn_update_loop(channel: Box<dyn UpdateChannel>, interval_secs: u64) {
     });
 }
 
-/// Sous-commande `status`.
 pub fn status(config: &Config) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
     println!("  mode         : {}", if config.general.dry_run { "dry-run" } else { "réel" });
     println!("  socket VICI  : {}", config.vici.socket);
+    println!("  interface web: http://{}", config.api.bind);
     println!("  WAN          : {}", config.firewall.wan_iface);
     println!("  LAN          : {:?}", config.firewall.lan_ifaces);
-    println!("  mode firewall: {:?}", config.firewall.mode);
     println!("  connexions   : {}", config.connections.len());
     for c in &config.connections {
         println!("    - {} -> {} [{}]", c.name, c.remote_addr, c.ike_proposal);
@@ -205,7 +247,6 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sous-commande `check-update`.
 pub async fn check_update(config: &Config) -> anyhow::Result<()> {
     let channel = update_channel(config);
     let current = channel.current_version().await?;

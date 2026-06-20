@@ -1,0 +1,24 @@
+[package]
+name = "helios-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Embarque l'app React dans le binaire (prod). Nécessite d'avoir exécuté
+# `npm run build` dans web/ au préalable.
+embed-ui = ["dep:rust-embed"]
+
+[dependencies]
+helios-core.workspace = true
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+mime_guess.workspace = true
+rust-embed = { version = "8", optional = true }

@@ -14,6 +14,8 @@ pub struct Config {
     pub vici: Vici,
     pub firewall: Firewall,
     #[serde(default)]
+    pub api: Api,
+    #[serde(default)]
     pub update: Update,
     #[serde(default)]
     pub connections: Vec<Connection>,
@@ -113,6 +115,24 @@ impl Default for Vici {
     }
 }
 
+/// Configuration du serveur HTTP (interface web + API REST + WebSocket).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Api {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_bind")]
+    pub bind: String,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_bind(),
+        }
+    }
+}
+
 impl Default for Update {
     fn default() -> Self {
         Self {
@@ -134,6 +154,9 @@ fn default_vici_socket() -> String {
 }
 fn default_update_interval() -> u64 {
     3600
+}
+fn default_bind() -> String {
+    "127.0.0.1:8080".to_string()
 }
 
 #[cfg(test)]
