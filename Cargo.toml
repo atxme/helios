@@ -7,6 +7,7 @@ members = [
     "crates/helios-update",
     "crates/helios-api",
     "crates/heliosd",
+    "tools/helios-ctl",
 ]
 
 [workspace.package]
@@ -35,11 +36,13 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 mime_guess = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
 
 helios-core = { path = "crates/helios-core" }
 helios-api = { path = "crates/helios-api" }

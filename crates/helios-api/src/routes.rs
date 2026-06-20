@@ -19,6 +19,10 @@ pub struct StatusResponse {
 pub struct ConnectionSummary {
     pub name: String,
     pub remote_addr: String,
+    pub local_id: Option<String>,
+    pub remote_id: Option<String>,
+    pub ike_proposal: String,
+    pub esp_proposal: String,
 }
 
 #[derive(Serialize)]
@@ -41,6 +45,10 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
             .map(|c| ConnectionSummary {
                 name: c.name.clone(),
                 remote_addr: c.remote_addr.clone(),
+                local_id: c.local_id.clone(),
+                remote_id: c.remote_id.clone(),
+                ike_proposal: c.ike_proposal.clone(),
+                esp_proposal: c.esp_proposal.clone(),
             })
             .collect(),
         dry_run: s.config.general.dry_run,

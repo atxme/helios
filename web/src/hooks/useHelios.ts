@@ -1,50 +1,76 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createWebSocket, fetchStatus, tunnelStart, tunnelStop } from '../api'
 import type { HeliosEvent, Status, TunnelState } from '../types'
 
-const MAX_EVENTS = 60
+const MAX_EVENTS = 100
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected'
 
 export function useHelios() {
   const [status, setStatus] = useState<Status | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [events, setEvents] = useState<Array<HeliosEvent & { ts: string }>>([])
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting')
   const wsRef = useRef<WebSocket | null>(null)
+  const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backoffRef = useRef(1000)
 
-  useEffect(() => {
-    fetchStatus().then(setStatus).catch(console.error)
+  const pushEvent = useCallback((ev: HeliosEvent) => {
+    const ts = new Date().toLocaleTimeString('fr-FR', { hour12: false })
+    setEvents(prev => [{ ...ev, ts }, ...prev].slice(0, MAX_EVENTS))
+  }, [])
+
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return
+    setWsStatus('connecting')
 
     const ws = createWebSocket()
     wsRef.current = ws
 
-    ws.onopen = () => setWsStatus('connected')
-    ws.onclose = () => setWsStatus('disconnected')
-    ws.onerror = () => setWsStatus('disconnected')
-
-    ws.onmessage = (e: MessageEvent) => {
-      const event: HeliosEvent = JSON.parse(e.data as string)
-      const ts = new Date().toLocaleTimeString()
-
-      if (event.type === 'state_changed') {
-        setStatus(s => s ? { ...s, state: event.state } : s)
-      }
-      setEvents(prev => [{ ...event, ts }, ...prev].slice(0, MAX_EVENTS))
+    ws.onopen = () => {
+      setWsStatus('connected')
+      backoffRef.current = 1000
     }
 
-    return () => ws.close()
-  }, [])
+    ws.onmessage = (e: MessageEvent) => {
+      const ev: HeliosEvent = JSON.parse(e.data as string)
+      if (ev.type === 'state_changed') {
+        setStatus(s => s ? { ...s, state: ev.state } : s)
+      }
+      pushEvent(ev)
+    }
 
-  const connect = async () => {
+    ws.onclose = () => {
+      setWsStatus('disconnected')
+      // Reconnexion automatique avec backoff exponentiel (max 30s)
+      const delay = Math.min(backoffRef.current, 30_000)
+      backoffRef.current = delay * 2
+      reconnectRef.current = setTimeout(() => connect(), delay)
+    }
+
+    ws.onerror = () => ws.close()
+  }, [pushEvent])
+
+  useEffect(() => {
+    fetchStatus()
+      .then(s => { setStatus(s); setError(null) })
+      .catch(() => setError('Impossible de joindre le daemon — vérifiez que heliosd tourne sur :8080'))
+    connect()
+    return () => {
+      if (reconnectRef.current) clearTimeout(reconnectRef.current)
+      wsRef.current?.close()
+    }
+  }, [connect])
+
+  const handleConnect = async () => {
     await tunnelStart()
-    // L'état sera mis à jour via WebSocket — pas besoin de re-fetch.
   }
 
-  const disconnect = async () => {
+  const handleDisconnect = async () => {
     await tunnelStop()
   }
 
   const currentState: TunnelState = status?.state ?? 'down'
 
-  return { status, events, wsStatus, currentState, connect, disconnect }
+  return { status, error, events, wsStatus, currentState, connect: handleConnect, disconnect: handleDisconnect }
 }

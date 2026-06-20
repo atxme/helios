@@ -3,6 +3,10 @@ export type TunnelState = 'down' | 'connecting' | 'up' | 'rekeying' | 'failed'
 export interface ConnectionSummary {
   name: string
   remote_addr: string
+  local_id: string | null
+  remote_id: string | null
+  ike_proposal: string
+  esp_proposal: string
 }
 
 export interface Status {

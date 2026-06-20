@@ -1,0 +1,19 @@
+[package]
+name = "helios-ctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "helios-ctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = "0.24"

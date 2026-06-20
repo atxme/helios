@@ -6,7 +6,21 @@
       "Bash(cargo clippy *)",
       "Bash(cargo run *)",
       "Bash(timeout 2 cargo run -q -p heliosd -- --config config/helios.toml run)",
-      "Bash(timeout 2 ./target/debug/heliosd --config config/helios.toml run)"
+      "Bash(timeout 2 ./target/debug/heliosd --config config/helios.toml run)",
+      "Bash(./target/debug/heliosd run *)",
+      "Bash(timeout 1 ./target/debug/heliosd --config config/helios.toml run --dev)",
+      "Bash(sed 's/dry_run = true/dry_run = false/' config/helios.toml)",
+      "Bash(timeout 1 ./target/debug/heliosd --config /tmp/helios-real.toml run)",
+      "Bash(NO_COLOR=1 timeout 1 ./target/debug/heliosd --config config/helios.toml run --dev)",
+      "Bash(NO_COLOR=1 timeout 1 ./target/debug/heliosd --config /tmp/helios-real.toml run)",
+      "Bash(npm install *)",
+      "Read(//usr/bin/**)",
+      "Read(//home/christophe/.nvm/versions/**)",
+      "Bash(command -v pnpm bun yarn)",
+      "Bash(npm --version)",
+      "Read(//home/christophe/.local/share/fnm/node-versions/**)",
+      "Read(//home/christophe/**)",
+      "Bash(npm run *)"
     ]
   }
 }
