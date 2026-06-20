@@ -41,6 +41,10 @@ fn update_channel(config: &Config) -> Box<dyn UpdateChannel> {
     }
 }
 
+fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
+    let _ = tx.send(HeliosEvent::Log { level: level.into(), message: message.into() });
+}
+
 /// Met à jour l'état partagé, émet un événement WebSocket et applique le pare-feu.
 async fn transition(
     shared: &Arc<RwLock<TunnelState>>,
@@ -72,12 +76,15 @@ pub async fn run(
     // 2. Montée initiale du tunnel.
     do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
 
-    // 3. OTA.
+    // 3. Télémétrie réseau (/proc/net/dev).
+    spawn_telemetry_loop(config.firewall.wan_iface.clone(), event_tx.clone());
+
+    // 4. OTA.
     if config.update.enabled {
         spawn_update_loop(update_channel(&config), config.update.check_interval_secs);
     }
 
-    // 4. Boucle principale : commandes de l'UI ou signal d'arrêt.
+    // 5. Boucle principale : commandes de l'UI ou signal d'arrêt.
     let state_str = format!("{:?}", *shared_state.read().await);
     info!("heliosd opérationnel (état {state_str}). Ctrl-C pour quitter.");
     loop {
@@ -89,10 +96,12 @@ pub async fn run(
             cmd = cmd_rx.recv() => match cmd {
                 Some(OrchestratorCmd::Connect) => {
                     info!("connexion demandée via l'interface web");
+                    emit_log(&event_tx, "info", "Connexion demandée via l'interface web");
                     do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
                 }
                 Some(OrchestratorCmd::Disconnect) => {
                     info!("déconnexion demandée via l'interface web");
+                    emit_log(&event_tx, "info", "Déconnexion demandée via l'interface web");
                     transition(&shared_state, &event_tx, TunnelState::Down, fw.as_ref(), &policy).await?;
                 }
                 None => break,
@@ -123,14 +132,21 @@ async fn simulate_bringup(
     policy: &FirewallPolicy,
 ) -> anyhow::Result<()> {
     info!("[dry-run] simulation de la montée du tunnel");
+    emit_log(event_tx, "info", "[dry-run] Démarrage de la simulation IKEv2 + ML-KEM-768");
     let mut state = *shared.read().await;
-    // Repart de Down si nécessaire.
     if state != TunnelState::Down {
         state = TunnelState::Down;
     }
     for event in [TunnelEvent::StartRequested, TunnelEvent::IkeEstablished, TunnelEvent::ChildUp] {
         state = state.on(event).context("transition d'état")?;
         info!("événement {event:?} -> état {state:?}");
+        let msg = match event {
+            TunnelEvent::StartRequested  => "Négociation IKEv2 initiée…",
+            TunnelEvent::IkeEstablished  => "IKE_SA établi — échange ML-KEM-768 + ECDHE terminé",
+            TunnelEvent::ChildUp         => "CHILD_SA actif — trafic chiffré ESP autorisé",
+            _ => "",
+        };
+        if !msg.is_empty() { emit_log(event_tx, "info", msg); }
         transition(shared, event_tx, state, fw, policy).await?;
     }
     Ok(())
@@ -150,6 +166,7 @@ async fn bring_up_real(
 
     let mut state = TunnelState::Down;
     for conn in &config.connections {
+        emit_log(event_tx, "info", &format!("Connexion `{}` — négociation IKEv2…", conn.name));
         state = state.on(TunnelEvent::StartRequested)?;
         transition(shared, event_tx, state, fw, policy).await?;
 
@@ -158,9 +175,11 @@ async fn bring_up_real(
             Ok(()) => {
                 state = state.on(TunnelEvent::ChildUp)?;
                 info!("connexion `{}` établie", conn.name);
+                emit_log(event_tx, "info", &format!("CHILD_SA `{}` actif — trafic chiffré ESP", conn.name));
             }
             Err(e) => {
                 error!("échec de `{}` : {e}", conn.name);
+                emit_log(event_tx, "error", &format!("Échec de `{}` : {e}", conn.name));
                 state = state.on(TunnelEvent::Error)?;
             }
         }
@@ -208,6 +227,44 @@ async fn initiate(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<
         );
     }
     Ok(())
+}
+
+fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with(iface) { continue; }
+        let rest = trimmed.trim_start_matches(iface).trim_start_matches(':');
+        let fields: Vec<u64> = rest.split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        // /proc/net/dev : rx_bytes[0] rx_packets[1] ... tx_bytes[8] tx_packets[9]
+        if fields.len() >= 10 {
+            return Some((fields[0], fields[8], fields[1], fields[9]));
+        }
+    }
+    None
+}
+
+fn spawn_telemetry_loop(iface: String, event_tx: broadcast::Sender<HeliosEvent>) {
+    tokio::spawn(async move {
+        let mut prev: Option<(u64, u64, u64, u64)> = None;
+        let mut ticker = time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            let Ok(content) = tokio::fs::read_to_string("/proc/net/dev").await else { continue };
+            let Some(cur) = parse_proc_net_dev(&content, &iface) else { continue };
+            if let Some(p) = prev {
+                let _ = event_tx.send(HeliosEvent::Telemetry {
+                    iface: iface.clone(),
+                    rx_bps: (cur.0.saturating_sub(p.0)) * 8,
+                    tx_bps: (cur.1.saturating_sub(p.1)) * 8,
+                    rx_pps: cur.2.saturating_sub(p.2),
+                    tx_pps: cur.3.saturating_sub(p.3),
+                });
+            }
+            prev = Some(cur);
+        }
+    });
 }
 
 fn spawn_update_loop(channel: Box<dyn UpdateChannel>, interval_secs: u64) {

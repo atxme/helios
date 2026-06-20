@@ -1,7 +1,7 @@
-import type { HeliosEvent } from '../types'
+import type { DisplayEvent } from '../types'
 import type { WsStatus } from '../hooks/useHelios'
 
-type TimestampedEvent = HeliosEvent & { ts: string }
+type TimestampedEvent = DisplayEvent & { ts: string }
 
 interface Props {
   events: TimestampedEvent[]

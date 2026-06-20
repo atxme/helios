@@ -39,11 +39,11 @@ const STATE = {
     Icon: ShieldOff,
     label: 'HORS LIGNE',
     sub: 'Kill-switch engagé · Aucun trafic autorisé',
-    color: 'text-zinc-500',
-    iconBg: 'bg-zinc-800 border-zinc-700',
-    border: 'border-zinc-700/50',
-    card: 'bg-zinc-900/60',
-    dot: 'bg-zinc-600',
+    color: 'text-slate-500',
+    iconBg: 'bg-slate-800 border-slate-700',
+    border: 'border-slate-700/50',
+    card: 'bg-slate-900/60',
+    dot: 'bg-slate-600',
     iconAnim: '',
   },
   failed: {
@@ -95,23 +95,23 @@ export function StatusHero({ state, status }: Props) {
               {s.label}
             </span>
           </div>
-          <p className="text-zinc-500 text-xs truncate">{s.sub}</p>
+          <p className="text-slate-500 text-xs truncate">{s.sub}</p>
         </div>
 
         {/* Proposition cryptographique */}
         {conn && (
-          <div className="hidden md:block shrink-0 text-right border-l border-zinc-800 pl-4">
-            <p className="text-zinc-600 text-[10px] uppercase tracking-widest mb-1.5">Chiffrement IKE</p>
-            <p className="font-mono text-[11px] text-zinc-400 leading-relaxed">
+          <div className="hidden md:block shrink-0 text-right border-l border-slate-800 pl-4">
+            <p className="text-slate-600 text-[10px] uppercase tracking-widest mb-1.5">Chiffrement IKE</p>
+            <p className="font-mono text-[11px] text-slate-400 leading-relaxed">
               {conn.ike_proposal.split('-').map((part, i) => (
                 <span key={i}>
-                  {i > 0 && <span className="text-zinc-700"> · </span>}
+                  {i > 0 && <span className="text-slate-700"> · </span>}
                   {part}
                 </span>
               ))}
             </p>
-            <p className="text-zinc-600 text-[10px] uppercase tracking-widest mt-1.5 mb-1">ESP</p>
-            <p className="font-mono text-[11px] text-zinc-500">{conn.esp_proposal}</p>
+            <p className="text-slate-600 text-[10px] uppercase tracking-widest mt-1.5 mb-1">ESP</p>
+            <p className="font-mono text-[11px] text-slate-500">{conn.esp_proposal}</p>
           </div>
         )}
       </div>

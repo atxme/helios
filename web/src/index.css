@@ -8,19 +8,19 @@
   }
 
   body {
-    background-color: #09090b;
+    background-color: #020617;
     /* Grille de points très subtile — identité "security ops" */
-    background-image: radial-gradient(circle, rgba(63, 63, 70, 0.4) 1px, transparent 1px);
+    background-image: radial-gradient(circle, rgba(30, 41, 59, 0.5) 1px, transparent 1px);
     background-size: 28px 28px;
     -webkit-font-smoothing: antialiased;
   }
 
   /* Scrollbar fine style terminal */
   ::-webkit-scrollbar { width: 4px; height: 4px; }
-  ::-webkit-scrollbar-track { background: #18181b; }
-  ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 2px; }
-  ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+  ::-webkit-scrollbar-track { background: #0f172a; }
+  ::-webkit-scrollbar-thumb { background: #475569; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: #334155; }
 
   /* Sélection de texte */
-  ::selection { background: rgba(16, 185, 129, 0.25); color: #f4f4f5; }
+  ::selection { background: rgba(16, 185, 129, 0.25); color: #f1f5f9; }
 }

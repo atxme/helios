@@ -22,3 +22,14 @@ export interface Status {
 export type HeliosEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'log'; level: string; message: string }
+  | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
+
+export interface TelemetrySample {
+  rx_bps: number
+  tx_bps: number
+  rx_pps: number
+  tx_pps: number
+}
+
+/** Événements affichés dans le terminal — hors télémétrie (streamée séparément). */
+export type DisplayEvent = Exclude<HeliosEvent, { type: 'telemetry' }>
