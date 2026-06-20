@@ -1,0 +1,32 @@
+# Configuration Helios — exemple.
+# Sur WSL2, garder dry_run = true : aucune écriture réelle dans le kernel.
+
+[general]
+dry_run = true          # passer à false uniquement sur la machine dédiée
+log_level = "info"
+
+[vici]
+socket = "/var/run/charon.vici"
+
+[firewall]
+wan_iface = "eth0"      # contrôleur Realtek RTL8111HS sur la cible
+lan_ifaces = ["eth1"]
+ike_peers = ["203.0.113.10"]
+mode = "fail-closed"    # kill-switch ; "fail-open" pour le mode dégradé (déconseillé)
+
+[update]
+enabled = false
+check_interval_secs = 3600
+# manifest = "/var/lib/helios/releases.json"
+
+# Une connexion = une politique IPsec négociée auprès de charon.
+# La proposition IKE impose l'échange de clés HYBRIDE post-quantique :
+#   ecp384         -> ECDHE classique (sécurité immédiate)
+#   ke1_mlkem768   -> ML-KEM-768 en échange additionnel (RFC 9370), résistance quantique
+[[connections]]
+name = "site-a"
+remote_addr = "203.0.113.10"
+local_id = "client@helios"
+remote_id = "gw@example.net"
+ike_proposal = "aes256gcm16-prfsha384-ecp384-ke1_mlkem768"
+esp_proposal = "aes256gcm16-ecp384"

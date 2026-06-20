@@ -1,0 +1,26 @@
+[package]
+name = "heliosd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "heliosd"
+path = "src/main.rs"
+
+[features]
+default = []
+# Propage l'activation du backend Netlink réel (cible).
+netlink = ["helios-firewall/netlink"]
+
+[dependencies]
+helios-core.workspace = true
+helios-vici.workspace = true
+helios-firewall.workspace = true
+helios-update.workspace = true
+tokio = { workspace = true }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

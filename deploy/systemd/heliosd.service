@@ -1,0 +1,25 @@
+[Unit]
+Description=Helios IPsec orchestrator (kill-switch + OTA)
+Documentation=https://github.com/christophe/helios
+# On démarre après le réseau et charon, mais heliosd engage le kill-switch
+# AVANT d'autoriser le moindre trafic : fail-closed dès le boot.
+After=network-pre.target strongswan.service
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/heliosd --config /etc/helios/helios.toml run
+Restart=on-failure
+RestartSec=2
+
+# heliosd a besoin de manipuler nftables et XFRM.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/helios
+RuntimeDirectory=helios
+
+[Install]
+WantedBy=multi-user.target
