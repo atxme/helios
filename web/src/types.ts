@@ -9,14 +9,25 @@ export interface ConnectionSummary {
   esp_proposal: string
 }
 
+export interface ProfileSummary {
+  id: string
+  name: string
+  description: string
+  pqc_level: string
+  reserved: boolean
+}
+
 export interface Status {
   state: TunnelState
   version: string
   wan_iface: string
   lan_ifaces: string[]
   ike_peers: string[]
+  allow_ssh_from: string[]
   connections: ConnectionSummary[]
   dry_run: boolean
+  profiles: ProfileSummary[]
+  active_profile: string | null
 }
 
 export type HeliosEvent =
@@ -33,3 +44,9 @@ export interface TelemetrySample {
 
 /** Événements affichés dans le terminal — hors télémétrie (streamée séparément). */
 export type DisplayEvent = Exclude<HeliosEvent, { type: 'telemetry' }>
+
+export interface FirewallRules {
+  rules: string
+  default_verdict: string
+  dry_run: boolean
+}

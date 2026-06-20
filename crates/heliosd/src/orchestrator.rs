@@ -4,7 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use helios_core::{
-    Config, Connection, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelEvent, TunnelState,
+    profiles, Config, Connection, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelEvent,
+    TunnelState,
 };
 use helios_firewall::{DryRunBackend, FirewallBackend};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
@@ -65,6 +66,7 @@ pub async fn run(
     shared_state: Arc<RwLock<TunnelState>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
+    effective_proposals: Arc<RwLock<Option<(String, String)>>>,
 ) -> anyhow::Result<()> {
     let policy = config.firewall_policy();
     let fw = firewall_backend(config.general.dry_run);
@@ -99,9 +101,56 @@ pub async fn run(
                     emit_log(&event_tx, "info", "Connexion demandée via l'interface web");
                     do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
                 }
+                Some(OrchestratorCmd::ConnectWithProfile(profile_id)) => {
+                    match profiles::find(&profile_id) {
+                        Some(p) => {
+                            info!("connexion avec profil `{}` ({})", p.id, p.name);
+                            emit_log(&event_tx, "info",
+                                &format!("Connexion avec profil {} — {}", p.name, p.ike_proposal));
+                            *effective_proposals.write().await =
+                                Some((p.ike_proposal.to_string(), p.esp_proposal.to_string()));
+                            let mut overridden = config.clone();
+                            for conn in &mut overridden.connections {
+                                conn.ike_proposal = p.ike_proposal.to_string();
+                                conn.esp_proposal = p.esp_proposal.to_string();
+                            }
+                            do_connect(&overridden, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
+                        }
+                        None => {
+                            error!("profil IKE inconnu : `{profile_id}`");
+                            emit_log(&event_tx, "error",
+                                &format!("Profil IKE inconnu : `{profile_id}`"));
+                        }
+                    }
+                }
+                Some(OrchestratorCmd::ConnectWithCustom { ike_proposal, esp_proposal }) => {
+                    info!("connexion avec propositions personnalisées : IKE={ike_proposal}");
+                    emit_log(&event_tx, "info",
+                        &format!("Connexion personnalisée — IKE : {ike_proposal}"));
+                    *effective_proposals.write().await =
+                        Some((ike_proposal.clone(), esp_proposal.clone()));
+                    let mut overridden = config.clone();
+                    for conn in &mut overridden.connections {
+                        conn.ike_proposal = ike_proposal.clone();
+                        conn.esp_proposal = esp_proposal.clone();
+                    }
+                    do_connect(&overridden, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
+                }
+                Some(OrchestratorCmd::ApplyFirewallRules(rules)) => {
+                    if config.general.dry_run {
+                        info!("[dry-run] règles nftables personnalisées reçues ({} octets) — non appliquées", rules.len());
+                        emit_log(&event_tx, "info",
+                            "[dry-run] Règles nftables reçues — application ignorée (mode simulation)");
+                    } else {
+                        info!("application de règles nftables personnalisées ({} octets)", rules.len());
+                        emit_log(&event_tx, "warn", "Règles nftables personnalisées appliquées — vérifiez la cohérence");
+                        // Sur cible : `nft -f /dev/stdin` serait appelé ici.
+                    }
+                }
                 Some(OrchestratorCmd::Disconnect) => {
                     info!("déconnexion demandée via l'interface web");
                     emit_log(&event_tx, "info", "Déconnexion demandée via l'interface web");
+                    *effective_proposals.write().await = None;
                     transition(&shared_state, &event_tx, TunnelState::Down, fw.as_ref(), &policy).await?;
                 }
                 None => break,

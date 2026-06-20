@@ -6,6 +6,7 @@ members = [
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
+    "crates/helio-tpm",
     "crates/heliosd",
     "tools/helios-ctl",
 ]
@@ -50,6 +51,7 @@ helios-api = { path = "crates/helios-api" }
 helios-vici = { path = "crates/helios-vici" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }
+helio-tpm = { path = "crates/helio-tpm" }
 
 [profile.release]
 lto = "thin"

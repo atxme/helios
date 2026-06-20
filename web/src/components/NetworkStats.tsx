@@ -56,7 +56,6 @@ function Sparkline({ values, color, height = 40 }: SparklineProps) {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      {/* Point courant */}
       {values.length > 0 && (
         <circle
           cx={PAD + (values.length - 1) * step}
@@ -75,37 +74,35 @@ export function NetworkStats({ samples, sparklineHeight = 40 }: Props) {
   const txValues = samples.map(s => s.tx_bps)
 
   return (
-    <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-5 flex flex-col gap-4">
+    <div className="panel hud p-5 flex flex-col gap-4">
       <div className="flex items-center gap-2">
-        <Activity className="h-3.5 w-3.5 text-slate-600" strokeWidth={1.5} />
-        <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500">
-          Télémétrie réseau
-        </h2>
+        <Activity className="h-3.5 w-3.5 text-cyan-500/70" strokeWidth={1.5} />
+        <h2 className="hud-title">Télémétrie réseau</h2>
         {!latest && (
-          <span className="ml-auto text-[10px] text-slate-700 font-mono">en attente…</span>
+          <span className="ml-auto text-[10px] text-slate-300 dark:text-slate-700 font-mono">en attente…</span>
         )}
       </div>
 
       {/* Rx */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-slate-600">Rx entrant</span>
-          <span className="font-mono text-xs text-emerald-400">
+          <span className="text-[10px] uppercase tracking-wider text-slate-400 dark:text-slate-600">Rx entrant</span>
+          <span className="font-mono text-xs text-cyan-600 dark:text-cyan-400">
             {latest ? `${formatBps(latest.rx_bps)} · ${formatPps(latest.rx_pps)}` : '—'}
           </span>
         </div>
-        <Sparkline values={rxValues} color="#34d399" height={sparklineHeight} />
+        <Sparkline values={rxValues} color="#22d3ee" height={sparklineHeight} />
       </div>
 
       {/* Tx */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-slate-600">Tx sortant</span>
-          <span className="font-mono text-xs text-sky-400">
+          <span className="text-[10px] uppercase tracking-wider text-slate-400 dark:text-slate-600">Tx sortant</span>
+          <span className="font-mono text-xs text-fuchsia-600 dark:text-fuchsia-400">
             {latest ? `${formatBps(latest.tx_bps)} · ${formatPps(latest.tx_pps)}` : '—'}
           </span>
         </div>
-        <Sparkline values={txValues} color="#38bdf8" height={sparklineHeight} />
+        <Sparkline values={txValues} color="#e879f9" height={sparklineHeight} />
       </div>
     </div>
   )

@@ -9,10 +9,12 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod policy;
+pub mod profiles;
 pub mod state;
 
 pub use config::{Config, Connection};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
+pub use profiles::{IkeProfile, PqcLevel};
 pub use state::{TunnelEvent, TunnelState};

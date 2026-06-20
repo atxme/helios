@@ -13,6 +13,8 @@ export function useHelios() {
   const [events, setEvents] = useState<Array<DisplayEvent & { ts: string }>>([])
   const [telemetry, setTelemetry] = useState<TelemetrySample[]>([])
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting')
+  const [tunnelUpSince, setTunnelUpSince] = useState<Date | null>(null)
+  const [selectedProfile, setSelectedProfile] = useState<string | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backoffRef = useRef(1000)
@@ -38,6 +40,8 @@ export function useHelios() {
       const ev: HeliosEvent = JSON.parse(e.data as string)
       if (ev.type === 'state_changed') {
         setStatus(s => s ? { ...s, state: ev.state } : s)
+        if (ev.state === 'up') setTunnelUpSince(new Date())
+        else if (ev.state === 'down' || ev.state === 'failed') setTunnelUpSince(null)
       } else if (ev.type === 'telemetry') {
         setTelemetry(prev => [...prev.slice(-(MAX_TELEMETRY - 1)), {
           rx_bps: ev.rx_bps, tx_bps: ev.tx_bps, rx_pps: ev.rx_pps, tx_pps: ev.tx_pps,
@@ -49,7 +53,6 @@ export function useHelios() {
 
     ws.onclose = () => {
       setWsStatus('disconnected')
-      // Reconnexion automatique avec backoff exponentiel (max 30s)
       const delay = Math.min(backoffRef.current, 30_000)
       backoffRef.current = delay * 2
       reconnectRef.current = setTimeout(() => connect(), delay)
@@ -60,7 +63,11 @@ export function useHelios() {
 
   useEffect(() => {
     fetchStatus()
-      .then(s => { setStatus(s); setError(null) })
+      .then(s => {
+        setStatus(s)
+        setError(null)
+        setSelectedProfile(s.active_profile)
+      })
       .catch(() => setError('Impossible de joindre le daemon — vérifiez que heliosd tourne sur :8080'))
     connect()
     return () => {
@@ -70,7 +77,7 @@ export function useHelios() {
   }, [connect])
 
   const handleConnect = async () => {
-    await tunnelStart()
+    await tunnelStart(selectedProfile ?? undefined)
   }
 
   const handleDisconnect = async () => {
@@ -79,5 +86,9 @@ export function useHelios() {
 
   const currentState: TunnelState = status?.state ?? 'down'
 
-  return { status, error, events, telemetry, wsStatus, currentState, connect: handleConnect, disconnect: handleDisconnect }
+  return {
+    status, error, events, telemetry, wsStatus, currentState,
+    tunnelUpSince, selectedProfile, setSelectedProfile,
+    connect: handleConnect, disconnect: handleDisconnect,
+  }
 }

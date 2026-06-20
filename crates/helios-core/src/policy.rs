@@ -27,6 +27,9 @@ pub struct FirewallPolicy {
     pub ike_peers: Vec<String>,
     /// Comportement hors tunnel.
     pub mode: PolicyMode,
+    /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),
+    /// même lorsque le kill-switch est engagé.
+    pub allow_ssh_from: Vec<String>,
 }
 
 impl FirewallPolicy {

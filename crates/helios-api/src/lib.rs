@@ -32,6 +32,9 @@ pub struct AppState {
     /// Canal de commandes vers l'orchestrateur (Start/Stop depuis l'UI).
     pub cmd_tx: mpsc::Sender<OrchestratorCmd>,
     pub config: Arc<Config>,
+    /// Propositions IKE/ESP effectives si surchargées par l'UI (ike, esp).
+    /// `None` = utiliser les valeurs de la config.
+    pub effective_proposals: Arc<RwLock<Option<(String, String)>>>,
 }
 
 impl AppState {
@@ -40,8 +43,9 @@ impl AppState {
         tunnel_state: Arc<RwLock<TunnelState>>,
         event_tx: broadcast::Sender<HeliosEvent>,
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
+        effective_proposals: Arc<RwLock<Option<(String, String)>>>,
     ) -> Self {
-        Self { tunnel_state, event_tx, cmd_tx, config }
+        Self { tunnel_state, event_tx, cmd_tx, config, effective_proposals }
     }
 }
 
@@ -57,6 +61,9 @@ pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
         .route("/api/status", get(routes::status))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
+        .route("/api/connections/apply", post(routes::connection_apply))
+        .route("/api/firewall/rules", get(routes::firewall_rules_get))
+        .route("/api/firewall/rules", post(routes::firewall_rules_apply))
         .route("/ws", get(ws::handler))
         .fallback(embed::static_handler)
         .layer(CorsLayer::permissive())

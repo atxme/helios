@@ -22,5 +22,11 @@ pub enum HeliosEvent {
 #[derive(Debug, Clone)]
 pub enum OrchestratorCmd {
     Connect,
+    /// Connexion avec un profil IKE spécifique (identifiant de `profiles::PROFILES`).
+    ConnectWithProfile(String),
+    /// Connexion avec des propositions IKE/ESP personnalisées (saisie manuelle).
+    ConnectWithCustom { ike_proposal: String, esp_proposal: String },
+    /// Applique un jeu de règles nftables brut (dry-run = log seulement).
+    ApplyFirewallRules(String),
     Disconnect,
 }

@@ -1,22 +1,24 @@
-import { Activity, LayoutDashboard, Settings2, Shield, ShieldHalf } from 'lucide-react'
+import { Activity, AlertCircle, Flame, KeyRound, LayoutDashboard, Settings2, Shield } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Status } from '../types'
 import type { WsStatus } from '../hooks/useHelios'
-import { AlertCircle } from 'lucide-react'
+import { useTheme } from '../hooks/useTheme'
+import { Background } from './Background'
 
-export type NavId = 'dashboard' | 'telemetry' | 'firewall' | 'settings'
+export type NavId = 'dashboard' | 'telemetry' | 'ipsec' | 'firewall' | 'settings'
 
 const NAV_ITEMS: { id: NavId; icon: React.ElementType; label: string }[] = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'   },
   { id: 'telemetry', icon: Activity,        label: 'Télémétrie'  },
+  { id: 'ipsec',     icon: KeyRound,        label: 'IKE SA'      },
   { id: 'firewall',  icon: Shield,          label: 'Pare-feu'    },
   { id: 'settings',  icon: Settings2,       label: 'Paramètres'  },
 ]
 
 const WS_LABEL: Record<WsStatus, { dot: string; label: string }> = {
-  connected:    { dot: 'bg-emerald-400',             label: 'Temps réel' },
-  connecting:   { dot: 'bg-amber-400 animate-pulse', label: 'Connexion…' },
-  disconnected: { dot: 'bg-red-500',                 label: 'Déconnecté' },
+  connected:    { dot: 'bg-cyan-400 shadow-neon-cyan',        label: 'WebSocket actif' },
+  connecting:   { dot: 'bg-amber-300 animate-pulse',          label: 'Connexion WS…'   },
+  disconnected: { dot: 'bg-red-500',                          label: 'WS déconnecté'   },
 }
 
 interface Props {
@@ -28,23 +30,51 @@ interface Props {
   wsStatus: WsStatus
 }
 
+// Sélecteur de thème flottant — segment LIGHT / DARK à la maquette.
+function ThemeSwitch({ dark, toggle }: { dark: boolean; toggle: () => void }) {
+  return (
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30">
+      <div className="card hud flex items-center p-1 text-[10px] font-mono uppercase tracking-[0.18em]">
+        <button
+          onClick={() => { if (dark) toggle() }}
+          className={`px-4 py-1.5 rounded-md transition-all ${
+            !dark ? 'bg-amber-400/90 text-amber-950 shadow-neon-amber' : 'text-slate-400 hover:text-amber-300'
+          }`}
+        >
+          Light
+        </button>
+        <button
+          onClick={() => { if (!dark) toggle() }}
+          className={`px-4 py-1.5 rounded-md transition-all ${
+            dark ? 'bg-cyan-400/90 text-cyan-950 shadow-neon-cyan' : 'text-slate-500 hover:text-cyan-600'
+          }`}
+        >
+          Dark
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export function Layout({ children, nav, onNav, status, error, wsStatus }: Props) {
   const ws = WS_LABEL[wsStatus]
+  const { dark, toggle } = useTheme()
 
   return (
-    <div className="flex h-screen bg-slate-950 text-slate-100 overflow-hidden">
+    <div className="relative flex h-screen overflow-hidden">
+      {/* Scène 3D — soleil ambre + réseau cyber (derrière tout) */}
+      <Background dark={dark} />
 
-      {/* ── Sidebar ── */}
-      <aside className="w-14 lg:w-56 shrink-0 flex flex-col border-r border-slate-800 bg-slate-950">
-
+      {/* ── Sidebar — verre cyber, identité soleil Helios ── */}
+      <aside className="panel relative z-20 m-2 w-14 lg:w-56 shrink-0 flex flex-col rounded-xl">
         {/* Logo */}
-        <div className="h-14 flex items-center gap-3 px-3 lg:px-4 border-b border-slate-800 shrink-0">
-          <div className="h-7 w-7 shrink-0 rounded border border-emerald-500/30 bg-emerald-500/8 flex items-center justify-center">
-            <ShieldHalf className="h-4 w-4 text-emerald-400" strokeWidth={1.5} />
+        <div className="h-14 flex items-center gap-3 px-3 lg:px-4 border-b border-[var(--panel-border)] shrink-0">
+          <div className="h-7 w-7 shrink-0 rounded-full border border-amber-400/50 bg-amber-400/15 flex items-center justify-center shadow-neon-amber">
+            <Flame className="h-4 w-4 text-amber-400" strokeWidth={1.5} />
           </div>
           <div className="hidden lg:block min-w-0">
-            <div className="font-bold tracking-[0.18em] text-xs text-slate-100">HELIOS</div>
-            <div className="text-[10px] text-slate-600 tracking-wide">IPsec Gateway</div>
+            <div className="font-bold tracking-[0.22em] text-xs text-amber-300">HELIOS</div>
+            <div className="text-[10px] text-cyan-500/70 tracking-wide font-mono">IPsec · PQC Gateway</div>
           </div>
         </div>
 
@@ -56,19 +86,19 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
               <button
                 key={id}
                 onClick={() => onNav(id)}
-                className={`
-                  group flex items-center gap-3 w-full px-2 py-2.5 rounded-lg text-left
-                  transition-all duration-150 relative
-                  ${active
-                    ? 'bg-slate-800 text-slate-100'
-                    : 'text-slate-500 hover:bg-slate-800/50 hover:text-slate-300'
-                  }
-                `}
+                className={`group relative flex items-center gap-3 w-full px-2 py-2.5 rounded-lg text-left transition-all duration-150 ${
+                  active
+                    ? 'bg-cyan-400/10 text-cyan-300'
+                    : 'text-slate-400 hover:bg-cyan-400/5 hover:text-cyan-400'
+                }`}
               >
                 {active && (
-                  <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 bg-emerald-500 rounded-r" />
+                  <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 bg-cyan-400 rounded-r shadow-neon-cyan" />
                 )}
-                <Icon className={`h-4 w-4 shrink-0 ${active ? 'text-emerald-400' : 'text-slate-600 group-hover:text-slate-400'}`} strokeWidth={1.5} />
+                <Icon
+                  className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-400' : 'text-slate-500 group-hover:text-cyan-400'}`}
+                  strokeWidth={1.5}
+                />
                 <span className="hidden lg:block text-xs font-medium tracking-wide">{label}</span>
               </button>
             )
@@ -76,33 +106,30 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
         </nav>
 
         {/* Pied de sidebar */}
-        <div className="border-t border-slate-800 px-3 lg:px-4 py-3 space-y-2 shrink-0">
-          {/* WS status */}
+        <div className="border-t border-[var(--panel-border)] px-3 lg:px-4 py-3 space-y-2 shrink-0">
           <div className="flex items-center gap-2 justify-center lg:justify-start">
             <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${ws.dot}`} />
-            <span className="hidden lg:block text-[10px] text-slate-600 font-mono">{ws.label}</span>
+            <span className="hidden lg:block text-[10px] text-slate-500 font-mono">{ws.label}</span>
           </div>
-          {/* Badges */}
           {status?.dry_run && (
             <div className="hidden lg:flex">
-              <span className="text-[10px] px-2 py-0.5 rounded border border-violet-500/30 bg-violet-500/8 text-violet-400 font-mono tracking-wider uppercase">
+              <span className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-400 font-mono tracking-wider uppercase">
                 Simulation
               </span>
             </div>
           )}
           {status && (
-            <div className="hidden lg:block text-[10px] text-slate-700 font-mono">v{status.version}</div>
+            <div className="hidden lg:block text-[10px] text-slate-500/70 font-mono">v{status.version}</div>
           )}
         </div>
       </aside>
 
       {/* ── Zone principale ── */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-
+      <div className="relative z-10 flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Bannière erreur daemon */}
         {error && (
-          <div className="shrink-0 border-b border-red-500/20 bg-red-500/5">
-            <div className="px-6 py-2.5 flex items-center gap-2.5">
+          <div className="shrink-0 m-2 mb-0 rounded-lg border border-red-500/30 bg-red-500/10 backdrop-blur-sm">
+            <div className="px-5 py-2.5 flex items-center gap-2.5">
               <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0" strokeWidth={1.5} />
               <span className="text-xs text-red-400">{error}</span>
             </div>
@@ -110,10 +137,12 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
         )}
 
         {/* Contenu vue active */}
-        <main className="flex-1 overflow-y-auto px-6 py-5">
+        <main className="flex-1 overflow-y-auto px-6 py-5 pb-16">
           {children}
         </main>
       </div>
+
+      <ThemeSwitch dark={dark} toggle={toggle} />
     </div>
   )
 }

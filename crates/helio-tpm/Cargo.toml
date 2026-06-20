@@ -1,0 +1,33 @@
+[package]
+name = "helio-tpm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Active l'accès réel au TPM via libtss2-esys (requiert les bibliothèques TSS2 système).
+# Ne pas activer sur WSL2 — le périphérique /dev/tpmrm0 et les libs C ne sont pas disponibles.
+tpm = ["dep:tss-esapi"]
+
+[dependencies]
+helios-core = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hex = "0.4"
+# Vérification des billets de rescellement (signature de l'éditeur). Pure Rust, testable WSL2.
+ed25519-dalek = "2"
+# Effacement mémoire du secret descellé.
+zeroize = { version = "1", features = ["derive"] }
+# CSPRNG pour la génération du secret au provisionnement.
+getrandom = "0.2"
+# Empreinte d'identité de l'état PCR (liaison du billet).
+sha2 = "0.10"
+# Backend TPM réel — cible uniquement.
+tss-esapi = { version = "7.5", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

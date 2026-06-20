@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use helio_tpm::{BootController, BootDecision};
 use helios_api::AppState;
 use helios_core::{Config, HeliosEvent, OrchestratorCmd, TunnelState};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -96,9 +97,25 @@ fn apply_dev_mode(config: &mut Config, explicit_dev: bool) {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
+    // Validation d'intégrité de démarrage par scellement TPM — AVANT tout réseau.
+    // Le secret descellé déchiffrera, à terme, les identifiants IPsec.
+    let boot = BootController::unlock(&config.tpm)
+        .map_err(|e| anyhow::anyhow!("déscellement TPM échoué — arrêt : {e}"))?;
+    match &boot {
+        BootDecision::Disabled => {}
+        BootDecision::Bypassed => warn!("intégrité TPM non vérifiée (enforce=false)"),
+        BootDecision::Unsealed(_) => info!("intégrité du démarrage confirmée (TPM)"),
+        BootDecision::Provisioned(_) => warn!("premier boot : provisionnement TOFU effectué"),
+        BootDecision::Resealed(_) => warn!("rescellement post-OTA effectué (billet valide)"),
+    }
+    // TODO : alimenter le déchiffrement des identifiants IPsec avec `boot.secret()`
+    // avant `load-conn`. Le secret est conservé (et zeroïsé) jusque-là.
+    let _boot = boot;
+
     let (event_tx, _) = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);
-    let tunnel_state = Arc::new(RwLock::new(TunnelState::Down));
+    let tunnel_state      = Arc::new(RwLock::new(TunnelState::Down));
+    let effective_proposals: Arc<RwLock<Option<(String, String)>>> = Arc::new(RwLock::new(None));
 
     if config.api.enabled {
         let state = AppState::new(
@@ -106,6 +123,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             Arc::clone(&tunnel_state),
             event_tx.clone(),
             cmd_tx,
+            Arc::clone(&effective_proposals),
         );
         let bind = config.api.bind.clone();
         tokio::spawn(async move {
@@ -115,5 +133,5 @@ async fn run(config: Config) -> anyhow::Result<()> {
         });
     }
 
-    orchestrator::run(config, tunnel_state, event_tx, cmd_rx).await
+    orchestrator::run(config, tunnel_state, event_tx, cmd_rx, effective_proposals).await
 }
