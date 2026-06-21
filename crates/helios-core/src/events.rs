@@ -17,8 +17,13 @@ pub enum HeliosEvent {
         tx_pps: u64,
     },
     /// Migration MOBIKE (RFC 4555) : l'adresse IP WAN a changé dynamiquement.
-    /// Le tunnel reste actif — strongSwan met à jour la SA sans renégociation IKE.
     AddressChanged { iface: String, old_ip: String, new_ip: String },
+    /// Portail captif interceptant le trafic HTTP détecté sur le réseau courant.
+    CaptivePortalDetected { gateway: String },
+    /// MTU optimal déterminé par PMTUD — règle MSS clamping appliquée.
+    MtuDiscovered { mtu: u16, mss: u16 },
+    /// Liste des CIDRs en split-tunneling mise à jour.
+    SplitTunnelChanged { cidrs: Vec<String> },
 }
 
 /// Commandes envoyées par l'interface web vers l'orchestrateur.
@@ -32,4 +37,10 @@ pub enum OrchestratorCmd {
     /// Applique un jeu de règles nftables brut (dry-run = log seulement).
     ApplyFirewallRules(String),
     Disconnect,
+    /// L'utilisateur a accepté le portail captif dans son navigateur — relancer la connexion.
+    AcknowledgeCaptivePortal,
+    /// Met à jour la liste des CIDRs bypassant le tunnel (split-tunneling dynamique).
+    SetSplitTunnel(Vec<String>),
+    /// Applique une valeur de MSS clamping issue de la sonde PMTUD (usage interne).
+    SetMssClamp(u16),
 }

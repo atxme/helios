@@ -19,7 +19,7 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use helios_core::{Config, HeliosEvent, OrchestratorCmd, TunnelState};
+use helios_core::{Config, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelState};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// État partagé entre tous les handlers Axum.
@@ -33,8 +33,10 @@ pub struct AppState {
     pub cmd_tx: mpsc::Sender<OrchestratorCmd>,
     pub config: Arc<Config>,
     /// Propositions IKE/ESP effectives si surchargées par l'UI (ike, esp).
-    /// `None` = utiliser les valeurs de la config.
     pub effective_proposals: Arc<RwLock<Option<(String, String)>>>,
+    /// Politique de pare-feu courante (mise à jour par l'orchestrateur).
+    /// Expose les champs dynamiques : split_tunnel_cidrs, mss_clamp, captive_portal_gateway.
+    pub policy: Arc<RwLock<FirewallPolicy>>,
 }
 
 impl AppState {
@@ -44,8 +46,9 @@ impl AppState {
         event_tx: broadcast::Sender<HeliosEvent>,
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
         effective_proposals: Arc<RwLock<Option<(String, String)>>>,
+        policy: Arc<RwLock<FirewallPolicy>>,
     ) -> Self {
-        Self { tunnel_state, event_tx, cmd_tx, config, effective_proposals }
+        Self { tunnel_state, event_tx, cmd_tx, config, effective_proposals, policy }
     }
 }
 
@@ -64,6 +67,8 @@ pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
         .route("/api/connections/apply", post(routes::connection_apply))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .route("/api/firewall/rules", post(routes::firewall_rules_apply))
+        .route("/api/captive-portal/release", post(routes::captive_portal_release))
+        .route("/api/split-tunnel", post(routes::split_tunnel_set))
         .route("/ws", get(ws::handler))
         .fallback(embed::static_handler)
         .layer(CorsLayer::permissive())

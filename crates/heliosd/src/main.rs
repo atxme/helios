@@ -114,8 +114,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let (event_tx, _) = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);
-    let tunnel_state      = Arc::new(RwLock::new(TunnelState::Down));
+    let tunnel_state        = Arc::new(RwLock::new(TunnelState::Down));
     let effective_proposals: Arc<RwLock<Option<(String, String)>>> = Arc::new(RwLock::new(None));
+    // Politique de pare-feu partagée entre l'orchestrateur et l'API REST.
+    let shared_policy       = Arc::new(RwLock::new(config.firewall_policy()));
 
     if config.api.enabled {
         let state = AppState::new(
@@ -124,6 +126,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             event_tx.clone(),
             cmd_tx,
             Arc::clone(&effective_proposals),
+            Arc::clone(&shared_policy),
         );
         let bind = config.api.bind.clone();
         tokio::spawn(async move {
@@ -133,5 +136,5 @@ async fn run(config: Config) -> anyhow::Result<()> {
         });
     }
 
-    orchestrator::run(config, tunnel_state, event_tx, cmd_rx, effective_proposals).await
+    orchestrator::run(config, tunnel_state, event_tx, cmd_rx, effective_proposals, shared_policy).await
 }

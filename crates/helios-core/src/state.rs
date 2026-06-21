@@ -8,9 +8,14 @@ use crate::error::{HeliosError, Result};
 /// le tunnel est réellement opérationnel ([`TunnelState::Up`] ou
 /// [`TunnelState::Rekeying`]). Dans tout autre état, le kill-switch est engagé
 /// (« fail-closed ») : aucune fuite en clair n'est possible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// Exception contrôlée : [`TunnelState::CaptivePortal`] lève partiellement le
+/// kill-switch (HTTP/HTTPS vers la passerelle locale uniquement) le temps que
+/// l'utilisateur accepte le portail captif.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TunnelState {
+    #[default]
     /// Aucun tunnel. Kill-switch ACTIF.
     Down,
     /// Négociation IKE/CHILD_SA en cours. Kill-switch ACTIF.
@@ -21,6 +26,9 @@ pub enum TunnelState {
     Rekeying,
     /// Échec. Kill-switch ACTIF.
     Failed,
+    /// Portail captif interceptant le trafic : kill-switch partiel
+    /// (HTTP/HTTPS vers la passerelle locale autorisés, tout le reste bloqué).
+    CaptivePortal,
 }
 
 /// Événements provenant du plan de contrôle (charon via VICI).
@@ -35,6 +43,10 @@ pub enum TunnelEvent {
     /// Migration MOBIKE (RFC 4555) : l'adresse IP locale a changé sans rupture de SA.
     /// Le tunnel reste opérationnel ; charon met à jour l'adresse dynamiquement.
     AddressChanged,
+    /// Portail captif détecté — HTTP intercepté sur le réseau courant.
+    CaptivePortalDetected,
+    /// L'utilisateur a validé le portail captif — tenter une reconnexion.
+    CaptivePortalResolved,
 }
 
 impl TunnelState {
@@ -48,6 +60,23 @@ impl TunnelState {
         !self.traffic_allowed()
     }
 
+    /// Portail captif actif : HTTP/HTTPS vers la passerelle locale autorisés.
+    pub fn captive_portal_active(self) -> bool {
+        matches!(self, TunnelState::CaptivePortal)
+    }
+
+    /// Représentation chaîne stable (utilisée par l'API REST).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TunnelState::Down          => "down",
+            TunnelState::Connecting    => "connecting",
+            TunnelState::Up            => "up",
+            TunnelState::Rekeying      => "rekeying",
+            TunnelState::Failed        => "failed",
+            TunnelState::CaptivePortal => "captive_portal",
+        }
+    }
+
     /// Applique un événement et renvoie l'état suivant, ou une erreur si la
     /// transition n'a pas de sens.
     pub fn on(self, event: TunnelEvent) -> Result<TunnelState> {
@@ -56,6 +85,8 @@ impl TunnelState {
 
         let next = match (self, event) {
             (Down | Failed, StartRequested) => Connecting,
+            // Portail captif : résolu par l'utilisateur → on retente la connexion
+            (CaptivePortal, CaptivePortalResolved) => Connecting,
             (Connecting, IkeEstablished) => Connecting, // IKE_SA up, on attend la CHILD_SA
             (Connecting, ChildUp) => Up,
             (Up, ChildRekeying) => Rekeying,
@@ -63,6 +94,8 @@ impl TunnelState {
             // MOBIKE : migration d'adresse sans rupture de SA — l'état ne change pas
             (Up, AddressChanged) => Up,
             (Rekeying, AddressChanged) => Rekeying,
+            // Portail captif détecté depuis n'importe quel état non-Up
+            (Down | Failed | Connecting, CaptivePortalDetected) => CaptivePortal,
             (_, Disconnected) => Down,
             (_, Error) => Failed,
             (s, e) => {
@@ -84,6 +117,7 @@ mod tests {
         assert!(TunnelState::Down.kill_switch_engaged());
         assert!(TunnelState::Failed.kill_switch_engaged());
         assert!(TunnelState::Connecting.kill_switch_engaged());
+        assert!(TunnelState::CaptivePortal.kill_switch_engaged());
     }
 
     #[test]
@@ -91,6 +125,20 @@ mod tests {
         assert!(TunnelState::Up.traffic_allowed());
         assert!(TunnelState::Rekeying.traffic_allowed());
         assert!(!TunnelState::Down.traffic_allowed());
+        assert!(!TunnelState::CaptivePortal.traffic_allowed());
+    }
+
+    #[test]
+    fn captive_portal_lifecycle() {
+        // Connecting → portail détecté → CaptivePortal
+        let s = TunnelState::Connecting
+            .on(TunnelEvent::CaptivePortalDetected)
+            .unwrap();
+        assert_eq!(s, TunnelState::CaptivePortal);
+        assert!(s.captive_portal_active());
+        // Résolu → Connecting
+        let s = s.on(TunnelEvent::CaptivePortalResolved).unwrap();
+        assert_eq!(s, TunnelState::Connecting);
     }
 
     #[test]

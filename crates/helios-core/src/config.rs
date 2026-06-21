@@ -104,6 +104,16 @@ pub struct Firewall {
     /// Vide par défaut (SSH bloqué).
     #[serde(default)]
     pub allow_ssh_from: Vec<String>,
+    /// Interface réseau exclusive pour l'accès à l'interface d'administration
+    /// (ex. `ipsec0`). Quand défini, le pare-feu bloque tout accès au port admin
+    /// depuis n'importe quelle autre interface — y compris le loopback.
+    /// Non défini = pas de restriction supplémentaire (mode dev / client).
+    #[serde(default)]
+    pub admin_iface: Option<String>,
+    /// CIDRs locaux bypassant le tunnel par défaut (configurables statiquement).
+    /// Complété dynamiquement par l'UI via `OrchestratorCmd::SetSplitTunnel`.
+    #[serde(default)]
+    pub split_tunnel_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -150,13 +160,28 @@ impl Config {
     }
 
     /// Projette la configuration vers la politique de pare-feu déclarative.
+    ///
+    /// Les champs dynamiques (`mss_clamp`, `captive_portal_gateway`) sont
+    /// initialisés à `None` ; l'orchestrateur les met à jour au fil du temps.
     pub fn firewall_policy(&self) -> FirewallPolicy {
+        // Le port admin est déduit de `api.bind` (ex. "0.0.0.0:8080" → 8080).
+        // Il n'est transmis à la politique que si `admin_iface` est défini —
+        // sans iface cible, la règle de restriction n'a pas de sens.
+        let admin_port = self.firewall.admin_iface.as_ref().and_then(|_| {
+            self.api.bind.rsplit(':').next()?.parse::<u16>().ok()
+        });
+
         FirewallPolicy {
             wan_iface: self.firewall.wan_iface.clone(),
             lan_ifaces: self.firewall.lan_ifaces.clone(),
             ike_peers: self.firewall.ike_peers.clone(),
             mode: self.firewall.mode,
             allow_ssh_from: self.firewall.allow_ssh_from.clone(),
+            admin_port,
+            admin_iface: self.firewall.admin_iface.clone(),
+            split_tunnel_cidrs: self.firewall.split_tunnel_cidrs.clone(),
+            mss_clamp: None,
+            captive_portal_gateway: None,
         }
     }
 }

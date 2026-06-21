@@ -26,6 +26,12 @@ pub struct StatusResponse {
     pub dry_run: bool,
     pub profiles: Vec<ProfileSummary>,
     pub active_profile: Option<String>,
+    /// CIDRs locaux actuellement en split-tunneling (mis à jour dynamiquement).
+    pub split_tunnel_cidrs: Vec<String>,
+    /// MSS clamping actif (déterminé par PMTUD après montée du tunnel). `null` = inactif.
+    pub mss_clamp: Option<u16>,
+    /// IP de la passerelle du portail captif courant. `null` = pas de portail.
+    pub captive_portal_gateway: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -66,9 +72,15 @@ pub struct ApplyRulesRequest {
     pub rules: String,
 }
 
+#[derive(Deserialize)]
+pub struct SplitTunnelRequest {
+    pub cidrs: Vec<String>,
+}
+
 pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     let state = s.tunnel_state.read().await;
     let effective = s.effective_proposals.read().await;
+    let policy = s.policy.read().await;
 
     let connections: Vec<ConnectionSummary> = s.config.connections.iter().map(|c| {
         let (ike, esp) = effective.clone()
@@ -96,7 +108,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     }).collect();
 
     Json(StatusResponse {
-        state: format!("{:?}", *state).to_lowercase(),
+        state: state.as_str().to_string(),
         version: env!("CARGO_PKG_VERSION"),
         wan_iface: s.config.firewall.wan_iface.clone(),
         lan_ifaces: s.config.firewall.lan_ifaces.clone(),
@@ -106,6 +118,9 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         dry_run: s.config.general.dry_run,
         profiles: profile_list,
         active_profile,
+        split_tunnel_cidrs: policy.split_tunnel_cidrs.clone(),
+        mss_clamp: policy.mss_clamp,
+        captive_portal_gateway: policy.captive_portal_gateway.clone(),
     })
 }
 
@@ -144,7 +159,7 @@ pub async fn connection_apply(
 /// Renvoie le jeu de règles nftables rendu pour l'état courant.
 pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRulesResponse> {
     let state = *s.tunnel_state.read().await;
-    let policy = s.config.firewall_policy();
+    let policy = s.policy.read().await;
     let rs = ruleset::render(&policy, state);
 
     let verdict_str = match rs.default_verdict {
@@ -176,5 +191,22 @@ pub async fn firewall_rules_apply(
     Json(body): Json<ApplyRulesRequest>,
 ) -> Json<CmdResponse> {
     let ok = s.cmd_tx.send(OrchestratorCmd::ApplyFirewallRules(body.rules)).await.is_ok();
+    Json(CmdResponse { ok })
+}
+
+/// L'utilisateur a validé le portail captif dans son navigateur.
+/// Relance une tentative de connexion IPsec.
+pub async fn captive_portal_release(State(s): State<AppState>) -> Json<CmdResponse> {
+    let ok = s.cmd_tx.send(OrchestratorCmd::AcknowledgeCaptivePortal).await.is_ok();
+    Json(CmdResponse { ok })
+}
+
+/// Met à jour la liste des CIDRs en split-tunneling.
+/// Passe `cidrs: []` pour désactiver le split-tunneling.
+pub async fn split_tunnel_set(
+    State(s): State<AppState>,
+    Json(body): Json<SplitTunnelRequest>,
+) -> Json<CmdResponse> {
+    let ok = s.cmd_tx.send(OrchestratorCmd::SetSplitTunnel(body.cidrs)).await.is_ok();
     Json(CmdResponse { ok })
 }

@@ -30,6 +30,19 @@ pub struct FirewallPolicy {
     /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),
     /// même lorsque le kill-switch est engagé.
     pub allow_ssh_from: Vec<String>,
+    /// Port TCP de l'interface d'administration REST/WS.
+    pub admin_port: Option<u16>,
+    /// Interface réseau exclusive pour l'accès à l'administration (ex. `ipsec0`).
+    pub admin_iface: Option<String>,
+    /// CIDRs locaux bypassant le tunnel (split-tunneling dynamique).
+    /// Vide = tout le trafic WAN passe par le tunnel (comportement par défaut).
+    pub split_tunnel_cidrs: Vec<String>,
+    /// MSS clamping post-PMTUD (octets). `None` = pas de clamping.
+    /// Calculé automatiquement au lancement du tunnel.
+    pub mss_clamp: Option<u16>,
+    /// IP de la passerelle du portail captif.
+    /// Renseigné lors de la détection ; HTTP/HTTPS vers cette IP sont autorisés.
+    pub captive_portal_gateway: Option<String>,
 }
 
 impl FirewallPolicy {
