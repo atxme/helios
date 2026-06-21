@@ -62,7 +62,7 @@ export function TunnelControls({
       {/* Sélecteur de profil IKE */}
       {status_profiles.length > 0 && (
         <div className="space-y-2">
-          <label className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600">
+          <label className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400">
             Profil IKEv2
           </label>
           <div className="grid grid-cols-1 gap-1.5">
@@ -140,10 +140,10 @@ export function TunnelControls({
       {/* Indicateur Kill-switch */}
       <div className="mt-auto pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
         {ks.engaged
-          ? <Lock     className="h-3 w-3 text-slate-400 dark:text-slate-600 shrink-0" strokeWidth={1.5} />
-          : <LockOpen className="h-3 w-3 text-slate-400 dark:text-slate-600 shrink-0" strokeWidth={1.5} />
+          ? <Lock     className="h-3 w-3 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
+          : <LockOpen className="h-3 w-3 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
         }
-        <span className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600">Kill-switch</span>
+        <span className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400">Kill-switch</span>
         <div className="flex items-center gap-1.5 ml-auto">
           <span className={`h-1.5 w-1.5 rounded-full ${ks.dot}`} />
           <span className={`text-[10px] font-mono uppercase ${ks.color}`}>{ks.label}</span>

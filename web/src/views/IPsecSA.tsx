@@ -166,7 +166,7 @@ function ConstrainedSelect<T extends string>({
   return (
     <div className="space-y-1">
       <label className={`block text-[9px] uppercase tracking-widest font-semibold ${
-        disabled ? 'text-slate-300 dark:text-slate-700' : 'text-slate-500 dark:text-slate-400'
+        disabled ? 'text-slate-500 dark:text-slate-500' : 'text-slate-500 dark:text-slate-400'
       }`}>{label}</label>
       <div className={`relative rounded-lg border transition-all ${
         disabled
@@ -180,7 +180,7 @@ function ConstrainedSelect<T extends string>({
           disabled={disabled}
           onChange={e => !disabled && onChange(e.target.value as T)}
           className={`w-full text-xs font-mono px-3 py-2.5 rounded-lg appearance-none bg-transparent focus:outline-none ${
-            disabled ? 'cursor-not-allowed text-slate-400 dark:text-slate-600'
+            disabled ? 'cursor-not-allowed text-slate-500 dark:text-slate-400'
             : highlight ? 'text-violet-700 dark:text-violet-300 cursor-pointer'
             : 'text-slate-700 dark:text-slate-300 cursor-pointer'
           }`}
@@ -194,7 +194,7 @@ function ConstrainedSelect<T extends string>({
             )
           })}
         </select>
-        <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400 dark:text-slate-600 text-[10px]">▾</div>
+        <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500 dark:text-slate-400 text-[10px]">▾</div>
       </div>
     </div>
   )
@@ -204,7 +204,7 @@ function SectionDivider({ label }: { label: string }) {
   return (
     <div className="flex items-center gap-2 my-1">
       <div className="h-px flex-1 bg-slate-100 dark:bg-slate-800" />
-      <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400 dark:text-slate-600 px-2">{label}</span>
+      <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400 px-2">{label}</span>
       <div className="h-px flex-1 bg-slate-100 dark:bg-slate-800" />
     </div>
   )
@@ -307,7 +307,7 @@ function SACard({ name, remoteAddr, localId, ikeProposal, espProposal, currentSt
               <span className="text-[9px] font-mono px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/8 text-violet-600 dark:text-violet-400 uppercase">PQC</span>
             )}
           </div>
-          <div className="text-[11px] text-slate-400 dark:text-slate-600 font-mono mt-0.5">
+          <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono mt-0.5">
             {remoteAddr}{localId ? ` · ${localId}` : ''}
           </div>
           {!open && <ProposalChips value={ikeProposal} />}
@@ -316,7 +316,7 @@ function SACard({ name, remoteAddr, localId, ikeProposal, espProposal, currentSt
           <span className={`flex items-center gap-1.5 text-[10px] font-mono uppercase px-2 py-1 rounded border ${
             isUp
               ? 'border-emerald-500/30 text-emerald-600 dark:text-emerald-400 bg-emerald-500/6'
-              : 'border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-600'
+              : 'border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400'
           }`}>
             <span className={`h-1.5 w-1.5 rounded-full ${isUp ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300 dark:bg-slate-600'}`} />
             {currentState}
@@ -332,7 +332,7 @@ function SACard({ name, remoteAddr, localId, ikeProposal, espProposal, currentSt
 
           {/* Profils prédéfinis */}
           <div>
-            <div className="text-[9px] uppercase tracking-widest font-semibold text-slate-400 dark:text-slate-600 mb-2">Profil prédéfini</div>
+            <div className="text-[9px] uppercase tracking-widest font-semibold text-slate-500 dark:text-slate-400 mb-2">Profil prédéfini</div>
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
               {PRESETS.map(p => {
                 const Icon = p.icon
@@ -391,7 +391,7 @@ function SACard({ name, remoteAddr, localId, ikeProposal, espProposal, currentSt
               />
             </div>
             {pfsForcedOff && (
-              <p className="mt-1.5 text-[10px] text-slate-400 dark:text-slate-600 font-mono leading-relaxed">
+              <p className="mt-1.5 text-[10px] text-slate-500 dark:text-slate-400 font-mono leading-relaxed">
                 Mode Full PQC : aucun DH classique → PFS via re-clé IKE ML-KEM uniquement
               </p>
             )}
@@ -403,9 +403,9 @@ function SACard({ name, remoteAddr, localId, ikeProposal, espProposal, currentSt
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
               {([['IKE SA', ikeStr], ['Child SA / ESP', espStr]] as const).map(([lbl, val]) => (
                 <div key={lbl} className="bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 space-y-2">
-                  <div className="text-[9px] uppercase tracking-widest text-slate-400 dark:text-slate-600">{lbl}</div>
+                  <div className="text-[9px] uppercase tracking-widest text-slate-500 dark:text-slate-400">{lbl}</div>
                   <ProposalChips value={val} />
-                  <div className="font-mono text-[10px] text-slate-400 dark:text-slate-600 break-all">{val}</div>
+                  <div className="font-mono text-[10px] text-slate-500 dark:text-slate-400 break-all">{val}</div>
                 </div>
               ))}
             </div>
@@ -476,7 +476,7 @@ export function IPsecSAView({ status, currentState }: Props) {
       </div>
       {status.connections.length === 0 ? (
         <div className="card p-12 text-center">
-          <KeyRound className="h-8 w-8 text-slate-300 dark:text-slate-700 mx-auto mb-3" strokeWidth={1.5} />
+          <KeyRound className="h-8 w-8 text-slate-500 dark:text-slate-500 mx-auto mb-3" strokeWidth={1.5} />
           <p className="text-sm text-slate-500">Aucune SA configurée</p>
         </div>
       ) : (
@@ -488,7 +488,7 @@ export function IPsecSAView({ status, currentState }: Props) {
         ))
       )}
       {status.dry_run && (
-        <p className="text-center text-[10px] font-mono text-slate-400 dark:text-slate-700 py-1">
+        <p className="text-center text-[10px] font-mono text-slate-500 dark:text-slate-500 py-1">
           Mode simulation — les commandes re-clé ne déclenchent pas de vraie négociation VICI
         </p>
       )}

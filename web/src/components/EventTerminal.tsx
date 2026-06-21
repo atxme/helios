@@ -26,8 +26,8 @@ function EventLine({ ev }: { ev: TimestampedEvent }) {
     }
     return (
       <li className="flex gap-3 items-baseline py-0.5 hover:bg-slate-100 dark:hover:bg-slate-800/30 px-2 -mx-2 rounded transition-colors">
-        <span className="text-slate-400 dark:text-slate-600 shrink-0 w-[4.5rem] font-mono text-[11px]">{ev.ts}</span>
-        <span className="text-slate-400 dark:text-slate-600 shrink-0 w-14 font-mono text-[11px] uppercase">STATE</span>
+        <span className="text-slate-500 dark:text-slate-400 shrink-0 w-[4.5rem] font-mono text-[11px]">{ev.ts}</span>
+        <span className="text-slate-500 dark:text-slate-400 shrink-0 w-14 font-mono text-[11px] uppercase">STATE</span>
         <span className={`font-mono text-[11px] font-medium ${stateColor[ev.state] ?? 'text-slate-500'}`}>
           {ev.state.toUpperCase()}
         </span>
@@ -39,12 +39,12 @@ function EventLine({ ev }: { ev: TimestampedEvent }) {
     error: 'text-red-500 dark:text-red-400',
     warn:  'text-amber-600 dark:text-amber-400',
     info:  'text-slate-500',
-    debug: 'text-slate-400 dark:text-slate-700',
+    debug: 'text-slate-500 dark:text-slate-500',
   }
 
   return (
     <li className="flex gap-3 items-baseline py-0.5 hover:bg-slate-100 dark:hover:bg-slate-800/30 px-2 -mx-2 rounded transition-colors">
-      <span className="text-slate-400 dark:text-slate-600 shrink-0 w-[4.5rem] font-mono text-[11px]">{ev.ts}</span>
+      <span className="text-slate-500 dark:text-slate-400 shrink-0 w-[4.5rem] font-mono text-[11px]">{ev.ts}</span>
       <span className={`shrink-0 w-14 font-mono text-[11px] uppercase ${levelStyle[ev.level] ?? 'text-slate-500'}`}>
         {ev.level.slice(0, 5)}
       </span>
@@ -64,20 +64,20 @@ export function EventTerminal({ events, wsStatus }: Props) {
           <Terminal className="h-3.5 w-3.5 text-cyan-500/70" strokeWidth={1.5} />
           <span className="hud-title">Journal d'événements</span>
           {events.length > 0 && (
-            <span className="text-[10px] text-slate-300 dark:text-slate-700 font-mono">({events.length})</span>
+            <span className="text-[10px] text-slate-500 dark:text-slate-500 font-mono">({events.length})</span>
           )}
         </div>
         <div className="flex items-center gap-1.5">
           <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
-          <span className="text-[10px] font-mono text-slate-400 dark:text-slate-600">{label}</span>
+          <span className="text-[10px] font-mono text-slate-500 dark:text-slate-400">{label}</span>
         </div>
       </div>
 
       {/* Corps terminal */}
       <div className="p-4">
         {events.length === 0 ? (
-          <p className="text-slate-400 dark:text-slate-700 text-[11px] font-mono px-2">
-            <span className="text-slate-400 dark:text-slate-600">{'>'}</span> En attente d'événements…
+          <p className="text-slate-500 dark:text-slate-500 text-[11px] font-mono px-2">
+            <span className="text-slate-500 dark:text-slate-400">{'>'}</span> En attente d'événements…
           </p>
         ) : (
           <ul className="space-y-0 max-h-56 overflow-y-auto">

@@ -15,7 +15,7 @@ interface Props {
 function Row({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
   return (
     <div className="flex items-center gap-3 py-2.5 border-b border-slate-200/60 dark:border-slate-800/60 last:border-0">
-      <Icon className="h-3.5 w-3.5 text-slate-400 dark:text-slate-600 shrink-0" strokeWidth={1.5} />
+      <Icon className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
       <span className="text-slate-500 text-xs w-24 shrink-0 uppercase tracking-wider">{label}</span>
       <span className="font-mono text-xs text-slate-700 dark:text-slate-300 truncate">{value || '—'}</span>
     </div>
@@ -52,7 +52,7 @@ function NftablesEditor({ dryRun }: { dryRun: boolean }) {
   return (
     <div className="card overflow-hidden">
       <div className="flex items-center gap-2 px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60 bg-slate-50/60 dark:bg-slate-950/40">
-        <Terminal className="h-3.5 w-3.5 text-slate-400 dark:text-slate-600" strokeWidth={1.5} />
+        <Terminal className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" strokeWidth={1.5} />
         <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500">Éditeur nftables</span>
         {dirty && (
           <span className="ml-2 text-[10px] text-amber-600 dark:text-amber-400 font-mono">● modifié</span>
@@ -175,7 +175,7 @@ export function FirewallView({ status, state }: Props) {
               <Row icon={Server}  label="Connexions"   value={`${status.connections.length} IKEv2`} />
             </>
           ) : (
-            <p className="text-slate-400 dark:text-slate-600 text-xs animate-pulse">Chargement…</p>
+            <p className="text-slate-500 dark:text-slate-400 text-xs animate-pulse">Chargement…</p>
           )}
         </div>
 
@@ -184,7 +184,7 @@ export function FirewallView({ status, state }: Props) {
           <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-3">SSH d'administration</h2>
           {sshCidrs.length === 0 ? (
             <div className="flex items-center gap-2 py-2">
-              <Lock className="h-3.5 w-3.5 text-slate-400 dark:text-slate-600 shrink-0" strokeWidth={1.5} />
+              <Lock className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
               <span className="text-xs text-slate-500 italic">
                 Bloqué (défaut sécurisé) — configurer <span className="font-mono not-italic">allow_ssh_from</span>
               </span>
@@ -196,7 +196,7 @@ export function FirewallView({ status, state }: Props) {
                   <span className="font-mono text-xs text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800/50 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700">
                     {cidr}
                   </span>
-                  <span className="text-[10px] font-mono text-slate-400 dark:text-slate-600 border border-slate-200 dark:border-slate-700 px-1.5 py-0.5 rounded">tcp/22</span>
+                  <span className="text-[10px] font-mono text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 px-1.5 py-0.5 rounded">tcp/22</span>
                   <span className="text-[10px] text-amber-600 dark:text-amber-400 font-mono">toujours actif</span>
                 </div>
               ))}
@@ -211,12 +211,12 @@ export function FirewallView({ status, state }: Props) {
       {/* Placeholder compteurs */}
       <div className="rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-dashed p-5">
         <div className="flex items-center gap-2 mb-2">
-          <ShieldAlert className="h-3.5 w-3.5 text-slate-300 dark:text-slate-700" strokeWidth={1.5} />
-          <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-300 dark:text-slate-700">
+          <ShieldAlert className="h-3.5 w-3.5 text-slate-500 dark:text-slate-500" strokeWidth={1.5} />
+          <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 dark:text-slate-500">
             Compteurs de paquets rejetés
           </h2>
         </div>
-        <p className="text-xs text-slate-400 dark:text-slate-700 italic">
+        <p className="text-xs text-slate-500 dark:text-slate-500 italic">
           Disponible sur cible — nécessite la lecture des compteurs nftables via Netlink
         </p>
       </div>

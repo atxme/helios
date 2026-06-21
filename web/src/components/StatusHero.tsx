@@ -101,16 +101,16 @@ export function StatusHero({ state, status }: Props) {
         {/* Proposition cryptographique */}
         {conn && (
           <div className="hidden md:block shrink-0 text-right border-l border-slate-200 dark:border-slate-800 pl-4">
-            <p className="text-slate-400 dark:text-slate-600 text-[10px] uppercase tracking-widest mb-1.5">Chiffrement IKE</p>
+            <p className="text-slate-500 dark:text-slate-400 text-[10px] uppercase tracking-widest mb-1.5">Chiffrement IKE</p>
             <p className="font-mono text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
               {conn.ike_proposal.split('-').map((part, i) => (
                 <span key={i}>
-                  {i > 0 && <span className="text-slate-300 dark:text-slate-700"> · </span>}
+                  {i > 0 && <span className="text-slate-500 dark:text-slate-500"> · </span>}
                   {part}
                 </span>
               ))}
             </p>
-            <p className="text-slate-400 dark:text-slate-600 text-[10px] uppercase tracking-widest mt-1.5 mb-1">ESP</p>
+            <p className="text-slate-500 dark:text-slate-400 text-[10px] uppercase tracking-widest mt-1.5 mb-1">ESP</p>
             <p className="font-mono text-[11px] text-slate-500">{conn.esp_proposal}</p>
           </div>
         )}

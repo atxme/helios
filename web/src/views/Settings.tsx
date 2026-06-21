@@ -55,7 +55,7 @@ function ConnectionCard({ conn, activeProfileId, profiles }: {
 
       {/* Proposition IKE */}
       <div>
-        <div className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600 mb-2">Proposition IKE</div>
+        <div className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400 mb-2">Proposition IKE</div>
         <div className="flex flex-wrap gap-1.5">
           {ike.parts.map((part, i) => {
             const isPqc = part.includes('mlkem') || part.includes('kyber')
@@ -77,7 +77,7 @@ function ConnectionCard({ conn, activeProfileId, profiles }: {
 
       {/* Proposition ESP */}
       <div>
-        <div className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600 mb-2">Proposition ESP</div>
+        <div className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400 mb-2">Proposition ESP</div>
         <div className="flex flex-wrap gap-1.5">
           {conn.esp_proposal.split('-').map((part, i) => (
             <span key={i} className="text-[10px] font-mono px-1.5 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/50 text-slate-600 dark:text-slate-400">
@@ -92,13 +92,13 @@ function ConnectionCard({ conn, activeProfileId, profiles }: {
         <div className="pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-2 gap-3">
           {conn.local_id && (
             <div>
-              <div className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600 mb-1">Local ID</div>
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400 mb-1">Local ID</div>
               <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400 truncate">{conn.local_id}</div>
             </div>
           )}
           {conn.remote_id && (
             <div>
-              <div className="text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-600 mb-1">Remote ID</div>
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 dark:text-slate-400 mb-1">Remote ID</div>
               <div className="font-mono text-[11px] text-slate-600 dark:text-slate-400 truncate">{conn.remote_id}</div>
             </div>
           )}
@@ -135,7 +135,7 @@ export function SettingsView({ status }: Props) {
               <Cpu className="h-3 w-3" strokeWidth={1.5} />ML-KEM actif
             </div>
           )}
-          <span className="text-[10px] text-slate-400 dark:text-slate-600 font-mono">v{status.version}</span>
+          <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">v{status.version}</span>
         </div>
       </div>
 
@@ -155,9 +155,9 @@ export function SettingsView({ status }: Props) {
       {/* Connexions */}
       {status.connections.length === 0 ? (
         <div className="card border-dashed p-8 text-center">
-          <ExternalLink className="h-5 w-5 text-slate-300 dark:text-slate-700 mx-auto mb-2" strokeWidth={1.5} />
+          <ExternalLink className="h-5 w-5 text-slate-500 dark:text-slate-500 mx-auto mb-2" strokeWidth={1.5} />
           <p className="text-xs text-slate-500">Aucune connexion configurée</p>
-          <p className="text-[11px] text-slate-400 dark:text-slate-600 mt-1">
+          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
             Ajoutez <span className="font-mono">[[connections]]</span> dans helios.toml
           </p>
         </div>
@@ -183,7 +183,7 @@ export function SettingsView({ status }: Props) {
           <div className="space-y-2">
             {safeProfiles.map(p => (
               <div key={p.id} className="flex items-center gap-3 py-2 border-b border-slate-200/60 dark:border-slate-800/60 last:border-0">
-                <span className="font-mono text-[10px] text-slate-400 dark:text-slate-600 w-20 shrink-0">{p.id}</span>
+                <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 w-20 shrink-0">{p.id}</span>
                 <span className="text-xs text-slate-700 dark:text-slate-300 font-medium">{p.name}</span>
                 {p.reserved && (
                   <span className="text-[10px] font-mono text-amber-600 dark:text-amber-400 border border-amber-500/30 px-1.5 py-0.5 rounded">réservé</span>

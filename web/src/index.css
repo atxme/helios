@@ -8,25 +8,27 @@
    ─────────────────────────────────────────────────────────────────────────── */
 :root {
   --bg-0:          #e9f0fb;
-  --panel:         rgba(255, 255, 255, 0.72);
-  --panel-2:       rgba(255, 255, 255, 0.55);
-  --panel-border:  rgba(8, 47, 73, 0.14);
-  --panel-border-strong: rgba(8, 47, 73, 0.22);
+  /* Panneaux nettement plus opaques en mode clair → le texte ne lutte plus
+     contre le réseau qui défile derrière (lisibilité + élégance). */
+  --panel:         rgba(247, 250, 254, 0.90);
+  --panel-2:       rgba(252, 253, 255, 0.78);
+  --panel-border:  rgba(8, 47, 73, 0.20);
+  --panel-border-strong: rgba(8, 47, 73, 0.30);
   --hud:           #0e7490;  /* cyan-700, accent HUD lisible sur fond clair */
   --text:          #0f172a;
-  --muted:         #64748b;
+  --muted:         #475569;  /* slate-600 — secondaire enfin contrasté */
   --grid:          rgba(8, 47, 73, 0.05);
 }
 
 .dark {
   --bg-0:          #03060f;
-  --panel:         rgba(10, 18, 34, 0.55);
-  --panel-2:       rgba(8, 14, 28, 0.70);
-  --panel-border:  rgba(56, 189, 248, 0.16);
-  --panel-border-strong: rgba(56, 189, 248, 0.30);
+  --panel:         rgba(12, 20, 38, 0.66);
+  --panel-2:       rgba(9, 15, 30, 0.78);
+  --panel-border:  rgba(56, 189, 248, 0.20);
+  --panel-border-strong: rgba(56, 189, 248, 0.34);
   --hud:           #22d3ee;  /* cyan-400 néon */
-  --text:          #e2e8f0;
-  --muted:         #7b8aa3;
+  --text:          #e6edf6;
+  --muted:         #94a3b8;  /* slate-400 — secondaire plus lisible sur l'espace */
   --grid:          rgba(56, 189, 248, 0.05);
 }
 

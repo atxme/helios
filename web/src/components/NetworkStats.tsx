@@ -79,14 +79,14 @@ export function NetworkStats({ samples, sparklineHeight = 40 }: Props) {
         <Activity className="h-3.5 w-3.5 text-cyan-500/70" strokeWidth={1.5} />
         <h2 className="hud-title">Télémétrie réseau</h2>
         {!latest && (
-          <span className="ml-auto text-[10px] text-slate-300 dark:text-slate-700 font-mono">en attente…</span>
+          <span className="ml-auto text-[10px] text-slate-500 dark:text-slate-500 font-mono">en attente…</span>
         )}
       </div>
 
       {/* Rx */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-slate-400 dark:text-slate-600">Rx entrant</span>
+          <span className="text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400">Rx entrant</span>
           <span className="font-mono text-xs text-cyan-600 dark:text-cyan-400">
             {latest ? `${formatBps(latest.rx_bps)} · ${formatPps(latest.rx_pps)}` : '—'}
           </span>
@@ -97,7 +97,7 @@ export function NetworkStats({ samples, sparklineHeight = 40 }: Props) {
       {/* Tx */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-slate-400 dark:text-slate-600">Tx sortant</span>
+          <span className="text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400">Tx sortant</span>
           <span className="font-mono text-xs text-fuchsia-600 dark:text-fuchsia-400">
             {latest ? `${formatBps(latest.tx_bps)} · ${formatPps(latest.tx_pps)}` : '—'}
           </span>

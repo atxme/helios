@@ -73,8 +73,8 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
             <Flame className="h-4 w-4 text-amber-400" strokeWidth={1.5} />
           </div>
           <div className="hidden lg:block min-w-0">
-            <div className="font-bold tracking-[0.22em] text-xs text-amber-300">HELIOS</div>
-            <div className="text-[10px] text-cyan-500/70 tracking-wide font-mono">IPsec · PQC Gateway</div>
+            <div className="font-bold tracking-[0.22em] text-xs text-amber-600 dark:text-amber-300">HELIOS</div>
+            <div className="text-[10px] text-cyan-700/80 dark:text-cyan-500/70 tracking-wide font-mono">IPsec · PQC Gateway</div>
           </div>
         </div>
 
@@ -88,15 +88,15 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
                 onClick={() => onNav(id)}
                 className={`group relative flex items-center gap-3 w-full px-2 py-2.5 rounded-lg text-left transition-all duration-150 ${
                   active
-                    ? 'bg-cyan-400/10 text-cyan-300'
-                    : 'text-slate-400 hover:bg-cyan-400/5 hover:text-cyan-400'
+                    ? 'bg-cyan-400/10 text-cyan-700 dark:text-cyan-300'
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-cyan-400/5 hover:text-cyan-700 dark:hover:text-cyan-400'
                 }`}
               >
                 {active && (
                   <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 bg-cyan-400 rounded-r shadow-neon-cyan" />
                 )}
                 <Icon
-                  className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-400' : 'text-slate-500 group-hover:text-cyan-400'}`}
+                  className={`h-4 w-4 shrink-0 ${active ? 'text-cyan-500 dark:text-cyan-400' : 'text-slate-500 group-hover:text-cyan-500 dark:group-hover:text-cyan-400'}`}
                   strokeWidth={1.5}
                 />
                 <span className="hidden lg:block text-xs font-medium tracking-wide">{label}</span>

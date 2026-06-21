@@ -11,6 +11,7 @@ type Pal = {
   bg: string
   node: string; flux: string; line: string
   sun: string; corona: string; sunGlow: number
+  ring: string; ringOpacity: number
   wire: string; wireOpacity: number
   stars: number; starColor: string
   bloom: number; useBloom: boolean
@@ -24,6 +25,7 @@ const PALETTE: Record<'dark' | 'light', Pal> = {
     bg: '#03060f',
     node: '#22d3ee', flux: '#e879f9', line: '#22d3ee',
     sun: '#ffc233', corona: '#f59e0b', sunGlow: 0.6,
+    ring: '#fcd34d', ringOpacity: 0.6,
     wire: '#22d3ee', wireOpacity: 0.05,
     stars: 1500, starColor: '#cfe0ff',
     bloom: 1.2, useBloom: true,
@@ -34,7 +36,9 @@ const PALETTE: Record<'dark' | 'light', Pal> = {
   light: {
     bg: '#dce7fa',
     node: '#0e7490', flux: '#9333ea', line: '#0f766e',
-    sun: '#f59e0b', corona: '#fbbf24', sunGlow: 0.45,
+    sun: '#f59e0b', corona: '#fb923c', sunGlow: 0.5,
+    // Anneaux ambre foncé en blending normal → visibles et nets sur ciel clair.
+    ring: '#b45309', ringOpacity: 0.72,
     wire: '#1e3a8a', wireOpacity: 0.07,
     stars: 0, starColor: '#ffffff',
     bloom: 0, useBloom: false,
@@ -95,12 +99,13 @@ function Sun({ pal }: { pal: Pal }) {
         </sprite>
       </group>
 
-      {/* Anneaux orbitaux — géométrie « système solaire » */}
-      <group ref={ringsRef}>
-        {[5.6, 7.2, 9.2].map((r, i) => (
-          <mesh key={i} rotation={[Math.PI / 2.3 + i * 0.22, i * 0.5, 0]}>
-            <torusGeometry args={[r, 0.018, 8, 140]} />
-            <meshBasicMaterial color={pal.corona} transparent opacity={0.45}
+      {/* Anneaux orbitaux — système incliné cohérent (type Saturne) */}
+      <group ref={ringsRef} rotation={[Math.PI / 2.45, 0.18, 0]}>
+        {[5.2, 6.0, 6.9, 8.1, 9.4].map((r, i) => (
+          <mesh key={i}>
+            <torusGeometry args={[r, 0.03, 12, 200]} />
+            <meshBasicMaterial color={pal.ring} transparent
+              opacity={pal.ringOpacity * (1 - i * 0.13)}
               blending={pal.blending} depthWrite={false} toneMapped={false} />
           </mesh>
         ))}

@@ -56,7 +56,7 @@ function StatusStrip({ state, status }: { state: TunnelState; status: Status | n
       <span className={`font-bold tracking-[0.12em] text-xs ${s.color}`}>{s.label}</span>
       {conn && (
         <div className="ml-auto hidden md:flex items-center gap-2">
-          <span className="text-slate-400 dark:text-slate-600 text-[10px] uppercase tracking-widest">IKE</span>
+          <span className="text-slate-500 dark:text-slate-400 text-[10px] uppercase tracking-widest">IKE</span>
           <div className="flex gap-1">
             {conn.ike_proposal.split('-').map((part, i) => (
               <span key={i} className={`text-[10px] font-mono px-1 py-0.5 rounded border ${
@@ -76,9 +76,9 @@ function StatPill({ icon: Icon, label, value, highlight = false }: {
 }) {
   return (
     <div className="card flex items-center gap-2.5 px-3 py-2 min-w-0">
-      <Icon className="h-3 w-3 text-slate-400 dark:text-slate-600 shrink-0" strokeWidth={1.5} />
+      <Icon className="h-3 w-3 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
       <div className="min-w-0">
-        <div className="text-[9px] uppercase tracking-widest text-slate-400 dark:text-slate-600 leading-none mb-0.5">{label}</div>
+        <div className="text-[9px] uppercase tracking-widest text-slate-500 dark:text-slate-400 leading-none mb-0.5">{label}</div>
         <div className={`text-[11px] font-mono truncate ${highlight ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-700 dark:text-slate-300'}`}>
           {value}
         </div>
