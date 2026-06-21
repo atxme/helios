@@ -29,10 +29,15 @@ wan_iface = "eth0"      # contrôleur Realtek RTL8111HS sur la cible
 lan_ifaces = ["eth1"]
 ike_peers = ["203.0.113.10"]
 mode = "fail-closed"    # kill-switch ; "fail-open" pour le mode dégradé (déconseillé)
+# Sur la PASSERELLE uniquement : restreindre l'interface web à ipsec0.
+# Le port est déduit de [api].bind. Tout autre accès (loopback inclus) est
+# bloqué en tête de chaîne nftables — invariant de sécurité fort.
+# admin_iface = "ipsec0"
 
 [api]
 enabled = true
-bind = "127.0.0.1:8080"   # écoute sur localhost uniquement ; changer pour 0.0.0.0:8080 si accès LAN
+bind = "127.0.0.1:8080"   # dev/client : écoute localhost
+# Passerelle : bind = "0.0.0.0:8080" + admin_iface = "ipsec0" dans [firewall]
 
 [update]
 enabled = false
