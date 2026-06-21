@@ -14,5 +14,5 @@ pub mod client;
 pub mod codec;
 pub mod message;
 
-pub use client::{PacketType, ViciClient};
+pub use client::{PacketType, ViciClient, ViciEventStream};
 pub use message::{Element, Message};

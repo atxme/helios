@@ -32,6 +32,9 @@ pub enum TunnelEvent {
     ChildRekeying,
     Disconnected,
     Error,
+    /// Migration MOBIKE (RFC 4555) : l'adresse IP locale a changé sans rupture de SA.
+    /// Le tunnel reste opérationnel ; charon met à jour l'adresse dynamiquement.
+    AddressChanged,
 }
 
 impl TunnelState {
@@ -57,6 +60,9 @@ impl TunnelState {
             (Connecting, ChildUp) => Up,
             (Up, ChildRekeying) => Rekeying,
             (Rekeying, ChildUp) => Up,
+            // MOBIKE : migration d'adresse sans rupture de SA — l'état ne change pas
+            (Up, AddressChanged) => Up,
+            (Rekeying, AddressChanged) => Rekeying,
             (_, Disconnected) => Down,
             (_, Error) => Failed,
             (s, e) => {
@@ -112,5 +118,20 @@ mod tests {
     #[test]
     fn invalid_transition_is_rejected() {
         assert!(TunnelState::Down.on(TunnelEvent::ChildRekeying).is_err());
+    }
+
+    #[test]
+    fn mobike_address_change_preserves_state() {
+        assert_eq!(
+            TunnelState::Up.on(TunnelEvent::AddressChanged).unwrap(),
+            TunnelState::Up
+        );
+        assert_eq!(
+            TunnelState::Rekeying.on(TunnelEvent::AddressChanged).unwrap(),
+            TunnelState::Rekeying
+        );
+        // MOBIKE n'a pas de sens hors tunnel actif
+        assert!(TunnelState::Down.on(TunnelEvent::AddressChanged).is_err());
+        assert!(TunnelState::Connecting.on(TunnelEvent::AddressChanged).is_err());
     }
 }

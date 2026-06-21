@@ -16,6 +16,9 @@ pub enum HeliosEvent {
         rx_pps: u64,
         tx_pps: u64,
     },
+    /// Migration MOBIKE (RFC 4555) : l'adresse IP WAN a changé dynamiquement.
+    /// Le tunnel reste actif — strongSwan met à jour la SA sans renégociation IKE.
+    AddressChanged { iface: String, old_ip: String, new_ip: String },
 }
 
 /// Commandes envoyées par l'interface web vers l'orchestrateur.

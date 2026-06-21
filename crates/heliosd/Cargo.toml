@@ -26,6 +26,7 @@ helios-update.workspace = true
 helios-api.workspace = true
 helio-tpm.workspace = true
 tokio = { workspace = true }
+netlink-sys.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

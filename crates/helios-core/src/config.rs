@@ -134,6 +134,11 @@ pub struct Connection {
     pub ike_proposal: String,
     /// Proposition ESP/CHILD_SA, ex. `aes256gcm16-ecp384`.
     pub esp_proposal: String,
+    /// Active MOBIKE (RFC 4555) pour les clients nomades (Wi-Fi ↔ 4G/5G).
+    /// Sans MOBIKE, un changement d'IP force une renégociation IKE complète —
+    /// coûteuse avec ML-KEM. Activé par défaut.
+    #[serde(default = "default_true")]
+    pub mobike: bool,
 }
 
 impl Config {

@@ -9,7 +9,7 @@ use helios_core::{
 };
 use helios_firewall::{DryRunBackend, FirewallBackend};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
-use helios_vici::{Message, ViciClient};
+use helios_vici::{Message, ViciClient, ViciEventStream};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -225,6 +225,14 @@ async fn bring_up_real(
                 state = state.on(TunnelEvent::ChildUp)?;
                 info!("connexion `{}` établie", conn.name);
                 emit_log(event_tx, "info", &format!("CHILD_SA `{}` actif — trafic chiffré ESP", conn.name));
+                if conn.mobike {
+                    spawn_mobike_monitor(
+                        config.vici.socket.clone(),
+                        config.firewall.wan_iface.clone(),
+                        conn.name.clone(),
+                        event_tx.clone(),
+                    );
+                }
             }
             Err(e) => {
                 error!("échec de `{}` : {e}", conn.name);
@@ -245,7 +253,8 @@ async fn load_connection(client: &mut ViciClient, conn: &Connection) -> anyhow::
     let mut body = Message::new()
         .list("remote_addrs", &[conn.remote_addr.as_str()])
         .list("proposals", &[conn.ike_proposal.as_str()])
-        .kv("version", "2");
+        .kv("version", "2")
+        .kv("mobike", if conn.mobike { "yes" } else { "no" });
     if let Some(id) = &conn.local_id {
         body = body.section("local", Message::new().kv("id", id));
     }
@@ -337,6 +346,223 @@ fn spawn_update_loop(channel: Box<dyn UpdateChannel>, interval_secs: u64) {
             }
         }
     });
+}
+
+/// Constantes Netlink (linux/rtnetlink.h) — groupe multicast adresses IPv4.
+const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+/// RTM_NEWADDR : une adresse IP a été assignée à une interface.
+const RTM_NEWADDR: u16 = 20;
+/// AF_INET (famille IPv4).
+const NL_AF_INET: u8 = 2;
+/// IFA_ADDRESS : attribut rtattr portant l'adresse IP dans un message ifaddrmsg.
+const IFA_ADDRESS: u16 = 1;
+
+/// Démarre deux tâches Tokio pour la surveillance MOBIKE d'une connexion :
+///
+/// 1. Flux d'événements VICI (`ike-updown`, `child-updown`) — journalise les
+///    changements d'adresse signalés par charon.
+/// 2. Listener Netlink `RTM_NEWADDR` — coût CPU nul au repos (interruption noyau
+///    plutôt que scrutation), latence de détection en microsecondes.
+fn spawn_mobike_monitor(
+    vici_socket: String,
+    wan_iface: String,
+    conn_name: String,
+    event_tx: broadcast::Sender<HeliosEvent>,
+) {
+    // Tâche 1 : flux d'événements VICI
+    {
+        let socket = vici_socket.clone();
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            match ViciEventStream::connect(&socket).await {
+                Err(e) => warn!("MOBIKE : connexion VICI événements impossible : {e}"),
+                Ok(mut stream) => {
+                    for ev in ["ike-updown", "child-updown"] {
+                        if let Err(e) = stream.subscribe(ev).await {
+                            warn!("MOBIKE : abonnement `{ev}` impossible : {e}");
+                            return;
+                        }
+                    }
+                    info!("MOBIKE : abonné aux événements VICI ike-updown + child-updown");
+                    loop {
+                        match stream.next_event().await {
+                            Ok((name, msg)) => {
+                                let local = msg.get_str("local-host").unwrap_or("?");
+                                let remote = msg.get_str("remote-host").unwrap_or("?");
+                                info!("VICI `{name}` : local={local} distant={remote}");
+                                emit_log(&tx, "info",
+                                    &format!("VICI {name} : {local} ↔ {remote}"));
+                            }
+                            Err(e) => {
+                                warn!("MOBIKE : perte du flux d'événements VICI : {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Tâche 2 : listener Netlink RTM_NEWADDR — zéro CPU au repos
+    tokio::spawn(async move {
+        if let Err(e) = netlink_addr_watcher(vici_socket, wan_iface, conn_name, event_tx).await {
+            warn!("MOBIKE : surveillance Netlink terminée : {e}");
+        }
+    });
+}
+
+/// Écoute les messages Netlink `RTM_NEWADDR` sur l'interface WAN.
+///
+/// Aucun syscall entre deux changements d'adresse (le noyau réveille la tâche
+/// via l'interruption du socket multicast, pas de timer actif). La détection
+/// est quasi-instantanée (microsecondes) versus le polling 2 s précédent.
+async fn netlink_addr_watcher(
+    vici_socket: String,
+    wan_iface: String,
+    conn_name: String,
+    event_tx: broadcast::Sender<HeliosEvent>,
+) -> anyhow::Result<()> {
+    use netlink_sys::{AsyncSocket, AsyncSocketExt, TokioSocket, SocketAddr as NlSocketAddr, protocols};
+
+    let if_index = read_if_index(&wan_iface).await
+        .with_context(|| format!("index introuvable pour {wan_iface} dans sysfs"))?;
+
+    let mut sock = TokioSocket::new(protocols::NETLINK_ROUTE)
+        .context("ouverture socket Netlink ROUTE")?;
+    // bind est sur Socket (inner), pas sur TokioSocket directement.
+    sock.socket_mut()
+        .bind(&NlSocketAddr::new(0, RTMGRP_IPV4_IFADDR))
+        .context("bind RTMGRP_IPV4_IFADDR")?;
+
+    // Seed de l'IP courante : une seule invocation de `ip` au démarrage du moniteur,
+    // puis uniquement des événements noyau pour la suite.
+    let mut current_ip = seed_wan_ip(&wan_iface).await;
+    info!(
+        "MOBIKE : listener Netlink RTM_NEWADDR actif sur {} (index={}, ip={})",
+        wan_iface,
+        if_index,
+        current_ip.as_deref().unwrap_or("?"),
+    );
+
+    loop {
+        // recv_from_full : attend le prochain paquet Netlink (wakeup noyau, pas de poll).
+        let (buf, _): (Vec<u8>, _) = sock.recv_from_full().await.context("recv Netlink")?;
+
+        // Un tampon peut contenir plusieurs messages consécutifs (NLMSG_NEXT).
+        let mut offset = 0usize;
+        while offset + 16 <= buf.len() {
+            let nlmsg_len =
+                u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let nlmsg_type =
+                u16::from_ne_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
+
+            if nlmsg_type == RTM_NEWADDR && offset + 24 <= buf.len() {
+                let ifa_family = buf[offset + 16];
+                let ifa_index =
+                    u32::from_ne_bytes(buf[offset + 20..offset + 24].try_into().unwrap());
+
+                if ifa_family == NL_AF_INET && ifa_index == if_index {
+                    let end = (offset + nlmsg_len).min(buf.len());
+                    if let Some(new_ip) = parse_ifa_address(&buf[offset + 24..end]) {
+                        match &current_ip {
+                            Some(prev) if *prev != new_ip => {
+                                info!("MOBIKE : {wan_iface} {prev} → {new_ip}");
+                                emit_log(&event_tx, "info",
+                                    &format!("MOBIKE : migration {prev} → {new_ip} sur {wan_iface}"));
+                                let _ = event_tx.send(HeliosEvent::AddressChanged {
+                                    iface: wan_iface.clone(),
+                                    old_ip: prev.clone(),
+                                    new_ip: new_ip.clone(),
+                                });
+                                trigger_mobike_update(&vici_socket, &conn_name).await;
+                                current_ip = Some(new_ip);
+                            }
+                            None => current_ip = Some(new_ip),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // NLMSG_ALIGN : alignement 4 octets entre messages.
+            let aligned = (nlmsg_len + 3) & !3;
+            if aligned == 0 { break; }
+            offset += aligned;
+        }
+    }
+}
+
+/// Extrait l'attribut `IFA_ADDRESS` (IPv4) depuis la zone rtattr d'un ifaddrmsg.
+fn parse_ifa_address(data: &[u8]) -> Option<String> {
+    let mut off = 0usize;
+    while off + 4 <= data.len() {
+        let rta_len = u16::from_ne_bytes(data[off..off + 2].try_into().ok()?) as usize;
+        let rta_type = u16::from_ne_bytes(data[off + 2..off + 4].try_into().ok()?);
+        // IFA_ADDRESS pour AF_INET : 4 octets d'IP + 4 octets d'en-tête rtattr = 8.
+        if rta_type == IFA_ADDRESS && rta_len == 8 && off + 8 <= data.len() {
+            return Some(format!(
+                "{}.{}.{}.{}",
+                data[off + 4], data[off + 5], data[off + 6], data[off + 7]
+            ));
+        }
+        let aligned = (rta_len + 3) & !3;
+        if aligned < 4 { break; }
+        off += aligned;
+    }
+    None
+}
+
+/// Lit l'index Netlink de l'interface depuis sysfs — sans dépendance à `libc`.
+async fn read_if_index(iface: &str) -> Option<u32> {
+    tokio::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .await
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Lit l'adresse IPv4 courante de l'interface WAN (appelée une seule fois au
+/// démarrage du moniteur pour initialiser la baseline avant tout RTM_NEWADDR).
+async fn seed_wan_ip(iface: &str) -> Option<String> {
+    let out = tokio::process::Command::new("ip")
+        .args(["-brief", "addr", "show", "dev", iface])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // "eth0  UP  192.168.1.100/24 fe80::1/64\n"
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .skip(2)
+        .find(|s| s.contains('.') && s.contains('/'))
+        .and_then(|cidr| cidr.split('/').next())
+        .map(str::to_string)
+}
+
+/// Envoie la commande VICI `mobike` à charon pour déclencher la mise à jour
+/// d'adresse de la SA IKEv2 concernée.
+async fn trigger_mobike_update(vici_socket: &str, conn_name: &str) {
+    match ViciClient::connect(vici_socket).await {
+        Err(e) => warn!("MOBIKE : connexion VICI impossible pour mise à jour : {e}"),
+        Ok(mut client) => {
+            let payload = Message::new().kv("ike", conn_name);
+            match client.request("mobike", payload).await {
+                Err(e) => warn!("MOBIKE : commande mobike échouée : {e}"),
+                Ok(reply) => {
+                    if reply.get_str("success") == Some("no") {
+                        warn!("MOBIKE : mise à jour rejetée par charon : {}",
+                            reply.get_str("errmsg").unwrap_or("raison inconnue"));
+                    } else {
+                        info!("MOBIKE : adresse mise à jour dans charon pour `{conn_name}`");
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn status(config: &Config) -> anyhow::Result<()> {
