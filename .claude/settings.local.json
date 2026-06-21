@@ -20,7 +20,13 @@
       "Bash(npm --version)",
       "Read(//home/christophe/.local/share/fnm/node-versions/**)",
       "Read(//home/christophe/**)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(rustup show *)",
+      "Bash(pkg-config --libs gtk+-3.0)",
+      "Bash(pkg-config --libs glib-2.0)",
+      "Bash(dpkg -l libgtk-3-dev)",
+      "Bash(chmod +x /home/christophe/helios/scripts/setup-dev.sh)",
+      "Bash(bash -n /home/christophe/helios/scripts/setup-dev.sh)"
     ]
   }
 }
