@@ -69,8 +69,36 @@ cible. Voir [docs/WSL2-DEV.md](docs/WSL2-DEV.md).
 - [Post-quantique](docs/POST-QUANTUM.md) — ML-KEM + ECDHE hybride
 - [OTA RAUC](docs/OTA-RAUC.md) — image A/B et rollback
 
+## Interface web
+
+`heliosd` embarque un serveur Axum sur `http://127.0.0.1:8080` (configurable).
+
+| Endpoint             | Rôle                                                   |
+|----------------------|--------------------------------------------------------|
+| `GET  /api/status`   | État courant du tunnel + config (JSON)                 |
+| `POST /api/tunnel/start` | Demande de connexion → `OrchestratorCmd::Connect`  |
+| `POST /api/tunnel/stop`  | Déconnexion → `OrchestratorCmd::Disconnect`        |
+| `WS   /ws`           | Flux temps réel de `HeliosEvent` (JSON)                |
+
+**Types d'événements WebSocket :**
+- `state_changed` — transition d'état du tunnel
+- `log` — message structuré (info / warn / error) de l'orchestrateur
+- `telemetry` — compteurs réseau WAN (Rx/Tx bps + pps) lus depuis `/proc/net/dev`, émis toutes les secondes
+
+**Stack frontend :** React 18 + TypeScript + Vite + Tailwind CSS · lucide-react · sparklines SVG natif
+
+```sh
+cd web && npm install && npm run dev   # Vite sur :5173, proxy /api + /ws → :8080
+cargo build -p heliosd --features embed-ui  # embed l'app dans le binaire
+```
+
 ## État du projet
 
-Squelette fonctionnel du plan de contrôle. À finaliser sur la cible : la
-traduction des règles dans le backend Netlink (`crates/helios-firewall/src/netlink.rs`)
-et la boucle d'événements VICI temps réel.
+Plan de contrôle fonctionnel. Composants à finaliser sur cible :
+- Backend Netlink (`crates/helios-firewall/src/netlink.rs`) — règles nftables réelles
+- Boucle d'événements VICI temps réel (`bring_up_real` dans l'orchestrateur)
+
+**Feuille de route IHM :**
+- `list-sas` VICI — afficher les algorithmes *négociés* (vs configurés) une fois le tunnel monté
+- Compteurs nftables — paquets rejetés par le kill-switch (confirmation d'isolation)
+- Sélecteur de profils — `OrchestratorCmd::ConnectWithProfile(String)` + dropdown UI

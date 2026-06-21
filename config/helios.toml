@@ -5,6 +5,22 @@
 dry_run = true          # passer à false uniquement sur la machine dédiée
 log_level = "info"
 
+# Validation d'intégrité de démarrage par SCELLEMENT TPM.
+# Le secret descellé (256 bits) déchiffre les identifiants IPsec : modifier le
+# binaire ne donne pas la clé, la garantie est matérielle.
+# Sur WSL2 / dev : laisser enabled = false (pas de /dev/tpmrm0).
+[tpm]
+enabled = false             # true uniquement sur la cible physique avec TPM
+enforce = true              # false = log seulement (DÉBOGAGE — jamais en prod)
+allow_provisioning = false  # true UNIQUEMENT en usine (premier boot TOFU) ;
+                            # sur le terrain, un blob manquant est une anomalie
+device = "/dev/tpmrm0"
+pcr_bank = "sha256"
+pcr_selection = [0, 4, 7]   # 0=firmware, 4=bootloader, 7=Secure Boot
+sealed_blob_path = "/var/lib/helios/sealed.key"
+ticket_path = "/var/lib/helios/reseal-ticket.json"  # billet signé déposé par l'OTA
+state_path = "/var/lib/helios/tpm-state.json"
+
 [vici]
 socket = "/var/run/charon.vici"
 
@@ -13,6 +29,10 @@ wan_iface = "eth0"      # contrôleur Realtek RTL8111HS sur la cible
 lan_ifaces = ["eth1"]
 ike_peers = ["203.0.113.10"]
 mode = "fail-closed"    # kill-switch ; "fail-open" pour le mode dégradé (déconseillé)
+
+[api]
+enabled = true
+bind = "127.0.0.1:8080"   # écoute sur localhost uniquement ; changer pour 0.0.0.0:8080 si accès LAN
 
 [update]
 enabled = false

@@ -50,6 +50,11 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
+    // SSH d'administration, autorisé quel que soit l'état du tunnel.
+    for src in &policy.allow_ssh_from {
+        rules.push(format!("ip saddr {src} tcp dport 22 accept"));
+    }
+
     if state.traffic_allowed() {
         // Tunnel opérationnel : on forwarde le LAN. XFRM se charge du chiffrement
         // en sortie ; un paquet non protégé par une policy IPsec ne sortira pas.
@@ -90,6 +95,7 @@ mod tests {
             lan_ifaces: vec!["eth1".into()],
             ike_peers: vec!["203.0.113.10".into()],
             mode: PolicyMode::FailClosed,
+            allow_ssh_from: vec![],
         }
     }
 
