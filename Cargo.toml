@@ -9,6 +9,7 @@ members = [
     "crates/helio-tpm",
     "crates/heliosd",
     "tools/helios-ctl",
+    "tools/helios-client",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ tower-http = { version = "0.5", features = ["cors"] }
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
+netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 
 helios-core = { path = "crates/helios-core" }
 helios-api = { path = "crates/helios-api" }

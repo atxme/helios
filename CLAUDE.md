@@ -48,6 +48,12 @@ cargo run -p helios-ctl -- watch               # live WebSocket event stream
 cargo run -p helios-ctl -- scenario nominal    # connect → Up → disconnect, checks timing
 cargo run -p helios-ctl -- scenario flap       # connect/disconnect ×5, measures latency
 cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status  # remote target
+
+# Client GUI léger (egui, multiplateforme) :
+cargo run -p helios-client                                # WSL2 / Linux (pas de systray)
+HELIOS_URL=http://192.168.1.1:8080 cargo run -p helios-client
+# Sur Windows/macOS (systray) :
+cargo run -p helios-client --features tray
 ```
 
 ## The WSL2 vs target split — read this first
