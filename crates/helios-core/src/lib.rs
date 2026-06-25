@@ -12,7 +12,7 @@ pub mod policy;
 pub mod profiles;
 pub mod state;
 
-pub use config::{Config, Connection};
+pub use config::{Connection, NetworkConfig, API_BIND, API_PORT};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};

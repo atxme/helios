@@ -68,7 +68,7 @@ pub(crate) struct TpmDevice {
 }
 
 impl TpmDevice {
-    pub(crate) fn new(cfg: &helios_core::config::TpmConfig) -> Result<Self> {
+    pub(crate) fn new(cfg: &crate::settings::TpmSettings) -> Result<Self> {
         // Refus immédiat des banques faibles (SHA-1) — défense en profondeur.
         hash_alg_from_bank(&cfg.pcr_bank)?;
         Ok(Self {

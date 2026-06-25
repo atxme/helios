@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use helios_core::config::TpmConfig;
+use crate::settings::TpmSettings;
 use serde::{Deserialize, Serialize};
 
 use crate::{reseal_ticket::ResealTicket, tpm_interface::SealedBlob, Result, TpmError};
@@ -17,11 +17,11 @@ pub(crate) struct TpmState {
 
 /// Accès à la partition de configuration : blob scellé, billet, état.
 pub(crate) struct BlobStore<'a> {
-    cfg: &'a TpmConfig,
+    cfg: &'a TpmSettings,
 }
 
 impl<'a> BlobStore<'a> {
-    pub(crate) fn new(cfg: &'a TpmConfig) -> Self {
+    pub(crate) fn new(cfg: &'a TpmSettings) -> Self {
         Self { cfg }
     }
 

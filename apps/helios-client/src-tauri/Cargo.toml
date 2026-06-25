@@ -1,0 +1,32 @@
+[package]
+name = "helios-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Client VPN Helios — IHM web embarquée (Tauri) pilotant la pile IKEv2 native de l'OS."
+
+[[bin]]
+name = "helios-client"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+helios-core = { workspace = true }
+helios-client-core = { path = "../../../crates/helios-client-core" }
+
+[features]
+default = []
+# Relais des features de pile IKEv2 réelle vers helios-client-core (target-only).
+linux-strongswan = ["helios-client-core/linux-strongswan"]
+native-windows = ["helios-client-core/native-windows"]
+native-macos = ["helios-client-core/native-macos"]

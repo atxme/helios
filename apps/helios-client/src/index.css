@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Thème sombre « espace profond » repris de l'app web de heliosd. */
+:root {
+  --bg-0: #03060f;
+  --panel: rgba(12, 20, 38, 0.72);
+  --panel-2: rgba(9, 15, 30, 0.82);
+  --panel-border: rgba(56, 189, 248, 0.20);
+  --text: #e6edf6;
+  --muted: #94a3b8;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 50% -10%, rgba(34, 211, 238, 0.08), transparent 60%),
+      var(--bg-0);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: rgba(100, 116, 139, 0.35); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(34, 211, 238, 0.45); }
+}
+
+@layer components {
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.9rem;
+    backdrop-filter: blur(10px);
+    box-shadow: var(--shadow, 0 10px 40px -14px rgba(0, 0, 0, 0.55));
+  }
+
+  .field {
+    @apply w-full rounded-lg bg-black/30 border border-white/10 px-3 py-2 text-sm
+      text-slate-100 outline-none transition focus:border-node/60 focus:ring-1 focus:ring-node/40;
+  }
+
+  .label {
+    @apply text-[11px] uppercase tracking-wide text-slate-400 mb-1 block;
+  }
+
+  .btn {
+    @apply rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-40
+      disabled:cursor-not-allowed;
+  }
+}

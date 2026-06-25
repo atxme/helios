@@ -1,4 +1,4 @@
-use helios_core::config::TpmConfig;
+use crate::settings::TpmSettings;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -39,7 +39,7 @@ impl BootDecision {
 pub struct BootController;
 
 impl BootController {
-    pub fn unlock(cfg: &TpmConfig) -> Result<BootDecision> {
+    pub fn unlock(cfg: &TpmSettings) -> Result<BootDecision> {
         if !cfg.enabled {
             info!("scellement TPM désactivé (tpm.enabled = false) — démarrage sans vérification");
             return Ok(BootDecision::Disabled);
@@ -61,7 +61,7 @@ impl BootController {
         }
     }
 
-    fn unlock_inner(cfg: &TpmConfig) -> Result<BootDecision> {
+    fn unlock_inner(cfg: &TpmSettings) -> Result<BootDecision> {
         let mut tpm = open_tpm(cfg)?;
         let store = BlobStore::new(cfg);
         Self::run_flow(cfg, &mut tpm, &store)
@@ -69,7 +69,7 @@ impl BootController {
 
     /// Logique de décision, générique sur le backend TPM (testable avec `DryRunTpm`).
     fn run_flow<T: TpmSealer>(
-        cfg: &TpmConfig,
+        cfg: &TpmSettings,
         tpm: &mut T,
         store: &BlobStore<'_>,
     ) -> Result<BootDecision> {
@@ -102,7 +102,7 @@ impl BootController {
 }
 
 /// Ouvre le backend TPM : réel sur la cible (`feature tpm`), simulé sinon.
-fn open_tpm(cfg: &TpmConfig) -> Result<impl TpmSealer> {
+fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
     #[cfg(feature = "tpm")]
     {
         crate::tpm_interface::TpmDevice::new(cfg)
@@ -123,8 +123,8 @@ mod tests {
     use crate::tpm_interface::DryRunTpm;
 
     /// Construit une config TPM pointant vers un répertoire temporaire.
-    fn test_cfg(dir: &std::path::Path, allow_provisioning: bool) -> TpmConfig {
-        TpmConfig {
+    fn test_cfg(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
+        TpmSettings {
             enabled: true,
             enforce: true,
             allow_provisioning,

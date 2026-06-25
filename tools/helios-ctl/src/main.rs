@@ -1,22 +1,19 @@
-//! `helios-ctl` — outil de développement et de test pour heliosd.
-//!
-//! Utilisation rapide (depuis la racine du workspace) :
+//! `helios-ctl` — outil de développement et de contrôle de heliosd.
 //!
 //! ```sh
-//! # Lancer heliosd en mode dev (sans crypto) :
-//! cargo run -p heliosd -- --config config/helios.toml run --dev
-//!
-//! # Dans un autre terminal, contrôler le daemon :
+//! cargo run -p heliosd -- run --dev          # daemon en mode dev
 //! cargo run -p helios-ctl -- status
-//! cargo run -p helios-ctl -- watch          # flux temps réel
-//! cargo run -p helios-ctl -- scenario       # test nominal complet
+//! cargo run -p helios-ctl -- watch
+//! cargo run -p helios-ctl -- network show
+//! cargo run -p helios-ctl -- network load config/network.toml
 //! ```
 
-use std::time::{Duration, Instant};
+use std::{path::PathBuf, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use helios_core::NetworkConfig;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,12 +29,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 EXEMPLES:
   cargo run -p helios-ctl -- status
   cargo run -p helios-ctl -- watch
+  cargo run -p helios-ctl -- network show
+  cargo run -p helios-ctl -- network load config/network.toml
   cargo run -p helios-ctl -- scenario nominal
-  cargo run -p helios-ctl -- scenario flap
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
-    /// URL de base de l'API heliosd.
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "HELIOS_URL")]
     url: String,
 
@@ -55,12 +52,26 @@ enum Cmd {
     Disconnect,
     /// Flux d'événements temps réel via WebSocket. Ctrl-C pour quitter.
     Watch,
+    /// Gestion de la configuration réseau.
+    Network {
+        #[command(subcommand)]
+        command: NetworkCmd,
+    },
     /// Exécute un scénario de test prédéfini.
     Scenario {
-        /// `nominal` (connect → attente Up → pause → disconnect)
-        /// `flap`    (connect/disconnect × 5, mesure les temps de transition)
         #[arg(default_value = "nominal")]
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Affiche la configuration réseau courante.
+    Show,
+    /// Charge une configuration réseau depuis un fichier TOML.
+    Load {
+        /// Chemin vers le fichier TOML de config réseau.
+        file: PathBuf,
     },
 }
 
@@ -86,6 +97,7 @@ struct ConnSummary {
 #[derive(Debug, Deserialize)]
 struct CmdResp {
     ok: bool,
+    error: Option<String>,
 }
 
 // ─── Affichage ────────────────────────────────────────────────────────────────
@@ -126,7 +138,7 @@ async fn api_status(client: &Client, base: &str) -> Result<Status> {
         .get(format!("{base}/api/status"))
         .send()
         .await
-        .context("connexion refusée — heliosd tourne-t-il ? (cargo run -p heliosd -- --config config/helios.toml run --dev)")?
+        .context("connexion refusée — heliosd tourne-t-il ? (cargo run -p heliosd -- run --dev)")?
         .json::<Status>()
         .await
         .context("réponse JSON inattendue")
@@ -172,7 +184,7 @@ async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
     if r.ok {
         println!("{} commande de connexion envoyée", ok());
     } else {
-        println!("{} refusé par le daemon", fail());
+        println!("{} refusé : {}", fail(), r.error.as_deref().unwrap_or("?"));
     }
     Ok(())
 }
@@ -182,7 +194,7 @@ async fn cmd_disconnect(client: &Client, base: &str) -> Result<()> {
     if r.ok {
         println!("{} déconnexion envoyée — kill-switch engagé", ok());
     } else {
-        println!("{} refusé par le daemon", fail());
+        println!("{} refusé : {}", fail(), r.error.as_deref().unwrap_or("?"));
     }
     Ok(())
 }
@@ -200,6 +212,69 @@ async fn cmd_watch(base: &str) -> Result<()> {
             let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             print_ws_event(&hh_mm_ss(), &v);
         }
+    }
+    Ok(())
+}
+
+async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
+    let cfg: NetworkConfig = client
+        .get(format!("{base}/api/network"))
+        .send()
+        .await
+        .context("connexion refusée")?
+        .json()
+        .await
+        .context("réponse JSON inattendue")?;
+
+    println!();
+    println!("  \x1b[1mConfig réseau\x1b[0m");
+    println!();
+    println!("  {:<16} {}", "WAN", if cfg.wan_iface.is_empty() { "(non défini)" } else { &cfg.wan_iface });
+    println!("  {:<16} {}", "LAN", if cfg.lan_ifaces.is_empty() { "(aucune)".to_string() } else { cfg.lan_ifaces.join(", ") });
+    if !cfg.allow_ssh_from.is_empty() {
+        println!("  {:<16} {}", "SSH autorisé de", cfg.allow_ssh_from.join(", "));
+    }
+    if let Some(ref iface) = cfg.admin_iface {
+        println!("  {:<16} {}", "Iface admin", iface);
+    }
+    println!("  {:<16} {}", "Connexions", cfg.connections.len());
+    for c in &cfg.connections {
+        let ids = match (&c.local_id, &c.remote_id) {
+            (Some(l), Some(r)) => format!("  ({l} → {r})"),
+            (Some(l), None)    => format!("  (local: {l})"),
+            _                  => String::new(),
+        };
+        println!("    - {} → {}{}", c.name, c.remote_addr, ids);
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result<()> {
+    let raw = tokio::fs::read_to_string(file)
+        .await
+        .with_context(|| format!("impossible de lire {}", file.display()))?;
+
+    let config: NetworkConfig = toml::from_str(&raw)
+        .with_context(|| format!("TOML invalide dans {}", file.display()))?;
+
+    let body = serde_json::to_string(&config)?;
+    let resp: CmdResp = client
+        .post(format!("{base}/api/network"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .context("connexion refusée")?
+        .json()
+        .await
+        .context("réponse JSON inattendue")?;
+
+    if resp.ok {
+        println!("{} config réseau chargée ({} connexion(s))",
+            ok(), config.connections.len());
+    } else {
+        println!("{} refusé : {}", fail(), resp.error.as_deref().unwrap_or("?"));
     }
     Ok(())
 }
@@ -226,7 +301,6 @@ fn print_ws_event(ts: &str, v: &Value) {
 
 // ─── Scénarios ────────────────────────────────────────────────────────────────
 
-/// Poll l'état via REST jusqu'à obtenir `target` ou timeout.
 async fn wait_state(client: &Client, base: &str, target: &str, timeout_secs: u64) -> Result<Duration> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
@@ -314,6 +388,10 @@ async fn main() -> Result<()> {
         Cmd::Connect      => cmd_connect(&client, base).await,
         Cmd::Disconnect   => cmd_disconnect(&client, base).await,
         Cmd::Watch        => cmd_watch(base).await,
+        Cmd::Network { command } => match command {
+            NetworkCmd::Show          => cmd_network_show(&client, base).await,
+            NetworkCmd::Load { file } => cmd_network_load(&client, base, &file).await,
+        },
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
             "flap"    => scenario_flap(&client, base).await,

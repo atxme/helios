@@ -1,0 +1,25 @@
+# Configuration réseau Helios — chargeable via :
+#   cargo run -p helios-ctl -- network load config/network.toml
+# ou via POST /api/network (JSON).
+#
+# Tous les autres paramètres sont compilés dans le binaire :
+#   - TPM : /dev/tpmrm0, PCR sha256 [0,4,7], /var/lib/helios/sealed.key
+#   - VICI : /var/run/charon.vici
+#   - API : 127.0.0.1:8080
+#   - IKE par défaut : profil hybride (ECDHE P-384 + ML-KEM-768)
+#   - Pare-feu : fail-closed (invariant de sécurité)
+
+wan_iface = "eth0"
+lan_ifaces = ["eth1"]
+
+# Optionnel : SSH d'administration autorisé même kill-switch engagé.
+# allow_ssh_from = ["10.0.0.0/8"]
+
+# Optionnel (passerelle uniquement) : restreindre l'API à une interface.
+# admin_iface = "ipsec0"
+
+[[connections]]
+name = "site-a"
+remote_addr = "203.0.113.10"
+local_id = "client@helios"
+remote_id = "gw@example.net"

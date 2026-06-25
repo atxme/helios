@@ -4,8 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use helios_core::{
-    profiles, Config, Connection, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelEvent,
-    TunnelState,
+    profiles, Connection, FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd,
+    TunnelEvent, TunnelState,
 };
 use helios_firewall::{DryRunBackend, FirewallBackend};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
@@ -18,6 +18,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VICI_SOCKET: &str = "/var/run/charon.vici";
 
 fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     if dry_run {
@@ -34,20 +35,23 @@ fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     }
 }
 
-fn update_channel(config: &Config) -> Box<dyn UpdateChannel> {
-    if config.general.dry_run {
+fn update_channel(dry_run: bool) -> Box<dyn UpdateChannel> {
+    if dry_run {
         Box::new(DryRunChannel::new(VERSION))
     } else {
-        let manifest = config.update.manifest.as_ref().map(Into::into);
-        Box::new(RaucChannel::new(VERSION, manifest))
+        Box::new(RaucChannel::new(VERSION, None))
     }
+}
+
+fn default_proposals() -> (String, String) {
+    let p = profiles::find("hybrid").expect("profil hybride manquant");
+    (p.ike_proposal.to_string(), p.esp_proposal.to_string())
 }
 
 fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
     let _ = tx.send(HeliosEvent::Log { level: level.into(), message: message.into() });
 }
 
-/// Met à jour l'état partagé, émet un événement WebSocket et applique le pare-feu.
 async fn transition(
     shared: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
@@ -61,26 +65,24 @@ async fn transition(
     Ok(())
 }
 
-/// Synchronise la politique locale vers le `Arc<RwLock>` partagé avec l'API.
 async fn sync_policy(shared: &Arc<RwLock<FirewallPolicy>>, policy: &FirewallPolicy) {
     *shared.write().await = policy.clone();
 }
 
 /// Boucle principale du daemon.
 pub async fn run(
-    config: Config,
+    shared_network: Arc<RwLock<NetworkConfig>>,
+    dry_run: bool,
     shared_state: Arc<RwLock<TunnelState>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
     effective_proposals: Arc<RwLock<Option<(String, String)>>>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
 ) -> anyhow::Result<()> {
-    let mut policy = config.firewall_policy();
+    let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
 
-    let fw = firewall_backend(config.general.dry_run);
-
-    // Canal interne : tâches d'arrière-plan (PMTUD) → boucle principale.
+    let fw = firewall_backend(dry_run);
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
 
     // 1. Fail-closed AVANT tout contact réseau.
@@ -88,19 +90,24 @@ pub async fn run(
     info!("kill-switch engagé, démarrage en fail-closed");
 
     // 2. Montée initiale du tunnel.
-    do_connect(&config, &shared_state, &event_tx, fw.as_ref(), &mut policy).await?;
-    spawn_mtu_probe_if_up(&config, &shared_state, &event_tx, &internal_tx).await;
+    {
+        let network = shared_network.read().await;
+        let proposals = effective_proposals.read().await.clone()
+            .unwrap_or_else(default_proposals);
+        do_connect(&network, dry_run, &proposals, &shared_state, &event_tx, fw.as_ref(), &mut policy).await?;
+        let wan = network.wan_iface.clone();
+        drop(network);
+        spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
+    }
     sync_policy(&shared_policy, &policy).await;
 
     // 3. Télémétrie réseau (/proc/net/dev).
-    spawn_telemetry_loop(config.firewall.wan_iface.clone(), event_tx.clone());
-
-    // 4. OTA.
-    if config.update.enabled {
-        spawn_update_loop(update_channel(&config), config.update.check_interval_secs);
+    {
+        let wan = shared_network.read().await.wan_iface.clone();
+        spawn_telemetry_loop(wan, event_tx.clone());
     }
 
-    // 5. Boucle principale : commandes de l'UI, résultats internes ou signal d'arrêt.
+    // 4. Boucle principale : commandes de l'UI, résultats internes ou signal d'arrêt.
     let state_str = shared_state.read().await.as_str();
     info!("heliosd opérationnel (état {state_str}). Ctrl-C pour quitter.");
 
@@ -111,32 +118,27 @@ pub async fn run(
                 break;
             }
 
-            // Commandes de l'interface web.
             cmd = cmd_rx.recv() => {
                 match cmd {
                     None => break,
                     Some(c) => {
                         handle_external_cmd(
-                            c, &config, &shared_state, &event_tx, fw.as_ref(),
+                            c, &shared_network, dry_run, &shared_state, &event_tx, fw.as_ref(),
                             &mut policy, &effective_proposals, &internal_tx, &shared_policy,
                         ).await?;
                     }
                 }
             }
 
-            // Résultats des tâches d'arrière-plan (PMTUD, …).
             internal = internal_rx.recv() => {
-                match internal {
-                    Some(OrchestratorCmd::SetMssClamp(mss)) => {
-                        policy.mss_clamp = Some(mss);
-                        let state = *shared_state.read().await;
-                        fw.apply(&policy, state).await.context("pare-feu MSS clamping")?;
-                        sync_policy(&shared_policy, &policy).await;
-                        info!("PMTUD : MSS clamping appliqué à {mss} octets");
-                        emit_log(&event_tx, "info",
-                            &format!("PMTUD : MSS optimal détecté = {mss} octets"));
-                    }
-                    _ => {}
+                if let Some(OrchestratorCmd::SetMssClamp(mss)) = internal {
+                    policy.mss_clamp = Some(mss);
+                    let state = *shared_state.read().await;
+                    fw.apply(&policy, state).await.context("pare-feu MSS clamping")?;
+                    sync_policy(&shared_policy, &policy).await;
+                    info!("PMTUD : MSS clamping appliqué à {mss} octets");
+                    emit_log(&event_tx, "info",
+                        &format!("PMTUD : MSS optimal détecté = {mss} octets"));
                 }
             }
         }
@@ -144,10 +146,11 @@ pub async fn run(
     Ok(())
 }
 
-/// Gère une commande externe (issue de l'API REST/WS).
+#[allow(clippy::too_many_arguments)]
 async fn handle_external_cmd(
     cmd: OrchestratorCmd,
-    config: &Config,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    dry_run: bool,
     shared_state: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
@@ -160,8 +163,13 @@ async fn handle_external_cmd(
         OrchestratorCmd::Connect => {
             info!("connexion demandée via l'interface web");
             emit_log(event_tx, "info", "Connexion demandée via l'interface web");
-            do_connect(config, shared_state, event_tx, fw, policy).await?;
-            spawn_mtu_probe_if_up(config, shared_state, event_tx, internal_tx).await;
+            let network = shared_network.read().await;
+            let proposals = effective_proposals.read().await.clone()
+                .unwrap_or_else(default_proposals);
+            do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+            let wan = network.wan_iface.clone();
+            drop(network);
+            spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -171,15 +179,13 @@ async fn handle_external_cmd(
                     info!("connexion avec profil `{}` ({})", p.id, p.name);
                     emit_log(event_tx, "info",
                         &format!("Connexion avec profil {} — {}", p.name, p.ike_proposal));
-                    *effective_proposals.write().await =
-                        Some((p.ike_proposal.to_string(), p.esp_proposal.to_string()));
-                    let mut overridden = config.clone();
-                    for conn in &mut overridden.connections {
-                        conn.ike_proposal = p.ike_proposal.to_string();
-                        conn.esp_proposal = p.esp_proposal.to_string();
-                    }
-                    do_connect(&overridden, shared_state, event_tx, fw, policy).await?;
-                    spawn_mtu_probe_if_up(config, shared_state, event_tx, internal_tx).await;
+                    let proposals = (p.ike_proposal.to_string(), p.esp_proposal.to_string());
+                    *effective_proposals.write().await = Some(proposals.clone());
+                    let network = shared_network.read().await;
+                    do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+                    let wan = network.wan_iface.clone();
+                    drop(network);
+                    spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
                     sync_policy(shared_policy, policy).await;
                 }
                 None => {
@@ -194,20 +200,18 @@ async fn handle_external_cmd(
             info!("connexion avec propositions personnalisées : IKE={ike_proposal}");
             emit_log(event_tx, "info",
                 &format!("Connexion personnalisée — IKE : {ike_proposal}"));
-            *effective_proposals.write().await =
-                Some((ike_proposal.clone(), esp_proposal.clone()));
-            let mut overridden = config.clone();
-            for conn in &mut overridden.connections {
-                conn.ike_proposal = ike_proposal.clone();
-                conn.esp_proposal = esp_proposal.clone();
-            }
-            do_connect(&overridden, shared_state, event_tx, fw, policy).await?;
-            spawn_mtu_probe_if_up(config, shared_state, event_tx, internal_tx).await;
+            let proposals = (ike_proposal, esp_proposal);
+            *effective_proposals.write().await = Some(proposals.clone());
+            let network = shared_network.read().await;
+            do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+            let wan = network.wan_iface.clone();
+            drop(network);
+            spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
             sync_policy(shared_policy, policy).await;
         }
 
         OrchestratorCmd::ApplyFirewallRules(rules) => {
-            if config.general.dry_run {
+            if dry_run {
                 info!("[dry-run] règles nftables personnalisées reçues ({} octets) — non appliquées", rules.len());
                 emit_log(event_tx, "info",
                     "[dry-run] Règles nftables reçues — application ignorée (mode simulation)");
@@ -238,8 +242,13 @@ async fn handle_external_cmd(
                 let next = current.on(TunnelEvent::CaptivePortalResolved)?;
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
-                do_connect(config, shared_state, event_tx, fw, policy).await?;
-                spawn_mtu_probe_if_up(config, shared_state, event_tx, internal_tx).await;
+                let network = shared_network.read().await;
+                let proposals = effective_proposals.read().await.clone()
+                    .unwrap_or_else(default_proposals);
+                do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+                let wan = network.wan_iface.clone();
+                drop(network);
+                spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
                 sync_policy(shared_policy, policy).await;
             }
         }
@@ -254,27 +263,38 @@ async fn handle_external_cmd(
         }
 
         OrchestratorCmd::SetMssClamp(mss) => {
-            // Peut être envoyé manuellement depuis l'API (override de la valeur PMTUD).
             policy.mss_clamp = Some(mss);
             let state = *shared_state.read().await;
             fw.apply(policy, state).await.context("pare-feu MSS clamping (manuel)")?;
             sync_policy(shared_policy, policy).await;
+        }
+
+        OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
+            info!("config réseau rechargée : {} connexion(s)", new_cfg.connections.len());
+            *policy = new_cfg.firewall_policy();
+            *shared_network.write().await = new_cfg;
+            let state = *shared_state.read().await;
+            fw.apply(policy, state).await.context("pare-feu après rechargement config")?;
+            sync_policy(shared_policy, policy).await;
+            emit_log(event_tx, "info", "Configuration réseau appliquée");
         }
     }
     Ok(())
 }
 
 async fn do_connect(
-    config: &Config,
+    network: &NetworkConfig,
+    dry_run: bool,
+    proposals: &(String, String),
     shared: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &mut FirewallPolicy,
 ) -> anyhow::Result<()> {
-    if config.general.dry_run {
+    if dry_run {
         simulate_bringup(shared, event_tx, fw, policy).await
     } else {
-        bring_up_real(config, shared, event_tx, fw, policy).await
+        bring_up_real(network, proposals, shared, event_tx, fw, policy).await
     }
 }
 
@@ -306,45 +326,43 @@ async fn simulate_bringup(
 }
 
 async fn bring_up_real(
-    config: &Config,
+    network: &NetworkConfig,
+    proposals: &(String, String),
     shared: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &mut FirewallPolicy,
 ) -> anyhow::Result<()> {
-    let mut client = ViciClient::connect(&config.vici.socket)
+    let mut client = ViciClient::connect(VICI_SOCKET)
         .await
-        .with_context(|| format!("connexion VICI sur {}", config.vici.socket))?;
-    info!("connecté à charon via {}", config.vici.socket);
+        .with_context(|| format!("connexion VICI sur {VICI_SOCKET}"))?;
+    info!("connecté à charon via {VICI_SOCKET}");
 
     let mut state = TunnelState::Down;
-    for conn in &config.connections {
+    for conn in &network.connections {
         emit_log(event_tx, "info", &format!("Connexion `{}` — négociation IKEv2…", conn.name));
         state = state.on(TunnelEvent::StartRequested)?;
         transition(shared, event_tx, state, fw, policy).await?;
 
-        load_connection(&mut client, conn).await?;
+        load_connection(&mut client, conn, &proposals.0, &proposals.1).await?;
         match initiate(&mut client, conn).await {
             Ok(()) => {
                 state = state.on(TunnelEvent::ChildUp)?;
                 info!("connexion `{}` établie", conn.name);
                 emit_log(event_tx, "info",
                     &format!("CHILD_SA `{}` actif — trafic chiffré ESP", conn.name));
-                if conn.mobike {
-                    spawn_mobike_monitor(
-                        config.vici.socket.clone(),
-                        config.firewall.wan_iface.clone(),
-                        conn.name.clone(),
-                        event_tx.clone(),
-                    );
-                }
+                spawn_mobike_monitor(
+                    VICI_SOCKET.to_string(),
+                    network.wan_iface.clone(),
+                    conn.name.clone(),
+                    event_tx.clone(),
+                );
             }
             Err(e) => {
                 error!("échec de `{}` : {e}", conn.name);
                 emit_log(event_tx, "error",
                     &format!("Échec de `{}` : {e}", conn.name));
 
-                // Tenter une détection de portail captif avant de basculer en Failed.
                 if let Some(gateway) = probe_captive_portal(&policy.wan_iface).await {
                     info!("portail captif détecté via sonde HTTP (passerelle : {gateway})");
                     emit_log(event_tx, "warn",
@@ -364,13 +382,6 @@ async fn bring_up_real(
     Ok(())
 }
 
-/// Sonde HTTP pour détecter un portail captif.
-///
-/// Envoie une requête `GET /generate_204` à `connectivitycheck.gstatic.com`.
-/// * Réponse 204 → pas de portail captif.
-/// * Toute autre réponse (redirect, captive page) → portail détecté.
-///
-/// Renvoie l'IP de la passerelle par défaut si un portail est détecté.
 async fn probe_captive_portal(wan_iface: &str) -> Option<String> {
     let result = tokio::time::timeout(
         Duration::from_secs(4),
@@ -379,18 +390,15 @@ async fn probe_captive_portal(wan_iface: &str) -> Option<String> {
     .await
     .ok()??;
 
-    // 204 = connectivité normale, pas de portail.
     if result == 204 {
         return None;
     }
 
-    // Portail détecté : récupérer l'IP de la passerelle depuis la table de routage.
     let gateway = get_default_gateway(wan_iface).await
         .unwrap_or_else(|| "inconnu".to_string());
     Some(gateway)
 }
 
-/// Effectue une requête HTTP/1.0 minimale et renvoie le code de statut.
 async fn tcp_http_probe(host: &str, port: u16, path: &str) -> Option<u16> {
     let mut stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
@@ -399,18 +407,15 @@ async fn tcp_http_probe(host: &str, port: u16, path: &str) -> Option<u16> {
     let mut buf = [0u8; 128];
     let n = stream.read(&mut buf).await.ok()?;
     let header = std::str::from_utf8(&buf[..n]).ok()?;
-    // "HTTP/1.x 204 No Content\r\n..."
     header.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Lit la passerelle par défaut de l'interface WAN depuis la table de routage.
 async fn get_default_gateway(wan_iface: &str) -> Option<String> {
     let out = tokio::process::Command::new("ip")
         .args(["route", "show", "default", "dev", wan_iface])
         .output()
         .await
         .ok()?;
-    // "default via 192.168.1.1 dev eth0 ..."
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .skip_while(|&w| w != "via")
@@ -418,24 +423,23 @@ async fn get_default_gateway(wan_iface: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Lance la sonde PMTUD si le tunnel vient de passer à l'état Up.
 async fn spawn_mtu_probe_if_up(
-    config: &Config,
+    wan_iface: &str,
+    dry_run: bool,
     shared_state: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
 ) {
     if *shared_state.read().await == TunnelState::Up {
         spawn_mtu_probe(
-            config.firewall.wan_iface.clone(),
+            wan_iface.to_string(),
             event_tx.clone(),
             internal_tx.clone(),
-            config.general.dry_run,
+            dry_run,
         );
     }
 }
 
-/// Démarre la sonde PMTUD en arrière-plan.
 fn spawn_mtu_probe(
     wan_iface: String,
     event_tx: broadcast::Sender<HeliosEvent>,
@@ -444,7 +448,6 @@ fn spawn_mtu_probe(
 ) {
     tokio::spawn(async move {
         let mss = if dry_run {
-            // En simulation, on retourne un MSS réaliste pour le test.
             1300u16
         } else {
             discover_mss(&wan_iface).await.unwrap_or(1300)
@@ -456,29 +459,29 @@ fn spawn_mtu_probe(
     });
 }
 
-/// Calcule le MSS optimal en lisant le MTU de l'interface WAN depuis sysfs.
-///
-/// Overhead ESP/UDP-NAT-T estimé : 62 octets (ESP+IV+ICV+padding+NAT-T+outer-IP).
-/// Overhead IP+TCP : 40 octets. Total soustrait au MTU : 102 octets.
 async fn discover_mss(wan_iface: &str) -> Option<u16> {
     let mtu_str = tokio::fs::read_to_string(format!("/sys/class/net/{wan_iface}/mtu"))
         .await
         .ok()?;
     let mtu: u16 = mtu_str.trim().parse().ok()?;
-    // min 576 octets (RFC 791) pour éviter un MSS négatif ou trop petit.
     Some(mtu.saturating_sub(102).max(576))
 }
 
-async fn load_connection(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<()> {
+async fn load_connection(
+    client: &mut ViciClient,
+    conn: &Connection,
+    ike_proposal: &str,
+    esp_proposal: &str,
+) -> anyhow::Result<()> {
     let child = Message::new()
-        .list("esp_proposals", &[conn.esp_proposal.as_str()])
+        .list("esp_proposals", &[esp_proposal])
         .kv("start_action", "trap");
 
     let mut body = Message::new()
         .list("remote_addrs", &[conn.remote_addr.as_str()])
-        .list("proposals", &[conn.ike_proposal.as_str()])
+        .list("proposals", &[ike_proposal])
         .kv("version", "2")
-        .kv("mobike", if conn.mobike { "yes" } else { "no" });
+        .kv("mobike", "yes");
     if let Some(id) = &conn.local_id {
         body = body.section("local", Message::new().kv("id", id));
     }
@@ -544,29 +547,6 @@ fn spawn_telemetry_loop(iface: String, event_tx: broadcast::Sender<HeliosEvent>)
                 });
             }
             prev = Some(cur);
-        }
-    });
-}
-
-fn spawn_update_loop(channel: Box<dyn UpdateChannel>, interval_secs: u64) {
-    tokio::spawn(async move {
-        if let Err(e) = channel.confirm_boot().await {
-            warn!("confirmation du boot impossible : {e}");
-        }
-        let mut ticker = time::interval(Duration::from_secs(interval_secs.max(1)));
-        loop {
-            ticker.tick().await;
-            match channel.check().await {
-                Ok(Some(release)) => {
-                    info!("mise à jour disponible : {}", release.version);
-                    match channel.install(&release).await {
-                        Ok(outcome) => info!("installation : {outcome:?}"),
-                        Err(e) => error!("installation échouée : {e}"),
-                    }
-                }
-                Ok(None) => info!("aucune mise à jour"),
-                Err(e) => warn!("vérification des mises à jour : {e}"),
-            }
         }
     });
 }
@@ -757,22 +737,23 @@ async fn trigger_mobike_update(vici_socket: &str, conn_name: &str) {
     }
 }
 
-pub fn status(config: &Config) -> anyhow::Result<()> {
+pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
-    println!("  mode         : {}", if config.general.dry_run { "dry-run" } else { "réel" });
-    println!("  socket VICI  : {}", config.vici.socket);
-    println!("  interface web: http://{}", config.api.bind);
-    println!("  WAN          : {}", config.firewall.wan_iface);
-    println!("  LAN          : {:?}", config.firewall.lan_ifaces);
-    println!("  connexions   : {}", config.connections.len());
-    for c in &config.connections {
-        println!("    - {} -> {} [{}]", c.name, c.remote_addr, c.ike_proposal);
+    println!("  mode         : {}", if dry_run { "dry-run" } else { "réel" });
+    println!("  socket VICI  : {VICI_SOCKET}");
+    println!("  interface web: http://{}", helios_core::API_BIND);
+    println!("  WAN          : {}", network.wan_iface);
+    println!("  LAN          : {:?}", network.lan_ifaces);
+    println!("  connexions   : {}", network.connections.len());
+    let (ike, _) = default_proposals();
+    for c in &network.connections {
+        println!("    - {} -> {} [{}]", c.name, c.remote_addr, ike);
     }
     Ok(())
 }
 
-pub async fn check_update(config: &Config) -> anyhow::Result<()> {
-    let channel = update_channel(config);
+pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {
+    let channel = update_channel(dry_run);
     let current = channel.current_version().await?;
     println!("version actuelle : {current}");
     match channel.check().await? {

@@ -30,12 +30,14 @@ mod boot_controller;
 mod provisioning;
 mod reseal_ticket;
 mod secret;
+mod settings;
 mod tpm_interface;
 #[cfg(feature = "tpm")]
 mod tpm_real;
 
 pub use boot_controller::{BootController, BootDecision};
 pub use secret::SecretKey;
+pub use settings::TpmSettings;
 
 use thiserror::Error;
 

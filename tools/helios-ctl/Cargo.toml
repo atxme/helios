@@ -9,10 +9,12 @@ name = "helios-ctl"
 path = "src/main.rs"
 
 [dependencies]
+helios-core.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }

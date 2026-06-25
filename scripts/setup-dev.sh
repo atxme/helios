@@ -75,21 +75,21 @@ sudo apt-get install -y \
     ca-certificates
 success "Outils de base OK"
 
-# ── 3. Dépendances helios-client (egui + GTK) ───────────────────────────────
-info "Dépendances helios-client (egui/glow + GTK3)..."
+# ── 3. Dépendances apps/helios-client (app Tauri = webkit2gtk) ──────────────
+info "Dépendances client Tauri (webkit2gtk-4.1 + GTK3)..."
 sudo apt-get install -y \
+    libwebkit2gtk-4.1-dev \
     libgtk-3-dev \
-    libgl1-mesa-dev libgles2-mesa-dev \
-    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-    libxkbcommon-dev \
-    libfontconfig1-dev \
+    librsvg2-dev \
+    libayatana-appindicator3-dev \
+    patchelf \
     libglib2.0-dev
-success "GTK3 + OpenGL OK"
+success "webkit2gtk + GTK3 OK"
 
 # Alerte WSL2 : l'affichage graphique nécessite WSLg ou un serveur X
 if $IS_WSL; then
-    warn "WSL2 : helios-client requiert WSLg (Windows 11) ou un serveur X (VcXsrv/X410)."
-    warn "Vérifiez que DISPLAY est défini avant de lancer le client."
+    warn "WSL2 : l'app helios-client (Tauri) requiert WSLg (Windows 11) ou un serveur X."
+    warn "La LOGIQUE du client reste testable sans affichage : cargo test -p helios-client-core."
 fi
 
 # ── 4. Node.js (UI web React) ────────────────────────────────────────────────
@@ -140,9 +140,23 @@ if $BUILD_MODE; then
     cargo build -p heliosd 2>&1 | tail -5
     success "heliosd OK → target/debug/heliosd"
 
-    info "Compilation de helios-client..."
-    cargo build -p helios-client 2>&1 | tail -5
-    success "helios-client OK → target/debug/helios-client"
+    info "Tests de la logique client (helios-client-core, sans webkit)..."
+    cargo test -p helios-client-core 2>&1 | tail -5
+    success "helios-client-core OK"
+
+    info "Build du frontend client (apps/helios-client)..."
+    (cd "$REPO_ROOT/apps/helios-client" && npm install --silent && npm run build 2>&1 | tail -5)
+    success "frontend client OK → apps/helios-client/dist"
+
+    # Le shell Tauri (cargo build -p helios-client) lie webkit2gtk : tenté seulement
+    # si la lib de dev est présente (sinon échec attendu, hors WSL2 minimal).
+    if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+        info "Compilation du shell Tauri helios-client..."
+        cargo build -p helios-client 2>&1 | tail -5
+        success "helios-client OK → target/debug/helios-client"
+    else
+        warn "webkit2gtk-4.1 absent → shell Tauri non compilé (cargo build -p helios-client sauté)."
+    fi
 
     if $TARGET_MODE; then
         info "Compilation de heliosd --features netlink (cible)..."
@@ -159,11 +173,11 @@ echo "Prochaines étapes :"
 echo "  # Daemon (dry-run) :"
 echo "  cargo run -p heliosd -- --config config/helios.toml run"
 echo ""
-echo "  # Client GUI :"
+echo "  # Client VPN (app Tauri) :"
 if $IS_WSL; then
     echo "  export DISPLAY=:0  # ou laisser WSLg gérer"
 fi
-echo "  cargo run -p helios-client"
+echo "  cd apps/helios-client && npm run tauri dev"
 echo ""
 echo "  # UI web (dev) :"
 echo "  cd web && npm run dev"

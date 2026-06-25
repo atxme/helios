@@ -7,9 +7,26 @@ members = [
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
+    "crates/helios-client-core",
     "crates/heliosd",
     "tools/helios-ctl",
-    "tools/helios-client",
+    "apps/helios-client/src-tauri",
+]
+
+# Le shell Tauri du client (apps/helios-client/src-tauri) lie webkit2gtk : il ne
+# compile PAS sur WSL2. On l'exclut donc du build par défaut — exactement comme la
+# feature `netlink` est target-only — pour que `cargo build`/`cargo test` (sans
+# `-p`) restent verts partout. Le construire est explicite : `cargo build -p helios-client`.
+default-members = [
+    "crates/helios-core",
+    "crates/helios-vici",
+    "crates/helios-firewall",
+    "crates/helios-update",
+    "crates/helios-api",
+    "crates/helio-tpm",
+    "crates/helios-client-core",
+    "crates/heliosd",
+    "tools/helios-ctl",
 ]
 
 [workspace.package]

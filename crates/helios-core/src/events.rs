@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::config::NetworkConfig;
 use crate::state::TunnelState;
 
 /// Événements diffusés aux abonnés (WebSocket).
@@ -43,4 +44,6 @@ pub enum OrchestratorCmd {
     SetSplitTunnel(Vec<String>),
     /// Applique une valeur de MSS clamping issue de la sonde PMTUD (usage interne).
     SetMssClamp(u16),
+    /// Recharge la configuration réseau à chaud (sans redémarrer le daemon).
+    LoadNetworkConfig(NetworkConfig),
 }

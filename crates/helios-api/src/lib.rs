@@ -3,8 +3,10 @@
 //! ## Architecture
 //!
 //! ```text
-//! navigateur ──GET /──────────────────► fichiers statiques React (embed ou 404)
+//! navigateur ──GET /──────────────────► fichiers statiques React (embed ou 503)
 //! navigateur ──GET /api/status────────► JSON état courant
+//! navigateur ──GET /api/network───────► JSON config réseau courante
+//! navigateur ──POST /api/network──────► recharge la config réseau (JSON)
 //! navigateur ──POST /api/tunnel/start► commande vers l'orchestrateur (mpsc)
 //! navigateur ──WS /ws─────────────────► flux d'événements temps réel (broadcast)
 //! ```
@@ -19,7 +21,7 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use helios_core::{Config, FirewallPolicy, HeliosEvent, OrchestratorCmd, TunnelState};
+use helios_core::{FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// État partagé entre tous les handlers Axum.
@@ -31,24 +33,28 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<HeliosEvent>,
     /// Canal de commandes vers l'orchestrateur (Start/Stop depuis l'UI).
     pub cmd_tx: mpsc::Sender<OrchestratorCmd>,
-    pub config: Arc<Config>,
+    /// Configuration réseau courante (rechargeable à chaud).
+    pub network: Arc<RwLock<NetworkConfig>>,
+    /// `true` = daemon en mode simulation (WSL2 ou --dev).
+    pub dry_run: bool,
     /// Propositions IKE/ESP effectives si surchargées par l'UI (ike, esp).
+    /// `None` = profil hybride par défaut.
     pub effective_proposals: Arc<RwLock<Option<(String, String)>>>,
     /// Politique de pare-feu courante (mise à jour par l'orchestrateur).
-    /// Expose les champs dynamiques : split_tunnel_cidrs, mss_clamp, captive_portal_gateway.
     pub policy: Arc<RwLock<FirewallPolicy>>,
 }
 
 impl AppState {
     pub fn new(
-        config: Arc<Config>,
+        network: Arc<RwLock<NetworkConfig>>,
+        dry_run: bool,
         tunnel_state: Arc<RwLock<TunnelState>>,
         event_tx: broadcast::Sender<HeliosEvent>,
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
         effective_proposals: Arc<RwLock<Option<(String, String)>>>,
         policy: Arc<RwLock<FirewallPolicy>>,
     ) -> Self {
-        Self { tunnel_state, event_tx, cmd_tx, config, effective_proposals, policy }
+        Self { tunnel_state, event_tx, cmd_tx, network, dry_run, effective_proposals, policy }
     }
 }
 
@@ -62,6 +68,8 @@ pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/status", get(routes::status))
+        .route("/api/network", get(routes::network_get))
+        .route("/api/network", post(routes::network_set))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
         .route("/api/connections/apply", post(routes::connection_apply))

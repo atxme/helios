@@ -1,5 +1,10 @@
-use axum::{body::Bytes, extract::State, Json};
-use helios_core::{profiles, OrchestratorCmd};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    Json,
+};
+use helios_core::{profiles, NetworkConfig, OrchestratorCmd};
 use helios_firewall::ruleset;
 use serde::{Deserialize, Serialize};
 
@@ -26,11 +31,8 @@ pub struct StatusResponse {
     pub dry_run: bool,
     pub profiles: Vec<ProfileSummary>,
     pub active_profile: Option<String>,
-    /// CIDRs locaux actuellement en split-tunneling (mis à jour dynamiquement).
     pub split_tunnel_cidrs: Vec<String>,
-    /// MSS clamping actif (déterminé par PMTUD après montée du tunnel). `null` = inactif.
     pub mss_clamp: Option<u16>,
-    /// IP de la passerelle du portail captif courant. `null` = pas de portail.
     pub captive_portal_gateway: Option<String>,
 }
 
@@ -47,6 +49,13 @@ pub struct ConnectionSummary {
 #[derive(Serialize)]
 pub struct CmdResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CmdResponse {
+    fn ok() -> Self { Self { ok: true, error: None } }
+    fn err(msg: impl Into<String>) -> Self { Self { ok: false, error: Some(msg.into()) } }
 }
 
 #[derive(Serialize)]
@@ -77,14 +86,21 @@ pub struct SplitTunnelRequest {
     pub cidrs: Vec<String>,
 }
 
+fn hybrid_proposals() -> (String, String) {
+    let p = profiles::find("hybrid").expect("profil hybride manquant");
+    (p.ike_proposal.to_string(), p.esp_proposal.to_string())
+}
+
 pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     let state = s.tunnel_state.read().await;
     let effective = s.effective_proposals.read().await;
     let policy = s.policy.read().await;
+    let network = s.network.read().await;
 
-    let connections: Vec<ConnectionSummary> = s.config.connections.iter().map(|c| {
+    let (default_ike, default_esp) = hybrid_proposals();
+    let connections: Vec<ConnectionSummary> = network.connections.iter().map(|c| {
         let (ike, esp) = effective.clone()
-            .unwrap_or_else(|| (c.ike_proposal.clone(), c.esp_proposal.clone()));
+            .unwrap_or_else(|| (default_ike.clone(), default_esp.clone()));
         ConnectionSummary {
             name: c.name.clone(),
             remote_addr: c.remote_addr.clone(),
@@ -95,9 +111,10 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         }
     }).collect();
 
-    let active_profile = connections.first()
-        .and_then(|c| profiles::detect(&c.ike_proposal))
-        .map(|p| p.id.to_string());
+    let active_ike = effective.as_ref()
+        .map(|(ike, _)| ike.as_str())
+        .unwrap_or(&default_ike);
+    let active_profile = profiles::detect(active_ike).map(|p| p.id.to_string());
 
     let profile_list = profiles::PROFILES.iter().map(|p| ProfileSummary {
         id: p.id.to_string(),
@@ -110,18 +127,37 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         state: state.as_str().to_string(),
         version: env!("CARGO_PKG_VERSION"),
-        wan_iface: s.config.firewall.wan_iface.clone(),
-        lan_ifaces: s.config.firewall.lan_ifaces.clone(),
-        ike_peers: s.config.firewall.ike_peers.clone(),
-        allow_ssh_from: s.config.firewall.allow_ssh_from.clone(),
+        wan_iface: network.wan_iface.clone(),
+        lan_ifaces: network.lan_ifaces.clone(),
+        ike_peers: network.ike_peers(),
+        allow_ssh_from: network.allow_ssh_from.clone(),
         connections,
-        dry_run: s.config.general.dry_run,
+        dry_run: s.dry_run,
         profiles: profile_list,
         active_profile,
         split_tunnel_cidrs: policy.split_tunnel_cidrs.clone(),
         mss_clamp: policy.mss_clamp,
         captive_portal_gateway: policy.captive_portal_gateway.clone(),
     })
+}
+
+/// Retourne la configuration réseau courante.
+pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfig> {
+    let network = s.network.read().await;
+    Json(network.clone())
+}
+
+/// Recharge la configuration réseau à chaud (JSON).
+/// Persiste sur disque et envoie `LoadNetworkConfig` à l'orchestrateur.
+pub async fn network_set(
+    State(s): State<AppState>,
+    Json(new_config): Json<NetworkConfig>,
+) -> Result<Json<CmdResponse>, (StatusCode, String)> {
+    if let Err(e) = new_config.save() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    let ok = s.cmd_tx.send(OrchestratorCmd::LoadNetworkConfig(new_config)).await.is_ok();
+    Ok(Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") }))
 }
 
 pub async fn tunnel_start(State(s): State<AppState>, body: Bytes) -> Json<CmdResponse> {
@@ -136,15 +172,14 @@ pub async fn tunnel_start(State(s): State<AppState>, body: Bytes) -> Json<CmdRes
         None => OrchestratorCmd::Connect,
     };
     let ok = s.cmd_tx.send(cmd).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }
 
 pub async fn tunnel_stop(State(s): State<AppState>) -> Json<CmdResponse> {
     let ok = s.cmd_tx.send(OrchestratorCmd::Disconnect).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }
 
-/// Applique des propositions IKE/ESP personnalisées et déclenche un re-clé.
 pub async fn connection_apply(
     State(s): State<AppState>,
     Json(body): Json<CustomProposalRequest>,
@@ -153,10 +188,9 @@ pub async fn connection_apply(
         ike_proposal: body.ike_proposal,
         esp_proposal: body.esp_proposal,
     }).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }
 
-/// Renvoie le jeu de règles nftables rendu pour l'état courant.
 pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRulesResponse> {
     let state = *s.tunnel_state.read().await;
     let policy = s.policy.read().await;
@@ -181,32 +215,27 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
     Json(FirewallRulesResponse {
         rules: lines.join("\n"),
         default_verdict: verdict_str.to_string(),
-        dry_run: s.config.general.dry_run,
+        dry_run: s.dry_run,
     })
 }
 
-/// Applique un jeu de règles nftables personnalisé (dry-run = log seulement).
 pub async fn firewall_rules_apply(
     State(s): State<AppState>,
     Json(body): Json<ApplyRulesRequest>,
 ) -> Json<CmdResponse> {
     let ok = s.cmd_tx.send(OrchestratorCmd::ApplyFirewallRules(body.rules)).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }
 
-/// L'utilisateur a validé le portail captif dans son navigateur.
-/// Relance une tentative de connexion IPsec.
 pub async fn captive_portal_release(State(s): State<AppState>) -> Json<CmdResponse> {
     let ok = s.cmd_tx.send(OrchestratorCmd::AcknowledgeCaptivePortal).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }
 
-/// Met à jour la liste des CIDRs en split-tunneling.
-/// Passe `cidrs: []` pour désactiver le split-tunneling.
 pub async fn split_tunnel_set(
     State(s): State<AppState>,
     Json(body): Json<SplitTunnelRequest>,
 ) -> Json<CmdResponse> {
     let ok = s.cmd_tx.send(OrchestratorCmd::SetSplitTunnel(body.cidrs)).await.is_ok();
-    Json(CmdResponse { ok })
+    Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") })
 }

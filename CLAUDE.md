@@ -12,12 +12,18 @@ Helios is an IPsec VPN gateway **orchestrator** (control plane) for a Linux appl
 
 **Flux de données** :
 - `GET /api/status` → JSON de l'état courant (lu depuis `Arc<RwLock<TunnelState>>`)
+- `GET /api/network` → JSON de la config réseau courante (`Arc<RwLock<NetworkConfig>>`)
+- `POST /api/network` → recharge la config réseau à chaud (JSON) → envoie `LoadNetworkConfig` à l'orchestrateur
 - `POST /api/tunnel/start|stop` → envoie un `OrchestratorCmd` via `mpsc` → l'orchestrateur réagit
 - `WS /ws` → flux de `HeliosEvent` JSON temps réel (`broadcast::Sender` côté orchestrateur, `subscribe()` par handler WS)
 
-**Câblage dans `main.rs`** : le `broadcast::channel` et le `mpsc::channel` sont créés là, le `Arc<RwLock<TunnelState>>` est partagé entre `AppState` (API) et `orchestrator::run`. La fonction `transition()` dans l'orchestrateur met à jour les trois en une seule opération atomique.
+**Câblage dans `main.rs`** : le `broadcast::channel` et le `mpsc::channel` sont créés là, le `Arc<RwLock<TunnelState>>` et le `Arc<RwLock<NetworkConfig>>` sont partagés entre `AppState` (API) et `orchestrator::run`. La fonction `transition()` dans l'orchestrateur met à jour les trois en une seule opération atomique.
+
+**Config réseau** : un seul fichier TOML (`/var/lib/helios/network.toml`) chargé au démarrage. Tous les autres paramètres (TPM, VICI socket `/var/run/charon.vici`, API bind `127.0.0.1:8080`, profil IKE hybride par défaut, fail-closed) sont des constantes compilées dans le binaire.
 
 **Feature `embed-ui`** : rust-embed embarque `web/dist/` dans le binaire. Sans cette feature, `/` renvoie 503 (pratique en dev où Vite tourne séparément et proxy `/api` + `/ws` vers `:8080`).
+
+**Invariant — le serveur web vit DERRIÈRE le tunnel.** Sur la passerelle (`admin_iface = "ipsec0"`), nftables ne laisse atteindre l'API REST/WS qu'à travers l'interface IPsec : elle n'est joignable **qu'une fois le tunnel établi**. Conséquence directe pour tout client : on **ne pilote jamais** la montée d'un tunnel via cette API (poule/œuf) — un client IPsec se connecte à la gateway par son **endpoint IKE** (IP/FQDN), pas par une URL HTTP. L'API web ne sert qu'à la supervision/télémétrie *post-connexion*.
 
 ## Commands
 
@@ -28,11 +34,11 @@ cargo test -p helios-vici        # one crate
 cargo test round_trip_keyvalue   # one test by name
 cargo clippy --all-targets
 
-# Run the daemon in dry-run (default config has dry_run = true):
-cargo run -p heliosd -- --config config/helios.toml status
-cargo run -p heliosd -- --config config/helios.toml run           # API on http://127.0.0.1:8080
-cargo run -p heliosd -- --config config/helios.toml run --dev     # dev mode: skips VICI timing
-cargo run -p heliosd -- --config config/helios.toml check-update
+# Run the daemon (auto-detects WSL2 → dry-run mode):
+cargo run -p heliosd -- status
+cargo run -p heliosd -- run              # API on http://127.0.0.1:8080
+cargo run -p heliosd -- run --dev        # force dev mode (simulation sans charon ni nftables)
+cargo run -p heliosd -- check-update
 
 # Target-only build (needs libnftnl/libmnl + nf_tables kernel; will NOT build on WSL2):
 cargo build -p heliosd --features netlink
@@ -44,16 +50,22 @@ cargo build -p heliosd --features embed-ui
 
 # Dev/test CLI (in a second terminal while heliosd is running):
 cargo run -p helios-ctl -- status
-cargo run -p helios-ctl -- watch               # live WebSocket event stream
+cargo run -p helios-ctl -- watch                               # live WebSocket event stream
+cargo run -p helios-ctl -- network show                        # affiche la config réseau courante
+cargo run -p helios-ctl -- network load config/network.toml   # charge une config réseau
 cargo run -p helios-ctl -- scenario nominal    # connect → Up → disconnect, checks timing
 cargo run -p helios-ctl -- scenario flap       # connect/disconnect ×5, measures latency
 cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status  # remote target
 
-# Client GUI léger (egui, multiplateforme) :
-cargo run -p helios-client                                # WSL2 / Linux (pas de systray)
-HELIOS_URL=http://192.168.1.1:8080 cargo run -p helios-client
-# Sur Windows/macOS (systray) :
-cargo run -p helios-client --features tray
+# Client VPN (app web Tauri, apps/helios-client) — VRAI client IPsec autonome :
+cargo test -p helios-client-core             # logique testable PARTOUT (config, dry-run) incl. WSL2
+cd apps/helios-client && npm install && npm run build   # frontend React (tsc + vite), pas de webkit
+# Lancer l'app complète (NÉCESSITE libwebkit2gtk-4.1-dev — ne build PAS sur WSL2 sans) :
+cd apps/helios-client && npm run tauri dev   # dry-run par défaut (aucune pile IKEv2 requise)
+# Build du shell Rust seul (webkit requis) — exclu du build workspace par défaut :
+cargo build -p helios-client
+# Backends IPsec réels (target-only, comme la feature netlink) :
+cargo build -p helios-client --features linux-strongswan   # | native-windows | native-macos
 ```
 
 ## The WSL2 vs target split — read this first
@@ -77,6 +89,8 @@ Control plane (user space) drives the kernel data plane. Crate dependency flows 
 - **`helio-tpm`** — TPM 2.0 boot integrity: seals a 256-bit secret against PCR 0/4/7 at provisioning; unseal at boot proves the bootchain is unmodified. The secret decrypts IPsec credentials before `load-conn`. Re-sealing after OTA requires a signed Ed25519 ticket (anti-rollback). `DryRunTpm` is fully testable on WSL2; `TpmDevice` (feature `tpm`) only on the target.
 - **`heliosd`** — `orchestrator.rs` wires it together: engage kill-switch *before* any network, then `simulate_bringup` (dry-run) or `bring_up_real` (VICI), plus the OTA loop.
 - **`helios-ctl`** (`tools/`) — developer CLI for scripting and scenario testing against a running `heliosd`; not part of the deployed appliance.
+- **`helios-client-core`** — cœur **portable** du client VPN (côté road-warrior, pas la gateway) : `config.rs` (le profil VPN `ClientProfile` éditable/persisté : endpoint IKE, identités, credentials, profil IKE/ESP), `backend/` (trait `VpnBackend` qui **monte réellement** le tunnel via la pile IKEv2 native de l'OS — `DryRunBackend` par défaut/testable WSL2, `linux`/`windows`/`macos` derrière des features target-only), `telemetry.rs` (consomme l'API heliosd **uniquement post-`Up`**). Zéro dépendance Tauri → testé sur WSL2 (`cargo test -p helios-client-core`).
+- **`apps/helios-client`** (`src-tauri` + frontend React) — shell **Tauri** mince : commandes `invoke` (connect/disconnect, CRUD profils), relais des `ClientEvent` vers l'IHM (`emit`). Lie `webkit2gtk-4.1` → **exclu des `default-members`** du workspace (ne build pas sur WSL2 sans webkit), comme la feature `netlink` est target-only. Note PQ : les piles IKEv2 natives Windows/macOS ne supportent pas l'échange ML-KEM (RFC 9370) — réservé aux clients strongSwan ≥ 6.
 
 ### Fail-closed is a hard rule, not a default
 
