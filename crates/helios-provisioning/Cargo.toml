@@ -1,0 +1,13 @@
+[package]
+name = "helios-provisioning"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Enrôlement des clients Orion côté gateway Helios : IPAM CGNAT déterministe sans état, échange ML-KEM, injection du PSK WireGuard. Testable sur WSL2."
+
+[dependencies]
+aether = { workspace = true }
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

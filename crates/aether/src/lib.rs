@@ -1,20 +1,23 @@
-//! Types fondamentaux partagés par tous les composants Helios.
+//! Le milieu partagé par Helios (la gateway) et Orion (le client) : types
+//! communs, machine à états du tunnel, politique de kill-switch « fail-closed »,
+//! et l'échange post-quantique ML-KEM ([`pq`]).
 //!
-//! Ce crate ne dépend d'aucune ressource système (ni Netlink, ni VICI, ni RAUC) :
-//! il compile et se teste partout, y compris sur WSL2. C'est lui qui porte la
-//! sémantique métier du projet — en particulier la machine à états du tunnel et
-//! la politique de kill-switch « fail-closed ».
+//! Aucune dépendance à une **ressource système au runtime** (ni Netlink, ni VICI,
+//! ni RAUC) : le crate se teste partout, WSL2 compris. Seule exception, à la
+//! compilation : [`pq`] tire `aws-lc-rs` (AWS-LC), qui construit un peu de C via
+//! le crate `cc` — comme `ring`, déjà présent. Cela n'exige qu'un compilateur C,
+//! pas de toolchain CMake/Go (voir ADR-001 §2 et les notes de vigilance).
 
 pub mod config;
 pub mod error;
 pub mod events;
 pub mod policy;
-pub mod profiles;
+pub mod pq;
 pub mod state;
 
 pub use config::{Connection, NetworkConfig, API_BIND, API_PORT};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
-pub use profiles::{IkeProfile, PqcLevel};
+pub use pq::{Kem, MlKem768Kem, PqError, SharedSecret};
 pub use state::{TunnelEvent, TunnelState};

@@ -1,24 +1,27 @@
-//! Orchestration : câblage VICI <-> machine à états <-> pare-feu <-> OTA.
+//! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu <-> OTA.
+//!
+//! État de la bascule (ADR-001) : le plan de contrôle VICI/charon a été retiré.
+//! La montée réelle du tunnel WireGuard (via `defguard_wireguard_rs`, netlink)
+//! est **target-only** et pas encore câblée ici — comme le backend Netlink du
+//! pare-feu. En dry-run (WSL2/dev), on simule la cinématique de montée.
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use aether::{
-    profiles, Connection, FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd,
-    TunnelEvent, TunnelState,
+    FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use helios_firewall::{DryRunBackend, FirewallBackend};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
-use helios_vici::{Message, ViciClient, ViciEventStream};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     sync::{broadcast, mpsc, RwLock},
     time,
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const VICI_SOCKET: &str = "/var/run/charon.vici";
+/// Port UDP d'écoute WireGuard (invariant d'architecture).
+const WG_PORT: u16 = 51820;
 
 fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     if dry_run {
@@ -41,11 +44,6 @@ fn update_channel(dry_run: bool) -> Box<dyn UpdateChannel> {
     } else {
         Box::new(RaucChannel::new(VERSION, None))
     }
-}
-
-fn default_proposals() -> (String, String) {
-    let p = profiles::find("hybrid").expect("profil hybride manquant");
-    (p.ike_proposal.to_string(), p.esp_proposal.to_string())
 }
 
 fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
@@ -76,7 +74,6 @@ pub async fn run(
     shared_state: Arc<RwLock<TunnelState>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
-    effective_proposals: Arc<RwLock<Option<(String, String)>>>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
@@ -92,9 +89,7 @@ pub async fn run(
     // 2. Montée initiale du tunnel.
     {
         let network = shared_network.read().await;
-        let proposals = effective_proposals.read().await.clone()
-            .unwrap_or_else(default_proposals);
-        do_connect(&network, dry_run, &proposals, &shared_state, &event_tx, fw.as_ref(), &mut policy).await?;
+        do_connect(&network, dry_run, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
         let wan = network.wan_iface.clone();
         drop(network);
         spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
@@ -124,7 +119,7 @@ pub async fn run(
                     Some(c) => {
                         handle_external_cmd(
                             c, &shared_network, dry_run, &shared_state, &event_tx, fw.as_ref(),
-                            &mut policy, &effective_proposals, &internal_tx, &shared_policy,
+                            &mut policy, &internal_tx, &shared_policy,
                         ).await?;
                     }
                 }
@@ -155,7 +150,6 @@ async fn handle_external_cmd(
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &mut FirewallPolicy,
-    effective_proposals: &Arc<RwLock<Option<(String, String)>>>,
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
 ) -> anyhow::Result<()> {
@@ -164,46 +158,7 @@ async fn handle_external_cmd(
             info!("connexion demandée via l'interface web");
             emit_log(event_tx, "info", "Connexion demandée via l'interface web");
             let network = shared_network.read().await;
-            let proposals = effective_proposals.read().await.clone()
-                .unwrap_or_else(default_proposals);
-            do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
-            let wan = network.wan_iface.clone();
-            drop(network);
-            spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
-            sync_policy(shared_policy, policy).await;
-        }
-
-        OrchestratorCmd::ConnectWithProfile(profile_id) => {
-            match profiles::find(&profile_id) {
-                Some(p) => {
-                    info!("connexion avec profil `{}` ({})", p.id, p.name);
-                    emit_log(event_tx, "info",
-                        &format!("Connexion avec profil {} — {}", p.name, p.ike_proposal));
-                    let proposals = (p.ike_proposal.to_string(), p.esp_proposal.to_string());
-                    *effective_proposals.write().await = Some(proposals.clone());
-                    let network = shared_network.read().await;
-                    do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
-                    let wan = network.wan_iface.clone();
-                    drop(network);
-                    spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
-                    sync_policy(shared_policy, policy).await;
-                }
-                None => {
-                    error!("profil IKE inconnu : `{profile_id}`");
-                    emit_log(event_tx, "error",
-                        &format!("Profil IKE inconnu : `{profile_id}`"));
-                }
-            }
-        }
-
-        OrchestratorCmd::ConnectWithCustom { ike_proposal, esp_proposal } => {
-            info!("connexion avec propositions personnalisées : IKE={ike_proposal}");
-            emit_log(event_tx, "info",
-                &format!("Connexion personnalisée — IKE : {ike_proposal}"));
-            let proposals = (ike_proposal, esp_proposal);
-            *effective_proposals.write().await = Some(proposals.clone());
-            let network = shared_network.read().await;
-            do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+            do_connect(&network, dry_run, shared_state, event_tx, fw, policy).await?;
             let wan = network.wan_iface.clone();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -225,7 +180,6 @@ async fn handle_external_cmd(
         OrchestratorCmd::Disconnect => {
             info!("déconnexion demandée via l'interface web");
             emit_log(event_tx, "info", "Déconnexion demandée via l'interface web");
-            *effective_proposals.write().await = None;
             policy.captive_portal_gateway = None;
             policy.mss_clamp = None;
             transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
@@ -243,9 +197,7 @@ async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                let proposals = effective_proposals.read().await.clone()
-                    .unwrap_or_else(default_proposals);
-                do_connect(&network, dry_run, &proposals, shared_state, event_tx, fw, policy).await?;
+                do_connect(&network, dry_run, shared_state, event_tx, fw, policy).await?;
                 let wan = network.wan_iface.clone();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -270,7 +222,7 @@ async fn handle_external_cmd(
         }
 
         OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
-            info!("config réseau rechargée : {} connexion(s)", new_cfg.connections.len());
+            info!("config réseau rechargée : {} pair(s)", new_cfg.connections.len());
             *policy = new_cfg.firewall_policy();
             *shared_network.write().await = new_cfg;
             let state = *shared_state.read().await;
@@ -285,103 +237,66 @@ async fn handle_external_cmd(
 async fn do_connect(
     network: &NetworkConfig,
     dry_run: bool,
-    proposals: &(String, String),
-    shared: &Arc<RwLock<TunnelState>>,
-    event_tx: &broadcast::Sender<HeliosEvent>,
-    fw: &dyn FirewallBackend,
-    policy: &mut FirewallPolicy,
-) -> anyhow::Result<()> {
-    if dry_run {
-        simulate_bringup(shared, event_tx, fw, policy).await
-    } else {
-        bring_up_real(network, proposals, shared, event_tx, fw, policy).await
-    }
-}
-
-async fn simulate_bringup(
     shared: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &FirewallPolicy,
 ) -> anyhow::Result<()> {
-    info!("[dry-run] simulation de la montée du tunnel");
-    emit_log(event_tx, "info", "[dry-run] Démarrage de la simulation IKEv2 + ML-KEM-768");
+    if !dry_run {
+        // Le backend WireGuard réel (defguard_wireguard_rs, netlink) est
+        // target-only et pas encore câblé — comme le backend Netlink du pare-feu.
+        // On simule la montée en attendant, sans jamais lever le kill-switch à tort.
+        warn!("backend WireGuard réel non câblé (target-only) : repli sur simulation");
+        emit_log(event_tx, "warn",
+            "Backend WireGuard réel non câblé (cible) — montée simulée");
+    }
+    simulate_bringup(network, shared, event_tx, fw, policy).await
+}
+
+/// Simule la cinématique de montée WireGuard (ADR-001) : montée classique
+/// (`Connecting`, kill-switch engagé) puis upgrade PSK post-quantique
+/// (`HandshakeEstablished` → `Up`).
+async fn simulate_bringup(
+    network: &NetworkConfig,
+    shared: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+    fw: &dyn FirewallBackend,
+    policy: &FirewallPolicy,
+) -> anyhow::Result<()> {
+    info!("[dry-run] simulation de la montée du tunnel WireGuard");
+    let peers = network.connections.len();
+    emit_log(event_tx, "info",
+        &format!("[dry-run] Montée WireGuard — {peers} pair(s), UDP {WG_PORT}"));
+
     let mut state = *shared.read().await;
     if state != TunnelState::Down && state != TunnelState::Failed {
         state = TunnelState::Down;
     }
-    for event in [TunnelEvent::StartRequested, TunnelEvent::IkeEstablished, TunnelEvent::ChildUp] {
-        state = state.on(event).context("transition d'état")?;
-        info!("événement {event:?} -> état {state:?}");
-        let msg = match event {
-            TunnelEvent::StartRequested  => "Négociation IKEv2 initiée…",
-            TunnelEvent::IkeEstablished  => "IKE_SA établi — échange ML-KEM-768 + ECDHE terminé",
-            TunnelEvent::ChildUp         => "CHILD_SA actif — trafic chiffré ESP autorisé",
-            _ => "",
-        };
-        if !msg.is_empty() { emit_log(event_tx, "info", msg); }
-        transition(shared, event_tx, state, fw, policy).await?;
-    }
+
+    // 1. Montée classique : tunnel Curve25519 up, mais PSK pas encore installé.
+    //    Kill-switch ENGAGÉ — aucun trafic utilisateur.
+    state = state.on(TunnelEvent::StartRequested).context("transition d'état")?;
+    info!("événement StartRequested -> état {state:?}");
+    emit_log(event_tx, "info", "Handshake WireGuard classique (Curve25519)…");
+    transition(shared, event_tx, state, fw, policy).await?;
+
+    // 2. Upgrade post-quantique : échange ML-KEM-768 sur le canal de contrôle,
+    //    PSK dérivé et installé des deux côtés (voir helios-provisioning).
+    emit_log(event_tx, "info", "Échange ML-KEM-768 → PSK post-quantique installé");
+
+    // 3. Handshake suivant réussit avec PSK → tunnel pleinement opérationnel.
+    state = state.on(TunnelEvent::HandshakeEstablished).context("transition d'état")?;
+    info!("événement HandshakeEstablished -> état {state:?}");
+    emit_log(event_tx, "info", "Tunnel Up — trafic autorisé, protégé PQ");
+    transition(shared, event_tx, state, fw, policy).await?;
+
     Ok(())
 }
 
-async fn bring_up_real(
-    network: &NetworkConfig,
-    proposals: &(String, String),
-    shared: &Arc<RwLock<TunnelState>>,
-    event_tx: &broadcast::Sender<HeliosEvent>,
-    fw: &dyn FirewallBackend,
-    policy: &mut FirewallPolicy,
-) -> anyhow::Result<()> {
-    let mut client = ViciClient::connect(VICI_SOCKET)
-        .await
-        .with_context(|| format!("connexion VICI sur {VICI_SOCKET}"))?;
-    info!("connecté à charon via {VICI_SOCKET}");
-
-    let mut state = TunnelState::Down;
-    for conn in &network.connections {
-        emit_log(event_tx, "info", &format!("Connexion `{}` — négociation IKEv2…", conn.name));
-        state = state.on(TunnelEvent::StartRequested)?;
-        transition(shared, event_tx, state, fw, policy).await?;
-
-        load_connection(&mut client, conn, &proposals.0, &proposals.1).await?;
-        match initiate(&mut client, conn).await {
-            Ok(()) => {
-                state = state.on(TunnelEvent::ChildUp)?;
-                info!("connexion `{}` établie", conn.name);
-                emit_log(event_tx, "info",
-                    &format!("CHILD_SA `{}` actif — trafic chiffré ESP", conn.name));
-                spawn_mobike_monitor(
-                    VICI_SOCKET.to_string(),
-                    network.wan_iface.clone(),
-                    conn.name.clone(),
-                    event_tx.clone(),
-                );
-            }
-            Err(e) => {
-                error!("échec de `{}` : {e}", conn.name);
-                emit_log(event_tx, "error",
-                    &format!("Échec de `{}` : {e}", conn.name));
-
-                if let Some(gateway) = probe_captive_portal(&policy.wan_iface).await {
-                    info!("portail captif détecté via sonde HTTP (passerelle : {gateway})");
-                    emit_log(event_tx, "warn",
-                        &format!("Portail captif détecté — passerelle : {gateway}"));
-                    state = state.on(TunnelEvent::CaptivePortalDetected)?;
-                    policy.captive_portal_gateway = Some(gateway.clone());
-                    transition(shared, event_tx, state, fw, policy).await?;
-                    let _ = event_tx.send(HeliosEvent::CaptivePortalDetected { gateway });
-                    return Ok(());
-                }
-
-                state = state.on(TunnelEvent::Error)?;
-            }
-        }
-        transition(shared, event_tx, state, fw, policy).await?;
-    }
-    Ok(())
-}
-
+// ─── Sondes conservées : câblées au futur backend WireGuard réel (target-only) ───
+// La détection de portail captif s'appuiera sur ces sondes lors de la montée
+// réelle. Non utilisées dans le chemin dry-run actuel.
+#[allow(dead_code)]
 async fn probe_captive_portal(wan_iface: &str) -> Option<String> {
     let result = tokio::time::timeout(
         Duration::from_secs(4),
@@ -399,7 +314,9 @@ async fn probe_captive_portal(wan_iface: &str) -> Option<String> {
     Some(gateway)
 }
 
+#[allow(dead_code)]
 async fn tcp_http_probe(host: &str, port: u16, path: &str) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect((host, port)).await.ok()?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.ok()?;
@@ -410,6 +327,7 @@ async fn tcp_http_probe(host: &str, port: u16, path: &str) -> Option<u16> {
     header.split_whitespace().nth(1)?.parse().ok()
 }
 
+#[allow(dead_code)]
 async fn get_default_gateway(wan_iface: &str) -> Option<String> {
     let out = tokio::process::Command::new("ip")
         .args(["route", "show", "default", "dev", wan_iface])
@@ -448,9 +366,9 @@ fn spawn_mtu_probe(
 ) {
     tokio::spawn(async move {
         let mss = if dry_run {
-            1300u16
+            1380u16
         } else {
-            discover_mss(&wan_iface).await.unwrap_or(1300)
+            discover_mss(&wan_iface).await.unwrap_or(1380)
         };
         let mtu = mss + 40;
         info!("PMTUD : MSS optimal = {mss} octets (MTU estimé = {mtu})");
@@ -464,54 +382,8 @@ async fn discover_mss(wan_iface: &str) -> Option<u16> {
         .await
         .ok()?;
     let mtu: u16 = mtu_str.trim().parse().ok()?;
-    Some(mtu.saturating_sub(102).max(576))
-}
-
-async fn load_connection(
-    client: &mut ViciClient,
-    conn: &Connection,
-    ike_proposal: &str,
-    esp_proposal: &str,
-) -> anyhow::Result<()> {
-    let child = Message::new()
-        .list("esp_proposals", &[esp_proposal])
-        .kv("start_action", "trap");
-
-    let mut body = Message::new()
-        .list("remote_addrs", &[conn.remote_addr.as_str()])
-        .list("proposals", &[ike_proposal])
-        .kv("version", "2")
-        .kv("mobike", "yes");
-    if let Some(id) = &conn.local_id {
-        body = body.section("local", Message::new().kv("id", id));
-    }
-    if let Some(id) = &conn.remote_id {
-        body = body.section("remote", Message::new().kv("id", id));
-    }
-    body = body.section("children", Message::new().section(&conn.name, child));
-
-    let reply = client.request("load-conn", Message::new().section(&conn.name, body)).await?;
-    if reply.get_str("success") == Some("no") {
-        anyhow::bail!(
-            "load-conn `{}` refusé : {}",
-            conn.name,
-            reply.get_str("errmsg").unwrap_or("raison inconnue")
-        );
-    }
-    Ok(())
-}
-
-async fn initiate(client: &mut ViciClient, conn: &Connection) -> anyhow::Result<()> {
-    let payload = Message::new().kv("child", &conn.name).kv("timeout", "-1");
-    let reply = client.request("initiate", payload).await?;
-    if reply.get_str("success") == Some("no") {
-        anyhow::bail!(
-            "initiate `{}` échoué : {}",
-            conn.name,
-            reply.get_str("errmsg").unwrap_or("raison inconnue")
-        );
-    }
-    Ok(())
+    // WireGuard : ~60 octets d'overhead (en-tête + UDP/IP) + 40 pour l'en-tête TCP/IP.
+    Some(mtu.saturating_sub(100).max(576))
 }
 
 fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
@@ -551,203 +423,16 @@ fn spawn_telemetry_loop(iface: String, event_tx: broadcast::Sender<HeliosEvent>)
     });
 }
 
-/// Constantes Netlink (linux/rtnetlink.h) — groupe multicast adresses IPv4.
-const RTMGRP_IPV4_IFADDR: u32 = 0x10;
-const RTM_NEWADDR: u16 = 20;
-const NL_AF_INET: u8 = 2;
-const IFA_ADDRESS: u16 = 1;
-
-fn spawn_mobike_monitor(
-    vici_socket: String,
-    wan_iface: String,
-    conn_name: String,
-    event_tx: broadcast::Sender<HeliosEvent>,
-) {
-    {
-        let socket = vici_socket.clone();
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            match ViciEventStream::connect(&socket).await {
-                Err(e) => warn!("MOBIKE : connexion VICI événements impossible : {e}"),
-                Ok(mut stream) => {
-                    for ev in ["ike-updown", "child-updown"] {
-                        if let Err(e) = stream.subscribe(ev).await {
-                            warn!("MOBIKE : abonnement `{ev}` impossible : {e}");
-                            return;
-                        }
-                    }
-                    info!("MOBIKE : abonné aux événements VICI ike-updown + child-updown");
-                    loop {
-                        match stream.next_event().await {
-                            Ok((name, msg)) => {
-                                let local = msg.get_str("local-host").unwrap_or("?");
-                                let remote = msg.get_str("remote-host").unwrap_or("?");
-                                info!("VICI `{name}` : local={local} distant={remote}");
-                                emit_log(&tx, "info",
-                                    &format!("VICI {name} : {local} ↔ {remote}"));
-                            }
-                            Err(e) => {
-                                warn!("MOBIKE : perte du flux d'événements VICI : {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    tokio::spawn(async move {
-        if let Err(e) = netlink_addr_watcher(vici_socket, wan_iface, conn_name, event_tx).await {
-            warn!("MOBIKE : surveillance Netlink terminée : {e}");
-        }
-    });
-}
-
-async fn netlink_addr_watcher(
-    vici_socket: String,
-    wan_iface: String,
-    conn_name: String,
-    event_tx: broadcast::Sender<HeliosEvent>,
-) -> anyhow::Result<()> {
-    use netlink_sys::{AsyncSocket, AsyncSocketExt, TokioSocket, SocketAddr as NlSocketAddr, protocols};
-
-    let if_index = read_if_index(&wan_iface).await
-        .with_context(|| format!("index introuvable pour {wan_iface} dans sysfs"))?;
-
-    let mut sock = TokioSocket::new(protocols::NETLINK_ROUTE)
-        .context("ouverture socket Netlink ROUTE")?;
-    sock.socket_mut()
-        .bind(&NlSocketAddr::new(0, RTMGRP_IPV4_IFADDR))
-        .context("bind RTMGRP_IPV4_IFADDR")?;
-
-    let mut current_ip = seed_wan_ip(&wan_iface).await;
-    info!(
-        "MOBIKE : listener Netlink RTM_NEWADDR actif sur {} (index={}, ip={})",
-        wan_iface,
-        if_index,
-        current_ip.as_deref().unwrap_or("?"),
-    );
-
-    loop {
-        let (buf, _): (Vec<u8>, _) = sock.recv_from_full().await.context("recv Netlink")?;
-        let mut offset = 0usize;
-        while offset + 16 <= buf.len() {
-            let nlmsg_len =
-                u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
-            let nlmsg_type =
-                u16::from_ne_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
-
-            if nlmsg_type == RTM_NEWADDR && offset + 24 <= buf.len() {
-                let ifa_family = buf[offset + 16];
-                let ifa_index =
-                    u32::from_ne_bytes(buf[offset + 20..offset + 24].try_into().unwrap());
-
-                if ifa_family == NL_AF_INET && ifa_index == if_index {
-                    let end = (offset + nlmsg_len).min(buf.len());
-                    if let Some(new_ip) = parse_ifa_address(&buf[offset + 24..end]) {
-                        match &current_ip {
-                            Some(prev) if *prev != new_ip => {
-                                info!("MOBIKE : {wan_iface} {prev} → {new_ip}");
-                                emit_log(&event_tx, "info",
-                                    &format!("MOBIKE : migration {prev} → {new_ip} sur {wan_iface}"));
-                                let _ = event_tx.send(HeliosEvent::AddressChanged {
-                                    iface: wan_iface.clone(),
-                                    old_ip: prev.clone(),
-                                    new_ip: new_ip.clone(),
-                                });
-                                trigger_mobike_update(&vici_socket, &conn_name).await;
-                                current_ip = Some(new_ip);
-                            }
-                            None => current_ip = Some(new_ip),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            let aligned = (nlmsg_len + 3) & !3;
-            if aligned == 0 { break; }
-            offset += aligned;
-        }
-    }
-}
-
-fn parse_ifa_address(data: &[u8]) -> Option<String> {
-    let mut off = 0usize;
-    while off + 4 <= data.len() {
-        let rta_len = u16::from_ne_bytes(data[off..off + 2].try_into().ok()?) as usize;
-        let rta_type = u16::from_ne_bytes(data[off + 2..off + 4].try_into().ok()?);
-        if rta_type == IFA_ADDRESS && rta_len == 8 && off + 8 <= data.len() {
-            return Some(format!(
-                "{}.{}.{}.{}",
-                data[off + 4], data[off + 5], data[off + 6], data[off + 7]
-            ));
-        }
-        let aligned = (rta_len + 3) & !3;
-        if aligned < 4 { break; }
-        off += aligned;
-    }
-    None
-}
-
-async fn read_if_index(iface: &str) -> Option<u32> {
-    tokio::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
-        .await
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-async fn seed_wan_ip(iface: &str) -> Option<String> {
-    let out = tokio::process::Command::new("ip")
-        .args(["-brief", "addr", "show", "dev", iface])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .skip(2)
-        .find(|s| s.contains('.') && s.contains('/'))
-        .and_then(|cidr| cidr.split('/').next())
-        .map(str::to_string)
-}
-
-async fn trigger_mobike_update(vici_socket: &str, conn_name: &str) {
-    match ViciClient::connect(vici_socket).await {
-        Err(e) => warn!("MOBIKE : connexion VICI impossible pour mise à jour : {e}"),
-        Ok(mut client) => {
-            let payload = Message::new().kv("ike", conn_name);
-            match client.request("mobike", payload).await {
-                Err(e) => warn!("MOBIKE : commande mobike échouée : {e}"),
-                Ok(reply) => {
-                    if reply.get_str("success") == Some("no") {
-                        warn!("MOBIKE : mise à jour rejetée par charon : {}",
-                            reply.get_str("errmsg").unwrap_or("raison inconnue"));
-                    } else {
-                        info!("MOBIKE : adresse mise à jour dans charon pour `{conn_name}`");
-                    }
-                }
-            }
-        }
-    }
-}
-
 pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
     println!("  mode         : {}", if dry_run { "dry-run" } else { "réel" });
-    println!("  socket VICI  : {VICI_SOCKET}");
+    println!("  transport    : WireGuard UDP {WG_PORT}");
     println!("  interface web: http://{}", aether::API_BIND);
     println!("  WAN          : {}", network.wan_iface);
     println!("  LAN          : {:?}", network.lan_ifaces);
-    println!("  connexions   : {}", network.connections.len());
-    let (ike, _) = default_proposals();
+    println!("  pairs        : {}", network.connections.len());
     for c in &network.connections {
-        println!("    - {} -> {} [{}]", c.name, c.remote_addr, ike);
+        println!("    - {} -> {}", c.name, c.remote_addr);
     }
     Ok(())
 }

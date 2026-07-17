@@ -64,7 +64,7 @@ impl NetworkConfig {
     }
 
     /// IKE peers déduits des adresses distantes des connexions.
-    pub fn ike_peers(&self) -> Vec<String> {
+    pub fn wg_peers(&self) -> Vec<String> {
         self.connections.iter().map(|c| c.remote_addr.clone()).collect()
     }
 
@@ -75,7 +75,7 @@ impl NetworkConfig {
         FirewallPolicy {
             wan_iface: self.wan_iface.clone(),
             lan_ifaces: self.lan_ifaces.clone(),
-            ike_peers: self.ike_peers(),
+            wg_peers: self.wg_peers(),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
             admin_port,
@@ -87,11 +87,12 @@ impl NetworkConfig {
     }
 }
 
-/// Une connexion IPsec à négocier auprès de charon.
+/// Un pair WireGuard connu de la configuration réseau.
 ///
-/// Les propositions cryptographiques sont gérées par l'orchestrateur (profil
-/// hybride par défaut, overridable via `OrchestratorCmd::ConnectWithProfile` ou
-/// `ConnectWithCustom`). MOBIKE (RFC 4555) est toujours actif.
+/// `remote_addr` est l'endpoint UDP du pair (IP joignable en clair sur le port
+/// 51820), utilisé pour scoper la règle de pare-feu. Les pairs road-warrior
+/// dynamiques (VIP dérivée, clé publique) sont gérés par `helios-provisioning`,
+/// pas ici ; cette structure ne couvre que les pairs statiques déclarés.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub name: String,
@@ -129,6 +130,6 @@ mod tests {
         assert_eq!(cfg.connections[0].remote_addr, "203.0.113.10");
         let policy = cfg.firewall_policy();
         assert!(policy.is_fail_closed());
-        assert_eq!(policy.ike_peers, vec!["203.0.113.10"]);
+        assert_eq!(policy.wg_peers, vec!["203.0.113.10"]);
     }
 }

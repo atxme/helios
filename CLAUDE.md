@@ -2,17 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## ⚠ État : migration IKEv2 → WireGuard actée, non commencée
+## ⚠ État : migration IKEv2 → WireGuard **en cours** (Phase B faite)
 
-**`docs/ADR-001-WIREGUARD.md` acte l'abandon d'IKEv2/IPsec au profit de WireGuard.** Aucune ligne n'a encore bougé : **tout ce que décrit ce fichier est l'état réel du dépôt** (VICI, charon, XFRM, RFC 9370). Ne pas confondre les deux.
+**`docs/ADR-001-WIREGUARD.md` acte et pilote l'abandon d'IKEv2/IPsec au profit de WireGuard.** La bascule a commencé. **Attention : ce fichier (`CLAUDE.md`) et `docs/ARCHITECTURE.md` / `docs/POST-QUANTUM.md` décrivent encore par endroits l'ancienne architecture IKEv2** — ils sont mis à jour au fur et à mesure. En cas de doute, le code fait foi, pas ces docs.
 
-Règles pendant la migration :
+**Déjà fait (Phases A/B) :**
+- Renommage : `helios-core` → **`aether`**, `helios-client-core` → **`orion-core`**, `apps/helios-client` → **`apps/orion`**.
+- **`aether::pq`** — échange ML-KEM-768 (`aws-lc-rs`, non-FIPS, statique) derrière le trait `Kem`.
+- **`helios-provisioning`** — IPAM CGNAT déterministe (`derive_cgnat_ip`, `assign_vip`), sans état disque.
+- **Supprimés** : `helios-vici` (crate entier), `aether/src/profiles.rs`, l'appareillage MOBIKE et VICI de l'orchestrateur.
+- **`TunnelState`** : plus de `Rekeying` ; `traffic_allowed()` = `Up` seul ; événements `HandshakeEstablished`/`HandshakeExpired` (polling). Le pare-feu autorise UDP 51820 vers le pair (plus 500/4500+ESP).
+- L'orchestrateur monte le tunnel en **dry-run WireGuard** (cinématique montée classique → upgrade PSK PQ).
 
-- **Ne pas « corriger » le code vers WireGuard au coup par coup.** Le code IKEv2 n'est pas un bug à réparer, c'est l'état courant. La bascule suit le plan de l'ADR, pas des retouches opportunistes.
-- **Ne pas réécrire ce fichier ni `docs/ARCHITECTURE.md` / `docs/POST-QUANTUM.md` en WireGuard tant que le code ne l'est pas.** Ils décrivent le code, pas l'intention. Ils sont mis à jour *au fur et à mesure* que la bascule avance.
-- **Nomenclature — renommage fait** : **Helios** = la gateway (`heliosd`, `helios-*`), **Orion** = le client (`orion-core`, `apps/orion`), **`aether`** = le milieu partagé par les deux (types communs, zéro dépendance système). Les anciens noms (`helios-core`, `helios-client-core`, `apps/helios-client`) n'existent plus.
+**Reste à faire (Phase C+, target-only) :** câbler le backend WireGuard réel (`defguard_wireguard_rs`, netlink) côté gateway ; le backend WireGuard + invariante d'adaptateur Wintun côté Orion ; le protocole d'enrôlement (canal TLS ancré TPM, rotation PSK) dans `helios-provisioning` ; refonte du `ClientProfile` d'Orion (modèle WireGuard : clé publique, endpoint, PSK) — les champs IKE y subsistent temporairement.
 
-Ce qui est condamné par l'ADR (~820 lignes) : `helios-vici` en entier, `aether/src/profiles.rs`, et dans `heliosd/src/orchestrator.rs` : `bring_up_real`, `load_connection`, `initiate` et l'appareillage MOBIKE (lignes 560-738). Inutile d'y investir.
+**Règle maintenue :** ne pas « corriger » vers WireGuard au coup par coup hors du plan de l'ADR. Les stubs target-only (backend réel) ne sont pas des bugs à réparer sur WSL2.
+
+**Nomenclature** : **Helios** = la gateway (`heliosd`, `helios-*`), **Orion** = le client (`orion-core`, `apps/orion`), **`aether`** = le milieu partagé (types communs). Les anciens noms n'existent plus.
 
 ## What this is
 
@@ -42,8 +48,8 @@ Helios is an IPsec VPN gateway **orchestrator** (control plane) for a Linux appl
 ```sh
 cargo build                      # whole workspace (default features = no kernel deps)
 cargo test                       # no system dependencies — runs anywhere incl. WSL2
-cargo test -p helios-vici        # one crate
-cargo test round_trip_keyvalue   # one test by name
+cargo test -p aether             # one crate
+cargo test derivation_deterministe   # one test by name
 cargo clippy --all-targets
 
 # Run the daemon (auto-detects WSL2 → dry-run mode):
@@ -84,8 +90,8 @@ cargo build -p orion --features linux-strongswan   # | native-windows | native-m
 
 Development happens on WSL2, deployment on a dedicated Linux box. **The WSL2 kernel lacks the data plane**: no `nf_tables`, ESP modules not loaded, no `nft`/`charon`/`rauc` binaries. This split is the single most important thing to internalize:
 
-- **Testable on WSL2 (~80% of code, all in `dry_run` mode):** the tunnel state machine, the full VICI wire codec (round-trip tested), kill-switch rule *rendering*, and all orchestration logic.
-- **Target-only (deliberately stubbed):** the real Netlink backend (`crates/helios-firewall/src/netlink.rs`) and the live VICI event loop (`bring_up_real` in the orchestrator). These cannot be compiled/exercised on WSL2.
+- **Testable on WSL2 (~80% of code, all in `dry_run` mode):** the tunnel state machine, l'échange ML-KEM (`aether::pq`, aws-lc-rs), l'IPAM (`helios-provisioning`), kill-switch rule *rendering*, and all orchestration logic.
+- **Target-only (deliberately stubbed):** the real Netlink backend (`crates/helios-firewall/src/netlink.rs`) et le backend WireGuard réel (defguard/netlink, pas encore câblé — l'orchestrateur simule en dry-run). These cannot be compiled/exercised on WSL2.
 
 When asked to "make the firewall actually apply rules" or similar, remember it can only be validated on the target — don't assume a green `cargo build` here proves the `netlink` feature works.
 
@@ -93,13 +99,13 @@ When asked to "make the firewall actually apply rules" or similar, remember it c
 
 Control plane (user space) drives the kernel data plane. Crate dependency flows one way: everything depends on `aether`; `heliosd` ties them together.
 
-- **`aether`** — pure types, zero system deps. Owns the **central security invariant** in `state.rs`: traffic is allowed *only* in `Up`/`Rekeying`; every other state engages the kill-switch (`kill_switch_engaged()`). `TunnelState::on(event)` is the state machine. `config.rs` maps `Config` → `FirewallPolicy`. `profiles.rs` holds the static `PROFILES` array of named IKE presets (classic, hybrid, hybrid-max, full-pqc).
-- **`helios-vici`** — native strongSwan VICI client, no C dependency. `codec.rs` implements the element wire format (the testable centerpiece); `client.rs` does length-prefixed packet framing over a Unix socket.
-- **`helios-firewall`** — `FirewallBackend` trait + `ruleset::render(policy, state)` which turns intent into an nftables ruleset (default verdict `Drop` = fail-closed). Two backends: `DryRunBackend` (logs, default) and `NetlinkBackend` (feature `netlink`, rustables).
+- **`aether`** — pure types (build-dep C via `aws-lc-rs`, voir plus bas). Owns the **central security invariant** in `state.rs`: traffic is allowed *only* in `Up`; every other state engages the kill-switch (`kill_switch_engaged()`). `TunnelState::on(event)` is the state machine (événements WireGuard : `HandshakeEstablished`/`HandshakeExpired`). `config.rs` maps `Config` → `FirewallPolicy`. `pq.rs` porte l'échange ML-KEM-768 derrière le trait `Kem`.
+- **`helios-provisioning`** — enrôlement des clients Orion côté gateway : `ipam.rs` dérive la VIP CGNAT (`100.64.0.0/10`) d'un pair depuis sa clé publique WireGuard, sans état disque. Le protocole d'enrôlement (TLS/TPM, rotation PSK) reste à écrire.
+- **`helios-firewall`** — `FirewallBackend` trait + `ruleset::render(policy, state)` which turns intent into an nftables ruleset (default verdict `Drop` = fail-closed). Autorise UDP 51820 vers les `wg_peers`. Two backends: `DryRunBackend` (logs, default) and `NetlinkBackend` (feature `netlink`, rustables).
 - **`helios-update`** — `UpdateChannel` trait + `RaucChannel` (shells to `rauc`, A/B + rollback) and `DryRunChannel`.
 - **`helios-api`** — Axum HTTP server crate: REST routes (`routes.rs`), WebSocket handler (`ws.rs`), optional static asset embedding (`embed.rs`, feature `embed-ui`). Shares `Arc<RwLock<TunnelState>>` and channels with the orchestrator via `AppState`.
 - **`helio-tpm`** — TPM 2.0 boot integrity: seals a 256-bit secret against PCR 0/4/7 at provisioning; unseal at boot proves the bootchain is unmodified. The secret decrypts IPsec credentials before `load-conn`. Re-sealing after OTA requires a signed Ed25519 ticket (anti-rollback). `DryRunTpm` is fully testable on WSL2; `TpmDevice` (feature `tpm`) only on the target.
-- **`heliosd`** — `orchestrator.rs` wires it together: engage kill-switch *before* any network, then `simulate_bringup` (dry-run) or `bring_up_real` (VICI), plus the OTA loop.
+- **`heliosd`** — `orchestrator.rs` wires it together: engage kill-switch *before* any network, then `simulate_bringup` (dry-run WireGuard : montée classique → upgrade PSK PQ). Le backend WireGuard réel (defguard/netlink) est target-only et pas encore câblé. Plus the OTA loop.
 - **`helios-ctl`** (`tools/`) — developer CLI for scripting and scenario testing against a running `heliosd`; not part of the deployed appliance.
 - **`orion-core`** — cœur **portable** du client VPN (côté road-warrior, pas la gateway) : `config.rs` (le profil VPN `ClientProfile` éditable/persisté : endpoint IKE, identités, credentials, profil IKE/ESP), `backend/` (trait `VpnBackend` qui **monte réellement** le tunnel via la pile IKEv2 native de l'OS — `DryRunBackend` par défaut/testable WSL2, `linux`/`windows`/`macos` derrière des features target-only), `telemetry.rs` (consomme l'API heliosd **uniquement post-`Up`**). Zéro dépendance Tauri → testé sur WSL2 (`cargo test -p orion-core`).
 - **`apps/orion`** (`src-tauri` + frontend React) — shell **Tauri** mince : commandes `invoke` (connect/disconnect, CRUD profils), relais des `ClientEvent` vers l'IHM (`emit`). Lie `webkit2gtk-4.1` → **exclu des `default-members`** du workspace (ne build pas sur WSL2 sans webkit), comme la feature `netlink` est target-only. Note PQ : les piles IKEv2 natives Windows/macOS ne supportent pas l'échange ML-KEM (RFC 9370) — réservé aux clients strongSwan ≥ 6.

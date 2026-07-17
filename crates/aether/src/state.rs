@@ -2,12 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{HeliosError, Result};
 
-/// État opérationnel du tunnel IPsec.
+/// État opérationnel du tunnel WireGuard.
 ///
-/// Invariant de sécurité : le trafic du LAN n'est autorisé à sortir QUE lorsque
-/// le tunnel est réellement opérationnel ([`TunnelState::Up`] ou
-/// [`TunnelState::Rekeying`]). Dans tout autre état, le kill-switch est engagé
-/// (« fail-closed ») : aucune fuite en clair n'est possible.
+/// Invariant de sécurité (gateway) : le trafic du LAN n'est autorisé à sortir QUE
+/// lorsque le tunnel est [`TunnelState::Up`]. Dans tout autre état, le kill-switch
+/// est engagé (« fail-closed »).
+///
+/// WireGuard est sans connexion : il n'y a pas d'état « en cours de rekey »
+/// observable (le rekey est transparent, ~toutes les 2 min). L'état `Up` est
+/// *inféré* d'un handshake récent (`last_handshake_time`, seuil ~150 s), pas reçu
+/// comme un événement de plan de contrôle — voir ADR-001 §3.
 ///
 /// Exception contrôlée : [`TunnelState::CaptivePortal`] lève partiellement le
 /// kill-switch (HTTP/HTTPS vers la passerelle locale uniquement) le temps que
@@ -18,12 +22,15 @@ pub enum TunnelState {
     #[default]
     /// Aucun tunnel. Kill-switch ACTIF.
     Down,
-    /// Négociation IKE/CHILD_SA en cours. Kill-switch ACTIF.
+    /// Tunnel en cours d'établissement. Kill-switch ACTIF.
+    ///
+    /// Couvre aussi la fenêtre de montée en deux temps de WireGuard : tunnel
+    /// classique monté (clés Curve25519) mais PSK post-quantique pas encore
+    /// installé. Le trafic reste bloqué jusqu'au passage `Up` (ADR-001,
+    /// cinématique).
     Connecting,
-    /// SA établies, trafic autorisé à travers le tunnel.
+    /// Handshake WireGuard récent : trafic autorisé à travers le tunnel.
     Up,
-    /// Renégociation des clés ; les anciennes SA protègent encore le trafic.
-    Rekeying,
     /// Échec. Kill-switch ACTIF.
     Failed,
     /// Portail captif interceptant le trafic : kill-switch partiel
@@ -31,18 +38,21 @@ pub enum TunnelState {
     CaptivePortal,
 }
 
-/// Événements provenant du plan de contrôle (charon via VICI).
+/// Événements pilotant la machine à états.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelEvent {
+    /// Montée demandée (UI ou démarrage).
     StartRequested,
-    IkeEstablished,
-    ChildUp,
-    ChildRekeying,
+    /// Handshake WireGuard frais observé (polling) *et* PSK en place → tunnel
+    /// pleinement opérationnel.
+    HandshakeEstablished,
+    /// Plus de handshake récent (polling) : le tunnel n'est plus considéré `Up`,
+    /// on retombe en tentative de rétablissement. Pas un échec dur.
+    HandshakeExpired,
+    /// Démontage explicite.
     Disconnected,
+    /// Erreur : retour fail-closed.
     Error,
-    /// Migration MOBIKE (RFC 4555) : l'adresse IP locale a changé sans rupture de SA.
-    /// Le tunnel reste opérationnel ; charon met à jour l'adresse dynamiquement.
-    AddressChanged,
     /// Portail captif détecté — HTTP intercepté sur le réseau courant.
     CaptivePortalDetected,
     /// L'utilisateur a validé le portail captif — tenter une reconnexion.
@@ -52,10 +62,10 @@ pub enum TunnelEvent {
 impl TunnelState {
     /// Le trafic utilisateur (LAN -> WAN) est-il autorisé dans cet état ?
     pub fn traffic_allowed(self) -> bool {
-        matches!(self, TunnelState::Up | TunnelState::Rekeying)
+        matches!(self, TunnelState::Up)
     }
 
-    /// Le kill-switch est-il engagé (tout est bloqué sauf IKE) ?
+    /// Le kill-switch est-il engagé (tout est bloqué sauf le port WireGuard) ?
     pub fn kill_switch_engaged(self) -> bool {
         !self.traffic_allowed()
     }
@@ -71,7 +81,6 @@ impl TunnelState {
             TunnelState::Down          => "down",
             TunnelState::Connecting    => "connecting",
             TunnelState::Up            => "up",
-            TunnelState::Rekeying      => "rekeying",
             TunnelState::Failed        => "failed",
             TunnelState::CaptivePortal => "captive_portal",
         }
@@ -87,13 +96,10 @@ impl TunnelState {
             (Down | Failed, StartRequested) => Connecting,
             // Portail captif : résolu par l'utilisateur → on retente la connexion
             (CaptivePortal, CaptivePortalResolved) => Connecting,
-            (Connecting, IkeEstablished) => Connecting, // IKE_SA up, on attend la CHILD_SA
-            (Connecting, ChildUp) => Up,
-            (Up, ChildRekeying) => Rekeying,
-            (Rekeying, ChildUp) => Up,
-            // MOBIKE : migration d'adresse sans rupture de SA — l'état ne change pas
-            (Up, AddressChanged) => Up,
-            (Rekeying, AddressChanged) => Rekeying,
+            // Handshake frais + PSK en place → tunnel pleinement opérationnel
+            (Connecting, HandshakeEstablished) => Up,
+            // Le handshake a vieilli au-delà du seuil → retour en tentative
+            (Up, HandshakeExpired) => Connecting,
             // Portail captif détecté depuis n'importe quel état non-Up
             (Down | Failed | Connecting, CaptivePortalDetected) => CaptivePortal,
             (_, Disconnected) => Down,
@@ -121,9 +127,9 @@ mod tests {
     }
 
     #[test]
-    fn only_up_and_rekeying_allow_traffic() {
+    fn only_up_allows_traffic() {
         assert!(TunnelState::Up.traffic_allowed());
-        assert!(TunnelState::Rekeying.traffic_allowed());
+        assert!(!TunnelState::Connecting.traffic_allowed());
         assert!(!TunnelState::Down.traffic_allowed());
         assert!(!TunnelState::CaptivePortal.traffic_allowed());
     }
@@ -146,40 +152,32 @@ mod tests {
         let s = TunnelState::Down;
         let s = s.on(TunnelEvent::StartRequested).unwrap();
         assert_eq!(s, TunnelState::Connecting);
-        let s = s.on(TunnelEvent::IkeEstablished).unwrap();
-        assert_eq!(s, TunnelState::Connecting);
-        let s = s.on(TunnelEvent::ChildUp).unwrap();
+        // Montée classique + upgrade PSK → handshake pleinement établi
+        let s = s.on(TunnelEvent::HandshakeEstablished).unwrap();
         assert_eq!(s, TunnelState::Up);
-        let s = s.on(TunnelEvent::ChildRekeying).unwrap();
-        assert_eq!(s, TunnelState::Rekeying);
-        let s = s.on(TunnelEvent::ChildUp).unwrap();
+    }
+
+    #[test]
+    fn handshake_expiry_returns_to_connecting() {
+        let s = TunnelState::Up.on(TunnelEvent::HandshakeExpired).unwrap();
+        assert_eq!(s, TunnelState::Connecting);
+        // Un nouveau handshake frais rétablit Up.
+        let s = s.on(TunnelEvent::HandshakeEstablished).unwrap();
         assert_eq!(s, TunnelState::Up);
     }
 
     #[test]
     fn error_always_fails_closed() {
-        for start in [TunnelState::Up, TunnelState::Rekeying, TunnelState::Connecting] {
+        for start in [TunnelState::Up, TunnelState::Connecting] {
             assert_eq!(start.on(TunnelEvent::Error).unwrap(), TunnelState::Failed);
         }
     }
 
     #[test]
     fn invalid_transition_is_rejected() {
-        assert!(TunnelState::Down.on(TunnelEvent::ChildRekeying).is_err());
-    }
-
-    #[test]
-    fn mobike_address_change_preserves_state() {
-        assert_eq!(
-            TunnelState::Up.on(TunnelEvent::AddressChanged).unwrap(),
-            TunnelState::Up
-        );
-        assert_eq!(
-            TunnelState::Rekeying.on(TunnelEvent::AddressChanged).unwrap(),
-            TunnelState::Rekeying
-        );
-        // MOBIKE n'a pas de sens hors tunnel actif
-        assert!(TunnelState::Down.on(TunnelEvent::AddressChanged).is_err());
-        assert!(TunnelState::Connecting.on(TunnelEvent::AddressChanged).is_err());
+        // Un handshake « établi » n'a pas de sens hors montée.
+        assert!(TunnelState::Down.on(TunnelEvent::HandshakeEstablished).is_err());
+        // Une expiration n'a de sens que depuis Up.
+        assert!(TunnelState::Down.on(TunnelEvent::HandshakeExpired).is_err());
     }
 }

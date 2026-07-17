@@ -17,8 +17,6 @@ pub enum HeliosEvent {
         rx_pps: u64,
         tx_pps: u64,
     },
-    /// Migration MOBIKE (RFC 4555) : l'adresse IP WAN a changé dynamiquement.
-    AddressChanged { iface: String, old_ip: String, new_ip: String },
     /// Portail captif interceptant le trafic HTTP détecté sur le réseau courant.
     CaptivePortalDetected { gateway: String },
     /// MTU optimal déterminé par PMTUD — règle MSS clamping appliquée.
@@ -31,10 +29,6 @@ pub enum HeliosEvent {
 #[derive(Debug, Clone)]
 pub enum OrchestratorCmd {
     Connect,
-    /// Connexion avec un profil IKE spécifique (identifiant de `profiles::PROFILES`).
-    ConnectWithProfile(String),
-    /// Connexion avec des propositions IKE/ESP personnalisées (saisie manuelle).
-    ConnectWithCustom { ike_proposal: String, esp_proposal: String },
     /// Applique un jeu de règles nftables brut (dry-run = log seulement).
     ApplyFirewallRules(String),
     Disconnect,

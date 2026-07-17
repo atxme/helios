@@ -31,20 +31,16 @@ impl Default for DryRunBackend {
 #[async_trait]
 impl VpnBackend for DryRunBackend {
     async fn connect(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
-        let (ike, _esp) = profile.resolved_proposals();
         sink(ClientEvent::state(TunnelState::Connecting));
         sink(ClientEvent::log(
             "info",
-            format!(
-                "[dry-run] négociation IKEv2 vers {} ({})",
-                profile.gateway, ike
-            ),
+            format!("[dry-run] handshake WireGuard vers {}", profile.gateway),
         ));
         tokio::time::sleep(self.negotiate_delay).await;
         sink(ClientEvent::state(TunnelState::Up));
         sink(ClientEvent::log(
             "info",
-            "[dry-run] tunnel établi — CHILD_SA simulée".to_string(),
+            "[dry-run] tunnel établi — PSK post-quantique installé".to_string(),
         ));
         Ok(())
     }

@@ -83,7 +83,7 @@ struct Status {
     version: String,
     wan_iface: String,
     lan_ifaces: Vec<String>,
-    ike_peers: Vec<String>,
+    wg_peers: Vec<String>,
     connections: Vec<ConnSummary>,
     dry_run: bool,
 }
@@ -171,7 +171,7 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  {:<14} {}", "WAN",       s.wan_iface);
     println!("  {:<14} {}", "LAN",       s.lan_ifaces.join(", "));
-    println!("  {:<14} {}", "Pairs IKE", s.ike_peers.join(", "));
+    println!("  {:<14} {}", "Pairs WG", s.wg_peers.join(", "));
     for c in &s.connections {
         println!("  {:<14} {} → {}", c.name, c.name, c.remote_addr);
     }

@@ -27,13 +27,17 @@ pub struct Ruleset {
 ///
 /// Quel que soit l'état, on autorise toujours :
 /// * la loopback,
-/// * le trafic déjà établi/connexe (les SA en cours), et
-/// * la négociation IKE vers les pairs déclarés (UDP 500/4500 + ESP).
+/// * le trafic déjà établi/connexe, et
+/// * le transport WireGuard vers les pairs déclarés (UDP 51820).
+///
+/// La règle WireGuard est **indépendante de l'état** : c'est elle qui empêche la
+/// fuite en clair (rien ne sort du WAN sauf vers l'endpoint du pair), pas la
+/// machine à états — voir ADR-001 §3.
 ///
 /// Règles spéciales par état :
 /// * `CaptivePortal` — HTTP/HTTPS vers la passerelle locale uniquement.
-/// * `Up`/`Rekeying` + split-tunnel — CIDRs locaux bypassent le tunnel.
-/// * `Up`/`Rekeying` + MSS clamping — limite la taille des SYN sortants.
+/// * `Up` + split-tunnel — CIDRs locaux bypassent le tunnel.
+/// * `Up` + MSS clamping — limite la taille des SYN sortants.
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     let mut rules = Vec::new();
 
@@ -50,14 +54,12 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     rules.push("iif \"lo\" accept".to_string());
     rules.push("ct state established,related accept".to_string());
 
-    // Négociation IKE et transport ESP vers les pairs autorisés, en clair.
-    for peer in &policy.ike_peers {
+    // Transport WireGuard (UDP 51820) vers les pairs autorisés, en clair.
+    // Scopé par IP de destination : autoriser 51820 sans restreindre la
+    // destination serait une fuite (ADR-001 §3).
+    for peer in &policy.wg_peers {
         rules.push(format!(
-            "oifname \"{wan}\" ip daddr {peer} udp dport {{ 500, 4500 }} accept",
-            wan = policy.wan_iface
-        ));
-        rules.push(format!(
-            "oifname \"{wan}\" ip daddr {peer} meta l4proto esp accept",
+            "oifname \"{wan}\" ip daddr {peer} udp dport 51820 accept",
             wan = policy.wan_iface
         ));
     }
@@ -143,7 +145,7 @@ mod tests {
         FirewallPolicy {
             wan_iface: "eth0".into(),
             lan_ifaces: vec!["eth1".into()],
-            ike_peers: vec!["203.0.113.10".into()],
+            wg_peers: vec!["203.0.113.10".into()],
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
             admin_port: None,
@@ -159,8 +161,8 @@ mod tests {
         let rs = render(&policy(), TunnelState::Down);
         assert_eq!(rs.default_verdict, Verdict::Drop);
         assert!(!rs.rules.iter().any(|r| r.contains("iifname \"eth1\"")));
-        // IKE reste autorisé pour pouvoir (re)monter le tunnel.
-        assert!(rs.rules.iter().any(|r| r.contains("udp dport")));
+        // Le transport WireGuard reste autorisé pour (re)monter le tunnel.
+        assert!(rs.rules.iter().any(|r| r.contains("udp dport 51820")));
     }
 
     #[test]

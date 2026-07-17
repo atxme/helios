@@ -12,12 +12,11 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aether::{profiles, TunnelState};
+use aether::TunnelState;
 use orion_core::{
     backend::EventSink, default_backend, telemetry, ClientConfig, ClientEvent, ClientProfile,
     VpnController,
 };
-use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{watch, Mutex};
 
@@ -60,33 +59,10 @@ fn emit_sink(app: AppHandle) -> EventSink {
 
 // ─── Commandes invoquées par le frontend ───────────────────────────────────────
 
-/// Profil cryptographique prédéfini, exposé tel quel à l'IHM.
-#[derive(Serialize)]
-struct PredefinedProfile {
-    id: &'static str,
-    name: &'static str,
-    description: &'static str,
-    pqc_level: String,
-    reserved: bool,
-    ike_proposal: &'static str,
-    esp_proposal: &'static str,
-}
-
-#[tauri::command]
-fn list_predefined() -> Vec<PredefinedProfile> {
-    profiles::PROFILES
-        .iter()
-        .map(|p| PredefinedProfile {
-            id: p.id,
-            name: p.name,
-            description: p.description,
-            pqc_level: format!("{:?}", p.pqc_level),
-            reserved: p.reserved,
-            ike_proposal: p.ike_proposal,
-            esp_proposal: p.esp_proposal,
-        })
-        .collect()
-}
+// Bascule WireGuard (ADR-001) : la liste des profils cryptographiques IKE
+// prédéfinis (`list_predefined`) a disparu — WireGuard n'a qu'une seule suite
+// (ChaCha20-Poly1305). Le choix de sécurité se réduit au profil PQ (PSK ML-KEM),
+// géré côté enrôlement. Le modèle WireGuard du client arrive en Phase C.
 
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> String {
@@ -205,7 +181,6 @@ fn main() {
             telemetry: Arc::new(TelemetryManager::default()),
         })
         .invoke_handler(tauri::generate_handler![
-            list_predefined,
             get_state,
             backend_kind,
             get_config,

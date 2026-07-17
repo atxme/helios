@@ -1,15 +1,18 @@
 //! Profil VPN du client : éditable dans l'IHM, persisté localement en TOML.
 //!
 //! Contrairement à `heliosd` (qui est la *gateway*), le client se connecte à une
-//! gateway distante par son **endpoint IKE** (IP/FQDN). Le profil porte donc tout
-//! ce qu'il faut pour initier un IKEv2 : endpoint, identités, credentials et la
-//! proposition cryptographique (profil prédéfini de [`aether::profiles`] ou
-//! proposition IKE/ESP saisie à la main).
+//! gateway distante par son endpoint (IP/FQDN).
+//!
+//! Bascule WireGuard (ADR-001) : le modèle d'identité de ce profil
+//! (authentification `AuthConfig` X.509/EAP, propositions IKE/ESP) est **hérité
+//! d'IKEv2 et condamné**. Il sera remplacé en Phase C par le modèle WireGuard
+//! (clé publique Curve25519 du pair, endpoint UDP, PSK post-quantique). Les
+//! champs IKE subsistent temporairement pour ne pas casser la sérialisation tant
+//! que le nouveau modèle n'est pas figé.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use aether::profiles;
 use serde::{Deserialize, Serialize};
 
 /// Méthode d'authentification IKEv2 du client auprès de la gateway.
@@ -77,29 +80,6 @@ impl Default for ClientProfile {
             esp_proposal: None,
             heliosd_url: None,
         }
-    }
-}
-
-impl ClientProfile {
-    /// Résout les propositions IKE/ESP effectives : profil prédéfini en priorité,
-    /// sinon les valeurs custom du profil. Réutilise [`aether::profiles`].
-    pub fn resolved_proposals(&self) -> (String, String) {
-        if let Some(id) = &self.profile_id {
-            if let Some(p) = profiles::find(id) {
-                return (p.ike_proposal.to_string(), p.esp_proposal.to_string());
-            }
-        }
-        (
-            self.ike_proposal.clone().unwrap_or_default(),
-            self.esp_proposal.clone().unwrap_or_default(),
-        )
-    }
-
-    /// La proposition effective embarque-t-elle un échange post-quantique
-    /// (ML-KEM, RFC 9370) ? Sert à prévenir l'utilisateur quand la pile IKEv2
-    /// native ne le supporte pas (Windows/macOS natifs).
-    pub fn uses_post_quantum(&self) -> bool {
-        self.resolved_proposals().0.contains("mlkem")
     }
 }
 
@@ -178,45 +158,6 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn profil_predefini_prioritaire_sur_custom() {
-        let p = ClientProfile {
-            profile_id: Some("classic".to_string()),
-            ike_proposal: Some("ignoré".to_string()),
-            ..ClientProfile::default()
-        };
-        let (ike, esp) = p.resolved_proposals();
-        assert_eq!(ike, "aes256gcm16-prfsha256-ecp256");
-        assert_eq!(esp, "aes256gcm16-ecp256");
-    }
-
-    #[test]
-    fn proposition_custom_si_pas_de_profil() {
-        let p = ClientProfile {
-            profile_id: None,
-            ike_proposal: Some("aes256gcm16-prfsha384-ecp384".to_string()),
-            esp_proposal: Some("aes256gcm16-ecp384".to_string()),
-            ..ClientProfile::default()
-        };
-        let (ike, esp) = p.resolved_proposals();
-        assert_eq!(ike, "aes256gcm16-prfsha384-ecp384");
-        assert_eq!(esp, "aes256gcm16-ecp384");
-    }
-
-    #[test]
-    fn detection_post_quantique() {
-        let hybrid = ClientProfile {
-            profile_id: Some("hybrid".to_string()),
-            ..ClientProfile::default()
-        };
-        assert!(hybrid.uses_post_quantum());
-        let classic = ClientProfile {
-            profile_id: Some("classic".to_string()),
-            ..ClientProfile::default()
-        };
-        assert!(!classic.uses_post_quantum());
-    }
 
     #[test]
     fn upsert_et_remove() {

@@ -37,7 +37,21 @@
       "Bash(sed -i 's|description = \"Logique du client VPN Helios \\(config, backend IKEv2, télémétrie\\) — testable sur WSL2, sans dépendance Tauri.\"|description = \"Logique du client VPN Orion \\(config, backend IKEv2, télémétrie\\) — testable sur WSL2, sans dépendance Tauri.\"|' crates/orion-core/Cargo.toml)",
       "Bash(sed -i 's|description = \"Client VPN Helios — IHM web embarquée \\(Tauri\\) pilotant la pile IKEv2 native de l'\"'\"'OS.\"|description = \"Client VPN Orion — IHM web embarquée \\(Tauri\\) pilotant la pile IKEv2 native de l'\"'\"'OS.\"|' apps/orion/src-tauri/Cargo.toml)",
       "Bash(cargo metadata *)",
-      "Bash(python3 -c \"import sys,json; [print\\(f\\\\\"{p['name']:14} {p['manifest_path'].replace\\('/home/christophe/helios/',''\\)}\\\\\"\\) for p in sorted\\(json.load\\(sys.stdin\\)['packages'], key=lambda x:x['name']\\)]\")"
+      "Bash(python3 -c \"import sys,json; [print\\(f\\\\\"{p['name']:14} {p['manifest_path'].replace\\('/home/christophe/helios/',''\\)}\\\\\"\\) for p in sorted\\(json.load\\(sys.stdin\\)['packages'], key=lambda x:x['name']\\)]\")",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo search *)",
+      "WebFetch(domain:aws.github.io)",
+      "Bash(cargo fetch *)",
+      "Bash(grep -nE 'ml-kem.*RustCrypto|RustCrypto|Rust pur.*ml-kem|`ml-kem`' docs/ADR-001-WIREGUARD.md)",
+      "Bash(sed -i 's/l'\"'\"'échange ML-KEM \\(`ml-kem`\\) et l'\"'\"'injection/l'\"'\"'échange ML-KEM \\(`aws-lc-rs`, sans `fips`\\) et l'\"'\"'injection/' docs/ADR-001-WIREGUARD.md)",
+      "Bash(sed -i 's/l'\"'\"'échange ML-KEM \\(`ml-kem` est du Rust pur\\)./l'\"'\"'échange ML-KEM \\(`aws-lc-rs`, statique, compilateur C requis mais pas de CMake\\)./' docs/ADR-001-WIREGUARD.md)",
+      "Bash(grep -nE '`ml-kem`|`aws-lc-rs`' docs/ADR-001-WIREGUARD.md)",
+      "Bash(cd *)",
+      "Bash(sed -i '/\"crates\\\\/helios-vici\",/d; /^helios-vici = { path = \"crates\\\\/helios-vici\" }$/d' Cargo.toml)",
+      "Bash(sed -i '/^helios-vici.workspace = true$/d; /^netlink-sys.workspace = true$/d' crates/heliosd/Cargo.toml)",
+      "Bash(git rm *)",
+      "Bash(awk '{print $1}')",
+      "Bash(awk '{print $NF, $1, $2, $3, $4}')"
     ]
   }
 }

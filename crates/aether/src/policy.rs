@@ -22,9 +22,9 @@ pub struct FirewallPolicy {
     pub wan_iface: String,
     /// Interfaces côté LAN dont le trafic doit transiter par le tunnel.
     pub lan_ifaces: Vec<String>,
-    /// Pairs (adresses IP) autorisés en clair pour la négociation IKE
-    /// (UDP 500/4500) et le transport ESP.
-    pub ike_peers: Vec<String>,
+    /// Pairs (adresses IP) joignables en clair pour le transport WireGuard
+    /// (UDP 51820). Seul trafic autorisé à sortir du WAN hors tunnel.
+    pub wg_peers: Vec<String>,
     /// Comportement hors tunnel.
     pub mode: PolicyMode,
     /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),

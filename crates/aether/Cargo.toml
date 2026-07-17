@@ -10,3 +10,5 @@ description = "Le milieu partagé entre Helios (la gateway) et Orion (le client)
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+aws-lc-rs.workspace = true
+zeroize.workspace = true

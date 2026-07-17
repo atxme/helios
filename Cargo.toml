@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/aether",
-    "crates/helios-vici",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
+    "crates/helios-provisioning",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -19,11 +19,11 @@ members = [
 # `-p`) restent verts partout. Le construire est explicite : `cargo build -p orion`.
 default-members = [
     "crates/aether",
-    "crates/helios-vici",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
+    "crates/helios-provisioning",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -64,10 +64,18 @@ mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
+# Backend crypto : AWS-LC (aws-lc-sys), non-FIPS → statique, builder `cc`, aucune
+# toolchain CMake/Go/Ninja ni bindgen (bindings pré-générés). ML-KEM-768 (FIPS 203)
+# est dans l'API `kem` standard. `prebuilt-nasm` évite NASM sur Windows x86-64.
+# La feature `fips` (validation FIPS 140-3) reste activable plus tard sans changer
+# le code — voir le trait `Kem` dans aether::pq et ADR-001 §2.
+aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
+blake3 = "1"
+zeroize = "1"
 
 aether = { path = "crates/aether" }
+helios-provisioning = { path = "crates/helios-provisioning" }
 helios-api = { path = "crates/helios-api" }
-helios-vici = { path = "crates/helios-vici" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }
 helio-tpm = { path = "crates/helio-tpm" }

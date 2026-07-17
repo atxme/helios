@@ -37,9 +37,6 @@ pub struct AppState {
     pub network: Arc<RwLock<NetworkConfig>>,
     /// `true` = daemon en mode simulation (WSL2 ou --dev).
     pub dry_run: bool,
-    /// Propositions IKE/ESP effectives si surchargées par l'UI (ike, esp).
-    /// `None` = profil hybride par défaut.
-    pub effective_proposals: Arc<RwLock<Option<(String, String)>>>,
     /// Politique de pare-feu courante (mise à jour par l'orchestrateur).
     pub policy: Arc<RwLock<FirewallPolicy>>,
 }
@@ -51,10 +48,9 @@ impl AppState {
         tunnel_state: Arc<RwLock<TunnelState>>,
         event_tx: broadcast::Sender<HeliosEvent>,
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
-        effective_proposals: Arc<RwLock<Option<(String, String)>>>,
         policy: Arc<RwLock<FirewallPolicy>>,
     ) -> Self {
-        Self { tunnel_state, event_tx, cmd_tx, network, dry_run, effective_proposals, policy }
+        Self { tunnel_state, event_tx, cmd_tx, network, dry_run, policy }
     }
 }
 
@@ -72,7 +68,6 @@ pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
         .route("/api/network", post(routes::network_set))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
-        .route("/api/connections/apply", post(routes::connection_apply))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .route("/api/firewall/rules", post(routes::firewall_rules_apply))
         .route("/api/captive-portal/release", post(routes::captive_portal_release))

@@ -107,7 +107,6 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let (event_tx, _)  = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);
     let tunnel_state   = Arc::new(RwLock::new(TunnelState::Down));
-    let effective_proposals: Arc<RwLock<Option<(String, String)>>> = Arc::new(RwLock::new(None));
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy  = Arc::new(RwLock::new(
         shared_network.read().await.firewall_policy()
@@ -119,7 +118,6 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         Arc::clone(&tunnel_state),
         event_tx.clone(),
         cmd_tx,
-        Arc::clone(&effective_proposals),
         Arc::clone(&shared_policy),
     );
     tokio::spawn(async move {
@@ -134,7 +132,6 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         tunnel_state,
         event_tx,
         cmd_rx,
-        effective_proposals,
         shared_policy,
     ).await
 }

@@ -9,9 +9,9 @@
 //! * `NetlinkBackend` (feature `netlink`) — applique les règles atomiquement via
 //!   l'API Netlink de nf_tables (crate `rustables`). Réservé à la cible.
 //!
-//! Principe directeur : **fail-closed**. Au démarrage, avant toute négociation,
-//! on engage le kill-switch ; le trafic LAN n'est ouvert que lorsque l'état
-//! passe à `Up`/`Rekeying`.
+//! Principe directeur : **fail-closed**. Au démarrage, avant tout réseau, on
+//! engage le kill-switch ; le trafic LAN n'est ouvert que lorsque l'état passe à
+//! `Up`.
 
 pub mod ruleset;
 

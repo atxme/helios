@@ -75,30 +75,45 @@ ni revue externe.
 À la place : le secret ML-KEM alimente le slot **`PresharedKey`**, qui existe
 déjà dans le format de fil et est déjà mélangé au handshake Noise.
 
-Implémentation : **`ml-kem`** (RustCrypto), Rust pur, FIPS 203.
+Implémentation : **`aws-lc-rs`** (AWS-LC), **sans la feature `fips`**. ML-KEM-768
+(FIPS 203) vit dans l'API `kem` standard, pas derrière FIPS. Concrètement, dans
+`aether::pq` derrière le trait `Kem` (module `pq`, testé sur WSL2).
 
+- **Sans `fips` → build statique et propre en cross-platform.** `aws-lc-sys`
+  non-FIPS n'exige **ni CMake, ni Go, ni Ninja, ni bindgen** (bindings
+  pré-générés, builder `cc`), seulement un compilateur C — que le projet requiert
+  déjà via `ring`. Sur Windows x86-64, la feature `prebuilt-nasm` évite NASM.
+  L'invariant « `cargo test` vert partout, WSL2 compris » est préservé.
 - **Pas `oqs`/liboqs** : bindings C exigeant CMake — précisément la
   cross-compilation Windows qu'on fuit.
-- **Pas `aws-lc-rs` avec la feature `fips`** : c'est la seule voie vers une
-  validation **FIPS 140-3** avec ML-KEM, mais elle exige CMake + Go + Ninja +
-  NASM sur Windows, et son build FIPS n'est statique que sur Linux/BSD — ailleurs
-  il produit une **bibliothèque partagée**. On livrerait une DLL crypto avec le
-  client.
+- **Pas la feature `fips`** : c'est la seule voie vers une validation
+  **FIPS 140-3** avec ML-KEM, mais elle exige CMake + Go + Ninja + NASM, et son
+  build FIPS n'est statique que sur Linux/BSD — ailleurs il produit une
+  **bibliothèque partagée** (DLL crypto livrée avec le client). Rejeté ici ; voir
+  ci-dessous pour la réactivation.
 
-FIPS 140-3 n'est pas une exigence contractuelle sur ce projet. C'est une
+**Statut conformité — à énoncer honnêtement.** Sans `fips`, il n'y a **aucune
+validation FIPS 140-3** : sur l'axe conformité, on est au même point qu'une
+implémentation Rust pure. Ce qu'on gagne en choisissant quand même `aws-lc-rs` :
+une seule lib crypto mature (la même que `rustls`/`reqwest` peuvent utiliser),
+accélérée matériellement (AES-NI, AVX2, ARMv8 Crypto), et **le chemin de
+réactivation FIPS tout tracé** — activer la feature `fips` plus tard ne touche
+pas le code, seulement la CI (qui devra alors fournir la toolchain CMake/Go).
+
+FIPS 140-3 n'est de toute façon pas une exigence contractuelle sur ce projet :
 contrainte de marchés publics américains ; côté ANSSI, l'exigence est CSPN /
 Critères Communs, et la position PQC publiée recommande l'**hybridation** — ce
 que fait déjà ce design.
 
 > **FIPS 203 ≠ FIPS 140-3.** Le premier est la *spécification* de l'algorithme
-> ML-KEM, que `ml-kem` implémente. Le second est la *validation d'un module* par
-> le CMVP, que `ml-kem` n'a pas et ne peut pas avoir. L'algorithme est le bon
-> standard NIST dans les deux cas.
+> ML-KEM, qu'`aws-lc-rs` implémente quelle que soit la feature. Le second est la
+> *validation d'un module* par le CMVP, active uniquement avec la feature `fips`.
+> L'algorithme est le bon standard NIST dans les deux cas.
 
 L'API ML-KEM est minuscule (keygen / encaps / decaps) : elle est placée derrière
-un trait, comme `VpnBackend` ou `FirewallBackend`. Basculer vers
-`libcrux-ml-kem` (Rust pur, formellement vérifié en F*) ou `aws-lc-rs` si un
-client exige FIPS coûterait quelques dizaines de lignes.
+le trait `Kem`, comme `VpnBackend` ou `FirewallBackend`. Activer la feature
+`fips` d'`aws-lc-rs`, ou basculer vers `libcrux-ml-kem` (Rust pur, vérifié en
+F*), ne toucherait que `aether::pq`.
 
 > **Ne pas revendiquer une preuve de sécurité formelle.** Ce design n'est **pas**
 > Rosenpass. Rosenpass est un protocole UDP dédié avec sa propre preuve, sa
@@ -434,7 +449,7 @@ Chiffres vérifiés contre l'arbre au 2026-07-17.
 : `helios-provisioning` — le seul chantier réellement neuf. Il porte
   l'enrôlement TLS 1.3 ancré TPM côté gateway, la dérivation d'adresse
   déterministe en mémoire (`derive_cgnat_ip()`), le sondage anti-collision contre
-  la table de pairs, l'échange ML-KEM (`ml-kem`) et l'injection dynamique du PSK
+  la table de pairs, l'échange ML-KEM (`aws-lc-rs`, sans `fips`) et l'injection dynamique du PSK
   via `defguard_wireguard_rs`.
 
 ## Alternatives écartées
@@ -509,4 +524,4 @@ en développement :
 
 Restent testables partout, en `dry_run` : la machine à états, le rendu des règles
 firewall, la dérivation d'adresse et le sondage anti-collision, la logique
-d'enrôlement et l'échange ML-KEM (`ml-kem` est du Rust pur).
+d'enrôlement et l'échange ML-KEM (`aws-lc-rs`, statique, compilateur C requis mais pas de CMake).
