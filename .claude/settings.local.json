@@ -29,7 +29,15 @@
       "Bash(bash -n /home/christophe/helios/scripts/setup-dev.sh)",
       "Bash(xargs ls)",
       "Bash(cargo --version)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "WebSearch",
+      "WebFetch(domain:www.wintun.net)",
+      "Bash(awk 'NR>=290 && /^\\(async \\)?fn |^}/ {print NR\": \"$0}' crates/heliosd/src/orchestrator.rs)",
+      "WebFetch(domain:crates.io)",
+      "Bash(sed -i 's|description = \"Logique du client VPN Helios \\(config, backend IKEv2, télémétrie\\) — testable sur WSL2, sans dépendance Tauri.\"|description = \"Logique du client VPN Orion \\(config, backend IKEv2, télémétrie\\) — testable sur WSL2, sans dépendance Tauri.\"|' crates/orion-core/Cargo.toml)",
+      "Bash(sed -i 's|description = \"Client VPN Helios — IHM web embarquée \\(Tauri\\) pilotant la pile IKEv2 native de l'\"'\"'OS.\"|description = \"Client VPN Orion — IHM web embarquée \\(Tauri\\) pilotant la pile IKEv2 native de l'\"'\"'OS.\"|' apps/orion/src-tauri/Cargo.toml)",
+      "Bash(cargo metadata *)",
+      "Bash(python3 -c \"import sys,json; [print\\(f\\\\\"{p['name']:14} {p['manifest_path'].replace\\('/home/christophe/helios/',''\\)}\\\\\"\\) for p in sorted\\(json.load\\(sys.stdin\\)['packages'], key=lambda x:x['name']\\)]\")"
     ]
   }
 }

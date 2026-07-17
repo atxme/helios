@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aether"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1591,9 +1600,9 @@ dependencies = [
 name = "helios-api"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "anyhow",
  "axum",
- "helios-core",
  "helios-firewall",
  "mime_guess",
  "rust-embed",
@@ -1605,54 +1614,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "helios-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "helios-client-core",
- "helios-core",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "helios-client-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "directories",
- "helios-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.2",
- "tracing",
-]
-
-[[package]]
-name = "helios-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.18",
- "toml 0.8.2",
-]
-
-[[package]]
 name = "helios-ctl"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "anyhow",
  "clap",
  "futures-util",
- "helios-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1665,8 +1633,8 @@ dependencies = [
 name = "helios-firewall"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "async-trait",
- "helios-core",
  "rustables",
  "tracing",
 ]
@@ -1675,8 +1643,8 @@ dependencies = [
 name = "helios-update"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "async-trait",
- "helios-core",
  "serde",
  "serde_json",
  "tokio",
@@ -1687,7 +1655,7 @@ dependencies = [
 name = "helios-vici"
 version = "0.1.0"
 dependencies = [
- "helios-core",
+ "aether",
  "tokio",
  "tracing",
 ]
@@ -1696,11 +1664,11 @@ dependencies = [
 name = "heliosd"
 version = "0.1.0"
 dependencies = [
+ "aether",
  "anyhow",
  "clap",
  "helio-tpm",
  "helios-api",
- "helios-core",
  "helios-firewall",
  "helios-update",
  "helios-vici",
@@ -2722,6 +2690,38 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orion"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "orion-core",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "orion-core"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "async-trait",
+ "directories",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+]
 
 [[package]]
 name = "pango"

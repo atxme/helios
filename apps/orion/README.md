@@ -1,4 +1,4 @@
-# helios-client (app Tauri)
+# orion (app Tauri)
 
 Client VPN Helios : **vrai client IPsec autonome**. Le backend Rust monte lui-même
 le tunnel IKEv2 vers la gateway (par son **endpoint**, IP/FQDN — pas une URL HTTP),
@@ -7,16 +7,16 @@ web vit derrière le tunnel).
 
 ## Architecture
 
-- **`apps/helios-client/src-tauri`** — shell Tauri (commandes `invoke`, `emit` des
+- **`apps/orion/src-tauri`** — shell Tauri (commandes `invoke`, `emit` des
   événements). Lie `webkit2gtk-4.1` → **ne compile pas sur WSL2** sans les libs système.
-- **`crates/helios-client-core`** — toute la logique (profils, backend IPsec,
-  télémétrie). **Sans dépendance Tauri**, donc testable partout : `cargo test -p helios-client-core`.
+- **`crates/orion-core`** — toute la logique (profils, backend IPsec,
+  télémétrie). **Sans dépendance Tauri**, donc testable partout : `cargo test -p orion-core`.
 
 ## Développement
 
 ```sh
 # Logique pure (testable sur WSL2, aucune lib système) :
-cargo test -p helios-client-core
+cargo test -p orion-core
 
 # Frontend seul (tsc + vite, pas de webkit) :
 npm install && npm run build
@@ -33,9 +33,9 @@ Comme la feature `netlink` côté heliosd, les piles réelles sont derrière des
 et ne se valident que sur la cible (privilèges root/admin requis) :
 
 ```sh
-cargo build -p helios-client --features linux-strongswan   # strongSwan swanctl/charon
-cargo build -p helios-client --features native-windows     # IKEv2 natif Windows
-cargo build -p helios-client --features native-macos       # IKEv2 natif macOS
+cargo build -p orion --features linux-strongswan   # strongSwan swanctl/charon
+cargo build -p orion --features native-windows     # IKEv2 natif Windows
+cargo build -p orion --features native-macos       # IKEv2 natif macOS
 ```
 
 > **Post-quantique** : les piles IKEv2 **natives Windows/macOS** ne supportent pas

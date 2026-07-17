@@ -7,7 +7,7 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
-use helios_core::HeliosEvent;
+use aether::HeliosEvent;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::AppState;

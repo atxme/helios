@@ -17,7 +17,7 @@
 //! pas par une URL HTTP. Le serveur web de heliosd n'est accessible qu'une fois le
 //! tunnel établi — il ne sert donc **jamais** à faire monter la connexion, mais
 //! uniquement à la télémétrie post-connexion. C'est pourquoi [`telemetry::run`]
-//! n'est démarré que sur transition vers [`helios_core::TunnelState::Up`].
+//! n'est démarré que sur transition vers [`aether::TunnelState::Up`].
 
 pub mod backend;
 pub mod config;

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use helios_core::Result;
+use aether::Result;
 use tracing::info;
 
 use crate::{InstallOutcome, Release, UpdateChannel};

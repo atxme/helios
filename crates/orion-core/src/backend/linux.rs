@@ -5,11 +5,11 @@
 //! compile/valide que sur la cible — jamais sur WSL2.
 //!
 //! Flux : on génère un fragment de configuration swanctl pour la connexion
-//! `helios-client`, on le charge (`swanctl --load-all`), puis on initie la SA
+//! `orion`, on le charge (`swanctl --load-all`), puis on initie la SA
 //! (`swanctl --initiate`). L'état est déduit du code de retour.
 
 use async_trait::async_trait;
-use helios_core::TunnelState;
+use aether::TunnelState;
 use tokio::process::Command;
 
 use crate::config::{AuthConfig, ClientProfile};
@@ -17,8 +17,8 @@ use crate::events::ClientEvent;
 
 use super::{EventSink, VpnBackend};
 
-const CONN_NAME: &str = "helios-client";
-const CONF_PATH: &str = "/etc/swanctl/conf.d/helios-client.conf";
+const CONN_NAME: &str = "orion";
+const CONF_PATH: &str = "/etc/swanctl/conf.d/orion.conf";
 
 pub struct StrongSwanBackend;
 

@@ -16,7 +16,7 @@ pub use dryrun::DryRunChannel;
 pub use rauc::RaucChannel;
 
 use async_trait::async_trait;
-use helios_core::Result;
+use aether::Result;
 use serde::{Deserialize, Serialize};
 
 /// Une release disponible, telle que décrite par l'index de mises à jour.

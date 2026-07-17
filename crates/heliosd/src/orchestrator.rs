@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
-use helios_core::{
+use aether::{
     profiles, Connection, FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd,
     TunnelEvent, TunnelState,
 };
@@ -741,7 +741,7 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
     println!("  mode         : {}", if dry_run { "dry-run" } else { "réel" });
     println!("  socket VICI  : {VICI_SOCKET}");
-    println!("  interface web: http://{}", helios_core::API_BIND);
+    println!("  interface web: http://{}", aether::API_BIND);
     println!("  WAN          : {}", network.wan_iface);
     println!("  LAN          : {:?}", network.lan_ifaces);
     println!("  connexions   : {}", network.connections.len());

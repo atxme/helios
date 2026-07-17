@@ -1,4 +1,4 @@
-// Types miroir des structures Rust (helios-client-core) sérialisées via Tauri.
+// Types miroir des structures Rust (orion-core) sérialisées via Tauri.
 // Aligné sur web/src/types.ts pour la partie état/télémétrie partagée avec heliosd.
 
 export type TunnelState =

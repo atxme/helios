@@ -9,7 +9,7 @@ name = "helios-ctl"
 path = "src/main.rs"
 
 [dependencies]
-helios-core.workspace = true
+aether.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

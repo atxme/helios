@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Helios VPN",
+  "productName": "Orion VPN",
   "version": "0.1.0",
-  "identifier": "net.helios.client",
+  "identifier": "net.helios.orion",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Helios VPN",
+        "title": "Orion VPN",
         "width": 440,
         "height": 680,
         "minWidth": 380,

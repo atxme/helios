@@ -4,7 +4,7 @@
 //! Shell Tauri du client VPN Helios.
 //!
 //! Mince couche de câblage : il ne contient aucune logique IPsec (déléguée à
-//! `helios-client-core`). Son rôle est de :
+//! `orion-core`). Son rôle est de :
 //! 1. exposer des commandes `invoke` au frontend (connect/disconnect, CRUD profils) ;
 //! 2. relayer les [`ClientEvent`] du cœur vers le frontend (`emit`) ;
 //! 3. démarrer la télémétrie heliosd **uniquement** quand le tunnel passe `Up`
@@ -12,8 +12,8 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
-use helios_core::{profiles, TunnelState};
-use helios_client_core::{
+use aether::{profiles, TunnelState};
+use orion_core::{
     backend::EventSink, default_backend, telemetry, ClientConfig, ClientEvent, ClientProfile,
     VpnController,
 };

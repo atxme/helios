@@ -35,7 +35,7 @@ et conserve tous les outils standard (`ip xfrm`, `nft`, `tcpdump`). Voir
 
 | Crate             | Rôle                                                            |
 |-------------------|-----------------------------------------------------------------|
-| `helios-core`     | Types métier : machine à états du tunnel, politique, config     |
+| `aether`     | Types métier : machine à états du tunnel, politique, config     |
 | `helios-vici`     | Client natif du protocole VICI de strongSwan (codec + client)   |
 | `helios-firewall` | Kill-switch : rendu de règles + backends `dry-run` / `netlink`  |
 | `helios-update`   | OTA A/B : trait `UpdateChannel` + backends `rauc` / `dry-run`   |

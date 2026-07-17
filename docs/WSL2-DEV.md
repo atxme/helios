@@ -14,7 +14,7 @@ document liste ce qui se teste ici et ce qui doit attendre la machine dédiée.
 
 ## Ce qui se teste sur WSL2 (≈ 80 % du code)
 
-- la **machine à états** du tunnel (`helios-core`) ;
+- la **machine à états** du tunnel (`aether`) ;
 - le **codec VICI** complet, par round-trip (`helios-vici`) ;
 - le **rendu des règles** du kill-switch selon l'état (`helios-firewall`) ;
 - toute l'**orchestration** en `dry_run` (`heliosd`), y compris la simulation de

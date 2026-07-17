@@ -3,13 +3,13 @@
 //! Contrairement à `heliosd` (qui est la *gateway*), le client se connecte à une
 //! gateway distante par son **endpoint IKE** (IP/FQDN). Le profil porte donc tout
 //! ce qu'il faut pour initier un IKEv2 : endpoint, identités, credentials et la
-//! proposition cryptographique (profil prédéfini de [`helios_core::profiles`] ou
+//! proposition cryptographique (profil prédéfini de [`aether::profiles`] ou
 //! proposition IKE/ESP saisie à la main).
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use helios_core::profiles;
+use aether::profiles;
 use serde::{Deserialize, Serialize};
 
 /// Méthode d'authentification IKEv2 du client auprès de la gateway.
@@ -82,7 +82,7 @@ impl Default for ClientProfile {
 
 impl ClientProfile {
     /// Résout les propositions IKE/ESP effectives : profil prédéfini en priorité,
-    /// sinon les valeurs custom du profil. Réutilise [`helios_core::profiles`].
+    /// sinon les valeurs custom du profil. Réutilise [`aether::profiles`].
     pub fn resolved_proposals(&self) -> (String, String) {
         if let Some(id) = &self.profile_id {
             if let Some(p) = profiles::find(id) {
@@ -114,13 +114,13 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Chemin du fichier de config. Surchargé par `HELIOS_CLIENT_CONFIG` (tests/dev),
+    /// Chemin du fichier de config. Surchargé par `ORION_CONFIG` (tests/dev),
     /// sinon répertoire de config standard de l'OS (`directories`).
     pub fn path() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("HELIOS_CLIENT_CONFIG") {
+        if let Ok(p) = std::env::var("ORION_CONFIG") {
             return Ok(PathBuf::from(p));
         }
-        let dirs = directories::ProjectDirs::from("net", "helios", "helios-client")
+        let dirs = directories::ProjectDirs::from("net", "helios", "orion")
             .context("impossible de déterminer le répertoire de config de l'OS")?;
         Ok(dirs.config_dir().join("profiles.toml"))
     }
@@ -138,7 +138,7 @@ impl ClientConfig {
     }
 
     /// Persiste la config de façon atomique (écriture temporaire + rename),
-    /// même schéma que [`helios_core::NetworkConfig::save`].
+    /// même schéma que [`aether::NetworkConfig::save`].
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
@@ -248,10 +248,10 @@ mod tests {
 
     #[test]
     fn roundtrip_disque() {
-        let dir = std::env::temp_dir().join(format!("helios-client-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("orion-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("profiles.toml");
-        std::env::set_var("HELIOS_CLIENT_CONFIG", &path);
+        std::env::set_var("ORION_CONFIG", &path);
 
         let mut cfg = ClientConfig::default();
         cfg.upsert(ClientProfile {
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(loaded.find("site-a").unwrap().gateway, "203.0.113.10");
         assert_eq!(loaded.selected.as_deref(), Some("site-a"));
 
-        std::env::remove_var("HELIOS_CLIENT_CONFIG");
+        std::env::remove_var("ORION_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

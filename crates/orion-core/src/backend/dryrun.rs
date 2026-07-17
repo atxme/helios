@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use helios_core::TunnelState;
+use aether::TunnelState;
 
 use crate::config::ClientProfile;
 use crate::events::ClientEvent;

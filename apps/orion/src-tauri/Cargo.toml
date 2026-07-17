@@ -1,13 +1,13 @@
 [package]
-name = "helios-client"
+name = "orion"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Client VPN Helios — IHM web embarquée (Tauri) pilotant la pile IKEv2 native de l'OS."
+description = "Client VPN Orion — IHM web embarquée (Tauri) pilotant la pile IKEv2 native de l'OS."
 
 [[bin]]
-name = "helios-client"
+name = "orion"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -21,12 +21,12 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-helios-core = { workspace = true }
-helios-client-core = { path = "../../../crates/helios-client-core" }
+aether = { workspace = true }
+orion-core = { path = "../../../crates/orion-core" }
 
 [features]
 default = []
-# Relais des features de pile IKEv2 réelle vers helios-client-core (target-only).
-linux-strongswan = ["helios-client-core/linux-strongswan"]
-native-windows = ["helios-client-core/native-windows"]
-native-macos = ["helios-client-core/native-macos"]
+# Relais des features de pile IKEv2 réelle vers orion-core (target-only).
+linux-strongswan = ["orion-core/linux-strongswan"]
+native-windows = ["orion-core/native-windows"]
+native-macos = ["orion-core/native-macos"]

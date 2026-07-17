@@ -1,9 +1,10 @@
 [package]
-name = "helios-core"
+name = "aether"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Le milieu partagé entre Helios (la gateway) et Orion (le client) : machine à états du tunnel, politiques de pare-feu, types communs. Zéro dépendance système."
 
 [dependencies]
 serde.workspace = true

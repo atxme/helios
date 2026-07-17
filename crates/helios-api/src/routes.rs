@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use helios_core::{profiles, NetworkConfig, OrchestratorCmd};
+use aether::{profiles, NetworkConfig, OrchestratorCmd};
 use helios_firewall::ruleset;
 use serde::{Deserialize, Serialize};
 

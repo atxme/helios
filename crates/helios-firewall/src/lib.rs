@@ -26,7 +26,7 @@ pub use ruleset::{render, Ruleset, Verdict};
 pub use netlink::NetlinkBackend;
 
 use async_trait::async_trait;
-use helios_core::{FirewallPolicy, Result, TunnelState};
+use aether::{FirewallPolicy, Result, TunnelState};
 
 /// Backend chargé d'imposer concrètement la politique de pare-feu.
 #[async_trait]

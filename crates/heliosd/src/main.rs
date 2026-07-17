@@ -8,7 +8,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use helio_tpm::{BootController, BootDecision, TpmSettings};
 use helios_api::AppState;
-use helios_core::{HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND};
+use aether::{HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;

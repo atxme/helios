@@ -1,9 +1,9 @@
 //! Événements émis par le cœur client vers l'IHM (via le shell Tauri).
 //!
-//! Forme alignée sur [`helios_core::HeliosEvent`] pour que le frontend partage
+//! Forme alignée sur [`aether::HeliosEvent`] pour que le frontend partage
 //! les mêmes types TypeScript que l'app web de heliosd.
 
-use helios_core::TunnelState;
+use aether::TunnelState;
 use serde::Serialize;
 
 /// Événement temps réel poussé vers le frontend (`emit("helios://event", …)`).

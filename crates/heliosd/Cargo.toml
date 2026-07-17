@@ -19,7 +19,7 @@ embed-ui = ["helios-api/embed-ui"]
 tpm = ["helio-tpm/tpm"]
 
 [dependencies]
-helios-core.workspace = true
+aether.workspace = true
 helios-vici.workspace = true
 helios-firewall.workspace = true
 helios-update.workspace = true

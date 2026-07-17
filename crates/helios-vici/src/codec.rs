@@ -14,7 +14,7 @@
 //! Les noms sont préfixés d'une longueur sur 1 octet, les valeurs sur 2 octets
 //! (big-endian).
 
-use helios_core::{HeliosError, Result};
+use aether::{HeliosError, Result};
 
 use crate::message::{Element, Message};
 

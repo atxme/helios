@@ -1,13 +1,13 @@
 [package]
-name = "helios-client-core"
+name = "orion-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Logique du client VPN Helios (config, backend IKEv2, télémétrie) — testable sur WSL2, sans dépendance Tauri."
+description = "Logique du client VPN Orion (config, backend IKEv2, télémétrie) — testable sur WSL2, sans dépendance Tauri."
 
 [dependencies]
-helios-core = { workspace = true }
+aether = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

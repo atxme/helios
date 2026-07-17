@@ -21,7 +21,7 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use helios_core::{FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState};
+use aether::{FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// État partagé entre tous les handlers Axum.

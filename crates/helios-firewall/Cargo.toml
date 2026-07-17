@@ -12,7 +12,7 @@ default = []
 netlink = ["dep:rustables"]
 
 [dependencies]
-helios-core.workspace = true
+aether.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 rustables = { version = "0.8", optional = true }

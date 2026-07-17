@@ -5,7 +5,7 @@
 //! comparer (diff) entre deux états. Le `NetlinkBackend` construit l'équivalent
 //! via l'API Netlink à partir de la même intention.
 
-use helios_core::{FirewallPolicy, TunnelState};
+use aether::{FirewallPolicy, TunnelState};
 
 /// Verdict d'une règle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +137,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helios_core::PolicyMode;
+    use aether::PolicyMode;
 
     fn policy() -> FirewallPolicy {
         FirewallPolicy {

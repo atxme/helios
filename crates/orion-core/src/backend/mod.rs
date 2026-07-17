@@ -10,7 +10,7 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use helios_core::TunnelState;
+use aether::TunnelState;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 

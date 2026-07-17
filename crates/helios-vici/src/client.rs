@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use helios_core::{HeliosError, Result};
+use aether::{HeliosError, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 

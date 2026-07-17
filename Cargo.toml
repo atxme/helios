@@ -1,30 +1,30 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/helios-core",
+    "crates/aether",
     "crates/helios-vici",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
-    "crates/helios-client-core",
+    "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
-    "apps/helios-client/src-tauri",
+    "apps/orion/src-tauri",
 ]
 
-# Le shell Tauri du client (apps/helios-client/src-tauri) lie webkit2gtk : il ne
+# Le shell Tauri du client (apps/orion/src-tauri) lie webkit2gtk : il ne
 # compile PAS sur WSL2. On l'exclut donc du build par défaut — exactement comme la
 # feature `netlink` est target-only — pour que `cargo build`/`cargo test` (sans
-# `-p`) restent verts partout. Le construire est explicite : `cargo build -p helios-client`.
+# `-p`) restent verts partout. Le construire est explicite : `cargo build -p orion`.
 default-members = [
-    "crates/helios-core",
+    "crates/aether",
     "crates/helios-vici",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
-    "crates/helios-client-core",
+    "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
 ]
@@ -65,7 +65,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 
-helios-core = { path = "crates/helios-core" }
+aether = { path = "crates/aether" }
 helios-api = { path = "crates/helios-api" }
 helios-vici = { path = "crates/helios-vici" }
 helios-firewall = { path = "crates/helios-firewall" }

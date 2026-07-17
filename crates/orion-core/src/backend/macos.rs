@@ -5,7 +5,7 @@
 //! l'échange hybride post-quantique RFC 9370 (ML-KEM) — voir le backend Windows.
 
 use async_trait::async_trait;
-use helios_core::TunnelState;
+use aether::TunnelState;
 
 use crate::config::ClientProfile;
 use crate::events::ClientEvent;

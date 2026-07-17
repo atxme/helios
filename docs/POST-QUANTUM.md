@@ -34,7 +34,7 @@ C'est la valeur du champ `ike_proposal` dans `helios.toml`.
 
 ## Où c'est appliqué dans le code
 
-- `helios-core::config::Connection::ike_proposal` porte la proposition ;
+- `aether::config::Connection::ike_proposal` porte la proposition ;
 - `heliosd` la transmet à charon via `load-conn` (voir `orchestrator::load_connection`).
 
 Le plan de données (ESP) reste symétrique (AES-256-GCM) : seul l'**établissement

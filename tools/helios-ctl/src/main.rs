@@ -13,7 +13,7 @@ use std::{path::PathBuf, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use helios_core::NetworkConfig;
+use aether::NetworkConfig;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;

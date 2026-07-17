@@ -26,7 +26,7 @@ utilisateur.
 
 ## Le kill-switch et la sémantique fail-closed
 
-L'invariant central (`helios-core::state`) :
+L'invariant central (`aether::state`) :
 
 > Le trafic LAN n'est autorisé à sortir **que** lorsque le tunnel est `Up` ou
 > `Rekeying`. Dans tout autre état (`Down`, `Connecting`, `Failed`), le

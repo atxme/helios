@@ -6,6 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-helios-core.workspace = true
+aether.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
