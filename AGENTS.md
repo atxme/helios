@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents (Claude Code, Codex, ...) when working with code in this repository.
 
 ## ⚠ État : migration IKEv2 → WireGuard **en cours** (Phase B faite)
 
@@ -14,7 +14,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`TunnelState`** : plus de `Rekeying` ; `traffic_allowed()` = `Up` seul ; événements `HandshakeEstablished`/`HandshakeExpired` (polling). Le pare-feu autorise UDP 51820 vers le pair (plus 500/4500+ESP).
 - L'orchestrateur monte le tunnel en **dry-run WireGuard** (cinématique montée classique → upgrade PSK PQ).
 
-**Reste à faire (Phase C+, target-only) :** câbler le backend WireGuard réel (`defguard_wireguard_rs`, netlink) côté gateway ; le backend WireGuard + invariante d'adaptateur Wintun côté Orion ; le protocole d'enrôlement (canal TLS ancré TPM, rotation PSK) dans `helios-provisioning` ; refonte du `ClientProfile` d'Orion (modèle WireGuard : clé publique, endpoint, PSK) — les champs IKE y subsistent temporairement.
+**Fait aussi (Phase C, partie testable) :**
+- **`ClientProfile` d'Orion** basculé au modèle WireGuard : `endpoint`, `private_key`, `peer_public_key`, `preshared_key` (PSK PQ), `address` (VIP CGNAT), `allowed_ips`, `persistent_keepalive`. `AuthConfig` (X.509/EAP) et les propositions IKE sont **supprimés**. `Debug` masque les secrets.
+- **Backends IKEv2 d'Orion supprimés** (`linux.rs`/`windows.rs`/`macos.rs` + leurs features) ; remplacés par une feature `wireguard` target-only, **pas encore implémentée**.
+- **`VpnBackend`** : `connect`/`disconnect` deviennent `up`/`down` + `last_handshake_age()` + `adapter_is_up()`. Cette séparation **porte l'invariante de sécurité d'Orion** — voir le doc-comment de `orion-core/src/backend/mod.rs`, à lire avant toute modif.
+- **`VpnController::poll_handshake`** : inférence `Up`/`Connecting` sur la fraîcheur du handshake (seuil `HANDSHAKE_STALE_AFTER` = 150 s).
+
+**Backend WireGuard réel côté Orion — écrit** (`orion-core/src/backend/wireguard.rs`, feature `wireguard`, via `defguard_wireguard_rs`). Il **compile** partout (`cargo clippy -p orion-core --features wireguard` propre, 15 tests) mais n'a **jamais été exécuté** : WSL2 n'a pas le module noyau `wireguard`. Attention, `defguard` impose l'implémentation par plateforme — sur **Windows c'est `wireguard-nt` (pilote noyau)**, pas BoringTun+Wintun comme prévu initialement ; voir l'amendement en §1 de l'ADR.
+
+**Reste à faire (target-only) :** le backend WireGuard réel côté **gateway** (heliosd simule encore) ; le protocole d'enrôlement (canal TLS ancré TPM, rotation PSK) dans `helios-provisioning` ; le `PeerTable` réel de l'IPAM (seule une fausse table de test existe) ; le frontend React d'Orion, resté sur l'ancien modèle IKE.
+
+⚠️ **`apps/orion` ne compile pas sur WSL2** (webkit2gtk-4.1 absent) : toute modif du shell Tauri échappe au compilateur ici. Le vérifier sur une machine avec webkit avant de s'y fier.
+
+ℹ️ Contrairement à ce qu'affirmait cette doc, `--features netlink` et `--features tpm` **compilent** sur WSL2 (`rustables` n'exige pas libnftnl à la compilation, `tss2-esys` est installé). La contrainte target-only porte sur l'**exécution** (pas de `nf_tables` dans le noyau WSL2), pas sur le build.
 
 **Règle maintenue :** ne pas « corriger » vers WireGuard au coup par coup hors du plan de l'ADR. Les stubs target-only (backend réel) ne sont pas des bugs à réparer sur WSL2.
 
@@ -91,9 +103,9 @@ cargo build -p orion --features linux-strongswan   # | native-windows | native-m
 Development happens on WSL2, deployment on a dedicated Linux box. **The WSL2 kernel lacks the data plane**: no `nf_tables`, ESP modules not loaded, no `nft`/`charon`/`rauc` binaries. This split is the single most important thing to internalize:
 
 - **Testable on WSL2 (~80% of code, all in `dry_run` mode):** the tunnel state machine, l'échange ML-KEM (`aether::pq`, aws-lc-rs), l'IPAM (`helios-provisioning`), kill-switch rule *rendering*, and all orchestration logic.
-- **Target-only (deliberately stubbed):** the real Netlink backend (`crates/helios-firewall/src/netlink.rs`) et le backend WireGuard réel (defguard/netlink, pas encore câblé — l'orchestrateur simule en dry-run). These cannot be compiled/exercised on WSL2.
+- **Target-only (écrits, jamais exécutés) :** le backend Netlink (`helios-firewall/src/netlink.rs`) et les backends WireGuard (`helios-wireguard` côté gateway, `orion-core::backend::wireguard` côté client). Ils **compilent** ici ; ils ne peuvent pas **tourner** (WSL2 n'a ni `nf_tables` ni module `wireguard`).
 
-When asked to "make the firewall actually apply rules" or similar, remember it can only be validated on the target — don't assume a green `cargo build` here proves the `netlink` feature works.
+Un `cargo build` vert ici ne prouve jamais qu'une feature target-only *fonctionne* — seulement qu'elle compile. Toute validation réelle passe par la machine dédiée.
 
 ## Architecture
 
@@ -101,11 +113,12 @@ Control plane (user space) drives the kernel data plane. Crate dependency flows 
 
 - **`aether`** — pure types (build-dep C via `aws-lc-rs`, voir plus bas). Owns the **central security invariant** in `state.rs`: traffic is allowed *only* in `Up`; every other state engages the kill-switch (`kill_switch_engaged()`). `TunnelState::on(event)` is the state machine (événements WireGuard : `HandshakeEstablished`/`HandshakeExpired`). `config.rs` maps `Config` → `FirewallPolicy`. `pq.rs` porte l'échange ML-KEM-768 derrière le trait `Kem`.
 - **`helios-provisioning`** — enrôlement des clients Orion côté gateway : `ipam.rs` dérive la VIP CGNAT (`100.64.0.0/10`) d'un pair depuis sa clé publique WireGuard, sans état disque. Le protocole d'enrôlement (TLS/TPM, rotation PSK) reste à écrire.
-- **`helios-firewall`** — `FirewallBackend` trait + `ruleset::render(policy, state)` which turns intent into an nftables ruleset (default verdict `Drop` = fail-closed). Autorise UDP 51820 vers les `wg_peers`. Two backends: `DryRunBackend` (logs, default) and `NetlinkBackend` (feature `netlink`, rustables).
+- **`helios-firewall`** — `FirewallBackend` trait + `ruleset::render(policy, state)`. **Le rendu est structuré** (`Rule` / `Match` / `ChainKind`), pas textuel : c'est cette structure que le backend Netlink traduit, et dont la syntaxe nftables dérive par `Display`. Chaque règle porte sa chaîne (`input`/`forward`/`output`). Ouvre UDP 51820 **en entrée** (rôle serveur : les clients road-warrior arrivent d'IP inconnues). Deux backends : `DryRunBackend` (journalise, défaut) et `NetlinkBackend` (feature `netlink`, rustables — transaction `Batch` atomique).
+- **`helios-wireguard`** — plan de données WireGuard de la gateway : trait `WireguardBackend`, `DryRunBackend` (défaut) et `KernelBackend` (feature `wireguard`, defguard). Fournit aussi `PeerAddressTable`, qui branche la table de pairs vivante sur l'IPAM de `helios-provisioning`.
 - **`helios-update`** — `UpdateChannel` trait + `RaucChannel` (shells to `rauc`, A/B + rollback) and `DryRunChannel`.
 - **`helios-api`** — Axum HTTP server crate: REST routes (`routes.rs`), WebSocket handler (`ws.rs`), optional static asset embedding (`embed.rs`, feature `embed-ui`). Shares `Arc<RwLock<TunnelState>>` and channels with the orchestrator via `AppState`.
 - **`helio-tpm`** — TPM 2.0 boot integrity: seals a 256-bit secret against PCR 0/4/7 at provisioning; unseal at boot proves the bootchain is unmodified. The secret decrypts IPsec credentials before `load-conn`. Re-sealing after OTA requires a signed Ed25519 ticket (anti-rollback). `DryRunTpm` is fully testable on WSL2; `TpmDevice` (feature `tpm`) only on the target.
-- **`heliosd`** — `orchestrator.rs` wires it together: engage kill-switch *before* any network, then `simulate_bringup` (dry-run WireGuard : montée classique → upgrade PSK PQ). Le backend WireGuard réel (defguard/netlink) est target-only et pas encore câblé. Plus the OTA loop.
+- **`heliosd`** — `orchestrator.rs` wires it together : kill-switch engagé *avant* tout réseau, puis montée de l'interface WireGuard via `helios-wireguard`, et un poller de handshakes (10 s) qui infère `Connecting`/`Up`. Plus the OTA loop.
 - **`helios-ctl`** (`tools/`) — developer CLI for scripting and scenario testing against a running `heliosd`; not part of the deployed appliance.
 - **`orion-core`** — cœur **portable** du client VPN (côté road-warrior, pas la gateway) : `config.rs` (le profil VPN `ClientProfile` éditable/persisté : endpoint IKE, identités, credentials, profil IKE/ESP), `backend/` (trait `VpnBackend` qui **monte réellement** le tunnel via la pile IKEv2 native de l'OS — `DryRunBackend` par défaut/testable WSL2, `linux`/`windows`/`macos` derrière des features target-only), `telemetry.rs` (consomme l'API heliosd **uniquement post-`Up`**). Zéro dépendance Tauri → testé sur WSL2 (`cargo test -p orion-core`).
 - **`apps/orion`** (`src-tauri` + frontend React) — shell **Tauri** mince : commandes `invoke` (connect/disconnect, CRUD profils), relais des `ClientEvent` vers l'IHM (`emit`). Lie `webkit2gtk-4.1` → **exclu des `default-members`** du workspace (ne build pas sur WSL2 sans webkit), comme la feature `netlink` est target-only. Note PQ : les piles IKEv2 natives Windows/macOS ne supportent pas l'échange ML-KEM (RFC 9370) — réservé aux clients strongSwan ≥ 6.
@@ -115,7 +128,7 @@ Control plane (user space) drives the kernel data plane. Crate dependency flows 
 This is the project's reason for existing — preserve it in any change:
 1. The kill-switch is engaged at startup **before** any network contact.
 2. On shutdown it is **left engaged** (never "unlock" on exit).
-3. `NetlinkBackend` returns an error rather than applying a *partial* policy — refusing to open a gap is correct behavior, not a bug to "fix" by making it succeed.
+3. `NetlinkBackend` applique tout via **une seule transaction Netlink** (`Batch`) : le kernel prend l'ensemble ou rien. Une erreur de traduction renvoie `Err` **sans rien envoyer** au kernel — la politique précédente reste en place. Ne jamais remplacer ça par une application règle par règle : ça créerait une fenêtre où le kill-switch serait à moitié levé.
 
 **Portée après ADR-001** : cette règle ne vaudra plus que pour **Helios**, la gateway. Le client **Orion** sera délibérément *fail-open* (CWE-636) : aucun pare-feu, aucun WFP. Sa protection reposera sur une invariante de cycle de vie — *l'adaptateur Wintun (`AllowedIPs = 0.0.0.0/0`) n'est jamais démonté sur échec, seulement sur déconnexion explicite* — qui laisse WireGuard jeter les paquets au lieu de fuir. Détail et justification en §3 bis de l'ADR. Le kill-switch de la gateway ne protège **pas** le client : deux machines, deux modèles de menace.
 

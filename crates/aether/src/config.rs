@@ -24,14 +24,64 @@ pub struct NetworkConfig {
     /// CIDRs ou IPs autorisés en SSH d'administration, même kill-switch engagé.
     #[serde(default)]
     pub allow_ssh_from: Vec<String>,
-    /// Interface réseau exclusive pour l'accès à l'administration (ex. `ipsec0`).
+    /// Interface réseau exclusive pour l'accès à l'administration.
+    /// Doit être l'interface WireGuard (`wg_iface`) : l'API vit derrière le tunnel.
     #[serde(default)]
     pub admin_iface: Option<String>,
     /// CIDRs locaux bypassant le tunnel par défaut (split-tunneling statique).
     #[serde(default)]
     pub split_tunnel_cidrs: Vec<String>,
+
+    // ── Plan de données WireGuard (rôle serveur) ──────────────────────────────
+    /// Nom de l'interface WireGuard créée par la gateway.
+    #[serde(default = "default_wg_iface")]
+    pub wg_iface: String,
+    /// Clé privée Curve25519 de la gateway, en base64. **Secret.**
+    /// Vide = la gateway ne peut pas monter son interface.
     #[serde(default)]
-    pub connections: Vec<Connection>,
+    pub wg_private_key: String,
+    /// Adresse de la gateway dans le réseau du tunnel (CGNAT, ADR-001 §4).
+    #[serde(default = "default_wg_address")]
+    pub wg_address: String,
+    /// Port UDP d'écoute.
+    #[serde(default = "default_wg_port")]
+    pub wg_listen_port: u16,
+    /// Pairs autorisés. À terme alimentés par `helios-provisioning` à
+    /// l'enrôlement ; déclarables à la main en attendant.
+    #[serde(default)]
+    pub peers: Vec<WgPeer>,
+
+    /// Pairs statiques joignables en sortie (site-à-site). Vide en road-warrior.
+    #[serde(default)]
+    pub static_peer_addrs: Vec<String>,
+}
+
+fn default_wg_iface() -> String {
+    "helios0".to_string()
+}
+
+/// `100.64.0.1/10` : première adresse de la plage CGNAT partagée (RFC 6598).
+fn default_wg_address() -> String {
+    "100.64.0.1/10".to_string()
+}
+
+fn default_wg_port() -> u16 {
+    51820
+}
+
+/// Un client WireGuard autorisé sur la gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgPeer {
+    /// Nom convivial (journalisation, IHM).
+    pub name: String,
+    /// Clé publique Curve25519 du client, en base64 — son identité.
+    pub public_key: String,
+    /// VIP assignée, en notation CIDR (ex. `100.64.1.2/32`).
+    /// Dans WireGuard, `AllowedIPs` **est** la table de routage cryptographique.
+    pub address: String,
+    /// PSK post-quantique dérivé de l'échange ML-KEM, en base64. **Secret.**
+    #[serde(default)]
+    pub preshared_key: Option<String>,
 }
 
 impl NetworkConfig {
@@ -63,9 +113,15 @@ impl NetworkConfig {
         Ok(())
     }
 
-    /// IKE peers déduits des adresses distantes des connexions.
+    /// Pairs statiques joignables en sortie (site-à-site). Vide en road-warrior :
+    /// les clients arrivent en entrée, sur `wg_listen_port`.
     pub fn wg_peers(&self) -> Vec<String> {
-        self.connections.iter().map(|c| c.remote_addr.clone()).collect()
+        self.static_peer_addrs.clone()
+    }
+
+    /// La gateway est-elle configurée pour monter son interface WireGuard ?
+    pub fn wireguard_ready(&self) -> bool {
+        !self.wg_private_key.trim().is_empty() && !self.wg_address.trim().is_empty()
     }
 
     /// Projette la config réseau vers la politique de pare-feu déclarative.
@@ -76,6 +132,10 @@ impl NetworkConfig {
             wan_iface: self.wan_iface.clone(),
             lan_ifaces: self.lan_ifaces.clone(),
             wg_peers: self.wg_peers(),
+            // Rôle serveur : on n'ouvre le port en entrée que si la gateway est
+            // réellement en mesure de monter son interface. Sinon on laisserait
+            // un port ouvert sans rien derrière.
+            wg_listen_port: self.wireguard_ready().then_some(self.wg_listen_port),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
             admin_port,
@@ -87,22 +147,6 @@ impl NetworkConfig {
     }
 }
 
-/// Un pair WireGuard connu de la configuration réseau.
-///
-/// `remote_addr` est l'endpoint UDP du pair (IP joignable en clair sur le port
-/// 51820), utilisé pour scoper la règle de pare-feu. Les pairs road-warrior
-/// dynamiques (VIP dérivée, clé publique) sont gérés par `helios-provisioning`,
-/// pas ici ; cette structure ne couvre que les pairs statiques déclarés.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Connection {
-    pub name: String,
-    pub remote_addr: String,
-    #[serde(default)]
-    pub local_id: Option<String>,
-    #[serde(default)]
-    pub remote_id: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,26 +154,49 @@ mod tests {
     #[test]
     fn config_vide_par_defaut() {
         let cfg = NetworkConfig::default();
-        assert!(cfg.connections.is_empty());
+        assert!(cfg.peers.is_empty());
         assert!(cfg.wan_iface.is_empty());
+        assert!(!cfg.wireguard_ready(), "sans clé privée, rien ne doit monter");
     }
 
     #[test]
-    fn deserialise_config_minimale() {
+    fn deserialise_config_gateway() {
         let toml = r#"
             wan_iface = "eth0"
             lan_ifaces = ["eth1"]
+            admin_iface = "helios0"
+            wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
-            [[connections]]
-            name = "site-a"
-            remote_addr = "203.0.113.10"
+            [[peers]]
+            name = "poste-christophe"
+            public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+            address = "100.64.1.2/32"
         "#;
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.wan_iface, "eth0");
-        assert_eq!(cfg.connections.len(), 1);
-        assert_eq!(cfg.connections[0].remote_addr, "203.0.113.10");
+        // Les défauts WireGuard s'appliquent sans être écrits.
+        assert_eq!(cfg.wg_iface, "helios0");
+        assert_eq!(cfg.wg_listen_port, 51820);
+        assert_eq!(cfg.wg_address, "100.64.0.1/10");
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.peers[0].address, "100.64.1.2/32");
+        assert!(cfg.wireguard_ready());
+
         let policy = cfg.firewall_policy();
         assert!(policy.is_fail_closed());
-        assert_eq!(policy.wg_peers, vec!["203.0.113.10"]);
+        // Rôle serveur : le port d'écoute doit être ouvert en entrée, sinon
+        // aucun client ne peut handshaker.
+        assert_eq!(policy.wg_listen_port, Some(51820));
+        assert!(policy.wg_peers.is_empty(), "road-warrior : pas de pair sortant");
+    }
+
+    #[test]
+    fn port_non_ouvert_si_la_gateway_n_est_pas_prete() {
+        // Pas de clé privée → on n'ouvre pas un port sans rien derrière.
+        let cfg = NetworkConfig {
+            wan_iface: "eth0".into(),
+            ..NetworkConfig::default()
+        };
+        assert_eq!(cfg.firewall_policy().wg_listen_port, None);
     }
 }

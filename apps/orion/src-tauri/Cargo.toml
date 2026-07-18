@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Client VPN Orion — IHM web embarquée (Tauri) pilotant la pile IKEv2 native de l'OS."
+description = "Client VPN Orion — IHM web embarquée (Tauri) pilotant le backend WireGuard."
 
 [[bin]]
 name = "orion"
@@ -26,7 +26,5 @@ orion-core = { path = "../../../crates/orion-core" }
 
 [features]
 default = []
-# Relais des features de pile IKEv2 réelle vers orion-core (target-only).
-linux-strongswan = ["orion-core/linux-strongswan"]
-native-windows = ["orion-core/native-windows"]
-native-macos = ["orion-core/native-macos"]
+# Relais de la feature du backend WireGuard réel vers orion-core (target-only).
+wireguard = ["orion-core/wireguard"]

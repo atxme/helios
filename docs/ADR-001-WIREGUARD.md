@@ -48,7 +48,33 @@ On bascule sur WireGuard. Cinq points structurent la bascule.
 ### 1. Plan de données asymétrique
 
 - **Gateway Linux (Helios)** : WireGuard **noyau**, piloté en netlink.
-- **Client Windows (Orion)** : BoringTun (userspace) + Wintun.
+- **Client Orion** : `defguard_wireguard_rs`, qui impose l'implémentation selon
+  la plateforme (voir l'amendement ci-dessous).
+
+> **Amendement (implémentation, Phase C) — le client Windows passe par le noyau,
+> pas par BoringTun.** Le plan d'origine prévoyait « BoringTun (userspace) +
+> Wintun » sur Windows. À l'écriture du backend, constat : le module
+> `wgapi_userspace` de `defguard_wireguard_rs` (celui qui embarque BoringTun) est
+> `#[cfg(unix)]` — **indisponible sur Windows**. Le crate n'y propose que
+> `WGApi<Kernel>`, adossé au pilote noyau **`wireguard-nt`**.
+>
+> | Plateforme | Implémentation retenue | Plan de données |
+> |---|---|---|
+> | Linux   | `WGApi<Kernel>`    | module noyau `wireguard` (netlink) |
+> | Windows | `WGApi<Kernel>`    | pilote noyau `wireguard-nt` |
+> | macOS   | `WGApi<Userspace>` | BoringTun embarqué |
+>
+> **Conséquence sur l'argumentaire d'origine** : la promesse « isolation à 100 %
+> en user-space, aucun risque de BSOD » tombe pour Windows. Elle était de toute
+> façon intenable — Wintun est lui-même un pilote NDIS noyau (voir les notes de
+> vigilance). On ne supprime donc pas le composant noyau, on choisit lequel :
+> `wireguard-nt` (WireGuard entier en noyau, ce qu'utilise le client officiel)
+> plutôt que Wintun (adaptateur TUN en noyau, crypto en userspace).
+>
+> Revenir au plan initial est possible mais **sort de `defguard_wireguard_rs`** :
+> il faudrait intégrer directement les crates `boringtun` et `wintun`, et écrire
+> soi-même la gestion d'adaptateur que defguard fournit. À arbitrer si la
+> surface noyau sous Windows est un critère dur.
 
 On ne met pas BoringTun sur la gateway : ce serait troquer un plan de données
 noyau (ESP/XFRM aujourd'hui) contre de l'userspace, dont le goulot est le coût

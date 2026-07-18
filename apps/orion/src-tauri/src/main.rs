@@ -27,6 +27,13 @@ struct AppState {
     telemetry: Arc<TelemetryManager>,
 }
 
+/// Intervalle d'interrogation du dernier handshake WireGuard.
+///
+/// WireGuard est sans connexion : l'état `Up` s'infère de la fraîcheur du
+/// handshake, il n'est jamais notifié (ADR-001 §3). Sans cette boucle, l'IHM
+/// resterait bloquée sur le dernier état connu.
+const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Gère le cycle de vie de la tâche de télémétrie (une seule active à la fois).
 #[derive(Default)]
 struct TelemetryManager {
@@ -127,9 +134,8 @@ async fn connect(
         .ok_or_else(|| "aucun profil sélectionné".to_string())?
     };
 
-    if profile.gateway.trim().is_empty() {
-        return Err("l'endpoint de la gateway (IP/FQDN) est requis".to_string());
-    }
+    // Valide le profil WireGuard (endpoint + clés) AVANT tout effet de bord.
+    profile.validate().map_err(|e| e.to_string())?;
 
     // Puits combinant relais vers le frontend ET pilotage de la télémétrie :
     // la télémétrie ne démarre QUE sur passage à Up (web derrière le tunnel).
@@ -152,7 +158,22 @@ async fn connect(
         base(ev);
     });
 
-    state.controller.connect(profile, sink).await;
+    state.controller.connect(profile, sink.clone()).await;
+
+    // Boucle d'inférence d'état : WireGuard ne notifie rien, on interroge l'âge
+    // du dernier handshake. Ne touche jamais à l'adaptateur (ADR-001 §3 bis).
+    let controller = Arc::clone(&state.controller);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HANDSHAKE_POLL_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if controller.state() == TunnelState::Down {
+                break; // déconnexion explicite : plus rien à inférer
+            }
+            controller.poll_handshake(sink.clone()).await;
+        }
+    });
+
     Ok(())
 }
 

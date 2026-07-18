@@ -12,6 +12,9 @@ use aether::{
     FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use helios_firewall::{DryRunBackend, FirewallBackend};
+use helios_wireguard::{
+    InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT,
+};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
@@ -21,7 +24,54 @@ use tracing::{info, warn};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Port UDP d'écoute WireGuard (invariant d'architecture).
-const WG_PORT: u16 = 51820;
+const WG_PORT: u16 = WG_LISTEN_PORT;
+
+/// Au-delà de cet âge, le handshake d'un pair est considéré périmé (ADR-001 §3).
+const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(150);
+
+/// Sélectionne le plan de données WireGuard. Comme pour le pare-feu : dry-run
+/// par défaut, backend noyau réel derrière la feature `wireguard`.
+fn wireguard_backend(dry_run: bool, ifname: &str) -> Box<dyn WireguardBackend> {
+    if dry_run {
+        return Box::new(helios_wireguard::DryRunBackend::new());
+    }
+    #[cfg(feature = "wireguard")]
+    {
+        match helios_wireguard::KernelBackend::new(ifname) {
+            Ok(backend) => return Box::new(backend),
+            Err(e) => {
+                tracing::error!("backend WireGuard noyau indisponible ({e}) — repli sur dry-run : AUCUN tunnel réel");
+                return Box::new(helios_wireguard::DryRunBackend::new());
+            }
+        }
+    }
+    #[cfg(not(feature = "wireguard"))]
+    {
+        let _ = ifname;
+        warn!("mode réel demandé mais feature `wireguard` non compilée : repli sur dry-run");
+        Box::new(helios_wireguard::DryRunBackend::new())
+    }
+}
+
+/// Projette la config réseau vers la config d'interface + les pairs WireGuard.
+fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
+    let iface = InterfaceConfig {
+        name: network.wg_iface.clone(),
+        private_key: network.wg_private_key.clone(),
+        listen_port: network.wg_listen_port,
+        address: network.wg_address.clone(),
+    };
+    let peers = network
+        .peers
+        .iter()
+        .map(|p| PeerConfig {
+            public_key: p.public_key.clone(),
+            allowed_ips: p.address.clone(),
+            preshared_key: p.preshared_key.clone(),
+        })
+        .collect();
+    (iface, peers)
+}
 
 fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
     if dry_run {
@@ -80,6 +130,10 @@ pub async fn run(
     sync_policy(&shared_policy, &policy).await;
 
     let fw = firewall_backend(dry_run);
+    let wg: Arc<dyn WireguardBackend> = {
+        let ifname = shared_network.read().await.wg_iface.clone();
+        Arc::from(wireguard_backend(dry_run, &ifname))
+    };
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
 
     // 1. Fail-closed AVANT tout contact réseau.
@@ -89,14 +143,17 @@ pub async fn run(
     // 2. Montée initiale du tunnel.
     {
         let network = shared_network.read().await;
-        do_connect(&network, dry_run, &shared_state, &event_tx, fw.as_ref(), &policy).await?;
+        do_connect(&network, wg.as_ref(), &shared_state, &event_tx, fw.as_ref(), &policy).await?;
         let wan = network.wan_iface.clone();
         drop(network);
         spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
     }
     sync_policy(&shared_policy, &policy).await;
 
-    // 3. Télémétrie réseau (/proc/net/dev).
+    // 3. Inférence d'état : WireGuard ne notifie rien, on interroge les handshakes.
+    spawn_handshake_poller(Arc::clone(&wg), Arc::clone(&shared_state), event_tx.clone());
+
+    // 4. Télémétrie réseau (/proc/net/dev).
     {
         let wan = shared_network.read().await.wan_iface.clone();
         spawn_telemetry_loop(wan, event_tx.clone());
@@ -118,8 +175,8 @@ pub async fn run(
                     None => break,
                     Some(c) => {
                         handle_external_cmd(
-                            c, &shared_network, dry_run, &shared_state, &event_tx, fw.as_ref(),
-                            &mut policy, &internal_tx, &shared_policy,
+                            c, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
+                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy,
                         ).await?;
                     }
                 }
@@ -146,6 +203,7 @@ async fn handle_external_cmd(
     cmd: OrchestratorCmd,
     shared_network: &Arc<RwLock<NetworkConfig>>,
     dry_run: bool,
+    wg: &dyn WireguardBackend,
     shared_state: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
@@ -158,7 +216,7 @@ async fn handle_external_cmd(
             info!("connexion demandée via l'interface web");
             emit_log(event_tx, "info", "Connexion demandée via l'interface web");
             let network = shared_network.read().await;
-            do_connect(&network, dry_run, shared_state, event_tx, fw, policy).await?;
+            do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
             let wan = network.wan_iface.clone();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -182,6 +240,10 @@ async fn handle_external_cmd(
             emit_log(event_tx, "info", "Déconnexion demandée via l'interface web");
             policy.captive_portal_gateway = None;
             policy.mss_clamp = None;
+            if let Err(e) = wg.down().await {
+                warn!("démontage de l'interface WireGuard : {e}");
+                emit_log(event_tx, "warn", &format!("Démontage de l'interface : {e}"));
+            }
             transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
             sync_policy(shared_policy, policy).await;
         }
@@ -197,7 +259,7 @@ async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                do_connect(&network, dry_run, shared_state, event_tx, fw, policy).await?;
+                do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
                 let wan = network.wan_iface.clone();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -222,75 +284,115 @@ async fn handle_external_cmd(
         }
 
         OrchestratorCmd::LoadNetworkConfig(new_cfg) => {
-            info!("config réseau rechargée : {} pair(s)", new_cfg.connections.len());
+            info!("config réseau rechargée : {} pair(s)", new_cfg.peers.len());
             *policy = new_cfg.firewall_policy();
-            *shared_network.write().await = new_cfg;
+            *shared_network.write().await = *new_cfg;
             let state = *shared_state.read().await;
             fw.apply(policy, state).await.context("pare-feu après rechargement config")?;
             sync_policy(shared_policy, policy).await;
+
+            // Aligne le plan de données sur la nouvelle liste de pairs
+            // (enrôlement d'un client, ou révocation).
+            if wg.is_up() {
+                let (_, peers) = wg_config(&*shared_network.read().await);
+                if let Err(e) = wg.sync_peers(&peers).await {
+                    warn!("synchronisation des pairs WireGuard : {e}");
+                    emit_log(event_tx, "warn", &format!("Synchronisation des pairs : {e}"));
+                }
+            }
             emit_log(event_tx, "info", "Configuration réseau appliquée");
         }
     }
     Ok(())
 }
 
+/// Monte l'interface WireGuard de la gateway et applique ses pairs.
+///
+/// La gateway est un **serveur** : elle crée son interface, écoute en UDP et
+/// attend les clients. Elle ne « compose » vers personne. L'état passe donc à
+/// `Connecting` dès l'interface montée ; c'est le polling des handshakes
+/// ([`spawn_handshake_poller`]) qui promeut vers `Up` quand un pair est
+/// réellement connecté (ADR-001 §3).
 async fn do_connect(
     network: &NetworkConfig,
-    dry_run: bool,
+    wg: &dyn WireguardBackend,
     shared: &Arc<RwLock<TunnelState>>,
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &FirewallPolicy,
 ) -> anyhow::Result<()> {
-    if !dry_run {
-        // Le backend WireGuard réel (defguard_wireguard_rs, netlink) est
-        // target-only et pas encore câblé — comme le backend Netlink du pare-feu.
-        // On simule la montée en attendant, sans jamais lever le kill-switch à tort.
-        warn!("backend WireGuard réel non câblé (target-only) : repli sur simulation");
-        emit_log(event_tx, "warn",
-            "Backend WireGuard réel non câblé (cible) — montée simulée");
+    if !network.wireguard_ready() {
+        emit_log(event_tx, "error",
+            "Clé privée WireGuard absente de la config réseau — impossible de monter l'interface");
+        anyhow::bail!("gateway non configurée : `wg_private_key` vide dans network.toml");
     }
-    simulate_bringup(network, shared, event_tx, fw, policy).await
-}
 
-/// Simule la cinématique de montée WireGuard (ADR-001) : montée classique
-/// (`Connecting`, kill-switch engagé) puis upgrade PSK post-quantique
-/// (`HandshakeEstablished` → `Up`).
-async fn simulate_bringup(
-    network: &NetworkConfig,
-    shared: &Arc<RwLock<TunnelState>>,
-    event_tx: &broadcast::Sender<HeliosEvent>,
-    fw: &dyn FirewallBackend,
-    policy: &FirewallPolicy,
-) -> anyhow::Result<()> {
-    info!("[dry-run] simulation de la montée du tunnel WireGuard");
-    let peers = network.connections.len();
-    emit_log(event_tx, "info",
-        &format!("[dry-run] Montée WireGuard — {peers} pair(s), UDP {WG_PORT}"));
+    let (iface, peers) = wg_config(network);
 
+    // Kill-switch engagé pendant toute la montée.
     let mut state = *shared.read().await;
     if state != TunnelState::Down && state != TunnelState::Failed {
         state = TunnelState::Down;
     }
-
-    // 1. Montée classique : tunnel Curve25519 up, mais PSK pas encore installé.
-    //    Kill-switch ENGAGÉ — aucun trafic utilisateur.
     state = state.on(TunnelEvent::StartRequested).context("transition d'état")?;
-    info!("événement StartRequested -> état {state:?}");
-    emit_log(event_tx, "info", "Handshake WireGuard classique (Curve25519)…");
     transition(shared, event_tx, state, fw, policy).await?;
 
-    // 2. Upgrade post-quantique : échange ML-KEM-768 sur le canal de contrôle,
-    //    PSK dérivé et installé des deux côtés (voir helios-provisioning).
-    emit_log(event_tx, "info", "Échange ML-KEM-768 → PSK post-quantique installé");
+    emit_log(event_tx, "info",
+        &format!("Montée de {} — écoute UDP {}, {} pair(s) autorisé(s)",
+            iface.name, iface.listen_port, peers.len()));
 
-    // 3. Handshake suivant réussit avec PSK → tunnel pleinement opérationnel.
-    state = state.on(TunnelEvent::HandshakeEstablished).context("transition d'état")?;
-    info!("événement HandshakeEstablished -> état {state:?}");
-    emit_log(event_tx, "info", "Tunnel Up — trafic autorisé, protégé PQ");
-    transition(shared, event_tx, state, fw, policy).await?;
+    wg.up(&iface, &peers).await.context("montée de l'interface WireGuard")?;
 
+    emit_log(event_tx, "info",
+        &format!("Interface {} active ({}) — en attente de handshake client",
+            iface.name, iface.address));
     Ok(())
+}
+
+/// Interroge périodiquement les handshakes des pairs pour inférer l'état.
+///
+/// WireGuard est sans connexion : `Up` ne se reçoit pas, il se déduit. La
+/// gateway est `Up` dès qu'**au moins un** pair a un handshake frais.
+fn spawn_handshake_poller(
+    wg: Arc<dyn WireguardBackend>,
+    shared: Arc<RwLock<TunnelState>>,
+    event_tx: broadcast::Sender<HeliosEvent>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = time::interval(Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            if !wg.is_up() {
+                continue;
+            }
+            let fresh = match wg.peers().await {
+                Ok(peers) => peers.iter().any(|p| {
+                    p.last_handshake
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age < HANDSHAKE_STALE_AFTER)
+                }),
+                Err(e) => {
+                    warn!("lecture des pairs WireGuard impossible : {e}");
+                    continue;
+                }
+            };
+
+            let current = *shared.read().await;
+            let next = match (current, fresh) {
+                (TunnelState::Connecting, true) => TunnelState::Up,
+                (TunnelState::Up, false) => TunnelState::Connecting,
+                _ => continue,
+            };
+            *shared.write().await = next;
+            let _ = event_tx.send(HeliosEvent::StateChanged { state: next });
+            let msg = if next == TunnelState::Up {
+                "Pair connecté — handshake WireGuard frais"
+            } else {
+                "Plus aucun handshake frais — kill-switch réengagé"
+            };
+            emit_log(&event_tx, "info", msg);
+        }
+    });
 }
 
 // ─── Sondes conservées : câblées au futur backend WireGuard réel (target-only) ───
@@ -430,9 +532,13 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("  interface web: http://{}", aether::API_BIND);
     println!("  WAN          : {}", network.wan_iface);
     println!("  LAN          : {:?}", network.lan_ifaces);
-    println!("  pairs        : {}", network.connections.len());
-    for c in &network.connections {
-        println!("    - {} -> {}", c.name, c.remote_addr);
+    println!("  interface WG : {} (UDP {})", network.wg_iface, network.wg_listen_port);
+    println!("  adresse WG   : {}", network.wg_address);
+    println!("  prêt         : {}", if network.wireguard_ready() { "oui" } else { "non (clé privée manquante)" });
+    println!("  pairs        : {}", network.peers.len());
+    for p in &network.peers {
+        let pq = if p.preshared_key.is_some() { "  [PQ]" } else { "" };
+        println!("    - {} -> {}{}", p.name, p.address, pq);
     }
     Ok(())
 }

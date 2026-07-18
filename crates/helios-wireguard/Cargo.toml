@@ -1,0 +1,26 @@
+[package]
+name = "helios-wireguard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Plan de données WireGuard de la gateway Helios : trait + backend dry-run (testable partout) et backend noyau (feature `wireguard`, target-only)."
+
+[dependencies]
+aether = { workspace = true }
+helios-provisioning = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = "0.22"
+defguard_wireguard_rs = { workspace = true, optional = true }
+
+[features]
+default = []
+# Backend WireGuard noyau réel (netlink sous Linux). Compile partout, mais ne
+# peut être *exercé* que là où le plan de données WireGuard existe — même statut
+# que la feature `netlink` de helios-firewall.
+wireguard = ["dep:defguard_wireguard_rs"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

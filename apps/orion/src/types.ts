@@ -1,44 +1,40 @@
 // Types miroir des structures Rust (orion-core) sérialisées via Tauri.
 // Aligné sur web/src/types.ts pour la partie état/télémétrie partagée avec heliosd.
 
+// Modèle WireGuard (ADR-001). `rekeying` a disparu : WireGuard rekeye de façon
+// transparente, il n'y a pas d'état observable. `up` est *inféré* d'un handshake
+// récent (< 150 s), pas reçu comme événement.
 export type TunnelState =
   | 'down'
   | 'connecting'
   | 'up'
-  | 'rekeying'
   | 'failed'
   | 'captive_portal'
 
-export type AuthConfig =
-  | { method: 'psk'; secret: string }
-  | { method: 'cert'; cert_path: string; key_path: string }
-  | { method: 'eap'; username: string; password: string }
-
+// Un pair WireGuard : identité = clé publique Curve25519, joint par un endpoint
+// UDP. Ni CA, ni EAP, ni proposition cryptographique — WireGuard n'a qu'une suite.
 export interface ClientProfile {
   name: string
-  gateway: string
-  local_id: string | null
-  remote_id: string | null
-  auth: AuthConfig
-  profile_id: string | null
-  ike_proposal: string | null
-  esp_proposal: string | null
+  /** Endpoint UDP de la gateway : `IP:port` ou `FQDN:port`. */
+  endpoint: string
+  /** Clé privée Curve25519 du client (base64). Secret. */
+  private_key: string
+  /** Clé publique Curve25519 de la gateway (base64). */
+  peer_public_key: string
+  /** PSK post-quantique dérivé de l'échange ML-KEM (base64). null = tunnel classique. */
+  preshared_key: string | null
+  /** VIP CGNAT assignée par la gateway à l'enrôlement (ex. `100.64.1.2/32`). */
+  address: string | null
+  /** Trafic routé dans le tunnel. Défaut `0.0.0.0/0`. */
+  allowed_ips: string
+  /** Keepalive en secondes. Défaut 25. */
+  persistent_keepalive: number
   heliosd_url: string | null
 }
 
 export interface ClientConfig {
   profiles: ClientProfile[]
   selected: string | null
-}
-
-export interface PredefinedProfile {
-  id: string
-  name: string
-  description: string
-  pqc_level: string
-  reserved: boolean
-  ike_proposal: string
-  esp_proposal: string
 }
 
 // Événements poussés par le backend Rust (emit "helios://event").

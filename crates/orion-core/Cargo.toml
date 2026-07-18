@@ -17,14 +17,15 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 directories = "5"
+defguard_wireguard_rs = { workspace = true, optional = true }
 
 [features]
 default = []
-# Backends IPsec réels — spécifiques à la plateforme, validables uniquement sur cible.
-# Comme la feature `netlink` côté heliosd : non compilés par défaut.
-linux-strongswan = []
-native-windows = []
-native-macos = []
+# Backend WireGuard réel via `defguard_wireguard_rs` (noyau Linux/Windows, ou
+# userspace BoringTun). Compile partout, mais ne peut être *exercé* que sur une
+# machine disposant du plan de données WireGuard — comme la feature `netlink`
+# côté heliosd. Les anciens backends IKEv2 ont été supprimés avec la bascule.
+wireguard = ["dep:defguard_wireguard_rs"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

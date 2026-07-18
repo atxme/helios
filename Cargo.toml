@@ -7,16 +7,19 @@ members = [
     "crates/helios-api",
     "crates/helio-tpm",
     "crates/helios-provisioning",
+    "crates/helios-wireguard",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
     "apps/orion/src-tauri",
 ]
 
-# Le shell Tauri du client (apps/orion/src-tauri) lie webkit2gtk : il ne
-# compile PAS sur WSL2. On l'exclut donc du build par défaut — exactement comme la
-# feature `netlink` est target-only — pour que `cargo build`/`cargo test` (sans
-# `-p`) restent verts partout. Le construire est explicite : `cargo build -p orion`.
+# `apps/orion/src-tauri` est dans le build par défaut : le client DOIT être
+# compilé à chaque `cargo build`/`cargo test`, sinon une casse du shell Tauri
+# dort sans être vue (c'est exactement ce qui est arrivé pendant la bascule
+# WireGuard). Il lie le webview natif — sous Linux `webkit2gtk-4.1`, installé par
+# `scripts/setup-dev.sh` ; sous Windows, la cible réelle d'Orion, c'est WebView2
+# et il n'y a aucune dépendance GTK.
 default-members = [
     "crates/aether",
     "crates/helios-firewall",
@@ -24,9 +27,11 @@ default-members = [
     "crates/helios-api",
     "crates/helio-tpm",
     "crates/helios-provisioning",
+    "crates/helios-wireguard",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
+    "apps/orion/src-tauri",
 ]
 
 [workspace.package]
@@ -72,9 +77,14 @@ netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
 blake3 = "1"
 zeroize = "1"
+# Backend WireGuard unifié (noyau Linux via netlink, Windows, ou userspace
+# BoringTun) derrière une seule API. Optionnel : activé par la feature
+# `wireguard` d'orion-core / heliosd.
+defguard_wireguard_rs = "0.11"
 
 aether = { path = "crates/aether" }
 helios-provisioning = { path = "crates/helios-provisioning" }
+helios-wireguard = { path = "crates/helios-wireguard" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }

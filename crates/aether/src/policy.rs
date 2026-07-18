@@ -23,8 +23,16 @@ pub struct FirewallPolicy {
     /// Interfaces côté LAN dont le trafic doit transiter par le tunnel.
     pub lan_ifaces: Vec<String>,
     /// Pairs (adresses IP) joignables en clair pour le transport WireGuard
-    /// (UDP 51820). Seul trafic autorisé à sortir du WAN hors tunnel.
+    /// (UDP 51820). Seul trafic autorisé à **sortir** du WAN hors tunnel.
+    /// Utile pour des pairs statiques (site-à-site) ; vide en pur road-warrior.
     pub wg_peers: Vec<String>,
+    /// Port UDP sur lequel la gateway **écoute** les clients WireGuard.
+    ///
+    /// `Some(port)` ouvre ce port en **entrée** depuis n'importe quelle source :
+    /// les road-warriors roament, leur IP est inconnue à l'avance. C'est la
+    /// seule ouverture entrante du modèle fail-closed, et elle est indispensable
+    /// — sans elle aucun client ne peut handshaker. `None` = pas de rôle serveur.
+    pub wg_listen_port: Option<u16>,
     /// Comportement hors tunnel.
     pub mode: PolicyMode,
     /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),

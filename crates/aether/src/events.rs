@@ -39,5 +39,6 @@ pub enum OrchestratorCmd {
     /// Applique une valeur de MSS clamping issue de la sonde PMTUD (usage interne).
     SetMssClamp(u16),
     /// Recharge la configuration réseau à chaud (sans redémarrer le daemon).
-    LoadNetworkConfig(NetworkConfig),
+    /// Boxée : `NetworkConfig` est bien plus grosse que les autres variantes.
+    LoadNetworkConfig(Box<NetworkConfig>),
 }

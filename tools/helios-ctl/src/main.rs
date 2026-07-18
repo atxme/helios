@@ -237,14 +237,12 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
     if let Some(ref iface) = cfg.admin_iface {
         println!("  {:<16} {}", "Iface admin", iface);
     }
-    println!("  {:<16} {}", "Connexions", cfg.connections.len());
-    for c in &cfg.connections {
-        let ids = match (&c.local_id, &c.remote_id) {
-            (Some(l), Some(r)) => format!("  ({l} → {r})"),
-            (Some(l), None)    => format!("  (local: {l})"),
-            _                  => String::new(),
-        };
-        println!("    - {} → {}{}", c.name, c.remote_addr, ids);
+    println!("  {:<16} {} (UDP {})", "Interface WG", cfg.wg_iface, cfg.wg_listen_port);
+    println!("  {:<16} {}", "Adresse WG", cfg.wg_address);
+    println!("  {:<16} {}", "Pairs", cfg.peers.len());
+    for p in &cfg.peers {
+        let pq = if p.preshared_key.is_some() { "  [PQ]" } else { "" };
+        println!("    - {} → {}{}", p.name, p.address, pq);
     }
     println!();
     Ok(())
@@ -271,8 +269,8 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .context("réponse JSON inattendue")?;
 
     if resp.ok {
-        println!("{} config réseau chargée ({} connexion(s))",
-            ok(), config.connections.len());
+        println!("{} config réseau chargée ({} pair(s))",
+            ok(), config.peers.len());
     } else {
         println!("{} refusé : {}", fail(), resp.error.as_deref().unwrap_or("?"));
     }

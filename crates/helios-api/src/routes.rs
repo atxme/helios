@@ -17,19 +17,24 @@ pub struct StatusResponse {
     pub lan_ifaces: Vec<String>,
     pub wg_peers: Vec<String>,
     pub allow_ssh_from: Vec<String>,
-    pub connections: Vec<ConnectionSummary>,
+    pub peers: Vec<PeerSummary>,
+    pub wg_iface: String,
+    pub wg_listen_port: Option<u16>,
     pub dry_run: bool,
     pub split_tunnel_cidrs: Vec<String>,
     pub mss_clamp: Option<u16>,
     pub captive_portal_gateway: Option<String>,
 }
 
+/// Un pair WireGuard autorisé, tel qu'exposé à l'IHM.
+/// La clé publique est publique par nature ; le PSK n'est jamais exposé,
+/// on n'en publie que la présence.
 #[derive(Serialize, Clone)]
-pub struct ConnectionSummary {
+pub struct PeerSummary {
     pub name: String,
-    pub remote_addr: String,
-    pub local_id: Option<String>,
-    pub remote_id: Option<String>,
+    pub public_key: String,
+    pub address: String,
+    pub post_quantum: bool,
 }
 
 #[derive(Serialize)]
@@ -66,12 +71,12 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     let policy = s.policy.read().await;
     let network = s.network.read().await;
 
-    let connections: Vec<ConnectionSummary> = network.connections.iter().map(|c| {
-        ConnectionSummary {
-            name: c.name.clone(),
-            remote_addr: c.remote_addr.clone(),
-            local_id: c.local_id.clone(),
-            remote_id: c.remote_id.clone(),
+    let peers: Vec<PeerSummary> = network.peers.iter().map(|p| {
+        PeerSummary {
+            name: p.name.clone(),
+            public_key: p.public_key.clone(),
+            address: p.address.clone(),
+            post_quantum: p.preshared_key.is_some(),
         }
     }).collect();
 
@@ -82,7 +87,9 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         lan_ifaces: network.lan_ifaces.clone(),
         wg_peers: network.wg_peers(),
         allow_ssh_from: network.allow_ssh_from.clone(),
-        connections,
+        peers,
+        wg_iface: network.wg_iface.clone(),
+        wg_listen_port: policy.wg_listen_port,
         dry_run: s.dry_run,
         split_tunnel_cidrs: policy.split_tunnel_cidrs.clone(),
         mss_clamp: policy.mss_clamp,
@@ -105,7 +112,7 @@ pub async fn network_set(
     if let Err(e) = new_config.save() {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
-    let ok = s.cmd_tx.send(OrchestratorCmd::LoadNetworkConfig(new_config)).await.is_ok();
+    let ok = s.cmd_tx.send(OrchestratorCmd::LoadNetworkConfig(Box::new(new_config))).await.is_ok();
     Ok(Json(if ok { CmdResponse::ok() } else { CmdResponse::err("orchestrateur injoignable") }))
 }
 
@@ -129,15 +136,32 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
         ruleset::Verdict::Accept => "accept",
     };
 
-    let mut lines = vec![
-        "table inet helios_kill {".to_string(),
-        "  chain forward {".to_string(),
-        format!("    type filter hook forward priority filter; policy {verdict_str};"),
-    ];
-    for rule in &rs.rules {
-        lines.push(format!("    {rule}"));
+    // Rendu fidèle à ce que le backend Netlink applique réellement : trois
+    // chaînes à hook, chacune avec sa politique par défaut.
+    let mut lines = vec!["table inet helios {".to_string()];
+    for kind in [
+        ruleset::ChainKind::Input,
+        ruleset::ChainKind::Forward,
+        ruleset::ChainKind::Output,
+    ] {
+        let name = kind.as_str();
+        lines.push(format!("  chain {name} {{"));
+        lines.push(format!(
+            "    type filter hook {name} priority filter; policy {verdict_str};"
+        ));
+        for rule in rs.chain(kind) {
+            match &rule.note {
+                Some(note) => lines.push(format!("    {rule}  # {note}")),
+                None => lines.push(format!("    {rule}")),
+            }
+        }
+        lines.push("  }".to_string());
     }
-    lines.push("  }".to_string());
+    if let Some(mss) = rs.mss_clamp {
+        lines.push(format!(
+            "  # MSS clamping demandé ({mss}) — non appliqué par le backend Netlink"
+        ));
+    }
     lines.push("}".to_string());
 
     Json(FirewallRulesResponse {

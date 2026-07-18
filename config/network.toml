@@ -1,25 +1,52 @@
-# Configuration réseau Helios — chargeable via :
+# Configuration réseau Helios (gateway WireGuard) — chargeable via :
 #   cargo run -p helios-ctl -- network load config/network.toml
 # ou via POST /api/network (JSON).
 #
 # Tous les autres paramètres sont compilés dans le binaire :
 #   - TPM : /dev/tpmrm0, PCR sha256 [0,4,7], /var/lib/helios/sealed.key
-#   - VICI : /var/run/charon.vici
 #   - API : 127.0.0.1:8080
-#   - IKE par défaut : profil hybride (ECDHE P-384 + ML-KEM-768)
 #   - Pare-feu : fail-closed (invariant de sécurité)
 
 wan_iface = "eth0"
 lan_ifaces = ["eth1"]
 
+# ── Plan de données WireGuard ────────────────────────────────────────────────
+# La gateway est un SERVEUR : elle écoute, les clients Orion s'y connectent.
+
+# Nom de l'interface créée par heliosd.
+wg_iface = "helios0"
+
+# Clé privée Curve25519 de la gateway, en base64. **SECRET.**
+# À générer sur la cible :  wg genkey
+# Clé publique correspondante (à donner aux clients) : echo <privkey> | wg pubkey
+wg_private_key = ""
+
+# Adresse de la gateway dans le tunnel. Plage CGNAT RFC 6598 (ADR-001 §4) : elle
+# évite les collisions avec les box résidentielles (192.168/16) et les réseaux
+# d'entreprise (10/8).
+wg_address = "100.64.0.1/10"
+
+# Port UDP d'écoute. C'est la seule ouverture entrante du modèle fail-closed.
+wg_listen_port = 51820
+
+# L'API web vit DERRIÈRE le tunnel : on la restreint à l'interface WireGuard.
+admin_iface = "helios0"
+
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
 # allow_ssh_from = ["10.0.0.0/8"]
 
-# Optionnel (passerelle uniquement) : restreindre l'API à une interface.
-# admin_iface = "ipsec0"
+# ── Pairs autorisés ──────────────────────────────────────────────────────────
+# À terme alimentés automatiquement par helios-provisioning à l'enrôlement.
+# En attendant, on les déclare à la main.
+#
+# `address` est la VIP du client : dans WireGuard, AllowedIPs EST la table de
+# routage cryptographique — deux pairs ne peuvent pas revendiquer la même.
+#
+# `preshared_key` porte le secret post-quantique issu de l'échange ML-KEM.
+# Absent = tunnel classique Curve25519 seul (pas de protection PQ).
 
-[[connections]]
-name = "site-a"
-remote_addr = "203.0.113.10"
-local_id = "client@helios"
-remote_id = "gw@example.net"
+# [[peers]]
+# name = "poste-christophe"
+# public_key = "<clé publique du client, base64>"
+# address = "100.64.1.2/32"
+# preshared_key = "<PSK ML-KEM, base64>"

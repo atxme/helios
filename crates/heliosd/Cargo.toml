@@ -13,6 +13,8 @@ path = "src/main.rs"
 default = []
 # Propage l'activation du backend Netlink réel (cible).
 netlink = ["helios-firewall/netlink"]
+# Backend WireGuard noyau réel (target-only, comme `netlink`).
+wireguard = ["helios-wireguard/wireguard"]
 # Embarque l'UI React dans le binaire.
 embed-ui = ["helios-api/embed-ui"]
 # Active la validation TPM réelle via libtss2-esys (cible uniquement, pas WSL2).
@@ -21,6 +23,7 @@ tpm = ["helio-tpm/tpm"]
 [dependencies]
 aether.workspace = true
 helios-firewall.workspace = true
+helios-wireguard.workspace = true
 helios-update.workspace = true
 helios-api.workspace = true
 helio-tpm.workspace = true

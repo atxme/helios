@@ -15,7 +15,7 @@ pub mod policy;
 pub mod pq;
 pub mod state;
 
-pub use config::{Connection, NetworkConfig, API_BIND, API_PORT};
+pub use config::{NetworkConfig, WgPeer, API_BIND, API_PORT};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
