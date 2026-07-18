@@ -27,6 +27,7 @@
 
 mod blob_store;
 mod boot_controller;
+pub mod escrow;
 pub mod keystore;
 mod provisioning;
 mod reseal_ticket;
@@ -37,6 +38,7 @@ mod tpm_interface;
 mod tpm_real;
 
 pub use boot_controller::{BootController, BootDecision};
+pub use escrow::EscrowError;
 pub use keystore::{KeystoreError, SealedKeystore};
 pub use secret::SecretKey;
 pub use settings::TpmSettings;
@@ -83,6 +85,9 @@ pub enum TpmError {
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),
+
+    #[error(transparent)]
+    Escrow(#[from] escrow::EscrowError),
 
     #[error("opération TPM réelle non implémentée ({0}) — à valider sur la cible")]
     NotImplemented(&'static str),

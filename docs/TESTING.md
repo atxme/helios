@@ -11,11 +11,15 @@ Elle exécute, avec les dépendances JavaScript verrouillées (`npm ci`) :
 1. le formatage, Clippy en mode `-D warnings`, les tests unitaires et les doc-tests Rust ;
 2. les tests de contrat REST du serveur Helios et les scénarios d’orchestration WireGuard en `dry-run` ;
 3. les tests unitaires des deux interfaces React ;
-4. la vérification TypeScript et le build de production de `web` et d’Orion.
+4. `npm audit` avec refus des vulnérabilités modérées, hautes ou critiques ;
+5. la vérification TypeScript et le build de production de `web` et d’Orion.
 
 La même campagne est obligatoire sur chaque push et pull request via
 `.github/workflows/regression.yml`. Une version ne doit être taguée que si ce
 job est vert.
+
+La recette interactive, les profils jetables et les contrôles des IHM sont
+décrits dans [MANUAL-TESTING.md](MANUAL-TESTING.md).
 
 ## Ce qui requiert la cible matérielle
 

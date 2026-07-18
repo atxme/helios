@@ -27,6 +27,8 @@ getrandom = "0.2"
 sha2 = "0.10"
 # AEAD (AES-256-GCM) du coffre chiffré par le secret descellé.
 aws-lc-rs.workspace = true
+# Séquestre de la clé WireGuard vers la clé publique de l'opérateur.
+x25519-dalek.workspace = true
 # Backend TPM réel — cible uniquement.
 tss-esapi = { version = "7.5", optional = true }
 

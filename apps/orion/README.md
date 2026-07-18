@@ -146,3 +146,7 @@ le canal `helios://event`.
 Depuis la racine du dépôt, `bash scripts/regression.sh` compile le shell Tauri,
 teste `orion-core`, exécute Vitest et construit le frontend. Les tests du backend
 WireGuard réel restent à effectuer sur la plateforme cible.
+
+La recette complète pour l'application Tauri, les profils jetables et le cycle
+adaptateur/connexion/déconnexion se trouve dans
+[`../../docs/MANUAL-TESTING.md`](../../docs/MANUAL-TESTING.md).

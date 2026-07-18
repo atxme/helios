@@ -255,7 +255,7 @@ async fn handle_external_cmd(
             // Rotation d'identité : on scelle d'abord, on n'applique qu'ensuite.
             // Sceller après avoir monté l'interface laisserait une fenêtre où la
             // clé en vigueur ne serait pas celle qui survivrait au redémarrage.
-            match crate::gateway_key::update_sealed(boot, &new_key) {
+            match crate::gateway_key::update_sealed(&*shared_network.read().await, boot, &new_key) {
                 Err(e) => {
                     warn!("rotation de la clé WireGuard refusée : {e}");
                     emit_log(event_tx, "error", &format!("Rotation refusée : {e}"));

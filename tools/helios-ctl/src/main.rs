@@ -87,14 +87,22 @@ struct Status {
     wan_iface: String,
     lan_ifaces: Vec<String>,
     wg_peers: Vec<String>,
-    connections: Vec<ConnSummary>,
+    allow_ssh_from: Vec<String>,
+    peers: Vec<PeerSummary>,
+    wg_iface: String,
+    wg_listen_port: Option<u16>,
     dry_run: bool,
+    split_tunnel_cidrs: Vec<String>,
+    mss_clamp: Option<u16>,
+    captive_portal_gateway: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ConnSummary {
+struct PeerSummary {
     name: String,
-    remote_addr: String,
+    public_key: String,
+    address: String,
+    post_quantum: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +116,8 @@ struct CmdResp {
 fn colored_state(s: &str) -> String {
     match s {
         "up" => format!("\x1b[32m{s}\x1b[0m"),
-        "rekeying" => format!("\x1b[33m{s}\x1b[0m"),
         "connecting" => format!("\x1b[33m{s}\x1b[0m"),
+        "captive_portal" => format!("\x1b[33m{s}\x1b[0m"),
         "failed" => format!("\x1b[31m{s}\x1b[0m"),
         _ => format!("\x1b[90m{s}\x1b[0m"),
     }
@@ -118,8 +126,8 @@ fn colored_state(s: &str) -> String {
 fn state_dot(s: &str) -> &'static str {
     match s {
         "up" => "\x1b[32m●\x1b[0m",
-        "rekeying" => "\x1b[33m●\x1b[0m",
         "connecting" => "\x1b[33m●\x1b[0m",
+        "captive_portal" => "\x1b[33m●\x1b[0m",
         "failed" => "\x1b[31m●\x1b[0m",
         _ => "\x1b[90m●\x1b[0m",
     }
@@ -192,9 +200,40 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  {:<14} {}", "WAN", s.wan_iface);
     println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
-    println!("  {:<14} {}", "Pairs WG", s.wg_peers.join(", "));
-    for c in &s.connections {
-        println!("  {:<14} {} → {}", c.name, c.name, c.remote_addr);
+    println!(
+        "  {:<14} {}{}",
+        "WireGuard",
+        s.wg_iface,
+        s.wg_listen_port
+            .map(|port| format!(" (UDP {port})"))
+            .unwrap_or_else(|| " (port fermé)".to_string())
+    );
+    for peer in &s.peers {
+        let pq = if peer.post_quantum { " [PQ]" } else { "" };
+        let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);
+        println!(
+            "  {:<14} {} → {} ({key}…){pq}",
+            "Pair", peer.name, peer.address
+        );
+    }
+    if !s.wg_peers.is_empty() {
+        println!("  {:<14} {}", "Site-à-site", s.wg_peers.join(", "));
+    }
+    if !s.allow_ssh_from.is_empty() {
+        println!("  {:<14} {}", "SSH autorisé", s.allow_ssh_from.join(", "));
+    }
+    if !s.split_tunnel_cidrs.is_empty() {
+        println!(
+            "  {:<14} {}",
+            "Split tunnel",
+            s.split_tunnel_cidrs.join(", ")
+        );
+    }
+    if let Some(mss) = s.mss_clamp {
+        println!("  {:<14} {}", "MSS clamp", mss);
+    }
+    if let Some(gateway) = &s.captive_portal_gateway {
+        println!("  {:<14} {}", "Portail captif", gateway);
     }
     println!();
     Ok(())
@@ -386,11 +425,13 @@ async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
         colored_state(&s.state)
     );
 
-    api_post(client, base, "/api/tunnel/start").await?;
+    let response = api_post(client, base, "/api/tunnel/start").await?;
+    ensure_command(response, "montée de l'interface")?;
     println!("  2/4  connexion…                {} commande envoyée", ok());
-    let t = wait_state(client, base, "up", 5).await?;
+    let target = if s.dry_run { "connecting" } else { "up" };
+    let t = wait_state(client, base, target, 5).await?;
     println!(
-        "       tunnel Up                 {} en {:.0}ms",
+        "       état {target:<10}          {} en {:.0}ms",
         ok(),
         t.as_millis()
     );
@@ -399,7 +440,8 @@ async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     println!("       {}  ok", ok());
 
-    api_post(client, base, "/api/tunnel/stop").await?;
+    let response = api_post(client, base, "/api/tunnel/stop").await?;
+    ensure_command(response, "arrêt de l'interface")?;
     println!("  4/4  déconnexion…              {} commande envoyée", ok());
     let t = wait_state(client, base, "down", 5).await?;
     println!(
@@ -424,13 +466,20 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
 
     let mut up_times = Vec::new();
     let mut down_times = Vec::new();
+    let target = if api_status(client, base).await?.dry_run {
+        "connecting"
+    } else {
+        "up"
+    };
 
     for i in 1..=cycles {
-        api_post(client, base, "/api/tunnel/start").await?;
-        let tu = wait_state(client, base, "up", 5).await?;
+        let response = api_post(client, base, "/api/tunnel/start").await?;
+        ensure_command(response, "montée de l'interface")?;
+        let tu = wait_state(client, base, target, 5).await?;
         up_times.push(tu.as_millis());
 
-        api_post(client, base, "/api/tunnel/stop").await?;
+        let response = api_post(client, base, "/api/tunnel/stop").await?;
+        ensure_command(response, "arrêt de l'interface")?;
         let td = wait_state(client, base, "down", 5).await?;
         down_times.push(td.as_millis());
 
@@ -458,6 +507,16 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
+    if response.ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{action} refusée : {}",
+        response.error.as_deref().unwrap_or("erreur inconnue")
+    )
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -480,5 +539,24 @@ async fn main() -> Result<()> {
             "flap" => scenario_flap(&client, base).await,
             other => anyhow::bail!("scénario inconnu '{other}'. Disponibles : nominal, flap"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Status;
+
+    #[test]
+    fn statut_wireguard_courant_est_deserialisable() {
+        let raw = r#"{
+            "state":"down","version":"0.1.0","wan_iface":"eth0",
+            "lan_ifaces":["eth1"],"wg_peers":[],"allow_ssh_from":[],
+            "peers":[{"name":"orion","public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":"100.64.1.2/32","post_quantum":false}],
+            "wg_iface":"helios0","wg_listen_port":51820,"dry_run":true,
+            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null
+        }"#;
+        let status: Status = serde_json::from_str(raw).expect("statut valide");
+        assert_eq!(status.wg_iface, "helios0");
+        assert_eq!(status.peers[0].name, "orion");
     }
 }

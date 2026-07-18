@@ -201,14 +201,16 @@ bash scripts/regression.sh
 ```
 
 Elle vérifie le formatage, Clippy avec avertissements interdits, tous les tests
-Rust, les tests Vitest et les builds de production des deux interfaces. La même
-campagne tourne dans GitHub Actions. Les contrôles spécifiques au matériel sont
-détaillés dans [docs/TESTING.md](docs/TESTING.md).
+Rust, les audits npm (seuil `moderate`), les tests Vitest et les builds de
+production des deux interfaces. La même campagne tourne dans GitHub Actions.
+Les contrôles spécifiques au matériel sont détaillés dans
+[docs/TESTING.md](docs/TESTING.md).
 
 ## Documentation
 
 - [ADR WireGuard](docs/ADR-001-WIREGUARD.md)
 - [Tests et validation cible](docs/TESTING.md)
+- [Tests manuels des binaires et des IHM](docs/MANUAL-TESTING.md)
 - [Développement WSL2](docs/WSL2-DEV.md)
 - [OTA RAUC](docs/OTA-RAUC.md)
 - [Architecture](docs/ARCHITECTURE.md) — document historique en cours de migration

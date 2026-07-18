@@ -5,7 +5,7 @@ mod orchestrator;
 
 use std::sync::Arc;
 
-use aether::{HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState};
+use aether::{HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use helio_tpm::{BootController, BootDecision, TpmSettings};
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "heliosd", version, about = "Orchestrateur VPN IPsec Helios")]
+#[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,8 +25,8 @@ struct Cli {
 enum Command {
     /// Lance le daemon (kill-switch + orchestration + interface web).
     Run {
-        /// Mode développement : simule le tunnel sans charon, nftables ni modules
-        /// IPsec. Activé automatiquement sur WSL2 si les modules ESP sont absents.
+        /// Mode développement : simule WireGuard, nftables, TPM et OTA.
+        /// Activé automatiquement sur WSL2 si WireGuard noyau est absent.
         #[arg(long)]
         dev: bool,
     },
@@ -68,20 +68,20 @@ fn is_wsl2() -> bool {
         .unwrap_or(false)
 }
 
-/// Vérifie si les modules ESP (data-plane IPsec) sont disponibles.
-fn ipsec_modules_present() -> bool {
-    std::path::Path::new("/sys/module/esp4").exists()
+/// Vérifie si le module WireGuard noyau est chargé.
+fn wireguard_module_present() -> bool {
+    std::path::Path::new("/sys/module/wireguard").exists()
 }
 
 /// Résout le mode dry-run : explicite (`--dev`) ou auto-détecté (WSL2 sans ESP).
 fn resolve_dry_run(explicit_dev: bool) -> bool {
     if explicit_dev {
-        info!("mode --dev activé : simulation sans charon ni nftables");
+        info!("mode --dev activé : simulation WireGuard, nftables, TPM et OTA");
         return true;
     }
-    if is_wsl2() && !ipsec_modules_present() {
+    if is_wsl2() && !wireguard_module_present() {
         warn!(
-            "WSL2 détecté sans modules ESP — bascule automatique en mode dev \
+            "WSL2 détecté sans module WireGuard — bascule automatique en mode dev \
              (simulation sans crypto)"
         );
         return true;
@@ -108,6 +108,10 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let resolved = gateway_key::resolve(&network, &boot);
     match resolved.origin {
         gateway_key::KeyOrigin::Sealed => {}
+        gateway_key::KeyOrigin::Recovered => warn!(
+            "identité restaurée depuis le séquestre après un changement de PCR — \
+             vérifier que le fichier de récupération a bien été effacé"
+        ),
         gateway_key::KeyOrigin::PlaintextConfig => warn!(
             "identité de la gateway en clair sur disque — sceller la clé puis retirer \
              `wg_private_key` de network.toml"
@@ -128,7 +132,14 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // L'API écoute sur l'adresse du tunnel : c'est par là que les clients Orion
     // atteignent le provisioning et la télémétrie. Le filtrage reste assuré par
     // le pare-feu (`admin_iface`), pas par l'adresse de bind.
-    let api_bind = shared_network.read().await.api_bind();
+    // Une simulation ne crée pas réellement l'adresse WireGuard. Elle écoute
+    // donc uniquement en local, ce qui rend le test manuel possible sans
+    // exposer l'API de développement sur le réseau de la machine.
+    let api_bind = if dry_run {
+        API_BIND_LOOPBACK.to_string()
+    } else {
+        shared_network.read().await.api_bind()
+    };
     info!("interface web sur http://{api_bind}");
 
     let state = AppState::new(

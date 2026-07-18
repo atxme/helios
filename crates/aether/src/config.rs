@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HeliosError, Result};
@@ -57,6 +59,19 @@ pub struct NetworkConfig {
     /// Pairs statiques joignables en sortie (site-à-site). Vide en road-warrior.
     #[serde(default)]
     pub static_peer_addrs: Vec<String>,
+
+    /// Clé **publique** X25519 de séquestre de l'opérateur, en base64.
+    ///
+    /// Quand elle est renseignée, la gateway chiffre une copie de sa clé privée
+    /// WireGuard vers cette clé à chaque scellement. Seul l'opérateur — qui
+    /// détient la moitié privée, gardée **hors** de la gateway — peut l'ouvrir.
+    ///
+    /// C'est ce qui permet de récupérer l'identité de la gateway après un
+    /// changement de PCR (nouveau kernel, bootloader, firmware) sans passer par
+    /// un accès SSH. Absente = pas de séquestre, la clé est alors définitivement
+    /// perdue dans ce cas.
+    #[serde(default)]
+    pub escrow_public_key: Option<String>,
 }
 
 fn default_wg_iface() -> String {
@@ -88,29 +103,41 @@ pub struct WgPeer {
 }
 
 impl NetworkConfig {
+    /// Chemin de configuration. `HELIOS_NETWORK_CONFIG` permet d'isoler les
+    /// essais manuels sans écrire dans `/var/lib/helios` ; le service de
+    /// production conserve le chemin système lorsqu'elle est absente.
+    pub fn path() -> PathBuf {
+        std::env::var_os("HELIOS_NETWORK_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(NETWORK_CONFIG_PATH))
+    }
+
     /// Charge la config réseau depuis `/var/lib/helios/network.toml`.
     /// Renvoie une config vide si le fichier n'existe pas encore.
     pub fn load() -> Result<Self> {
-        match std::fs::read_to_string(NETWORK_CONFIG_PATH) {
+        let path = Self::path();
+        match std::fs::read_to_string(&path) {
             Ok(raw) => toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(HeliosError::Config(format!(
-                "lecture de {NETWORK_CONFIG_PATH}: {e}"
+                "lecture de {}: {e}",
+                path.display()
             ))),
         }
     }
 
     /// Persiste la config réseau de façon atomique (rename).
     pub fn save(&self) -> Result<()> {
+        let path = Self::path();
         let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
-        let tmp = format!("{NETWORK_CONFIG_PATH}.tmp");
-        if let Some(parent) = std::path::Path::new(NETWORK_CONFIG_PATH).parent() {
+        let tmp = path.with_extension("toml.tmp");
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| HeliosError::Config(format!("création répertoire: {e}")))?;
         }
         std::fs::write(&tmp, raw.as_bytes())
             .map_err(|e| HeliosError::Config(format!("écriture: {e}")))?;
-        std::fs::rename(&tmp, NETWORK_CONFIG_PATH)
+        std::fs::rename(&tmp, &path)
             .map_err(|e| HeliosError::Config(format!("rename atomique: {e}")))?;
         Ok(())
     }

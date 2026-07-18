@@ -32,6 +32,27 @@ wg_listen_port = 51820
 # L'API web vit DERRIÈRE le tunnel : on la restreint à l'interface WireGuard.
 admin_iface = "helios0"
 
+# ── Séquestre de l'identité (reprise après changement de PCR) ────────────────
+# La clé privée ci-dessus est scellée par le TPM contre PCR 0/4/7 (firmware,
+# chaîne de démarrage, Secure Boot). Un nouveau kernel, bootloader ou firmware
+# déplace ces PCR : le secret est régénéré et la clé devient irrécupérable.
+# (Remplacer le seul binaire `heliosd` ne change RIEN — le rootfs n'est pas
+# mesuré dans ces PCR.)
+#
+# Le séquestre couvre ce cas SANS accès SSH : la gateway écrit une copie de sa
+# clé chiffrée vers la clé publique ci-dessous. Seul l'opérateur, qui détient la
+# moitié privée gardée HORS de la gateway, peut l'ouvrir.
+#
+# Reprise après changement de PCR :
+#   1. récupérer /var/lib/helios/wg-key.escrow
+#   2. l'ouvrir hors ligne avec la clé privée d'opérateur
+#   3. déposer la clé retrouvée dans /var/lib/helios/wg-key.recovery
+#      (livré avec le bundle OTA, comme le billet de rescellement)
+#   4. redémarrer : la gateway rescelle la clé et efface le fichier
+#
+# Absente = pas de filet : la clé serait définitivement perdue.
+# escrow_public_key = "<clé publique X25519 de l'opérateur, base64>"
+
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
 # allow_ssh_from = ["10.0.0.0/8"]
 

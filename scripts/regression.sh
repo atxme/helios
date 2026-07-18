@@ -19,6 +19,8 @@ cargo test --workspace
 for app in web apps/orion; do
   echo "==> Dépendances verrouillées : $app"
   npm ci --prefix "$app"
+  echo "==> Audit de sécurité : $app"
+  npm audit --prefix "$app" --audit-level=moderate
   echo "==> Tests frontend : $app"
   npm run test:unit --prefix "$app"
   echo "==> Build frontend : $app"
