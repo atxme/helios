@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createWebSocket, fetchStatus, tunnelStart, tunnelStop } from '../api'
+import {
+  createWebSocket,
+  fetchStatus,
+  releaseCaptivePortal,
+  setSplitTunnel,
+  tunnelStart,
+  tunnelStop,
+} from '../api'
 import type { DisplayEvent, HeliosEvent, Status, TelemetrySample, TunnelState } from '../types'
 
 const MAX_EVENTS = 100
@@ -14,17 +21,23 @@ export function useHelios() {
   const [telemetry, setTelemetry] = useState<TelemetrySample[]>([])
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting')
   const [tunnelUpSince, setTunnelUpSince] = useState<Date | null>(null)
-  const [selectedProfile, setSelectedProfile] = useState<string | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const backoffRef = useRef(1000)
 
-  const pushEvent = useCallback((ev: DisplayEvent) => {
+  const pushEvent = useCallback((event: DisplayEvent) => {
     const ts = new Date().toLocaleTimeString('fr-FR', { hour12: false })
-    setEvents(prev => [{ ...ev, ts }, ...prev].slice(0, MAX_EVENTS))
+    setEvents(previous => [{ ...event, ts }, ...previous].slice(0, MAX_EVENTS))
   }, [])
 
-  const connect = useCallback(() => {
+  const refresh = useCallback(async () => {
+    const next = await fetchStatus()
+    setStatus(next)
+    setError(null)
+    return next
+  }, [])
+
+  const connectWebSocket = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
     setWsStatus('connecting')
 
@@ -36,59 +49,73 @@ export function useHelios() {
       backoffRef.current = 1000
     }
 
-    ws.onmessage = (e: MessageEvent) => {
-      const ev: HeliosEvent = JSON.parse(e.data as string)
-      if (ev.type === 'state_changed') {
-        setStatus(s => s ? { ...s, state: ev.state } : s)
-        if (ev.state === 'up') setTunnelUpSince(new Date())
-        else if (ev.state === 'down' || ev.state === 'failed') setTunnelUpSince(null)
-      } else if (ev.type === 'telemetry') {
-        setTelemetry(prev => [...prev.slice(-(MAX_TELEMETRY - 1)), {
-          rx_bps: ev.rx_bps, tx_bps: ev.tx_bps, rx_pps: ev.rx_pps, tx_pps: ev.tx_pps,
+    ws.onmessage = (message: MessageEvent) => {
+      const event: HeliosEvent = JSON.parse(message.data as string)
+      if (event.type === 'state_changed') {
+        setStatus(current => current ? { ...current, state: event.state } : current)
+        if (event.state === 'up') setTunnelUpSince(current => current ?? new Date())
+        else setTunnelUpSince(null)
+      } else if (event.type === 'telemetry') {
+        setTelemetry(previous => [...previous.slice(-(MAX_TELEMETRY - 1)), {
+          rx_bps: event.rx_bps,
+          tx_bps: event.tx_bps,
+          rx_pps: event.rx_pps,
+          tx_pps: event.tx_pps,
         }])
         return
+      } else if (event.type === 'split_tunnel_changed') {
+        setStatus(current => current ? { ...current, split_tunnel_cidrs: event.cidrs } : current)
+      } else if (event.type === 'mtu_discovered') {
+        setStatus(current => current ? { ...current, mss_clamp: event.mss } : current)
+      } else if (event.type === 'captive_portal_detected') {
+        setStatus(current => current ? { ...current, captive_portal_gateway: event.gateway } : current)
       }
-      pushEvent(ev)
+      pushEvent(event)
     }
 
     ws.onclose = () => {
       setWsStatus('disconnected')
       const delay = Math.min(backoffRef.current, 30_000)
       backoffRef.current = delay * 2
-      reconnectRef.current = setTimeout(() => connect(), delay)
+      reconnectRef.current = setTimeout(connectWebSocket, delay)
     }
-
     ws.onerror = () => ws.close()
   }, [pushEvent])
 
   useEffect(() => {
-    fetchStatus()
-      .then(s => {
-        setStatus(s)
-        setError(null)
-        setSelectedProfile(s.active_profile)
-      })
-      .catch(() => setError('Impossible de joindre le daemon — vérifiez que heliosd tourne sur :8080'))
-    connect()
+    refresh().catch(() => setError('Impossible de joindre heliosd sur son adresse d’administration'))
+    connectWebSocket()
     return () => {
       if (reconnectRef.current) clearTimeout(reconnectRef.current)
       wsRef.current?.close()
     }
-  }, [connect])
+  }, [connectWebSocket, refresh])
 
-  const handleConnect = async () => {
-    await tunnelStart(selectedProfile ?? undefined)
-  }
-
-  const handleDisconnect = async () => {
-    await tunnelStop()
+  const run = async (action: () => Promise<void>) => {
+    setError(null)
+    try {
+      await action()
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+      throw cause
+    }
   }
 
   const currentState: TunnelState = status?.state ?? 'down'
 
   return {
-    status, error, events, telemetry, wsStatus, currentState,
-    tunnelUpSince, selectedProfile, setSelectedProfile,
-    connect: handleConnect, disconnect: handleDisconnect,
+    status,
+    error,
+    events,
+    telemetry,
+    wsStatus,
+    currentState,
+    tunnelUpSince,
+    refresh,
+    connect: () => run(tunnelStart),
+    disconnect: () => run(tunnelStop),
+    releaseCaptivePortal: () => run(releaseCaptivePortal),
+    updateSplitTunnel: (cidrs: string[]) => run(() => setSplitTunnel(cidrs)),
   }
 }

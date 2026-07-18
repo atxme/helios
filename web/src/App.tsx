@@ -4,7 +4,7 @@ import type { NavId } from './components/Layout'
 import { useHelios } from './hooks/useHelios'
 import { DashboardView } from './views/Dashboard'
 import { FirewallView } from './views/Firewall'
-import { IPsecSAView } from './views/IPsecSA'
+import { WireGuardView } from './views/WireGuard'
 import { SettingsView } from './views/Settings'
 import { TelemetryView } from './views/Telemetry'
 
@@ -28,23 +28,22 @@ export default function App() {
           events={helios.events}
           wsStatus={helios.wsStatus}
           tunnelUpSince={helios.tunnelUpSince}
-          selectedProfile={helios.selectedProfile}
-          onProfileChange={helios.setSelectedProfile}
           connect={helios.connect}
           disconnect={helios.disconnect}
+          releaseCaptivePortal={helios.releaseCaptivePortal}
         />
       )}
       {nav === 'telemetry' && (
         <TelemetryView samples={helios.telemetry} status={helios.status} />
       )}
-      {nav === 'ipsec' && (
-        <IPsecSAView status={helios.status} currentState={helios.currentState} />
+      {nav === 'wireguard' && (
+        <WireGuardView status={helios.status} currentState={helios.currentState} />
       )}
       {nav === 'firewall' && (
         <FirewallView status={helios.status} state={helios.currentState} />
       )}
       {nav === 'settings' && (
-        <SettingsView status={helios.status} />
+        <SettingsView status={helios.status} onSplitTunnelChange={helios.updateSplitTunnel} />
       )}
     </Layout>
   )

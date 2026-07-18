@@ -62,9 +62,7 @@ impl<'a> BlobStore<'a> {
 
     pub(crate) fn load_state(&self) -> Result<TpmState> {
         match std::fs::read(&self.cfg.state_path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|e| TpmError::Serde(e.to_string()))
-            }
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| TpmError::Serde(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TpmState::default()),
             Err(e) => Err(io_err(&self.cfg.state_path, e)),
         }

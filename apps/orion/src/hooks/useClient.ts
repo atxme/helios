@@ -4,7 +4,6 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
-  PredefinedProfile,
   TelemetrySample,
   TunnelState,
 } from '../types'
@@ -13,9 +12,9 @@ const MAX_LOGS = 80
 
 export function useClient() {
   const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null })
-  const [predefined, setPredefined] = useState<PredefinedProfile[]>([])
   const [state, setState] = useState<TunnelState>('down')
   const [backend, setBackend] = useState<string>('')
+  const [adapterUp, setAdapterUp] = useState(false)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [telemetry, setTelemetry] = useState<TelemetrySample | null>(null)
   const [upSince, setUpSince] = useState<number | null>(null)
@@ -30,14 +29,15 @@ export function useClient() {
   // Chargement initial + abonnement aux événements du backend.
   useEffect(() => {
     api.getConfig().then(setConfig).catch((e) => setError(String(e)))
-    api.listPredefined().then(setPredefined).catch(() => {})
     api.getState().then(setState).catch(() => {})
     api.backendKind().then(setBackend).catch(() => {})
+    api.adapterIsUp().then(setAdapterUp).catch(() => {})
 
     const unlisten = api.onEvent((ev) => {
       switch (ev.type) {
         case 'state_changed':
           setState(ev.state)
+          api.adapterIsUp().then(setAdapterUp).catch(() => {})
           if (ev.state === 'up') {
             if (upSinceRef.current === null) {
               upSinceRef.current = Date.now()
@@ -78,21 +78,40 @@ export function useClient() {
   const disconnect = useCallback(async () => {
     try {
       await api.disconnect()
+      setAdapterUp(false)
     } catch (e) {
       setError(String(e))
     }
   }, [])
 
   const saveProfile = useCallback(async (p: ClientProfile) => {
-    setConfig(await api.saveProfile(p))
+    try {
+      setError(null)
+      setConfig(await api.saveProfile(p))
+    } catch (cause) {
+      setError(String(cause))
+      throw cause
+    }
   }, [])
 
   const removeProfile = useCallback(async (name: string) => {
-    setConfig(await api.deleteProfile(name))
+    try {
+      setError(null)
+      setConfig(await api.deleteProfile(name))
+    } catch (cause) {
+      setError(String(cause))
+      throw cause
+    }
   }, [])
 
   const select = useCallback(async (name: string) => {
-    setConfig(await api.selectProfile(name))
+    try {
+      setError(null)
+      setConfig(await api.selectProfile(name))
+    } catch (cause) {
+      setError(String(cause))
+      throw cause
+    }
   }, [])
 
   const selectedProfile =
@@ -100,9 +119,9 @@ export function useClient() {
 
   return {
     config,
-    predefined,
     state,
     backend,
+    adapterUp,
     logs,
     telemetry,
     upSince,

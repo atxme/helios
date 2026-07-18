@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use aether::Result;
+use async_trait::async_trait;
 use tracing::info;
 
 use crate::{InstallOutcome, Release, UpdateChannel};
@@ -27,10 +27,7 @@ impl UpdateChannel for DryRunChannel {
     }
 
     async fn check(&self) -> Result<Option<Release>> {
-        Ok(self
-            .available
-            .clone()
-            .filter(|r| r.version != self.current))
+        Ok(self.available.clone().filter(|r| r.version != self.current))
     }
 
     async fn install(&self, release: &Release) -> Result<InstallOutcome> {

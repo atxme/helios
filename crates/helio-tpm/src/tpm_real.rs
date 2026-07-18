@@ -85,12 +85,10 @@ impl TpmSealer for TpmDevice {
         let alg = hash_alg_from_bank(&self.bank)?;
         let selection = pcr_selection(alg, &self.indices)?;
 
-        let (_, _, digests) = ctx
-            .pcr_read(selection)
-            .map_err(|e| TpmError::PcrRead {
-                index: 0,
-                cause: e.to_string(),
-            })?;
+        let (_, _, digests) = ctx.pcr_read(selection).map_err(|e| TpmError::PcrRead {
+            index: 0,
+            cause: e.to_string(),
+        })?;
 
         // Empreinte d'identité de l'état PCR (sert à lier le billet de rescellement) :
         // SHA-256 de la concaténation des valeurs PCR lues, dans l'ordre.
@@ -127,7 +125,14 @@ impl TpmSealer for TpmDevice {
 
             let created = ctx
                 .execute_with_session(Some(session), |ctx| {
-                    ctx.create(primary.key_handle, public, None, Some(sensitive), None, None)
+                    ctx.create(
+                        primary.key_handle,
+                        public,
+                        None,
+                        Some(sensitive),
+                        None,
+                        None,
+                    )
                 })
                 .map_err(|e| TpmError::Connection(format!("create (seal): {e}")));
 
@@ -242,7 +247,8 @@ fn pcr_selection(
 }
 
 fn empty_digest() -> Result<Digest> {
-    Digest::try_from(Vec::<u8>::new()).map_err(|e| TpmError::Connection(format!("digest vide: {e}")))
+    Digest::try_from(Vec::<u8>::new())
+        .map_err(|e| TpmError::Connection(format!("digest vide: {e}")))
 }
 
 /// Gabarit de la clé primaire ECC P-256 (clé de stockage restreinte).

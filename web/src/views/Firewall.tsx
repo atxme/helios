@@ -4,7 +4,11 @@ import { applyFirewallRules, fetchFirewallRules } from '../api'
 import type { Status, TunnelState } from '../types'
 
 const KILL_SWITCH_ENGAGED: Record<TunnelState, boolean> = {
-  up: false, rekeying: false, connecting: true, down: true, failed: true,
+  up: false,
+  connecting: true,
+  down: true,
+  failed: true,
+  captive_portal: true,
 }
 
 interface Props {
@@ -42,7 +46,12 @@ function NftablesEditor({ dryRun }: { dryRun: boolean }) {
     try {
       await applyFirewallRules(rules)
       setOriginal(rules)
-      setFeedback({ ok: true, msg: dryRun ? 'Reçu (dry-run — non appliqué au kernel)' : 'Règles appliquées' })
+      setFeedback({
+        ok: true,
+        msg: dryRun
+          ? 'Reçu en simulation — aucune application kernel'
+          : 'Commande reçue — l’application de rulesets bruts reste à câbler dans l’orchestrateur',
+      })
     } catch {
       setFeedback({ ok: false, msg: 'Erreur lors de l\'envoi' })
     } finally {
@@ -53,7 +62,7 @@ function NftablesEditor({ dryRun }: { dryRun: boolean }) {
     <div className="card overflow-hidden">
       <div className="flex items-center gap-2 px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60 bg-slate-50/60 dark:bg-slate-950/40">
         <Terminal className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" strokeWidth={1.5} />
-        <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500">Éditeur nftables</span>
+        <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500">Ruleset nftables · expérimental</span>
         {dirty && (
           <span className="ml-2 text-[10px] text-amber-600 dark:text-amber-400 font-mono">● modifié</span>
         )}
@@ -78,7 +87,7 @@ function NftablesEditor({ dryRun }: { dryRun: boolean }) {
               disabled:opacity-30 disabled:cursor-not-allowed"
           >
             <Save className="h-3 w-3" strokeWidth={2} />
-            {saving ? 'Envoi…' : 'Appliquer'}
+            {saving ? 'Envoi…' : 'Transmettre'}
           </button>
         </div>
       </div>
@@ -87,6 +96,13 @@ function NftablesEditor({ dryRun }: { dryRun: boolean }) {
         <div className="flex items-center gap-2 px-5 py-2 border-b border-amber-500/20 bg-amber-500/5 text-xs text-amber-600 dark:text-amber-400">
           <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.5} />
           Mode simulation — les règles seront journalisées mais non appliquées au kernel
+        </div>
+      )}
+
+      {!dryRun && (
+        <div className="flex items-center gap-2 px-5 py-2 border-b border-amber-500/20 bg-amber-500/5 text-xs text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.5} />
+          Le rendu reflète la politique structurée ; l’application de texte nftables personnalisé n’est pas encore implémentée.
         </div>
       )}
 
@@ -128,7 +144,7 @@ export function FirewallView({ status, state }: Props) {
     <div className="space-y-4 max-w-4xl">
       <div>
         <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-200 tracking-wide">Pare-feu · Kill-switch</h1>
-        <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic autorisé uniquement via ESP/XFRM</p>
+        <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic LAN autorisé uniquement après un handshake WireGuard frais</p>
       </div>
 
       {/* Carte kill-switch */}
@@ -148,8 +164,10 @@ export function FirewallView({ status, state }: Props) {
             </div>
             <p className="text-slate-500 text-xs">
               {engaged
-                ? 'Tout trafic est bloqué — aucune fuite réseau possible hors du tunnel ESP'
-                : 'Trafic autorisé via ESP/XFRM · Chiffrement actif sur toutes les interfaces LAN'}
+                ? state === 'captive_portal'
+                  ? 'Kill-switch partiel — HTTP/HTTPS limité à la passerelle du portail captif'
+                  : 'Trafic LAN bloqué — seuls WireGuard et les exceptions d’administration restent autorisés'
+                : 'Trafic LAN autorisé à travers l’interface WireGuard'}
             </p>
           </div>
           <div className="ml-auto shrink-0">
@@ -171,8 +189,8 @@ export function FirewallView({ status, state }: Props) {
             <>
               <Row icon={Globe}   label="WAN"          value={status.wan_iface} />
               <Row icon={Network} label="LAN protégé"  value={status.lan_ifaces.join(', ')} />
-              <Row icon={Wifi}    label="IKE peers"    value={status.ike_peers.join(', ')} />
-              <Row icon={Server}  label="Connexions"   value={`${status.connections.length} IKEv2`} />
+              <Row icon={Wifi}    label="Écoute WG"     value={status.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'fermée'} />
+              <Row icon={Server}  label="Pairs admis"   value={`${status.peers.length}`} />
             </>
           ) : (
             <p className="text-slate-500 dark:text-slate-400 text-xs animate-pulse">Chargement…</p>

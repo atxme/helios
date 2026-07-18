@@ -14,6 +14,10 @@ embed-ui = ["dep:rust-embed"]
 [dependencies]
 aether.workspace = true
 helios-firewall.workspace = true
+x25519-dalek = { workspace = true }
+base64.workspace = true
+helios-wireguard.workspace = true
+helios-provisioning.workspace = true
 axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }

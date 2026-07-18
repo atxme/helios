@@ -111,7 +111,12 @@ pub struct Rule {
 
 impl Rule {
     fn new(chain: ChainKind, matches: Vec<Match>, verdict: Verdict) -> Self {
-        Self { chain, matches, verdict, note: None }
+        Self {
+            chain,
+            matches,
+            verdict,
+            note: None,
+        }
     }
 
     fn with_note(mut self, note: impl Into<String>) -> Self {
@@ -172,7 +177,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             Rule::new(
                 Input,
                 vec![
-                    Match::DestPort { port, proto: L4::Tcp },
+                    Match::DestPort {
+                        port,
+                        proto: L4::Tcp,
+                    },
                     Match::InIface(iface.to_string()),
                 ],
                 Verdict::Accept,
@@ -182,7 +190,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         rules.push(
             Rule::new(
                 Input,
-                vec![Match::DestPort { port, proto: L4::Tcp }],
+                vec![Match::DestPort {
+                    port,
+                    proto: L4::Tcp,
+                }],
                 Verdict::Drop,
             )
             .with_note(
@@ -209,7 +220,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 Input,
                 vec![
                     Match::InIface(wan.clone()),
-                    Match::DestPort { port, proto: L4::Udp },
+                    Match::DestPort {
+                        port,
+                        proto: L4::Udp,
+                    },
                 ],
                 Verdict::Accept,
             )
@@ -226,7 +240,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             vec![
                 Match::OutIface(wan.clone()),
                 Match::DestNet(peer.clone()),
-                Match::DestPort { port: 51820, proto: L4::Udp },
+                Match::DestPort {
+                    port: 51820,
+                    proto: L4::Udp,
+                },
             ],
             Verdict::Accept,
         ));
@@ -238,7 +255,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             Input,
             vec![
                 Match::SourceNet(src.clone()),
-                Match::DestPort { port: 22, proto: L4::Tcp },
+                Match::DestPort {
+                    port: 22,
+                    proto: L4::Tcp,
+                },
             ],
             Verdict::Accept,
         ));
@@ -246,7 +266,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
 
     if state.captive_portal_active() {
         // Portail captif : on lève le kill-switch pour HTTP/HTTPS seulement.
-        let ports = Match::DestPortSet { ports: vec![80, 443], proto: L4::Tcp };
+        let ports = Match::DestPortSet {
+            ports: vec![80, 443],
+            proto: L4::Tcp,
+        };
         match &policy.captive_portal_gateway {
             Some(gw) => {
                 for chain in [Output, Forward] {
@@ -310,7 +333,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     Ruleset {
         default_verdict,
         rules,
-        mss_clamp: state.traffic_allowed().then_some(policy.mss_clamp).flatten(),
+        mss_clamp: state
+            .traffic_allowed()
+            .then_some(policy.mss_clamp)
+            .flatten(),
     }
 }
 
@@ -401,7 +427,11 @@ mod tests {
 
     #[test]
     fn fail_closed_default_is_always_drop() {
-        for st in [TunnelState::Down, TunnelState::Failed, TunnelState::Connecting] {
+        for st in [
+            TunnelState::Down,
+            TunnelState::Failed,
+            TunnelState::Connecting,
+        ] {
             assert_eq!(render(&policy(), st).default_verdict, Verdict::Drop);
         }
     }

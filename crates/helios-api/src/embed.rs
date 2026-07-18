@@ -47,7 +47,9 @@ async fn serve_embedded(uri: Uri) -> Response {
             ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
         }
         None => match Assets::get("index.html") {
-            Some(content) => Html(String::from_utf8_lossy(&content.data).into_owned()).into_response(),
+            Some(content) => {
+                Html(String::from_utf8_lossy(&content.data).into_owned()).into_response()
+            }
             None => StatusCode::NOT_FOUND.into_response(),
         },
     }

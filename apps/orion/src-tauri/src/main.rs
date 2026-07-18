@@ -1,14 +1,14 @@
 // Empêche l'ouverture d'une console Windows en mode release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Shell Tauri du client VPN Helios.
+//! Shell Tauri du client VPN Orion.
 //!
-//! Mince couche de câblage : il ne contient aucune logique IPsec (déléguée à
+//! Mince couche de câblage : il ne contient aucune logique WireGuard (déléguée à
 //! `orion-core`). Son rôle est de :
 //! 1. exposer des commandes `invoke` au frontend (connect/disconnect, CRUD profils) ;
 //! 2. relayer les [`ClientEvent`] du cœur vers le frontend (`emit`) ;
 //! 3. démarrer la télémétrie heliosd **uniquement** quand le tunnel passe `Up`
-//!    (le serveur web vit derrière l'IPsec) et l'arrêter à la déconnexion.
+//!    (le serveur web vit derrière WireGuard) et l'arrêter à la déconnexion.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -66,10 +66,9 @@ fn emit_sink(app: AppHandle) -> EventSink {
 
 // ─── Commandes invoquées par le frontend ───────────────────────────────────────
 
-// Bascule WireGuard (ADR-001) : la liste des profils cryptographiques IKE
-// prédéfinis (`list_predefined`) a disparu — WireGuard n'a qu'une seule suite
-// (ChaCha20-Poly1305). Le choix de sécurité se réduit au profil PQ (PSK ML-KEM),
-// géré côté enrôlement. Le modèle WireGuard du client arrive en Phase C.
+// WireGuard n'a qu'une seule suite (ChaCha20-Poly1305). La protection
+// post-quantique vient du PSK ML-KEM ; son provisioning automatique restera
+// masqué dans l'IHM tant que son installation gateway n'est pas câblée.
 
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> String {
@@ -79,6 +78,13 @@ fn get_state(state: State<'_, AppState>) -> String {
 #[tauri::command]
 fn backend_kind(state: State<'_, AppState>) -> &'static str {
     state.controller.backend_kind()
+}
+
+/// Indique si l'adaptateur WireGuard est toujours monté. En cas d'échec, il
+/// doit rester debout pour capter les routes et empêcher une fuite en clair.
+#[tauri::command]
+fn adapter_is_up(state: State<'_, AppState>) -> bool {
+    state.controller.adapter_is_up()
 }
 
 #[tauri::command]
@@ -98,10 +104,7 @@ async fn save_profile(
 }
 
 #[tauri::command]
-async fn delete_profile(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<ClientConfig, String> {
+async fn delete_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
     cfg.remove(&name);
     cfg.save().map_err(|e| e.to_string())?;
@@ -109,10 +112,7 @@ async fn delete_profile(
 }
 
 #[tauri::command]
-async fn select_profile(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<ClientConfig, String> {
+async fn select_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
     cfg.selected = Some(name);
     cfg.save().map_err(|e| e.to_string())?;
@@ -187,8 +187,7 @@ async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -204,6 +203,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             backend_kind,
+            adapter_is_up,
             get_config,
             save_profile,
             delete_profile,

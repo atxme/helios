@@ -138,11 +138,7 @@ mod tests {
     }
 
     /// Écrit un billet signé par la clé de développement sur le disque.
-    fn write_ticket(
-        path: &std::path::Path,
-        version: u64,
-        expected_pcr_digest: Option<[u8; 32]>,
-    ) {
+    fn write_ticket(path: &std::path::Path, version: u64, expected_pcr_digest: Option<[u8; 32]>) {
         const DOMAIN: &[u8] = b"helios-tpm-reseal-v1";
         let sk = SigningKey::from_bytes(&DEV_VENDOR_SEED);
         let mut msg = Vec::new();

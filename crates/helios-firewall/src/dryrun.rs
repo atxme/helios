@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use aether::{FirewallPolicy, Result, TunnelState};
+use async_trait::async_trait;
 use tracing::info;
 
 use crate::ruleset::{render, ChainKind};

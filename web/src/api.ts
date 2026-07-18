@@ -1,49 +1,34 @@
-// Les URLs sont relatives : en dev Vite proxy /api et /ws vers heliosd:8080,
-// en prod tout vient du même serveur Axum.
-import type { Status } from './types'
+// En dev, Vite proxie /api et /ws vers heliosd. En production, l'interface
+// embarquée et l'API sont servies par le même processus Axum.
+import type { CommandResponse, FirewallRules, Status } from './types'
 
-export async function fetchStatus(): Promise<Status> {
-  const res = await fetch('/api/status')
-  if (!res.ok) throw new Error(`status ${res.status}`)
-  return res.json()
+async function json<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return response.json() as Promise<T>
 }
 
-export async function tunnelStart(profileId?: string): Promise<void> {
-  await fetch('/api/tunnel/start', {
+async function command(url: string, body?: unknown): Promise<void> {
+  const response = await json<CommandResponse>(url, {
     method: 'POST',
-    ...(profileId
-      ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ profile: profileId }) }
-      : {}),
+    ...(body === undefined ? {} : {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
   })
+  if (!response.ok) throw new Error(response.error ?? 'commande refusée')
 }
 
-export async function tunnelStop(): Promise<void> {
-  await fetch('/api/tunnel/stop', { method: 'POST' })
-}
+export const fetchStatus = () => json<Status>('/api/status')
+export const tunnelStart = () => command('/api/tunnel/start')
+export const tunnelStop = () => command('/api/tunnel/stop')
+export const releaseCaptivePortal = () => command('/api/captive-portal/release')
+export const setSplitTunnel = (cidrs: string[]) => command('/api/split-tunnel', { cidrs })
 
-export async function connectionApply(ike_proposal: string, esp_proposal: string): Promise<void> {
-  await fetch('/api/connections/apply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ike_proposal, esp_proposal }),
-  })
-}
-
-export async function fetchFirewallRules(): Promise<import('./types').FirewallRules> {
-  const res = await fetch('/api/firewall/rules')
-  if (!res.ok) throw new Error(`status ${res.status}`)
-  return res.json()
-}
-
-export async function applyFirewallRules(rules: string): Promise<void> {
-  await fetch('/api/firewall/rules', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rules }),
-  })
-}
+export const fetchFirewallRules = () => json<FirewallRules>('/api/firewall/rules')
+export const applyFirewallRules = (rules: string) => command('/api/firewall/rules', { rules })
 
 export function createWebSocket(): WebSocket {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return new WebSocket(`${proto}//${window.location.host}/ws`)
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return new WebSocket(`${protocol}//${window.location.host}/ws`)
 }

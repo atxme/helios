@@ -4,10 +4,10 @@
 //! sans attendre le prochain événement. On souscrit au broadcast AVANT de lire
 //! l'état pour éviter de manquer une transition simultanée.
 
+use aether::HeliosEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
-use aether::HeliosEvent;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::AppState;

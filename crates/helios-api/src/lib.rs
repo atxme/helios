@@ -16,6 +16,7 @@
 //! (RwLock partagé avec l'orchestrateur).
 
 pub mod embed;
+pub mod provision;
 pub mod routes;
 pub mod ws;
 
@@ -50,7 +51,14 @@ impl AppState {
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
         policy: Arc<RwLock<FirewallPolicy>>,
     ) -> Self {
-        Self { tunnel_state, event_tx, cmd_tx, network, dry_run, policy }
+        Self {
+            tunnel_state,
+            event_tx,
+            cmd_tx,
+            network,
+            dry_run,
+            policy,
+        }
     }
 }
 
@@ -66,11 +74,18 @@ pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
         .route("/api/status", get(routes::status))
         .route("/api/network", get(routes::network_get))
         .route("/api/network", post(routes::network_set))
+        // Provisioning : joignable uniquement dans le tunnel, comme le reste.
+        .route("/api/provision", post(provision::provision))
+        // Rotation de l'identité WireGuard de la gateway — tunnel uniquement.
+        .route("/api/gateway/wireguard-key", post(routes::gateway_key_set))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .route("/api/firewall/rules", post(routes::firewall_rules_apply))
-        .route("/api/captive-portal/release", post(routes::captive_portal_release))
+        .route(
+            "/api/captive-portal/release",
+            post(routes::captive_portal_release),
+        )
         .route("/api/split-tunnel", post(routes::split_tunnel_set))
         .route("/ws", get(ws::handler))
         .fallback(embed::static_handler)

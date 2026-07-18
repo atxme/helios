@@ -20,8 +20,6 @@ export function stateMeta(state: TunnelState): StateMeta {
   switch (state) {
     case 'up':
       return { label: 'Connecté', color: UP, glow: 'shadow-neon-emerald', active: true, transitioning: false }
-    case 'rekeying':
-      return { label: 'Renégociation', color: UP, glow: 'shadow-neon-emerald', active: true, transitioning: false }
     case 'connecting':
       return { label: 'Connexion…', color: TRANSIT, glow: 'shadow-neon-amber', active: false, transitioning: true }
     case 'captive_portal':

@@ -1,21 +1,25 @@
 //! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu <-> OTA.
 //!
-//! État de la bascule (ADR-001) : le plan de contrôle VICI/charon a été retiré.
-//! La montée réelle du tunnel WireGuard (via `defguard_wireguard_rs`, netlink)
-//! est **target-only** et pas encore câblée ici — comme le backend Netlink du
-//! pare-feu. En dry-run (WSL2/dev), on simule la cinématique de montée.
+//! La gateway est un **serveur** : elle monte son interface WireGuard, écoute en
+//! UDP 51820 et attend les clients. Elle ne compose vers personne. L'état passe
+//! donc à `Connecting` dès l'interface montée, et c'est le poller de handshakes
+//! qui promeut vers `Up` quand un pair est réellement connecté — WireGuard étant
+//! sans connexion, `Up` s'infère et ne se reçoit pas (ADR-001 §3).
+//!
+//! Le plan de données réel vit derrière les features `wireguard`
+//! (`helios-wireguard`) et `netlink` (`helios-firewall`) : elles **compilent**
+//! partout mais ne peuvent **tourner** que sur la cible. Sans elles, ou en
+//! dry-run, on retombe sur les backends de simulation.
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Context;
 use aether::{
     FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelEvent, TunnelState,
 };
+use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_wireguard::{
-    InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT,
-};
 use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
+use helios_wireguard::{InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -97,7 +101,10 @@ fn update_channel(dry_run: bool) -> Box<dyn UpdateChannel> {
 }
 
 fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
-    let _ = tx.send(HeliosEvent::Log { level: level.into(), message: message.into() });
+    let _ = tx.send(HeliosEvent::Log {
+        level: level.into(),
+        message: message.into(),
+    });
 }
 
 async fn transition(
@@ -109,7 +116,9 @@ async fn transition(
 ) -> anyhow::Result<()> {
     *shared.write().await = new_state;
     let _ = event_tx.send(HeliosEvent::StateChanged { state: new_state });
-    fw.apply(policy, new_state).await.context("application du pare-feu")?;
+    fw.apply(policy, new_state)
+        .await
+        .context("application du pare-feu")?;
     Ok(())
 }
 
@@ -125,6 +134,9 @@ pub async fn run(
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
+    // Détenue ici et nulle part ailleurs : le secret de scellement TPM ne doit
+    // pas transiter par le crate API. Seul l'orchestrateur peut sceller.
+    boot: helio_tpm::BootDecision,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
@@ -137,13 +149,28 @@ pub async fn run(
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
 
     // 1. Fail-closed AVANT tout contact réseau.
-    transition(&shared_state, &event_tx, TunnelState::Down, fw.as_ref(), &policy).await?;
+    transition(
+        &shared_state,
+        &event_tx,
+        TunnelState::Down,
+        fw.as_ref(),
+        &policy,
+    )
+    .await?;
     info!("kill-switch engagé, démarrage en fail-closed");
 
     // 2. Montée initiale du tunnel.
     {
         let network = shared_network.read().await;
-        do_connect(&network, wg.as_ref(), &shared_state, &event_tx, fw.as_ref(), &policy).await?;
+        do_connect(
+            &network,
+            wg.as_ref(),
+            &shared_state,
+            &event_tx,
+            fw.as_ref(),
+            &policy,
+        )
+        .await?;
         let wan = network.wan_iface.clone();
         drop(network);
         spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
@@ -176,7 +203,7 @@ pub async fn run(
                     Some(c) => {
                         handle_external_cmd(
                             c, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
-                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy,
+                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
                         ).await?;
                     }
                 }
@@ -210,6 +237,7 @@ async fn handle_external_cmd(
     policy: &mut FirewallPolicy,
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
+    boot: &helio_tpm::BootDecision,
 ) -> anyhow::Result<()> {
     match cmd {
         OrchestratorCmd::Connect => {
@@ -223,15 +251,60 @@ async fn handle_external_cmd(
             sync_policy(shared_policy, policy).await;
         }
 
+        OrchestratorCmd::UpdateGatewayKey(new_key) => {
+            // Rotation d'identité : on scelle d'abord, on n'applique qu'ensuite.
+            // Sceller après avoir monté l'interface laisserait une fenêtre où la
+            // clé en vigueur ne serait pas celle qui survivrait au redémarrage.
+            match crate::gateway_key::update_sealed(boot, &new_key) {
+                Err(e) => {
+                    warn!("rotation de la clé WireGuard refusée : {e}");
+                    emit_log(event_tx, "error", &format!("Rotation refusée : {e}"));
+                }
+                Ok(()) => {
+                    {
+                        let mut network = shared_network.write().await;
+                        network.wg_private_key = new_key;
+                    }
+                    emit_log(
+                        event_tx,
+                        "warn",
+                        "Clé WireGuard remplacée et rescellée — tous les clients \
+                         doivent mettre à jour `peer_public_key` de la gateway",
+                    );
+
+                    // L'interface porte encore l'ancienne identité : on la remonte.
+                    if let Err(e) = wg.down().await {
+                        warn!("démontage avant rotation : {e}");
+                    }
+                    let network = shared_network.read().await;
+                    do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
+                    drop(network);
+                    sync_policy(shared_policy, policy).await;
+                }
+            }
+        }
+
         OrchestratorCmd::ApplyFirewallRules(rules) => {
             if dry_run {
-                info!("[dry-run] règles nftables personnalisées reçues ({} octets) — non appliquées", rules.len());
-                emit_log(event_tx, "info",
-                    "[dry-run] Règles nftables reçues — application ignorée (mode simulation)");
+                info!(
+                    "[dry-run] règles nftables personnalisées reçues ({} octets) — non appliquées",
+                    rules.len()
+                );
+                emit_log(
+                    event_tx,
+                    "info",
+                    "[dry-run] Règles nftables reçues — application ignorée (mode simulation)",
+                );
             } else {
-                info!("application de règles nftables personnalisées ({} octets)", rules.len());
-                emit_log(event_tx, "warn",
-                    "Règles nftables personnalisées appliquées — vérifiez la cohérence");
+                info!(
+                    "application de règles nftables personnalisées ({} octets)",
+                    rules.len()
+                );
+                emit_log(
+                    event_tx,
+                    "warn",
+                    "Règles nftables personnalisées appliquées — vérifiez la cohérence",
+                );
             }
         }
 
@@ -252,8 +325,11 @@ async fn handle_external_cmd(
             let current = *shared_state.read().await;
             if current == TunnelState::CaptivePortal {
                 info!("portail captif validé par l'utilisateur — reconnexion");
-                emit_log(event_tx, "info",
-                    "Portail captif validé — tentative de reconnexion…");
+                emit_log(
+                    event_tx,
+                    "info",
+                    "Portail captif validé — tentative de reconnexion…",
+                );
                 policy.captive_portal_gateway = None;
                 let next = current.on(TunnelEvent::CaptivePortalResolved)?;
                 transition(shared_state, event_tx, next, fw, policy).await?;
@@ -271,7 +347,9 @@ async fn handle_external_cmd(
             info!("split-tunneling mis à jour : {} CIDR(s)", cidrs.len());
             policy.split_tunnel_cidrs = cidrs.clone();
             let state = *shared_state.read().await;
-            fw.apply(policy, state).await.context("pare-feu split-tunnel")?;
+            fw.apply(policy, state)
+                .await
+                .context("pare-feu split-tunnel")?;
             let _ = event_tx.send(HeliosEvent::SplitTunnelChanged { cidrs });
             sync_policy(shared_policy, policy).await;
         }
@@ -279,7 +357,9 @@ async fn handle_external_cmd(
         OrchestratorCmd::SetMssClamp(mss) => {
             policy.mss_clamp = Some(mss);
             let state = *shared_state.read().await;
-            fw.apply(policy, state).await.context("pare-feu MSS clamping (manuel)")?;
+            fw.apply(policy, state)
+                .await
+                .context("pare-feu MSS clamping (manuel)")?;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -288,7 +368,9 @@ async fn handle_external_cmd(
             *policy = new_cfg.firewall_policy();
             *shared_network.write().await = *new_cfg;
             let state = *shared_state.read().await;
-            fw.apply(policy, state).await.context("pare-feu après rechargement config")?;
+            fw.apply(policy, state)
+                .await
+                .context("pare-feu après rechargement config")?;
             sync_policy(shared_policy, policy).await;
 
             // Aligne le plan de données sur la nouvelle liste de pairs
@@ -297,7 +379,11 @@ async fn handle_external_cmd(
                 let (_, peers) = wg_config(&*shared_network.read().await);
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("synchronisation des pairs WireGuard : {e}");
-                    emit_log(event_tx, "warn", &format!("Synchronisation des pairs : {e}"));
+                    emit_log(
+                        event_tx,
+                        "warn",
+                        &format!("Synchronisation des pairs : {e}"),
+                    );
                 }
             }
             emit_log(event_tx, "info", "Configuration réseau appliquée");
@@ -322,8 +408,11 @@ async fn do_connect(
     policy: &FirewallPolicy,
 ) -> anyhow::Result<()> {
     if !network.wireguard_ready() {
-        emit_log(event_tx, "error",
-            "Clé privée WireGuard absente de la config réseau — impossible de monter l'interface");
+        emit_log(
+            event_tx,
+            "error",
+            "Clé privée WireGuard absente de la config réseau — impossible de monter l'interface",
+        );
         anyhow::bail!("gateway non configurée : `wg_private_key` vide dans network.toml");
     }
 
@@ -334,18 +423,34 @@ async fn do_connect(
     if state != TunnelState::Down && state != TunnelState::Failed {
         state = TunnelState::Down;
     }
-    state = state.on(TunnelEvent::StartRequested).context("transition d'état")?;
+    state = state
+        .on(TunnelEvent::StartRequested)
+        .context("transition d'état")?;
     transition(shared, event_tx, state, fw, policy).await?;
 
-    emit_log(event_tx, "info",
-        &format!("Montée de {} — écoute UDP {}, {} pair(s) autorisé(s)",
-            iface.name, iface.listen_port, peers.len()));
+    emit_log(
+        event_tx,
+        "info",
+        &format!(
+            "Montée de {} — écoute UDP {}, {} pair(s) autorisé(s)",
+            iface.name,
+            iface.listen_port,
+            peers.len()
+        ),
+    );
 
-    wg.up(&iface, &peers).await.context("montée de l'interface WireGuard")?;
+    wg.up(&iface, &peers)
+        .await
+        .context("montée de l'interface WireGuard")?;
 
-    emit_log(event_tx, "info",
-        &format!("Interface {} active ({}) — en attente de handshake client",
-            iface.name, iface.address));
+    emit_log(
+        event_tx,
+        "info",
+        &format!(
+            "Interface {} active ({}) — en attente de handshake client",
+            iface.name, iface.address
+        ),
+    );
     Ok(())
 }
 
@@ -411,7 +516,8 @@ async fn probe_captive_portal(wan_iface: &str) -> Option<String> {
         return None;
     }
 
-    let gateway = get_default_gateway(wan_iface).await
+    let gateway = get_default_gateway(wan_iface)
+        .await
         .unwrap_or_else(|| "inconnu".to_string());
     Some(gateway)
 }
@@ -491,9 +597,12 @@ async fn discover_mss(wan_iface: &str) -> Option<u16> {
 fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if !trimmed.starts_with(iface) { continue; }
+        if !trimmed.starts_with(iface) {
+            continue;
+        }
         let rest = trimmed.trim_start_matches(iface).trim_start_matches(':');
-        let fields: Vec<u64> = rest.split_whitespace()
+        let fields: Vec<u64> = rest
+            .split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect();
         if fields.len() >= 10 {
@@ -509,8 +618,12 @@ fn spawn_telemetry_loop(iface: String, event_tx: broadcast::Sender<HeliosEvent>)
         let mut ticker = time::interval(Duration::from_secs(1));
         loop {
             ticker.tick().await;
-            let Ok(content) = tokio::fs::read_to_string("/proc/net/dev").await else { continue };
-            let Some(cur) = parse_proc_net_dev(&content, &iface) else { continue };
+            let Ok(content) = tokio::fs::read_to_string("/proc/net/dev").await else {
+                continue;
+            };
+            let Some(cur) = parse_proc_net_dev(&content, &iface) else {
+                continue;
+            };
             if let Some(p) = prev {
                 let _ = event_tx.send(HeliosEvent::Telemetry {
                     iface: iface.clone(),
@@ -527,17 +640,34 @@ fn spawn_telemetry_loop(iface: String, event_tx: broadcast::Sender<HeliosEvent>)
 
 pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     println!("heliosd v{VERSION}");
-    println!("  mode         : {}", if dry_run { "dry-run" } else { "réel" });
+    println!(
+        "  mode         : {}",
+        if dry_run { "dry-run" } else { "réel" }
+    );
     println!("  transport    : WireGuard UDP {WG_PORT}");
-    println!("  interface web: http://{}", aether::API_BIND);
+    println!("  interface web: http://{}", network.api_bind());
     println!("  WAN          : {}", network.wan_iface);
     println!("  LAN          : {:?}", network.lan_ifaces);
-    println!("  interface WG : {} (UDP {})", network.wg_iface, network.wg_listen_port);
+    println!(
+        "  interface WG : {} (UDP {})",
+        network.wg_iface, network.wg_listen_port
+    );
     println!("  adresse WG   : {}", network.wg_address);
-    println!("  prêt         : {}", if network.wireguard_ready() { "oui" } else { "non (clé privée manquante)" });
+    println!(
+        "  prêt         : {}",
+        if network.wireguard_ready() {
+            "oui"
+        } else {
+            "non (clé privée manquante)"
+        }
+    );
     println!("  pairs        : {}", network.peers.len());
     for p in &network.peers {
-        let pq = if p.preshared_key.is_some() { "  [PQ]" } else { "" };
+        let pq = if p.preshared_key.is_some() {
+            "  [PQ]"
+        } else {
+            ""
+        };
         println!("    - {} -> {}{}", p.name, p.address, pq);
     }
     Ok(())
@@ -552,4 +682,118 @@ pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {
         None => println!("disponible       : aucune (à jour)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PEER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    fn configured_network() -> NetworkConfig {
+        NetworkConfig {
+            wan_iface: "eth0".into(),
+            wg_iface: "helios0".into(),
+            wg_private_key: PRIVATE_KEY.into(),
+            wg_address: "100.64.0.1/10".into(),
+            wg_listen_port: WG_LISTEN_PORT,
+            peers: vec![aether::WgPeer {
+                name: "poste-test".into(),
+                public_key: PEER_KEY.into(),
+                address: "100.64.1.2/32".into(),
+                preshared_key: Some("psk-test".into()),
+            }],
+            ..NetworkConfig::default()
+        }
+    }
+
+    #[test]
+    fn projection_wireguard_conserve_interface_et_secrets_necessaires() {
+        let network = configured_network();
+
+        let (iface, peers) = wg_config(&network);
+
+        assert_eq!(iface.name, "helios0");
+        assert_eq!(iface.private_key, PRIVATE_KEY);
+        assert_eq!(iface.listen_port, WG_LISTEN_PORT);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].allowed_ips, "100.64.1.2/32");
+        assert_eq!(peers[0].preshared_key.as_deref(), Some("psk-test"));
+    }
+
+    #[test]
+    fn lecture_proc_net_dev_reconnait_interface_et_compteurs() {
+        let proc_net_dev = "Inter-|   Receive                                                |  Transmit\n\
+                         face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+                           eth0: 42 3 1 0 0 0 0 0 84 4 2 0 0 0 0 0\n";
+
+        assert_eq!(
+            parse_proc_net_dev(proc_net_dev, "eth0"),
+            Some((42, 84, 3, 4))
+        );
+        assert_eq!(parse_proc_net_dev(proc_net_dev, "eth1"), None);
+    }
+
+    #[tokio::test]
+    async fn connexion_dry_run_reste_bloquee_jusqu_au_handshake() {
+        let network = configured_network();
+        let state = Arc::new(RwLock::new(TunnelState::Down));
+        let (events, _) = broadcast::channel(8);
+        let firewall = DryRunBackend;
+        let wireguard = helios_wireguard::DryRunBackend::new();
+
+        do_connect(
+            &network,
+            &wireguard,
+            &state,
+            &events,
+            &firewall,
+            &network.firewall_policy(),
+        )
+        .await
+        .unwrap();
+
+        assert!(wireguard.is_up());
+        assert_eq!(*state.read().await, TunnelState::Connecting);
+        assert!(state.read().await.kill_switch_engaged());
+    }
+
+    #[tokio::test]
+    async fn deconnexion_demonte_wireguard_et_reengage_le_kill_switch() {
+        let network = configured_network();
+        let shared_network = Arc::new(RwLock::new(network.clone()));
+        let state = Arc::new(RwLock::new(TunnelState::Up));
+        let policy = Arc::new(RwLock::new(network.firewall_policy()));
+        let (events, _) = broadcast::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(1);
+        let firewall = DryRunBackend;
+        let wireguard = helios_wireguard::DryRunBackend::new();
+        let (iface, peers) = wg_config(&network);
+        wireguard.up(&iface, &peers).await.unwrap();
+        let mut current_policy = network.firewall_policy();
+        current_policy.mss_clamp = Some(1380);
+
+        handle_external_cmd(
+            OrchestratorCmd::Disconnect,
+            &shared_network,
+            true,
+            &wireguard,
+            &state,
+            &events,
+            &firewall,
+            &mut current_policy,
+            &internal_tx,
+            &policy,
+            // TPM désactivé : ce test ne fait pas de rotation de clé.
+            &helio_tpm::BootDecision::Disabled,
+        )
+        .await
+        .unwrap();
+
+        assert!(!wireguard.is_up());
+        assert_eq!(*state.read().await, TunnelState::Down);
+        assert!(state.read().await.kill_switch_engaged());
+        assert_eq!(policy.read().await.mss_clamp, None);
+    }
 }

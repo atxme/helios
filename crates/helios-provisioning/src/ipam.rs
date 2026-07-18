@@ -146,7 +146,10 @@ mod tests {
         let pk = [7u8; 32];
         assert_eq!(derive_cgnat_ip(&pk, 0), derive_cgnat_ip(&pk, 0));
         // Deux clés différentes ⇒ (quasi toujours) deux VIP différentes.
-        assert_ne!(derive_cgnat_ip(&[1u8; 32], 0), derive_cgnat_ip(&[2u8; 32], 0));
+        assert_ne!(
+            derive_cgnat_ip(&[1u8; 32], 0),
+            derive_cgnat_ip(&[2u8; 32], 0)
+        );
     }
 
     #[test]
@@ -170,7 +173,11 @@ mod tests {
 
         let vip_b = assign_vip(&table, &pk_b, 64).unwrap();
         assert_ne!(vip_b, vip_b_naturelle, "B doit éviter la VIP prise par A");
-        assert_eq!(vip_b, derive_cgnat_ip(&pk_b, 1), "B bascule sur le compteur 1");
+        assert_eq!(
+            vip_b,
+            derive_cgnat_ip(&pk_b, 1),
+            "B bascule sur le compteur 1"
+        );
     }
 
     #[test]

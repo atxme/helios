@@ -7,8 +7,11 @@ const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
 
 /// Port TCP de l'API REST/WS (hardcodé, invariant d'architecture).
 pub const API_PORT: u16 = 8080;
-/// Adresse d'écoute du serveur HTTP.
-pub const API_BIND: &str = "127.0.0.1:8080";
+/// Adresse d'écoute du serveur HTTP en mode dégradé (pas d'interface tunnel).
+///
+/// Boucle locale uniquement : sans tunnel, l'API n'a aucune raison d'être
+/// joignable de l'extérieur.
+pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 
 /// Configuration réseau chargeable par l'opérateur via CLI ou interface graphique.
 ///
@@ -99,8 +102,7 @@ impl NetworkConfig {
 
     /// Persiste la config réseau de façon atomique (rename).
     pub fn save(&self) -> Result<()> {
-        let raw =
-            toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
+        let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
         let tmp = format!("{NETWORK_CONFIG_PATH}.tmp");
         if let Some(parent) = std::path::Path::new(NETWORK_CONFIG_PATH).parent() {
             std::fs::create_dir_all(parent)
@@ -122,6 +124,30 @@ impl NetworkConfig {
     /// La gateway est-elle configurée pour monter son interface WireGuard ?
     pub fn wireguard_ready(&self) -> bool {
         !self.wg_private_key.trim().is_empty() && !self.wg_address.trim().is_empty()
+    }
+
+    /// Adresse d'écoute du serveur HTTP.
+    ///
+    /// **L'API doit écouter sur l'adresse du tunnel**, pas sur la boucle locale :
+    /// c'est par là que les clients Orion atteignent le provisioning et la
+    /// télémétrie. Une écoute sur `127.0.0.1` rendrait la règle de pare-feu
+    /// filtrant sur `admin_iface` inopérante — elle ne pourrait jamais
+    /// s'appliquer, faute de socket à atteindre.
+    ///
+    /// Le filtrage reste assuré par le pare-feu (`admin_iface`), pas par
+    /// l'adresse de bind : c'est nftables qui refuse les connexions venues
+    /// d'ailleurs que du tunnel.
+    ///
+    /// Sans gateway configurée, on retombe sur la boucle locale.
+    pub fn api_bind(&self) -> String {
+        if !self.wireguard_ready() {
+            return API_BIND_LOOPBACK.to_string();
+        }
+        // `wg_address` est en CIDR (`100.64.0.1/10`) : on n'en garde que l'hôte.
+        match self.wg_address.split('/').next() {
+            Some(host) if !host.trim().is_empty() => format!("{}:{}", host.trim(), API_PORT),
+            _ => API_BIND_LOOPBACK.to_string(),
+        }
     }
 
     /// Projette la config réseau vers la politique de pare-feu déclarative.
@@ -156,7 +182,10 @@ mod tests {
         let cfg = NetworkConfig::default();
         assert!(cfg.peers.is_empty());
         assert!(cfg.wan_iface.is_empty());
-        assert!(!cfg.wireguard_ready(), "sans clé privée, rien ne doit monter");
+        assert!(
+            !cfg.wireguard_ready(),
+            "sans clé privée, rien ne doit monter"
+        );
     }
 
     #[test]
@@ -187,7 +216,42 @@ mod tests {
         // Rôle serveur : le port d'écoute doit être ouvert en entrée, sinon
         // aucun client ne peut handshaker.
         assert_eq!(policy.wg_listen_port, Some(51820));
-        assert!(policy.wg_peers.is_empty(), "road-warrior : pas de pair sortant");
+        assert!(
+            policy.wg_peers.is_empty(),
+            "road-warrior : pas de pair sortant"
+        );
+    }
+
+    /// L'API doit écouter sur l'adresse du tunnel. Sur `127.0.0.1`, aucun client
+    /// Orion ne pourrait atteindre le provisioning, et la règle de pare-feu
+    /// filtrant sur `admin_iface` ne pourrait jamais s'appliquer.
+    #[test]
+    fn l_api_ecoute_sur_l_adresse_du_tunnel() {
+        let cfg = NetworkConfig {
+            wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            wg_address: "100.64.0.1/10".into(),
+            ..NetworkConfig::default()
+        };
+        assert_eq!(cfg.api_bind(), "100.64.0.1:8080");
+        assert_ne!(
+            cfg.api_bind(),
+            API_BIND_LOOPBACK,
+            "sur la boucle locale, le provisioning serait injoignable"
+        );
+    }
+
+    /// Sans gateway configurée, aucune raison d'exposer l'API : boucle locale.
+    #[test]
+    fn repli_sur_la_boucle_locale_sans_gateway() {
+        assert_eq!(NetworkConfig::default().api_bind(), API_BIND_LOOPBACK);
+
+        // Adresse malformée : on se replie plutôt que d'exposer n'importe quoi.
+        let cfg = NetworkConfig {
+            wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            wg_address: "/10".into(),
+            ..NetworkConfig::default()
+        };
+        assert_eq!(cfg.api_bind(), API_BIND_LOOPBACK);
     }
 
     #[test]

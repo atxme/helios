@@ -9,13 +9,14 @@
 //! pas de toolchain CMake/Go (voir ADR-001 §2 et les notes de vigilance).
 
 pub mod config;
+pub mod enroll;
 pub mod error;
 pub mod events;
 pub mod policy;
 pub mod pq;
 pub mod state;
 
-pub use config::{NetworkConfig, WgPeer, API_BIND, API_PORT};
+pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};

@@ -8,12 +8,15 @@
 //! cargo run -p helios-ctl -- network load config/network.toml
 //! ```
 
-use std::{path::PathBuf, time::{Duration, Instant}};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
+use aether::NetworkConfig;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use aether::NetworkConfig;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -104,31 +107,43 @@ struct CmdResp {
 
 fn colored_state(s: &str) -> String {
     match s {
-        "up"         => format!("\x1b[32m{s}\x1b[0m"),
-        "rekeying"   => format!("\x1b[33m{s}\x1b[0m"),
+        "up" => format!("\x1b[32m{s}\x1b[0m"),
+        "rekeying" => format!("\x1b[33m{s}\x1b[0m"),
         "connecting" => format!("\x1b[33m{s}\x1b[0m"),
-        "failed"     => format!("\x1b[31m{s}\x1b[0m"),
-        _            => format!("\x1b[90m{s}\x1b[0m"),
+        "failed" => format!("\x1b[31m{s}\x1b[0m"),
+        _ => format!("\x1b[90m{s}\x1b[0m"),
     }
 }
 
 fn state_dot(s: &str) -> &'static str {
     match s {
-        "up"         => "\x1b[32m●\x1b[0m",
-        "rekeying"   => "\x1b[33m●\x1b[0m",
+        "up" => "\x1b[32m●\x1b[0m",
+        "rekeying" => "\x1b[33m●\x1b[0m",
         "connecting" => "\x1b[33m●\x1b[0m",
-        "failed"     => "\x1b[31m●\x1b[0m",
-        _            => "\x1b[90m●\x1b[0m",
+        "failed" => "\x1b[31m●\x1b[0m",
+        _ => "\x1b[90m●\x1b[0m",
     }
 }
 
-fn ok()   -> &'static str { "\x1b[32m✓\x1b[0m" }
-fn fail() -> &'static str { "\x1b[31m✗\x1b[0m" }
+fn ok() -> &'static str {
+    "\x1b[32m✓\x1b[0m"
+}
+fn fail() -> &'static str {
+    "\x1b[31m✗\x1b[0m"
+}
 
 fn hh_mm_ss() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("\x1b[2m{:02}:{:02}:{:02}\x1b[0m", (s / 3600) % 24, (s / 60) % 60, s % 60)
+    let s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "\x1b[2m{:02}:{:02}:{:02}\x1b[0m",
+        (s / 3600) % 24,
+        (s / 60) % 60,
+        s % 60
+    )
 }
 
 // ─── HTTP ─────────────────────────────────────────────────────────────────────
@@ -156,21 +171,27 @@ async fn api_post(client: &Client, base: &str, path: &str) -> Result<CmdResp> {
 }
 
 fn ws_url(base: &str) -> String {
-    base.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
+    base.replace("http://", "ws://")
+        .replace("https://", "wss://")
+        + "/ws"
 }
 
 // ─── Commandes ────────────────────────────────────────────────────────────────
 
 async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     let s = api_status(client, base).await?;
-    let dry = if s.dry_run { "  \x1b[35m[dry-run]\x1b[0m" } else { "" };
+    let dry = if s.dry_run {
+        "  \x1b[35m[dry-run]\x1b[0m"
+    } else {
+        ""
+    };
     println!();
     println!("  \x1b[1mheliosd v{}\x1b[0m{}", s.version, dry);
     println!();
     println!("  {}  {}", state_dot(&s.state), colored_state(&s.state));
     println!();
-    println!("  {:<14} {}", "WAN",       s.wan_iface);
-    println!("  {:<14} {}", "LAN",       s.lan_ifaces.join(", "));
+    println!("  {:<14} {}", "WAN", s.wan_iface);
+    println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
     println!("  {:<14} {}", "Pairs WG", s.wg_peers.join(", "));
     for c in &s.connections {
         println!("  {:<14} {} → {}", c.name, c.name, c.remote_addr);
@@ -229,19 +250,46 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  \x1b[1mConfig réseau\x1b[0m");
     println!();
-    println!("  {:<16} {}", "WAN", if cfg.wan_iface.is_empty() { "(non défini)" } else { &cfg.wan_iface });
-    println!("  {:<16} {}", "LAN", if cfg.lan_ifaces.is_empty() { "(aucune)".to_string() } else { cfg.lan_ifaces.join(", ") });
+    println!(
+        "  {:<16} {}",
+        "WAN",
+        if cfg.wan_iface.is_empty() {
+            "(non défini)"
+        } else {
+            &cfg.wan_iface
+        }
+    );
+    println!(
+        "  {:<16} {}",
+        "LAN",
+        if cfg.lan_ifaces.is_empty() {
+            "(aucune)".to_string()
+        } else {
+            cfg.lan_ifaces.join(", ")
+        }
+    );
     if !cfg.allow_ssh_from.is_empty() {
-        println!("  {:<16} {}", "SSH autorisé de", cfg.allow_ssh_from.join(", "));
+        println!(
+            "  {:<16} {}",
+            "SSH autorisé de",
+            cfg.allow_ssh_from.join(", ")
+        );
     }
     if let Some(ref iface) = cfg.admin_iface {
         println!("  {:<16} {}", "Iface admin", iface);
     }
-    println!("  {:<16} {} (UDP {})", "Interface WG", cfg.wg_iface, cfg.wg_listen_port);
+    println!(
+        "  {:<16} {} (UDP {})",
+        "Interface WG", cfg.wg_iface, cfg.wg_listen_port
+    );
     println!("  {:<16} {}", "Adresse WG", cfg.wg_address);
     println!("  {:<16} {}", "Pairs", cfg.peers.len());
     for p in &cfg.peers {
-        let pq = if p.preshared_key.is_some() { "  [PQ]" } else { "" };
+        let pq = if p.preshared_key.is_some() {
+            "  [PQ]"
+        } else {
+            ""
+        };
         println!("    - {} → {}{}", p.name, p.address, pq);
     }
     println!();
@@ -253,8 +301,8 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .await
         .with_context(|| format!("impossible de lire {}", file.display()))?;
 
-    let config: NetworkConfig = toml::from_str(&raw)
-        .with_context(|| format!("TOML invalide dans {}", file.display()))?;
+    let config: NetworkConfig =
+        toml::from_str(&raw).with_context(|| format!("TOML invalide dans {}", file.display()))?;
 
     let body = serde_json::to_string(&config)?;
     let resp: CmdResp = client
@@ -269,10 +317,17 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .context("réponse JSON inattendue")?;
 
     if resp.ok {
-        println!("{} config réseau chargée ({} pair(s))",
-            ok(), config.peers.len());
+        println!(
+            "{} config réseau chargée ({} pair(s))",
+            ok(),
+            config.peers.len()
+        );
     } else {
-        println!("{} refusé : {}", fail(), resp.error.as_deref().unwrap_or("?"));
+        println!(
+            "{} refusé : {}",
+            fail(),
+            resp.error.as_deref().unwrap_or("?")
+        );
     }
     Ok(())
 }
@@ -285,11 +340,11 @@ fn print_ws_event(ts: &str, v: &Value) {
         }
         "log" => {
             let level = v["level"].as_str().unwrap_or("info");
-            let msg   = v["message"].as_str().unwrap_or("");
+            let msg = v["message"].as_str().unwrap_or("");
             let lc = match level {
                 "error" => format!("\x1b[31m{level}\x1b[0m"),
-                "warn"  => format!("\x1b[33m{level}\x1b[0m"),
-                _       => format!("\x1b[90m{level}\x1b[0m"),
+                "warn" => format!("\x1b[33m{level}\x1b[0m"),
+                _ => format!("\x1b[90m{level}\x1b[0m"),
             };
             println!("{}  [{}]  {}", ts, lc, msg);
         }
@@ -299,7 +354,12 @@ fn print_ws_event(ts: &str, v: &Value) {
 
 // ─── Scénarios ────────────────────────────────────────────────────────────────
 
-async fn wait_state(client: &Client, base: &str, target: &str, timeout_secs: u64) -> Result<Duration> {
+async fn wait_state(
+    client: &Client,
+    base: &str,
+    target: &str,
+    timeout_secs: u64,
+) -> Result<Duration> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     loop {
@@ -320,12 +380,20 @@ async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
     println!("────────────────");
 
     let s = api_status(client, base).await?;
-    println!("  1/4  état initial              {} ({})", ok(), colored_state(&s.state));
+    println!(
+        "  1/4  état initial              {} ({})",
+        ok(),
+        colored_state(&s.state)
+    );
 
     api_post(client, base, "/api/tunnel/start").await?;
     println!("  2/4  connexion…                {} commande envoyée", ok());
     let t = wait_state(client, base, "up", 5).await?;
-    println!("       tunnel Up                 {} en {:.0}ms", ok(), t.as_millis());
+    println!(
+        "       tunnel Up                 {} en {:.0}ms",
+        ok(),
+        t.as_millis()
+    );
 
     println!("  3/4  pause 2s…");
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -334,9 +402,17 @@ async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
     api_post(client, base, "/api/tunnel/stop").await?;
     println!("  4/4  déconnexion…              {} commande envoyée", ok());
     let t = wait_state(client, base, "down", 5).await?;
-    println!("       kill-switch               {} en {:.0}ms", ok(), t.as_millis());
+    println!(
+        "       kill-switch               {} en {:.0}ms",
+        ok(),
+        t.as_millis()
+    );
 
-    println!("\n  {} nominal terminé en \x1b[1m{:.2}s\x1b[0m\n", ok(), t0.elapsed().as_secs_f32());
+    println!(
+        "\n  {} nominal terminé en \x1b[1m{:.2}s\x1b[0m\n",
+        ok(),
+        t0.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 
@@ -346,7 +422,7 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
     println!("\n\x1b[1mScénario flap\x1b[0m (×{cycles})");
     println!("─────────────");
 
-    let mut up_times   = Vec::new();
+    let mut up_times = Vec::new();
     let mut down_times = Vec::new();
 
     for i in 1..=cycles {
@@ -358,18 +434,27 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
         let td = wait_state(client, base, "down", 5).await?;
         down_times.push(td.as_millis());
 
-        println!("  cycle {i}/{cycles}  up={:>4}ms  down={:>4}ms  {}", tu.as_millis(), td.as_millis(), ok());
+        println!(
+            "  cycle {i}/{cycles}  up={:>4}ms  down={:>4}ms  {}",
+            tu.as_millis(),
+            td.as_millis(),
+            ok()
+        );
     }
 
-    let avg_up   = up_times.iter().sum::<u128>() / up_times.len() as u128;
+    let avg_up = up_times.iter().sum::<u128>() / up_times.len() as u128;
     let avg_down = down_times.iter().sum::<u128>() / down_times.len() as u128;
-    let max_up   = up_times.iter().max().copied().unwrap_or(0);
+    let max_up = up_times.iter().max().copied().unwrap_or(0);
     let max_down = down_times.iter().max().copied().unwrap_or(0);
 
     println!();
     println!("  moyenne  up={avg_up}ms  down={avg_down}ms");
     println!("  max      up={max_up}ms  down={max_down}ms");
-    println!("\n  {} flap terminé en \x1b[1m{:.2}s\x1b[0m\n", ok(), t0.elapsed().as_secs_f32());
+    println!(
+        "\n  {} flap terminé en \x1b[1m{:.2}s\x1b[0m\n",
+        ok(),
+        t0.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 
@@ -382,20 +467,18 @@ async fn main() -> Result<()> {
     let base = cli.url.trim_end_matches('/');
 
     match cli.command {
-        Cmd::Status       => cmd_status(&client, base).await,
-        Cmd::Connect      => cmd_connect(&client, base).await,
-        Cmd::Disconnect   => cmd_disconnect(&client, base).await,
-        Cmd::Watch        => cmd_watch(base).await,
+        Cmd::Status => cmd_status(&client, base).await,
+        Cmd::Connect => cmd_connect(&client, base).await,
+        Cmd::Disconnect => cmd_disconnect(&client, base).await,
+        Cmd::Watch => cmd_watch(base).await,
         Cmd::Network { command } => match command {
-            NetworkCmd::Show          => cmd_network_show(&client, base).await,
+            NetworkCmd::Show => cmd_network_show(&client, base).await,
             NetworkCmd::Load { file } => cmd_network_load(&client, base, &file).await,
         },
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
-            "flap"    => scenario_flap(&client, base).await,
-            other     => anyhow::bail!(
-                "scénario inconnu '{other}'. Disponibles : nominal, flap"
-            ),
+            "flap" => scenario_flap(&client, base).await,
+            other => anyhow::bail!("scénario inconnu '{other}'. Disponibles : nominal, flap"),
         },
     }
 }

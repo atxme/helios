@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ShieldCheck, ShieldOff, Wifi } from 'lucide-react'
+import { LockKeyhole, ShieldCheck, ShieldOff, Wifi } from 'lucide-react'
 import type { ClientProfile, TelemetrySample, TunnelState } from '../types'
 import { elapsed, formatBps, stateMeta } from '../components/state'
 
@@ -9,6 +9,7 @@ interface Props {
   upSince: number | null
   telemetry: TelemetrySample | null
   backend: string
+  adapterUp: boolean
   onConnect: () => void
   onDisconnect: () => void
 }
@@ -19,6 +20,7 @@ export function ConnectView({
   upSince,
   telemetry,
   backend,
+  adapterUp,
   onConnect,
   onDisconnect,
 }: Props) {
@@ -33,7 +35,7 @@ export function ConnectView({
   }, [upSince])
 
   const duration = elapsed(upSince, now)
-  const pq = profile ? Boolean(profile.profile_id && profile.profile_id !== 'classic') : false
+  const pq = profile ? Boolean(profile.preshared_key?.trim()) : false
 
   return (
     <div className="flex flex-col items-center gap-5 px-5 py-6">
@@ -59,7 +61,7 @@ export function ConnectView({
         </div>
         {profile ? (
           <div className="mt-0.5 font-mono text-xs text-slate-400">
-            {profile.gateway || '— endpoint non défini —'}
+            {profile.endpoint || '— endpoint non défini —'}
           </div>
         ) : (
           <div className="mt-0.5 text-xs text-slate-500">Aucun profil sélectionné</div>
@@ -74,14 +76,10 @@ export function ConnectView({
               <span className="font-mono">{duration}</span>
             </Row>
           )}
-          {profile?.profile_id && (
-            <Row label="Profil">
-              <span>
-                {profile.profile_id}
-                {pq && <span className="ml-1 text-node">· PQ</span>}
-              </span>
-            </Row>
-          )}
+          <Row label="Protection">
+            <span>{pq ? <span className="text-node">WireGuard · PSK PQ</span> : 'WireGuard classique'}</span>
+          </Row>
+          {profile?.address && <Row label="Adresse"><span className="font-mono">{profile.address}</span></Row>}
           <Row label="Débit">
             {telemetry ? (
               <span className="font-mono">
@@ -100,15 +98,14 @@ export function ConnectView({
           <button
             className="btn w-full bg-red-950/70 text-red-200 hover:bg-red-900/70"
             onClick={onDisconnect}
-            disabled={meta.transitioning && !meta.active}
           >
-            {meta.transitioning && !meta.active ? 'Connexion…' : 'Déconnecter'}
+            {state === 'connecting' ? 'Annuler et démonter' : 'Déconnecter'}
           </button>
         ) : (
           <button
             className="btn w-full bg-emerald-900/60 text-emerald-200 hover:bg-emerald-800/70"
             onClick={onConnect}
-            disabled={!profile || !profile.gateway}
+            disabled={!profile || !profile.endpoint || !profile.private_key || !profile.peer_public_key}
           >
             Connecter
           </button>
@@ -118,6 +115,10 @@ export function ConnectView({
       <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
         <Wifi size={12} />
         backend : <span className="font-mono text-slate-400">{backend || '—'}</span>
+      </div>
+      <div className={`flex items-center gap-1.5 text-[11px] ${adapterUp ? 'text-emerald-400' : 'text-slate-500'}`}>
+        <LockKeyhole size={12} />
+        adaptateur : <span className="font-mono">{adapterUp ? 'monté · routes capturées' : 'démonté'}</span>
       </div>
     </div>
   )

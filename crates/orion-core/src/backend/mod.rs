@@ -251,7 +251,11 @@ mod tests {
         // Laisse la tâche de connexion échouer.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(ctrl.state(), TunnelState::Failed, "l'échec doit être visible");
+        assert_eq!(
+            ctrl.state(),
+            TunnelState::Failed,
+            "l'échec doit être visible"
+        );
         assert!(
             ctrl.adapter_is_up(),
             "INVARIANTE VIOLÉE : l'adaptateur a été démonté sur échec — \
@@ -271,7 +275,10 @@ mod tests {
         assert!(ctrl.adapter_is_up());
 
         ctrl.disconnect(sink()).await;
-        assert!(!ctrl.adapter_is_up(), "disconnect doit démonter l'adaptateur");
+        assert!(
+            !ctrl.adapter_is_up(),
+            "disconnect doit démonter l'adaptateur"
+        );
         assert_eq!(ctrl.state(), TunnelState::Down);
     }
 

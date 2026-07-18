@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Settings2, Activity, Sun, X } from 'lucide-react'
+import { Activity, Orbit, Settings2, X } from 'lucide-react'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
@@ -16,8 +16,8 @@ export default function App() {
       {/* En-tête */}
       <header className="flex items-center justify-between px-4 py-3">
         <div className="flex items-center gap-2">
-          <Sun size={18} className="text-sun" />
-          <span className="text-sm font-semibold tracking-wide">Helios VPN</span>
+          <Orbit size={18} className="text-sun" />
+          <span className="text-sm font-semibold tracking-wide">Orion VPN</span>
         </div>
         <nav className="flex gap-1">
           <TabBtn active={tab === 'connect'} onClick={() => setTab('connect')}>
@@ -48,13 +48,13 @@ export default function App() {
             upSince={c.upSince}
             telemetry={c.telemetry}
             backend={c.backend}
-            onConnect={() => c.connect()}
+            adapterUp={c.adapterUp}
+            onConnect={() => c.connect(c.selectedProfile?.name)}
             onDisconnect={c.disconnect}
           />
         ) : (
           <ProfilesView
             config={c.config}
-            predefined={c.predefined}
             onSave={c.saveProfile}
             onDelete={c.removeProfile}
             onSelect={c.select}

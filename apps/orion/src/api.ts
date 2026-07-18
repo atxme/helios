@@ -1,14 +1,15 @@
 // Couche d'accès au backend Rust via Tauri (invoke) + flux d'événements (listen).
-// Aucune requête HTTP ici : se connecter = monter l'IPsec côté Rust.
+// La connexion monte WireGuard côté Rust. Seule la télémétrie/provisioning
+// post-tunnel utilise ensuite l'API HTTP interne d'Helios.
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { ClientConfig, ClientEvent, ClientProfile, PredefinedProfile, TunnelState } from './types'
+import type { ClientConfig, ClientEvent, ClientProfile, TunnelState } from './types'
 
 export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
+export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
-export const listPredefined = () => invoke<PredefinedProfile[]>('list_predefined')
 
 export const saveProfile = (profile: ClientProfile) =>
   invoke<ClientConfig>('save_profile', { profile })

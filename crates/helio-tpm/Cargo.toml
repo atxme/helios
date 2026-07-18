@@ -25,6 +25,8 @@ zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 # Empreinte d'identité de l'état PCR (liaison du billet).
 sha2 = "0.10"
+# AEAD (AES-256-GCM) du coffre chiffré par le secret descellé.
+aws-lc-rs.workspace = true
 # Backend TPM réel — cible uniquement.
 tss-esapi = { version = "7.5", optional = true }
 

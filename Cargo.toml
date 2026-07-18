@@ -77,6 +77,10 @@ netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
 blake3 = "1"
 zeroize = "1"
+base64 = "0.22"
+# `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
+# profil WireGuard), par opposition aux clés éphémères par défaut.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 # Backend WireGuard unifié (noyau Linux via netlink, Windows, ou userspace
 # BoringTun) derrière une seule API. Optionnel : activé par la feature
 # `wireguard` d'orion-core / heliosd.

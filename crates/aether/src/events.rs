@@ -7,8 +7,13 @@ use crate::state::TunnelState;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HeliosEvent {
-    StateChanged { state: TunnelState },
-    Log { level: String, message: String },
+    StateChanged {
+        state: TunnelState,
+    },
+    Log {
+        level: String,
+        message: String,
+    },
     /// Compteurs réseau lus depuis /proc/net/dev, émis toutes les secondes.
     Telemetry {
         iface: String,
@@ -18,17 +23,32 @@ pub enum HeliosEvent {
         tx_pps: u64,
     },
     /// Portail captif interceptant le trafic HTTP détecté sur le réseau courant.
-    CaptivePortalDetected { gateway: String },
+    CaptivePortalDetected {
+        gateway: String,
+    },
     /// MTU optimal déterminé par PMTUD — règle MSS clamping appliquée.
-    MtuDiscovered { mtu: u16, mss: u16 },
+    MtuDiscovered {
+        mtu: u16,
+        mss: u16,
+    },
     /// Liste des CIDRs en split-tunneling mise à jour.
-    SplitTunnelChanged { cidrs: Vec<String> },
+    SplitTunnelChanged {
+        cidrs: Vec<String>,
+    },
 }
 
 /// Commandes envoyées par l'interface web vers l'orchestrateur.
 #[derive(Debug, Clone)]
 pub enum OrchestratorCmd {
     Connect,
+    /// Remplace la clé privée WireGuard de la gateway et la scelle dans le TPM.
+    ///
+    /// Le secret de scellement ne quitte jamais `heliosd` : l'API ne fait que
+    /// transmettre la nouvelle clé, l'orchestrateur seul sait la sceller.
+    ///
+    /// **Rotation d'identité** : après application, tous les clients doivent
+    /// mettre à jour leur `peer_public_key`.
+    UpdateGatewayKey(String),
     /// Applique un jeu de règles nftables brut (dry-run = log seulement).
     ApplyFirewallRules(String),
     Disconnect,

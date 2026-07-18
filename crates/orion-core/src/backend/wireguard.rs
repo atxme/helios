@@ -38,8 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aether::TunnelState;
 use async_trait::async_trait;
 use defguard_wireguard_rs::{
-    key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi,
-    WireguardInterfaceApi,
+    key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi, WireguardInterfaceApi,
 };
 
 use crate::config::ClientProfile;
@@ -100,15 +99,18 @@ impl WireGuardBackend {
         peer.set_endpoint(&profile.endpoint)
             .map_err(|e| anyhow::anyhow!("endpoint `{}` invalide : {e}", profile.endpoint))?;
 
-        let allowed = IpAddrMask::from_str(&profile.allowed_ips).map_err(|e| {
-            anyhow::anyhow!("allowed_ips `{}` invalide : {e}", profile.allowed_ips)
-        })?;
+        let allowed = IpAddrMask::from_str(&profile.allowed_ips)
+            .map_err(|e| anyhow::anyhow!("allowed_ips `{}` invalide : {e}", profile.allowed_ips))?;
         peer.set_allowed_ips(vec![allowed]);
 
         peer.persistent_keepalive_interval = Some(profile.persistent_keepalive);
 
         // PSK post-quantique (ML-KEM). Absent = tunnel classique seul.
-        if let Some(psk) = profile.preshared_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        if let Some(psk) = profile
+            .preshared_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
+        {
             let psk = Key::try_from(psk)
                 .map_err(|e| anyhow::anyhow!("PSK post-quantique invalide : {e}"))?;
             peer.preshared_key = Some(psk);
@@ -282,7 +284,10 @@ mod tests {
         let mut p = profile();
         p.preshared_key = Some("cCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCA=".into());
         let peer = WireGuardBackend::build_peer(&p).unwrap();
-        assert!(peer.preshared_key.is_some(), "le PSK ML-KEM doit atteindre WireGuard");
+        assert!(
+            peer.preshared_key.is_some(),
+            "le PSK ML-KEM doit atteindre WireGuard"
+        );
     }
 
     #[test]

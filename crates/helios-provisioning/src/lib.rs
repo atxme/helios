@@ -7,11 +7,34 @@
 //! ML-KEM) vivent dans [`aether::pq`], pas ici, pour qu'`orion-core` n'ait
 //! jamais à dépendre d'un crate `helios-*`.
 //!
-//! État d'avancement (A2) : l'IPAM CGNAT déterministe est en place et testé.
-//! Le protocole d'enrôlement (canal TLS ancré TPM, échange des clés publiques,
-//! rotation du PSK) sera ajouté quand son format sera figé — on ne code pas des
-//! types de protocole avant qu'il soit conçu.
+//! # Enrôlement = admission + provisioning
+//!
+//! Les deux ne s'automatisent pas de la même façon, et confondre les deux mène
+//! à un design impossible :
+//!
+//! * **Admission** (premier contact) — un client dont la clé publique est
+//!   inconnue ne peut pas monter le tunnel : WireGuard est fondé sur Noise_IK,
+//!   le répondeur rejette un initiateur qu'il ne connaît pas. L'admission est
+//!   donc **nécessairement hors bande** : un opérateur déclare la clé publique
+//!   (aujourd'hui : `peers` dans `network.toml`). Sa VIP en est dérivée
+//!   déterministement par [`ipam`], sans état sur disque.
+//! * **Provisioning** ([`session`]) — une fois le tunnel classique monté, le
+//!   canal de contrôle *dans* le tunnel automatise l'échange ML-KEM, la
+//!   dérivation du PSK post-quantique et la confirmation de la VIP.
+//!
+//! Les messages du protocole et la dérivation du PSK vivent dans
+//! [`aether::enroll`], puisque le client doit les partager.
+//!
+//! État : le cœur protocolaire est écrit et testé de bout en bout (avec la
+//! vraie crypto ML-KEM). Le **transport** — TLS 1.3 ancré TPM — et le câblage
+//! dans `heliosd` restent à faire.
 
 pub mod ipam;
+pub mod rotation;
+pub mod session;
 
 pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, POOL_SIZE};
+pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
+pub use session::{
+    handle_request, AdmittedPeers, GatewayIdentity, Provisioned, DEFAULT_PSK_LIFETIME_SECS,
+};

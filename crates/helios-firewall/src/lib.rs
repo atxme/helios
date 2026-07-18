@@ -25,8 +25,8 @@ pub use ruleset::{render, Ruleset, Verdict};
 #[cfg(feature = "netlink")]
 pub use netlink::NetlinkBackend;
 
-use async_trait::async_trait;
 use aether::{FirewallPolicy, Result, TunnelState};
+use async_trait::async_trait;
 
 /// Backend chargé d'imposer concrètement la politique de pare-feu.
 #[async_trait]

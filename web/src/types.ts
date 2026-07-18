@@ -1,39 +1,38 @@
-export type TunnelState = 'down' | 'connecting' | 'up' | 'rekeying' | 'failed'
+export type TunnelState = 'down' | 'connecting' | 'up' | 'failed' | 'captive_portal'
 
-export interface ConnectionSummary {
+/** Pair WireGuard admis par la gateway. Le PSK n'est jamais exposé. */
+export interface PeerSummary {
   name: string
-  remote_addr: string
-  local_id: string | null
-  remote_id: string | null
-  ike_proposal: string
-  esp_proposal: string
+  public_key: string
+  address: string
+  post_quantum: boolean
 }
 
-export interface ProfileSummary {
-  id: string
-  name: string
-  description: string
-  pqc_level: string
-  reserved: boolean
-}
-
+/** Contrat exact de GET /api/status. */
 export interface Status {
   state: TunnelState
   version: string
   wan_iface: string
   lan_ifaces: string[]
-  ike_peers: string[]
+  /** Pairs statiques sortants (site-à-site), distincts des clients admis. */
+  wg_peers: string[]
   allow_ssh_from: string[]
-  connections: ConnectionSummary[]
+  peers: PeerSummary[]
+  wg_iface: string
+  wg_listen_port: number | null
   dry_run: boolean
-  profiles: ProfileSummary[]
-  active_profile: string | null
+  split_tunnel_cidrs: string[]
+  mss_clamp: number | null
+  captive_portal_gateway: string | null
 }
 
 export type HeliosEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
+  | { type: 'captive_portal_detected'; gateway: string }
+  | { type: 'mtu_discovered'; mtu: number; mss: number }
+  | { type: 'split_tunnel_changed'; cidrs: string[] }
 
 export interface TelemetrySample {
   rx_bps: number
@@ -49,4 +48,9 @@ export interface FirewallRules {
   rules: string
   default_verdict: string
   dry_run: boolean
+}
+
+export interface CommandResponse {
+  ok: boolean
+  error?: string
 }

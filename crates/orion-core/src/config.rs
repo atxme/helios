@@ -104,7 +104,9 @@ impl ClientProfile {
 
     /// Le tunnel est-il protégé en post-quantique (PSK ML-KEM installé) ?
     pub fn is_post_quantum(&self) -> bool {
-        self.preshared_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+        self.preshared_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
     }
 }
 
@@ -151,8 +153,9 @@ impl ClientConfig {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         match std::fs::read_to_string(&path) {
-            Ok(raw) => toml::from_str(&raw)
-                .with_context(|| format!("config invalide: {}", path.display())),
+            Ok(raw) => {
+                toml::from_str(&raw).with_context(|| format!("config invalide: {}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("lecture de {}", path.display())),
         }
@@ -271,7 +274,10 @@ mod tests {
             ..ClientProfile::default()
         };
         let dump = format!("{p:?}");
-        assert!(!dump.contains("TRES_SECRET"), "la clé privée fuit dans les logs");
+        assert!(
+            !dump.contains("TRES_SECRET"),
+            "la clé privée fuit dans les logs"
+        );
         assert!(!dump.contains("PSK_SECRET"), "le PSK fuit dans les logs");
     }
 }

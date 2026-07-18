@@ -5,8 +5,8 @@
 //! liste de pairs, handshakes — pour que l'orchestrateur, l'IPAM et l'API soient
 //! pleinement exerçables sans noyau WireGuard ni privilèges.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -46,7 +46,10 @@ impl DryRunBackend {
                 if k.len() == 32 {
                     Ok(k)
                 } else {
-                    Err(WgError::BadKey(format!("longueur {} au lieu de 32", k.len())))
+                    Err(WgError::BadKey(format!(
+                        "longueur {} au lieu de 32",
+                        k.len()
+                    )))
                 }
             })
     }
@@ -154,7 +157,9 @@ mod tests {
         let be = DryRunBackend::new();
         assert!(!be.is_up());
 
-        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")]).await.unwrap();
+        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")])
+            .await
+            .unwrap();
         assert!(be.is_up());
         assert_eq!(be.peers().await.unwrap().len(), 1);
 
@@ -166,7 +171,9 @@ mod tests {
     #[tokio::test]
     async fn sync_peers_remplace_la_liste() {
         let be = DryRunBackend::new();
-        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")]).await.unwrap();
+        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")])
+            .await
+            .unwrap();
 
         be.sync_peers(&[]).await.unwrap();
         assert!(be.peers().await.unwrap().is_empty(), "révocation appliquée");
@@ -190,7 +197,9 @@ mod tests {
         use helios_provisioning::PeerTable;
 
         let be = DryRunBackend::with_handshakes();
-        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")]).await.unwrap();
+        be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")])
+            .await
+            .unwrap();
 
         let snapshot = be.peers().await.unwrap();
         assert!(snapshot[0].last_handshake.is_some());

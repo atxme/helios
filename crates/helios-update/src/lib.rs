@@ -15,8 +15,8 @@ mod rauc;
 pub use dryrun::DryRunChannel;
 pub use rauc::RaucChannel;
 
-use async_trait::async_trait;
 use aether::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Une release disponible, telle que décrite par l'index de mises à jour.

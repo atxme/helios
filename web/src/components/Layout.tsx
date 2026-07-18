@@ -1,16 +1,16 @@
-import { Activity, AlertCircle, Flame, KeyRound, LayoutDashboard, Settings2, Shield } from 'lucide-react'
+import { Activity, AlertCircle, Flame, LayoutDashboard, RadioTower, Settings2, Shield } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Status } from '../types'
 import type { WsStatus } from '../hooks/useHelios'
 import { useTheme } from '../hooks/useTheme'
 import { Background } from './Background'
 
-export type NavId = 'dashboard' | 'telemetry' | 'ipsec' | 'firewall' | 'settings'
+export type NavId = 'dashboard' | 'telemetry' | 'wireguard' | 'firewall' | 'settings'
 
 const NAV_ITEMS: { id: NavId; icon: React.ElementType; label: string }[] = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'   },
   { id: 'telemetry', icon: Activity,        label: 'Télémétrie'  },
-  { id: 'ipsec',     icon: KeyRound,        label: 'IKE SA'      },
+  { id: 'wireguard', icon: RadioTower,      label: 'WireGuard'   },
   { id: 'firewall',  icon: Shield,          label: 'Pare-feu'    },
   { id: 'settings',  icon: Settings2,       label: 'Paramètres'  },
 ]
@@ -74,7 +74,7 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
           </div>
           <div className="hidden lg:block min-w-0">
             <div className="font-bold tracking-[0.22em] text-xs text-amber-600 dark:text-amber-300">HELIOS</div>
-            <div className="text-[10px] text-cyan-700/80 dark:text-cyan-500/70 tracking-wide font-mono">IPsec · PQC Gateway</div>
+            <div className="text-[10px] text-cyan-700/80 dark:text-cyan-500/70 tracking-wide font-mono">WireGuard · PQ Gateway</div>
           </div>
         </div>
 

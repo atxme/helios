@@ -27,6 +27,7 @@
 
 mod blob_store;
 mod boot_controller;
+pub mod keystore;
 mod provisioning;
 mod reseal_ticket;
 mod secret;
@@ -36,6 +37,7 @@ mod tpm_interface;
 mod tpm_real;
 
 pub use boot_controller::{BootController, BootDecision};
+pub use keystore::{KeystoreError, SealedKeystore};
 pub use secret::SecretKey;
 pub use settings::TpmSettings;
 
@@ -78,6 +80,9 @@ pub enum TpmError {
 
     #[error("billet de rescellement lié à un état PCR différent de l'état courant")]
     TicketPcrMismatch,
+
+    #[error(transparent)]
+    Keystore(#[from] keystore::KeystoreError),
 
     #[error("opération TPM réelle non implémentée ({0}) — à valider sur la cible")]
     NotImplemented(&'static str),

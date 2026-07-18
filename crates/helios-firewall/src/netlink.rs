@@ -33,8 +33,8 @@
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use async_trait::async_trait;
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
+use async_trait::async_trait;
 use rustables::{
     Batch, Chain, ChainPolicy, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule as NfRule,
     Table,
@@ -106,7 +106,11 @@ impl NetlinkBackend {
         } else {
             let ip = IpAddr::from_str(addr)
                 .map_err(|e| Self::err(format!("IP `{addr}` invalide : {e}")))?;
-            Ok(if source { rule.saddr(ip) } else { rule.daddr(ip) })
+            Ok(if source {
+                rule.saddr(ip)
+            } else {
+                rule.daddr(ip)
+            })
         }
     }
 
@@ -127,7 +131,10 @@ impl NetlinkBackend {
             .iter()
             .map(|port| {
                 let mut copy = matches.to_vec();
-                copy[idx] = Match::DestPort { port: *port, proto: *proto };
+                copy[idx] = Match::DestPort {
+                    port: *port,
+                    proto: *proto,
+                };
                 copy
             })
             .collect()
@@ -238,12 +245,21 @@ mod tests {
     fn les_ensembles_de_ports_sont_eclates() {
         let matches = vec![
             Match::OutIface("eth0".into()),
-            Match::DestPortSet { ports: vec![80, 443], proto: L4::Tcp },
+            Match::DestPortSet {
+                ports: vec![80, 443],
+                proto: L4::Tcp,
+            },
         ];
         let expanded = NetlinkBackend::expand_port_sets(&matches);
         assert_eq!(expanded.len(), 2);
-        assert!(expanded[0].contains(&Match::DestPort { port: 80, proto: L4::Tcp }));
-        assert!(expanded[1].contains(&Match::DestPort { port: 443, proto: L4::Tcp }));
+        assert!(expanded[0].contains(&Match::DestPort {
+            port: 80,
+            proto: L4::Tcp
+        }));
+        assert!(expanded[1].contains(&Match::DestPort {
+            port: 443,
+            proto: L4::Tcp
+        }));
         // Les autres critères sont préservés dans chaque règle produite.
         assert!(expanded[0].contains(&Match::OutIface("eth0".into())));
     }

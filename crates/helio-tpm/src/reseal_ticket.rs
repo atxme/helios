@@ -120,8 +120,8 @@ impl ResealTicket {
         current_pcr: &[u8; 32],
     ) -> Result<()> {
         let msg = signing_bytes(self.version, &self.expected_pcr_digest);
-        let sig = Signature::from_slice(&self.signature)
-            .map_err(|_| TpmError::TicketInvalidSignature)?;
+        let sig =
+            Signature::from_slice(&self.signature).map_err(|_| TpmError::TicketInvalidSignature)?;
         vk.verify_strict(&msg, &sig)
             .map_err(|_| TpmError::TicketInvalidSignature)?;
 
@@ -165,7 +165,9 @@ mod tests {
     fn billet_valide_accepte() {
         let sk = SigningKey::from_bytes(&DEV_VENDOR_SEED);
         let t = sign_ticket(&DEV_VENDOR_SEED, 1, None);
-        assert!(t.verify_with_key(&sk.verifying_key(), 0, &[0u8; 32]).is_ok());
+        assert!(t
+            .verify_with_key(&sk.verifying_key(), 0, &[0u8; 32])
+            .is_ok());
     }
 
     #[test]
@@ -187,7 +189,10 @@ mod tests {
         // version courante déjà 3 → rejet.
         assert!(matches!(
             t.verify_with_key(&vk, 3, &[0u8; 32]),
-            Err(TpmError::TicketRollback { ticket: 3, current: 3 })
+            Err(TpmError::TicketRollback {
+                ticket: 3,
+                current: 3
+            })
         ));
     }
 

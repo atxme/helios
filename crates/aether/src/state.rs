@@ -78,10 +78,10 @@ impl TunnelState {
     /// Représentation chaîne stable (utilisée par l'API REST).
     pub fn as_str(self) -> &'static str {
         match self {
-            TunnelState::Down          => "down",
-            TunnelState::Connecting    => "connecting",
-            TunnelState::Up            => "up",
-            TunnelState::Failed        => "failed",
+            TunnelState::Down => "down",
+            TunnelState::Connecting => "connecting",
+            TunnelState::Up => "up",
+            TunnelState::Failed => "failed",
             TunnelState::CaptivePortal => "captive_portal",
         }
     }
@@ -176,7 +176,9 @@ mod tests {
     #[test]
     fn invalid_transition_is_rejected() {
         // Un handshake « établi » n'a pas de sens hors montée.
-        assert!(TunnelState::Down.on(TunnelEvent::HandshakeEstablished).is_err());
+        assert!(TunnelState::Down
+            .on(TunnelEvent::HandshakeEstablished)
+            .is_err());
         // Une expiration n'a de sens que depuis Up.
         assert!(TunnelState::Down.on(TunnelEvent::HandshakeExpired).is_err());
     }

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Logique du client VPN Orion (config, backend IKEv2, télémétrie) — testable sur WSL2, sans dépendance Tauri."
+description = "Logique du client VPN Orion (config, backend WireGuard, provisioning et télémétrie) — testable sans dépendance Tauri."
 
 [dependencies]
 aether = { workspace = true }
@@ -14,9 +14,17 @@ toml = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 directories = "5"
+base64.workspace = true
+aws-lc-rs.workspace = true
+# Dérive la clé publique Curve25519 depuis la clé privée du profil. On la
+# recalcule plutôt que de la stocker : une clé publique stockée pourrait diverger
+# de la clé privée réellement utilisée, et l'identité annoncée à la gateway ne
+# correspondrait plus au tunnel monté.
+x25519-dalek = { workspace = true }
 defguard_wireguard_rs = { workspace = true, optional = true }
 
 [features]

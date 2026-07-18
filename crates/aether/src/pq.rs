@@ -93,8 +93,8 @@ impl Kem for MlKem768Kem {
         if public_key.len() != PUBLIC_KEY_LEN {
             return Err(PqError::BadPublicKey);
         }
-        let ek = EncapsulationKey::new(&ML_KEM_768, public_key)
-            .map_err(|_| PqError::BadPublicKey)?;
+        let ek =
+            EncapsulationKey::new(&ML_KEM_768, public_key).map_err(|_| PqError::BadPublicKey)?;
         let (ciphertext, secret) = ek.encapsulate().map_err(|_| PqError::Encapsulation)?;
         let secret = to_shared_secret(secret.as_ref())?;
         Ok((ciphertext.as_ref().to_vec(), secret))

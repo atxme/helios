@@ -208,6 +208,9 @@ mod tests {
     #[test]
     fn cle_publique_en_base64() {
         let p = peer(&[0u8; 32], "100.64.0.2/32");
-        assert_eq!(p.public_key_b64(), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert_eq!(
+            p.public_key_b64(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
     }
 }

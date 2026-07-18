@@ -92,13 +92,17 @@ impl VpnBackend for DryRunBackend {
         } else {
             "tunnel classique (PSK PQ absent)"
         };
-        sink(ClientEvent::log("info", format!("[dry-run] tunnel établi — {pq}")));
+        sink(ClientEvent::log(
+            "info",
+            format!("[dry-run] tunnel établi — {pq}"),
+        ));
         Ok(())
     }
 
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()> {
         self.adapter_up.store(false, Ordering::SeqCst);
-        self.handshake_age_secs.store(NO_HANDSHAKE, Ordering::SeqCst);
+        self.handshake_age_secs
+            .store(NO_HANDSHAKE, Ordering::SeqCst);
         sink(ClientEvent::log("info", "[dry-run] adaptateur démonté"));
         sink(ClientEvent::state(TunnelState::Down));
         Ok(())

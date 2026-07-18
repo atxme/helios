@@ -12,8 +12,8 @@
 //! empêcherait précisément le roaming.
 
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use defguard_wireguard_rs::{
@@ -62,7 +62,11 @@ impl KernelBackend {
             .map_err(|e| WgError::BadAddress(format!("{} : {e}", cfg.allowed_ips)))?;
         peer.set_allowed_ips(vec![allowed]);
 
-        if let Some(psk) = cfg.preshared_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        if let Some(psk) = cfg
+            .preshared_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
+        {
             let psk = Key::try_from(psk)
                 .map_err(|e| WgError::BadKey(format!("PSK post-quantique : {e}")))?;
             peer.preshared_key = Some(psk);
@@ -144,7 +148,11 @@ impl WireguardBackend for KernelBackend {
             api.configure_peer(peer).map_err(|e| self.iface_err(e))?;
         }
 
-        info!("{} pair(s) synchronisé(s) sur {}", wanted.len(), self.ifname);
+        info!(
+            "{} pair(s) synchronisé(s) sur {}",
+            wanted.len(),
+            self.ifname
+        );
         Ok(())
     }
 
@@ -164,9 +172,7 @@ impl WireguardBackend for KernelBackend {
                 allowed_ips: p.allowed_ips.iter().map(ToString::to_string).collect(),
                 // WireGuard rapporte l'epoch tant qu'aucun handshake n'a eu lieu :
                 // le traduire en `None` plutôt qu'en « il y a 55 ans ».
-                last_handshake: p
-                    .last_handshake
-                    .filter(|t| *t != std::time::UNIX_EPOCH),
+                last_handshake: p.last_handshake.filter(|t| *t != std::time::UNIX_EPOCH),
                 endpoint: p.endpoint.map(|e| e.to_string()),
                 rx_bytes: p.rx_bytes,
                 tx_bytes: p.tx_bytes,
