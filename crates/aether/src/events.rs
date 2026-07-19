@@ -1,6 +1,8 @@
 use serde::Serialize;
+use tokio::sync::oneshot;
 
 use crate::config::NetworkConfig;
+use crate::secret::SecretString;
 use crate::state::TunnelState;
 
 /// Événements diffusés aux abonnés (WebSocket).
@@ -61,4 +63,38 @@ pub enum OrchestratorCmd {
     /// Recharge la configuration réseau à chaud (sans redémarrer le daemon).
     /// Boxée : `NetworkConfig` est bien plus grosse que les autres variantes.
     LoadNetworkConfig(Box<NetworkConfig>),
+}
+
+/// Demande d'installation d'un PSK post-quantique sur un pair du plan de
+/// données, émise par l'endpoint de provisioning vers l'orchestrateur.
+///
+/// # Pourquoi un canal dédié plutôt qu'une variante d'[`OrchestratorCmd`]
+///
+/// Deux raisons, toutes deux structurelles :
+///
+/// * cette demande porte un **secret** et attend une **réponse**, là où
+///   `OrchestratorCmd` est un flux d'ordres d'IHM sans retour — la doter d'un
+///   `oneshot` lui ferait perdre `Clone` ;
+/// * garder le PSK hors d'une énumération qui dérive `Debug` supprime toute
+///   possibilité de fuite par journalisation. Le champ est de surcroît un
+///   [`SecretString`], donc muet à l'affichage.
+///
+/// # Pourquoi une réponse est indispensable
+///
+/// WireGuard n'a qu'un seul slot PSK par pair : une valeur posée d'un seul côté
+/// fait échouer **tous** les handshakes suivants. L'endpoint ne doit donc
+/// annoncer le PSK au client qu'une fois la gateway certaine de l'avoir posé.
+/// Sans cet acquittement, un échec côté plan de données laisserait le client
+/// installer un PSK orphelin et tomber — sans canal de contrôle pour se
+/// rattraper, puisque ce canal vit dans le tunnel qui vient de mourir.
+#[derive(Debug)]
+pub struct InstallPskRequest {
+    /// Clé publique Curve25519 du pair concerné (base64) — son identité.
+    pub public_key: String,
+    /// VIP attribuée au pair, en notation CIDR (ex. `100.64.1.2/32`).
+    pub address: String,
+    /// PSK dérivé de l'échange ML-KEM, en base64. **Secret.**
+    pub psk: SecretString,
+    /// Acquittement : `Ok` seulement si le PSK est réellement posé sur le pair.
+    pub reply: oneshot::Sender<Result<(), String>>,
 }

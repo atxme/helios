@@ -23,7 +23,9 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use aether::{FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState};
+use aether::{
+    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState,
+};
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
@@ -43,6 +45,10 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<HeliosEvent>,
     /// Canal de commandes vers l'orchestrateur (Start/Stop depuis l'UI).
     pub cmd_tx: mpsc::Sender<OrchestratorCmd>,
+    /// Canal du provisioning : pose du PSK post-quantique sur le plan de
+    /// données. Séparé de `cmd_tx` parce qu'il porte un secret et attend un
+    /// acquittement (voir [`aether::InstallPskRequest`]).
+    pub psk_tx: mpsc::Sender<InstallPskRequest>,
     /// Configuration réseau courante (rechargeable à chaud).
     pub network: Arc<RwLock<NetworkConfig>>,
     /// `true` = daemon en mode simulation (WSL2 ou --dev).
@@ -58,12 +64,14 @@ impl AppState {
         tunnel_state: Arc<RwLock<TunnelState>>,
         event_tx: broadcast::Sender<HeliosEvent>,
         cmd_tx: mpsc::Sender<OrchestratorCmd>,
+        psk_tx: mpsc::Sender<InstallPskRequest>,
         policy: Arc<RwLock<FirewallPolicy>>,
     ) -> Self {
         Self {
             tunnel_state,
             event_tx,
             cmd_tx,
+            psk_tx,
             network,
             dry_run,
             policy,
@@ -170,10 +178,26 @@ mod security_tests {
                 Arc::new(RwLock::new(TunnelState::Down)),
                 event_tx,
                 cmd_tx,
+                auto_ack_psk_channel(),
                 Arc::new(RwLock::new(policy)),
             ),
             cmd_rx,
         )
+    }
+
+    /// Orchestrateur simulé qui acquitte toute installation de PSK.
+    ///
+    /// Ces tests portent sur le routeur et la rédaction des secrets, pas sur le
+    /// plan de données : sans ce puits, le canal serait fermé et le provisioning
+    /// échouerait pour une raison sans rapport avec ce qu'ils vérifient.
+    fn auto_ack_psk_channel() -> mpsc::Sender<InstallPskRequest> {
+        let (tx, mut rx) = mpsc::channel::<InstallPskRequest>(8);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let _ = request.reply.send(Ok(()));
+            }
+        });
+        tx
     }
 
     #[tokio::test]

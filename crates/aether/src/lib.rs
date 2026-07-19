@@ -14,12 +14,14 @@ pub mod error;
 pub mod events;
 pub mod policy;
 pub mod pq;
+pub mod secret;
 pub mod sig;
 pub mod state;
 
 pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
 pub use error::{HeliosError, Result};
-pub use events::{HeliosEvent, OrchestratorCmd};
+pub use events::{HeliosEvent, InstallPskRequest, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
 pub use pq::{Kem, MlKem768Kem, PqError, SharedSecret};
+pub use secret::SecretString;
 pub use state::{TunnelEvent, TunnelState};

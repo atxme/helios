@@ -5,7 +5,9 @@ mod orchestrator;
 
 use std::sync::Arc;
 
-use aether::{HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK};
+use aether::{
+    HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK,
+};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use helio_tpm::{BootController, BootDecision, TpmSettings};
@@ -125,6 +127,9 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
 
     let (event_tx, _) = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);
+    // Canal dédié au provisioning : il porte un secret et attend un
+    // acquittement, contrairement au flux d'ordres d'IHM.
+    let (psk_tx, psk_rx) = mpsc::channel::<InstallPskRequest>(8);
     let tunnel_state = Arc::new(RwLock::new(TunnelState::Down));
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy = Arc::new(RwLock::new(shared_network.read().await.firewall_policy()));
@@ -148,6 +153,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         Arc::clone(&tunnel_state),
         event_tx.clone(),
         cmd_tx,
+        psk_tx,
         Arc::clone(&shared_policy),
     );
     tokio::spawn(async move {
@@ -162,6 +168,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         tunnel_state,
         event_tx,
         cmd_rx,
+        psk_rx,
         shared_policy,
         boot,
     )

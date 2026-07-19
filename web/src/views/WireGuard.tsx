@@ -74,11 +74,11 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
             le provisioning n’étend jamais cette liste, il ne fait que servir les pairs déjà déclarés.
           </p>
           <p>
-            <strong className="text-amber-600 dark:text-amber-400">Chantier ouvert.</strong> Le PSK est
-            bien dérivé et renvoyé au client, mais son <em>installation sur le pair côté plan de données</em>{' '}
-            n’est pas encore câblée — elle doit passer par l’orchestrateur. Tant que ce n’est pas fait,
-            un pair marqué « PSK post-quantique » ci-dessus l’est par sa configuration statique, pas par
-            un enrôlement.
+            <strong className="text-slate-600 dark:text-slate-400">Provisioning post-quantique.</strong>{' '}
+            Le PSK est dérivé par ML-KEM-768 puis posé sur le pair <em>avant</em> d’être annoncé au
+            client : un PSK présent d’un seul côté ferait échouer tous les handshakes. En cas d’échec,
+            la demande est refusée et le tunnel reste classique. Un pair peut donc porter un PSK issu
+            d’un enrôlement ou d’une configuration statique.
           </p>
         </div>
       </div>

@@ -437,6 +437,9 @@ mod tests {
                 Arc::new(RwLock::new(state)),
                 event_tx,
                 cmd_tx,
+                // Ces tests ne touchent pas au provisioning : un canal jamais
+                // servi suffit.
+                mpsc::channel(1).0,
                 Arc::new(RwLock::new(policy)),
             ),
             cmd_rx,

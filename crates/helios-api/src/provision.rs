@@ -29,12 +29,17 @@
 //! faut sceller, c'est **`wg_private_key`** — l'identité cryptographique réelle
 //! de la gateway, aujourd'hui en clair dans `network.toml`. Chantier ouvert.
 
+use std::time::Duration;
+
 use aether::enroll::{EnrollError, ProvisionRequest, ProvisionResponse};
+use aether::{InstallPskRequest, SecretString};
 use axum::{extract::State, http::StatusCode, Json};
 use helios_provisioning::{
-    handle_request, session::fresh_nonce, AdmittedPeers, GatewayIdentity, DEFAULT_PSK_LIFETIME_SECS,
+    handle_request, session::fresh_nonce, AdmittedPeers, GatewayIdentity, Provisioned,
+    DEFAULT_PSK_LIFETIME_SECS,
 };
 use helios_wireguard::PeerAddressTable;
+use tokio::sync::oneshot;
 
 use crate::AppState;
 
@@ -86,16 +91,73 @@ pub async fn provision(
     let provisioned =
         handle_request(&request, &identity, &admitted, &peers, fresh_nonce()).map_err(to_http)?;
 
+    // La config n'est plus nécessaire, et l'orchestrateur va vouloir l'écrire :
+    // relâcher le verrou en lecture avant de lui passer la main.
+    drop(network);
+
+    // Le PSK est posé sur le plan de données AVANT d'être annoncé au client.
+    // WireGuard n'a qu'un seul slot PSK par pair : un PSK installé d'un seul
+    // côté fait échouer tous les handshakes suivants — et le canal de contrôle
+    // qui permettrait de se rattraper vit précisément dans ce tunnel.
+    install_psk(&s, &request.client_wg_public_key, &provisioned).await?;
+
     tracing::info!(
         peer = %request.client_wg_public_key,
         vip = %provisioned.address,
-        "provisioning effectué — PSK post-quantique dérivé"
+        "provisioning effectué — PSK post-quantique dérivé et installé"
     );
 
-    // NOTE : le PSK doit encore être installé sur le pair côté plan de données.
-    // Ce câblage passe par l'orchestrateur (voir `OrchestratorCmd`) et n'est pas
-    // fait ici : cet endpoint ne doit pas manipuler le plan de données lui-même.
     Ok(Json(provisioned.response))
+}
+
+/// Délai d'attente de l'acquittement de l'orchestrateur.
+///
+/// Généreux au regard d'un `sync_peers` local, mais borné : un client bloqué
+/// indéfiniment ne saurait pas s'il doit installer le PSK ou non.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Demande à l'orchestrateur de poser le PSK, et attend sa confirmation.
+///
+/// Toute défaillance — canal saturé, orchestrateur arrêté, plan de données en
+/// erreur, délai dépassé — se traduit par un échec de la requête. C'est
+/// délibérément fail-closed : mieux vaut un provisioning refusé, qui laisse le
+/// tunnel classique intact, qu'un PSK orphelin qui tue le tunnel.
+async fn install_psk(
+    s: &AppState,
+    client_public_key: &str,
+    provisioned: &Provisioned,
+) -> Result<(), (StatusCode, String)> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    let request = InstallPskRequest {
+        public_key: client_public_key.to_string(),
+        address: format!("{}/32", provisioned.address),
+        psk: SecretString::new(aether::enroll::psk_to_base64(&provisioned.psk)),
+        reply: reply_tx,
+    };
+
+    s.psk_tx.send(request).await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "orchestrateur indisponible : PSK non installé".to_string(),
+        )
+    })?;
+
+    match tokio::time::timeout(INSTALL_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("installation du PSK refusée : {e}"),
+        )),
+        Ok(Err(_)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "orchestrateur arrêté avant d'acquitter le PSK".to_string(),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "délai dépassé à l'installation du PSK".to_string(),
+        )),
+    }
 }
 
 /// Traduit une erreur de protocole en réponse HTTP.
@@ -130,8 +192,163 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::enroll::{derive_psk, ProvisionRequest, NONCE_LEN, PROTOCOL_VERSION};
+    use aether::pq::{Kem, MlKem768Kem};
+    use aether::{NetworkConfig, TunnelState};
+    use std::sync::Arc;
+    use tokio::sync::{broadcast, mpsc, RwLock};
 
     const PRIV: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const CLIENT_PRIV: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    /// Clé publique du client, telle que la gateway la connaît par l'admission.
+    fn client_public_key() -> String {
+        use base64::Engine as _;
+        let raw: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(CLIENT_PRIV)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let secret = x25519_dalek::StaticSecret::from(raw);
+        base64::engine::general_purpose::STANDARD
+            .encode(x25519_dalek::PublicKey::from(&secret).as_bytes())
+    }
+
+    /// `AppState` gréé pour le provisioning, avec le canal PSK rendu au test :
+    /// c'est lui qui décide d'acquitter ou non, donc qui joue l'orchestrateur.
+    fn state_provisionnable() -> (AppState, mpsc::Receiver<InstallPskRequest>) {
+        let network = NetworkConfig {
+            wg_private_key: PRIV.into(),
+            wg_address: "100.64.0.1/10".into(),
+            peers: vec![aether::WgPeer {
+                name: "poste".into(),
+                public_key: client_public_key(),
+                address: "100.64.1.2/32".into(),
+                preshared_key: None,
+            }],
+            ..NetworkConfig::default()
+        };
+        let policy = network.firewall_policy();
+        let (event_tx, _) = broadcast::channel(8);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let (psk_tx, psk_rx) = mpsc::channel(8);
+        let state = AppState::new(
+            Arc::new(RwLock::new(network)),
+            true,
+            Arc::new(RwLock::new(TunnelState::Connecting)),
+            event_tx,
+            cmd_tx,
+            psk_tx,
+            Arc::new(RwLock::new(policy)),
+        );
+        (state, psk_rx)
+    }
+
+    /// Construit une vraie requête de provisioning, comme le ferait Orion.
+    fn requete_client() -> (
+        <MlKem768Kem as Kem>::SecretKey,
+        [u8; NONCE_LEN],
+        ProvisionRequest,
+    ) {
+        let (dk, ek) = MlKem768Kem::generate().unwrap();
+        let nonce = [42u8; NONCE_LEN];
+        (
+            dk,
+            nonce,
+            ProvisionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                client_wg_public_key: client_public_key(),
+                kem_public_key: ek,
+                client_nonce: nonce,
+            },
+        )
+    }
+
+    /// Le tour complet : le PSK annoncé au client est exactement celui que la
+    /// gateway a demandé d'installer, et l'installation précède la réponse.
+    #[tokio::test]
+    async fn le_psk_est_installe_avant_d_etre_annonce_et_les_deux_bouts_concordent() {
+        let (state, mut psk_rx) = state_provisionnable();
+        let (dk, client_nonce, request) = requete_client();
+
+        // L'orchestrateur simulé : il acquitte et retient ce qu'on lui a demandé.
+        let orchestrateur = tokio::spawn(async move {
+            let demande = psk_rx.recv().await.expect("une demande doit arriver");
+            let psk = demande.psk.expose().to_string();
+            let address = demande.address.clone();
+            demande.reply.send(Ok(())).unwrap();
+            (psk, address)
+        });
+
+        let response = provision(State(state), Json(request))
+            .await
+            .expect("le provisioning doit aboutir")
+            .0;
+
+        let (psk_installe, address) = orchestrateur.await.unwrap();
+        // La VIP transmise est celle que l'IPAM dérive de la clé publique, et
+        // c'est bien celle annoncée au client : les deux doivent concorder.
+        assert_eq!(
+            address, response.assigned_address,
+            "la VIP posée doit être celle annoncée au client"
+        );
+
+        // Côté client : décapsulation et dérivation indépendantes.
+        let kem_secret = MlKem768Kem::decapsulate(&dk, &response.kem_ciphertext).unwrap();
+        let psk_client = derive_psk(
+            &kem_secret,
+            &client_nonce,
+            &response.gateway_nonce,
+            &client_public_key(),
+            &response.gateway_wg_public_key,
+        )
+        .unwrap();
+
+        assert_eq!(
+            aether::enroll::psk_to_base64(&psk_client),
+            psk_installe,
+            "le PSK posé sur la gateway doit être celui que le client dérive, \
+             sinon tous les handshakes suivants échoueraient"
+        );
+    }
+
+    /// Fail-closed : si la gateway ne peut pas poser le PSK, elle ne l'annonce
+    /// pas. Le client reste en tunnel classique plutôt que de poser un PSK
+    /// orphelin qui tuerait le tunnel — et avec lui le canal de rattrapage.
+    #[tokio::test]
+    async fn un_psk_non_installe_n_est_jamais_annonce_au_client() {
+        let (state, mut psk_rx) = state_provisionnable();
+        let (_dk, _nonce, request) = requete_client();
+
+        // L'orchestrateur refuse la pose.
+        tokio::spawn(async move {
+            let demande = psk_rx.recv().await.unwrap();
+            demande
+                .reply
+                .send(Err("plan de données indisponible".into()))
+                .unwrap();
+        });
+
+        let erreur = provision(State(state), Json(request))
+            .await
+            .expect_err("un PSK non posé doit faire échouer la requête");
+
+        assert_eq!(erreur.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Orchestrateur arrêté : même exigence, par un autre chemin.
+    #[tokio::test]
+    async fn orchestrateur_absent_fait_echouer_le_provisioning() {
+        let (state, psk_rx) = state_provisionnable();
+        drop(psk_rx);
+        let (_dk, _nonce, request) = requete_client();
+
+        let erreur = provision(State(state), Json(request))
+            .await
+            .expect_err("sans orchestrateur, aucun PSK ne doit être annoncé");
+
+        assert_eq!(erreur.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn la_cle_publique_de_la_gateway_derive_de_sa_cle_privee() {

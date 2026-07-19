@@ -146,10 +146,12 @@ export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
             value={draft.preshared_key ?? ''}
             onChange={(v) => set('preshared_key', v || null)}
           />
-          <Note tone="warn">
-            L’installation automatique côté gateway n’est pas encore câblée : ne renseignez cette
-            valeur que si les <strong>deux</strong> pairs portent déjà la même. Une valeur présente
-            d’un seul côté fait échouer tous les handshakes.
+          <Note>
+            Laissez ce champ vide : le PSK est négocié automatiquement à la connexion (ML-KEM-768),
+            à condition que l’URL Helios interne soit renseignée ci-dessous. Une valeur saisie ici
+            est considérée comme un PSK statique et <strong>désactive</strong> la négociation — les
+            deux pairs doivent alors porter exactement la même, faute de quoi tous les handshakes
+            échouent.
           </Note>
         </Section>
 

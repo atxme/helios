@@ -14,7 +14,8 @@
 use std::{sync::Arc, time::Duration};
 
 use aether::{
-    FirewallPolicy, HeliosEvent, NetworkConfig, OrchestratorCmd, TunnelEvent, TunnelState,
+    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelEvent,
+    TunnelState,
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
@@ -121,12 +122,20 @@ async fn sync_policy(shared: &Arc<RwLock<FirewallPolicy>>, policy: &FirewallPoli
 }
 
 /// Boucle principale du daemon.
+///
+/// Beaucoup de paramètres, mais chacun est une dépendance distincte injectée
+/// une seule fois depuis `main` : les regrouper en structure déplacerait le
+/// câblage sans le simplifier.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     shared_network: Arc<RwLock<NetworkConfig>>,
     dry_run: bool,
     shared_state: Arc<RwLock<TunnelState>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
+    // Demandes d'installation de PSK issues du provisioning (canal dédié :
+    // elles portent un secret et attendent un acquittement).
+    mut psk_rx: mpsc::Receiver<InstallPskRequest>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
     // Détenue ici et nulle part ailleurs : le secret de scellement TPM ne doit
     // pas transiter par le crate API. Seul l'orchestrateur peut sceller.
@@ -200,6 +209,15 @@ pub async fn run(
                             fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
                         ).await?;
                     }
+                }
+            }
+
+            // Provisioning : pose du PSK post-quantique sur un pair. L'appelant
+            // (l'endpoint HTTP) attend l'acquittement avant d'annoncer le PSK au
+            // client — voir `InstallPskRequest`.
+            psk_request = psk_rx.recv() => {
+                if let Some(request) = psk_request {
+                    install_peer_psk(request, &shared_network, wg.as_ref(), &event_tx).await;
                 }
             }
 
@@ -393,6 +411,126 @@ async fn handle_external_cmd(
 /// `Connecting` dès l'interface montée ; c'est le polling des handshakes
 /// ([`spawn_handshake_poller`]) qui promeut vers `Up` quand un pair est
 /// réellement connecté (ADR-001 §3).
+/// Pose le PSK post-quantique d'un pair sur le plan de données.
+///
+/// # Ordre des opérations
+///
+/// La configuration en mémoire est mise à jour **d'abord**, puis synchronisée
+/// vers le plan de données. En cas d'échec de `sync_peers`, la modification est
+/// annulée : la config en mémoire ne doit jamais annoncer un PSK que l'interface
+/// ne porte pas, sans quoi une reconnexion ultérieure poserait un PSK que le
+/// client a, lui, déjà oublié.
+///
+/// # Limite connue : la VIP dérivée n'est pas réconciliée
+///
+/// `helios_provisioning::assign_vip` dérive la VIP de la clé publique du pair
+/// et ne consulte jamais l'adresse déclarée dans `network.toml`. Les deux
+/// peuvent donc diverger. Cette fonction **conserve l'adresse déclarée** et se
+/// contente de journaliser l'écart : l'opérateur reste la source de vérité, et
+/// une bascule silencieuse d'`AllowedIPs` couperait le trafic d'un client qui,
+/// lui, garde l'adresse de son profil. Réconcilier les deux demande de trancher
+/// qui fait autorité — ce n'est pas du ressort de la pose d'un PSK.
+///
+/// # Ce qui n'est délibérément pas fait : la persistance
+///
+/// Le PSK n'est **pas** écrit dans `network.toml`. Il est dérivé par session,
+/// sa durée de vie est bornée ([`helios_provisioning::DEFAULT_PSK_LIFETIME_SECS`]),
+/// et un client qui se reconnecte en redemande un neuf. L'écrire sur disque
+/// ajouterait un secret persistant sans rien apporter — et contredirait
+/// l'éphémérité qui borne la fenêtre d'exploitation en cas de fuite.
+///
+/// # Sur l'absence de coupure
+///
+/// Changer le PSK d'un pair vivant ne casse pas la session en cours : les clés
+/// de session sont déjà dérivées, le nouveau PSK ne servira qu'au handshake
+/// suivant (≤ 2 min). C'est ce qui rend la pose sûre à chaud — voir
+/// `helios_provisioning::rotation`.
+async fn install_peer_psk(
+    request: InstallPskRequest,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    wg: &dyn WireguardBackend,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+) {
+    let InstallPskRequest {
+        public_key,
+        address,
+        psk,
+        reply,
+    } = request;
+
+    // Mise à jour en mémoire, avec de quoi revenir en arrière.
+    let previous = {
+        let mut network = shared_network.write().await;
+        match network
+            .peers
+            .iter_mut()
+            .find(|p| p.public_key == public_key)
+        {
+            None => {
+                // Ne devrait pas arriver : l'endpoint a déjà vérifié l'admission.
+                let _ = reply.send(Err(format!(
+                    "pair inconnu de la configuration : {public_key}"
+                )));
+                return;
+            }
+            Some(peer) => {
+                // L'adresse déclarée par l'opérateur fait foi et n'est **pas**
+                // écrasée par la VIP dérivée. `AllowedIPs` est la table de
+                // routage cryptographique de WireGuard : la changer sous une
+                // session vivante, alors que le client garde l'adresse de son
+                // profil, couperait le trafic. La divergence est signalée, pas
+                // résolue en silence — voir la limite connue du module.
+                if peer.address != address {
+                    warn!(
+                        peer = %public_key,
+                        declaree = %peer.address,
+                        derivee = %address,
+                        "la VIP dérivée diffère de l'adresse déclarée : \
+                         l'adresse déclarée est conservée"
+                    );
+                }
+                let previous = peer.preshared_key.take();
+                peer.preshared_key = Some(psk.expose().to_string());
+                previous
+            }
+        }
+    };
+
+    let (_, peers) = wg_config(&*shared_network.read().await);
+
+    match wg.sync_peers(&peers).await {
+        Ok(()) => {
+            info!(peer = %public_key, vip = %address, "PSK post-quantique installé sur le pair");
+            emit_log(
+                event_tx,
+                "info",
+                &format!("PSK post-quantique installé pour {address} — le prochain handshake sera protégé"),
+            );
+            let _ = reply.send(Ok(()));
+        }
+        Err(e) => {
+            // Annulation : la config en mémoire doit refléter le plan de données.
+            {
+                let mut network = shared_network.write().await;
+                if let Some(peer) = network
+                    .peers
+                    .iter_mut()
+                    .find(|p| p.public_key == public_key)
+                {
+                    peer.preshared_key = previous;
+                }
+            }
+            warn!(peer = %public_key, "installation du PSK impossible : {e}");
+            emit_log(
+                event_tx,
+                "error",
+                &format!("Installation du PSK post-quantique refusée : {e}"),
+            );
+            let _ = reply.send(Err(e.to_string()));
+        }
+    }
+}
+
 async fn do_connect(
     network: &NetworkConfig,
     wg: &dyn WireguardBackend,
@@ -727,6 +865,119 @@ mod tests {
             Some((42, 84, 3, 4))
         );
         assert_eq!(parse_proc_net_dev(proc_net_dev, "eth1"), None);
+    }
+
+    /// Réseau dont le pair n'a pas encore de PSK : l'état de départ d'un client
+    /// qui vient de monter son tunnel classique.
+    fn network_sans_psk() -> NetworkConfig {
+        let mut network = configured_network();
+        network.peers[0].preshared_key = None;
+        network
+    }
+
+    async fn demander_installation(
+        shared: &Arc<RwLock<NetworkConfig>>,
+        wg: &dyn WireguardBackend,
+        public_key: &str,
+    ) -> Result<(), String> {
+        let (events, _) = broadcast::channel(8);
+        let (reply, reponse) = tokio::sync::oneshot::channel();
+        install_peer_psk(
+            InstallPskRequest {
+                public_key: public_key.into(),
+                address: "100.64.1.2/32".into(),
+                psk: aether::SecretString::new("psk-issu-de-ml-kem"),
+                reply,
+            },
+            shared,
+            wg,
+            &events,
+        )
+        .await;
+        reponse
+            .await
+            .expect("l'orchestrateur doit toujours acquitter")
+    }
+
+    #[tokio::test]
+    async fn psk_provisionne_est_pose_sur_le_plan_de_donnees() {
+        let shared = Arc::new(RwLock::new(network_sans_psk()));
+        let wireguard = helios_wireguard::DryRunBackend::new();
+
+        demander_installation(&shared, &wireguard, PEER_KEY)
+            .await
+            .expect("l'installation doit réussir");
+
+        // La config en mémoire porte le PSK…
+        assert_eq!(
+            shared.read().await.peers[0].preshared_key.as_deref(),
+            Some("psk-issu-de-ml-kem")
+        );
+        // …et le plan de données aussi : c'est lui qui protège réellement.
+        let peers = wireguard.peers().await.unwrap();
+        assert_eq!(peers.len(), 1, "le pair doit être présent sur l'interface");
+    }
+
+    /// Si le plan de données refuse, la config en mémoire ne doit pas rester en
+    /// avance sur lui : elle annoncerait un PSK que l'interface ne porte pas, et
+    /// une reconnexion ultérieure le poserait alors que le client l'a oublié.
+    #[tokio::test]
+    async fn echec_du_plan_de_donnees_annule_le_psk_en_memoire() {
+        let shared = Arc::new(RwLock::new(network_sans_psk()));
+        let wireguard = helios_wireguard::DryRunBackend::failing_sync();
+
+        let resultat = demander_installation(&shared, &wireguard, PEER_KEY).await;
+
+        assert!(resultat.is_err(), "l'échec doit remonter à l'appelant");
+        assert_eq!(
+            shared.read().await.peers[0].preshared_key,
+            None,
+            "INVARIANTE VIOLÉE : la config garde un PSK que le plan de données \
+             a refusé — le prochain handshake échouerait sans explication"
+        );
+    }
+
+    /// L'ancien PSK doit être restauré, pas simplement effacé : une rotation
+    /// ratée ne doit pas dégrader un pair qui était déjà protégé.
+    #[tokio::test]
+    async fn echec_de_rotation_restaure_le_psk_precedent() {
+        // `configured_network` part avec un PSK déjà en place.
+        let shared = Arc::new(RwLock::new(configured_network()));
+        let wireguard = helios_wireguard::DryRunBackend::failing_sync();
+
+        let resultat = demander_installation(&shared, &wireguard, PEER_KEY).await;
+
+        assert!(resultat.is_err());
+        assert_eq!(
+            shared.read().await.peers[0].preshared_key.as_deref(),
+            Some("psk-test"),
+            "une rotation ratée doit rendre le pair à son état antérieur"
+        );
+    }
+
+    /// L'endpoint vérifie déjà l'admission, mais l'orchestrateur ne doit pas
+    /// s'en remettre à un appelant : un pair absent de la config est refusé.
+    #[tokio::test]
+    async fn pair_absent_de_la_configuration_est_refuse() {
+        let shared = Arc::new(RwLock::new(network_sans_psk()));
+        let wireguard = helios_wireguard::DryRunBackend::new();
+
+        let resultat = demander_installation(
+            &shared,
+            &wireguard,
+            "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        )
+        .await;
+
+        assert!(
+            resultat.is_err(),
+            "un pair non déclaré ne doit pas être posé"
+        );
+        assert_eq!(
+            shared.read().await.peers[0].preshared_key,
+            None,
+            "le pair légitime ne doit pas avoir été touché"
+        );
     }
 
     #[tokio::test]

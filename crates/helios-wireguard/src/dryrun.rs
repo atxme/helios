@@ -23,6 +23,10 @@ pub struct DryRunBackend {
     /// Si `true`, les pairs simulés rapportent un handshake frais (utile pour
     /// exercer l'inférence d'état sans plan de données).
     simulate_handshakes: bool,
+    /// Si `true`, [`WireguardBackend::sync_peers`] échoue systématiquement.
+    /// Sert à exercer les chemins de rattrapage de l'orchestrateur — notamment
+    /// l'annulation d'une pose de PSK que le plan de données a refusée.
+    fail_sync: bool,
 }
 
 impl DryRunBackend {
@@ -34,6 +38,15 @@ impl DryRunBackend {
     pub fn with_handshakes() -> Self {
         Self {
             simulate_handshakes: true,
+            ..Self::default()
+        }
+    }
+
+    /// Variante dont `sync_peers` échoue toujours : simule un plan de données
+    /// qui refuse une reconfiguration.
+    pub fn failing_sync() -> Self {
+        Self {
+            fail_sync: true,
             ..Self::default()
         }
     }
@@ -91,6 +104,11 @@ impl WireguardBackend for DryRunBackend {
     }
 
     async fn sync_peers(&self, peers: &[PeerConfig]) -> Result<()> {
+        if self.fail_sync {
+            return Err(WgError::Unavailable(
+                "[dry-run] synchronisation des pairs refusée (panne simulée)".into(),
+            ));
+        }
         for p in peers {
             Self::decode_key(&p.public_key)?;
         }
