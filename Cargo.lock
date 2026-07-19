@@ -30,6 +30,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml 0.8.2",
  "zeroize",
 ]
@@ -1805,14 +1806,18 @@ version = "0.1.0"
 dependencies = [
  "aether",
  "anyhow",
+ "aws-lc-rs",
+ "base64 0.22.1",
  "clap",
  "futures-util",
+ "orion-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.2",
+ "x25519-dalek 2.0.1",
 ]
 
 [[package]]

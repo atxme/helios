@@ -27,6 +27,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 echo '==> Tests Rust, toutes les features'
 cargo test --workspace --all-features
 
+echo '==> Campagne de provisioning post-quantique (dry-run)'
+# Monte un daemon isolé et joue la campagne de bout en bout : c'est le seul
+# point de la régression qui exerce le chemin complet client -> HTTP ->
+# orchestrateur -> plan de données. Les scénarios de plan de données s'y
+# déclarent hors de portée : ils exigent la cible (docs/TESTING.md).
+bash "$repo_root/scripts/campaign.sh"
+
 echo '==> Refus release du trousseau éditeur de développement'
 if HELIOS_PUBLISHER_KEYRING_PATH="$repo_root/crates/aether/publisher-keyring.dev.json" \
   cargo check --release -p aether >/dev/null 2>&1; then

@@ -22,6 +22,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+mod campaign;
+
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -64,6 +66,32 @@ enum Cmd {
     Scenario {
         #[arg(default_value = "nominal")]
         name: String,
+    },
+    /// Campagne de bout en bout du provisioning post-quantique.
+    ///
+    /// Le même binaire vaut pour le dry-run et pour la cible : seuls les
+    /// scénarios de plan de données exigent `--wg-iface` et un noyau réel.
+    Campaign {
+        /// Clé privée WireGuard du client (base64). Le pair correspondant doit
+        /// être **admis** sur la gateway : l'admission reste hors bande.
+        #[arg(long, env = "HELIOS_CAMPAIGN_CLIENT_KEY")]
+        client_key: Option<String>,
+        /// Clé publique WireGuard de la gateway (base64).
+        #[arg(long, env = "HELIOS_CAMPAIGN_GATEWAY_KEY")]
+        gateway_key: Option<String>,
+        /// Interface WireGuard à inspecter (ex. `helios0`). Active les
+        /// scénarios de plan de données — **cible uniquement**.
+        #[arg(long)]
+        wg_iface: Option<String>,
+        /// Ne joue qu'une catégorie de scénarios.
+        #[arg(long, value_enum)]
+        only: Option<campaign::Category>,
+        /// Nombre de passes (campagne d'endurance au-delà de 1).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Génère une paire de clés à déclarer, puis quitte.
+        #[arg(long)]
+        generate_keys: bool,
     },
 }
 
@@ -570,6 +598,31 @@ async fn main() -> Result<()> {
             "flap" => scenario_flap(&client, base).await,
             other => anyhow::bail!("scénario inconnu '{other}'. Disponibles : nominal, flap"),
         },
+        Cmd::Campaign {
+            client_key,
+            gateway_key,
+            wg_iface,
+            only,
+            repeat,
+            generate_keys,
+        } => {
+            if generate_keys {
+                campaign::generate_keys();
+                return Ok(());
+            }
+            campaign::run(
+                &client,
+                base,
+                campaign::Options {
+                    client_key,
+                    gateway_key,
+                    wg_iface,
+                    only,
+                    repeat,
+                },
+            )
+            .await
+        }
     }
 }
 
