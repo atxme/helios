@@ -84,7 +84,9 @@
       "Bash(chmod +x scripts/campaign.sh)",
       "Bash(bash scripts/campaign.sh)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(git merge *)"
     ]
   }
 }
