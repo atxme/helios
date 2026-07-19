@@ -36,6 +36,33 @@ compteur anti-rejeu fichier ou NV TPM.
 - Une release exige `HELIOS_PUBLISHER_KEYRING_PATH`. Les secrets éditeur ne
   doivent jamais entrer dans une gateway ni dans le dépôt.
 
+## Interdiction des TODO
+
+Aucun marqueur `TODO`, `FIXME`, `XXX`, `HACK`, `TBD`, `todo!()` ni
+`unimplemented!()` ne doit être introduit dans ce dépôt. Un marqueur est une
+dette invisible : il ne compile aucun test, ne bloque aucune release et sort du
+champ de vision dès la revue suivante.
+
+Face à une fonctionnalité incomplète, trois issues seulement :
+
+1. **La développer** — c’est le défaut. Si la tâche est faisable, la faire
+   plutôt que de la baliser.
+2. **La refuser explicitement dans le type** — variante d’erreur nommée et
+   documentée (modèle : `helio_tpm::TpmError::NotImplemented`), testée, qui
+   échoue franchement à l’exécution. Jamais un chemin silencieux ou dégradé.
+3. **La documenter comme limite connue** — section « Limite connue » dans le
+   doc-comment du module, plus une ligne dans l’ADR concerné si elle engage
+   l’architecture. Le texte doit dire *pourquoi* c’est hors périmètre et *ce
+   qui débloquerait*, pas seulement que ça manque.
+
+Un blocage qui attend un arbitrage humain (ADR-002 amendement 2) relève du
+point 3, pas d’un `TODO`. Une limite matérielle non vérifiable en WSL2 relève
+du point 3 et de [docs/TESTING.md](docs/TESTING.md).
+
+Si une limite documentée est visible par l’utilisateur, l’IHM doit la dire —
+c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
+`apps/orion/src/views/ProfilesView.tsx`.
+
 ## Workspace
 
 - `aether` : états, config, politique, ML-KEM, protocole et signatures hybrides.

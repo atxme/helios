@@ -23,7 +23,7 @@ compilation/tests sans exécuter d’effet réel.
 | Tauri | commandes IPC, CSP, prototypes figés et capability minimale |
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application |
-| OTA | index absent/invalide/identique/nouveau et non-exécution de RAUC si déjà à jour |
+| OTA | index absent/invalide/identique/nouveau, non-exécution de RAUC si déjà à jour, et lecture du slot booté dans `rauc status --output-format=json` (parsing seul) |
 
 `cargo-audit` est un prérequis local :
 
@@ -74,7 +74,10 @@ Valider avec accès console :
 - API inaccessible depuis le WAN et accessible via `helios0` ;
 - Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
 - PCR correct et incorrect, billet signé valide, rejoué, altéré et PCR optionnel ;
-- RAUC : installation slot inactif, boot sain, `mark-good`, boot cassé et rollback.
+- RAUC : installation slot inactif, boot sain, `mark-good`, boot cassé et rollback ;
+- RAUC : `heliosd check-update` après un rollback rapporte bien la version du
+  slot effectivement booté, et la divergence avec la version compilée est
+  journalisée en `warn` si le slot status a été altéré.
 
 Ces essais modifient le pare-feu, les routes, le TPM et les slots de boot : ne
 jamais les lancer contre une appliance de production.
