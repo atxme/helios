@@ -72,7 +72,19 @@
       "Bash(curl -s http://127.0.0.1:8080/api/trust)",
       "Bash(python3 -m json.tool)",
       "Bash(pkill -f \"heliosd run\")",
-      "Bash(cargo fmt *)"
+      "Bash(cargo fmt *)",
+      "Bash(cargo doc *)",
+      "Bash(sed -n '/async fn do_connect/,/^}/p' crates/heliosd/src/orchestrator.rs)",
+      "Bash(sed -n '/pub struct WgPeer/,/^}/p' crates/aether/src/config.rs)",
+      "Bash(grep -c \"^test .* ok$\")",
+      "Bash(timeout 900 bash scripts/regression.sh)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(curl -s http://127.0.0.1:8080/api/network)",
+      "Bash(pkill -f \"heliosd run --dev\")",
+      "Bash(chmod +x scripts/campaign.sh)",
+      "Bash(bash scripts/campaign.sh)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }

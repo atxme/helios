@@ -182,7 +182,8 @@ echo "  # Client VPN (app Tauri) :"
 if $IS_WSL; then
     echo "  export DISPLAY=:0  # ou laisser WSLg gérer"
 fi
-echo "  cd apps/orion && npm run tauri dev"
+
+echo "  cargo run -p orion"
 echo ""
 echo "  # UI web (dev) :"
 echo "  cd web && npm run dev"

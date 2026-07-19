@@ -52,7 +52,14 @@ Rust et frontend :
 cargo test -p orion-core
 npm run test:unit --prefix apps/orion
 npm run build --prefix apps/orion
+
+# Application complète en dry-run ; démarre Vite automatiquement
+cargo run -p orion
 ```
+
+Le dernier lancement requiert WSLg (`xdpyinfo` doit réussir). Il utilise le
+backend Orion simulé mais le véritable shell Tauri et son pont IPC. Sans WSLg,
+les trois commandes de test et de build restent utilisables, pas l'IHM native.
 
 ## Ce qui doit rester sur la cible
 

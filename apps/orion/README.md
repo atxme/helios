@@ -88,14 +88,25 @@ compile le shell Rust mais ne remplace pas le workflow de packaging Tauri.
 cargo test -p orion-core
 
 # Tests et build du frontend
-cd apps/orion
-npm ci
-npm run test:unit
-npm run build
+npm ci --prefix apps/orion
+npm run test:unit --prefix apps/orion
+npm run build --prefix apps/orion
 
 # Application complète en simulation
-npm run tauri dev
+cargo run -p orion
+
+# Variante pilotée par la CLI Tauri
+npm run tauri dev --prefix apps/orion
 ```
+
+En profil de développement, `cargo run -p orion` vérifie que Vite écoute sur
+le port 1420 et le démarre automatiquement si nécessaire. Le processus Vite est
+arrêté avec Orion. La CLI Tauri continue d'utiliser `beforeDevCommand` ; Orion
+détecte alors le serveur déjà actif et ne le lance pas une seconde fois.
+
+Sous WSL2, l'affichage natif exige WSLg. `xdpyinfo` doit pouvoir joindre
+`DISPLAY` avant le lancement ; sans WSLg, le shell peut être compilé mais aucune
+fenêtre Linux ne peut être affichée.
 
 Sous Linux, Tauri requiert notamment `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
 `librsvg2-dev`, `patchelf` et `libayatana-appindicator3-dev`. Sous Windows,
