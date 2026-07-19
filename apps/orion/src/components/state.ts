@@ -32,6 +32,58 @@ export function stateMeta(state: TunnelState): StateMeta {
   }
 }
 
+/**
+ * Posture de sécurité réelle du poste — distincte de l'état du tunnel.
+ *
+ * Orion est délibérément **fail-open** (ADR-001 §3 bis) : pas de pare-feu, pas
+ * de WFP. Sa protection tient à une invariante de cycle de vie — l'adaptateur
+ * WireGuard, qui capte `0.0.0.0/0`, n'est jamais démonté sur échec, seulement
+ * sur déconnexion explicite. Tant qu'il est monté, WireGuard **jette** les
+ * paquets faute de handshake ; il n'y a pas de fuite.
+ *
+ * C'est contre-intuitif et l'IHM doit le dire : « Échec » avec l'adaptateur
+ * monté n'est pas une situation exposée. Sans cette distinction, un utilisateur
+ * voit une erreur rouge et démonte l'adaptateur « pour réessayer proprement » —
+ * geste qui le fait précisément fuir en clair.
+ */
+export type Posture = 'protected' | 'held' | 'exposed'
+
+export interface PostureMeta {
+  posture: Posture
+  label: string
+  detail: string
+  color: string
+}
+
+const HELD = '#7dd3fc'
+const EXPOSED = '#ff8f57'
+
+export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta {
+  if (!adapterUp) {
+    return {
+      posture: 'exposed',
+      label: 'Trafic en clair',
+      detail: 'Adaptateur démonté : le trafic emprunte la route par défaut, hors tunnel.',
+      color: EXPOSED,
+    }
+  }
+  if (state === 'up') {
+    return {
+      posture: 'protected',
+      label: 'Trafic dans le tunnel',
+      detail: 'Handshake frais, adaptateur monté. Tout passe par la gateway.',
+      color: UP,
+    }
+  }
+  return {
+    posture: 'held',
+    label: 'Trafic retenu',
+    detail:
+      'Adaptateur monté sans handshake : WireGuard jette les paquets. Rien ne fuit — ne pas démonter.',
+    color: HELD,
+  }
+}
+
 export function elapsed(upSince: number | null, now: number): string | null {
   if (upSince === null) return null
   const s = Math.max(0, Math.floor((now - upSince) / 1000))

@@ -1,18 +1,18 @@
 [Unit]
-Description=Helios IPsec orchestrator (kill-switch + OTA)
+Description=Helios WireGuard gateway (kill-switch + OTA)
 Documentation=https://github.com/christophe/helios
-# On démarre après le réseau et charon, mais heliosd engage le kill-switch
-# AVANT d'autoriser le moindre trafic : fail-closed dès le boot.
-After=network-pre.target strongswan.service
+# heliosd engage le kill-switch avant d'autoriser le moindre trafic.
 Wants=network-pre.target
+Before=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/heliosd --config /etc/helios/helios.toml run
+Environment=HELIOS_NETWORK_CONFIG=/var/lib/helios/network.toml
+ExecStart=/usr/local/bin/heliosd run
 Restart=on-failure
 RestartSec=2
 
-# heliosd a besoin de manipuler nftables et XFRM.
+# heliosd manipule nftables et l'interface WireGuard.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=true

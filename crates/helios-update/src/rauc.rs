@@ -90,3 +90,44 @@ impl UpdateChannel for RaucChannel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn index_absent_invalide_identique_et_nouveau_sont_distingues() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("release.json");
+        let channel = RaucChannel::new("1.0.0", Some(manifest.clone()));
+
+        assert!(channel.check().await.is_err());
+        std::fs::write(&manifest, b"pas du json").unwrap();
+        assert!(channel.check().await.is_err());
+
+        std::fs::write(&manifest, br#"{"version":"1.0.0","bundle":"same.raucb"}"#).unwrap();
+        assert_eq!(channel.check().await.unwrap(), None);
+
+        std::fs::write(&manifest, br#"{"version":"1.1.0","bundle":"next.raucb"}"#).unwrap();
+        assert_eq!(
+            channel.check().await.unwrap(),
+            Some(Release {
+                version: "1.1.0".into(),
+                bundle: "next.raucb".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn version_identique_n_execute_pas_rauc() {
+        let channel = RaucChannel::new("1.0.0", None);
+        let release = Release {
+            version: "1.0.0".into(),
+            bundle: "inexistant.raucb".into(),
+        };
+        assert_eq!(
+            channel.install(&release).await.unwrap(),
+            InstallOutcome::AlreadyUpToDate
+        );
+    }
+}

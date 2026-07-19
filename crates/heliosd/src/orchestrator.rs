@@ -8,8 +8,8 @@
 //!
 //! Le plan de données réel vit derrière les features `wireguard`
 //! (`helios-wireguard`) et `netlink` (`helios-firewall`) : elles **compilent**
-//! partout mais ne peuvent **tourner** que sur la cible. Sans elles, ou en
-//! dry-run, on retombe sur les backends de simulation.
+//! partout mais ne peuvent **tourner** que sur la cible. Les backends de
+//! simulation ne sont sélectionnés qu’en dry-run explicite ou auto-détecté.
 
 use std::{sync::Arc, time::Duration};
 
@@ -35,25 +35,20 @@ const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(150);
 
 /// Sélectionne le plan de données WireGuard. Comme pour le pare-feu : dry-run
 /// par défaut, backend noyau réel derrière la feature `wireguard`.
-fn wireguard_backend(dry_run: bool, ifname: &str) -> Box<dyn WireguardBackend> {
+fn wireguard_backend(dry_run: bool, ifname: &str) -> anyhow::Result<Box<dyn WireguardBackend>> {
     if dry_run {
-        return Box::new(helios_wireguard::DryRunBackend::new());
+        return Ok(Box::new(helios_wireguard::DryRunBackend::new()));
     }
     #[cfg(feature = "wireguard")]
     {
-        match helios_wireguard::KernelBackend::new(ifname) {
-            Ok(backend) => return Box::new(backend),
-            Err(e) => {
-                tracing::error!("backend WireGuard noyau indisponible ({e}) — repli sur dry-run : AUCUN tunnel réel");
-                return Box::new(helios_wireguard::DryRunBackend::new());
-            }
-        }
+        let backend = helios_wireguard::KernelBackend::new(ifname)
+            .map_err(|e| anyhow::anyhow!("backend WireGuard noyau indisponible : {e}"))?;
+        Ok(Box::new(backend))
     }
     #[cfg(not(feature = "wireguard"))]
     {
         let _ = ifname;
-        warn!("mode réel demandé mais feature `wireguard` non compilée : repli sur dry-run");
-        Box::new(helios_wireguard::DryRunBackend::new())
+        anyhow::bail!("mode réel demandé sans feature `wireguard`");
     }
 }
 
@@ -77,18 +72,17 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
     (iface, peers)
 }
 
-fn firewall_backend(dry_run: bool) -> Box<dyn FirewallBackend> {
+fn firewall_backend(dry_run: bool) -> anyhow::Result<Box<dyn FirewallBackend>> {
     if dry_run {
-        return Box::new(DryRunBackend);
+        return Ok(Box::new(DryRunBackend));
     }
     #[cfg(feature = "netlink")]
     {
-        Box::new(helios_firewall::NetlinkBackend::new())
+        Ok(Box::new(helios_firewall::NetlinkBackend::new()))
     }
     #[cfg(not(feature = "netlink"))]
     {
-        warn!("mode réel demandé mais feature `netlink` non compilée : repli sur dry-run");
-        Box::new(DryRunBackend)
+        anyhow::bail!("mode réel demandé sans feature `netlink`");
     }
 }
 
@@ -141,10 +135,10 @@ pub async fn run(
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
 
-    let fw = firewall_backend(dry_run);
+    let fw = firewall_backend(dry_run)?;
     let wg: Arc<dyn WireguardBackend> = {
         let ifname = shared_network.read().await.wg_iface.clone();
-        Arc::from(wireguard_backend(dry_run, &ifname))
+        Arc::from(wireguard_backend(dry_run, &ifname)?)
     };
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
 

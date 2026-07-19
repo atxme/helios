@@ -111,6 +111,27 @@ struct CmdResp {
     error: Option<String>,
 }
 
+/// Vue sans secret renvoyée par `GET /api/network`.
+#[derive(Debug, Deserialize)]
+struct NetworkConfigView {
+    wan_iface: String,
+    lan_ifaces: Vec<String>,
+    allow_ssh_from: Vec<String>,
+    admin_iface: Option<String>,
+    wg_iface: String,
+    wg_private_key_configured: bool,
+    wg_address: String,
+    wg_listen_port: u16,
+    peers: Vec<NetworkPeerView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkPeerView {
+    name: String,
+    address: String,
+    preshared_key_configured: bool,
+}
+
 // ─── Affichage ────────────────────────────────────────────────────────────────
 
 fn colored_state(s: &str) -> String {
@@ -170,6 +191,7 @@ async fn api_status(client: &Client, base: &str) -> Result<Status> {
 async fn api_post(client: &Client, base: &str, path: &str) -> Result<CmdResp> {
     client
         .post(format!("{base}{path}"))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .context("connexion refusée")?
@@ -277,7 +299,7 @@ async fn cmd_watch(base: &str) -> Result<()> {
 }
 
 async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
-    let cfg: NetworkConfig = client
+    let cfg: NetworkConfigView = client
         .get(format!("{base}/api/network"))
         .send()
         .await
@@ -321,10 +343,19 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
         "  {:<16} {} (UDP {})",
         "Interface WG", cfg.wg_iface, cfg.wg_listen_port
     );
+    println!(
+        "  {:<16} {}",
+        "Clé privée",
+        if cfg.wg_private_key_configured {
+            "configurée (masquée)"
+        } else {
+            "absente"
+        }
+    );
     println!("  {:<16} {}", "Adresse WG", cfg.wg_address);
     println!("  {:<16} {}", "Pairs", cfg.peers.len());
     for p in &cfg.peers {
-        let pq = if p.preshared_key.is_some() {
+        let pq = if p.preshared_key_configured {
             "  [PQ]"
         } else {
             ""

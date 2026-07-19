@@ -5,10 +5,9 @@ daemon Rust. Orion est son client de bureau Tauri. Le projet sépare le plan de
 contrôle (états, politiques, provisioning, OTA) du plan de données noyau
 (WireGuard et nftables).
 
-La migration depuis IKEv2 est actée par
-[ADR-001](docs/ADR-001-WIREGUARD.md). Il ne reste plus de crate VICI ni de
-backend IPsec dans le workspace ; les références IKEv2 encore présentes dans
-certains documents historiques ne décrivent pas le code actuel.
+La rupture avec IKEv2 est achevée dans le code et documentée par
+[ADR-001](docs/ADR-001-WIREGUARD.md). La signature hybride des artefacts éditeur
+est arrêtée par [ADR-002](docs/ADR-002-SIGNATURES-PQ.md).
 
 ```text
                          plan de contrôle (Rust)
@@ -55,7 +54,7 @@ démonte.
 
 | Composant | Rôle |
 |---|---|
-| `aether` | Types communs, états, politique, configuration, ML-KEM et contrat de provisioning |
+| `aether` | Types communs, états, politique, ML-KEM et enveloppes signées hybrides |
 | `helios-firewall` | Rendu nftables et backends `dry-run` / `netlink` |
 | `helios-wireguard` | Plan de données gateway, backends mémoire / noyau et table de pairs |
 | `helios-provisioning` | IPAM CGNAT déterministe, session ML-KEM et rotation de PSK |
@@ -66,6 +65,7 @@ démonte.
 | `orion-core` | Logique portable du client WireGuard |
 | `apps/orion` | Application de bureau Tauri avec IHM React embarquée |
 | `helios-ctl` | CLI de diagnostic et scénarios contre l’API |
+| `helios-publisher` | Outil éditeur hors gateway : clés Ed25519/ML-DSA-65 et billets signés |
 | `web` | IHM d’administration React de la gateway |
 
 ## Configuration de la gateway
@@ -87,7 +87,7 @@ replie sur `127.0.0.1:8080`. Le pare-feu limite l’accès distant à
 
 ## Développement
 
-Prérequis : Rust 1.82 ou plus récent, Node.js 18 ou plus récent et npm. Le shell
+Prérequis : Rust 1.82 ou plus récent, Node.js 20.19+ ou 22.12+ et npm. Le shell
 Tauri Linux nécessite aussi WebKitGTK 4.1 et GTK3.
 
 ```sh
@@ -113,7 +113,8 @@ Vite écoute sur `:5173` et proxie `/api` et `/ws` vers `localhost:8080`.
 | Route | Fonction |
 |---|---|
 | `GET /api/status` | État, interfaces, pairs admis et politique résolue |
-| `GET /api/network` | Configuration réseau complète |
+| `GET /api/trust` | Algorithmes requis, époques et empreintes du trousseau éditeur compilé |
+| `GET /api/network` | Vue réseau expurgée : présence des secrets, jamais leur valeur |
 | `POST /api/network` | Persistance atomique et rechargement à chaud |
 | `POST /api/provision` | Échange ML-KEM dans le tunnel pour un pair déjà admis |
 | `POST /api/tunnel/start` | Montage/reconfiguration de l’interface WireGuard |
@@ -127,9 +128,9 @@ Vite écoute sur `:5173` et proxie `/api` et `/ws` vers `localhost:8080`.
 Le WebSocket diffuse `state_changed`, `log`, `telemetry`,
 `captive_portal_detected`, `mtu_discovered` et `split_tunnel_changed`.
 
-Attention : `GET /api/network` contient actuellement les secrets de
-configuration. Cette route doit rester protégée derrière l’interface
-d’administration WireGuard.
+Toutes les mutations HTTP exigent `Content-Type: application/json`; le serveur
+ne publie aucun CORS permissif. Cela complète — sans le remplacer — le filtrage
+de l’API derrière `admin_iface`.
 
 ## Interfaces embarquées
 
@@ -192,6 +193,18 @@ le pair WireGuard côté gateway et son orchestration de rotation. Tant que ce
 câblage manque, le provisioning automatique ne doit pas être présenté comme une
 fonction de production.
 
+## Signature des artefacts éditeur
+
+Les billets de rescellement TPM v2 exigent **Ed25519 ET ML-DSA-65** sur les
+mêmes octets canoniques. `key_epoch` est signé et indexe un trousseau public
+compilé ; une signature absente, dupliquée, invalide ou une époque inconnue est
+un rejet. Les builds release refusent le trousseau de développement.
+
+La signature s’effectue exclusivement avec `helios-publisher`, hors gateway.
+Voir [le guide éditeur](docs/PUBLISHER-SIGNING.md). Le fichier de récupération
+WireGuard reste bloqué jusqu’au choix explicite du compteur anti-rejeu (fichier
+ou NV TPM) ; aucune implémentation implicite n’a été ajoutée.
+
 ## Tests de non-régression
 
 La commande de référence avant chaque version est :
@@ -200,18 +213,21 @@ La commande de référence avant chaque version est :
 bash scripts/regression.sh
 ```
 
-Elle vérifie le formatage, Clippy avec avertissements interdits, tous les tests
-Rust, les audits npm (seuil `moderate`), les tests Vitest et les builds de
-production des deux interfaces. La même campagne tourne dans GitHub Actions.
+Elle vérifie le formatage, Clippy et les tests Rust avec toutes les features,
+les contrats de sécurité, les audits Cargo/npm, les tests Vitest et les builds
+de production des deux interfaces. La même campagne tourne dans GitHub Actions.
 Les contrôles spécifiques au matériel sont détaillés dans
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Documentation
 
 - [ADR WireGuard](docs/ADR-001-WIREGUARD.md)
+- [ADR signatures PQ](docs/ADR-002-SIGNATURES-PQ.md)
+- [Signature éditeur](docs/PUBLISHER-SIGNING.md)
 - [Tests et validation cible](docs/TESTING.md)
+- [Sécurité et dette suivie](docs/SECURITY.md)
 - [Tests manuels des binaires et des IHM](docs/MANUAL-TESTING.md)
 - [Développement WSL2](docs/WSL2-DEV.md)
 - [OTA RAUC](docs/OTA-RAUC.md)
-- [Architecture](docs/ARCHITECTURE.md) — document historique en cours de migration
-- [Post-quantique](docs/POST-QUANTUM.md) — document historique en cours de migration
+- [Architecture](docs/ARCHITECTURE.md)
+- [Post-quantique](docs/POST-QUANTUM.md)

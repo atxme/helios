@@ -33,6 +33,63 @@ pub struct PeerSummary {
     pub post_quantum: bool,
 }
 
+/// Vue publique de la configuration réseau.
+///
+/// Elle est volontairement distincte de [`NetworkConfig`] : une régression de
+/// sérialisation ne peut donc pas réintroduire la clé privée WireGuard ni les
+/// PSK dans `GET /api/network`.
+#[derive(Serialize)]
+pub struct NetworkConfigView {
+    pub wan_iface: String,
+    pub lan_ifaces: Vec<String>,
+    pub allow_ssh_from: Vec<String>,
+    pub admin_iface: Option<String>,
+    pub split_tunnel_cidrs: Vec<String>,
+    pub wg_iface: String,
+    pub wg_private_key_configured: bool,
+    pub wg_address: String,
+    pub wg_listen_port: u16,
+    pub peers: Vec<NetworkPeerView>,
+    pub static_peer_addrs: Vec<String>,
+    pub escrow_public_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct NetworkPeerView {
+    pub name: String,
+    pub public_key: String,
+    pub address: String,
+    pub preshared_key_configured: bool,
+}
+
+impl From<&NetworkConfig> for NetworkConfigView {
+    fn from(config: &NetworkConfig) -> Self {
+        Self {
+            wan_iface: config.wan_iface.clone(),
+            lan_ifaces: config.lan_ifaces.clone(),
+            allow_ssh_from: config.allow_ssh_from.clone(),
+            admin_iface: config.admin_iface.clone(),
+            split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
+            wg_iface: config.wg_iface.clone(),
+            wg_private_key_configured: !config.wg_private_key.trim().is_empty(),
+            wg_address: config.wg_address.clone(),
+            wg_listen_port: config.wg_listen_port,
+            peers: config
+                .peers
+                .iter()
+                .map(|peer| NetworkPeerView {
+                    name: peer.name.clone(),
+                    public_key: peer.public_key.clone(),
+                    address: peer.address.clone(),
+                    preshared_key_configured: peer.preshared_key.is_some(),
+                })
+                .collect(),
+            static_peer_addrs: config.static_peer_addrs.clone(),
+            escrow_public_key: config.escrow_public_key.clone(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct CmdResponse {
     pub ok: bool,
@@ -153,10 +210,10 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
-/// Retourne la configuration réseau courante.
-pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfig> {
+/// Retourne la configuration réseau courante sans aucun secret.
+pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
     let network = s.network.read().await;
-    Json(network.clone())
+    Json(NetworkConfigView::from(&*network))
 }
 
 /// Recharge la configuration réseau à chaud (JSON).
@@ -288,6 +345,55 @@ pub async fn split_tunnel_set(
     })
 }
 
+/// Ancre de confiance éditeur, telle que compilée dans **ce** binaire (ADR-002).
+///
+/// Tout ce qui est ici est une constante de compilation, pas un état runtime :
+/// c'est précisément le propos de l'ADR — la racine de confiance ne se
+/// reconfigure pas à chaud, elle se remplace par une mise à jour firmware.
+/// L'IHM l'affiche pour qu'un opérateur puisse vérifier *quel* trousseau le
+/// binaire déployé porte réellement.
+#[derive(Serialize)]
+pub struct TrustResponse {
+    /// Algorithmes dont une signature valide est exigée — jamais « au moins un ».
+    pub required_algs: Vec<&'static str>,
+    /// Époques de clés éditeur reconnues.
+    pub publisher_keys: Vec<PublisherKeySummary>,
+    /// `true` = trousseau de développement. Interdit en release par le build script.
+    pub development_keys: bool,
+    /// Domaine de séparation du billet de rescellement, et sa version de format.
+    pub reseal_domain: String,
+    pub reseal_format_version: u32,
+}
+
+/// Une époque du trousseau éditeur. Les clés publiques ne sont pas exposées
+/// entières : l'IHM n'en a pas l'usage, une empreinte suffit à les comparer.
+#[derive(Serialize)]
+pub struct PublisherKeySummary {
+    pub key_epoch: u32,
+    pub fingerprint: String,
+}
+
+pub async fn trust() -> Json<TrustResponse> {
+    use aether::sig::{ArtifactPayload as _, ResealPayload};
+
+    Json(TrustResponse {
+        required_algs: aether::sig::REQUIRED_ALGS
+            .iter()
+            .map(|alg| alg.as_str())
+            .collect(),
+        publisher_keys: aether::sig::PUBLISHER_KEYS
+            .iter()
+            .map(|keys| PublisherKeySummary {
+                key_epoch: keys.key_epoch,
+                fingerprint: keys.fingerprint(),
+            })
+            .collect(),
+        development_keys: aether::sig::USING_DEVELOPMENT_PUBLISHER_KEYS,
+        reseal_domain: String::from_utf8_lossy(ResealPayload::DOMAIN).into_owned(),
+        reseal_format_version: ResealPayload::FORMAT_VERSION,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -350,6 +456,41 @@ mod tests {
         assert!(response.peers[0].post_quantum);
         let payload = serde_json::to_string(&response).unwrap();
         assert!(!payload.contains("secret-pq-ne-doit-pas-sortir"));
+    }
+
+    #[tokio::test]
+    async fn configuration_lue_ne_serialize_jamais_les_secrets() {
+        let (app, _cmd_rx) = app_state(TunnelState::Up);
+
+        let response = network_get(State(app)).await.0;
+        let payload = serde_json::to_string(&response).unwrap();
+
+        assert!(response.wg_private_key_configured);
+        assert!(response.peers[0].preshared_key_configured);
+        assert!(!payload.contains(PRIVATE_KEY));
+        assert!(!payload.contains("secret-pq-ne-doit-pas-sortir"));
+        assert!(!payload.contains("wg_private_key\""));
+        assert!(!payload.contains("preshared_key\""));
+    }
+
+    #[tokio::test]
+    async fn trust_publie_l_hybride_exige_et_jamais_de_cle_entiere() {
+        let response = trust().await.0;
+
+        // L'IHM doit pouvoir affirmer « les deux, sinon rejet » : si un jour
+        // quelqu'un retire ML-DSA de REQUIRED_ALGS, ce test tombe.
+        assert_eq!(response.required_algs, vec!["ed25519", "ml-dsa-65"]);
+        assert!(!response.publisher_keys.is_empty());
+        assert_eq!(response.reseal_domain, "helios-tpm-reseal-v2");
+
+        // Une empreinte tronquée à 128 bits, pas la clé.
+        let payload = serde_json::to_string(&response).unwrap();
+        for keys in aether::sig::PUBLISHER_KEYS {
+            assert_eq!(keys.fingerprint().len(), 32);
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(keys.ml_dsa_65);
+            assert!(!payload.contains(&encoded));
+        }
     }
 
     #[tokio::test]

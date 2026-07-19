@@ -1,37 +1,68 @@
-# Développer sur WSL2
+# Développement sous WSL2
 
-Le kernel Microsoft de WSL2 n'embarque pas tout le plan de données IPsec. Ce
-document liste ce qui se teste ici et ce qui doit attendre la machine dédiée.
+WSL2 permet de compiler et tester l’essentiel du projet, y compris les features
+`netlink`, `wireguard` et `tpm` lorsque les bibliothèques de développement sont
+installées. Son noyau ne fournit toutefois pas le plan de données nécessaire à
+leur exécution réelle.
 
-## Diagnostic constaté sur cette machine
+| Élément | Compilation WSL2 | Exécution WSL2 |
+|---|---:|---:|
+| états, politique, IPAM, ML-KEM, signatures | oui | oui |
+| API Axum, WebSocket, dry-run | oui | oui |
+| rendu nftables | oui | oui |
+| backend Netlink nftables | oui | non sans `nf_tables` |
+| backend WireGuard noyau | oui | non sans module WireGuard/droits |
+| backend TPM TSS2 | oui | seulement avec TPM accessible |
+| RAUC | oui | non sans appliance A/B |
+| shell Tauri Orion | oui avec WebKitGTK 4.1 | oui avec WSLg, sinon build seulement |
 
-| Élément                         | WSL2            | Conséquence                          |
-|---------------------------------|-----------------|--------------------------------------|
-| `xfrm_user`, `/proc/net/xfrm_stat` | présents     | l'interface de contrôle XFRM existe  |
-| modules `esp4` / `esp6`         | non chargés     | pas de chiffrement ESP réel          |
-| `nf_tables`                     | absent          | pas de kill-switch réel              |
-| `nft`, `swanctl`, `charon`      | non installés   | pas de plan de contrôle réel         |
+Un build vert d’une feature matérielle prouve donc que l’API utilisée compile,
+pas que l’effet noyau, TPM ou bootloader fonctionne.
 
-## Ce qui se teste sur WSL2 (≈ 80 % du code)
-
-- la **machine à états** du tunnel (`aether`) ;
-- le **codec VICI** complet, par round-trip (`helios-vici`) ;
-- le **rendu des règles** du kill-switch selon l'état (`helios-firewall`) ;
-- toute l'**orchestration** en `dry_run` (`heliosd`), y compris la simulation de
-  montée du tunnel et la boucle OTA simulée.
+## Installation
 
 ```sh
-cargo test                                          # 13 tests, 0 dépendance système
-cargo run -p heliosd -- --config config/helios.toml run
+./scripts/setup-dev.sh
 ```
 
-## Ce qui exige la machine dédiée
+Pour installer aussi les outils de compilation cible :
 
-- le backend **Netlink** réel (`--features netlink`, nécessite `libnftnl`/`libmnl`) ;
-- la **négociation IKE** réelle via charon ;
-- le **tunnel chiffré** de bout en bout (XFRM/ESP) ;
-- la mesure de **performance** Gigabit (IRQ, Realtek RTL8111HS) ;
-- l'**OTA RAUC** réel (slots A/B, bootloader).
+```sh
+./scripts/setup-dev.sh --target
+```
 
-Bascule : mettre `dry_run = false` dans `helios.toml` et compiler
-`--features netlink`. Voir [`scripts/setup-target.sh`](../scripts/setup-target.sh).
+WSL2 affiche un avertissement avant ce second mode. Les modules noyau absents
+ne sont pas contournés.
+
+## Boucle quotidienne
+
+```sh
+bash scripts/regression.sh
+
+HELIOS_NETWORK_CONFIG=/tmp/helios-network.toml \
+  cargo run -p heliosd -- run --dev
+
+npm run dev --prefix web
+```
+
+Orion peut être exercé en simulation via Tauri/WSLg, ou seulement au niveau
+Rust et frontend :
+
+```sh
+cargo test -p orion-core
+npm run test:unit --prefix apps/orion
+npm run build --prefix apps/orion
+```
+
+## Ce qui doit rester sur la cible
+
+Avant livraison, une machine isolée avec accès console doit valider :
+
+- la transaction nftables et le fail-closed avant/après handshake ;
+- la création et la reconfiguration réelles des interfaces WireGuard ;
+- l’expiration de handshake et la conservation des routes Orion sur échec ;
+- le scellement/déscellement PCR 0/4/7 et le billet de rescellement ;
+- l’installation RAUC dans le slot inactif, le `mark-good` et le rollback.
+
+La procédure détaillée se trouve dans [TESTING.md](TESTING.md) et
+[MANUAL-TESTING.md](MANUAL-TESTING.md).

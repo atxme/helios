@@ -11,6 +11,7 @@ members = [
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
+    "tools/helios-publisher",
     "apps/orion/src-tauri",
 ]
 
@@ -64,7 +65,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["cors"] }
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
@@ -75,9 +75,16 @@ netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # La feature `fips` (validation FIPS 140-3) reste activable plus tard sans changer
 # le code — voir le trait `Kem` dans aether::pq et ADR-001 §2.
 aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
+# ML-DSA-65 (FIPS 204), épinglé après lecture de la source 0.4.6. Les autres
+# jeux de paramètres et le RNG par défaut restent désactivés côté vérification.
+fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65"] }
+# Précontrôles Ed25519 stricts (points faibles + scalaires canoniques) avant AWS-LC.
+# Déjà présent transitivement via x25519-dalek ; ce n'est pas un backend de signature.
+curve25519-dalek = "4"
 blake3 = "1"
 zeroize = "1"
 base64 = "0.22"
+hex = "0.4"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
 x25519-dalek = { version = "2", features = ["static_secrets"] }

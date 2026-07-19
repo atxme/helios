@@ -1,0 +1,23 @@
+[package]
+name = "helios-publisher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "helios-publisher"
+path = "src/main.rs"
+
+[dependencies]
+aether = { workspace = true, features = ["publisher-signing"] }
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

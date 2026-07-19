@@ -7,6 +7,7 @@ import { FirewallView } from './views/Firewall'
 import { WireGuardView } from './views/WireGuard'
 import { SettingsView } from './views/Settings'
 import { TelemetryView } from './views/Telemetry'
+import { TrustView } from './views/Trust'
 
 export default function App() {
   const [nav, setNav] = useState<NavId>('dashboard')
@@ -42,6 +43,7 @@ export default function App() {
       {nav === 'firewall' && (
         <FirewallView status={helios.status} state={helios.currentState} />
       )}
+      {nav === 'trust' && <TrustView />}
       {nav === 'settings' && (
         <SettingsView status={helios.status} onSplitTunnelChange={helios.updateSplitTunnel} />
       )}

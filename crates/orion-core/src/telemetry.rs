@@ -1,6 +1,6 @@
 //! Consommation de l'API web de heliosd — **uniquement après montage du tunnel**.
 //!
-//! Rappel de l'invariant : le serveur web de heliosd vit *derrière* l'IPsec. Il
+//! Rappel de l'invariant : le serveur web de heliosd vit *derrière* WireGuard. Il
 //! n'est joignable que lorsque le tunnel est `Up`. Cette boucle n'est donc lancée
 //! par le shell que sur la transition vers `Up`, et annulée dès la déconnexion.
 //!

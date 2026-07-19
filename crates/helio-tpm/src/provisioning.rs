@@ -37,12 +37,12 @@ pub(crate) fn reseal<T: TpmSealer>(tpm: &mut T, store: &BlobStore<'_>) -> Result
     let blob = tpm.seal(&secret)?;
     store.store_blob(&blob)?;
 
-    state.version = ticket.version;
+    state.version = ticket.version();
     store.store_state(&state)?;
     store.consume_ticket()?;
 
     tracing::warn!(
-        version = ticket.version,
+        version = ticket.version(),
         "rescellement post-OTA autorisé par billet — nouveau secret scellé"
     );
     Ok(secret)

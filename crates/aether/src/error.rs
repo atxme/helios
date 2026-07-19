@@ -6,9 +6,6 @@ pub enum HeliosError {
     #[error("erreur de configuration : {0}")]
     Config(String),
 
-    #[error("erreur du protocole VICI : {0}")]
-    Vici(String),
-
     #[error("erreur du pare-feu : {0}")]
     Firewall(String),
 

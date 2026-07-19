@@ -73,7 +73,7 @@ fn wireguard_module_present() -> bool {
     std::path::Path::new("/sys/module/wireguard").exists()
 }
 
-/// Résout le mode dry-run : explicite (`--dev`) ou auto-détecté (WSL2 sans ESP).
+/// Résout le mode dry-run : explicite (`--dev`) ou auto-détecté (WSL2 sans WireGuard).
 fn resolve_dry_run(explicit_dev: bool) -> bool {
     if explicit_dev {
         info!("mode --dev activé : simulation WireGuard, nftables, TPM et OTA");

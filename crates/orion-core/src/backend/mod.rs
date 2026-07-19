@@ -85,20 +85,15 @@ pub trait VpnBackend: Send + Sync {
 /// journalisant** plutôt que de retomber silencieusement sur la simulation : un
 /// utilisateur qui croit son trafic chiffré alors qu'il ne l'est pas serait bien
 /// pire qu'une erreur visible.
-pub fn default_backend() -> Arc<dyn VpnBackend> {
+pub fn default_backend() -> anyhow::Result<Arc<dyn VpnBackend>> {
     #[cfg(feature = "wireguard")]
     {
-        match wireguard::WireGuardBackend::new() {
-            Ok(backend) => return Arc::new(backend),
-            Err(e) => {
-                tracing::error!(
-                    "backend WireGuard indisponible ({e}) — repli sur la simulation : \
-                     AUCUN trafic ne sera réellement chiffré"
-                );
-            }
-        }
+        let backend = wireguard::WireGuardBackend::new()
+            .map_err(|e| anyhow::anyhow!("backend WireGuard réel indisponible : {e}"))?;
+        Ok(Arc::new(backend))
     }
-    Arc::new(dryrun::DryRunBackend::default())
+    #[cfg(not(feature = "wireguard"))]
+    Ok(Arc::new(dryrun::DryRunBackend::default()))
 }
 
 /// Contrôleur de connexion : détient l'état courant du tunnel et orchestre le

@@ -1,17 +1,19 @@
-import { Activity, AlertCircle, Flame, LayoutDashboard, RadioTower, Settings2, Shield } from 'lucide-react'
+import { Activity, AlertCircle, LayoutDashboard, RadioTower, Settings2, Shield, ShieldCheck } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Status } from '../types'
 import type { WsStatus } from '../hooks/useHelios'
 import { useTheme } from '../hooks/useTheme'
 import { Background } from './Background'
+import { HeliosMark } from './HeliosMark'
 
-export type NavId = 'dashboard' | 'telemetry' | 'wireguard' | 'firewall' | 'settings'
+export type NavId = 'dashboard' | 'telemetry' | 'wireguard' | 'firewall' | 'trust' | 'settings'
 
 const NAV_ITEMS: { id: NavId; icon: React.ElementType; label: string }[] = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'   },
   { id: 'telemetry', icon: Activity,        label: 'Télémétrie'  },
   { id: 'wireguard', icon: RadioTower,      label: 'WireGuard'   },
   { id: 'firewall',  icon: Shield,          label: 'Pare-feu'    },
+  { id: 'trust',     icon: ShieldCheck,     label: 'Confiance'   },
   { id: 'settings',  icon: Settings2,       label: 'Paramètres'  },
 ]
 
@@ -69,12 +71,13 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
       <aside className="panel relative z-20 m-2 w-14 lg:w-56 shrink-0 flex flex-col rounded-xl">
         {/* Logo */}
         <div className="h-14 flex items-center gap-3 px-3 lg:px-4 border-b border-[var(--panel-border)] shrink-0">
-          <div className="h-7 w-7 shrink-0 rounded-full border border-amber-400/50 bg-amber-400/15 flex items-center justify-center shadow-neon-amber">
-            <Flame className="h-4 w-4 text-amber-400" strokeWidth={1.5} />
-          </div>
-          <div className="hidden lg:block min-w-0">
-            <div className="font-bold tracking-[0.22em] text-xs text-amber-600 dark:text-amber-300">HELIOS</div>
-            <div className="text-[10px] text-cyan-700/80 dark:text-cyan-500/70 tracking-wide font-mono">WireGuard · PQ Gateway</div>
+          <HeliosMark
+            className="h-7 w-7 shrink-0 text-amber-500 dark:text-amber-400 drop-shadow-[0_0_6px_rgba(251,191,36,0.35)]"
+            title="Helios"
+          />
+          <div className="hidden lg:block min-w-0 leading-none">
+            <div className="font-bold tracking-[0.26em] text-xs text-amber-600 dark:text-amber-300">HELIOS</div>
+            <div className="mt-1 text-[9px] uppercase tracking-[0.14em] text-cyan-700/80 dark:text-cyan-500/70 font-mono">WireGuard · PQ Gateway</div>
           </div>
         </div>
 

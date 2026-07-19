@@ -32,10 +32,16 @@ export default {
           '0%, 100%': { opacity: '1' },
           '50%': { opacity: '0.4' },
         },
+        // Rotation de la trajectoire pendant la négociation du handshake.
+        orbit: {
+          from: { transform: 'rotate(0deg)' },
+          to: { transform: 'rotate(360deg)' },
+        },
       },
       animation: {
         'glow-emerald': 'glow-emerald 3s ease-in-out infinite',
         'pulse-slow': 'pulse 1.6s ease-in-out infinite',
+        orbit: 'orbit 9s linear infinite',
       },
     },
   },

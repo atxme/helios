@@ -1,138 +1,59 @@
-use std::sync::OnceLock;
+use std::sync::Once;
 
-use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use aether::sig::{
+    PublisherPublicKeys, SignedResealTicket, PUBLISHER_KEYS, USING_DEVELOPMENT_PUBLISHER_KEYS,
+};
 
 use crate::{Result, TpmError};
 
-/// Séparation de domaine : préfixe les octets signés pour éviter toute confusion
-/// avec une autre signature de l'éditeur.
-const TICKET_DOMAIN: &[u8] = b"helios-tpm-reseal-v1";
-
-/// Graine de la clé de **développement** (la clé publique dérivée est utilisée si
-/// `HELIOS_TPM_VENDOR_PUBKEY_HEX` n'est pas fourni au build). **AUCUNE sécurité** :
-/// la clé privée correspondante est publique. Fournir la vraie clé en production.
-#[cfg(any(test, debug_assertions))]
-pub(crate) const DEV_VENDOR_SEED: [u8; 32] = *b"helios-dev-vendor-seed-000000001";
-
-/// Clé publique Ed25519 de l'éditeur, résolue une fois.
-///
-/// Priorité à `HELIOS_TPM_VENDOR_PUBKEY_HEX` (injectée au build de production) ;
-/// sinon, clé de développement dérivée de [`DEV_VENDOR_SEED`].
-fn vendor_public_key() -> &'static VerifyingKey {
-    static KEY: OnceLock<VerifyingKey> = OnceLock::new();
-    KEY.get_or_init(|| {
-        if let Some(hex_str) = option_env!("HELIOS_TPM_VENDOR_PUBKEY_HEX") {
-            let bytes = hex::decode(hex_str).expect("HELIOS_TPM_VENDOR_PUBKEY_HEX : hex invalide");
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .expect("HELIOS_TPM_VENDOR_PUBKEY_HEX : 32 octets attendus");
-            VerifyingKey::from_bytes(&arr).expect("clé publique Ed25519 invalide")
-        } else {
-            #[cfg(any(test, debug_assertions))]
-            {
-                tracing::warn!(
-                    "clé éditeur de DÉVELOPPEMENT utilisée pour les billets TPM — \
-                     fournir HELIOS_TPM_VENDOR_PUBKEY_HEX au build de production"
-                );
-                ed25519_dalek::SigningKey::from_bytes(&DEV_VENDOR_SEED).verifying_key()
-            }
-            #[cfg(not(any(test, debug_assertions)))]
-            {
-                panic!(
-                    "HELIOS_TPM_VENDOR_PUBKEY_HEX doit être fournie au build release \
-                     (pas de clé éditeur embarquée)"
-                );
-            }
-        }
-    })
-}
-
-/// Construit les octets canoniques signés par l'éditeur.
-fn signing_bytes(version: u64, expected_pcr_digest: &Option<[u8; 32]>) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(TICKET_DOMAIN.len() + 1 + 8 + 32);
-    msg.extend_from_slice(TICKET_DOMAIN);
-    msg.extend_from_slice(&version.to_le_bytes());
-    match expected_pcr_digest {
-        Some(d) => {
-            msg.push(1);
-            msg.extend_from_slice(d);
-        }
-        None => msg.push(0),
-    }
-    msg
-}
-
-/// Billet d'autorisation de rescellement, émis et signé par l'éditeur, livré avec l'OTA.
+/// Billet v2 : enveloppe hybride Ed25519 + ML-DSA-65, sans compatibilité v1.
 pub(crate) struct ResealTicket {
-    /// Version monotone — strictement croissante (anti-rejeu/anti-rollback).
-    pub version: u64,
-    /// Durcissement optionnel : lie l'autorisation à un état PCR précis.
-    /// Si présent, le rescellement n'est permis que si l'état courant correspond.
-    pub expected_pcr_digest: Option<[u8; 32]>,
-    /// Signature Ed25519 (64 octets) des octets canoniques.
-    pub signature: [u8; 64],
-}
-
-/// Représentation disque (JSON inspectable) du billet.
-#[derive(Serialize, Deserialize)]
-struct TicketWire {
-    version: u64,
-    #[serde(default)]
-    expected_pcr_digest: Option<String>,
-    signature: String,
+    envelope: SignedResealTicket,
 }
 
 impl ResealTicket {
     pub(crate) fn from_json(bytes: &[u8]) -> Result<Self> {
-        let wire: TicketWire =
-            serde_json::from_slice(bytes).map_err(|e| TpmError::Serde(e.to_string()))?;
-        let signature: [u8; 64] = hex::decode(&wire.signature)
-            .ok()
-            .and_then(|v| <[u8; 64]>::try_from(v).ok())
-            .ok_or(TpmError::TicketInvalidSignature)?;
-        let expected_pcr_digest = match wire.expected_pcr_digest {
-            Some(h) => Some(
-                hex::decode(&h)
-                    .ok()
-                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
-                    .ok_or_else(|| TpmError::Serde("expected_pcr_digest hex invalide".into()))?,
-            ),
-            None => None,
-        };
-        Ok(Self {
-            version: wire.version,
-            expected_pcr_digest,
-            signature,
-        })
+        let envelope = serde_json::from_slice(bytes).map_err(|e| TpmError::Serde(e.to_string()))?;
+        Ok(Self { envelope })
     }
 
-    /// Vérifie le billet : signature de l'éditeur, anti-rejeu, liaison PCR optionnelle.
+    pub(crate) const fn version(&self) -> u64 {
+        self.envelope.payload.version
+    }
+
+    /// Vérifie l'hybride AND, l'époque signée, l'anti-rejeu puis la liaison PCR optionnelle.
     pub(crate) fn verify(&self, current_version: u64, current_pcr: &[u8; 32]) -> Result<()> {
-        self.verify_with_key(vendor_public_key(), current_version, current_pcr)
+        if USING_DEVELOPMENT_PUBLISHER_KEYS {
+            static WARN_ONCE: Once = Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "trousseau éditeur de DÉVELOPPEMENT utilisé pour les billets TPM — \
+                     fournir HELIOS_PUBLISHER_KEYRING_PATH au build de production"
+                );
+            });
+        }
+        self.verify_with_keyring(PUBLISHER_KEYS, current_version, current_pcr)
     }
 
-    /// Variante testable avec une clé arbitraire (l'API publique fige la clé éditeur).
-    fn verify_with_key(
+    fn verify_with_keyring(
         &self,
-        vk: &VerifyingKey,
+        keyring: &[PublisherPublicKeys],
         current_version: u64,
         current_pcr: &[u8; 32],
     ) -> Result<()> {
-        let msg = signing_bytes(self.version, &self.expected_pcr_digest);
-        let sig =
-            Signature::from_slice(&self.signature).map_err(|_| TpmError::TicketInvalidSignature)?;
-        vk.verify_strict(&msg, &sig)
+        self.envelope
+            .verify(keyring)
             .map_err(|_| TpmError::TicketInvalidSignature)?;
 
-        if self.version <= current_version {
+        let payload = &self.envelope.payload;
+        if payload.version <= current_version {
             return Err(TpmError::TicketRollback {
-                ticket: self.version,
+                ticket: payload.version,
                 current: current_version,
             });
         }
-        if let Some(expected) = &self.expected_pcr_digest {
-            if expected != current_pcr {
+        if let Some(expected) = payload.expected_pcr_digest {
+            if expected != *current_pcr {
                 return Err(TpmError::TicketPcrMismatch);
             }
         }
@@ -142,53 +63,62 @@ impl ResealTicket {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, SigningKey};
+    use aether::sig::{PublisherSigner, ResealPayload};
 
     use super::*;
 
+    const ED_SEED: [u8; 32] = *b"helios-sign-ed25519-test-seed001";
+    const ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-test-seed001";
+
     fn sign_ticket(
-        seed: &[u8; 32],
         version: u64,
         expected_pcr_digest: Option<[u8; 32]>,
-    ) -> ResealTicket {
-        let sk = SigningKey::from_bytes(seed);
-        let msg = signing_bytes(version, &expected_pcr_digest);
-        let sig = sk.sign(&msg);
-        ResealTicket {
-            version,
-            expected_pcr_digest,
-            signature: sig.to_bytes(),
-        }
+    ) -> (ResealTicket, PublisherPublicKeys) {
+        let signer = PublisherSigner::from_seed_material(7, &ED_SEED, &ML_SEED).unwrap();
+        let public_keys = signer.public_keys();
+        let envelope = signer
+            .sign(ResealPayload {
+                version,
+                expected_pcr_digest,
+            })
+            .unwrap();
+        (ResealTicket { envelope }, public_keys)
     }
 
     #[test]
-    fn billet_valide_accepte() {
-        let sk = SigningKey::from_bytes(&DEV_VENDOR_SEED);
-        let t = sign_ticket(&DEV_VENDOR_SEED, 1, None);
-        assert!(t
-            .verify_with_key(&sk.verifying_key(), 0, &[0u8; 32])
-            .is_ok());
+    fn billet_hybride_valide_accepte() {
+        let (ticket, keys) = sign_ticket(1, None);
+        assert!(ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]).is_ok());
     }
 
     #[test]
-    fn signature_invalide_rejetee() {
-        // Signé par une autre clé que celle de vérification.
-        let other = [9u8; 32];
-        let t = sign_ticket(&other, 1, None);
-        let vk = SigningKey::from_bytes(&DEV_VENDOR_SEED).verifying_key();
+    fn signature_ed25519_invalide_rejetee() {
+        let (mut ticket, keys) = sign_ticket(1, None);
+        ticket.envelope.signatures[0].sig.push('A');
         assert!(matches!(
-            t.verify_with_key(&vk, 0, &[0u8; 32]),
+            ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]),
+            Err(TpmError::TicketInvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signature_ml_dsa_absente_rejetee() {
+        let (mut ticket, keys) = sign_ticket(1, None);
+        ticket
+            .envelope
+            .signatures
+            .retain(|signature| signature.alg != "ml-dsa-65");
+        assert!(matches!(
+            ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]),
             Err(TpmError::TicketInvalidSignature)
         ));
     }
 
     #[test]
     fn rollback_rejete() {
-        let vk = SigningKey::from_bytes(&DEV_VENDOR_SEED).verifying_key();
-        let t = sign_ticket(&DEV_VENDOR_SEED, 3, None);
-        // version courante déjà 3 → rejet.
+        let (ticket, keys) = sign_ticket(3, None);
         assert!(matches!(
-            t.verify_with_key(&vk, 3, &[0u8; 32]),
+            ticket.verify_with_keyring(&[keys], 3, &[0u8; 32]),
             Err(TpmError::TicketRollback {
                 ticket: 3,
                 current: 3
@@ -197,14 +127,54 @@ mod tests {
     }
 
     #[test]
-    fn liaison_pcr_incoherente_rejetee() {
-        let vk = SigningKey::from_bytes(&DEV_VENDOR_SEED).verifying_key();
-        let t = sign_ticket(&DEV_VENDOR_SEED, 1, Some([1u8; 32]));
+    fn liaison_pcr_optionnelle_et_incoherence_rejetee() {
+        let (sans_pcr, keys) = sign_ticket(1, None);
+        assert!(sans_pcr
+            .verify_with_keyring(&[keys], 0, &[99u8; 32])
+            .is_ok());
+
+        let (avec_pcr, keys) = sign_ticket(1, Some([1u8; 32]));
         assert!(matches!(
-            t.verify_with_key(&vk, 0, &[2u8; 32]),
+            avec_pcr.verify_with_keyring(&[keys], 0, &[2u8; 32]),
             Err(TpmError::TicketPcrMismatch)
         ));
-        // état courant conforme → accepté.
-        assert!(t.verify_with_key(&vk, 0, &[1u8; 32]).is_ok());
+        assert!(avec_pcr.verify_with_keyring(&[keys], 0, &[1u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn ancien_format_v1_refuse_sans_fallback() {
+        let old = br#"{"version":1,"expected_pcr_digest":null,"signature":"00"}"#;
+        assert!(matches!(
+            ResealTicket::from_json(old),
+            Err(TpmError::Serde(_))
+        ));
+    }
+
+    #[test]
+    fn signature_est_verifiee_avant_anti_rollback_et_pcr() {
+        let (mut ticket, keys) = sign_ticket(1, Some([1u8; 32]));
+        ticket.envelope.signatures.clear();
+
+        // Une enveloppe forgée ne doit pas servir d'oracle permettant de
+        // distinguer compteur et PCR avant authentification de l'éditeur.
+        assert!(matches!(
+            ticket.verify_with_keyring(&[keys], 99, &[2u8; 32]),
+            Err(TpmError::TicketInvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn json_refuse_digest_pcr_malforme_et_champs_inconnus() {
+        let malformed = br#"{"payload":{"version":1,"expected_pcr_digest":"abcd"},"key_epoch":1,"signatures":[]}"#;
+        assert!(matches!(
+            ResealTicket::from_json(malformed),
+            Err(TpmError::Serde(_))
+        ));
+
+        let unknown = br#"{"payload":{"version":1,"expected_pcr_digest":null,"bypass":true},"key_epoch":1,"signatures":[]}"#;
+        assert!(matches!(
+            ResealTicket::from_json(unknown),
+            Err(TpmError::Serde(_))
+        ));
     }
 }

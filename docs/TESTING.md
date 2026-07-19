@@ -1,39 +1,91 @@
-# Tests de non-régression
+# Stratégie de test et de sécurité
 
-La commande de référence avant chaque version est :
+La commande de référence est :
 
 ```sh
 bash scripts/regression.sh
 ```
 
-Elle exécute, avec les dépendances JavaScript verrouillées (`npm ci`) :
+Elle doit être verte avant fusion ou livraison. Elle utilise les lockfiles,
+interdit les avertissements Clippy et couvre les features matérielles au niveau
+compilation/tests sans exécuter d’effet réel.
 
-1. le formatage, Clippy en mode `-D warnings`, les tests unitaires et les doc-tests Rust ;
-2. les tests de contrat REST du serveur Helios et les scénarios d’orchestration WireGuard en `dry-run` ;
-3. les tests unitaires des deux interfaces React ;
-4. `npm audit` avec refus des vulnérabilités modérées, hautes ou critiques ;
-5. la vérification TypeScript et le build de production de `web` et d’Orion.
+## Matrice automatisée
 
-La même campagne est obligatoire sur chaque push et pull request via
-`.github/workflows/regression.yml`. Une version ne doit être taguée que si ce
-job est vert.
+| Couche | Contrôles |
+|---|---|
+| Rust | `fmt`, Clippy `--all-targets --all-features`, tests workspace `--all-features`, doc-tests |
+| Dépendances Rust | `cargo audit` : vulnérabilités bloquantes, avis informatifs suivis |
+| Helios/Orion web | `npm ci`, `npm audit --audit-level=moderate`, Vitest, TypeScript et build Vite |
+| Signatures | hybride AND, anti-downgrade, époque signée, domaines, JSON strict, Ed25519 faible/non canonique |
+| TPM | anti-rejeu, PCR facultatif, rejet v1, ordre authentification → compteur → PCR |
+| API | routeur complet, absence de secrets, JSON obligatoire pour les mutations, absence de CORS permissif |
+| Tauri | commandes IPC, CSP, prototypes figés et capability minimale |
+| Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
+| Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application |
+| OTA | index absent/invalide/identique/nouveau et non-exécution de RAUC si déjà à jour |
 
-La recette interactive, les profils jetables et les contrôles des IHM sont
-décrits dans [MANUAL-TESTING.md](MANUAL-TESTING.md).
-
-## Ce qui requiert la cible matérielle
-
-Les backends `netlink`, WireGuard noyau et TPM compilent dans la campagne mais
-ne sont pas exécutables sous WSL2. Avant une livraison destinée à une gateway,
-effectuer aussi sur une machine Linux cible :
+`cargo-audit` est un prérequis local :
 
 ```sh
-cargo build -p heliosd --features netlink,wireguard,tpm
-cargo run -p heliosd --features netlink,wireguard -- status
+cargo install cargo-audit --locked
 ```
 
-Puis valider le scénario de déploiement avec un pair de test dédié : montée,
-handshake, transfert, perte de handshake et déconnexion. Le kill-switch doit
-rester engagé avant la montée, après la perte de handshake et après l’arrêt.
-Ne pas automatiser cette dernière étape contre une gateway de production : elle
-modifie réellement son pare-feu et son interface WireGuard.
+La CI l’installe explicitement. Les vulnérabilités RustSec font échouer la
+campagne. Les avis informatifs `unmaintained`/`unsound` transitifs sont affichés
+et suivis dans [SECURITY.md](SECURITY.md), car `--deny warnings` rendrait la CI
+inexécutable tant que Tauri Linux dépend de GTK3. Les audits ne détectent pas une
+erreur de conception ; les tests d’invariants restent obligatoires.
+
+## Invariants de sécurité verrouillés
+
+1. Seul `TunnelState::Up` autorise le trafic gateway.
+2. Le kill-switch précède tout réseau et reste engagé à l’arrêt.
+3. Un mode réel sans backend noyau opérationnel échoue au démarrage.
+4. Le ruleset Netlink est atomique ; une traduction incomplète n’est pas envoyée.
+5. Orion ne démonte son adaptateur qu’après déconnexion explicite.
+6. Un backend Orion réel indisponible ne retombe pas sur le dry-run.
+7. `GET /api/network` ne sérialise jamais clé privée ni PSK.
+8. Une mutation HTTP sans JSON est refusée et aucun CORS wildcard n’est publié.
+9. Ed25519 et ML-DSA-65 sont toutes deux obligatoires ; `key_epoch` est signé.
+10. Une release ne compile pas avec le trousseau éditeur de développement, même
+   si son chemin est fourni explicitement.
+11. Le billet TPM v1 ne bénéficie d’aucune période de compatibilité.
+
+Lorsqu’un bug de sécurité est corrigé, ajouter d’abord un test qui échoue avec
+l’ancien comportement et le garder comme test de non-régression.
+
+## Tests matériels obligatoires
+
+Les tests automatisés ne peuvent pas promettre la fiabilité du matériel absent.
+Sur une gateway de laboratoire, compiler puis exercer :
+
+```sh
+HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \
+  cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui
+```
+
+Valider avec accès console :
+
+- démarrage fail-closed avant création de l’interface ;
+- handshake réel, passage `connecting` → `up`, puis expiration ;
+- absence de trafic LAN dans tous les états sauf `up` ;
+- erreur Netlink laissant intacte la politique précédente ;
+- API inaccessible depuis le WAN et accessible via `helios0` ;
+- Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
+- PCR correct et incorrect, billet signé valide, rejoué, altéré et PCR optionnel ;
+- RAUC : installation slot inactif, boot sain, `mark-good`, boot cassé et rollback.
+
+Ces essais modifient le pare-feu, les routes, le TPM et les slots de boot : ne
+jamais les lancer contre une appliance de production.
+
+## Limites connues
+
+- le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;
+- le flux PSK ML-KEM n’est pas encore installé atomiquement de bout en bout ;
+- la récupération signée attend l’arbitrage du compteur monotone ;
+- le chemin Tauri Linux ne valide pas Windows/WireGuard-NT ;
+- une campagne verte réduit le risque de régression, elle ne constitue ni audit
+  externe ni preuve formelle.
+
+La recette interactive est dans [MANUAL-TESTING.md](MANUAL-TESTING.md).

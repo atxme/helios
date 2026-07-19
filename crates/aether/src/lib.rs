@@ -2,7 +2,7 @@
 //! communs, machine à états du tunnel, politique de kill-switch « fail-closed »,
 //! et l'échange post-quantique ML-KEM ([`pq`]).
 //!
-//! Aucune dépendance à une **ressource système au runtime** (ni Netlink, ni VICI,
+//! Aucune dépendance à une **ressource système au runtime** (ni Netlink, ni TPM,
 //! ni RAUC) : le crate se teste partout, WSL2 compris. Seule exception, à la
 //! compilation : [`pq`] tire `aws-lc-rs` (AWS-LC), qui construit un peu de C via
 //! le crate `cc` — comme `ring`, déjà présent. Cela n'exige qu'un compilateur C,
@@ -14,6 +14,7 @@ pub mod error;
 pub mod events;
 pub mod policy;
 pub mod pq;
+pub mod sig;
 pub mod state;
 
 pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};

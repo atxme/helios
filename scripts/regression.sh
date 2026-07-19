@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Campagne de non-régression reproductible, exécutable localement et en CI.
-# Les tests de backends noyau (nf_tables, WireGuard, TPM) restent sur la cible :
-# voir docs/TESTING.md avant une livraison matérielle.
+# Les features noyau/TPM sont compilées et testées sans effet réel ; leur recette
+# d'exécution reste sur la cible, voir docs/TESTING.md.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,12 +9,6 @@ cd "$repo_root"
 
 echo '==> Formatage Rust'
 cargo fmt --check
-
-echo '==> Analyse Rust'
-cargo clippy --workspace --all-targets -- -D warnings
-
-echo '==> Tests Rust'
-cargo test --workspace
 
 for app in web apps/orion; do
   echo "==> Dépendances verrouillées : $app"
@@ -26,3 +20,31 @@ for app in web apps/orion; do
   echo "==> Build frontend : $app"
   npm run build --prefix "$app"
 done
+
+echo '==> Analyse Rust, toutes les features'
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+echo '==> Tests Rust, toutes les features'
+cargo test --workspace --all-features
+
+echo '==> Refus release du trousseau éditeur de développement'
+if HELIOS_PUBLISHER_KEYRING_PATH="$repo_root/crates/aether/publisher-keyring.dev.json" \
+  cargo check --release -p aether >/dev/null 2>&1; then
+  echo 'ERREUR : le trousseau de développement a été accepté en release' >&2
+  exit 1
+fi
+
+echo '==> Build release avec trousseau éditeur explicitement fourni'
+publisher_test_dir="$(mktemp -d)"
+trap 'rm -rf -- "$publisher_test_dir"' EXIT
+cargo run --quiet -p helios-publisher -- keygen \
+  --key-epoch 4294967295 --output-dir "$publisher_test_dir/keys"
+HELIOS_PUBLISHER_KEYRING_PATH="$publisher_test_dir/keys/publisher-keyring.json" \
+  cargo check --release -p aether
+
+echo '==> Audit des dépendances Rust'
+if ! command -v cargo-audit >/dev/null 2>&1; then
+  echo 'cargo-audit absent : cargo install cargo-audit --locked' >&2
+  exit 1
+fi
+cargo audit

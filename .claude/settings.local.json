@@ -64,7 +64,14 @@
       "Bash(sed -n '/pub\\(crate\\) fn reseal/,/^}/p' crates/helio-tpm/src/provisioning.rs)",
       "Bash(grep -nE 'pub fn seal_in_place_append_tag|pub fn open_in_place|pub struct LessSafeKey|pub fn new|pub const AES_256_GCM|pub struct Nonce|pub fn assume_unique' __TRACKED_VAR__/src/aead.rs)",
       "Bash(sed -i 's/^mod orchestrator;$/mod gateway_key;\\\\nmod orchestrator;/' crates/heliosd/src/main.rs)",
-      "Bash(sed -i 's/^anyhow.workspace = true$/anyhow.workspace = true\\\\nbase64.workspace = true/' crates/heliosd/Cargo.toml)"
+      "Bash(sed -i 's/^anyhow.workspace = true$/anyhow.workspace = true\\\\nbase64.workspace = true/' crates/heliosd/Cargo.toml)",
+      "Skill(artifact-design)",
+      "Artifact",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(curl -s http://127.0.0.1:8080/api/trust)",
+      "Bash(python3 -m json.tool)",
+      "Bash(pkill -f \"heliosd run\")"
     ]
   }
 }

@@ -26,6 +26,24 @@ export interface Status {
   captive_portal_gateway: string | null
 }
 
+/** Une époque du trousseau éditeur. La clé n'est jamais exposée, seulement son empreinte. */
+export interface PublisherKey {
+  key_epoch: number
+  fingerprint: string
+}
+
+/**
+ * Contrat de GET /api/trust — l'ancre de confiance compilée dans le binaire (ADR-002).
+ * Tout y est constante de compilation : rien ici ne se reconfigure à chaud.
+ */
+export interface Trust {
+  required_algs: string[]
+  publisher_keys: PublisherKey[]
+  development_keys: boolean
+  reseal_domain: string
+  reseal_format_version: number
+}
+
 export type HeliosEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'log'; level: string; message: string }

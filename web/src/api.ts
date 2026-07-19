@@ -1,6 +1,6 @@
 // En dev, Vite proxie /api et /ws vers heliosd. En production, l'interface
 // embarquée et l'API sont servies par le même processus Axum.
-import type { CommandResponse, FirewallRules, Status } from './types'
+import type { CommandResponse, FirewallRules, Status, Trust } from './types'
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -11,15 +11,14 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 async function command(url: string, body?: unknown): Promise<void> {
   const response = await json<CommandResponse>(url, {
     method: 'POST',
-    ...(body === undefined ? {} : {
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
   })
   if (!response.ok) throw new Error(response.error ?? 'commande refusée')
 }
 
 export const fetchStatus = () => json<Status>('/api/status')
+export const fetchTrust = () => json<Trust>('/api/trust')
 export const tunnelStart = () => command('/api/tunnel/start')
 export const tunnelStop = () => command('/api/tunnel/stop')
 export const releaseCaptivePortal = () => command('/api/captive-portal/release')

@@ -52,9 +52,46 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
         )}
       </div>
 
-      <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-xs text-slate-500">
-        L’admission initiale reste hors bande : la clé publique du client doit être déclarée dans la configuration. Le protocole ML-KEM est implémenté, mais l’installation automatique du PSK dans le plan de données gateway reste à câbler.
+      <div className="card overflow-hidden">
+        <div className="px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60">
+          <h2 className="hud-title">Enrôlement</h2>
+          <p className="mt-0.5 text-[11px] text-slate-500">
+            <span className="font-mono">POST /api/provision</span> — joignable uniquement à travers
+            le tunnel, comme le reste de cette interface.
+          </p>
+        </div>
+
+        <dl className="px-5 py-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <Field label="Échange de clés" value="ML-KEM-768" note="Le secret alimente le slot PresharedKey de WireGuard, sans toucher au handshake." />
+          <Field label="Plage d’adressage" value="100.64.0.0/10" note="VIP CGNAT dérivée de la clé publique du pair. Aucun état sur disque." />
+          <Field label="Durée de vie du PSK" value="3600 s" note="Au-delà, le client redemande un PSK par un nouvel échange." />
+        </dl>
+
+        <div className="border-t border-slate-200/60 dark:border-slate-800/60 px-5 py-3.5 space-y-2.5 text-[11px] leading-relaxed text-slate-500">
+          <p>
+            <strong className="text-slate-600 dark:text-slate-400">L’admission reste hors bande.</strong>{' '}
+            La clé publique du client doit figurer dans <span className="font-mono">network.toml</span> ;
+            le provisioning n’étend jamais cette liste, il ne fait que servir les pairs déjà déclarés.
+          </p>
+          <p>
+            <strong className="text-amber-600 dark:text-amber-400">Chantier ouvert.</strong> Le PSK est
+            bien dérivé et renvoyé au client, mais son <em>installation sur le pair côté plan de données</em>{' '}
+            n’est pas encore câblée — elle doit passer par l’orchestrateur. Tant que ce n’est pas fait,
+            un pair marqué « PSK post-quantique » ci-dessus l’est par sa configuration statique, pas par
+            un enrôlement.
+          </p>
+        </div>
       </div>
+    </div>
+  )
+}
+
+function Field({ label, value, note }: { label: string; value: string; note: string }) {
+  return (
+    <div>
+      <dt className="text-[9px] uppercase tracking-widest text-slate-500">{label}</dt>
+      <dd className="mt-1 font-mono text-xs text-slate-700 dark:text-slate-300">{value}</dd>
+      <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">{note}</p>
     </div>
   )
 }

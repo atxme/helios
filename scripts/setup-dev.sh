@@ -3,7 +3,7 @@
 #
 # Usage :
 #   ./scripts/setup-dev.sh           # mode dev WSL2 — daemon + client GUI
-#   ./scripts/setup-dev.sh --target  # machine dédiée : ajoute netlink/TPM/strongSwan
+#   ./scripts/setup-dev.sh --target  # ajoute nftables/WireGuard/TPM/RAUC
 #   ./scripts/setup-dev.sh --build   # installe ET compile tout
 set -euo pipefail
 
@@ -24,7 +24,7 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--target] [--build]"
             echo "  (aucun flag)  Dépendances dev WSL2 : daemon (dry-run) + client GUI"
-            echo "  --target      Ajoute les dépendances cible : netlink, TPM, strongSwan, rauc"
+            echo "  --target      Ajoute les dépendances cible : nftables, WireGuard, TPM, RAUC"
             echo "  --build       Installe les dépendances ET compile les binaires"
             exit 0 ;;
         *) die "Argument inconnu : $arg. Utilisez --help pour l'aide." ;;
@@ -94,7 +94,7 @@ fi
 
 # ── 4. Node.js (UI web React) ────────────────────────────────────────────────
 info "Vérification de Node.js..."
-NODE_MIN=18
+NODE_MIN=22
 if command -v node &>/dev/null; then
     NODE_VER=$(node --version | tr -d 'v' | cut -d. -f1)
     if [[ "$NODE_VER" -ge "$NODE_MIN" ]]; then
@@ -114,38 +114,43 @@ fi
 
 # ── 5. Dépendances cible uniquement ─────────────────────────────────────────
 if $TARGET_MODE; then
-    info "Dépendances cible (Netlink/nftables, TPM, strongSwan, RAUC)..."
+    info "Dépendances cible (Netlink/nftables, WireGuard, TPM, RAUC)..."
     sudo apt-get install -y \
         libnftnl-dev libmnl-dev \
-        nftables \
-        strongswan strongswan-swanctl \
+        nftables wireguard-tools \
         rauc \
         tpm2-tools libtss2-dev
     success "Dépendances cible OK"
 
-    info "Chargement des modules kernel IPsec..."
-    sudo modprobe esp4 esp6 xfrm_user af_key 2>/dev/null || warn "Certains modules kernel non disponibles (normal en VM/WSL2)."
+    info "Chargement des modules kernel WireGuard/nf_tables..."
+    sudo modprobe wireguard 2>/dev/null || warn "Module WireGuard indisponible (normal en WSL2)."
+    sudo modprobe nf_tables 2>/dev/null || warn "Module nf_tables indisponible (normal en WSL2)."
 fi
 
-# ── 6. Dépendances npm (UI web) ──────────────────────────────────────────────
-info "Installation des dépendances npm (web/)..."
-(cd "$(dirname "$0")/../web" && npm install --silent)
-success "node_modules OK"
+# ── 6. Dépendances npm verrouillées ──────────────────────────────────────────
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+for app in web apps/orion; do
+    info "Installation npm verrouillée ($app)..."
+    npm ci --silent --prefix "$REPO_ROOT/$app"
+done
+success "node_modules Helios et Orion OK"
 
 # ── 7. Build (optionnel) ─────────────────────────────────────────────────────
 if $BUILD_MODE; then
-    REPO_ROOT="$(dirname "$0")/.."
-
     info "Compilation de heliosd (dry-run, sans features noyau)..."
     cargo build -p heliosd 2>&1 | tail -5
     success "heliosd OK → target/debug/heliosd"
+
+    info "Build du frontend gateway (web)..."
+    npm run build --prefix "$REPO_ROOT/web" 2>&1 | tail -8
+    success "frontend gateway OK → web/dist"
 
     info "Tests de la logique client (orion-core, sans webkit)..."
     cargo test -p orion-core 2>&1 | tail -5
     success "orion-core OK"
 
     info "Build du frontend client (apps/orion)..."
-    (cd "$REPO_ROOT/apps/orion" && npm install --silent && npm run build 2>&1 | tail -5)
+    (cd "$REPO_ROOT/apps/orion" && npm run build 2>&1 | tail -5)
     success "frontend client OK → apps/orion/dist"
 
     # Le shell Tauri (cargo build -p orion) lie webkit2gtk : tenté seulement
@@ -159,9 +164,9 @@ if $BUILD_MODE; then
     fi
 
     if $TARGET_MODE; then
-        info "Compilation de heliosd --features netlink (cible)..."
-        cargo build --release -p heliosd --features netlink 2>&1 | tail -5
-        success "heliosd (release + netlink) OK → target/release/heliosd"
+        info "Compilation des features matérielles (debug)..."
+        cargo build -p heliosd --features netlink,wireguard,tpm,embed-ui 2>&1 | tail -5
+        success "features netlink/WireGuard/TPM/embed-ui compilées"
     fi
 fi
 
@@ -171,7 +176,7 @@ echo -e "${GREEN}Installation terminée.${NC}"
 echo ""
 echo "Prochaines étapes :"
 echo "  # Daemon (dry-run) :"
-echo "  cargo run -p heliosd -- --config config/helios.toml run"
+echo "  HELIOS_NETWORK_CONFIG=config/network.toml cargo run -p heliosd -- run --dev"
 echo ""
 echo "  # Client VPN (app Tauri) :"
 if $IS_WSL; then
@@ -184,5 +189,5 @@ echo "  cd web && npm run dev"
 if $TARGET_MODE; then
     echo ""
     echo "  # Daemon en mode réel (machine dédiée) :"
-    echo "  cargo build --release -p heliosd --features netlink"
+    echo "  HELIOS_PUBLISHER_KEYRING_PATH=/chemin/keyring.json cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui"
 fi

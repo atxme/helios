@@ -40,8 +40,19 @@ Les bundles `.raucb` sont **signés** ; RAUC vérifie la signature contre le
 keyring (`/etc/rauc/keyring.pem`) avant d'écrire le slot. Voir
 [`deploy/rauc/system.conf`](../deploy/rauc/system.conf).
 
+RAUC protège l’image elle-même. L’autorisation de **resceller** les secrets TPM
+après le changement de PCR est une opération distincte : elle exige un billet
+`helios-tpm-reseal-v2` signé à la fois par Ed25519 et ML-DSA-65. Le compteur doit
+strictement augmenter ; le digest PCR est facultatif et, s’il est fourni, doit
+correspondre. Voir [PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md).
+
 ## Statut
 
 `RaucChannel` pilote `rauc install` / `mark-good`. À finaliser sur la cible :
 le parsing de `rauc status --output-format=json` pour lire le slot actif, et le
 remplacement de l'index local par une source HTTPS signée.
+
+La recette de livraison doit tester le chemin sain (`mark-good`) et un boot
+volontairement défaillant qui revient au slot précédent. Le fichier de
+récupération WireGuard signé n’est pas encore disponible : son compteur
+anti-rejeu reste à arbitrer dans l’ADR-002.

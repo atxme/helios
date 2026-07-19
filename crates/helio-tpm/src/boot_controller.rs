@@ -22,7 +22,7 @@ pub enum BootDecision {
 }
 
 impl BootDecision {
-    /// Secret de déverrouillage si disponible (déchiffrement des identifiants IPsec).
+    /// Secret de déverrouillage si disponible (déchiffrement des secrets WireGuard).
     pub fn secret(&self) -> Option<&SecretKey> {
         match self {
             BootDecision::Unsealed(s)
@@ -116,11 +116,13 @@ fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, SigningKey};
+    use aether::sig::{PublisherSigner, ResealPayload};
 
     use super::*;
-    use crate::reseal_ticket::DEV_VENDOR_SEED;
     use crate::tpm_interface::DryRunTpm;
+
+    const DEV_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-dev-seed-001";
+    const DEV_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-dev-seed-001";
 
     /// Construit une config TPM pointant vers un répertoire temporaire.
     fn test_cfg(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
@@ -139,25 +141,14 @@ mod tests {
 
     /// Écrit un billet signé par la clé de développement sur le disque.
     fn write_ticket(path: &std::path::Path, version: u64, expected_pcr_digest: Option<[u8; 32]>) {
-        const DOMAIN: &[u8] = b"helios-tpm-reseal-v1";
-        let sk = SigningKey::from_bytes(&DEV_VENDOR_SEED);
-        let mut msg = Vec::new();
-        msg.extend_from_slice(DOMAIN);
-        msg.extend_from_slice(&version.to_le_bytes());
-        match &expected_pcr_digest {
-            Some(d) => {
-                msg.push(1);
-                msg.extend_from_slice(d);
-            }
-            None => msg.push(0),
-        }
-        let sig = sk.sign(&msg);
-        let json = serde_json::json!({
-            "version": version,
-            "expected_pcr_digest": expected_pcr_digest.map(hex::encode),
-            "signature": hex::encode(sig.to_bytes()),
-        });
-        std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let signer = PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED).unwrap();
+        let ticket = signer
+            .sign(ResealPayload {
+                version,
+                expected_pcr_digest,
+            })
+            .unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&ticket).unwrap()).unwrap();
     }
 
     #[test]

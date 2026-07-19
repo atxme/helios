@@ -48,3 +48,44 @@ impl UpdateChannel for DryRunChannel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cycle_dry_run_couvre_absence_mise_a_jour_et_installation() {
+        let mut channel = DryRunChannel::new("1.0.0");
+        assert_eq!(channel.current_version().await.unwrap(), "1.0.0");
+        assert_eq!(channel.check().await.unwrap(), None);
+
+        channel.available = Some(Release {
+            version: "1.1.0".into(),
+            bundle: "https://updates.invalid/helios-1.1.0.raucb".into(),
+        });
+        let release = channel.check().await.unwrap().unwrap();
+        assert_eq!(
+            channel.install(&release).await.unwrap(),
+            InstallOutcome::Installed {
+                reboot_required: true
+            }
+        );
+        channel.confirm_boot().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_identique_n_est_jamais_reinstallee() {
+        let mut channel = DryRunChannel::new("1.0.0");
+        let same = Release {
+            version: "1.0.0".into(),
+            bundle: "local.raucb".into(),
+        };
+        channel.available = Some(same.clone());
+
+        assert_eq!(channel.check().await.unwrap(), None);
+        assert_eq!(
+            channel.install(&same).await.unwrap(),
+            InstallOutcome::AlreadyUpToDate
+        );
+    }
+}

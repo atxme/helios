@@ -67,6 +67,9 @@ L’intégration est configurée dans `src-tauri/tauri.conf.json` :
 - `beforeDevCommand` lance Vite sur le port 1420 ;
 - `beforeBuildCommand` exécute `npm run build` ;
 - `frontendDist: ../dist` embarque le résultat dans l’application native.
+- une CSP restrictive est injectée, sans `unsafe-eval`, et
+  `freezePrototype` est activé ;
+- la capability de la fenêtre principale reste limitée à `core:default`.
 
 Le package final se construit donc avec :
 
@@ -114,9 +117,9 @@ npm run tauri build -- --features wireguard
 ```
 
 Le backend réel doit être exécuté avec le plan de données et les droits requis
-sur la plateforme. S’il ne peut pas être initialisé, le code journalise l’erreur
-et se replie actuellement sur la simulation ; l’IHM affiche toujours le type de
-backend actif.
+sur la plateforme. S’il ne peut pas être initialisé, Orion refuse de démarrer :
+un binaire réel ne retombe jamais implicitement sur la simulation. L’IHM affiche
+toujours le type de backend actif.
 
 ## Provisioning post-quantique
 
@@ -144,7 +147,8 @@ le canal `helios://event`.
 ## Régression
 
 Depuis la racine du dépôt, `bash scripts/regression.sh` compile le shell Tauri,
-teste `orion-core`, exécute Vitest et construit le frontend. Les tests du backend
+teste `orion-core` avec toutes ses features, vérifie le pont IPC, la CSP et les
+capabilities, exécute Vitest et construit le frontend. Les tests du backend
 WireGuard réel restent à effectuer sur la plateforme cible.
 
 La recette complète pour l'application Tauri, les profils jetables et le cycle

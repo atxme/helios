@@ -35,7 +35,7 @@ pub trait FirewallBackend: Send + Sync {
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()>;
 
     /// Engage le kill-switch (équivaut à `apply(policy, TunnelState::Down)`).
-    /// À appeler au démarrage du daemon, avant tout contact avec charon.
+    /// À appeler au démarrage du daemon, avant tout contact réseau.
     async fn engage_kill_switch(&self, policy: &FirewallPolicy) -> Result<()> {
         self.apply(policy, TunnelState::Down).await
     }

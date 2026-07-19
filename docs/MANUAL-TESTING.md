@@ -28,6 +28,9 @@ bash scripts/regression.sh
 Cette commande inclut désormais `npm audit` et refuse toute vulnérabilité npm
 de niveau modéré ou supérieur.
 
+Installer aussi `cargo-audit` une fois (`cargo install cargo-audit --locked`) :
+la campagne refuse les avis de sécurité Rust connus.
+
 ## Helios et son IHM en simulation
 
 ### 1. Préparer une configuration jetable
@@ -109,6 +112,43 @@ curl --fail http://127.0.0.1:8080/api/status
 curl --fail http://127.0.0.1:8080/
 ```
 
+### 5. Contrôler le contrat de sécurité HTTP
+
+```sh
+curl --fail http://127.0.0.1:8080/api/network
+curl --fail http://127.0.0.1:8080/api/trust
+
+# Doit répondre 415 et ne déclencher aucune commande.
+curl --include --request POST http://127.0.0.1:8080/api/tunnel/start
+
+# Doit répondre 200.
+curl --fail --request POST --header 'Content-Type: application/json' \
+  --data '{}' http://127.0.0.1:8080/api/tunnel/start
+```
+
+Vérifier qu’aucune valeur de `wg_private_key` ou `preshared_key` n’apparaît dans
+la première réponse et qu’aucun en-tête `Access-Control-Allow-Origin: *` n’est
+présent.
+
+## Billets éditeur hybrides
+
+Exercer le cycle dans un répertoire jetable, jamais avec une clé de production :
+
+```sh
+tmp_keys=$(mktemp -d)
+cargo run -p helios-publisher -- keygen --key-epoch 99 --output-dir "$tmp_keys/keys"
+cargo run -p helios-publisher -- reseal-ticket \
+  --key-epoch 99 --version 1 \
+  --ed25519-private-key "$tmp_keys/keys/ed25519-private.pk8" \
+  --ml-dsa-65-private-key "$tmp_keys/keys/ml-dsa-65-private.bin" \
+  --keyring "$tmp_keys/keys/publisher-keyring.json" \
+  --output "$tmp_keys/ticket.json"
+```
+
+Le billet doit contenir exactement une signature `ed25519` et une
+`ml-dsa-65`. Une deuxième commande vers le même `--output` doit échouer. Le
+guide de production est [PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md).
+
 ## Orion et son IHM Tauri
 
 Un navigateur lancé avec `npm run dev` ne suffit pas pour Orion : les actions
@@ -144,6 +184,10 @@ Créer un profil dans l'IHM avec :
 Le backend par défaut est simulé. Vérifier que le profil peut être enregistré
 et sélectionné, que **Connecter** mène à `up`, que l'indicateur d'adaptateur est
 monté, puis que **Déconnecter** revient à `down` et démonte l'adaptateur.
+
+Inspecter aussi la configuration Tauri générée : la CSP doit être présente,
+`freezePrototype` actif et la capability limitée à `core:default` pour la
+fenêtre `main`.
 
 Pour tester le paquet réellement distribué :
 
@@ -190,6 +234,8 @@ La recette de sécurité attendue est :
    supprimées ;
 6. API et IHM Helios injoignables depuis le WAN, mais joignables depuis le
    tunnel sur l'adresse `wg_address`.
+7. un Orion compilé avec `wireguard` refuse de démarrer si le backend réel est
+   absent ou non initialisable ; aucun repli dry-run n’est acceptable.
 
 Le provisioning ML-KEM peut être testé au niveau protocole, mais son PSK ne doit
 pas être considéré comme installé automatiquement tant que le câblage atomique

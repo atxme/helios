@@ -9,6 +9,8 @@ import type {
 } from '../types'
 
 const MAX_LOGS = 80
+/** Fenêtre de la courbe de débit. À un échantillon par seconde, ~1 minute. */
+const MAX_SAMPLES = 60
 
 export function useClient() {
   const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null })
@@ -17,6 +19,7 @@ export function useClient() {
   const [adapterUp, setAdapterUp] = useState(false)
   const [logs, setLogs] = useState<LogLine[]>([])
   const [telemetry, setTelemetry] = useState<TelemetrySample | null>(null)
+  const [history, setHistory] = useState<TelemetrySample[]>([])
   const [upSince, setUpSince] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const upSinceRef = useRef<number | null>(null)
@@ -47,14 +50,20 @@ export function useClient() {
             upSinceRef.current = null
             setUpSince(null)
             setTelemetry(null)
+            // L'historique repart à zéro : recoller deux sessions produirait une
+            // courbe continue qui n'a jamais existé.
+            setHistory([])
           }
           break
         case 'log':
           pushLog(ev.level, ev.message)
           break
-        case 'telemetry':
-          setTelemetry({ rx_bps: ev.rx_bps, tx_bps: ev.tx_bps })
+        case 'telemetry': {
+          const sample = { rx_bps: ev.rx_bps, tx_bps: ev.tx_bps }
+          setTelemetry(sample)
+          setHistory((prev) => [...prev, sample].slice(-MAX_SAMPLES))
           break
+        }
         case 'error':
           setError(ev.message)
           pushLog('error', ev.message)
@@ -124,6 +133,7 @@ export function useClient() {
     adapterUp,
     logs,
     telemetry,
+    history,
     upSince,
     error,
     selectedProfile,

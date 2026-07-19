@@ -40,7 +40,7 @@ pub struct FirewallPolicy {
     pub allow_ssh_from: Vec<String>,
     /// Port TCP de l'interface d'administration REST/WS.
     pub admin_port: Option<u16>,
-    /// Interface réseau exclusive pour l'accès à l'administration (ex. `ipsec0`).
+    /// Interface réseau exclusive pour l'accès à l'administration (ex. `helios0`).
     pub admin_iface: Option<String>,
     /// CIDRs locaux bypassant le tunnel (split-tunneling dynamique).
     /// Vide = tout le trafic WAN passe par le tunnel (comportement par défaut).

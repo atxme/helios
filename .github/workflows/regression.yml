@@ -22,9 +22,11 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             apps/orion/package-lock.json
-      - name: Dépendances système de Tauri
+      - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev
+      - name: Audit Rust
+        run: cargo install cargo-audit --locked
       - name: Campagne de régression
         run: bash scripts/regression.sh

@@ -1,8 +1,8 @@
 //! Enrôlement des clients Orion côté gateway Helios (ADR-001, §4).
 //!
 //! WireGuard ne fournit ni authentification riche (X.509/EAP) ni adressage
-//! dynamique (Config Payload) : ce crate reconstruit ce qu'IKEv2 donnait
-//! gratuitement. Il tourne **sur la gateway** — son client est Orion, mais le
+//! dynamique intégré : ce crate fournit explicitement ce que WireGuard ne donne
+//! pas gratuitement. Il tourne **sur la gateway** — son client est Orion, mais le
 //! service est ici. Les primitives partagées par les deux bouts (l'échange
 //! ML-KEM) vivent dans [`aether::pq`], pas ici, pour qu'`orion-core` n'ait
 //! jamais à dépendre d'un crate `helios-*`.

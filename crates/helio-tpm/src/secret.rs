@@ -5,7 +5,7 @@ use crate::{Result, TpmError};
 /// Secret de déverrouillage 256 bits descellé par le TPM.
 ///
 /// Effacé de la mémoire à la destruction (`ZeroizeOnDrop`). Sert à déchiffrer les
-/// identifiants IPsec ; ne jamais le journaliser (le `Debug` est masqué).
+/// secrets WireGuard ; ne jamais le journaliser (le `Debug` est masqué).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey([u8; 32]);
 

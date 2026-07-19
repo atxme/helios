@@ -19,7 +19,7 @@ pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 ///
 /// Persistée dans `/var/lib/helios/network.toml`. C'est le seul fichier de
 /// configuration fourni par l'opérateur — tous les autres paramètres (TPM,
-/// VICI, API, firewall mode) sont des constantes d'architecture.
+/// TPM, API et mode pare-feu) sont des constantes d'architecture.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     #[serde(default)]

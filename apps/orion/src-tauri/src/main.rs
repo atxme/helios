@@ -191,7 +191,10 @@ fn main() {
         )
         .init();
 
-    let controller = Arc::new(VpnController::new(default_backend()));
+    let backend = default_backend().expect(
+        "backend WireGuard réel indisponible — Orion refuse de démarrer en simulation implicite",
+    );
+    let controller = Arc::new(VpnController::new(backend));
     let config = ClientConfig::load().unwrap_or_default();
 
     tauri::Builder::default()
@@ -213,4 +216,33 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("erreur au lancement de Tauri");
+}
+
+#[cfg(test)]
+mod security_tests {
+    #[test]
+    fn configuration_tauri_impose_une_csp_et_fige_les_prototypes() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &config["app"]["security"];
+        let csp = security["csp"].as_str().expect("CSP Tauri obligatoire");
+
+        assert_eq!(security["freezePrototype"], true);
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains("script-src *"));
+        assert!(!csp.contains("connect-src *"));
+    }
+
+    #[test]
+    fn capabilities_tauri_restent_minimales() {
+        let capabilities: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
+        assert_eq!(
+            capabilities["permissions"],
+            serde_json::json!(["core:default"])
+        );
+    }
 }

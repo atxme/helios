@@ -44,6 +44,7 @@ pub(crate) struct DryRunTpm {
 #[cfg(any(not(feature = "tpm"), test))]
 impl DryRunTpm {
     /// Construit depuis l'environnement : `HELIOS_TPM_FAKE_PCR` (hex 32 octets) ou zéros.
+    #[cfg(not(feature = "tpm"))]
     pub(crate) fn from_env() -> Self {
         let pcr_digest = std::env::var("HELIOS_TPM_FAKE_PCR")
             .ok()

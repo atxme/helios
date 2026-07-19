@@ -10,17 +10,18 @@
 //!   (bootloader/kernel altéré) → `TPM2_RC_POLICY_FAIL`, le secret reste verrouillé.
 //! - **Mise à jour OTA** : l'OTA change le kernel → les PCR changent → l'unseal
 //!   échoue légitimement. Le rescellement n'est autorisé que par un **billet
-//!   signé** (Ed25519) vérifié avec la clé publique de l'éditeur. Cela ferme la
+//!   signé** (Ed25519 **et** ML-DSA-65) vérifié avec le trousseau compilé de
+//!   l'éditeur. Cela ferme la
 //!   faille du TOFU sur le terrain (un attaquant ne peut pas forcer un faux
 //!   « premier boot » pour sceller son kernel malveillant).
 //!
 //! Le secret descellé n'est pas qu'une porte : il **déchiffre les identifiants
-//! IPsec** avant `load-conn`. Modifier le binaire ne donne donc pas la clé — la
+//! WireGuard** avant de monter l'interface. Modifier le binaire ne donne donc pas la clé — la
 //! garantie est matérielle, pas logicielle.
 //!
 //! ## Découpage WSL2 / cible
 //!
-//! Toute la logique de décision (flux de boot, billet Ed25519, blob store,
+//! Toute la logique de décision (flux de boot, billet hybride, blob store,
 //! anti-rejeu) est testable sur WSL2 via [`tpm_interface::DryRunTpm`]. Le backend
 //! réel (`feature tpm`, `tpm_interface::TpmDevice`) n'est validable que sur la
 //! cible — comme le backend Netlink du pare-feu.
