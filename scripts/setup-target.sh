@@ -39,4 +39,4 @@ sudo systemctl daemon-reload
 echo "==> Terminé"
 echo "Éditez /var/lib/helios/network.toml, conservez un accès console, puis :"
 echo "  sudo systemctl enable --now heliosd"
-echo "Exécutez ensuite la recette matérielle de docs/TESTING.md."
+echo "Exécutez ensuite la recette matérielle de docs/testing/TESTING.md."

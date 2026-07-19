@@ -6,8 +6,8 @@ Instructions pour les agents de code travaillant dans ce dépôt.
 
 Helios est une gateway WireGuard Linux ; Orion est son client Tauri ; `aether`
 porte les types et contrats communs. La rupture avec IKEv2 est terminée dans le
-code. [ADR-001](docs/ADR-001-WIREGUARD.md) conserve le raisonnement de migration
-et [ADR-002](docs/ADR-002-SIGNATURES-PQ.md) fixe la signature hybride des
+code. [ADR-001](docs/adr/ADR-001-WIREGUARD.md) conserve le raisonnement de migration
+et [ADR-002](docs/adr/ADR-002-SIGNATURES-PQ.md) fixe la signature hybride des
 artefacts éditeur. En cas de doute, le code et les ADR acceptés font foi.
 
 Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Le PSK
@@ -19,7 +19,7 @@ sienne, l’écart est journalisé) ; le fichier de récupération signé est bl
 jusqu’au choix du compteur anti-rejeu fichier ou NV TPM.
 
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
-lieu — voir [docs/TESTING.md](docs/TESTING.md).
+lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 ## Invariants de sécurité
 
@@ -66,7 +66,7 @@ Face à une fonctionnalité incomplète, trois issues seulement :
 
 Un blocage qui attend un arbitrage humain (ADR-002 amendement 2) relève du
 point 3, pas d’un `TODO`. Une limite matérielle non vérifiable en WSL2 relève
-du point 3 et de [docs/TESTING.md](docs/TESTING.md).
+du point 3 et de [docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 Si une limite documentée est visible par l’utilisateur, l’IHM doit la dire —
 c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
@@ -102,7 +102,7 @@ français.
 
 WSL2 compile les features `netlink`, `wireguard` et `tpm` si leurs dépendances
 sont installées, mais ne prouve pas leurs effets réels. Les essais noyau, TPM,
-WireGuard-NT et RAUC sont target-only ; suivre [docs/TESTING.md](docs/TESTING.md).
+WireGuard-NT et RAUC sont target-only ; suivre [docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 Features matérielles :
 

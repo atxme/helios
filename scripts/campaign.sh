@@ -15,7 +15,7 @@
 #   helios-ctl campaign --only plan-de-donnees --wg-iface helios0 \
 #     --client-key <privée du client> --gateway-key <publique gateway>
 #
-# Voir docs/TESTING.md.
+# Voir docs/testing/TESTING.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

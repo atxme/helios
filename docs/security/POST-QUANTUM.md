@@ -76,7 +76,7 @@ réservé aux builds debug et n’apporte aucune sécurité.
 
 Le guide opératoire est [PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md). Les choix,
 limites et motifs sont conservés dans
-[ADR-002-SIGNATURES-PQ.md](ADR-002-SIGNATURES-PQ.md).
+[ADR-002-SIGNATURES-PQ.md](../adr/ADR-002-SIGNATURES-PQ.md).
 
 ## Limites explicites
 

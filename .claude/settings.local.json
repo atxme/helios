@@ -86,7 +86,12 @@
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git checkout *)",
-      "Bash(git merge *)"
+      "Bash(git merge *)",
+      "Bash(sed -i 's/\\\\[PUBLISHER-SIGNING\\\\.md\\\\]\\(PUBLISHER-SIGNING\\\\.md\\)/[PUBLISHER-SIGNING.md]\\(PUBLISHER-SIGNING.md\\)/' security/POST-QUANTUM.md)",
+      "Bash(sed -i 's/\\\\[ADR-002-SIGNATURES-PQ\\\\.md\\\\]\\(ADR-002-SIGNATURES-PQ\\\\.md\\)/[ADR-002-SIGNATURES-PQ.md]\\(..\\\\/adr\\\\/ADR-002-SIGNATURES-PQ.md\\)/' security/POST-QUANTUM.md)",
+      "Bash(sed -i 's/\\\\[TESTING\\\\.md\\\\]\\(TESTING\\\\.md\\)/[TESTING.md]\\(testing\\\\/TESTING.md\\)/' ARCHITECTURE.md)",
+      "Bash(sed -i 's/\\\\[SECURITY\\\\.md\\\\]\\(SECURITY\\\\.md\\)/[SECURITY.md]\\(..\\\\/security\\\\/SECURITY.md\\)/' testing/TESTING.md)",
+      "Bash(sed -i 's/\\\\[PUBLISHER-SIGNING\\\\.md\\\\]\\(PUBLISHER-SIGNING\\\\.md\\)/[PUBLISHER-SIGNING.md]\\(security\\\\/PUBLISHER-SIGNING.md\\)/' OTA-RAUC.md)"
     ]
   }
 }

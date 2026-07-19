@@ -34,7 +34,7 @@ cargo install cargo-audit --locked
 
 La CI l’installe explicitement. Les vulnérabilités RustSec font échouer la
 campagne. Les avis informatifs `unmaintained`/`unsound` transitifs sont affichés
-et suivis dans [SECURITY.md](SECURITY.md), car `--deny warnings` rendrait la CI
+et suivis dans [SECURITY.md](../security/SECURITY.md), car `--deny warnings` rendrait la CI
 inexécutable tant que Tauri Linux dépend de GTK3. Les audits ne détectent pas une
 erreur de conception ; les tests d’invariants restent obligatoires.
 

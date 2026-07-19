@@ -6,7 +6,7 @@
 //! le même binaire s'exécute contre un `heliosd --dev` sur WSL2 et contre une
 //! gateway réelle. Seule la catégorie [`Category::PlanDeDonnees`] exige la
 //! cible, parce qu'elle lit l'état WireGuard du noyau — ce qu'aucune simulation
-//! ne peut prouver (voir `docs/TESTING.md`).
+//! ne peut prouver (voir `docs/testing/TESTING.md`).
 //!
 //! # La campagne est un client, elle n'en simule pas un
 //!

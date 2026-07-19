@@ -164,4 +164,4 @@ WireGuard réel restent à effectuer sur la plateforme cible.
 
 La recette complète pour l'application Tauri, les profils jetables et le cycle
 adaptateur/connexion/déconnexion se trouve dans
-[`../../docs/MANUAL-TESTING.md`](../../docs/MANUAL-TESTING.md).
+[`../../docs/testing/MANUAL-TESTING.md`](../../docs/testing/MANUAL-TESTING.md).

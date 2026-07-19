@@ -44,7 +44,7 @@ RAUC protège l’image elle-même. L’autorisation de **resceller** les secret
 après le changement de PCR est une opération distincte : elle exige un billet
 `helios-tpm-reseal-v2` signé à la fois par Ed25519 et ML-DSA-65. Le compteur doit
 strictement augmenter ; le digest PCR est facultatif et, s’il est fourni, doit
-correspondre. Voir [PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md).
+correspondre. Voir [PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md).
 
 ## Statut
 

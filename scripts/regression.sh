@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Campagne de non-régression reproductible, exécutable localement et en CI.
 # Les features noyau/TPM sont compilées et testées sans effet réel ; leur recette
-# d'exécution reste sur la cible, voir docs/TESTING.md.
+# d'exécution reste sur la cible, voir docs/testing/TESTING.md.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,7 +31,7 @@ echo '==> Campagne de provisioning post-quantique (dry-run)'
 # Monte un daemon isolé et joue la campagne de bout en bout : c'est le seul
 # point de la régression qui exerce le chemin complet client -> HTTP ->
 # orchestrateur -> plan de données. Les scénarios de plan de données s'y
-# déclarent hors de portée : ils exigent la cible (docs/TESTING.md).
+# déclarent hors de portée : ils exigent la cible (docs/testing/TESTING.md).
 bash "$repo_root/scripts/campaign.sh"
 
 echo '==> Refus release du trousseau éditeur de développement'

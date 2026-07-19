@@ -109,7 +109,7 @@ tranché avant le lot 3 de l’ADR-002.
 Les backends par défaut sont simulés. Les features matérielles sont `netlink`,
 `wireguard`, `tpm` et `embed-ui`. Leur compilation sous WSL2 valide les types et
 les contrats ; elle ne valide pas les effets noyau ou TPM. La recette matérielle
-de [TESTING.md](TESTING.md) reste obligatoire avant livraison.
+de [TESTING.md](testing/TESTING.md) reste obligatoire avant livraison.
 
 Lorsque le mode réel est demandé, une feature ou un backend indisponible arrête
 le daemon. Une gateway ne retombe jamais silencieusement sur une simulation.

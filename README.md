@@ -6,8 +6,8 @@ contrôle (états, politiques, provisioning, OTA) du plan de données noyau
 (WireGuard et nftables).
 
 La rupture avec IKEv2 est achevée dans le code et documentée par
-[ADR-001](docs/ADR-001-WIREGUARD.md). La signature hybride des artefacts éditeur
-est arrêtée par [ADR-002](docs/ADR-002-SIGNATURES-PQ.md).
+[ADR-001](docs/adr/ADR-001-WIREGUARD.md). La signature hybride des artefacts éditeur
+est arrêtée par [ADR-002](docs/adr/ADR-002-SIGNATURES-PQ.md).
 
 ```text
                          plan de contrôle (Rust)
@@ -201,7 +201,7 @@ compilé ; une signature absente, dupliquée, invalide ou une époque inconnue e
 un rejet. Les builds release refusent le trousseau de développement.
 
 La signature s’effectue exclusivement avec `helios-publisher`, hors gateway.
-Voir [le guide éditeur](docs/PUBLISHER-SIGNING.md). Le fichier de récupération
+Voir [le guide éditeur](docs/security/PUBLISHER-SIGNING.md). Le fichier de récupération
 WireGuard reste bloqué jusqu’au choix explicite du compteur anti-rejeu (fichier
 ou NV TPM) ; aucune implémentation implicite n’a été ajoutée.
 
@@ -217,17 +217,9 @@ Elle vérifie le formatage, Clippy et les tests Rust avec toutes les features,
 les contrats de sécurité, les audits Cargo/npm, les tests Vitest et les builds
 de production des deux interfaces. La même campagne tourne dans GitHub Actions.
 Les contrôles spécifiques au matériel sont détaillés dans
-[docs/TESTING.md](docs/TESTING.md).
+[docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 ## Documentation
 
-- [ADR WireGuard](docs/ADR-001-WIREGUARD.md)
-- [ADR signatures PQ](docs/ADR-002-SIGNATURES-PQ.md)
-- [Signature éditeur](docs/PUBLISHER-SIGNING.md)
-- [Tests et validation cible](docs/TESTING.md)
-- [Sécurité et dette suivie](docs/SECURITY.md)
-- [Tests manuels des binaires et des IHM](docs/MANUAL-TESTING.md)
-- [Développement WSL2](docs/WSL2-DEV.md)
-- [OTA RAUC](docs/OTA-RAUC.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Post-quantique](docs/POST-QUANTUM.md)
+Voir [l'index de la documentation](docs/README.md) pour le plan complet
+(architecture, ADR, sécurité, tests, OTA).

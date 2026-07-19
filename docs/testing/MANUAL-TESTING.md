@@ -147,7 +147,7 @@ cargo run -p helios-publisher -- reseal-ticket \
 
 Le billet doit contenir exactement une signature `ed25519` et une
 `ml-dsa-65`. Une deuxième commande vers le même `--output` doit échouer. Le
-guide de production est [PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md).
+guide de production est [PUBLISHER-SIGNING.md](../security/PUBLISHER-SIGNING.md).
 
 ## Orion et son IHM Tauri
 
