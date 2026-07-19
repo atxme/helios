@@ -23,6 +23,7 @@ compilation/tests sans exécuter d’effet réel.
 | Tauri | commandes IPC, CSP, prototypes figés et capability minimale |
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application |
+| Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
 | OTA | index absent/invalide/identique/nouveau, non-exécution de RAUC si déjà à jour, et lecture du slot booté dans `rauc status --output-format=json` (parsing seul) |
 
 `cargo-audit` est un prérequis local :
@@ -74,6 +75,11 @@ Valider avec accès console :
 - API inaccessible depuis le WAN et accessible via `helios0` ;
 - Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
 - PCR correct et incorrect, billet signé valide, rejoué, altéré et PCR optionnel ;
+- provisioning PQ : un client Orion réel obtient son PSK dans le tunnel, le
+  handshake suivant (≤ 2 min) réussit avec `PresharedKey` posé des deux côtés,
+  et `wg show` confirme le slot renseigné sur la gateway comme sur le client ;
+- provisioning PQ, chemin dégradé : gateway dont `sync_peers` échoue — le client
+  doit rester en tunnel classique opérationnel, sans PSK orphelin ;
 - RAUC : installation slot inactif, boot sain, `mark-good`, boot cassé et rollback ;
 - RAUC : `heliosd check-update` après un rollback rapporte bien la version du
   slot effectivement booté, et la divergence avec la version compilée est
@@ -81,6 +87,62 @@ Valider avec accès console :
 
 Ces essais modifient le pare-feu, les routes, le TPM et les slots de boot : ne
 jamais les lancer contre une appliance de production.
+
+## Campagne de provisioning post-quantique
+
+`helios-ctl campaign` joue les mêmes scénarios en dry-run et sur la cible. Il
+agit en **vrai client** : il emprunte `orion_core::provision`, le code
+qu'embarque Orion. Une campagne qui tombe accuse donc le daemon *ou* le client.
+
+Trois catégories, selon ce qu'elles exigent de l'environnement :
+
+| Catégorie | Exige | Ce qu'elle établit |
+| --- | --- | --- |
+| `client` | rien | validation côté client : gateway usurpée, ciphertext malformé, version inconnue |
+| `protocole` | un daemon joignable | tour ML-KEM complet, PSK frais par session, VIP stable, refus d’un pair non admis, absence de secret dans l’API |
+| `plan-de-donnees` | `wg` et un noyau réel | le PSK est **réellement** dans le slot WireGuard, et le handshake a survécu à sa pose |
+
+### Dry-run
+
+```sh
+bash scripts/campaign.sh            # daemon isolé, campagne, démontage
+bash scripts/campaign.sh --repeat 20  # endurance
+```
+
+Le script monte son propre `heliosd --dev` sur une configuration temporaire :
+il ne touche jamais `/var/lib/helios`. Il est joué par `scripts/regression.sh`.
+
+### Cible
+
+Le dry-run ne prouve rien du plan de données : `DryRunBackend` accepte un PSK
+sans qu'aucun paquet ne soit chiffré. Seule la catégorie `plan-de-donnees`
+tranche, et elle exige la cible.
+
+Déclarer d’abord le pair de campagne sur la gateway (l’admission reste hors
+bande — la campagne ne s’auto-admet jamais) :
+
+```sh
+helios-ctl campaign --generate-keys     # imprime le bloc [[peers]] à coller
+```
+
+Puis, **depuis le client**, tunnel classique monté :
+
+```sh
+helios-ctl --url http://100.64.0.1:8080 campaign \
+  --client-key <privée du client> --gateway-key <publique de la gateway>
+```
+
+Enfin, **depuis la gateway**, la catégorie que le dry-run ne peut pas jouer :
+
+```sh
+helios-ctl campaign --only plan-de-donnees --wg-iface helios0 \
+  --client-key <privée du client> --gateway-key <publique de la gateway>
+```
+
+Attendre au moins un handshake (≤ 2 min) entre le provisioning et cette
+dernière commande : c’est précisément l’intervalle où un PSK posé d’un seul
+côté se manifesterait, et le scénario `handshake vivant avec PSK` est là pour
+l’attraper.
 
 ## Limites connues
 

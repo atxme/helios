@@ -10,10 +10,16 @@ code. [ADR-001](docs/ADR-001-WIREGUARD.md) conserve le raisonnement de migration
 et [ADR-002](docs/ADR-002-SIGNATURES-PQ.md) fixe la signature hybride des
 artefacts éditeur. En cas de doute, le code et les ADR acceptés font foi.
 
-Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Deux limites
-restent explicites : l’installation atomique finale du PSK PQ gateway n’est pas
-terminée ; le fichier de récupération signé est bloqué jusqu’au choix du
-compteur anti-rejeu fichier ou NV TPM.
+Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Le PSK
+post-quantique est négocié et posé de bout en bout : la gateway l’installe sur
+le plan de données **avant** de l’annoncer au client, et refuse la demande si
+la pose échoue. Deux limites restent explicites : la VIP dérivée par l’IPAM
+n’est pas réconciliée avec l’adresse déclarée en config (chaque bout garde la
+sienne, l’écart est journalisé) ; le fichier de récupération signé est bloqué
+jusqu’au choix du compteur anti-rejeu fichier ou NV TPM.
+
+Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
+lieu — voir [docs/TESTING.md](docs/TESTING.md).
 
 ## Invariants de sécurité
 
@@ -31,6 +37,9 @@ compteur anti-rejeu fichier ou NV TPM.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.
+- PSK post-quantique : toujours posé sur le plan de données **avant** d’être
+  annoncé au client, et jamais persisté sur disque. Un slot PSK renseigné d’un
+  seul côté fait échouer tous les handshakes, sans canal de rattrapage.
 - Billets TPM : Ed25519 **et** ML-DSA-65 obligatoires, `key_epoch` signé,
   trousseau compilé, v1 refusé. Compteur strictement croissant ; PCR facultatif.
 - Une release exige `HELIOS_PUBLISHER_KEYRING_PATH`. Les secrets éditeur ne
@@ -74,12 +83,14 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `helios-update` : RAUC A/B.
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
-- `helios-ctl` : diagnostic ; `helios-publisher` : outil éditeur hors gateway.
+- `helios-ctl` : diagnostic et campagnes de bout en bout (`campaign`, agit en
+  vrai client via `orion-core`) ; `helios-publisher` : outil éditeur hors gateway.
 
 ## Développement et validation
 
 ```sh
 bash scripts/regression.sh
+bash scripts/campaign.sh          # campagne provisioning PQ, daemon isolé
 cargo test --workspace --all-features
 cargo run -p heliosd -- run --dev
 npm run dev --prefix web
