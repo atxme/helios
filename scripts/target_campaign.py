@@ -605,9 +605,17 @@ def _assurer_cles(ctx: Contexte) -> None:
 
 
 def _config_reseau(ctx: Contexte, iface_wan: str) -> str:
-    """Configuration isolée : jamais /var/lib/helios. ``allow_ssh_from`` est
-    renseigné avec le préfixe de gestion — sans lui, le kill-switch réel coupe
-    toute nouvelle connexion SSH vers la cible."""
+    """Configuration isolée : jamais /var/lib/helios.
+
+    ``allow_ssh_from`` est renseigné avec le préfixe de gestion — sans lui, le
+    kill-switch réel coupe toute nouvelle connexion SSH vers la cible.
+
+    Le pair de campagne est déclaré ``admin`` (ADR-003) : les routes de mutation
+    exigent cette autorisation, résolue à partir de la VIP source. Sans elle, la
+    campagne se verrait refuser en 403 les scénarios qui éprouvent justement ces
+    routes. Un champ inconnu d'un binaire antérieur à l'ADR-003 est simplement
+    ignoré à la désérialisation, la déclaration est donc rétrocompatible.
+    """
     return f"""wan_iface = "{iface_wan}"
 wg_iface = "helios-test0"
 wg_private_key = "{ctx.gateway_priv}"
@@ -620,6 +628,7 @@ allow_ssh_from = ["{ctx.prefixe_gestion}"]
 name = "campagne"
 public_key = "{ctx.client_pub}"
 address = "100.64.1.2/32"
+admin = true
 """
 
 
