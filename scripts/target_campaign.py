@@ -731,11 +731,20 @@ def _campagne_protocole(ctx: Contexte):
         _tuer_daemons(ctx)
 
 
-@scenario("catégorie plan-de-donnees : PSK réellement posé", "campagne")
-def _campagne_plan_de_donnees(ctx: Contexte):
-    """Le seul scénario que le dry-run ne peut pas jouer : il lit l'état noyau
-    via ``wg show`` et vérifie que le slot PSK est renseigné des deux côtés,
-    après qu'un handshake a survécu à sa pose."""
+@scenario("daemon réel : plan de données noyau monté", "campagne")
+def _campagne_daemon_reel(ctx: Contexte):
+    """Monte heliosd avec les backends noyau et constate leurs effets réels.
+
+    C'est ce que le dry-run ne peut pas faire : `DryRunBackend` journalise un
+    ruleset sans qu'aucun paquet ne soit filtré, et déclare une interface qui
+    n'existe pas. On vérifie ici que le noyau a bien reçu les trois choses —
+    table nft en `drop`, interface WireGuard adressée, pair déclaré.
+
+    L'API n'est délibérément pas sollicitée : le ruleset refuse le port
+    d'administration depuis toute interface autre que le tunnel, loopback
+    compris (`ruleset.rs`, « en tête de chaîne, avant même le loopback »). La
+    gateway ne joint donc pas sa propre API, et c'est l'invariant recherché.
+    """
     if not ctx.pare_feu_autorise:
         return Etat.HORS_PORTEE, (
             "exige --pare-feu : monter le backend réel installe un ruleset "
@@ -759,30 +768,66 @@ def _campagne_plan_de_donnees(ctx: Contexte):
                 f"setcap refusé sur {binaire} : {(pose.stderr or pose.stdout).strip()[:300]} "
                 "— relancer --bootstrap pour rafraîchir la règle sudoers"
             )
+
     journal_daemon = f"{ctx.tmp}/daemon-reel.log"
     pid = _lancer_daemon(ctx, {"config": "network-reel.toml", "mode": "run"}, journal_daemon)
-    # En mode réel l'API est liée à `admin_iface`, donc à `wg_address` : elle
-    # n'écoute pas sur le loopback, contrairement au mode --dev.
-    url = "http://100.64.0.1:8080"
+    details: list[str] = []
     try:
-        if not _attendre_api(ctx, url, pid):
+        if not _attendre_interface(ctx, "helios-test0", pid):
             journal = ctx.cible.executer(f"cat {journal_daemon}").stdout
-            return Etat.ECHEC, f"le daemon réel n'a pas démarré :\n{journal.strip()[-1200:]}"
-        if not _api_est_la_notre(ctx, url):
-            return Etat.ECHEC, "l'API répondante n'est pas celle du daemon réel lancé"
-        s = ctx.cible.executer(
-            f"./target/release/helios-ctl campaign --only plan-de-donnees "
-            f"--wg-iface helios-test0 "
-            f"--client-key {shlex.quote(ctx.client_priv)} "
-            f"--gateway-key {shlex.quote(ctx.gateway_pub)}",
-            timeout=300,
+            return Etat.ECHEC, f"le daemon réel n'a pas monté l'interface :\n{journal.strip()[-1200:]}"
+
+        adresse = ctx.cible.executer("ip -brief addr show helios-test0").stdout.strip()
+        if "100.64.0.1" not in adresse:
+            return Etat.ECHEC, f"interface sans adresse attendue : {adresse}"
+        details.append(f"✓ interface WireGuard adressée        {adresse}")
+
+        pairs = ctx.cible.executer("sudo -n wg show helios-test0 dump", dans_repo=False)
+        if not pairs.ok:
+            return Etat.ECHEC, f"wg show a échoué : {(pairs.stderr or pairs.stdout).strip()[:300]}"
+        # La première ligne décrit l'interface, les suivantes les pairs.
+        lignes_pairs = [l for l in pairs.stdout.strip().splitlines()[1:] if l.strip()]
+        if not any(ctx.client_pub in l for l in lignes_pairs):
+            return Etat.ECHEC, "le pair de campagne n'est pas déclaré dans le noyau"
+        details.append(f"✓ pair déclaré dans le noyau          {len(lignes_pairs)} pair(s)")
+
+        table = ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False)
+        if not table.ok or "policy drop" not in table.stdout:
+            return Etat.ECHEC, "la table nft n'est pas posée en politique drop"
+        details.append(
+            f"✓ table nft fail-closed posée         {table.stdout.count('policy drop')} chaînes en drop"
         )
-        if not s.ok:
-            return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:]
-        return Etat.OK, _resume_campagne(s.stdout), _details_campagne(s.stdout)
+
+        # Le PSK n'est pas encore négocié : le slot doit être vide à ce stade.
+        # Le vérifier évite de confondre « pas de provisioning » et « PSK posé ».
+        psk_vides = sum(1 for l in lignes_pairs if l.split("\t")[1:2] in ([""], ["(none)"]))
+        details.append(f"— slot PSK vide avant provisioning    {psk_vides}/{len(lignes_pairs)}")
+        return Etat.OK, "interface, pair et ruleset confirmés dans le noyau", details
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
         _tuer_daemons(ctx)
+
+
+@scenario("PSK réellement posé dans le slot WireGuard", "campagne")
+def _campagne_psk_plan_de_donnees(ctx: Contexte):
+    """Limite connue : ce scénario exige un **second poste**.
+
+    Le PSK n'arrive dans le slot qu'au terme d'un provisioning mené *par un
+    client, à travers le tunnel* — c'est la recette en deux machines de
+    docs/testing/TESTING.md. Or le ruleset refuse le port d'administration
+    depuis toute interface autre que celle du tunnel, loopback compris : la
+    gateway ne peut pas se provisionner elle-même, et c'est voulu.
+
+    Le déclarer « hors portée » plutôt que de le faire échouer est délibéré :
+    l'échec laisserait croire à une régression du PSK, alors que rien n'a été
+    éprouvé. Ce qui débloquerait : un second hôte joignable, monté en client
+    WireGuard, d'où jouer `helios-ctl --url http://100.64.0.1:8080 campaign`
+    avant d'inspecter le slot depuis la gateway.
+    """
+    return Etat.HORS_PORTEE, (
+        "exige un second poste client : la gateway ne joint pas sa propre API "
+        "(port d'administration refusé hors interface de tunnel)"
+    )
 
 
 # ── Scénarios : pare-feu réel ───────────────────────────────────────────────
@@ -844,30 +889,34 @@ def _pare_feu_ssh(ctx: Contexte):
     return Etat.OK, "nouvelle connexion acceptée"
 
 
-@scenario("aucun secret exposé par GET /api/network", "pare-feu")
-def _pare_feu_api(ctx: Contexte):
+@scenario("port d'administration refusé hors tunnel", "pare-feu")
+def _pare_feu_admin(ctx: Contexte):
+    """L'API ne doit être atteignable que par l'interface du tunnel.
+
+    On lit la table effectivement posée dans le noyau plutôt que d'interroger
+    l'API : la joindre est précisément ce que l'invariant interdit, et un
+    `curl` qui échoue ne distingue pas « refusé » de « daemon arrêté ».
+
+    L'ordre compte autant que la présence : l'acceptation scopée au tunnel doit
+    précéder le refus général, sinon elle est morte.
+    """
     if not ctx.pare_feu_autorise:
         return Etat.HORS_PORTEE, "exige --pare-feu"
-    s = ctx.cible.executer("curl -sf -m 5 http://127.0.0.1:8080/api/network || true")
-    corps = s.stdout
-    if not corps.strip():
-        return Etat.HORS_PORTEE, "aucun daemon en écoute à ce stade"
-    for secret in (ctx.gateway_priv, ctx.client_priv):
-        if secret and secret in corps:
-            return Etat.ECHEC, "une clé privée est sérialisée par l'API"
-    # Chercher des *valeurs* secrètes, pas des sous-chaînes : la réponse
-    # contient légitimement `wg_private_key_configured`, un booléen d'état qui
-    # n'expose rien. Un test qui échoue là-dessus crie au loup.
-    try:
-        champs = json.loads(corps)
-    except json.JSONDecodeError:
-        return Etat.ECHEC, f"réponse non-JSON : {corps[:200]}"
-    exposes = [c for c in ("wg_private_key", "preshared_key", "psk") if champs.get(c)]
-    for pair in champs.get("peers", []):
-        exposes += [f"peers.{c}" for c in ("preshared_key", "private_key") if pair.get(c)]
-    if exposes:
-        return Etat.ECHEC, f"champs secrets sérialisés : {', '.join(exposes)}"
-    return Etat.OK, "aucun secret sérialisé"
+    table = ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False)
+    if not table.ok:
+        return Etat.HORS_PORTEE, "aucune table posée à inspecter"
+
+    entree = table.stdout.split("chain input")[1].split("}")[0]
+    lignes = [l.strip() for l in entree.splitlines() if "8080" in l]
+    accept = next((i for i, l in enumerate(lignes) if "helios-test0" in l and "accept" in l), None)
+    drop = next((i for i, l in enumerate(lignes) if "drop" in l), None)
+    if accept is None:
+        return Etat.ECHEC, "aucune acceptation du port d'administration via le tunnel"
+    if drop is None:
+        return Etat.ECHEC, "le port d'administration n'est refusé nulle part ailleurs"
+    if accept > drop:
+        return Etat.ECHEC, "le refus général précède l'acceptation : l'API est injoignable partout"
+    return Etat.OK, "accepté via helios-test0, refusé partout ailleurs"
 
 
 @scenario("purge du ruleset d'essai", "pare-feu")
@@ -950,6 +999,21 @@ def _attendre_api(ctx: Contexte, url: str, pid: str, essais: int = 60) -> bool:
     """Attend que l'API réponde plutôt que de dormir un délai arbitraire."""
     for _ in range(essais):
         if ctx.cible.executer(f"curl -sf -m 5 {url}/api/status >/dev/null").ok:
+            return True
+        if not ctx.cible.executer(f"kill -0 {pid} 2>/dev/null").ok:
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _attendre_interface(ctx: Contexte, iface: str, pid: str, essais: int = 60) -> bool:
+    """Attend que l'interface WireGuard existe.
+
+    En mode réel c'est le bon signal de démarrage : l'API, elle, est
+    volontairement injoignable depuis la gateway.
+    """
+    for _ in range(essais):
+        if ctx.cible.executer(f"ip link show {iface} >/dev/null 2>&1").ok:
             return True
         if not ctx.cible.executer(f"kill -0 {pid} 2>/dev/null").ok:
             return False
