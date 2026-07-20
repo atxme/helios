@@ -226,11 +226,42 @@ sudo nft delete table inet helios
 
 ### Ce que cette campagne ne couvre pas
 
+**La pose effective du PSK exige un second poste.** Le PSK n'entre dans le slot
+WireGuard qu'au terme d'un provisioning mené *par un client, à travers le
+tunnel*. Or le ruleset refuse le port d'administration depuis toute interface
+autre que celle du tunnel, loopback compris — « en tête de chaîne, avant même
+le loopback » (`ruleset.rs`). La gateway ne peut donc pas se provisionner
+elle-même, et c'est l'invariant recherché, pas une gêne à contourner.
+
+Le scénario est déclaré « hors portée » plutôt que mis en échec : un échec
+laisserait croire à une régression du PSK alors que rien n'aurait été éprouvé.
+Ce qui le débloquerait : un second hôte monté en client WireGuard, d'où jouer
+la recette en deux machines décrite plus haut.
+
+Ce que la campagne établit malgré tout sur le plan de données réel : interface
+WireGuard adressée par le noyau, pair déclaré et visible dans `wg show`, table
+nft posée en politique `drop`, et slot PSK vide avant provisioning — ce dernier
+point évitant de confondre « aucun provisioning » et « PSK posé ».
+
 Le rescellement TPM (billets, PCR, anti-rejeu) et le cycle RAUC A/B ne sont pas
-automatisés : ils modifient le NV du TPM et les slots de boot, et un échec sans
-accès console rend la cible non amorçable. Ils restent dans la recette
-interactive de [MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui débloquerait leur
-automatisation : une cible à console série pilotable et un TPM dédié aux essais.
+automatisés non plus : ils modifient le NV du TPM et les slots de boot, et un
+échec sans accès console rend la cible non amorçable. Ils restent dans la
+recette interactive de [MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui
+débloquerait leur automatisation : une cible à console série pilotable et un TPM
+dédié aux essais. Le seul contrôle TPM automatisé est un *refus* — heliosd
+compilé avec la feature s'arrête faute de blob scellé — précisément parce qu'un
+refus n'écrit rien.
+
+### Bugs trouvés par le premier passage sur cible
+
+Trois défauts que le dry-run ne pouvait structurellement pas voir, tous
+confirmés puis corrigés avec test de non-régression :
+
+| Défaut | Effet |
+| --- | --- |
+| `Del` d'une table nft absente | `ENOENT`, transaction entière rejetée : aucun kill-switch au premier démarrage d'une machine |
+| `iif "lo"` sur la chaîne `output` | ne matche jamais ; tout le trafic loopback sortant tombait sous `drop` |
+| API liée avant la création de la VIP | `bind` en échec, erreur avalée : gateway opérationnelle mais définitivement sans API |
 
 ## Limites connues
 
