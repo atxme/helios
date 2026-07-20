@@ -736,11 +736,14 @@ def _campagne_plan_de_donnees(ctx: Contexte):
             )
     journal_daemon = f"{ctx.tmp}/daemon-reel.log"
     pid = _lancer_daemon(ctx, {"config": "network-reel.toml", "mode": "run"}, journal_daemon)
+    # En mode réel l'API est liée à `admin_iface`, donc à `wg_address` : elle
+    # n'écoute pas sur le loopback, contrairement au mode --dev.
+    url = "http://100.64.0.1:8080"
     try:
-        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
+        if not _attendre_api(ctx, url, pid):
             journal = ctx.cible.executer(f"cat {journal_daemon}").stdout
             return Etat.ECHEC, f"le daemon réel n'a pas démarré :\n{journal.strip()[-1200:]}"
-        if not _api_est_la_notre(ctx, "http://127.0.0.1:8080"):
+        if not _api_est_la_notre(ctx, url):
             return Etat.ECHEC, "l'API répondante n'est pas celle du daemon réel lancé"
         s = ctx.cible.executer(
             f"./target/release/helios-ctl campaign --only plan-de-donnees "
@@ -820,7 +823,7 @@ def _pare_feu_ssh(ctx: Contexte):
 def _pare_feu_api(ctx: Contexte):
     if not ctx.pare_feu_autorise:
         return Etat.HORS_PORTEE, "exige --pare-feu"
-    s = ctx.cible.executer("curl -sf http://127.0.0.1:8080/api/network || true")
+    s = ctx.cible.executer("curl -sf -m 5 http://127.0.0.1:8080/api/network || true")
     corps = s.stdout
     if not corps.strip():
         return Etat.HORS_PORTEE, "aucun daemon en écoute à ce stade"
@@ -903,6 +906,9 @@ def _lancer_daemon(ctx: Contexte, arguments: str, journal: str) -> str:
     _tuer_daemons(ctx)
     if ctx.cible.executer("ss -lnt | grep -q ':8080 '", dans_repo=False).ok:
         raise RuntimeError("le port 8080 est déjà occupé : un daemon étranger écoute")
+    # L'interface d'essai survit à un daemon tué brutalement et ferait échouer
+    # la création suivante.
+    ctx.cible.executer("sudo -n ip link delete helios-test0 2>/dev/null; true", dans_repo=False)
     repo = ctx.cible.repo
     lancement = (
         f'cd "{repo}"; HELIOS_NETWORK_CONFIG={ctx.tmp}/{arguments["config"]} '
@@ -918,7 +924,7 @@ def _lancer_daemon(ctx: Contexte, arguments: str, journal: str) -> str:
 def _attendre_api(ctx: Contexte, url: str, pid: str, essais: int = 60) -> bool:
     """Attend que l'API réponde plutôt que de dormir un délai arbitraire."""
     for _ in range(essais):
-        if ctx.cible.executer(f"curl -sf {url}/api/status >/dev/null").ok:
+        if ctx.cible.executer(f"curl -sf -m 5 {url}/api/status >/dev/null").ok:
             return True
         if not ctx.cible.executer(f"kill -0 {pid} 2>/dev/null").ok:
             return False
@@ -933,7 +939,7 @@ def _api_est_la_notre(ctx: Contexte, url: str) -> bool:
     place du nôtre : l'attente réussit, les scénarios s'exécutent contre un
     inconnu, et le vert obtenu ne prouve rien. C'est arrivé.
     """
-    s = ctx.cible.executer(f"curl -sf {url}/api/network")
+    s = ctx.cible.executer(f"curl -sf -m 5 {url}/api/network")
     if not s.ok:
         return False
     try:

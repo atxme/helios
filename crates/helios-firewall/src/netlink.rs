@@ -82,7 +82,6 @@ impl NetlinkBackend {
         };
 
         Ok(match m {
-            Match::Loopback => rule.iiface("lo").map_err(Self::err)?,
             Match::Established => rule.established().map_err(Self::err)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
@@ -310,7 +309,7 @@ mod tests {
 
     #[test]
     fn un_jeu_sans_ensemble_reste_intact() {
-        let matches = vec![Match::Loopback];
+        let matches = vec![Match::InIface("lo".into())];
         assert_eq!(NetlinkBackend::expand_port_sets(&matches), vec![matches]);
     }
 

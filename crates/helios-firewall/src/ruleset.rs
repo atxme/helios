@@ -63,8 +63,6 @@ impl L4 {
 /// Un critère de correspondance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
-    /// `iif "lo"` — interface d'entrée loopback.
-    Loopback,
     /// `ct state established,related`
     Established,
     /// `iifname "<iface>"`
@@ -84,7 +82,6 @@ pub enum Match {
 impl fmt::Display for Match {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Match::Loopback => write!(f, "iif \"lo\""),
             Match::Established => write!(f, "ct state established,related"),
             Match::InIface(i) => write!(f, "iifname \"{i}\""),
             Match::OutIface(i) => write!(f, "oifname \"{i}\""),
@@ -206,7 +203,17 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
 
     // ── Toujours autorisé ────────────────────────────────────────────────────
     for chain in [Input, Forward, Output] {
-        rules.push(Rule::new(chain, vec![Match::Loopback], Verdict::Accept));
+        // Le loopback se désigne par l'interface d'*entrée* en input et forward,
+        // mais de *sortie* en output : un paquet généré localement n'a pas
+        // d'interface d'entrée. Un `iifname "lo"` sur le hook output ne matche
+        // donc jamais, et tout le trafic local tombe sous la politique `drop` —
+        // y compris l'API de la gateway sur 127.0.0.1. Constaté sur cible.
+        let boucle = if chain == Output {
+            Match::OutIface("lo".into())
+        } else {
+            Match::InIface("lo".into())
+        };
+        rules.push(Rule::new(chain, vec![boucle], Verdict::Accept));
         rules.push(Rule::new(chain, vec![Match::Established], Verdict::Accept));
     }
 
@@ -402,6 +409,32 @@ mod tests {
 
     /// L'écoute WireGuard est en `input` (trafic vers la gateway), le forward
     /// LAN en `forward`. Les confondre bloquerait ou ouvrirait le mauvais trafic.
+    #[test]
+    fn le_loopback_est_accepte_selon_la_direction_de_la_chaine() {
+        // Non-régression : `iif "lo"` était posé sur les trois chaînes. Sur le
+        // hook output, un paquet généré localement n'a pas d'interface
+        // d'entrée : la règle ne matchait jamais et tout le trafic loopback
+        // sortant tombait sous `policy drop`. Symptôme observé sur cible —
+        // toute connexion vers 127.0.0.1 restait suspendue, sans refus.
+        let rs = render(&policy(), TunnelState::Down);
+
+        assert!(
+            rs.chain(ChainKind::Output)
+                .any(|r| r.matches == vec![Match::OutIface("lo".into())]
+                    && r.verdict == Verdict::Accept),
+            "la chaîne output doit accepter le loopback par son interface de sortie"
+        );
+
+        for kind in [ChainKind::Input, ChainKind::Forward] {
+            assert!(
+                rs.chain(kind)
+                    .any(|r| r.matches == vec![Match::InIface("lo".into())]
+                        && r.verdict == Verdict::Accept),
+                "{kind:?} doit accepter le loopback par son interface d'entrée"
+            );
+        }
+    }
+
     #[test]
     fn les_regles_sont_dans_la_bonne_chaine() {
         let rs = render(&policy(), TunnelState::Up);
