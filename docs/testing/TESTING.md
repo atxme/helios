@@ -144,6 +144,73 @@ dernière commande : c’est précisément l’intervalle où un PSK posé d’u
 côté se manifesterait, et le scénario `handshake vivant avec PSK` est là pour
 l’attraper.
 
+## Campagne matérielle automatisée
+
+`scripts/target_campaign.py` joue la recette matérielle ci-dessus depuis la
+machine de dev, sur une cible Linux accessible par SSH. Il n'a aucune
+dépendance hors bibliothèque standard Python.
+
+Le partage des rôles est explicite : les **tests unitaires restent en Rust** —
+le script se contente d'exécuter `cargo test --workspace --all-features` sur la
+cible, ce que WSL2 ne sait pas faire pour les features noyau/TPM — tandis que
+l'**enchaînement d'états** de la campagne (daemon monté, handshake attendu,
+kill-switch engagé) est orchestré en Python.
+
+Provisionnement ponctuel de la cible :
+
+```sh
+python3 scripts/target_campaign.py --aide-sudoers   # imprime la recette
+```
+
+Elle installe les dépendances via `scripts/setup-dev.sh --target`, ajoute
+l'utilisateur au groupe `tss` (accès `/dev/tpmrm0`) et pose une règle sudoers
+NOPASSWD limitée à `modprobe`, `nft`, `ip`, `wg` et `setcap` sur le binaire
+d'essai — jamais un shell générique.
+
+Exécution :
+
+```sh
+python3 scripts/target_campaign.py --only preflight    # sans effet de bord
+python3 scripts/target_campaign.py --only unite        # cargo fmt/clippy/test
+python3 scripts/target_campaign.py                     # tout sauf le pare-feu réel
+python3 scripts/target_campaign.py --pare-feu --json rapport.json
+```
+
+Les catégories sont `preflight`, `synchro`, `unite`, `build`, `campagne` et
+`pare-feu`. Un scénario que l'environnement ne permet pas de trancher est
+rapporté « hors portée », jamais « réussi ».
+
+### Survie de la session SSH
+
+Le backend Netlink réel pose une table `inet helios` en politique `drop` sur la
+chaîne `input`, et cette table **survit à l'arrêt du daemon** (invariant
+fail-closed : `teardown()` ne supprime jamais la table). Sans précaution, la
+campagne se coupe l'accès à sa propre cible. Deux protections cumulées :
+
+1. toutes les commandes passent par une **connexion SSH multiplexée unique**,
+   déjà `established` avant l'engagement du kill-switch, donc acceptée par la
+   règle `ct state established,related` ;
+2. la configuration générée renseigne `allow_ssh_from` avec le préfixe de
+   gestion (`--prefixe-gestion`, défaut `192.168.1.0/24`), ce qui rouvre le
+   port 22 même kill-switch engagé.
+
+Le scénario `SSH de gestion préservé par allow_ssh_from` ouvre délibérément une
+connexion **hors** multiplexage pour vérifier cette seconde protection plutôt
+que de la supposer. Les scénarios qui touchent au pare-feu réel exigent malgré
+tout `--pare-feu` explicite. En cas de perte d'accès, depuis la console :
+
+```sh
+sudo nft delete table inet helios
+```
+
+### Ce que cette campagne ne couvre pas
+
+Le rescellement TPM (billets, PCR, anti-rejeu) et le cycle RAUC A/B ne sont pas
+automatisés : ils modifient le NV du TPM et les slots de boot, et un échec sans
+accès console rend la cible non amorçable. Ils restent dans la recette
+interactive de [MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui débloquerait leur
+automatisation : une cible à console série pilotable et un TPM dédié aux essais.
+
 ## Limites connues
 
 - le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;

@@ -56,7 +56,7 @@ if ! command -v rustup &>/dev/null; then
     source "$HOME/.cargo/env"
     success "rustup installé"
 else
-    rustup update stable --quiet
+    rustup update --quiet stable
     success "Rust $(rustc --version)"
 fi
 
