@@ -404,6 +404,34 @@ def _synchro_git(ctx: Contexte):
 # ── Scénarios : tests unitaires Rust ────────────────────────────────────────
 
 
+@scenario("frontends construits (prérequis de --all-features)", "unite")
+def _unite_frontends(ctx: Contexte):
+    """Construit `web/dist` et `apps/orion/dist` s'ils manquent.
+
+    Ce n'est pas une commodité, c'est un prérequis de compilation :
+    `--all-features` active `embed-ui`, dont le `#[derive(RustEmbed)]` pointe
+    sur `web/dist/`. Dossier absent, la macro ne génère pas `Assets::get` et
+    `helios-api` ne compile pas — l'erreur ne dit rien du frontend manquant.
+    Le crate `orion` a la même dépendance via `frontendDist` de Tauri.
+
+    C'est la raison pour laquelle `scripts/regression.sh` construit les
+    frontends avant clippy et les tests ; l'ordre est ici le même.
+    """
+    construits = []
+    for app, dist in (("web", "web/dist"), ("apps/orion", "apps/orion/dist")):
+        if ctx.cible.executer(f"test -d {dist}").ok:
+            continue
+        s = ctx.cible.executer(
+            f"npm ci --prefix {app} && npm run build --prefix {app}", timeout=1800
+        )
+        if not s.ok:
+            return Etat.ECHEC, f"{app} : {(s.stderr or s.stdout).strip()[-800:]}"
+        construits.append(app)
+    if not construits:
+        return Etat.OK, "déjà présents"
+    return Etat.OK, f"construits : {', '.join(construits)}"
+
+
 @scenario("cargo fmt", "unite")
 def _unite_fmt(ctx: Contexte):
     s = ctx.cible.executer("cargo fmt --check")
@@ -545,7 +573,7 @@ def _campagne_protocole(ctx: Contexte):
     s = ctx.cible.executer(lancement)
     pid = s.stdout.strip()
     try:
-        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid, f"{ctx.tmp}/daemon-dev.log"):
+        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
             journal = ctx.cible.executer(f"cat {ctx.tmp}/daemon-dev.log").stdout
             return Etat.ECHEC, f"le daemon n'a pas répondu :\n{journal.strip()[-1000:]}"
         s = ctx.cible.executer(
@@ -598,7 +626,7 @@ def _campagne_plan_de_donnees(ctx: Contexte):
     )
     pid = ctx.cible.executer(lancement).stdout.strip()
     try:
-        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid, f"{ctx.tmp}/daemon-reel.log"):
+        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
             journal = ctx.cible.executer(f"cat {ctx.tmp}/daemon-reel.log").stdout
             return Etat.ECHEC, f"le daemon réel n'a pas démarré :\n{journal.strip()[-1200:]}"
         s = ctx.cible.executer(
@@ -680,7 +708,7 @@ def _pare_feu_api(ctx: Contexte):
 # ── Utilitaires de scénario ─────────────────────────────────────────────────
 
 
-def _attendre_api(ctx: Contexte, url: str, pid: str, journal: str, essais: int = 60) -> bool:
+def _attendre_api(ctx: Contexte, url: str, pid: str, essais: int = 60) -> bool:
     """Attend que l'API réponde plutôt que de dormir un délai arbitraire."""
     for _ in range(essais):
         if ctx.cible.executer(f"curl -sf {url}/api/status >/dev/null").ok:
