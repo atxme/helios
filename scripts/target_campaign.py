@@ -274,6 +274,7 @@ class Contexte:
     branche: str
     prefixe_gestion: str
     pare_feu_autorise: bool
+    forcer_synchro: bool = False
     # Rempli au fil de la campagne : les scénarios tardifs dépendent des clés
     # et du répertoire de travail créés par les précédents.
     tmp: str = ""
@@ -387,10 +388,12 @@ def _synchro_git(ctx: Contexte):
         # détruire un correctif en cours sur la cible. Lister les fichiers
         # concernés, sans quoi l'utilisateur doit aller les chercher lui-même.
         fichiers = ", ".join(l.strip().split(maxsplit=1)[-1] for l in s.stdout.strip().splitlines())
-        return Etat.ECHEC, (
-            f"arbre de travail sale sur la cible ({fichiers}) : refus d'écraser. "
-            "Committer ou annuler ces modifications avant de relancer."
-        )
+        if not ctx.forcer_synchro:
+            return Etat.ECHEC, (
+                f"arbre de travail sale sur la cible ({fichiers}) : refus d'écraser. "
+                "Committer, annuler, ou relancer avec --forcer-synchro."
+            )
+        detail(_c("33", f"--forcer-synchro : modifications écrasées ({fichiers})"))
     s = ctx.cible.executer(
         f"git fetch --quiet origin && git checkout --quiet {shlex.quote(ctx.branche)} && "
         f"git reset --hard --quiet origin/{shlex.quote(ctx.branche)} && git rev-parse HEAD"
@@ -463,16 +466,50 @@ def _unite_tests(ctx: Contexte):
 # ── Scénarios : build matériel ──────────────────────────────────────────────
 
 
+def _assurer_keyring(ctx: Contexte) -> str:
+    """Garantit un trousseau éditeur d'essai, et renvoie son chemin.
+
+    `aether/build.rs` refuse le trousseau de développement en profil release
+    (invariant : une release ne se construit qu'avec une ancre éditeur
+    explicite). **Toute** commande `cargo` en release doit donc porter
+    `HELIOS_PUBLISHER_KEYRING_PATH`, pas seulement celle de `heliosd`.
+    """
+    if ctx.keyring:
+        return ctx.keyring
+    chemin = f"{ctx.tmp}/keys/publisher-keyring.json"
+    if not ctx.cible.executer(f"test -f {shlex.quote(chemin)}").ok:
+        s = ctx.cible.executer(
+            f"cargo run --quiet -p helios-publisher -- keygen "
+            f"--key-epoch 4294967295 --output-dir {shlex.quote(ctx.tmp)}/keys"
+        )
+        if not s.ok:
+            raise RuntimeError(
+                f"génération du trousseau impossible : {(s.stderr or s.stdout).strip()[-500:]}"
+            )
+    ctx.keyring = chemin
+    return chemin
+
+
+def _cargo_release(ctx: Contexte, arguments: str, timeout: int = 3600) -> Sortie:
+    """Joue une commande cargo en release avec l'ancre éditeur.
+
+    Centralisé parce que l'oublier ne produit pas une erreur parlante : le
+    build script d'`aether` panique sur le trousseau de développement, et le
+    message ne dit pas quelle commande a omis la variable.
+    """
+    keyring = _assurer_keyring(ctx)
+    return ctx.cible.executer(
+        f"HELIOS_PUBLISHER_KEYRING_PATH={shlex.quote(keyring)} {arguments}",
+        timeout=timeout,
+    )
+
+
 @scenario("trousseau éditeur d'essai", "build")
 def _build_keyring(ctx: Contexte):
-    ctx.keyring = f"{ctx.tmp}/keys/publisher-keyring.json"
-    s = ctx.cible.executer(
-        f"cargo run --quiet -p helios-publisher -- keygen "
-        f"--key-epoch 4294967295 --output-dir {shlex.quote(ctx.tmp)}/keys"
-    )
-    if not s.ok:
-        return Etat.ECHEC, (s.stderr or s.stdout).strip()[-800:]
-    return Etat.OK, ""
+    try:
+        return Etat.OK, _assurer_keyring(ctx)
+    except RuntimeError as exc:
+        return Etat.ECHEC, str(exc)
 
 
 @scenario("build release avec netlink, wireguard, tpm", "build")
@@ -480,10 +517,8 @@ def _build_release(ctx: Contexte):
     s = ctx.cible.executer("npm ci --prefix web && npm run build --prefix web", timeout=1800)
     if not s.ok:
         return Etat.ECHEC, f"frontend : {(s.stderr or s.stdout).strip()[-800:]}"
-    s = ctx.cible.executer(
-        f"HELIOS_PUBLISHER_KEYRING_PATH={shlex.quote(ctx.keyring)} "
-        "cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui",
-        timeout=3600,
+    s = _cargo_release(
+        ctx, "cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui"
     )
     if not s.ok:
         return Etat.ECHEC, s.stderr.strip()[-1500:]
@@ -492,7 +527,7 @@ def _build_release(ctx: Contexte):
 
 @scenario("build helios-ctl", "build")
 def _build_ctl(ctx: Contexte):
-    s = ctx.cible.executer("cargo build --release -p helios-ctl", timeout=1800)
+    s = _cargo_release(ctx, "cargo build --release -p helios-ctl", timeout=1800)
     return (Etat.OK, "") if s.ok else (Etat.ECHEC, s.stderr.strip()[-1000:])
 
 
@@ -501,7 +536,9 @@ def _build_orion(ctx: Contexte):
     """Invariant : compilé avec ``wireguard``, Orion ne retombe jamais sur le
     dry-run. On vérifie ici que la feature lie bien sur la cible ; le refus au
     démarrage est couvert par les tests unitaires d'orion-core."""
-    s = ctx.cible.executer("cargo build --release -p orion-core --features wireguard", timeout=1800)
+    s = _cargo_release(
+        ctx, "cargo build --release -p orion-core --features wireguard", timeout=1800
+    )
     return (Etat.OK, "") if s.ok else (Etat.ECHEC, s.stderr.strip()[-1000:])
 
 
@@ -511,12 +548,15 @@ def _build_orion(ctx: Contexte):
 def _generer_cles(ctx: Contexte) -> None:
     """Deux paires WireGuard jetables, jamais persistées hors du répertoire
     temporaire de la campagne."""
+    if not ctx.cible.executer("test -x target/release/helios-ctl").ok:
+        raise RuntimeError("target/release/helios-ctl absent : jouer la catégorie build")
     for role in ("client", "gateway"):
-        s = ctx.cible.executer(
-            f"./target/release/helios-ctl campaign --generate-keys 2>/dev/null"
-        )
+        s = ctx.cible.executer("./target/release/helios-ctl campaign --generate-keys 2>/dev/null")
         if not s.ok:
-            raise RuntimeError(f"génération de clés {role} impossible : {s.stderr}")
+            raise RuntimeError(
+                f"génération de clés {role} impossible (code {s.code}) : "
+                f"{(s.stderr or s.stdout).strip()[-300:] or 'aucune sortie'}"
+            )
         for ligne in s.stdout.splitlines():
             if ligne.startswith("WG_PRIVATE_KEY="):
                 setattr(ctx, f"{role}_priv", ligne.split("=", 1)[1].strip())
@@ -525,6 +565,18 @@ def _generer_cles(ctx: Contexte) -> None:
     for champ in ("client_priv", "client_pub", "gateway_priv", "gateway_pub"):
         if not getattr(ctx, champ):
             raise RuntimeError(f"clé {champ} non extraite")
+
+
+def _assurer_cles(ctx: Contexte) -> None:
+    """Génère les clés de campagne une seule fois, à la demande.
+
+    Le premier scénario de la catégorie composait sa configuration avant que
+    `_generer_cles` ait tourné : `wg_private_key` sortait vide et heliosd
+    s'arrêtait sur « gateway non configurée », masquant ce qu'on voulait
+    mesurer.
+    """
+    if not ctx.gateway_priv:
+        _generer_cles(ctx)
 
 
 def _config_reseau(ctx: Contexte, iface_wan: str) -> str:
@@ -546,9 +598,69 @@ address = "100.64.1.2/32"
 """
 
 
+@scenario("TPM enforce : refus de démarrer sans blob scellé", "campagne")
+def _campagne_tpm_fail_closed(ctx: Contexte):
+    """Vérifie le fail-closed TPM sur le matériel réel, sans rien y écrire.
+
+    Compilé avec la feature `tpm`, `TpmSettings::default()` donne
+    `enabled = true`, `enforce = true` et `allow_provisioning = false`. Sans
+    blob dans `/var/lib/helios/sealed.key`, `BootController::unlock` renvoie
+    `MissingBlobOnField` et le démarrage doit s'arrêter là — avant tout réseau.
+
+    C'est le seul scénario TPM automatisable sans risque : il constate un refus,
+    donc il ne scelle rien et ne touche pas au NV. Le rescellement et les
+    billets restent dans la recette manuelle.
+    """
+    if not ctx.cible.executer("test -c /dev/tpmrm0").ok:
+        return Etat.HORS_PORTEE, "aucun TPM sur cette cible"
+    if ctx.cible.executer("test -f /var/lib/helios/sealed.key").ok:
+        return Etat.HORS_PORTEE, "un blob scellé existe déjà : le refus n'est pas exerçable"
+
+    # Reconstruire explicitement avec `tpm` : le scénario suivant produit un
+    # binaire sans la feature, et le réutiliser ici ne prouverait rien.
+    build = _cargo_release(
+        ctx, "cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui"
+    )
+    if not build.ok:
+        return Etat.ECHEC, build.stderr.strip()[-800:]
+
+    _assurer_cles(ctx)
+    ctx.cible.deposer(_config_reseau(ctx, "lo"), f"{ctx.tmp}/network-tpm.toml")
+    s = ctx.cible.executer(
+        f"HELIOS_NETWORK_CONFIG={ctx.tmp}/network-tpm.toml "
+        "timeout 30 ./target/release/heliosd run --dev 2>&1 || true"
+    )
+    journal = s.stdout + s.stderr
+    if "déscellement TPM échoué" not in journal and "MissingBlob" not in journal:
+        return Etat.ECHEC, (
+            "heliosd n'a pas refusé de démarrer sur absence de blob scellé : "
+            f"{journal.strip()[-600:]}"
+        )
+    return Etat.OK, "refus avant tout réseau"
+
+
+@scenario("binaire de campagne sans tpm", "campagne")
+def _campagne_binaire(ctx: Contexte):
+    """Reconstruit heliosd avec les backends réseau réels mais sans `tpm`.
+
+    Le scénario précédent vient d'établir qu'un binaire `tpm` refuse de démarrer
+    tant qu'aucune identité n'est scellée. Provisionner ce scellement sur la
+    machine ferait sortir la campagne de son périmètre — elle écrirait dans le
+    TPM. On désactive donc la feature plutôt que de contourner l'invariant :
+    `enabled` retombe à `false`, `BootDecision::Disabled`, et le plan de données
+    reste pleinement réel (netlink et WireGuard noyau).
+    """
+    s = _cargo_release(
+        ctx, "cargo build --release -p heliosd --features netlink,wireguard,embed-ui"
+    )
+    if not s.ok:
+        return Etat.ECHEC, s.stderr.strip()[-1200:]
+    return Etat.OK, "netlink + wireguard réels, tpm désactivé"
+
+
 @scenario("catégorie client : validations hors daemon", "campagne")
 def _campagne_client(ctx: Contexte):
-    _generer_cles(ctx)
+    _assurer_cles(ctx)
     s = ctx.cible.executer(
         f"./target/release/helios-ctl campaign --only client "
         f"--client-key {shlex.quote(ctx.client_priv)} "
@@ -565,17 +677,16 @@ def _campagne_protocole(ctx: Contexte):
     orchestrateur. Le dry-run suffit ici : c'est le protocole qui est en cause,
     pas le plan de données."""
     ctx.cible.deposer(_config_reseau(ctx, "lo"), f"{ctx.tmp}/network-dev.toml")
-    lancement = (
-        f"HELIOS_NETWORK_CONFIG={ctx.tmp}/network-dev.toml "
-        f"nohup ./target/release/heliosd run --dev "
-        f"> {ctx.tmp}/daemon-dev.log 2>&1 & echo $!"
+    journal_daemon = f"{ctx.tmp}/daemon-dev.log"
+    pid = _lancer_daemon(
+        ctx, {"config": "network-dev.toml", "mode": "run --dev"}, journal_daemon
     )
-    s = ctx.cible.executer(lancement)
-    pid = s.stdout.strip()
     try:
         if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
-            journal = ctx.cible.executer(f"cat {ctx.tmp}/daemon-dev.log").stdout
+            journal = ctx.cible.executer(f"cat {journal_daemon}").stdout
             return Etat.ECHEC, f"le daemon n'a pas répondu :\n{journal.strip()[-1000:]}"
+        if not _api_est_la_notre(ctx, "http://127.0.0.1:8080"):
+            return Etat.ECHEC, "l'API répondante n'est pas celle du daemon lancé"
         s = ctx.cible.executer(
             f"./target/release/helios-ctl campaign --only protocole "
             f"--client-key {shlex.quote(ctx.client_priv)} "
@@ -592,6 +703,7 @@ def _campagne_protocole(ctx: Contexte):
         return Etat.OK, _resume_campagne(s.stdout)
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
+        _tuer_daemons(ctx)
 
 
 @scenario("catégorie plan-de-donnees : PSK réellement posé", "campagne")
@@ -607,28 +719,29 @@ def _campagne_plan_de_donnees(ctx: Contexte):
 
     iface_wan = ctx.faits.get("iface_wan", "lo")
     ctx.cible.deposer(_config_reseau(ctx, iface_wan), f"{ctx.tmp}/network-reel.toml")
-    # Chemin littéral : il doit correspondre au mot pour mot à la règle
-    # sudoers, qui n'accepte aucun joker (sudo-rs).
-    binaire = f"{ctx.cible.repo}/target/release/heliosd"
-    pose = ctx.cible.executer(
-        f"sudo -n setcap cap_net_admin,cap_net_raw+eip {shlex.quote(binaire)}",
-        dans_repo=False,
-    )
-    if not pose.ok:
-        return Etat.ECHEC, (
-            f"setcap refusé sur {binaire} : {(pose.stderr or pose.stdout).strip()[:300]} "
-            "— vérifier que la règle sudoers vise ce chemin exact (--aide-sudoers)"
+    # Chemins littéraux : ils doivent correspondre au mot pour mot à la règle
+    # sudoers, qui n'accepte aucun joker (sudo-rs). `helios-ctl` en a besoin
+    # autant que le daemon : c'est lui qui lit le plan de données via
+    # `wg show`, refusé sans CAP_NET_ADMIN.
+    for nom in ("heliosd", "helios-ctl"):
+        binaire = f"{ctx.cible.repo}/target/release/{nom}"
+        pose = ctx.cible.executer(
+            f"sudo -n setcap cap_net_admin,cap_net_raw+eip {shlex.quote(binaire)}",
+            dans_repo=False,
         )
-    lancement = (
-        f"HELIOS_NETWORK_CONFIG={ctx.tmp}/network-reel.toml "
-        f"nohup ./target/release/heliosd run "
-        f"> {ctx.tmp}/daemon-reel.log 2>&1 & echo $!"
-    )
-    pid = ctx.cible.executer(lancement).stdout.strip()
+        if not pose.ok:
+            return Etat.ECHEC, (
+                f"setcap refusé sur {binaire} : {(pose.stderr or pose.stdout).strip()[:300]} "
+                "— relancer --bootstrap pour rafraîchir la règle sudoers"
+            )
+    journal_daemon = f"{ctx.tmp}/daemon-reel.log"
+    pid = _lancer_daemon(ctx, {"config": "network-reel.toml", "mode": "run"}, journal_daemon)
     try:
         if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
-            journal = ctx.cible.executer(f"cat {ctx.tmp}/daemon-reel.log").stdout
+            journal = ctx.cible.executer(f"cat {journal_daemon}").stdout
             return Etat.ECHEC, f"le daemon réel n'a pas démarré :\n{journal.strip()[-1200:]}"
+        if not _api_est_la_notre(ctx, "http://127.0.0.1:8080"):
+            return Etat.ECHEC, "l'API répondante n'est pas celle du daemon réel lancé"
         s = ctx.cible.executer(
             f"./target/release/helios-ctl campaign --only plan-de-donnees "
             f"--wg-iface helios-test0 "
@@ -641,21 +754,31 @@ def _campagne_plan_de_donnees(ctx: Contexte):
         return Etat.OK, _resume_campagne(s.stdout)
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
+        _tuer_daemons(ctx)
 
 
 # ── Scénarios : pare-feu réel ───────────────────────────────────────────────
 
 
-@scenario("table inet helios présente et fail-closed", "pare-feu")
+@scenario("ruleset fail-closed maintenu après l'arrêt du daemon", "pare-feu")
 def _pare_feu_table(ctx: Contexte):
+    """Vérifie l'invariant de persistance.
+
+    Le daemon de la catégorie précédente est déjà arrêté quand ce scénario
+    s'exécute : constater que la table est toujours là, et toujours en `drop`,
+    c'est constater que `teardown()` ne la supprime jamais. Un kill-switch qui
+    tomberait avec le processus ne serait pas un kill-switch.
+    """
     if not ctx.pare_feu_autorise:
         return Etat.HORS_PORTEE, "exige --pare-feu"
     s = ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False)
     if not s.ok:
         return Etat.ECHEC, "aucune table inet helios : le backend Netlink n'a rien posé"
-    if "policy drop" not in s.stdout:
+    chaines = s.stdout.count("policy drop")
+    if chaines == 0:
         return Etat.ECHEC, "la table existe mais aucune chaîne n'est en politique drop"
-    return Etat.OK, f"{s.stdout.count('policy drop')} chaînes en drop"
+    ctx.faits["table_posee"] = True
+    return Etat.OK, f"{chaines} chaînes en drop, daemon arrêté"
 
 
 @scenario("SSH de gestion préservé par allow_ssh_from", "pare-feu")
@@ -665,6 +788,10 @@ def _pare_feu_ssh(ctx: Contexte):
     multiplexée."""
     if not ctx.pare_feu_autorise:
         return Etat.HORS_PORTEE, "exige --pare-feu"
+    if not ctx.faits.get("table_posee"):
+        # Sans ruleset engagé, rien ne bloque SSH : un succès ici ne
+        # prouverait pas que `allow_ssh_from` protège quoi que ce soit.
+        return Etat.HORS_PORTEE, "aucun ruleset engagé : la protection n'est pas exerçable"
     proc = subprocess.run(
         [
             "ssh",
@@ -700,12 +827,92 @@ def _pare_feu_api(ctx: Contexte):
     for secret in (ctx.gateway_priv, ctx.client_priv):
         if secret and secret in corps:
             return Etat.ECHEC, "une clé privée est sérialisée par l'API"
-    if "preshared" in corps.lower() or "private" in corps.lower():
-        return Etat.ECHEC, f"champ suspect dans la réponse : {corps[:300]}"
-    return Etat.OK, ""
+    # Chercher des *valeurs* secrètes, pas des sous-chaînes : la réponse
+    # contient légitimement `wg_private_key_configured`, un booléen d'état qui
+    # n'expose rien. Un test qui échoue là-dessus crie au loup.
+    try:
+        champs = json.loads(corps)
+    except json.JSONDecodeError:
+        return Etat.ECHEC, f"réponse non-JSON : {corps[:200]}"
+    exposes = [c for c in ("wg_private_key", "preshared_key", "psk") if champs.get(c)]
+    for pair in champs.get("peers", []):
+        exposes += [f"peers.{c}" for c in ("preshared_key", "private_key") if pair.get(c)]
+    if exposes:
+        return Etat.ECHEC, f"champs secrets sérialisés : {', '.join(exposes)}"
+    return Etat.OK, "aucun secret sérialisé"
+
+
+@scenario("purge du ruleset d'essai", "pare-feu")
+def _pare_feu_purge(ctx: Contexte):
+    """Retire la table ``inet helios`` laissée par la campagne.
+
+    L'invariant fail-closed veut que la table survive au daemon, et le scénario
+    précédent vient de le vérifier. Mais la chaîne ``output`` est elle aussi en
+    ``drop`` : tant que la table est en place, la cible n'a plus de trafic
+    sortant — ni DNS, ni paquets, ni cargo. La laisser serait transformer une
+    campagne d'essai en panne.
+
+    La purge est donc délibérée et journalisée, jamais implicite. Elle s'exécute
+    même si les scénarios précédents ont échoué, et même sans ``--pare-feu`` :
+    une table oubliée par une exécution interrompue doit pouvoir être nettoyée.
+    """
+    if not ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False).ok:
+        return Etat.HORS_PORTEE, "aucune table à purger"
+    if not ctx.cible.executer("sudo -n nft delete table inet helios", dans_repo=False).ok:
+        return Etat.ECHEC, (
+            "purge impossible — la cible reste sans trafic sortant. Depuis la "
+            "console : sudo nft delete table inet helios"
+        )
+    if ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False).ok:
+        return Etat.ECHEC, "la table est toujours présente après suppression"
+    # Constater le rétablissement plutôt que le supposer.
+    sortant = ctx.cible.executer("curl -sf -m 8 -o /dev/null https://deb.nodesource.com")
+    if not sortant.ok:
+        return Etat.OK, "table retirée ; trafic sortant non reconfirmé (réseau externe)"
+    return Etat.OK, "table retirée, trafic sortant rétabli"
 
 
 # ── Utilitaires de scénario ─────────────────────────────────────────────────
+
+
+def _tuer_daemons(ctx: Contexte) -> None:
+    """Élimine tout heliosd résiduel.
+
+    ``pkill -x`` compare le **nom** du processus : un ``pkill -f`` sur le chemin
+    tuerait aussi la session SSH qui le lance, puisque le motif figure dans sa
+    propre ligne de commande.
+    """
+    ctx.cible.executer("pkill -x heliosd; sleep 0.5; true", dans_repo=False)
+
+
+def _lancer_daemon(ctx: Contexte, arguments: str, journal: str) -> str:
+    """Lance heliosd en arrière-plan et renvoie son PID réel.
+
+    Deux pièges, tous deux rencontrés :
+
+    * ``cd X && cmd &`` fait porter le ``&`` sur le compound entier, donc
+      ``$!`` renvoie le PID du sous-shell et non celui de heliosd — un ``kill``
+      sur ce PID laisse le daemon orphelin, qui squatte le port de l'API pour
+      les exécutions suivantes ;
+    * ce même sous-shell garde le tube ssh ouvert, et ``subprocess`` bloque
+      jusqu'à son timeout au lieu de rendre la main.
+
+    D'où le ``;`` au lieu du ``&&``, et la redirection des trois descripteurs :
+    le ``&`` ne porte plus que sur une commande simple, qui ne retient rien.
+    """
+    _tuer_daemons(ctx)
+    if ctx.cible.executer("ss -lnt | grep -q ':8080 '", dans_repo=False).ok:
+        raise RuntimeError("le port 8080 est déjà occupé : un daemon étranger écoute")
+    repo = ctx.cible.repo
+    lancement = (
+        f'cd "{repo}"; HELIOS_NETWORK_CONFIG={ctx.tmp}/{arguments["config"]} '
+        f'nohup ./target/release/heliosd {arguments["mode"]} '
+        f"> {journal} 2>&1 </dev/null & echo $!"
+    )
+    pid = ctx.cible.executer(lancement, dans_repo=False).stdout.strip()
+    if not pid.isdigit():
+        raise RuntimeError(f"PID du daemon illisible : {pid!r}")
+    return pid
 
 
 def _attendre_api(ctx: Contexte, url: str, pid: str, essais: int = 60) -> bool:
@@ -717,6 +924,23 @@ def _attendre_api(ctx: Contexte, url: str, pid: str, essais: int = 60) -> bool:
             return False
         time.sleep(0.5)
     return False
+
+
+def _api_est_la_notre(ctx: Contexte, url: str) -> bool:
+    """Vérifie que l'API interrogée est bien celle du daemon qu'on a lancé.
+
+    Sans ce contrôle, un daemon résiduel qui détient déjà le port répond à la
+    place du nôtre : l'attente réussit, les scénarios s'exécutent contre un
+    inconnu, et le vert obtenu ne prouve rien. C'est arrivé.
+    """
+    s = ctx.cible.executer(f"curl -sf {url}/api/network")
+    if not s.ok:
+        return False
+    try:
+        pairs = json.loads(s.stdout).get("peers", [])
+    except json.JSONDecodeError:
+        return False
+    return any(p.get("public_key") == ctx.client_pub for p in pairs)
 
 
 def _resume_campagne(sortie: str) -> str:
@@ -820,16 +1044,20 @@ def _regle_sudoers(utilisateur: str, repo: str) -> str:
 
     Ni shell générique, ni ``apt-get``, ni root inconditionnel n'y figurent.
     """
-    binaire = f"{repo}/target/release/heliosd"
+    binaires = [f"{repo}/target/release/heliosd", f"{repo}/target/release/helios-ctl"]
     commandes = [
         "/usr/sbin/modprobe wireguard",
         "/usr/sbin/modprobe nf_tables",
         "/usr/sbin/nft",
         "/usr/sbin/ip",
         "/usr/bin/wg",
-        rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw+eip {binaire}",
-        rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw=ep {binaire}",
     ]
+    # `helios-ctl` interroge le plan de données via `wg show` : sans
+    # CAP_NET_ADMIN il obtient « Operation not permitted » et le scénario
+    # plan-de-donnees échoue sans rien prouver.
+    for binaire in binaires:
+        commandes.append(rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw+eip {binaire}")
+        commandes.append(rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw=ep {binaire}")
     return f"{utilisateur} ALL=(root) NOPASSWD: {', '.join(commandes)}\n"
 
 
@@ -919,6 +1147,11 @@ def main() -> int:
         "et montent le backend WireGuard noyau",
     )
     p.add_argument(
+        "--forcer-synchro",
+        action="store_true",
+        help="écrase les modifications non commitées de l'arbre de travail de la cible",
+    )
+    p.add_argument(
         "--prefixe-gestion",
         default="192.168.1.0/24",
         help="CIDR à inscrire dans allow_ssh_from pour préserver l'accès SSH",
@@ -968,6 +1201,7 @@ def main() -> int:
             branche=args.branche,
             prefixe_gestion=args.prefixe_gestion,
             pare_feu_autorise=args.pare_feu,
+            forcer_synchro=args.forcer_synchro,
             tmp=tmp,
         )
         # Interface portant la route par défaut : c'est le wan_iface réaliste.
