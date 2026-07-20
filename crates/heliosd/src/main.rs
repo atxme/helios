@@ -48,6 +48,13 @@ enum Command {
     Status,
     /// Vérifie la disponibilité d'une mise à jour.
     CheckUpdate,
+    /// Provisionne le coffre TPM au premier déploiement.
+    ///
+    /// À jouer **une seule fois**, à l'installation, avec accès console. Sur le
+    /// terrain, un coffre absent est une anomalie de sécurité : le démarrage
+    /// nominal refuse donc de provisionner de lui-même, et cette commande est le
+    /// seul chemin explicite pour le faire.
+    ProvisionTpm,
 }
 
 #[tokio::main]
@@ -72,6 +79,53 @@ async fn main() -> anyhow::Result<()> {
             let dry_run = resolve_dry_run(false);
             orchestrator::check_update(dry_run).await
         }
+        Command::ProvisionTpm => provision_tpm(),
+    }
+}
+
+/// Scelle un secret neuf dans le TPM, au premier déploiement seulement.
+///
+/// `TpmSettings::default()` porte `allow_provisioning = false` : c'est
+/// délibéré, un coffre absent sur le terrain signale qu'on a pu l'effacer pour
+/// forcer un faux premier boot. Le démarrage nominal doit donc s'arrêter là.
+///
+/// Il faut malgré tout un chemin pour le premier scellement, sans quoi une
+/// gateway compilée avec la feature `tpm` ne peut jamais démarrer. Cette
+/// commande est ce chemin : explicite, distincte du démarrage, et refusant
+/// d'écraser un coffre existant — un écrasement détruirait l'identité de la
+/// gateway sans possibilité de retour.
+fn provision_tpm() -> anyhow::Result<()> {
+    let mut tpm = TpmSettings::default();
+
+    if !tpm.enabled {
+        anyhow::bail!(
+            "binaire compilé sans la feature `tpm` : aucun scellement possible. \
+             Recompiler avec --features tpm sur la cible."
+        );
+    }
+
+    if std::path::Path::new(&tpm.sealed_blob_path).exists() {
+        anyhow::bail!(
+            "un coffre existe déjà dans {} — refus d'écraser. Le supprimer ferait \
+             perdre l'identité scellée de la gateway.",
+            tpm.sealed_blob_path
+        );
+    }
+
+    tpm.allow_provisioning = true;
+    match BootController::unlock(&tpm).map_err(|e| anyhow::anyhow!("scellement échoué : {e}"))? {
+        BootDecision::Provisioned(_) => {
+            info!(
+                "coffre TPM provisionné dans {} — lié aux PCR {:?} de la banque {}",
+                tpm.sealed_blob_path, tpm.pcr_selection, tpm.pcr_bank
+            );
+            info!(
+                "démarrer heliosd : la clé WireGuard en clair de network.toml sera \
+                 scellée automatiquement, après quoi `wg_private_key` peut en être retiré"
+            );
+            Ok(())
+        }
+        autre => anyhow::bail!("provisionnement attendu, obtenu : {autre:?}"),
     }
 }
 
