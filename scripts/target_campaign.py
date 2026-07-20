@@ -51,6 +51,7 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -93,6 +94,7 @@ class Resultat:
     etat: Etat
     message: str = ""
     duree_s: float = 0.0
+    details: list[str] = field(default_factory=list)
 
 
 # ── Exécution distante ──────────────────────────────────────────────────────
@@ -455,12 +457,35 @@ def _unite_tests(ctx: Contexte):
     """Les features noyau/TPM sont ici compilées **et** liées sur la cible :
     c'est ce que WSL2 ne peut pas faire. L'exécution réelle des effets reste
     l'affaire des catégories campagne et pare-feu."""
-    s = ctx.cible.executer("cargo test --workspace --all-features", timeout=3600)
+    s = ctx.cible.executer(
+        "cargo test --workspace --all-features 2>&1", timeout=3600
+    )
+    # `Running unittests src/lib.rs (target/debug/deps/aether-1a2b)` précède le
+    # `test result:` du même binaire : on apparie les deux pour nommer chaque
+    # ligne de résultat, sinon le détail est une colonne de chiffres anonymes.
+    details: list[str] = []
+    binaire = "?"
+    for ligne in s.stdout.splitlines():
+        depouillee = ligne.strip()
+        if depouillee.startswith(("Running ", "Doc-tests ")):
+            binaire = depouillee.split("(")[-1].rstrip(")").split("/")[-1]
+            # Le suffixe de hash change à chaque compilation : il n'apporte
+            # rien à la lecture et fait diverger deux rapports identiques.
+            binaire = re.sub(r"-[0-9a-f]{8,}$", "", binaire)
+            if depouillee.startswith("Doc-tests"):
+                binaire = f"doc:{depouillee.split()[-1]}"
+        elif depouillee.startswith("test result:"):
+            bilan = depouillee.removeprefix("test result:").strip()
+            # « 0 measured; 0 filtered out » n'est jamais informatif ici.
+            bilan = re.sub(r";\s*\d+ (measured|filtered out)", "", bilan)
+            details.append(f"{binaire:<28} {bilan}")
+        elif depouillee.startswith("---- ") and " stdout" in depouillee:
+            details.append(f"ÉCHEC {depouillee}")
     if not s.ok:
-        return Etat.ECHEC, s.stdout.strip()[-1500:] or s.stderr.strip()[-1500:]
-    lignes = [l for l in s.stdout.splitlines() if "test result:" in l]
-    total = sum(int(l.split("test result:")[1].split()[1]) for l in lignes if "ok." in l)
-    return Etat.OK, f"{total} tests sur {len(lignes)} binaires"
+        return Etat.ECHEC, s.stdout.strip()[-1500:], details
+    resultats = [l for l in s.stdout.splitlines() if "test result:" in l]
+    total = sum(int(l.split("test result:")[1].split()[1]) for l in resultats if "ok." in l)
+    return Etat.OK, f"{total} tests sur {len(resultats)} binaires", details
 
 
 # ── Scénarios : build matériel ──────────────────────────────────────────────
@@ -667,8 +692,8 @@ def _campagne_client(ctx: Contexte):
         f"--gateway-key {shlex.quote(ctx.gateway_pub)}"
     )
     if not s.ok:
-        return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:]
-    return Etat.OK, _resume_campagne(s.stdout)
+        return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:], _details_campagne(s.stdout)
+    return Etat.OK, _resume_campagne(s.stdout), _details_campagne(s.stdout)
 
 
 @scenario("catégorie protocole : tour ML-KEM complet", "campagne")
@@ -693,14 +718,14 @@ def _campagne_protocole(ctx: Contexte):
             f"--gateway-key {shlex.quote(ctx.gateway_pub)}"
         )
         if not s.ok:
-            return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:]
+            return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:], _details_campagne(s.stdout)
         # Invariant : aucun secret ne doit transiter par le journal.
         fuite = ctx.cible.executer(
             f"grep -qF {shlex.quote(ctx.client_priv)} {ctx.tmp}/daemon-dev.log"
         )
         if fuite.ok:
             return Etat.ECHEC, "une clé privée a été journalisée par le daemon"
-        return Etat.OK, _resume_campagne(s.stdout)
+        return Etat.OK, _resume_campagne(s.stdout), _details_campagne(s.stdout)
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
         _tuer_daemons(ctx)
@@ -754,7 +779,7 @@ def _campagne_plan_de_donnees(ctx: Contexte):
         )
         if not s.ok:
             return Etat.ECHEC, (s.stdout + s.stderr).strip()[-1200:]
-        return Etat.OK, _resume_campagne(s.stdout)
+        return Etat.OK, _resume_campagne(s.stdout), _details_campagne(s.stdout)
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
         _tuer_daemons(ctx)
@@ -949,15 +974,41 @@ def _api_est_la_notre(ctx: Contexte, url: str) -> bool:
     return any(p.get("public_key") == ctx.client_pub for p in pairs)
 
 
+def _sans_ansi(texte: str) -> str:
+    """Retire les séquences d'échappement ANSI d'une ligne."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", texte)
+
+
 def _resume_campagne(sortie: str) -> str:
     """Extrait la ligne de synthèse de helios-ctl, sans les codes ANSI."""
     for ligne in reversed(sortie.strip().splitlines()):
-        nettoyee = "".join(
-            c for c in ligne if c.isprintable()
-        ).replace("\x1b", "")
+        nettoyee = _sans_ansi(ligne).strip()
         if "scénario" in nettoyee:
-            return nettoyee.strip()
+            return nettoyee
     return ""
+
+
+def _details_campagne(sortie: str) -> list[str]:
+    """Remonte chaque sous-scénario joué par helios-ctl.
+
+    Sans cela, six vérifications distinctes disparaissent derrière un unique
+    « campagne réussie » : on sait que rien n'a cassé, pas ce qui a été
+    éprouvé. Les en-têtes de catégorie sont conservés pour le regroupement.
+    """
+    lignes: list[str] = []
+    for brute in sortie.splitlines():
+        nettoyee = _sans_ansi(brute).rstrip()
+        depouillee = nettoyee.strip()
+        if not depouillee:
+            continue
+        if depouillee[0] in "✓✗—":
+            lignes.append(depouillee)
+        elif depouillee.endswith("─" * 3):
+            # Ligne de soulignement : on garde l'intitulé qui la précède.
+            continue
+        elif nettoyee.startswith(("plan de données", "protocole", "client")):
+            lignes.append(f"[{depouillee}]")
+    return lignes
 
 
 # ── Orchestration ───────────────────────────────────────────────────────────
@@ -973,12 +1024,19 @@ def jouer(ctx: Contexte, categories: list[str]) -> list[Resultat]:
             info(categorie)
             categorie_courante = categorie
         debut = time.monotonic()
+        details: list[str] = []
         try:
-            etat, message = fn(ctx)
+            # Un scénario renvoie (état, message) ou, s'il agrège des
+            # sous-tests, (état, message, détails).
+            issue = fn(ctx)
+            if len(issue) == 3:
+                etat, message, details = issue
+            else:
+                etat, message = issue
         except Exception as exc:  # un scénario qui explose est un échec, pas un crash
             etat, message = Etat.ECHEC, f"{type(exc).__name__}: {exc}"
         duree = time.monotonic() - debut
-        resultats.append(Resultat(nom, categorie, etat, message, duree))
+        resultats.append(Resultat(nom, categorie, etat, message, duree, details))
         marque = {
             Etat.OK: _c("32", "✓"),
             Etat.ECHEC: _c("31", "✗"),
@@ -986,6 +1044,17 @@ def jouer(ctx: Contexte, categories: list[str]) -> list[Resultat]:
         }[etat]
         suffixe = f"  {_c('2', message)}" if message and etat is not Etat.ECHEC else ""
         print(f"  {marque} {nom:<52} {duree:6.1f}s{suffixe}", flush=True)
+        for ligne in details:
+            if ligne.startswith("["):
+                print(f"      {_c('1', ligne.strip('[]'))}", flush=True)
+            elif ligne.startswith("✗") or ligne.startswith("ÉCHEC"):
+                print(f"        {_c('31', ligne)}", flush=True)
+            elif ligne.startswith("—"):
+                print(f"        {_c('33', ligne)}", flush=True)
+            elif ligne.startswith("✓"):
+                print(f"        {_c('32', ligne)}", flush=True)
+            else:
+                print(f"        {_c('2', ligne)}", flush=True)
         if etat is Etat.ECHEC and message:
             for ligne in message.strip().splitlines():
                 print(f"      {_c('31', ligne)}", flush=True)
@@ -1234,6 +1303,7 @@ def main() -> int:
                                 "etat": r.etat.value,
                                 "message": r.message,
                                 "duree_s": round(r.duree_s, 2),
+                                "details": r.details,
                             }
                             for r in resultats
                         ],
