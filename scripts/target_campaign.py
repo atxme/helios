@@ -252,6 +252,22 @@ class Cible:
             raise RuntimeError(f"écriture de {chemin_distant} impossible : {proc.stderr}")
 
 
+def _local(commande: str, timeout: int = 180) -> Sortie:
+    """Exécute une commande sur la machine de dev.
+
+    La catégorie `tunnel` est la seule où cette machine n'est pas seulement le
+    pilote : elle est le **client WireGuard**. Les deux bouts du tunnel sont
+    donc pilotés depuis le même processus, l'un par SSH, l'autre en local.
+    """
+    try:
+        proc = subprocess.run(
+            ["bash", "-lc", commande], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return Sortie(124, "", f"délai dépassé après {timeout}s")
+    return Sortie(proc.returncode, proc.stdout, proc.stderr)
+
+
 # ── Registre de scénarios ───────────────────────────────────────────────────
 
 CATEGORIES = (
@@ -262,6 +278,7 @@ CATEGORIES = (
     "campagne",
     "mise-a-jour",
     "tpm",
+    "tunnel",
     "pare-feu",
 )
 
@@ -969,6 +986,187 @@ def _tpm_materiel(ctx: Contexte):
     if not details:
         return Etat.ECHEC, "aucun essai matériel joué — la variable a-t-elle porté ?", details
     return Etat.OK, f"{len(details)} essais sur /dev/tpmrm0", details
+
+
+# ── Scénarios : tunnel réel de bout en bout ─────────────────────────────────
+
+IFACE_CLIENT = "helios-cli0"
+VIP_CLIENT = "100.64.1.2/32"
+
+
+@scenario("prérequis client WireGuard local", "tunnel")
+def _tunnel_preflight(ctx: Contexte):
+    """Vérifie que la machine de dev peut tenir le rôle de client réel."""
+    if not _local("command -v wg").ok:
+        return Etat.ECHEC, "wireguard-tools absent : sudo apt install wireguard-tools"
+    if not _local("test -d /sys/module/wireguard").ok:
+        if not _local("sudo -n modprobe wireguard").ok:
+            return Etat.ECHEC, "module wireguard non chargé : sudo modprobe wireguard"
+    refuses = [c for c in ("ip link show", "wg show") if not _local(f"sudo -n {c}").ok]
+    if refuses:
+        utilisateur = _local("id -un").stdout.strip()
+        chemin_ip = _local("command -v ip").stdout.strip()
+        chemin_wg = _local("command -v wg").stdout.strip()
+        regle = f"{utilisateur} ALL=(root) NOPASSWD: {chemin_ip}, {chemin_wg}"
+        return Etat.ECHEC, (
+            f"sudo local interactif pour : {', '.join(refuses)}. "
+            "Poser la règle, en une fois, depuis un terminal :\n"
+            f"  echo {shlex.quote(regle)} | sudo tee /etc/sudoers.d/helios-client-tests "
+            "&& sudo chmod 0440 /etc/sudoers.d/helios-client-tests"
+        )
+    return Etat.OK, "wg, module noyau et privilèges réseau disponibles"
+
+
+def _demonter_client() -> None:
+    _local(f"sudo -n ip link delete {IFACE_CLIENT} 2>/dev/null; true")
+
+
+@scenario("tunnel réel : handshake, PSK posé des deux côtés", "tunnel")
+def _tunnel_bout_en_bout(ctx: Contexte):
+    """Le seul scénario qui fait circuler des paquets chiffrés.
+
+    Tout le reste de la campagne éprouve le plan de contrôle, ou constate que
+    le noyau accepte une configuration. Ici deux machines distinctes montent un
+    vrai tunnel, un vrai handshake a lieu, le provisioning post-quantique passe
+    **dans** ce tunnel, et le PSK négocié est vérifié dans les deux slots
+    WireGuard — celui de la gateway et celui du client.
+
+    C'est la recette en deux postes de TESTING.md, la machine de dev tenant le
+    rôle du client Orion.
+    """
+    if not ctx.pare_feu_autorise:
+        return Etat.HORS_PORTEE, "exige --pare-feu : la gateway monte son backend noyau"
+
+    details: list[str] = []
+    _assurer_cles(ctx)
+    iface_wan = ctx.faits.get("iface_wan", "lo")
+    hote = ctx.cible.hote.split("@")[-1]
+
+    # Client : helios-ctl local, il joue le vrai code d'Orion.
+    keyring = _keyring_local()
+    if keyring is None:
+        return Etat.ECHEC, "génération du trousseau éditeur local impossible"
+    build = _local(
+        f"HELIOS_PUBLISHER_KEYRING_PATH={shlex.quote(keyring)} "
+        "cargo build --release -p helios-ctl",
+        timeout=1800,
+    )
+    if not build.ok:
+        return Etat.ECHEC, f"build local de helios-ctl : {build.stderr.strip()[-800:]}"
+
+    ctx.cible.deposer(_config_reseau(ctx, iface_wan), f"{ctx.tmp}/network-tunnel.toml")
+    binaire = f"{ctx.cible.repo}/target/release/heliosd"
+    if not ctx.cible.executer(
+        f"sudo -n setcap cap_net_admin,cap_net_raw+eip {shlex.quote(binaire)}", dans_repo=False
+    ).ok:
+        return Etat.ECHEC, "setcap refusé sur heliosd — relancer --bootstrap"
+
+    journal = f"{ctx.tmp}/daemon-tunnel.log"
+    pid = _lancer_daemon(ctx, {"config": "network-tunnel.toml", "mode": "run"}, journal)
+    _demonter_client()
+    try:
+        if not _attendre_interface(ctx, "helios-test0", pid):
+            trace = ctx.cible.executer(f"cat {journal}").stdout
+            return Etat.ECHEC, f"gateway : interface non montée\n{trace.strip()[-1000:]}"
+        details.append("✓ gateway : interface et ruleset posés")
+
+        # Client : interface WireGuard réelle, pair = gateway, endpoint LAN.
+        # `ctx.tmp` désigne le répertoire temporaire **de la cible** : la clé du
+        # client doit être écrite ici, sur la machine de dev.
+        cle = os.path.join(tempfile.gettempdir(), f"helios-client-{os.getpid()}.key")
+        montage = "; ".join([
+            f"umask 077 && printf '%s' {shlex.quote(ctx.client_priv)} > {cle}",
+            f"sudo -n ip link add dev {IFACE_CLIENT} type wireguard",
+            f"sudo -n wg set {IFACE_CLIENT} private-key {cle} peer {ctx.gateway_pub}"
+            f" endpoint {hote}:51821 allowed-ips 100.64.0.0/10 persistent-keepalive 15",
+            f"sudo -n ip address add {VIP_CLIENT} dev {IFACE_CLIENT}",
+            f"sudo -n ip link set up dev {IFACE_CLIENT}",
+        ])
+        pose = _local(montage)
+        if not pose.ok:
+            return Etat.ECHEC, f"montage du client : {(pose.stderr or pose.stdout).strip()[-600:]}"
+        details.append(f"✓ client : {IFACE_CLIENT} monté vers {hote}:51821")
+
+        # Handshake : c'est ici que la crypto WireGuard s'exerce réellement.
+        if not _attendre_handshake():
+            trace = _local(f"sudo -n wg show {IFACE_CLIENT}").stdout
+            return Etat.ECHEC, f"aucun handshake en 30 s\n{trace.strip()[-600:]}", details
+        details.append("✓ handshake WireGuard établi")
+
+        # Provisioning PQ **dans** le tunnel, depuis le client.
+        campagne = _local(
+            f"./target/release/helios-ctl --url http://100.64.0.1:8080 campaign "
+            f"--only protocole --client-key {shlex.quote(ctx.client_priv)} "
+            f"--gateway-key {shlex.quote(ctx.gateway_pub)}",
+            timeout=300,
+        )
+        details += _details_campagne(campagne.stdout)
+        if not campagne.ok:
+            return Etat.ECHEC, (campagne.stdout + campagne.stderr).strip()[-1000:], details
+
+        # Le PSK doit être dans les deux slots : un slot rempli d'un seul côté
+        # fait échouer tous les handshakes suivants, sans canal de rattrapage.
+        psk_gw = _psk_du_dump(
+            ctx.cible.executer("sudo -n wg show helios-test0 dump", dans_repo=False).stdout
+        )
+        psk_cli = _psk_du_dump(_local(f"sudo -n wg show {IFACE_CLIENT} dump").stdout)
+        details.append(f"{'✓' if psk_gw else '✗'} PSK dans le slot gateway")
+        details.append(f"{'✓' if psk_cli else '✗'} PSK dans le slot client")
+        if not psk_gw or not psk_cli:
+            return Etat.ECHEC, "PSK absent d'au moins un slot : tout handshake ultérieur échouera", details
+
+        return Etat.OK, "tunnel réel, PSK négocié et posé des deux côtés", details
+    finally:
+        _demonter_client()
+        _local(
+            "rm -f "
+            + shlex.quote(os.path.join(tempfile.gettempdir(), f"helios-client-{os.getpid()}.key"))
+        )
+        ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
+        _tuer_daemons(ctx)
+
+
+def _keyring_local() -> str | None:
+    """Trousseau éditeur d'essai sur la machine de dev.
+
+    `aether/build.rs` refuse le trousseau de développement en profil release :
+    le client se construit donc sous la même contrainte que la gateway.
+    """
+    dossier = os.path.join(tempfile.gettempdir(), "helios-keyring-client")
+    chemin = os.path.join(dossier, "publisher-keyring.json")
+    if os.path.exists(chemin):
+        return chemin
+    s = _local(
+        "cargo run --quiet -p helios-publisher -- keygen "
+        f"--key-epoch 4294967295 --output-dir {shlex.quote(dossier)}",
+        timeout=900,
+    )
+    return chemin if s.ok and os.path.exists(chemin) else None
+
+
+def _attendre_handshake(essais: int = 30) -> bool:
+    """Attend un handshake effectif plutôt qu'un délai arbitraire."""
+    for _ in range(essais):
+        s = _local(f"sudo -n wg show {IFACE_CLIENT} latest-handshakes")
+        for ligne in s.stdout.strip().splitlines():
+            champs = ligne.split()
+            if len(champs) >= 2 and champs[1] != "0":
+                return True
+        time.sleep(1)
+    return False
+
+
+def _psk_du_dump(dump: str) -> bool:
+    """Indique si un slot PSK est renseigné dans une sortie `wg show ... dump`.
+
+    La première ligne décrit l'interface ; les suivantes les pairs, dont le
+    deuxième champ est la clé pré-partagée — `(none)` quand elle est absente.
+    """
+    for ligne in dump.strip().splitlines()[1:]:
+        champs = ligne.split("\t")
+        if len(champs) >= 2 and champs[1] not in ("", "(none)"):
+            return True
+    return False
 
 
 # ── Scénarios : pare-feu réel ───────────────────────────────────────────────
