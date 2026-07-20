@@ -16,6 +16,18 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// Nombre d'essais de mise en écoute de l'API avant abandon.
+///
+/// L'adresse d'écoute appartient à l'interface WireGuard, créée par
+/// l'orchestrateur après le lancement du serveur : les premiers essais échouent
+/// nécessairement. La borne évite une boucle infinie si l'adresse ne vient
+/// jamais — une configuration erronée doit rester visible, pas être masquée par
+/// des tentatives silencieuses.
+const API_BIND_TENTATIVES: u32 = 20;
+
+/// Attente entre deux essais de mise en écoute de l'API.
+const API_BIND_DELAI: std::time::Duration = std::time::Duration::from_millis(500);
+
 #[derive(Parser)]
 #[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
 struct Cli {
@@ -157,8 +169,28 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         Arc::clone(&shared_policy),
     );
     tokio::spawn(async move {
-        if let Err(e) = helios_api::serve(state, &api_bind).await {
-            tracing::error!("serveur API : {e:#}");
+        // Hors simulation, l'API écoute sur l'adresse WireGuard — que
+        // l'orchestrateur, démarré juste après, n'a pas encore assignée à
+        // l'interface. Le premier `bind` échoue donc en « Cannot assign
+        // requested address », et sans réessai la gateway tournait pour de
+        // bon sans API : ni provisioning, ni télémétrie, pour une course
+        // perdue de quelques dizaines de millisecondes.
+        for tentative in 1..=API_BIND_TENTATIVES {
+            match helios_api::serve(state.clone(), &api_bind).await {
+                Ok(()) => return,
+                Err(e) if tentative < API_BIND_TENTATIVES => {
+                    warn!(
+                        "serveur API indisponible (tentative {tentative}/{API_BIND_TENTATIVES}), \
+                         nouvel essai : {e:#}"
+                    );
+                    tokio::time::sleep(API_BIND_DELAI).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "serveur API abandonné après {API_BIND_TENTATIVES} tentatives : {e:#}"
+                    );
+                }
+            }
         }
     });
 
