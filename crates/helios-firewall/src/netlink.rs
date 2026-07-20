@@ -17,10 +17,15 @@
 //! où la table serait à moitié peuplée — c'est-à-dire aucun instant où le
 //! kill-switch serait partiellement levé.
 //!
-//! La table est **recréée à chaque application** (`Del` puis `Add` dans la même
-//! transaction) : c'est le seul moyen d'obtenir un remplacement atomique sans
-//! laisser traîner d'anciennes règles. Le `Del` initial est toléré si la table
-//! n'existe pas encore.
+//! La table est **recréée à chaque application** (`Add`, `Del`, puis `Add` dans
+//! la même transaction) : c'est le seul moyen d'obtenir un remplacement atomique
+//! sans laisser traîner d'anciennes règles.
+//!
+//! Le premier `Add` garantit l'existence de la table avant sa suppression. Le
+//! noyau ne tolère **pas** un `Del` sur une table absente : il répond `ENOENT`
+//! et rejette la transaction entière. Sans ce `Add`, aucun kill-switch n'était
+//! posé au tout premier démarrage d'une machine et heliosd s'arrêtait — un
+//! comportement que seul un essai sur cible réelle pouvait révéler.
 //!
 //! # Limite connue : MSS clamping
 //!
@@ -140,6 +145,14 @@ impl NetlinkBackend {
             .collect()
     }
 
+    /// Séquence de messages appliquée à la table elle-même, dans cet ordre.
+    ///
+    /// Le `Add` initial n'est pas décoratif : sans lui, le `Del` porte sur une
+    /// table absente au tout premier démarrage, le noyau répond `ENOENT` et
+    /// rejette la transaction entière — donc pas de kill-switch, et heliosd
+    /// s'arrête. Constaté sur cible réelle ; le dry-run ne pouvait pas le voir.
+    const SEQUENCE_TABLE: [MsgType; 3] = [MsgType::Add, MsgType::Del, MsgType::Add];
+
     /// Construit la transaction complète pour ce jeu de règles.
     ///
     /// Ne touche à rien : en cas d'erreur de traduction, on renvoie `Err` sans
@@ -150,9 +163,21 @@ impl NetlinkBackend {
         let table = Table::new(ProtocolFamily::Inet).with_name(self.table_name.clone());
 
         // Remplacement atomique : retrait de l'ancienne table et recréation dans
-        // la même transaction. Le `Del` sur une table absente est toléré.
-        batch.add(&table, MsgType::Del);
-        batch.add(&table, MsgType::Add);
+        // la même transaction.
+        //
+        // Le premier `Add` n'est pas redondant. Contrairement à ce qu'on
+        // pourrait attendre, le noyau ne tolère pas un `Del` sur une table
+        // absente : il répond `ENOENT` et **rejette la transaction entière**.
+        // Sur une machine où `inet helios` n'a jamais existé — donc à tout
+        // premier démarrage — le pare-feu ne s'appliquait pas et heliosd
+        // s'arrêtait sur « application du pare-feu ».
+        //
+        // L'idiome nftables consiste à garantir l'existence de la table avant
+        // de la supprimer : `Add` (no-op si présente), `Del` (désormais sûr),
+        // puis `Add` pour repartir d'une table vide.
+        for msg in Self::SEQUENCE_TABLE {
+            batch.add(&table, msg);
+        }
 
         let policy = match rs.default_verdict {
             Verdict::Drop => ChainPolicy::Drop,
@@ -262,6 +287,25 @@ mod tests {
         }));
         // Les autres critères sont préservés dans chaque règle produite.
         assert!(expanded[0].contains(&Match::OutIface("eth0".into())));
+    }
+
+    #[test]
+    fn la_table_est_creee_avant_d_etre_supprimee() {
+        // Non-régression : `Del` d'abord échouait en `ENOENT` sur une machine
+        // où `inet helios` n'avait jamais existé, et le noyau rejetait toute
+        // la transaction — aucun kill-switch posé, démarrage impossible.
+        let seq = NetlinkBackend::SEQUENCE_TABLE;
+        assert_eq!(seq[0], MsgType::Add, "la table doit exister avant le Del");
+        let del = seq
+            .iter()
+            .position(|m| *m == MsgType::Del)
+            .expect("un Del est attendu");
+        assert!(del > 0, "aucun Add ne précède le Del");
+        assert_eq!(
+            seq[del + 1],
+            MsgType::Add,
+            "la table doit être recréée après le Del"
+        );
     }
 
     #[test]
