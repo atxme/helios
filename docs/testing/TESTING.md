@@ -156,16 +156,37 @@ cible, ce que WSL2 ne sait pas faire pour les features noyau/TPM — tandis que
 l'**enchaînement d'états** de la campagne (daemon monté, handshake attendu,
 kill-switch engagé) est orchestré en Python.
 
-Provisionnement ponctuel de la cible :
+Provisionnement ponctuel de la cible, en deux commandes :
 
 ```sh
-python3 scripts/target_campaign.py --aide-sudoers   # imprime la recette
+ssh -t <cible> 'cd ~/helios && bash scripts/setup-dev.sh --target'
+python3 scripts/target_campaign.py --bootstrap
 ```
 
-Elle installe les dépendances via `scripts/setup-dev.sh --target`, ajoute
-l'utilisateur au groupe `tss` (accès `/dev/tpmrm0`) et pose une règle sudoers
-NOPASSWD limitée à `modprobe`, `nft`, `ip`, `wg` et `setcap` sur le binaire
-d'essai — jamais un shell générique.
+`--bootstrap` résout l'utilisateur et le chemin absolu du dépôt sur la cible,
+compose la règle sudoers, **la fait valider par `visudo` avant de l'installer**
+— un fichier invalide déposé dans `/etc/sudoers.d` casserait sudo pour toute la
+machine — puis l'installe et ajoute l'utilisateur au groupe `tss` (accès
+`/dev/tpmrm0`). Un seul mot de passe est demandé, et la vérification finale se
+fait sur une session neuve, seule façon de constater que la règle porte.
+
+La règle est limitée à `modprobe wireguard`, `modprobe nf_tables`, `nft`, `ip`,
+`wg` et `setcap` sur le seul binaire d'essai : jamais un shell générique, ni
+`apt-get`, ni root inconditionnel. `--aide-sudoers` l'imprime pour contrôle.
+
+Trois contraintes de forme, constatées sur Ubuntu 26.04 qui embarque **sudo-rs**
+et non le sudo classique :
+
+- aucun joker n'est accepté dans les arguments de commande — les invocations de
+  `setcap` sont donc écrites littéralement, dans leurs deux variantes de
+  syntaxe de capacités (`+eip` et `=ep`) ;
+- la virgule qui sépare les capacités doit être échappée (`cap_net_admin\,`),
+  sinon elle est lue comme le séparateur de la liste de commandes ;
+- le chemin du binaire est absolu, et doit correspondre au mot près à celui que
+  la campagne passe à `setcap` — d'où sa résolution par `pwd -P`.
+
+Ces contraintes sont la raison d'être de `--bootstrap` : recopiée à la main, la
+règle échoue silencieusement ou casse sudo.
 
 Exécution :
 

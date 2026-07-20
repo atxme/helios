@@ -350,11 +350,29 @@ def _preflight_toolchain(ctx: Contexte):
 
 @scenario("sudo non interactif sur les commandes d'essai", "preflight")
 def _preflight_sudo(ctx: Contexte):
-    if not ctx.cible.executer("sudo -n true").ok:
+    """Sonde les commandes réellement nécessaires, une par une.
+
+    Tester ``sudo -n true`` serait un contresens : la règle est délibérément
+    scopée, donc ``true`` n'y figure pas et échouerait même une fois le
+    provisionnement correct. Les sondes ci-dessous sont toutes en lecture ou
+    idempotentes.
+    """
+    sondes = {
+        "modprobe": "sudo -n modprobe wireguard",
+        "nft": "sudo -n nft list tables",
+        "ip": "sudo -n ip link show",
+        "wg": "sudo -n wg show",
+    }
+    refusees = [nom for nom, cmd in sondes.items() if not ctx.cible.executer(cmd).ok]
+    if refusees:
         return Etat.ECHEC, (
-            "sudo exige un mot de passe : installer la règle NOPASSWD scopée "
-            "(voir --aide-sudoers)"
+            f"sudo exige un mot de passe pour : {', '.join(refusees)} — "
+            "provisionner avec --bootstrap"
         )
+    # setcap ne se sonde pas sans l'appliquer : on lit la liste des droits.
+    droits = ctx.cible.executer("sudo -n -l 2>/dev/null")
+    if droits.ok and "setcap" not in droits.stdout:
+        return Etat.ECHEC, "setcap absent de la règle NOPASSWD — relancer --bootstrap"
     return Etat.OK, ""
 
 
@@ -733,43 +751,122 @@ def rapporter(resultats: list[Resultat]) -> int:
 
 
 AIDE_SUDOERS = """\
-Provisionnement ponctuel de la cible. Ces étapes exigent un mot de passe sudo :
-les jouer depuis un vrai terminal, avec un TTY (l'option -t de ssh).
+Le provisionnement est automatisé — rien de tout ceci n'est à recopier :
 
-    ssh -t christophe@192.168.1.44
+    python3 scripts/target_campaign.py --bootstrap
 
-Puis, sur la cible :
+Cette commande résout le dépôt et l'utilisateur sur la cible, compose la règle
+ci-dessous, la fait valider par visudo *avant* installation, puis l'installe et
+ajoute l'utilisateur au groupe tss. Un seul mot de passe sudo est demandé.
 
-    cd ~/helios
-    git fetch origin && git checkout client-app
+Seules les dépendances système restent à poser une fois, sur la cible :
 
-    # 1. dépendances noyau/TPM/WireGuard, toolchain et Node >= 22
-    bash scripts/setup-dev.sh --target
+    ssh -t christophe@192.168.1.44 'cd ~/helios && bash scripts/setup-dev.sh --target'
 
-    # 2. accès TPM sans sudo (prend effet à la session suivante)
-    sudo usermod -aG tss "$USER"
+Règle générée pour cette cible, donnée à titre de contrôle :
 
-    # 3. règle sudoers strictement scopée : ni shell générique, ni apt-get,
-    #    ni root inconditionnel — uniquement les commandes des essais.
-    #
-    #    Deux contraintes d'Ubuntu 26.04, qui embarque sudo-rs et non le sudo
-    #    classique : aucun joker n'est accepté dans les arguments (l'appel
-    #    setcap est donc écrit littéralement), et la virgule de la liste de
-    #    capacités doit être échappée, sinon elle est lue comme le séparateur
-    #    de commandes. Le heredoc est quoté pour que le shell n'y touche pas :
-    #    adapter les chemins à la main si l'utilisateur n'est pas christophe.
-    #    La règle tient sur une seule ligne : ni indentation ni continuation à
-    #    recoller, donc rien qui puisse casser à la copie.
-    sudo tee /etc/sudoers.d/helios-target-tests >/dev/null <<'EOF'
-christophe ALL=(root) NOPASSWD: /usr/sbin/modprobe wireguard, /usr/sbin/modprobe nf_tables, /usr/sbin/nft, /usr/sbin/ip, /usr/bin/wg, /usr/sbin/setcap cap_net_admin\\,cap_net_raw+eip /home/christophe/helios/target/release/heliosd
-EOF
-    sudo chmod 0440 /etc/sudoers.d/helios-target-tests
-    visudo -c -f /etc/sudoers.d/helios-target-tests
-
-Refermer la session, puis vérifier depuis la machine de dev :
-
-    python3 scripts/target_campaign.py --only preflight
+{regle}
+Notes de portabilité, constatées sur Ubuntu 26.04 (sudo-rs, pas le sudo
+classique) : aucun joker n'est accepté dans les arguments, d'où les deux
+variantes littérales de setcap ; et la virgule des capacités est échappée,
+faute de quoi elle serait lue comme le séparateur de la liste de commandes.
 """
+
+
+SUDOERS_CHEMIN = "/etc/sudoers.d/helios-target-tests"
+
+
+def _regle_sudoers(utilisateur: str, repo: str) -> str:
+    """Compose la règle NOPASSWD, strictement scopée aux essais.
+
+    Trois contraintes dictent cette forme, toutes constatées sur Ubuntu 26.04
+    qui embarque sudo-rs et non le sudo classique :
+
+    * aucun joker n'est accepté dans les arguments, donc chaque invocation de
+      ``setcap`` est écrite littéralement — d'où les deux variantes de syntaxe
+      de capacités, ``+eip`` et ``=ep`` ;
+    * la virgule qui sépare les capacités doit être échappée, sinon elle est
+      lue comme le séparateur de la liste de commandes ;
+    * le chemin du binaire est absolu et littéral : il doit correspondre au mot
+      près à celui que la campagne passera à ``setcap``.
+
+    Ni shell générique, ni ``apt-get``, ni root inconditionnel n'y figurent.
+    """
+    binaire = f"{repo}/target/release/heliosd"
+    commandes = [
+        "/usr/sbin/modprobe wireguard",
+        "/usr/sbin/modprobe nf_tables",
+        "/usr/sbin/nft",
+        "/usr/sbin/ip",
+        "/usr/bin/wg",
+        rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw+eip {binaire}",
+        rf"/usr/sbin/setcap cap_net_admin\,cap_net_raw=ep {binaire}",
+    ]
+    return f"{utilisateur} ALL=(root) NOPASSWD: {', '.join(commandes)}\n"
+
+
+def bootstrap(hote: str, repo: str, verbeux: bool) -> int:
+    """Provisionne la cible : règle sudoers et accès TPM, en un seul mot de passe.
+
+    Le fichier est **validé avant** d'être installé : ``visudo -c`` ne demande
+    aucun privilège sur un fichier temporaire, et un sudoers invalide déposé
+    dans ``/etc/sudoers.d`` casserait sudo pour toute la machine.
+    """
+    with Cible(hote, repo, verbeux) as cible:
+        chemin_repo = cible.resoudre_repo()
+        utilisateur = cible.executer("id -un", dans_repo=False).stdout.strip()
+        detail(f"utilisateur {utilisateur}, dépôt {chemin_repo}")
+
+        regle = _regle_sudoers(utilisateur, chemin_repo)
+        temporaire = "/tmp/helios-target-tests.sudoers"
+        cible.deposer(regle, temporaire)
+
+        info("validation de la règle avant installation")
+        verif = cible.executer(f"visudo -c -f {temporaire}", dans_repo=False)
+        if not verif.ok:
+            detail(_c("31", (verif.stderr or verif.stdout).strip()))
+            cible.executer(f"rm -f {temporaire}", dans_repo=False)
+            return 1
+        detail(_c("32", verif.stdout.strip() or "syntaxe correcte"))
+
+        deja = cible.executer(
+            f"sudo -n -l 2>/dev/null | grep -q setcap", dans_repo=False
+        ).ok
+        if deja:
+            info("règle déjà active ; réinstallation pour rafraîchir les chemins")
+
+        # Seule étape privilégiée, et donc seul mot de passe demandé. Elle
+        # exige un TTY : d'où le ssh -t dédié, hors session multiplexée.
+        script = (
+            f"sudo install -m 0440 -o root -g root {temporaire} {SUDOERS_CHEMIN} && "
+            f"sudo usermod -aG tss {shlex.quote(utilisateur)} && "
+            f"rm -f {temporaire} && echo PROVISIONNEMENT-OK"
+        )
+        info("installation (mot de passe sudo demandé une fois)")
+        proc = subprocess.run(
+            ["ssh", "-t", "-o", "BatchMode=no", hote, f"bash -lc {shlex.quote(script)}"]
+        )
+        if proc.returncode != 0:
+            detail(_c("31", "installation interrompue ou refusée"))
+            return 1
+
+    # Session neuve : la règle et l'appartenance au groupe tss ne prennent
+    # effet que hors de la connexion qui les a posées.
+    info("vérification sur une session neuve")
+    with Cible(hote, repo, verbeux) as cible:
+        cible.resoudre_repo()
+        ctx = Contexte(cible=cible, branche="", prefixe_gestion="", pare_feu_autorise=False)
+        etat, message = _preflight_sudo(ctx)
+        if etat is not Etat.OK:
+            detail(_c("31", message))
+            return 1
+        detail(_c("32", "sudo non interactif opérationnel"))
+        if not cible.executer("test -r /dev/tpmrm0").ok:
+            detail(
+                _c("33", "/dev/tpmrm0 encore illisible : le groupe tss prend effet")
+            )
+            detail(_c("33", "à la prochaine ouverture de session sur la cible."))
+    return 0
 
 
 def main() -> int:
@@ -800,12 +897,27 @@ def main() -> int:
     )
     p.add_argument("--json", metavar="FICHIER", help="écrit le rapport structuré")
     p.add_argument("-v", "--verbose", action="store_true", help="trace les commandes distantes")
-    p.add_argument("--aide-sudoers", action="store_true", help="affiche la configuration sudoers")
+    p.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="provisionne la cible : règle sudoers scopée et accès TPM "
+        "(un seul mot de passe, exige un terminal)",
+    )
+    p.add_argument("--aide-sudoers", action="store_true", help="affiche la règle sudoers générée")
     args = p.parse_args()
 
     if args.aide_sudoers:
-        print(AIDE_SUDOERS)
+        with Cible(args.host, args.repo, args.verbose) as cible:
+            regle = _regle_sudoers(
+                cible.executer("id -un", dans_repo=False).stdout.strip(),
+                cible.resoudre_repo(),
+            )
+        print(AIDE_SUDOERS.format(regle=regle))
         return 0
+
+    if args.bootstrap:
+        info(f"provisionnement de {args.host}")
+        return bootstrap(args.host, args.repo, args.verbose)
 
     categories = args.only or list(CATEGORIES)
     if args.pare_feu:
