@@ -17,9 +17,9 @@
 //! boot et pouvaient rendre la cible non amorçable.
 //!
 //! Aucun PCR n'est étendu : une extension est irréversible jusqu'au prochain
-//! redémarrage. Le refus sur PCR divergents est obtenu en *scellant* sous une
-//! sélection puis en tentant le déscellement sous une autre — même effet
-//! observable, sans toucher à l'état de la plateforme.
+//! redémarrage. La liaison aux PCR est éprouvée en réécrivant la sélection
+//! *inscrite dans le blob* — le TPM répond alors `TPM2_RC_POLICY_FAIL`, sans
+//! que l'état de la plateforme ait été touché.
 //!
 //! # Exécution
 //!

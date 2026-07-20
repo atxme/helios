@@ -81,7 +81,9 @@ Valider avec accès console :
 - erreur Netlink laissant intacte la politique précédente ;
 - API inaccessible depuis le WAN et accessible via `helios0` ;
 - Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
-- PCR correct et incorrect, billet signé valide, rejoué, altéré et PCR optionnel ;
+- billet de rescellement : signé valide, rejoué, altéré et PCR optionnel — le
+  scellement lui-même est désormais couvert par la catégorie `tpm` de la
+  campagne, qui l'exerce sur `/dev/tpmrm0` ;
 - provisioning PQ : un client Orion réel obtient son PSK dans le tunnel, le
   handshake suivant (≤ 2 min) réussit avec `PresharedKey` posé des deux côtés,
   et `wg show` confirme le slot renseigné sur la gateway comme sur le client ;
@@ -272,11 +274,22 @@ WireGuard adressée par le noyau, pair déclaré et visible dans `wg show`, tabl
 nft posée en politique `drop`, et slot PSK vide avant provisioning — ce dernier
 point évitant de confondre « aucun provisioning » et « PSK posé ».
 
-Le rescellement TPM (billets, PCR, anti-rejeu) n'est pas automatisé non plus :
-il écrit dans le NV du TPM, et un échec sans accès console rend la cible
-inutilisable. Il reste dans la recette interactive de
-[MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui débloquerait son automatisation :
-une cible à console série pilotable et un TPM dédié aux essais. Le seul contrôle TPM automatisé est un *refus* — heliosd
+Le **scellement** TPM est automatisé depuis la catégorie `tpm` : elle exerce
+`/dev/tpmrm0` pour de bon (provisionnement, déscellement du même secret, refus
+d'un blob absent, altéré, ou dont la sélection PCR a été réécrite).
+
+Ces essais sont réversibles, contrairement à ce que ce document affirmait : le
+backend réel n'utilise que `create_primary` transitoire, `create`, `load`,
+`policy_pcr` et `unseal` — ni écriture NV, ni handle persistant, ni changement
+de hiérarchie. Ils travaillent dans un répertoire temporaire, jamais
+`/var/lib/helios`, et n'étendent aucun PCR : la liaison est éprouvée en
+réécrivant la sélection inscrite dans le blob, ce à quoi le TPM répond
+`TPM2_RC_POLICY_FAIL`.
+
+Restent manuels : les **billets de rescellement** (rejeu, altération, PCR
+optionnel), qui supposent un changement de PCR donc un redémarrage contrôlé.
+Ils sont dans [MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui débloquerait leur
+automatisation : une cible à console série pilotable. Le seul contrôle TPM automatisé est un *refus* — heliosd
 compilé avec la feature s'arrête faute de blob scellé — précisément parce qu'un
 refus n'écrit rien.
 

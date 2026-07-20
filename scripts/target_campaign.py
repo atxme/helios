@@ -261,6 +261,7 @@ CATEGORIES = (
     "build",
     "campagne",
     "mise-a-jour",
+    "tpm",
     "pare-feu",
 )
 
@@ -934,6 +935,40 @@ def _campagne_psk_plan_de_donnees(ctx: Contexte):
         "exige un second poste client : la gateway ne joint pas sa propre API "
         "(port d'administration refusé hors interface de tunnel)"
     )
+
+
+@scenario("scellement et liaison PCR sur TPM réel", "tpm")
+def _tpm_materiel(ctx: Contexte):
+    """Exécute les essais matériels de `helio-tpm` sur `/dev/tpmrm0`.
+
+    Les tests unitaires du crate tournent contre `DryRunTpm` : ils éprouvent la
+    logique de décision, jamais le silicium. Ceux-ci scellent réellement, puis
+    exigent que le **même** secret revienne — seule preuve qu'un vrai passage
+    par le TPM a eu lieu.
+
+    Réversible par construction : le backend n'écrit ni en NV, ni en handle
+    persistant, et ces essais travaillent dans un répertoire temporaire, jamais
+    `/var/lib/helios`. Aucun PCR n'est étendu.
+    """
+    if not ctx.cible.executer("test -c /dev/tpmrm0").ok:
+        return Etat.HORS_PORTEE, "aucun /dev/tpmrm0 sur cette cible"
+    if not ctx.cible.executer("test -r /dev/tpmrm0").ok:
+        return Etat.ECHEC, "TPM présent mais illisible — relancer --bootstrap (groupe tss)"
+
+    s = ctx.cible.executer(
+        "HELIOS_TPM_MATERIEL=1 cargo test -p helio-tpm --features tpm --test materiel 2>&1",
+        timeout=1800,
+    )
+    details = [
+        f"✓ {l.split()[1]}" if " ... ok" in l else f"✗ {l.strip()}"
+        for l in s.stdout.splitlines()
+        if l.startswith("test ") and " ... " in l
+    ]
+    if not s.ok:
+        return Etat.ECHEC, s.stdout.strip()[-1500:], details
+    if not details:
+        return Etat.ECHEC, "aucun essai matériel joué — la variable a-t-elle porté ?", details
+    return Etat.OK, f"{len(details)} essais sur /dev/tpmrm0", details
 
 
 # ── Scénarios : pare-feu réel ───────────────────────────────────────────────
