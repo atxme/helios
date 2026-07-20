@@ -128,6 +128,19 @@ class Cible:
 
     # -- cycle de vie --------------------------------------------------------
 
+    def resoudre_repo(self) -> str:
+        """Résout le dépôt en chemin absolu, une fois pour toutes.
+
+        La règle sudoers autorise ``setcap`` sur un chemin littéral : un dépôt
+        désigné par ``~/helios`` ici et par ``/home/…/helios`` là-bas ne
+        correspondrait pas, et l'appel serait refusé.
+        """
+        s = self.executer("pwd -P", dans_repo=True)
+        if not s.ok:
+            raise RuntimeError(f"dépôt {self.repo} introuvable sur {self.hote}")
+        self.repo = s.stdout.strip()
+        return self.repo
+
     def ouvrir(self) -> None:
         """Établit la connexion maître. Toute commande ultérieure la réutilise."""
         self._maitre = subprocess.Popen(
@@ -352,7 +365,14 @@ def _preflight_sudo(ctx: Contexte):
 def _synchro_git(ctx: Contexte):
     s = ctx.cible.executer("git status --porcelain")
     if s.stdout.strip():
-        return Etat.ECHEC, "l'arbre de travail de la cible est sale : refus d'écraser"
+        # La synchronisation fait un reset --hard : refuser plutôt que de
+        # détruire un correctif en cours sur la cible. Lister les fichiers
+        # concernés, sans quoi l'utilisateur doit aller les chercher lui-même.
+        fichiers = ", ".join(l.strip().split(maxsplit=1)[-1] for l in s.stdout.strip().splitlines())
+        return Etat.ECHEC, (
+            f"arbre de travail sale sur la cible ({fichiers}) : refus d'écraser. "
+            "Committer ou annuler ces modifications avant de relancer."
+        )
     s = ctx.cible.executer(
         f"git fetch --quiet origin && git checkout --quiet {shlex.quote(ctx.branche)} && "
         f"git reset --hard --quiet origin/{shlex.quote(ctx.branche)} && git rev-parse HEAD"
@@ -541,11 +561,18 @@ def _campagne_plan_de_donnees(ctx: Contexte):
 
     iface_wan = ctx.faits.get("iface_wan", "lo")
     ctx.cible.deposer(_config_reseau(ctx, iface_wan), f"{ctx.tmp}/network-reel.toml")
-    ctx.cible.executer(
-        "sudo -n setcap cap_net_admin,cap_net_raw+eip "
-        f"{ctx.cible.repo}/target/release/heliosd",
+    # Chemin littéral : il doit correspondre au mot pour mot à la règle
+    # sudoers, qui n'accepte aucun joker (sudo-rs).
+    binaire = f"{ctx.cible.repo}/target/release/heliosd"
+    pose = ctx.cible.executer(
+        f"sudo -n setcap cap_net_admin,cap_net_raw+eip {shlex.quote(binaire)}",
         dans_repo=False,
     )
+    if not pose.ok:
+        return Etat.ECHEC, (
+            f"setcap refusé sur {binaire} : {(pose.stderr or pose.stdout).strip()[:300]} "
+            "— vérifier que la règle sudoers vise ce chemin exact (--aide-sudoers)"
+        )
     lancement = (
         f"HELIOS_NETWORK_CONFIG={ctx.tmp}/network-reel.toml "
         f"nohup ./target/release/heliosd run "
@@ -724,13 +751,20 @@ Puis, sur la cible :
 
     # 3. règle sudoers strictement scopée : ni shell générique, ni apt-get,
     #    ni root inconditionnel — uniquement les commandes des essais.
-    sudo tee /etc/sudoers.d/helios-target-tests >/dev/null <<EOF
-    $USER ALL=(root) NOPASSWD: /usr/sbin/modprobe wireguard, \\
-      /usr/sbin/modprobe nf_tables, /usr/sbin/nft, /usr/sbin/ip, \\
-      /usr/bin/wg, /usr/sbin/setcap * $HOME/helios/target/release/heliosd
-    EOF
+    #
+    #    Deux contraintes d'Ubuntu 26.04, qui embarque sudo-rs et non le sudo
+    #    classique : aucun joker n'est accepté dans les arguments (l'appel
+    #    setcap est donc écrit littéralement), et la virgule de la liste de
+    #    capacités doit être échappée, sinon elle est lue comme le séparateur
+    #    de commandes. Le heredoc est quoté pour que le shell n'y touche pas :
+    #    adapter les chemins à la main si l'utilisateur n'est pas christophe.
+    #    La règle tient sur une seule ligne : ni indentation ni continuation à
+    #    recoller, donc rien qui puisse casser à la copie.
+    sudo tee /etc/sudoers.d/helios-target-tests >/dev/null <<'EOF'
+christophe ALL=(root) NOPASSWD: /usr/sbin/modprobe wireguard, /usr/sbin/modprobe nf_tables, /usr/sbin/nft, /usr/sbin/ip, /usr/bin/wg, /usr/sbin/setcap cap_net_admin\\,cap_net_raw+eip /home/christophe/helios/target/release/heliosd
+EOF
     sudo chmod 0440 /etc/sudoers.d/helios-target-tests
-    sudo visudo -c
+    visudo -c -f /etc/sudoers.d/helios-target-tests
 
 Refermer la session, puis vérifier depuis la machine de dev :
 
@@ -787,6 +821,7 @@ def main() -> int:
 
     info(f"cible {args.host}, branche {args.branche}")
     with Cible(args.host, args.repo, args.verbose) as cible:
+        detail(f"dépôt {cible.resoudre_repo()}")
         tmp = cible.executer("mktemp -d -t helios-campagne-XXXXXX", dans_repo=False).stdout.strip()
         ctx = Contexte(
             cible=cible,

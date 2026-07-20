@@ -104,7 +104,10 @@
       "Bash(python3 scripts/target_campaign.py --aide-sudoers)",
       "Bash(timeout 180 python3 scripts/target_campaign.py --only preflight 2>&1)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('scripts/target_campaign.py'\\).read\\(\\)\\)\")",
-      "Bash(timeout 120 python3 scripts/target_campaign.py --only synchro)"
+      "Bash(timeout 120 python3 scripts/target_campaign.py --only synchro)",
+      "Bash(sed -n '/^christophe ALL/p')",
+      "Read(//tmp/**)",
+      "Bash(git fetch *)"
     ]
   }
 }
