@@ -58,7 +58,10 @@ fn reglages(dir: &std::path::Path, provisionnement: bool) -> TpmSettings {
         pcr_bank: "sha256".to_string(),
         pcr_selection: vec![0, 4, 7],
         sealed_blob_path: dir.join("sealed.key").to_string_lossy().into_owned(),
-        ticket_path: dir.join("reseal-ticket.json").to_string_lossy().into_owned(),
+        ticket_path: dir
+            .join("reseal-ticket.json")
+            .to_string_lossy()
+            .into_owned(),
         state_path: dir.join("tpm-state.json").to_string_lossy().into_owned(),
     }
 }
@@ -146,25 +149,47 @@ fn un_blob_altere_est_refuse() {
 }
 
 #[test]
-fn une_selection_pcr_divergente_refuse_le_descellement() {
-    if !materiel_demande("refus sur PCR divergents") {
+fn une_selection_pcr_alteree_dans_le_blob_refuse_le_descellement() {
+    if !materiel_demande("liaison aux PCR effectivement appliquée") {
         return;
     }
-    let dir = repertoire_jetable("pcr-divergents");
+    let dir = repertoire_jetable("pcr-alteres");
+    let blob = dir.join("sealed.key");
 
     BootController::unlock(&reglages(&dir, true)).expect("provisionnement sous PCR 0,4,7");
 
-    // Même blob, politique différente : la sélection PCR fait partie du digest
-    // de politique, donc le déscellement doit échouer. C'est l'équivalent
-    // observable d'un firmware ou d'un bootloader modifié, obtenu sans étendre
-    // aucun PCR — une extension serait irréversible jusqu'au redémarrage.
-    let mut divergent = reglages(&dir, false);
-    divergent.pcr_selection = vec![0, 4];
+    // La sélection PCR appliquée au déscellement vient du **blob**, pas des
+    // réglages : le blob est auto-descriptif (`unmarshal_blob`). Modifier
+    // `TpmSettings::pcr_selection` n'aurait donc aucun effet ici, et un essai
+    // bâti là-dessus passerait au vert sans rien prouver.
+    //
+    // La propriété qui compte est ailleurs : le digest de politique est figé
+    // dans l'objet scellé à sa création. Réécrire la sélection inscrite dans le
+    // blob produit une politique qui ne correspond plus, et le TPM doit refuser.
+    // C'est ce qui empêche un attaquant de déscelller en déclarant une liaison
+    // plus faible que celle d'origine.
+    //
+    // Disposition du blob : MAGIC(4) | VERSION(1) | BANQUE(1) | n(1) | indices(n).
+    const OFFSET_INDICES: usize = 7;
+    let mut octets = std::fs::read(&blob).expect("lecture du blob");
+    assert_eq!(
+        octets[OFFSET_INDICES - 1],
+        3,
+        "trois indices PCR attendus dans le blob"
+    );
+    assert_eq!(
+        &octets[OFFSET_INDICES..OFFSET_INDICES + 3],
+        &[0, 4, 7],
+        "sélection PCR inattendue dans le blob"
+    );
+    // PCR 7 (Secure Boot) → PCR 6 : liaison différente, objet inchangé.
+    octets[OFFSET_INDICES + 2] = 6;
+    std::fs::write(&blob, &octets).expect("écriture du blob altéré");
 
-    let issue = BootController::unlock(&divergent);
+    let issue = BootController::unlock(&reglages(&dir, false));
     assert!(
         issue.is_err(),
-        "une sélection PCR divergente doit refuser le déscellement, obtenu : {issue:?}"
+        "une sélection PCR réécrite doit refuser le déscellement, obtenu : {issue:?}"
     );
 
     std::fs::remove_dir_all(&dir).expect("nettoyage");
