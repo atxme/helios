@@ -80,7 +80,7 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.
 - `helios-api` : Axum REST/WS, provisioning et IHM embarquée.
 - `helio-tpm` : scellement PCR, séquestre et billets de rescellement.
-- `helios-update` : RAUC A/B.
+- `helios-update` : mises à jour applicatives signées (ADR-003).
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
 - `helios-ctl` : diagnostic et campagnes de bout en bout (`campaign`, agit en
@@ -102,7 +102,8 @@ français.
 
 WSL2 compile les features `netlink`, `wireguard` et `tpm` si leurs dépendances
 sont installées, mais ne prouve pas leurs effets réels. Les essais noyau, TPM,
-WireGuard-NT et RAUC sont target-only ; suivre [docs/testing/TESTING.md](docs/testing/TESTING.md).
+WireGuard-NT et l'installation d'une release sont target-only ; suivre
+[docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 Features matérielles :
 

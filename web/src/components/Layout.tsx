@@ -1,4 +1,4 @@
-import { Activity, AlertCircle, LayoutDashboard, RadioTower, Settings2, Shield, ShieldCheck } from 'lucide-react'
+import { Activity, AlertCircle, LayoutDashboard, RadioTower, RefreshCw, Settings2, Shield, ShieldCheck } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Status } from '../types'
 import type { WsStatus } from '../hooks/useHelios'
@@ -6,7 +6,7 @@ import { useTheme } from '../hooks/useTheme'
 import { Background } from './Background'
 import { HeliosMark } from './HeliosMark'
 
-export type NavId = 'dashboard' | 'telemetry' | 'wireguard' | 'firewall' | 'trust' | 'settings'
+export type NavId = 'dashboard' | 'telemetry' | 'wireguard' | 'firewall' | 'trust' | 'update' | 'settings'
 
 const NAV_ITEMS: { id: NavId; icon: React.ElementType; label: string }[] = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard'   },
@@ -14,6 +14,7 @@ const NAV_ITEMS: { id: NavId; icon: React.ElementType; label: string }[] = [
   { id: 'wireguard', icon: RadioTower,      label: 'WireGuard'   },
   { id: 'firewall',  icon: Shield,          label: 'Pare-feu'    },
   { id: 'trust',     icon: ShieldCheck,     label: 'Confiance'   },
+  { id: 'update',    icon: RefreshCw,       label: 'Mise à jour' },
   { id: 'settings',  icon: Settings2,       label: 'Paramètres'  },
 ]
 

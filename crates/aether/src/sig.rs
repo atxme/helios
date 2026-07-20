@@ -289,6 +289,73 @@ impl ArtifactPayload for ResealPayload {
 
 pub type SignedResealTicket = SignedEnvelope<ResealPayload>;
 
+/// Métadonnées signées d’un binaire `heliosd` distribuable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryReleasePayload {
+    pub product: String,
+    pub channel: String,
+    pub release_sequence: u64,
+    pub version: String,
+    pub git_commit: String,
+    pub target: String,
+    pub features: Vec<String>,
+    pub binary_size: u64,
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub sha256: [u8; 32],
+    pub minimum_installer_version: u32,
+}
+
+impl ArtifactPayload for BinaryReleasePayload {
+    const DOMAIN: &'static [u8] = b"helios-binary-release-v1";
+    const FORMAT_VERSION: u32 = 1;
+
+    fn encode_canonical(&self, output: &mut Vec<u8>) {
+        encode_string(output, &self.product);
+        encode_string(output, &self.channel);
+        output.extend_from_slice(&self.release_sequence.to_be_bytes());
+        encode_string(output, &self.version);
+        encode_string(output, &self.git_commit);
+        encode_string(output, &self.target);
+        output.extend_from_slice(&(self.features.len() as u32).to_be_bytes());
+        for feature in &self.features {
+            encode_string(output, feature);
+        }
+        output.extend_from_slice(&self.binary_size.to_be_bytes());
+        output.extend_from_slice(&self.sha256);
+        output.extend_from_slice(&self.minimum_installer_version.to_be_bytes());
+    }
+}
+
+pub type SignedBinaryRelease = SignedEnvelope<BinaryReleasePayload>;
+
+fn encode_string(output: &mut Vec<u8>, value: &str) {
+    let bytes = value.as_bytes();
+    output.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn serialize_digest<S>(digest: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&hex::encode(digest))
+}
+
+fn deserialize_digest<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    hex::decode(encoded)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| serde::de::Error::custom("SHA-256 hex invalide"))
+}
+
 fn serialize_optional_digest<S>(digest: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -556,6 +623,32 @@ mod tests {
             envelope.verify(&[keys]),
             Err(SignatureError::DuplicateAlgorithm(AlgId::Ed25519))
         );
+    }
+
+    #[test]
+    fn manifeste_binaire_a_un_encodage_canonique_strict() {
+        let payload = BinaryReleasePayload {
+            product: "heliosd".into(),
+            channel: "testing".into(),
+            release_sequence: 42,
+            version: "1.2.3".into(),
+            git_commit: "0123456789abcdef".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            features: vec!["embed-ui".into(), "netlink".into()],
+            binary_size: 1234,
+            sha256: [7; 32],
+            minimum_installer_version: 1,
+        };
+        let bytes = signing_bytes(&payload, 3);
+        assert!(bytes.starts_with(BinaryReleasePayload::DOMAIN));
+
+        let json = serde_json::to_vec(&payload).unwrap();
+        let decoded: BinaryReleasePayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, payload);
+
+        let mut value = serde_json::to_value(&payload).unwrap();
+        value["champ_inconnu"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<BinaryReleasePayload>(value).is_err());
     }
 
     #[test]

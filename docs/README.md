@@ -7,7 +7,8 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — vue opérationnelle courante du système
   (Helios, Orion, `aether`).
-- [OTA-RAUC.md](OTA-RAUC.md) — mises à jour A/B via RAUC.
+- [adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
+  — architecture de mise à jour du binaire `heliosd`.
 
 ## Décisions (ADR)
 
@@ -15,6 +16,8 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
   vers WireGuard.
 - [adr/ADR-002-SIGNATURES-PQ.md](adr/ADR-002-SIGNATURES-PQ.md) — signatures
   post-quantiques hybrides des artefacts de confiance.
+- [adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
+  — mises à jour applicatives signées, autorisation WireGuard et rollback.
 
 ## Sécurité
 

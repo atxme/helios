@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aether = { workspace = true, features = ["publisher-signing"] }
+helios-update.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

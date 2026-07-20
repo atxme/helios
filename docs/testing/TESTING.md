@@ -24,7 +24,8 @@ compilation/tests sans exécuter d’effet réel.
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application |
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
-| OTA | index absent/invalide/identique/nouveau, non-exécution de RAUC si déjà à jour, et lecture du slot booté dans `rauc status --output-format=json` (parsing seul) |
+| Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
+| Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |
 
 `cargo-audit` est un prérequis local :
 
@@ -52,6 +53,12 @@ erreur de conception ; les tests d’invariants restent obligatoires.
 10. Une release ne compile pas avec le trousseau éditeur de développement, même
    si son chemin est fourni explicitement.
 11. Le billet TPM v1 ne bénéficie d’aucune période de compatibilité.
+12. Une route de mutation exige un pair `admin`, identifié par l’adresse source
+   du socket ; aucun en-tête de proxy ne participe à la décision.
+13. Une `release_sequence` inférieure ou égale à la dernière confirmée est
+   refusée, y compris avec des signatures valides.
+14. Un binaire installé qui n’atteint pas son point de disponibilité rend la
+   main à la version précédente.
 
 Lorsqu’un bug de sécurité est corrigé, ajouter d’abord un test qui échoue avec
 l’ancien comportement et le garder comme test de non-régression.
@@ -80,13 +87,24 @@ Valider avec accès console :
   et `wg show` confirme le slot renseigné sur la gateway comme sur le client ;
 - provisioning PQ, chemin dégradé : gateway dont `sync_peers` échoue — le client
   doit rester en tunnel classique opérationnel, sans PSK orphelin ;
-- RAUC : installation slot inactif, boot sain, `mark-good`, boot cassé et rollback ;
-- RAUC : `heliosd check-update` après un rollback rapporte bien la version du
-  slot effectivement booté, et la divergence avec la version compilée est
-  journalisée en `warn` si le slot status a été altéré.
+- mise à jour applicative ([ADR-003](../adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)) :
+  transfert du manifeste et du binaire par fragments JSON, refus d'une signature
+  altérée, refus d'une `release_sequence` inférieure ou égale à la dernière
+  confirmée, activation, redémarrage du daemon et reconnexion de l'API ;
+- mise à jour applicative, rollback : un binaire qui n'atteint pas son point de
+  disponibilité dans le délai imparti doit rendre la main à la version
+  précédente, service redémarré et lien `current` restauré ;
+- autorisation : un pair `admin = false` se voit refuser toute route de
+  mutation, et l'adresse source du socket seule fait foi — jamais un en-tête de
+  proxy.
 
-Ces essais modifient le pare-feu, les routes, le TPM et les slots de boot : ne
+Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
+
+L'ADR-003 retire RAUC du chemin de mise à jour Helios : la mise à jour ne
+remplace ni rootfs, ni kernel, ni bootloader, ne redémarre pas la machine, et
+laisse donc les PCR 0/4/7 inchangés — aucun billet de rescellement n'est requis.
+Administrer l'OS resterait une fonctionnalité distincte, à valider séparément.
 
 ## Campagne de provisioning post-quantique
 
@@ -197,8 +215,19 @@ python3 scripts/target_campaign.py                     # tout sauf le pare-feu r
 python3 scripts/target_campaign.py --pare-feu --json rapport.json
 ```
 
-Les catégories sont `preflight`, `synchro`, `unite`, `build`, `campagne` et
-`pare-feu`. Un scénario que l'environnement ne permet pas de trancher est
+Les catégories sont `preflight`, `synchro`, `unite`, `build`, `campagne`,
+`mise-a-jour` et `pare-feu`. Pour rejouer la mise à jour depuis la branche
+distante courante :
+
+```sh
+python3 scripts/target_campaign.py --only synchro --only mise-a-jour
+```
+
+La feature doit donc avoir été commitée et poussée avant cette commande ; la
+campagne refuse une révision cible dont `helios-publisher` ne connaît pas
+`binary-release`. La catégorie exerce le refus d’un manifeste altéré, le
+transfert JSON borné, le SHA-256 et l’autorisation d’activation sur un daemon
+cible isolé. Un scénario que l'environnement ne permet pas de trancher est
 rapporté « hors portée », jamais « réussi ».
 
 ### Survie de la session SSH
@@ -243,12 +272,11 @@ WireGuard adressée par le noyau, pair déclaré et visible dans `wg show`, tabl
 nft posée en politique `drop`, et slot PSK vide avant provisioning — ce dernier
 point évitant de confondre « aucun provisioning » et « PSK posé ».
 
-Le rescellement TPM (billets, PCR, anti-rejeu) et le cycle RAUC A/B ne sont pas
-automatisés non plus : ils modifient le NV du TPM et les slots de boot, et un
-échec sans accès console rend la cible non amorçable. Ils restent dans la
-recette interactive de [MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui
-débloquerait leur automatisation : une cible à console série pilotable et un TPM
-dédié aux essais. Le seul contrôle TPM automatisé est un *refus* — heliosd
+Le rescellement TPM (billets, PCR, anti-rejeu) n'est pas automatisé non plus :
+il écrit dans le NV du TPM, et un échec sans accès console rend la cible
+inutilisable. Il reste dans la recette interactive de
+[MANUAL-TESTING.md](MANUAL-TESTING.md). Ce qui débloquerait son automatisation :
+une cible à console série pilotable et un TPM dédié aux essais. Le seul contrôle TPM automatisé est un *refus* — heliosd
 compilé avec la feature s'arrête faute de blob scellé — précisément parce qu'un
 refus n'écrit rien.
 

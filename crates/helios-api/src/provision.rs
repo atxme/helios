@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use aether::enroll::{EnrollError, ProvisionRequest, ProvisionResponse};
 use aether::{InstallPskRequest, SecretString};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use helios_provisioning::{
     handle_request, session::fresh_nonce, AdmittedPeers, GatewayIdentity, Provisioned,
     DEFAULT_PSK_LIFETIME_SECS,
@@ -58,8 +58,27 @@ impl AdmittedPeers for AdmittedFromConfig {
 /// Traite une demande de provisioning venue d'un client, **dans le tunnel**.
 pub async fn provision(
     State(s): State<AppState>,
+    caller: Option<Extension<crate::auth::Caller>>,
     Json(request): Json<ProvisionRequest>,
 ) -> Result<Json<ProvisionResponse>, (StatusCode, String)> {
+    match caller {
+        Some(Extension(caller)) if caller.dev_loopback => {}
+        Some(Extension(caller))
+            if caller.public_key.as_deref() == Some(request.client_wg_public_key.as_str()) => {}
+        Some(_) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "la clé demandée n’appartient pas au pair WireGuard appelant".into(),
+            ));
+        }
+        None if s.dry_run => {}
+        None => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "identité WireGuard absente".into(),
+            ));
+        }
+    }
     let network = s.network.read().await;
 
     // Sans clé privée, la gateway n'a pas d'identité à annoncer : refuser
@@ -224,6 +243,7 @@ mod tests {
                 name: "poste".into(),
                 public_key: client_public_key(),
                 address: "100.64.1.2/32".into(),
+                admin: false,
                 preshared_key: None,
             }],
             ..NetworkConfig::default()
@@ -280,7 +300,7 @@ mod tests {
             (psk, address)
         });
 
-        let response = provision(State(state), Json(request))
+        let response = provision(State(state), None, Json(request))
             .await
             .expect("le provisioning doit aboutir")
             .0;
@@ -329,11 +349,28 @@ mod tests {
                 .unwrap();
         });
 
-        let erreur = provision(State(state), Json(request))
+        let erreur = provision(State(state), None, Json(request))
             .await
             .expect_err("un PSK non posé doit faire échouer la requête");
 
         assert_eq!(erreur.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn la_cle_demandee_doit_appartenir_au_pair_appelant() {
+        let (state, _psk_rx) = state_provisionnable();
+        let (_dk, _nonce, request) = requete_client();
+        let caller = crate::auth::Caller {
+            source: "100.64.1.3".parse().unwrap(),
+            name: "autre-pair".into(),
+            public_key: Some("cle-d-un-autre-pair".into()),
+            admin: false,
+            dev_loopback: false,
+        };
+        let error = provision(State(state), Some(Extension(caller)), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
     }
 
     /// Orchestrateur arrêté : même exigence, par un autre chemin.
@@ -343,7 +380,7 @@ mod tests {
         drop(psk_rx);
         let (_dk, _nonce, request) = requete_client();
 
-        let erreur = provision(State(state), Json(request))
+        let erreur = provision(State(state), None, Json(request))
             .await
             .expect_err("sans orchestrateur, aucun PSK ne doit être annoncé");
 

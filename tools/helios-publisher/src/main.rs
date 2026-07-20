@@ -6,8 +6,8 @@ use std::{
 };
 
 use aether::sig::{
-    PublisherPublicKeys, PublisherSigner, ResealPayload, ED25519_PUBLIC_KEY_LEN,
-    ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
+    BinaryReleasePayload, PublisherPublicKeys, PublisherSigner, ResealPayload,
+    ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -51,6 +51,33 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Signe le manifeste d’un binaire heliosd déjà construit.
+    BinaryRelease {
+        #[arg(long, value_parser = positive_u32)]
+        key_epoch: u32,
+        #[arg(long, value_parser = positive_u64)]
+        release_sequence: u64,
+        #[arg(long, value_parser = release_channel)]
+        channel: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        git_commit: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        ed25519_private_key: PathBuf,
+        #[arg(long)]
+        ml_dsa_65_private_key: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,6 +107,33 @@ fn main() -> Result<()> {
             key_epoch,
             version,
             expected_pcr_digest,
+            &ed25519_private_key,
+            &ml_dsa_65_private_key,
+            &keyring,
+            &output,
+        ),
+        Command::BinaryRelease {
+            key_epoch,
+            release_sequence,
+            channel,
+            version,
+            git_commit,
+            target,
+            features,
+            binary,
+            ed25519_private_key,
+            ml_dsa_65_private_key,
+            keyring,
+            output,
+        } => sign_binary_release(
+            key_epoch,
+            release_sequence,
+            channel,
+            version,
+            git_commit,
+            target,
+            features,
+            &binary,
             &ed25519_private_key,
             &ml_dsa_65_private_key,
             &keyring,
@@ -168,6 +222,103 @@ fn sign_reseal_ticket(
         output.display()
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_binary_release(
+    key_epoch: u32,
+    release_sequence: u64,
+    channel: String,
+    version: String,
+    git_commit: String,
+    target: String,
+    mut features: Vec<String>,
+    binary: &Path,
+    ed25519_path: &Path,
+    ml_dsa_65_path: &Path,
+    keyring_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    if version.trim().is_empty() || git_commit.trim().is_empty() || target.trim().is_empty() {
+        bail!("version, commit et target doivent être renseignés");
+    }
+    if features.iter().any(|feature| feature.trim().is_empty()) {
+        bail!("une feature vide est interdite");
+    }
+    features.sort();
+    features.dedup();
+
+    let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
+    let metadata = fs::metadata(binary)
+        .with_context(|| format!("lecture des métadonnées de {}", binary.display()))?;
+    if metadata.len() == 0 || metadata.len() > helios_update::MAX_BINARY_SIZE {
+        bail!("taille du binaire hors limite : {} octets", metadata.len());
+    }
+    helios_update::verify_elf(binary, &target)
+        .with_context(|| format!("validation ELF de {}", binary.display()))?;
+    let sha256 = helios_update::sha256_file(binary)
+        .with_context(|| format!("SHA-256 de {}", binary.display()))?;
+    let manifest = signer
+        .sign(BinaryReleasePayload {
+            product: "heliosd".into(),
+            channel,
+            release_sequence,
+            version,
+            git_commit,
+            target,
+            features,
+            binary_size: metadata.len(),
+            sha256,
+            minimum_installer_version: helios_update::INSTALLER_VERSION,
+        })
+        .context("signature hybride du manifeste binaire")?;
+    let keyring = load_keyring(keyring_path)?;
+    manifest
+        .verify(&keyring)
+        .context("auto-vérification du manifeste produit")?;
+    let json = serde_json::to_vec_pretty(&manifest).context("sérialisation du manifeste")?;
+    write_new(output, &json, true)?;
+    println!(
+        "release {} séquence {}, SHA-256 {}, écrite dans {}",
+        manifest.payload.version,
+        release_sequence,
+        hex::encode(manifest.payload.sha256),
+        output.display()
+    );
+    Ok(())
+}
+
+fn load_signer(
+    key_epoch: u32,
+    ed25519_path: &Path,
+    ml_dsa_65_path: &Path,
+    keyring_path: &Path,
+) -> Result<PublisherSigner> {
+    let ed25519 =
+        fs::read(ed25519_path).with_context(|| format!("lecture de {}", ed25519_path.display()))?;
+    let ml_dsa_65 = fs::read(ml_dsa_65_path)
+        .with_context(|| format!("lecture de {}", ml_dsa_65_path.display()))?;
+    if ml_dsa_65.len() != ML_DSA_65_PRIVATE_KEY_LEN {
+        bail!(
+            "clé privée ML-DSA-65 : {} octets au lieu de {}",
+            ml_dsa_65.len(),
+            ML_DSA_65_PRIVATE_KEY_LEN
+        );
+    }
+    let signer = PublisherSigner::from_private_keys(key_epoch, &ed25519, &ml_dsa_65)
+        .context("chargement des clés privées éditeur")?;
+    let keyring = load_keyring(keyring_path)?;
+    let expected_keys = keyring
+        .iter()
+        .find(|keys| keys.key_epoch == key_epoch)
+        .with_context(|| format!("époque {key_epoch} absente du trousseau public"))?;
+    let actual_keys = signer.public_keys();
+    if expected_keys.ed25519 != actual_keys.ed25519
+        || expected_keys.ml_dsa_65 != actual_keys.ml_dsa_65
+    {
+        bail!("les clés privées ne correspondent pas à l’époque {key_epoch} du trousseau public");
+    }
+    Ok(signer)
 }
 
 fn load_keyring(path: &Path) -> Result<Vec<PublisherPublicKeys>> {
@@ -272,4 +423,11 @@ fn parse_digest(value: &str) -> Result<[u8; 32], String> {
         .map_err(|e| e.to_string())?
         .try_into()
         .map_err(|bytes: Vec<u8>| format!("{} octets au lieu de 32", bytes.len()))
+}
+
+fn release_channel(value: &str) -> Result<String, String> {
+    match value {
+        "testing" | "production" => Ok(value.to_string()),
+        _ => Err("canal attendu : testing ou production".into()),
+    }
 }

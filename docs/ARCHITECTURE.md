@@ -1,7 +1,8 @@
 # Architecture actuelle
 
 Ce document décrit le code après la rupture IKEv2 → WireGuard (ADR-001) et
-l’introduction des signatures hybrides d’artefacts (ADR-002). Les ADR conservent
+l’introduction des signatures hybrides d’artefacts (ADR-002) et des mises à
+jour applicatives (ADR-003). Les ADR conservent
 le raisonnement historique ; ce document est la vue opérationnelle courante.
 
 ## Frontières du système
@@ -19,7 +20,7 @@ Orion (Tauri)                         Helios (appliance Linux)
 │  └─ backend WG      │◄─ WireGuard ─►│  ├─ backend WireGuard         │
 └─────────────────────┘              │  ├─ pare-feu nftables         │
                                      │  ├─ TPM / séquestre           │
-                                     │  └─ OTA RAUC A/B              │
+                                     │  └─ update signé + rollback   │
                                      └───────────────────────────────┘
 ```
 
@@ -72,10 +73,24 @@ sinon sur `127.0.0.1:8080`. nftables limite l’accès distant à `admin_iface`.
   trousseau éditeur compilé, jamais les clés complètes ;
 - toutes les mutations exigent `application/json` et aucun CORS permissif n’est
   activé ;
+- l’adresse source est rattachée à l’unique VIP `/32` d’un pair WireGuard et
+  les mutations exigent `admin = true` ;
 - le WebSocket diffuse les transitions et la télémétrie post-connexion.
 
-Cette barrière HTTP protège des formulaires cross-origin ; elle ne remplace ni
-le filtrage réseau ni une future authentification applicative.
+Cette barrière HTTP protège des formulaires cross-origin. L’identité
+applicative est celle du pair WireGuard ; aucun login web distinct n’est ajouté.
+
+## Mise à jour applicative
+
+L’IHM transfère un manifeste `helios-binary-release-v1` et le binaire par
+fragments JSON. `heliosd` vérifie les signatures Ed25519 et ML-DSA-65, la
+target, le canal, la taille et le SHA-256, puis stage sous
+`/var/lib/helios/updates`. `helios-installer`, lancé par systemd et privé de
+réseau, revérifie l’artefact, bascule `/opt/helios/current`, redémarre le daemon
+et restaure le lien précédent si le daemon et son API ne deviennent pas prêts.
+
+Ce flux ne remplace ni kernel ni rootfs, ne redémarre pas la machine et ne
+modifie donc pas les PCR TPM 0/4/7.
 
 ## Provisioning et post-quantique
 

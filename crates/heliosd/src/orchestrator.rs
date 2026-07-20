@@ -1,4 +1,4 @@
-//! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu <-> OTA.
+//! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu.
 //!
 //! La gateway est un **serveur** : elle monte son interface WireGuard, écoute en
 //! UDP 51820 et attend les clients. Elle ne compose vers personne. L'état passe
@@ -11,7 +11,13 @@
 //! partout mais ne peuvent **tourner** que sur la cible. Les backends de
 //! simulation ne sont sélectionnés qu’en dry-run explicite ou auto-détecté.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use aether::{
     FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelEvent,
@@ -19,7 +25,6 @@ use aether::{
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
 use helios_wireguard::{InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
@@ -87,14 +92,6 @@ fn firewall_backend(dry_run: bool) -> anyhow::Result<Box<dyn FirewallBackend>> {
     }
 }
 
-fn update_channel(dry_run: bool) -> Box<dyn UpdateChannel> {
-    if dry_run {
-        Box::new(DryRunChannel::new(VERSION))
-    } else {
-        Box::new(RaucChannel::new(VERSION, None))
-    }
-}
-
 fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
     let _ = tx.send(HeliosEvent::Log {
         level: level.into(),
@@ -140,6 +137,7 @@ pub async fn run(
     // Détenue ici et nulle part ailleurs : le secret de scellement TPM ne doit
     // pas transiter par le crate API. Seul l'orchestrateur peut sceller.
     boot: helio_tpm::BootDecision,
+    api_ready: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
@@ -192,10 +190,14 @@ pub async fn run(
     // 4. Boucle principale : commandes de l'UI, résultats internes ou signal d'arrêt.
     let state_str = shared_state.read().await.as_str();
     info!("heliosd opérationnel (état {state_str}). Ctrl-C pour quitter.");
+    wait_api_ready(&api_ready).await?;
+    publish_readiness(dry_run)?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown => {
                 info!("arrêt demandé : kill-switch maintenu (fail-closed)");
                 break;
             }
@@ -234,6 +236,69 @@ pub async fn run(
             }
         }
     }
+    if let Err(error) = transition(
+        &shared_state,
+        &event_tx,
+        TunnelState::Down,
+        fw.as_ref(),
+        &policy,
+    )
+    .await
+    {
+        warn!("engagement du kill-switch à l’arrêt : {error:#}");
+    }
+    if let Err(error) = wg.down().await {
+        warn!("démontage WireGuard à l’arrêt : {error}");
+    }
+    Ok(())
+}
+
+async fn wait_api_ready(api_ready: &AtomicBool) -> anyhow::Result<()> {
+    for _ in 0..40 {
+        if api_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("l’API n’a pas atteint son état disponible dans le délai imparti")
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installation du handler SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn publish_readiness(dry_run: bool) -> anyhow::Result<()> {
+    let path = std::env::var_os("HELIOS_READY_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            if dry_run {
+                std::env::temp_dir().join(format!("helios-ready-{}", std::process::id()))
+            } else {
+                std::path::PathBuf::from("/run/helios/ready")
+            }
+        });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(
+        &temporary,
+        format!("version={VERSION}\nmode_reel={}\n", !dry_run),
+    )?;
+    std::fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -325,11 +390,13 @@ async fn handle_external_cmd(
             emit_log(event_tx, "info", "Déconnexion demandée via l'interface web");
             policy.captive_portal_gateway = None;
             policy.mss_clamp = None;
+            // Engager le verdict fail-closed avant de modifier l’interface :
+            // même ordre que lors d’un arrêt systemd pour mise à jour.
+            transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
             if let Err(e) = wg.down().await {
                 warn!("démontage de l'interface WireGuard : {e}");
                 emit_log(event_tx, "warn", &format!("Démontage de l'interface : {e}"));
             }
-            transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -806,12 +873,18 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
 }
 
 pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {
-    let channel = update_channel(dry_run);
-    let current = channel.current_version().await?;
-    println!("version actuelle : {current}");
-    match channel.check().await? {
-        Some(r) => println!("disponible       : {} ({})", r.version, r.bundle),
-        None => println!("disponible       : aucune (à jour)"),
+    let store = helios_update::UpdateStore::new(helios_update::UpdateLayout::for_daemon(dry_run));
+    let status = store.status()?;
+    println!("version compilée : {VERSION}");
+    println!("canal            : {}", status.channel);
+    println!("target           : {}", status.target);
+    println!("séquence active  : {}", status.highest_confirmed_sequence);
+    if let Some(version) = status.active_version {
+        println!("version confirmée: {version}");
+    }
+    println!("releases stagées : {}", status.staged.len());
+    if let Some(sequence) = status.activation_pending {
+        println!("activation       : séquence {sequence} en attente");
     }
     Ok(())
 }
@@ -834,6 +907,7 @@ mod tests {
                 name: "poste-test".into(),
                 public_key: PEER_KEY.into(),
                 address: "100.64.1.2/32".into(),
+                admin: false,
                 preshared_key: Some("psk-test".into()),
             }],
             ..NetworkConfig::default()

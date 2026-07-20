@@ -31,6 +31,7 @@ pub struct PeerSummary {
     pub public_key: String,
     pub address: String,
     pub post_quantum: bool,
+    pub admin: bool,
 }
 
 /// Vue publique de la configuration réseau.
@@ -60,6 +61,7 @@ pub struct NetworkPeerView {
     pub public_key: String,
     pub address: String,
     pub preshared_key_configured: bool,
+    pub admin: bool,
 }
 
 impl From<&NetworkConfig> for NetworkConfigView {
@@ -82,6 +84,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
                     public_key: peer.public_key.clone(),
                     address: peer.address.clone(),
                     preshared_key_configured: peer.preshared_key.is_some(),
+                    admin: peer.admin,
                 })
                 .collect(),
             static_peer_addrs: config.static_peer_addrs.clone(),
@@ -190,6 +193,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
             public_key: p.public_key.clone(),
             address: p.address.clone(),
             post_quantum: p.preshared_key.is_some(),
+            admin: p.admin,
         })
         .collect();
 
@@ -419,6 +423,7 @@ mod tests {
                 name: "poste-test".into(),
                 public_key: PEER_KEY.into(),
                 address: "100.64.1.2/32".into(),
+                admin: true,
                 preshared_key: Some("secret-pq-ne-doit-pas-sortir".into()),
             }],
             ..NetworkConfig::default()

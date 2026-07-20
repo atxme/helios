@@ -1,0 +1,16 @@
+[Unit]
+Description=Installe atomiquement une mise à jour applicative Helios
+
+[Service]
+Type=oneshot
+Environment=HELIOS_UPDATE_CHANNEL=production
+Environment=HELIOS_UPDATE_STAGING=/var/lib/helios/updates
+Environment=HELIOS_INSTALL_ROOT=/opt/helios/releases
+Environment=HELIOS_CURRENT_LINK=/opt/helios/current
+Environment=HELIOS_READY_PATH=/run/helios/ready
+ExecStart=/usr/libexec/helios-installer install-pending
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateNetwork=true
+ReadWritePaths=/var/lib/helios/updates /opt/helios /run/helios

@@ -70,4 +70,5 @@ admin_iface = "helios0"
 # name = "poste-christophe"
 # public_key = "<clé publique du client, base64>"
 # address = "100.64.1.2/32"
+# admin = true
 # preshared_key = "<PSK ML-KEM, base64>"

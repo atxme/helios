@@ -2,7 +2,7 @@
 
 Helios est une passerelle VPN **WireGuard** pour appliance Linux, pilotée par un
 daemon Rust. Orion est son client de bureau Tauri. Le projet sépare le plan de
-contrôle (états, politiques, provisioning, OTA) du plan de données noyau
+contrôle (états, politiques, provisioning, mise à jour) du plan de données noyau
 (WireGuard et nftables).
 
 La rupture avec IKEv2 est achevée dans le code et documentée par
@@ -17,7 +17,7 @@ est arrêtée par [ADR-002](docs/adr/ADR-002-SIGNATURES-PQ.md).
     │                       ├── helios-firewall ── politique fail-closed
     │                       ├── helios-wireguard ── interface + pairs
     │                       ├── helio-tpm ── intégrité du démarrage
-    │                       └── helios-update ── RAUC A/B
+    │                       └── helios-update ── binaire signé + rollback
     │
     └── orion-core ── profil, adaptateur, handshake, télémétrie
 
@@ -59,13 +59,14 @@ démonte.
 | `helios-wireguard` | Plan de données gateway, backends mémoire / noyau et table de pairs |
 | `helios-provisioning` | IPAM CGNAT déterministe, session ML-KEM et rotation de PSK |
 | `helios-api` | API Axum, WebSocket, provisioning et fichiers web embarqués |
-| `helios-update` | Vérification et installation OTA RAUC A/B |
+| `helios-update` | Manifeste hybride, staging, anti-rollback et bascule atomique |
 | `helio-tpm` | Scellement PCR, billets de rescellement et contrôle du boot |
 | `heliosd` | CLI et orchestration de la gateway |
 | `orion-core` | Logique portable du client WireGuard |
 | `apps/orion` | Application de bureau Tauri avec IHM React embarquée |
 | `helios-ctl` | CLI de diagnostic et scénarios contre l’API |
 | `helios-publisher` | Outil éditeur hors gateway : clés Ed25519/ML-DSA-65 et billets signés |
+| `helios-installer` | Helper privilégié sans réseau : activation, health check et rollback |
 | `web` | IHM d’administration React de la gateway |
 
 ## Configuration de la gateway
@@ -117,6 +118,8 @@ Vite écoute sur `:5173` et proxie `/api` et `/ws` vers `localhost:8080`.
 | `GET /api/network` | Vue réseau expurgée : présence des secrets, jamais leur valeur |
 | `POST /api/network` | Persistance atomique et rechargement à chaud |
 | `POST /api/provision` | Échange ML-KEM dans le tunnel pour un pair déjà admis |
+| `GET /api/update` | Canal, target, séquence confirmée et releases stagées |
+| `POST /api/update/*` | Staging JSON, finalisation et activation réservés à un pair administrateur |
 | `POST /api/tunnel/start` | Montage/reconfiguration de l’interface WireGuard |
 | `POST /api/tunnel/stop` | Démontage explicite de l’interface |
 | `GET /api/firewall/rules` | Rendu du ruleset courant |
@@ -222,4 +225,4 @@ Les contrôles spécifiques au matériel sont détaillés dans
 ## Documentation
 
 Voir [l'index de la documentation](docs/README.md) pour le plan complet
-(architecture, ADR, sécurité, tests, OTA).
+(architecture, ADR, sécurité, tests et mises à jour).

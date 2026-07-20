@@ -2,7 +2,7 @@
 
 **Statut** : **accepté** (2026-07-19) — choix techniques figés, voir « Choix arrêtés »
 **Portée** : signature du billet de rescellement, du fichier de récupération de
-la clé WireGuard, et à terme des manifestes OTA. Ne concerne pas l'échange de
+la clé WireGuard et des manifestes de binaires Helios. Ne concerne pas l'échange de
 clés (ADR-001 §2, déjà post-quantique via ML-KEM-768).
 
 ## État d’implémentation au 2026-07-19

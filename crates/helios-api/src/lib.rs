@@ -16,12 +16,17 @@
 //! (broadcast), le canal de commandes (mpsc) et l'état courant du tunnel
 //! (RwLock partagé avec l'orchestrateur).
 
+pub mod auth;
 pub mod embed;
 pub mod provision;
 pub mod routes;
+pub mod update;
 pub mod ws;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use aether::{
     FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState,
@@ -55,6 +60,12 @@ pub struct AppState {
     pub dry_run: bool,
     /// Politique de pare-feu courante (mise à jour par l'orchestrateur).
     pub policy: Arc<RwLock<FirewallPolicy>>,
+    /// Staging applicatif signé. L’installation privilégiée reste hors du
+    /// processus API.
+    pub updates: helios_update::UpdateStore,
+    /// Vrai dès que le socket API est effectivement lié. Le health check de
+    /// mise à jour ne confirme pas un daemon dont l’IHM resterait absente.
+    pub api_ready: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -75,6 +86,10 @@ impl AppState {
             network,
             dry_run,
             policy,
+            updates: helios_update::UpdateStore::new(helios_update::UpdateLayout::for_daemon(
+                dry_run,
+            )),
+            api_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -84,26 +99,43 @@ impl AppState {
 /// Exposé séparément de [`serve`] afin que les tests d'intégration traversent
 /// les mêmes routes et middlewares que le binaire réel.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/status", get(routes::status))
-        // Ancre de confiance éditeur compilée dans le binaire (ADR-002).
-        .route("/api/trust", get(routes::trust))
-        .route("/api/network", get(routes::network_get))
+    let admin = Router::new()
         .route("/api/network", post(routes::network_set))
-        // Provisioning : joignable uniquement dans le tunnel, comme le reste.
-        .route("/api/provision", post(provision::provision))
-        // Rotation de l'identité WireGuard de la gateway — tunnel uniquement.
         .route("/api/gateway/wireguard-key", post(routes::gateway_key_set))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
-        .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .route("/api/firewall/rules", post(routes::firewall_rules_apply))
         .route(
             "/api/captive-portal/release",
             post(routes::captive_portal_release),
         )
         .route("/api/split-tunnel", post(routes::split_tunnel_set))
+        .route("/api/update", get(update::status))
+        .route("/api/update/stage", post(update::stage))
+        .route("/api/update/chunk", post(update::chunk))
+        .route("/api/update/finalize", post(update::finalize))
+        .route("/api/update/activate", post(update::activate))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ));
+
+    let authenticated_peer = Router::new()
+        .route("/api/provision", post(provision::provision))
         .route("/ws", get(ws::handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_peer,
+        ));
+
+    Router::new()
+        .route("/api/status", get(routes::status))
+        // Ancre de confiance éditeur compilée dans le binaire (ADR-002).
+        .route("/api/trust", get(routes::trust))
+        .route("/api/network", get(routes::network_get))
+        .route("/api/firewall/rules", get(routes::firewall_rules_get))
+        .merge(admin)
+        .merge(authenticated_peer)
         .fallback(embed::static_handler)
         .layer(middleware::from_fn(require_json_for_mutations))
         .with_state(state)
@@ -135,12 +167,18 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
 
 /// Lance le serveur HTTP et bloque jusqu'à son arrêt.
 pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
-    let app = router(state);
+    let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    state.api_ready.store(true, Ordering::Release);
     tracing::info!("interface web disponible sur http://{}", bind);
-    axum::serve(listener, app).await?;
-    Ok(())
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
+    state.api_ready.store(false, Ordering::Release);
+    result.map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -148,8 +186,10 @@ mod security_tests {
     use super::*;
     use axum::{
         body::{to_bytes, Body},
+        extract::ConnectInfo,
         http::{header, Request},
     };
+    use std::net::SocketAddr;
     use tower::ServiceExt;
 
     const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -164,6 +204,7 @@ mod security_tests {
                 name: "poste".into(),
                 public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
                 address: "100.64.1.2/32".into(),
+                admin: true,
                 preshared_key: Some(PEER_PSK.into()),
             }],
             ..NetworkConfig::default()
@@ -247,7 +288,42 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn mutation_json_est_transmise_sans_cors_permissif() {
+    async fn mutation_exige_le_pair_admin_identifie_par_sa_vip() {
+        let (non_admin_state, mut cmd_rx) = state();
+        non_admin_state.network.write().await.peers[0].admin = false;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/tunnel/start")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(non_admin_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(cmd_rx.try_recv().is_err());
+
+        let (state, mut cmd_rx) = state();
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/tunnel/start")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(OrchestratorCmd::Connect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutation_json_d_origine_croisee_est_refusee_sans_cors() {
         let (state, mut cmd_rx) = state();
         let response = router(state)
             .oneshot(
@@ -262,14 +338,11 @@ mod security_tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(response
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none());
-        assert!(matches!(
-            cmd_rx.recv().await,
-            Some(OrchestratorCmd::Connect)
-        ));
+        assert!(cmd_rx.try_recv().is_err());
     }
 }

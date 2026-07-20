@@ -31,7 +31,10 @@ nettoyer() {
 trap nettoyer EXIT
 
 echo "==> Construction"
-cargo build --quiet -p heliosd -p helios-ctl
+cargo run --quiet -p helios-publisher -- keygen \
+    --key-epoch 4294967294 --output-dir "$TMP/publisher"
+export HELIOS_PUBLISHER_KEYRING_PATH="$TMP/publisher/publisher-keyring.json"
+cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher
 
 # Clés de campagne, jetables : elles ne servent qu'à cette exécution et
 # disparaissent avec le répertoire temporaire. `--generate-keys` n'écrit que des
@@ -59,10 +62,14 @@ wg_listen_port = 51820
 name = "campagne"
 public_key = "$CLIENT_PUB"
 address = "100.64.1.2/32"
+admin = true
 EOF
 
 echo "==> Daemon dry-run isolé"
 HELIOS_NETWORK_CONFIG="$TMP/network.toml" \
+HELIOS_UPDATE_STAGING="$TMP/updates" \
+HELIOS_UPDATE_CHANNEL=testing \
+HELIOS_READY_PATH="$TMP/ready" \
     cargo run --quiet -p heliosd -- run --dev > "$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
@@ -85,6 +92,30 @@ cargo run --quiet -p helios-ctl -- campaign \
     --client-key "$CLIENT_PRIV" \
     --gateway-key "$GW_PUB" \
     "$@"
+
+echo "==> Campagne de mise à jour applicative signée"
+TARGET_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+GIT_COMMIT="$(git rev-parse --short=16 HEAD)"
+PACKAGE_ID="$(cargo pkgid -p heliosd)"
+HELIOS_VERSION="${PACKAGE_ID##*#}"
+HELIOS_VERSION="${HELIOS_VERSION##*@}"
+cargo run --quiet -p helios-publisher -- binary-release \
+    --key-epoch 4294967294 \
+    --release-sequence 9001 \
+    --channel testing \
+    --version "$HELIOS_VERSION" \
+    --git-commit "$GIT_COMMIT" \
+    --target "$TARGET_TRIPLE" \
+    --binary target/debug/heliosd \
+    --ed25519-private-key "$TMP/publisher/ed25519-private.pk8" \
+    --ml-dsa-65-private-key "$TMP/publisher/ml-dsa-65-private.bin" \
+    --keyring "$TMP/publisher/publisher-keyring.json" \
+    --output "$TMP/heliosd.release.json"
+python3 scripts/update_campaign.py \
+    --url http://127.0.0.1:8080 \
+    --manifest "$TMP/heliosd.release.json" \
+    --binary target/debug/heliosd \
+    --activate
 
 echo "==> Vérification : aucun secret dans le journal du daemon"
 if grep -qF "$CLIENT_PRIV" "$TMP/daemon.log"; then

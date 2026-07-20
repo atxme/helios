@@ -39,7 +39,7 @@ struct Cli {
 enum Command {
     /// Lance le daemon (kill-switch + orchestration + interface web).
     Run {
-        /// Mode développement : simule WireGuard, nftables, TPM et OTA.
+        /// Mode développement : simule WireGuard, nftables et TPM.
         /// Activé automatiquement sur WSL2 si WireGuard noyau est absent.
         #[arg(long)]
         dev: bool,
@@ -90,7 +90,7 @@ fn wireguard_module_present() -> bool {
 /// Résout le mode dry-run : explicite (`--dev`) ou auto-détecté (WSL2 sans WireGuard).
 fn resolve_dry_run(explicit_dev: bool) -> bool {
     if explicit_dev {
-        info!("mode --dev activé : simulation WireGuard, nftables, TPM et OTA");
+        info!("mode --dev activé : simulation WireGuard, nftables et TPM");
         return true;
     }
     if is_wsl2() && !wireguard_module_present() {
@@ -168,6 +168,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         psk_tx,
         Arc::clone(&shared_policy),
     );
+    let api_ready = Arc::clone(&state.api_ready);
     tokio::spawn(async move {
         // Hors simulation, l'API écoute sur l'adresse WireGuard — que
         // l'orchestrateur, démarré juste après, n'a pas encore assignée à
@@ -203,6 +204,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         psk_rx,
         shared_policy,
         boot,
+        api_ready,
     )
     .await
 }

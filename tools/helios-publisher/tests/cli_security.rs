@@ -137,3 +137,67 @@ fn arguments_de_securite_refusent_zero_et_digest_pcr_malforme() {
     assert!(!malformed.status.success());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("octets au lieu de 32"));
 }
+
+#[test]
+fn manifeste_binaire_signe_exactement_les_octets_fournis() {
+    let root = tempfile::tempdir().unwrap();
+    let keys = root.path().join("cles");
+    assert!(publisher()
+        .args(["keygen", "--key-epoch", "11", "--output-dir"])
+        .arg(&keys)
+        .status()
+        .unwrap()
+        .success());
+    let binary = root.path().join("heliosd");
+    let mut elf = vec![0u8; 64];
+    elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+    fs::write(&binary, elf).unwrap();
+    let manifest = root.path().join("heliosd.release.json");
+    let output = publisher()
+        .args([
+            "binary-release",
+            "--key-epoch",
+            "11",
+            "--release-sequence",
+            "73",
+            "--channel",
+            "testing",
+            "--version",
+            "1.4.0",
+            "--git-commit",
+            "0123456789abcdef",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--features",
+            "wireguard,embed-ui,netlink",
+            "--binary",
+        ])
+        .arg(&binary)
+        .arg("--ed25519-private-key")
+        .arg(keys.join("ed25519-private.pk8"))
+        .arg("--ml-dsa-65-private-key")
+        .arg(keys.join("ml-dsa-65-private.bin"))
+        .arg("--keyring")
+        .arg(keys.join("publisher-keyring.json"))
+        .arg("--output")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+    assert_eq!(json["payload"]["release_sequence"], 73);
+    assert_eq!(
+        json["payload"]["binary_size"],
+        fs::metadata(binary).unwrap().len()
+    );
+    assert_eq!(
+        json["payload"]["features"],
+        serde_json::json!(["embed-ui", "netlink", "wireguard"])
+    );
+    assert_eq!(json["signatures"].as_array().unwrap().len(), 2);
+}

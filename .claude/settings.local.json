@@ -107,7 +107,14 @@
       "Bash(timeout 120 python3 scripts/target_campaign.py --only synchro)",
       "Bash(sed -n '/^christophe ALL/p')",
       "Read(//tmp/**)",
-      "Bash(git fetch *)"
+      "Bash(git fetch *)",
+      "Bash(python3 *)",
+      "Bash(git rev-list *)",
+      "Bash(git push *)",
+      "Bash(echo \"code=$?\")",
+      "Bash(timeout 25 ssh -o ConnectTimeout=10 helios-target 'echo SSH-OK; echo \"--- table ---\"; sudo -n nft list tables 2>&1; echo \"--- heliosd ---\"; ps -eo pid,etime,comm | grep heliosd || echo aucun; echo \"--- ports ---\"; ss -lnt 2>/dev/null | grep -E \"8080\" || echo \"rien sur 8080\"; echo \"--- wg ---\"; ip -brief addr show helios-test0 2>&1')",
+      "Bash(pkill -f \"target_campaign.py\")",
+      "Bash(awk 'length > 80 {print FILENAME\":\"FNR\": \"length\" car\"}' CLAUDE.md docs/testing/TESTING.md)"
     ]
   }
 }

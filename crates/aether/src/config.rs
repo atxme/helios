@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, net::Ipv4Addr, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +97,10 @@ pub struct WgPeer {
     /// VIP assignée, en notation CIDR (ex. `100.64.1.2/32`).
     /// Dans WireGuard, `AllowedIPs` **est** la table de routage cryptographique.
     pub address: String,
+    /// Autorise ce pair à muter le plan de contrôle et à piloter les mises à
+    /// jour. Le pair reste un client WireGuard ordinaire.
+    #[serde(default)]
+    pub admin: bool,
     /// PSK post-quantique dérivé de l'échange ML-KEM, en base64. **Secret.**
     #[serde(default)]
     pub preshared_key: Option<String>,
@@ -117,7 +121,12 @@ impl NetworkConfig {
     pub fn load() -> Result<Self> {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
-            Ok(raw) => toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string())),
+            Ok(raw) => {
+                let config: Self =
+                    toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
+                config.validate_peer_identities()?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(HeliosError::Config(format!(
                 "lecture de {}: {e}",
@@ -128,6 +137,7 @@ impl NetworkConfig {
 
     /// Persiste la config réseau de façon atomique (rename).
     pub fn save(&self) -> Result<()> {
+        self.validate_peer_identities()?;
         let path = Self::path();
         let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
         let tmp = path.with_extension("toml.tmp");
@@ -139,6 +149,43 @@ impl NetworkConfig {
             .map_err(|e| HeliosError::Config(format!("écriture: {e}")))?;
         std::fs::rename(&tmp, &path)
             .map_err(|e| HeliosError::Config(format!("rename atomique: {e}")))?;
+        Ok(())
+    }
+
+    /// Valide la table d'identité utilisée par l'API pour rattacher l'adresse
+    /// source d'une requête au pair WireGuard qui l'a émise.
+    ///
+    /// Une VIP large ou dupliquée rendrait l'autorisation administrateur
+    /// ambiguë. Les clients Helios utilisent donc exclusivement une IPv4 hôte
+    /// en `/32`, cohérente avec leur `AllowedIPs` WireGuard.
+    pub fn validate_peer_identities(&self) -> Result<()> {
+        let mut addresses = HashSet::new();
+        let mut public_keys = HashSet::new();
+        for peer in &self.peers {
+            let (host, prefix) = peer.address.split_once('/').ok_or_else(|| {
+                HeliosError::Config(format!(
+                    "VIP du pair {} sans préfixe /32 : {}",
+                    peer.name, peer.address
+                ))
+            })?;
+            if prefix != "32" || host.parse::<Ipv4Addr>().is_err() {
+                return Err(HeliosError::Config(format!(
+                    "VIP du pair {} invalide, une IPv4 /32 est exigée : {}",
+                    peer.name, peer.address
+                )));
+            }
+            if !addresses.insert(host.to_string()) {
+                return Err(HeliosError::Config(format!(
+                    "VIP dupliquée dans la table de pairs : {host}/32"
+                )));
+            }
+            if !public_keys.insert(peer.public_key.as_str()) {
+                return Err(HeliosError::Config(format!(
+                    "clé publique WireGuard dupliquée pour le pair {}",
+                    peer.name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -227,6 +274,7 @@ mod tests {
             name = "poste-christophe"
             public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
             address = "100.64.1.2/32"
+            admin = true
         "#;
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.wan_iface, "eth0");
@@ -236,6 +284,7 @@ mod tests {
         assert_eq!(cfg.wg_address, "100.64.0.1/10");
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].address, "100.64.1.2/32");
+        assert!(cfg.peers[0].admin);
         assert!(cfg.wireguard_ready());
 
         let policy = cfg.firewall_policy();
@@ -247,6 +296,31 @@ mod tests {
             policy.wg_peers.is_empty(),
             "road-warrior : pas de pair sortant"
         );
+    }
+
+    #[test]
+    fn identites_exigent_des_vip_hotes_uniques() {
+        let peer = |name: &str, key: &str, address: &str| WgPeer {
+            name: name.into(),
+            public_key: key.into(),
+            address: address.into(),
+            admin: false,
+            preshared_key: None,
+        };
+        let mut cfg = NetworkConfig {
+            peers: vec![
+                peer("a", "cle-a", "100.64.1.2/32"),
+                peer("b", "cle-b", "100.64.1.2/32"),
+            ],
+            ..NetworkConfig::default()
+        };
+        assert!(cfg.validate_peer_identities().is_err());
+
+        cfg.peers[1].address = "100.64.1.3/24".into();
+        assert!(cfg.validate_peer_identities().is_err());
+
+        cfg.peers[1].address = "100.64.1.3/32".into();
+        assert!(cfg.validate_peer_identities().is_ok());
     }
 
     /// L'API doit écouter sur l'adresse du tunnel. Sur `127.0.0.1`, aucun client

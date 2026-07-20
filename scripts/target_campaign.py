@@ -31,12 +31,11 @@ explicite : sans accès console, une erreur de manipulation coûte la machine.
 
 Limite connue
 -------------
-Les catégories ``rauc`` et ``tpm-billets`` ne sont pas jouées ici. Le
-rescellement TPM et le rollback A/B modifient les slots de boot et le NV du
-TPM ; les rejouer sans accès console rendrait la cible non amorçable. Ils
-restent dans la recette manuelle de docs/testing/MANUAL-TESTING.md. Ce qui
-débloquerait leur automatisation : une cible avec console série pilotable et un
-TPM logiciel dédié aux essais.
+La consommation des billets TPM n’est pas jouée ici : elle modifie l’état
+scellé et le NV du TPM. Elle reste dans la recette manuelle de
+docs/testing/MANUAL-TESTING.md. Ce qui débloquerait son automatisation : un TPM
+dédié aux essais. La mise à jour applicative, elle, ne touche pas aux PCR et
+possède sa propre catégorie.
 
 Usage
 -----
@@ -255,7 +254,15 @@ class Cible:
 
 # ── Registre de scénarios ───────────────────────────────────────────────────
 
-CATEGORIES = ("preflight", "synchro", "unite", "build", "campagne", "pare-feu")
+CATEGORIES = (
+    "preflight",
+    "synchro",
+    "unite",
+    "build",
+    "campagne",
+    "mise-a-jour",
+    "pare-feu",
+)
 
 _REGISTRE: list[tuple[str, str, Callable]] = []
 
@@ -740,6 +747,96 @@ def _campagne_protocole(ctx: Contexte):
         _tuer_daemons(ctx)
 
 
+@scenario("transfert signé, altération et activation contrôlée", "mise-a-jour")
+def _mise_a_jour_api(ctx: Contexte):
+    """Exerce sur la cible le même flux JSON que l’IHM, avec un daemon isolé.
+
+    L’activation reste une demande stagée : cette catégorie ne remplace pas le
+    service système de la gateway d’essai et ne touche pas `/opt/helios`. Le
+    scénario systemd complet est joué séparément lors de la campagne dédiée à
+    la gateway installée, où le rollback peut être observé sans confondre le
+    binaire de campagne avec le service en production.
+    """
+    publisher_help = ctx.cible.executer(
+        "cargo run --quiet -p helios-publisher -- --help", timeout=300
+    )
+    if not publisher_help.ok:
+        return Etat.ECHEC, (
+            "helios-publisher indisponible sur la cible : "
+            f"{(publisher_help.stderr or publisher_help.stdout).strip()[-800:]}"
+        )
+    if "binary-release" not in publisher_help.stdout:
+        cible_head = ctx.cible.executer("git rev-parse --short=12 HEAD").stdout.strip()
+        return Etat.ECHEC, (
+            f"la révision cible {cible_head or 'inconnue'} ne contient pas la commande "
+            "binary-release. Les sources de la feature doivent d’abord être commitées "
+            "et poussées, puis synchronisées avec : python3 "
+            "scripts/target_campaign.py --only synchro --only mise-a-jour"
+        )
+
+    keyring = _assurer_keyring(ctx)
+    build_daemon = _cargo_release(
+        ctx, "cargo build --release -p heliosd --features netlink,wireguard"
+    )
+    if not build_daemon.ok:
+        return Etat.ECHEC, build_daemon.stderr.strip()[-1200:]
+    if not ctx.cible.executer("test -x target/release/helios-ctl").ok:
+        build_ctl = _cargo_release(ctx, "cargo build --release -p helios-ctl", timeout=1800)
+        if not build_ctl.ok:
+            return Etat.ECHEC, build_ctl.stderr.strip()[-1000:]
+    _assurer_cles(ctx)
+    target = ctx.cible.executer("rustc -vV | sed -n 's/^host: //p'").stdout.strip()
+    commit = ctx.cible.executer("git rev-parse --short=16 HEAD").stdout.strip()
+    package_id = ctx.cible.executer("cargo pkgid -p heliosd").stdout.strip()
+    version = package_id.rsplit("#", 1)[-1].rsplit("@", 1)[-1]
+    manifest = f"{ctx.tmp}/heliosd.release.json"
+    signer = ctx.cible.executer(
+        f"HELIOS_PUBLISHER_KEYRING_PATH={shlex.quote(keyring)} "
+        "cargo run --quiet -p helios-publisher -- binary-release "
+        "--key-epoch 4294967295 --release-sequence 9101 --channel testing "
+        f"--version {shlex.quote(version)} --git-commit {shlex.quote(commit)} "
+        f"--target {shlex.quote(target)} --features netlink,wireguard "
+        "--binary target/release/heliosd "
+        f"--ed25519-private-key {ctx.tmp}/keys/ed25519-private.pk8 "
+        f"--ml-dsa-65-private-key {ctx.tmp}/keys/ml-dsa-65-private.bin "
+        f"--keyring {shlex.quote(keyring)} --output {manifest}"
+    )
+    if not signer.ok:
+        return Etat.ECHEC, (signer.stderr or signer.stdout).strip()[-1000:]
+
+    ctx.cible.deposer(_config_reseau(ctx, "lo"), f"{ctx.tmp}/network-update.toml")
+    journal = f"{ctx.tmp}/daemon-update.log"
+    pid = _lancer_daemon(
+        ctx,
+        {
+            "config": "network-update.toml",
+            "mode": "run --dev",
+            "environment": (
+                f"HELIOS_UPDATE_STAGING={ctx.tmp}/updates "
+                f"HELIOS_UPDATE_CHANNEL=testing HELIOS_READY_PATH={ctx.tmp}/ready"
+            ),
+        },
+        journal,
+    )
+    try:
+        if not _attendre_api(ctx, "http://127.0.0.1:8080", pid):
+            sortie = ctx.cible.executer(f"cat {journal}").stdout
+            return Etat.ECHEC, f"API de mise à jour absente : {sortie.strip()[-900:]}"
+        result = ctx.cible.executer(
+            "python3 scripts/update_campaign.py "
+            "--url http://127.0.0.1:8080 "
+            f"--manifest {manifest} --binary target/release/heliosd --activate",
+            timeout=600,
+        )
+        details = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not result.ok:
+            return Etat.ECHEC, (result.stderr or result.stdout).strip()[-1200:], details
+        return Etat.OK, "artefact signé stagé et activation enregistrée", details
+    finally:
+        ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
+        _tuer_daemons(ctx)
+
+
 @scenario("daemon réel : plan de données noyau monté", "campagne")
 def _campagne_daemon_reel(ctx: Contexte):
     """Monte heliosd avec les backends noyau et constate leurs effets réels.
@@ -971,7 +1068,7 @@ def _tuer_daemons(ctx: Contexte) -> None:
     ctx.cible.executer("pkill -x heliosd; sleep 0.5; true", dans_repo=False)
 
 
-def _lancer_daemon(ctx: Contexte, arguments: str, journal: str) -> str:
+def _lancer_daemon(ctx: Contexte, arguments: dict[str, str], journal: str) -> str:
     """Lance heliosd en arrière-plan et renvoie son PID réel.
 
     Deux pièges, tous deux rencontrés :
@@ -993,8 +1090,10 @@ def _lancer_daemon(ctx: Contexte, arguments: str, journal: str) -> str:
     # la création suivante.
     ctx.cible.executer("sudo -n ip link delete helios-test0 2>/dev/null; true", dans_repo=False)
     repo = ctx.cible.repo
+    environment = arguments.get("environment", "")
     lancement = (
-        f'cd "{repo}"; HELIOS_NETWORK_CONFIG={ctx.tmp}/{arguments["config"]} '
+        f'cd "{repo}"; {environment} '
+        f'HELIOS_NETWORK_CONFIG={ctx.tmp}/{arguments["config"]} '
         f'nohup ./target/release/heliosd {arguments["mode"]} '
         f"> {journal} 2>&1 </dev/null & echo $!"
     )

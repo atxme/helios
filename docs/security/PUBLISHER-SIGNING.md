@@ -64,6 +64,48 @@ Les deux signatures couvrent exactement :
 Il n'existe aucun mode Ed25519 seul et aucun fallback vers
 `helios-tpm-reseal-v1`.
 
+## Signer une release applicative
+
+Construire le frontend puis le binaire une seule fois. Le SHA-256 de ce fichier
+est l’identité de promotion entre test et production : il est interdit de le
+recompiler après la campagne de laboratoire.
+
+```sh
+npm run build --prefix web
+HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \
+  cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui
+
+cargo run -p helios-publisher -- binary-release \
+  --key-epoch 1 \
+  --release-sequence 42 \
+  --channel production \
+  --version 1.2.0 \
+  --git-commit "$(git rev-parse --short=16 HEAD)" \
+  --target x86_64-unknown-linux-gnu \
+  --features embed-ui,netlink,tpm,wireguard \
+  --binary target/release/heliosd \
+  --ed25519-private-key /chemin/hors-ligne/epoch-1/ed25519-private.pk8 \
+  --ml-dsa-65-private-key /chemin/hors-ligne/epoch-1/ml-dsa-65-private.bin \
+  --keyring /chemin/public/publisher-keyring.json \
+  --output heliosd.release.json
+```
+
+Pour la gateway de laboratoire, signer d’abord avec `--channel testing` et
+l’époque éditeur déjà compilée dans le binaire. Après la campagne, rejouer la
+commande avec `--channel production`, la même époque et le **même** fichier
+`target/release/heliosd`. Comparer le SHA-256 affiché par les deux commandes
+avant publication. Le canal appartient au payload signé : une gateway de
+production refuse le manifeste `testing` sans exiger un binaire différent.
+
+Les campagnes automatisées génèrent un trousseau éphémère pour tester le
+mécanisme sans exposer les clés éditeur. Le binaire ainsi produit est un
+artefact de campagne et ne peut pas être promu en production.
+
+Le compteur `release_sequence` doit être strictement supérieur à celui déjà
+confirmé sur les gateways. L’outil valide également l’en-tête ELF et sa target,
+trie les features, refuse l’écrasement du manifeste et auto-vérifie les deux
+signatures.
+
 ## Fichier de récupération WireGuard
 
 Sa signature reste volontairement non implémentée. Le lot est bloqué jusqu'au
