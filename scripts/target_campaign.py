@@ -1505,6 +1505,29 @@ faute de quoi elle serait lue comme le séparateur de la liste de commandes.
 """
 
 
+def _remettre_en_etat(ctx: Contexte) -> None:
+    """Rend la cible à son état d'avant campagne, quoi qu'il soit arrivé.
+
+    Appelée depuis un ``finally`` : c'est le filet qui rattrape une campagne
+    interrompue. Sans elle, la table ``inet helios`` survit — c'est son
+    invariant — et la cible reste sans trafic sortant, puisque la chaîne
+    ``output`` est elle aussi en ``drop``.
+
+    Silencieuse quand il n'y a rien à faire, bavarde dès qu'elle agit : une
+    remise en état qui passe inaperçue est une remise en état qu'on ne saura
+    pas déboguer.
+    """
+    _tuer_daemons(ctx)
+    if not ctx.cible.executer("sudo -n nft list table inet helios", dans_repo=False).ok:
+        return
+    info("remise en état : retrait de la table inet helios")
+    if ctx.cible.executer("sudo -n nft delete table inet helios", dans_repo=False).ok:
+        detail(_c("32", "table retirée, trafic sortant rétabli"))
+    else:
+        detail(_c("31", "ÉCHEC du retrait — depuis la console de la cible :"))
+        detail(_c("31", "  sudo nft delete table inet helios"))
+
+
 SUDOERS_CHEMIN = "/etc/sudoers.d/helios-target-tests"
 
 
@@ -1691,6 +1714,11 @@ def main() -> int:
         try:
             resultats = jouer(ctx, categories)
         finally:
+            # Remise en état inconditionnelle. Le scénario de purge ne suffit
+            # pas : une interruption (Ctrl-C, fin de session, exception) le
+            # saute et laisse la table en place — donc une cible sans trafic
+            # sortant, la chaîne `output` étant en `drop`. Constaté.
+            _remettre_en_etat(ctx)
             # Les clés jetables et la config ne survivent pas à la campagne.
             cible.executer(f"rm -rf {shlex.quote(tmp)}", dans_repo=False)
 
