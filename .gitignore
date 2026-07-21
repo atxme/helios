@@ -3,3 +3,7 @@
 *.pem
 *.raucb
 .env
+
+# Artefacts Python (scripts/target_campaign.py)
+__pycache__/
+*.py[cod]
