@@ -16,6 +16,7 @@ import {
   disconnect,
   getConfig,
   getState,
+  importProfile,
   onEvent,
   saveProfile,
   selectProfile,
@@ -32,6 +33,7 @@ describe('pont Tauri Orion', () => {
     await backendKind()
     await adapterIsUp()
     await getConfig()
+    await importProfile('{"format":"orion-profile"}', 'portable.json')
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -44,6 +46,10 @@ describe('pont Tauri Orion', () => {
       ['backend_kind'],
       ['adapter_is_up'],
       ['get_config'],
+      [
+        'import_profile',
+        { contents: '{"format":"orion-profile"}', fileName: 'portable.json' },
+      ],
       ['save_profile', { profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],

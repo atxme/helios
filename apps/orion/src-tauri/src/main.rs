@@ -22,8 +22,8 @@ use std::{
 
 use aether::TunnelState;
 use orion_core::{
-    backend::EventSink, default_backend, telemetry, ClientConfig, ClientEvent, ClientProfile,
-    VpnController,
+    backend::EventSink, default_backend, parse_profile_import, telemetry, ClientConfig,
+    ClientEvent, ClientProfile, VpnController,
 };
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{watch, Mutex};
@@ -178,13 +178,24 @@ async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> 
     Ok(state.config.lock().await.clone())
 }
 
+/// Décode un document choisi par l'utilisateur sans le persister.
+///
+/// L'IHM affiche le résultat comme brouillon : un fichier valide ne remplace
+/// donc jamais silencieusement un profil portant le même nom.
+#[tauri::command]
+fn import_profile(contents: String, file_name: String) -> Result<ClientProfile, String> {
+    parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn save_profile(
     state: State<'_, AppState>,
     profile: ClientProfile,
 ) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
+    let selected = profile.name.clone();
     cfg.upsert(profile);
+    cfg.selected = Some(selected);
     cfg.save().map_err(|e| e.to_string())?;
     Ok(cfg.clone())
 }
@@ -298,6 +309,7 @@ fn main() {
             backend_kind,
             adapter_is_up,
             get_config,
+            import_profile,
             save_profile,
             delete_profile,
             select_profile,

@@ -23,10 +23,12 @@ pub mod backend;
 pub mod config;
 pub mod events;
 pub mod mtu;
+pub mod profile_import;
 pub mod provisioning;
 pub mod telemetry;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
 pub use config::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 pub use events::ClientEvent;
+pub use profile_import::{parse_profile_import, MAX_PROFILE_IMPORT_BYTES};
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};

@@ -172,7 +172,28 @@ printf 'client privé: %s\nclient public: %s\ngateway public: %s\n' \
   "$client_private" "$client_public" "$gateway_public"
 ```
 
-Créer un profil dans l'IHM avec :
+Dans l’onglet **Profils**, utiliser **Importer** avec un fichier WireGuard
+`site-labo.conf` contenant :
+
+```ini
+[Interface]
+PrivateKey = <client_private>
+Address = 100.64.1.2/32
+
+[Peer]
+PublicKey = <gateway_public>
+AllowedIPs = 0.0.0.0/0
+Endpoint = 127.0.0.1:51820
+PersistentKeepalive = 25
+```
+
+Remplacer les valeurs entre chevrons par les clés générées. Vérifier que le
+profil importé est présenté comme un brouillon, puis l’enregistrer. Réimporter
+le même fichier doit avertir que l’enregistrement remplacera le profil
+existant. Un fichier contenant un second `[Peer]` ou `DNS = 100.64.0.1` doit
+être refusé explicitement et ne doit modifier aucun profil enregistré.
+
+Le même profil peut toujours être créé à la main avec :
 
 - endpoint : `127.0.0.1:51820` ;
 - clé privée : `client_private` ;

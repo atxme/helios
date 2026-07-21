@@ -103,6 +103,16 @@ export function useClient() {
     }
   }, [])
 
+  const importProfile = useCallback(async (contents: string, fileName: string) => {
+    try {
+      setError(null)
+      return await api.importProfile(contents, fileName)
+    } catch (cause) {
+      setError(String(cause))
+      throw cause
+    }
+  }, [])
+
   const removeProfile = useCallback(async (name: string) => {
     try {
       setError(null)
@@ -139,6 +149,7 @@ export function useClient() {
     selectedProfile,
     connect,
     disconnect,
+    importProfile,
     saveProfile,
     removeProfile,
     select,

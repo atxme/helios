@@ -114,7 +114,32 @@
       "Bash(echo \"code=$?\")",
       "Bash(timeout 25 ssh -o ConnectTimeout=10 helios-target 'echo SSH-OK; echo \"--- table ---\"; sudo -n nft list tables 2>&1; echo \"--- heliosd ---\"; ps -eo pid,etime,comm | grep heliosd || echo aucun; echo \"--- ports ---\"; ss -lnt 2>/dev/null | grep -E \"8080\" || echo \"rien sur 8080\"; echo \"--- wg ---\"; ip -brief addr show helios-test0 2>&1')",
       "Bash(pkill -f \"target_campaign.py\")",
-      "Bash(awk 'length > 80 {print FILENAME\":\"FNR\": \"length\" car\"}' CLAUDE.md docs/testing/TESTING.md)"
+      "Bash(awk 'length > 80 {print FILENAME\":\"FNR\": \"length\" car\"}' CLAUDE.md docs/testing/TESTING.md)",
+      "Bash(modprobe -n wireguard)",
+      "Bash(command -v wg wg-quick)",
+      "Bash(echo \"--- code=$? ---\")",
+      "Bash(ip link *)",
+      "Bash(sudo -n true)",
+      "Bash(command -v ip wg)",
+      "Bash(command -v visudo)",
+      "Bash(visudo -c -f /tmp/regle-locale.sudoers)",
+      "Bash(command -v ip)",
+      "Bash(command -v wg)",
+      "Bash(command -v modprobe)",
+      "Bash(echo '__CMDSUB_OUTPUT__ ALL=\\(root\\) NOPASSWD: __TRACKED_VAR__ wireguard, __TRACKED_VAR__, __TRACKED_VAR__')",
+      "Bash(visudo -c -f /tmp/regle-client.txt)",
+      "Read(//etc/sudoers.d/**)",
+      "Bash(sudo -n modprobe wireguard)",
+      "Bash(sudo -n ip link show)",
+      "Bash(sudo -n wg show)",
+      "Bash(sudo -n ip link delete hct0)",
+      "Bash(timeout 20 sudo -n ip link add dev hct0 type wireguard)",
+      "Bash(echo \"code=$? \\(124=timeout\\)\")",
+      "Bash(timeout 15 curl -sv -X POST -H 'Content-Type: application/json' -d '{}' http://100.64.0.1:8080/api/provision)",
+      "Bash(sudo -n wg show helios-cli0)",
+      "Bash(sudo -n ip link delete helios-cli0)",
+      "Bash(rm -f /tmp/cli.key /tmp/ctx.json /tmp/ctx2.json)",
+      "Bash(grep -E \"^\\\\s+\\\\$|✓|✗|montage|handshake\")"
     ]
   }
 }

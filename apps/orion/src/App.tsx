@@ -104,6 +104,7 @@ export default function App() {
         ) : (
           <ProfilesView
             config={c.config}
+            onImport={c.importProfile}
             onSave={c.saveProfile}
             onDelete={c.removeProfile}
             onSelect={c.select}

@@ -10,6 +10,8 @@ export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
 export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
+export const importProfile = (contents: string, fileName: string) =>
+  invoke<ClientProfile>('import_profile', { contents, fileName })
 
 export const saveProfile = (profile: ClientProfile) =>
   invoke<ClientConfig>('save_profile', { profile })

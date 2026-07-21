@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
-import { Check, Eye, EyeOff, Plus, Save, Trash2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Check, Eye, EyeOff, Plus, Save, Trash2, Upload } from 'lucide-react'
 import type { ClientConfig, ClientProfile } from '../types'
 
 interface Props {
   config: ClientConfig
+  onImport: (contents: string, fileName: string) => Promise<ClientProfile>
   onSave: (p: ClientProfile) => Promise<void>
   onDelete: (name: string) => Promise<void>
   onSelect: (name: string) => Promise<void>
@@ -23,7 +24,11 @@ function blankProfile(): ClientProfile {
   }
 }
 
-export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
+type ImportNotice = { tone: 'success' | 'error'; message: string }
+
+const MAX_IMPORT_BYTES = 64 * 1024
+
+export function ProfilesView({ config, onImport, onSave, onDelete, onSelect }: Props) {
   const [draft, setDraft] = useState<ClientProfile>(
     () =>
       config.profiles.find((p) => p.name === config.selected) ??
@@ -31,6 +36,9 @@ export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
       blankProfile(),
   )
   const [dirty, setDirty] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [importNotice, setImportNotice] = useState<ImportNotice | null>(null)
+  const fileInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (dirty) return
@@ -41,14 +49,45 @@ export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
   const set = <K extends keyof ClientProfile>(key: K, value: ClientProfile[K]) => {
     setDraft((profile) => ({ ...profile, [key]: value }))
     setDirty(true)
+    setImportNotice(null)
   }
 
   const save = async () => {
     try {
       await onSave(draft)
       setDirty(false)
+      setImportNotice(null)
     } catch {
       // L'erreur est affichée par le hook global ; le brouillon reste modifié.
+    }
+  }
+
+  const importFile = async (file: File | undefined) => {
+    if (!file) return
+    setImportNotice(null)
+    if (file.size > MAX_IMPORT_BYTES) {
+      setImportNotice({ tone: 'error', message: 'Fichier trop volumineux (maximum 64 Kio).' })
+      if (fileInput.current) fileInput.current.value = ''
+      return
+    }
+
+    setImporting(true)
+    try {
+      const profile = await onImport(await file.text(), file.name)
+      setDraft(profile)
+      setDirty(true)
+      const replaces = config.profiles.some((candidate) => candidate.name === profile.name)
+      setImportNotice({
+        tone: 'success',
+        message: replaces
+          ? `Profil « ${profile.name} » chargé. Enregistrer remplacera le profil existant.`
+          : `Profil « ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.`,
+      })
+    } catch (cause) {
+      setImportNotice({ tone: 'error', message: `Import impossible : ${String(cause)}` })
+    } finally {
+      setImporting(false)
+      if (fileInput.current) fileInput.current.value = ''
     }
   }
 
@@ -66,6 +105,7 @@ export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
               onClick={() => {
                 setDraft(profile)
                 setDirty(false)
+                setImportNotice(null)
                 void onSelect(profile.name).catch(() => {})
               }}
               className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs transition ${
@@ -83,15 +123,44 @@ export function ProfilesView({ config, onSave, onDelete, onSelect }: Props) {
           onClick={() => {
             setDraft(blankProfile())
             setDirty(true)
+            setImportNotice(null)
           }}
           className="flex items-center gap-1 rounded-full border border-dashed border-white/15 px-3 py-1 text-xs text-slate-400 hover:border-white/25 hover:text-slate-200"
         >
           <Plus size={11} /> Nouveau
         </button>
+        <input
+          ref={fileInput}
+          className="hidden"
+          type="file"
+          accept=".json,.conf,application/json,text/plain"
+          onChange={(event) => void importFile(event.target.files?.[0])}
+        />
+        <button
+          type="button"
+          disabled={importing}
+          onClick={() => fileInput.current?.click()}
+          className="ml-auto flex items-center gap-1 rounded-full border border-node/20 bg-node/10 px-3 py-1 text-xs text-node transition hover:bg-node/20 disabled:opacity-50"
+          title="Charger un profil Orion JSON ou WireGuard"
+        >
+          <Upload size={11} /> {importing ? 'Chargement…' : 'Importer'}
+        </button>
       </div>
 
       {/* ── Formulaire, groupé par ce que chaque champ décide ── */}
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4">
+        {importNotice && (
+          <div
+            role={importNotice.tone === 'error' ? 'alert' : 'status'}
+            className={`rounded-lg border px-3 py-2 text-xs leading-relaxed ${
+              importNotice.tone === 'error'
+                ? 'border-red-500/30 bg-red-950/40 text-red-200'
+                : 'border-node/25 bg-node/10 text-node'
+            }`}
+          >
+            {importNotice.message}
+          </div>
+        )}
         <Section title="Identité">
           <Field label="Nom du profil" value={draft.name} onChange={(v) => set('name', v)} />
           <Field

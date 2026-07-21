@@ -44,6 +44,49 @@ est stockée dans le répertoire applicatif de l’OS sous `net/helios/orion`. L
 variable `ORION_CONFIG` permet de surcharger le chemin en test ou en
 développement.
 
+### Importer plutôt que ressaisir
+
+Le bouton **Importer** de l’onglet Profils accepte deux formats :
+
+- un profil Orion JSON versionné (`.json`), qui porte aussi les paramètres
+  propres à Helios ;
+- un fichier WireGuard `wg-quick` (`.conf`) avec exactement une section
+  `[Interface]` et un seul `[Peer]`.
+
+L’import charge un brouillon dans le formulaire. Il n’écrit rien tant que
+**Enregistrer** n’est pas activé et annonce explicitement si le nom importé
+remplacera un profil existant. Les documents sont bornés à 64 Kio, les clés
+WireGuard doivent décoder exactement 32 octets et les options que le client ne
+sait pas appliquer (`DNS`, scripts `PreUp`, plusieurs pairs, etc.) sont refusées
+plutôt qu’ignorées.
+
+Le format JSON courant est `orion-profile` version 1 :
+
+```json
+{
+  "format": "orion-profile",
+  "version": 1,
+  "profile": {
+    "name": "site-paris",
+    "endpoint": "vpn.example.net:51820",
+    "private_key": "base64-de-32-octets",
+    "peer_public_key": "base64-de-32-octets",
+    "address": "100.64.1.2/32",
+    "allowed_ips": "0.0.0.0/0",
+    "persistent_keepalive": 25,
+    "heliosd_url": "http://100.64.0.1:8080"
+  }
+}
+```
+
+`allowed_ips`, `persistent_keepalive`, `heliosd_url` et `preshared_key` sont
+facultatifs. L’adresse virtuelle reste obligatoire : le tunnel initial en a
+besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut `0.0.0.0/0` et
+le keepalive 25 secondes lorsqu’ils sont omis. Un `preshared_key` importé est
+traité comme un PSK statique et désactive la négociation ML-KEM automatique ;
+il ne doit être fourni que si les deux pairs portent déjà exactement la même
+valeur.
+
 ## Cycle de vie et protection anti-fuite
 
 L’état `up` est inféré à partir d’un handshake de moins de 150 secondes.
@@ -139,17 +182,18 @@ Le client sait générer une paire ML-KEM-768 éphémère, appeler
 dériver un PSK de 32 octets lié aux deux identités et aux deux nonces.
 
 Cette étape suppose que la clé publique du client a déjà été admise hors bande
-sur Helios et que le tunnel WireGuard classique est joignable. L’installation
-automatique du PSK côté plan de données gateway n’est pas encore câblée ; l’IHM
-n’expose donc pas de bouton de provisioning trompeur et signale cette limite à
-côté du champ PSK manuel.
+sur Helios et que le tunnel WireGuard classique est joignable. La gateway pose
+le PSK sur son plan de données avant de le remettre à Orion ; Orion le pose
+ensuite sur son adaptateur sans le démonter. Un échec garde le tunnel classique
+opérationnel et reste visible dans le journal.
 
 ## Commandes Tauri exposées
 
 Le frontend utilise les commandes suivantes :
 
 - `get_state`, `backend_kind`, `adapter_is_up` ;
-- `get_config`, `save_profile`, `delete_profile`, `select_profile` ;
+- `get_config`, `import_profile`, `save_profile`, `delete_profile`,
+  `select_profile` ;
 - `connect`, `disconnect`.
 
 Les événements `state_changed`, `log`, `telemetry` et `error` sont relayés sur
