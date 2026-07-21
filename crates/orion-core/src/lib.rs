@@ -22,6 +22,7 @@
 pub mod backend;
 pub mod config;
 pub mod events;
+pub mod mtu;
 pub mod provisioning;
 pub mod telemetry;
 

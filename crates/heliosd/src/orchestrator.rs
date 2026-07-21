@@ -65,6 +65,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         private_key: network.wg_private_key.clone(),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
+        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(&network.wan_iface))),
     };
     let peers = network
         .peers
@@ -791,6 +792,25 @@ async fn discover_mss(wan_iface: &str) -> Option<u16> {
     let mtu: u16 = mtu_str.trim().parse().ok()?;
     // WireGuard : ~60 octets d'overhead (en-tête + UDP/IP) + 40 pour l'en-tête TCP/IP.
     Some(mtu.saturating_sub(100).max(576))
+}
+
+/// MTU du lien WAN, lu dans sysfs.
+///
+/// Lecture bloquante assumée : `wg_config` est appelée sur le chemin de montage
+/// de l'interface, avant toute mise en réseau, et le fichier est en mémoire.
+/// Un WAN illisible — nom erroné, interface pas encore créée — retombe sur
+/// l'Ethernet standard, ce qui redonne le comportement d'avant ce réglage.
+fn mtu_transport(wan_iface: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{wan_iface}/mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            warn!(
+                "MTU de {wan_iface} illisible — repli sur {} octets",
+                aether::mtu::MTU_TRANSPORT_DEFAUT
+            );
+            aether::mtu::MTU_TRANSPORT_DEFAUT
+        })
 }
 
 fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
