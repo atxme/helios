@@ -949,11 +949,28 @@ def _campagne_daemon_reel(ctx: Contexte):
             f"✓ table nft fail-closed posée         {table.stdout.count('policy drop')} chaînes en drop"
         )
 
+        # MTU dérivé du WAN, et non le 1420 par défaut de WireGuard. Sur un
+        # transport plus étroit que 1500, ce défaut fait disparaître les gros
+        # paquets sans rien signaler — voir `aether::mtu`.
+        mtu_wan = ctx.cible.executer(f"cat /sys/class/net/{iface_wan}/mtu").stdout.strip()
+        mtu_tunnel = ctx.cible.executer(
+            "cat /sys/class/net/helios-test0/mtu"
+        ).stdout.strip()
+        if not mtu_wan.isdigit() or not mtu_tunnel.isdigit():
+            return Etat.ECHEC, f"MTU illisible (wan={mtu_wan!r}, tunnel={mtu_tunnel!r})", details
+        attendu = max(576, int(mtu_wan) - 80)
+        if int(mtu_tunnel) != attendu:
+            return Etat.ECHEC, (
+                f"MTU du tunnel {mtu_tunnel} au lieu de {attendu} attendu pour un "
+                f"WAN à {mtu_wan} : la dérivation n'est pas appliquée"
+            ), details
+        details.append(f"✓ MTU dérivé du WAN                   {mtu_wan} → {mtu_tunnel}")
+
         # Le PSK n'est pas encore négocié : le slot doit être vide à ce stade.
         # Le vérifier évite de confondre « pas de provisioning » et « PSK posé ».
         psk_vides = sum(1 for l in lignes_pairs if l.split("\t")[1:2] in ([""], ["(none)"]))
         details.append(f"— slot PSK vide avant provisioning    {psk_vides}/{len(lignes_pairs)}")
-        return Etat.OK, "interface, pair et ruleset confirmés dans le noyau", details
+        return Etat.OK, "interface, pair, ruleset et MTU confirmés dans le noyau", details
     finally:
         ctx.cible.executer(f"kill {pid} 2>/dev/null; true")
         _tuer_daemons(ctx)
@@ -1046,8 +1063,11 @@ def _tunnel_preflight(ctx: Contexte):
     return Etat.OK, "wg, module noyau et privilèges réseau disponibles"
 
 
-# Surcoût d'encapsulation WireGuard : en-tête UDP + en-tête WireGuard, majoré
-# pour couvrir un transport IPv6 (60 o suffisent en IPv4).
+# Surcoût d'encapsulation WireGuard. Doit rester aligné sur
+# `aether::mtu::SURCOUT_WIREGUARD`, dont ce calcul est le miroir : la campagne
+# monte son client par `wg set` et non par Orion, elle refait donc l'arithmétique
+# que le client ferait pour elle. Le scénario `daemon réel` vérifie de son côté
+# que la gateway applique bien la même règle.
 SURCOUT_WIREGUARD = 80
 
 

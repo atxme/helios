@@ -251,8 +251,11 @@ Deux pièges de terrain méritent d'être connus, car leurs symptômes égarent 
 
 - **MTU.** WireGuard prend 1420 par défaut, ce qui suppose un transport à 1500.
   L'`eth0` de WSL2 est à 1280 : le handshake et les petites requêtes passent,
-  mais un ciphertext ML-KEM disparaît en silence. La campagne déduit le MTU du
-  tunnel de celui du lien qui porte la route.
+  mais un ciphertext ML-KEM disparaît en silence. Depuis, les deux bouts
+  dérivent leur MTU du lien qui les porte (`aether::mtu`) ; le scénario
+  `daemon réel` vérifie que la gateway l'applique. Mesure de référence sur
+  cible, transport à 1280 : **1220 passe, 1221 échoue**, soit 60 octets de
+  surcoût en IPv4 — la valeur retenue (80) couvre aussi IPv6.
 - **Témoin de disponibilité.** Hors dry-run, heliosd écrit dans `/run/helios`,
   répertoire fourni par systemd (`RuntimeDirectory=helios`). Lancé à la main
   avec les seules capacités réseau, il s'arrête sur `EPERM` *après* avoir monté
