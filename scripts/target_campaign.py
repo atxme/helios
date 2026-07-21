@@ -126,6 +126,7 @@ class Cible:
             tempfile.mkdtemp(prefix="helios-cible-"), "control.sock"
         )
         self._maitre: subprocess.Popen | None = None
+        self._ip: str | None = None
 
     # -- cycle de vie --------------------------------------------------------
 
@@ -141,6 +142,32 @@ class Cible:
             raise RuntimeError(f"dépôt {self.repo} introuvable sur {self.hote}")
         self.repo = s.stdout.strip()
         return self.repo
+
+    def adresse_ip(self) -> str:
+        """Adresse IP de la cible, telle que la machine de dev la joint.
+
+        `--host` est le plus souvent un alias `~/.ssh/config`, que seul ssh sait
+        résoudre : le passer tel quel à `wg set endpoint` fait boucler la
+        résolution DNS (backoff exponentiel, plus de trois minutes avant
+        d'abandonner). On lit donc l'adresse dans `SSH_CONNECTION`, dont le
+        troisième champ est l'IP du serveur vue depuis cette connexion — ce qui
+        vaut aussi bien pour un alias que pour une IP littérale.
+        """
+        if self._ip:
+            return self._ip
+        champs = self.executer("echo $SSH_CONNECTION", dans_repo=False).stdout.split()
+        if len(champs) >= 3:
+            self._ip = champs[2]
+            return self._ip
+        # Repli : demander à ssh lui-même ce que l'alias désigne.
+        rendu = subprocess.run(
+            ["ssh", "-G", self.hote], capture_output=True, text=True
+        ).stdout
+        for ligne in rendu.splitlines():
+            if ligne.startswith("hostname "):
+                self._ip = ligne.split(maxsplit=1)[1].strip()
+                return self._ip
+        raise RuntimeError(f"adresse IP de {self.hote} indéterminable")
 
     def ouvrir(self) -> None:
         """Établit la connexion maître. Toute commande ultérieure la réutilise."""
@@ -992,6 +1019,8 @@ def _tpm_materiel(ctx: Contexte):
 
 IFACE_CLIENT = "helios-cli0"
 VIP_CLIENT = "100.64.1.2/32"
+# Plage CGNAT du tunnel (ADR-001 §4) : sert d'`allowed-ips` et de route client.
+CGNAT = "100.64.0.0/10"
 
 
 @scenario("prérequis client WireGuard local", "tunnel")
@@ -1017,11 +1046,38 @@ def _tunnel_preflight(ctx: Contexte):
     return Etat.OK, "wg, module noyau et privilèges réseau disponibles"
 
 
+# Surcoût d'encapsulation WireGuard : en-tête UDP + en-tête WireGuard, majoré
+# pour couvrir un transport IPv6 (60 o suffisent en IPv4).
+SURCOUT_WIREGUARD = 80
+
+
+def _mtu_client(hote: str) -> int:
+    """MTU à poser sur l'interface cliente, déduit du MTU du transport.
+
+    WireGuard prend 1420 par défaut, ce qui suppose un transport à 1500. Sous
+    WSL2 l'`eth0` est à 1280 : les paquets chiffrés dépassent alors le MTU du
+    lien et sont jetés en silence. Le symptôme est trompeur — le handshake
+    passe, les petites requêtes aussi, et seules les grosses (un ciphertext
+    ML-KEM, par exemple) disparaissent, avec des retransmissions TCP à la clé.
+
+    On déduit donc le MTU du tunnel de celui de l'interface qui porte
+    réellement la route vers la gateway.
+    """
+    rendu = _local(f"ip route get {hote}").stdout
+    lien = rendu.split(" dev ", 1)[1].split()[0] if " dev " in rendu else ""
+    brut = _local(f"cat /sys/class/net/{lien}/mtu").stdout.strip() if lien else ""
+    transport = int(brut) if brut.isdigit() else 1500
+    # Plancher à 576, le minimum IPv4 : un plancher à 1280 (minimum IPv6)
+    # annulerait le calcul sur un transport déjà à 1280, précisément le cas
+    # qu'on cherche à corriger.
+    return max(576, transport - SURCOUT_WIREGUARD)
+
+
 def _demonter_client() -> None:
     _local(f"sudo -n ip link delete {IFACE_CLIENT} 2>/dev/null; true")
 
 
-@scenario("tunnel réel : handshake, PSK posé des deux côtés", "tunnel")
+@scenario("tunnel réel : handshake et provisioning PQ dans le tunnel", "tunnel")
 def _tunnel_bout_en_bout(ctx: Contexte):
     """Le seul scénario qui fait circuler des paquets chiffrés.
 
@@ -1040,7 +1096,8 @@ def _tunnel_bout_en_bout(ctx: Contexte):
     details: list[str] = []
     _assurer_cles(ctx)
     iface_wan = ctx.faits.get("iface_wan", "lo")
-    hote = ctx.cible.hote.split("@")[-1]
+    # Adresse routable, jamais l'alias SSH : `wg set` ne résout pas ~/.ssh/config.
+    hote = ctx.cible.adresse_ip()
 
     # Client : helios-ctl local, il joue le vrai code d'Orion.
     keyring = _keyring_local()
@@ -1078,9 +1135,16 @@ def _tunnel_bout_en_bout(ctx: Contexte):
             f"umask 077 && printf '%s' {shlex.quote(ctx.client_priv)} > {cle}",
             f"sudo -n ip link add dev {IFACE_CLIENT} type wireguard",
             f"sudo -n wg set {IFACE_CLIENT} private-key {cle} peer {ctx.gateway_pub}"
-            f" endpoint {hote}:51821 allowed-ips 100.64.0.0/10 persistent-keepalive 15",
+            f" endpoint {hote}:51821 allowed-ips {CGNAT} persistent-keepalive 15",
             f"sudo -n ip address add {VIP_CLIENT} dev {IFACE_CLIENT}",
+            f"sudo -n ip link set mtu {_mtu_client(hote)} dev {IFACE_CLIENT}",
             f"sudo -n ip link set up dev {IFACE_CLIENT}",
+            # `wg set` ne pose aucune route, et la VIP en /32 n'en crée pas.
+            # Sans celle-ci, l'API de la gateway (100.64.0.1) est injoignable
+            # alors même que le handshake a réussi : le tunnel est monté, mais
+            # rien ne dirige les paquets dedans. La route reprend `allowed-ips`,
+            # comme le ferait Orion, et disparaît avec l'interface.
+            f"sudo -n ip route add {CGNAT} dev {IFACE_CLIENT}",
         ])
         pose = _local(montage)
         if not pose.ok:
@@ -1104,18 +1168,37 @@ def _tunnel_bout_en_bout(ctx: Contexte):
         if not campagne.ok:
             return Etat.ECHEC, (campagne.stdout + campagne.stderr).strip()[-1000:], details
 
-        # Le PSK doit être dans les deux slots : un slot rempli d'un seul côté
-        # fait échouer tous les handshakes suivants, sans canal de rattrapage.
+        # Invariant testable ici : la gateway pose le PSK sur son plan de
+        # données **avant** de l'annoncer au client. Le provisioning ayant
+        # abouti, le slot doit être renseigné côté gateway.
         psk_gw = _psk_du_dump(
             ctx.cible.executer("sudo -n wg show helios-test0 dump", dans_repo=False).stdout
         )
-        psk_cli = _psk_du_dump(_local(f"sudo -n wg show {IFACE_CLIENT} dump").stdout)
-        details.append(f"{'✓' if psk_gw else '✗'} PSK dans le slot gateway")
-        details.append(f"{'✓' if psk_cli else '✗'} PSK dans le slot client")
-        if not psk_gw or not psk_cli:
-            return Etat.ECHEC, "PSK absent d'au moins un slot : tout handshake ultérieur échouera", details
+        details.append(f"{'✓' if psk_gw else '✗'} PSK posé côté gateway avant annonce")
+        if not psk_gw:
+            return Etat.ECHEC, (
+                "le provisioning a réussi mais le slot PSK de la gateway est vide : "
+                "le PSK a été annoncé sans avoir été posé"
+            ), details
 
-        return Etat.OK, "tunnel réel, PSK négocié et posé des deux côtés", details
+        # Le slot client, lui, n'est pas établissable par cette campagne.
+        # `helios-ctl` emprunte le protocole d'Orion (`orion_core::provision`),
+        # pas son adaptateur : seul ce dernier écrit le PSK dans l'interface
+        # cliente (`orion-core/src/backend/mod.rs`). Le client monté ici l'est
+        # par `wg set`, et rien ne l'y renseigne.
+        #
+        # Ce qui débloquerait la vérification : un mode headless d'Orion, ou une
+        # sous-commande `helios-ctl` qui applique le profil reçu au lieu de se
+        # limiter à l'inspecter.
+        psk_cli = _psk_du_dump(_local(f"sudo -n wg show {IFACE_CLIENT} dump").stdout)
+        if psk_cli:
+            details.append("✓ PSK également présent côté client")
+            return Etat.OK, "tunnel réel, PSK négocié et posé des deux côtés", details
+        details.append("— slot client non renseigné : exige l'adaptateur Orion")
+        return Etat.OK, (
+            "tunnel réel et PSK posé côté gateway ; le slot client exige "
+            "l'adaptateur d'Orion, hors de portée de helios-ctl"
+        ), details
     finally:
         _demonter_client()
         _local(
@@ -1324,8 +1407,15 @@ def _lancer_daemon(ctx: Contexte, arguments: dict[str, str], journal: str) -> st
     ctx.cible.executer("sudo -n ip link delete helios-test0 2>/dev/null; true", dans_repo=False)
     repo = ctx.cible.repo
     environment = arguments.get("environment", "")
+    # `HELIOS_READY_PATH` : hors dry-run, heliosd publie son témoin de
+    # disponibilité dans /run/helios, répertoire que seul systemd crée pour lui
+    # (`RuntimeDirectory=helios` dans l'unité). Lancé à la main avec les seules
+    # capacités réseau, il n'a pas le droit de le créer et s'arrête sur
+    # « Permission denied » **après** avoir monté l'interface — d'où un tunnel
+    # qui handshake, puis une API injoignable. La variable existe pour ce cas.
     lancement = (
         f'cd "{repo}"; {environment} '
+        f"HELIOS_READY_PATH={ctx.tmp}/helios-ready "
         f'HELIOS_NETWORK_CONFIG={ctx.tmp}/{arguments["config"]} '
         f'nohup ./target/release/heliosd {arguments["mode"]} '
         f"> {journal} 2>&1 </dev/null & echo $!"
