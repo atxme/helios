@@ -191,8 +191,17 @@ machine — puis l'installe et ajoute l'utilisateur au groupe `tss` (accès
 fait sur une session neuve, seule façon de constater que la règle porte.
 
 La règle est limitée à `modprobe wireguard`, `modprobe nf_tables`, `nft`, `ip`,
-`wg` et `setcap` sur le seul binaire d'essai : jamais un shell générique, ni
+`wg` et `setcap` sur les seuls binaires d'essai (`heliosd` et `helios-ctl`,
+qui lit le plan de données via `wg show`) : jamais un shell générique, ni
 `apt-get`, ni root inconditionnel. `--aide-sudoers` l'imprime pour contrôle.
+
+La catégorie `tunnel` fait de la machine de dev un **vrai client WireGuard**.
+Elle exige donc une règle locale, à poser une fois depuis un terminal :
+
+```sh
+echo "$(id -un) ALL=(root) NOPASSWD: /usr/sbin/modprobe wireguard, $(command -v ip), $(command -v wg)" \
+  | sudo tee /etc/sudoers.d/helios-client-tests && sudo chmod 0440 /etc/sudoers.d/helios-client-tests
+```
 
 Trois contraintes de forme, constatées sur Ubuntu 26.04 qui embarque **sudo-rs**
 et non le sudo classique :
@@ -218,12 +227,48 @@ python3 scripts/target_campaign.py --pare-feu --json rapport.json
 ```
 
 Les catégories sont `preflight`, `synchro`, `unite`, `build`, `campagne`,
-`mise-a-jour` et `pare-feu`. Pour rejouer la mise à jour depuis la branche
-distante courante :
+`mise-a-jour`, `tpm`, `tunnel` et `pare-feu`. Pour rejouer la mise à jour depuis
+la branche distante courante :
 
 ```sh
 python3 scripts/target_campaign.py --only synchro --only mise-a-jour
 ```
+
+### Ce que la cible a permis d'établir
+
+Ces points ne sont pas démontrables en WSL2, et deux d'entre eux ont révélé des
+défauts réels lors du premier passage :
+
+- le ruleset Netlink est réellement posé, en `drop` sur les trois chaînes, et
+  **survit à l'arrêt du daemon** ;
+- le scellement TPM sur `/dev/tpmrm0` refuse un blob absent, altéré, ou dont la
+  sélection PCR a été modifiée, et restitue le secret à l'identique ;
+- un vrai tunnel WireGuard s'établit entre la machine de dev et la gateway, et
+  le provisioning post-quantique s'y déroule de bout en bout ;
+- la gateway pose le PSK sur son plan de données **avant** de l'annoncer.
+
+Deux pièges de terrain méritent d'être connus, car leurs symptômes égarent :
+
+- **MTU.** WireGuard prend 1420 par défaut, ce qui suppose un transport à 1500.
+  L'`eth0` de WSL2 est à 1280 : le handshake et les petites requêtes passent,
+  mais un ciphertext ML-KEM disparaît en silence. La campagne déduit le MTU du
+  tunnel de celui du lien qui porte la route.
+- **Témoin de disponibilité.** Hors dry-run, heliosd écrit dans `/run/helios`,
+  répertoire fourni par systemd (`RuntimeDirectory=helios`). Lancé à la main
+  avec les seules capacités réseau, il s'arrête sur `EPERM` *après* avoir monté
+  l'interface. La campagne passe `HELIOS_READY_PATH`, prévu pour ce cas.
+
+### Limite connue : le slot PSK côté client
+
+La campagne vérifie le slot PSK de la gateway, pas celui du client. `helios-ctl`
+emprunte le **protocole** d'Orion (`orion_core::provision`), pas son
+**adaptateur** : seul ce dernier écrit le PSK dans l'interface cliente. Le
+client monté par la campagne l'est par `wg set`, et rien ne l'y renseigne.
+
+Ce qui débloquerait la vérification : un mode headless d'Orion, ou une
+sous-commande `helios-ctl` qui applique le profil reçu au lieu de se limiter à
+l'inspecter. En attendant, le scénario le déclare hors de portée plutôt que de
+le compter comme réussi.
 
 La feature doit donc avoir été commitée et poussée avant cette commande ; la
 campagne refuse une révision cible dont `helios-publisher` ne connaît pas
