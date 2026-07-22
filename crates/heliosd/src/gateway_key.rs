@@ -295,7 +295,7 @@ pub fn initialize(
     rotate: bool,
 ) -> Result<String, String> {
     let store = keystore();
-    refuse_ecrasement(store.exists(), rotate)?;
+    reject_overwrite(store.exists(), rotate)?;
 
     let secret = boot.secret().ok_or_else(|| {
         "aucun secret TPM disponible : impossible de sceller une identité. Provisionner le \
@@ -324,8 +324,8 @@ pub fn initialize(
 ///
 /// Isolé du système de fichiers pour que la règle soit vérifiable sans TPM :
 /// c'est elle qui protège de la perte d'identité, pas le chemin du coffre.
-fn refuse_ecrasement(existe: bool, rotate: bool) -> Result<(), String> {
-    if existe && !rotate {
+fn reject_overwrite(exists: bool, rotate: bool) -> Result<(), String> {
+    if exists && !rotate {
         return Err(format!(
             "une identité est déjà scellée dans {KEYSTORE_PATH} — l'écraser ferait perdre \
              l'identité de la gateway et couperait tous les clients. Utiliser --rotate pour \
@@ -434,9 +434,9 @@ mod tests {
     /// comportement par défaut d'une commande d'initialisation.
     #[test]
     fn initialisation_refuse_d_ecraser_sans_rotation_explicite() {
-        assert!(refuse_ecrasement(true, false).is_err());
-        assert!(refuse_ecrasement(true, true).is_ok(), "--rotate assume");
-        assert!(refuse_ecrasement(false, false).is_ok(), "premier boot");
+        assert!(reject_overwrite(true, false).is_err());
+        assert!(reject_overwrite(true, true).is_ok(), "--rotate assume");
+        assert!(reject_overwrite(false, false).is_ok(), "premier boot");
     }
 
     #[test]

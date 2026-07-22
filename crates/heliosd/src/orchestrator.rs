@@ -694,7 +694,7 @@ async fn do_connect(
     Ok(())
 }
 
-fn handshake_frais(peer: &helios_wireguard::PeerStatus) -> bool {
+fn handshake_is_fresh(peer: &helios_wireguard::PeerStatus) -> bool {
     peer.last_handshake
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age < HANDSHAKE_STALE_AFTER)
@@ -728,32 +728,32 @@ fn handshake_frais(peer: &helios_wireguard::PeerStatus) -> bool {
 /// sans rien remonter à l'espace utilisateur. `wg` ne liste que les pairs
 /// configurés. Ce qui débloquerait : une règle `log` nftables sur le port
 /// d'écoute, au prix d'un journal bruyant sur une gateway exposée.
-async fn journaliser_les_pairs(
+async fn log_peer_transitions(
     peers: &[helios_wireguard::PeerStatus],
     shared_network: &Arc<RwLock<NetworkConfig>>,
-    connus: &mut std::collections::HashMap<Vec<u8>, (bool, Option<String>)>,
+    seen: &mut std::collections::HashMap<Vec<u8>, (bool, Option<String>)>,
     event_tx: &broadcast::Sender<HeliosEvent>,
 ) {
     let network = shared_network.read().await;
     for peer in peers {
-        let frais = handshake_frais(peer);
-        let observe = (frais, peer.endpoint.clone());
-        let precedent = connus.insert(peer.public_key.clone(), observe.clone());
-        if precedent.as_ref() == Some(&observe) {
+        let fresh = handshake_is_fresh(peer);
+        let observed = (fresh, peer.endpoint.clone());
+        let previous = seen.insert(peer.public_key.clone(), observed.clone());
+        if previous.as_ref() == Some(&observed) {
             continue;
         }
 
-        let cle = peer.public_key_b64();
-        let declare = network.peers.iter().find(|p| p.public_key == cle);
-        let nom = declare.map_or("pair non déclaré", |p| p.name.as_str());
+        let key = peer.public_key_b64();
+        let declared = network.peers.iter().find(|p| p.public_key == key);
+        let name = declared.map_or("pair non déclaré", |p| p.name.as_str());
         let endpoint = peer.endpoint.as_deref().unwrap_or("endpoint inconnu");
 
-        match (precedent, frais) {
+        match (previous, fresh) {
             (Some((true, _)), false) => {
                 emit_log(
                     event_tx,
                     "info",
-                    &format!("pair « {nom} » inactif — plus de handshake frais"),
+                    &format!("pair « {name} » inactif — plus de handshake frais"),
                 );
             }
             // Un pair jamais vu frais qui reste périmé n'a rien à annoncer :
@@ -764,13 +764,13 @@ async fn journaliser_les_pairs(
                     event_tx,
                     "info",
                     &format!(
-                        "pair « {nom} » reconnecté depuis {endpoint} — nouvelle session, \
+                        "pair « {name} » reconnecté depuis {endpoint} — nouvelle session, \
                          l'ancienne n'est pas reprise"
                     ),
                 );
             }
             (_, true) => {
-                let protection = match declare.map(|p| p.preshared_key.is_some()) {
+                let protection = match declared.map(|p| p.preshared_key.is_some()) {
                     Some(true) => "post-quantique (PSK ML-KEM posé)",
                     // Sans PSK, le tunnel est monté sur Curve25519 seul : c'est
                     // l'étape 1 de la cinématique ADR-001, pas un défaut. Le dire
@@ -781,7 +781,7 @@ async fn journaliser_les_pairs(
                     event_tx,
                     "info",
                     &format!(
-                        "pair « {nom} » connecté depuis {endpoint} — VIP {} — protection {protection}",
+                        "pair « {name} » connecté depuis {endpoint} — VIP {} — protection {protection}",
                         peer.allowed_ips.join(", ")
                     ),
                 );
@@ -807,7 +807,7 @@ fn spawn_handshake_poller(
         // mémoire, on ne peut pas distinguer « ce pair vient de se connecter »
         // de « ce pair est connecté depuis une heure », et on journaliserait
         // toutes les dix secondes.
-        let mut connus: std::collections::HashMap<Vec<u8>, (bool, Option<String>)> =
+        let mut seen: std::collections::HashMap<Vec<u8>, (bool, Option<String>)> =
             std::collections::HashMap::new();
         loop {
             ticker.tick().await;
@@ -822,9 +822,9 @@ fn spawn_handshake_poller(
                 }
             };
 
-            journaliser_les_pairs(&peers, &shared_network, &mut connus, &event_tx).await;
+            log_peer_transitions(&peers, &shared_network, &mut seen, &event_tx).await;
 
-            let fresh = peers.iter().any(handshake_frais);
+            let fresh = peers.iter().any(handshake_is_fresh);
             let current = *shared.read().await;
             let next = match (current, fresh) {
                 (TunnelState::Connecting, true) => TunnelState::Up,
@@ -1122,7 +1122,7 @@ mod tests {
         );
     }
 
-    fn pair_connecte(endpoint: &str) -> helios_wireguard::PeerStatus {
+    fn connected_peer(endpoint: &str) -> helios_wireguard::PeerStatus {
         helios_wireguard::PeerStatus {
             public_key: base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
@@ -1143,7 +1143,7 @@ mod tests {
     async fn la_connexion_d_un_pair_est_journalisee_une_seule_fois() {
         let network = Arc::new(RwLock::new(configured_network()));
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut connus = std::collections::HashMap::new();
+        let mut seen = std::collections::HashMap::new();
         let peers = vec![helios_wireguard::PeerStatus {
             public_key: base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
@@ -1157,7 +1157,7 @@ mod tests {
             tx_bytes: 0,
         }];
 
-        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
         let message = match events.try_recv() {
             Ok(HeliosEvent::Log { message, .. }) => message,
             autre => panic!("événement inattendu : {autre:?}"),
@@ -1171,7 +1171,7 @@ mod tests {
 
         // Deuxième tour, même état : rien de neuf à dire. Sans cette
         // déduplication, le journal répéterait la ligne toutes les dix secondes.
-        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
         assert!(
             events.try_recv().is_err(),
             "connexion journalisée deux fois"
@@ -1186,10 +1186,10 @@ mod tests {
     async fn une_reconnexion_pendant_la_fenetre_de_peremption_est_visible() {
         let network = Arc::new(RwLock::new(configured_network()));
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut connus = std::collections::HashMap::new();
+        let mut seen = std::collections::HashMap::new();
 
-        let mut peers = vec![pair_connecte("192.168.1.41:58466")];
-        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        let mut peers = vec![connected_peer("192.168.1.41:58466")];
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
         assert!(matches!(events.try_recv(), Ok(HeliosEvent::Log { .. })));
 
         // Même pair, toujours frais, nouveau port source : le client Windows a
@@ -1197,7 +1197,7 @@ mod tests {
         // session, pas la reprise de l'ancienne.
         peers[0].endpoint = Some("192.168.1.41:56776".into());
         peers[0].last_handshake = Some(std::time::SystemTime::now());
-        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
 
         let message = match events.try_recv() {
             Ok(HeliosEvent::Log { message, .. }) => message,
@@ -1214,7 +1214,7 @@ mod tests {
     async fn une_session_sans_psk_est_annoncee_comme_classique() {
         let network = Arc::new(RwLock::new(network_sans_psk()));
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut connus = std::collections::HashMap::new();
+        let mut seen = std::collections::HashMap::new();
         let peers = vec![helios_wireguard::PeerStatus {
             public_key: base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
@@ -1228,7 +1228,7 @@ mod tests {
             tx_bytes: 0,
         }];
 
-        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
         let message = match events.try_recv() {
             Ok(HeliosEvent::Log { message, .. }) => message,
             autre => panic!("événement inattendu : {autre:?}"),

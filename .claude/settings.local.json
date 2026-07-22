@@ -173,7 +173,8 @@
       "Bash(timeout 30 ssh -o BatchMode=yes christophe@192.168.1.44 'sha256sum ~/helios-0.1.0-*.tar.gz; echo \"--- ce qui tourne encore\"; pgrep -a heliosd || echo \"aucun heliosd en cours\"')",
       "Bash(chmod +x scripts/deploy.sh)",
       "Bash(bash -n scripts/deploy.sh)",
-      "Bash(./scripts/deploy.sh --help)"
+      "Bash(./scripts/deploy.sh --help)",
+      "Bash([ -f $M/MEMORY.md ])"
     ]
   }
 }

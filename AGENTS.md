@@ -127,8 +127,13 @@ npm run dev --prefix web
 ```
 
 `scripts/regression.sh` est la référence : fmt, Clippy/tests toutes features,
-audits Cargo/npm, Vitest et builds frontend. Commentaires, docs et logs sont en
-français.
+audits Cargo/npm, Vitest et builds frontend.
+
+**Langue.** Le code est en **anglais** : noms de fonctions, de types, de champs
+et de variables (`render`, `assign_vip`, `verify_manifest`). Les commentaires,
+les doc-comments, les messages de journal et la documentation sont en
+**français**. Les noms de tests suivent le français, comme la documentation
+qu'ils constituent.
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

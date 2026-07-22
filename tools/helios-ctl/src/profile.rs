@@ -101,7 +101,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
             // Un profil complet porte une clé privée : il naît en 0600, et ne
             // remplace jamais un fichier existant en silence.
             crate::files::write_new(path, json.as_bytes(), private_key.is_some())?;
-            rapport(path, &options, &public_key);
+            report(path, &options, &public_key);
         }
         None => println!("{json}"),
     }
@@ -121,12 +121,9 @@ fn resolve_keys(options: &EmitOptions) -> Result<(String, Option<String>)> {
             Ok((public_key, None))
         }
         (None, true) => {
-            let paire = aether::wg::generate_keypair()
+            let pair = aether::wg::generate_keypair()
                 .map_err(|e| anyhow::anyhow!("génération de la paire client : {e}"))?;
-            Ok((
-                paire.public_key,
-                Some(paire.private_key.expose().to_string()),
-            ))
+            Ok((pair.public_key, Some(pair.private_key.expose().to_string())))
         }
         (None, false) => bail!(
             "indiquer --public-key <clé publique du client> (mode recommandé : le secret du \
@@ -150,24 +147,24 @@ async fn admit_or_reuse(
         Ok(peer) => Ok(peer.address),
         Err(error) => {
             let view = api::network(client, base).await?;
-            let existant = view
+            let existing = view
                 .peers
                 .iter()
                 .find(|peer| peer.name.trim() == options.name.trim())
                 .ok_or(error)?;
-            if existant.public_key.trim() != public_key {
+            if existing.public_key.trim() != public_key {
                 bail!(
                     "un pair « {} » est déjà admis avec une autre clé publique. Le révoquer \
                      d'abord (`helios-ctl peer revoke --name {}`) si l'ancienne clé est \
                      bien perdue : le client qui la détient tombera au prochain handshake.",
-                    existant.name,
-                    existant.name
+                    existing.name,
+                    existing.name
                 );
             }
             eprintln!(
                 "  \x1b[2mpair déjà admis avec la même clé — profil réémis sur son adresse\x1b[0m"
             );
-            Ok(existant.address.clone())
+            Ok(existing.address.clone())
         }
     }
 }
@@ -183,7 +180,7 @@ fn heliosd_url(wg_address: &str) -> Option<String> {
     Some(format!("http://{host}:{}", aether::API_PORT))
 }
 
-fn rapport(path: &Path, options: &EmitOptions, public_key: &str) {
+fn report(path: &Path, options: &EmitOptions, public_key: &str) {
     println!(
         "{} profil « {} » écrit dans {}",
         crate::ok(),
@@ -221,13 +218,13 @@ mod tests {
 
     #[test]
     fn le_mode_invitation_ne_produit_aucune_cle_privee() {
-        let paire = aether::wg::generate_keypair().unwrap();
+        let pair = aether::wg::generate_keypair().unwrap();
         let (public_key, private_key) = resolve_keys(&EmitOptions {
-            public_key: Some(paire.public_key.clone()),
+            public_key: Some(pair.public_key.clone()),
             ..options()
         })
         .expect("mode invitation");
-        assert_eq!(public_key, paire.public_key);
+        assert_eq!(public_key, pair.public_key);
         assert!(
             private_key.is_none(),
             "le secret du client ne doit pas être fabriqué par l'opérateur"
