@@ -157,7 +157,9 @@
       "Bash(echo \"LAB_EXIT=$?\")",
       "Bash(curl --fail --location --silent --show-error https://download.wireguard.com/wireguard-nt/wireguard-nt-1.1.zip --output wgnt.zip)",
       "Bash(unzip -l wgnt.zip)",
-      "Bash(unzip -o -q wgnt.zip -d wgnt)"
+      "Bash(unzip -o -q wgnt.zip -d wgnt)",
+      "Bash(ldd --version)",
+      "Bash(rustc -vV)"
     ]
   }
 }

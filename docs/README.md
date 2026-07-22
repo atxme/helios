@@ -38,6 +38,8 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 
 - [testing/TESTING.md](testing/TESTING.md) — stratégie de test, matrice
   automatisée, référence `scripts/regression.sh`.
+- [testing/PREMIER-DEPLOIEMENT.md](testing/PREMIER-DEPLOIEMENT.md) — marche à
+  suivre pour installer une vraie gateway et y connecter un client Windows.
 - [testing/MANUAL-TESTING.md](testing/MANUAL-TESTING.md) — recette
   interactive pour les binaires et les IHM.
 - [testing/WSL2-DEV.md](testing/WSL2-DEV.md) — ce que WSL2 prouve et ne prouve
