@@ -29,6 +29,12 @@ pub struct NetworkConfig {
     /// CIDRs ou IPs autorisés en SSH d'administration, même kill-switch engagé.
     #[serde(default)]
     pub allow_ssh_from: Vec<String>,
+    /// Autorise DHCP (UDP 67/68) sur l'interface WAN, kill-switch engagé.
+    ///
+    /// À activer quand l'adresse du WAN vient d'un bail. Voir
+    /// [`crate::FirewallPolicy::allow_dhcp_on_wan`] pour ce que coûte l'oubli.
+    #[serde(default)]
+    pub allow_dhcp_on_wan: bool,
     /// Interface réseau exclusive pour l'accès à l'administration.
     /// Doit être l'interface WireGuard (`wg_iface`) : l'API vit derrière le tunnel.
     #[serde(default)]
@@ -238,6 +244,7 @@ impl NetworkConfig {
             wg_listen_port: self.wireguard_ready().then_some(self.wg_listen_port),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
+            allow_dhcp_on_wan: self.allow_dhcp_on_wan,
             admin_port,
             admin_iface: self.admin_iface.clone(),
             split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),

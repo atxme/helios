@@ -44,6 +44,11 @@ pub struct NetworkConfigView {
     pub wan_iface: String,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Exposé délibérément : ce n'est pas un secret, et une vue qui l'omettrait
+    /// ferait retomber le champ à `false` au premier rechargement de
+    /// configuration depuis l'IHM — la gateway perdrait son bail des heures
+    /// plus tard, sans que rien ne relie la panne au réglage.
+    pub allow_dhcp_on_wan: bool,
     pub admin_iface: Option<String>,
     pub split_tunnel_cidrs: Vec<String>,
     pub wg_iface: String,
@@ -75,6 +80,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             wan_iface: config.wan_iface.clone(),
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
+            allow_dhcp_on_wan: config.allow_dhcp_on_wan,
             admin_iface: config.admin_iface.clone(),
             split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
             wg_iface: config.wg_iface.clone(),

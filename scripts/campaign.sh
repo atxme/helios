@@ -30,6 +30,18 @@ nettoyer() {
 }
 trap nettoyer EXIT
 
+# Un daemon résiduel — typiquement celui que `lab.sh --keep` laisse vivant —
+# tiendrait le port et la campagne interrogerait *sa* configuration au lieu de
+# celle qu'elle vient d'écrire. Les scénarios échoueraient alors sur « pair
+# inconnu », un message qui n'a aucun rapport avec la cause.
+if curl -sf http://127.0.0.1:8080/api/status > /dev/null 2>&1; then
+    echo "Refus : un heliosd écoute déjà sur 127.0.0.1:8080." >&2
+    echo "La campagne interrogerait ce daemon-là, pas le sien." >&2
+    echo "L'arrêter d'abord (banc laissé vivant par 'lab.sh --keep' ?) :" >&2
+    echo "  pkill -f 'heliosd run'" >&2
+    exit 1
+fi
+
 echo "==> Construction"
 cargo run --quiet -p helios-publisher -- keygen \
     --key-epoch 4294967294 --output-dir "$TMP/publisher"

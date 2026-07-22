@@ -159,7 +159,11 @@
       "Bash(unzip -l wgnt.zip)",
       "Bash(unzip -o -q wgnt.zip -d wgnt)",
       "Bash(ldd --version)",
-      "Bash(rustc -vV)"
+      "Bash(rustc -vV)",
+      "Bash(git stash *)",
+      "Bash(echo \"SANS_MES_CHANGEMENTS_EXIT=$?\")",
+      "Bash(curl -s http://127.0.0.1:8080/api/status)",
+      "Bash(kill 51779)"
     ]
   }
 }

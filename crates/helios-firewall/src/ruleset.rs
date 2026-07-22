@@ -256,6 +256,39 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
+    // ── Renouvellement du bail DHCP sur le WAN ───────────────────────────────
+    // Scopé à l'interface WAN et aux deux ports du protocole. Le trafic est
+    // local au lien : le client émet vers 67, le serveur répond vers 68. La
+    // réponse n'est pas laissée à `ct state established` — un DHCPDISCOVER part
+    // en diffusion et la réponse ne se rattache pas toujours à un flux suivi.
+    if policy.allow_dhcp_on_wan {
+        rules.push(
+            Rule::new(
+                Output,
+                vec![
+                    Match::OutIface(wan.clone()),
+                    Match::DestPort {
+                        port: 67,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note("DHCP : sans renouvellement, la gateway perd son adresse WAN"),
+        );
+        rules.push(Rule::new(
+            Input,
+            vec![
+                Match::InIface(wan.clone()),
+                Match::DestPort {
+                    port: 68,
+                    proto: L4::Udp,
+                },
+            ],
+            Verdict::Accept,
+        ));
+    }
+
     // ── SSH d'administration, quel que soit l'état du tunnel ─────────────────
     for src in &policy.allow_ssh_from {
         rules.push(Rule::new(
@@ -360,6 +393,7 @@ mod tests {
             wg_listen_port: Some(51820),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
+            allow_dhcp_on_wan: false,
             admin_port: None,
             admin_iface: None,
             split_tunnel_cidrs: vec![],
@@ -393,6 +427,54 @@ mod tests {
                     .iter()
                     .any(|r| r == "iifname \"eth0\" udp dport 51820 accept"),
                 "état {st:?} : le port d'écoute WireGuard doit rester joignable"
+            );
+        }
+    }
+
+    /// Le défaut reste fermé : une gateway a normalement une adresse fixe, et
+    /// ouvrir DHCP sans raison élargirait le fail-closed pour rien.
+    #[test]
+    fn dhcp_est_ferme_par_defaut() {
+        let rs = render(&policy(), TunnelState::Down);
+        for kind in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, kind)
+                    .iter()
+                    .any(|r| r.contains("dport 67") || r.contains("dport 68")),
+                "DHCP ouvert sans que la configuration le demande"
+            );
+        }
+    }
+
+    /// Sans ces deux règles, une gateway adressée par bail perd son adresse au
+    /// premier renouvellement — donc son tunnel et son administration —,
+    /// plusieurs heures après un démarrage qui semblait réussi.
+    #[test]
+    fn dhcp_autorise_reste_scope_au_wan() {
+        let mut p = policy();
+        p.allow_dhcp_on_wan = true;
+
+        for st in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let rs = render(&p, st);
+            assert!(
+                text(&rs, ChainKind::Output)
+                    .iter()
+                    .any(|r| r.starts_with("oifname \"eth0\" udp dport 67 accept")),
+                "état {st:?} : la demande de renouvellement doit pouvoir sortir"
+            );
+            assert!(
+                text(&rs, ChainKind::Input)
+                    .iter()
+                    .any(|r| r.starts_with("iifname \"eth0\" udp dport 68 accept")),
+                "état {st:?} : la réponse du serveur doit pouvoir entrer"
+            );
+            // L'ouverture ne doit exister que sur le WAN : sur le LAN elle
+            // laisserait un client parler DHCP à travers la gateway.
+            assert!(
+                !text(&rs, ChainKind::Forward)
+                    .iter()
+                    .any(|r| r.contains("dport 67") || r.contains("dport 68")),
+                "état {st:?} : DHCP ne doit pas traverser la gateway"
             );
         }
     }

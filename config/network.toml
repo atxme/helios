@@ -72,6 +72,19 @@ admin_iface = "helios0"
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
 # allow_ssh_from = ["10.0.0.0/8"]
 
+# ── Adresse du WAN obtenue par bail DHCP ─────────────────────────────────────
+# Le kill-switch n'ouvre pas DHCP par défaut : une gateway a normalement une
+# adresse fixe, et l'ouvrir sans raison élargirait le fail-closed pour rien.
+#
+# Mais une gateway placée derrière une box tient souvent son adresse d'un bail.
+# Sans cette ligne, elle la perd au premier renouvellement — donc son tunnel ET
+# son administration à la fois, plusieurs heures après un démarrage qui semblait
+# réussi. Vérifier avec :  ip -4 addr show <wan_iface> | grep dynamic
+#
+# L'ouverture reste scopée : UDP 67 en sortie et 68 en entrée, sur la seule
+# interface WAN, et jamais en traversée.
+# allow_dhcp_on_wan = true
+
 # ── Pairs autorisés ──────────────────────────────────────────────────────────
 # Ne plus éditer cette liste à la main : l'admission dérive la VIP de la clé
 # publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.

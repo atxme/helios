@@ -22,7 +22,7 @@ compilation/tests sans exécuter d’effet réel.
 | API | routeur complet, absence de secrets, JSON obligatoire pour les mutations, absence de CORS permissif |
 | Tauri | commandes IPC, CSP, prototypes figés et capability minimale |
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
-| Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application |
+| Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application, ouverture DHCP scopée au WAN et fermée par défaut |
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
 | Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
 | Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |

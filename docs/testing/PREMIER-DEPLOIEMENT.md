@@ -22,11 +22,11 @@ Deux protections, à mettre en place **avant** le premier démarrage :
    nftables ne sont pas persistées : si vous perdez l'accès, un redémarrage de
    la machine restaure tout, puisque le daemon ne se relancera pas.
 
-3. **Une adresse IP statique sur l'interface WAN.** Le ruleset n'ouvre pas
-   DHCP : une machine qui tient son adresse d'un bail la perdra au premier
-   renouvellement, kill-switch engagé. `allow_ssh_from` ne sauve rien quand la
-   machine n'a plus d'adresse. Le cas normal d'une gateway est une IP fixe ;
-   pour une machine configurée en DHCP, la figer avant de commencer.
+3. **Le bail DHCP, si l'adresse du WAN en vient une.** Kill-switch engagé, le
+   renouvellement est bloqué par défaut et la machine perd son adresse — donc
+   son tunnel et son administration à la fois. `allow_ssh_from` ne sauve rien
+   quand il n'y a plus d'adresse à joindre. Soit figer l'adresse, soit poser
+   `allow_dhcp_on_wan = true`.
 
 S'assurer d'avoir un moyen de redémarrer la machine — bouton, console, panneau
 d'hébergeur — avant de commencer.
@@ -149,23 +149,29 @@ admin_iface = "helios0"
 **`allow_ssh_from` n'est pas optionnel ici.** Sans lui, le premier démarrage
 vous coupe l'accès et il faudra redémarrer la machine.
 
-### Figer l'adresse de la gateway
-
-Vérifier d'abord si l'adresse vient d'un bail :
+### Si l'adresse du WAN vient d'un bail
 
 ```sh
-ip -4 addr show <interface> | grep -q dynamic && echo "DHCP — à figer"
+ip -4 addr show <interface> | grep -q dynamic && echo "DHCP"
 ```
 
-Le kill-switch n'ouvre ni le port 67/68 ni le port 53 : c'est cohérent pour une
-gateway, qui a normalement une adresse fixe, mais une machine en DHCP perdra son
-adresse au premier renouvellement — soit typiquement quelques heures après le
-démarrage, donc bien après que le test a semblé réussir.
+Le kill-switch n'ouvre pas DHCP par défaut : c'est cohérent pour une gateway,
+qui a normalement une adresse fixe. Une machine en DHCP, elle, perd son adresse
+au premier renouvellement — typiquement quelques heures après le démarrage, donc
+bien après que le test a semblé réussir.
 
-Fixer l'adresse au niveau du système (`netplan`, `systemd-networkd` ou
-NetworkManager selon la distribution), ou à défaut poser une réservation sur le
-routeur **et** configurer la même adresse en statique sur la machine. Une
-réservation seule ne suffit pas : le client continue de demander un bail.
+Deux réponses, au choix :
+
+```toml
+allow_dhcp_on_wan = true
+```
+
+L'ouverture est scopée : UDP 67 en sortie et 68 en entrée, sur la seule
+interface WAN, jamais en traversée.
+
+Ou figer l'adresse au niveau du système (`netplan`, `systemd-networkd` ou
+NetworkManager selon la distribution). Une réservation sur le routeur ne suffit
+pas : le client continuerait à demander un bail.
 
 ## Étape 5 — Identité scellée
 

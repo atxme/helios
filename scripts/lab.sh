@@ -43,6 +43,16 @@ nettoyer() {
 }
 trap nettoyer EXIT
 
+# Un banc déjà monté tiendrait le port : le nouveau daemon ne pourrait pas se
+# lier et toutes les commandes suivantes s'adresseraient à l'ancien, avec sa
+# configuration et ses pairs. Mieux vaut refuser que de piloter le mauvais.
+if curl -sf "$URL/api/status" > /dev/null 2>&1; then
+    echo "Refus : un heliosd écoute déjà sur ${URL#http://}." >&2
+    echo "Un banc précédent est sans doute resté vivant (--keep) :" >&2
+    echo "  pkill -f 'heliosd run'" >&2
+    exit 1
+fi
+
 echo "==> Construction"
 cargo build --quiet -p heliosd -p helios-ctl
 
