@@ -49,7 +49,17 @@ pub async fn require_peer(
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        None => {
+            // Un refus est la seule trace exploitable d'une tentative d'accès :
+            // le module noyau WireGuard, lui, rejette les handshakes inconnus
+            // sans rien remonter. Sans cette ligne, l'opérateur ne verrait rien.
+            tracing::warn!(
+                source = ?source_of(&request),
+                uri = %request.uri(),
+                "accès refusé : adresse source non rattachée à un pair admis"
+            );
+            StatusCode::UNAUTHORIZED.into_response()
+        }
     }
 }
 
@@ -72,8 +82,23 @@ pub async fn require_admin(
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
-        Some(_) => StatusCode::FORBIDDEN.into_response(),
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        Some(caller) => {
+            tracing::warn!(
+                pair = %caller.name,
+                source = %caller.source,
+                uri = %request.uri(),
+                "mutation refusée : pair admis mais non administrateur"
+            );
+            StatusCode::FORBIDDEN.into_response()
+        }
+        None => {
+            tracing::warn!(
+                source = ?source_of(&request),
+                uri = %request.uri(),
+                "mutation refusée : adresse source non rattachée à un pair admis"
+            );
+            StatusCode::UNAUTHORIZED.into_response()
+        }
     }
 }
 

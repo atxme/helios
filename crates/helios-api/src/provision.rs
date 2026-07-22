@@ -191,6 +191,10 @@ fn to_http(e: EnrollError) -> (StatusCode, String) {
         EnrollError::Kdf => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };
+    // Un provisioning refusé se voit dans le journal : c'est le seul endroit où
+    // une tentative d'enrôlement laisse une trace, le refus WireGuard d'un pair
+    // inconnu restant invisible depuis l'espace utilisateur.
+    tracing::warn!(status = %code, "provisioning refusé : {e}");
     (code, e.to_string())
 }
 
