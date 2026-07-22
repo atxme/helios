@@ -49,6 +49,9 @@ pub struct NetworkConfigView {
     /// configuration depuis l'IHM — la gateway perdrait son bail des heures
     /// plus tard, sans que rien ne relie la panne au réglage.
     pub allow_dhcp_on_wan: bool,
+    /// Exposé pour la même raison qu'`allow_dhcp_on_wan` : une vue qui
+    /// l'omettrait le remettrait à `false` au premier rechargement depuis l'IHM.
+    pub allow_client_internet: bool,
     pub admin_iface: Option<String>,
     pub split_tunnel_cidrs: Vec<String>,
     pub wg_iface: String,
@@ -81,6 +84,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
+            allow_client_internet: config.allow_client_internet,
             admin_iface: config.admin_iface.clone(),
             split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
             wg_iface: config.wg_iface.clone(),
@@ -439,6 +443,14 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
                 None => lines.push(format!("    {rule}")),
             }
         }
+        lines.push("  }".to_string());
+    }
+    if let Some(out) = &rs.masquerade_out {
+        lines.push("  chain postrouting {".to_string());
+        lines.push("    type nat hook postrouting priority srcnat;".to_string());
+        lines.push(format!(
+            "    oifname \"{out}\" masquerade  # sortie Internet des clients du tunnel"
+        ));
         lines.push("  }".to_string());
     }
     if let Some(mss) = rs.mss_clamp {

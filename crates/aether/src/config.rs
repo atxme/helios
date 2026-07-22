@@ -35,6 +35,14 @@ pub struct NetworkConfig {
     /// [`crate::FirewallPolicy::allow_dhcp_on_wan`] pour ce que coûte l'oubli.
     #[serde(default)]
     pub allow_dhcp_on_wan: bool,
+    /// Route le trafic des clients du tunnel vers Internet (forward + NAT).
+    ///
+    /// Fermé par défaut : une gateway d'accès à des ressources internes n'a
+    /// aucune raison de router Internet, et l'ouvrir élargirait sa surface pour
+    /// rien. Voir [`crate::FirewallPolicy::allow_client_internet`] pour ce que
+    /// cela couvre — et ce que cela ne couvre pas, notamment le DNS.
+    #[serde(default)]
+    pub allow_client_internet: bool,
     /// Interface réseau exclusive pour l'accès à l'administration.
     /// Doit être l'interface WireGuard (`wg_iface`) : l'API vit derrière le tunnel.
     #[serde(default)]
@@ -245,6 +253,8 @@ impl NetworkConfig {
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
+            allow_client_internet: self.allow_client_internet,
+            wg_iface: self.wg_iface.clone(),
             admin_port,
             admin_iface: self.admin_iface.clone(),
             split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),

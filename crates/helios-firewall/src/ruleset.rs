@@ -12,23 +12,30 @@
 //! qu'elle émet dans `output`. Les confondre laisserait passer — ou bloquerait —
 //! le mauvais trafic.
 //!
-//! # Limite connue : un client du tunnel ne sort pas sur Internet
+//! # Sortie Internet des clients du tunnel
 //!
-//! Le `forward` n'ouvre que `lan_ifaces -> wan_iface`, et aucune règle de NAT
-//! n'existe dans ce crate. C'est la forme **site-à-site** : des postes situés
-//! derrière la gateway sortent par le tunnel.
+//! Deux formes coexistent, et elles n'ouvrent pas les mêmes chemins :
 //!
-//! La forme **road-warrior** — un client qui arrive *par* `helios0` et veut
-//! atteindre Internet — n'est pas implémentée. Un tel client joint la gateway
-//! et son API, rien de plus : ses paquets vers l'extérieur tombent sous la
-//! politique `drop`, et n'auraient de toute façon pas d'adresse source
-//! routable faute de masquerade.
+//! * **site-à-site**, toujours actif : `forward` de `lan_ifaces` vers
+//!   `wan_iface`, pour des postes situés *derrière* la gateway ;
+//! * **road-warrior**, derrière `allow_client_internet` : `forward` de
+//!   `wg_iface` vers `wan_iface`, plus un masquerade en `postrouting`, pour un
+//!   client qui arrive *par* le tunnel.
 //!
-//! Ce qui débloquerait : une règle `forward` de `wg_iface` vers `wan_iface`
-//! dans l'état `Up`, une chaîne `postrouting` de NAT — que l'API haut niveau de
-//! `rustables` n'exprime pas encore ici, comme pour le MSS clamping — et une
-//! décision sur le DNS, puisqu'un client tunnelé sans résolveur joignable ne
-//! naviguerait pas davantage. Voir le lot 5 de l'ADR-004.
+//! La seconde est fermée par défaut. Une gateway d'accès à des ressources
+//! internes n'a aucune raison de router Internet, et l'ouvrir élargirait sa
+//! surface sans contrepartie. Les deux ne valent que dans un état où le trafic
+//! est autorisé : le NAT est posé et retiré avec le tunnel, sans quoi le
+//! kill-switch laisserait sortir en clair ce qu'il vient de couper.
+//!
+//! # Limite connue : le DNS n'est pas tunnelé
+//!
+//! Même `allow_client_internet` actif, le client garde son propre résolveur :
+//! ses requêtes DNS sortent hors du tunnel et révèlent les noms qu'il consulte,
+//! alors que le reste de son trafic est protégé. Ce qui débloquerait : un champ
+//! de résolveur dans le document `orion-profile` — que `orion-core` refuse
+//! aujourd'hui, y compris la clé `DNS` d'un fichier `wg-quick` — et le choix
+//! d'un résolveur joignable dans le tunnel. Voir le lot 5 de l'ADR-004.
 
 use std::fmt;
 
@@ -164,6 +171,18 @@ pub struct Ruleset {
     /// (réécriture d'option TCP), pas un verdict de filtrage, et l'API haut
     /// niveau de `rustables` ne l'exprime pas. Voir le backend Netlink.
     pub mss_clamp: Option<u16>,
+    /// Interface de sortie sur laquelle masquer la source du trafic client.
+    ///
+    /// Hors de `rules` pour la même raison que `mss_clamp` : ce n'est pas un
+    /// verdict de filtrage mais une réécriture d'adresse, qui vit dans une
+    /// chaîne d'un autre type (`nat`) et d'un autre hook (`postrouting`).
+    /// Contrairement au MSS clamping, `rustables` sait l'exprimer : le backend
+    /// Netlink l'applique réellement.
+    ///
+    /// `None` hors des états où le trafic est autorisé — le NAT ne doit jamais
+    /// survivre à la chute du tunnel, sinon le kill-switch laisse fuir ce qu'il
+    /// est censé retenir.
+    pub masquerade_out: Option<String>,
 }
 
 impl Ruleset {
@@ -379,6 +398,24 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 Verdict::Accept,
             ));
         }
+
+        // Sortie Internet des clients du tunnel. Le retour est couvert par la
+        // règle `ct state established,related` de la chaîne forward : ouvrir
+        // l'aller suffit, et scoper au seul sens client -> WAN évite d'exposer
+        // le LAN de la gateway aux clients.
+        if policy.allow_client_internet && !policy.wg_iface.is_empty() {
+            rules.push(
+                Rule::new(
+                    Forward,
+                    vec![
+                        Match::InIface(policy.wg_iface.clone()),
+                        Match::OutIface(wan.clone()),
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("sortie Internet des clients du tunnel (masquerade en postrouting)"),
+            );
+        }
     }
 
     // En fail-open, la politique par défaut devient accept hors tunnel (déconseillé).
@@ -395,6 +432,14 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             .traffic_allowed()
             .then_some(policy.mss_clamp)
             .flatten(),
+        // Le NAT suit exactement l'état du tunnel : posé avec lui, retiré avec
+        // lui. Un masquerade qui survivrait à la chute laisserait sortir en
+        // clair ce que le kill-switch vient de couper.
+        masquerade_out: (state.traffic_allowed()
+            && policy.allow_client_internet
+            && !policy.wg_iface.is_empty()
+            && !wan.is_empty())
+        .then(|| wan.clone()),
     }
 }
 
@@ -412,6 +457,8 @@ mod tests {
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
             allow_dhcp_on_wan: false,
+            allow_client_internet: false,
+            wg_iface: "helios0".into(),
             admin_port: None,
             admin_iface: None,
             split_tunnel_cidrs: vec![],
@@ -495,6 +542,70 @@ mod tests {
                 "état {st:?} : DHCP ne doit pas traverser la gateway"
             );
         }
+    }
+
+    /// Fermé par défaut : une gateway d'accès à des ressources internes n'a
+    /// aucune raison de router Internet.
+    #[test]
+    fn la_sortie_internet_des_clients_est_fermee_par_defaut() {
+        let rs = render(&policy(), TunnelState::Up);
+        assert!(rs.masquerade_out.is_none(), "NAT posé sans le demander");
+        assert!(!text(&rs, ChainKind::Forward)
+            .iter()
+            .any(|r| r.contains("iifname \"helios0\"")));
+    }
+
+    /// Le NAT et le forward doivent apparaître **et disparaître** avec le
+    /// tunnel. Un masquerade qui survivrait à la chute laisserait sortir en
+    /// clair ce que le kill-switch vient de couper.
+    #[test]
+    fn la_sortie_internet_suit_exactement_l_etat_du_tunnel() {
+        let mut p = policy();
+        p.allow_client_internet = true;
+
+        let up = render(&p, TunnelState::Up);
+        assert_eq!(up.masquerade_out.as_deref(), Some("eth0"));
+        assert!(
+            text(&up, ChainKind::Forward)
+                .iter()
+                .any(|r| r == "iifname \"helios0\" oifname \"eth0\" accept"),
+            "forward client absent dans l'état Up : {:?}",
+            text(&up, ChainKind::Forward)
+        );
+
+        for st in [
+            TunnelState::Down,
+            TunnelState::Connecting,
+            TunnelState::Failed,
+        ] {
+            let rs = render(&p, st);
+            assert!(
+                rs.masquerade_out.is_none(),
+                "état {st:?} : le NAT ne doit pas exister hors tunnel"
+            );
+            assert!(
+                !text(&rs, ChainKind::Forward)
+                    .iter()
+                    .any(|r| r.contains("iifname \"helios0\"")),
+                "état {st:?} : le trafic client ne doit pas traverser"
+            );
+        }
+    }
+
+    /// L'ouverture est unidirectionnelle : le client sort, mais rien n'entre
+    /// vers le LAN de la gateway. Le retour est couvert par `established`.
+    #[test]
+    fn la_sortie_internet_n_ouvre_pas_le_lan_aux_clients() {
+        let mut p = policy();
+        p.allow_client_internet = true;
+        let rs = render(&p, TunnelState::Up);
+
+        assert!(
+            !text(&rs, ChainKind::Forward)
+                .iter()
+                .any(|r| r.starts_with("iifname \"helios0\" oifname \"eth1\"")),
+            "un client ne doit pas atteindre le LAN de la gateway"
+        );
     }
 
     #[test]

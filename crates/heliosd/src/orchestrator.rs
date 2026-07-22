@@ -639,6 +639,37 @@ async fn install_peer_psk(
     }
 }
 
+/// Chemin du drapeau de routage IPv4 du noyau. Surchargeable pour les tests :
+/// le fichier système est en lecture seule pour un utilisateur ordinaire.
+const IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+
+/// Signale un routage noyau désactivé alors que la config demande de router.
+///
+/// Sans `ip_forward`, le pare-feu autorise le trafic et le noyau le jette
+/// quand même : le tunnel monte, les règles sont correctes, et rien ne passe.
+/// Le symptôme est indiscernable d'un problème de pare-feu, d'où l'avertissement
+/// explicite. On ne l'active pas soi-même — modifier un réglage global du noyau
+/// sans le dire dépasse ce que la configuration a demandé.
+fn warn_if_ip_forward_disabled(event_tx: &broadcast::Sender<HeliosEvent>) {
+    let path = std::env::var("HELIOS_IP_FORWARD_PATH").unwrap_or_else(|_| IP_FORWARD_PATH.into());
+    match std::fs::read_to_string(&path) {
+        Ok(value) if value.trim() == "0" => emit_log(
+            event_tx,
+            "warn",
+            "`allow_client_internet` est actif mais le routage IPv4 du noyau est \
+             désactivé : les paquets des clients seront jetés malgré des règles \
+             correctes. Corriger avec `sysctl -w net.ipv4.ip_forward=1`, et le rendre \
+             permanent dans /etc/sysctl.d/.",
+        ),
+        Ok(_) => {}
+        Err(e) => emit_log(
+            event_tx,
+            "warn",
+            &format!("routage IPv4 du noyau non vérifiable ({path} : {e})"),
+        ),
+    }
+}
+
 async fn do_connect(
     network: &NetworkConfig,
     wg: &dyn WireguardBackend,
@@ -654,6 +685,10 @@ async fn do_connect(
             "Clé privée WireGuard absente de la config réseau — impossible de monter l'interface",
         );
         anyhow::bail!("gateway non configurée : `wg_private_key` vide dans network.toml");
+    }
+
+    if network.allow_client_internet {
+        warn_if_ip_forward_disabled(event_tx);
     }
 
     let (iface, peers) = wg_config(network);

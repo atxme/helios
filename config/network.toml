@@ -85,6 +85,23 @@ admin_iface = "helios0"
 # interface WAN, et jamais en traversée.
 # allow_dhcp_on_wan = true
 
+# ── Sortie Internet des clients du tunnel ────────────────────────────────────
+# Fermé par défaut. Sans cette ligne, un client connecté atteint la gateway et
+# son API, rien de plus : c'est une gateway d'accès à des ressources internes.
+# Avec, il navigue par la gateway — ce qu'on attend d'un VPN grand public.
+#
+# Ce que ça pose : forward `wg_iface -> wan_iface` et masquerade en
+# postrouting, uniquement dans un état où le trafic est autorisé. Le NAT tombe
+# avec le tunnel ; il ne survit jamais au kill-switch.
+#
+# Deux prérequis, sinon le tunnel monte et ne route rien :
+#   sysctl -w net.ipv4.ip_forward=1     # à rendre permanent dans /etc/sysctl.d/
+#   AllowedIPs = 0.0.0.0/0              # côté client, sinon il ne route rien
+#
+# Limite : le DNS n'est PAS tunnelé. Le client garde son résolveur, donc ses
+# requêtes sortent hors du tunnel et révèlent les noms consultés.
+# allow_client_internet = true
+
 # ── Pairs autorisés ──────────────────────────────────────────────────────────
 # Ne plus éditer cette liste à la main : l'admission dérive la VIP de la clé
 # publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.

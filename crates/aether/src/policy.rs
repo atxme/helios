@@ -46,6 +46,16 @@ pub struct FirewallPolicy {
     /// renouvellement — donc son tunnel et son administration à la fois, et
     /// plusieurs heures après un démarrage qui semblait réussi.
     pub allow_dhcp_on_wan: bool,
+    /// Route le trafic des clients du tunnel vers Internet : forward
+    /// `wg_iface -> wan_iface` et masquerade, **uniquement** dans un état où le
+    /// trafic est autorisé.
+    ///
+    /// Fermé par défaut. Ce que cela ne couvre pas : le DNS. Le client garde
+    /// son résolveur, donc ses requêtes sortent hors du tunnel — un profil
+    /// Orion ne sait pas encore pousser de résolveur.
+    pub allow_client_internet: bool,
+    /// Interface WireGuard, source du trafic client à router.
+    pub wg_iface: String,
     /// Port TCP de l'interface d'administration REST/WS.
     pub admin_port: Option<u16>,
     /// Interface réseau exclusive pour l'accès à l'administration (ex. `helios0`).

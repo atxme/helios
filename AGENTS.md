@@ -18,9 +18,9 @@ le plan de données **avant** de l’annoncer au client, et refuse la demande si
 la pose échoue. Trois limites restent explicites : la VIP dérivée par l’IPAM
 n’est pas réconciliée avec l’adresse déclarée en config (chaque bout garde la
 sienne, l’écart est journalisé) ; le fichier de récupération signé est bloqué
-jusqu’au choix du compteur anti-rejeu fichier ou NV TPM ; un client du tunnel
-**ne sort pas sur Internet** — ni forward `wg_iface -> wan_iface`, ni NAT (voir
-le doc-comment de `helios-firewall::ruleset` et le lot 5).
+jusqu’au choix du compteur anti-rejeu fichier ou NV TPM ; le **DNS d’un client
+n’est pas tunnelé**, même `allow_client_internet` actif — ses requêtes sortent
+hors du tunnel (voir le doc-comment de `helios-firewall::ruleset`).
 
 L’outillage d’exploitation existe (ADR-004, lot 1) : `heliosd init-identity`
 crée l’identité WireGuard scellée sans jamais l’écrire en clair, `heliosd peer`
@@ -44,7 +44,9 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
 - Hors `--dev`, un backend noyau absent est une erreur de démarrage ; aucun
   repli implicite vers un backend simulé.
 - Netlink : traduire tout le ruleset puis envoyer une transaction atomique ; ne
-  jamais appliquer règle par règle.
+  jamais appliquer règle par règle. Le NAT entre dans la **même** transaction
+  que le filtrage : un masquerade qui survivrait au kill-switch laisserait
+  sortir en clair ce qu’il vient de couper.
 - Orion : lire le doc-comment de `orion-core/src/backend/mod.rs` avant toute
   modification. L’adaptateur reste monté sur échec et `down()` n’est appelé que
   sur déconnexion explicite.

@@ -41,8 +41,8 @@ use std::str::FromStr;
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    Batch, Chain, ChainPolicy, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule as NfRule,
-    Table,
+    expr::Masquerade, Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol,
+    ProtocolFamily, Rule as NfRule, Table,
 };
 use tracing::{info, warn};
 
@@ -203,6 +203,31 @@ impl NetlinkBackend {
                     nf.add_to_batch(&mut batch);
                 }
             }
+        }
+
+        // ── Masquerade des clients du tunnel ─────────────────────────────────
+        // Chaîne d'un autre type (`nat`) et d'un autre hook (`postrouting`), donc
+        // hors de la boucle ci-dessus. Elle vit dans la **même** transaction :
+        // le NAT et le filtrage doivent apparaître et disparaître ensemble, sinon
+        // il existe un instant où l'un protège sans l'autre.
+        //
+        // Priorité 100 (`NF_IP_PRI_NAT_SRC`) : c'est la place attendue d'un
+        // source-NAT, après le filtrage.
+        if let Some(out_iface) = &rs.masquerade_out {
+            let chain = Chain::new(&table)
+                .with_name("postrouting")
+                .with_hook(Hook::new(HookClass::PostRouting, 100))
+                .with_type(ChainType::Nat)
+                // Pas de politique par défaut sur une chaîne NAT : elle ne rend
+                // pas de verdict de filtrage, elle réécrit ou laisse passer.
+                .add_to_batch(&mut batch);
+
+            NfRule::new(&chain)
+                .map_err(Self::err)?
+                .oiface(out_iface)
+                .map_err(Self::err)?
+                .with_expr(Masquerade::default())
+                .add_to_batch(&mut batch);
         }
 
         Ok(batch)
