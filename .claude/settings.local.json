@@ -163,7 +163,12 @@
       "Bash(git stash *)",
       "Bash(echo \"SANS_MES_CHANGEMENTS_EXIT=$?\")",
       "Bash(curl -s http://127.0.0.1:8080/api/status)",
-      "Bash(kill 51779)"
+      "Bash(kill 51779)",
+      "Bash(timeout 25 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new christophe@192.168.1.44 ' *)",
+      "Bash(timeout 120 scp -o BatchMode=yes target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu.tar.gz christophe@192.168.1.44:~/)",
+      "Bash(timeout 30 ssh -o BatchMode=yes christophe@192.168.1.44 'ls -lh ~/helios-0.1.0-*.tar.gz && sha256sum ~/helios-0.1.0-*.tar.gz')",
+      "Bash(tee /tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/client.env)",
+      "Bash(command -v b3sum)"
     ]
   }
 }

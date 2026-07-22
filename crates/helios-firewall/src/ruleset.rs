@@ -11,6 +11,24 @@
 //! `input`, le trafic du LAN qui la traverse dans `forward`, et le trafic
 //! qu'elle émet dans `output`. Les confondre laisserait passer — ou bloquerait —
 //! le mauvais trafic.
+//!
+//! # Limite connue : un client du tunnel ne sort pas sur Internet
+//!
+//! Le `forward` n'ouvre que `lan_ifaces -> wan_iface`, et aucune règle de NAT
+//! n'existe dans ce crate. C'est la forme **site-à-site** : des postes situés
+//! derrière la gateway sortent par le tunnel.
+//!
+//! La forme **road-warrior** — un client qui arrive *par* `helios0` et veut
+//! atteindre Internet — n'est pas implémentée. Un tel client joint la gateway
+//! et son API, rien de plus : ses paquets vers l'extérieur tombent sous la
+//! politique `drop`, et n'auraient de toute façon pas d'adresse source
+//! routable faute de masquerade.
+//!
+//! Ce qui débloquerait : une règle `forward` de `wg_iface` vers `wan_iface`
+//! dans l'état `Up`, une chaîne `postrouting` de NAT — que l'API haut niveau de
+//! `rustables` n'exprime pas encore ici, comme pour le MSS clamping — et une
+//! décision sur le DNS, puisqu'un client tunnelé sans résolveur joignable ne
+//! naviguerait pas davantage. Voir le lot 5 de l'ADR-004.
 
 use std::fmt;
 

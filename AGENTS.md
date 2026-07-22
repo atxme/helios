@@ -15,10 +15,12 @@ les ADR acceptés font foi.
 Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Le PSK
 post-quantique est négocié et posé de bout en bout : la gateway l’installe sur
 le plan de données **avant** de l’annoncer au client, et refuse la demande si
-la pose échoue. Deux limites restent explicites : la VIP dérivée par l’IPAM
+la pose échoue. Trois limites restent explicites : la VIP dérivée par l’IPAM
 n’est pas réconciliée avec l’adresse déclarée en config (chaque bout garde la
 sienne, l’écart est journalisé) ; le fichier de récupération signé est bloqué
-jusqu’au choix du compteur anti-rejeu fichier ou NV TPM.
+jusqu’au choix du compteur anti-rejeu fichier ou NV TPM ; un client du tunnel
+**ne sort pas sur Internet** — ni forward `wg_iface -> wan_iface`, ni NAT (voir
+le doc-comment de `helios-firewall::ruleset` et le lot 5).
 
 L’outillage d’exploitation existe (ADR-004, lot 1) : `heliosd init-identity`
 crée l’identité WireGuard scellée sans jamais l’écrire en clair, `heliosd peer`
