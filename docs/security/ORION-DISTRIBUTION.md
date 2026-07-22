@@ -68,6 +68,35 @@ sans jeton temporel n'est pas une release : après expiration du certificat,
 Windows ne pourrait plus établir que le binaire avait été signé pendant sa
 période de validité.
 
+## Fabrication en CI, signature hors ligne
+
+Personne n'installe de chaîne de compilation pour utiliser Orion : la CI
+fabrique l'installateur, et l'utilisateur reçoit un MSI. Le job `orion-windows`
+de `release.yml` tourne sur `windows-latest` — le bundling MSI/NSIS et
+l'édition de liens MSVC n'ont pas d'équivalent croisé depuis Linux — et publie
+les installateurs **non signés** avec leurs empreintes.
+
+La CI ne détient aucun certificat, et ne doit pas en détenir. Elle emprunte donc
+un chemin explicite :
+
+```text
+ORION_UNSIGNED_FOR_OFFLINE_SIGNING=1
+```
+
+`sign-orion.ps1` refuse toujours de signer sans certificat ni horodatage ; cette
+variable, comparée strictement à `1`, lui fait sauter la signature en le disant
+bruyamment. Le job renomme ensuite les artefacts en `-unsigned` et **vérifie par
+`Get-AuthenticodeSignature` qu'ils sont réellement nus** : un artefact à moitié
+signé serait le pire des deux états.
+
+La suite se joue sur le poste de signature : télécharger l'artefact, le signer
+avec `windows/sign-orion.ps1` en fournissant les deux variables ci-dessus, puis
+distribuer. C'est la même séparation que pour le bundle gateway, où la CI
+assemble et où `helios-publisher` signe hors ligne.
+
+Une machine Windows de développement reste utile pour itérer, mais elle n'est
+plus le seul chemin vers un installateur.
+
 ## Amorçage circulaire
 
 Le premier installateur ne peut pas installer la racine qui doit déjà le rendre

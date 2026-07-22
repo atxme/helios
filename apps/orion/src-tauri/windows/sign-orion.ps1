@@ -6,6 +6,18 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Chemin non signé, explicite et bruyant. La CI ne détient aucun certificat et
+# ne doit pas en détenir (ADR-004 §7) : elle produit un artefact destiné à la
+# signature hors ligne. La comparaison est stricte — une valeur approchante ne
+# désactive pas la signature — et le job qui emprunte ce chemin renomme les
+# fichiers en `-unsigned`, de sorte qu'aucun d'eux ne puisse être confondu avec
+# une release.
+if ($env:ORION_UNSIGNED_FOR_OFFLINE_SIGNING -eq "1") {
+    Write-Warning "ORION_UNSIGNED_FOR_OFFLINE_SIGNING=1 : $Artifact n'est PAS signé."
+    Write-Warning "Cet artefact doit être signé hors ligne avant toute distribution."
+    exit 0
+}
+
 $thumbprint = $env:ORION_SIGNING_CERT_SHA1
 if ([string]::IsNullOrWhiteSpace($thumbprint)) {
     throw "ORION_SIGNING_CERT_SHA1 doit contenir l'empreinte du certificat Authenticode installé."
