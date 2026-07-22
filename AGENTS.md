@@ -120,6 +120,7 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 bash scripts/regression.sh
 bash scripts/campaign.sh          # campagnes PQ, mise à jour signée et bundle
 bash scripts/lab.sh --keep        # banc complet : gateway + client admis + profil
+./scripts/deploy.sh               # construit, signe, copie et installe sur la gateway
 cargo test --workspace --all-features
 cargo run -p heliosd -- run --dev
 npm run dev --prefix web
@@ -128,6 +129,13 @@ npm run dev --prefix web
 `scripts/regression.sh` est la référence : fmt, Clippy/tests toutes features,
 audits Cargo/npm, Vitest et builds frontend. Commentaires, docs et logs sont en
 français.
+
+`scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
+signer hors ligne, archiver — puis copie et installe. La séparation garde son
+sens pour une release publique ; pour un opérateur qui détient les trois rôles,
+la retaper à chaque fois n'apporte rien. La séquence de release est un
+horodatage : l'anti-rollback exige une valeur strictement croissante, et un
+compteur local se désynchronise dès qu'on déploie depuis une autre machine.
 
 `scripts/lab.sh` monte un banc jetable avec les **mêmes outils qu'en
 production** — `helios-ctl peer add`, `helios-ctl profile emit` — et non un

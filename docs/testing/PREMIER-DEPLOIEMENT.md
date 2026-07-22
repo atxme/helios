@@ -72,6 +72,25 @@ moitié publique, qui sera compilée dans le binaire. Perdre les privées interd
 toute mise à jour signée ultérieure ; les divulguer permet à un tiers d'en
 fabriquer une.
 
+## Le raccourci, une fois l'étape 1 faite
+
+`scripts/deploy.sh` enchaîne les étapes 2 et 3 — construction, signature,
+archivage, copie, vérification d'empreinte et installation privilégiée :
+
+```sh
+./scripts/deploy.sh christophe@192.168.1.44   # première fois : l'hôte est retenu
+./scripts/deploy.sh                           # ensuite
+```
+
+Il demande le mot de passe `sudo` de la gateway au moment de l'installation, et
+rien d'autre. La séquence de release est un horodatage Unix : l'anti-rollback
+exige une valeur strictement croissante, et un compteur tenu à la main se
+désynchronise dès qu'on déploie depuis une autre machine.
+
+Les étapes détaillées ci-dessous restent la référence — pour comprendre ce que
+le script fait, ou pour une release publique où la signature se joue sur un
+poste séparé.
+
 ## Étape 2 — Fabriquer le bundle
 
 ```sh
