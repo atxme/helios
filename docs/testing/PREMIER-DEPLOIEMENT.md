@@ -22,6 +22,12 @@ Deux protections, à mettre en place **avant** le premier démarrage :
    nftables ne sont pas persistées : si vous perdez l'accès, un redémarrage de
    la machine restaure tout, puisque le daemon ne se relancera pas.
 
+3. **Une adresse IP statique sur l'interface WAN.** Le ruleset n'ouvre pas
+   DHCP : une machine qui tient son adresse d'un bail la perdra au premier
+   renouvellement, kill-switch engagé. `allow_ssh_from` ne sauve rien quand la
+   machine n'a plus d'adresse. Le cas normal d'une gateway est une IP fixe ;
+   pour une machine configurée en DHCP, la figer avant de commencer.
+
 S'assurer d'avoir un moyen de redémarrer la machine — bouton, console, panneau
 d'hébergeur — avant de commencer.
 
@@ -143,6 +149,24 @@ admin_iface = "helios0"
 **`allow_ssh_from` n'est pas optionnel ici.** Sans lui, le premier démarrage
 vous coupe l'accès et il faudra redémarrer la machine.
 
+### Figer l'adresse de la gateway
+
+Vérifier d'abord si l'adresse vient d'un bail :
+
+```sh
+ip -4 addr show <interface> | grep -q dynamic && echo "DHCP — à figer"
+```
+
+Le kill-switch n'ouvre ni le port 67/68 ni le port 53 : c'est cohérent pour une
+gateway, qui a normalement une adresse fixe, mais une machine en DHCP perdra son
+adresse au premier renouvellement — soit typiquement quelques heures après le
+démarrage, donc bien après que le test a semblé réussir.
+
+Fixer l'adresse au niveau du système (`netplan`, `systemd-networkd` ou
+NetworkManager selon la distribution), ou à défaut poser une réservation sur le
+routeur **et** configurer la même adresse en statique sur la machine. Une
+réservation seule ne suffit pas : le client continue de demander un bail.
+
 ## Étape 5 — Identité scellée
 
 Avec TPM :
@@ -215,20 +239,38 @@ magasins de certificats** : Windows affichera un avertissement d'éditeur
 inconnu, qu'on accepte. Cela laisse la machine intacte pour un test ultérieur de
 la chaîne de confiance interne, qui ne se teste qu'une fois par machine vierge.
 
-Deux façons d'obtenir l'installateur :
+Aucun MSI n'existe avant qu'on le fabrique. Deux façons :
 
-* **Par la CI** — pousser la branche, définir la variable de dépôt
-  `HELIOS_PUBLISHER_KEYRING` avec le contenu du trousseau **public**, puis
-  déclencher le workflow « Bundle de release ». Télécharger l'artefact
-  `installateurs-orion-windows-non-signes`. Aucun outil à installer sur le PC.
-* **En local** — exige Visual Studio Build Tools (charge « Développement Desktop
-  en C++ ») et Node.js :
+**Par la CI — rien à installer sur le PC.**
 
-  ```powershell
-  $env:ORION_UNSIGNED_FOR_OFFLINE_SIGNING = "1"
-  npm ci --prefix apps\orion
-  npm run tauri build --prefix apps\orion -- --features wireguard
-  ```
+```sh
+git push -u origin <branche>
+git tag v0.1.0-rc1 && git push origin v0.1.0-rc1
+```
+
+Le déclencheur `workflow_dispatch` n'apparaît dans l'onglet Actions que si le
+workflow existe sur la branche **par défaut** du dépôt ; le déclencheur par tag,
+lui, fonctionne depuis n'importe quelle branche. D'où le tag pour un premier
+essai, qui évite de fusionner du travail en cours. Le tag se supprime ensuite
+(`git push origin :v0.1.0-rc1`).
+
+Avant de pousser, définir la variable de dépôt `HELIOS_PUBLISHER_KEYRING`
+(Settings → Secrets and variables → Actions → **Variables**) avec le contenu de
+`publisher-keyring.json` produit à l'étape 1. C'est la moitié **publique** :
+elle n'a rien à faire dans les *secrets*, et le job refuse de démarrer si le
+contenu ressemble à une clé privée.
+
+Récupérer ensuite l'artefact `installateurs-orion-windows-non-signes` dans le
+résumé du workflow.
+
+**En local** — exige Visual Studio Build Tools (charge « Développement Desktop
+en C++ », environ 7 Gio) et Node.js :
+
+```powershell
+$env:ORION_UNSIGNED_FOR_OFFLINE_SIGNING = "1"
+npm ci --prefix apps\orion
+npm run tauri build --prefix apps\orion -- --features wireguard
+```
 
 Installer le MSI, lancer Orion — il demande l'élévation — puis importer
 `poste-windows.json` et connecter. WireGuardNT installe son pilote à la première
@@ -239,6 +281,33 @@ Vérifier des deux côtés que le PSK post-quantique est posé :
 ```sh
 sudo wg show          # sur la gateway : preshared key doit apparaître
 ```
+
+### Désinstaller Orion
+
+L'installateur se retire par **Paramètres → Applications**, ou en ligne de
+commande :
+
+```powershell
+msiexec /x "chemin\vers\Orion VPN_0.1.0_x64_en-US.msi"   # variante MSI
+```
+
+Trois résidus que la désinstallation ne retire pas :
+
+* **Les profils**, qui contiennent des clés privées :
+  `%APPDATA%\helios\orion\config\profiles.toml`. À supprimer explicitement si
+  la machine ne doit pas les garder.
+* **L'adaptateur WireGuard**, s'il reste après un arrêt brutal. Le retirer dans
+  le Gestionnaire de périphériques, section *Cartes réseau*.
+* **Le pilote WireGuardNT**, qui reste dans la banque de pilotes. Pour l'ôter
+  complètement, en PowerShell administrateur :
+
+  ```powershell
+  pnputil /enum-drivers | Select-String -Context 3 wireguard
+  pnputil /delete-driver oemXX.inf /uninstall
+  ```
+
+  C'est le pilote du client WireGuard officiel : le supprimer casserait une
+  installation de WireGuard for Windows présente sur la même machine.
 
 ## Si vous perdez l'accès
 
