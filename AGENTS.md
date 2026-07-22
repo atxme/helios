@@ -8,7 +8,9 @@ Helios est une gateway WireGuard Linux ; Orion est son client Tauri ; `aether`
 porte les types et contrats communs. La rupture avec IKEv2 est terminée dans le
 code. [ADR-001](docs/adr/ADR-001-WIREGUARD.md) conserve le raisonnement de migration
 et [ADR-002](docs/adr/ADR-002-SIGNATURES-PQ.md) fixe la signature hybride des
-artefacts éditeur. En cas de doute, le code et les ADR acceptés font foi.
+artefacts éditeur. [ADR-004](docs/adr/ADR-004-CHAINE-DE-LIVRAISON.md) fixe le
+cycle de vie des secrets et la chaîne de livraison. En cas de doute, le code et
+les ADR acceptés font foi.
 
 Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Le PSK
 post-quantique est négocié et posé de bout en bout : la gateway l’installe sur
@@ -17,6 +19,18 @@ la pose échoue. Deux limites restent explicites : la VIP dérivée par l’IPAM
 n’est pas réconciliée avec l’adresse déclarée en config (chaque bout garde la
 sienne, l’écart est journalisé) ; le fichier de récupération signé est bloqué
 jusqu’au choix du compteur anti-rejeu fichier ou NV TPM.
+
+L’outillage d’exploitation existe (ADR-004, lot 1) : `heliosd init-identity`
+crée l’identité WireGuard scellée sans jamais l’écrire en clair, `heliosd peer`
+et `helios-ctl peer` admettent les clients par le **même** code
+(`helios-provisioning::admission`), `helios-ctl profile emit` produit le
+document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
+expose enfin le séquestre.
+
+La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
+`helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
+`helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
+compile plus rien. Les installateurs Orion (lot 3) restent à faire.
 
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
 lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
@@ -42,6 +56,14 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   seul côté fait échouer tous les handshakes, sans canal de rattrapage.
 - Billets TPM : Ed25519 **et** ML-DSA-65 obligatoires, `key_epoch` signé,
   trousseau compilé, v1 refusé. Compteur strictement croissant ; PCR facultatif.
+- Identité de la gateway : elle naît **sur** la gateway (`heliosd
+  init-identity`), scellée au TPM. `wg_private_key` en clair dans
+  `network.toml` est un repli hérité, pas un chemin d’installation.
+- Admission : jamais de *read-modify-write* de `network.toml` depuis la vue
+  expurgée de l’API — les PSK des autres pairs y seraient effacés. Passer par
+  `helios_provisioning::admission`, et persister sans clé privée ni PSK.
+- Clé privée de séquestre : sur le poste opérateur, jamais sur la gateway
+  qu’elle secourt.
 - Une release exige `HELIOS_PUBLISHER_KEYRING_PATH`. Les secrets éditeur ne
   doivent jamais entrer dans une gateway ni dans le dépôt.
 
@@ -83,14 +105,19 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `helios-update` : mises à jour applicatives signées (ADR-003).
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
-- `helios-ctl` : diagnostic et campagnes de bout en bout (`campaign`, agit en
-  vrai client via `orion-core`) ; `helios-publisher` : outil éditeur hors gateway.
+- `xtask` : fabrique de bundles d’installation (poste de build, jamais la
+  gateway) — `cargo xtask bundle`, `cargo xtask pack`.
+- `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
+  bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
+  profils clients (`profile`) et séquestre (`escrow`) ;
+  `helios-publisher` : outil du **poste éditeur**, hors gateway.
 
 ## Développement et validation
 
 ```sh
 bash scripts/regression.sh
-bash scripts/campaign.sh          # campagne provisioning PQ, daemon isolé
+bash scripts/campaign.sh          # campagnes PQ, mise à jour signée et bundle
+bash scripts/lab.sh --keep        # banc complet : gateway + client admis + profil
 cargo test --workspace --all-features
 cargo run -p heliosd -- run --dev
 npm run dev --prefix web
@@ -99,6 +126,13 @@ npm run dev --prefix web
 `scripts/regression.sh` est la référence : fmt, Clippy/tests toutes features,
 audits Cargo/npm, Vitest et builds frontend. Commentaires, docs et logs sont en
 français.
+
+`scripts/lab.sh` monte un banc jetable avec les **mêmes outils qu'en
+production** — `helios-ctl peer add`, `helios-ctl profile emit` — et non un
+chemin de test parallèle : il éprouve donc l'outillage d'exploitation en même
+temps qu'il sert au développement. Il produit un profil directement importable
+dans Orion. Il ne fait pas partie de la régression : celle-ci vérifie des
+invariants, elle ne lance pas d'environnements.
 
 WSL2 compile les features `netlink`, `wireguard` et `tpm` si leurs dépendances
 sont installées, mais ne prouve pas leurs effets réels. Les essais noyau, TPM,

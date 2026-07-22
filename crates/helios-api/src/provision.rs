@@ -196,16 +196,8 @@ fn to_http(e: EnrollError) -> (StatusCode, String) {
 
 /// Dérive la clé publique WireGuard de la gateway depuis sa clé privée.
 fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
-    use base64::Engine as _;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(private_key_b64.trim())
-        .map_err(|e| format!("clé privée de la gateway illisible : {e}"))?;
-    let raw: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| "clé privée de la gateway de longueur invalide".to_string())?;
-    let secret = x25519_dalek::StaticSecret::from(raw);
-    let public = x25519_dalek::PublicKey::from(&secret);
-    Ok(base64::engine::general_purpose::STANDARD.encode(public.as_bytes()))
+    aether::wg::public_from_private(private_key_b64)
+        .map_err(|e| format!("clé privée de la gateway illisible : {e}"))
 }
 
 #[cfg(test)]

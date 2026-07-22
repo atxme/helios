@@ -106,6 +106,59 @@ confirmé sur les gateways. L’outil valide également l’en-tête ELF et sa t
 trie les features, refuse l’écrasement du manifeste et auto-vérifie les deux
 signatures.
 
+## Signer un bundle d’installation
+
+Un bundle porte le daemon, l’installateur, l’outil d’exploitation, les unités
+systemd et un exemple de configuration. Sa signature est **distincte** de celle
+d’une release binaire, et son domaine l’est aussi (`helios-bundle-v1`) : une
+signature de bundle ne peut pas être rejouée comme signature de release, ni
+l’inverse.
+
+Assembler d’abord, sur le poste de build :
+
+```sh
+HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \
+  cargo xtask bundle
+```
+
+Puis signer, sur le poste éditeur :
+
+```sh
+cargo run -p helios-publisher -- bundle \
+  --dir target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu \
+  --key-epoch 1 \
+  --release-sequence 42 \
+  --channel production \
+  --version 0.1.0 \
+  --git-commit "$(git rev-parse --short=16 HEAD)" \
+  --target x86_64-unknown-linux-gnu \
+  --ed25519-private-key /chemin/hors-ligne/epoch-1/ed25519-private.pk8 \
+  --ml-dsa-65-private-key /chemin/hors-ligne/epoch-1/ml-dsa-65-private.bin \
+  --keyring /chemin/public/publisher-keyring.json
+```
+
+La commande écrit `manifest.json` dans le répertoire. Le manifeste énumère
+**exhaustivement** le contenu, avec pour chaque fichier sa taille, son empreinte
+SHA-256 et son bit d’exécution. L’installateur refuse un fichier modifié, un
+fichier manquant **et** un fichier surnuméraire : glisser une unité systemd non
+signée à côté de celles qui le sont ne passe pas.
+
+`--release-sequence` partage le compteur d’anti-rollback des releases binaires
+(ADR-003 §4) : une même release porte la même séquence dans son bundle et dans
+son manifeste `heliosd`. Installer un bundle sème ce compteur, ce qui interdit
+d’y appliquer ensuite une mise à jour applicative plus ancienne.
+
+Archiver enfin — `pack` refuse un répertoire sans manifeste, de sorte qu’un
+bundle non signé ne puisse pas partir par distraction :
+
+```sh
+cargo xtask pack --dir target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu
+```
+
+L’empreinte affichée est celle à publier avec l’archive : c’est elle que
+l’opérateur compare avant le tout premier `helios-installer bootstrap`, quand
+aucun installateur vérifié n’existe encore sur la machine.
+
 ## Fichier de récupération WireGuard
 
 Sa signature reste volontairement non implémentée. Le lot est bloqué jusqu'au

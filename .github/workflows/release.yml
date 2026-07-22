@@ -1,0 +1,74 @@
+name: Bundle de release
+
+# Déclenché à la main ou sur un tag. La CI **ne signe rien** : elle produit des
+# artefacts nus et leurs empreintes (ADR-004 §7). La signature hybride est jouée
+# hors ligne, sur le poste éditeur, avec des clés qui n'entrent jamais ici.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Assemblage du bundle gateway
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Dépendances système des features matérielles
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libnftnl-dev libmnl-dev libtss2-dev
+
+      # Le trousseau **public** de l'éditeur n'est pas un secret : c'est l'ancre
+      # de confiance compilée dans le binaire. Il est fourni en variable de
+      # dépôt, pas en secret, pour que ce fait reste visible.
+      - name: Ancre de confiance éditeur
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if [ -z "$KEYRING" ]; then
+            echo "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente." \
+                 "Y placer le contenu du trousseau PUBLIC de production" \
+                 "(publisher-keyring.json). Aucune clé privée ne doit y figurer."
+            exit 1
+          fi
+          printf '%s' "$KEYRING" > "$RUNNER_TEMP/publisher-keyring.json"
+          if grep -qi 'private' "$RUNNER_TEMP/publisher-keyring.json"; then
+            echo "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          fi
+
+      - name: Assemblage
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+        run: cargo xtask bundle
+
+      - name: Empreintes
+        run: |
+          cd target/bundle
+          dir="$(ls)"
+          cd "$dir"
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      # Artefacts **non signés** : à télécharger sur le poste éditeur, signer
+      # avec `helios-publisher bundle`, puis archiver avec `cargo xtask pack`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-gateway
+          path: |
+            target/bundle/
+          if-no-files-found: error
+          retention-days: 14

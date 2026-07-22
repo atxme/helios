@@ -1,0 +1,4 @@
+# `cargo xtask …` : la fabrique de bundles d'installation (ADR-004).
+# L'alias évite d'avoir à retenir le nom du paquet et le double tiret.
+[alias]
+xtask = "run --package xtask --"

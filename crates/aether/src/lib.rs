@@ -18,6 +18,7 @@ pub mod pq;
 pub mod secret;
 pub mod sig;
 pub mod state;
+pub mod wg;
 
 pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
 pub use error::{HeliosError, Result};

@@ -162,6 +162,9 @@ handshake tout en testant le même cycle de vie. Le backend réel est fourni par
 `defguard_wireguard_rs` derrière la feature `wireguard` :
 
 ```sh
+# Requis sur Windows : télécharge WireGuardNT et vérifie son empreinte épinglée.
+cargo xtask orion-deps
+
 # Compilation Rust du shell avec le backend réel
 cargo build -p orion --features wireguard
 
@@ -174,6 +177,19 @@ Le backend réel doit être exécuté avec le plan de données et les droits req
 sur la plateforme. S’il ne peut pas être initialisé, Orion refuse de démarrer :
 un binaire réel ne retombe jamais implicitement sur la simulation. L’IHM affiche
 toujours le type de backend actif.
+
+Le paquet Windows embarque les DLL AMD64 et ARM64 sous le chemin exact ouvert
+par `defguard_wireguard_rs`; son manifeste demande `requireAdministrator`. Le
+paquet Debian dépend de `libcap2-bin` et son `postinst` pose
+`cap_net_admin=ep` sur `/usr/bin/orion`. Les limites de ces choix et la chaîne
+Authenticode sont détaillées dans
+[`../../docs/security/ORION-DISTRIBUTION.md`](../../docs/security/ORION-DISTRIBUTION.md).
+
+Les fichiers `.orionprofile` sont associés à Orion. Le premier double-clic et
+les suivants passent par la même file single-instance, la même lecture Rust
+bornée à 64 Kio, le même parseur et la même complétion des invitations depuis
+la clé privée locale de même nom. L'import reste un brouillon à vérifier puis à
+enregistrer ; il n'écrase jamais silencieusement la configuration.
 
 ## Provisioning post-quantique
 
@@ -194,10 +210,13 @@ Le frontend utilise les commandes suivantes :
 - `get_state`, `backend_kind`, `adapter_is_up` ;
 - `get_config`, `import_profile`, `save_profile`, `delete_profile`,
   `select_profile` ;
+- `import_profile_path`, réservé aux chemins reçus de l'association système ;
 - `connect`, `disconnect`.
 
 Les événements `state_changed`, `log`, `telemetry` et `error` sont relayés sur
-le canal `helios://event`.
+le canal `helios://event`. `helios://profile-path` signale qu'un chemin associé
+attend dans la file Rust sans donner au frontend un accès général au système de
+fichiers.
 
 ## Régression
 

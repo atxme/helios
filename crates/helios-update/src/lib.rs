@@ -19,6 +19,8 @@ use aether::{
 use aws_lc_rs::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 
+pub mod bundle;
+
 pub const INSTALLER_VERSION: u32 = 1;
 pub const BUILD_TARGET: &str = env!("HELIOS_BUILD_TARGET");
 pub const MAX_BINARY_SIZE: u64 = 128 * 1024 * 1024;

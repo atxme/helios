@@ -55,6 +55,50 @@ enum Command {
     /// nominal refuse donc de provisionner de lui-même, et cette commande est le
     /// seul chemin explicite pour le faire.
     ProvisionTpm,
+    /// Crée l'identité WireGuard de la gateway et la scelle (ADR-004 §3).
+    ///
+    /// À jouer après `provision-tpm`, avec accès console. La clé privée est
+    /// générée en mémoire et scellée sans jamais toucher le disque en clair ;
+    /// seule la clé publique est affichée, à remettre aux clients.
+    InitIdentity {
+        /// Remplace une identité déjà scellée. **Tous les clients devront
+        /// mettre à jour `peer_public_key`** : ce n'est pas une reprise, c'est
+        /// un changement d'identité de la gateway.
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Admission locale des clients, avec accès console.
+    ///
+    /// Sert au bootstrap du premier pair administrateur — sans lui, aucune
+    /// mutation distante n'est autorisée (ADR-003 §3) — et au dépannage. Le
+    /// chemin nominal ensuite est `helios-ctl peer`, à travers le tunnel.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// Admet un client et lui attribue sa VIP.
+    Add {
+        /// Nom convivial, unique sur la gateway.
+        #[arg(long)]
+        name: String,
+        /// Clé publique Curve25519 du client, en base64.
+        #[arg(long)]
+        public_key: String,
+        /// Autorise ce pair à muter le plan de contrôle et les mises à jour.
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Liste les pairs admis.
+    List,
+    /// Retire un pair de l'admission.
+    Remove {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -80,6 +124,91 @@ async fn main() -> anyhow::Result<()> {
             orchestrator::check_update(dry_run).await
         }
         Command::ProvisionTpm => provision_tpm(),
+        Command::InitIdentity { rotate } => init_identity(&network, rotate),
+        Command::Peer { command } => peer_command(network, command),
+    }
+}
+
+/// Crée et scelle l'identité WireGuard de la gateway.
+///
+/// Le déscellement passe par le même `BootController` que le démarrage
+/// nominal : si l'intégrité de la chaîne de démarrage n'est pas confirmée, il
+/// n'y a pas de secret, donc pas de scellement — et pas d'identité créée à
+/// moitié.
+fn init_identity(network: &NetworkConfig, rotate: bool) -> anyhow::Result<()> {
+    let tpm = TpmSettings::default();
+    let boot = BootController::unlock(&tpm).map_err(|e| {
+        anyhow::anyhow!(
+            "déscellement TPM échoué : {e}. Provisionner le coffre d'abord \
+             (`heliosd provision-tpm`)."
+        )
+    })?;
+
+    let public_key = gateway_key::initialize(network, &boot, rotate)
+        .map_err(|e| anyhow::anyhow!("initialisation de l'identité impossible : {e}"))?;
+
+    println!("{public_key}");
+    info!(
+        "clé publique de la gateway ci-dessus — c'est la valeur `peer_public_key` \
+         des profils clients. La clé privée reste scellée et n'est jamais affichée."
+    );
+    Ok(())
+}
+
+/// Admission locale : lit, modifie et réécrit `network.toml`.
+///
+/// Le daemon garde sa configuration en mémoire : une modification par ce chemin
+/// ne prend effet qu'au prochain démarrage. C'est assumé — cette commande vise
+/// le bootstrap et le dépannage console, pas l'exploitation courante, qui passe
+/// par l'API (`helios-ctl peer`).
+fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Result<()> {
+    match command {
+        PeerCommand::List => {
+            if network.peers.is_empty() {
+                println!("aucun pair admis");
+                return Ok(());
+            }
+            for peer in &network.peers {
+                let role = if peer.admin { " [admin]" } else { "" };
+                let pq = if peer.preshared_key.is_some() {
+                    " [PQ]"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}\t{}\t{}{role}{pq}",
+                    peer.name, peer.address, peer.public_key
+                );
+            }
+            Ok(())
+        }
+        PeerCommand::Add {
+            name,
+            public_key,
+            admin,
+        } => {
+            let peer = helios_provisioning::admit(&mut network, &name, &public_key, admin)
+                .map_err(|e| anyhow::anyhow!("admission refusée : {e}"))?;
+            network
+                .save()
+                .context("écriture de la configuration réseau")?;
+            println!("{}\t{}", peer.name, peer.address);
+            info!("pair admis — la modification prendra effet au prochain démarrage de heliosd");
+            Ok(())
+        }
+        PeerCommand::Remove { name } => {
+            let peer = helios_provisioning::revoke(&mut network, &name)
+                .map_err(|e| anyhow::anyhow!("révocation refusée : {e}"))?;
+            network
+                .save()
+                .context("écriture de la configuration réseau")?;
+            println!("{} retiré", peer.name);
+            warn!(
+                "le pair tombera à son prochain handshake ; aucune révocation \
+                 cryptographique n'existe (ADR-004)"
+            );
+            Ok(())
+        }
     }
 }
 

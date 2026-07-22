@@ -17,8 +17,18 @@ lan_ifaces = ["eth1"]
 wg_iface = "helios0"
 
 # Clé privée Curve25519 de la gateway, en base64. **SECRET.**
-# À générer sur la cible :  wg genkey
-# Clé publique correspondante (à donner aux clients) : echo <privkey> | wg pubkey
+#
+# DÉPRÉCIÉ en production (ADR-004 §3). L'identité de la gateway se crée sur la
+# gateway, scellée dans le TPM, sans jamais toucher le disque en clair :
+#
+#   sudo heliosd provision-tpm     # une seule fois, premier déploiement
+#   sudo heliosd init-identity     # affiche la clé PUBLIQUE à donner aux clients
+#
+# Ce champ ne subsiste que pour deux cas : les gateways déjà installées, et les
+# campagnes automatisées qui fabriquent une configuration jetable sans TPM. Une
+# clé laissée ici est lue avec avertissement, scellée au démarrage suivant, et
+# doit ensuite être retirée : en clair sur disque, elle suffit à usurper la
+# gateway.
 wg_private_key = ""
 
 # Adresse de la gateway dans le tunnel. Plage CGNAT RFC 6598 (ADR-001 §4) : elle
@@ -51,14 +61,27 @@ admin_iface = "helios0"
 #   4. redémarrer : la gateway rescelle la clé et efface le fichier
 #
 # Absente = pas de filet : la clé serait définitivement perdue.
+#
+# Générer la paire sur le poste opérateur, jamais sur la gateway :
+#   helios-ctl escrow keygen --output-dir ~/helios-escrow
+# puis, le jour où il faut s'en servir :
+#   helios-ctl escrow open --escrow wg-key.escrow \
+#     --private-key ~/helios-escrow/escrow-private.key --output wg-key.recovery
 # escrow_public_key = "<clé publique X25519 de l'opérateur, base64>"
 
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
 # allow_ssh_from = ["10.0.0.0/8"]
 
 # ── Pairs autorisés ──────────────────────────────────────────────────────────
-# À terme alimentés automatiquement par helios-provisioning à l'enrôlement.
-# En attendant, on les déclare à la main.
+# Ne plus éditer cette liste à la main : l'admission dérive la VIP de la clé
+# publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.
+#
+#   sudo heliosd peer add --name poste --public-key <clé> --admin  # console
+#   helios-ctl peer add --name poste --public-key <clé>            # dans le tunnel
+#
+# Puis émettre le profil client :
+#   helios-ctl profile emit --name poste --endpoint vpn.example.net:51820 \
+#     --public-key <clé publique du client> --output poste.json
 #
 # `address` est la VIP du client : dans WireGuard, AllowedIPs EST la table de
 # routage cryptographique — deux pairs ne peuvent pas revendiquer la même.

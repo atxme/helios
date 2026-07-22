@@ -34,7 +34,7 @@ echo "==> Construction"
 cargo run --quiet -p helios-publisher -- keygen \
     --key-epoch 4294967294 --output-dir "$TMP/publisher"
 export HELIOS_PUBLISHER_KEYRING_PATH="$TMP/publisher/publisher-keyring.json"
-cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher
+cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher -p helios-installer
 
 # Clés de campagne, jetables : elles ne servent qu'à cette exécution et
 # disparaissent avec le répertoire temporaire. `--generate-keys` n'écrit que des
@@ -116,6 +116,17 @@ python3 scripts/update_campaign.py \
     --manifest "$TMP/heliosd.release.json" \
     --binary target/debug/heliosd \
     --activate
+
+echo "==> Campagne d'installation par bundle signé"
+# Le bundle est vérifié contre le trousseau éditeur réellement compilé dans
+# `helios-installer` — c'est ce que les tests unitaires, qui injectent un
+# trousseau, ne peuvent pas prouver.
+python3 scripts/bundle_campaign.py \
+    --tmp "$TMP" \
+    --epoch-dir "$TMP/publisher" \
+    --version "$HELIOS_VERSION" \
+    --git-commit "$GIT_COMMIT" \
+    --target "$TARGET_TRIPLE"
 
 echo "==> Vérification : aucun secret dans le journal du daemon"
 if grep -qF "$CLIENT_PRIV" "$TMP/daemon.log"; then

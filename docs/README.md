@@ -18,6 +18,9 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
   post-quantiques hybrides des artefacts de confiance.
 - [adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md](adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)
   — mises à jour applicatives signées, autorisation WireGuard et rollback.
+- [adr/ADR-004-CHAINE-DE-LIVRAISON.md](adr/ADR-004-CHAINE-DE-LIVRAISON.md) —
+  cycle de vie des secrets, admission, profils clients et livraison
+  d'artefacts.
 
 ## Sécurité
 
@@ -26,7 +29,10 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [security/POST-QUANTUM.md](security/POST-QUANTUM.md) — les deux mécanismes
   post-quantiques (PSK WireGuard, signatures éditeur) et ce qui les distingue.
 - [security/PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md) — guide
-  opératoire de `helios-publisher`.
+  opératoire de `helios-publisher` (poste éditeur).
+- [security/OPERATOR-TOOLING.md](security/OPERATOR-TOOLING.md) — guide
+  opératoire du poste opérateur : identité de la gateway, séquestre, admission
+  et profils clients.
 
 ## Tests et validation
 

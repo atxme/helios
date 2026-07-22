@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 aether.workspace = true
+# Séquestre de l'identité de la gateway : la moitié opérateur (génération de la
+# paire, ouverture du blob) vit ici, jamais sur la gateway. Sans la feature
+# `tpm` : le module `escrow` est de la crypto pure, aucun accès matériel.
+helio-tpm.workspace = true
 # La campagne agit comme un **vrai** client : elle emprunte le chemin de
 # provisioning d'Orion plutôt que de le réimplémenter, sans quoi elle
 # validerait sa propre copie du protocole et non le code livré.

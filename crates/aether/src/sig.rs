@@ -332,6 +332,136 @@ impl ArtifactPayload for BinaryReleasePayload {
 
 pub type SignedBinaryRelease = SignedEnvelope<BinaryReleasePayload>;
 
+/// Un fichier du bundle, désigné par son chemin relatif et son empreinte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleEntry {
+    /// Chemin **relatif** à la racine du bundle, séparateurs `/`.
+    pub path: String,
+    pub size: u64,
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub sha256: [u8; 32],
+    /// Fichier exécutable : installé en 0755, sinon en 0644.
+    pub executable: bool,
+}
+
+/// Métadonnées signées d’un bundle d’installation complet.
+///
+/// # Pourquoi un second type d’artefact plutôt que le manifeste binaire
+///
+/// [`BinaryReleasePayload`] authentifie **un** exécutable : c’est ce dont la
+/// mise à jour applicative (ADR-003) a besoin, et rien de plus. Un bundle
+/// d’installation porte aussi le programme d’installation, l’outil
+/// d’exploitation et les unités systemd. Les livrer sous l’autorité d’une
+/// signature qui ne les couvre pas reviendrait à afficher une garantie fausse :
+/// l’unité systemd décide de la ligne de commande du daemon, elle est aussi
+/// sensible que le binaire qu’elle lance.
+///
+/// Le domaine est distinct (`helios-bundle-v1`), donc la signature d’un bundle
+/// ne peut pas être rejouée comme signature de release binaire, ni l’inverse
+/// (ADR-002 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundlePayload {
+    pub product: String,
+    pub channel: String,
+    pub release_sequence: u64,
+    pub version: String,
+    pub git_commit: String,
+    pub target: String,
+    pub minimum_installer_version: u32,
+    /// Contenu exhaustif, trié par chemin. Un fichier présent dans l’archive
+    /// mais absent d’ici doit faire échouer l’installation.
+    pub files: Vec<BundleEntry>,
+}
+
+/// Refus d’un contenu de bundle, avant même de regarder les signatures.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BundleError {
+    #[error("bundle sans aucun fichier déclaré")]
+    Empty,
+    #[error("chemin de bundle invalide : {0}")]
+    Path(String),
+    #[error("liste de fichiers non triée ou dupliquée à « {0} »")]
+    Order(String),
+}
+
+impl BundlePayload {
+    /// Valide la forme de la liste de fichiers.
+    ///
+    /// À appeler **avant** d’extraire quoi que ce soit. Un chemin absolu ou
+    /// remontant (`..`) écrirait hors de la destination prévue ; une liste non
+    /// triée rendrait l’encodage canonique ambigu, et un doublon permettrait de
+    /// déclarer deux empreintes pour le même fichier.
+    pub fn validate(&self) -> Result<(), BundleError> {
+        if self.files.is_empty() {
+            return Err(BundleError::Empty);
+        }
+        let mut previous: Option<&str> = None;
+        for entry in &self.files {
+            validate_bundle_path(&entry.path)?;
+            if let Some(previous) = previous {
+                if entry.path.as_str() <= previous {
+                    return Err(BundleError::Order(entry.path.clone()));
+                }
+            }
+            previous = Some(&entry.path);
+        }
+        Ok(())
+    }
+
+    /// Entrée correspondant à un chemin relatif, si elle est déclarée.
+    pub fn entry(&self, path: &str) -> Option<&BundleEntry> {
+        self.files.iter().find(|entry| entry.path == path)
+    }
+}
+
+fn validate_bundle_path(path: &str) -> Result<(), BundleError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\\')
+        || path.contains(':')
+        || path.contains('\0')
+    {
+        return Err(BundleError::Path(path.to_string()));
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(BundleError::Path(path.to_string()));
+    }
+    Ok(())
+}
+
+impl ArtifactPayload for BundlePayload {
+    const DOMAIN: &'static [u8] = b"helios-bundle-v1";
+    const FORMAT_VERSION: u32 = 1;
+
+    fn encode_canonical(&self, output: &mut Vec<u8>) {
+        encode_string(output, &self.product);
+        encode_string(output, &self.channel);
+        output.extend_from_slice(&self.release_sequence.to_be_bytes());
+        encode_string(output, &self.version);
+        encode_string(output, &self.git_commit);
+        encode_string(output, &self.target);
+        output.extend_from_slice(&self.minimum_installer_version.to_be_bytes());
+        output.extend_from_slice(&(self.files.len() as u32).to_be_bytes());
+        for entry in &self.files {
+            encode_string(output, &entry.path);
+            output.extend_from_slice(&entry.size.to_be_bytes());
+            output.extend_from_slice(&entry.sha256);
+            output.push(u8::from(entry.executable));
+        }
+    }
+}
+
+pub type SignedBundle = SignedEnvelope<BundlePayload>;
+
 fn encode_string(output: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
     output.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -552,6 +682,103 @@ mod tests {
             },
             keys,
         )
+    }
+
+    fn entree(path: &str) -> BundleEntry {
+        BundleEntry {
+            path: path.to_string(),
+            size: 10,
+            sha256: [1u8; 32],
+            executable: false,
+        }
+    }
+
+    fn bundle(files: Vec<BundleEntry>) -> BundlePayload {
+        BundlePayload {
+            product: "helios".into(),
+            channel: "testing".into(),
+            release_sequence: 1,
+            version: "0.1.0".into(),
+            git_commit: "abcdef".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            minimum_installer_version: 1,
+            files,
+        }
+    }
+
+    /// Un chemin absolu ou remontant écrirait hors de la destination : c'est
+    /// une écriture arbitraire déguisée en installation.
+    #[test]
+    fn un_chemin_de_bundle_hors_de_la_racine_est_refuse() {
+        for chemin in [
+            "/etc/systemd/system/heliosd.service",
+            "../../etc/passwd",
+            "bin/../../../root/.ssh/authorized_keys",
+            "./heliosd",
+            "C:/heliosd",
+            "bin\\heliosd",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    bundle(vec![entree(chemin)]).validate(),
+                    Err(BundleError::Path(_))
+                ),
+                "chemin accepté à tort : {chemin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn une_liste_non_triee_ou_dupliquee_est_refusee() {
+        assert!(matches!(
+            bundle(vec![entree("b"), entree("a")]).validate(),
+            Err(BundleError::Order(_))
+        ));
+        assert!(matches!(
+            bundle(vec![entree("a"), entree("a")]).validate(),
+            Err(BundleError::Order(_))
+        ));
+        assert_eq!(bundle(vec![]).validate(), Err(BundleError::Empty));
+        assert_eq!(bundle(vec![entree("a"), entree("b/c")]).validate(), Ok(()));
+    }
+
+    /// Le domaine sépare les artefacts : la signature d'un bundle ne doit pas
+    /// pouvoir servir de signature de release binaire (ADR-002 §3).
+    #[test]
+    fn le_domaine_du_bundle_est_distinct_des_autres_artefacts() {
+        let octets = signing_bytes(&bundle(vec![entree("heliosd")]), 1);
+        assert!(octets.starts_with(b"helios-bundle-v1"));
+        assert_ne!(BundlePayload::DOMAIN, BinaryReleasePayload::DOMAIN);
+        assert_ne!(BundlePayload::DOMAIN, ResealPayload::DOMAIN);
+    }
+
+    /// Chaque champ du contenu doit entrer dans les octets signés : un fichier
+    /// dont on pourrait changer l'empreinte ou le bit exécutable sans invalider
+    /// la signature ne serait pas protégé du tout.
+    #[test]
+    fn toute_alteration_du_contenu_change_les_octets_signes() {
+        let reference = signing_bytes(&bundle(vec![entree("heliosd")]), 1);
+
+        let mut autre_empreinte = entree("heliosd");
+        autre_empreinte.sha256 = [2u8; 32];
+        let mut autre_taille = entree("heliosd");
+        autre_taille.size = 11;
+        let mut autre_mode = entree("heliosd");
+        autre_mode.executable = true;
+
+        for modifie in [autre_empreinte, autre_taille, autre_mode, entree("autre")] {
+            assert_ne!(
+                signing_bytes(&bundle(vec![modifie]), 1),
+                reference,
+                "une modification du contenu n'a pas changé les octets signés"
+            );
+        }
+        assert_ne!(
+            signing_bytes(&bundle(vec![entree("heliosd")]), 2),
+            reference,
+            "l'époque de clé doit être signée (ADR-002 amendement 3)"
+        );
     }
 
     #[test]

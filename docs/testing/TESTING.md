@@ -26,6 +26,8 @@ compilation/tests sans exécuter d’effet réel.
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
 | Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
 | Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |
+| Admission | VIP dérivée de la clé publique, adresse de la gateway réservée, doublons de nom et de clé refusés, PSK des autres pairs préservés, persistance sans clé privée ni PSK (ADR-004) |
+| Bundle d'installation | manifeste `helios-bundle-v1` : signature hybride, fichier altéré, manquant **et surnuméraire**, chemin hors racine, lien symbolique, destination inconnue, canal, anti-rollback, configuration préservée (ADR-004) |
 
 `cargo-audit` est un prérequis local :
 
@@ -66,11 +68,24 @@ l’ancien comportement et le garder comme test de non-régression.
 ## Tests matériels obligatoires
 
 Les tests automatisés ne peuvent pas promettre la fiabilité du matériel absent.
-Sur une gateway de laboratoire, compiler puis exercer :
+La gateway de laboratoire ne se compile plus sur place : elle reçoit un bundle,
+comme une gateway de production (ADR-004).
+
+Sur le poste de build :
 
 ```sh
 HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \
-  cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui
+  cargo xtask bundle
+cargo run -p helios-publisher -- bundle --dir target/bundle/<nom> --channel testing …
+cargo xtask pack --dir target/bundle/<nom>
+```
+
+Sur la gateway de laboratoire :
+
+```sh
+sudo ./scripts/setup-target.sh
+sha256sum helios-<version>-<target>.tar.gz    # comparer à l'empreinte publiée
+sudo ./helios-installer bootstrap --archive helios-<version>-<target>.tar.gz
 ```
 
 Valider avec accès console :
@@ -81,6 +96,16 @@ Valider avec accès console :
 - erreur Netlink laissant intacte la politique précédente ;
 - API inaccessible depuis le WAN et accessible via `helios0` ;
 - Orion : adaptateur/routes maintenus sur panne UDP, retrait sur déconnexion ;
+- installateur Orion Windows : `wireguard.dll` présente et signée par son
+  éditeur dans un bundle produit après `cargo xtask orion-deps`, manifeste
+  `requireAdministrator`, et horodatage RFC 3161 valide sur l'exécutable comme
+  sur l'installateur ;
+- association Orion : double-clic sur `.orionprofile` au premier lancement puis
+  avec l'application déjà ouverte, une seule instance et reprise de la clé
+  privée locale de même nom ;
+- paquet Orion Debian : `getcap /usr/bin/orion` annonce
+  `cap_net_admin=ep`, puis WebKitGTK démarre sans dépendre de
+  `LD_LIBRARY_PATH` ;
 - billet de rescellement : signé valide, rejoué, altéré et PCR optionnel — le
   scellement lui-même est désormais couvert par la catégorie `tpm` de la
   campagne, qui l'exerce sur `/dev/tpmrm0` ;
@@ -98,7 +123,28 @@ Valider avec accès console :
   précédente, service redémarré et lien `current` restauré ;
 - autorisation : un pair `admin = false` se voit refuser toute route de
   mutation, et l'adresse source du socket seule fait foi — jamais un en-tête de
-  proxy.
+  proxy ;
+- identité de la gateway ([ADR-004](../adr/ADR-004-CHAINE-DE-LIVRAISON.md) §3) :
+  `heliosd init-identity` scelle réellement dans le TPM, refuse d'écraser un
+  coffre existant sans `--rotate`, n'écrit la clé privée nulle part en clair, et
+  la gateway redémarrée retrouve la même identité — seul le scellement effectif
+  distingue ce chemin d'un succès apparent, et il n'est pas observable en WSL2 ;
+- séquestre, circuit complet : `helios-ctl escrow keygen` sur le poste
+  opérateur, `escrow_public_key` déclarée, séquestre écrit par la gateway au
+  scellement, `helios-ctl escrow open` hors ligne, dépôt du fichier de
+  récupération, redémarrage — l'identité doit être restaurée, rescellée, et le
+  fichier de récupération effacé ;
+- admission : la VIP dérivée par `heliosd peer add` est bien celle que le client
+  reçoit à l'enrôlement, et l'ajout d'un pair n'efface ni la clé scellée ni les
+  PSK des pairs déjà connectés — vérifier par `wg show` que leurs slots restent
+  renseignés après l'opération ;
+- bundle d'installation ([ADR-004](../adr/ADR-004-CHAINE-DE-LIVRAISON.md) §7 bis)
+  sur une machine réelle : `bootstrap` sur une gateway vierge, unités
+  effectivement rechargées par systemd, service démarrable, puis `bootstrap`
+  d'une séquence supérieure sur une gateway **déjà configurée** — la
+  configuration, l'identité scellée et les pairs admis doivent survivre. La
+  campagne automatisée couvre la vérification et les refus, pas l'interaction
+  avec systemd ni la persistance à travers un redémarrage.
 
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
@@ -107,6 +153,47 @@ L'ADR-003 retire RAUC du chemin de mise à jour Helios : la mise à jour ne
 remplace ni rootfs, ni kernel, ni bootloader, ne redémarre pas la machine, et
 laisse donc les PCR 0/4/7 inchangés — aucun billet de rescellement n'est requis.
 Administrer l'OS resterait une fonctionnalité distincte, à valider séparément.
+
+## Banc de développement
+
+`scripts/lab.sh` monte un environnement complet — gateway `--dev` isolée, client
+admis par l'API, profils émis, campagne jouée — puis le démonte. `--keep` laisse
+le daemon vivant pour l'exploration manuelle.
+
+Il emprunte les **mêmes outils qu'un opérateur** (`helios-ctl peer add`,
+`helios-ctl profile emit`) plutôt qu'un chemin de test parallèle : une régression
+de l'outillage d'exploitation y tombe immédiatement. Il contrôle aussi la forme
+des deux profils émis — l'invitation ne doit porter aucun secret, le profil
+assisté doit être importable tel quel.
+
+Il ne fait **pas** partie de `regression.sh` : la régression vérifie des
+invariants, elle ne lance pas d'environnements. Le banc est un outil de
+développement et un point d'entrée pour la recette manuelle d'Orion — le profil
+`lab-poste.json` s'importe directement dans le client
+([MANUAL-TESTING.md](MANUAL-TESTING.md)).
+
+Ce qu'il ne prouve pas : le plan de données. Le tunnel reste simulé, comme dans
+toute exécution `--dev`.
+
+## Campagne d'installation par bundle signé
+
+`scripts/campaign.sh` joue `scripts/bundle_campaign.py` après le provisioning et
+la mise à jour applicative. Elle assemble un bundle, le signe avec l'époque
+éphémère de la campagne, puis l'installe dans un faux système jetable.
+
+Ce qu'elle prouve et que les tests unitaires ne prouvent pas : le chemin passe
+par le trousseau éditeur **réellement compilé** dans `helios-installer`, pas par
+un trousseau injecté. Une régression du build — ancre absente, époque
+incohérente, encodage canonique modifié — se voit là.
+
+Neuf scénarios : signature valide, binaire substitué après signature, unité
+systemd ajoutée après signature, époque éditeur inconnue, canal confronté à
+celui de la gateway, installation complète avec bascule du lien `current`,
+anti-rollback semé, rejeu de séquence refusé, configuration existante préservée.
+
+Ce qu'elle ne couvre pas : l'interaction réelle avec systemd, la persistance à
+travers un redémarrage, et le premier `bootstrap` sur une machine vierge. Ces
+trois points appartiennent à la recette matérielle.
 
 ## Campagne de provisioning post-quantique
 

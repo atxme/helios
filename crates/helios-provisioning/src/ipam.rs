@@ -29,6 +29,13 @@ const HOST_MASK: u32 = (1 << HOST_BITS) - 1;
 /// Nombre d'adresses assignables dans la plage, hors réservées (voir plus bas).
 pub const POOL_SIZE: u32 = 1 << HOST_BITS;
 
+/// Nombre de sondes d'anti-collision de VIP.
+///
+/// Partagé par l'enrôlement et l'admission : deux bornes différentes rendraient
+/// l'adresse choisie dépendante du chemin emprunté, alors que tout l'intérêt de
+/// la dérivation est qu'elle soit la même partout.
+pub const MAX_VIP_PROBES: u32 = 64;
+
 /// Vue en lecture seule de la table de pairs WireGuard vivante.
 ///
 /// Abstraite en trait pour rester **testable sur WSL2** : l'implémentation réelle

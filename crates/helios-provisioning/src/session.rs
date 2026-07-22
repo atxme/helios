@@ -21,7 +21,7 @@ use aether::enroll::{
 };
 use aether::pq::{Kem, MlKem768Kem};
 
-use crate::ipam::{assign_vip, PeerTable};
+use crate::ipam::{assign_vip, PeerTable, MAX_VIP_PROBES};
 
 /// Durée de validité par défaut d'un PSK, en secondes (1 heure).
 ///
@@ -29,9 +29,6 @@ use crate::ipam::{assign_vip, PeerTable};
 /// multiplie les rotations — et chaque rotation est un moment de fragilité
 /// (voir `rotation`).
 pub const DEFAULT_PSK_LIFETIME_SECS: u32 = 3600;
-
-/// Nombre de sondes d'anti-collision de VIP.
-const MAX_VIP_PROBES: u32 = 64;
 
 /// Le registre des pairs admis, côté gateway.
 ///

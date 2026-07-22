@@ -16,8 +16,8 @@
 //!   inconnue ne peut pas monter le tunnel : WireGuard est fondé sur Noise_IK,
 //!   le répondeur rejette un initiateur qu'il ne connaît pas. L'admission est
 //!   donc **nécessairement hors bande** : un opérateur déclare la clé publique
-//!   (aujourd'hui : `peers` dans `network.toml`). Sa VIP en est dérivée
-//!   déterministement par [`ipam`], sans état sur disque.
+//!   dans `peers`, via [`admission`]. Sa VIP en est dérivée déterministement
+//!   par [`ipam`], sans état sur disque.
 //! * **Provisioning** ([`session`]) — une fois le tunnel classique monté, le
 //!   canal de contrôle *dans* le tunnel automatise l'échange ML-KEM, la
 //!   dérivation du PSK post-quantique et la confirmation de la VIP.
@@ -63,12 +63,19 @@
 //! l'opérateur, le client conserve celle de son profil, et l'écart est
 //! journalisé de part et d'autre. Réconcilier demande de décider qui fait
 //! autorité — l'opérateur ou la dérivation — ce qui déborde du provisioning.
+//!
+//! [`admission::admit`] **réduit** cet écart sans le supprimer : elle déclare
+//! précisément l'adresse que l'IPAM dérive, si bien qu'un pair admis par cette
+//! voie ne diverge pas. Restent les entrées écrites à la main dans
+//! `network.toml`, pour lesquelles la limite ci-dessus tient toujours.
 
+pub mod admission;
 pub mod ipam;
 pub mod rotation;
 pub mod session;
 
-pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, POOL_SIZE};
+pub use admission::{admit, revoke, AdmissionError};
+pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, MAX_VIP_PROBES, POOL_SIZE};
 pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
 pub use session::{
     handle_request, AdmittedPeers, GatewayIdentity, Provisioned, DEFAULT_PSK_LIFETIME_SECS,

@@ -8,6 +8,7 @@
 //! navigateur ──GET /api/trust─────────► ancre de confiance éditeur (ADR-002)
 //! navigateur ──GET /api/network───────► JSON config réseau courante
 //! navigateur ──POST /api/network──────► recharge la config réseau (JSON)
+//! navigateur ──POST /api/peers────────► admet un pair, VIP dérivée (ADR-004)
 //! navigateur ──POST /api/tunnel/start► commande vers l'orchestrateur (mpsc)
 //! navigateur ──WS /ws─────────────────► flux d'événements temps réel (broadcast)
 //! ```
@@ -101,6 +102,8 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     let admin = Router::new()
         .route("/api/network", post(routes::network_set))
+        .route("/api/peers", post(routes::peer_admit))
+        .route("/api/peers/revoke", post(routes::peer_revoke))
         .route("/api/gateway/wireguard-key", post(routes::gateway_key_set))
         .route("/api/tunnel/start", post(routes::tunnel_start))
         .route("/api/tunnel/stop", post(routes::tunnel_stop))
@@ -196,6 +199,16 @@ mod security_tests {
     const PEER_PSK: &str = "psk-ultra-secret-ne-doit-jamais-sortir";
 
     fn state() -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
+        state_avec_mode(true)
+    }
+
+    /// Même état, mais en mode réel : la persistance des secrets n'y obéit pas
+    /// aux mêmes règles qu'en dry-run, où le TPM est absent.
+    fn state_reel() -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
+        state_avec_mode(false)
+    }
+
+    fn state_avec_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
         let network = NetworkConfig {
             wan_iface: "eth0".into(),
             admin_iface: Some("helios0".into()),
@@ -215,7 +228,7 @@ mod security_tests {
         (
             AppState::new(
                 Arc::new(RwLock::new(network)),
-                true,
+                dry_run,
                 Arc::new(RwLock::new(TunnelState::Down)),
                 event_tx,
                 cmd_tx,
@@ -224,6 +237,38 @@ mod security_tests {
             ),
             cmd_rx,
         )
+    }
+
+    /// Sérialise les tests qui persistent `network.toml` et détourne le chemin
+    /// système vers un fichier jetable.
+    ///
+    /// `HELIOS_NETWORK_CONFIG` est un état de processus : sans ce verrou, deux
+    /// tests parallèles liraient le fichier de l'autre et échoueraient par
+    /// intermittence, ce qui est pire qu'un test absent.
+    async fn config_isolee() -> (tokio::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        // Verrou asynchrone : les tests qui le prennent traversent des `await`,
+        // ce qu'un `std::sync::Mutex` ne permet pas de tenir sainement.
+        static VERROU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = VERROU.lock().await;
+        let path =
+            std::env::temp_dir().join(format!("helios-api-network-{}.toml", std::process::id()));
+        std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
+        let _ = std::fs::remove_file(&path);
+        (guard, path)
+    }
+
+    /// Requête admin authentifiée par la VIP du pair `poste`, qui est `admin`.
+    fn requete_admin(uri: &str, corps: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(corps.to_string()))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        request
     }
 
     /// Orchestrateur simulé qui acquitte toute installation de PSK.
@@ -262,6 +307,12 @@ mod security_tests {
         assert_eq!(json["peers"][0]["preshared_key_configured"], true);
         assert!(!text.contains(PRIVATE_KEY));
         assert!(!text.contains(PEER_PSK));
+        // La moitié publique, elle, doit sortir : c'est le `peer_public_key`
+        // que l'opérateur met dans les profils clients.
+        assert_eq!(
+            json["wg_public_key"],
+            aether::wg::public_from_private(PRIVATE_KEY).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -320,6 +371,226 @@ mod security_tests {
             cmd_rx.recv().await,
             Some(OrchestratorCmd::Connect)
         ));
+    }
+
+    /// Clé publique de test, distincte de celle du pair déjà admis.
+    const NOUVELLE_CLE: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+
+    #[tokio::test]
+    async fn admission_alloue_une_vip_et_notifie_l_orchestrateur() {
+        let (_verrou, _path) = config_isolee().await;
+        let (state, mut cmd_rx) = state();
+
+        let response = router(state)
+            .oneshot(requete_admin(
+                "/api/peers",
+                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "portable");
+        assert_eq!(json["admin"], false);
+        assert_eq!(
+            json["post_quantum"], false,
+            "l'admission ne pose pas de PSK"
+        );
+        let adresse = json["address"].as_str().expect("adresse");
+        assert!(adresse.ends_with("/32"), "adresse : {adresse}");
+        assert!(adresse.starts_with("100."), "hors CGNAT : {adresse}");
+
+        match cmd_rx.recv().await {
+            Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
+                assert_eq!(config.peers.len(), 2);
+                assert_eq!(
+                    config.wg_private_key, PRIVATE_KEY,
+                    "l'orchestrateur doit garder l'identité résolue"
+                );
+                assert_eq!(
+                    config.peers[0].preshared_key.as_deref(),
+                    Some(PEER_PSK),
+                    "le PSK du pair existant doit survivre à l'admission"
+                );
+            }
+            autre => panic!("commande inattendue : {autre:?}"),
+        }
+    }
+
+    /// En mode réel, la clé vient du coffre scellé : la réécrire dans
+    /// `network.toml` annulerait le scellement. Les PSK, eux, ne sont jamais
+    /// persistés, quel que soit le mode.
+    #[tokio::test]
+    async fn la_persistance_reelle_ne_contient_ni_cle_privee_ni_psk() {
+        let (_verrou, path) = config_isolee().await;
+        let (state, mut cmd_rx) = state_reel();
+
+        let response = router(state)
+            .oneshot(requete_admin(
+                "/api/peers",
+                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = cmd_rx.recv().await;
+
+        let persiste = std::fs::read_to_string(&path).expect("network.toml écrit");
+        assert!(
+            persiste.contains("portable"),
+            "le pair admis doit être persisté : {persiste}"
+        );
+        assert!(
+            !persiste.contains(PRIVATE_KEY),
+            "clé privée écrite en clair : {persiste}"
+        );
+        assert!(
+            !persiste.contains(PEER_PSK),
+            "PSK persisté sur disque : {persiste}"
+        );
+    }
+
+    /// En dry-run il n'y a pas de coffre TPM : `network.toml` est le seul
+    /// endroit où l'identité puisse vivre. L'effacer ferait perdre son identité
+    /// à un daemon `--dev` au premier `peer add`, ce qui casse le banc de dev
+    /// sans message reliant la panne à sa cause.
+    #[tokio::test]
+    async fn la_persistance_en_dry_run_conserve_l_identite_mais_pas_les_psk() {
+        let (_verrou, path) = config_isolee().await;
+        let (state, mut cmd_rx) = state();
+
+        let response = router(state)
+            .oneshot(requete_admin(
+                "/api/peers",
+                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = cmd_rx.recv().await;
+
+        let persiste = std::fs::read_to_string(&path).expect("network.toml écrit");
+        assert!(
+            persiste.contains(PRIVATE_KEY),
+            "le daemon --dev a perdu son identité en admettant un pair : {persiste}"
+        );
+        assert!(
+            !persiste.contains(PEER_PSK),
+            "un PSK ne doit jamais atteindre le disque, même en dry-run : {persiste}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_en_doublon_est_un_conflit() {
+        let (_verrou, _path) = config_isolee().await;
+
+        for (corps, attendu) in [
+            (
+                format!(r#"{{"name":"poste","public_key":"{NOUVELLE_CLE}"}}"#),
+                StatusCode::CONFLICT,
+            ),
+            (
+                r#"{"name":"autre","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#
+                    .to_string(),
+                StatusCode::CONFLICT,
+            ),
+            (
+                r#"{"name":"autre","public_key":"pas-une-cle"}"#.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (state, mut cmd_rx) = state();
+            let response = router(state)
+                .oneshot(requete_admin("/api/peers", &corps))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), attendu, "corps : {corps}");
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "un refus ne doit rien envoyer à l'orchestrateur"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_retire_le_pair_et_refuse_un_inconnu() {
+        let (_verrou, _path) = config_isolee().await;
+
+        let (etat, mut cmd_rx) = state();
+        let response = router(etat)
+            .oneshot(requete_admin("/api/peers/revoke", r#"{"name":"poste"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        match cmd_rx.recv().await {
+            Some(OrchestratorCmd::LoadNetworkConfig(config)) => assert!(config.peers.is_empty()),
+            autre => panic!("commande inattendue : {autre:?}"),
+        }
+
+        let (etat_neuf, mut cmd_rx) = state();
+        let response = router(etat_neuf)
+            .oneshot(requete_admin("/api/peers/revoke", r#"{"name":"fantome"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// L'admission mute le plan de contrôle : elle doit exiger le rôle admin,
+    /// comme les autres mutations (ADR-003 §3).
+    #[tokio::test]
+    async fn l_admission_exige_le_role_admin() {
+        let (_verrou, _path) = config_isolee().await;
+        let (state, mut cmd_rx) = state();
+        state.network.write().await.peers[0].admin = false;
+
+        let response = router(state)
+            .oneshot(requete_admin(
+                "/api/peers",
+                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// Le piège de l'ADR-004 §4, côté rechargement complet : une configuration
+    /// relue puis repostée revient sans secrets, et ne doit pas les effacer.
+    #[tokio::test]
+    async fn un_rechargement_de_config_ne_perd_ni_identite_ni_psk() {
+        let (_verrou, _path) = config_isolee().await;
+        let (state, mut cmd_rx) = state();
+
+        let response = router(state)
+            .oneshot(requete_admin(
+                "/api/network",
+                r#"{"wan_iface":"eth1","peers":[{"name":"poste",
+                    "public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "address":"100.64.1.2/32","admin":true}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        match cmd_rx.recv().await {
+            Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
+                assert_eq!(config.wan_iface, "eth1", "le réglage demandé s'applique");
+                assert_eq!(
+                    config.wg_private_key, PRIVATE_KEY,
+                    "l'identité de la gateway a été effacée par un simple réglage"
+                );
+                assert_eq!(
+                    config.peers[0].preshared_key.as_deref(),
+                    Some(PEER_PSK),
+                    "le PSK négocié a été effacé par un simple réglage"
+                );
+            }
+            autre => panic!("commande inattendue : {autre:?}"),
+        }
     }
 
     #[tokio::test]

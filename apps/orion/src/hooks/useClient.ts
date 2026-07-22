@@ -22,12 +22,27 @@ export function useClient() {
   const [history, setHistory] = useState<TelemetrySample[]>([])
   const [upSince, setUpSince] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
 
   const pushLog = useCallback((level: string, message: string) => {
     const ts = new Date().toLocaleTimeString('fr-FR', { hour12: false })
     setLogs((prev) => [{ level, message, ts }, ...prev].slice(0, MAX_LOGS))
   }, [])
+
+  const consumeProfilePath = useCallback(async () => {
+    try {
+      const profile = await api.importProfilePath()
+      if (profile) {
+        setError(null)
+        setPathImportedProfile(profile)
+      }
+    } catch (cause) {
+      const message = `Import du profil associé impossible : ${String(cause)}`
+      setError(message)
+      pushLog('error', message)
+    }
+  }, [pushLog])
 
   // Chargement initial + abonnement aux événements du backend.
   useEffect(() => {
@@ -70,10 +85,17 @@ export function useClient() {
           break
       }
     })
+    const unlistenProfilePath = api.onProfilePath(() => {
+      void consumeProfilePath()
+    })
+    // Le premier lancement a pu recevoir son argv avant que React installe
+    // l'écouteur. La commande consomme alors le chemin conservé côté Rust.
+    void unlistenProfilePath.then(() => consumeProfilePath())
     return () => {
       unlisten.then((f) => f())
+      unlistenProfilePath.then((f) => f())
     }
-  }, [pushLog])
+  }, [consumeProfilePath, pushLog])
 
   const connect = useCallback(async (name?: string) => {
     setError(null)
@@ -133,6 +155,8 @@ export function useClient() {
     }
   }, [])
 
+  const clearPathImportedProfile = useCallback(() => setPathImportedProfile(null), [])
+
   const selectedProfile =
     config.profiles.find((p) => p.name === config.selected) ?? config.profiles[0] ?? null
 
@@ -147,12 +171,14 @@ export function useClient() {
     upSince,
     error,
     selectedProfile,
+    pathImportedProfile,
     connect,
     disconnect,
     importProfile,
     saveProfile,
     removeProfile,
     select,
+    clearPathImportedProfile,
     clearError: () => setError(null),
   }
 }

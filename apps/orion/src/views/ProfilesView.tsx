@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Eye, EyeOff, Plus, Save, Trash2, Upload } from 'lucide-react'
+import * as api from '../api'
 import type { ClientConfig, ClientProfile } from '../types'
 
 interface Props {
   config: ClientConfig
+  pathImport: ClientProfile | null
+  onPathImportHandled: () => void
   onImport: (contents: string, fileName: string) => Promise<ClientProfile>
   onSave: (p: ClientProfile) => Promise<void>
   onDelete: (name: string) => Promise<void>
@@ -28,7 +31,15 @@ type ImportNotice = { tone: 'success' | 'error'; message: string }
 
 const MAX_IMPORT_BYTES = 64 * 1024
 
-export function ProfilesView({ config, onImport, onSave, onDelete, onSelect }: Props) {
+export function ProfilesView({
+  config,
+  pathImport,
+  onPathImportHandled,
+  onImport,
+  onSave,
+  onDelete,
+  onSelect,
+}: Props) {
   const [draft, setDraft] = useState<ClientProfile>(
     () =>
       config.profiles.find((p) => p.name === config.selected) ??
@@ -38,13 +49,45 @@ export function ProfilesView({ config, onImport, onSave, onDelete, onSelect }: P
   const [dirty, setDirty] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importNotice, setImportNotice] = useState<ImportNotice | null>(null)
+  const [publicKey, setPublicKey] = useState<string | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+
+  // La dérivation vit côté Rust : l'IHM ne manipule pas de crypto, et une clé
+  // privée incomplète en cours de saisie rend simplement une valeur absente.
+  useEffect(() => {
+    let annule = false
+    api
+      .profilePublicKey(draft)
+      .then((key) => {
+        if (!annule) setPublicKey(key)
+      })
+      .catch(() => {
+        if (!annule) setPublicKey(null)
+      })
+    return () => {
+      annule = true
+    }
+  }, [draft])
 
   useEffect(() => {
     if (dirty) return
     const selected = config.profiles.find((p) => p.name === config.selected) ?? config.profiles[0]
     if (selected) setDraft(selected)
   }, [config, dirty])
+
+  useEffect(() => {
+    if (!pathImport) return
+    const replaces = config.profiles.some((candidate) => candidate.name === pathImport.name)
+    setDraft(pathImport)
+    setDirty(true)
+    setImportNotice({
+      tone: 'success',
+      message: replaces
+        ? `Profil « ${pathImport.name} » chargé par l'association de fichier. Enregistrer remplacera le profil existant.`
+        : `Profil « ${pathImport.name} » chargé par l'association de fichier. Vérifiez-le puis enregistrez-le.`,
+    })
+    onPathImportHandled()
+  }, [config.profiles, onPathImportHandled, pathImport])
 
   const set = <K extends keyof ClientProfile>(key: K, value: ClientProfile[K]) => {
     setDraft((profile) => ({ ...profile, [key]: value }))
@@ -74,12 +117,13 @@ export function ProfilesView({ config, onImport, onSave, onDelete, onSelect }: P
     setImporting(true)
     try {
       const profile = await onImport(await file.text(), file.name)
+      const existing = config.profiles.find((candidate) => candidate.name === profile.name)
+
       setDraft(profile)
       setDirty(true)
-      const replaces = config.profiles.some((candidate) => candidate.name === profile.name)
       setImportNotice({
         tone: 'success',
-        message: replaces
+        message: existing
           ? `Profil « ${profile.name} » chargé. Enregistrer remplacera le profil existant.`
           : `Profil « ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.`,
       })
@@ -174,14 +218,19 @@ export function ProfilesView({ config, onImport, onSave, onDelete, onSelect }: P
             value={draft.private_key}
             onChange={(v) => set('private_key', v)}
           />
+          <ReadOnlyField
+            label="Clé publique du client"
+            value={publicKey ?? '—'}
+            hint="À transmettre à l’opérateur pour être admis."
+          />
           <Field
             label="Clé publique de la gateway"
             value={draft.peer_public_key}
             onChange={(v) => set('peer_public_key', v)}
           />
           <Note tone="warn">
-            L’admission est <strong>hors bande</strong> : la clé publique dérivée de cette clé privée
-            doit être déclarée sur Helios avant le premier handshake.
+            L’admission est <strong>hors bande</strong> : la clé publique ci-dessus doit être
+            déclarée sur Helios avant le premier handshake.
           </Note>
         </Section>
 
@@ -314,6 +363,25 @@ function Field({
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
+    </div>
+  )
+}
+
+/** Valeur dérivée, non saisissable : la modifier n'aurait aucun sens. */
+function ReadOnlyField({
+  label,
+  value,
+  hint,
+}: {
+  label: string
+  value: string
+  hint?: string
+}) {
+  return (
+    <div>
+      <label className="label">{label}</label>
+      <input className="field font-mono text-xs opacity-70" value={value} readOnly />
+      {hint && <p className="mt-1 text-[11px] text-slate-500">{hint}</p>}
     </div>
   )
 }

@@ -102,6 +102,16 @@ impl ClientProfile {
         Ok(())
     }
 
+    /// Clé publique correspondant à la clé privée du profil.
+    ///
+    /// C'est la seule moitié de la paire qui ait vocation à sortir du poste :
+    /// l'utilisateur la communique à l'opérateur pour être admis sur la gateway
+    /// (ADR-004 §6). `None` si le profil n'a pas encore de clé privée, ou si
+    /// celle-ci est illisible.
+    pub fn public_key(&self) -> Option<String> {
+        aether::wg::public_from_private(&self.private_key).ok()
+    }
+
     /// Le tunnel est-il protégé en post-quantique (PSK ML-KEM installé) ?
     pub fn is_post_quantum(&self) -> bool {
         self.preshared_key

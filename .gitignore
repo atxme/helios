@@ -1,4 +1,5 @@
 /target
+/resources-windows
 **/*.rs.bk
 *.pem
 *.raucb

@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use helios_update::{clear_activation, prepare_switch, read_activation, SwitchGuard, UpdateLayout};
+use helios_update::{
+    bundle::{self, BootstrapLayout},
+    clear_activation, prepare_switch, read_activation, SwitchGuard, UpdateLayout,
+};
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -28,12 +31,131 @@ struct Cli {
 enum CommandKind {
     /// Consomme `/var/lib/helios/updates/activate.json`.
     InstallPending,
+    /// Installe un bundle signé sur une gateway (ADR-004).
+    ///
+    /// Premier déploiement comme réinstallation : le contenu est vérifié
+    /// entièrement — signature hybride, empreinte de chaque fichier, absence de
+    /// fichier surnuméraire — avant la moindre écriture.
+    Bootstrap {
+        /// Archive produite par `cargo xtask pack`.
+        #[arg(long, conflicts_with = "dir")]
+        archive: Option<PathBuf>,
+        /// Répertoire de bundle déjà extrait.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         CommandKind::InstallPending => install_pending(),
+        CommandKind::Bootstrap { archive, dir } => bootstrap(archive, dir),
     }
+}
+
+/// Installe un bundle signé, puis rend la main à l'opérateur.
+///
+/// La commande n'active aucun service et ne démarre rien : sur une gateway
+/// neuve, l'identité WireGuard n'existe pas encore et le kill-switch couperait
+/// l'accès. La séquence d'après appartient à l'opérateur, avec accès console.
+fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
+    let update = UpdateLayout::for_daemon(false);
+    let layout = BootstrapLayout::system(update);
+
+    let (root, extracted) = match (archive, dir) {
+        (Some(archive), _) => {
+            let root = extract(&archive)?;
+            (root, true)
+        }
+        (None, Some(dir)) => (dir, false),
+        (None, None) => bail!("indiquer --archive <fichier.tar.gz> ou --dir <répertoire>"),
+    };
+
+    let report = bundle::install(&root, &layout)
+        .with_context(|| format!("installation du bundle {}", root.display()))?;
+
+    if extracted {
+        if let Some(parent) = root.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    let units_reloaded = reload_units();
+
+    println!(
+        "helios {} séquence {} installé (canal {})",
+        report.version, report.release_sequence, report.channel
+    );
+    for path in &report.installed {
+        println!("  {}", path.display());
+    }
+    if report.config_preserved {
+        println!("  {} conservée telle quelle", layout.config_path.display());
+    }
+    if let Err(error) = units_reloaded {
+        // Les fichiers sont posés et vérifiés : échouer ici annoncerait une
+        // installation ratée alors qu'elle a réussi. On le dit fort, sans
+        // masquer, parce que les unités restent à recharger.
+        eprintln!(
+            "\nATTENTION : les unités systemd n'ont pas été rechargées ({error:#}). \
+             Exécuter `systemctl daemon-reload` avant d'activer les services."
+        );
+    }
+    println!("\nSuite, avec accès console :");
+    println!("  sudo heliosd provision-tpm     # premier déploiement seulement");
+    println!("  sudo heliosd init-identity     # affiche la clé publique de la gateway");
+    println!("  sudo heliosd peer add --name <nom> --public-key <clé> --admin");
+    println!("  sudo systemctl enable --now heliosd helios-update.path");
+    Ok(())
+}
+
+/// Extrait une archive dans un répertoire jetable et rend la racine du bundle.
+fn extract(archive: &Path) -> Result<PathBuf> {
+    if !archive.is_file() {
+        bail!("{} introuvable", archive.display());
+    }
+    let workspace = std::env::temp_dir().join(format!("helios-bootstrap-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace)
+        .with_context(|| format!("création de {}", workspace.display()))?;
+
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&workspace)
+        .status()
+        .context("exécution de tar")?;
+    if !status.success() {
+        bail!("extraction de {} échouée ({status})", archive.display());
+    }
+
+    // L'archive contient un unique répertoire racine. Tout autre contenu est
+    // une archive qui n'a pas été produite par `cargo xtask pack`, et dont on
+    // ne devinera pas la disposition.
+    let mut entries: Vec<PathBuf> = fs::read_dir(&workspace)
+        .with_context(|| format!("lecture de {}", workspace.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    entries.sort();
+    match entries.as_slice() {
+        [only] if only.is_dir() => Ok(only.clone()),
+        _ => bail!(
+            "archive inattendue : un unique répertoire racine est attendu, {} entrée(s) trouvée(s)",
+            entries.len()
+        ),
+    }
+}
+
+fn reload_units() -> Result<()> {
+    let status = Command::new("systemctl")
+        .arg("daemon-reload")
+        .status()
+        .context("exécution de systemctl daemon-reload")?;
+    if !status.success() {
+        bail!("systemctl daemon-reload a échoué ({status})");
+    }
+    Ok(())
 }
 
 fn install_pending() -> Result<()> {

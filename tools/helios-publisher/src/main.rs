@@ -78,6 +78,34 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Signe le contenu d’un bundle d’installation déjà assemblé.
+    ///
+    /// Écrit `manifest.json` à la racine du répertoire. Le manifeste énumère
+    /// exhaustivement le contenu : un fichier ajouté ou modifié après coup fait
+    /// échouer l’installation.
+    Bundle {
+        /// Répertoire assemblé par `cargo xtask bundle`.
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, value_parser = positive_u32)]
+        key_epoch: u32,
+        #[arg(long, value_parser = positive_u64)]
+        release_sequence: u64,
+        #[arg(long, value_parser = release_channel)]
+        channel: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        git_commit: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        ed25519_private_key: PathBuf,
+        #[arg(long)]
+        ml_dsa_65_private_key: PathBuf,
+        #[arg(long)]
+        keyring: PathBuf,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,7 +167,106 @@ fn main() -> Result<()> {
             &keyring,
             &output,
         ),
+        Command::Bundle {
+            dir,
+            key_epoch,
+            release_sequence,
+            channel,
+            version,
+            git_commit,
+            target,
+            ed25519_private_key,
+            ml_dsa_65_private_key,
+            keyring,
+        } => sign_bundle(
+            &dir,
+            key_epoch,
+            release_sequence,
+            channel,
+            version,
+            git_commit,
+            target,
+            &ed25519_private_key,
+            &ml_dsa_65_private_key,
+            &keyring,
+        ),
     }
+}
+
+/// Signe le contenu d’un répertoire de bundle.
+///
+/// Le binaire `heliosd` est revalidé comme ELF de la target déclarée avant
+/// signature : signer un bundle dont l’exécutable ne correspond pas à sa cible
+/// produirait un artefact authentique et pourtant ininstallable, découvert
+/// seulement sur la gateway.
+#[allow(clippy::too_many_arguments)]
+fn sign_bundle(
+    dir: &Path,
+    key_epoch: u32,
+    release_sequence: u64,
+    channel: String,
+    version: String,
+    git_commit: String,
+    target: String,
+    ed25519_path: &Path,
+    ml_dsa_65_path: &Path,
+    keyring_path: &Path,
+) -> Result<()> {
+    use helios_update::bundle;
+
+    if version.trim().is_empty() || git_commit.trim().is_empty() || target.trim().is_empty() {
+        bail!("version, commit et target doivent être renseignés");
+    }
+    let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
+
+    let heliosd = dir.join("heliosd");
+    if !heliosd.is_file() {
+        bail!(
+            "{} absent : un bundle gateway contient toujours le daemon",
+            heliosd.display()
+        );
+    }
+    helios_update::verify_elf(&heliosd, &target)
+        .with_context(|| format!("validation ELF de {}", heliosd.display()))?;
+
+    let files = bundle::collect(dir).context("recensement du contenu du bundle")?;
+    let payload = aether::sig::BundlePayload {
+        product: bundle::BUNDLE_PRODUCT.to_string(),
+        channel,
+        release_sequence,
+        version,
+        git_commit,
+        target,
+        minimum_installer_version: helios_update::INSTALLER_VERSION,
+        files,
+    };
+    payload
+        .validate()
+        .map_err(|e| anyhow::anyhow!("contenu de bundle refusé : {e}"))?;
+
+    let manifest = signer
+        .sign(payload)
+        .context("signature hybride du manifeste de bundle")?;
+    let keyring = load_keyring(keyring_path)?;
+    manifest
+        .verify(&keyring)
+        .context("auto-vérification du manifeste produit")?;
+
+    let json = serde_json::to_vec_pretty(&manifest).context("sérialisation du manifeste")?;
+    let output = dir.join(bundle::BUNDLE_MANIFEST_FILE);
+    write_new(&output, &json, false)?;
+
+    println!(
+        "bundle {} séquence {}, {} fichier(s), écrit dans {}",
+        manifest.payload.version,
+        release_sequence,
+        manifest.payload.files.len(),
+        output.display()
+    );
+    for entry in &manifest.payload.files {
+        println!("  {} {}", hex::encode(entry.sha256), entry.path);
+    }
+    Ok(())
 }
 
 fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {

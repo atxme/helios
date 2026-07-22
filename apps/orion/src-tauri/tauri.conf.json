@@ -29,6 +29,21 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png"],
+    "fileAssociations": [
+      {
+        "ext": ["orionprofile"],
+        "name": "Profil Orion",
+        "description": "Profil de connexion VPN Orion",
+        "mimeType": "application/x-orion-profile",
+        "role": "Editor"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libcap2-bin"],
+        "postInstallScript": "linux/postinst"
+      }
+    }
   }
 }

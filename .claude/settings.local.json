@@ -139,7 +139,25 @@
       "Bash(sudo -n wg show helios-cli0)",
       "Bash(sudo -n ip link delete helios-cli0)",
       "Bash(rm -f /tmp/cli.key /tmp/ctx.json /tmp/ctx2.json)",
-      "Bash(grep -E \"^\\\\s+\\\\$|✓|✗|montage|handshake\")"
+      "Bash(grep -E \"^\\\\s+\\\\$|✓|✗|montage|handshake\")",
+      "Bash(npm test *)",
+      "Bash(bash scripts/regression.sh)",
+      "Bash(echo \"REGRESSION_EXIT=$?\")",
+      "Bash(pkg-config --exists libnftnl)",
+      "Bash(pkg-config --exists libmnl)",
+      "Bash(pkg-config --exists tss2-esys)",
+      "Bash(HELIOS_PUBLISHER_KEYRING_PATH=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/epoch/publisher-keyring.json cargo xtask bundle --skip-frontend)",
+      "Bash(HELIOS_UPDATE_CHANNEL=production HELIOS_UPDATE_STAGING=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/var/lib/helios/updates HELIOS_INSTALL_ROOT=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/opt/helios/releases HELIOS_CURRENT_LINK=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/opt/helios/current HELIOS_LIBEXEC_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/usr/libexec HELIOS_BIN_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/usr/local/bin HELIOS_SYSTEMD_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/etc/systemd/system HELIOS_NETWORK_CONFIG=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/var/lib/helios/network.toml target/release/helios-installer bootstrap --archive target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu.tar.gz)",
+      "Bash(HELIOS_UPDATE_CHANNEL=production HELIOS_UPDATE_STAGING=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/var/lib/helios/updates HELIOS_INSTALL_ROOT=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/opt/helios/releases HELIOS_CURRENT_LINK=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/opt/helios/current HELIOS_LIBEXEC_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/usr/libexec HELIOS_BIN_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/usr/local/bin HELIOS_SYSTEMD_DIR=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/etc/systemd/system HELIOS_NETWORK_CONFIG=/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/var/lib/helios/network.toml target/x86_64-unknown-linux-gnu/release/helios-installer bootstrap --archive target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu.tar.gz)",
+      "Bash(/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/opt/helios/current/heliosd --version)",
+      "Bash(/tmp/claude-1000/-home-christophe-helios/8f6bfbdb-8766-4569-afc2-ab14e73aa7a9/scratchpad/faux-systeme/usr/local/bin/helios-ctl --help)",
+      "Bash(echo \"CAMPAGNE_EXIT=$?\")",
+      "Bash(bash scripts/lab.sh --keep)",
+      "Bash(bash scripts/lab.sh)",
+      "Bash(echo \"LAB_EXIT=$?\")",
+      "Bash(curl --fail --location --silent --show-error https://download.wireguard.com/wireguard-nt/wireguard-nt-1.1.zip --output wgnt.zip)",
+      "Bash(unzip -l wgnt.zip)",
+      "Bash(unzip -o -q wgnt.zip -d wgnt)"
     ]
   }
 }

@@ -4,14 +4,13 @@
 //! Helios, et le format `wg-quick` à un seul pair. L'import ne persiste rien :
 //! il produit un [`ClientProfile`] validé que l'IHM présente comme brouillon.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::{collections::HashMap, fs::File, io::Read, net::IpAddr, path::Path};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 
-use crate::{ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
+use crate::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 
 /// Identifiant stable du document JSON échangeable avec Orion.
 pub const PROFILE_IMPORT_FORMAT: &str = "orion-profile";
@@ -41,6 +40,10 @@ struct JsonHeader {
 struct JsonProfile {
     name: String,
     endpoint: String,
+    /// Absente dans un profil d'invitation : l'opérateur ne détient pas la clé
+    /// privée du client et n'a donc rien à lui renvoyer (ADR-004 §6). L'IHM
+    /// complète alors depuis le profil local de même nom.
+    #[serde(default)]
     private_key: String,
     peer_public_key: String,
     #[serde(default)]
@@ -98,6 +101,56 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientPro
     };
 
     validate_imported_profile(profile)
+}
+
+/// Lit un profil depuis un chemin sans jamais allouer plus que la borne
+/// d'import. La vérification porte sur les octets réellement lus : une taille
+/// issue des métadonnées ne suffirait pas face à un fichier modifié en cours de
+/// lecture.
+pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
+    let file = File::open(path).with_context(|| format!("ouverture de {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(MAX_PROFILE_IMPORT_BYTES.min(4096));
+    file.take((MAX_PROFILE_IMPORT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("lecture de {}", path.display()))?;
+    if bytes.len() > MAX_PROFILE_IMPORT_BYTES {
+        anyhow::bail!(
+            "fichier trop volumineux (maximum {} Kio)",
+            MAX_PROFILE_IMPORT_BYTES / 1024
+        );
+    }
+    let contents = String::from_utf8(bytes).context("le profil n'est pas encodé en UTF-8")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("le nom du profil n'est pas représentable en UTF-8")?;
+    parse_profile_import(&contents, file_name)
+}
+
+/// Complète un document d'invitation depuis le profil local de même nom.
+///
+/// Les imports par sélecteur de fichier et par association système appellent
+/// tous deux cette fonction. Une invitation reçue sur une autre machine est
+/// refusée explicitement : fabriquer une nouvelle clé privée romprait
+/// l'admission déjà liée à la clé publique originale.
+pub fn complete_profile_import(
+    mut profile: ClientProfile,
+    config: &ClientConfig,
+) -> Result<ClientProfile> {
+    if profile.private_key.is_empty() {
+        let existing = config
+            .find(&profile.name)
+            .filter(|candidate| !candidate.private_key.trim().is_empty())
+            .with_context(|| {
+                format!(
+                    "ce profil ne contient pas de clé privée et aucun profil local « {} » n'en fournit une ; l'importer sur le poste qui a généré la clé ou demander un profil complet à l'opérateur",
+                    profile.name
+                )
+            })?;
+        profile.private_key = existing.private_key.clone();
+    }
+    profile.validate()?;
+    Ok(profile)
 }
 
 fn parse_json(contents: &str) -> Result<ClientProfile> {
@@ -281,9 +334,14 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     if profile.name.is_empty() {
         anyhow::bail!("le nom du profil est requis");
     }
-    profile.validate()?;
     validate_endpoint(&profile.endpoint)?;
-    validate_wg_key(&profile.private_key, "clé privée du client")?;
+    // Un profil d'invitation arrive sans clé privée : l'opérateur n'a jamais
+    // détenu celle du client, c'est précisément ce qui rend ce mode sûr. Le
+    // document reste rejeté si la clé est présente mais malformée — une clé
+    // tronquée n'est pas une invitation, c'est une erreur.
+    if !profile.private_key.is_empty() {
+        validate_wg_key(&profile.private_key, "clé privée du client")?;
+    }
     validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
     if let Some(psk) = &profile.preshared_key {
         validate_wg_key(psk, "PresharedKey")?;
@@ -410,6 +468,117 @@ mod tests {
         assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
     }
 
+    /// Profil d'invitation (ADR-004 §6) : l'opérateur admet la clé publique que
+    /// le client lui a transmise et renvoie tout **sauf** la clé privée, qu'il
+    /// n'a jamais détenue. L'IHM la reprend du profil local de même nom.
+    #[test]
+    fn importe_une_invitation_sans_cle_privee() {
+        let raw = format!(
+            r#"{{
+                "format": "orion-profile",
+                "version": 1,
+                "profile": {{
+                    "name": "portable",
+                    "endpoint": "vpn.example.net:51820",
+                    "peer_public_key": "{GATEWAY_PUBLIC}",
+                    "address": "100.64.1.2/32"
+                }}
+            }}"#
+        );
+
+        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        assert!(
+            profile.private_key.is_empty(),
+            "l'invitation ne doit porter aucune clé privée"
+        );
+        assert_eq!(profile.peer_public_key, GATEWAY_PUBLIC);
+        assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
+        assert!(
+            profile.validate().is_err(),
+            "une invitation seule ne doit pas être présentée comme connectable"
+        );
+    }
+
+    #[test]
+    fn complete_une_invitation_avec_la_cle_locale_de_meme_nom() {
+        let invitation = ClientProfile {
+            name: "portable".into(),
+            endpoint: "vpn.example.net:51820".into(),
+            peer_public_key: GATEWAY_PUBLIC.into(),
+            address: Some("100.64.1.2/32".into()),
+            ..ClientProfile::default()
+        };
+        let config = ClientConfig {
+            profiles: vec![ClientProfile {
+                name: "portable".into(),
+                private_key: CLIENT_PRIVATE.into(),
+                ..ClientProfile::default()
+            }],
+            selected: None,
+        };
+
+        let completed = complete_profile_import(invitation, &config).unwrap();
+        assert_eq!(completed.private_key, CLIENT_PRIVATE);
+    }
+
+    #[test]
+    fn refuse_une_invitation_sans_cle_locale_correspondante() {
+        let invitation = ClientProfile {
+            name: "portable".into(),
+            endpoint: "vpn.example.net:51820".into(),
+            peer_public_key: GATEWAY_PUBLIC.into(),
+            address: Some("100.64.1.2/32".into()),
+            ..ClientProfile::default()
+        };
+
+        let error = complete_profile_import(invitation, &ClientConfig::default()).unwrap_err();
+        assert!(error.to_string().contains("aucun profil local"));
+    }
+
+    /// Tolérer l'absence de clé privée ne doit pas faire tolérer une clé
+    /// tronquée : ce n'est pas une invitation, c'est une corruption.
+    #[test]
+    fn une_cle_privee_presente_mais_malformee_reste_refusee() {
+        let raw = r#"{
+            "format": "orion-profile",
+            "version": 1,
+            "profile": {
+                "name": "portable",
+                "endpoint": "vpn.example.net:51820",
+                "private_key": "AAAA",
+                "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                "address": "100.64.1.2/32"
+            }
+        }"#;
+        let erreur = parse_profile_import(raw, "portable.json").unwrap_err();
+        assert!(
+            erreur.to_string().contains("clé privée"),
+            "message : {erreur}"
+        );
+    }
+
+    /// `wg-quick` n'a pas de notion d'invitation : un fichier sans `PrivateKey`
+    /// est un fichier incomplet, et le dire tôt évite un tunnel qui ne monte
+    /// jamais sans explication.
+    #[test]
+    fn wg_quick_sans_cle_privee_reste_refuse() {
+        let raw = format!(
+            r#"
+                [Interface]
+                Address = 100.64.1.2/32
+
+                [Peer]
+                PublicKey = {GATEWAY_PUBLIC}
+                Endpoint = vpn.example.net:51820
+            "#
+        );
+        let erreur = parse_profile_import(&raw, "portable.conf").unwrap_err();
+        assert!(
+            erreur.to_string().contains("PrivateKey"),
+            "message : {erreur}"
+        );
+    }
+
     #[test]
     fn importe_wg_quick_a_un_pair() {
         let raw = format!(
@@ -524,5 +693,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("trop volumineux"));
+    }
+
+    #[test]
+    fn lecture_par_chemin_reutilise_le_parseur_et_la_borne() {
+        let directory = std::env::temp_dir().join(format!(
+            "orion-import-chemin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let profile_path = directory.join("portable.orionprofile");
+        let raw = format!(
+            r#"{{
+                "format": "orion-profile",
+                "version": 1,
+                "profile": {{
+                    "name": "portable",
+                    "endpoint": "vpn.example.net:51820",
+                    "private_key": "{CLIENT_PRIVATE}",
+                    "peer_public_key": "{GATEWAY_PUBLIC}",
+                    "address": "100.64.1.2/32"
+                }}
+            }}"#
+        );
+        std::fs::write(&profile_path, raw).unwrap();
+        assert_eq!(
+            read_profile_import_path(&profile_path).unwrap().name,
+            "portable"
+        );
+
+        let oversized_path = directory.join("trop-grand.orionprofile");
+        std::fs::write(&oversized_path, vec![b' '; MAX_PROFILE_IMPORT_BYTES + 1]).unwrap();
+        assert!(read_profile_import_path(&oversized_path)
+            .unwrap_err()
+            .to_string()
+            .contains("trop volumineux"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

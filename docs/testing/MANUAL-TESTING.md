@@ -160,8 +160,64 @@ cd apps/orion
 ORION_CONFIG=/tmp/orion-manual/profiles.toml npm run tauri dev
 ```
 
-`ORION_CONFIG` empêche le test de modifier les profils habituels. Dans un autre
-terminal, générer deux identités de test :
+`ORION_CONFIG` empêche le test de modifier les profils habituels.
+
+### Installateurs Orion
+
+Sur le poste de build Windows, préparer les DLL puis produire un bundle signé :
+
+```powershell
+cargo xtask orion-deps
+$env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_ESPACES"
+$env:ORION_TIMESTAMP_URL = "https://tsa.interne.example/rfc3161"
+npm run tauri build --prefix apps/orion -- --features wireguard
+```
+
+Après installation sur une machine propre :
+
+1. vérifier `signtool verify /pa /tw` sur l'exécutable et l'installateur ;
+2. vérifier la demande UAC au lancement ;
+3. importer un profil `.orionprofile` par double-clic quand Orion est arrêté ;
+4. recommencer avec Orion ouvert et confirmer qu'une seule fenêtre subsiste ;
+5. pour une invitation sans clé privée, confirmer la reprise de la clé du
+   profil local de même nom et le refus si ce profil local n'existe pas ;
+6. connecter réellement le tunnel et contrôler handshake, routes et retrait
+   uniquement après déconnexion explicite.
+
+Sur une cible Debian, installer le `.deb`, puis vérifier :
+
+```sh
+getcap /usr/bin/orion
+/usr/bin/orion
+```
+
+La première commande doit annoncer `cap_net_admin=ep`. La seconde doit ouvrir
+WebKitGTK sans dépendre de `LD_LIBRARY_PATH`; si une distribution supportée
+échoue précisément après `setcap`, conserver les traces du chargeur et appliquer
+la décision ADR-004 de basculer le privilège réseau vers polkit.
+
+### Le chemin court : un profil venu d'une vraie gateway
+
+`bash scripts/lab.sh --keep` monte une gateway de développement, admet un client
+et émet deux profils. Importer `lab-poste.json` : il porte tout ce qu'il faut et
+son pair est réellement admis, ce que des clés fabriquées à la main ne
+garantissent pas.
+
+Vérifier ensuite, dans l'onglet **Profils** :
+
+- la **clé publique du client** s'affiche en lecture seule et correspond à celle
+  que `helios-ctl peer list` montre côté gateway — c'est la valeur que
+  l'utilisateur transmet à l'opérateur ;
+- importer `lab.invitation.json` (sans clé privée) alors qu'un profil `lab`
+  existe déjà localement : la clé privée locale doit être reprise
+  silencieusement, sans que l'utilisateur ait à la ressaisir ;
+- importer ce même fichier d'invitation sur un profil **inconnu** (renommer le
+  champ `name`) : l'import doit être refusé avec un message expliquant qu'il
+  faut l'importer sur le poste qui détient la clé, et ne modifier aucun profil.
+
+### Le chemin manuel
+
+Dans un autre terminal, générer deux identités de test :
 
 ```sh
 client_private=$(wg genkey)
