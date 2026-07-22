@@ -706,6 +706,21 @@ fn handshake_frais(peer: &helios_wireguard::PeerStatus) -> bool {
 /// le tunnel** : le nom du pair vient de sa table d'admission, l'endpoint et le
 /// handshake de son propre plan de données.
 ///
+/// # Ce que la déconnexion d'un client n'est pas
+///
+/// WireGuard est **sans connexion** : le protocole n'a pas de message de
+/// déconnexion. Un client qui se désactive détruit son interface sans rien
+/// annoncer, et la gateway ne peut le déduire que de l'absence de nouveau
+/// handshake — d'où un délai pouvant aller jusqu'à [`HANDSHAKE_STALE_AFTER`].
+/// Raccourcir ce seuil déclarerait morts des pairs bien vivants mais silencieux,
+/// qui ne rehandshakent que toutes les deux minutes environ.
+///
+/// C'est pourquoi une reconnexion est signalée par son **endpoint**, et pas
+/// seulement par le passage de périmé à frais : un client qui se rattache dans
+/// la fenêtre de péremption reste « frais » d'un tour à l'autre, et son retour
+/// passerait autrement inaperçu. Le port source change à chaque session, la
+/// ligne le montre.
+///
 /// # Limite connue
 ///
 /// Un handshake **refusé** — clé publique inconnue — n'apparaît pas ici et ne
@@ -716,43 +731,61 @@ fn handshake_frais(peer: &helios_wireguard::PeerStatus) -> bool {
 async fn journaliser_les_pairs(
     peers: &[helios_wireguard::PeerStatus],
     shared_network: &Arc<RwLock<NetworkConfig>>,
-    connus: &mut std::collections::HashMap<Vec<u8>, bool>,
+    connus: &mut std::collections::HashMap<Vec<u8>, (bool, Option<String>)>,
     event_tx: &broadcast::Sender<HeliosEvent>,
 ) {
     let network = shared_network.read().await;
     for peer in peers {
         let frais = handshake_frais(peer);
-        let precedent = connus.insert(peer.public_key.clone(), frais);
-        if precedent == Some(frais) {
+        let observe = (frais, peer.endpoint.clone());
+        let precedent = connus.insert(peer.public_key.clone(), observe.clone());
+        if precedent.as_ref() == Some(&observe) {
             continue;
         }
 
         let cle = peer.public_key_b64();
         let declare = network.peers.iter().find(|p| p.public_key == cle);
         let nom = declare.map_or("pair non déclaré", |p| p.name.as_str());
-        if frais {
-            let protection = match declare.map(|p| p.preshared_key.is_some()) {
-                Some(true) => "post-quantique (PSK ML-KEM posé)",
-                // Sans PSK, le tunnel est monté sur Curve25519 seul : c'est
-                // l'étape 1 de la cinématique ADR-001, pas un défaut. Le dire
-                // évite de croire la session protégée en post-quantique.
-                _ => "classique (Curve25519, PSK non encore négocié)",
-            };
-            emit_log(
-                event_tx,
-                "info",
-                &format!(
-                    "pair « {nom} » connecté depuis {} — VIP {} — protection {protection}",
-                    peer.endpoint.as_deref().unwrap_or("endpoint inconnu"),
-                    peer.allowed_ips.join(", ")
-                ),
-            );
-        } else if precedent.is_some() {
-            emit_log(
-                event_tx,
-                "info",
-                &format!("pair « {nom} » inactif — plus de handshake frais"),
-            );
+        let endpoint = peer.endpoint.as_deref().unwrap_or("endpoint inconnu");
+
+        match (precedent, frais) {
+            (Some((true, _)), false) => {
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!("pair « {nom} » inactif — plus de handshake frais"),
+                );
+            }
+            // Un pair jamais vu frais qui reste périmé n'a rien à annoncer :
+            // ce serait signaler la déconnexion d'un client jamais connecté.
+            (_, false) => {}
+            (Some((true, _)), true) => {
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!(
+                        "pair « {nom} » reconnecté depuis {endpoint} — nouvelle session, \
+                         l'ancienne n'est pas reprise"
+                    ),
+                );
+            }
+            (_, true) => {
+                let protection = match declare.map(|p| p.preshared_key.is_some()) {
+                    Some(true) => "post-quantique (PSK ML-KEM posé)",
+                    // Sans PSK, le tunnel est monté sur Curve25519 seul : c'est
+                    // l'étape 1 de la cinématique ADR-001, pas un défaut. Le dire
+                    // évite de croire la session protégée en post-quantique.
+                    _ => "classique (Curve25519, PSK non encore négocié)",
+                };
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!(
+                        "pair « {nom} » connecté depuis {endpoint} — VIP {} — protection {protection}",
+                        peer.allowed_ips.join(", ")
+                    ),
+                );
+            }
         }
     }
 }
@@ -774,7 +807,8 @@ fn spawn_handshake_poller(
         // mémoire, on ne peut pas distinguer « ce pair vient de se connecter »
         // de « ce pair est connecté depuis une heure », et on journaliserait
         // toutes les dix secondes.
-        let mut connus: std::collections::HashMap<Vec<u8>, bool> = std::collections::HashMap::new();
+        let mut connus: std::collections::HashMap<Vec<u8>, (bool, Option<String>)> =
+            std::collections::HashMap::new();
         loop {
             ticker.tick().await;
             if !wg.is_up() {
@@ -1088,6 +1122,21 @@ mod tests {
         );
     }
 
+    fn pair_connecte(endpoint: &str) -> helios_wireguard::PeerStatus {
+        helios_wireguard::PeerStatus {
+            public_key: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                PEER_KEY,
+            )
+            .unwrap(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
+            last_handshake: Some(std::time::SystemTime::now()),
+            endpoint: Some(endpoint.into()),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+
     /// La trace qui permet d'affirmer que c'est bien `heliosd` qui tient le
     /// tunnel, et de distinguer une session classique d'une session protégée.
     #[tokio::test]
@@ -1127,6 +1176,35 @@ mod tests {
             events.try_recv().is_err(),
             "connexion journalisée deux fois"
         );
+    }
+
+    /// Un client qui se réactive pendant la fenêtre de péremption reste
+    /// « frais » d'un tour à l'autre : sans surveillance de l'endpoint, son
+    /// retour serait totalement muet. C'est ce qui donnait l'impression que la
+    /// gateway ne voyait rien — et qu'une ancienne session était reprise.
+    #[tokio::test]
+    async fn une_reconnexion_pendant_la_fenetre_de_peremption_est_visible() {
+        let network = Arc::new(RwLock::new(configured_network()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut connus = std::collections::HashMap::new();
+
+        let mut peers = vec![pair_connecte("192.168.1.41:58466")];
+        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+        assert!(matches!(events.try_recv(), Ok(HeliosEvent::Log { .. })));
+
+        // Même pair, toujours frais, nouveau port source : le client Windows a
+        // détruit son interface et rouvert une socket. C'est une nouvelle
+        // session, pas la reprise de l'ancienne.
+        peers[0].endpoint = Some("192.168.1.41:56776".into());
+        peers[0].last_handshake = Some(std::time::SystemTime::now());
+        journaliser_les_pairs(&peers, &network, &mut connus, &event_tx).await;
+
+        let message = match events.try_recv() {
+            Ok(HeliosEvent::Log { message, .. }) => message,
+            autre => panic!("la reconnexion doit être journalisée, obtenu : {autre:?}"),
+        };
+        assert!(message.contains("reconnecté"), "message : {message}");
+        assert!(message.contains("56776"), "message : {message}");
     }
 
     /// Sans PSK, la session est montée sur Curve25519 seul. Le dire évite de
