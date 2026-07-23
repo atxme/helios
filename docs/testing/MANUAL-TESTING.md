@@ -162,6 +162,32 @@ ORION_CONFIG=/tmp/orion-manual/profiles.toml npm run tauri dev
 
 `ORION_CONFIG` empêche le test de modifier les profils habituels.
 
+### Accessibilité et interactions
+
+Sur Windows et Linux cible, vérifier au clavier et avec le lecteur d’écran
+disponible sur la plateforme :
+
+1. parcourir Connexion, Profils et Journal sans souris ; chaque contrôle actif
+   doit recevoir un focus nettement visible ;
+2. changer d’onglet avec les flèches, puis confirmer que son panneau est
+   annoncé avec le bon intitulé ;
+3. provoquer une erreur de connexion et confirmer son annonce immédiate, puis
+   fermer l’alerte avec son bouton nommé ;
+4. afficher et masquer chaque secret ; le nom accessible doit décrire l’action
+   à venir et aucun secret ne doit être annoncé tant qu’il reste masqué ;
+5. ouvrir la suppression d’un profil, annuler une première fois, puis confirmer
+   que la boîte de dialogue décrit l’effet et précise que le pair distant reste
+   admis ;
+6. activer la réduction des animations dans l’OS et vérifier que le halo et
+   l’orbite ne produisent plus d’animation perceptible ;
+7. agrandir le texte à 200 % et vérifier que chaque vue reste défilable sans
+   masquer les actions Enregistrer, Connecter ou Déconnecter.
+
+Les couleurs ne doivent jamais être le seul signal : la posture comporte un
+libellé et une icône, le journal un liseré et un niveau, et les erreurs un rôle
+d’alerte. Les contrôles matériels, WireGuard et packaging restent à exécuter
+séparément selon la plateforme.
+
 ### Installateurs Orion
 
 Sur le poste de build Windows, préparer les DLL puis produire un bundle signé :

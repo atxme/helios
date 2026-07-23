@@ -1,4 +1,10 @@
 import { useEffect, useState } from 'react'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import Tooltip from '@mui/material/Tooltip'
+import Typography from '@mui/material/Typography'
 import { ArrowDown, ArrowUp, Info, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
 import type { ClientProfile, TelemetrySample, TunnelState } from '../types'
 import { elapsed, formatBps, postureMeta, stateMeta } from '../components/state'
@@ -50,95 +56,126 @@ export function ConnectView({
   const PostureIcon = POSTURE_ICON[posture.posture]
 
   return (
-    <div className="flex h-full flex-col gap-5 overflow-y-auto px-6 py-6">
-      {/* ── Instrument principal ── */}
-      <div className="flex flex-col items-center gap-4">
+    <Stack
+      spacing={2.25}
+      sx={{ height: '100%', overflowY: 'auto', px: { xs: 2, sm: 3 }, py: 2.5 }}
+    >
+      <Stack spacing={1.5} sx={{ alignItems: 'center' }}>
         <StatusOrb state={state} adapterUp={adapterUp} />
 
-        <div className="text-center">
-          <div className="text-xl font-semibold tracking-tight" style={{ color: meta.color }}>
+        <Box sx={{ textAlign: 'center' }} aria-live="polite" aria-atomic="true">
+          <Typography
+            component="h2"
+            sx={{ color: meta.color, fontSize: 21, fontWeight: 700, letterSpacing: '-0.02em' }}
+          >
             {meta.label}
-          </div>
-          <div className="mt-1 font-mono text-xs text-slate-400">
+          </Typography>
+          <Typography
+            color="text.secondary"
+            sx={{ mt: 0.5, fontFamily: 'monospace', fontSize: 12, overflowWrap: 'anywhere' }}
+          >
             {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
-          </div>
+          </Typography>
           {duration && (
-            <div className="mt-1 font-mono text-[11px] tabular-nums text-slate-500">{duration}</div>
+            <Typography
+              color="text.disabled"
+              sx={{ mt: 0.4, fontFamily: 'monospace', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}
+            >
+              {duration}
+            </Typography>
           )}
-        </div>
-      </div>
+        </Box>
+      </Stack>
 
-      {/* ── Posture : ce qui protège réellement le poste (ADR-001 §3 bis) ── */}
-      <div
-        className="flex items-start gap-3 rounded-xl border px-4 py-3"
-        style={{ borderColor: `${posture.color}44`, background: `${posture.color}0e` }}
+      {/* La couleur et l’icône portent toutes deux la posture de sécurité réelle. */}
+      <Paper
+        variant="outlined"
+        sx={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 1.5,
+          borderColor: `${posture.color}44`,
+          bgcolor: `${posture.color}0e`,
+          p: 1.5,
+        }}
       >
-        <PostureIcon size={17} className="mt-0.5 shrink-0" style={{ color: posture.color }} />
-        <div className="min-w-0">
-          <div className="text-[13px] font-medium" style={{ color: posture.color }}>
+        <PostureIcon size={19} aria-hidden style={{ color: posture.color, flexShrink: 0, marginTop: 2 }} />
+        <Box sx={{ minWidth: 0 }}>
+          <Typography sx={{ color: posture.color, fontSize: 13, fontWeight: 700 }}>
             {posture.label}
-          </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">{posture.detail}</p>
-        </div>
-      </div>
+          </Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11, lineHeight: 1.55 }}>
+            {posture.detail}
+          </Typography>
+        </Box>
+      </Paper>
 
-      {/* ── Débit ── */}
       {meta.active && <Throughput telemetry={telemetry} history={history} />}
 
-      {/* ── Caractéristiques du profil ── */}
-      <div className="grid grid-cols-2 gap-2">
+      <Box
+        aria-label="Caractéristiques du profil"
+        sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1 }}
+      >
         <Tile
           label="Protection"
           value={pq ? 'PSK post-quantique' : 'WireGuard classique'}
           accent={pq}
           hint={
             pq
-              ? 'Le secret ML-KEM-768 alimente le slot PresharedKey — un enregistrement du trafic reste illisible pour un adversaire quantique.'
-              : 'Sans PSK, la confidentialité repose sur Curve25519 seul : vulnérable au « récolter maintenant, déchiffrer plus tard ».'
+              ? 'Le secret ML-KEM-768 alimente le slot PresharedKey : un enregistrement du trafic reste illisible pour un adversaire quantique.'
+              : 'Sans PSK, la confidentialité repose sur Curve25519 seul et reste exposée au scénario « récolter maintenant, déchiffrer plus tard ».'
           }
         />
         <Tile label="Adresse virtuelle" value={profile?.address ?? 'assignée à l’enrôlement'} mono />
         <Tile label="Trafic capté" value={profile?.allowed_ips ?? '—'} mono />
         <Tile label="Backend" value={backend || '—'} mono />
-      </div>
+      </Box>
 
-      {/* ── Action ── */}
-      <div className="mt-auto flex flex-col gap-2 pt-1">
+      <Stack spacing={1} sx={{ mt: 'auto', pt: 0.5 }}>
         {meta.active || meta.transitioning ? (
-          <button
-            className="btn flex items-center justify-center gap-2 border border-red-500/30 bg-red-950/50 text-red-200 hover:bg-red-900/60"
+          <Button
+            fullWidth
+            variant="outlined"
+            color="error"
+            startIcon={<Power size={17} aria-hidden />}
             onClick={onDisconnect}
+            sx={{ bgcolor: 'rgba(127, 29, 29, 0.18)' }}
           >
-            <Power size={15} />
             {state === 'connecting' ? 'Annuler et démonter' : 'Déconnecter'}
-          </button>
+          </Button>
         ) : (
-          <button
-            className="btn flex items-center justify-center gap-2 border border-node/30 bg-node/15 text-node hover:bg-node/25"
+          <Button
+            fullWidth
+            variant="contained"
+            startIcon={<Power size={17} aria-hidden />}
             onClick={onConnect}
             disabled={!ready}
           >
-            <Power size={15} />
             Connecter
-          </button>
+          </Button>
         )}
 
         {!ready && profile && (
-          <p className="text-center text-[11px] text-amber-400/80">
-            Profil incomplet — endpoint, clé privée et clé publique de la gateway sont requis.
-          </p>
+          <Typography
+            role="status"
+            color="warning.main"
+            sx={{ textAlign: 'center', fontSize: 11, opacity: 0.9 }}
+          >
+            Profil incomplet : endpoint, clé privée et clé publique de la gateway sont requis.
+          </Typography>
         )}
 
-        {/* Le geste que l'invariante fail-open interdit, dit explicitement. */}
         {posture.posture === 'held' && (
-          <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-slate-500">
-            <Info size={12} className="mt-0.5 shrink-0" />
-            Déconnecter démonte l’adaptateur et rend la route par défaut au trafic en clair. Pour
-            relancer une négociation, laissez Orion réessayer.
-          </p>
+          <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, color: 'text.disabled' }}>
+            <Info size={14} aria-hidden style={{ flexShrink: 0, marginTop: 2 }} />
+            <Typography sx={{ fontSize: 11, lineHeight: 1.5 }}>
+              Déconnecter démonte l’adaptateur et rend la route par défaut au trafic en clair. Pour
+              relancer une négociation, laissez Orion réessayer.
+            </Typography>
+          </Box>
         )}
-      </div>
-    </div>
+      </Stack>
+    </Stack>
   )
 }
 
@@ -150,15 +187,18 @@ function Throughput({
   history: TelemetrySample[]
 }) {
   // Échelle commune aux deux séries — voir le doc-comment de Sparkline.
-  const ceiling = Math.max(1, ...history.map((s) => Math.max(s.rx_bps, s.tx_bps)))
+  const ceiling = Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
 
   return (
-    <div className="grid grid-cols-2 gap-2">
+    <Box
+      aria-label="Débit du tunnel"
+      sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1 }}
+    >
       <Series
         icon={ArrowDown}
         label="Réception"
         value={telemetry ? formatBps(telemetry.rx_bps) : '—'}
-        points={history.map((s) => s.rx_bps)}
+        points={history.map((sample) => sample.rx_bps)}
         ceiling={ceiling}
         color="#28e4a0"
       />
@@ -166,11 +206,11 @@ function Throughput({
         icon={ArrowUp}
         label="Émission"
         value={telemetry ? formatBps(telemetry.tx_bps) : '—'}
-        points={history.map((s) => s.tx_bps)}
+        points={history.map((sample) => sample.tx_bps)}
         ceiling={ceiling}
         color="#22d3ee"
       />
-    </div>
+    </Box>
   )
 }
 
@@ -190,16 +230,26 @@ function Series({
   color: string
 }) {
   return (
-    <div className="rounded-xl border border-white/5 bg-black/20 px-3 pb-1 pt-2.5">
-      <div className="flex items-baseline gap-1.5">
-        <Icon size={11} style={{ color }} />
-        <span className="text-[9px] uppercase tracking-[0.14em] text-slate-500">{label}</span>
-        <span className="ml-auto font-mono text-[11px] tabular-nums" style={{ color }}>
+    <Paper variant="outlined" sx={{ minWidth: 0, bgcolor: 'rgba(0, 0, 0, 0.18)', px: 1.25, pt: 1.1 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6 }}>
+        <Icon size={13} aria-hidden style={{ color }} />
+        <Typography variant="overline" color="text.disabled" sx={{ fontSize: 9 }}>
+          {label}
+        </Typography>
+        <Typography
+          sx={{
+            ml: 'auto',
+            color,
+            fontFamily: 'monospace',
+            fontSize: 11,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
           {value}
-        </span>
-      </div>
+        </Typography>
+      </Box>
       <Sparkline points={points} ceiling={ceiling} color={color} label={label} />
-    </div>
+    </Paper>
   )
 }
 
@@ -216,16 +266,27 @@ function Tile({
   accent?: boolean
   hint?: string
 }) {
-  return (
-    <div className="rounded-xl border border-white/5 bg-black/20 px-3 py-2.5" title={hint}>
-      <div className="text-[9px] uppercase tracking-[0.14em] text-slate-500">{label}</div>
-      <div
-        className={`mt-1 truncate text-[11px] ${mono ? 'font-mono' : ''} ${
-          accent ? 'text-node' : 'text-slate-300'
-        }`}
+  const tile = (
+    <Paper
+      variant="outlined"
+      sx={{ minWidth: 0, bgcolor: 'rgba(0, 0, 0, 0.18)', px: 1.25, py: 1.1 }}
+    >
+      <Typography variant="overline" color="text.disabled" sx={{ display: 'block', fontSize: 9 }}>
+        {label}
+      </Typography>
+      <Typography
+        noWrap
+        sx={{
+          mt: 0.35,
+          color: accent ? 'primary.main' : 'text.secondary',
+          fontFamily: mono ? 'monospace' : undefined,
+          fontSize: 11,
+        }}
       >
         {value}
-      </div>
-    </div>
+      </Typography>
+    </Paper>
   )
+
+  return hint ? <Tooltip title={hint}>{tile}</Tooltip> : tile
 }

@@ -1,3 +1,5 @@
+import Box from '@mui/material/Box'
+import { keyframes } from '@mui/material/styles'
 import type { TunnelState } from '../types'
 import { postureMeta, stateMeta } from './state'
 
@@ -40,26 +42,42 @@ const BELT = [
   { x: 32.5, y: 17.5, r: 2.4 },
 ]
 
+const pulse = keyframes`
+  0%, 100% { opacity: 0.22; }
+  50% { opacity: 0.42; }
+`
+
+const orbit = keyframes`
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+`
+
 export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
   const meta = stateMeta(state)
   const posture = postureMeta(state, adapterUp)
   const lit = litStars(state, adapterUp)
 
   return (
-    <div className="relative grid place-items-center" style={{ width: size, height: size }}>
-      {/* Halo — n'apparaît que lorsque le trafic passe réellement. */}
+    <Box sx={{ position: 'relative', display: 'grid', width: size, height: size, placeItems: 'center' }}>
       {posture.posture === 'protected' && (
-        <div
-          className="pointer-events-none absolute inset-0 rounded-full blur-2xl opacity-30 motion-safe:animate-pulse-slow"
-          style={{ background: `radial-gradient(circle, ${posture.color} 0%, transparent 65%)` }}
+        <Box
+          aria-hidden
+          sx={{
+            position: 'absolute',
+            inset: 0,
+            borderRadius: '50%',
+            background: `radial-gradient(circle, ${posture.color} 0%, transparent 65%)`,
+            filter: 'blur(20px)',
+            pointerEvents: 'none',
+            animation: `${pulse} 2.4s ease-in-out infinite`,
+          }}
         />
       )}
 
       <svg
         viewBox="0 0 48 48"
         fill="none"
-        className="relative"
-        style={{ width: size, height: size }}
+        style={{ position: 'relative', width: size, height: size }}
         role="img"
         aria-label={`${meta.label} — ${posture.label}`}
       >
@@ -85,10 +103,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
         />
 
         {/* Trajectoire active — tourne pendant la négociation, fixe autrement. */}
-        <g
-          className={meta.transitioning ? 'motion-safe:animate-orbit' : ''}
-          style={{ transformOrigin: '24px 24px' }}
-        >
+        <g style={{ transformOrigin: '24px 24px', animation: meta.transitioning ? `${orbit} 9s linear infinite` : undefined }}>
           <ellipse
             cx="24"
             cy="24"
@@ -118,8 +133,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
                 cx={star.x}
                 cy={star.y}
                 r={star.r}
-                fill={on ? meta.color : 'currentColor'}
-                className={on ? '' : 'text-slate-700'}
+                fill={on ? meta.color : '#334155'}
                 fillOpacity={on ? 1 : 0.45}
                 style={{ transition: 'fill-opacity 400ms ease, fill 400ms ease' }}
               />
@@ -127,6 +141,6 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           })}
         </g>
       </svg>
-    </div>
+    </Box>
   )
 }

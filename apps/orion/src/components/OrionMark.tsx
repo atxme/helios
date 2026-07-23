@@ -26,17 +26,19 @@ const OUTLIERS = [
 
 interface Props {
   className?: string
+  style?: CSSProperties
   /** Masque la trajectoire orbitale — version compacte pour les très petites tailles. */
   compact?: boolean
   title?: string
 }
 
-export function OrionMark({ className = '', compact = false, title }: Props) {
+export function OrionMark({ className = '', style, compact = false, title }: Props) {
   return (
     <svg
       viewBox="0 0 48 48"
       fill="none"
       className={className}
+      style={style}
       role={title ? 'img' : undefined}
       aria-hidden={title ? undefined : true}
       aria-label={title}
@@ -83,14 +85,29 @@ export function OrionMark({ className = '', compact = false, title }: Props) {
 /** Marque + typographie, pour l'en-tête de l'application. */
 export function OrionLockup({ className = '' }: { className?: string }) {
   return (
-    <div className={`flex items-center gap-3 ${className}`}>
-      <OrionMark className="h-8 w-8 shrink-0 text-node" title="Orion" />
-      <div className="min-w-0 leading-none">
-        <div className="text-[13px] font-bold tracking-[0.28em] text-slate-100">ORION</div>
-        <div className="mt-1 font-mono text-[9px] uppercase tracking-[0.16em] text-node/70">
-          WireGuard · PQ Client
+    <div className={className} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+      <OrionMark
+        style={{ width: 32, height: 32, flexShrink: 0, color: '#22d3ee' }}
+        title="Orion"
+      />
+      <div style={{ minWidth: 0, lineHeight: 1 }}>
+        <div style={{ color: '#e6edf6', fontSize: 13, fontWeight: 700, letterSpacing: '0.28em' }}>
+          ORION
+        </div>
+        <div
+          style={{
+            marginTop: 4,
+            color: 'rgba(34, 211, 238, 0.7)',
+            fontFamily: 'monospace',
+            fontSize: 9,
+            letterSpacing: '0.16em',
+            textTransform: 'uppercase',
+          }}
+        >
+          WireGuard · Client PQ
         </div>
       </div>
     </div>
   )
 }
+import type { CSSProperties } from 'react'

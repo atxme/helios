@@ -1,38 +1,72 @@
+import Box from '@mui/material/Box'
+import Divider from '@mui/material/Divider'
+import Typography from '@mui/material/Typography'
 import type { LogLine } from '../types'
 
-/** Le niveau est porté par un liseré à gauche autant que par la couleur du texte. */
+/** Le niveau est porté par un liseré autant que par la couleur du texte. */
 const LEVEL: Record<string, { text: string; rail: string }> = {
-  error: { text: 'text-red-300', rail: 'bg-red-500' },
-  warn: { text: 'text-amber-300', rail: 'bg-amber-500' },
-  info: { text: 'text-slate-300', rail: 'bg-transparent' },
+  error: { text: '#fca5a5', rail: '#ef4444' },
+  warn: { text: '#fcd34d', rail: '#f59e0b' },
+  info: { text: '#cbd5e1', rail: 'transparent' },
 }
 
 export function EventLog({ logs }: { logs: LogLine[] }) {
   return (
-    <div className="flex max-h-48 flex-col">
-      <div className="flex shrink-0 items-center justify-between border-b border-white/5 px-4 py-1.5">
-        <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Journal</span>
-        <span className="font-mono text-[10px] tabular-nums text-slate-600">
+    <Box sx={{ display: 'flex', maxHeight: 192, flexDirection: 'column' }}>
+      <Box sx={{ display: 'flex', flexShrink: 0, alignItems: 'center', px: 2, py: 0.75 }}>
+        <Typography variant="overline" color="text.disabled">
+          Journal
+        </Typography>
+        <Typography
+          color="text.disabled"
+          sx={{ ml: 'auto', fontFamily: 'monospace', fontSize: 10, fontVariantNumeric: 'tabular-nums' }}
+        >
           {logs.length} {logs.length > 1 ? 'entrées' : 'entrée'}
-        </span>
-      </div>
+        </Typography>
+      </Box>
+      <Divider />
 
       {logs.length === 0 ? (
-        <p className="px-4 py-3 text-xs text-slate-600">Aucun événement pour l’instant.</p>
+        <Typography color="text.disabled" sx={{ px: 2, py: 1.5, fontSize: 12 }}>
+          Aucun événement pour l’instant.
+        </Typography>
       ) : (
-        <div className="overflow-y-auto py-1 font-mono text-[11px] leading-relaxed">
+        <Box
+          component="ol"
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          sx={{ m: 0, overflowY: 'auto', py: 0.5, pl: 0, fontFamily: 'monospace', listStyle: 'none' }}
+        >
           {logs.map((line, index) => {
             const level = LEVEL[line.level] ?? LEVEL.info
             return (
-              <div key={index} className="flex items-start gap-2 px-4 py-px">
-                <span className={`mt-1 h-3 w-0.5 shrink-0 rounded-full ${level.rail}`} />
-                <span className="shrink-0 tabular-nums text-slate-600">{line.ts}</span>
-                <span className={`min-w-0 break-words ${level.text}`}>{line.message}</span>
-              </div>
+              <Box
+                component="li"
+                key={`${line.ts}-${index}`}
+                sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, px: 2, py: 0.2 }}
+              >
+                <Box
+                  aria-hidden
+                  sx={{ mt: 0.35, width: 2, height: 12, flexShrink: 0, borderRadius: 1, bgcolor: level.rail }}
+                />
+                <Typography
+                  component="time"
+                  color="text.disabled"
+                  sx={{ flexShrink: 0, fontFamily: 'inherit', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}
+                >
+                  {line.ts}
+                </Typography>
+                <Typography
+                  sx={{ minWidth: 0, color: level.text, fontFamily: 'inherit', fontSize: 11, overflowWrap: 'anywhere' }}
+                >
+                  {line.message}
+                </Typography>
+              </Box>
             )
           })}
-        </div>
+        </Box>
       )}
-    </div>
+    </Box>
   )
 }

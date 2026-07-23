@@ -105,6 +105,27 @@ démonté.
 
 ## IHM embarquée
 
+L’IHM utilise Material UI au-dessus de React. Le thème sombre Orion centralise
+les couleurs, la typographie, les rayons, les états de focus et la réduction
+des animations. Les couleurs de posture restent définies séparément dans
+`src/components/state.ts` : elles expriment un état de sécurité et ne sont pas
+de simples accents décoratifs.
+
+Les composants MUI sont importés par chemin pour limiter le coût du bundle.
+Emotion reste local à la WebView ; aucune police, feuille de style ou ressource
+Google n’est chargée sur le réseau. La CSP Tauri existante suffit donc au thème
+sans élargir `connect-src`, `font-src` ou `script-src`.
+
+Le socle d’accessibilité comprend :
+
+- une navigation par onglets au clavier avec relations `tab` / `tabpanel` ;
+- des libellés explicites pour les actions à icône et les champs secrets ;
+- une annonce des changements d’état, des erreurs et des événements ;
+- un focus visible commun à tous les contrôles ;
+- le respect de `prefers-reduced-motion` ;
+- une confirmation avant la suppression d’un profil ;
+- du texte sélectionnable, notamment pour les clés et les diagnostics.
+
 L’intégration est configurée dans `src-tauri/tauri.conf.json` :
 
 - `beforeDevCommand` lance Vite sur le port 1420 ;

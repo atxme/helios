@@ -1,4 +1,16 @@
 import { useEffect, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import AppBar from '@mui/material/AppBar'
+import Badge from '@mui/material/Badge'
+import Box from '@mui/material/Box'
+import Chip from '@mui/material/Chip'
+import IconButton from '@mui/material/IconButton'
+import Paper from '@mui/material/Paper'
+import Tab from '@mui/material/Tab'
+import Tabs from '@mui/material/Tabs'
+import Toolbar from '@mui/material/Toolbar'
+import Tooltip from '@mui/material/Tooltip'
+import Typography from '@mui/material/Typography'
 import { Radio, Settings2, Terminal, X } from 'lucide-react'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
@@ -20,135 +32,187 @@ export default function App() {
   }, [c.pathImportedProfile])
 
   return (
-    <div className="flex h-screen flex-col gap-2 p-2">
-      {/* ── En-tête : identité + pastille de posture ── */}
-      <header className="flex shrink-0 items-center gap-3 px-2 py-1">
-        <OrionMark className="h-7 w-7 shrink-0 text-node" title="Orion" />
-        <div className="min-w-0 leading-none">
-          <div className="text-[12px] font-bold tracking-[0.26em] text-slate-100">ORION</div>
-          <div className="mt-1 font-mono text-[9px] uppercase tracking-[0.14em] text-node/70">
-            WireGuard · PQ Client
-          </div>
-        </div>
-
-        {/* Résumé permanent : la posture reste lisible depuis n'importe quel onglet. */}
-        <div
-          className="ml-auto flex items-center gap-2 rounded-full border px-2.5 py-1"
-          style={{ borderColor: `${posture.color}40`, background: `${posture.color}12` }}
-          title={posture.detail}
-        >
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              posture.posture === 'protected' ? 'motion-safe:animate-pulse' : ''
-            }`}
-            style={{ background: posture.color }}
+    <Box sx={{ display: 'flex', height: '100vh', flexDirection: 'column', gap: 1, p: 1 }}>
+      <AppBar
+        component="header"
+        position="static"
+        color="transparent"
+        elevation={0}
+        sx={{ flexShrink: 0, border: 0, borderRadius: 2.5 }}
+      >
+        <Toolbar disableGutters sx={{ minHeight: 52, gap: 1.5, px: 1.25 }}>
+          <OrionMark
+            style={{ width: 32, height: 32, flexShrink: 0, color: '#22d3ee' }}
+            title="Orion"
           />
-          <span className="text-[10px] font-medium" style={{ color: posture.color }}>
-            {posture.label}
-          </span>
-        </div>
-      </header>
+          <Box sx={{ minWidth: 0, lineHeight: 1 }}>
+            <Typography
+              component="h1"
+              sx={{ fontSize: 13, fontWeight: 800, letterSpacing: '0.26em', lineHeight: 1 }}
+            >
+              ORION
+            </Typography>
+            <Typography
+              color="primary.light"
+              sx={{ mt: 0.6, fontFamily: 'monospace', fontSize: 9, letterSpacing: '0.12em' }}
+            >
+              WIREGUARD · POST-QUANTIQUE
+            </Typography>
+          </Box>
 
-      {/* ── Onglets ── */}
-      <nav className="flex shrink-0 gap-1 px-2">
-        <TabBtn active={tab === 'connect'} onClick={() => setTab('connect')} icon={Radio}>
-          Connexion
-        </TabBtn>
-        <TabBtn active={tab === 'profiles'} onClick={() => setTab('profiles')} icon={Settings2}>
-          Profils
-        </TabBtn>
+          {/* La posture réelle reste lisible depuis toutes les vues. */}
+          <Chip
+            size="small"
+            aria-label={`${posture.label}. ${posture.detail}`}
+            label={posture.label}
+            icon={
+              <Box
+                component="span"
+                sx={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: '50%',
+                  bgcolor: posture.color,
+                  boxShadow:
+                    posture.posture === 'protected' ? `0 0 8px ${posture.color}` : undefined,
+                }}
+              />
+            }
+            sx={{
+              ml: 'auto',
+              maxWidth: 190,
+              color: posture.color,
+              bgcolor: `${posture.color}12`,
+              border: `1px solid ${posture.color}40`,
+              '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' },
+              '& .MuiChip-icon': { ml: 1 },
+            }}
+          />
+        </Toolbar>
+      </AppBar>
 
-        <button
-          onClick={() => setLogOpen((open) => !open)}
-          className={`ml-auto flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs transition ${
-            logOpen
-              ? 'bg-white/10 text-slate-200'
-              : 'text-slate-500 hover:bg-white/5 hover:text-slate-300'
-          }`}
-          aria-expanded={logOpen}
+      <Box component="nav" aria-label="Navigation principale" sx={{ display: 'flex', px: 0.5 }}>
+        <Tabs
+          value={tab}
+          onChange={(_event, value: Tab) => setTab(value)}
+          aria-label="Vues d’Orion"
+          sx={{ minHeight: 44 }}
         >
-          <Terminal size={13} />
-          Journal
-          {c.logs.length > 0 && (
-            <span className="rounded-full bg-white/10 px-1.5 text-[10px] tabular-nums text-slate-400">
-              {c.logs.length}
-            </span>
-          )}
-        </button>
-      </nav>
+          <Tab
+            id="orion-tab-connect"
+            value="connect"
+            icon={<Radio size={16} aria-hidden />}
+            iconPosition="start"
+            label="Connexion"
+            aria-controls="orion-panel-connect"
+          />
+          <Tab
+            id="orion-tab-profiles"
+            value="profiles"
+            icon={<Settings2 size={16} aria-hidden />}
+            iconPosition="start"
+            label="Profils"
+            aria-controls="orion-panel-profiles"
+          />
+        </Tabs>
 
-      {/* ── Bannière d'erreur ── */}
-      {c.error && (
-        <div className="mx-2 flex shrink-0 items-start justify-between gap-2 rounded-lg border border-red-500/30 bg-red-950/40 px-3 py-2 text-xs text-red-200">
-          <span className="min-w-0 break-words">{c.error}</span>
-          <button
-            onClick={c.clearError}
-            className="shrink-0 text-red-300/70 hover:text-red-200"
-            aria-label="Masquer l’erreur"
+        <Tooltip title={logOpen ? 'Fermer le journal' : 'Ouvrir le journal'}>
+          <IconButton
+            color={logOpen ? 'primary' : 'default'}
+            onClick={() => setLogOpen((open) => !open)}
+            aria-label={logOpen ? 'Fermer le journal' : 'Ouvrir le journal'}
+            aria-expanded={logOpen}
+            aria-controls="orion-event-log"
+            sx={{ ml: 'auto', alignSelf: 'center' }}
           >
-            <X size={14} />
-          </button>
-        </div>
+            <Badge badgeContent={c.logs.length} color="primary" max={99}>
+              <Terminal size={18} aria-hidden />
+            </Badge>
+          </IconButton>
+        </Tooltip>
+      </Box>
+
+      {c.error && (
+        <Alert
+          severity="error"
+          variant="outlined"
+          action={
+            <IconButton
+              color="inherit"
+              size="small"
+              onClick={c.clearError}
+              aria-label="Masquer l’erreur"
+            >
+              <X size={16} aria-hidden />
+            </IconButton>
+          }
+          sx={{ mx: 0.5, flexShrink: 0, bgcolor: 'rgba(127, 29, 29, 0.18)' }}
+        >
+          {c.error}
+        </Alert>
       )}
 
-      {/* ── Contenu ── */}
-      <main className="panel min-h-0 flex-1 overflow-hidden">
+      <Paper
+        component="main"
+        elevation={8}
+        sx={{
+          minHeight: 0,
+          flex: 1,
+          overflow: 'hidden',
+          bgcolor: 'rgba(12, 20, 38, 0.78)',
+          backdropFilter: 'blur(12px)',
+          boxShadow: '0 18px 50px -28px rgba(0, 0, 0, 0.9)',
+        }}
+      >
         {tab === 'connect' ? (
-          <ConnectView
-            state={c.state}
-            profile={c.selectedProfile}
-            upSince={c.upSince}
-            telemetry={c.telemetry}
-            history={c.history}
-            backend={c.backend}
-            adapterUp={c.adapterUp}
-            onConnect={() => c.connect(c.selectedProfile?.name)}
-            onDisconnect={c.disconnect}
-          />
+          <Box
+            id="orion-panel-connect"
+            role="tabpanel"
+            aria-labelledby="orion-tab-connect"
+            sx={{ height: '100%' }}
+          >
+            <ConnectView
+              state={c.state}
+              profile={c.selectedProfile}
+              upSince={c.upSince}
+              telemetry={c.telemetry}
+              history={c.history}
+              backend={c.backend}
+              adapterUp={c.adapterUp}
+              onConnect={() => c.connect(c.selectedProfile?.name)}
+              onDisconnect={c.disconnect}
+            />
+          </Box>
         ) : (
-          <ProfilesView
-            config={c.config}
-            pathImport={c.pathImportedProfile}
-            onPathImportHandled={c.clearPathImportedProfile}
-            onImport={c.importProfile}
-            onSave={c.saveProfile}
-            onDelete={c.removeProfile}
-            onSelect={c.select}
-          />
+          <Box
+            id="orion-panel-profiles"
+            role="tabpanel"
+            aria-labelledby="orion-tab-profiles"
+            sx={{ height: '100%' }}
+          >
+            <ProfilesView
+              config={c.config}
+              pathImport={c.pathImportedProfile}
+              onPathImportHandled={c.clearPathImportedProfile}
+              onImport={c.importProfile}
+              onSave={c.saveProfile}
+              onDelete={c.removeProfile}
+              onSelect={c.select}
+            />
+          </Box>
         )}
-      </main>
+      </Paper>
 
-      {/* ── Journal, replié par défaut : il ne dispute plus la place à l'instrument ── */}
       {logOpen && (
-        <footer className="panel shrink-0 overflow-hidden">
+        <Paper
+          id="orion-event-log"
+          component="footer"
+          elevation={4}
+          sx={{ flexShrink: 0, overflow: 'hidden', bgcolor: 'rgba(12, 20, 38, 0.9)' }}
+        >
           <EventLog logs={c.logs} />
-        </footer>
+        </Paper>
       )}
-    </div>
-  )
-}
-
-function TabBtn({
-  active,
-  onClick,
-  icon: Icon,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  icon: React.ElementType
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs transition ${
-        active ? 'bg-node/15 text-node' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'
-      }`}
-      aria-current={active ? 'page' : undefined}
-    >
-      <Icon size={13} />
-      {children}
-    </button>
+    </Box>
   )
 }
