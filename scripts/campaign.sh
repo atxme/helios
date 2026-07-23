@@ -15,7 +15,7 @@
 #   helios-ctl campaign --only plan-de-donnees --wg-iface helios0 \
 #     --client-key <privée du client> --gateway-key <publique gateway>
 #
-# Voir docs/TESTING.md.
+# Voir docs/testing/TESTING.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -30,8 +30,23 @@ nettoyer() {
 }
 trap nettoyer EXIT
 
+# Un daemon résiduel — typiquement celui que `lab.sh --keep` laisse vivant —
+# tiendrait le port et la campagne interrogerait *sa* configuration au lieu de
+# celle qu'elle vient d'écrire. Les scénarios échoueraient alors sur « pair
+# inconnu », un message qui n'a aucun rapport avec la cause.
+if curl -sf http://127.0.0.1:8080/api/status > /dev/null 2>&1; then
+    echo "Refus : un heliosd écoute déjà sur 127.0.0.1:8080." >&2
+    echo "La campagne interrogerait ce daemon-là, pas le sien." >&2
+    echo "L'arrêter d'abord (banc laissé vivant par 'lab.sh --keep' ?) :" >&2
+    echo "  pkill -f 'heliosd run'" >&2
+    exit 1
+fi
+
 echo "==> Construction"
-cargo build --quiet -p heliosd -p helios-ctl
+cargo run --quiet -p helios-publisher -- keygen \
+    --key-epoch 4294967294 --output-dir "$TMP/publisher"
+export HELIOS_PUBLISHER_KEYRING_PATH="$TMP/publisher/publisher-keyring.json"
+cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher -p helios-installer
 
 # Clés de campagne, jetables : elles ne servent qu'à cette exécution et
 # disparaissent avec le répertoire temporaire. `--generate-keys` n'écrit que des
@@ -59,10 +74,14 @@ wg_listen_port = 51820
 name = "campagne"
 public_key = "$CLIENT_PUB"
 address = "100.64.1.2/32"
+admin = true
 EOF
 
 echo "==> Daemon dry-run isolé"
 HELIOS_NETWORK_CONFIG="$TMP/network.toml" \
+HELIOS_UPDATE_STAGING="$TMP/updates" \
+HELIOS_UPDATE_CHANNEL=testing \
+HELIOS_READY_PATH="$TMP/ready" \
     cargo run --quiet -p heliosd -- run --dev > "$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
@@ -85,6 +104,41 @@ cargo run --quiet -p helios-ctl -- campaign \
     --client-key "$CLIENT_PRIV" \
     --gateway-key "$GW_PUB" \
     "$@"
+
+echo "==> Campagne de mise à jour applicative signée"
+TARGET_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+GIT_COMMIT="$(git rev-parse --short=16 HEAD)"
+PACKAGE_ID="$(cargo pkgid -p heliosd)"
+HELIOS_VERSION="${PACKAGE_ID##*#}"
+HELIOS_VERSION="${HELIOS_VERSION##*@}"
+cargo run --quiet -p helios-publisher -- binary-release \
+    --key-epoch 4294967294 \
+    --release-sequence 9001 \
+    --channel testing \
+    --version "$HELIOS_VERSION" \
+    --git-commit "$GIT_COMMIT" \
+    --target "$TARGET_TRIPLE" \
+    --binary target/debug/heliosd \
+    --ed25519-private-key "$TMP/publisher/ed25519-private.pk8" \
+    --ml-dsa-65-private-key "$TMP/publisher/ml-dsa-65-private.bin" \
+    --keyring "$TMP/publisher/publisher-keyring.json" \
+    --output "$TMP/heliosd.release.json"
+python3 scripts/update_campaign.py \
+    --url http://127.0.0.1:8080 \
+    --manifest "$TMP/heliosd.release.json" \
+    --binary target/debug/heliosd \
+    --activate
+
+echo "==> Campagne d'installation par bundle signé"
+# Le bundle est vérifié contre le trousseau éditeur réellement compilé dans
+# `helios-installer` — c'est ce que les tests unitaires, qui injectent un
+# trousseau, ne peuvent pas prouver.
+python3 scripts/bundle_campaign.py \
+    --tmp "$TMP" \
+    --epoch-dir "$TMP/publisher" \
+    --version "$HELIOS_VERSION" \
+    --git-commit "$GIT_COMMIT" \
+    --target "$TARGET_TRIPLE"
 
 echo "==> Vérification : aucun secret dans le journal du daemon"
 if grep -qF "$CLIENT_PRIV" "$TMP/daemon.log"; then

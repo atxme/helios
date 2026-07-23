@@ -16,7 +16,11 @@ import {
   disconnect,
   getConfig,
   getState,
+  importProfile,
+  importProfilePath,
   onEvent,
+  onProfilePath,
+  profilePublicKey,
   saveProfile,
   selectProfile,
 } from './api'
@@ -32,6 +36,9 @@ describe('pont Tauri Orion', () => {
     await backendKind()
     await adapterIsUp()
     await getConfig()
+    await importProfile('{"format":"orion-profile"}', 'portable.json')
+    await importProfilePath('C:\\Profils\\portable.orionprofile')
+    await profilePublicKey(profile as never)
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -44,6 +51,15 @@ describe('pont Tauri Orion', () => {
       ['backend_kind'],
       ['adapter_is_up'],
       ['get_config'],
+      [
+        'import_profile',
+        { contents: '{"format":"orion-profile"}', fileName: 'portable.json' },
+      ],
+      [
+        'import_profile_path',
+        { path: 'C:\\Profils\\portable.orionprofile' },
+      ],
+      ['profile_public_key', { profile }],
       ['save_profile', { profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],
@@ -64,5 +80,18 @@ describe('pont Tauri Orion', () => {
     await expect(onEvent(callback)).resolves.toBe(unlisten)
     expect(mocks.listen).toHaveBeenCalledWith('helios://event', expect.any(Function))
     expect(callback).toHaveBeenCalledWith({ type: 'state_changed', state: 'up' })
+  })
+
+  it('signale les chemins de profil sans exposer de lecture JavaScript', async () => {
+    const unlisten = vi.fn()
+    const callback = vi.fn()
+    mocks.listen.mockImplementation(async (_name, handler) => {
+      handler({ payload: null })
+      return unlisten
+    })
+
+    await expect(onProfilePath(callback)).resolves.toBe(unlisten)
+    expect(mocks.listen).toHaveBeenCalledWith('helios://profile-path', callback)
+    expect(callback).toHaveBeenCalledOnce()
   })
 })

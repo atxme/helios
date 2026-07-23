@@ -4,10 +4,12 @@ import {
   createWebSocket,
   fetchStatus,
   fetchTrust,
+  fetchUpdateStatus,
   releaseCaptivePortal,
   setSplitTunnel,
   tunnelStart,
   tunnelStop,
+  stageUpdate,
 } from './api'
 
 describe('client REST Helios', () => {
@@ -77,6 +79,26 @@ describe('client REST Helios', () => {
     ))
 
     await expect(fetchTrust()).resolves.toEqual(trust)
+  })
+
+  it('stage un manifeste signé uniquement sous forme JSON', async () => {
+    const release = { release_sequence: 7, version: '1.2.0', sha256: 'ab'.repeat(32) }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ release }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const manifest = { payload: { product: 'heliosd' }, signatures: [] }
+
+    await expect(stageUpdate(manifest)).resolves.toEqual(release)
+    expect(fetchMock).toHaveBeenCalledWith('/api/update/stage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manifest }),
+    })
+  })
+
+  it('lit le canal et la séquence de mise à jour', async () => {
+    const status = { channel: 'testing', highest_confirmed_sequence: 4 }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(status), { status: 200 })))
+    await expect(fetchUpdateStatus()).resolves.toEqual(status)
   })
 
   it('choisit un WebSocket chiffré lorsque la page est en HTTPS', () => {

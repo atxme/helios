@@ -10,6 +10,14 @@ export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
 export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
+export const importProfile = (contents: string, fileName: string) =>
+  invoke<ClientProfile>('import_profile', { contents, fileName })
+export const importProfilePath = (path?: string) =>
+  invoke<ClientProfile | null>('import_profile_path', { path: path ?? null })
+
+/** Clé publique dérivée du profil : la seule moitié à communiquer à l'opérateur. */
+export const profilePublicKey = (profile: ClientProfile) =>
+  invoke<string | null>('profile_public_key', { profile })
 
 export const saveProfile = (profile: ClientProfile) =>
   invoke<ClientConfig>('save_profile', { profile })
@@ -24,4 +32,9 @@ export const disconnect = () => invoke<void>('disconnect')
 /** Abonnement au flux d'événements temps réel du backend. */
 export function onEvent(cb: (ev: ClientEvent) => void): Promise<UnlistenFn> {
   return listen<ClientEvent>('helios://event', (e) => cb(e.payload))
+}
+
+/** Un double-clic a ajouté un chemin à la file Rust d'import. */
+export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
+  return listen('helios://profile-path', cb)
 }

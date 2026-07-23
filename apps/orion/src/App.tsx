@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Radio, Settings2, Terminal, X } from 'lucide-react'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
@@ -14,6 +14,10 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('connect')
   const [logOpen, setLogOpen] = useState(false)
   const posture = postureMeta(c.state, c.adapterUp)
+
+  useEffect(() => {
+    if (c.pathImportedProfile) setTab('profiles')
+  }, [c.pathImportedProfile])
 
   return (
     <div className="flex h-screen flex-col gap-2 p-2">
@@ -104,6 +108,9 @@ export default function App() {
         ) : (
           <ProfilesView
             config={c.config}
+            pathImport={c.pathImportedProfile}
+            onPathImportHandled={c.clearPathImportedProfile}
+            onImport={c.importProfile}
             onSave={c.saveProfile}
             onDelete={c.removeProfile}
             onSelect={c.select}

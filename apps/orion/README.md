@@ -44,6 +44,49 @@ est stockée dans le répertoire applicatif de l’OS sous `net/helios/orion`. L
 variable `ORION_CONFIG` permet de surcharger le chemin en test ou en
 développement.
 
+### Importer plutôt que ressaisir
+
+Le bouton **Importer** de l’onglet Profils accepte deux formats :
+
+- un profil Orion JSON versionné (`.json`), qui porte aussi les paramètres
+  propres à Helios ;
+- un fichier WireGuard `wg-quick` (`.conf`) avec exactement une section
+  `[Interface]` et un seul `[Peer]`.
+
+L’import charge un brouillon dans le formulaire. Il n’écrit rien tant que
+**Enregistrer** n’est pas activé et annonce explicitement si le nom importé
+remplacera un profil existant. Les documents sont bornés à 64 Kio, les clés
+WireGuard doivent décoder exactement 32 octets et les options que le client ne
+sait pas appliquer (`DNS`, scripts `PreUp`, plusieurs pairs, etc.) sont refusées
+plutôt qu’ignorées.
+
+Le format JSON courant est `orion-profile` version 1 :
+
+```json
+{
+  "format": "orion-profile",
+  "version": 1,
+  "profile": {
+    "name": "site-paris",
+    "endpoint": "vpn.example.net:51820",
+    "private_key": "base64-de-32-octets",
+    "peer_public_key": "base64-de-32-octets",
+    "address": "100.64.1.2/32",
+    "allowed_ips": "0.0.0.0/0",
+    "persistent_keepalive": 25,
+    "heliosd_url": "http://100.64.0.1:8080"
+  }
+}
+```
+
+`allowed_ips`, `persistent_keepalive`, `heliosd_url` et `preshared_key` sont
+facultatifs. L’adresse virtuelle reste obligatoire : le tunnel initial en a
+besoin avant de pouvoir joindre l’API interne. `AllowedIPs` vaut `0.0.0.0/0` et
+le keepalive 25 secondes lorsqu’ils sont omis. Un `preshared_key` importé est
+traité comme un PSK statique et désactive la négociation ML-KEM automatique ;
+il ne doit être fourni que si les deux pairs portent déjà exactement la même
+valeur.
+
 ## Cycle de vie et protection anti-fuite
 
 L’état `up` est inféré à partir d’un handshake de moins de 150 secondes.
@@ -119,6 +162,9 @@ handshake tout en testant le même cycle de vie. Le backend réel est fourni par
 `defguard_wireguard_rs` derrière la feature `wireguard` :
 
 ```sh
+# Requis sur Windows : télécharge WireGuardNT et vérifie son empreinte épinglée.
+cargo xtask orion-deps
+
 # Compilation Rust du shell avec le backend réel
 cargo build -p orion --features wireguard
 
@@ -132,6 +178,19 @@ sur la plateforme. S’il ne peut pas être initialisé, Orion refuse de démarr
 un binaire réel ne retombe jamais implicitement sur la simulation. L’IHM affiche
 toujours le type de backend actif.
 
+Le paquet Windows embarque les DLL AMD64 et ARM64 sous le chemin exact ouvert
+par `defguard_wireguard_rs`; son manifeste demande `requireAdministrator`. Le
+paquet Debian dépend de `libcap2-bin` et son `postinst` pose
+`cap_net_admin=ep` sur `/usr/bin/orion`. Les limites de ces choix et la chaîne
+Authenticode sont détaillées dans
+[`../../docs/security/ORION-DISTRIBUTION.md`](../../docs/security/ORION-DISTRIBUTION.md).
+
+Les fichiers `.orionprofile` sont associés à Orion. Le premier double-clic et
+les suivants passent par la même file single-instance, la même lecture Rust
+bornée à 64 Kio, le même parseur et la même complétion des invitations depuis
+la clé privée locale de même nom. L'import reste un brouillon à vérifier puis à
+enregistrer ; il n'écrase jamais silencieusement la configuration.
+
 ## Provisioning post-quantique
 
 Le client sait générer une paire ML-KEM-768 éphémère, appeler
@@ -139,21 +198,25 @@ Le client sait générer une paire ML-KEM-768 éphémère, appeler
 dériver un PSK de 32 octets lié aux deux identités et aux deux nonces.
 
 Cette étape suppose que la clé publique du client a déjà été admise hors bande
-sur Helios et que le tunnel WireGuard classique est joignable. L’installation
-automatique du PSK côté plan de données gateway n’est pas encore câblée ; l’IHM
-n’expose donc pas de bouton de provisioning trompeur et signale cette limite à
-côté du champ PSK manuel.
+sur Helios et que le tunnel WireGuard classique est joignable. La gateway pose
+le PSK sur son plan de données avant de le remettre à Orion ; Orion le pose
+ensuite sur son adaptateur sans le démonter. Un échec garde le tunnel classique
+opérationnel et reste visible dans le journal.
 
 ## Commandes Tauri exposées
 
 Le frontend utilise les commandes suivantes :
 
 - `get_state`, `backend_kind`, `adapter_is_up` ;
-- `get_config`, `save_profile`, `delete_profile`, `select_profile` ;
+- `get_config`, `import_profile`, `save_profile`, `delete_profile`,
+  `select_profile` ;
+- `import_profile_path`, réservé aux chemins reçus de l'association système ;
 - `connect`, `disconnect`.
 
 Les événements `state_changed`, `log`, `telemetry` et `error` sont relayés sur
-le canal `helios://event`.
+le canal `helios://event`. `helios://profile-path` signale qu'un chemin associé
+attend dans la file Rust sans donner au frontend un accès général au système de
+fichiers.
 
 ## Régression
 
@@ -164,4 +227,4 @@ WireGuard réel restent à effectuer sur la plateforme cible.
 
 La recette complète pour l'application Tauri, les profils jetables et le cycle
 adaptateur/connexion/déconnexion se trouve dans
-[`../../docs/MANUAL-TESTING.md`](../../docs/MANUAL-TESTING.md).
+[`../../docs/testing/MANUAL-TESTING.md`](../../docs/testing/MANUAL-TESTING.md).

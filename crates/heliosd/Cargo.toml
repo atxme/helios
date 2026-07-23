@@ -27,6 +27,7 @@ helios-wireguard.workspace = true
 helios-update.workspace = true
 helios-api.workspace = true
 helio-tpm.workspace = true
+helios-provisioning.workspace = true
 tokio = { workspace = true }
 clap.workspace = true
 anyhow.workspace = true

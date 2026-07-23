@@ -276,6 +276,65 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
     }
 }
 
+/// Crée l'identité WireGuard de la gateway, la scelle, et renvoie sa clé
+/// **publique** — la seule moitié destinée à sortir d'ici.
+///
+/// C'est le chemin de premier provisionnement (ADR-004 §3). Il est
+/// nécessairement **local** : `POST /api/gateway/wireguard-key` vit derrière
+/// `admin_iface`, donc derrière un tunnel qui suppose déjà une identité de
+/// gateway et un pair administrateur admis. Cette route est un chemin de
+/// rotation, pas de bootstrap.
+///
+/// La clé privée n'est jamais écrite en clair : elle est générée en mémoire et
+/// scellée directement. `rotate` autorise le remplacement d'une identité
+/// existante — une opération lourde, puisque tous les clients devront mettre à
+/// jour leur `peer_public_key`.
+pub fn initialize(
+    network: &NetworkConfig,
+    boot: &BootDecision,
+    rotate: bool,
+) -> Result<String, String> {
+    let store = keystore();
+    reject_overwrite(store.exists(), rotate)?;
+
+    let secret = boot.secret().ok_or_else(|| {
+        "aucun secret TPM disponible : impossible de sceller une identité. Provisionner le \
+         coffre d'abord (`heliosd provision-tpm`), ou compiler avec --features tpm sur la cible."
+            .to_string()
+    })?;
+
+    let keypair = aether::wg::generate_keypair().map_err(|e| e.to_string())?;
+    store
+        .store(secret, keypair.private_key.expose().as_bytes())
+        .map_err(|e| format!("scellement de l'identité impossible : {e}"))?;
+    write_escrow(network, keypair.private_key.expose());
+
+    if rotate {
+        warn!(
+            "identité WireGuard régénérée — tous les clients doivent mettre à jour \
+             `peer_public_key` avant de pouvoir se reconnecter"
+        );
+    } else {
+        info!("identité WireGuard créée et scellée dans {KEYSTORE_PATH}");
+    }
+    Ok(keypair.public_key)
+}
+
+/// Refuse d'écraser une identité déjà scellée si la rotation n'est pas demandée.
+///
+/// Isolé du système de fichiers pour que la règle soit vérifiable sans TPM :
+/// c'est elle qui protège de la perte d'identité, pas le chemin du coffre.
+fn reject_overwrite(exists: bool, rotate: bool) -> Result<(), String> {
+    if exists && !rotate {
+        return Err(format!(
+            "une identité est déjà scellée dans {KEYSTORE_PATH} — l'écraser ferait perdre \
+             l'identité de la gateway et couperait tous les clients. Utiliser --rotate pour \
+             l'assumer explicitement."
+        ));
+    }
+    Ok(())
+}
+
 /// Remplace la clé privée WireGuard et la scelle.
 ///
 /// Appelé par l'API (`POST /api/gateway/wireguard-key`), donc **uniquement à
@@ -316,17 +375,7 @@ pub fn update_sealed(
 /// On refuse **avant** d'écrire : sceller une clé invalide rendrait la gateway
 /// incapable de monter son interface, sans moyen de la joindre pour corriger.
 pub fn validate_wg_key(key: &str) -> Result<(), String> {
-    use base64::Engine as _;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(key)
-        .map_err(|e| format!("clé non décodable en base64 : {e}"))?;
-    if raw.len() != 32 {
-        return Err(format!(
-            "clé de {} octets au lieu de 32 — ce n'est pas une clé Curve25519",
-            raw.len()
-        ));
-    }
-    Ok(())
+    aether::wg::validate_key(key).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -370,6 +419,24 @@ mod tests {
     #[test]
     fn mise_a_jour_refusee_sans_secret_tpm() {
         assert!(update_sealed(&NetworkConfig::default(), &BootDecision::Disabled, VALID).is_err());
+    }
+
+    /// Sans secret TPM, il n'y a pas de scellement possible : on refuse plutôt
+    /// que de créer une identité qui finirait en clair quelque part.
+    #[test]
+    fn initialisation_refusee_sans_secret_tpm() {
+        let erreur = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
+            .expect_err("sans secret TPM, l'initialisation doit échouer");
+        assert!(erreur.contains("provision-tpm"), "message : {erreur}");
+    }
+
+    /// Écraser une identité scellée coupe tout le parc : ça ne peut pas être le
+    /// comportement par défaut d'une commande d'initialisation.
+    #[test]
+    fn initialisation_refuse_d_ecraser_sans_rotation_explicite() {
+        assert!(reject_overwrite(true, false).is_err());
+        assert!(reject_overwrite(true, true).is_ok(), "--rotate assume");
+        assert!(reject_overwrite(false, false).is_ok(), "premier boot");
     }
 
     #[test]

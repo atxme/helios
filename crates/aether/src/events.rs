@@ -60,6 +60,15 @@ pub enum OrchestratorCmd {
     SetSplitTunnel(Vec<String>),
     /// Applique une valeur de MSS clamping issue de la sonde PMTUD (usage interne).
     SetMssClamp(u16),
+    /// État déduit du polling des handshakes WireGuard (**usage interne**).
+    ///
+    /// Émise par le sondeur, jamais par l'API — aucune route ne la construit.
+    /// Elle existe parce que le sondeur ne détient ni le backend de pare-feu ni
+    /// la politique : écrire l'état lui-même laisserait le ruleset figé sur
+    /// l'état précédent. Passer par la boucle principale garantit qu'une
+    /// promotion vers `Up` ou une retombée vers `Connecting` re-rende toujours
+    /// le pare-feu.
+    TunnelStateInferred(TunnelState),
     /// Recharge la configuration réseau à chaud (sans redémarrer le daemon).
     /// Boxée : `NetworkConfig` est bien plus grosse que les autres variantes.
     LoadNetworkConfig(Box<NetworkConfig>),

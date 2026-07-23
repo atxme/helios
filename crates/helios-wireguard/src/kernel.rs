@@ -95,7 +95,7 @@ impl WireguardBackend for KernelBackend {
             addresses: vec![address],
             port: config.listen_port,
             peers: wg_peers,
-            mtu: None,
+            mtu: config.mtu,
             fwmark: None,
         };
 

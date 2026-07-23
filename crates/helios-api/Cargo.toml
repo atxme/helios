@@ -18,6 +18,7 @@ x25519-dalek = { workspace = true }
 base64.workspace = true
 helios-wireguard.workspace = true
 helios-provisioning.workspace = true
+helios-update.workspace = true
 axum = { workspace = true }
 tokio = { workspace = true }
 serde.workspace = true

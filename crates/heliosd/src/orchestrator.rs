@@ -1,4 +1,4 @@
-//! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu <-> OTA.
+//! Orchestration : câblage WireGuard <-> machine à états <-> pare-feu.
 //!
 //! La gateway est un **serveur** : elle monte son interface WireGuard, écoute en
 //! UDP 51820 et attend les clients. Elle ne compose vers personne. L'état passe
@@ -11,7 +11,13 @@
 //! partout mais ne peuvent **tourner** que sur la cible. Les backends de
 //! simulation ne sont sélectionnés qu’en dry-run explicite ou auto-détecté.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use aether::{
     FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelEvent,
@@ -19,7 +25,6 @@ use aether::{
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_update::{DryRunChannel, RaucChannel, UpdateChannel};
 use helios_wireguard::{InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
@@ -60,6 +65,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         private_key: network.wg_private_key.clone(),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
+        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(&network.wan_iface))),
     };
     let peers = network
         .peers
@@ -87,15 +93,19 @@ fn firewall_backend(dry_run: bool) -> anyhow::Result<Box<dyn FirewallBackend>> {
     }
 }
 
-fn update_channel(dry_run: bool) -> Box<dyn UpdateChannel> {
-    if dry_run {
-        Box::new(DryRunChannel::new(VERSION))
-    } else {
-        Box::new(RaucChannel::new(VERSION, None))
-    }
-}
-
+/// Journalise **et** diffuse : le canal d'événements alimente l'IHM et
+/// `helios-ctl watch`, `tracing` alimente la console et journald.
+///
+/// N'écrire que dans le canal laissait un opérateur en console aveugle aux
+/// changements d'état : un pair pouvait se connecter sans qu'une seule ligne
+/// n'apparaisse dans le terminal du daemon. Constaté au premier déploiement
+/// réel.
 fn emit_log(tx: &broadcast::Sender<HeliosEvent>, level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!("{message}"),
+        "warn" => warn!("{message}"),
+        _ => info!("{message}"),
+    }
     let _ = tx.send(HeliosEvent::Log {
         level: level.into(),
         message: message.into(),
@@ -140,6 +150,7 @@ pub async fn run(
     // Détenue ici et nulle part ailleurs : le secret de scellement TPM ne doit
     // pas transiter par le crate API. Seul l'orchestrateur peut sceller.
     boot: helio_tpm::BootDecision,
+    api_ready: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
@@ -181,7 +192,13 @@ pub async fn run(
     sync_policy(&shared_policy, &policy).await;
 
     // 3. Inférence d'état : WireGuard ne notifie rien, on interroge les handshakes.
-    spawn_handshake_poller(Arc::clone(&wg), Arc::clone(&shared_state), event_tx.clone());
+    spawn_handshake_poller(
+        Arc::clone(&wg),
+        Arc::clone(&shared_state),
+        Arc::clone(&shared_network),
+        event_tx.clone(),
+        internal_tx.clone(),
+    );
 
     // 4. Télémétrie réseau (/proc/net/dev).
     {
@@ -192,10 +209,14 @@ pub async fn run(
     // 4. Boucle principale : commandes de l'UI, résultats internes ou signal d'arrêt.
     let state_str = shared_state.read().await.as_str();
     info!("heliosd opérationnel (état {state_str}). Ctrl-C pour quitter.");
+    wait_api_ready(&api_ready).await?;
+    publish_readiness(dry_run)?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown => {
                 info!("arrêt demandé : kill-switch maintenu (fail-closed)");
                 break;
             }
@@ -222,18 +243,96 @@ pub async fn run(
             }
 
             internal = internal_rx.recv() => {
-                if let Some(OrchestratorCmd::SetMssClamp(mss)) = internal {
-                    policy.mss_clamp = Some(mss);
-                    let state = *shared_state.read().await;
-                    fw.apply(&policy, state).await.context("pare-feu MSS clamping")?;
-                    sync_policy(&shared_policy, &policy).await;
-                    info!("PMTUD : MSS clamping appliqué à {mss} octets");
-                    emit_log(&event_tx, "info",
-                        &format!("PMTUD : MSS optimal détecté = {mss} octets"));
+                match internal {
+                    Some(OrchestratorCmd::SetMssClamp(mss)) => {
+                        policy.mss_clamp = Some(mss);
+                        let state = *shared_state.read().await;
+                        fw.apply(&policy, state).await.context("pare-feu MSS clamping")?;
+                        sync_policy(&shared_policy, &policy).await;
+                        info!("PMTUD : MSS clamping appliqué à {mss} octets");
+                        emit_log(&event_tx, "info",
+                            &format!("PMTUD : MSS optimal détecté = {mss} octets"));
+                    }
+                    // Promotion ou retombée déduite des handshakes. Elle passe
+                    // par `transition`, donc par une réapplication du pare-feu :
+                    // c'est ce qui manquait, et le forward n'était jamais posé.
+                    Some(OrchestratorCmd::TunnelStateInferred(state)) => {
+                        transition(&shared_state, &event_tx, state, fw.as_ref(), &policy).await?;
+                        let msg = if state == TunnelState::Up {
+                            "Pair connecté — handshake WireGuard frais, pare-feu réappliqué"
+                        } else {
+                            "Plus aucun handshake frais — kill-switch réengagé"
+                        };
+                        emit_log(&event_tx, "info", msg);
+                    }
+                    _ => {}
                 }
             }
         }
     }
+    if let Err(error) = transition(
+        &shared_state,
+        &event_tx,
+        TunnelState::Down,
+        fw.as_ref(),
+        &policy,
+    )
+    .await
+    {
+        warn!("engagement du kill-switch à l’arrêt : {error:#}");
+    }
+    if let Err(error) = wg.down().await {
+        warn!("démontage WireGuard à l’arrêt : {error}");
+    }
+    Ok(())
+}
+
+async fn wait_api_ready(api_ready: &AtomicBool) -> anyhow::Result<()> {
+    for _ in 0..40 {
+        if api_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("l’API n’a pas atteint son état disponible dans le délai imparti")
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installation du handler SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn publish_readiness(dry_run: bool) -> anyhow::Result<()> {
+    let path = std::env::var_os("HELIOS_READY_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            if dry_run {
+                std::env::temp_dir().join(format!("helios-ready-{}", std::process::id()))
+            } else {
+                std::path::PathBuf::from("/run/helios/ready")
+            }
+        });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(
+        &temporary,
+        format!("version={VERSION}\nmode_reel={}\n", !dry_run),
+    )?;
+    std::fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -325,11 +424,13 @@ async fn handle_external_cmd(
             emit_log(event_tx, "info", "Déconnexion demandée via l'interface web");
             policy.captive_portal_gateway = None;
             policy.mss_clamp = None;
+            // Engager le verdict fail-closed avant de modifier l’interface :
+            // même ordre que lors d’un arrêt systemd pour mise à jour.
+            transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
             if let Err(e) = wg.down().await {
                 warn!("démontage de l'interface WireGuard : {e}");
                 emit_log(event_tx, "warn", &format!("Démontage de l'interface : {e}"));
             }
-            transition(shared_state, event_tx, TunnelState::Down, fw, policy).await?;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -399,6 +500,13 @@ async fn handle_external_cmd(
                 }
             }
             emit_log(event_tx, "info", "Configuration réseau appliquée");
+        }
+        // Émise par le sondeur de handshakes sur le canal **interne**, jamais
+        // par l'API : aucune route ne la construit. Si elle arrivait tout de
+        // même par le canal externe, l'ignorer vaut mieux que de laisser un
+        // appelant piloter la machine à états du tunnel.
+        OrchestratorCmd::TunnelStateInferred(state) => {
+            warn!("état déduit reçu sur le canal externe, ignoré : {state:?}");
         }
     }
     Ok(())
@@ -531,6 +639,37 @@ async fn install_peer_psk(
     }
 }
 
+/// Chemin du drapeau de routage IPv4 du noyau. Surchargeable pour les tests :
+/// le fichier système est en lecture seule pour un utilisateur ordinaire.
+const IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+
+/// Signale un routage noyau désactivé alors que la config demande de router.
+///
+/// Sans `ip_forward`, le pare-feu autorise le trafic et le noyau le jette
+/// quand même : le tunnel monte, les règles sont correctes, et rien ne passe.
+/// Le symptôme est indiscernable d'un problème de pare-feu, d'où l'avertissement
+/// explicite. On ne l'active pas soi-même — modifier un réglage global du noyau
+/// sans le dire dépasse ce que la configuration a demandé.
+fn warn_if_ip_forward_disabled(event_tx: &broadcast::Sender<HeliosEvent>) {
+    let path = std::env::var("HELIOS_IP_FORWARD_PATH").unwrap_or_else(|_| IP_FORWARD_PATH.into());
+    match std::fs::read_to_string(&path) {
+        Ok(value) if value.trim() == "0" => emit_log(
+            event_tx,
+            "warn",
+            "`allow_client_internet` est actif mais le routage IPv4 du noyau est \
+             désactivé : les paquets des clients seront jetés malgré des règles \
+             correctes. Corriger avec `sysctl -w net.ipv4.ip_forward=1`, et le rendre \
+             permanent dans /etc/sysctl.d/.",
+        ),
+        Ok(_) => {}
+        Err(e) => emit_log(
+            event_tx,
+            "warn",
+            &format!("routage IPv4 du noyau non vérifiable ({path} : {e})"),
+        ),
+    }
+}
+
 async fn do_connect(
     network: &NetworkConfig,
     wg: &dyn WireguardBackend,
@@ -546,6 +685,10 @@ async fn do_connect(
             "Clé privée WireGuard absente de la config réseau — impossible de monter l'interface",
         );
         anyhow::bail!("gateway non configurée : `wg_private_key` vide dans network.toml");
+    }
+
+    if network.allow_client_internet {
+        warn_if_ip_forward_disabled(event_tx);
     }
 
     let (iface, peers) = wg_config(network);
@@ -586,6 +729,102 @@ async fn do_connect(
     Ok(())
 }
 
+fn handshake_is_fresh(peer: &helios_wireguard::PeerStatus) -> bool {
+    peer.last_handshake
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < HANDSHAKE_STALE_AFTER)
+}
+
+/// Journalise les connexions et déconnexions de pairs, une fois chacune.
+///
+/// C'est la trace qui permet d'affirmer que **c'est bien `heliosd` qui tient
+/// le tunnel** : le nom du pair vient de sa table d'admission, l'endpoint et le
+/// handshake de son propre plan de données.
+///
+/// # Ce que la déconnexion d'un client n'est pas
+///
+/// WireGuard est **sans connexion** : le protocole n'a pas de message de
+/// déconnexion. Un client qui se désactive détruit son interface sans rien
+/// annoncer, et la gateway ne peut le déduire que de l'absence de nouveau
+/// handshake — d'où un délai pouvant aller jusqu'à [`HANDSHAKE_STALE_AFTER`].
+/// Raccourcir ce seuil déclarerait morts des pairs bien vivants mais silencieux,
+/// qui ne rehandshakent que toutes les deux minutes environ.
+///
+/// C'est pourquoi une reconnexion est signalée par son **endpoint**, et pas
+/// seulement par le passage de périmé à frais : un client qui se rattache dans
+/// la fenêtre de péremption reste « frais » d'un tour à l'autre, et son retour
+/// passerait autrement inaperçu. Le port source change à chaque session, la
+/// ligne le montre.
+///
+/// # Limite connue
+///
+/// Un handshake **refusé** — clé publique inconnue — n'apparaît pas ici et ne
+/// peut pas y apparaître : le module noyau WireGuard rejette silencieusement,
+/// sans rien remonter à l'espace utilisateur. `wg` ne liste que les pairs
+/// configurés. Ce qui débloquerait : une règle `log` nftables sur le port
+/// d'écoute, au prix d'un journal bruyant sur une gateway exposée.
+async fn log_peer_transitions(
+    peers: &[helios_wireguard::PeerStatus],
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    seen: &mut std::collections::HashMap<Vec<u8>, (bool, Option<String>)>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+) {
+    let network = shared_network.read().await;
+    for peer in peers {
+        let fresh = handshake_is_fresh(peer);
+        let observed = (fresh, peer.endpoint.clone());
+        let previous = seen.insert(peer.public_key.clone(), observed.clone());
+        if previous.as_ref() == Some(&observed) {
+            continue;
+        }
+
+        let key = peer.public_key_b64();
+        let declared = network.peers.iter().find(|p| p.public_key == key);
+        let name = declared.map_or("pair non déclaré", |p| p.name.as_str());
+        let endpoint = peer.endpoint.as_deref().unwrap_or("endpoint inconnu");
+
+        match (previous, fresh) {
+            (Some((true, _)), false) => {
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!("pair « {name} » inactif — plus de handshake frais"),
+                );
+            }
+            // Un pair jamais vu frais qui reste périmé n'a rien à annoncer :
+            // ce serait signaler la déconnexion d'un client jamais connecté.
+            (_, false) => {}
+            (Some((true, _)), true) => {
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!(
+                        "pair « {name} » reconnecté depuis {endpoint} — nouvelle session, \
+                         l'ancienne n'est pas reprise"
+                    ),
+                );
+            }
+            (_, true) => {
+                let protection = match declared.map(|p| p.preshared_key.is_some()) {
+                    Some(true) => "post-quantique (PSK ML-KEM posé)",
+                    // Sans PSK, le tunnel est monté sur Curve25519 seul : c'est
+                    // l'étape 1 de la cinématique ADR-001, pas un défaut. Le dire
+                    // évite de croire la session protégée en post-quantique.
+                    _ => "classique (Curve25519, PSK non encore négocié)",
+                };
+                emit_log(
+                    event_tx,
+                    "info",
+                    &format!(
+                        "pair « {name} » connecté depuis {endpoint} — VIP {} — protection {protection}",
+                        peer.allowed_ips.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// Interroge périodiquement les handshakes des pairs pour inférer l'état.
 ///
 /// WireGuard est sans connexion : `Up` ne se reçoit pas, il se déduit. La
@@ -593,41 +832,52 @@ async fn do_connect(
 fn spawn_handshake_poller(
     wg: Arc<dyn WireguardBackend>,
     shared: Arc<RwLock<TunnelState>>,
+    shared_network: Arc<RwLock<NetworkConfig>>,
     event_tx: broadcast::Sender<HeliosEvent>,
+    internal_tx: mpsc::Sender<OrchestratorCmd>,
 ) {
     tokio::spawn(async move {
         let mut ticker = time::interval(Duration::from_secs(10));
+        // Fraîcheur observée au tour précédent, par clé publique : sans cette
+        // mémoire, on ne peut pas distinguer « ce pair vient de se connecter »
+        // de « ce pair est connecté depuis une heure », et on journaliserait
+        // toutes les dix secondes.
+        let mut seen: std::collections::HashMap<Vec<u8>, (bool, Option<String>)> =
+            std::collections::HashMap::new();
         loop {
             ticker.tick().await;
             if !wg.is_up() {
                 continue;
             }
-            let fresh = match wg.peers().await {
-                Ok(peers) => peers.iter().any(|p| {
-                    p.last_handshake
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age < HANDSHAKE_STALE_AFTER)
-                }),
+            let peers = match wg.peers().await {
+                Ok(peers) => peers,
                 Err(e) => {
                     warn!("lecture des pairs WireGuard impossible : {e}");
                     continue;
                 }
             };
 
+            log_peer_transitions(&peers, &shared_network, &mut seen, &event_tx).await;
+
+            let fresh = peers.iter().any(handshake_is_fresh);
             let current = *shared.read().await;
             let next = match (current, fresh) {
                 (TunnelState::Connecting, true) => TunnelState::Up,
                 (TunnelState::Up, false) => TunnelState::Connecting,
                 _ => continue,
             };
-            *shared.write().await = next;
-            let _ = event_tx.send(HeliosEvent::StateChanged { state: next });
-            let msg = if next == TunnelState::Up {
-                "Pair connecté — handshake WireGuard frais"
-            } else {
-                "Plus aucun handshake frais — kill-switch réengagé"
-            };
-            emit_log(&event_tx, "info", msg);
+
+            // Passer par la boucle principale, seule détentrice du backend de
+            // pare-feu et de la politique. Écrire l'état ici laisserait le
+            // ruleset figé sur l'état précédent — le forward n'existe que dans
+            // les états où le trafic est autorisé, il ne serait jamais posé.
+            if internal_tx
+                .send(OrchestratorCmd::TunnelStateInferred(next))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     });
 }
@@ -726,6 +976,25 @@ async fn discover_mss(wan_iface: &str) -> Option<u16> {
     Some(mtu.saturating_sub(100).max(576))
 }
 
+/// MTU du lien WAN, lu dans sysfs.
+///
+/// Lecture bloquante assumée : `wg_config` est appelée sur le chemin de montage
+/// de l'interface, avant toute mise en réseau, et le fichier est en mémoire.
+/// Un WAN illisible — nom erroné, interface pas encore créée — retombe sur
+/// l'Ethernet standard, ce qui redonne le comportement d'avant ce réglage.
+fn mtu_transport(wan_iface: &str) -> u32 {
+    std::fs::read_to_string(format!("/sys/class/net/{wan_iface}/mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            warn!(
+                "MTU de {wan_iface} illisible — repli sur {} octets",
+                aether::mtu::MTU_TRANSPORT_DEFAUT
+            );
+            aether::mtu::MTU_TRANSPORT_DEFAUT
+        })
+}
+
 fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -806,12 +1075,18 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
 }
 
 pub async fn check_update(dry_run: bool) -> anyhow::Result<()> {
-    let channel = update_channel(dry_run);
-    let current = channel.current_version().await?;
-    println!("version actuelle : {current}");
-    match channel.check().await? {
-        Some(r) => println!("disponible       : {} ({})", r.version, r.bundle),
-        None => println!("disponible       : aucune (à jour)"),
+    let store = helios_update::UpdateStore::new(helios_update::UpdateLayout::for_daemon(dry_run));
+    let status = store.status()?;
+    println!("version compilée : {VERSION}");
+    println!("canal            : {}", status.channel);
+    println!("target           : {}", status.target);
+    println!("séquence active  : {}", status.highest_confirmed_sequence);
+    if let Some(version) = status.active_version {
+        println!("version confirmée: {version}");
+    }
+    println!("releases stagées : {}", status.staged.len());
+    if let Some(sequence) = status.activation_pending {
+        println!("activation       : séquence {sequence} en attente");
     }
     Ok(())
 }
@@ -834,10 +1109,166 @@ mod tests {
                 name: "poste-test".into(),
                 public_key: PEER_KEY.into(),
                 address: "100.64.1.2/32".into(),
+                admin: false,
                 preshared_key: Some("psk-test".into()),
             }],
             ..NetworkConfig::default()
         }
+    }
+
+    /// Le sondeur ne doit **pas** écrire l'état lui-même : il ne détient ni le
+    /// backend de pare-feu ni la politique, et une écriture directe laisserait
+    /// le ruleset figé sur l'état précédent. Le forward n'existant que dans les
+    /// états où le trafic est autorisé, il ne serait jamais posé — un tunnel
+    /// « up » qui ne route rien, sans rien dans les journaux pour l'expliquer.
+    #[tokio::test]
+    async fn la_promotion_par_handshake_passe_par_la_boucle_principale() {
+        let network = Arc::new(RwLock::new(configured_network()));
+        let wireguard = Arc::new(helios_wireguard::DryRunBackend::with_handshakes());
+        let (iface, peers) = wg_config(&*network.read().await);
+        wireguard.up(&iface, &peers).await.expect("montage dry-run");
+
+        let etat = Arc::new(RwLock::new(TunnelState::Connecting));
+        let (event_tx, _rx) = broadcast::channel(16);
+        let (internal_tx, mut internal_rx) = mpsc::channel(8);
+
+        spawn_handshake_poller(
+            wireguard,
+            Arc::clone(&etat),
+            Arc::clone(&network),
+            event_tx,
+            internal_tx,
+        );
+
+        let recu = time::timeout(Duration::from_secs(5), internal_rx.recv())
+            .await
+            .expect("le sondeur doit signaler la promotion");
+        assert!(
+            matches!(
+                recu,
+                Some(OrchestratorCmd::TunnelStateInferred(TunnelState::Up))
+            ),
+            "commande inattendue : {recu:?}"
+        );
+        assert_eq!(
+            *etat.read().await,
+            TunnelState::Connecting,
+            "le sondeur a écrit l'état sans passer par la réapplication du pare-feu"
+        );
+    }
+
+    fn connected_peer(endpoint: &str) -> helios_wireguard::PeerStatus {
+        helios_wireguard::PeerStatus {
+            public_key: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                PEER_KEY,
+            )
+            .unwrap(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
+            last_handshake: Some(std::time::SystemTime::now()),
+            endpoint: Some(endpoint.into()),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+
+    /// La trace qui permet d'affirmer que c'est bien `heliosd` qui tient le
+    /// tunnel, et de distinguer une session classique d'une session protégée.
+    #[tokio::test]
+    async fn la_connexion_d_un_pair_est_journalisee_une_seule_fois() {
+        let network = Arc::new(RwLock::new(configured_network()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut seen = std::collections::HashMap::new();
+        let peers = vec![helios_wireguard::PeerStatus {
+            public_key: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                PEER_KEY,
+            )
+            .unwrap(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
+            last_handshake: Some(std::time::SystemTime::now()),
+            endpoint: Some("203.0.113.7:51820".into()),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }];
+
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
+        let message = match events.try_recv() {
+            Ok(HeliosEvent::Log { message, .. }) => message,
+            autre => panic!("événement inattendu : {autre:?}"),
+        };
+        assert!(message.contains("poste-test"), "message : {message}");
+        assert!(message.contains("203.0.113.7:51820"), "message : {message}");
+        assert!(
+            message.contains("post-quantique"),
+            "le pair porte un PSK, la protection doit être annoncée : {message}"
+        );
+
+        // Deuxième tour, même état : rien de neuf à dire. Sans cette
+        // déduplication, le journal répéterait la ligne toutes les dix secondes.
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
+        assert!(
+            events.try_recv().is_err(),
+            "connexion journalisée deux fois"
+        );
+    }
+
+    /// Un client qui se réactive pendant la fenêtre de péremption reste
+    /// « frais » d'un tour à l'autre : sans surveillance de l'endpoint, son
+    /// retour serait totalement muet. C'est ce qui donnait l'impression que la
+    /// gateway ne voyait rien — et qu'une ancienne session était reprise.
+    #[tokio::test]
+    async fn une_reconnexion_pendant_la_fenetre_de_peremption_est_visible() {
+        let network = Arc::new(RwLock::new(configured_network()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut seen = std::collections::HashMap::new();
+
+        let mut peers = vec![connected_peer("192.168.1.41:58466")];
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
+        assert!(matches!(events.try_recv(), Ok(HeliosEvent::Log { .. })));
+
+        // Même pair, toujours frais, nouveau port source : le client Windows a
+        // détruit son interface et rouvert une socket. C'est une nouvelle
+        // session, pas la reprise de l'ancienne.
+        peers[0].endpoint = Some("192.168.1.41:56776".into());
+        peers[0].last_handshake = Some(std::time::SystemTime::now());
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
+
+        let message = match events.try_recv() {
+            Ok(HeliosEvent::Log { message, .. }) => message,
+            autre => panic!("la reconnexion doit être journalisée, obtenu : {autre:?}"),
+        };
+        assert!(message.contains("reconnecté"), "message : {message}");
+        assert!(message.contains("56776"), "message : {message}");
+    }
+
+    /// Sans PSK, la session est montée sur Curve25519 seul. Le dire évite de
+    /// croire une session protégée en post-quantique alors qu'elle ne l'est pas
+    /// — c'est l'étape 1 de la cinématique ADR-001, pas un défaut.
+    #[tokio::test]
+    async fn une_session_sans_psk_est_annoncee_comme_classique() {
+        let network = Arc::new(RwLock::new(network_sans_psk()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut seen = std::collections::HashMap::new();
+        let peers = vec![helios_wireguard::PeerStatus {
+            public_key: base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                PEER_KEY,
+            )
+            .unwrap(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
+            last_handshake: Some(std::time::SystemTime::now()),
+            endpoint: None,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }];
+
+        log_peer_transitions(&peers, &network, &mut seen, &event_tx).await;
+        let message = match events.try_recv() {
+            Ok(HeliosEvent::Log { message, .. }) => message,
+            autre => panic!("événement inattendu : {autre:?}"),
+        };
+        assert!(message.contains("classique"), "message : {message}");
     }
 
     #[test]

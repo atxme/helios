@@ -22,7 +22,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+mod api;
 mod campaign;
+mod escrow;
+mod files;
+mod peer;
+mod profile;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -62,6 +67,25 @@ enum Cmd {
         #[command(subcommand)]
         command: NetworkCmd,
     },
+    /// Admission des clients sur la gateway (ADR-004 §4).
+    Peer {
+        #[command(subcommand)]
+        command: PeerCmd,
+    },
+    /// Profils clients Orion (ADR-004 §6).
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCmd,
+    },
+    /// Séquestre de l'identité de la gateway — **poste opérateur**.
+    ///
+    /// Ces commandes sont hors ligne : elles n'utilisent pas `--url`. La clé
+    /// privée de séquestre ne doit jamais se trouver sur la gateway qu'elle
+    /// secourt.
+    Escrow {
+        #[command(subcommand)]
+        command: EscrowCmd,
+    },
     /// Exécute un scénario de test prédéfini.
     Scenario {
         #[arg(default_value = "nominal")]
@@ -92,6 +116,78 @@ enum Cmd {
         /// Génère une paire de clés à déclarer, puis quitte.
         #[arg(long)]
         generate_keys: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// Liste les pairs admis.
+    List,
+    /// Admet un client et lui attribue sa VIP.
+    Add {
+        /// Nom convivial, unique sur la gateway.
+        #[arg(long)]
+        name: String,
+        /// Clé publique Curve25519 du client, en base64.
+        #[arg(long)]
+        public_key: String,
+        /// Autorise ce pair à muter le plan de contrôle et les mises à jour.
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Retire un pair de l'admission.
+    Revoke {
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Émet un profil client lisible par l'import Orion.
+    Emit {
+        /// Nom du profil, aussi utilisé comme nom du pair sur la gateway.
+        #[arg(long)]
+        name: String,
+        /// Endpoint UDP public de la gateway (`IP:port` ou `FQDN:port`).
+        #[arg(long)]
+        endpoint: String,
+        /// Clé publique du client, reçue hors bande. **Mode recommandé** : le
+        /// secret du client ne voyage pas.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// L'opérateur génère la paire et livre un profil complet. Le seul
+        /// chemin où une clé privée client existe hors du poste client.
+        #[arg(long)]
+        with_private_key: bool,
+        /// Admet le pair comme administrateur du plan de contrôle.
+        #[arg(long)]
+        admin: bool,
+        /// Fichier de sortie. Absent : sortie standard.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscrowCmd {
+    /// Génère la paire de séquestre de l'opérateur.
+    Keygen {
+        /// Répertoire à créer. La clé privée y reste, hors ligne.
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Ouvre un séquestre et écrit le fichier de récupération.
+    Open {
+        /// Séquestre récupéré sur la gateway (`wg-key.escrow`).
+        #[arg(long)]
+        escrow: PathBuf,
+        /// Clé privée de séquestre de l'opérateur.
+        #[arg(long)]
+        private_key: PathBuf,
+        /// Fichier de récupération à produire.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -133,32 +229,7 @@ struct PeerSummary {
     post_quantum: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CmdResp {
-    ok: bool,
-    error: Option<String>,
-}
-
-/// Vue sans secret renvoyée par `GET /api/network`.
-#[derive(Debug, Deserialize)]
-struct NetworkConfigView {
-    wan_iface: String,
-    lan_ifaces: Vec<String>,
-    allow_ssh_from: Vec<String>,
-    admin_iface: Option<String>,
-    wg_iface: String,
-    wg_private_key_configured: bool,
-    wg_address: String,
-    wg_listen_port: u16,
-    peers: Vec<NetworkPeerView>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NetworkPeerView {
-    name: String,
-    address: String,
-    preshared_key_configured: bool,
-}
+use crate::api::{CmdResp, NetworkConfigView};
 
 // ─── Affichage ────────────────────────────────────────────────────────────────
 
@@ -592,6 +663,47 @@ async fn main() -> Result<()> {
         Cmd::Network { command } => match command {
             NetworkCmd::Show => cmd_network_show(&client, base).await,
             NetworkCmd::Load { file } => cmd_network_load(&client, base, &file).await,
+        },
+        Cmd::Peer { command } => match command {
+            PeerCmd::List => peer::cmd_list(&client, base).await,
+            PeerCmd::Add {
+                name,
+                public_key,
+                admin,
+            } => peer::cmd_add(&client, base, &name, &public_key, admin).await,
+            PeerCmd::Revoke { name } => peer::cmd_revoke(&client, base, &name).await,
+        },
+        Cmd::Profile { command } => match command {
+            ProfileCmd::Emit {
+                name,
+                endpoint,
+                public_key,
+                with_private_key,
+                admin,
+                output,
+            } => {
+                profile::emit(
+                    &client,
+                    base,
+                    profile::EmitOptions {
+                        name,
+                        endpoint,
+                        public_key,
+                        with_private_key,
+                        admin,
+                        output,
+                    },
+                )
+                .await
+            }
+        },
+        Cmd::Escrow { command } => match command {
+            EscrowCmd::Keygen { output_dir } => escrow::keygen(&output_dir),
+            EscrowCmd::Open {
+                escrow,
+                private_key,
+                output,
+            } => escrow::open(&escrow, &private_key, &output),
         },
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,

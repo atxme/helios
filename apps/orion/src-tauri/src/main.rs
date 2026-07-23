@@ -10,22 +10,25 @@
 //! 3. démarrer la télémétrie heliosd **uniquement** quand le tunnel passe `Up`
 //!    (le serveur web vit derrière WireGuard) et l'arrêter à la déconnexion.
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+};
 
 #[cfg(debug_assertions)]
 use std::{
     net::{SocketAddr, TcpStream},
-    path::Path,
     process::{Child, Command},
     time::{Duration, Instant},
 };
 
 use aether::TunnelState;
 use orion_core::{
-    backend::EventSink, default_backend, telemetry, ClientConfig, ClientEvent, ClientProfile,
-    VpnController,
+    backend::EventSink, complete_profile_import, default_backend, parse_profile_import,
+    read_profile_import_path, telemetry, ClientConfig, ClientEvent, ClientProfile, VpnController,
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
 /// État applicatif partagé, injecté dans chaque commande via [`State`].
@@ -33,6 +36,7 @@ struct AppState {
     controller: Arc<VpnController>,
     config: Mutex<ClientConfig>,
     telemetry: Arc<TelemetryManager>,
+    pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
 }
 
 /// Intervalle d'interrogation du dernier handshake WireGuard.
@@ -178,13 +182,68 @@ async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> 
     Ok(state.config.lock().await.clone())
 }
 
+/// Décode un document choisi par l'utilisateur sans le persister.
+///
+/// L'IHM affiche le résultat comme brouillon : un fichier valide ne remplace
+/// donc jamais silencieusement un profil portant le même nom.
+#[tauri::command]
+async fn import_profile(
+    state: State<'_, AppState>,
+    contents: String,
+    file_name: String,
+) -> Result<ClientProfile, String> {
+    let profile = parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
+    let config = state.config.lock().await;
+    complete_profile_import(profile, &config).map_err(|error| error.to_string())
+}
+
+/// Relit un profil dont le chemin vient de l'association système.
+///
+/// `path = None` consomme le prochain chemin mis en attente au démarrage ou
+/// transmis par le plugin single-instance. Le frontend appelle cette forme
+/// après avoir installé son écouteur, ce qui rend le premier double-clic aussi
+/// fiable que les suivants.
+#[tauri::command]
+async fn import_profile_path(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<Option<ClientProfile>, String> {
+    let path = match path {
+        Some(path) => PathBuf::from(path),
+        None => match state.pending_profile_paths.lock().unwrap().pop_front() {
+            Some(path) => path,
+            None => return Ok(None),
+        },
+    };
+    if !is_associated_profile_path(&path) {
+        return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
+    }
+    let profile = read_profile_import_path(&path).map_err(|error| error.to_string())?;
+    let config = state.config.lock().await;
+    complete_profile_import(profile, &config)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+/// Clé publique correspondant à la clé privée d'un profil.
+///
+/// C'est ce que l'utilisateur communique à l'opérateur pour être admis sur la
+/// gateway (ADR-004 §6) : la dériver ici évite de lui faire manipuler sa clé
+/// privée dans un terminal pour obtenir une valeur qui, elle, est publique.
+#[tauri::command]
+fn profile_public_key(profile: ClientProfile) -> Option<String> {
+    profile.public_key()
+}
+
 #[tauri::command]
 async fn save_profile(
     state: State<'_, AppState>,
     profile: ClientProfile,
 ) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
+    let selected = profile.name.clone();
     cfg.upsert(profile);
+    cfg.selected = Some(selected);
     cfg.save().map_err(|e| e.to_string())?;
     Ok(cfg.clone())
 }
@@ -270,6 +329,64 @@ async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     Ok(())
 }
 
+fn is_associated_profile_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("orionprofile"))
+}
+
+fn associated_profile_paths(args: &[String], cwd: &Path) -> Vec<PathBuf> {
+    args.iter()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|path| is_associated_profile_path(path))
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .take(1)
+        .collect()
+}
+
+/// `defguard_wireguard_rs 0.11.0` ouvre WireGuardNT par un chemin relatif fixé
+/// dans sa source. Un double-clic donne à Orion un répertoire courant qui peut
+/// être celui du profil ; on le remplace donc avant de construire le backend.
+#[cfg(all(target_os = "windows", feature = "wireguard"))]
+fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    const DLL: &str = "resources-windows/binaries/wireguard-amd64.dll";
+    #[cfg(target_arch = "aarch64")]
+    const DLL: &str = "resources-windows/binaries/wireguard-arm64.dll";
+
+    let executable_dir = std::env::current_exe()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("répertoire du binaire Orion introuvable"))?;
+    let source_dir = if executable_dir.join(DLL).is_file() {
+        executable_dir
+    } else {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .ok_or_else(|| anyhow::anyhow!("racine du workspace Orion introuvable"))?;
+        if !workspace.join(DLL).is_file() {
+            anyhow::bail!(
+                "WireGuardNT est absent ({DLL}) ; exécuter `cargo xtask orion-deps` avant Orion"
+            );
+        }
+        workspace.to_path_buf()
+    };
+    std::env::set_current_dir(&source_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "impossible de sélectionner les ressources WireGuardNT dans {} : {error}",
+            source_dir.display()
+        )
+    })
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -281,6 +398,14 @@ fn main() {
     let _frontend_dev_server =
         ensure_frontend_dev_server().expect("impossible de préparer l'IHM de développement Orion");
 
+    let startup_cwd = std::env::current_dir().unwrap_or_default();
+    let startup_args: Vec<String> = std::env::args().collect();
+    let pending_profile_paths = associated_profile_paths(&startup_args, &startup_cwd).into();
+
+    #[cfg(all(target_os = "windows", feature = "wireguard"))]
+    prepare_wireguard_nt_working_directory()
+        .expect("impossible de préparer la DLL WireGuardNT livrée avec Orion");
+
     let backend = default_backend().expect(
         "backend WireGuard réel indisponible — Orion refuse de démarrer en simulation implicite",
     );
@@ -288,16 +413,34 @@ fn main() {
     let config = ClientConfig::load().unwrap_or_default();
 
     tauri::Builder::default()
+        // Doit rester le premier plugin enregistré : il intercepte l'instance
+        // secondaire avant que les autres plugins puissent agir.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let paths = associated_profile_paths(&args, Path::new(&cwd));
+            if !paths.is_empty() {
+                let state = app.state::<AppState>();
+                state.pending_profile_paths.lock().unwrap().extend(paths);
+                let _ = app.emit("helios://profile-path", ());
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(AppState {
             controller,
             config: Mutex::new(config),
             telemetry: Arc::new(TelemetryManager::default()),
+            pending_profile_paths: StdMutex::new(pending_profile_paths),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
             backend_kind,
             adapter_is_up,
             get_config,
+            import_profile,
+            import_profile_path,
+            profile_public_key,
             save_profile,
             delete_profile,
             select_profile,
@@ -310,6 +453,8 @@ fn main() {
 
 #[cfg(test)]
 mod security_tests {
+    use super::{associated_profile_paths, Path, PathBuf};
+
     #[test]
     fn serveur_cargo_run_aligne_avec_la_dev_url_tauri() {
         let config: serde_json::Value =
@@ -335,6 +480,43 @@ mod security_tests {
     }
 
     #[test]
+    fn bundle_declare_association_et_capability_linux() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let association = &config["bundle"]["fileAssociations"][0];
+        assert_eq!(association["ext"], serde_json::json!(["orionprofile"]));
+        assert_eq!(
+            config["bundle"]["linux"]["deb"]["postInstallScript"],
+            "linux/postinst"
+        );
+        assert!(config["bundle"]["linux"]["deb"]["depends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dependency| dependency == "libcap2-bin"));
+        let postinst = include_str!("../linux/postinst");
+        assert!(postinst.contains("setcap cap_net_admin=ep"));
+    }
+
+    #[test]
+    fn bundle_windows_livre_wireguard_et_impose_signtool_horodate() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        assert_eq!(
+            config["bundle"]["resources"]["../../../resources-windows/"],
+            "resources-windows/"
+        );
+        let args = config["bundle"]["windows"]["signCommand"]["args"]
+            .as_array()
+            .unwrap();
+        assert!(args.iter().any(|arg| arg == "windows/sign-orion.ps1"));
+        let signer = include_str!("../windows/sign-orion.ps1");
+        for required in ["ORION_TIMESTAMP_URL", "/tr", "/td", "SHA256", "/tw"] {
+            assert!(signer.contains(required), "élément absent : {required}");
+        }
+    }
+
+    #[test]
     fn capabilities_tauri_restent_minimales() {
         let capabilities: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
@@ -343,5 +525,26 @@ mod security_tests {
             capabilities["permissions"],
             serde_json::json!(["core:default"])
         );
+    }
+
+    #[test]
+    fn association_ne_transmet_que_les_profils_orion() {
+        let args = vec![
+            "orion.exe".to_string(),
+            "invitation.orionprofile".to_string(),
+            "--inattendu".to_string(),
+            "autre.json".to_string(),
+        ];
+        assert_eq!(
+            associated_profile_paths(&args, Path::new("/profils")),
+            vec![PathBuf::from("/profils/invitation.orionprofile")]
+        );
+    }
+
+    #[test]
+    fn manifeste_windows_exige_les_privileges_administrateur() {
+        let manifest = include_str!("../windows/orion-manifest.xml");
+        assert!(manifest.contains("requireAdministrator"));
+        assert!(manifest.contains("Microsoft.Windows.Common-Controls"));
     }
 }

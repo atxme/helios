@@ -159,6 +159,7 @@ mod tests {
             private_key: KEY_A.into(),
             listen_port: crate::WG_LISTEN_PORT,
             address: "100.64.0.1/10".into(),
+            mtu: None,
         }
     }
 

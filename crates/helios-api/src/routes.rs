@@ -31,6 +31,7 @@ pub struct PeerSummary {
     pub public_key: String,
     pub address: String,
     pub post_quantum: bool,
+    pub admin: bool,
 }
 
 /// Vue publique de la configuration réseau.
@@ -43,10 +44,23 @@ pub struct NetworkConfigView {
     pub wan_iface: String,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Exposé délibérément : ce n'est pas un secret, et une vue qui l'omettrait
+    /// ferait retomber le champ à `false` au premier rechargement de
+    /// configuration depuis l'IHM — la gateway perdrait son bail des heures
+    /// plus tard, sans que rien ne relie la panne au réglage.
+    pub allow_dhcp_on_wan: bool,
+    /// Exposé pour la même raison qu'`allow_dhcp_on_wan` : une vue qui
+    /// l'omettrait le remettrait à `false` au premier rechargement depuis l'IHM.
+    pub allow_client_internet: bool,
     pub admin_iface: Option<String>,
     pub split_tunnel_cidrs: Vec<String>,
     pub wg_iface: String,
     pub wg_private_key_configured: bool,
+    /// Clé publique WireGuard de la gateway — publique par nature, c'est la
+    /// valeur `peer_public_key` des profils clients. `None` tant qu'aucune
+    /// identité n'est résolue. La dériver ici évite que l'opérateur doive la
+    /// recopier depuis le terminal où il a lancé `heliosd init-identity`.
+    pub wg_public_key: Option<String>,
     pub wg_address: String,
     pub wg_listen_port: u16,
     pub peers: Vec<NetworkPeerView>,
@@ -60,6 +74,7 @@ pub struct NetworkPeerView {
     pub public_key: String,
     pub address: String,
     pub preshared_key_configured: bool,
+    pub admin: bool,
 }
 
 impl From<&NetworkConfig> for NetworkConfigView {
@@ -68,10 +83,13 @@ impl From<&NetworkConfig> for NetworkConfigView {
             wan_iface: config.wan_iface.clone(),
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
+            allow_dhcp_on_wan: config.allow_dhcp_on_wan,
+            allow_client_internet: config.allow_client_internet,
             admin_iface: config.admin_iface.clone(),
             split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
             wg_iface: config.wg_iface.clone(),
             wg_private_key_configured: !config.wg_private_key.trim().is_empty(),
+            wg_public_key: aether::wg::public_from_private(&config.wg_private_key).ok(),
             wg_address: config.wg_address.clone(),
             wg_listen_port: config.wg_listen_port,
             peers: config
@@ -82,6 +100,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
                     public_key: peer.public_key.clone(),
                     address: peer.address.clone(),
                     preshared_key_configured: peer.preshared_key.is_some(),
+                    admin: peer.admin,
                 })
                 .collect(),
             static_peer_addrs: config.static_peer_addrs.clone(),
@@ -190,6 +209,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
             public_key: p.public_key.clone(),
             address: p.address.clone(),
             post_quantum: p.preshared_key.is_some(),
+            admin: p.admin,
         })
         .collect();
 
@@ -220,21 +240,160 @@ pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
 /// Persiste sur disque et envoie `LoadNetworkConfig` à l'orchestrateur.
 pub async fn network_set(
     State(s): State<AppState>,
-    Json(new_config): Json<NetworkConfig>,
+    Json(mut new_config): Json<NetworkConfig>,
 ) -> Result<Json<CmdResponse>, (StatusCode, String)> {
-    if let Err(e) = new_config.save() {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    // `GET /api/network` n'expose ni la clé privée ni les PSK : une
+    // configuration relue puis repostée par l'IHM revient donc nécessairement
+    // sans eux. Les reprendre de la configuration en vigueur évite qu'un simple
+    // changement d'interface LAN efface l'identité résolue depuis le coffre
+    // scellé et tous les PSK négociés — la gateway resterait montée, puis tous
+    // les handshakes échoueraient sans que rien ne relie la panne au réglage
+    // qui l'a causée.
+    {
+        let courant = s.network.read().await;
+        if new_config.wg_private_key.trim().is_empty() {
+            new_config
+                .wg_private_key
+                .clone_from(&courant.wg_private_key);
+        }
+        for peer in &mut new_config.peers {
+            if peer.preshared_key.is_none() {
+                peer.preshared_key = courant
+                    .peers
+                    .iter()
+                    .find(|connu| connu.public_key == peer.public_key)
+                    .and_then(|connu| connu.preshared_key.clone());
+            }
+        }
     }
-    let ok = s
-        .cmd_tx
-        .send(OrchestratorCmd::LoadNetworkConfig(Box::new(new_config)))
-        .await
-        .is_ok();
-    Ok(Json(if ok {
-        CmdResponse::ok()
-    } else {
-        CmdResponse::err("orchestrateur injoignable")
+    apply_network(&s, new_config).await?;
+    Ok(Json(CmdResponse::ok()))
+}
+
+#[derive(Deserialize)]
+pub struct PeerAdmitRequest {
+    /// Nom convivial, unique sur la gateway.
+    pub name: String,
+    /// Clé publique Curve25519 du client, en base64.
+    pub public_key: String,
+    /// Autorise ce pair à muter le plan de contrôle et les mises à jour.
+    #[serde(default)]
+    pub admin: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PeerRevokeRequest {
+    pub name: String,
+}
+
+/// Admet un pair et lui attribue sa VIP (ADR-004 §4).
+///
+/// # Pourquoi une route dédiée plutôt qu'un `POST /api/network`
+///
+/// `GET /api/network` renvoie une vue sciemment expurgée : ni clé privée, ni
+/// PSK. Un outil qui relirait cette vue, y ajouterait un pair et la reposterait
+/// écraserait la configuration **sans les PSK des autres pairs**. Or un slot
+/// PSK renseigné d'un seul côté fait échouer tous les handshakes du pair
+/// concerné, sans canal de rattrapage : l'opérateur se couperait de son parc en
+/// croyant ajouter un client. La mutation doit donc être ciblée et jouée ici,
+/// là où la configuration complète est connue.
+pub async fn peer_admit(
+    State(s): State<AppState>,
+    Json(body): Json<PeerAdmitRequest>,
+) -> Result<Json<PeerSummary>, (StatusCode, String)> {
+    let mut updated = s.network.read().await.clone();
+    let peer = helios_provisioning::admit(&mut updated, &body.name, &body.public_key, body.admin)
+        .map_err(admission_status)?;
+    apply_network(&s, updated).await?;
+
+    tracing::info!(peer = %peer.name, vip = %peer.address, admin = peer.admin, "pair admis");
+    Ok(Json(PeerSummary {
+        name: peer.name,
+        public_key: peer.public_key,
+        address: peer.address,
+        post_quantum: peer.preshared_key.is_some(),
+        admin: peer.admin,
     }))
+}
+
+/// Retire un pair de l'admission.
+///
+/// Ce n'est pas une révocation cryptographique : le pair tombe à son prochain
+/// handshake, il n'existe pas de liste de révocation (ADR-004).
+pub async fn peer_revoke(
+    State(s): State<AppState>,
+    Json(body): Json<PeerRevokeRequest>,
+) -> Result<Json<PeerSummary>, (StatusCode, String)> {
+    let mut updated = s.network.read().await.clone();
+    let peer = helios_provisioning::revoke(&mut updated, &body.name).map_err(admission_status)?;
+    apply_network(&s, updated).await?;
+
+    tracing::warn!(peer = %peer.name, "pair retiré de l'admission");
+    Ok(Json(PeerSummary {
+        name: peer.name,
+        public_key: peer.public_key,
+        address: peer.address,
+        post_quantum: peer.preshared_key.is_some(),
+        admin: peer.admin,
+    }))
+}
+
+/// Persiste une configuration mutée puis la transmet à l'orchestrateur.
+///
+/// La copie écrite sur disque est privée des secrets que la configuration en
+/// mémoire porte :
+///
+/// * les PSK post-quantiques, **toujours** : ils se renégocient à l'enrôlement,
+///   et un PSK sur disque survivrait à la rotation censée le remplacer ;
+/// * la clé privée WireGuard, **hors dry-run** : elle vient du coffre scellé
+///   TPM, et la réécrire dans `network.toml` la remettrait en clair sur le
+///   disque, exactement ce que le scellement existe pour empêcher.
+///
+/// L'exception dry-run est explicite et non contournable autrement : sans TPM,
+/// le coffre n'existe pas et `network.toml` est le **seul** endroit où
+/// l'identité de la gateway puisse vivre. L'effacer ferait perdre son identité
+/// à un daemon `--dev` au premier ajout de pair, sans qu'aucun message ne relie
+/// la panne à l'admission qui l'a causée.
+///
+/// L'orchestrateur, lui, reçoit la configuration complète : c'est elle qui
+/// monte l'interface et pose les pairs.
+async fn apply_network(
+    s: &AppState,
+    updated: aether::NetworkConfig,
+) -> Result<(), (StatusCode, String)> {
+    let mut on_disk = updated.clone();
+    if !s.dry_run {
+        on_disk.wg_private_key.clear();
+    }
+    for peer in &mut on_disk.peers {
+        peer.preshared_key = None;
+    }
+    on_disk
+        .save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    s.cmd_tx
+        .send(OrchestratorCmd::LoadNetworkConfig(Box::new(updated)))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "orchestrateur injoignable".to_string(),
+            )
+        })
+}
+
+/// Traduit un refus d'admission en code HTTP : chaque cause a le sien, pour que
+/// l'appelant distingue une erreur de saisie d'un conflit d'état.
+fn admission_status(error: helios_provisioning::AdmissionError) -> (StatusCode, String) {
+    use helios_provisioning::AdmissionError as E;
+    let code = match &error {
+        E::EmptyName | E::Key(_) => StatusCode::BAD_REQUEST,
+        E::NameTaken(_) | E::KeyTaken(_) => StatusCode::CONFLICT,
+        E::Unknown(_) => StatusCode::NOT_FOUND,
+        E::Ipam(_) => StatusCode::INSUFFICIENT_STORAGE,
+    };
+    (code, error.to_string())
 }
 
 pub async fn tunnel_start(State(s): State<AppState>) -> Json<CmdResponse> {
@@ -284,6 +443,14 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
                 None => lines.push(format!("    {rule}")),
             }
         }
+        lines.push("  }".to_string());
+    }
+    if let Some(out) = &rs.masquerade_out {
+        lines.push("  chain postrouting {".to_string());
+        lines.push("    type nat hook postrouting priority srcnat;".to_string());
+        lines.push(format!(
+            "    oifname \"{out}\" masquerade  # sortie Internet des clients du tunnel"
+        ));
         lines.push("  }".to_string());
     }
     if let Some(mss) = rs.mss_clamp {
@@ -419,6 +586,7 @@ mod tests {
                 name: "poste-test".into(),
                 public_key: PEER_KEY.into(),
                 address: "100.64.1.2/32".into(),
+                admin: true,
                 preshared_key: Some("secret-pq-ne-doit-pas-sortir".into()),
             }],
             ..NetworkConfig::default()

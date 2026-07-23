@@ -12,6 +12,8 @@ members = [
     "crates/heliosd",
     "tools/helios-ctl",
     "tools/helios-publisher",
+    "tools/helios-installer",
+    "tools/xtask",
     "apps/orion/src-tauri",
 ]
 
@@ -32,6 +34,8 @@ default-members = [
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
+    "tools/helios-installer",
+    "tools/xtask",
     "apps/orion/src-tauri",
 ]
 

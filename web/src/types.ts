@@ -6,6 +6,7 @@ export interface PeerSummary {
   public_key: string
   address: string
   post_quantum: boolean
+  admin: boolean
 }
 
 /** Contrat exact de GET /api/status. */
@@ -71,4 +72,19 @@ export interface FirewallRules {
 export interface CommandResponse {
   ok: boolean
   error?: string
+}
+
+export interface FinalizedRelease {
+  release_sequence: number
+  version: string
+  sha256: string
+}
+
+export interface UpdateStatus {
+  highest_confirmed_sequence: number
+  active_version: string | null
+  staged: FinalizedRelease[]
+  activation_pending: number | null
+  channel: string
+  target: string
 }

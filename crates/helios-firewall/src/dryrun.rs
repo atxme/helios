@@ -24,6 +24,9 @@ impl FirewallBackend for DryRunBackend {
                 info!("  [{}] {}", kind.as_str(), rule);
             }
         }
+        if let Some(out) = &rs.masquerade_out {
+            info!("  [postrouting] oifname \"{out}\" masquerade  # sortie Internet des clients");
+        }
         if let Some(mss) = rs.mss_clamp {
             info!("  (mangle) MSS clamping = {mss}");
         }

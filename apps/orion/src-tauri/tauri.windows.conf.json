@@ -1,0 +1,26 @@
+{
+  "build": {
+    "beforeBuildCommand": "cargo xtask orion-deps && npm run build"
+  },
+  "bundle": {
+    "resources": {
+      "../../../resources-windows/": "resources-windows/"
+    },
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "signCommand": {
+        "cmd": "powershell.exe",
+        "args": [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "windows/sign-orion.ps1",
+          "%1"
+        ]
+      }
+    }
+  }
+}

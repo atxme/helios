@@ -152,7 +152,12 @@ impl VpnBackend for WireGuardBackend {
             addresses: vec![address],
             port: CLIENT_LISTEN_PORT as u32 as u16,
             peers: vec![peer.clone()],
-            mtu: None,
+            // Le défaut de WireGuard (1420) suppose un transport à 1500. Sous
+            // ce seuil, les paquets chiffrés dépassent le MTU du lien et sont
+            // jetés en silence : le handshake et les requêtes courtes passent,
+            // seules les grosses disparaissent. Une interface cliente ne porte
+            // qu'un pair, donc son MTU peut coller au chemin réel.
+            mtu: crate::mtu::mtu_transport().map(aether::mtu::tunnel_mtu),
             fwmark: None,
         };
 

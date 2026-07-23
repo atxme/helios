@@ -38,6 +38,24 @@ pub struct FirewallPolicy {
     /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),
     /// même lorsque le kill-switch est engagé.
     pub allow_ssh_from: Vec<String>,
+    /// Autorise DHCP (UDP 67/68) sur l'interface WAN, kill-switch engagé.
+    ///
+    /// Une gateway a normalement une adresse fixe, d'où le défaut à `false`.
+    /// Mais une gateway placée derrière une box tient souvent son adresse d'un
+    /// bail : sans cette ouverture, elle perd son adresse au premier
+    /// renouvellement — donc son tunnel et son administration à la fois, et
+    /// plusieurs heures après un démarrage qui semblait réussi.
+    pub allow_dhcp_on_wan: bool,
+    /// Route le trafic des clients du tunnel vers Internet : forward
+    /// `wg_iface -> wan_iface` et masquerade, **uniquement** dans un état où le
+    /// trafic est autorisé.
+    ///
+    /// Fermé par défaut. Ce que cela ne couvre pas : le DNS. Le client garde
+    /// son résolveur, donc ses requêtes sortent hors du tunnel — un profil
+    /// Orion ne sait pas encore pousser de résolveur.
+    pub allow_client_internet: bool,
+    /// Interface WireGuard, source du trafic client à router.
+    pub wg_iface: String,
     /// Port TCP de l'interface d'administration REST/WS.
     pub admin_port: Option<u16>,
     /// Interface réseau exclusive pour l'accès à l'administration (ex. `helios0`).

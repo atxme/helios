@@ -3,7 +3,7 @@
 #
 # Usage :
 #   ./scripts/setup-dev.sh           # mode dev WSL2 — daemon + client GUI
-#   ./scripts/setup-dev.sh --target  # ajoute nftables/WireGuard/TPM/RAUC
+#   ./scripts/setup-dev.sh --target  # ajoute nftables/WireGuard/TPM
 #   ./scripts/setup-dev.sh --build   # installe ET compile tout
 set -euo pipefail
 
@@ -24,7 +24,7 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--target] [--build]"
             echo "  (aucun flag)  Dépendances dev WSL2 : daemon (dry-run) + client GUI"
-            echo "  --target      Ajoute les dépendances cible : nftables, WireGuard, TPM, RAUC"
+            echo "  --target      Ajoute les dépendances cible : nftables, WireGuard, TPM"
             echo "  --build       Installe les dépendances ET compile les binaires"
             exit 0 ;;
         *) die "Argument inconnu : $arg. Utilisez --help pour l'aide." ;;
@@ -56,7 +56,7 @@ if ! command -v rustup &>/dev/null; then
     source "$HOME/.cargo/env"
     success "rustup installé"
 else
-    rustup update stable --quiet
+    rustup update    stable
     success "Rust $(rustc --version)"
 fi
 
@@ -114,11 +114,10 @@ fi
 
 # ── 5. Dépendances cible uniquement ─────────────────────────────────────────
 if $TARGET_MODE; then
-    info "Dépendances cible (Netlink/nftables, WireGuard, TPM, RAUC)..."
+    info "Dépendances cible (Netlink/nftables, WireGuard, TPM)..."
     sudo apt-get install -y \
         libnftnl-dev libmnl-dev \
         nftables wireguard-tools \
-        rauc \
         tpm2-tools libtss2-dev
     success "Dépendances cible OK"
 

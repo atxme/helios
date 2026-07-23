@@ -1,0 +1,172 @@
+name: Bundle de release
+
+# Déclenché à la main ou sur un tag. La CI **ne signe rien** : elle produit des
+# artefacts nus et leurs empreintes (ADR-004 §7). Les signatures — hybride
+# Ed25519 + ML-DSA-65 pour la gateway, Authenticode pour Orion — sont jouées
+# hors ligne, avec des clés qui n'entrent jamais ici.
+#
+# Deux artefacts, deux plateformes de fabrication : le bundle gateway se
+# construit sous Linux, les installateurs Orion sous Windows, parce que le
+# bundling MSI/NSIS et l'édition de liens MSVC n'y ont pas d'équivalent
+# croisé. Aucun des deux ne demande quoi que ce soit à l'utilisateur final.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Assemblage du bundle gateway
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Dépendances système des features matérielles
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libnftnl-dev libmnl-dev libtss2-dev
+
+      # Le trousseau **public** de l'éditeur n'est pas un secret : c'est l'ancre
+      # de confiance compilée dans le binaire. Il est fourni en variable de
+      # dépôt, pas en secret, pour que ce fait reste visible.
+      - name: Ancre de confiance éditeur
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if [ -z "$KEYRING" ]; then
+            echo "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente." \
+                 "Y placer le contenu du trousseau PUBLIC de production" \
+                 "(publisher-keyring.json). Aucune clé privée ne doit y figurer."
+            exit 1
+          fi
+          printf '%s' "$KEYRING" > "$RUNNER_TEMP/publisher-keyring.json"
+          if grep -qi 'private' "$RUNNER_TEMP/publisher-keyring.json"; then
+            echo "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          fi
+
+      - name: Assemblage
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+        run: cargo xtask bundle
+
+      - name: Empreintes
+        run: |
+          cd target/bundle
+          dir="$(ls)"
+          cd "$dir"
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
+          cat ../SHA256SUMS
+
+      # Artefacts **non signés** : à télécharger sur le poste éditeur, signer
+      # avec `helios-publisher bundle`, puis archiver avec `cargo xtask pack`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-gateway
+          path: |
+            target/bundle/
+          if-no-files-found: error
+          retention-days: 14
+
+  orion-windows:
+    name: Installateurs Orion (Windows)
+    # Le bundling MSI/NSIS et l'édition de liens MSVC n'existent que sur
+    # Windows : ce job est la seule façon de produire un installateur Orion
+    # sans machine Windows manuelle.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/orion/package-lock.json
+
+      # Orion dépend d'`aether`, dont le build script refuse le trousseau de
+      # développement en profil release. Un installateur se construit donc avec
+      # la même ancre publique que la gateway — sans elle, le build échoue.
+      - name: Ancre de confiance éditeur
+        shell: pwsh
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KEYRING)) {
+            Write-Output "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente. Y placer le contenu du trousseau PUBLIC de production."
+            exit 1
+          }
+          $path = Join-Path $env:RUNNER_TEMP "publisher-keyring.json"
+          [System.IO.File]::WriteAllText($path, $env:KEYRING)
+          if (Select-String -Path $path -Pattern "private" -Quiet) {
+            Write-Output "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          }
+
+      - name: Dépendances npm
+        run: npm ci --prefix apps/orion
+
+      # `beforeBuildCommand` déclenche `cargo xtask orion-deps`, qui télécharge
+      # WireGuardNT et vérifie son empreinte épinglée. La DLL entre dans
+      # l'installateur : l'utilisateur final ne télécharge jamais rien.
+      - name: Construction des installateurs
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+          ORION_UNSIGNED_FOR_OFFLINE_SIGNING: "1"
+        run: npm run tauri build --prefix apps/orion -- --features wireguard
+
+      # Le suffixe `-unsigned` est posé avant toute publication : un MSI sans
+      # signature ne doit pas pouvoir être confondu avec une release au moment
+      # où quelqu'un le récupère.
+      - name: Marquage et empreintes
+        shell: pwsh
+        run: |
+          $bundle = "target/release/bundle"
+          Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe | ForEach-Object {
+            $destination = Join-Path $_.DirectoryName "$($_.BaseName)-unsigned$($_.Extension)"
+            Move-Item -LiteralPath $_.FullName -Destination $destination
+          }
+
+          $artifacts = Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe
+          if ($artifacts.Count -eq 0) {
+            Write-Output "::error::Aucun installateur produit."
+            exit 1
+          }
+
+          # Garde-fou du chemin non signé : il doit avoir réellement laissé les
+          # artefacts nus. Un artefact à moitié signé serait le pire des deux.
+          $signed = $artifacts | Where-Object {
+            (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne "NotSigned"
+          }
+          if ($signed) {
+            Write-Output "::error::Artefact signé alors que la CI ne doit rien signer : $($signed.Name -join ', ')"
+            exit 1
+          }
+
+          $artifacts |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path -Leaf $_.Path) } |
+            Tee-Object -FilePath (Join-Path $bundle "SHA256SUMS")
+
+      # À télécharger sur le poste de signature, signer avec
+      # `windows/sign-orion.ps1`, puis distribuer.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installateurs-orion-windows-non-signes
+          path: |
+            target/release/bundle/msi/
+            target/release/bundle/nsis/
+            target/release/bundle/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

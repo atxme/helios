@@ -21,6 +21,9 @@ base64.workspace = true
 hex.workspace = true
 fips204.workspace = true
 curve25519-dalek.workspace = true
+# Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
+# clé privée persistée d'un pair, par opposition aux clés éphémères.
+x25519-dalek.workspace = true
 # `sync` seul : aether ne tire aucun runtime, uniquement le `oneshot` qui porte
 # l'acquittement d'installation du PSK (voir `events::InstallPskRequest`).
 tokio = { workspace = true, features = ["sync"] }

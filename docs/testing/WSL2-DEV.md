@@ -13,7 +13,8 @@ leur exécution réelle.
 | backend Netlink nftables | oui | non sans `nf_tables` |
 | backend WireGuard noyau | oui | non sans module WireGuard/droits |
 | backend TPM TSS2 | oui | seulement avec TPM accessible |
-| RAUC | oui | non sans appliance A/B |
+| staging et vérification du binaire | oui | oui |
+| activation systemd et rollback du service | oui | non sans gateway installée |
 | shell Tauri Orion | oui avec WebKitGTK 4.1 | oui avec WSLg, sinon build seulement |
 
 Un build vert d’une feature matérielle prouve donc que l’API utilisée compile,
@@ -69,7 +70,8 @@ Avant livraison, une machine isolée avec accès console doit valider :
 - la création et la reconfiguration réelles des interfaces WireGuard ;
 - l’expiration de handshake et la conservation des routes Orion sur échec ;
 - le scellement/déscellement PCR 0/4/7 et le billet de rescellement ;
-- l’installation RAUC dans le slot inactif, le `mark-good` et le rollback.
+- l’activation par l’unité systemd, le health check réel et le rollback du lien
+  `/opt/helios/current`.
 
 La procédure détaillée se trouve dans [TESTING.md](TESTING.md) et
 [MANUAL-TESTING.md](MANUAL-TESTING.md).

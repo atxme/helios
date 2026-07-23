@@ -33,7 +33,7 @@ export function TrustView() {
         </h1>
         <p className="text-xs text-slate-500 mt-0.5">
           Ce que ce binaire exige d’un artefact éditeur avant de l’accepter — billet de rescellement
-          TPM, et à terme manifestes OTA.
+          TPM et manifestes de binaires Helios.
         </p>
       </div>
 

@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+ORION_BINARY=/usr/bin/orion
+
+if ! command -v setcap >/dev/null 2>&1; then
+    echo "orion: setcap est absent ; installer libcap2-bin" >&2
+    exit 1
+fi
+if [ ! -x "$ORION_BINARY" ]; then
+    echo "orion: binaire installé introuvable : $ORION_BINARY" >&2
+    exit 1
+fi
+
+setcap cap_net_admin=ep "$ORION_BINARY"
+
+if command -v getcap >/dev/null 2>&1; then
+    CAPABILITIES=$(getcap "$ORION_BINARY" 2>/dev/null || true)
+    case "$CAPABILITIES" in
+        *cap_net_admin*ep*) ;;
+        *)
+            echo "orion: la capability cap_net_admin n'a pas été posée sur $ORION_BINARY" >&2
+            exit 1
+            ;;
+    esac
+fi

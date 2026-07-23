@@ -57,6 +57,16 @@ pub struct InterfaceConfig {
     pub listen_port: u16,
     /// Adresse de la gateway dans le réseau du tunnel (ex. `100.64.0.1/10`).
     pub address: String,
+    /// MTU de l'interface, ou `None` pour laisser le défaut de WireGuard.
+    ///
+    /// Dérivé du MTU du lien WAN par [`aether::mtu::tunnel_mtu`] : le défaut de
+    /// 1420 suppose un transport à 1500 et fait disparaître les gros paquets
+    /// dès que le WAN est plus étroit.
+    ///
+    /// Le MTU WireGuard étant **par interface et non par pair**, cette valeur
+    /// vaut pour tous les clients. Ceux dont le chemin est plus étroit relèvent
+    /// du MSS clamping (TCP) ou du PMTUD (UDP), pas de ce réglage.
+    pub mtu: Option<u32>,
 }
 
 /// Un pair (client Orion) autorisé sur la gateway.
