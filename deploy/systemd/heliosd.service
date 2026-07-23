@@ -20,6 +20,12 @@ RestartSec=2
 # heliosd manipule nftables et l'interface WireGuard.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# /dev/tpmrm0 appartient à tss:tss (mode 660). Le service tourne en root, mais
+# CapabilityBoundingSet lui retire CAP_DAC_OVERRIDE : sans elle, root ne
+# traverse plus les permissions de fichier et ne peut pas ouvrir le TPM. On lui
+# rend l'accès par le groupe, pas en lui rendant le droit d'ignorer TOUTES les
+# permissions — moindre privilège plutôt que CAP_DAC_OVERRIDE.
+SupplementaryGroups=tss
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
