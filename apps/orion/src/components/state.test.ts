@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ClientProfile } from '../types'
-import { elapsed, formatBps, postureMeta, protectionMeta, stateMeta } from './state'
+import type { ClientProfile, ProtectionMode } from '../types'
+import {
+  elapsed,
+  formatBps,
+  modeAllowed,
+  modeLevel,
+  postureMeta,
+  protectionMeta,
+  stateMeta,
+} from './state'
 
 const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'site-a',
@@ -13,8 +21,22 @@ const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
   heliosd_url: null,
+  key_negotiation: null,
   ...over,
 })
+
+const negotiating = (mode: ProtectionMode, minimum_mode: ProtectionMode = 'classic') =>
+  profile({
+    key_negotiation: {
+      mode,
+      minimum_mode,
+      endpoint: '203.0.113.10:51821',
+      server_name: 'vpn.example.net',
+      gateway_ca_der: 'MIIB',
+      gateway_pq_certificate: 'e30=',
+      identity: 'orion-site-a',
+    },
+  })
 
 describe('Orion UI state', () => {
   it('only indicates active traffic on a fresh WireGuard handshake', () => {
@@ -66,6 +88,35 @@ describe('Orion UI state', () => {
     // Without an internal URL, no negotiation will happen: nothing to wait for.
     expect(protectionMeta(profile(), null, 'down').tone).toBe('classic')
     expect(protectionMeta(null, null, 'down').tone).toBe('classic')
+  })
+
+  it('announces the mode about to be negotiated rather than the legacy guess', () => {
+    // Helios never substitutes another mode: what the profile requests is a
+    // sound announcement — but still an announcement, hence `pending`.
+    expect(protectionMeta(negotiating('ml_kem'), null, 'down').tone).toBe('pending')
+    expect(protectionMeta(negotiating('static_psk'), null, 'down').tone).toBe('static')
+    expect(protectionMeta(negotiating('classic'), null, 'down').tone).toBe('classic')
+
+    // The negotiated mode wins over the legacy internal-URL clue: a profile
+    // that negotiates in classic mode must not be shown as awaiting a PQC PSK.
+    const both = negotiating('classic')
+    both.heliosd_url = 'http://100.64.0.1:8080'
+    expect(protectionMeta(both, null, 'down').tone).toBe('classic')
+
+    // And the event still overrides everything.
+    expect(protectionMeta(negotiating('ml_kem'), 'none', 'up').tone).toBe('classic')
+  })
+
+  it('only lets a mode be chosen at or above the floor', () => {
+    // The client refuses a mode below its floor before touching the network,
+    // exactly as the gateway does; the screen must not offer it.
+    expect(modeLevel('classic')).toBeLessThan(modeLevel('static_psk'))
+    expect(modeLevel('static_psk')).toBeLessThan(modeLevel('ml_kem'))
+
+    expect(modeAllowed('ml_kem', 'ml_kem')).toBe(true)
+    expect(modeAllowed('static_psk', 'ml_kem')).toBe(false)
+    expect(modeAllowed('classic', 'ml_kem')).toBe(false)
+    expect(modeAllowed('classic', 'classic')).toBe(true)
   })
 
   it('formats a duration without a negative value', () => {

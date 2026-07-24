@@ -55,6 +55,97 @@ pub struct KeyNegotiationSettings {
     pub identity: String,
 }
 
+impl KeyNegotiationSettings {
+    /// Decodes the pinned gateway PQ certificate.
+    pub fn gateway_pq_certificate(&self) -> Result<aether::key_negotiation::PqCertificate> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(self.gateway_pq_certificate.trim())
+            .context("décodage du certificat PQ de la gateway")?;
+        serde_json::from_slice(&raw).context("lecture du certificat PQ de la gateway")
+    }
+
+    /// SHA-256 fingerprint of the pinned gateway PQ certificate.
+    ///
+    /// It is the value `heliosd init-key-negotiation` prints on the gateway:
+    /// showing it in Orion lets the user read out loud what their client
+    /// pinned instead of trusting that the imported file is the right one.
+    /// `None` as long as the certificate is unreadable — the fault is then
+    /// reported by [`validate_key_negotiation`], not disguised as a hash.
+    pub fn gateway_pq_fingerprint(&self) -> Option<String> {
+        self.gateway_pq_certificate().ok()?.fingerprint().ok()
+    }
+}
+
+/// Validates a key-negotiation block against the profile carrying it.
+///
+/// Shared by [`ClientProfile::validate`], profile import and
+/// [`crate::inspect_profile`]: three rule sets for the same block would
+/// eventually diverge, and a screen would accept what the connection refuses.
+///
+/// The messages are user-facing — they are displayed as-is in Orion.
+pub fn validate_key_negotiation(
+    settings: &KeyNegotiationSettings,
+    peer_public_key: &str,
+    has_preshared_key: bool,
+) -> Result<()> {
+    if settings.endpoint.trim().is_empty()
+        || settings.server_name.trim().is_empty()
+        || settings.gateway_ca_der.trim().is_empty()
+        || settings.gateway_pq_certificate.trim().is_empty()
+        || settings.identity.trim().is_empty()
+    {
+        anyhow::bail!(
+            "négociation de clé incomplète : endpoint, nom de serveur, CA, certificat PQ et identité protégée sont tous requis"
+        );
+    }
+    if !settings.mode.satisfies(settings.minimum_mode) {
+        anyhow::bail!(
+            "le mode {} est sous le plancher {} : la négociation ne redescend jamais",
+            mode_label(settings.mode),
+            mode_label(settings.minimum_mode)
+        );
+    }
+    let authority = base64::engine::general_purpose::STANDARD
+        .decode(settings.gateway_ca_der.trim())
+        .context("la CA de la gateway n'est pas encodée en base64")?;
+    if authority.is_empty() {
+        anyhow::bail!("la CA de la gateway est vide");
+    }
+
+    let certificate = settings.gateway_pq_certificate()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("l'horloge système précède l'époque Unix")?
+        .as_secs();
+    certificate
+        .verify_self_signed(
+            aether::key_negotiation::PqCertificateRole::Gateway,
+            Some(&settings.server_name),
+            peer_public_key,
+            now,
+        )
+        .context("le certificat PQ épinglé ne correspond pas à cette gateway")?;
+
+    match (settings.mode, has_preshared_key) {
+        (ProtectionMode::StaticPsk, false) => {
+            anyhow::bail!("le mode PSK statique exige un PSK dans le profil")
+        }
+        (ProtectionMode::Classic | ProtectionMode::MlKem, true) => {
+            anyhow::bail!("un PSK de profil n'est valable qu'avec le mode PSK statique")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Name of a mode as the user reads it on screen.
+fn mode_label(mode: ProtectionMode) -> &'static str {
+    match mode {
+        ProtectionMode::Classic => "classique",
+        ProtectionMode::StaticPsk => "PSK statique",
+        ProtectionMode::MlKem => "ML-KEM-768",
+    }
+}
+
 /// A complete VPN profile, as edited by the user in the UI.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientProfile {
@@ -138,45 +229,7 @@ impl ClientProfile {
             anyhow::bail!("la clé publique de la gateway est requise");
         }
         if let Some(settings) = &self.key_negotiation {
-            if settings.endpoint.trim().is_empty()
-                || settings.server_name.trim().is_empty()
-                || settings.gateway_ca_der.trim().is_empty()
-                || settings.gateway_pq_certificate.trim().is_empty()
-                || settings.identity.trim().is_empty()
-            {
-                anyhow::bail!("key-negotiation settings are incomplete");
-            }
-            if !settings.mode.satisfies(settings.minimum_mode) {
-                anyhow::bail!("selected key-negotiation mode is below the profile security floor");
-            }
-            let gateway_pq_certificate: aether::key_negotiation::PqCertificate =
-                serde_json::from_slice(
-                    &base64::engine::general_purpose::STANDARD
-                        .decode(settings.gateway_pq_certificate.trim())
-                        .context("decoding the gateway PQ certificate")?,
-                )
-                .context("parsing the gateway PQ certificate")?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("system clock predates the Unix epoch")?
-                .as_secs();
-            gateway_pq_certificate
-                .verify_self_signed(
-                    aether::key_negotiation::PqCertificateRole::Gateway,
-                    Some(&settings.server_name),
-                    &self.peer_public_key,
-                    now,
-                )
-                .context("verifying the pinned gateway PQ certificate")?;
-            match (settings.mode, self.has_preshared_key()) {
-                (ProtectionMode::StaticPsk, false) => {
-                    anyhow::bail!("static key-negotiation mode requires a profile PSK")
-                }
-                (ProtectionMode::Classic | ProtectionMode::MlKem, true) => {
-                    anyhow::bail!("a profile PSK is only valid with static key-negotiation mode")
-                }
-                _ => {}
-            }
+            validate_key_negotiation(settings, &self.peer_public_key, self.has_preshared_key())?;
         }
         Ok(())
     }
@@ -280,10 +333,45 @@ impl ClientConfig {
     }
 
     /// Inserts or replaces a profile (key = `name`).
-    pub fn upsert(&mut self, profile: ClientProfile) {
+    ///
+    /// The key-negotiation floor only ever goes **up**, exactly as the gateway
+    /// refuses to lower a peer's floor when a redacted view is reposted
+    /// (ADR-001, amendment of 24 July 2026). A screen that forgot the block,
+    /// or a draft opened before a raise and saved after it, must not silently
+    /// reopen a weaker negotiation. Lowering the floor stays possible, but
+    /// only by editing `profiles.toml` by hand — a deliberate local act, never
+    /// a side effect of saving a form.
+    pub fn upsert(&mut self, mut profile: ClientProfile) {
         match self.profiles.iter_mut().find(|p| p.name == profile.name) {
-            Some(slot) => *slot = profile,
+            Some(slot) => {
+                Self::keep_strongest_floor(&mut profile, slot);
+                *slot = profile;
+            }
             None => self.profiles.push(profile),
+        }
+    }
+
+    /// Carries the known floor over to the profile about to replace it.
+    ///
+    /// Dropping the block entirely is a downgrade too: a profile that
+    /// negotiated in ML-KEM and comes back without any block would fall back
+    /// to the legacy path, whose first handshake is unprotected. The known
+    /// block is therefore preserved rather than erased.
+    fn keep_strongest_floor(incoming: &mut ClientProfile, known: &ClientProfile) {
+        let Some(previous) = known.key_negotiation.as_ref() else {
+            return;
+        };
+        let Some(next) = incoming.key_negotiation.as_mut() else {
+            if previous.minimum_mode != ProtectionMode::Classic {
+                incoming.key_negotiation = Some(previous.clone());
+            }
+            return;
+        };
+        if !next.minimum_mode.satisfies(previous.minimum_mode) {
+            next.minimum_mode = previous.minimum_mode;
+        }
+        if !next.mode.satisfies(next.minimum_mode) {
+            next.mode = next.minimum_mode;
         }
     }
 
@@ -326,6 +414,75 @@ mod tests {
         cfg.remove("b");
         assert_eq!(cfg.profiles.len(), 1);
         assert_eq!(cfg.selected.as_deref(), Some("a")); // auto re-selection
+    }
+
+    fn negotiating(mode: ProtectionMode, minimum_mode: ProtectionMode) -> ClientProfile {
+        ClientProfile {
+            name: "poste".into(),
+            key_negotiation: Some(KeyNegotiationSettings {
+                mode,
+                minimum_mode,
+                endpoint: "vpn.example.net:51821".into(),
+                server_name: "vpn.example.net".into(),
+                gateway_ca_der: "MIIB".into(),
+                gateway_pq_certificate: "e30=".into(),
+                identity: "orion-poste".into(),
+            }),
+            ..ClientProfile::default()
+        }
+    }
+
+    /// Saving a profile must never reopen a weaker negotiation.
+    ///
+    /// The scenario is ordinary: a screen left open before the floor was
+    /// raised, saved afterwards. Without the ratchet, the stale draft would
+    /// carry the whole client back down to `classic` — exactly the downgrade
+    /// the gateway refuses over the network.
+    #[test]
+    fn saving_a_profile_never_lowers_the_key_negotiation_floor() {
+        let mut cfg = ClientConfig::default();
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        cfg.upsert(negotiating(
+            ProtectionMode::Classic,
+            ProtectionMode::Classic,
+        ));
+
+        let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
+        assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
+        // A mode left below the restored floor is raised with it: the two
+        // must never contradict each other on disk.
+        assert_eq!(saved.mode, ProtectionMode::MlKem);
+    }
+
+    /// Dropping the block is a downgrade too: the legacy path leaves the
+    /// first handshake unprotected.
+    #[test]
+    fn saving_a_profile_without_its_block_keeps_the_known_one() {
+        let mut cfg = ClientConfig::default();
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        cfg.upsert(ClientProfile {
+            name: "poste".into(),
+            ..ClientProfile::default()
+        });
+
+        let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
+        assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
+    }
+
+    /// A floor still at `classic` carries no promise: nothing to preserve.
+    #[test]
+    fn a_classic_floor_does_not_pin_the_block() {
+        let mut cfg = ClientConfig::default();
+        cfg.upsert(negotiating(
+            ProtectionMode::Classic,
+            ProtectionMode::Classic,
+        ));
+        cfg.upsert(ClientProfile {
+            name: "poste".into(),
+            ..ClientProfile::default()
+        });
+
+        assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
     }
 
     #[test]

@@ -29,6 +29,14 @@ et `helios-ctl peer` admettent les clients par le **même** code
 document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
 expose enfin le séquestre.
 
+La négociation de clé pré-WireGuard (ADR-001, amendement du 24 juillet 2026)
+existe de bout en bout : port UDP dédié, authentification ML-DSA-65, trois modes
+et plancher anti-downgrade qui monte seul et ne redescend pas. Les deux IHM
+l’exposent — plancher par pair côté gateway, choix du mode et empreinte du
+certificat épinglé côté Orion. **Limite connue** : le stockage protégé
+d’identité du shell Windows n’est pas câblé, donc un profil porteur du bloc
+échoue avant WireGuard ; l’écran *Profils* le dit.
+
 La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
 `helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
 `helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne

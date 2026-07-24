@@ -16,7 +16,12 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
+use aether::key_negotiation::ProtectionMode;
+
+use crate::{
+    config::validate_key_negotiation, ClientConfig, ClientProfile, KeyNegotiationSettings,
+    DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
+};
 
 /// Stable identifier of the JSON document exchangeable with Orion.
 pub const PROFILE_IMPORT_FORMAT: &str = "orion-profile";
@@ -63,6 +68,46 @@ struct JsonProfile {
     persistent_keepalive: Option<u16>,
     #[serde(default)]
     heliosd_url: Option<String>,
+    /// Public key-negotiation material distributed with the profile.
+    ///
+    /// The client's own certificate and private key never travel here: they
+    /// go into the machine's protected identity store, and the document only
+    /// names the entry to look up.
+    #[serde(default)]
+    key_negotiation: Option<JsonKeyNegotiation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonKeyNegotiation {
+    mode: ProtectionMode,
+    #[serde(default)]
+    minimum_mode: Option<ProtectionMode>,
+    endpoint: String,
+    server_name: String,
+    gateway_ca_der: String,
+    gateway_pq_certificate: String,
+    identity: String,
+}
+
+impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
+    fn from(value: JsonKeyNegotiation) -> Self {
+        Self {
+            mode: value.mode,
+            // An absent floor is not "no floor": a document asking for ML-KEM
+            // that would accept a classic negotiation tomorrow protects
+            // nothing. The floor therefore starts at the mode the operator
+            // chose, and an explicit floor is honored as-is — including a
+            // contradictory one, which import then rejects rather than
+            // silently repairs.
+            minimum_mode: value.minimum_mode.unwrap_or(value.mode),
+            endpoint: value.endpoint,
+            server_name: value.server_name,
+            gateway_ca_der: value.gateway_ca_der,
+            gateway_pq_certificate: value.gateway_pq_certificate,
+            identity: value.identity,
+        }
+    }
 }
 
 impl From<JsonProfile> for ClientProfile {
@@ -81,7 +126,7 @@ impl From<JsonProfile> for ClientProfile {
                 .persistent_keepalive
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
-            key_negotiation: None,
+            key_negotiation: profile.key_negotiation.map(KeyNegotiationSettings::from),
         }
     }
 }
@@ -343,6 +388,14 @@ pub struct ProfileIssues {
     pub allowed_ips: Option<String>,
     pub persistent_keepalive: Option<String>,
     pub heliosd_url: Option<String>,
+    /// Fault of the key-negotiation block as a whole.
+    ///
+    /// Deliberately a single message rather than one per sub-field: what
+    /// makes the block wrong is almost always a relation — a mode below the
+    /// floor, a PSK that contradicts the mode, a certificate pinned to
+    /// another gateway. Reporting the fault on one sub-field would designate
+    /// the wrong culprit.
+    pub key_negotiation: Option<String>,
 }
 
 impl ProfileIssues {
@@ -403,6 +456,14 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
             .heliosd_url
             .as_deref()
             .and_then(|value| when_filled(value, validate_heliosd_url)),
+        // The block is only judged once the gateway key it is pinned to is
+        // readable: without it, every certificate would look wrong while the
+        // profile is merely incomplete.
+        key_negotiation: profile.key_negotiation.as_ref().and_then(|settings| {
+            when_filled(&profile.peer_public_key, |peer_public_key| {
+                validate_key_negotiation(settings, peer_public_key, profile.has_preshared_key())
+            })
+        }),
     }
 }
 
@@ -445,6 +506,22 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     }
     if let Some(url) = &profile.heliosd_url {
         validate_heliosd_url(url)?;
+    }
+    // Taken out of the profile: the block is validated against the peer key
+    // and the PSK of the very profile that carries it.
+    if let Some(mut settings) = profile.key_negotiation.take() {
+        settings.endpoint = settings.endpoint.trim().to_string();
+        settings.server_name = settings.server_name.trim().to_string();
+        settings.gateway_ca_der = settings.gateway_ca_der.trim().to_string();
+        settings.gateway_pq_certificate = settings.gateway_pq_certificate.trim().to_string();
+        settings.identity = settings.identity.trim().to_string();
+        validate_endpoint(&settings.endpoint).context("endpoint de négociation de clé invalide")?;
+        validate_key_negotiation(
+            &settings,
+            &profile.peer_public_key,
+            profile.has_preshared_key(),
+        )?;
+        profile.key_negotiation = Some(settings);
     }
     Ok(profile)
 }
@@ -736,6 +813,155 @@ mod tests {
         let issues = inspect_profile(&profile);
         assert!(issues.persistent_keepalive.is_some());
         assert_eq!(issues.preshared_key, None);
+    }
+
+    /// Gateway material as the operator distributes it: public certificate,
+    /// public CA, and the name of the protected store entry — never the
+    /// client's own private key.
+    #[cfg(feature = "key-negotiation")]
+    fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
+        use aether::key_negotiation::{
+            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            PQ_CERTIFICATE_VERSION,
+        };
+        use base64::engine::general_purpose::STANDARD;
+
+        let (private_key, public_key) = generate_ml_dsa_65_keypair().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let certificate = issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [7u8; 16],
+                subject: "vpn.example.net".into(),
+                issuer: "vpn.example.net".into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: GATEWAY_PUBLIC.into(),
+                ml_dsa_65_public_key: STANDARD.encode(&public_key),
+                not_before_unix: now - 60,
+                not_after_unix: now + 3600,
+                ml_dsa_65_signature: String::new(),
+            },
+            &private_key,
+        )
+        .unwrap();
+
+        KeyNegotiationSettings {
+            mode,
+            minimum_mode: mode,
+            endpoint: "vpn.example.net:51821".into(),
+            server_name: "vpn.example.net".into(),
+            gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
+            gateway_pq_certificate: STANDARD.encode(serde_json::to_vec(&certificate).unwrap()),
+            identity: "orion-portable".into(),
+        }
+    }
+
+    #[cfg(feature = "key-negotiation")]
+    fn document_with(settings: serde_json::Value) -> String {
+        serde_json::json!({
+            "format": PROFILE_IMPORT_FORMAT,
+            "version": PROFILE_IMPORT_VERSION,
+            "profile": {
+                "name": "portable",
+                "endpoint": "vpn.example.net:51820",
+                "private_key": CLIENT_PRIVATE,
+                "peer_public_key": GATEWAY_PUBLIC,
+                "address": "100.64.1.2/32",
+                "key_negotiation": settings,
+            }
+        })
+        .to_string()
+    }
+
+    /// The operator document is the vehicle for the negotiation settings:
+    /// without it, the screen would have nothing to display and the user
+    /// would have to retype a certificate by hand.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn imports_the_key_negotiation_block_of_an_operator_document() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let raw = document_with(serde_json::to_value(&settings).unwrap());
+
+        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let imported = profile.key_negotiation.expect("block expected");
+        assert_eq!(imported.mode, ProtectionMode::MlKem);
+        assert_eq!(imported.minimum_mode, ProtectionMode::MlKem);
+        assert_eq!(imported.endpoint, "vpn.example.net:51821");
+        assert!(imported.gateway_pq_fingerprint().is_some());
+    }
+
+    /// An absent floor is not "no floor": accepting a classic negotiation
+    /// tomorrow would void the mode chosen today.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn an_imported_block_without_a_floor_takes_its_selected_mode_as_floor() {
+        let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+        settings
+            .as_object_mut()
+            .unwrap()
+            .remove("minimum_mode")
+            .expect("the fixture carries a floor");
+
+        let profile = parse_profile_import(&document_with(settings), "portable.json").unwrap();
+        assert_eq!(
+            profile.key_negotiation.unwrap().minimum_mode,
+            ProtectionMode::MlKem
+        );
+    }
+
+    /// A document that asks for less than its own floor is contradictory:
+    /// import refuses it rather than silently picking a side.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn a_mode_below_the_declared_floor_is_refused_at_import() {
+        let mut settings = gateway_settings(ProtectionMode::Classic);
+        settings.minimum_mode = ProtectionMode::MlKem;
+        let raw = document_with(serde_json::to_value(&settings).unwrap());
+
+        let error = parse_profile_import(&raw, "portable.json")
+            .expect_err("a mode below the floor must be refused")
+            .to_string();
+        assert!(error.contains("plancher"), "message : {error}");
+    }
+
+    /// A certificate pinned to another gateway must not pass for this one:
+    /// it's the only check that ties the imported material to the peer key
+    /// the profile is about to talk to.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn a_certificate_pinned_to_another_gateway_is_refused() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["peer_public_key"] =
+            serde_json::Value::String(CLIENT_PRIVATE.to_string());
+
+        assert!(parse_profile_import(&document.to_string(), "portable.json").is_err());
+    }
+
+    /// The three modes don't take the same profile material, and the fault
+    /// is a relation between two fields — the block carries it as a whole.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn a_psk_that_contradicts_the_mode_is_reported_on_the_block() {
+        let profile = ClientProfile {
+            preshared_key: Some("cHNr".into()),
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        let message = inspect_profile(&profile)
+            .key_negotiation
+            .expect("a PSK is only valid in static mode");
+        assert!(message.contains("PSK statique"), "message : {message}");
+
+        let sound = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&sound).key_negotiation, None);
     }
 
     #[test]

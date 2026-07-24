@@ -1,4 +1,4 @@
-import type { ClientProfile, PskKind, TunnelState } from '../types'
+import type { ClientProfile, ProtectionMode, PskKind, TunnelState } from '../types'
 
 export interface StateMeta {
   label: string
@@ -150,6 +150,11 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
  * static PSK. It's the core's `protection` event that is authoritative; the
  * profile only serves to announce what's *expected* while the connection
  * hasn't decided yet.
+ *
+ * What the profile *does* say, when it carries a `key_negotiation` block, is
+ * the mode about to be requested. Helios never substitutes another one, so
+ * that mode is a sound announcement — but it is still an announcement, and
+ * it is displayed as pending until the event confirms it.
  */
 export type ProtectionTone = 'pqc' | 'static' | 'classic' | 'pending'
 
@@ -186,17 +191,87 @@ export function protectionMeta(
 
   // Nothing observed: we announce the wait, never the acquired state. A
   // profile that *can* obtain a PQC PSK doesn't have it yet.
+  const pending = (label: string, detail: string): ProtectionMeta => {
+    const meta = stateMeta(state)
+    return {
+      tone: 'pending',
+      label: meta.active || meta.transitioning ? `${label} — négociation…` : `${label} à la connexion`,
+      detail,
+    }
+  }
+
+  // The negotiated mode is authoritative over every other clue: it is what
+  // the client is about to ask for, and the gateway substitutes nothing.
+  const negotiated = profile?.key_negotiation
+  if (negotiated) {
+    if (negotiated.mode === 'ml_kem') return pending('PSK PQC', PQC_DETAIL)
+    if (negotiated.mode === 'static_psk') {
+      return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
+    }
+    return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
+  }
+
   const staticPsk = Boolean(profile?.preshared_key?.trim())
   if (staticPsk) return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
 
-  if (profile?.heliosd_url?.trim()) {
-    const meta = stateMeta(state)
-    return meta.active || meta.transitioning
-      ? { tone: 'pending', label: 'PSK PQC — négociation…', detail: PQC_DETAIL }
-      : { tone: 'pending', label: 'PSK PQC à la connexion', detail: PQC_DETAIL }
-  }
+  if (profile?.heliosd_url?.trim()) return pending('PSK PQC', PQC_DETAIL)
 
   return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
+}
+
+/**
+ * The three negotiable modes, from weakest to strongest.
+ *
+ * The order isn't decorative: it's the one the gateway enforces
+ * (`classic < static_psk < ml_kem`), and the screen derives from it what a
+ * profile may still choose.
+ */
+export const PROTECTION_MODES: ProtectionMode[] = ['classic', 'static_psk', 'ml_kem']
+
+export interface ModeMeta {
+  /** Chip label. */
+  label: string
+  /** What this mode gives, and what it costs. */
+  detail: string
+}
+
+const MODE_META: Record<ProtectionMode, ModeMeta> = {
+  classic: {
+    label: 'Classique',
+    detail:
+      'Aucun PSK négocié : la confidentialité repose sur Curve25519 seul, cassable par un adversaire quantique qui aurait enregistré le trafic.',
+  },
+  static_psk: {
+    label: 'PSK statique',
+    detail:
+      'Le PSK du profil est retrouvé par comparaison d’empreinte — la valeur ne circule jamais. Il protège du « récolter maintenant, déchiffrer plus tard », mais il ne tourne pas.',
+  },
+  ml_kem: {
+    label: 'ML-KEM-768',
+    detail:
+      'Un PSK frais est dérivé à chaque connexion et n’est jamais écrit sur disque. Helios le pose avant de répondre, et le retire si le handshake n’aboutit pas.',
+  },
+}
+
+export function modeMeta(mode: ProtectionMode): ModeMeta {
+  return MODE_META[mode] ?? MODE_META.classic
+}
+
+/** Rank in the monotonic order. Higher = stronger. */
+export function modeLevel(mode: ProtectionMode): number {
+  const level = PROTECTION_MODES.indexOf(mode)
+  return level < 0 ? 0 : level
+}
+
+/**
+ * Can this mode still be selected under that floor?
+ *
+ * The client refuses a mode below its own floor **before** touching the
+ * network, exactly as the gateway does. The screen therefore doesn't offer
+ * what would be refused a second later.
+ */
+export function modeAllowed(mode: ProtectionMode, floor: ProtectionMode): boolean {
+  return modeLevel(mode) >= modeLevel(floor)
 }
 
 export function elapsed(upSince: number | null, now: number): string | null {

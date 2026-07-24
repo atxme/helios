@@ -153,9 +153,9 @@ renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.
 
 Les deux clés clientes produites en `0600` servent au transfert initial vers le
 stockage protégé du poste Orion, puis doivent être effacées du poste opérateur.
-Le câblage de ce stockage dans le shell Windows et les écrans d’import sont le
-lot IHM suivant. Pour valider mTLS, ML-DSA et les messages sans modifier
-durablement un slot :
+Le câblage de ce stockage dans le shell Windows reste à faire : Orion l’annonce
+sur son écran *Profils* et refuse la connexion plutôt que de la tenter. Pour
+valider mTLS, ML-DSA et les messages sans modifier durablement un slot :
 
 ```sh
 helios-ctl key-nego probe \
@@ -206,6 +206,32 @@ chemin où une clé privée client existe hors du poste client.
 Les deux modes admettent le pair au passage. Réémettre un profil pour une clé
 déjà admise réutilise son adresse ; changer de clé pour un nom existant exige
 une révocation explicite.
+
+### Bloc de négociation dans le profil
+
+`profile emit` n'écrit pas encore ce bloc : il se colle dans le document émis,
+sous `profile`, à côté des champs WireGuard. Il ne porte que du public — le
+certificat client et sa clé privée vont dans le stockage protégé du poste, le
+document n'en nomme que l'entrée :
+
+```json
+"key_negotiation": {
+  "mode": "ml_kem",
+  "minimum_mode": "ml_kem",
+  "endpoint": "vpn.example.net:51821",
+  "server_name": "vpn.example.net",
+  "gateway_ca_der": "<base64 de key-negotiation-cert.der>",
+  "gateway_pq_certificate": "<base64 de key-negotiation-pq-cert.json>",
+  "identity": "orion-portable"
+}
+```
+
+`minimum_mode` est facultatif : absent, il prend la valeur de `mode`, car un
+profil qui demande ML-KEM aujourd'hui et accepterait le classique demain ne
+protège rien. Un `mode` sous son propre plancher fait refuser l'import. Orion
+vérifie à l'import que le certificat PQ est bien épinglé à la clé WireGuard de
+cette gateway, et affiche son empreinte sur l'écran *Profils* : c'est la valeur
+qu'a imprimée `heliosd init-key-negotiation`.
 
 ## Ce que cet outillage ne fait pas
 

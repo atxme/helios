@@ -191,7 +191,8 @@
       "Bash(awk -F: '{s+=$2} END {print s\" lines with french chars\"}')",
       "Bash(git submodule *)",
       "Bash(echo \"EXIT:$?\")",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(npx eslint *)"
     ]
   }
 }

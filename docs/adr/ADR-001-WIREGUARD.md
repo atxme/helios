@@ -472,8 +472,28 @@ mais ne protège pas son premier handshake. La suppression de ce chemin exige
 que les profils existants aient reçu certificat, empreinte et second endpoint.
 
 Le cœur Orion expose le fournisseur d'identité protégée et toute la transaction.
-Le câblage Windows de ce fournisseur, ainsi que les écrans de choix du mode et
-d'import du PSK/certificat, appartiennent au lot IHM suivant. En attendant,
+
+### Lot IHM
+
+Les deux interfaces disent maintenant ce que le protocole fait. Côté gateway,
+l'écran *WireGuard* publie le second port, le plancher de chaque pair et le fait
+que l'ancre d'authentification est ML-DSA-65, pas TLS. Côté Orion, l'écran
+*Profils* porte le choix du mode : les modes sous le plancher sont montrés
+désactivés plutôt que masqués, et l'empreinte du certificat PQ épinglé est
+affichée pour être comparée à celle qu'a imprimée `heliosd
+init-key-negotiation`. Le document `orion-profile` transporte désormais le bloc
+`key_negotiation` ; un bloc sans plancher explicite prend son propre mode comme
+plancher, car accepter demain une négociation classique viderait de sens le mode
+choisi aujourd'hui.
+
+Le cliquet existe des deux côtés : `ClientConfig::upsert` refuse d'abaisser un
+plancher connu — y compris en supprimant le bloc — et une négociation aboutie
+élève le plancher du profil, comme la gateway élève le sien. Descendre exige
+d'éditer `profiles.toml`.
+
+**Limite connue.** Le câblage Windows du stockage protégé d'identité reste à
+faire : sans lui, un profil porteur du bloc échoue avant WireGuard. Orion le dit
+sur l'écran *Profils* plutôt que de le laisser découvrir à la connexion, et
 `helios-ctl key-nego probe` exerce le protocole sans committer le slot.
 
 ## Conséquences sur le workspace

@@ -287,6 +287,24 @@ impl VpnController {
         self
     }
 
+    /// Can this build actually negotiate a key before WireGuard?
+    ///
+    /// Two conditions, and the UI must not confuse them: the binary must be
+    /// compiled with the `key-negotiation` feature, and the shell must have
+    /// supplied a protected identity store. A profile carrying the block
+    /// would otherwise fail at connection time, after the user has been
+    /// promised a mode the client cannot honor.
+    pub fn key_negotiation_ready(&self) -> bool {
+        #[cfg(feature = "key-negotiation")]
+        {
+            self.key_negotiation_identities.is_some()
+        }
+        #[cfg(not(feature = "key-negotiation"))]
+        {
+            false
+        }
+    }
+
     /// Current tunnel state.
     pub fn state(&self) -> TunnelState {
         *self.state.read().unwrap()

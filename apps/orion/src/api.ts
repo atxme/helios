@@ -8,6 +8,7 @@ import type {
   ClientConfig,
   ClientEvent,
   ClientProfile,
+  KeyNegotiationSupport,
   ProfileIssues,
   TunnelState,
 } from './types'
@@ -33,6 +34,25 @@ export const validateProfile = (profile: ClientProfile) =>
 /** Public key derived from the profile: the only half to send to the operator. */
 export const profilePublicKey = (profile: ClientProfile) =>
   invoke<string | null>('profile_public_key', { profile })
+
+/**
+ * What this build can do with the negotiation port.
+ *
+ * Compiled-in support and a wired identity store fail differently, so the
+ * screen states which one is missing rather than promising a mode the client
+ * would refuse at connection time.
+ */
+export const keyNegotiationSupport = () =>
+  invoke<KeyNegotiationSupport>('key_negotiation_support')
+
+/**
+ * Fingerprint of the gateway PQ certificate pinned by the profile.
+ *
+ * Read out loud against what the gateway printed, it is what proves the
+ * imported material comes from the right gateway.
+ */
+export const keyNegotiationFingerprint = (profile: ClientProfile) =>
+  invoke<string | null>('key_negotiation_fingerprint', { profile })
 
 export const saveProfile = (profile: ClientProfile) =>
   invoke<ClientConfig>('save_profile', { profile })

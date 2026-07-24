@@ -1,5 +1,12 @@
 export type TunnelState = 'down' | 'connecting' | 'up' | 'failed' | 'captive_portal'
 
+/**
+ * Protection a client may negotiate before the WireGuard handshake
+ * (ADR-001, amendment of 24 July 2026). The order is monotonic:
+ * `classic < static_psk < ml_kem`.
+ */
+export type ProtectionMode = 'classic' | 'static_psk' | 'ml_kem'
+
 /** WireGuard peer admitted by the gateway. The PSK is never exposed. */
 export interface PeerSummary {
   name: string
@@ -7,6 +14,12 @@ export interface PeerSummary {
   address: string
   post_quantum: boolean
   admin: boolean
+  /**
+   * Floor this peer can no longer fall back below. It rises on its own after
+   * each committed negotiation and never comes back down over the network —
+   * only a local edit of `network.toml` lowers it.
+   */
+  minimum_key_negotiation_mode: ProtectionMode
 }
 
 /** Exact contract of GET /api/status. */
@@ -21,6 +34,8 @@ export interface Status {
   peers: PeerSummary[]
   wg_iface: string
   wg_listen_port: number | null
+  /** Public UDP port of the key negotiation, `null` if the service is off. */
+  key_negotiation_port: number | null
   dry_run: boolean
   split_tunnel_cidrs: string[]
   mss_clamp: number | null

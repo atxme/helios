@@ -11,6 +11,47 @@ export type TunnelState =
   | 'failed'
   | 'captive_portal'
 
+/**
+ * Protection negotiated **before** the WireGuard handshake, on the gateway's
+ * public key-negotiation port (ADR-001, amendment of 24 July 2026).
+ *
+ * The order is monotonic — `classic < static_psk < ml_kem` — and it is the
+ * whole point: a profile carries a floor it can rise above but never fall
+ * below.
+ */
+export type ProtectionMode = 'classic' | 'static_psk' | 'ml_kem'
+
+/**
+ * Public settings of the key negotiation, as the operator distributes them.
+ *
+ * **No client secret lives here.** The certificate and its private key stay
+ * in the machine's protected store; `identity` is only the name of the entry
+ * to look up there.
+ */
+export interface KeyNegotiationSettings {
+  mode: ProtectionMode
+  /** Floor below which this profile refuses to negotiate. */
+  minimum_mode: ProtectionMode
+  /** Gateway's UDP endpoint for the negotiation — normally port 51821. */
+  endpoint: string
+  /** DNS name authenticated by the gateway certificate. */
+  server_name: string
+  /** Gateway CA certificate, DER encoded in base64. */
+  gateway_ca_der: string
+  /** Pinned ML-DSA-65 gateway certificate: base64-encoded JSON. */
+  gateway_pq_certificate: string
+  /** Opaque lookup name in the protected identity store. */
+  identity: string
+}
+
+/** What this Orion build can actually do with the negotiation port. */
+export interface KeyNegotiationSupport {
+  /** The binary was compiled with the `key-negotiation` feature. */
+  compiled: boolean
+  /** A protected identity store is wired into the client core. */
+  identity_store: boolean
+}
+
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP
 // endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
 // one suite.
@@ -37,6 +78,13 @@ export interface ClientProfile {
   /** Keepalive in seconds. Defaults to 25. */
   persistent_keepalive: number
   heliosd_url: string | null
+  /**
+   * Authenticated negotiation played before WireGuard is mounted.
+   *
+   * `null` = legacy path: a classic tunnel first, then a PQ PSK over the
+   * internal API. That path leaves the **first** handshake unprotected.
+   */
+  key_negotiation: KeyNegotiationSettings | null
 }
 
 export interface ClientConfig {
@@ -60,6 +108,14 @@ export interface ProfileIssues {
   allowed_ips: string | null
   persistent_keepalive: string | null
   heliosd_url: string | null
+  /**
+   * Fault of the key-negotiation block as a whole.
+   *
+   * One message rather than one per sub-field: what makes the block wrong is
+   * almost always a relation — a mode under the floor, a PSK contradicting
+   * the mode, a certificate pinned to another gateway.
+   */
+  key_negotiation: string | null
 }
 
 /**

@@ -13,6 +13,8 @@ import Divider from '@mui/material/Divider'
 import IconButton from '@mui/material/IconButton'
 import InputAdornment from '@mui/material/InputAdornment'
 import TextField from '@mui/material/TextField'
+import ToggleButton from '@mui/material/ToggleButton'
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import {
@@ -27,8 +29,16 @@ import {
   Upload,
 } from 'lucide-react'
 import * as api from '../api'
+import { modeAllowed, modeMeta, PROTECTION_MODES } from '../components/state'
 import { GUTTER } from '../theme'
-import type { ClientConfig, ClientProfile, ProfileIssues } from '../types'
+import type {
+  ClientConfig,
+  ClientProfile,
+  KeyNegotiationSettings,
+  KeyNegotiationSupport,
+  ProfileIssues,
+  ProtectionMode,
+} from '../types'
 
 /**
  * Profiles view — master-detail.
@@ -66,6 +76,9 @@ function blankProfile(): ClientProfile {
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
     heliosd_url: null,
+    // Negotiation material comes from the operator, never from a blank form:
+    // it carries a pinned certificate nobody types by hand.
+    key_negotiation: null,
   }
 }
 
@@ -116,7 +129,43 @@ export function ProfilesView({
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [advanced, setAdvanced] = useState(false)
+  const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
+  const [fingerprint, setFingerprint] = useState<string | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+
+  // A build fact, not a profile one: asked once.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .keyNegotiationSupport()
+      .then((found) => {
+        if (!cancelled) setSupport(found)
+      })
+      .catch(() => {
+        if (!cancelled) setSupport(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Same rule as the public key: the fingerprint is derived on the Rust side.
+  // The UI handles no crypto, and an unreadable certificate simply yields no
+  // value — the fault is reported by the core, not disguised as a hash.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .keyNegotiationFingerprint(draft)
+      .then((found) => {
+        if (!cancelled) setFingerprint(found)
+      })
+      .catch(() => {
+        if (!cancelled) setFingerprint(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [draft])
 
   // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
   // incomplete private key mid-entry simply yields an absent value.
@@ -181,6 +230,26 @@ export function ProfilesView({
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
     setDraft((profile) => ({ ...profile, [key]: value }))
+    setDirty(true)
+    setImportNotice(null)
+  }
+
+  /**
+   * Selects the negotiated mode.
+   *
+   * A mode under the floor is refused here rather than silently written: the
+   * core refuses it too, before any network access, and the screen must not
+   * promise what the connection would reject.
+   */
+  const setMode = (mode: ProtectionMode) => {
+    const settings = draft.key_negotiation
+    if (!settings || !modeAllowed(mode, settings.minimum_mode)) return
+    setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
+    setDraft((profile) =>
+      profile.key_negotiation
+        ? { ...profile, key_negotiation: { ...profile.key_negotiation, mode } }
+        : profile,
+    )
     setDirty(true)
     setImportNotice(null)
   }
@@ -402,8 +471,10 @@ export function ProfilesView({
           </Box>
         </Box>
 
-        {/* ── Detail: the essentials visible, the rare things collapsed. ── */}
-        <Box sx={{ minWidth: 0, overflow: 'hidden', px: GUTTER, py: 1.5 }}>
+        {/* ── Detail: the essentials visible, the rare things collapsed. ──
+            Vertical scrolling is allowed here, and only here: a clipped
+            certificate warning would be worse than a scrollbar. */}
+        <Box sx={{ minWidth: 0, overflowX: 'hidden', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
           {importNotice && (
             <Alert
               severity={importNotice.tone}
@@ -532,6 +603,16 @@ export function ProfilesView({
               </Collapse>
             </Box>
           </Box>
+
+          <Divider sx={{ my: 1.75 }} />
+
+          <KeyNegotiation
+            settings={draft.key_negotiation}
+            issue={issues.key_negotiation}
+            support={support}
+            fingerprint={fingerprint}
+            onModeChange={setMode}
+          />
         </Box>
       </Box>
 
@@ -602,6 +683,176 @@ export function ProfilesView({
       </Dialog>
     </Box>
   )
+}
+
+/**
+ * Key negotiation — the only screen where the user chooses a level of
+ * protection rather than an address.
+ *
+ * Everything here except the mode is **received**, not typed: endpoint,
+ * server name, pinned certificate and identity name come from the operator's
+ * document. They are shown read-only, because their only real use is to be
+ * compared — a fingerprint read out loud is what ties the imported material
+ * to the right gateway.
+ *
+ * The mode is the one editable decision, and it only goes **up**: the floor
+ * rises by itself after each committed negotiation, on this side as on the
+ * gateway's. Lower modes are therefore shown disabled rather than hidden —
+ * seeing what one has left behind is the whole point of a ratchet.
+ */
+function KeyNegotiation({
+  settings,
+  issue,
+  support,
+  fingerprint,
+  onModeChange,
+}: {
+  settings: KeyNegotiationSettings | null
+  issue?: string | null
+  support: KeyNegotiationSupport | null
+  fingerprint: string | null
+  onModeChange: (mode: ProtectionMode) => void
+}) {
+  const title = (
+    <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
+      Négociation de clé
+    </Typography>
+  )
+
+  if (!settings) {
+    return (
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+        {title}
+        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
+          Ce profil n’en fait pas. Il monte un tunnel classique, puis demande un PSK
+          post-quantique par l’API interne : son <strong>premier handshake</strong> n’est donc pas
+          protégé. Le bloc de négociation arrive avec le profil fourni par l’opérateur — il porte
+          le certificat épinglé de la gateway, qui ne se saisit pas à la main.
+        </Typography>
+      </Box>
+    )
+  }
+
+  const floor = modeMeta(settings.minimum_mode)
+  const selected = modeMeta(settings.mode)
+  const unusable = support && (!support.compiled || !support.identity_store)
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        {title}
+        <Tooltip
+          title={`Les modes sous « ${floor.label} » sont refusés avant tout accès réseau. Ce plancher monte seul après chaque négociation aboutie et ne redescend pas depuis cet écran.`}
+        >
+          <Typography
+            sx={{
+              px: 0.75,
+              py: 0.15,
+              border: '1px solid',
+              borderColor: 'divider',
+              borderRadius: 1,
+              color: 'text.secondary',
+              fontFamily: 'monospace',
+              fontSize: 10,
+            }}
+          >
+            plancher : {floor.label}
+          </Typography>
+        </Tooltip>
+      </Box>
+
+      <ToggleButtonGroup
+        exclusive
+        size="small"
+        value={settings.mode}
+        onChange={(_event, value: ProtectionMode | null) => {
+          if (value) onModeChange(value)
+        }}
+        aria-label="Mode de négociation"
+        sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
+      >
+        {PROTECTION_MODES.map((mode) => {
+          const meta = modeMeta(mode)
+          const allowed = modeAllowed(mode, settings.minimum_mode)
+          return (
+            <ToggleButton
+              key={mode}
+              value={mode}
+              disabled={!allowed}
+              aria-label={meta.label}
+              title={allowed ? meta.detail : `Sous le plancher : ${floor.label}.`}
+            >
+              {meta.label}
+            </ToggleButton>
+          )
+        })}
+      </ToggleButtonGroup>
+
+      <Typography color="text.secondary" sx={{ fontSize: 11, lineHeight: 1.55 }}>
+        {selected.detail}
+      </Typography>
+
+      <Box
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+          columnGap: 1.5,
+          rowGap: 0.4,
+        }}
+      >
+        <Detail label="endpoint" value={settings.endpoint} />
+        <Detail label="serveur" value={settings.server_name} />
+        <Detail label="identité protégée" value={settings.identity} />
+        <Detail
+          label="empreinte PQ"
+          value={fingerprint ?? 'illisible'}
+          hint="Certificat ML-DSA-65 épinglé de la gateway. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil importé à la bonne gateway."
+        />
+      </Box>
+
+      {issue && (
+        <Alert severity="error" variant="outlined" sx={{ py: 0, fontSize: 11 }}>
+          {issue}
+        </Alert>
+      )}
+
+      {unusable && (
+        <Caution>
+          {!support?.compiled
+            ? 'Cette version d’Orion a été compilée sans la négociation de clé : la connexion échouera avant WireGuard. Il faut une version bâtie avec la feature « key-negotiation ».'
+            : 'Aucun stockage protégé d’identité n’est câblé dans cette version : le certificat client ne peut pas être lu et la connexion échouera avant WireGuard.'}
+        </Caution>
+      )}
+    </Box>
+  )
+}
+
+/** Received value, read-only: it is meant to be compared, not edited. */
+function Detail({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  const row = (
+    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, minWidth: 0 }}>
+      <Typography
+        color="text.disabled"
+        sx={{
+          flexShrink: 0,
+          fontFamily: 'monospace',
+          fontSize: 9.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+        }}
+      >
+        {label}
+      </Typography>
+      <Typography
+        noWrap
+        color="text.secondary"
+        sx={{ fontFamily: 'monospace', fontSize: 10.5, minWidth: 0 }}
+      >
+        {value}
+      </Typography>
+    </Box>
+  )
+  return hint ? <Tooltip title={hint}>{row}</Tooltip> : row
 }
 
 /**

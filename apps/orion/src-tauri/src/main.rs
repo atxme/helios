@@ -35,7 +35,7 @@ use tokio::sync::{watch, Mutex};
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
     controller: Arc<VpnController>,
-    config: Mutex<ClientConfig>,
+    config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
 }
@@ -177,6 +177,40 @@ fn adapter_is_up(state: State<'_, AppState>) -> bool {
     state.controller.adapter_is_up()
 }
 
+/// What this build can do with the gateway's key-negotiation port.
+///
+/// The two facts are reported separately because they fail differently: a
+/// binary compiled without the feature will never negotiate, while a build
+/// that has it still needs the machine's protected certificate store to be
+/// wired in. The screen states whichever is missing instead of letting the
+/// user discover it when the connection fails.
+#[derive(serde::Serialize)]
+struct KeyNegotiationSupport {
+    compiled: bool,
+    identity_store: bool,
+}
+
+#[tauri::command]
+fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport {
+    KeyNegotiationSupport {
+        compiled: cfg!(feature = "key-negotiation"),
+        identity_store: state.controller.key_negotiation_ready(),
+    }
+}
+
+/// Fingerprint of the gateway PQ certificate pinned by a profile.
+///
+/// Same reasoning as [`profile_public_key`]: the value is derived on the Rust
+/// side and displayed so the user can compare it, out loud or by phone, with
+/// what `heliosd init-key-negotiation` printed on the gateway.
+#[tauri::command]
+fn key_negotiation_fingerprint(profile: ClientProfile) -> Option<String> {
+    profile
+        .key_negotiation
+        .as_ref()
+        .and_then(|settings| settings.gateway_pq_fingerprint())
+}
+
 #[tauri::command]
 async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> {
     Ok(state.config.lock().await.clone())
@@ -288,7 +322,20 @@ async fn connect(
     let telemetry = Arc::clone(&state.telemetry);
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
+    let negotiating = profile.key_negotiation.is_some();
+    let negotiated_profile = profile.name.clone();
+    let config = Arc::clone(&state.config);
     let sink: EventSink = Arc::new(move |ev: ClientEvent| {
+        // Mirror of the gateway rule: a committed negotiation raises this
+        // profile's floor for good. Helios does the same on its side and
+        // would refuse a weaker mode afterwards — a client that kept
+        // offering one would only produce a failed connection the user
+        // couldn't explain.
+        if negotiating {
+            if let ClientEvent::Protection { psk } = &ev {
+                raise_key_negotiation_floor(Arc::clone(&config), negotiated_profile.clone(), *psk);
+            }
+        }
         if let ClientEvent::StateChanged { state } = &ev {
             match state {
                 TunnelState::Up => {
@@ -320,6 +367,45 @@ async fn connect(
     });
 
     Ok(())
+}
+
+/// Persists a floor raise announced by a committed negotiation.
+///
+/// Runs in a task because the sink is synchronous while the configuration is
+/// behind an async lock. A failed write is logged and nothing else: the
+/// session in progress stays valid, and the gateway keeps its own floor —
+/// which is the one that actually refuses a downgrade.
+fn raise_key_negotiation_floor(
+    config: Arc<Mutex<ClientConfig>>,
+    name: String,
+    observed: orion_core::PskKind,
+) {
+    use aether::key_negotiation::ProtectionMode;
+
+    let reached = match observed {
+        orion_core::PskKind::MlKem => ProtectionMode::MlKem,
+        orion_core::PskKind::Static => ProtectionMode::StaticPsk,
+        // Classic commits nothing to raise.
+        orion_core::PskKind::None => return,
+    };
+    tokio::spawn(async move {
+        let mut cfg = config.lock().await;
+        let Some(settings) = cfg
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.key_negotiation.as_mut())
+        else {
+            return;
+        };
+        if settings.minimum_mode.satisfies(reached) {
+            return;
+        }
+        settings.minimum_mode = reached;
+        if let Err(error) = cfg.save() {
+            tracing::warn!(%error, "unable to persist the raised key-negotiation floor");
+        }
+    });
 }
 
 #[tauri::command]
@@ -519,7 +605,7 @@ fn main() {
         }))
         .manage(AppState {
             controller,
-            config: Mutex::new(config),
+            config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
         })
@@ -539,6 +625,8 @@ fn main() {
             export_logs,
             resize_for_view,
             validate_profile,
+            key_negotiation_support,
+            key_negotiation_fingerprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");

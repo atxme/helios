@@ -9,6 +9,7 @@ import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../ty
 import {
   elapsed,
   formatBps,
+  modeMeta,
   postureMeta,
   protectionMeta,
   stateMeta,
@@ -90,6 +91,7 @@ export function ConnectView({
 
   const duration = elapsed(upSince, now)
   const protection = protectionMeta(profile, psk, state)
+  const negotiation = profile?.key_negotiation
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
   // Only "held" deserves a sentence: it's the one counter-intuitive case,
@@ -216,6 +218,16 @@ export function ConnectView({
           <Fact label="adresse" value={profile?.address ?? '—'} />
           <Fact label="capté" value={profile?.allowed_ips ?? '—'} />
           <Fact label="backend" value={backend || '—'} />
+          {/* Where the PSK comes from — the chip above says its nature, not
+              its origin. Absent from the line when the profile negotiates
+              nothing: a permanent "aucune" would be noise. */}
+          {negotiation && (
+            <Fact
+              label="négociation"
+              value={modeMeta(negotiation.mode).label}
+              hint={`Échange authentifié en ML-DSA-65 sur ${negotiation.endpoint}, avant le montage de WireGuard. ${modeMeta(negotiation.mode).detail}`}
+            />
+          )}
         </Box>
       </Box>
 
@@ -261,8 +273,8 @@ function ceilingOf(history: TelemetrySample[]): number {
   return Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
-  return (
+function Fact({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  const fact = (
     <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.5, minWidth: 0 }}>
       <Typography
         color="text.disabled"
@@ -279,6 +291,7 @@ function Fact({ label, value }: { label: string; value: string }) {
       </Typography>
     </Box>
   )
+  return hint ? <Tooltip title={hint}>{fact}</Tooltip> : fact
 }
 
 function Series({

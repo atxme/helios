@@ -16,6 +16,11 @@ pub struct StatusResponse {
     pub peers: Vec<PeerSummary>,
     pub wg_iface: String,
     pub wg_listen_port: Option<u16>,
+    /// Public UDP port of the pre-WireGuard key negotiation, `None` when the
+    /// gateway doesn't run the service. Exposed next to `wg_listen_port`
+    /// because the two are redirected together on the box: a UI that only
+    /// showed one would hide half of what has to be opened.
+    pub key_negotiation_port: Option<u16>,
     pub dry_run: bool,
     pub split_tunnel_cidrs: Vec<String>,
     pub mss_clamp: Option<u16>,
@@ -238,6 +243,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         peers,
         wg_iface: network.wg_iface.clone(),
         wg_listen_port: policy.wg_listen_port,
+        key_negotiation_port: network.key_negotiation_port,
         dry_run: s.dry_run,
         split_tunnel_cidrs: policy.split_tunnel_cidrs.clone(),
         mss_clamp: policy.mss_clamp,
@@ -641,6 +647,7 @@ mod tests {
             wg_private_key: PRIVATE_KEY.into(),
             wg_address: "100.64.0.1/10".into(),
             wg_listen_port: 51820,
+            key_negotiation_port: Some(51821),
             peers: vec![WgPeer {
                 name: "test-workstation".into(),
                 public_key: PEER_KEY.into(),
@@ -648,8 +655,8 @@ mod tests {
                 admin: true,
                 preshared_key: Some("pq-secret-must-not-leak".into()),
                 key_negotiation_certificate_sha256: None,
-                key_negotiation_pq_certificate_sha256: None,
-                minimum_key_negotiation_mode: ProtectionMode::Classic,
+                key_negotiation_pq_certificate_sha256: Some("aa".repeat(32)),
+                minimum_key_negotiation_mode: ProtectionMode::MlKem,
             }],
             ..NetworkConfig::default()
         }
@@ -687,6 +694,15 @@ mod tests {
         assert_eq!(response.peers.len(), 1);
         assert_eq!(response.peers[0].name, "test-workstation");
         assert!(response.peers[0].post_quantum);
+        // Both ports are published: they are redirected together on the box,
+        // and the UI states what the operator has to open.
+        assert_eq!(response.key_negotiation_port, Some(51821));
+        // The floor travels with the peer: the screen shows what this peer
+        // can no longer fall back to.
+        assert_eq!(
+            response.peers[0].minimum_key_negotiation_mode,
+            ProtectionMode::MlKem
+        );
         let payload = serde_json::to_string(&response).unwrap();
         assert!(!payload.contains("pq-secret-must-not-leak"));
     }
