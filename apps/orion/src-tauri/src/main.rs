@@ -354,7 +354,9 @@ fn window_size_for(view: &str) -> (f64, f64) {
     match view {
         "profiles" => (800.0, 720.0),
         "logs" => (760.0, 640.0),
-        _ => (520.0, 660.0),
+        // La connexion n'a qu'un orbe, un état et un bouton : lui donner la
+        // hauteur des autres vues ne produisait qu'un trou au milieu.
+        _ => (520.0, 560.0),
     }
 }
 

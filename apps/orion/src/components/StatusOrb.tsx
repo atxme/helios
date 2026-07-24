@@ -11,16 +11,20 @@ import { postureMeta, stateMeta } from './state'
  *
  * - **l’anneau extérieur** porte la couleur de la *posture* (ce qui protège
  *   réellement le poste), pas celle de l’état du tunnel ;
- * - **la trajectoire tourne dans deux régimes distincts** — vive et pointillée
- *   pendant la négociation, lente et pleine une fois connecté. La couleur les
- *   sépare : ambre tant que rien n’est acquis, vert dès que le trafic passe. On
- *   ne confond pas « ça travaille » avec « c’est bon » ;
+ * - **deux trajectoires tournent en sens inverse**, vives et pointillées pendant
+ *   la négociation, lentes et pleines une fois connecté. La couleur les sépare :
+ *   ambre tant que rien n’est acquis, vert dès que le trafic passe. On ne
+ *   confond pas « ça travaille » avec « c’est bon » ;
+ * - **un satellite** parcourt la trajectoire principale : c’est lui qui donne la
+ *   lecture du sens et de la vitesse ;
  * - **les trois étoiles de la ceinture** s’allument une à une avec la
- *   progression : endpoint joignable → handshake → trafic.
+ *   progression — endpoint joignable → handshake → trafic — et scintillent
+ *   légèrement, en décalé, une fois le tunnel établi.
  *
- * Coût : l’orbite n’anime qu’un `transform: rotate` sur un calque promu, ce que
- * le GPU compose sans repeindre. C’est ce qui permet de la laisser tourner en
- * continu à l’état connecté sans coûter de fluidité.
+ * **Coût.** Toutes ces animations ne touchent que `transform` et `opacity`, sur
+ * des calques promus : le GPU les compose sans repeindre. Ce n’est pas leur
+ * nombre qui coûte, c’est leur nature — le halo d’origine saccadait à lui seul
+ * parce qu’il animait un `filter: blur()`, re-rastérisé à chaque frame.
  */
 
 interface Props {
@@ -54,8 +58,22 @@ const orbit = keyframes`
   to { transform: rotate(360deg); }
 `
 
+/** Sens inverse : deux plans qui se croisent lisent mieux qu’un seul. */
+const counterOrbit = keyframes`
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+`
+
+const twinkle = keyframes`
+  0%, 100% { opacity: 0.62; }
+  50% { opacity: 1; }
+`
+
 /** Étoile non encore franchie — un gris papier, pas un gris d’écran sombre. */
 const UNLIT = '#CBD5D1'
+
+/** Point de la trajectoire au repos, avant l’inclinaison de 27°. */
+const SATELLITE_X = 44.5
 
 export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
   const meta = stateMeta(state)
@@ -66,6 +84,8 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
   // rapide y suggérerait une négociation encore en cours.
   const settled = state === 'up'
   const spinning = meta.transitioning || settled
+  const mainPeriod = settled ? '22s' : '8s'
+  const counterPeriod = settled ? '34s' : '13s'
 
   return (
     <Box sx={{ position: 'relative', display: 'grid', width: size, height: size, placeItems: 'center' }}>
@@ -83,8 +103,6 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
             // un coût nul.
             background: `radial-gradient(circle, ${posture.accent}3D 0%, ${posture.accent}1F 38%, transparent 72%)`,
             pointerEvents: 'none',
-            // Seule l'opacité est animée, sur un calque promu : le GPU compose
-            // sans repeindre.
             willChange: 'opacity',
             animation: `${pulse} 2.4s ease-in-out infinite`,
             '@media (prefers-reduced-motion: reduce)': {
@@ -123,15 +141,37 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           strokeWidth="0.8"
         />
 
-        {/* Trajectoire active. */}
+        {/* Second plan, en sens inverse — donne la profondeur sans bruit. */}
+        {spinning && (
+          <Box
+            component="g"
+            sx={{
+              transformOrigin: '24px 24px',
+              willChange: 'transform',
+              animation: `${counterOrbit} ${counterPeriod} linear infinite`,
+              '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
+            }}
+          >
+            <ellipse
+              cx="24"
+              cy="24"
+              rx="20.5"
+              ry="7.25"
+              transform="rotate(-27 24 24)"
+              stroke={meta.accent}
+              strokeOpacity="0.3"
+              strokeWidth="0.7"
+            />
+          </Box>
+        )}
+
+        {/* Trajectoire principale, avec son satellite. */}
         <Box
           component="g"
           sx={{
             transformOrigin: '24px 24px',
             willChange: spinning ? 'transform' : undefined,
-            animation: spinning
-              ? `${orbit} ${settled ? '22s' : '8s'} linear infinite`
-              : undefined,
+            animation: spinning ? `${orbit} ${mainPeriod} linear infinite` : undefined,
             '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
           }}
         >
@@ -147,6 +187,11 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
             strokeDasharray={meta.transitioning ? '5 9' : undefined}
             strokeLinecap="round"
           />
+          {spinning && (
+            <g transform="rotate(27 24 24)">
+              <circle cx={SATELLITE_X} cy="24" r="1.6" fill={meta.accent} />
+            </g>
+          )}
         </Box>
 
         {/* Lignes de constellation. */}
@@ -159,13 +204,23 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           {BELT.map((star, index) => {
             const on = index < lit
             return (
-              <circle
+              <Box
+                component="circle"
                 key={star.x}
                 cx={star.x}
                 cy={star.y}
                 r={star.r}
                 fill={on ? meta.accent : UNLIT}
-                style={{ transition: 'fill 400ms ease' }}
+                sx={{
+                  transition: 'fill 400ms ease',
+                  // Scintillement décalé : trois étoiles qui pulseraient
+                  // ensemble feraient un clignotant, pas une constellation.
+                  animation:
+                    on && settled
+                      ? `${twinkle} ${2.8 + index * 0.6}s ease-in-out ${index * 0.35}s infinite`
+                      : undefined,
+                  '@media (prefers-reduced-motion: reduce)': { animation: 'none' },
+                }}
               />
             )
           })}

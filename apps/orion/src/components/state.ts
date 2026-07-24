@@ -110,8 +110,8 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
   if (!adapterUp) {
     return {
       posture: 'exposed',
-      label: 'Trafic en clair',
-      detail: 'Le trafic sort hors tunnel.',
+      label: 'Exposé',
+      detail: 'Adaptateur démonté : le trafic sort hors tunnel.',
       color: EXPOSED,
       accent: EXPOSED_VIVID,
     }
@@ -119,15 +119,15 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
   if (state === 'up') {
     return {
       posture: 'protected',
-      label: 'Trafic dans le tunnel',
-      detail: 'Tout passe par la gateway.',
+      label: 'Protégé',
+      detail: 'Handshake frais : tout passe par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }
   }
   return {
     posture: 'held',
-    label: 'Trafic retenu',
+    label: 'Retenu',
     detail: 'WireGuard retient les paquets. Rien ne fuit — ne pas démonter.',
     color: HELD,
     accent: HELD_VIVID,

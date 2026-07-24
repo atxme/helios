@@ -4,6 +4,7 @@ import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import IconButton from '@mui/material/IconButton'
+import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { Radio, Settings2, Terminal, X } from 'lucide-react'
 import * as api from './api'
@@ -85,29 +86,32 @@ export default function App() {
           Orion
         </Typography>
 
-        {/* La posture réelle reste lisible depuis toutes les vues. */}
-        <Box
-          aria-label={`${posture.label}. ${posture.detail}`}
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 0.75,
-            ml: 'auto',
-            px: 1.25,
-            py: 0.5,
-            borderRadius: 5,
-            border: `1px solid ${posture.color}33`,
-            bgcolor: `${posture.accent}14`,
-          }}
-        >
+        {/* Seul porteur de la posture dans l'IHM : la vue Connexion ne la
+            répète plus. L'explication est là, en infobulle, sans encombrer. */}
+        <Tooltip title={posture.detail}>
           <Box
-            aria-hidden
-            sx={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, bgcolor: posture.accent }}
-          />
-          <Typography sx={{ color: posture.color, fontSize: 11.5, fontWeight: 650 }}>
-            {posture.label}
-          </Typography>
-        </Box>
+            aria-label={`${posture.label}. ${posture.detail}`}
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.75,
+              ml: 'auto',
+              px: 1.25,
+              py: 0.5,
+              borderRadius: 5,
+              border: `1px solid ${posture.color}33`,
+              bgcolor: `${posture.accent}14`,
+            }}
+          >
+            <Box
+              aria-hidden
+              sx={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, bgcolor: posture.accent }}
+            />
+            <Typography sx={{ color: posture.color, fontSize: 11.5, fontWeight: 650 }}>
+              {posture.label}
+            </Typography>
+          </Box>
+        </Tooltip>
       </Box>
 
       {c.error ? (

@@ -15,9 +15,10 @@ import { EMERALD, GUTTER } from '../theme'
  * Vue Connexion — l’écran qui répond à la seule question qui compte :
  * « mon trafic est-il protégé ? »
  *
- * Hiérarchie assumée : l’orbe et l’état d’abord, la posture ensuite, les
- * caractéristiques techniques en dernier et en petit. Rien ne défile ; ce qui ne
- * mérite pas sa place à l’écran n’y est pas.
+ * Hiérarchie assumée : l’orbe et l’état occupent le centre optique, les
+ * caractéristiques techniques restent en bas et en petit. Rien ne défile ; ce
+ * qui ne mérite pas sa place à l’écran n’y est pas — et ce que l’en-tête dit
+ * déjà n’est pas répété ici.
  */
 
 interface Props {
@@ -63,17 +64,21 @@ export function ConnectView({
   const pq = Boolean(profile?.preshared_key?.trim())
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
-  // Le paragraphe de posture n'apparaît que là où la lecture spontanée est
-  // fausse — voir le doc-comment de `postureMeta`. Sur « protégé », l'état se
-  // suffit et la phrase ne serait que du bruit.
-  const explain = posture.posture !== 'protected'
+  // Seul « retenu » mérite une phrase : c'est le seul cas contre-intuitif, où
+  // l'utilisateur croit fuir alors que WireGuard jette ses paquets. « Protégé »
+  // et « en clair » sont déjà dits par la pastille de l'en-tête, mot pour mot —
+  // les répéter ici ne fait que remplir.
+  const explain = posture.posture === 'held'
   // Le débit ne s'affiche que s'il existe vraiment. Tant que la télémétrie
   // n'émet rien, une carte vide serait une promesse non tenue.
   const hasThroughput = meta.active && history.length >= 2
 
   return (
     <Stack sx={{ height: '100%', px: GUTTER, py: GUTTER }}>
-      <Stack spacing={1.25} sx={{ alignItems: 'center' }}>
+      <Stack
+        spacing={1.25}
+        sx={{ alignItems: 'center', justifyContent: 'center', flex: 1, minHeight: 0 }}
+      >
         <StatusOrb state={state} adapterUp={adapterUp} size={150} />
 
         <Box sx={{ textAlign: 'center' }} aria-live="polite" aria-atomic="true">
@@ -100,10 +105,10 @@ export function ConnectView({
         </Box>
       </Stack>
 
-      {/* Posture : rien quand tout va bien — la pastille de l'en-tête le dit
-          déjà, un bandeau de plus n'ajouterait aucune information. Il
-          n'apparaît que là où la lecture spontanée induirait un geste
-          dangereux (voir le doc-comment de `postureMeta`). */}
+      {/* Posture : uniquement « retenu ». Les deux autres états sont déjà
+          énoncés à l'identique par la pastille de l'en-tête ; seul celui-ci dit
+          quelque chose que la pastille ne dit pas — que WireGuard jette les
+          paquets et qu'il ne faut surtout pas démonter l'adaptateur. */}
       {explain && (
         <Box
           sx={{
@@ -148,7 +153,7 @@ export function ConnectView({
       )}
 
       {/* Caractéristiques : de la référence, pas un titre. Discrètes par choix. */}
-      <Box sx={{ mt: 'auto', pt: 2 }}>
+      <Box sx={{ pt: 1.5 }}>
         <Tooltip
           title={
             pq
