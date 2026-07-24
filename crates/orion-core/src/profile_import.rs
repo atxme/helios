@@ -4,11 +4,17 @@
 //! Helios, et le format `wg-quick` à un seul pair. L'import ne persiste rien :
 //! il produit un [`ClientProfile`] validé que l'IHM présente comme brouillon.
 
-use std::{collections::HashMap, fs::File, io::Read, net::IpAddr, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 
@@ -321,6 +327,83 @@ fn profile_name_from_file(file_name: &str) -> String {
     }
 }
 
+/// Diagnostic champ par champ d’un profil en cours d’édition.
+///
+/// `None` = rien à signaler. Chaque champ est indépendant des autres.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIssues {
+    pub name: Option<String>,
+    pub endpoint: Option<String>,
+    pub private_key: Option<String>,
+    pub peer_public_key: Option<String>,
+    pub preshared_key: Option<String>,
+    pub address: Option<String>,
+    pub allowed_ips: Option<String>,
+    pub persistent_keepalive: Option<String>,
+    pub heliosd_url: Option<String>,
+}
+
+impl ProfileIssues {
+    /// `true` si au moins un champ est fautif.
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Relève **tous** les champs fautifs d’un profil en cours d’édition.
+///
+/// Contrairement à [`parse_profile_import`], qui refuse un document au premier
+/// défaut, cette inspection ne s’arrête pas : l’IHM doit pouvoir surligner
+/// chaque case en une passe, plutôt que d’en faire découvrir une à chaque
+/// tentative d’enregistrement.
+///
+/// **Un champ vide n’est pas signalé.** Pendant la saisie, « pas encore
+/// rempli » n’est pas « impossible » — noircir de rouge un profil neuf serait
+/// du bruit. La complétude est jugée ailleurs, au moment de connecter.
+///
+/// Les validateurs sont ceux de l’import : c’est délibéré. Deux jeux de règles,
+/// un pour l’import et un pour la saisie, finiraient par diverger et l’IHM
+/// accepterait des valeurs que le cœur refuse.
+pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
+    /// Ne valide que si la valeur est renseignée.
+    fn when_filled(value: &str, check: impl Fn(&str) -> Result<()>) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        check(trimmed).err().map(|error| error.to_string())
+    }
+
+    ProfileIssues {
+        name: None,
+        endpoint: when_filled(&profile.endpoint, validate_endpoint),
+        private_key: when_filled(&profile.private_key, |value| {
+            validate_wg_key(value, "clé privée")
+        }),
+        peer_public_key: when_filled(&profile.peer_public_key, |value| {
+            validate_wg_key(value, "clé publique de la gateway")
+        }),
+        preshared_key: profile
+            .preshared_key
+            .as_deref()
+            .and_then(|value| when_filled(value, |value| validate_wg_key(value, "PSK"))),
+        address: profile.address.as_deref().and_then(|value| {
+            when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
+        }),
+        allowed_ips: when_filled(&profile.allowed_ips, |value| {
+            validate_cidr(value, "trafic capté")
+        }),
+        // Zéro n'est pas « vide » : c'est une valeur, et elle désactive le
+        // keepalive alors qu'un client derrière NAT en dépend.
+        persistent_keepalive: (profile.persistent_keepalive == 0)
+            .then(|| "le keepalive doit être supérieur à zéro".to_string()),
+        heliosd_url: profile
+            .heliosd_url
+            .as_deref()
+            .and_then(|value| when_filled(value, validate_heliosd_url)),
+    }
+}
+
 fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile> {
     profile.name = profile.name.trim().to_string();
     profile.endpoint = profile.endpoint.trim().to_string();
@@ -371,12 +454,28 @@ fn non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Longueur d'une clé WireGuard : 32 octets bruts…
+const WG_KEY_BYTES: usize = 32;
+/// …soit exactement 44 caractères une fois encodés en base64.
+const WG_KEY_BASE64_LEN: usize = 44;
+
+/// Valide une clé Curve25519 encodée en base64.
+///
+/// Les messages disent ce qu'on attend, pas seulement que c'est refusé :
+/// « base64 attendu » n'aide personne à voir qu'il manque un caractère au bout
+/// d'un copier-coller tronqué. La longueur observée est donnée pour qu'on puisse
+/// la comparer d'un coup d'œil aux 44 caractères attendus.
 fn validate_wg_key(value: &str, label: &str) -> Result<()> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .with_context(|| format!("{label} invalide : base64 attendu"))?;
-    if decoded.len() != 32 {
-        anyhow::bail!("{label} invalide : 32 octets attendus");
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        anyhow::bail!(
+            "{label} : caractères invalides. Une clé WireGuard fait {WG_KEY_BASE64_LEN} caractères base64 (A–Z, a–z, 0–9, + et /) et se termine par « = »."
+        );
+    };
+    if decoded.len() != WG_KEY_BYTES {
+        anyhow::bail!(
+            "{label} : {} caractères au lieu de {WG_KEY_BASE64_LEN}. Une clé WireGuard fait {WG_KEY_BYTES} octets et se termine par « = » — vérifier que le copier-coller est complet.",
+            value.chars().count()
+        );
     }
     Ok(())
 }
@@ -402,6 +501,56 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
         .context("Endpoint invalide : port UDP non numérique")?;
     if port == 0 {
         anyhow::bail!("Endpoint invalide : le port UDP doit être supérieur à zéro");
+    }
+    validate_endpoint_host(host)
+}
+
+/// Valide l'hôte d'un endpoint : littéral IPv6 entre crochets, adresse IPv4, ou
+/// nom d'hôte.
+///
+/// Le cas qui motive cette fonction : `86.229.1286` n'est **ni** une IPv4 valide
+/// (1286 dépasse 255) **ni** un nom d'hôte légitime — la RFC 1123 interdit qu'un
+/// dernier label soit entièrement numérique, précisément pour qu'on ne puisse
+/// pas confondre les deux. Sans cette règle, une IPv4 mal tapée passe pour un
+/// nom de domaine et le défaut ne se révèle qu'au premier handshake, sous la
+/// forme d'une résolution DNS qui échoue.
+fn validate_endpoint_host(host: &str) -> Result<()> {
+    if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return inner
+            .parse::<Ipv6Addr>()
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("Endpoint invalide : adresse IPv6 illisible"));
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+
+    if host.len() > 253 {
+        anyhow::bail!("Endpoint invalide : nom d'hôte trop long");
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for label in &labels {
+        if label.is_empty() {
+            anyhow::bail!("Endpoint invalide : nom d'hôte mal formé");
+        }
+        if label.len() > 63 {
+            anyhow::bail!("Endpoint invalide : partie de nom d'hôte trop longue");
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            anyhow::bail!("Endpoint invalide : caractère interdit dans le nom d'hôte");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!("Endpoint invalide : nom d'hôte mal formé");
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
+    {
+        anyhow::bail!("Endpoint invalide : adresse IP mal formée");
     }
     Ok(())
 }
@@ -443,6 +592,149 @@ mod tests {
 
     const CLIENT_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const GATEWAY_PUBLIC: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+
+    fn profil_complet() -> ClientProfile {
+        ClientProfile {
+            name: "poste".into(),
+            endpoint: "vpn.example.net:51820".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            peer_public_key: GATEWAY_PUBLIC.into(),
+            address: Some("100.64.1.2/32".into()),
+            allowed_ips: "0.0.0.0/0".into(),
+            persistent_keepalive: 25,
+            ..ClientProfile::default()
+        }
+    }
+
+    /// Une IPv4 mal tapée ne doit pas passer pour un nom de domaine.
+    ///
+    /// `86.229.1286` est le cas réel : 1286 dépasse 255, mais la chaîne reste
+    /// syntaxiquement acceptable comme suite de labels. Sans la règle RFC 1123
+    /// sur le dernier label numérique, le défaut ne se révélait qu'au premier
+    /// handshake, sous la forme d'une résolution DNS qui échoue.
+    #[test]
+    fn une_adresse_ip_mal_formee_ne_passe_pas_pour_un_nom_d_hote() {
+        for accepte in [
+            "86.229.12.86:51820",
+            "vpn.example.net:51820",
+            "gateway:51820",
+            "[2a01:cb1e:101d:4b5c::1]:51820",
+        ] {
+            let profile = ClientProfile {
+                endpoint: accepte.into(),
+                ..profil_complet()
+            };
+            assert_eq!(
+                inspect_profile(&profile).endpoint,
+                None,
+                "{accepte} aurait dû être accepté"
+            );
+        }
+
+        for refuse in [
+            "86.229.1286:51820",
+            "256.1.1.1:51820",
+            "10.0.0:51820",
+            "[zz::1]:51820",
+            "-mauvais.example.net:51820",
+            "vpn..example.net:51820",
+        ] {
+            let profile = ClientProfile {
+                endpoint: refuse.into(),
+                ..profil_complet()
+            };
+            assert!(
+                inspect_profile(&profile).endpoint.is_some(),
+                "{refuse} aurait dû être refusé"
+            );
+        }
+    }
+
+    /// Le message doit dire **ce qu'on attend**, pas seulement que c'est refusé.
+    /// « base64 attendu » n'aide pas à voir qu'un copier-coller a été tronqué ;
+    /// la longueur observée face aux 44 caractères attendus, si.
+    #[test]
+    fn le_message_d_une_cle_invalide_donne_la_longueur_attendue() {
+        let tronquee = &CLIENT_PRIVATE[..CLIENT_PRIVATE.len() - 4];
+        let profile = ClientProfile {
+            private_key: tronquee.into(),
+            ..profil_complet()
+        };
+        let message = inspect_profile(&profile)
+            .private_key
+            .expect("une clé tronquée doit être refusée");
+        assert!(message.contains("44"), "message : {message}");
+        assert!(message.contains("clé privée"), "message : {message}");
+
+        let profile = ClientProfile {
+            peer_public_key: "pas du base64 !".into(),
+            ..profil_complet()
+        };
+        let message = inspect_profile(&profile)
+            .peer_public_key
+            .expect("des caractères interdits doivent être refusés");
+        assert!(message.contains("44"), "message : {message}");
+    }
+
+    #[test]
+    fn un_profil_valide_ne_signale_aucun_champ() {
+        assert!(!inspect_profile(&profil_complet()).any());
+    }
+
+    /// Pendant la saisie, « pas encore rempli » n’est pas « impossible » :
+    /// noircir de rouge un profil neuf serait du bruit.
+    #[test]
+    fn les_champs_vides_ne_sont_pas_signales() {
+        let issues = inspect_profile(&ClientProfile::default());
+        assert_eq!(issues.endpoint, None);
+        assert_eq!(issues.private_key, None);
+        assert_eq!(issues.peer_public_key, None);
+        assert_eq!(issues.address, None);
+    }
+
+    /// L’intérêt de l’inspection par rapport à l’import : elle ne s’arrête pas
+    /// au premier défaut, sinon l’IHM en ferait découvrir un par tentative.
+    #[test]
+    fn tous_les_champs_fautifs_sont_releves_en_une_passe() {
+        let profile = ClientProfile {
+            endpoint: "https://vpn.example.net".into(),
+            private_key: "pas-du-base64".into(),
+            peer_public_key: "AAAA".into(),
+            address: Some("100.64.1.2".into()),
+            allowed_ips: "0.0.0.0/33".into(),
+            persistent_keepalive: 0,
+            heliosd_url: Some("100.64.0.1:8080".into()),
+            ..profil_complet()
+        };
+        let issues = inspect_profile(&profile);
+
+        assert!(issues.any());
+        for (champ, valeur) in [
+            ("endpoint", &issues.endpoint),
+            ("private_key", &issues.private_key),
+            ("peer_public_key", &issues.peer_public_key),
+            ("address", &issues.address),
+            ("allowed_ips", &issues.allowed_ips),
+            ("persistent_keepalive", &issues.persistent_keepalive),
+            ("heliosd_url", &issues.heliosd_url),
+        ] {
+            assert!(valeur.is_some(), "{champ} aurait dû être signalé");
+        }
+    }
+
+    /// Zéro n’est pas « vide » : c’est une valeur, et elle coupe le keepalive
+    /// dont un client derrière NAT dépend.
+    #[test]
+    fn un_keepalive_nul_est_signale_alors_qu_un_psk_absent_ne_l_est_pas() {
+        let profile = ClientProfile {
+            persistent_keepalive: 0,
+            preshared_key: None,
+            ..profil_complet()
+        };
+        let issues = inspect_profile(&profile);
+        assert!(issues.persistent_keepalive.is_some());
+        assert_eq!(issues.preshared_key, None);
+    }
 
     #[test]
     fn importe_json_versionne_avec_defauts() {

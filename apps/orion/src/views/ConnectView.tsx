@@ -1,15 +1,24 @@
 import { useEffect, useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { ArrowDown, ArrowUp, Info, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
+import { ArrowDown, ArrowUp, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
 import type { ClientProfile, TelemetrySample, TunnelState } from '../types'
 import { elapsed, formatBps, postureMeta, stateMeta } from '../components/state'
 import { Sparkline } from '../components/Sparkline'
 import { StatusOrb } from '../components/StatusOrb'
+import { EMERALD, GUTTER } from '../theme'
+
+/**
+ * Vue Connexion — l’écran qui répond à la seule question qui compte :
+ * « mon trafic est-il protégé ? »
+ *
+ * Hiérarchie assumée : l’orbe et l’état d’abord, la posture ensuite, les
+ * caractéristiques techniques en dernier et en petit. Rien ne défile ; ce qui ne
+ * mérite pas sa place à l’écran n’y est pas.
+ */
 
 interface Props {
   state: TunnelState
@@ -54,32 +63,36 @@ export function ConnectView({
   const pq = Boolean(profile?.preshared_key?.trim())
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
+  // Le paragraphe de posture n'apparaît que là où la lecture spontanée est
+  // fausse — voir le doc-comment de `postureMeta`. Sur « protégé », l'état se
+  // suffit et la phrase ne serait que du bruit.
+  const explain = posture.posture !== 'protected'
+  // Le débit ne s'affiche que s'il existe vraiment. Tant que la télémétrie
+  // n'émet rien, une carte vide serait une promesse non tenue.
+  const hasThroughput = meta.active && history.length >= 2
 
   return (
-    <Stack
-      spacing={2.25}
-      sx={{ height: '100%', overflowY: 'auto', px: { xs: 2, sm: 3 }, py: 2.5 }}
-    >
-      <Stack spacing={1.5} sx={{ alignItems: 'center' }}>
-        <StatusOrb state={state} adapterUp={adapterUp} />
+    <Stack sx={{ height: '100%', px: GUTTER, py: GUTTER }}>
+      <Stack spacing={1.25} sx={{ alignItems: 'center' }}>
+        <StatusOrb state={state} adapterUp={adapterUp} size={150} />
 
         <Box sx={{ textAlign: 'center' }} aria-live="polite" aria-atomic="true">
           <Typography
             component="h2"
-            sx={{ color: meta.color, fontSize: 21, fontWeight: 700, letterSpacing: '-0.02em' }}
+            sx={{ color: meta.color, fontSize: 24, fontWeight: 700, letterSpacing: '-0.02em', lineHeight: 1.1 }}
           >
             {meta.label}
           </Typography>
           <Typography
             color="text.secondary"
-            sx={{ mt: 0.5, fontFamily: 'monospace', fontSize: 12, overflowWrap: 'anywhere' }}
+            sx={{ mt: 0.6, fontFamily: 'monospace', fontSize: 12, overflowWrap: 'anywhere' }}
           >
             {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
           </Typography>
           {duration && (
             <Typography
               color="text.disabled"
-              sx={{ mt: 0.4, fontFamily: 'monospace', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}
+              sx={{ mt: 0.3, fontFamily: 'monospace', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}
             >
               {duration}
             </Typography>
@@ -87,51 +100,96 @@ export function ConnectView({
         </Box>
       </Stack>
 
-      {/* La couleur et l’icône portent toutes deux la posture de sécurité réelle. */}
-      <Paper
-        variant="outlined"
-        sx={{
-          display: 'flex',
-          alignItems: 'flex-start',
-          gap: 1.5,
-          borderColor: `${posture.color}44`,
-          bgcolor: `${posture.color}0e`,
-          p: 1.5,
-        }}
-      >
-        <PostureIcon size={19} aria-hidden style={{ color: posture.color, flexShrink: 0, marginTop: 2 }} />
-        <Box sx={{ minWidth: 0 }}>
-          <Typography sx={{ color: posture.color, fontSize: 13, fontWeight: 700 }}>
+      {/* Posture : rien quand tout va bien — la pastille de l'en-tête le dit
+          déjà, un bandeau de plus n'ajouterait aucune information. Il
+          n'apparaît que là où la lecture spontanée induirait un geste
+          dangereux (voir le doc-comment de `postureMeta`). */}
+      {explain && (
+        <Box
+          sx={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: 0.75,
+            mt: 1.5,
+          }}
+        >
+          <PostureIcon size={15} aria-hidden style={{ color: posture.color, flexShrink: 0 }} />
+          <Typography sx={{ color: posture.color, fontSize: 12, fontWeight: 650 }}>
             {posture.label}
           </Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11, lineHeight: 1.55 }}>
+          <Typography color="text.secondary" sx={{ fontSize: 12, lineHeight: 1.5 }}>
             {posture.detail}
           </Typography>
         </Box>
-      </Paper>
+      )}
 
-      {meta.active && <Throughput telemetry={telemetry} history={history} />}
+      {hasThroughput && (
+        <Box
+          aria-label="Débit du tunnel"
+          sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1, mt: 1.25 }}
+        >
+          <Series
+            icon={ArrowDown}
+            label="Réception"
+            value={telemetry ? formatBps(telemetry.rx_bps) : '—'}
+            points={history.map((sample) => sample.rx_bps)}
+            ceiling={ceilingOf(history)}
+          />
+          <Series
+            icon={ArrowUp}
+            label="Émission"
+            value={telemetry ? formatBps(telemetry.tx_bps) : '—'}
+            points={history.map((sample) => sample.tx_bps)}
+            ceiling={ceilingOf(history)}
+          />
+        </Box>
+      )}
 
-      <Box
-        aria-label="Caractéristiques du profil"
-        sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1 }}
-      >
-        <Tile
-          label="Protection"
-          value={pq ? 'PSK post-quantique' : 'WireGuard classique'}
-          accent={pq}
-          hint={
+      {/* Caractéristiques : de la référence, pas un titre. Discrètes par choix. */}
+      <Box sx={{ mt: 'auto', pt: 2 }}>
+        <Tooltip
+          title={
             pq
-              ? 'Le secret ML-KEM-768 alimente le slot PresharedKey : un enregistrement du trafic reste illisible pour un adversaire quantique.'
-              : 'Sans PSK, la confidentialité repose sur Curve25519 seul et reste exposée au scénario « récolter maintenant, déchiffrer plus tard ».'
+              ? 'Le secret ML-KEM-768 occupe le slot PresharedKey : un trafic enregistré aujourd’hui reste illisible pour un adversaire quantique.'
+              : 'Sans PSK, la confidentialité repose sur Curve25519 seul.'
           }
-        />
-        <Tile label="Adresse virtuelle" value={profile?.address ?? 'assignée à l’enrôlement'} mono />
-        <Tile label="Trafic capté" value={profile?.allowed_ips ?? '—'} mono />
-        <Tile label="Backend" value={backend || '—'} mono />
+        >
+          <Box
+            sx={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 0.75,
+              px: 1,
+              py: 0.4,
+              borderRadius: 1,
+              border: '1px solid',
+              borderColor: pq ? `${EMERALD}66` : 'divider',
+              bgcolor: pq ? `${EMERALD}14` : 'transparent',
+            }}
+          >
+            <Typography
+              sx={{
+                color: pq ? 'primary.main' : 'text.secondary',
+                fontFamily: 'monospace',
+                fontSize: 10.5,
+                fontWeight: 600,
+              }}
+            >
+              {pq ? 'PSK POST-QUANTIQUE' : 'WIREGUARD CLASSIQUE'}
+            </Typography>
+          </Box>
+        </Tooltip>
+
+        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.4, mt: 1 }}>
+          <Fact label="adresse" value={profile?.address ?? '—'} />
+          <Fact label="capté" value={profile?.allowed_ips ?? '—'} />
+          <Fact label="backend" value={backend || '—'} />
+        </Box>
       </Box>
 
-      <Stack spacing={1} sx={{ mt: 'auto', pt: 0.5 }}>
+      <Stack spacing={0.75} sx={{ pt: 1.75 }}>
         {meta.active || meta.transitioning ? (
           <Button
             fullWidth
@@ -139,7 +197,6 @@ export function ConnectView({
             color="error"
             startIcon={<Power size={17} aria-hidden />}
             onClick={onDisconnect}
-            sx={{ bgcolor: 'rgba(127, 29, 29, 0.18)' }}
           >
             {state === 'connecting' ? 'Annuler et démonter' : 'Déconnecter'}
           </Button>
@@ -159,57 +216,37 @@ export function ConnectView({
           <Typography
             role="status"
             color="warning.main"
-            sx={{ textAlign: 'center', fontSize: 11, opacity: 0.9 }}
+            sx={{ textAlign: 'center', fontSize: 11 }}
           >
             Profil incomplet : endpoint, clé privée et clé publique de la gateway sont requis.
           </Typography>
-        )}
-
-        {posture.posture === 'held' && (
-          <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.75, color: 'text.disabled' }}>
-            <Info size={14} aria-hidden style={{ flexShrink: 0, marginTop: 2 }} />
-            <Typography sx={{ fontSize: 11, lineHeight: 1.5 }}>
-              Déconnecter démonte l’adaptateur et rend la route par défaut au trafic en clair. Pour
-              relancer une négociation, laissez Orion réessayer.
-            </Typography>
-          </Box>
         )}
       </Stack>
     </Stack>
   )
 }
 
-function Throughput({
-  telemetry,
-  history,
-}: {
-  telemetry: TelemetrySample | null
-  history: TelemetrySample[]
-}) {
-  // Échelle commune aux deux séries — voir le doc-comment de Sparkline.
-  const ceiling = Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
+/** Échelle commune aux deux séries — voir le doc-comment de `Sparkline`. */
+function ceilingOf(history: TelemetrySample[]): number {
+  return Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
+}
 
+function Fact({ label, value }: { label: string; value: string }) {
   return (
-    <Box
-      aria-label="Débit du tunnel"
-      sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1 }}
-    >
-      <Series
-        icon={ArrowDown}
-        label="Réception"
-        value={telemetry ? formatBps(telemetry.rx_bps) : '—'}
-        points={history.map((sample) => sample.rx_bps)}
-        ceiling={ceiling}
-        color="#28e4a0"
-      />
-      <Series
-        icon={ArrowUp}
-        label="Émission"
-        value={telemetry ? formatBps(telemetry.tx_bps) : '—'}
-        points={history.map((sample) => sample.tx_bps)}
-        ceiling={ceiling}
-        color="#22d3ee"
-      />
+    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.5, minWidth: 0 }}>
+      <Typography
+        color="text.disabled"
+        sx={{ fontFamily: 'monospace', fontSize: 9.5, letterSpacing: '0.1em', textTransform: 'uppercase' }}
+      >
+        {label}
+      </Typography>
+      <Typography
+        noWrap
+        color="text.secondary"
+        sx={{ fontFamily: 'monospace', fontSize: 10.5, mr: 1 }}
+      >
+        {value}
+      </Typography>
     </Box>
   )
 }
@@ -220,26 +257,34 @@ function Series({
   value,
   points,
   ceiling,
-  color,
 }: {
   icon: React.ElementType
   label: string
   value: string
   points: number[]
   ceiling: number
-  color: string
 }) {
   return (
-    <Paper variant="outlined" sx={{ minWidth: 0, bgcolor: 'rgba(0, 0, 0, 0.18)', px: 1.25, pt: 1.1 }}>
+    <Box
+      sx={{
+        minWidth: 0,
+        px: 1.25,
+        pt: 0.9,
+        pb: 0.4,
+        borderRadius: 2,
+        border: '1px solid',
+        borderColor: 'divider',
+      }}
+    >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6 }}>
-        <Icon size={13} aria-hidden style={{ color }} />
+        <Icon size={12} aria-hidden style={{ color: EMERALD }} />
         <Typography variant="overline" color="text.disabled" sx={{ fontSize: 9 }}>
           {label}
         </Typography>
         <Typography
           sx={{
             ml: 'auto',
-            color,
+            color: 'primary.main',
             fontFamily: 'monospace',
             fontSize: 11,
             fontVariantNumeric: 'tabular-nums',
@@ -248,45 +293,7 @@ function Series({
           {value}
         </Typography>
       </Box>
-      <Sparkline points={points} ceiling={ceiling} color={color} label={label} />
-    </Paper>
+      <Sparkline points={points} ceiling={ceiling} color={EMERALD} label={label} />
+    </Box>
   )
-}
-
-function Tile({
-  label,
-  value,
-  mono = false,
-  accent = false,
-  hint,
-}: {
-  label: string
-  value: string
-  mono?: boolean
-  accent?: boolean
-  hint?: string
-}) {
-  const tile = (
-    <Paper
-      variant="outlined"
-      sx={{ minWidth: 0, bgcolor: 'rgba(0, 0, 0, 0.18)', px: 1.25, py: 1.1 }}
-    >
-      <Typography variant="overline" color="text.disabled" sx={{ display: 'block', fontSize: 9 }}>
-        {label}
-      </Typography>
-      <Typography
-        noWrap
-        sx={{
-          mt: 0.35,
-          color: accent ? 'primary.main' : 'text.secondary',
-          fontFamily: mono ? 'monospace' : undefined,
-          fontSize: 11,
-        }}
-      >
-        {value}
-      </Typography>
-    </Paper>
-  )
-
-  return hint ? <Tooltip title={hint}>{tile}</Tooltip> : tile
 }

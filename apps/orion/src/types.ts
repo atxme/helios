@@ -37,6 +37,24 @@ export interface ClientConfig {
   selected: string | null
 }
 
+/**
+ * Champs fautifs d'un profil, relevés par `orion-core::inspect_profile`.
+ *
+ * `null` = rien à signaler. Un champ vide n'est jamais signalé : pendant la
+ * saisie, « pas encore rempli » n'est pas « impossible ».
+ */
+export interface ProfileIssues {
+  name: string | null
+  endpoint: string | null
+  private_key: string | null
+  peer_public_key: string | null
+  preshared_key: string | null
+  address: string | null
+  allowed_ips: string | null
+  persistent_keepalive: string | null
+  heliosd_url: string | null
+}
+
 // Événements poussés par le backend Rust (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }

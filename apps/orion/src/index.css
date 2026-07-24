@@ -1,7 +1,10 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
+/* Aucune vue ne défile : la fenêtre est taillée pour son contenu. */
+html,
 body {
   overflow: hidden;
+  overscroll-behavior: none;
 }

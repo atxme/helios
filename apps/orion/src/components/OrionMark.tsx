@@ -1,3 +1,5 @@
+import type { CSSProperties } from 'react'
+
 /**
  * Marque Orion — le client.
  *
@@ -82,32 +84,3 @@ export function OrionMark({ className = '', style, compact = false, title }: Pro
   )
 }
 
-/** Marque + typographie, pour l'en-tête de l'application. */
-export function OrionLockup({ className = '' }: { className?: string }) {
-  return (
-    <div className={className} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-      <OrionMark
-        style={{ width: 32, height: 32, flexShrink: 0, color: '#22d3ee' }}
-        title="Orion"
-      />
-      <div style={{ minWidth: 0, lineHeight: 1 }}>
-        <div style={{ color: '#e6edf6', fontSize: 13, fontWeight: 700, letterSpacing: '0.28em' }}>
-          ORION
-        </div>
-        <div
-          style={{
-            marginTop: 4,
-            color: 'rgba(34, 211, 238, 0.7)',
-            fontFamily: 'monospace',
-            fontSize: 9,
-            letterSpacing: '0.16em',
-            textTransform: 'uppercase',
-          }}
-        >
-          WireGuard · Client PQ
-        </div>
-      </div>
-    </div>
-  )
-}
-import type { CSSProperties } from 'react'

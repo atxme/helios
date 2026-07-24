@@ -14,9 +14,9 @@
       {
         "label": "main",
         "title": "Orion VPN",
-        "width": 440,
-        "height": 680,
-        "minWidth": 380,
+        "width": 520,
+        "height": 660,
+        "minWidth": 500,
         "minHeight": 560,
         "resizable": true
       }
@@ -29,10 +29,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "fileAssociations": [
       {
-        "ext": ["orionprofile"],
+        "ext": [
+          "orionprofile"
+        ],
         "name": "Profil Orion",
         "description": "Profil de connexion VPN Orion",
         "mimeType": "application/x-orion-profile",
@@ -41,7 +46,11 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libcap2-bin"],
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libcap2-bin"
+        ],
         "postInstallScript": "linux/postinst"
       }
     }

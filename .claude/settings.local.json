@@ -176,7 +176,16 @@
       "Bash(./scripts/deploy.sh --help)",
       "Bash([ -f $M/MEMORY.md ])",
       "Bash(timeout 60 ssh -o BatchMode=yes christophe@192.168.1.44 ' *)",
-      "Bash(timeout 30 ssh -o BatchMode=yes christophe@192.168.1.44 'pgrep -a heliosd || echo \"aucun heliosd\"; echo \"--- table nftables présente ?\"; nft list tables 2>&1 | head -3')"
+      "Bash(timeout 30 ssh -o BatchMode=yes christophe@192.168.1.44 'pgrep -a heliosd || echo \"aucun heliosd\"; echo \"--- table nftables présente ?\"; nft list tables 2>&1 | head -3')",
+      "Bash(gh run *)",
+      "Bash(gh api *)",
+      "Bash(git ls-remote *)",
+      "Bash(git tag *)",
+      "Bash(npx --prefix apps/orion vitest run --root apps/orion)",
+      "Bash(command -v chromium chromium-browser google-chrome)",
+      "Bash(xargs -I{} echo \"{} avertissement\\(s\\)/erreur\\(s\\)\")",
+      "Bash(xargs -I{} echo \"clippy : {} problème\\(s\\)\")",
+      "Bash(xargs -I{} echo \"{} problème\\(s\\)\")"
     ]
   }
 }

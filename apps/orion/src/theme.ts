@@ -6,46 +6,77 @@ const MONO_FONT =
   '"Cascadia Code", "JetBrains Mono", "Fira Code", Consolas, ui-monospace, monospace'
 
 /**
- * Socle Material Design d’Orion.
+ * Socle visuel d’Orion — « encre & pin ».
  *
- * Les couleurs de posture restent pilotées par `components/state.ts` : elles
- * portent un sens de sécurité et ne doivent pas être remplacées par une simple
- * couleur décorative du thème.
+ * Parti pris : **la couleur est rare, donc elle signifie**. Orion n’a qu’un seul
+ * message à faire passer — le trafic est-il protégé — et `components/state.ts`
+ * encode cette réponse par une couleur. Une interface qui colore aussi ses
+ * en-têtes, ses onglets et ses accents noie ce signal parmi les décorations.
+ *
+ * D’où un fond papier, une typographie encre, et le vert pin réservé à deux
+ * emplois : l’action principale et l’état protégé. Tout le reste est neutre.
+ *
+ * Corollaire : les couleurs d’état ne sont PAS dérivées de ce thème. Elles
+ * vivent dans `state.ts` parce qu’elles portent un sens de sécurité, pas une
+ * intention esthétique.
  */
+
+/** Fond papier — blanc froid, délibérément pas crème. */
+export const PAPER = '#FBFCFB'
+/** Texte principal : un noir teinté vert, qui rattache la typo à la marque. */
+export const INK = '#10231C'
+/** Texte secondaire. */
+export const GRAPHITE = '#5A6B65'
+/** Texte tertiaire — jamais porteur d’information critique. */
+export const SLATE = '#8A9691'
+/** Filets et séparateurs. */
+export const RULE = '#E2E8E5'
+/** Le vert de la marque : action principale et état protégé, rien d’autre. */
+export const PINE = '#0B6B4E'
+/**
+ * Vert vif — **graphiques seulement**. Il ne tient pas le ratio AA sur papier,
+ * donc il n’énonce jamais : il éclaire (orbe, pastilles, courbes, liserés).
+ */
+export const EMERALD = '#12B981'
+/** Seule surface teintée de l’interface. */
+export const MINT = '#E3F6EE'
+
+/**
+ * Gouttière commune, en unités d’espacement MUI (2 = 16 px).
+ *
+ * En-tête, navigation et contenu s’alignent tous dessus. Une vue qui choisirait
+ * sa propre valeur décalerait son texte au changement d’onglet — le défaut le
+ * plus visible d’une IHM à plusieurs vues, et le plus facile à laisser filer.
+ */
+export const GUTTER = 2
+
 export const orionTheme = createTheme({
   cssVariables: true,
   palette: {
-    mode: 'dark',
+    mode: 'light',
     primary: {
-      main: '#22d3ee',
-      light: '#67e8f9',
-      dark: '#0891b2',
-      contrastText: '#031318',
+      main: PINE,
+      light: EMERALD,
+      dark: '#075139',
+      contrastText: '#FFFFFF',
     },
-    secondary: {
-      main: '#e879f9',
-    },
-    success: {
-      main: '#28e4a0',
-    },
-    warning: {
-      main: '#ffb347',
-    },
-    error: {
-      main: '#ff5757',
-    },
+    success: { main: PINE },
+    warning: { main: '#A16207' },
+    error: { main: '#9B2C2C' },
+    info: { main: '#2F5D8A' },
     background: {
-      default: '#03060f',
-      paper: '#0c1426',
+      default: PAPER,
+      paper: '#FFFFFF',
     },
     text: {
-      primary: '#e6edf6',
-      secondary: '#94a3b8',
+      primary: INK,
+      secondary: GRAPHITE,
+      disabled: SLATE,
     },
-    divider: 'rgba(148, 163, 184, 0.14)',
+    divider: RULE,
   },
   shape: {
-    borderRadius: 14,
+    borderRadius: 10,
   },
   typography: {
     fontFamily: SYSTEM_FONT,
@@ -54,10 +85,13 @@ export const orionTheme = createTheme({
       letterSpacing: '0.01em',
       textTransform: 'none',
     },
+    // La voix « instrument » : capitales étroites en chasse fixe, très espacées.
+    // Elle sert à étiqueter les données, jamais à les énoncer.
     overline: {
+      fontFamily: MONO_FONT,
       fontSize: '0.625rem',
-      fontWeight: 700,
-      letterSpacing: '0.16em',
+      fontWeight: 600,
+      letterSpacing: '0.18em',
       lineHeight: 1.5,
     },
     caption: {
@@ -69,12 +103,13 @@ export const orionTheme = createTheme({
       styleOverrides: {
         'html, body, #root': {
           height: '100%',
+          // Aucune vue ne défile : la fenêtre est dimensionnée pour son contenu.
+          overflow: 'hidden',
         },
         body: {
           margin: 0,
-          background:
-            'radial-gradient(900px 520px at 50% -12%, rgba(34, 211, 238, 0.11), transparent 62%), #03060f',
-          color: '#e6edf6',
+          backgroundColor: PAPER,
+          color: INK,
           WebkitFontSmoothing: 'antialiased',
           textRendering: 'optimizeLegibility',
         },
@@ -85,20 +120,7 @@ export const orionTheme = createTheme({
           fontFamily: MONO_FONT,
         },
         '::selection': {
-          backgroundColor: 'rgba(34, 211, 238, 0.28)',
-        },
-        '::-webkit-scrollbar': {
-          width: 8,
-          height: 8,
-        },
-        '::-webkit-scrollbar-thumb': {
-          backgroundColor: 'rgba(148, 163, 184, 0.3)',
-          border: '2px solid transparent',
-          borderRadius: 8,
-          backgroundClip: 'padding-box',
-        },
-        '::-webkit-scrollbar-thumb:hover': {
-          backgroundColor: 'rgba(34, 211, 238, 0.48)',
+          backgroundColor: 'rgba(18, 185, 129, 0.24)',
         },
         '@media (prefers-reduced-motion: reduce)': {
           '*, *::before, *::after': {
@@ -117,9 +139,9 @@ export const orionTheme = createTheme({
       styleOverrides: {
         root: {
           minHeight: 40,
-          borderRadius: 10,
+          borderRadius: 8,
           '&.Mui-focusVisible': {
-            outline: '3px solid rgba(34, 211, 238, 0.32)',
+            outline: `3px solid ${PINE}44`,
             outlineOffset: 2,
           },
         },
@@ -129,7 +151,7 @@ export const orionTheme = createTheme({
       styleOverrides: {
         root: {
           '&.Mui-focusVisible': {
-            outline: '3px solid rgba(34, 211, 238, 0.32)',
+            outline: `3px solid ${PINE}44`,
             outlineOffset: 2,
           },
         },
@@ -139,29 +161,7 @@ export const orionTheme = createTheme({
       styleOverrides: {
         root: {
           backgroundImage: 'none',
-          border: '1px solid rgba(56, 189, 248, 0.16)',
-        },
-      },
-    },
-    MuiTab: {
-      styleOverrides: {
-        root: {
-          minHeight: 44,
-          minWidth: 0,
-          borderRadius: 10,
-          textTransform: 'none',
-          '&.Mui-focusVisible': {
-            outline: '3px solid rgba(34, 211, 238, 0.32)',
-            outlineOffset: -3,
-          },
-        },
-      },
-    },
-    MuiTabs: {
-      styleOverrides: {
-        indicator: {
-          height: 3,
-          borderRadius: '3px 3px 0 0',
+          border: `1px solid ${RULE}`,
         },
       },
     },

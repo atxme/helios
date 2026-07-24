@@ -25,8 +25,9 @@ use std::{
 
 use aether::TunnelState;
 use orion_core::{
-    backend::EventSink, complete_profile_import, default_backend, parse_profile_import,
-    read_profile_import_path, telemetry, ClientConfig, ClientEvent, ClientProfile, VpnController,
+    backend::EventSink, complete_profile_import, default_backend, inspect_profile,
+    parse_profile_import, read_profile_import_path, telemetry, ClientConfig, ClientEvent,
+    ClientProfile, ProfileIssues, VpnController,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
@@ -329,6 +330,95 @@ async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     Ok(())
 }
 
+/// Relève les champs fautifs d'un profil en cours d'édition.
+///
+/// La validation reste **côté Rust** : l'IHM surligne ce que le cœur refuse,
+/// elle ne réimplémente pas ses règles. Deux jeux de règles finiraient par
+/// diverger, et l'IHM accepterait des valeurs que la connexion rejette.
+#[tauri::command]
+fn validate_profile(profile: ClientProfile) -> ProfileIssues {
+    inspect_profile(&profile)
+}
+
+/// Dimensions de la fenêtre selon la vue affichée.
+///
+/// Chaque vue a des besoins différents : la connexion tient dans une colonne
+/// étroite, le formulaire de profils réclame deux colonnes, le journal veut de
+/// la largeur pour ne pas replier ses lignes. Une fenêtre unique obligerait à
+/// prendre le maximum des trois en permanence.
+///
+/// Une vue inconnue retombe sur la taille de « connexion » : c'est la vue de
+/// démarrage, et une taille par défaut vaut mieux qu'une erreur pour un libellé
+/// que seule l'IHM produit.
+fn window_size_for(view: &str) -> (f64, f64) {
+    match view {
+        "profiles" => (800.0, 720.0),
+        "logs" => (760.0, 640.0),
+        _ => (520.0, 660.0),
+    }
+}
+
+/// Ajuste la fenêtre à la vue demandée.
+///
+/// Le redimensionnement vit **côté Rust** parce que l'exposer au frontend
+/// exigerait `core:window:allow-set-size` dans les capacités — un droit général
+/// sur la fenêtre pour trois tailles connues à la compilation.
+#[tauri::command]
+fn resize_for_view(app: AppHandle, view: String) -> Result<(), String> {
+    let (width, height) = window_size_for(&view);
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "fenêtre principale introuvable".to_string())?;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| format!("redimensionnement de la fenêtre : {e}"))
+}
+
+/// Borne de l'export. Le journal du frontend est plafonné à 80 lignes, mais la
+/// commande ne fait pas confiance à cette borne : elle vient de l'appelant.
+const MAX_LOG_EXPORT_BYTES: usize = 512 * 1024;
+
+/// Réduit un libellé proposé par le frontend à un nom de fichier sûr.
+///
+/// Le frontend choisit le libellé — il est le seul à connaître l'heure locale —
+/// mais jamais le chemin. Seuls les caractères d'un nom ordinaire survivent, ce
+/// qui élimine d'un coup les séparateurs, les `..` et les extensions déguisées :
+/// un export ne doit pas pouvoir écrire ailleurs que dans le répertoire que la
+/// commande a choisi.
+fn sanitize_stem(proposed: &str) -> String {
+    let cleaned: String = proposed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "orion-journal".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Écrit le journal dans un fichier et renvoie son chemin.
+///
+/// Passe par une commande plutôt que par les plugins `dialog`/`fs` : Orion
+/// n'accorde que `core:default` en capacité, et ouvrir au frontend un accès
+/// disque général pour un simple export serait disproportionné.
+#[tauri::command]
+fn export_logs(app: AppHandle, stem: String, contents: String) -> Result<String, String> {
+    if contents.len() > MAX_LOG_EXPORT_BYTES {
+        return Err("journal trop volumineux pour être exporté".to_string());
+    }
+    let dir = app
+        .path()
+        .document_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("aucun répertoire d'export disponible : {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("création de {} : {e}", dir.display()))?;
+    let path = dir.join(format!("{}.log", sanitize_stem(&stem)));
+    std::fs::write(&path, contents).map_err(|e| format!("écriture de {} : {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
 fn is_associated_profile_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -446,6 +536,9 @@ fn main() {
             select_profile,
             connect,
             disconnect,
+            export_logs,
+            resize_for_view,
+            validate_profile,
         ])
         .run(tauri::generate_context!())
         .expect("erreur au lancement de Tauri");
@@ -453,7 +546,55 @@ fn main() {
 
 #[cfg(test)]
 mod security_tests {
-    use super::{associated_profile_paths, Path, PathBuf};
+    use super::{associated_profile_paths, sanitize_stem, window_size_for, Path, PathBuf};
+
+    /// Chaque vue a sa taille, et un libellé inattendu ne doit pas produire une
+    /// fenêtre dégénérée : il retombe sur la vue de démarrage.
+    #[test]
+    fn chaque_vue_a_sa_taille_et_l_inconnu_retombe_sur_la_connexion() {
+        let connect = window_size_for("connect");
+        assert_eq!(window_size_for("inconnue"), connect);
+        assert_ne!(window_size_for("profiles"), connect);
+        assert_ne!(window_size_for("logs"), connect);
+        // Le formulaire de profils est la vue la plus exigeante des trois.
+        for view in ["connect", "logs"] {
+            assert!(window_size_for("profiles").0 >= window_size_for(view).0);
+        }
+        // Aucune taille ne descend sous le minimum déclaré dans tauri.conf.json.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let window = &config["app"]["windows"][0];
+        let (min_w, min_h) = (
+            window["minWidth"].as_f64().expect("minWidth"),
+            window["minHeight"].as_f64().expect("minHeight"),
+        );
+        for view in ["connect", "profiles", "logs"] {
+            let (w, h) = window_size_for(view);
+            assert!(w >= min_w, "{view} : {w} < {min_w}");
+            assert!(h >= min_h, "{view} : {h} < {min_h}");
+        }
+    }
+
+    /// Le frontend nomme l'export, il ne le place pas. Tout ce qui pourrait
+    /// désigner un autre répertoire doit disparaître du libellé.
+    #[test]
+    fn le_nom_d_export_ne_peut_pas_designer_un_autre_chemin() {
+        assert_eq!(
+            sanitize_stem("orion-journal-2026-07-23"),
+            "orion-journal-2026-07-23"
+        );
+        assert_eq!(sanitize_stem("../../etc/passwd"), "etcpasswd");
+        assert_eq!(
+            sanitize_stem("C:\\Windows\\System32\\x"),
+            "CWindowsSystem32x"
+        );
+        assert_eq!(sanitize_stem("journal.log.exe"), "journallogexe");
+        // Un libellé vide ou entièrement filtré retombe sur un nom par défaut
+        // plutôt que de produire un fichier caché « .log ».
+        assert_eq!(sanitize_stem(""), "orion-journal");
+        assert_eq!(sanitize_stem("../.."), "orion-journal");
+        assert_eq!(sanitize_stem(&"a".repeat(200)).len(), 64);
+    }
 
     #[test]
     fn serveur_cargo_run_aligne_avec_la_dev_url_tauri() {
