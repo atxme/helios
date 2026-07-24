@@ -1,44 +1,43 @@
 /**
- * Verrouillage du shell WebView : Orion est une application, pas une page web.
+ * WebView shell lockdown: Orion is an application, not a web page.
  *
- * WebView2 apporte ses réflexes de navigateur — menu contextuel avec
- * « Actualiser », F5, Ctrl+R. Recharger n'y est pas anodin : le frontend est la
- * seule source de vérité sur ce que l'utilisateur voit du tunnel, et un
- * rechargement le remet à zéro sans rien dire au cœur Rust. Un profil en cours
- * d'édition disparaît, le journal de la session est perdu, la nature du PSK
- * négocié — jamais persistée, par construction — n'est plus connue de personne.
- * Le tunnel, lui, reste monté : l'IHM se rouvre en affirmant « Déconnecté » sur
- * un adaptateur bien vivant. C'est un mensonge d'interface sur l'objet même
- * dont elle rend compte.
+ * WebView2 brings its browser reflexes — a context menu with "Refresh", F5,
+ * Ctrl+R. Reloading isn't harmless there: the frontend is the sole source of
+ * truth on what the user sees of the tunnel, and a reload resets it to zero
+ * without telling the Rust core anything. A profile being edited disappears,
+ * the session log is lost, the nature of the negotiated PSK — never
+ * persisted, by design — is no longer known to anyone. The tunnel itself
+ * stays mounted: the UI reopens claiming "Disconnected" over a very much
+ * alive adapter. It's an interface lie about the very thing it reports on.
  *
- * ## Ce qui reste permis, et pourquoi
+ * ## What remains allowed, and why
  *
- * Le menu contextuel survit dans les **champs de saisie**. Coller une clé
- * WireGuard de 44 caractères au clic droit est un geste normal, et WebView2 y
- * présente le menu d'édition — couper/copier/coller —, pas celui de la page :
- * « Actualiser » n'y figure pas. Le supprimer partout coûterait cette ergonomie
- * sans rien fermer de plus.
+ * The context menu survives in **input fields**. Pasting a 44-character
+ * WireGuard key via right-click is a normal gesture, and WebView2 presents
+ * the edit menu there — cut/copy/paste — not the page's: "Refresh" doesn't
+ * appear in it. Removing it everywhere would cost this ergonomics without
+ * closing anything more.
  *
- * Ailleurs, le texte reste sélectionnable et Ctrl+C fonctionne ; le journal a de
- * toute façon ses boutons « Copier » et « Exporter », qui ne dépendent pas du
- * presse-papiers du navigateur.
+ * Elsewhere, text stays selectable and Ctrl+C works; the log has its
+ * "Copy" and "Export" buttons anyway, which don't depend on the browser's
+ * clipboard.
  *
- * ## Forme du module
+ * ## Module shape
  *
- * La décision est isolée dans deux prédicats purs et la cible d'écoute est un
- * paramètre. Le module se teste donc entièrement sans DOM — le projet n'embarque
- * pas de jsdom, et ce verrou ne justifie pas d'en ajouter un.
+ * The decision is isolated in two pure predicates and the listening target
+ * is a parameter. The module is therefore entirely testable without a DOM —
+ * the project doesn't ship jsdom, and this lock doesn't justify adding one.
  */
 
-/** Sélecteur des contextes où le menu natif est un menu d'édition. */
+/** Selector for contexts where the native menu is an edit menu. */
 const EDITABLE =
   'input, textarea, [contenteditable=""], [contenteditable="true"]'
 
 /**
- * Cible d'écoute : `window` en production, un double dans les tests.
+ * Listening target: `window` in production, a double in tests.
  *
- * Volontairement plus étroit que `Window` — ce module n'a besoin que de poser
- * et retirer deux écouteurs.
+ * Deliberately narrower than `Window` — this module only needs to set and
+ * remove two listeners.
  */
 export interface ShellTarget {
   addEventListener(
@@ -54,11 +53,11 @@ export interface ShellTarget {
 }
 
 /**
- * Le clic droit doit-il garder le menu natif ?
+ * Should a right-click keep the native menu?
  *
- * Duck-typé sur `closest` plutôt que sur `instanceof Element` : la question est
- * « cette cible sait-elle remonter ses ancêtres ? », et la poser ainsi rend le
- * prédicat vérifiable sans DOM.
+ * Duck-typed on `closest` rather than `instanceof Element`: the question is
+ * "does this target know how to walk up its ancestors?", and asking it this
+ * way makes the predicate verifiable without a DOM.
  */
 export function keepsNativeContextMenu(target: unknown): boolean {
   const node = target as { closest?: (selector: string) => unknown } | null
@@ -67,10 +66,10 @@ export function keepsNativeContextMenu(target: unknown): boolean {
 }
 
 /**
- * L'événement clavier demande-t-il un rechargement ?
+ * Does the keyboard event request a reload?
  *
- * Couvre les quatre chords : F5, Ctrl+F5, Ctrl+R et Ctrl+Shift+R. `metaKey`
- * assure la parité macOS, même si Orion n'y est pas livré aujourd'hui.
+ * Covers the four chords: F5, Ctrl+F5, Ctrl+R and Ctrl+Shift+R. `metaKey`
+ * ensures macOS parity, even though Orion isn't shipped there today.
  */
 export function isReloadChord(event: {
   key: string
@@ -82,10 +81,10 @@ export function isReloadChord(event: {
 }
 
 /**
- * Installe les garde-fous et renvoie de quoi les retirer.
+ * Installs the guardrails and returns a way to remove them.
  *
- * Le retour n'est pas décoratif : il rend le verrou réversible, donc testable,
- * et laisse React nettoyer proprement là où `StrictMode` monte deux fois.
+ * The return value isn't decorative: it makes the lock reversible, hence
+ * testable, and lets React clean up properly where `StrictMode` mounts twice.
  */
 export function lockShell(target: ShellTarget): () => void {
   const onContextMenu = (event: Event) => {
@@ -96,7 +95,7 @@ export function lockShell(target: ShellTarget): () => void {
     if (isReloadChord(event as KeyboardEvent)) event.preventDefault()
   }
 
-  // `capture` : intercepter avant qu'un champ de saisie ou MUI ne réagisse.
+  // `capture`: intercept before an input field or MUI reacts.
   target.addEventListener('contextmenu', onContextMenu)
   target.addEventListener('keydown', onKeyDown, { capture: true })
 

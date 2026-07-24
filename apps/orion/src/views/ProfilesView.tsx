@@ -31,18 +31,18 @@ import { GUTTER } from '../theme'
 import type { ClientConfig, ClientProfile, ProfileIssues } from '../types'
 
 /**
- * Vue Profils — maître-détail.
+ * Profiles view — master-detail.
  *
- * Le parti pris vient de l’usage réel : **on importe un profil, on ne le tape
- * pas**. Personne ne saisit une clé base64 à la main. L’écran privilégie donc
- * choisir et importer, pas remplir ; les quatre réglages qu’on ne touche
- * presque jamais vivent sous « Avancé ».
+ * The stance comes from actual usage: **a profile is imported, not typed**.
+ * Nobody enters a base64 key by hand. The screen therefore favors choosing
+ * and importing, not filling in; the four settings almost never touched
+ * live under "Advanced".
  *
- * Les avertissements sont **conditionnels** plutôt que permanents : un
- * paragraphe affiché en toutes circonstances devient invisible à force d’être
- * là. Celui sur `AllowedIPs` n’apparaît que si la plage a été restreinte, celui
- * sur le PSK que si une valeur statique a été posée — c’est-à-dire au moment
- * précis où le risque existe.
+ * Warnings are **conditional** rather than permanent: a paragraph shown at
+ * all times becomes invisible from being there. The one about `AllowedIPs`
+ * only appears if the range has been restricted, the one about the PSK only
+ * if a static value has been set — that is, at the precise moment the risk
+ * exists.
  */
 
 interface Props {
@@ -73,23 +73,23 @@ type ImportNotice = { tone: 'success' | 'error'; message: string }
 
 const MAX_IMPORT_BYTES = 64 * 1024
 
-/** Plage qui capte tout le trafic — celle qui fait tenir l’invariante fail-open. */
+/** Range that captures all traffic — the one that holds up the fail-open invariant. */
 const CAPTURE_ALL = '0.0.0.0/0'
 
 /**
- * Délai avant de juger un champ, en millisecondes.
+ * Delay before judging a field, in milliseconds.
  *
- * On attend que la frappe s’arrête : valider à chaque caractère surlignerait en
- * rouge tous les états intermédiaires d’une adresse qu’on est en train de
- * saisir — « 86 », « 86.2 », « 86.22 » sont tous invalides en chemin.
+ * We wait for typing to stop: validating on every character would highlight
+ * red on every intermediate state of an address being entered — "86",
+ * "86.2", "86.22" are all invalid along the way.
  */
 const VALIDATION_DELAY_MS = 500
 
 /**
- * Profondeur de l’historique d’annulation.
+ * Depth of the undo history.
  *
- * Une entrée par modification de champ : de quoi défaire une saisie entière
- * sans laisser le tableau grandir indéfiniment pendant une longue session.
+ * One entry per field modification: enough to undo an entire entry without
+ * letting the array grow indefinitely during a long session.
  */
 const HISTORY_LIMIT = 50
 
@@ -118,8 +118,8 @@ export function ProfilesView({
   const [advanced, setAdvanced] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
 
-  // La dérivation vit côté Rust : l’IHM ne manipule pas de crypto, et une clé
-  // privée incomplète en cours de saisie rend simplement une valeur absente.
+  // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
+  // incomplete private key mid-entry simply yields an absent value.
   useEffect(() => {
     let cancelled = false
     api
@@ -135,9 +135,9 @@ export function ProfilesView({
     }
   }, [draft])
 
-  // Les règles vivent dans `orion-core` : on interroge le cœur plutôt que de
-  // dupliquer sa grammaire de validation dans l'IHM. L'appel est différé le
-  // temps que la saisie se termine.
+  // The rules live in `orion-core`: we query the core rather than duplicate
+  // its validation grammar in the UI. The call is deferred until typing
+  // finishes.
   useEffect(() => {
     let cancelled = false
     const timer = setTimeout(() => {
@@ -185,7 +185,7 @@ export function ProfilesView({
     setImportNotice(null)
   }
 
-  /** Défait la dernière modification de champ. */
+  /** Undoes the last field modification. */
   const undo = useCallback(() => {
     if (history.length === 0) return
     setDraft(history[history.length - 1])
@@ -194,7 +194,7 @@ export function ProfilesView({
     setImportNotice(null)
   }, [history])
 
-  /** Revient au profil tel qu'il est enregistré, d'un coup. */
+  /** Reverts to the profile as saved, in one go. */
   const revert = () => {
     const saved =
       config.profiles.find((profile) => profile.name === draft.name) ??
@@ -212,9 +212,10 @@ export function ProfilesView({
       const combo =
         (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z'
       if (!combo) return
-      // Les champs sont contrôlés par React : l'annulation native du navigateur
-      // y est inopérante puisque la valeur est réécrite à chaque rendu. C'est
-      // donc à la vue de tenir l'historique, et d'intercepter le raccourci.
+      // Fields are controlled by React: the browser's native undo is
+      // inoperative there since the value is rewritten on every render. It's
+      // therefore up to the view to hold the history, and to intercept the
+      // shortcut.
       event.preventDefault()
       undo()
     }
@@ -228,7 +229,7 @@ export function ProfilesView({
       setDirty(false)
       setImportNotice(null)
     } catch {
-      // L’erreur globale garde le brouillon intact pour permettre une correction.
+      // The global error keeps the draft intact to allow a correction.
     }
   }
 
@@ -238,7 +239,7 @@ export function ProfilesView({
       setDeleteOpen(false)
       setDirty(false)
     } catch {
-      // L’erreur globale explique l’échec et la boîte reste ouverte.
+      // The global error explains the failure and the dialog stays open.
     }
   }
 
@@ -277,8 +278,8 @@ export function ProfilesView({
   const narrowed = draft.allowed_ips.trim() !== CAPTURE_ALL
   const staticPsk = Boolean(draft.preshared_key?.trim())
   const invalid = Object.values(issues).some(Boolean)
-  // Le repli « Avancé » doit signaler ce qu'il cache : sinon une case fautive
-  // resterait invisible jusqu'à ce qu'on pense à l'ouvrir.
+  // The "Advanced" collapse must flag what it hides: otherwise a faulty
+  // field would stay invisible until someone thinks to open it.
   const advancedFlagged =
     narrowed ||
     staticPsk ||
@@ -289,7 +290,7 @@ export function ProfilesView({
   return (
     <Box sx={{ display: 'flex', height: '100%', flexDirection: 'column' }}>
       <Box sx={{ display: 'grid', gridTemplateColumns: '176px 1fr', minHeight: 0, flex: 1 }}>
-        {/* ── Maître : la liste. Choisir est l'action principale. ── */}
+        {/* ── Master: the list. Choosing is the primary action. ── */}
         <Box
           sx={{
             display: 'flex',
@@ -401,7 +402,7 @@ export function ProfilesView({
           </Box>
         </Box>
 
-        {/* ── Détail : l'essentiel visible, le rare replié. ── */}
+        {/* ── Detail: the essentials visible, the rare things collapsed. ── */}
         <Box sx={{ minWidth: 0, overflow: 'hidden', px: GUTTER, py: 1.5 }}>
           {importNotice && (
             <Alert
@@ -604,8 +605,8 @@ export function ProfilesView({
 }
 
 /**
- * Avertissement contextuel — il n’apparaît qu’au moment où le risque existe.
- * Une mise en garde permanente finit par ne plus être lue.
+ * Contextual warning — it only appears at the moment the risk exists. A
+ * permanent warning eventually stops being read.
  */
 function Caution({ children }: { children: React.ReactNode }) {
   return (
@@ -635,7 +636,7 @@ function Field({
   onChange: (value: string) => void
   type?: 'text' | 'number'
   placeholder?: string
-  /** Message du cœur, `null` si le champ est acceptable. */
+  /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
 }) {
   return (
@@ -658,10 +659,10 @@ function Field({
 }
 
 /**
- * Valeur dérivée, non saisissable : la modifier n’aurait aucun sens.
+ * Derived value, not editable: modifying it would make no sense.
  *
- * L’explication passe par une infobulle plutôt que par un texte permanent —
- * elle ne sert qu’une fois, au moment de l’enrôlement.
+ * The explanation goes through a tooltip rather than permanent text — it's
+ * only useful once, at enrollment time.
  */
 function ReadOnlyField({ label, value, hint }: { label: string; value: string; hint?: string }) {
   const field = (
@@ -677,7 +678,7 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
   return hint ? <Tooltip title={hint}>{field}</Tooltip> : field
 }
 
-/** Champ secret : masqué par défaut, révélable sans imposer une saisie à l’aveugle. */
+/** Secret field: masked by default, revealable without forcing blind entry. */
 function Secret({
   label,
   value,
@@ -687,7 +688,7 @@ function Secret({
   label: string
   value: string
   onChange: (value: string) => void
-  /** Message du cœur, `null` si le champ est acceptable. */
+  /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
 }) {
   const [visible, setVisible] = useState(false)

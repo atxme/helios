@@ -6,47 +6,47 @@ const MONO_FONT =
   '"Cascadia Code", "JetBrains Mono", "Fira Code", Consolas, ui-monospace, monospace'
 
 /**
- * Socle visuel d’Orion — « encre & pin ».
+ * Orion's visual base — "ink & pine".
  *
- * Parti pris : **la couleur est rare, donc elle signifie**. Orion n’a qu’un seul
- * message à faire passer — le trafic est-il protégé — et `components/state.ts`
- * encode cette réponse par une couleur. Une interface qui colore aussi ses
- * en-têtes, ses onglets et ses accents noie ce signal parmi les décorations.
+ * Stance: **color is rare, therefore it means something**. Orion has only
+ * one message to convey — is the traffic protected — and `components/state.ts`
+ * encodes that answer with a color. An interface that also colors its
+ * headers, tabs, and accents drowns that signal among decorations.
  *
- * D’où un fond papier, une typographie encre, et le vert pin réservé à deux
- * emplois : l’action principale et l’état protégé. Tout le reste est neutre.
+ * Hence a paper background, ink typography, and pine green reserved for two
+ * uses: the primary action and the protected state. Everything else is
+ * neutral.
  *
- * Corollaire : les couleurs d’état ne sont PAS dérivées de ce thème. Elles
- * vivent dans `state.ts` parce qu’elles portent un sens de sécurité, pas une
- * intention esthétique.
+ * Corollary: state colors are NOT derived from this theme. They live in
+ * `state.ts` because they carry a security meaning, not an aesthetic intent.
  */
 
-/** Fond papier — blanc froid, délibérément pas crème. */
+/** Paper background — cold white, deliberately not cream. */
 export const PAPER = '#FBFCFB'
-/** Texte principal : un noir teinté vert, qui rattache la typo à la marque. */
+/** Primary text: a green-tinted black, which ties the type to the brand. */
 export const INK = '#10231C'
-/** Texte secondaire. */
+/** Secondary text. */
 export const GRAPHITE = '#5A6B65'
-/** Texte tertiaire — jamais porteur d’information critique. */
+/** Tertiary text — never carries critical information. */
 export const SLATE = '#8A9691'
-/** Filets et séparateurs. */
+/** Rules and separators. */
 export const RULE = '#E2E8E5'
-/** Le vert de la marque : action principale et état protégé, rien d’autre. */
+/** The brand's green: primary action and protected state, nothing else. */
 export const PINE = '#0B6B4E'
 /**
- * Vert vif — **graphiques seulement**. Il ne tient pas le ratio AA sur papier,
- * donc il n’énonce jamais : il éclaire (orbe, pastilles, courbes, liserés).
+ * Vivid green — **graphics only**. It doesn't hold the AA ratio on paper,
+ * so it never states: it illuminates (orb, chips, curves, rails).
  */
 export const EMERALD = '#12B981'
-/** Seule surface teintée de l’interface. */
+/** The interface's only tinted surface. */
 export const MINT = '#E3F6EE'
 
 /**
- * Gouttière commune, en unités d’espacement MUI (2 = 16 px).
+ * Shared gutter, in MUI spacing units (2 = 16 px).
  *
- * En-tête, navigation et contenu s’alignent tous dessus. Une vue qui choisirait
- * sa propre valeur décalerait son texte au changement d’onglet — le défaut le
- * plus visible d’une IHM à plusieurs vues, et le plus facile à laisser filer.
+ * Header, navigation, and content all align to it. A view that chose its own
+ * value would shift its text on tab change — the most visible defect of a
+ * multi-view UI, and the easiest to let slip.
  */
 export const GUTTER = 2
 
@@ -85,8 +85,8 @@ export const orionTheme = createTheme({
       letterSpacing: '0.01em',
       textTransform: 'none',
     },
-    // La voix « instrument » : capitales étroites en chasse fixe, très espacées.
-    // Elle sert à étiqueter les données, jamais à les énoncer.
+    // The "instrument" voice: narrow monospace capitals, widely spaced. It
+    // labels data, never states it.
     overline: {
       fontFamily: MONO_FONT,
       fontSize: '0.625rem',
@@ -103,7 +103,7 @@ export const orionTheme = createTheme({
       styleOverrides: {
         'html, body, #root': {
           height: '100%',
-          // Aucune vue ne défile : la fenêtre est dimensionnée pour son contenu.
+          // No view scrolls: the window is sized to fit its content.
           overflow: 'hidden',
         },
         body: {

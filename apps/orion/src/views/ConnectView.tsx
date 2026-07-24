@@ -18,17 +18,17 @@ import { Sparkline } from '../components/Sparkline'
 import { StatusOrb } from '../components/StatusOrb'
 import { EMERALD, GUTTER, PINE } from '../theme'
 
-/** Ambre de transition — même teinte que l’état « Connexion… », lisible sur papier. */
+/** Transition amber — same tint as the "Connecting…" state, readable on paper. */
 const AMBER = '#A16207'
 
 /**
- * Vue Connexion — l’écran qui répond à la seule question qui compte :
- * « mon trafic est-il protégé ? »
+ * Connect view — the screen that answers the only question that matters:
+ * "is my traffic protected?"
  *
- * Hiérarchie assumée : l’orbe et l’état occupent le centre optique, les
- * caractéristiques techniques restent en bas et en petit. Rien ne défile ; ce
- * qui ne mérite pas sa place à l’écran n’y est pas — et ce que l’en-tête dit
- * déjà n’est pas répété ici.
+ * Deliberate hierarchy: the orb and the state occupy the optical center,
+ * technical characteristics stay at the bottom and small. Nothing scrolls;
+ * what doesn't deserve its place on screen isn't there — and what the
+ * header already says isn't repeated here.
  */
 
 interface Props {
@@ -39,7 +39,7 @@ interface Props {
   history: TelemetrySample[]
   backend: string
   adapterUp: boolean
-  /** Nature du PSK posé pour la session en cours. `null` = pas encore tranché. */
+  /** Kind of PSK set for the current session. `null` = not yet decided. */
   psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
@@ -52,12 +52,12 @@ const POSTURE_ICON = {
 } as const
 
 /**
- * Habillage de la pastille de protection.
+ * Styling of the protection chip.
  *
- * Trois niveaux visuels pour trois faits distincts, et l’écart entre `pqc` et
- * `static` est voulu : le PSK statique protège, mais il ne tourne pas. Lui
- * donner le même vert plein qu’au PSK PQC gommerait la seule différence qui
- * compte.
+ * Three visual levels for three distinct facts, and the gap between `pqc`
+ * and `static` is intentional: the static PSK protects, but it doesn't
+ * rotate. Giving it the same solid green as the PQC PSK would erase the
+ * only difference that matters.
  */
 const PROTECTION_SKIN: Record<ProtectionTone, { border: string; fill: string; text: string }> = {
   pqc: { border: `${EMERALD}66`, fill: `${EMERALD}14`, text: 'primary.main' },
@@ -92,13 +92,13 @@ export function ConnectView({
   const protection = protectionMeta(profile, psk, state)
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
-  // Seul « retenu » mérite une phrase : c'est le seul cas contre-intuitif, où
-  // l'utilisateur croit fuir alors que WireGuard jette ses paquets. « Protégé »
-  // et « en clair » sont déjà dits par la pastille de l'en-tête, mot pour mot —
-  // les répéter ici ne fait que remplir.
+  // Only "held" deserves a sentence: it's the one counter-intuitive case,
+  // where the user believes they're leaking while WireGuard drops their
+  // packets. "Protected" and "in clear" are already said by the header
+  // chip, word for word — repeating them here would just be filler.
   const explain = posture.posture === 'held'
-  // Le débit ne s'affiche que s'il existe vraiment. Tant que la télémétrie
-  // n'émet rien, une carte vide serait une promesse non tenue.
+  // Throughput is only shown if it truly exists. As long as telemetry
+  // emits nothing, an empty card would be an unfulfilled promise.
   const hasThroughput = meta.active && history.length >= 2
 
   return (
@@ -133,10 +133,10 @@ export function ConnectView({
         </Box>
       </Stack>
 
-      {/* Posture : uniquement « retenu ». Les deux autres états sont déjà
-          énoncés à l'identique par la pastille de l'en-tête ; seul celui-ci dit
-          quelque chose que la pastille ne dit pas — que WireGuard jette les
-          paquets et qu'il ne faut surtout pas démonter l'adaptateur. */}
+      {/* Posture: only "held". The other two states are already stated
+          identically by the header chip; only this one says something the
+          chip doesn't — that WireGuard drops the packets and that the
+          adapter must absolutely not be unmounted. */}
       {explain && (
         <Box
           sx={{
@@ -180,7 +180,7 @@ export function ConnectView({
         </Box>
       )}
 
-      {/* Caractéristiques : de la référence, pas un titre. Discrètes par choix. */}
+      {/* Characteristics: reference material, not a headline. Discreet by choice. */}
       <Box sx={{ pt: 1.5 }}>
         <Tooltip title={protection.detail}>
           <Box
@@ -256,7 +256,7 @@ export function ConnectView({
   )
 }
 
-/** Échelle commune aux deux séries — voir le doc-comment de `Sparkline`. */
+/** Scale shared by both series — see `Sparkline`'s doc-comment. */
 function ceilingOf(history: TelemetrySample[]): number {
   return Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
 }

@@ -1,9 +1,9 @@
-// Types miroir des structures Rust (orion-core) sérialisées via Tauri.
-// Aligné sur web/src/types.ts pour la partie état/télémétrie partagée avec heliosd.
+// Mirror types of Rust structures (orion-core) serialized via Tauri.
+// Aligned with web/src/types.ts for the state/telemetry part shared with heliosd.
 
-// Modèle WireGuard (ADR-001). `rekeying` a disparu : WireGuard rekeye de façon
-// transparente, il n'y a pas d'état observable. `up` est *inféré* d'un handshake
-// récent (< 150 s), pas reçu comme événement.
+// WireGuard model (ADR-001). `rekeying` disappeared: WireGuard rekeys
+// transparently, there's no observable state. `up` is *inferred* from a
+// recent handshake (< 150 s), not received as an event.
 export type TunnelState =
   | 'down'
   | 'connecting'
@@ -11,29 +11,30 @@ export type TunnelState =
   | 'failed'
   | 'captive_portal'
 
-// Un pair WireGuard : identité = clé publique Curve25519, joint par un endpoint
-// UDP. Ni CA, ni EAP, ni proposition cryptographique — WireGuard n'a qu'une suite.
+// A WireGuard peer: identity = Curve25519 public key, reached via a UDP
+// endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
+// one suite.
 export interface ClientProfile {
   name: string
-  /** Endpoint UDP de la gateway : `IP:port` ou `FQDN:port`. */
+  /** Gateway's UDP endpoint: `IP:port` or `FQDN:port`. */
   endpoint: string
-  /** Clé privée Curve25519 du client (base64). Secret. */
+  /** Client's Curve25519 private key (base64). Secret. */
   private_key: string
-  /** Clé publique Curve25519 de la gateway (base64). */
+  /** Gateway's Curve25519 public key (base64). */
   peer_public_key: string
   /**
-   * PSK **statique** partagé hors bande (base64). Secret.
+   * **Static** PSK shared out of band (base64). Secret.
    *
-   * Le PSK PQC issu de ML-KEM n'atterrit jamais ici : il n'est pas persisté et
-   * se renégocie à chaque connexion. `null` est donc le cas normal d'un profil
-   * Helios — voir `PskKind`.
+   * The PQC PSK from ML-KEM never lands here: it isn't persisted and gets
+   * renegotiated on every connection. `null` is therefore the normal case
+   * for a Helios profile — see `PskKind`.
    */
   preshared_key: string | null
-  /** VIP CGNAT assignée par la gateway à l'enrôlement (ex. `100.64.1.2/32`). */
+  /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
-  /** Trafic routé dans le tunnel. Défaut `0.0.0.0/0`. */
+  /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0`. */
   allowed_ips: string
-  /** Keepalive en secondes. Défaut 25. */
+  /** Keepalive in seconds. Defaults to 25. */
   persistent_keepalive: number
   heliosd_url: string | null
 }
@@ -44,10 +45,10 @@ export interface ClientConfig {
 }
 
 /**
- * Champs fautifs d'un profil, relevés par `orion-core::inspect_profile`.
+ * Faulty fields of a profile, reported by `orion-core::inspect_profile`.
  *
- * `null` = rien à signaler. Un champ vide n'est jamais signalé : pendant la
- * saisie, « pas encore rempli » n'est pas « impossible ».
+ * `null` = nothing to report. An empty field is never reported: while
+ * typing, "not filled in yet" is not "impossible".
  */
 export interface ProfileIssues {
   name: string | null
@@ -62,18 +63,18 @@ export interface ProfileIssues {
 }
 
 /**
- * Ce qui occupe le slot `PresharedKey` du tunnel courant — miroir de
+ * What occupies the `PresharedKey` slot of the current tunnel — mirror of
  * `orion_core::events::PskKind`.
  *
- * Un PSK n'est pas un PSK PQC : les deux vivent dans le même slot WireGuard,
- * mais l'un a été recopié à la main et ne tourne jamais, l'autre vient d'un
- * échange ML-KEM-768 rejoué à chaque connexion. Le profil ne permet pas de les
- * distinguer, puisque le second n'est jamais persisté — seul le cœur client
- * sait lequel il a posé.
+ * A PSK is not a PQC PSK: both live in the same WireGuard slot, but one was
+ * copied by hand and never rotates, the other comes from an ML-KEM-768
+ * exchange replayed on every connection. The profile can't distinguish them,
+ * since the latter is never persisted — only the client core knows which
+ * one it set.
  */
 export type PskKind = 'none' | 'static' | 'ml_kem'
 
-// Événements poussés par le backend Rust (emit "helios://event").
+// Events pushed by the Rust backend (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'protection'; psk: PskKind }

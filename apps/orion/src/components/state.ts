@@ -135,29 +135,29 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
 }
 
 /**
- * Nature de la protection du slot `PresharedKey`, telle qu’à afficher.
+ * Nature of the `PresharedKey` slot's protection, as it should be displayed.
  *
- * **Un PSK n’est pas un PSK PQC**, et l’IHM ne doit pas les confondre : le
- * premier est un secret recopié à la main, partagé hors bande, qui ne tourne
- * jamais et dont la présence *désactive* la négociation ML-KEM ; le second est
- * dérivé d’un échange ML-KEM-768 rejoué à chaque connexion. Les deux tiennent
- * face au « récolter maintenant, déchiffrer plus tard » — appeler le premier
- * « post-quantique » n’était pas faux, c’était imprécis, et l’imprécision
- * cachait qu’aucune rotation n’a lieu.
+ * **A PSK is not a PQC PSK**, and the UI must not confuse them: the first is
+ * a secret copied by hand, shared out of band, that never rotates and whose
+ * presence *disables* ML-KEM negotiation; the second is derived from an
+ * ML-KEM-768 exchange replayed on every connection. Both hold up against
+ * "harvest now, decrypt later" — calling the first one "post-quantum" wasn't
+ * wrong, it was imprecise, and the imprecision hid that no rotation happens.
  *
- * **Le profil ne suffit pas à trancher**, dans les deux sens : le PSK PQC n’y
- * est jamais écrit (un tunnel PQC parfaitement établi montre `preshared_key:
- * null`), et un `preshared_key` renseigné désigne toujours un PSK statique.
- * C’est l’événement `protection` du cœur qui fait foi ; le profil ne sert qu’à
- * annoncer ce qu’on *attend* tant que la connexion n’a pas tranché.
+ * **The profile alone isn't enough to decide**, in both directions: the PQC
+ * PSK is never written there (a perfectly established PQC tunnel shows
+ * `preshared_key: null`), and a filled-in `preshared_key` always denotes a
+ * static PSK. It's the core's `protection` event that is authoritative; the
+ * profile only serves to announce what's *expected* while the connection
+ * hasn't decided yet.
  */
 export type ProtectionTone = 'pqc' | 'static' | 'classic' | 'pending'
 
 export interface ProtectionMeta {
   tone: ProtectionTone
-  /** Étiquette courte de la pastille. */
+  /** Short chip label. */
   label: string
-  /** Phrase d’infobulle : ce que ça protège, et à quel prix. */
+  /** Tooltip sentence: what it protects, and at what cost. */
   detail: string
 }
 
@@ -184,8 +184,8 @@ export function protectionMeta(
   if (observed === 'static') return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
   if (observed === 'none') return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
 
-  // Rien d'observé : on annonce l'attente, jamais l'acquis. Un profil qui
-  // *peut* obtenir un PSK PQC ne l'a pas encore.
+  // Nothing observed: we announce the wait, never the acquired state. A
+  // profile that *can* obtain a PQC PSK doesn't have it yet.
   const staticPsk = Boolean(profile?.preshared_key?.trim())
   if (staticPsk) return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
 

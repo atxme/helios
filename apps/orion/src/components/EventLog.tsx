@@ -10,27 +10,26 @@ import { EMERALD, GUTTER, PINE } from '../theme'
 import type { LogLine } from '../types'
 
 /**
- * Journal des événements — vue à part entière.
+ * Event log — a full-fledged view.
  *
- * Trois façons d’en sortir le texte, parce qu’elles ne servent pas la même
- * chose : la **sélection** pour prélever une ligne, la **copie** pour coller
- * l’ensemble dans un rapport, l’**export** pour joindre un fichier. Aucune ne
- * remplace les deux autres.
+ * Three ways to get text out of it, because they don't serve the same
+ * purpose: **selection** to lift a line, **copy** to paste the whole thing
+ * into a report, **export** to attach a file. None replaces the other two.
  *
- * Limite assumée : la vue ne défile pas et n’affiche donc que les entrées les
- * plus récentes qui tiennent. C’est le seul endroit où « tout afficher » se
- * heurte à la réalité — un journal n’a pas de fin. Le compteur dit combien
- * existent, la copie et l’export les emportent toutes.
+ * Accepted limitation: the view doesn't scroll and therefore only shows the
+ * most recent entries that fit. This is the one place where "show
+ * everything" runs into reality — a log has no end. The counter says how
+ * many exist, copy and export take all of them.
  */
 
-/** Le niveau est porté par un liseré autant que par la couleur du texte. */
+/** The level is carried by a rail as much as by the text color. */
 const LEVEL: Record<string, { text: string; rail: string }> = {
   error: { text: '#9B2C2C', rail: '#EF4444' },
   warn: { text: '#A16207', rail: '#F5B301' },
   info: { text: '#5A6B65', rail: 'transparent' },
 }
 
-/** Rend le journal en texte brut, une ligne par entrée, du plus ancien au plus récent. */
+/** Renders the log as plain text, one line per entry, oldest to most recent. */
 function toPlainText(logs: LogLine[]): string {
   return [...logs]
     .reverse()
@@ -38,7 +37,7 @@ function toPlainText(logs: LogLine[]): string {
     .join('\n')
 }
 
-/** Libellé de fichier lisible, en heure locale. Rust l’assainit avant usage. */
+/** Readable file label, in local time. Rust sanitizes it before use. */
 function exportStem(): string {
   const d = new Date()
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -48,9 +47,9 @@ function exportStem(): string {
 }
 
 /**
- * Copie via l’API presse-papiers, avec repli sur la sélection d’un textarea.
- * WebView2 refuse `navigator.clipboard` dans certains contextes ; sans repli, le
- * bouton échouerait en silence.
+ * Copy via the clipboard API, falling back to selecting a textarea.
+ * WebView2 refuses `navigator.clipboard` in some contexts; without a
+ * fallback, the button would fail silently.
  */
 async function copyText(text: string): Promise<void> {
   try {
@@ -165,13 +164,13 @@ export function EventLog({ logs }: { logs: LogLine[] }) {
             m: 0,
             minHeight: 0,
             flex: 1,
-            // Ni barre ni molette : on montre les plus récents qui tiennent.
+            // No scrollbar or wheel: shows the most recent entries that fit.
             overflow: 'hidden',
             py: 0.5,
             pl: 0,
             fontFamily: 'monospace',
             listStyle: 'none',
-            // Le texte doit rester prélevable à la souris.
+            // Text must remain selectable with the mouse.
             userSelect: 'text',
             cursor: 'text',
           }}

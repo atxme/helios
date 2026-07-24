@@ -7,8 +7,8 @@ import './index.css'
 import { lockShell } from './shell'
 import { orionTheme } from './theme'
 
-// Avant le premier rendu : le menu contextuel de WebView2 existe dès que la
-// page existe, indépendamment de React.
+// Before the first render: WebView2's context menu exists as soon as the
+// page exists, independently of React.
 lockShell(window)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

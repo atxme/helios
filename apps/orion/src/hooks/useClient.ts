@@ -10,7 +10,7 @@ import type {
 } from '../types'
 
 const MAX_LOGS = 80
-/** Fenêtre de la courbe de débit. À un échantillon par seconde, ~1 minute. */
+/** Throughput curve window. At one sample per second, ~1 minute. */
 const MAX_SAMPLES = 60
 
 export function useClient() {
@@ -22,8 +22,8 @@ export function useClient() {
   const [telemetry, setTelemetry] = useState<TelemetrySample | null>(null)
   const [history, setHistory] = useState<TelemetrySample[]>([])
   const [upSince, setUpSince] = useState<number | null>(null)
-  // `null` = la connexion en cours n'a pas encore tranché. Surtout pas `'none'`
-  // par défaut : ce serait affirmer l'absence de PSK avant de le savoir.
+  // `null` = the ongoing connection hasn't decided yet. Definitely not
+  // `'none'` by default: that would assert the absence of a PSK before knowing.
   const [psk, setPsk] = useState<PskKind | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
@@ -48,7 +48,7 @@ export function useClient() {
     }
   }, [pushLog])
 
-  // Chargement initial + abonnement aux événements du backend.
+  // Initial load + subscription to backend events.
   useEffect(() => {
     api.getConfig().then(setConfig).catch((e) => setError(String(e)))
     api.getState().then(setState).catch(() => {})
@@ -69,12 +69,12 @@ export function useClient() {
             upSinceRef.current = null
             setUpSince(null)
             setTelemetry(null)
-            // L'historique repart à zéro : recoller deux sessions produirait une
-            // courbe continue qui n'a jamais existé.
+            // History resets to zero: stitching two sessions together would
+            // produce a continuous curve that never existed.
             setHistory([])
-            // Le PSK PQC ne survit pas à la session : il n'est pas persisté et
-            // se renégocie au montage suivant. Le garder afficherait une
-            // protection qu'aucun tunnel ne porte plus.
+            // The PQC PSK doesn't survive the session: it isn't persisted and
+            // gets renegotiated on the next mount. Keeping it would display a
+            // protection that no tunnel carries anymore.
             setPsk(null)
           }
           break
@@ -99,8 +99,8 @@ export function useClient() {
     const unlistenProfilePath = api.onProfilePath(() => {
       void consumeProfilePath()
     })
-    // Le premier lancement a pu recevoir son argv avant que React installe
-    // l'écouteur. La commande consomme alors le chemin conservé côté Rust.
+    // The first launch may have received its argv before React installs the
+    // listener. The command then consumes the path kept on the Rust side.
     void unlistenProfilePath.then(() => consumeProfilePath())
     return () => {
       unlisten.then((f) => f())
@@ -110,10 +110,10 @@ export function useClient() {
 
   const connect = useCallback(async (name?: string) => {
     setError(null)
-    // Nouvelle session, nouvelle négociation : on repart d'« inconnu ». Le
-    // remettre ici plutôt que sur la transition `connecting` est délibéré — un
-    // handshake périmé en cours de session repasse par `connecting` sans que la
-    // protection posée ait changé.
+    // New session, new negotiation: we start over from "unknown". Resetting
+    // it here rather than on the `connecting` transition is deliberate — a
+    // stale handshake mid-session goes back through `connecting` without the
+    // set protection having changed.
     setPsk(null)
     try {
       await api.connect(name)

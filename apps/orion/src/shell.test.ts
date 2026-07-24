@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { isReloadChord, keepsNativeContextMenu, lockShell, type ShellTarget } from './shell'
 
-/** Double de `window` : retient les écouteurs pour pouvoir les déclencher. */
+/** `window` double: retains listeners so they can be triggered. */
 function fakeTarget() {
   const handlers = new Map<string, (event: Event) => void>()
   const target: ShellTarget = {
@@ -10,7 +10,7 @@ function fakeTarget() {
     removeEventListener: (type) => void handlers.delete(type),
   }
 
-  /** Déclenche un écouteur et dit si l'événement a été annulé. */
+  /** Triggers a listener and says whether the event was prevented. */
   const fire = (type: string, event: Record<string, unknown>): boolean => {
     let prevented = false
     const handler = handlers.get(type)
@@ -22,12 +22,12 @@ function fakeTarget() {
   return { target, fire, installed: () => [...handlers.keys()].sort() }
 }
 
-/** Cible de clic droit : seul `closest` compte pour le verrou. */
+/** Right-click target: only `closest` matters for the lock. */
 const inEditable = { closest: (selector: string) => (selector.includes('input') ? {} : null) }
 const inPage = { closest: () => null }
 
-describe('verrouillage du shell', () => {
-  it('pose puis retire ses deux écouteurs', () => {
+describe('shell lockdown', () => {
+  it('sets then removes its two listeners', () => {
     const { target, installed } = fakeTarget()
     const release = lockShell(target)
     expect(installed()).toEqual(['contextmenu', 'keydown'])
@@ -35,29 +35,29 @@ describe('verrouillage du shell', () => {
     expect(installed()).toEqual([])
   })
 
-  it('supprime le menu contextuel de la page', () => {
+  it('removes the page context menu', () => {
     const { target, fire } = fakeTarget()
     lockShell(target)
 
-    // C'est ce menu-là qui porte « Actualiser ».
+    // This is the menu that carries "Refresh".
     expect(fire('contextmenu', { target: inPage })).toBe(true)
   })
 
-  it('laisse le menu d’édition des champs de saisie', () => {
+  it('leaves the edit menu of input fields', () => {
     const { target, fire } = fakeTarget()
     lockShell(target)
 
-    // Coller une clé WireGuard au clic droit doit rester possible ; WebView2 y
-    // présente couper/copier/coller, pas « Actualiser ».
+    // Pasting a WireGuard key via right-click must stay possible; WebView2
+    // presents cut/copy/paste there, not "Refresh".
     expect(fire('contextmenu', { target: inEditable })).toBe(false)
     expect(keepsNativeContextMenu(inEditable)).toBe(true)
     expect(keepsNativeContextMenu(inPage)).toBe(false)
-    // Une cible sans `closest` (le document, `window`) n'est pas un champ.
+    // A target without `closest` (the document, `window`) is not a field.
     expect(keepsNativeContextMenu(null)).toBe(false)
     expect(keepsNativeContextMenu({})).toBe(false)
   })
 
-  it('bloque les quatre raccourcis de rechargement', () => {
+  it('blocks the four reload shortcuts', () => {
     const { target, fire } = fakeTarget()
     lockShell(target)
 
@@ -68,15 +68,15 @@ describe('verrouillage du shell', () => {
     expect(fire('keydown', { key: 'r', metaKey: true })).toBe(true)
   })
 
-  it('ne touche pas aux frappes ordinaires', () => {
+  it('does not touch ordinary keystrokes', () => {
     const { target, fire } = fakeTarget()
     lockShell(target)
 
-    // Sans ce test, un « r » interdit de saisie passerait inaperçu jusqu'à la
-    // première clé WireGuard à recopier.
+    // Without this test, an "r" forbidden from input would go unnoticed
+    // until the first WireGuard key to copy in.
     expect(fire('keydown', { key: 'r' })).toBe(false)
     expect(fire('keydown', { key: 'R', shiftKey: true })).toBe(false)
-    // Ctrl+C et Ctrl+Z servent tous les deux dans l'IHM.
+    // Ctrl+C and Ctrl+Z are both used in the UI.
     expect(fire('keydown', { key: 'c', ctrlKey: true })).toBe(false)
     expect(fire('keydown', { key: 'z', ctrlKey: true })).toBe(false)
     expect(isReloadChord({ key: 'v', ctrlKey: true })).toBe(false)
