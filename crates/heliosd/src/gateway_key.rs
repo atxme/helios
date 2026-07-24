@@ -1,42 +1,42 @@
-//! Clé privée WireGuard de la gateway : chargement scellé et mise à jour.
+//! Gateway's WireGuard private key: sealed loading and update.
 //!
-//! # Pourquoi la clé ne vit plus dans `network.toml`
+//! # Why the key no longer lives in `network.toml`
 //!
-//! `wg_private_key` est l'**identité cryptographique** de la gateway : c'est
-//! elle qui authentifie chaque handshake WireGuard. En clair sur disque, un
-//! disque volé suffit à usurper la gateway. Elle est donc déplacée dans un
-//! coffre chiffré par le secret scellé dans le TPM ([`helio_tpm::keystore`]) :
-//! la déchiffrer exige un déscellement réussi, donc une chaîne de démarrage
-//! intacte (PCR 0/4/7).
+//! `wg_private_key` is the gateway's **cryptographic identity**: it is what
+//! authenticates every WireGuard handshake. In the clear on disk, a stolen
+//! disk is enough to impersonate the gateway. It is therefore moved into a
+//! vault encrypted by the secret sealed in the TPM ([`helio_tpm::keystore`]):
+//! decrypting it requires a successful unseal, hence an intact boot chain
+//! (PCR 0/4/7).
 //!
-//! # Quelles mises à jour font perdre la clé — et lesquelles ne font rien
+//! # Which updates lose the key — and which do nothing
 //!
-//! Le scellement porte sur **PCR 0/4/7** : firmware, chaîne de démarrage,
-//! Secure Boot. C'est ce qui décide, pas « il y a eu une OTA » :
+//! Sealing is bound to **PCR 0/4/7**: firmware, boot chain, Secure Boot.
+//! That is what decides, not "there was an OTA":
 //!
-//! | Mise à jour | PCR | Clé |
+//! | Update | PCR | Key |
 //! |---|---|---|
-//! | binaire `heliosd` seul (userspace) | inchangés | **survit** |
-//! | kernel / initrd | PCR 4 | perdue |
-//! | bootloader | PCR 4 | perdue |
-//! | firmware UEFI | PCR 0 | perdue |
-//! | clés Secure Boot | PCR 7 | perdue |
+//! | `heliosd` binary alone (userspace) | unchanged | **survives** |
+//! | kernel / initrd | PCR 4 | lost |
+//! | bootloader | PCR 4 | lost |
+//! | UEFI firmware | PCR 0 | lost |
+//! | Secure Boot keys | PCR 7 | lost |
 //!
-//! PCR 4 mesure la chaîne de démarrage, pas les fichiers du rootfs : remplacer
-//! `/usr/bin/heliosd` ne la déplace pas. Le cas « clé perdue » est donc plus
-//! rare qu'il n'y paraît — il ne concerne que les OTA qui embarquent un noyau.
+//! PCR 4 measures the boot chain, not the rootfs files: replacing
+//! `/usr/bin/heliosd` does not move it. The "lost key" case is therefore
+//! rarer than it appears — it only concerns OTAs that ship a kernel.
 //!
-//! # Reprise sans SSH : le séquestre
+//! # Recovery without SSH: escrow
 //!
-//! Quand les PCR changent, le rescellement génère un **nouveau** secret et le
-//! coffre devient indéchiffrable. Le [séquestre](helio_tpm::escrow) couvre ce
-//! cas : une copie de la clé, chiffrée vers la clé publique de l'opérateur, est
-//! écrite à chaque scellement. L'opérateur l'ouvre hors ligne, dépose la clé
-//! dans un fichier de récupération livré **avec le bundle OTA** — même canal
-//! que le billet de rescellement — et la gateway la rescelle au démarrage.
+//! When the PCRs change, resealing generates a **new** secret and the vault
+//! becomes undecipherable. [Escrow](helio_tpm::escrow) covers this case: a
+//! copy of the key, encrypted to the operator's public key, is written on
+//! every sealing. The operator opens it offline, deposits the key into a
+//! recovery file delivered **with the OTA bundle** — the same channel as the
+//! resealing ticket — and the gateway reseals it at startup.
 //!
-//! Sans séquestre configuré (`escrow_public_key` absente), la clé est
-//! définitivement perdue dans ce cas et la reprise redevient manuelle.
+//! Without escrow configured (`escrow_public_key` absent), the key is
+//! permanently lost in this case and recovery becomes manual again.
 
 use std::path::PathBuf;
 
@@ -44,38 +44,39 @@ use aether::NetworkConfig;
 use helio_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
 use tracing::{info, warn};
 
-/// Emplacement du coffre contenant la clé privée WireGuard.
+/// Location of the vault containing the WireGuard private key.
 const KEYSTORE_PATH: &str = "/var/lib/helios/wg-key.sealed";
 
-/// Séquestre : copie de la clé chiffrée vers la clé publique de l'opérateur.
+/// Escrow: copy of the key encrypted to the operator's public key.
 ///
-/// Réécrit à chaque scellement. L'opérateur le récupère et le conserve ; lui
-/// seul peut l'ouvrir. La gateway, elle, en est incapable — c'est le principe.
+/// Rewritten on every sealing. The operator retrieves it and keeps it; only
+/// they can open it. The gateway itself is unable to — that is the point.
 const ESCROW_PATH: &str = "/var/lib/helios/wg-key.escrow";
 
-/// Fichier de récupération, livré par l'opérateur avec le bundle OTA — même
-/// canal que le billet de rescellement, donc **aucun SSH requis**.
+/// Recovery file, delivered by the operator with the OTA bundle — the same
+/// channel as the resealing ticket, hence **no SSH required**.
 ///
-/// Contient la clé privée WireGuard en base64. Consommé **une seule fois**, et
-/// uniquement si le coffre est réellement indéchiffrable ; effacé aussitôt.
+/// Contains the WireGuard private key in base64. Consumed **only once**, and
+/// only if the vault is actually undecipherable; erased immediately after.
 const RECOVERY_PATH: &str = "/var/lib/helios/wg-key.recovery";
 
-/// Origine de la clé effectivement utilisée — sert à alerter l'opérateur.
+/// Origin of the key actually in use — used to alert the operator.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyOrigin {
-    /// Chargée depuis le coffre TPM. Cas nominal.
+    /// Loaded from the TPM vault. Nominal case.
     Sealed,
-    /// Lue en clair dans `network.toml`. **Dégradé** : à sceller au plus vite.
+    /// Read in the clear from `network.toml`. **Degraded**: to be sealed as
+    /// soon as possible.
     PlaintextConfig,
-    /// Restaurée depuis le séquestre après un changement de PCR.
+    /// Restored from escrow after a PCR change.
     Recovered,
-    /// Aucune clé exploitable : la gateway ne peut pas monter son interface.
+    /// No usable key: the gateway cannot bring up its interface.
     Missing,
 }
 
-/// Clé résolue au démarrage.
+/// Key resolved at startup.
 pub struct ResolvedKey {
-    /// Clé privée en base64, prête pour le plan de données. Vide si `Missing`.
+    /// Private key in base64, ready for the data plane. Empty if `Missing`.
     pub private_key: String,
     pub origin: KeyOrigin,
 }
@@ -84,19 +85,19 @@ fn keystore() -> SealedKeystore {
     SealedKeystore::new(PathBuf::from(KEYSTORE_PATH))
 }
 
-/// Écrit le séquestre de `private_key` vers la clé publique de l'opérateur.
+/// Writes the escrow of `private_key` to the operator's public key.
 ///
-/// Sans erreur fatale : un séquestre absent n'empêche pas la gateway de
-/// fonctionner, il prive seulement d'un moyen de reprise. On le signale
-/// bruyamment plutôt que d'échouer au démarrage.
+/// No fatal error: a missing escrow does not prevent the gateway from
+/// working, it only removes a recovery option. It is reported loudly rather
+/// than failing at startup.
 fn write_escrow(network: &NetworkConfig, private_key: &str) {
     use base64::Engine as _;
 
     let Some(pubkey_b64) = network.escrow_public_key.as_deref().map(str::trim) else {
         warn!(
-            "aucune clé publique de séquestre configurée (`escrow_public_key`) — \
-             en cas de changement de PCR (kernel, bootloader, firmware), l'identité \
-             de la gateway sera définitivement perdue"
+            "no escrow public key configured (`escrow_public_key`) — \
+             in case of a PCR change (kernel, bootloader, firmware), the \
+             gateway's identity will be permanently lost"
         );
         return;
     };
@@ -107,7 +108,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
     let pubkey = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64) {
         Ok(k) => k,
         Err(e) => {
-            warn!("clé publique de séquestre illisible ({e}) — séquestre non écrit");
+            warn!("unreadable escrow public key ({e}) — escrow not written");
             return;
         }
     };
@@ -115,20 +116,20 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
     match helio_tpm::escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
         Ok(blob) => match write_atomic(ESCROW_PATH, &blob) {
             Ok(()) => info!(
-                "séquestre de la clé WireGuard écrit dans {ESCROW_PATH} — \
-                 le récupérer et le conserver hors de la gateway"
+                "WireGuard key escrow written to {ESCROW_PATH} — \
+                 retrieve it and keep it off the gateway"
             ),
-            Err(e) => warn!("écriture du séquestre impossible : {e}"),
+            Err(e) => warn!("could not write escrow: {e}"),
         },
-        Err(e) => warn!("scellement du séquestre impossible : {e}"),
+        Err(e) => warn!("could not seal escrow: {e}"),
     }
 }
 
-/// Tente une reprise depuis le fichier de récupération laissé par l'opérateur.
+/// Attempts recovery from the recovery file left by the operator.
 ///
-/// N'est appelée **que** lorsque le coffre est indéchiffrable : hors de ce cas,
-/// un fichier de récupération traînant ne doit jamais pouvoir remplacer la clé
-/// en vigueur — ce serait un vecteur de substitution d'identité.
+/// Only called when the vault is undecipherable: outside of that case, a
+/// stray recovery file must never be able to replace the key in effect —
+/// that would be an identity substitution vector.
 fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
     let path = PathBuf::from(RECOVERY_PATH);
     if !path.exists() {
@@ -138,34 +139,34 @@ fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            warn!("fichier de récupération illisible : {e}");
+            warn!("unreadable recovery file: {e}");
             return None;
         }
     };
     let key = raw.trim().to_string();
 
     if let Err(e) = validate_wg_key(&key) {
-        warn!("fichier de récupération invalide ({e}) — ignoré, non consommé");
+        warn!("invalid recovery file ({e}) — ignored, not consumed");
         return None;
     }
 
-    // Rescelle immédiatement sous le nouveau secret TPM.
+    // Reseals immediately under the new TPM secret.
     if let Err(e) = keystore().store(secret, key.as_bytes()) {
-        warn!("rescellement de la clé récupérée impossible : {e}");
+        warn!("could not reseal the recovered key: {e}");
         return None;
     }
 
-    // Puis efface : la clé ne doit pas rester en clair sur disque plus longtemps
-    // que ce démarrage. L'échec de suppression est une anomalie à signaler fort.
+    // Then erases: the key must not stay in the clear on disk longer than
+    // this startup. A deletion failure is an anomaly to report loudly.
     match std::fs::remove_file(&path) {
-        Ok(()) => info!("fichier de récupération consommé et effacé"),
+        Ok(()) => info!("recovery file consumed and erased"),
         Err(e) => warn!(
-            "ÉCHEC DE L'EFFACEMENT de {RECOVERY_PATH} ({e}) — la clé privée reste \
-             EN CLAIR sur disque, la supprimer manuellement sans délai"
+            "FAILED TO ERASE {RECOVERY_PATH} ({e}) — the private key remains \
+             IN THE CLEAR on disk, delete it manually without delay"
         ),
     }
 
-    warn!("identité WireGuard restaurée depuis le séquestre et rescellée");
+    warn!("WireGuard identity restored from escrow and resealed");
     Some(key)
 }
 
@@ -179,50 +180,52 @@ fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-/// Résout la clé privée WireGuard au démarrage.
+/// Resolves the WireGuard private key at startup.
 ///
-/// Ordre de priorité :
-/// 1. le coffre scellé (nominal) ;
-/// 2. la clé en clair de `network.toml`, **avec avertissement** — et on la scelle
-///    immédiatement pour que le passage au mode protégé soit automatique ;
-/// 3. rien : la gateway démarre en fail-closed sans monter d'interface.
+/// Priority order:
+/// 1. the sealed vault (nominal);
+/// 2. the plaintext key from `network.toml`, **with a warning** — and it is
+///    sealed immediately so the switch to protected mode is automatic;
+/// 3. nothing: the gateway starts fail-closed without bringing up an
+///    interface.
 pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
     let store = keystore();
     let secret = boot.secret();
 
-    // 1. Coffre scellé.
+    // 1. Sealed vault.
     if store.exists() {
         match secret {
             None => {
-                // TPM désactivé ou contourné : on ne peut pas ouvrir le coffre.
+                // TPM disabled or bypassed: the vault cannot be opened.
                 warn!(
-                    "coffre de clé présent mais aucun secret TPM disponible \
-                     (tpm.enabled=false ou enforce=false) — clé inaccessible"
+                    "key vault present but no TPM secret available \
+                     (tpm.enabled=false or enforce=false) — key inaccessible"
                 );
             }
             Some(secret) => match store.load(secret) {
                 Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
                     Ok(key) => {
-                        info!("clé WireGuard chargée depuis le coffre scellé TPM");
+                        info!("WireGuard key loaded from the sealed TPM vault");
                         let key = key.trim().to_string();
-                        // Le séquestre suit la clé : si la configuration d'escrow
-                        // vient d'être ajoutée, il est créé dès ce démarrage.
+                        // Escrow follows the key: if the escrow configuration
+                        // was just added, it is created on this very startup.
                         write_escrow(network, &key);
                         return ResolvedKey {
                             private_key: key,
                             origin: KeyOrigin::Sealed,
                         };
                     }
-                    Err(_) => warn!("contenu du coffre illisible (encodage)"),
+                    Err(_) => warn!("unreadable vault content (encoding)"),
                 },
                 Err(TpmError::Keystore(KeystoreError::Undecipherable)) => {
-                    // Les PCR ont bougé (kernel, bootloader ou firmware) : le
-                    // secret a été régénéré et l'ancien coffre est perdu. C'est
-                    // exactement le cas que le séquestre existe pour couvrir.
+                    // The PCRs have moved (new kernel, bootloader or
+                    // firmware): the secret has been regenerated and the old
+                    // vault is lost. This is exactly the case escrow exists
+                    // to cover.
                     warn!(
-                        "COFFRE INDÉCHIFFRABLE — les PCR ont changé (nouveau kernel, \
-                         bootloader ou firmware) et le secret TPM a été régénéré. \
-                         Recherche d'un fichier de récupération…"
+                        "UNDECIPHERABLE VAULT — the PCRs have changed (new kernel, \
+                         bootloader or firmware) and the TPM secret has been \
+                         regenerated. Looking for a recovery file…"
                     );
                     if let Some(key) = try_recovery(secret) {
                         write_escrow(network, &key);
@@ -232,36 +235,36 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                         };
                     }
                     warn!(
-                        "aucun fichier de récupération exploitable dans {RECOVERY_PATH}. \
-                         Ouvrir le séquestre {ESCROW_PATH} avec la clé privée d'opérateur, \
-                         déposer la clé retrouvée dans ce fichier (livré avec le bundle OTA, \
-                         comme le billet de rescellement) et redémarrer."
+                        "no usable recovery file in {RECOVERY_PATH}. Open the escrow \
+                         {ESCROW_PATH} with the operator's private key, deposit the \
+                         recovered key into this file (delivered with the OTA bundle, \
+                         like the resealing ticket) and restart."
                     );
                 }
-                Err(e) => warn!("lecture du coffre impossible : {e}"),
+                Err(e) => warn!("could not read the vault: {e}"),
             },
         }
     }
 
-    // 2. Repli sur la clé en clair de la config — mode dégradé.
+    // 2. Fall back to the plaintext key from the config — degraded mode.
     let plain = network.wg_private_key.trim();
     if !plain.is_empty() {
         warn!(
-            "clé WireGuard lue EN CLAIR dans network.toml — un disque volé suffit \
-             à usurper la gateway. Scellement automatique dans le coffre TPM…"
+            "WireGuard key read IN THE CLEAR from network.toml — a stolen disk is \
+             enough to impersonate the gateway. Automatic sealing into the TPM vault…"
         );
         if let Some(secret) = secret {
             match store.store(secret, plain.as_bytes()) {
                 Ok(()) => {
                     info!(
-                        "clé scellée dans {KEYSTORE_PATH} — retirer `wg_private_key` de network.toml"
+                        "key sealed into {KEYSTORE_PATH} — remove `wg_private_key` from network.toml"
                     );
                     write_escrow(network, plain);
                 }
-                Err(e) => warn!("scellement automatique impossible : {e}"),
+                Err(e) => warn!("automatic sealing failed: {e}"),
             }
         } else {
-            warn!("aucun secret TPM disponible : la clé reste en clair");
+            warn!("no TPM secret available: the key stays in the clear");
         }
         return ResolvedKey {
             private_key: plain.to_string(),
@@ -269,26 +272,26 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
         };
     }
 
-    // 3. Rien d'exploitable.
+    // 3. Nothing usable.
     ResolvedKey {
         private_key: String::new(),
         origin: KeyOrigin::Missing,
     }
 }
 
-/// Crée l'identité WireGuard de la gateway, la scelle, et renvoie sa clé
-/// **publique** — la seule moitié destinée à sortir d'ici.
+/// Creates the gateway's WireGuard identity, seals it, and returns its
+/// **public** key — the only half meant to leave here.
 ///
-/// C'est le chemin de premier provisionnement (ADR-004 §3). Il est
-/// nécessairement **local** : `POST /api/gateway/wireguard-key` vit derrière
-/// `admin_iface`, donc derrière un tunnel qui suppose déjà une identité de
-/// gateway et un pair administrateur admis. Cette route est un chemin de
-/// rotation, pas de bootstrap.
+/// This is the first-provisioning path (ADR-004 §3). It is necessarily
+/// **local**: `POST /api/gateway/wireguard-key` lives behind `admin_iface`,
+/// hence behind a tunnel that already assumes a gateway identity and an
+/// admitted administrator peer. This route is a rotation path, not a
+/// bootstrap one.
 ///
-/// La clé privée n'est jamais écrite en clair : elle est générée en mémoire et
-/// scellée directement. `rotate` autorise le remplacement d'une identité
-/// existante — une opération lourde, puisque tous les clients devront mettre à
-/// jour leur `peer_public_key`.
+/// The private key is never written in the clear: it is generated in memory
+/// and sealed directly. `rotate` authorizes replacing an existing identity —
+/// a heavy operation, since all clients will need to update their
+/// `peer_public_key`.
 pub fn initialize(
     network: &NetworkConfig,
     boot: &BootDecision,
@@ -298,51 +301,52 @@ pub fn initialize(
     reject_overwrite(store.exists(), rotate)?;
 
     let secret = boot.secret().ok_or_else(|| {
-        "aucun secret TPM disponible : impossible de sceller une identité. Provisionner le \
-         coffre d'abord (`heliosd provision-tpm`), ou compiler avec --features tpm sur la cible."
+        "no TPM secret available: cannot seal an identity. Provision the vault \
+         first (`heliosd provision-tpm`), or build with --features tpm on the target."
             .to_string()
     })?;
 
     let keypair = aether::wg::generate_keypair().map_err(|e| e.to_string())?;
     store
         .store(secret, keypair.private_key.expose().as_bytes())
-        .map_err(|e| format!("scellement de l'identité impossible : {e}"))?;
+        .map_err(|e| format!("could not seal the identity: {e}"))?;
     write_escrow(network, keypair.private_key.expose());
 
     if rotate {
         warn!(
-            "identité WireGuard régénérée — tous les clients doivent mettre à jour \
-             `peer_public_key` avant de pouvoir se reconnecter"
+            "WireGuard identity regenerated — all clients must update \
+             `peer_public_key` before they can reconnect"
         );
     } else {
-        info!("identité WireGuard créée et scellée dans {KEYSTORE_PATH}");
+        info!("WireGuard identity created and sealed into {KEYSTORE_PATH}");
     }
     Ok(keypair.public_key)
 }
 
-/// Refuse d'écraser une identité déjà scellée si la rotation n'est pas demandée.
+/// Refuses to overwrite an already-sealed identity unless rotation is
+/// requested.
 ///
-/// Isolé du système de fichiers pour que la règle soit vérifiable sans TPM :
-/// c'est elle qui protège de la perte d'identité, pas le chemin du coffre.
+/// Isolated from the filesystem so the rule is verifiable without a TPM: it
+/// is this rule that protects against identity loss, not the vault path.
 fn reject_overwrite(exists: bool, rotate: bool) -> Result<(), String> {
     if exists && !rotate {
         return Err(format!(
-            "une identité est déjà scellée dans {KEYSTORE_PATH} — l'écraser ferait perdre \
-             l'identité de la gateway et couperait tous les clients. Utiliser --rotate pour \
-             l'assumer explicitement."
+            "an identity is already sealed in {KEYSTORE_PATH} — overwriting it would lose \
+             the gateway's identity and cut off all clients. Use --rotate to \
+             explicitly accept that."
         ));
     }
     Ok(())
 }
 
-/// Remplace la clé privée WireGuard et la scelle.
+/// Replaces the WireGuard private key and seals it.
 ///
-/// Appelé par l'API (`POST /api/gateway/wireguard-key`), donc **uniquement à
-/// travers le tunnel** : le pare-feu restreint l'API à `admin_iface`.
+/// Called by the API (`POST /api/gateway/wireguard-key`), hence **only
+/// through the tunnel**: the firewall restricts the API to `admin_iface`.
 ///
-/// Changer cette clé change l'identité de la gateway : **tous les clients
-/// devront mettre à jour leur `peer_public_key`**. C'est une rotation, pas une
-/// opération anodine — d'où la validation stricte en amont.
+/// Changing this key changes the gateway's identity: **all clients will
+/// have to update their `peer_public_key`**. This is a rotation, not a
+/// trivial operation — hence the strict upfront validation.
 pub fn update_sealed(
     network: &NetworkConfig,
     boot: &BootDecision,
@@ -353,27 +357,28 @@ pub fn update_sealed(
 
     let secret = boot
         .secret()
-        .ok_or_else(|| "aucun secret TPM disponible : impossible de sceller".to_string())?;
+        .ok_or_else(|| "no TPM secret available: cannot seal".to_string())?;
 
     keystore()
         .store(secret, key.as_bytes())
-        .map_err(|e| format!("scellement de la nouvelle clé impossible : {e}"))?;
+        .map_err(|e| format!("could not seal the new key: {e}"))?;
 
-    // Le séquestre doit suivre la nouvelle clé : sinon une reprise post-OTA
-    // restaurerait l'ancienne identité, que plus aucun client n'attend.
+    // Escrow must follow the new key: otherwise a post-OTA recovery would
+    // restore the old identity, which no client expects anymore.
     write_escrow(network, key);
 
     warn!(
-        "clé privée WireGuard remplacée et rescellée — l'identité de la gateway a \
-         changé, tous les clients doivent mettre à jour `peer_public_key`"
+        "WireGuard private key replaced and resealed — the gateway's identity has \
+         changed, all clients must update `peer_public_key`"
     );
     Ok(())
 }
 
-/// Valide qu'une chaîne est bien une clé Curve25519 base64 de 32 octets.
+/// Validates that a string is indeed a 32-byte base64 Curve25519 key.
 ///
-/// On refuse **avant** d'écrire : sceller une clé invalide rendrait la gateway
-/// incapable de monter son interface, sans moyen de la joindre pour corriger.
+/// Refused **before** writing: sealing an invalid key would leave the
+/// gateway unable to bring up its interface, with no way to reach it to fix
+/// it.
 pub fn validate_wg_key(key: &str) -> Result<(), String> {
     aether::wg::validate_key(key).map_err(|e| e.to_string())
 }
@@ -385,27 +390,27 @@ mod tests {
     const VALID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
     #[test]
-    fn validation_de_la_cle() {
+    fn key_validation() {
         assert!(validate_wg_key(VALID).is_ok());
-        assert!(validate_wg_key("pas-du-base64").is_err());
-        assert!(validate_wg_key("AAAA").is_err(), "longueur invalide");
+        assert!(validate_wg_key("not-base64").is_err());
+        assert!(validate_wg_key("AAAA").is_err(), "invalid length");
         assert!(validate_wg_key("").is_err());
     }
 
-    /// Sans coffre ni clé en config, la gateway doit le dire clairement plutôt
-    /// que de démarrer avec une identité vide.
+    /// Without a vault or a key in the config, the gateway must say so
+    /// clearly rather than starting with an empty identity.
     #[test]
-    fn absence_totale_de_cle_signalee() {
+    fn total_absence_of_key_is_reported() {
         let network = NetworkConfig::default();
         let resolved = resolve(&network, &BootDecision::Disabled);
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
     }
 
-    /// TPM désactivé + clé en clair : on fonctionne, mais en signalant le mode
-    /// dégradé (le scellement automatique est impossible sans secret).
+    /// TPM disabled + plaintext key: it works, but reports the degraded mode
+    /// (automatic sealing is impossible without a secret).
     #[test]
-    fn cle_en_clair_utilisee_mais_signalee_degradee() {
+    fn plaintext_key_used_but_reported_degraded() {
         let network = NetworkConfig {
             wg_private_key: VALID.into(),
             ..NetworkConfig::default()
@@ -415,36 +420,36 @@ mod tests {
         assert_eq!(resolved.private_key, VALID);
     }
 
-    /// Sans secret TPM, on refuse de sceller plutôt que d'échouer en silence.
+    /// Without a TPM secret, sealing is refused rather than silently failing.
     #[test]
-    fn mise_a_jour_refusee_sans_secret_tpm() {
+    fn update_refused_without_tpm_secret() {
         assert!(update_sealed(&NetworkConfig::default(), &BootDecision::Disabled, VALID).is_err());
     }
 
-    /// Sans secret TPM, il n'y a pas de scellement possible : on refuse plutôt
-    /// que de créer une identité qui finirait en clair quelque part.
+    /// Without a TPM secret, no sealing is possible: refuse rather than
+    /// create an identity that would end up in the clear somewhere.
     #[test]
-    fn initialisation_refusee_sans_secret_tpm() {
-        let erreur = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
-            .expect_err("sans secret TPM, l'initialisation doit échouer");
-        assert!(erreur.contains("provision-tpm"), "message : {erreur}");
+    fn initialization_refused_without_tpm_secret() {
+        let error = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
+            .expect_err("without a TPM secret, initialization must fail");
+        assert!(error.contains("provision-tpm"), "message: {error}");
     }
 
-    /// Écraser une identité scellée coupe tout le parc : ça ne peut pas être le
-    /// comportement par défaut d'une commande d'initialisation.
+    /// Overwriting a sealed identity cuts off the whole fleet: that cannot
+    /// be the default behavior of an initialization command.
     #[test]
-    fn initialisation_refuse_d_ecraser_sans_rotation_explicite() {
+    fn initialization_refuses_to_overwrite_without_explicit_rotation() {
         assert!(reject_overwrite(true, false).is_err());
-        assert!(reject_overwrite(true, true).is_ok(), "--rotate assume");
-        assert!(reject_overwrite(false, false).is_ok(), "premier boot");
+        assert!(reject_overwrite(true, true).is_ok(), "--rotate accepts it");
+        assert!(reject_overwrite(false, false).is_ok(), "first boot");
     }
 
     #[test]
-    fn mise_a_jour_refuse_une_cle_invalide() {
+    fn update_refuses_an_invalid_key() {
         assert!(update_sealed(
             &NetworkConfig::default(),
             &BootDecision::Disabled,
-            "pas-une-cle"
+            "not-a-key"
         )
         .is_err());
     }

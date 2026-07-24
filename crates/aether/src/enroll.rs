@@ -1,112 +1,113 @@
-//! Protocole de provisioning : messages et dérivation du PSK post-quantique.
+//! Provisioning protocol: messages and derivation of the post-quantum PSK.
 //!
-//! Ce module est **partagé** par les deux bouts, comme [`crate::pq`] : la
-//! gateway (`helios-provisioning`) et le client (`orion-core`) doivent parler le
-//! même format et dériver **le même** PSK. Le placer d'un seul côté forcerait
-//! l'autre à dépendre d'un crate qui ne le concerne pas.
+//! This module is **shared** by both ends, like [`crate::pq`]: the gateway
+//! (`helios-provisioning`) and the client (`orion-core`) must speak the same
+//! format and derive **the same** PSK. Placing it on only one side would
+//! force the other to depend on a crate that does not concern it.
 //!
-//! # Portée : provisioning, pas admission
+//! # Scope: provisioning, not admission
 //!
-//! Ce protocole ne fait **pas** entrer un client inconnu. WireGuard est fondé
-//! sur Noise_IK : le répondeur rejette un initiateur dont il ne connaît pas la
-//! clé publique statique. Un client jamais déclaré ne peut donc pas monter le
-//! tunnel — et ce protocole vit *à l'intérieur* du tunnel.
+//! This protocol does **not** let in an unknown client. WireGuard is built
+//! on Noise_IK: the responder rejects an initiator whose static public key
+//! it does not know. A client that was never declared therefore cannot
+//! bring up the tunnel — and this protocol lives *inside* the tunnel.
 //!
-//! L'enrôlement se scinde en deux :
+//! Enrollment splits into two:
 //!
-//! * **Admission** (premier contact) — nécessairement **hors bande** : un
-//!   opérateur déclare la clé publique du client. Sa VIP en est dérivée
-//!   déterministement (`helios-provisioning::ipam`).
-//! * **Provisioning** (ce module) — dans le tunnel, automatisé : échange
-//!   ML-KEM, dérivation du PSK, confirmation de la VIP, rotation.
+//! * **Admission** (first contact) — necessarily **out-of-band**: an
+//!   operator declares the client's public key. Its VIP is derived
+//!   deterministically from it (`helios-provisioning::ipam`).
+//! * **Provisioning** (this module) — inside the tunnel, automated: ML-KEM
+//!   exchange, PSK derivation, VIP confirmation, rotation.
 //!
-//! # Cinématique (ADR-001)
+//! # Sequence (ADR-001)
 //!
 //! ```text
-//! 1. Tunnel WireGuard classique monté (Curve25519), état Connecting,
-//!    kill-switch engagé — aucun trafic utilisateur.
-//! 2. Canal de contrôle DANS le tunnel :
-//!      client  -> ProvisionRequest  { clé publique ML-KEM éphémère, nonce }
-//!      gateway -> ProvisionResponse { ciphertext ML-KEM, nonce, VIP }
-//!    Les deux dérivent le même PSK.
-//! 3. PSK installé des deux côtés -> le handshake suivant réussit -> Up.
+//! 1. Classic WireGuard tunnel established (Curve25519), Connecting state,
+//!    kill-switch engaged — no user traffic.
+//! 2. Control channel INSIDE the tunnel:
+//!      client  -> ProvisionRequest  { ephemeral ML-KEM public key, nonce }
+//!      gateway -> ProvisionResponse { ML-KEM ciphertext, nonce, VIP }
+//!    Both derive the same PSK.
+//! 3. PSK installed on both sides -> the next handshake succeeds -> Up.
 //! ```
 //!
-//! C'est le **client** qui génère la paire ML-KEM et la **gateway** qui
-//! encapsule : le secret est ainsi frais à chaque session et sa fraîcheur est
-//! contrôlée par la gateway, pas par un client potentiellement compromis.
+//! It is the **client** that generates the ML-KEM key pair and the
+//! **gateway** that encapsulates: the secret is thus fresh for every session
+//! and its freshness is controlled by the gateway, not by a potentially
+//! compromised client.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::pq::SharedSecret;
 
-/// Version du protocole. Un client et une gateway de versions différentes
-/// doivent se refuser explicitement plutôt que de négocier à l'aveugle.
+/// Protocol version. A client and a gateway on different versions must
+/// explicitly refuse rather than negotiate blindly.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Séparateur de domaine du KDF. Changer cette valeur invalide tous les PSK
-/// dérivés : elle fait partie du contrat cryptographique.
+/// KDF domain separator. Changing this value invalidates every derived PSK:
+/// it is part of the cryptographic contract.
 const PSK_DOMAIN: &[u8] = b"helios-provisioning-psk-v1";
 
-/// Longueur des nonces de session, en octets.
+/// Length of session nonces, in bytes.
 pub const NONCE_LEN: usize = 16;
 
-/// PSK WireGuard dérivé, 32 octets, effacé à la destruction.
+/// Derived WireGuard PSK, 32 bytes, wiped on drop.
 pub type Psk = Zeroizing<[u8; 32]>;
 
-/// Erreurs du protocole de provisioning.
+/// Provisioning protocol errors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EnrollError {
-    #[error("version de protocole incompatible : client {client}, gateway {gateway}")]
+    #[error("incompatible protocol version: client {client}, gateway {gateway}")]
     VersionMismatch { client: u16, gateway: u16 },
-    #[error("clé publique ML-KEM de longueur invalide : {0} au lieu de {expected}", expected = crate::pq::PUBLIC_KEY_LEN)]
+    #[error("ML-KEM public key of invalid length: {0} instead of {expected}", expected = crate::pq::PUBLIC_KEY_LEN)]
     BadKemPublicKey(usize),
-    #[error("ciphertext ML-KEM de longueur invalide : {0} au lieu de {expected}", expected = crate::pq::CIPHERTEXT_LEN)]
+    #[error("ML-KEM ciphertext of invalid length: {0} instead of {expected}", expected = crate::pq::CIPHERTEXT_LEN)]
     BadKemCiphertext(usize),
-    #[error("clé publique WireGuard du client absente ou vide")]
+    #[error("client WireGuard public key missing or empty")]
     MissingClientKey,
-    #[error("pair inconnu : admission hors bande non effectuée")]
+    #[error("unknown peer: out-of-band admission not performed")]
     UnknownPeer,
-    #[error("dérivation du PSK impossible")]
+    #[error("PSK derivation failed")]
     Kdf,
 }
 
-/// Demande de provisioning, émise par le client **dans** le tunnel.
+/// Provisioning request, emitted by the client **inside** the tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisionRequest {
     pub protocol_version: u16,
-    /// Clé publique WireGuard du client (base64) — son identité, déjà connue de
-    /// la gateway via l'admission hors bande.
+    /// Client's WireGuard public key (base64) — its identity, already known
+    /// to the gateway via out-of-band admission.
     pub client_wg_public_key: String,
-    /// Clé publique ML-KEM **éphémère**, générée pour cette session.
+    /// **Ephemeral** ML-KEM public key, generated for this session.
     pub kem_public_key: Vec<u8>,
-    /// Aléa du client. Contribue au sel du KDF pour qu'aucun des deux bouts ne
-    /// contrôle seul la dérivation.
+    /// Client-side randomness. Contributes to the KDF salt so that neither
+    /// end alone controls the derivation.
     pub client_nonce: [u8; NONCE_LEN],
 }
 
-/// Réponse de la gateway.
+/// Gateway response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisionResponse {
     pub protocol_version: u16,
-    /// Encapsulation ML-KEM vers la clé publique éphémère du client.
+    /// ML-KEM encapsulation towards the client's ephemeral public key.
     pub kem_ciphertext: Vec<u8>,
-    /// Aléa de la gateway.
+    /// Gateway-side randomness.
     pub gateway_nonce: [u8; NONCE_LEN],
-    /// VIP attribuée au client, en notation CIDR (ex. `100.64.1.2/32`).
-    /// Dérivée de sa clé publique WireGuard, donc stable sans état disque.
+    /// VIP assigned to the client, in CIDR notation (e.g. `100.64.1.2/32`).
+    /// Derived from its WireGuard public key, hence stable without disk state.
     pub assigned_address: String,
-    /// Clé publique WireGuard de la gateway (base64), pour que le client
-    /// complète son profil sans configuration manuelle.
+    /// Gateway's WireGuard public key (base64), so the client can complete
+    /// its profile without manual configuration.
     pub gateway_wg_public_key: String,
-    /// Durée de validité du PSK, en secondes. Passé ce délai, le client doit
-    /// relancer un provisioning.
+    /// PSK validity duration, in seconds. Past this delay, the client must
+    /// restart a provisioning.
     pub psk_lifetime_secs: u32,
 }
 
 impl ProvisionRequest {
-    /// Validation structurelle, avant toute opération cryptographique.
+    /// Structural validation, before any cryptographic operation.
     pub fn validate(&self) -> Result<(), EnrollError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(EnrollError::VersionMismatch {
@@ -139,22 +140,22 @@ impl ProvisionResponse {
     }
 }
 
-/// Dérive le PSK WireGuard à partir du secret ML-KEM.
+/// Derives the WireGuard PSK from the ML-KEM secret.
 ///
-/// Le secret ML-KEM fait déjà 32 octets uniformes, exactement la taille du slot
-/// PSK : on pourrait l'utiliser brut. On passe malgré tout par un HKDF pour
-/// **lier** le PSK à son contexte :
+/// The ML-KEM secret is already 32 uniform bytes, exactly the size of the
+/// PSK slot: it could be used raw. We still go through an HKDF to **bind**
+/// the PSK to its context:
 ///
-/// * les deux nonces — le même secret ne peut pas être rejoué dans une autre
-///   session, et aucun des deux bouts ne contrôle seul le sel ;
-/// * les deux identités WireGuard — un PSK dérivé pour un couple
-///   (client, gateway) ne vaut pas pour un autre ;
-/// * un séparateur de domaine versionné — le secret ne peut pas être détourné
-///   vers un autre usage cryptographique du projet.
+/// * both nonces — the same secret cannot be replayed in another session,
+///   and neither end alone controls the salt;
+/// * both WireGuard identities — a PSK derived for a (client, gateway) pair
+///   is not valid for another;
+/// * a versioned domain separator — the secret cannot be diverted towards
+///   another cryptographic use in the project.
 ///
-/// L'ordre de concaténation est fixe (client puis gateway) : les deux bouts
-/// **doivent** l'appliquer identiquement, sinon les PSK divergent et le
-/// handshake échoue silencieusement.
+/// The concatenation order is fixed (client then gateway): both ends
+/// **must** apply it identically, otherwise the PSKs diverge and the
+/// handshake fails silently.
 pub fn derive_psk(
     kem_secret: &SharedSecret,
     client_nonce: &[u8; NONCE_LEN],
@@ -164,7 +165,7 @@ pub fn derive_psk(
 ) -> Result<Psk, EnrollError> {
     use aws_lc_rs::hkdf;
 
-    // Sel : contribution des deux bouts, ordre fixe.
+    // Salt: contribution from both ends, fixed order.
     let mut salt_bytes = Vec::with_capacity(NONCE_LEN * 2);
     salt_bytes.extend_from_slice(client_nonce);
     salt_bytes.extend_from_slice(gateway_nonce);
@@ -172,15 +173,15 @@ pub fn derive_psk(
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt_bytes);
     let prk = salt.extract(kem_secret.as_slice());
 
-    // `info` : domaine + identités, longueurs préfixées pour qu'aucune
-    // concaténation ambiguë ne puisse produire deux contextes identiques.
+    // `info`: domain + identities, length-prefixed so that no ambiguous
+    // concatenation can produce two identical contexts.
     let client_id = client_wg_public_key.as_bytes();
     let gateway_id = gateway_wg_public_key.as_bytes();
     let client_len = (client_id.len() as u16).to_be_bytes();
     let gateway_len = (gateway_id.len() as u16).to_be_bytes();
     let info: [&[u8]; 5] = [PSK_DOMAIN, &client_len, client_id, &gateway_len, gateway_id];
 
-    // `HKDF_SHA256` comme `KeyType` produit exactement 32 octets.
+    // `HKDF_SHA256` as `KeyType` produces exactly 32 bytes.
     let okm = prk
         .expand(&info, hkdf::HKDF_SHA256)
         .map_err(|_| EnrollError::Kdf)?;
@@ -189,7 +190,7 @@ pub fn derive_psk(
     Ok(psk)
 }
 
-/// Encode un PSK en base64, format attendu par WireGuard.
+/// Encodes a PSK in base64, the format expected by WireGuard.
 pub fn psk_to_base64(psk: &Psk) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(psk.as_slice())
@@ -214,22 +215,22 @@ mod tests {
     }
 
     #[test]
-    fn derivation_deterministe_pour_les_deux_bouts() {
-        // Le client et la gateway calculent séparément : ils doivent converger.
+    fn derivation_is_deterministic_for_both_ends() {
+        // The client and the gateway compute separately: they must converge.
         let a = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
         let b = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
         assert_eq!(*a, *b);
     }
 
     #[test]
-    fn le_psk_depend_de_chaque_nonce() {
+    fn the_psk_depends_on_each_nonce() {
         let base = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
-        // Changer le nonce du client suffit.
+        // Changing the client's nonce is enough.
         assert_ne!(
             *base,
             *psk_for(&secret(7), [9; 16], [2; 16], "client", "gateway")
         );
-        // Celui de la gateway aussi : aucun des deux ne contrôle seul le sel.
+        // So is the gateway's: neither controls the salt alone.
         assert_ne!(
             *base,
             *psk_for(&secret(7), [1; 16], [9; 16], "client", "gateway")
@@ -237,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn le_psk_est_lie_aux_deux_identites() {
+    fn the_psk_is_bound_to_both_identities() {
         let base = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
         assert_ne!(
             *base,
@@ -249,32 +250,32 @@ mod tests {
         );
     }
 
-    /// Sans préfixe de longueur, ("ab","c") et ("a","bc") donneraient le même
-    /// `info` — deux contextes distincts partageraient un PSK.
+    /// Without a length prefix, ("ab","c") and ("a","bc") would give the same
+    /// `info` — two distinct contexts would share a PSK.
     #[test]
-    fn pas_de_collision_par_concatenation_ambigue() {
+    fn no_collision_from_ambiguous_concatenation() {
         let a = psk_for(&secret(7), [1; 16], [2; 16], "ab", "c");
         let b = psk_for(&secret(7), [1; 16], [2; 16], "a", "bc");
         assert_ne!(*a, *b);
     }
 
     #[test]
-    fn un_secret_kem_different_donne_un_psk_different() {
+    fn a_different_kem_secret_gives_a_different_psk() {
         let a = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
         let b = psk_for(&secret(8), [1; 16], [2; 16], "client", "gateway");
         assert_ne!(*a, *b);
     }
 
     #[test]
-    fn psk_encode_en_base64_de_44_caracteres() {
+    fn psk_encodes_to_44_base64_characters() {
         let psk = psk_for(&secret(7), [1; 16], [2; 16], "client", "gateway");
         let b64 = psk_to_base64(&psk);
-        // 32 octets -> 44 caractères base64, format attendu par WireGuard.
+        // 32 bytes -> 44 base64 characters, the format expected by WireGuard.
         assert_eq!(b64.len(), 44);
     }
 
     #[test]
-    fn requete_valide_les_versions_et_longueurs() {
+    fn request_validates_versions_and_lengths() {
         let mut req = ProvisionRequest {
             protocol_version: PROTOCOL_VERSION,
             client_wg_public_key: "cGVlcg==".into(),
@@ -302,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn reponse_valide_la_longueur_du_ciphertext() {
+    fn response_validates_the_ciphertext_length() {
         let mut resp = ProvisionResponse {
             protocol_version: PROTOCOL_VERSION,
             kem_ciphertext: vec![0u8; crate::pq::CIPHERTEXT_LEN],

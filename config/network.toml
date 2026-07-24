@@ -39,6 +39,11 @@ wg_address = "100.64.0.1/10"
 # Port UDP d'écoute. C'est la seule ouverture entrante du modèle fail-closed.
 wg_listen_port = 51820
 
+# Port UDP public de key-nego (QUIC + PKI). Il doit être redirigé séparément
+# par la box vers cette gateway. Le laisser absent garde le port fermé lorsque
+# heliosd n'est pas compilé avec la feature `key-negotiation`.
+# key_negotiation_port = 51821
+
 # L'API web vit DERRIÈRE le tunnel : on la restreint à l'interface WireGuard.
 admin_iface = "helios0"
 
@@ -116,12 +121,15 @@ admin_iface = "helios0"
 # `address` est la VIP du client : dans WireGuard, AllowedIPs EST la table de
 # routage cryptographique — deux pairs ne peuvent pas revendiquer la même.
 #
-# `preshared_key` porte le secret post-quantique issu de l'échange ML-KEM.
-# Absent = tunnel classique Curve25519 seul (pas de protection PQ).
+# Les PSK ML-KEM sont éphémères et ne doivent jamais être écrits ici.
+# `minimum_key_negotiation_mode = "ml_kem"` interdit une reconnexion classique
+# ou statique. Les deux empreintes lient les identités TLS et ML-DSA du client.
 
 # [[peers]]
 # name = "poste-christophe"
 # public_key = "<clé publique du client, base64>"
 # address = "100.64.1.2/32"
 # admin = true
-# preshared_key = "<PSK ML-KEM, base64>"
+# key_negotiation_certificate_sha256 = "<empreinte TLS>"
+# key_negotiation_pq_certificate_sha256 = "<empreinte certificat ML-DSA>"
+# minimum_key_negotiation_mode = "ml_kem"

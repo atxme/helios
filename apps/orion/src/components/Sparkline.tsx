@@ -2,20 +2,20 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 
 /**
- * Courbe de débit — une aire, une ligne, un point terminal accentué.
+ * Throughput curve — an area, a line, an accented end point.
  *
- * Les deux séries (↓ et ↑) partagent la même échelle verticale, calculée sur
- * le maximum des deux : sinon un pic de 2 kB/s en émission aurait la même
- * hauteur qu’un pic de 20 MB/s en réception, ce qui serait trompeur.
+ * The two series (↓ and ↑) share the same vertical scale, computed from the
+ * max of both: otherwise a 2 kB/s spike in transmission would have the same
+ * height as a 20 MB/s spike in reception, which would be misleading.
  */
 
 interface Props {
-  /** Historique, du plus ancien au plus récent. */
+  /** History, from oldest to most recent. */
   points: number[]
-  /** Plafond commun aux séries comparées. */
+  /** Ceiling shared by the compared series. */
   ceiling: number
   color: string
-  /** Hauteur du tracé en unités de viewBox. */
+  /** Trace height in viewBox units. */
   height?: number
   label: string
 }

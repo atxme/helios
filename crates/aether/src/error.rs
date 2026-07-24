@@ -1,18 +1,18 @@
 use thiserror::Error;
 
-/// Erreur unifiée de l'ensemble du projet Helios.
+/// Unified error type for the whole Helios project.
 #[derive(Debug, Error)]
 pub enum HeliosError {
-    #[error("erreur de configuration : {0}")]
+    #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("erreur du pare-feu : {0}")]
+    #[error("firewall error: {0}")]
     Firewall(String),
 
-    #[error("erreur de mise à jour : {0}")]
+    #[error("update error: {0}")]
     Update(String),
 
-    #[error("transition d'état invalide : {0}")]
+    #[error("invalid state transition: {0}")]
     State(String),
 
     #[error(transparent)]

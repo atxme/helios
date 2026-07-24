@@ -137,7 +137,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     exiger_refus(
         bootstrap(installateur, altere, tmp / "cible-altere"),
         "un bundle dont un binaire a été substitué",
-        "empreinte différente",
+        "digest mismatch",
     )
     if (tmp / "cible-altere").exists():
         raise Echec("une installation refusée a tout de même écrit sur la cible")
@@ -150,7 +150,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     exiger_refus(
         bootstrap(installateur, surnumeraire, tmp / "cible-surnumeraire"),
         "un bundle enrichi d'une unité non signée",
-        "non signé",
+        "unsigned file",
     )
     print("  ✓ unité systemd ajoutée après signature refusée")
 
@@ -181,7 +181,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     exiger_refus(
         bootstrap(installateur, autre, tmp / "cible-autre"),
         "un bundle signé par une époque absente du trousseau compilé",
-        "signature du bundle refusée",
+        "bundle signature rejected",
     )
     print("  ✓ époque éditeur inconnue refusée")
 
@@ -194,7 +194,11 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
         [str(installateur), "bootstrap", "--dir", str(canal)],
         env={**environnement_cible(tmp / "cible-canal"), "HELIOS_UPDATE_CHANNEL": "production"},
     )
-    exiger_refus(resultat, "un bundle testing sur une gateway production", "canal testing refusé")
+    exiger_refus(
+        resultat,
+        "un bundle testing sur une gateway production",
+        "channel testing refused",
+    )
     print("  ✓ canal du bundle confronté à celui de la gateway")
 
     # ── Installation nominale ────────────────────────────────────────────────
@@ -218,7 +222,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     if os.access(cible / "opt/helios/releases" / str(SEQUENCE) / "heliosd", os.X_OK) is False:
         raise Echec("le daemon installé n'est pas exécutable")
     print(f"  ✓ {len(attendus)} fichiers installés et lien `current` basculé")
-    if "séquence" not in sortie:
+    if "sequence" not in sortie:
         raise Echec(f"rapport d'installation inattendu :\n{sortie}")
 
     etat = json.loads((cible / "var/lib/helios/updates/state.json").read_text())
@@ -230,7 +234,7 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
     exiger_refus(
         bootstrap(installateur, bundle, cible),
         "la réinstallation d'une séquence déjà confirmée",
-        f"séquence {SEQUENCE} refusée",
+        f"sequence {SEQUENCE} refused",
     )
     print("  ✓ rejeu de la séquence refusé par l'anti-rollback")
 

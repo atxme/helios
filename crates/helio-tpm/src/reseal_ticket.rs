@@ -6,7 +6,7 @@ use aether::sig::{
 
 use crate::{Result, TpmError};
 
-/// Billet v2 : enveloppe hybride Ed25519 + ML-DSA-65, sans compatibilité v1.
+/// v2 ticket: hybrid Ed25519 + ML-DSA-65 envelope, no v1 compatibility.
 pub(crate) struct ResealTicket {
     envelope: SignedResealTicket,
 }
@@ -21,14 +21,14 @@ impl ResealTicket {
         self.envelope.payload.version
     }
 
-    /// Vérifie l'hybride AND, l'époque signée, l'anti-rejeu puis la liaison PCR optionnelle.
+    /// Verifies the hybrid AND, the signed epoch, anti-replay, then the optional PCR binding.
     pub(crate) fn verify(&self, current_version: u64, current_pcr: &[u8; 32]) -> Result<()> {
         if USING_DEVELOPMENT_PUBLISHER_KEYS {
             static WARN_ONCE: Once = Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    "trousseau éditeur de DÉVELOPPEMENT utilisé pour les billets TPM — \
-                     fournir HELIOS_PUBLISHER_KEYRING_PATH au build de production"
+                    "DEVELOPMENT publisher keyring used for TPM tickets — \
+                     supply HELIOS_PUBLISHER_KEYRING_PATH for a production build"
                 );
             });
         }
@@ -86,13 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn billet_hybride_valide_accepte() {
+    fn valid_hybrid_ticket_is_accepted() {
         let (ticket, keys) = sign_ticket(1, None);
         assert!(ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]).is_ok());
     }
 
     #[test]
-    fn signature_ed25519_invalide_rejetee() {
+    fn invalid_ed25519_signature_is_rejected() {
         let (mut ticket, keys) = sign_ticket(1, None);
         ticket.envelope.signatures[0].sig.push('A');
         assert!(matches!(
@@ -102,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_ml_dsa_absente_rejetee() {
+    fn missing_ml_dsa_signature_is_rejected() {
         let (mut ticket, keys) = sign_ticket(1, None);
         ticket
             .envelope
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_rejete() {
+    fn rollback_is_rejected() {
         let (ticket, keys) = sign_ticket(3, None);
         assert!(matches!(
             ticket.verify_with_keyring(&[keys], 3, &[0u8; 32]),
@@ -127,22 +127,22 @@ mod tests {
     }
 
     #[test]
-    fn liaison_pcr_optionnelle_et_incoherence_rejetee() {
-        let (sans_pcr, keys) = sign_ticket(1, None);
-        assert!(sans_pcr
+    fn optional_pcr_binding_and_mismatch_is_rejected() {
+        let (without_pcr, keys) = sign_ticket(1, None);
+        assert!(without_pcr
             .verify_with_keyring(&[keys], 0, &[99u8; 32])
             .is_ok());
 
-        let (avec_pcr, keys) = sign_ticket(1, Some([1u8; 32]));
+        let (with_pcr, keys) = sign_ticket(1, Some([1u8; 32]));
         assert!(matches!(
-            avec_pcr.verify_with_keyring(&[keys], 0, &[2u8; 32]),
+            with_pcr.verify_with_keyring(&[keys], 0, &[2u8; 32]),
             Err(TpmError::TicketPcrMismatch)
         ));
-        assert!(avec_pcr.verify_with_keyring(&[keys], 0, &[1u8; 32]).is_ok());
+        assert!(with_pcr.verify_with_keyring(&[keys], 0, &[1u8; 32]).is_ok());
     }
 
     #[test]
-    fn ancien_format_v1_refuse_sans_fallback() {
+    fn old_v1_format_refused_without_fallback() {
         let old = br#"{"version":1,"expected_pcr_digest":null,"signature":"00"}"#;
         assert!(matches!(
             ResealTicket::from_json(old),
@@ -151,12 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn signature_est_verifiee_avant_anti_rollback_et_pcr() {
+    fn signature_is_verified_before_anti_rollback_and_pcr() {
         let (mut ticket, keys) = sign_ticket(1, Some([1u8; 32]));
         ticket.envelope.signatures.clear();
 
-        // Une enveloppe forgée ne doit pas servir d'oracle permettant de
-        // distinguer compteur et PCR avant authentification de l'éditeur.
+        // A forged envelope must not act as an oracle allowing the counter
+        // and PCR to be distinguished before publisher authentication.
         assert!(matches!(
             ticket.verify_with_keyring(&[keys], 99, &[2u8; 32]),
             Err(TpmError::TicketInvalidSignature)
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn json_refuse_digest_pcr_malforme_et_champs_inconnus() {
+    fn json_rejects_malformed_pcr_digest_and_unknown_fields() {
         let malformed = br#"{"payload":{"version":1,"expected_pcr_digest":"abcd"},"key_epoch":1,"signatures":[]}"#;
         assert!(matches!(
             ResealTicket::from_json(malformed),

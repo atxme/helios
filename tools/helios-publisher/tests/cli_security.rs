@@ -5,7 +5,7 @@ fn publisher() -> Command {
 }
 
 #[test]
-fn cycle_complet_produit_un_billet_hybride_et_refuse_tout_ecrasement() {
+fn full_cycle_produces_a_hybrid_ticket_and_refuses_any_overwrite() {
     let root = tempfile::tempdir().unwrap();
     let keys = root.path().join("cles");
 
@@ -76,7 +76,7 @@ fn cycle_complet_produit_un_billet_hybride_et_refuse_tout_ecrasement() {
         .collect();
     assert_eq!(algorithms, HashSet::from(["ed25519", "ml-dsa-65"]));
 
-    // Ni les clés ni les billets ne doivent être écrasés silencieusement.
+    // Neither the keys nor the tickets must be silently overwritten.
     let overwrite_ticket = publisher()
         .args([
             "reseal-ticket",
@@ -106,13 +106,13 @@ fn cycle_complet_produit_un_billet_hybride_et_refuse_tout_ecrasement() {
 }
 
 #[test]
-fn arguments_de_securite_refusent_zero_et_digest_pcr_malforme() {
+fn security_arguments_reject_zero_and_malformed_pcr_digest() {
     let zero = publisher()
-        .args(["keygen", "--key-epoch", "0", "--output-dir", "inutilise"])
+        .args(["keygen", "--key-epoch", "0", "--output-dir", "unused"])
         .output()
         .unwrap();
     assert!(!zero.status.success());
-    assert!(String::from_utf8_lossy(&zero.stderr).contains("doit être > 0"));
+    assert!(String::from_utf8_lossy(&zero.stderr).contains("must be > 0"));
 
     let malformed = publisher()
         .args([
@@ -135,11 +135,11 @@ fn arguments_de_securite_refusent_zero_et_digest_pcr_malforme() {
         .output()
         .unwrap();
     assert!(!malformed.status.success());
-    assert!(String::from_utf8_lossy(&malformed.stderr).contains("octets au lieu de 32"));
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("bytes instead of 32"));
 }
 
 #[test]
-fn manifeste_binaire_signe_exactement_les_octets_fournis() {
+fn binary_manifest_signs_exactly_the_provided_bytes() {
     let root = tempfile::tempdir().unwrap();
     let keys = root.path().join("cles");
     assert!(publisher()

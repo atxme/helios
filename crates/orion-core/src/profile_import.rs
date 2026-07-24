@@ -1,8 +1,8 @@
-//! Import de profils Orion depuis un document d'échange.
+//! Import of Orion profiles from an exchange document.
 //!
-//! Deux formats sont acceptés : le JSON Orion versionné, destiné aux outils
-//! Helios, et le format `wg-quick` à un seul pair. L'import ne persiste rien :
-//! il produit un [`ClientProfile`] validé que l'IHM présente comme brouillon.
+//! Two formats are accepted: versioned Orion JSON, intended for Helios tools,
+//! and the single-peer `wg-quick` format. Import persists nothing: it
+//! produces a validated [`ClientProfile`] that the UI presents as a draft.
 
 use std::{
     collections::HashMap,
@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
 
-/// Identifiant stable du document JSON échangeable avec Orion.
+/// Stable identifier of the JSON document exchangeable with Orion.
 pub const PROFILE_IMPORT_FORMAT: &str = "orion-profile";
-/// Version courante du document JSON échangeable avec Orion.
+/// Current version of the JSON document exchangeable with Orion.
 pub const PROFILE_IMPORT_VERSION: u16 = 1;
-/// Taille maximale d'un profil importé. Un profil normal tient dans quelques Ko.
+/// Maximum size of an imported profile. A normal profile fits in a few KB.
 pub const MAX_PROFILE_IMPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -46,9 +46,10 @@ struct JsonHeader {
 struct JsonProfile {
     name: String,
     endpoint: String,
-    /// Absente dans un profil d'invitation : l'opérateur ne détient pas la clé
-    /// privée du client et n'a donc rien à lui renvoyer (ADR-004 §6). L'IHM
-    /// complète alors depuis le profil local de même nom.
+    /// Absent in an invitation profile: the operator doesn't hold the
+    /// client's private key and therefore has nothing to send back
+    /// (ADR-004 §6). The UI then completes it from the local profile of the
+    /// same name.
     #[serde(default)]
     private_key: String,
     peer_public_key: String,
@@ -80,14 +81,15 @@ impl From<JsonProfile> for ClientProfile {
                 .persistent_keepalive
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
+            key_negotiation: None,
         }
     }
 }
 
-/// Décode un profil importé sans l'écrire sur disque.
+/// Decodes an imported profile without writing it to disk.
 ///
-/// Le suffixe du fichier choisit le parseur ; pour un fichier sans suffixe,
-/// le premier caractère significatif permet de reconnaître JSON ou wg-quick.
+/// The file suffix picks the parser; for a suffix-less file, the first
+/// meaningful character lets us recognize JSON or wg-quick.
 pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientProfile> {
     if contents.len() > MAX_PROFILE_IMPORT_BYTES {
         anyhow::bail!(
@@ -109,10 +111,9 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientPro
     validate_imported_profile(profile)
 }
 
-/// Lit un profil depuis un chemin sans jamais allouer plus que la borne
-/// d'import. La vérification porte sur les octets réellement lus : une taille
-/// issue des métadonnées ne suffirait pas face à un fichier modifié en cours de
-/// lecture.
+/// Reads a profile from a path without ever allocating more than the import
+/// limit. The check applies to bytes actually read: a size derived from
+/// metadata wouldn't suffice against a file modified during reading.
 pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
     let file = File::open(path).with_context(|| format!("ouverture de {}", path.display()))?;
     let mut bytes = Vec::with_capacity(MAX_PROFILE_IMPORT_BYTES.min(4096));
@@ -133,12 +134,12 @@ pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
     parse_profile_import(&contents, file_name)
 }
 
-/// Complète un document d'invitation depuis le profil local de même nom.
+/// Completes an invitation document from the local profile of the same name.
 ///
-/// Les imports par sélecteur de fichier et par association système appellent
-/// tous deux cette fonction. Une invitation reçue sur une autre machine est
-/// refusée explicitement : fabriquer une nouvelle clé privée romprait
-/// l'admission déjà liée à la clé publique originale.
+/// Both file-picker and system-association imports call this function. An
+/// invitation received on another machine is explicitly refused: fabricating
+/// a new private key would break the admission already tied to the original
+/// public key.
 pub fn complete_profile_import(
     mut profile: ClientProfile,
     config: &ClientConfig,
@@ -160,8 +161,8 @@ pub fn complete_profile_import(
 }
 
 fn parse_json(contents: &str) -> Result<ClientProfile> {
-    // Lire d'abord l'en-tête garantit une erreur de version intelligible même
-    // si une version future modifie entièrement la forme de `profile`.
+    // Reading the header first guarantees an intelligible version error even
+    // if a future version entirely changes the shape of `profile`.
     let header: JsonHeader =
         serde_json::from_str(contents).context("document JSON Orion invalide")?;
     if header.format != PROFILE_IMPORT_FORMAT {
@@ -282,6 +283,7 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
             .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),
         persistent_keepalive: keepalive,
         heliosd_url: None,
+        key_negotiation: None,
     })
 }
 
@@ -327,9 +329,9 @@ fn profile_name_from_file(file_name: &str) -> String {
     }
 }
 
-/// Diagnostic champ par champ d’un profil en cours d’édition.
+/// Field-by-field diagnostic of a profile being edited.
 ///
-/// `None` = rien à signaler. Chaque champ est indépendant des autres.
+/// `None` = nothing to report. Each field is independent of the others.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileIssues {
     pub name: Option<String>,
@@ -344,28 +346,28 @@ pub struct ProfileIssues {
 }
 
 impl ProfileIssues {
-    /// `true` si au moins un champ est fautif.
+    /// `true` if at least one field is faulty.
     pub fn any(&self) -> bool {
         *self != Self::default()
     }
 }
 
-/// Relève **tous** les champs fautifs d’un profil en cours d’édition.
+/// Reports **all** faulty fields of a profile being edited.
 ///
-/// Contrairement à [`parse_profile_import`], qui refuse un document au premier
-/// défaut, cette inspection ne s’arrête pas : l’IHM doit pouvoir surligner
-/// chaque case en une passe, plutôt que d’en faire découvrir une à chaque
-/// tentative d’enregistrement.
+/// Unlike [`parse_profile_import`], which refuses a document at the first
+/// fault, this inspection doesn't stop: the UI must be able to highlight
+/// every field in one pass, rather than discovering one at a time on each
+/// save attempt.
 ///
-/// **Un champ vide n’est pas signalé.** Pendant la saisie, « pas encore
-/// rempli » n’est pas « impossible » — noircir de rouge un profil neuf serait
-/// du bruit. La complétude est jugée ailleurs, au moment de connecter.
+/// **An empty field is not reported.** While typing, "not filled in yet" is
+/// not "impossible" — marking a fresh profile red would be noise.
+/// Completeness is judged elsewhere, at connection time.
 ///
-/// Les validateurs sont ceux de l’import : c’est délibéré. Deux jeux de règles,
-/// un pour l’import et un pour la saisie, finiraient par diverger et l’IHM
-/// accepterait des valeurs que le cœur refuse.
+/// The validators are the same as import's: that's deliberate. Two rule sets,
+/// one for import and one for editing, would eventually diverge and the UI
+/// would accept values the core refuses.
 pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
-    /// Ne valide que si la valeur est renseignée.
+    /// Only validates if the value is filled in.
     fn when_filled(value: &str, check: impl Fn(&str) -> Result<()>) -> Option<String> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -393,8 +395,8 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
         allowed_ips: when_filled(&profile.allowed_ips, |value| {
             validate_cidr(value, "trafic capté")
         }),
-        // Zéro n'est pas « vide » : c'est une valeur, et elle désactive le
-        // keepalive alors qu'un client derrière NAT en dépend.
+        // Zero is not "empty": it's a value, and it disables keepalive while
+        // a client behind NAT depends on it.
         persistent_keepalive: (profile.persistent_keepalive == 0)
             .then(|| "le keepalive doit être supérieur à zéro".to_string()),
         heliosd_url: profile
@@ -418,10 +420,10 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
         anyhow::bail!("le nom du profil est requis");
     }
     validate_endpoint(&profile.endpoint)?;
-    // Un profil d'invitation arrive sans clé privée : l'opérateur n'a jamais
-    // détenu celle du client, c'est précisément ce qui rend ce mode sûr. Le
-    // document reste rejeté si la clé est présente mais malformée — une clé
-    // tronquée n'est pas une invitation, c'est une erreur.
+    // An invitation profile arrives without a private key: the operator
+    // never held the client's, which is precisely what makes this mode safe.
+    // The document is still rejected if the key is present but malformed —
+    // a truncated key isn't an invitation, it's an error.
     if !profile.private_key.is_empty() {
         validate_wg_key(&profile.private_key, "clé privée du client")?;
     }
@@ -454,17 +456,17 @@ fn non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
-/// Longueur d'une clé WireGuard : 32 octets bruts…
+/// Length of a WireGuard key: 32 raw bytes…
 const WG_KEY_BYTES: usize = 32;
-/// …soit exactement 44 caractères une fois encodés en base64.
+/// …i.e. exactly 44 characters once base64-encoded.
 const WG_KEY_BASE64_LEN: usize = 44;
 
-/// Valide une clé Curve25519 encodée en base64.
+/// Validates a base64-encoded Curve25519 key.
 ///
-/// Les messages disent ce qu'on attend, pas seulement que c'est refusé :
-/// « base64 attendu » n'aide personne à voir qu'il manque un caractère au bout
-/// d'un copier-coller tronqué. La longueur observée est donnée pour qu'on puisse
-/// la comparer d'un coup d'œil aux 44 caractères attendus.
+/// The messages say what's expected, not just that it's refused: "base64
+/// expected" doesn't help anyone see that a character is missing at the end
+/// of a truncated copy-paste. The observed length is given so it can be
+/// compared at a glance to the expected 44 characters.
 fn validate_wg_key(value: &str, label: &str) -> Result<()> {
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) else {
         anyhow::bail!(
@@ -505,15 +507,15 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
     validate_endpoint_host(host)
 }
 
-/// Valide l'hôte d'un endpoint : littéral IPv6 entre crochets, adresse IPv4, ou
-/// nom d'hôte.
+/// Validates an endpoint's host: IPv6 literal in brackets, IPv4 address, or
+/// hostname.
 ///
-/// Le cas qui motive cette fonction : `86.229.1286` n'est **ni** une IPv4 valide
-/// (1286 dépasse 255) **ni** un nom d'hôte légitime — la RFC 1123 interdit qu'un
-/// dernier label soit entièrement numérique, précisément pour qu'on ne puisse
-/// pas confondre les deux. Sans cette règle, une IPv4 mal tapée passe pour un
-/// nom de domaine et le défaut ne se révèle qu'au premier handshake, sous la
-/// forme d'une résolution DNS qui échoue.
+/// The case that motivates this function: `86.229.1286` is **neither** a
+/// valid IPv4 (1286 exceeds 255) **nor** a legitimate hostname — RFC 1123
+/// forbids a last label from being entirely numeric, precisely so the two
+/// can't be confused. Without this rule, a mistyped IPv4 passes for a domain
+/// name and the defect only shows up at the first handshake, as a failing
+/// DNS resolution.
 fn validate_endpoint_host(host: &str) -> Result<()> {
     if let Some(inner) = host
         .strip_prefix('[')
@@ -593,7 +595,7 @@ mod tests {
     const CLIENT_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const GATEWAY_PUBLIC: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
 
-    fn profil_complet() -> ClientProfile {
+    fn complete_profile() -> ClientProfile {
         ClientProfile {
             name: "poste".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -606,32 +608,32 @@ mod tests {
         }
     }
 
-    /// Une IPv4 mal tapée ne doit pas passer pour un nom de domaine.
+    /// A mistyped IPv4 must not pass for a domain name.
     ///
-    /// `86.229.1286` est le cas réel : 1286 dépasse 255, mais la chaîne reste
-    /// syntaxiquement acceptable comme suite de labels. Sans la règle RFC 1123
-    /// sur le dernier label numérique, le défaut ne se révélait qu'au premier
-    /// handshake, sous la forme d'une résolution DNS qui échoue.
+    /// `86.229.1286` is the real case: 1286 exceeds 255, but the string
+    /// remains syntactically acceptable as a sequence of labels. Without the
+    /// RFC 1123 rule on the numeric last label, the defect only showed up at
+    /// the first handshake, as a failing DNS resolution.
     #[test]
-    fn une_adresse_ip_mal_formee_ne_passe_pas_pour_un_nom_d_hote() {
-        for accepte in [
+    fn a_malformed_ip_address_does_not_pass_for_a_hostname() {
+        for accepted in [
             "86.229.12.86:51820",
             "vpn.example.net:51820",
             "gateway:51820",
             "[2a01:cb1e:101d:4b5c::1]:51820",
         ] {
             let profile = ClientProfile {
-                endpoint: accepte.into(),
-                ..profil_complet()
+                endpoint: accepted.into(),
+                ..complete_profile()
             };
             assert_eq!(
                 inspect_profile(&profile).endpoint,
                 None,
-                "{accepte} aurait dû être accepté"
+                "{accepted} should have been accepted"
             );
         }
 
-        for refuse in [
+        for refused in [
             "86.229.1286:51820",
             "256.1.1.1:51820",
             "10.0.0:51820",
@@ -640,51 +642,51 @@ mod tests {
             "vpn..example.net:51820",
         ] {
             let profile = ClientProfile {
-                endpoint: refuse.into(),
-                ..profil_complet()
+                endpoint: refused.into(),
+                ..complete_profile()
             };
             assert!(
                 inspect_profile(&profile).endpoint.is_some(),
-                "{refuse} aurait dû être refusé"
+                "{refused} should have been refused"
             );
         }
     }
 
-    /// Le message doit dire **ce qu'on attend**, pas seulement que c'est refusé.
-    /// « base64 attendu » n'aide pas à voir qu'un copier-coller a été tronqué ;
-    /// la longueur observée face aux 44 caractères attendus, si.
+    /// The message must say **what's expected**, not just that it's refused.
+    /// "base64 expected" doesn't help see that a copy-paste was truncated;
+    /// the observed length against the expected 44 characters does.
     #[test]
-    fn le_message_d_une_cle_invalide_donne_la_longueur_attendue() {
-        let tronquee = &CLIENT_PRIVATE[..CLIENT_PRIVATE.len() - 4];
+    fn the_message_for_an_invalid_key_gives_the_expected_length() {
+        let truncated = &CLIENT_PRIVATE[..CLIENT_PRIVATE.len() - 4];
         let profile = ClientProfile {
-            private_key: tronquee.into(),
-            ..profil_complet()
+            private_key: truncated.into(),
+            ..complete_profile()
         };
         let message = inspect_profile(&profile)
             .private_key
-            .expect("une clé tronquée doit être refusée");
-        assert!(message.contains("44"), "message : {message}");
-        assert!(message.contains("clé privée"), "message : {message}");
+            .expect("a truncated key must be refused");
+        assert!(message.contains("44"), "message: {message}");
+        assert!(message.contains("clé privée"), "message: {message}");
 
         let profile = ClientProfile {
-            peer_public_key: "pas du base64 !".into(),
-            ..profil_complet()
+            peer_public_key: "not base64 at all!".into(),
+            ..complete_profile()
         };
         let message = inspect_profile(&profile)
             .peer_public_key
-            .expect("des caractères interdits doivent être refusés");
-        assert!(message.contains("44"), "message : {message}");
+            .expect("forbidden characters must be refused");
+        assert!(message.contains("44"), "message: {message}");
     }
 
     #[test]
-    fn un_profil_valide_ne_signale_aucun_champ() {
-        assert!(!inspect_profile(&profil_complet()).any());
+    fn a_valid_profile_reports_no_field() {
+        assert!(!inspect_profile(&complete_profile()).any());
     }
 
-    /// Pendant la saisie, « pas encore rempli » n’est pas « impossible » :
-    /// noircir de rouge un profil neuf serait du bruit.
+    /// While typing, "not filled in yet" is not "impossible": marking a
+    /// fresh profile red would be noise.
     #[test]
-    fn les_champs_vides_ne_sont_pas_signales() {
+    fn empty_fields_are_not_reported() {
         let issues = inspect_profile(&ClientProfile::default());
         assert_eq!(issues.endpoint, None);
         assert_eq!(issues.private_key, None);
@@ -692,24 +694,24 @@ mod tests {
         assert_eq!(issues.address, None);
     }
 
-    /// L’intérêt de l’inspection par rapport à l’import : elle ne s’arrête pas
-    /// au premier défaut, sinon l’IHM en ferait découvrir un par tentative.
+    /// The point of inspection versus import: it doesn't stop at the first
+    /// fault, otherwise the UI would discover one per attempt.
     #[test]
-    fn tous_les_champs_fautifs_sont_releves_en_une_passe() {
+    fn all_faulty_fields_are_reported_in_one_pass() {
         let profile = ClientProfile {
             endpoint: "https://vpn.example.net".into(),
-            private_key: "pas-du-base64".into(),
+            private_key: "not-base64".into(),
             peer_public_key: "AAAA".into(),
             address: Some("100.64.1.2".into()),
             allowed_ips: "0.0.0.0/33".into(),
             persistent_keepalive: 0,
             heliosd_url: Some("100.64.0.1:8080".into()),
-            ..profil_complet()
+            ..complete_profile()
         };
         let issues = inspect_profile(&profile);
 
         assert!(issues.any());
-        for (champ, valeur) in [
+        for (field, value) in [
             ("endpoint", &issues.endpoint),
             ("private_key", &issues.private_key),
             ("peer_public_key", &issues.peer_public_key),
@@ -718,18 +720,18 @@ mod tests {
             ("persistent_keepalive", &issues.persistent_keepalive),
             ("heliosd_url", &issues.heliosd_url),
         ] {
-            assert!(valeur.is_some(), "{champ} aurait dû être signalé");
+            assert!(value.is_some(), "{field} should have been reported");
         }
     }
 
-    /// Zéro n’est pas « vide » : c’est une valeur, et elle coupe le keepalive
-    /// dont un client derrière NAT dépend.
+    /// Zero is not "empty": it's a value, and it cuts off the keepalive a
+    /// client behind NAT depends on.
     #[test]
-    fn un_keepalive_nul_est_signale_alors_qu_un_psk_absent_ne_l_est_pas() {
+    fn a_zero_keepalive_is_reported_while_an_absent_psk_is_not() {
         let profile = ClientProfile {
             persistent_keepalive: 0,
             preshared_key: None,
-            ..profil_complet()
+            ..complete_profile()
         };
         let issues = inspect_profile(&profile);
         assert!(issues.persistent_keepalive.is_some());
@@ -737,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn importe_json_versionne_avec_defauts() {
+    fn imports_versioned_json_with_defaults() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -760,11 +762,12 @@ mod tests {
         assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
     }
 
-    /// Profil d'invitation (ADR-004 §6) : l'opérateur admet la clé publique que
-    /// le client lui a transmise et renvoie tout **sauf** la clé privée, qu'il
-    /// n'a jamais détenue. L'IHM la reprend du profil local de même nom.
+    /// Invitation profile (ADR-004 §6): the operator admits the public key
+    /// the client sent, and returns everything **except** the private key,
+    /// which it never held. The UI takes it back from the local profile of
+    /// the same name.
     #[test]
-    fn importe_une_invitation_sans_cle_privee() {
+    fn imports_an_invitation_without_a_private_key() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -781,18 +784,18 @@ mod tests {
         let profile = parse_profile_import(&raw, "portable.json").unwrap();
         assert!(
             profile.private_key.is_empty(),
-            "l'invitation ne doit porter aucune clé privée"
+            "the invitation must carry no private key"
         );
         assert_eq!(profile.peer_public_key, GATEWAY_PUBLIC);
         assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
         assert!(
             profile.validate().is_err(),
-            "une invitation seule ne doit pas être présentée comme connectable"
+            "an invitation alone must not be presented as connectable"
         );
     }
 
     #[test]
-    fn complete_une_invitation_avec_la_cle_locale_de_meme_nom() {
+    fn completes_an_invitation_with_the_local_key_of_the_same_name() {
         let invitation = ClientProfile {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -814,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn refuse_une_invitation_sans_cle_locale_correspondante() {
+    fn refuses_an_invitation_without_a_matching_local_key() {
         let invitation = ClientProfile {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -827,10 +830,10 @@ mod tests {
         assert!(error.to_string().contains("aucun profil local"));
     }
 
-    /// Tolérer l'absence de clé privée ne doit pas faire tolérer une clé
-    /// tronquée : ce n'est pas une invitation, c'est une corruption.
+    /// Tolerating the absence of a private key must not tolerate a truncated
+    /// key: that's not an invitation, it's a corruption.
     #[test]
-    fn une_cle_privee_presente_mais_malformee_reste_refusee() {
+    fn a_private_key_present_but_malformed_stays_refused() {
         let raw = r#"{
             "format": "orion-profile",
             "version": 1,
@@ -842,18 +845,15 @@ mod tests {
                 "address": "100.64.1.2/32"
             }
         }"#;
-        let erreur = parse_profile_import(raw, "portable.json").unwrap_err();
-        assert!(
-            erreur.to_string().contains("clé privée"),
-            "message : {erreur}"
-        );
+        let error = parse_profile_import(raw, "portable.json").unwrap_err();
+        assert!(error.to_string().contains("clé privée"), "message: {error}");
     }
 
-    /// `wg-quick` n'a pas de notion d'invitation : un fichier sans `PrivateKey`
-    /// est un fichier incomplet, et le dire tôt évite un tunnel qui ne monte
-    /// jamais sans explication.
+    /// `wg-quick` has no notion of invitation: a file without `PrivateKey`
+    /// is an incomplete file, and saying so early avoids a tunnel that never
+    /// mounts without explanation.
     #[test]
-    fn wg_quick_sans_cle_privee_reste_refuse() {
+    fn wg_quick_without_a_private_key_stays_refused() {
         let raw = format!(
             r#"
                 [Interface]
@@ -864,18 +864,15 @@ mod tests {
                 Endpoint = vpn.example.net:51820
             "#
         );
-        let erreur = parse_profile_import(&raw, "portable.conf").unwrap_err();
-        assert!(
-            erreur.to_string().contains("PrivateKey"),
-            "message : {erreur}"
-        );
+        let error = parse_profile_import(&raw, "portable.conf").unwrap_err();
+        assert!(error.to_string().contains("PrivateKey"), "message: {error}");
     }
 
     #[test]
-    fn importe_wg_quick_a_un_pair() {
+    fn imports_wg_quick_with_one_peer() {
         let raw = format!(
             r#"
-                # profil émis par l'administrateur
+                # profile issued by the administrator
                 [Interface]
                 PrivateKey = {CLIENT_PRIVATE}
                 Address = 100.64.1.2/32
@@ -897,13 +894,13 @@ mod tests {
     }
 
     #[test]
-    fn refuse_json_inconnu_ou_champ_imprevu() {
+    fn refuses_unknown_json_or_unexpected_field() {
         let wrong_version = r#"{
             "format": "orion-profile",
             "version": 2,
             "profile": {}
         }"#;
-        assert!(parse_profile_import(wrong_version, "profil.json")
+        assert!(parse_profile_import(wrong_version, "profile.json")
             .unwrap_err()
             .to_string()
             .contains("version"));
@@ -921,11 +918,11 @@ mod tests {
                 }}
             }}"#
         );
-        assert!(parse_profile_import(&unknown_field, "profil.json").is_err());
+        assert!(parse_profile_import(&unknown_field, "profile.json").is_err());
     }
 
     #[test]
-    fn refuse_plusieurs_pairs_et_options_non_appliquees() {
+    fn refuses_multiple_peers_and_unapplied_options() {
         let multiple = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\n[Peer]\nPublicKey={GATEWAY_PUBLIC}"
         );
@@ -944,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn refuse_cles_et_endpoint_invalides() {
+    fn refuses_invalid_keys_and_endpoint() {
         let bad_key = format!(
-            "[Interface]\nPrivateKey=court\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+            "[Interface]\nPrivateKey=short\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&bad_key, "invalide.conf").is_err());
+        assert!(parse_profile_import(&bad_key, "invalid.conf").is_err());
 
         let url = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=https://vpn.example.net"
@@ -960,11 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn refuse_un_profil_incomplet_ou_non_routable() {
+    fn refuses_an_incomplete_or_unroutable_profile() {
         let no_address = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&no_address, "sans-adresse.conf")
+        assert!(parse_profile_import(&no_address, "no-address.conf")
             .unwrap_err()
             .to_string()
             .contains("adresse virtuelle"));
@@ -972,25 +969,25 @@ mod tests {
         let no_keepalive = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nPersistentKeepalive=0"
         );
-        assert!(parse_profile_import(&no_keepalive, "sans-keepalive.conf")
+        assert!(parse_profile_import(&no_keepalive, "no-keepalive.conf")
             .unwrap_err()
             .to_string()
             .contains("supérieur à zéro"));
     }
 
     #[test]
-    fn refuse_un_document_demesure() {
+    fn refuses_an_oversized_document() {
         let raw = " ".repeat(MAX_PROFILE_IMPORT_BYTES + 1);
-        assert!(parse_profile_import(&raw, "gros.json")
+        assert!(parse_profile_import(&raw, "big.json")
             .unwrap_err()
             .to_string()
             .contains("trop volumineux"));
     }
 
     #[test]
-    fn lecture_par_chemin_reutilise_le_parseur_et_la_borne() {
+    fn reading_by_path_reuses_the_parser_and_the_limit() {
         let directory = std::env::temp_dir().join(format!(
-            "orion-import-chemin-{}-{:?}",
+            "orion-import-path-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1015,7 +1012,7 @@ mod tests {
             "portable"
         );
 
-        let oversized_path = directory.join("trop-grand.orionprofile");
+        let oversized_path = directory.join("too-big.orionprofile");
         std::fs::write(&oversized_path, vec![b' '; MAX_PROFILE_IMPORT_BYTES + 1]).unwrap();
         assert!(read_profile_import_path(&oversized_path)
             .unwrap_err()

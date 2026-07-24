@@ -5,11 +5,21 @@ import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { ArrowDown, ArrowUp, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
-import type { ClientProfile, TelemetrySample, TunnelState } from '../types'
-import { elapsed, formatBps, postureMeta, stateMeta } from '../components/state'
+import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../types'
+import {
+  elapsed,
+  formatBps,
+  postureMeta,
+  protectionMeta,
+  stateMeta,
+  type ProtectionTone,
+} from '../components/state'
 import { Sparkline } from '../components/Sparkline'
 import { StatusOrb } from '../components/StatusOrb'
-import { EMERALD, GUTTER } from '../theme'
+import { EMERALD, GUTTER, PINE } from '../theme'
+
+/** Ambre de transition — même teinte que l’état « Connexion… », lisible sur papier. */
+const AMBER = '#A16207'
 
 /**
  * Vue Connexion — l’écran qui répond à la seule question qui compte :
@@ -29,6 +39,8 @@ interface Props {
   history: TelemetrySample[]
   backend: string
   adapterUp: boolean
+  /** Nature du PSK posé pour la session en cours. `null` = pas encore tranché. */
+  psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
 }
@@ -39,6 +51,21 @@ const POSTURE_ICON = {
   exposed: ShieldAlert,
 } as const
 
+/**
+ * Habillage de la pastille de protection.
+ *
+ * Trois niveaux visuels pour trois faits distincts, et l’écart entre `pqc` et
+ * `static` est voulu : le PSK statique protège, mais il ne tourne pas. Lui
+ * donner le même vert plein qu’au PSK PQC gommerait la seule différence qui
+ * compte.
+ */
+const PROTECTION_SKIN: Record<ProtectionTone, { border: string; fill: string; text: string }> = {
+  pqc: { border: `${EMERALD}66`, fill: `${EMERALD}14`, text: 'primary.main' },
+  static: { border: `${PINE}44`, fill: 'transparent', text: 'primary.main' },
+  pending: { border: `${AMBER}55`, fill: `${AMBER}12`, text: AMBER },
+  classic: { border: 'divider', fill: 'transparent', text: 'text.secondary' },
+}
+
 export function ConnectView({
   state,
   profile,
@@ -47,6 +74,7 @@ export function ConnectView({
   history,
   backend,
   adapterUp,
+  psk,
   onConnect,
   onDisconnect,
 }: Props) {
@@ -61,7 +89,7 @@ export function ConnectView({
   }, [upSince])
 
   const duration = elapsed(upSince, now)
-  const pq = Boolean(profile?.preshared_key?.trim())
+  const protection = protectionMeta(profile, psk, state)
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
   // Seul « retenu » mérite une phrase : c'est le seul cas contre-intuitif, où
@@ -154,14 +182,9 @@ export function ConnectView({
 
       {/* Caractéristiques : de la référence, pas un titre. Discrètes par choix. */}
       <Box sx={{ pt: 1.5 }}>
-        <Tooltip
-          title={
-            pq
-              ? 'Le secret ML-KEM-768 occupe le slot PresharedKey : un trafic enregistré aujourd’hui reste illisible pour un adversaire quantique.'
-              : 'Sans PSK, la confidentialité repose sur Curve25519 seul.'
-          }
-        >
+        <Tooltip title={protection.detail}>
           <Box
+            aria-label={`${protection.label}. ${protection.detail}`}
             sx={{
               display: 'inline-flex',
               alignItems: 'center',
@@ -170,19 +193,21 @@ export function ConnectView({
               py: 0.4,
               borderRadius: 1,
               border: '1px solid',
-              borderColor: pq ? `${EMERALD}66` : 'divider',
-              bgcolor: pq ? `${EMERALD}14` : 'transparent',
+              borderColor: PROTECTION_SKIN[protection.tone].border,
+              bgcolor: PROTECTION_SKIN[protection.tone].fill,
             }}
           >
             <Typography
               sx={{
-                color: pq ? 'primary.main' : 'text.secondary',
+                color: PROTECTION_SKIN[protection.tone].text,
                 fontFamily: 'monospace',
                 fontSize: 10.5,
                 fontWeight: 600,
+                textTransform: 'uppercase',
+                letterSpacing: '0.04em',
               }}
             >
-              {pq ? 'PSK POST-QUANTIQUE' : 'WIREGUARD CLASSIQUE'}
+              {protection.label}
             </Typography>
           </Box>
         </Tooltip>

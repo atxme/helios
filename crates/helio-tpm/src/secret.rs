@@ -2,15 +2,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{Result, TpmError};
 
-/// Secret de déverrouillage 256 bits descellé par le TPM.
+/// 256-bit unlock secret unsealed by the TPM.
 ///
-/// Effacé de la mémoire à la destruction (`ZeroizeOnDrop`). Sert à déchiffrer les
-/// secrets WireGuard ; ne jamais le journaliser (le `Debug` est masqué).
+/// Wiped from memory on drop (`ZeroizeOnDrop`). Used to decrypt the
+/// WireGuard secrets; never log it (`Debug` is masked).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretKey([u8; 32]);
 
 impl SecretKey {
-    /// Génère un secret aléatoire via le CSPRNG de l'OS (provisionnement / rescellement).
+    /// Generates a random secret via the OS CSPRNG (provisioning / resealing).
     pub(crate) fn generate() -> Result<Self> {
         let mut buf = [0u8; 32];
         getrandom::getrandom(&mut buf).map_err(|e| TpmError::Rng(e.to_string()))?;
@@ -21,7 +21,7 @@ impl SecretKey {
         Self(bytes)
     }
 
-    /// Octets bruts du secret — pour alimenter le déchiffrement des identifiants.
+    /// Raw bytes of the secret — used to feed decryption of the credentials.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

@@ -94,14 +94,17 @@ modifie donc pas les PCR TPM 0/4/7.
 
 ## Provisioning et post-quantique
 
-L’admission initiale de la clé publique WireGuard est hors bande. Une fois le
-tunnel classique établi, Orion appelle `/api/provision` avec une clé ML-KEM-768
-éphémère. Les deux côtés dérivent un PSK de 32 octets lié aux identités
-WireGuard et aux nonces du protocole.
+L’admission initiale lie hors bande la clé publique WireGuard et les empreintes
+des certificats Orion TLS et ML-DSA-65. Avant WireGuard, un port QUIC/mTLS de
+key-negotiation prépare le mode choisi par Orion. TLS transporte ; le certificat
+PQ et les signatures ML-DSA authentifient `kpub`, le ciphertext, la confirmation
+et l’ACK. Un plancher persistant interdit toute renégociation sous le niveau
+admis. Helios pose son slot avant de répondre ; une fermeture ou expiration
+restaure le slot précédent.
 
-Le protocole, la dérivation et l’IPAM CGNAT déterministe sont implémentés. Le
-câblage atomique final du PSK dans le plan de données gateway reste incomplet :
-il ne faut pas présenter cette rotation comme prête pour la production.
+L’ancien `/api/provision` derrière un tunnel classique reste un chemin de
+compatibilité pour les profils non migrés. L’IPAM CGNAT déterministe demeure
+indépendant de la key-negotiation.
 
 ## Démarrage vérifié et signature éditeur
 

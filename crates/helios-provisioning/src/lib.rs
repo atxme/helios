@@ -1,80 +1,86 @@
-//! Enrôlement des clients Orion côté gateway Helios (ADR-001, §4).
+//! Enrollment of Orion clients on the Helios gateway side (ADR-001, §4).
 //!
-//! WireGuard ne fournit ni authentification riche (X.509/EAP) ni adressage
-//! dynamique intégré : ce crate fournit explicitement ce que WireGuard ne donne
-//! pas gratuitement. Il tourne **sur la gateway** — son client est Orion, mais le
-//! service est ici. Les primitives partagées par les deux bouts (l'échange
-//! ML-KEM) vivent dans [`aether::pq`], pas ici, pour qu'`orion-core` n'ait
-//! jamais à dépendre d'un crate `helios-*`.
+//! WireGuard provides neither rich authentication (X.509/EAP) nor built-in
+//! dynamic addressing: this crate explicitly provides what WireGuard doesn't
+//! give for free. It runs **on the gateway** — its client is Orion, but the
+//! service lives here. The primitives shared by both ends (the ML-KEM
+//! exchange) live in [`aether::pq`], not here, so `orion-core` never has to
+//! depend on a `helios-*` crate.
 //!
-//! # Enrôlement = admission + provisioning
+//! # Enrollment = admission + provisioning
 //!
-//! Les deux ne s'automatisent pas de la même façon, et confondre les deux mène
-//! à un design impossible :
+//! The two are not automated the same way, and conflating them leads to an
+//! impossible design:
 //!
-//! * **Admission** (premier contact) — un client dont la clé publique est
-//!   inconnue ne peut pas monter le tunnel : WireGuard est fondé sur Noise_IK,
-//!   le répondeur rejette un initiateur qu'il ne connaît pas. L'admission est
-//!   donc **nécessairement hors bande** : un opérateur déclare la clé publique
-//!   dans `peers`, via [`admission`]. Sa VIP en est dérivée déterministement
-//!   par [`ipam`], sans état sur disque.
-//! * **Provisioning** ([`session`]) — une fois le tunnel classique monté, le
-//!   canal de contrôle *dans* le tunnel automatise l'échange ML-KEM, la
-//!   dérivation du PSK post-quantique et la confirmation de la VIP.
+//! * **Admission** (first contact) — a client whose public key is unknown
+//!   cannot bring up the tunnel: WireGuard is built on Noise_IK, the
+//!   responder rejects an initiator it doesn't know. Admission is therefore
+//!   **necessarily out of band**: an operator declares the public key in
+//!   `peers`, via [`admission`]. Its VIP is deterministically derived from it
+//!   by [`ipam`], with no state on disk.
+//! * **Provisioning** ([`session`]) — once the classical tunnel is up, the
+//!   control channel *inside* the tunnel automates the ML-KEM exchange, the
+//!   derivation of the post-quantum PSK, and confirmation of the VIP.
 //!
-//! Les messages du protocole et la dérivation du PSK vivent dans
-//! [`aether::enroll`], puisque le client doit les partager.
+//! The protocol messages and PSK derivation live in [`aether::enroll`], since
+//! the client has to share them.
 //!
-//! # Transport : pas de TLS, et c'est délibéré
+//! # Transport: no TLS, and it's deliberate
 //!
-//! L'ADR-001 envisageait un canal TLS 1.3 dédié, ancré TPM. Il a été **écarté à
-//! l'implémentation** : le canal vit de toute façon *à l'intérieur* du tunnel
-//! WireGuard, qui fournit déjà la confidentialité et l'authentification
-//! mutuelle. Le raisonnement complet est en tête de `helios-api::provision` et
-//! de `orion_core::provisioning`. Le transport réel est donc `POST
-//! /api/provision` sur le serveur HTTP existant, lui aussi derrière le tunnel.
+//! ADR-001 planned a dedicated TLS 1.3 channel, TPM-anchored. It was
+//! **dropped at implementation time**: the channel lives inside the
+//! WireGuard tunnel anyway, which already provides confidentiality and
+//! mutual authentication. The full reasoning is at the top of
+//! `helios-api::provision` and `orion_core::provisioning`. The real
+//! transport is therefore `POST /api/provision` on the existing HTTP server,
+//! itself also behind the tunnel.
 //!
-//! L'intention TPM reste valable mais vise un autre secret : `wg_private_key`,
-//! l'identité réelle de la gateway, aujourd'hui en clair dans `network.toml`.
+//! The TPM intent remains valid but targets a different secret:
+//! `wg_private_key`, the gateway's real identity, today stored in clear in
+//! `network.toml`.
 //!
-//! # Pose du PSK : l'ordre est un invariant de sûreté
+//! # PSK installation: the order is a safety invariant
 //!
-//! Le PSK dérivé est installé sur le plan de données **avant** d'être annoncé
-//! au client. WireGuard n'a qu'un seul slot PSK par pair : une valeur présente
-//! d'un seul côté fait échouer *tous* les handshakes suivants, et le canal de
-//! contrôle qui permettrait de se rattraper vit précisément dans le tunnel qui
-//! vient de mourir.
+//! The derived PSK is installed on the data plane **before** being announced
+//! to the client. WireGuard has only one PSK slot per peer: a value present
+//! on only one side makes *every* subsequent handshake fail, and the control
+//! channel that would allow recovery lives precisely in the tunnel that just
+//! died.
 //!
-//! La chaîne est donc fail-closed de bout en bout : `helios-api::provision`
-//! transmet le PSK à l'orchestrateur via [`aether::InstallPskRequest`] et
-//! attend son acquittement ; l'orchestrateur ne l'acquitte qu'après un
-//! `sync_peers` réussi, et annule sa modification en mémoire sinon. Un échec
-//! quelconque se traduit par une requête refusée, laissant le tunnel classique
-//! intact plutôt que de créer un PSK orphelin.
+//! The chain is therefore fail-closed end to end: `helios-api::provision`
+//! forwards the PSK to the orchestrator via [`aether::InstallPskRequest`] and
+//! waits for its acknowledgement; the orchestrator only acknowledges it after
+//! a successful `sync_peers`, and rolls back its in-memory change otherwise.
+//! Any failure results in a refused request, leaving the classical tunnel
+//! intact rather than creating an orphaned PSK.
 //!
-//! Côté client, `orion_core::backend` n'installe le PSK qu'une fois cette
-//! réponse reçue, par un `up()` idempotent qui ne démonte jamais l'adaptateur.
+//! On the client side, `orion_core::backend` only installs the PSK once this
+//! response is received, via an idempotent `up()` that never tears down the
+//! adapter.
 //!
-//! # Limite connue : la VIP dérivée n'est pas réconciliée
+//! # Known limitation: the derived VIP is not reconciled
 //!
-//! [`ipam::assign_vip`] dérive la VIP de la clé publique du pair et ne consulte
-//! jamais l'adresse déclarée dans `network.toml`. Les deux peuvent diverger.
-//! Aucun des deux bouts ne tranche : la gateway conserve l'adresse déclarée par
-//! l'opérateur, le client conserve celle de son profil, et l'écart est
-//! journalisé de part et d'autre. Réconcilier demande de décider qui fait
-//! autorité — l'opérateur ou la dérivation — ce qui déborde du provisioning.
+//! [`ipam::assign_vip`] derives the VIP from the peer's public key and never
+//! consults the address declared in `network.toml`. The two can diverge.
+//! Neither end arbitrates: the gateway keeps the address the operator
+//! declared, the client keeps the one from its profile, and the discrepancy
+//! is logged on both sides. Reconciling requires deciding who has
+//! authority — the operator or the derivation — which is beyond the scope of
+//! provisioning.
 //!
-//! [`admission::admit`] **réduit** cet écart sans le supprimer : elle déclare
-//! précisément l'adresse que l'IPAM dérive, si bien qu'un pair admis par cette
-//! voie ne diverge pas. Restent les entrées écrites à la main dans
-//! `network.toml`, pour lesquelles la limite ci-dessus tient toujours.
+//! [`admission::admit`] **reduces** this gap without eliminating it: it
+//! declares precisely the address the IPAM derives, so a peer admitted this
+//! way does not diverge. What remains are entries written by hand into
+//! `network.toml`, for which the above limitation still holds.
 
 pub mod admission;
 pub mod ipam;
 pub mod rotation;
 pub mod session;
 
-pub use admission::{admit, revoke, AdmissionError};
+pub use admission::{
+    admit, admit_with_certificate, admit_with_key_negotiation, revoke, AdmissionError,
+};
 pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, MAX_VIP_PROBES, POOL_SIZE};
 pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
 pub use session::{

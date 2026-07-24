@@ -508,15 +508,16 @@ export function ProfilesView({
                     onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
                   />
                   <Secret
-                    label="PSK"
+                    label="PSK statique"
                 error={issues.preshared_key}
                     value={draft.preshared_key ?? ''}
                     onChange={(value) => set('preshared_key', value || null)}
                   />
                   {staticPsk && (
                     <Caution>
-                      PSK statique : la négociation ML-KEM est <strong>désactivée</strong> et les
-                      deux pairs doivent porter la même valeur.
+                      Laisser vide pour obtenir un <strong>PSK PQC</strong> négocié en ML-KEM-768 à
+                      chaque connexion. Une valeur ici la <strong>désactive</strong> : le secret ne
+                      tourne plus et les deux pairs doivent porter la même valeur.
                     </Caution>
                   )}
                   <Field

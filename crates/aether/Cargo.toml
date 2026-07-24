@@ -10,6 +10,8 @@ description = "Le milieu partagé entre Helios (la gateway) et Orion (le client)
 default = []
 # API de génération et de signature réservée à l'outil éditeur hors gateway.
 publisher-signing = ["fips204/default-rng"]
+# Runtime ML-DSA signing for authenticated key negotiation.
+key-negotiation-signing = ["fips204/default-rng"]
 
 [dependencies]
 serde.workspace = true
@@ -19,6 +21,7 @@ aws-lc-rs.workspace = true
 zeroize.workspace = true
 base64.workspace = true
 hex.workspace = true
+serde_json.workspace = true
 fips204.workspace = true
 curve25519-dalek.workspace = true
 # Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
@@ -33,4 +36,3 @@ base64.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true

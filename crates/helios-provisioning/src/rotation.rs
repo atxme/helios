@@ -1,93 +1,93 @@
-//! Rotation du PSK sans briquer le pair (ADR-001, « Rotation du PSK sans brique »).
+//! PSK rotation without bricking the peer (ADR-001, "PSK rotation without a brick").
 //!
-//! # Le piège
+//! # The trap
 //!
-//! WireGuard n'a **qu'un seul slot PSK par pair**. Impossible d'accepter
-//! simultanément l'ancien et le nouveau : il n'y a pas de « make-before-break ».
-//! Si les deux bouts se désynchronisent, le handshake échoue, le tunnel tombe —
-//! et avec lui le canal de contrôle qui aurait permis de resynchroniser. Sur une
-//! appliance distante, cela signifie une intervention physique.
+//! WireGuard has **only one PSK slot per peer**. It's impossible to accept
+//! the old and the new one at the same time: there is no "make-before-break".
+//! If the two ends fall out of sync, the handshake fails, the tunnel drops —
+//! and with it the control channel that would have allowed resynchronizing.
+//! On a remote appliance, this means a physical intervention.
 //!
-//! # La parade : revert local sur délai
+//! # The fix: local revert on timeout
 //!
-//! Changer le PSK d'un pair vivant **ne casse pas la session en cours** : les
-//! clés de session sont déjà dérivées. Le nouveau PSK ne sert qu'au handshake
-//! suivant, ≤ 2 min plus tard. Chaque bout applique alors, **sans avoir besoin
-//! de communiquer** :
+//! Changing a live peer's PSK **does not break the ongoing session**: the
+//! session keys are already derived. The new PSK is only used at the next
+//! handshake, ≤ 2 min later. Each end then applies, **without needing to
+//! communicate**:
 //!
-//! > pas de handshake réussi [`REVERT_AFTER`] après l'installation de `PSK_new`
-//! > → retour à `PSK_old`.
+//! > no successful handshake [`REVERT_AFTER`] after installing `PSK_new`
+//! > → revert to `PSK_old`.
 //!
-//! Deux minuteurs locaux et déterministes convergent vers le même état. Le pire
-//! cas est un déni de service temporaire, jamais une brique ni une fuite.
+//! Two local, deterministic timers converge to the same state. The worst
+//! case is a temporary denial of service, never a brick nor a leak.
 //!
-//! Le temps est **injecté** (`now`) plutôt que lu de l'horloge : la logique est
-//! ainsi entièrement déterministe et testable sans attendre trois minutes.
+//! Time is **injected** (`now`) rather than read from the clock: the logic
+//! is thus entirely deterministic and testable without waiting three minutes.
 
 use std::time::Duration;
 
 use aether::enroll::Psk;
 
-/// Délai au-delà duquel un PSK non confirmé est abandonné.
+/// Delay beyond which an unconfirmed PSK is abandoned.
 ///
-/// 180 s = `REJECT_AFTER_TIME` de WireGuard : passé ce délai, si aucun handshake
-/// n'a réussi, c'est que le nouveau PSK n'est pas partagé par le pair.
+/// 180 s = WireGuard's `REJECT_AFTER_TIME`: past this delay, if no handshake
+/// has succeeded, it's because the new PSK isn't shared by the peer.
 pub const REVERT_AFTER: Duration = Duration::from_secs(180);
 
-/// État de la rotation pour un pair donné.
+/// Rotation state for a given peer.
 #[derive(Debug, Default)]
 pub enum RotationState {
-    /// Aucun PSK installé (tunnel classique seul, pas encore upgradé PQ).
+    /// No PSK installed (classical tunnel only, not yet PQ-upgraded).
     #[default]
     None,
-    /// Un PSK confirmé par au moins un handshake réussi.
+    /// A PSK confirmed by at least one successful handshake.
     Stable { psk: Psk },
-    /// Un nouveau PSK installé, en attente de confirmation.
+    /// A new PSK installed, awaiting confirmation.
     Pending {
         new_psk: Psk,
-        /// Conservé pour pouvoir revenir en arrière. `None` si on partait de rien.
+        /// Kept so we can roll back. `None` if we started from nothing.
         previous: Option<Psk>,
-        /// Âge de l'installation, alimenté par l'appelant.
+        /// Age of the installation, fed by the caller.
         installed_since: Duration,
     },
 }
 
-/// Ce que l'appelant doit appliquer au plan de données après une transition.
+/// What the caller must apply to the data plane after a transition.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RotationAction {
-    /// Rien à faire.
+    /// Nothing to do.
     Nothing,
-    /// Installer ce PSK sur le pair (base64), ou le retirer si `None`.
+    /// Install this PSK on the peer (base64), or remove it if `None`.
     InstallPsk(Option<String>),
 }
 
 impl RotationState {
-    /// PSK actuellement en vigueur, s'il y en a un.
+    /// Currently active PSK, if there is one.
     pub fn active(&self) -> Option<&Psk> {
         match self {
             RotationState::None => None,
             RotationState::Stable { psk } => Some(psk),
-            // En attente, c'est bien le nouveau qui est posé sur le pair.
+            // While pending, it is indeed the new one that is installed on the peer.
             RotationState::Pending { new_psk, .. } => Some(new_psk),
         }
     }
 
-    /// Une rotation est-elle en cours d'attente de confirmation ?
+    /// Is a rotation currently awaiting confirmation?
     pub fn is_pending(&self) -> bool {
         matches!(self, RotationState::Pending { .. })
     }
 
-    /// Installe un nouveau PSK issu d'un provisioning.
+    /// Installs a new PSK coming from a provisioning.
     ///
-    /// L'ancien est conservé : tant que le nouveau n'est pas confirmé par un
-    /// handshake, on doit pouvoir y revenir.
+    /// The old one is kept: as long as the new one isn't confirmed by a
+    /// handshake, we must be able to fall back to it.
     pub fn install(&mut self, new_psk: Psk) -> RotationAction {
         let previous = match std::mem::replace(self, RotationState::None) {
             RotationState::None => None,
             RotationState::Stable { psk } => Some(psk),
-            // Rotation pendant une rotation : on garde l'ancien *confirmé*,
-            // pas l'intermédiaire jamais validé — sinon un revert nous
-            // ramènerait à un PSK dont on ne sait pas s'il fonctionne.
+            // Rotation during a rotation: keep the *confirmed* old one, not
+            // the never-validated intermediate one — otherwise a revert
+            // would take us back to a PSK we don't know works.
             RotationState::Pending { previous, .. } => previous,
         };
 
@@ -100,12 +100,12 @@ impl RotationState {
         action
     }
 
-    /// Un handshake a réussi : le PSK en vigueur est confirmé.
+    /// A handshake succeeded: the active PSK is confirmed.
     ///
-    /// **Idempotent.** Le poller signale un handshake frais à chaque tour : cette
-    /// méthode ne doit toucher à l'état que s'il y a effectivement une rotation
-    /// à confirmer. Prendre l'état inconditionnellement (`mem::replace`) ferait
-    /// perdre le PSK dès le deuxième appel.
+    /// **Idempotent.** The poller signals a fresh handshake on every tick:
+    /// this method must only touch the state if there is actually a
+    /// rotation to confirm. Taking the state unconditionally (`mem::replace`)
+    /// would lose the PSK starting on the second call.
     pub fn on_handshake_success(&mut self) -> RotationAction {
         if !self.is_pending() {
             return RotationAction::Nothing;
@@ -117,9 +117,9 @@ impl RotationState {
         RotationAction::Nothing
     }
 
-    /// Fait avancer le temps. À appeler depuis la boucle de polling.
+    /// Advances time. To be called from the polling loop.
     ///
-    /// Renvoie l'action à appliquer : un revert si le délai est dépassé.
+    /// Returns the action to apply: a revert if the delay is exceeded.
     pub fn tick(&mut self, elapsed: Duration) -> RotationAction {
         let RotationState::Pending {
             previous,
@@ -135,8 +135,8 @@ impl RotationState {
             return RotationAction::Nothing;
         }
 
-        // Délai dépassé sans handshake : le pair n'a manifestement pas le même
-        // PSK. On revient à l'état antérieur, qui lui fonctionnait.
+        // Delay exceeded without a handshake: the peer manifestly doesn't
+        // have the same PSK. Revert to the previous state, which did work.
         let previous = previous.take();
         let action =
             RotationAction::InstallPsk(previous.as_ref().map(aether::enroll::psk_to_base64));
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn installation_puis_confirmation() {
+    fn installation_then_confirmation() {
         let mut st = RotationState::default();
         assert!(st.active().is_none());
 
@@ -168,85 +168,89 @@ mod tests {
         assert_eq!(**st.active().unwrap(), [1u8; 32]);
 
         st.on_handshake_success();
-        assert!(!st.is_pending(), "un handshake réussi confirme le PSK");
+        assert!(!st.is_pending(), "a successful handshake confirms the PSK");
         assert_eq!(**st.active().unwrap(), [1u8; 32]);
     }
 
-    /// Le cœur de la parade anti-brique : sans confirmation, on revient seul à
-    /// l'état antérieur, sans avoir eu besoin de parler au pair.
+    /// The core of the anti-brick fix: without confirmation, we revert alone
+    /// to the previous state, with no need to talk to the peer.
     #[test]
-    fn revert_automatique_sans_handshake() {
+    fn automatic_revert_without_a_handshake() {
         let mut st = RotationState::default();
         st.install(psk(1));
-        st.on_handshake_success(); // PSK 1 confirmé
+        st.on_handshake_success(); // PSK 1 confirmed
 
-        st.install(psk(2)); // rotation vers PSK 2
+        st.install(psk(2)); // rotation to PSK 2
         assert_eq!(**st.active().unwrap(), [2u8; 32]);
 
-        // Avant le délai : on patiente, rien ne bouge.
+        // Before the delay: we wait, nothing moves.
         assert_eq!(st.tick(Duration::from_secs(179)), RotationAction::Nothing);
         assert!(st.is_pending());
 
-        // Délai franchi sans handshake : retour au PSK qui fonctionnait.
+        // Delay exceeded without a handshake: revert to the PSK that worked.
         let action = st.tick(Duration::from_secs(2));
         assert!(matches!(action, RotationAction::InstallPsk(Some(_))));
-        assert_eq!(**st.active().unwrap(), [1u8; 32], "retour au PSK confirmé");
+        assert_eq!(
+            **st.active().unwrap(),
+            [1u8; 32],
+            "reverted to the confirmed PSK"
+        );
         assert!(!st.is_pending());
     }
 
     #[test]
-    fn confirmation_juste_avant_le_delai_annule_le_revert() {
+    fn confirmation_just_before_the_delay_cancels_the_revert() {
         let mut st = RotationState::default();
         st.install(psk(1));
         st.on_handshake_success();
         st.install(psk(2));
 
         st.tick(Duration::from_secs(179));
-        st.on_handshake_success(); // le pair a bien le PSK 2
+        st.on_handshake_success(); // the peer does have PSK 2
 
-        // Le temps continue de passer : plus aucun revert ne doit survenir.
+        // Time keeps passing: no revert must ever occur again.
         assert_eq!(st.tick(Duration::from_secs(600)), RotationAction::Nothing);
         assert_eq!(**st.active().unwrap(), [2u8; 32]);
     }
 
-    /// Premier PSK jamais confirmé : le revert doit retirer le PSK et revenir
-    /// au tunnel classique, pas installer un PSK inexistant.
+    /// First PSK never confirmed: the revert must remove the PSK and go
+    /// back to the classical tunnel, not install a nonexistent PSK.
     #[test]
-    fn revert_depuis_rien_retire_le_psk() {
+    fn revert_from_nothing_removes_the_psk() {
         let mut st = RotationState::default();
         st.install(psk(1));
         let action = st.tick(REVERT_AFTER);
         assert_eq!(
             action,
             RotationAction::InstallPsk(None),
-            "sans PSK antérieur, on retire le PSK et le tunnel reste classique"
+            "with no prior PSK, the PSK is removed and the tunnel stays classical"
         );
         assert!(st.active().is_none());
     }
 
-    /// Une rotation qui en écrase une autre ne doit pas prendre comme filet un
-    /// PSK jamais validé : on garde le dernier PSK *confirmé*.
+    /// A rotation that overwrites another must not use a never-validated PSK
+    /// as a safety net: we keep the last *confirmed* PSK.
     #[test]
-    fn rotation_pendant_rotation_garde_le_dernier_psk_confirme() {
+    fn rotation_during_rotation_keeps_the_last_confirmed_psk() {
         let mut st = RotationState::default();
         st.install(psk(1));
-        st.on_handshake_success(); // 1 confirmé
+        st.on_handshake_success(); // 1 confirmed
 
-        st.install(psk(2)); // jamais confirmé
-        st.install(psk(3)); // écrase 2
+        st.install(psk(2)); // never confirmed
+        st.install(psk(3)); // overwrites 2
 
         st.tick(REVERT_AFTER);
         assert_eq!(
             **st.active().unwrap(),
             [1u8; 32],
-            "le revert doit ramener au dernier PSK réellement validé"
+            "the revert must fall back to the last actually validated PSK"
         );
     }
 
-    /// Le poller signale un handshake frais à CHAQUE tour (toutes les 10 s) :
-    /// confirmer un PSK déjà confirmé ne doit surtout pas le perdre.
+    /// The poller signals a fresh handshake on EVERY tick (every 10 s):
+    /// confirming an already-confirmed PSK must absolutely not lose it.
     #[test]
-    fn confirmations_repetees_sont_idempotentes() {
+    fn repeated_confirmations_are_idempotent() {
         let mut st = RotationState::default();
         st.install(psk(1));
         st.on_handshake_success();
@@ -255,15 +259,14 @@ mod tests {
         for _ in 0..5 {
             st.on_handshake_success();
             assert_eq!(
-                **st.active()
-                    .expect("le PSK confirmé ne doit jamais disparaître"),
+                **st.active().expect("the confirmed PSK must never disappear"),
                 [1u8; 32]
             );
         }
     }
 
     #[test]
-    fn tick_sans_rotation_en_cours_ne_fait_rien() {
+    fn tick_without_an_ongoing_rotation_does_nothing() {
         let mut st = RotationState::default();
         assert_eq!(st.tick(Duration::from_secs(999)), RotationAction::Nothing);
 

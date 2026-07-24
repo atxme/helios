@@ -1,5 +1,5 @@
-// En dev, Vite proxie /api et /ws vers heliosd. En production, l'interface
-// embarquée et l'API sont servies par le même processus Axum.
+// In dev, Vite proxies /api and /ws to heliosd. In production, the embedded
+// interface and the API are served by the same Axum process.
 import type { CommandResponse, FinalizedRelease, FirewallRules, Status, Trust, UpdateStatus } from './types'
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {

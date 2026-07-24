@@ -1,116 +1,118 @@
-//! Abstraction du backend WireGuard et contrôleur de connexion.
+//! WireGuard backend abstraction and connection controller.
 //!
-//! # L'invariante de cycle de vie de l'adaptateur — lire avant de modifier
+//! # The adapter lifecycle invariant — read before modifying
 //!
-//! Orion est délibérément **fail-open** (CWE-636) : aucun pare-feu, aucun WFP
-//! (ADR-001 §3 bis). Sa seule protection contre la fuite en clair est une
-//! discipline de cycle de vie :
+//! Orion is deliberately **fail-open** (CWE-636): no firewall, no WFP
+//! (ADR-001 §3 bis). Its only protection against leaking in clear is a
+//! lifecycle discipline:
 //!
-//! > L'adaptateur (Wintun) porte `AllowedIPs = 0.0.0.0/0`. Il est monté à la
-//! > connexion et **n'est JAMAIS démonté sur échec** — ni en `Connecting`, ni en
-//! > `Failed`, ni après N tentatives. Il n'est retiré que sur **déconnexion
-//! > explicite** de l'utilisateur ou fermeture de l'application.
+//! > The adapter (Wintun) carries `AllowedIPs = 0.0.0.0/0`. It is mounted on
+//! > connection and **is NEVER unmounted on failure** — neither in `Connecting`,
+//! > nor in `Failed`, nor after N attempts. It is removed only on **explicit
+//! > disconnection** by the user or application shutdown.
 //!
-//! Tant que l'adaptateur tient, les paquets partent vers WireGuard qui les
-//! **jette** si la session est morte : l'attaquant qui bloque l'UDP 51820
-//! n'obtient qu'un déni de service. S'il tombe, la route par défaut retombe sur
-//! l'interface physique et le trafic sort **en clair**.
+//! As long as the adapter holds, packets go out toward WireGuard, which
+//! **drops** them if the session is dead: an attacker who blocks UDP 51820
+//! only gets a denial of service. If it falls, the default route falls back to
+//! the physical interface and traffic exits **in clear**.
 //!
-//! C'est pour cela que le trait sépare [`VpnBackend::up`] de
-//! [`VpnBackend::down`] : `down` n'est appelé que depuis
-//! [`VpnController::disconnect`], jamais sur un chemin d'erreur. Le test
-//! `adaptateur_reste_monte_apres_echec` verrouille cette propriété.
+//! This is why the trait separates [`VpnBackend::up`] from
+//! [`VpnBackend::down`]: `down` is only called from
+//! [`VpnController::disconnect`], never on an error path. The test
+//! `adapter_stays_mounted_after_failure` locks in this property.
 //!
-//! Seul [`dryrun::DryRunBackend`] est compilé par défaut (testable sur WSL2). Le
-//! backend WireGuard réel (BoringTun + Wintun via `defguard_wireguard_rs`) est
-//! target-only, comme la feature `netlink` côté heliosd.
+//! Only [`dryrun::DryRunBackend`] is compiled by default (testable on WSL2). The
+//! real WireGuard backend (BoringTun + Wintun via `defguard_wireguard_rs`) is
+//! target-only, just like the `netlink` feature on the heliosd side.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aether::TunnelState;
+#[cfg(feature = "key-negotiation")]
+use anyhow::Context as _;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::ClientProfile;
-use crate::events::ClientEvent;
+use crate::events::{ClientEvent, PskKind};
 
 pub mod dryrun;
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
 
-/// Au-delà de cet âge, le dernier handshake est considéré périmé et l'état
-/// retombe de `Up` à `Connecting`.
+/// Beyond this age, the last handshake is considered stale and the state
+/// falls back from `Up` to `Connecting`.
 ///
-/// 150 s laisse une marge sous `REJECT_AFTER_TIME` (180 s) : à 179 s on
-/// flapperait au moindre jitter (ADR-001 §3).
+/// 150 s leaves margin under `REJECT_AFTER_TIME` (180 s): at 179 s we would
+/// flap at the slightest jitter (ADR-001 §3).
 pub const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(150);
 
-/// Délai maximal d'attente du premier handshake avant de tenter le
-/// provisioning post-quantique.
+/// Maximum wait time for the first handshake before attempting
+/// post-quantum provisioning.
 ///
-/// Le canal de provisioning vit *dans* le tunnel : inutile de l'appeler avant
-/// que le tunnel classique ne porte du trafic. Au-delà, on renonce pour cette
-/// session — sans casser quoi que ce soit, le tunnel classique reste debout.
+/// The provisioning channel lives *inside* the tunnel: no point calling it
+/// before the classic tunnel carries traffic. Beyond that, we give up for
+/// this session — without breaking anything, the classic tunnel stays up.
 const PROVISION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Période de sondage du handshake pendant l'attente ci-dessus.
+/// Handshake polling period during the wait above.
 const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Puits d'événements : le backend pousse ses transitions d'état et ses logs ici.
-/// Le shell Tauri fournit une implémentation qui relaie vers le frontend.
+/// Event sink: the backend pushes its state transitions and logs here.
+/// The Tauri shell provides an implementation that relays to the frontend.
 pub type EventSink = Arc<dyn Fn(ClientEvent) + Send + Sync>;
 
-/// Une pile WireGuard capable de monter/démonter un tunnel vers une gateway.
+/// A WireGuard stack capable of mounting/unmounting a tunnel to a gateway.
 #[async_trait]
 pub trait VpnBackend: Send + Sync {
-    /// Monte l'adaptateur (`AllowedIPs = 0.0.0.0/0`) et configure le pair.
+    /// Mounts the adapter (`AllowedIPs = 0.0.0.0/0`) and configures the peer.
     ///
-    /// **Contrat** : en cas d'échec, l'implémentation ne doit **pas** démonter
-    /// l'adaptateur si elle a réussi à le créer — laisser WireGuard jeter les
-    /// paquets vaut mieux que de rendre la route physique au trafic en clair.
-    /// Doit être idempotent : rappeler `up` sur un adaptateur déjà monté
-    /// reconfigure le pair sans le recréer.
+    /// **Contract**: on failure, the implementation must **not** unmount
+    /// the adapter if it succeeded in creating it — letting WireGuard drop
+    /// packets is better than giving back the physical route to clear traffic.
+    /// Must be idempotent: calling `up` again on an already-mounted adapter
+    /// reconfigures the peer without recreating it.
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()>;
 
-    /// Démonte l'adaptateur. **Appelé uniquement sur déconnexion explicite.**
+    /// Unmounts the adapter. **Called only on explicit disconnection.**
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()>;
 
-    /// Âge du dernier handshake réussi, ou `None` si aucun.
-    /// Source de l'inférence d'état (WireGuard est sans connexion).
+    /// Age of the last successful handshake, or `None` if none.
+    /// Source of state inference (WireGuard is connectionless).
     async fn last_handshake_age(&self) -> Option<Duration>;
 
-    /// L'adaptateur est-il actuellement monté ? Sert à vérifier l'invariante.
+    /// Is the adapter currently mounted? Used to check the invariant.
     fn adapter_is_up(&self) -> bool;
 
-    /// Identifiant lisible du backend (diagnostic / IHM).
+    /// Human-readable backend identifier (diagnostics / UI).
     fn kind(&self) -> &'static str;
 }
 
-/// Sélectionne le backend selon les features compilées. Sans backend réel
-/// compilé, on retombe sur la simulation dry-run (cas WSL2/dev).
+/// Selects the backend according to compiled features. Without a real backend
+/// compiled in, falls back to dry-run simulation (WSL2/dev case).
 ///
-/// Avec la feature `wireguard`, on tente le backend réel ; s'il ne peut même pas
-/// s'initialiser (plan de données absent, droits insuffisants), on **échoue en
-/// journalisant** plutôt que de retomber silencieusement sur la simulation : un
-/// utilisateur qui croit son trafic chiffré alors qu'il ne l'est pas serait bien
-/// pire qu'une erreur visible.
+/// With the `wireguard` feature, attempts the real backend; if it can't even
+/// initialize (data plane absent, insufficient privileges), it **fails while
+/// logging** rather than silently falling back to simulation: a user who
+/// believes their traffic is encrypted when it isn't would be far worse than
+/// a visible error.
 pub fn default_backend() -> anyhow::Result<Arc<dyn VpnBackend>> {
     #[cfg(feature = "wireguard")]
     {
         let backend = wireguard::WireGuardBackend::new()
-            .map_err(|e| anyhow::anyhow!("backend WireGuard réel indisponible : {e}"))?;
+            .map_err(|e| anyhow::anyhow!("real WireGuard backend unavailable: {e}"))?;
         Ok(Arc::new(backend))
     }
     #[cfg(not(feature = "wireguard"))]
     Ok(Arc::new(dryrun::DryRunBackend::default()))
 }
 
-/// Attend qu'un handshake frais prouve que le tunnel classique porte du trafic.
+/// Waits for a fresh handshake to prove the classic tunnel carries traffic.
 ///
-/// Renvoie `false` si le délai expire : l'appelant doit alors renoncer au
-/// provisioning sans rien casser.
+/// Returns `false` if the timeout expires: the caller must then give up on
+/// provisioning without breaking anything.
 async fn wait_for_handshake(backend: &Arc<dyn VpnBackend>) -> bool {
     let deadline = tokio::time::Instant::now() + PROVISION_HANDSHAKE_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
@@ -125,41 +127,52 @@ async fn wait_for_handshake(backend: &Arc<dyn VpnBackend>) -> bool {
     false
 }
 
-/// Upgrade post-quantique : obtient le PSK auprès de la gateway et l'installe.
+/// Post-quantum upgrade: obtains the PSK from the gateway and installs it.
 ///
-/// # Cinématique (ADR-001)
+/// # Timing (ADR-001)
 ///
-/// Ne tourne qu'**après** montage du tunnel classique, puisque le canal de
-/// provisioning vit à l'intérieur de ce tunnel. Une fois le PSK dérivé des deux
-/// côtés, il est posé sur le pair via un `up()` — documenté idempotent : il
-/// reconfigure le pair sans recréer l'adaptateur, donc **sans jamais le
-/// démonter**. L'invariante anti-fuite en tête de module reste intacte.
+/// Only runs **after** the classic tunnel is mounted, since the provisioning
+/// channel lives inside that tunnel. Once the PSK is derived on both sides,
+/// it is set on the peer via an `up()` call — documented as idempotent: it
+/// reconfigures the peer without recreating the adapter, therefore **never
+/// unmounting it**. The anti-leak invariant at the top of the module remains
+/// intact.
 ///
-/// # Pourquoi l'échec n'est jamais fatal
+/// # Why failure is never fatal
 ///
-/// Un provisioning raté laisse le tunnel classique opérationnel : on perd la
-/// protection post-quantique, pas la connexion. Propager l'erreur ferait
-/// basculer l'état en `Failed` pour un tunnel qui fonctionne — bien pire que de
-/// journaliser.
+/// A failed provisioning leaves the classic tunnel operational: we lose
+/// post-quantum protection, not the connection. Propagating the error would
+/// flip the state to `Failed` for a tunnel that works — far worse than
+/// logging.
 ///
-/// # Ordre d'installation
+/// # Installation order
 ///
-/// La gateway pose le PSK **avant** de répondre (elle refuse la requête sinon).
-/// Quand ce code s'exécute, le PSK est donc déjà en place côté gateway, et la
-/// fenêtre où un seul des deux bouts le porte se referme en quelques
-/// millisecondes — bien avant le handshake suivant (≤ 2 min), le seul moment
-/// où un PSK unilatéral se verrait.
+/// The gateway sets the PSK **before** responding (it refuses the request
+/// otherwise). By the time this code runs, the PSK is therefore already in
+/// place on the gateway side, and the window where only one end carries it
+/// closes within milliseconds — well before the next handshake (≤ 2 min), the
+/// only moment a unilateral PSK would be noticeable.
 async fn upgrade_to_post_quantum(
     backend: &Arc<dyn VpnBackend>,
     profile: &ClientProfile,
     sink: &EventSink,
 ) {
-    // Déjà protégé : un PSK statique déclaré à la main reste souverain.
+    // Already protected: a manually declared static PSK remains sovereign.
+    // It's a PSK, not a PQC PSK: it protects, but it doesn't rotate and isn't
+    // derived from any exchange. The UI must be able to name it differently.
     if profile.preshared_key.is_some() {
+        sink(ClientEvent::protection(PskKind::Static));
+        sink(ClientEvent::log(
+            "info",
+            "PSK statique au profil : la négociation ML-KEM est désactivée. \
+             Le tunnel est protégé par un secret partagé hors bande, non renouvelé."
+                .to_string(),
+        ));
         return;
     }
 
     let Some(url) = profile.heliosd_url.clone() else {
+        sink(ClientEvent::protection(PskKind::None));
         sink(ClientEvent::log(
             "info",
             "Pas d'URL Helios interne au profil : le tunnel reste classique \
@@ -170,10 +183,11 @@ async fn upgrade_to_post_quantum(
     };
 
     if !wait_for_handshake(backend).await {
+        sink(ClientEvent::protection(PskKind::None));
         sink(ClientEvent::log(
             "warn",
-            "Aucun handshake dans le délai imparti : upgrade post-quantique \
-             reporté à la prochaine connexion"
+            "Aucun handshake dans le délai imparti : PSK PQC reporté à la \
+             prochaine connexion — le tunnel reste classique"
                 .to_string(),
         ));
         return;
@@ -182,17 +196,18 @@ async fn upgrade_to_post_quantum(
     let outcome = match crate::provisioning::provision(profile, &url).await {
         Ok(outcome) => outcome,
         Err(e) => {
+            sink(ClientEvent::protection(PskKind::None));
             sink(ClientEvent::log(
                 "warn",
-                format!("Upgrade post-quantique impossible : {e} — le tunnel reste classique"),
+                format!("Négociation du PSK PQC impossible : {e} — le tunnel reste classique"),
             ));
             return;
         }
     };
 
-    // La VIP annoncée doit correspondre à celle du profil. On ne la corrige pas
-    // en silence : l'adresse de l'adaptateur est déjà posée, et la changer sous
-    // les pieds d'une session vivante ferait plus de dégâts que de bien.
+    // The announced VIP must match the profile's. We don't silently correct
+    // it: the adapter's address is already set, and changing it under a live
+    // session's feet would do more harm than good.
     if let Some(declared) = profile.address.as_deref() {
         if declared != outcome.address {
             sink(ClientEvent::log(
@@ -212,34 +227,43 @@ async fn upgrade_to_post_quantum(
     };
 
     match backend.up(&upgraded, sink).await {
-        Ok(()) => sink(ClientEvent::log(
-            "info",
-            format!(
-                "PSK post-quantique installé (ML-KEM-768, valable {} s) — \
-                 le prochain handshake sera protégé",
-                outcome.lifetime.as_secs()
-            ),
-        )),
-        // Le PSK est posé côté gateway mais pas ici : le prochain handshake
-        // échouera. Le dire explicitement, c'est la seule façon pour
-        // l'utilisateur de comprendre une coupure qui arrivera deux minutes
-        // plus tard.
-        Err(e) => sink(ClientEvent::log(
-            "error",
-            format!(
-                "PSK obtenu mais non installé localement : {e}. La gateway l'a \
-                 posé de son côté — se reconnecter pour resynchroniser."
-            ),
-        )),
+        Ok(()) => {
+            sink(ClientEvent::protection(PskKind::MlKem));
+            sink(ClientEvent::log(
+                "info",
+                format!(
+                    "PSK PQC installé (ML-KEM-768, valable {} s) — \
+                     le prochain handshake sera protégé",
+                    outcome.lifetime.as_secs()
+                ),
+            ));
+        }
+        // The PSK is set on the gateway side but not here: the next handshake
+        // will fail. Saying so explicitly is the only way for the user to
+        // understand a disconnection that will happen two minutes later. And
+        // above all: don't announce anything as protected. The local slot
+        // is empty, this tunnel has no PSK.
+        Err(e) => {
+            sink(ClientEvent::protection(PskKind::None));
+            sink(ClientEvent::log(
+                "error",
+                format!(
+                    "PSK PQC obtenu mais non installé localement : {e}. La gateway \
+                     l'a posé de son côté — se reconnecter pour resynchroniser."
+                ),
+            ));
+        }
     }
 }
 
-/// Contrôleur de connexion : détient l'état courant du tunnel et orchestre le
-/// backend. Source de vérité unique de [`TunnelState`] côté client.
+/// Connection controller: holds the tunnel's current state and orchestrates
+/// the backend. Single source of truth for [`TunnelState`] on the client side.
 pub struct VpnController {
     backend: Arc<dyn VpnBackend>,
     state: Arc<RwLock<TunnelState>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(feature = "key-negotiation")]
+    key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
 impl VpnController {
@@ -248,28 +272,40 @@ impl VpnController {
             backend,
             state: Arc::new(RwLock::new(TunnelState::Down)),
             task: Mutex::new(None),
+            #[cfg(feature = "key-negotiation")]
+            key_negotiation_identities: None,
         }
     }
 
-    /// État courant du tunnel.
+    /// Supplies the protected client-certificate store used before WireGuard.
+    #[cfg(feature = "key-negotiation")]
+    pub fn with_key_negotiation_identities(
+        mut self,
+        identities: Arc<dyn crate::key_negotiation::IdentityProvider>,
+    ) -> Self {
+        self.key_negotiation_identities = Some(identities);
+        self
+    }
+
+    /// Current tunnel state.
     pub fn state(&self) -> TunnelState {
         *self.state.read().unwrap()
     }
 
-    /// Backend actif (diagnostic).
+    /// Active backend (diagnostics).
     pub fn backend_kind(&self) -> &'static str {
         self.backend.kind()
     }
 
-    /// L'adaptateur est-il monté ? Permet à l'IHM de distinguer « tunnel en
-    /// échec mais protégé » (adaptateur debout, WireGuard jette) de « exposé ».
+    /// Is the adapter mounted? Lets the UI distinguish "tunnel failed but
+    /// protected" (adapter up, WireGuard drops) from "exposed".
     pub fn adapter_is_up(&self) -> bool {
         self.backend.adapter_is_up()
     }
 
-    /// Construit un puits qui synchronise l'état interne **avant** de relayer
-    /// l'événement à `user_sink`. Garantit que `state()` reflète toujours la
-    /// dernière transition vue par l'IHM.
+    /// Builds a sink that synchronizes internal state **before** relaying
+    /// the event to `user_sink`. Guarantees that `state()` always reflects
+    /// the last transition seen by the UI.
     fn wrap_sink(&self, user_sink: EventSink) -> EventSink {
         let state = Arc::clone(&self.state);
         Arc::new(move |ev: ClientEvent| {
@@ -280,35 +316,61 @@ impl VpnController {
         })
     }
 
-    /// Lance la connexion en tâche de fond (n'attend pas la montée complète).
-    /// Annule toute connexion précédente.
+    /// Launches the connection as a background task (doesn't wait for full
+    /// mount). Cancels any previous connection.
     ///
-    /// **En cas d'échec, `down()` n'est délibérément PAS appelé** : l'adaptateur
-    /// reste monté et WireGuard continue de jeter les paquets. Voir l'invariante
-    /// en tête de module — supprimer cette propriété rouvrirait la fuite en clair.
+    /// **On failure, `down()` is deliberately NOT called**: the adapter
+    /// stays mounted and WireGuard keeps dropping packets. See the invariant
+    /// at the top of the module — removing this property would reopen the
+    /// clear-text leak.
     pub async fn connect(&self, profile: ClientProfile, user_sink: EventSink) {
         self.abort_task().await;
         let sink = self.wrap_sink(user_sink);
         let backend = Arc::clone(&self.backend);
+        #[cfg(feature = "key-negotiation")]
+        let identities = self.key_negotiation_identities.clone();
         let handle = tokio::spawn(async move {
+            #[cfg(feature = "key-negotiation")]
+            if profile.key_negotiation.is_some() {
+                if let Err(error) =
+                    connect_with_key_negotiation(&backend, &profile, &sink, identities.as_deref())
+                        .await
+                {
+                    sink(ClientEvent::state(TunnelState::Failed));
+                    sink(ClientEvent::Error {
+                        message: format!("key negotiation failed: {error}"),
+                    });
+                }
+                return;
+            }
+            #[cfg(not(feature = "key-negotiation"))]
+            if profile.key_negotiation.is_some() {
+                sink(ClientEvent::state(TunnelState::Failed));
+                sink(ClientEvent::Error {
+                    message: "this Orion binary was built without key-negotiation support"
+                        .to_string(),
+                });
+                return;
+            }
+
             if let Err(e) = backend.up(&profile, &sink).await {
                 sink(ClientEvent::state(TunnelState::Failed));
                 sink(ClientEvent::Error {
                     message: format!("échec de connexion: {e}"),
                 });
-                // Volontairement aucun `backend.down(...)` ici.
+                // Deliberately no `backend.down(...)` here.
                 return;
             }
-            // Tunnel classique debout : on tente l'upgrade post-quantique. Cette
-            // étape est longue (attente d'un handshake) mais reste dans la tâche
-            // de connexion, donc annulée proprement par `abort_task` sur
-            // reconnexion ou déconnexion.
+            // Classic tunnel up: attempt the post-quantum upgrade. This step
+            // is long (waiting for a handshake) but stays within the
+            // connection task, so it's cleanly cancelled by `abort_task` on
+            // reconnection or disconnection.
             upgrade_to_post_quantum(&backend, &profile, &sink).await;
         });
         *self.task.lock().await = Some(handle);
     }
 
-    /// Démonte le tunnel — **seul chemin autorisé à retirer l'adaptateur**.
+    /// Unmounts the tunnel — **the only path allowed to remove the adapter**.
     pub async fn disconnect(&self, user_sink: EventSink) {
         self.abort_task().await;
         let sink = self.wrap_sink(user_sink);
@@ -317,17 +379,17 @@ impl VpnController {
                 message: format!("échec de déconnexion: {e}"),
             });
         }
-        // Garantit le retour à Down même si le backend n'a rien émis.
+        // Guarantees a return to Down even if the backend emitted nothing.
         if self.state() != TunnelState::Down {
             sink(ClientEvent::state(TunnelState::Down));
         }
     }
 
-    /// Réévalue l'état à partir de l'âge du dernier handshake (WireGuard est
-    /// sans connexion : `Up` s'infère, il ne se reçoit pas).
+    /// Re-evaluates state from the age of the last handshake (WireGuard is
+    /// connectionless: `Up` is inferred, not received).
     ///
-    /// Ne touche **jamais** à l'adaptateur : cette inférence pilote l'IHM et la
-    /// télémétrie, pas la protection anti-fuite (ADR-001 §3).
+    /// **Never** touches the adapter: this inference drives the UI and
+    /// telemetry, not the anti-leak protection (ADR-001 §3).
     pub async fn poll_handshake(&self, user_sink: EventSink) {
         let fresh = matches!(
             self.backend.last_handshake_age().await,
@@ -360,6 +422,67 @@ impl VpnController {
     }
 }
 
+#[cfg(feature = "key-negotiation")]
+async fn connect_with_key_negotiation(
+    backend: &Arc<dyn VpnBackend>,
+    profile: &ClientProfile,
+    sink: &EventSink,
+    identities: Option<&dyn crate::key_negotiation::IdentityProvider>,
+) -> anyhow::Result<()> {
+    let identities = identities
+        .context("the Orion shell did not provide a protected key-negotiation identity store")?;
+    let negotiated = crate::key_negotiation::prepare_for_profile(profile, identities).await?;
+    let mode = negotiated.mode;
+    let confirmation_timeout = negotiated.confirmation_timeout;
+    let prepared_at = tokio::time::Instant::now();
+    let negotiated_profile = ClientProfile {
+        preshared_key: negotiated
+            .psk
+            .as_ref()
+            .map(|secret| secret.expose().to_string()),
+        ..profile.clone()
+    };
+
+    backend.up(&negotiated_profile, sink).await?;
+    if !wait_for_new_handshake(backend, prepared_at, confirmation_timeout).await {
+        anyhow::bail!(
+            "no fresh WireGuard handshake before the key-negotiation transaction expired"
+        );
+    }
+    negotiated.confirm().await?;
+
+    let protection = match mode {
+        aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
+        aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
+        aether::key_negotiation::ProtectionMode::MlKem => PskKind::MlKem,
+    };
+    sink(ClientEvent::protection(protection));
+    sink(ClientEvent::log(
+        "info",
+        format!("key negotiation committed after a fresh WireGuard handshake ({mode:?})"),
+    ));
+    Ok(())
+}
+
+#[cfg(feature = "key-negotiation")]
+async fn wait_for_new_handshake(
+    backend: &Arc<dyn VpnBackend>,
+    prepared_at: tokio::time::Instant,
+    confirmation_timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + confirmation_timeout;
+    while tokio::time::Instant::now() < deadline {
+        if matches!(
+            backend.last_handshake_age().await,
+            Some(age) if age <= prepared_at.elapsed()
+        ) {
+            return true;
+        }
+        tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,33 +502,33 @@ mod tests {
         }
     }
 
-    /// L'invariante de sécurité d'Orion (ADR-001 §3 bis). Si ce test tombe, la
-    /// fuite en clair devient exploitable par simple blocage de l'UDP 51820.
+    /// Orion's security invariant (ADR-001 §3 bis). If this test breaks, the
+    /// clear-text leak becomes exploitable by simply blocking UDP 51820.
     #[tokio::test]
-    async fn adaptateur_reste_monte_apres_echec() {
+    async fn adapter_stays_mounted_after_failure() {
         let backend = Arc::new(DryRunBackend::failing());
         let ctrl = VpnController::new(backend.clone());
 
         ctrl.connect(profile(), sink()).await;
-        // Laisse la tâche de connexion échouer.
+        // Let the connection task fail.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
             ctrl.state(),
             TunnelState::Failed,
-            "l'échec doit être visible"
+            "the failure must be visible"
         );
         assert!(
             ctrl.adapter_is_up(),
-            "INVARIANTE VIOLÉE : l'adaptateur a été démonté sur échec — \
-             la route par défaut retombe sur l'interface physique et le trafic \
-             sort en clair (ADR-001 §3 bis)"
+            "INVARIANT VIOLATED: the adapter was unmounted on failure — \
+             the default route falls back to the physical interface and traffic \
+             exits in clear (ADR-001 §3 bis)"
         );
     }
 
-    /// Seule la déconnexion explicite a le droit de retirer l'adaptateur.
+    /// Only explicit disconnection may remove the adapter.
     #[tokio::test]
-    async fn seule_la_deconnexion_explicite_demonte() {
+    async fn only_explicit_disconnection_unmounts() {
         let backend = Arc::new(DryRunBackend::default());
         let ctrl = VpnController::new(backend.clone());
 
@@ -414,58 +537,55 @@ mod tests {
         assert!(ctrl.adapter_is_up());
 
         ctrl.disconnect(sink()).await;
-        assert!(
-            !ctrl.adapter_is_up(),
-            "disconnect doit démonter l'adaptateur"
-        );
+        assert!(!ctrl.adapter_is_up(), "disconnect must unmount the adapter");
         assert_eq!(ctrl.state(), TunnelState::Down);
     }
 
     #[tokio::test]
-    async fn polling_infere_up_puis_retombe_si_perime() {
+    async fn polling_infers_up_then_falls_back_if_stale() {
         let backend = Arc::new(DryRunBackend::default());
         let ctrl = VpnController::new(backend.clone());
 
         ctrl.connect(profile(), sink()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Handshake frais → Up.
+        // Fresh handshake → Up.
         backend.set_handshake_age(Some(Duration::from_secs(10)));
         ctrl.poll_handshake(sink()).await;
         assert_eq!(ctrl.state(), TunnelState::Up);
 
-        // Handshake périmé → retour Connecting, sans toucher à l'adaptateur.
+        // Stale handshake → back to Connecting, without touching the adapter.
         backend.set_handshake_age(Some(Duration::from_secs(200)));
         ctrl.poll_handshake(sink()).await;
         assert_eq!(ctrl.state(), TunnelState::Connecting);
-        assert!(ctrl.adapter_is_up(), "le polling ne doit jamais démonter");
+        assert!(ctrl.adapter_is_up(), "polling must never unmount");
     }
 
-    /// Un profil déjà porteur d'un PSK statique ne doit pas être renégocié :
-    /// l'upgrade rend la main immédiatement, sans toucher au réseau.
+    /// A profile already carrying a static PSK must not be renegotiated:
+    /// the upgrade returns immediately, without touching the network.
     #[tokio::test]
-    async fn psk_statique_deja_present_court_circuite_l_upgrade() {
+    async fn static_psk_already_present_short_circuits_the_upgrade() {
         let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
         let mut p = profile();
-        p.preshared_key = Some("psk-declare-a-la-main".into());
-        // `heliosd_url` renseignée : seule la présence du PSK doit arrêter.
+        p.preshared_key = Some("manually-declared-psk".into());
+        // `heliosd_url` set: only the PSK's presence should stop it.
         p.heliosd_url = Some("http://127.0.0.1:1".into());
 
-        // Sans court-circuit, l'attente de handshake durerait 30 s.
+        // Without the short circuit, the handshake wait would take 30 s.
         tokio::time::timeout(
             Duration::from_millis(200),
             upgrade_to_post_quantum(&backend, &p, &sink()),
         )
         .await
-        .expect("un PSK déjà présent doit rendre la main sans attendre");
+        .expect("an already-present PSK must return immediately without waiting");
     }
 
-    /// Sans URL interne, l'upgrade est impossible : il doit le dire et renoncer,
-    /// pas attendre un handshake qui ne servira à rien.
+    /// Without an internal URL, the upgrade is impossible: it must say so and
+    /// give up, not wait for a handshake that would serve no purpose.
     #[tokio::test]
-    async fn absence_d_url_interne_renonce_en_le_signalant() {
+    async fn absence_of_internal_url_gives_up_while_reporting_it() {
         let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
-        let p = profile(); // `heliosd_url` vaut None par défaut.
+        let p = profile(); // `heliosd_url` defaults to None.
 
         let journal = Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = Arc::clone(&journal);
@@ -480,24 +600,68 @@ mod tests {
             upgrade_to_post_quantum(&backend, &p, &sink),
         )
         .await
-        .expect("sans URL, l'upgrade doit renoncer immédiatement");
+        .expect("without a URL, the upgrade must give up immediately");
 
         let journal = journal.lock().unwrap();
         assert!(
             journal.iter().any(|m| m.contains("tunnel reste classique")),
-            "l'utilisateur doit être averti qu'il n'a pas la protection \
-             post-quantique, sinon il la croit acquise : {journal:?}"
+            "the user must be warned they don't have post-quantum protection, \
+             otherwise they'd believe it's already in place: {journal:?}"
         );
     }
 
-    /// L'invariante anti-fuite tient aussi pendant l'upgrade : quel que soit le
-    /// sort du provisioning, l'adaptateur ne doit jamais être démonté.
+    /// Captures the PSK kind announced by an upgrade.
+    async fn announced_protection(profile: &ClientProfile) -> Vec<PskKind> {
+        let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
+        let vu = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&vu);
+        let sink: EventSink = Arc::new(move |ev| {
+            if let ClientEvent::Protection { psk } = ev {
+                capture.lock().unwrap().push(psk);
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            upgrade_to_post_quantum(&backend, profile, &sink),
+        )
+        .await
+        .expect("both tested cases must return without waiting");
+
+        let vu = vu.lock().unwrap();
+        vu.clone()
+    }
+
+    /// A static PSK and a PQC PSK occupy the same WireGuard slot, but don't
+    /// protect the same way: one never rotates. The UI can't tell them apart
+    /// on its own — if the upgrade stayed silent, it would display
+    /// "post-quantum" for a manually copied secret.
     #[tokio::test]
-    async fn l_upgrade_ne_demonte_jamais_l_adaptateur() {
+    async fn a_static_psk_announces_itself_as_static_not_pqc() {
+        let mut p = profile();
+        p.preshared_key = Some("manually-declared-psk".into());
+        p.heliosd_url = Some("http://127.0.0.1:1".into());
+
+        assert_eq!(announced_protection(&p).await, vec![PskKind::Static]);
+    }
+
+    /// Without an internal URL, no PSK will be set: it must be said, or the
+    /// UI would stay stuck on its waiting display indefinitely.
+    #[tokio::test]
+    async fn a_tunnel_without_psk_announces_itself_as_lacking_one() {
+        let p = profile(); // neither a static PSK nor `heliosd_url`.
+
+        assert_eq!(announced_protection(&p).await, vec![PskKind::None]);
+    }
+
+    /// The anti-leak invariant also holds during the upgrade: whatever the
+    /// fate of provisioning, the adapter must never be unmounted.
+    #[tokio::test]
+    async fn the_upgrade_never_unmounts_the_adapter() {
         let backend = Arc::new(DryRunBackend::default());
         let ctrl = VpnController::new(backend.clone());
         let mut p = profile();
-        // URL injoignable : le provisioning échouera à coup sûr.
+        // Unreachable URL: provisioning will fail for sure.
         p.heliosd_url = Some("http://127.0.0.1:1".into());
 
         ctrl.connect(p, sink()).await;
@@ -507,13 +671,13 @@ mod tests {
 
         assert!(
             ctrl.adapter_is_up(),
-            "INVARIANTE VIOLÉE : un provisioning raté a démonté l'adaptateur — \
-             la route par défaut retombe sur l'interface physique (ADR-001 §3 bis)"
+            "INVARIANT VIOLATED: a failed provisioning unmounted the adapter — \
+             the default route falls back to the physical interface (ADR-001 §3 bis)"
         );
     }
 
     #[test]
-    fn profil_incomplet_rejete_avant_le_reseau() {
+    fn incomplete_profile_rejected_before_the_network() {
         let mut p = profile();
         p.private_key = String::new();
         assert!(p.validate().is_err());

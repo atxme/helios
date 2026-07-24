@@ -1,8 +1,8 @@
-//! Réception, vérification et installation atomique d’un binaire `heliosd`.
+//! Reception, verification and atomic installation of a `heliosd` binary.
 //!
-//! Le daemon ne fait que déposer l’artefact sous `/var/lib/helios/updates`.
-//! L’installation privilégiée est rejouée et revérifiée par
-//! `helios-installer`, sans accès réseau.
+//! The daemon only deposits the artifact under `/var/lib/helios/updates`.
+//! The privileged installation is replayed and re-verified by
+//! `helios-installer`, with no network access.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -31,7 +31,7 @@ const PART_FILE: &str = "heliosd.part";
 const BINARY_FILE: &str = "heliosd";
 const FINALIZED_FILE: &str = "finalized.json";
 
-/// Paramètres locaux du canal et des chemins de mise à jour.
+/// Local parameters for the update channel and paths.
 #[derive(Debug, Clone)]
 pub struct UpdateLayout {
     pub staging_root: PathBuf,
@@ -91,7 +91,7 @@ impl UpdateLayout {
     }
 }
 
-/// État persistant minimal nécessaire à l’anti-rollback.
+/// Minimal persistent state required for anti-rollback.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateState {
@@ -125,7 +125,7 @@ pub struct UpdateStatus {
     pub target: String,
 }
 
-/// Store clonable partagé par les handlers HTTP.
+/// Clonable store shared by the HTTP handlers.
 #[derive(Clone)]
 pub struct UpdateStore {
     layout: UpdateLayout,
@@ -165,7 +165,7 @@ impl UpdateStore {
         fs::create_dir_all(&directory)?;
         let manifest_path = directory.join(MANIFEST_FILE);
         let bytes = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| update_error(format!("sérialisation du manifeste : {e}")))?;
+            .map_err(|e| update_error(format!("manifest serialization: {e}")))?;
         write_new_synced(&manifest_path, &bytes, 0o600)?;
         write_new_synced(&directory.join(PART_FILE), &[], 0o600)?;
         sync_directory(&directory)?;
@@ -175,7 +175,7 @@ impl UpdateStore {
     pub fn append_chunk(&self, sequence: u64, offset: u64, data: &[u8]) -> Result<u64> {
         if data.is_empty() || data.len() > MAX_CHUNK_SIZE {
             return Err(update_error(format!(
-                "fragment de {} octets hors limite 1..={MAX_CHUNK_SIZE}",
+                "chunk of {} bytes out of bounds 1..={MAX_CHUNK_SIZE}",
                 data.len()
             )));
         }
@@ -190,12 +190,12 @@ impl UpdateStore {
         let current = file.metadata()?.len();
         if current != offset {
             return Err(update_error(format!(
-                "offset inattendu : reçu {offset}, attendu {current}"
+                "unexpected offset: received {offset}, expected {current}"
             )));
         }
         let next = current.saturating_add(data.len() as u64);
         if next > manifest.payload.binary_size || next > MAX_BINARY_SIZE {
-            return Err(update_error("le fragment dépasserait la taille signée"));
+            return Err(update_error("the chunk would exceed the signed size"));
         }
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
@@ -212,7 +212,7 @@ impl UpdateStore {
         fs::rename(directory.join(PART_FILE), directory.join(BINARY_FILE))?;
         let finalized = summary(&manifest);
         let bytes = serde_json::to_vec_pretty(&finalized)
-            .map_err(|e| update_error(format!("sérialisation de la finalisation : {e}")))?;
+            .map_err(|e| update_error(format!("finalization serialization: {e}")))?;
         write_new_synced(&directory.join(FINALIZED_FILE), &bytes, 0o600)?;
         sync_directory(&directory)?;
         Ok(finalized)
@@ -221,7 +221,7 @@ impl UpdateStore {
     pub fn request_activation(&self, sequence: u64, confirmation: &str) -> Result<()> {
         let _guard = self.lock.lock().map_err(lock_error)?;
         if confirmation != format!("INSTALLER {sequence}") {
-            return Err(update_error("confirmation d’activation incorrecte"));
+            return Err(update_error("incorrect activation confirmation"));
         }
         let directory = self.layout.staged_dir(sequence);
         let _: FinalizedRelease = read_json(&directory.join(FINALIZED_FILE))?;
@@ -232,14 +232,14 @@ impl UpdateStore {
         let request = ActivationRequest {
             release_sequence: sequence,
             requested_at_unix: unix_now()?,
-            // Laisse au serveur HTTP le temps d’envoyer son 202 avant que le
-            // helper ne redémarre le daemon et son interface WireGuard.
+            // Leaves the HTTP server time to send its 202 before the helper
+            // restarts the daemon and its WireGuard interface.
             delay_seconds: 2,
         };
         let bytes = serde_json::to_vec_pretty(&request)
-            .map_err(|e| update_error(format!("sérialisation de l’activation : {e}")))?;
+            .map_err(|e| update_error(format!("activation serialization: {e}")))?;
         if self.layout.activation_path.exists() {
-            return Err(update_error("une activation est déjà en attente"));
+            return Err(update_error("an activation is already pending"));
         }
         write_new_synced(&self.layout.activation_path, &bytes, 0o600)
     }
@@ -282,20 +282,20 @@ fn verify_manifest_with_keyring(
 ) -> Result<()> {
     manifest
         .verify(keyring)
-        .map_err(|e| update_error(format!("signature du manifeste refusée : {e}")))?;
+        .map_err(|e| update_error(format!("manifest signature rejected: {e}")))?;
     let payload = &manifest.payload;
     if payload.product != "heliosd" {
-        return Err(update_error("le manifeste ne cible pas heliosd"));
+        return Err(update_error("manifest does not target heliosd"));
     }
     if payload.channel != layout.channel {
         return Err(update_error(format!(
-            "canal {} refusé, {} attendu",
+            "channel {} refused, {} expected",
             payload.channel, layout.channel
         )));
     }
     if payload.target != layout.target {
         return Err(update_error(format!(
-            "target {} refusée, {} attendue",
+            "target {} refused, {} expected",
             payload.target, layout.target
         )));
     }
@@ -303,20 +303,20 @@ fn verify_manifest_with_keyring(
         || payload.version.trim().is_empty()
         || payload.git_commit.trim().is_empty()
     {
-        return Err(update_error("métadonnées de release incomplètes"));
+        return Err(update_error("incomplete release metadata"));
     }
     if payload.binary_size == 0 || payload.binary_size > MAX_BINARY_SIZE {
-        return Err(update_error("taille de binaire hors limite"));
+        return Err(update_error("binary size out of bounds"));
     }
     if payload.minimum_installer_version > INSTALLER_VERSION {
         return Err(update_error(format!(
-            "installer v{} requis, v{INSTALLER_VERSION} présent",
+            "installer v{} required, v{INSTALLER_VERSION} present",
             payload.minimum_installer_version
         )));
     }
     if payload.features.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(update_error(
-            "les features doivent être triées, uniques et non vides",
+            "features must be sorted, unique and non-empty",
         ));
     }
     if payload
@@ -324,7 +324,7 @@ fn verify_manifest_with_keyring(
         .iter()
         .any(|feature| feature.trim().is_empty())
     {
-        return Err(update_error("feature vide dans le manifeste"));
+        return Err(update_error("empty feature in the manifest"));
     }
     Ok(())
 }
@@ -333,37 +333,37 @@ pub fn verify_binary(path: &Path, manifest: &SignedBinaryRelease) -> Result<()> 
     let metadata = fs::metadata(path)?;
     if metadata.len() != manifest.payload.binary_size {
         return Err(update_error(format!(
-            "taille du binaire : {} au lieu de {}",
+            "binary size: {} instead of {}",
             metadata.len(),
             manifest.payload.binary_size
         )));
     }
     let digest = sha256_file(path)?;
     if digest != manifest.payload.sha256 {
-        return Err(update_error("SHA-256 du binaire incorrect"));
+        return Err(update_error("incorrect binary SHA-256"));
     }
     verify_elf(path, &manifest.payload.target)?;
     Ok(())
 }
 
-/// Refuse un artefact signé par erreur qui ne serait pas un ELF de
-/// l’architecture annoncée. La signature reste le contrôle d’authenticité ; ce
-/// précontrôle évite une indisponibilité causée par un mauvais fichier.
+/// Rejects an artifact signed by mistake that would not be an ELF of the
+/// announced architecture. The signature remains the authenticity check;
+/// this precheck avoids downtime caused by a bad file.
 pub fn verify_elf(path: &Path, target: &str) -> Result<()> {
     let mut header = [0u8; 20];
     File::open(path)?.read_exact(&mut header).map_err(|error| {
         update_error(format!(
-            "en-tête ELF incomplet dans {} : {error}",
+            "incomplete ELF header in {}: {error}",
             path.display()
         ))
     })?;
     if &header[..4] != b"\x7fELF" || header[4] != 2 {
-        return Err(update_error("le fichier n’est pas un ELF 64 bits"));
+        return Err(update_error("file is not a 64-bit ELF"));
     }
     let machine = match header[5] {
         1 => u16::from_le_bytes([header[18], header[19]]),
         2 => u16::from_be_bytes([header[18], header[19]]),
-        _ => return Err(update_error("endianness ELF inconnue")),
+        _ => return Err(update_error("unknown ELF endianness")),
     };
     let expected = if target.starts_with("x86_64-") {
         62
@@ -373,12 +373,12 @@ pub fn verify_elf(path: &Path, target: &str) -> Result<()> {
         243
     } else {
         return Err(update_error(format!(
-            "architecture de target non prise en charge par l’installer : {target}"
+            "target architecture not supported by the installer: {target}"
         )));
     };
     if machine != expected {
         return Err(update_error(format!(
-            "architecture ELF {machine} incohérente avec {target}"
+            "ELF architecture {machine} inconsistent with {target}"
         )));
     }
     Ok(())
@@ -399,12 +399,12 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32]> {
         .finish()
         .as_ref()
         .try_into()
-        .map_err(|_| update_error("SHA-256 de longueur inattendue"))
+        .map_err(|_| update_error("SHA-256 of unexpected length"))
 }
 
-/// Installe les octets vérifiés et bascule atomiquement le lien `current`.
-/// Le redémarrage et la décision de confirmer ou restaurer appartiennent au
-/// binaire privilégié.
+/// Installs the verified bytes and atomically switches the `current` link.
+/// The restart and the decision to confirm or restore belong to the
+/// privileged binary.
 pub fn prepare_switch(layout: &UpdateLayout, sequence: u64) -> Result<SwitchGuard> {
     prepare_switch_with_keyring(layout, sequence, PUBLISHER_KEYS)
 }
@@ -427,13 +427,14 @@ fn prepare_switch_with_keyring(
     if !binary_destination.exists() {
         let temporary = release_dir.join("heliosd.installing");
         copy_executable(&staged.join(BINARY_FILE), &temporary)?;
-        // La source appartient au staging du daemon et peut changer pendant la
-        // copie. Seule la copie root sous /opt est immuable pour le daemon :
-        // elle doit donc correspondre au manifeste avant de devenir active.
+        // The source belongs to the daemon's staging area and can change
+        // during the copy. Only the root copy under /opt is immutable for
+        // the daemon: it must therefore match the manifest before becoming
+        // active.
         verify_binary(&temporary, &manifest)?;
         fs::rename(&temporary, &binary_destination)?;
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| update_error(format!("sérialisation du manifeste installé : {e}")))?;
+            .map_err(|e| update_error(format!("installed manifest serialization: {e}")))?;
         write_new_synced(&release_dir.join(MANIFEST_FILE), &manifest_bytes, 0o600)?;
         sync_directory(&release_dir)?;
     } else {
@@ -471,7 +472,7 @@ impl SwitchGuard {
         let previous = self
             .previous
             .as_ref()
-            .ok_or_else(|| update_error("aucune version précédente pour le rollback"))?;
+            .ok_or_else(|| update_error("no previous version for rollback"))?;
         switch_link(&self.current_link, previous)
     }
 }
@@ -510,7 +511,7 @@ fn read_state(path: &Path) -> Result<UpdateState> {
 fn reject_rollback(sequence: u64, state: &UpdateState) -> Result<()> {
     if sequence <= state.highest_confirmed_sequence {
         return Err(update_error(format!(
-            "séquence {sequence} refusée, la séquence {} est déjà confirmée",
+            "sequence {sequence} refused, sequence {} is already confirmed",
             state.highest_confirmed_sequence
         )));
     }
@@ -528,15 +529,15 @@ fn summary(manifest: &SignedBinaryRelease) -> FinalizedRelease {
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes)
-        .map_err(|e| update_error(format!("JSON {} invalide : {e}", path.display())))
+        .map_err(|e| update_error(format!("invalid JSON {}: {e}", path.display())))
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| update_error(format!("sérialisation JSON : {e}")))?;
+        .map_err(|e| update_error(format!("JSON serialization: {e}")))?;
     let parent = path
         .parent()
-        .ok_or_else(|| update_error("chemin d’état sans répertoire parent"))?;
+        .ok_or_else(|| update_error("state path without a parent directory"))?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
@@ -587,7 +588,7 @@ fn switch_link(link: &Path, target: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
     let parent = link
         .parent()
-        .ok_or_else(|| update_error("lien current sans répertoire parent"))?;
+        .ok_or_else(|| update_error("current link without a parent directory"))?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join("current.switching");
     match fs::remove_file(&temporary) {
@@ -603,7 +604,7 @@ fn switch_link(link: &Path, target: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn switch_link(_link: &Path, _target: &Path) -> Result<()> {
     Err(update_error(
-        "l’installation atomique est disponible uniquement sur Unix",
+        "atomic installation is only available on Unix",
     ))
 }
 
@@ -616,7 +617,7 @@ fn unix_now() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|e| update_error(format!("horloge système antérieure à Unix : {e}")))
+        .map_err(|e| update_error(format!("system clock predates Unix epoch: {e}")))
 }
 
 fn update_error(message: impl Into<String>) -> HeliosError {
@@ -624,7 +625,7 @@ fn update_error(message: impl Into<String>) -> HeliosError {
 }
 
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> HeliosError {
-    update_error(format!("verrou de mise à jour empoisonné : {error}"))
+    update_error(format!("poisoned update lock: {error}"))
 }
 
 #[cfg(test)]
@@ -691,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_borne_et_verifie_chaque_octet() {
+    fn staging_bounds_and_verifies_every_byte() {
         let dir = tempfile::tempdir().unwrap();
         let (store, manifest, binary) = store_with_test_keys(dir.path());
 
@@ -711,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_altere_refuse() {
+    fn altered_hash_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("heliosd");
         let expected = test_elf();
@@ -723,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn anti_rollback_strict() {
+    fn strict_anti_rollback() {
         let state = UpdateState {
             highest_confirmed_sequence: 4,
             active_version: Some("1.0.4".into()),
@@ -735,7 +736,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lien_courant_bascule_et_revient_atomiquement() {
+    fn current_link_switches_and_reverts_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("old");
         let new = dir.path().join("new");
@@ -752,7 +753,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn installation_confirmee_persiste_l_anti_rollback() {
+    fn confirmed_installation_persists_anti_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout(dir.path());
         let binary = test_elf();

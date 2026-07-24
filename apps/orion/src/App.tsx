@@ -17,22 +17,20 @@ import { postureMeta } from './components/state'
 import { GUTTER, PINE } from './theme'
 
 /**
- * Coquille de l’application — un rail de navigation, une zone de contenu, rien
- * qui défile.
+ * Application shell — a navigation rail, a content area, nothing that scrolls.
  *
- * Le rail n’affiche que des icônes et ne se déploie qu’au survol ou au focus.
- * Deux raisons : la première vue reste dégagée, et surtout les icônes occupent
- * un emplacement de **largeur fixe**, ce qui les aligne par construction. Des
- * onglets qui centrent le groupe icône + libellé décalent les icônes dès que les
- * libellés n’ont pas la même longueur — c’est exactement le défaut qu’on corrige
- * ici.
+ * The rail only shows icons and only expands on hover or focus. Two reasons:
+ * the first view stays uncluttered, and above all the icons occupy a
+ * **fixed-width** slot, which aligns them by construction. Tabs that center
+ * the icon + label group shift the icons as soon as the labels aren't the
+ * same length — that's exactly the defect being fixed here.
  */
 
 type View = 'connect' | 'profiles' | 'logs'
 
-/** Largeur du rail replié. L’emplacement d’icône fait exactement cette largeur. */
+/** Width of the collapsed rail. The icon slot is exactly this width. */
 const RAIL = 56
-/** Largeur déployée. Le panneau recouvre le contenu : rien ne se remet en page. */
+/** Expanded width. The panel covers the content: nothing reflows. */
 const NAV_OPEN = 184
 
 const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
@@ -51,10 +49,10 @@ export default function App() {
     if (c.pathImportedProfile) setView('profiles')
   }, [c.pathImportedProfile])
 
-  // Chaque vue a ses besoins de place : la connexion tient dans une colonne
-  // étroite, le formulaire de profils réclame deux colonnes, le journal veut de
-  // la largeur. La fenêtre suit la vue plutôt que d'adopter en permanence le
-  // maximum des trois.
+  // Each view has its own space needs: connection fits in a narrow column,
+  // the profile form needs two columns, the log wants width. The window
+  // follows the view rather than permanently adopting the maximum of the
+  // three.
   useEffect(() => {
     void api.resizeForView(view).catch(() => {})
   }, [view])
@@ -86,8 +84,8 @@ export default function App() {
           Orion
         </Typography>
 
-        {/* Seul porteur de la posture dans l'IHM : la vue Connexion ne la
-            répète plus. L'explication est là, en infobulle, sans encombrer. */}
+        {/* Sole carrier of posture in the UI: the Connect view no longer
+            repeats it. The explanation is there, as a tooltip, without clutter. */}
         <Tooltip title={posture.detail}>
           <Box
             aria-label={`${posture.label}. ${posture.detail}`}
@@ -138,8 +136,9 @@ export default function App() {
             onMouseLeave={() => setNavOpen(false)}
             onFocus={() => setNavOpen(true)}
             onBlur={(event) => {
-              // Ne referme que si le focus quitte réellement le rail : sans ce
-              // test, passer d'un élément à l'autre au clavier le replierait.
+              // Only close if focus truly leaves the rail: without this
+              // check, moving from one element to another via keyboard
+              // would collapse it.
               if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
                 setNavOpen(false)
               }
@@ -157,8 +156,8 @@ export default function App() {
               borderRight: 1,
               borderColor: 'divider',
               overflow: 'hidden',
-              // Le panneau déployé recouvre le contenu au lieu de le pousser :
-              // une remise en page à chaque survol serait insupportable.
+              // The expanded panel covers the content instead of pushing it:
+              // reflowing the layout on every hover would be unbearable.
               zIndex: 3,
               boxShadow: navOpen ? '6px 0 20px -12px rgba(16, 35, 28, 0.45)' : 'none',
               transition: 'width 160ms ease, box-shadow 160ms ease',
@@ -199,8 +198,8 @@ export default function App() {
                       }}
                     />
                   )}
-                  {/* Emplacement d'icône de largeur fixe : c'est lui qui garantit
-                      l'alignement, replié comme déployé. */}
+                  {/* Fixed-width icon slot: this is what guarantees
+                      alignment, collapsed as well as expanded. */}
                   <Box
                     sx={{ display: 'grid', placeItems: 'center', width: RAIL, flexShrink: 0 }}
                   >
@@ -241,6 +240,7 @@ export default function App() {
                 history={c.history}
                 backend={c.backend}
                 adapterUp={c.adapterUp}
+                psk={c.psk}
                 onConnect={() => c.connect(c.selectedProfile?.name)}
                 onDisconnect={c.disconnect}
               />

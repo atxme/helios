@@ -1,0 +1,26 @@
+[package]
+name = "helios-key-negotiation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Authenticated QUIC transport for pre-WireGuard key negotiation."
+
+[dependencies]
+aether = { workspace = true, features = ["key-negotiation-signing"] }
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+aws-lc-rs.workspace = true
+tracing.workspace = true
+hex.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

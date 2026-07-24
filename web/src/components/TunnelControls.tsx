@@ -34,7 +34,7 @@ export function TunnelControls({
     try {
       await action()
     } catch {
-      // Le bandeau global affiche l'erreur remontée par useHelios.
+      // The global banner shows the error surfaced by useHelios.
     } finally {
       setLoading(false)
     }

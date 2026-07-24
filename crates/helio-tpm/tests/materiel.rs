@@ -1,32 +1,32 @@
-//! Essais TPM sur matériel réel — cible uniquement.
+//! Real hardware TPM trials — target only.
 //!
-//! Les 27 tests unitaires du crate s'exécutent contre `DryRunTpm` : ils
-//! vérifient la *logique* de décision, jamais le silicium. Ce fichier ferme
-//! l'écart, en exerçant `/dev/tpmrm0` pour de bon.
+//! The crate's 27 unit tests run against `DryRunTpm`: they verify the
+//! decision *logic*, never the silicon. This file closes the gap, by
+//! exercising `/dev/tpmrm0` for real.
 //!
-//! # Ce que ces essais écrivent, et pourquoi c'est réversible
+//! # What these trials write, and why it is reversible
 //!
-//! Le backend réel n'utilise que `create_primary` (clé primaire **transitoire**,
-//! jamais rendue persistante), `create`, `load`, `policy_pcr` et `unseal`. Aucune
-//! écriture NV, aucun `evict_control`, aucun changement de hiérarchie, aucun
-//! `clear`. Tout l'état Helios tient dans les fichiers désignés par
-//! `TpmSettings` — ici un répertoire temporaire, jamais `/var/lib/helios`.
+//! The real backend only uses `create_primary` (a **transient** primary key,
+//! never made persistent), `create`, `load`, `policy_pcr` and `unseal`. No NV
+//! write, no `evict_control`, no hierarchy change, no `clear`. All Helios
+//! state lives in the files designated by `TpmSettings` — here a temporary
+//! directory, never `/var/lib/helios`.
 //!
-//! Supprimer ce répertoire ramène donc la machine à son état initial. C'est ce
-//! qui distingue ces essais de ceux du cycle RAUC, qui touchaient aux slots de
-//! boot et pouvaient rendre la cible non amorçable.
+//! Deleting this directory therefore returns the machine to its initial
+//! state. This is what distinguishes these trials from the RAUC cycle
+//! trials, which touched boot slots and could render the target unbootable.
 //!
-//! Aucun PCR n'est étendu : une extension est irréversible jusqu'au prochain
-//! redémarrage. La liaison aux PCR est éprouvée en réécrivant la sélection
-//! *inscrite dans le blob* — le TPM répond alors `TPM2_RC_POLICY_FAIL`, sans
-//! que l'état de la plateforme ait été touché.
+//! No PCR is extended: an extension is irreversible until the next reboot.
+//! PCR binding is exercised by rewriting the selection *recorded in the
+//! blob* — the TPM then answers `TPM2_RC_POLICY_FAIL`, without the platform
+//! state having been touched.
 //!
-//! # Exécution
+//! # Execution
 //!
-//! Ces essais ne s'exécutent que si `HELIOS_TPM_MATERIEL=1` est positionné :
-//! `cargo test --all-features` doit rester jouable sur une machine sans TPM,
-//! WSL2 comprise. La campagne cible positionne la variable, ce qui garantit
-//! qu'ils tournent réellement quelque part.
+//! These trials only run if `HELIOS_TPM_MATERIEL=1` is set:
+//! `cargo test --all-features` must remain runnable on a machine without a
+//! TPM, WSL2 included. The target campaign sets the variable, which
+//! guarantees they actually run somewhere.
 //!
 //! ```sh
 //! HELIOS_TPM_MATERIEL=1 cargo test -p helio-tpm --features tpm --test materiel
@@ -35,25 +35,25 @@
 
 use helio_tpm::{BootController, BootDecision, SealedKeystore, TpmSettings};
 
-/// Indique si les essais matériels sont demandés.
+/// Indicates whether hardware trials are requested.
 ///
-/// L'absence de la variable n'est pas un échec : c'est un environnement qui ne
-/// permet pas de trancher. Le message le dit explicitement plutôt que de
-/// laisser croire à un succès.
-fn materiel_demande(nom: &str) -> bool {
+/// The absence of the variable is not a failure: it is an environment that
+/// cannot settle the question. The message says so explicitly rather than
+/// letting it look like a success.
+fn hardware_requested(name: &str) -> bool {
     if std::env::var("HELIOS_TPM_MATERIEL").as_deref() == Ok("1") {
         return true;
     }
-    eprintln!("[hors portée] {nom} : positionner HELIOS_TPM_MATERIEL=1 sur une cible à TPM");
+    eprintln!("[out of scope] {name}: set HELIOS_TPM_MATERIEL=1 on a TPM-equipped target");
     false
 }
 
-/// Réglages pointant sur un répertoire jetable, provisionnement autorisé.
-fn reglages(dir: &std::path::Path, provisionnement: bool) -> TpmSettings {
+/// Settings pointing to a disposable directory, provisioning allowed.
+fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
     TpmSettings {
         enabled: true,
         enforce: true,
-        allow_provisioning: provisionnement,
+        allow_provisioning,
         device: "/dev/tpmrm0".to_string(),
         pcr_bank: "sha256".to_string(),
         pcr_selection: vec![0, 4, 7],
@@ -66,159 +66,159 @@ fn reglages(dir: &std::path::Path, provisionnement: bool) -> TpmSettings {
     }
 }
 
-fn repertoire_jetable(nom: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("helios-tpm-{nom}-{}", std::process::id()));
+fn disposable_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("helios-tpm-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("création du répertoire d'essai");
+    std::fs::create_dir_all(&dir).expect("creation of the test directory");
     dir
 }
 
 #[test]
-fn le_secret_provisionne_est_reobtenu_a_l_identique() {
-    if !materiel_demande("scellement puis déscellement") {
+fn the_provisioned_secret_is_retrieved_identically() {
+    if !hardware_requested("seal then unseal") {
         return;
     }
-    let dir = repertoire_jetable("aller-retour");
+    let dir = disposable_dir("aller-retour");
 
-    // Premier boot : aucun blob, provisionnement autorisé.
-    let provisionne = match BootController::unlock(&reglages(&dir, true)) {
+    // First boot: no blob, provisioning allowed.
+    let provisioned = match BootController::unlock(&settings(&dir, true)) {
         Ok(BootDecision::Provisioned(secret)) => secret,
-        autre => panic!("provisionnement attendu, obtenu : {autre:?}"),
+        other => panic!("provisioning expected, got: {other:?}"),
     };
-    assert!(dir.join("sealed.key").exists(), "aucun blob scellé écrit");
+    assert!(dir.join("sealed.key").exists(), "no sealed blob written");
 
-    // Boot suivant : le blob existe, le provisionnement n'est plus autorisé.
-    let descelle = match BootController::unlock(&reglages(&dir, false)) {
+    // Next boot: the blob exists, provisioning is no longer allowed.
+    let unsealed = match BootController::unlock(&settings(&dir, false)) {
         Ok(BootDecision::Unsealed(secret)) => secret,
-        autre => panic!("déscellement attendu, obtenu : {autre:?}"),
+        other => panic!("unseal expected, got: {other:?}"),
     };
 
-    // Le cœur de l'essai : c'est l'égalité des deux secrets qui prouve que le
-    // TPM a réellement scellé puis déscellé, et non qu'un chemin dégradé a
-    // renvoyé deux valeurs plausibles.
+    // The heart of the trial: the equality of the two secrets proves that
+    // the TPM really sealed then unsealed, and not that a degraded path
+    // returned two plausible values.
     assert_eq!(
-        provisionne.as_bytes(),
-        descelle.as_bytes(),
-        "le secret déscellé diffère du secret scellé"
+        provisioned.as_bytes(),
+        unsealed.as_bytes(),
+        "the unsealed secret differs from the sealed secret"
     );
 
-    std::fs::remove_dir_all(&dir).expect("nettoyage");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[test]
-fn un_blob_absent_hors_provisionnement_est_refuse() {
-    if !materiel_demande("fail-closed sur blob absent") {
+fn a_missing_blob_outside_provisioning_is_refused() {
+    if !hardware_requested("fail-closed on missing blob") {
         return;
     }
-    let dir = repertoire_jetable("blob-absent");
+    let dir = disposable_dir("blob-absent");
 
-    let issue = BootController::unlock(&reglages(&dir, false));
+    let outcome = BootController::unlock(&settings(&dir, false));
     assert!(
-        issue.is_err(),
-        "un blob absent hors provisionnement doit échouer, obtenu : {issue:?}"
+        outcome.is_err(),
+        "a missing blob outside provisioning must fail, got: {outcome:?}"
     );
 
-    std::fs::remove_dir_all(&dir).expect("nettoyage");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[test]
-fn un_blob_altere_est_refuse() {
-    if !materiel_demande("refus d'un blob altéré") {
+fn a_tampered_blob_is_refused() {
+    if !hardware_requested("refusal of a tampered blob") {
         return;
     }
-    let dir = repertoire_jetable("blob-altere");
+    let dir = disposable_dir("blob-altere");
     let blob = dir.join("sealed.key");
 
-    BootController::unlock(&reglages(&dir, true)).expect("provisionnement initial");
+    BootController::unlock(&settings(&dir, true)).expect("initial provisioning");
 
-    // Retourner un octet au milieu du blob : le TPM doit refuser de le charger
-    // ou d'en dériver le secret. Un déscellement qui réussirait signalerait que
-    // l'intégrité n'est pas vérifiée.
-    let mut octets = std::fs::read(&blob).expect("lecture du blob");
-    let milieu = octets.len() / 2;
-    octets[milieu] ^= 0xFF;
-    std::fs::write(&blob, &octets).expect("écriture du blob altéré");
+    // Flip a byte in the middle of the blob: the TPM must refuse to load it
+    // or to derive the secret from it. An unseal that succeeded would
+    // signal that integrity is not verified.
+    let mut bytes = std::fs::read(&blob).expect("reading the blob");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&blob, &bytes).expect("writing the tampered blob");
 
-    let issue = BootController::unlock(&reglages(&dir, false));
+    let outcome = BootController::unlock(&settings(&dir, false));
     assert!(
-        issue.is_err(),
-        "un blob altéré doit être refusé, obtenu : {issue:?}"
+        outcome.is_err(),
+        "a tampered blob must be refused, got: {outcome:?}"
     );
 
-    std::fs::remove_dir_all(&dir).expect("nettoyage");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[test]
-fn une_selection_pcr_alteree_dans_le_blob_refuse_le_descellement() {
-    if !materiel_demande("liaison aux PCR effectivement appliquée") {
+fn a_tampered_pcr_selection_in_the_blob_refuses_unseal() {
+    if !hardware_requested("PCR binding actually enforced") {
         return;
     }
-    let dir = repertoire_jetable("pcr-alteres");
+    let dir = disposable_dir("pcr-alteres");
     let blob = dir.join("sealed.key");
 
-    BootController::unlock(&reglages(&dir, true)).expect("provisionnement sous PCR 0,4,7");
+    BootController::unlock(&settings(&dir, true)).expect("provisioning under PCR 0,4,7");
 
-    // La sélection PCR appliquée au déscellement vient du **blob**, pas des
-    // réglages : le blob est auto-descriptif (`unmarshal_blob`). Modifier
-    // `TpmSettings::pcr_selection` n'aurait donc aucun effet ici, et un essai
-    // bâti là-dessus passerait au vert sans rien prouver.
+    // The PCR selection applied at unseal time comes from the **blob**, not
+    // from the settings: the blob is self-describing (`unmarshal_blob`).
+    // Modifying `TpmSettings::pcr_selection` would therefore have no effect
+    // here, and a trial built on that would pass green without proving anything.
     //
-    // La propriété qui compte est ailleurs : le digest de politique est figé
-    // dans l'objet scellé à sa création. Réécrire la sélection inscrite dans le
-    // blob produit une politique qui ne correspond plus, et le TPM doit refuser.
-    // C'est ce qui empêche un attaquant de déscelller en déclarant une liaison
-    // plus faible que celle d'origine.
+    // The property that matters is elsewhere: the policy digest is frozen
+    // into the sealed object at creation time. Rewriting the selection
+    // recorded in the blob produces a policy that no longer matches, and
+    // the TPM must refuse. This is what prevents an attacker from unsealing
+    // by declaring a weaker binding than the original one.
     //
-    // Disposition du blob : MAGIC(4) | VERSION(1) | BANQUE(1) | n(1) | indices(n).
+    // Blob layout: MAGIC(4) | VERSION(1) | BANK(1) | n(1) | indices(n).
     const OFFSET_INDICES: usize = 7;
-    let mut octets = std::fs::read(&blob).expect("lecture du blob");
+    let mut bytes = std::fs::read(&blob).expect("reading the blob");
     assert_eq!(
-        octets[OFFSET_INDICES - 1],
+        bytes[OFFSET_INDICES - 1],
         3,
-        "trois indices PCR attendus dans le blob"
+        "three PCR indices expected in the blob"
     );
     assert_eq!(
-        &octets[OFFSET_INDICES..OFFSET_INDICES + 3],
+        &bytes[OFFSET_INDICES..OFFSET_INDICES + 3],
         &[0, 4, 7],
-        "sélection PCR inattendue dans le blob"
+        "unexpected PCR selection in the blob"
     );
-    // PCR 7 (Secure Boot) → PCR 6 : liaison différente, objet inchangé.
-    octets[OFFSET_INDICES + 2] = 6;
-    std::fs::write(&blob, &octets).expect("écriture du blob altéré");
+    // PCR 7 (Secure Boot) -> PCR 6: different binding, object unchanged.
+    bytes[OFFSET_INDICES + 2] = 6;
+    std::fs::write(&blob, &bytes).expect("writing the tampered blob");
 
-    let issue = BootController::unlock(&reglages(&dir, false));
+    let outcome = BootController::unlock(&settings(&dir, false));
     assert!(
-        issue.is_err(),
-        "une sélection PCR réécrite doit refuser le déscellement, obtenu : {issue:?}"
+        outcome.is_err(),
+        "a rewritten PCR selection must refuse unseal, got: {outcome:?}"
     );
 
-    std::fs::remove_dir_all(&dir).expect("nettoyage");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[test]
-fn la_cle_wireguard_survit_a_un_aller_retour_scelle() {
-    if !materiel_demande("coffre de la clé WireGuard") {
+fn the_wireguard_key_survives_a_sealed_round_trip() {
+    if !hardware_requested("WireGuard key vault") {
         return;
     }
-    let dir = repertoire_jetable("keystore");
+    let dir = disposable_dir("keystore");
 
-    let secret = match BootController::unlock(&reglages(&dir, true)) {
+    let secret = match BootController::unlock(&settings(&dir, true)) {
         Ok(BootDecision::Provisioned(secret)) => secret,
-        autre => panic!("provisionnement attendu, obtenu : {autre:?}"),
+        other => panic!("provisioning expected, got: {other:?}"),
     };
 
-    // Une clé privée WireGuard fait 32 octets ; on vérifie qu'elle ressort
-    // intacte du coffre chiffré par le secret dérivé du TPM.
-    let cle: Vec<u8> = (0u8..32).collect();
-    let coffre = SealedKeystore::new(dir.join("wg-key.sealed"));
-    coffre.store(&secret, &cle).expect("scellement de la clé");
-    assert!(coffre.exists(), "le coffre n'a pas été écrit");
+    // A WireGuard private key is 32 bytes; we verify it comes back intact
+    // from the vault encrypted by the TPM-derived secret.
+    let key: Vec<u8> = (0u8..32).collect();
+    let vault = SealedKeystore::new(dir.join("wg-key.sealed"));
+    vault.store(&secret, &key).expect("sealing the key");
+    assert!(vault.exists(), "the vault was not written");
 
-    let relue = coffre.load(&secret).expect("relecture de la clé");
-    assert_eq!(relue.as_slice(), cle.as_slice(), "clé WireGuard altérée");
+    let reread = vault.load(&secret).expect("re-reading the key");
+    assert_eq!(reread.as_slice(), key.as_slice(), "WireGuard key tampered");
 
-    coffre.remove().expect("retrait du coffre");
-    assert!(!coffre.exists(), "le coffre subsiste après retrait");
+    vault.remove().expect("removing the vault");
+    assert!(!vault.exists(), "the vault still exists after removal");
 
-    std::fs::remove_dir_all(&dir).expect("nettoyage");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }

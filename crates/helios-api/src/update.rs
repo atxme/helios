@@ -1,4 +1,4 @@
-//! API d’administration des mises à jour applicatives signées.
+//! Administration API for signed application updates.
 
 use aether::sig::SignedBinaryRelease;
 use axum::{extract::State, http::StatusCode, Json};
@@ -75,7 +75,7 @@ pub async fn chunk(
     let data = STANDARD.decode(request.data).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            format!("fragment base64 invalide : {e}"),
+            format!("invalid base64 fragment: {e}"),
         )
     })?;
     state

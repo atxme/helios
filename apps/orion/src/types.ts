@@ -21,7 +21,13 @@ export interface ClientProfile {
   private_key: string
   /** Clé publique Curve25519 de la gateway (base64). */
   peer_public_key: string
-  /** PSK post-quantique dérivé de l'échange ML-KEM (base64). null = tunnel classique. */
+  /**
+   * PSK **statique** partagé hors bande (base64). Secret.
+   *
+   * Le PSK PQC issu de ML-KEM n'atterrit jamais ici : il n'est pas persisté et
+   * se renégocie à chaque connexion. `null` est donc le cas normal d'un profil
+   * Helios — voir `PskKind`.
+   */
   preshared_key: string | null
   /** VIP CGNAT assignée par la gateway à l'enrôlement (ex. `100.64.1.2/32`). */
   address: string | null
@@ -55,9 +61,22 @@ export interface ProfileIssues {
   heliosd_url: string | null
 }
 
+/**
+ * Ce qui occupe le slot `PresharedKey` du tunnel courant — miroir de
+ * `orion_core::events::PskKind`.
+ *
+ * Un PSK n'est pas un PSK PQC : les deux vivent dans le même slot WireGuard,
+ * mais l'un a été recopié à la main et ne tourne jamais, l'autre vient d'un
+ * échange ML-KEM-768 rejoué à chaque connexion. Le profil ne permet pas de les
+ * distinguer, puisque le second n'est jamais persisté — seul le cœur client
+ * sait lequel il a posé.
+ */
+export type PskKind = 'none' | 'static' | 'ml_kem'
+
 // Événements poussés par le backend Rust (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
+  | { type: 'protection'; psk: PskKind }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }

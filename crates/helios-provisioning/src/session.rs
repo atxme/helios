@@ -1,18 +1,18 @@
-//! Traitement d'une session de provisioning, côté gateway.
+//! Handling of a provisioning session, on the gateway side.
 //!
-//! Transport-agnostique : cette logique ne sait rien de TLS ni de sockets. Elle
-//! consomme une [`ProvisionRequest`] et produit une [`ProvisionResponse`] plus
-//! le PSK à installer. Le canal réel (TLS 1.3 ancré TPM, *à l'intérieur* du
-//! tunnel) l'enveloppe sans la modifier — ce découpage rend tout l'échange
-//! testable sans réseau, y compris sur WSL2, avec la **vraie** crypto ML-KEM.
+//! Transport-agnostic: this logic knows nothing about TLS or sockets. It
+//! consumes a [`ProvisionRequest`] and produces a [`ProvisionResponse`] plus
+//! the PSK to install. The real channel (TPM-anchored TLS 1.3, *inside* the
+//! tunnel) wraps it without modifying it — this separation makes the entire
+//! exchange testable without a network, even on WSL2, with **real** ML-KEM crypto.
 //!
-//! # Ce que cette session ne fait pas
+//! # What this session does not do
 //!
-//! Elle n'admet pas un client inconnu. WireGuard étant fondé sur Noise_IK, un
-//! pair non déclaré ne peut pas monter le tunnel, donc ne peut pas atteindre ce
-//! code. L'admission est **hors bande** (voir [`crate`] et `aether::enroll`) :
-//! ici, on refuse un pair inconnu avec [`EnrollError::UnknownPeer`] plutôt que
-//! de l'enrôler à la volée.
+//! It does not admit an unknown client. Since WireGuard is built on
+//! Noise_IK, an undeclared peer cannot bring up the tunnel, so it cannot
+//! reach this code. Admission is **out of band** (see [`crate`] and
+//! `aether::enroll`): here, an unknown peer is refused with
+//! [`EnrollError::UnknownPeer`] rather than enrolled on the fly.
 
 use std::net::Ipv4Addr;
 
@@ -23,46 +23,46 @@ use aether::pq::{Kem, MlKem768Kem};
 
 use crate::ipam::{assign_vip, PeerTable, MAX_VIP_PROBES};
 
-/// Durée de validité par défaut d'un PSK, en secondes (1 heure).
+/// Default PSK validity duration, in seconds (1 hour).
 ///
-/// Borne la fenêtre d'exploitation d'un PSK compromis. Trop court, on
-/// multiplie les rotations — et chaque rotation est un moment de fragilité
-/// (voir `rotation`).
+/// Bounds the exploitation window of a compromised PSK. Too short, and
+/// rotations multiply — and every rotation is a moment of fragility (see
+/// `rotation`).
 pub const DEFAULT_PSK_LIFETIME_SECS: u32 = 3600;
 
-/// Le registre des pairs admis, côté gateway.
+/// The registry of admitted peers, on the gateway side.
 ///
-/// L'admission est hors bande : cette interface ne fait que *consulter*. Une
-/// implémentation typique lit la liste `peers` de `network.toml`.
+/// Admission is out of band: this interface only *queries*. A typical
+/// implementation reads the `peers` list from `network.toml`.
 pub trait AdmittedPeers {
-    /// Ce pair a-t-il été admis (clé publique WireGuard, base64) ?
+    /// Has this peer been admitted (WireGuard public key, base64)?
     fn is_admitted(&self, wg_public_key: &str) -> bool;
 }
 
-/// Résultat d'une session réussie.
+/// Result of a successful session.
 #[derive(Debug)]
 pub struct Provisioned {
-    /// À renvoyer au client sur le canal de contrôle.
+    /// To be sent back to the client over the control channel.
     pub response: ProvisionResponse,
-    /// PSK à installer sur le pair WireGuard côté gateway. **Secret.**
+    /// PSK to install on the WireGuard peer, gateway side. **Secret.**
     pub psk: Psk,
-    /// VIP retenue pour ce pair.
+    /// VIP retained for this peer.
     pub address: Ipv4Addr,
 }
 
-/// Paramètres invariants de la gateway pour une session.
+/// The gateway's invariant parameters for a session.
 pub struct GatewayIdentity<'a> {
-    /// Clé publique WireGuard de la gateway (base64).
+    /// Gateway's WireGuard public key (base64).
     pub wg_public_key: &'a str,
-    /// Durée de validité annoncée pour le PSK.
+    /// Validity duration announced for the PSK.
     pub psk_lifetime_secs: u32,
 }
 
-/// Traite une demande de provisioning.
+/// Handles a provisioning request.
 ///
-/// `gateway_nonce` est injecté plutôt que tiré ici : cela rend la fonction
-/// déterministe et donc testable de bout en bout. En production, l'appelant le
-/// tire du CSPRNG de l'OS — voir [`fresh_nonce`].
+/// `gateway_nonce` is injected rather than drawn here: this makes the
+/// function deterministic and therefore testable end to end. In production,
+/// the caller draws it from the OS's CSPRNG — see [`fresh_nonce`].
 pub fn handle_request<P, T>(
     request: &ProvisionRequest,
     gateway: &GatewayIdentity<'_>,
@@ -74,27 +74,27 @@ where
     P: AdmittedPeers,
     T: PeerTable,
 {
-    // 1. Validation structurelle avant toute opération coûteuse ou secrète.
+    // 1. Structural validation before any costly or secret operation.
     request.validate()?;
 
-    // 2. L'admission est un prérequis, pas un effet de bord de cette session.
+    // 2. Admission is a prerequisite, not a side effect of this session.
     if !admitted.is_admitted(&request.client_wg_public_key) {
         return Err(EnrollError::UnknownPeer);
     }
 
-    // 3. VIP dérivée de la clé publique WireGuard du client : stable d'une
-    //    session à l'autre et d'un redémarrage à l'autre, sans état sur disque.
+    // 3. VIP derived from the client's WireGuard public key: stable across
+    //    sessions and restarts, with no state on disk.
     let pubkey_bytes = decode_wg_key(&request.client_wg_public_key)?;
     let address =
         assign_vip(peers, &pubkey_bytes, MAX_VIP_PROBES).map_err(|_| EnrollError::UnknownPeer)?;
 
-    // 4. Encapsulation ML-KEM vers la clé éphémère du client. C'est la gateway
-    //    qui encapsule : la fraîcheur du secret ne dépend donc pas d'un client
-    //    potentiellement compromis.
+    // 4. ML-KEM encapsulation towards the client's ephemeral key. It is the
+    //    gateway that encapsulates: the secret's freshness therefore does
+    //    not depend on a potentially compromised client.
     let (ciphertext, kem_secret) = MlKem768Kem::encapsulate(&request.kem_public_key)
         .map_err(|_| EnrollError::BadKemPublicKey(request.kem_public_key.len()))?;
 
-    // 5. PSK lié aux deux nonces et aux deux identités.
+    // 5. PSK bound to both nonces and both identities.
     let psk = derive_psk(
         &kem_secret,
         &request.client_nonce,
@@ -117,10 +117,10 @@ where
     })
 }
 
-/// Décode une clé publique WireGuard base64 en ses 32 octets bruts.
+/// Decodes a base64 WireGuard public key into its 32 raw bytes.
 ///
-/// Ce sont ces octets — pas la chaîne base64 — qui alimentent l'IPAM : la
-/// dérivation de VIP doit être indépendante de l'encodage.
+/// These are the bytes — not the base64 string — that feed the IPAM: VIP
+/// derivation must be independent of the encoding.
 fn decode_wg_key(b64: &str) -> Result<Vec<u8>, EnrollError> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD
@@ -132,15 +132,15 @@ fn decode_wg_key(b64: &str) -> Result<Vec<u8>, EnrollError> {
     Ok(raw)
 }
 
-/// Tire un nonce de session depuis le CSPRNG du système.
+/// Draws a session nonce from the system's CSPRNG.
 pub fn fresh_nonce() -> [u8; NONCE_LEN] {
     use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
     let mut nonce = [0u8; NONCE_LEN];
-    // `SystemRandom` ne peut échouer que si l'OS n'a pas d'entropie : dans ce
-    // cas on ne doit surtout pas continuer avec un nonce prévisible.
+    // `SystemRandom` can only fail if the OS has no entropy: in that case we
+    // must absolutely not continue with a predictable nonce.
     SystemRandom::new()
         .fill(&mut nonce)
-        .expect("CSPRNG système indisponible — impossible de provisionner sûrement");
+        .expect("system CSPRNG unavailable — cannot provision safely");
     nonce
 }
 
@@ -178,7 +178,7 @@ mod tests {
         }
     }
 
-    /// Simule le client : génère sa paire ML-KEM éphémère et sa requête.
+    /// Simulates the client: generates its ephemeral ML-KEM pair and its request.
     fn client_request() -> (
         <MlKem768Kem as Kem>::SecretKey,
         [u8; NONCE_LEN],
@@ -195,18 +195,18 @@ mod tests {
         (dk, client_nonce, req)
     }
 
-    /// L'échange complet, avec la **vraie** crypto ML-KEM : les deux bouts
-    /// doivent dériver le même PSK. C'est le test qui valide le protocole.
+    /// The full exchange, with **real** ML-KEM crypto: both ends must
+    /// derive the same PSK. This is the test that validates the protocol.
     #[test]
-    fn echange_complet_les_deux_bouts_derivent_le_meme_psk() {
+    fn the_full_exchange_both_ends_derive_the_same_psk() {
         let (dk, client_nonce, req) = client_request();
         let gw_nonce = [7u8; NONCE_LEN];
 
-        // ── Côté gateway ──
+        // ── Gateway side ──
         let out = handle_request(&req, &gateway(), &registry(), &EmptyTable, gw_nonce).unwrap();
         out.response.validate().unwrap();
 
-        // ── Côté client : décapsule et dérive de son côté ──
+        // ── Client side: decapsulates and derives independently ──
         let kem_secret = MlKem768Kem::decapsulate(&dk, &out.response.kem_ciphertext).unwrap();
         let client_psk = derive_psk(
             &kem_secret,
@@ -219,13 +219,13 @@ mod tests {
 
         assert_eq!(
             *client_psk, *out.psk,
-            "client et gateway doivent dériver un PSK identique, sinon le \
-             handshake WireGuard échouerait silencieusement"
+            "client and gateway must derive an identical PSK, otherwise the \
+             WireGuard handshake would fail silently"
         );
     }
 
     #[test]
-    fn la_vip_est_stable_entre_deux_sessions() {
+    fn the_vip_is_stable_across_two_sessions() {
         let (_, _, req1) = client_request();
         let (_, _, req2) = client_request();
         let a =
@@ -234,22 +234,22 @@ mod tests {
             handle_request(&req2, &gateway(), &registry(), &EmptyTable, [2; NONCE_LEN]).unwrap();
         assert_eq!(
             a.address, b.address,
-            "la VIP dérive de la clé, pas de la session"
+            "the VIP derives from the key, not from the session"
         );
         assert!(a.response.assigned_address.ends_with("/32"));
     }
 
     #[test]
-    fn deux_sessions_donnent_des_psk_differents() {
+    fn two_sessions_yield_different_psks() {
         let (_, _, req) = client_request();
         let a = handle_request(&req, &gateway(), &registry(), &EmptyTable, [1; NONCE_LEN]).unwrap();
         let b = handle_request(&req, &gateway(), &registry(), &EmptyTable, [2; NONCE_LEN]).unwrap();
-        assert_ne!(*a.psk, *b.psk, "chaque session doit produire un PSK frais");
+        assert_ne!(*a.psk, *b.psk, "every session must produce a fresh PSK");
     }
 
-    /// Un client non admis est refusé : cette session ne fait pas d'admission.
+    /// An unadmitted client is refused: this session performs no admission.
     #[test]
-    fn pair_non_admis_refuse() {
+    fn unadmitted_peer_refused() {
         let (_, _, mut req) = client_request();
         req.client_wg_public_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into();
         let err = handle_request(&req, &gateway(), &registry(), &EmptyTable, [0; NONCE_LEN]);
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn version_incompatible_refusee_avant_toute_crypto() {
+    fn incompatible_version_refused_before_any_crypto() {
         let (_, _, mut req) = client_request();
         req.protocol_version = 99;
         assert!(matches!(
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn cle_kem_malformee_refusee() {
+    fn malformed_kem_key_refused() {
         let (_, _, mut req) = client_request();
         req.kem_public_key = vec![0u8; 10];
         assert!(matches!(
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn les_nonces_tires_sont_distincts() {
+    fn drawn_nonces_are_distinct() {
         assert_ne!(fresh_nonce(), fresh_nonce());
     }
 }

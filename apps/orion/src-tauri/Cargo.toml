@@ -29,3 +29,6 @@ orion-core = { path = "../../../crates/orion-core" }
 default = []
 # Relais de la feature du backend WireGuard réel vers orion-core (target-only).
 wireguard = ["orion-core/wireguard"]
+# Authenticated pre-WireGuard negotiation. The Windows shell supplies the
+# protected certificate identity store.
+key-negotiation = ["orion-core/key-negotiation"]

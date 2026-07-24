@@ -1,20 +1,20 @@
-//! Séquestre de l'identité de la gateway, côté **poste opérateur**.
+//! Escrow of the gateway identity, from the **operator workstation**.
 //!
-//! La gateway écrit à chaque scellement une copie de sa clé privée WireGuard,
-//! chiffrée vers la clé publique de l'opérateur (`helio_tpm::escrow`). C'est le
-//! seul moyen de récupérer l'identité d'une gateway après un changement de PCR
-//! — nouveau noyau, bootloader ou firmware — sans accès SSH.
+//! On each sealing, the gateway writes a copy of its WireGuard private key,
+//! encrypted to the operator's public key (`helio_tpm::escrow`). This is the
+//! only way to recover a gateway's identity after a PCR change — new kernel,
+//! bootloader, or firmware — without SSH access.
 //!
-//! Le code existait des deux côtés sans qu'aucun outil ne l'expose : la ligne
-//! `escrow_public_key` de `network.toml` était un commentaire que personne ne
-//! pouvait honorer. Ces deux commandes ferment le circuit.
+//! The code existed on both sides without any tool exposing it: the
+//! `escrow_public_key` line in `network.toml` was a comment nobody could
+//! honor. These two commands close the loop.
 //!
-//! # Où vit la clé privée d'opérateur
+//! # Where the operator private key lives
 //!
-//! **Jamais sur la gateway qu'elle secourt.** Un séquestre déposé à côté de sa
-//! propre clé de déchiffrement ne protège plus rien : il ajoute une copie en
-//! clair de l'identité, exactement ce que le scellement TPM existe pour
-//! empêcher. Elle vit hors ligne, sur le poste opérateur (ADR-004 §2).
+//! **Never on the gateway it rescues.** An escrow deposited next to its own
+//! decryption key no longer protects anything: it adds a plaintext copy of
+//! the identity, exactly what TPM sealing exists to prevent. It lives
+//! offline, on the operator workstation (ADR-004 §2).
 
 use std::path::Path;
 
@@ -27,11 +27,11 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 const PRIVATE_FILE: &str = "escrow-private.key";
 const PUBLIC_FILE: &str = "escrow-public.key";
 
-/// Génère la paire de séquestre de l'opérateur dans un répertoire neuf.
+/// Generates the operator's escrow key pair in a fresh directory.
 pub fn keygen(output_dir: &Path) -> Result<()> {
     crate::files::create_private_dir(output_dir)?;
     let (private_key, public_key) = helio_tpm::escrow::generate_operator_keypair()
-        .map_err(|e| anyhow::anyhow!("génération de la paire de séquestre : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("generating the escrow key pair: {e}"))?;
 
     let public_b64 = B64.encode(public_key);
     crate::files::write_new(
@@ -43,61 +43,60 @@ pub fn keygen(output_dir: &Path) -> Result<()> {
 
     println!("{public_b64}");
     eprintln!();
-    eprintln!("  Clé publique de séquestre ci-dessus. À déclarer sur la gateway :");
+    eprintln!("  Escrow public key above. Declare it on the gateway:");
     eprintln!();
     eprintln!("    escrow_public_key = \"{public_b64}\"");
     eprintln!();
     eprintln!(
-        "  {} doit rester hors ligne et hors de la gateway : c'est la seule",
+        "  {} must stay offline and off the gateway: it is the only",
         output_dir.join(PRIVATE_FILE).display()
     );
-    eprintln!("  moitié capable d'ouvrir un séquestre.");
+    eprintln!("  half able to open an escrow.");
     Ok(())
 }
 
-/// Ouvre un séquestre et écrit le fichier de récupération à déposer sur la
-/// gateway.
+/// Opens an escrow and writes the recovery file to deposit on the gateway.
 ///
-/// La clé retrouvée n'est **pas** affichée : seule sa moitié publique l'est,
-/// ce qui suffit à vérifier qu'on a bien ouvert le séquestre de la gateway
-/// attendue, sans en faire défiler le secret dans un terminal ni un journal.
+/// The recovered key is **not** displayed: only its public half is, which is
+/// enough to verify the escrow of the expected gateway was opened, without
+/// scrolling the secret through a terminal or a log.
 pub fn open(escrow_path: &Path, private_key_path: &Path, output: &Path) -> Result<()> {
     let blob = std::fs::read(escrow_path)
-        .with_context(|| format!("lecture du séquestre {}", escrow_path.display()))?;
+        .with_context(|| format!("reading escrow {}", escrow_path.display()))?;
     let private_b64 = std::fs::read_to_string(private_key_path)
-        .with_context(|| format!("lecture de {}", private_key_path.display()))?;
+        .with_context(|| format!("reading {}", private_key_path.display()))?;
     let private_key = B64
         .decode(private_b64.trim())
-        .context("clé privée de séquestre illisible (base64 attendu)")?;
+        .context("unreadable escrow private key (expected base64)")?;
     if private_key.len() != helio_tpm::escrow::KEY_LEN {
         bail!(
-            "clé privée de séquestre de {} octets au lieu de {}",
+            "escrow private key is {} bytes instead of {}",
             private_key.len(),
             helio_tpm::escrow::KEY_LEN
         );
     }
 
     let recovered = helio_tpm::escrow::open_as_operator(&private_key, &blob)
-        .map_err(|e| anyhow::anyhow!("ouverture du séquestre impossible : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not open escrow: {e}"))?;
     let wg_private_key = std::str::from_utf8(recovered.as_slice())
-        .context("le séquestre ne contient pas une clé WireGuard base64")?
+        .context("escrow does not contain a base64 WireGuard key")?
         .trim()
         .to_string();
     let wg_public_key = aether::wg::public_from_private(&wg_private_key)
-        .context("le séquestre ne contient pas une clé WireGuard valide")?;
+        .context("escrow does not contain a valid WireGuard key")?;
 
     crate::files::write_new(output, wg_private_key.as_bytes(), true)?;
 
     println!("{wg_public_key}");
     eprintln!();
-    eprintln!("  Identité retrouvée : la clé publique ci-dessus doit être celle que");
-    eprintln!("  les clients connaissent déjà. Si elle diffère, ce séquestre n'est");
-    eprintln!("  pas celui de cette gateway — ne pas le déposer.");
+    eprintln!("  Identity recovered: the public key above must match the one");
+    eprintln!("  clients already know. If it differs, this escrow does not");
+    eprintln!("  belong to this gateway — do not deposit it.");
     eprintln!();
     eprintln!(
-        "  Déposer {} dans /var/lib/helios/wg-key.recovery sur la gateway, puis",
+        "  Deposit {} at /var/lib/helios/wg-key.recovery on the gateway, then",
         output.display()
     );
-    eprintln!("  redémarrer : elle rescelle la clé et efface le fichier.");
+    eprintln!("  restart it: it reseals the key and erases the file.");
     Ok(())
 }

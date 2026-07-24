@@ -185,7 +185,10 @@
       "Bash(command -v chromium chromium-browser google-chrome)",
       "Bash(xargs -I{} echo \"{} avertissement\\(s\\)/erreur\\(s\\)\")",
       "Bash(xargs -I{} echo \"clippy : {} problème\\(s\\)\")",
-      "Bash(xargs -I{} echo \"{} problème\\(s\\)\")"
+      "Bash(xargs -I{} echo \"{} problème\\(s\\)\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(find . -type f '\\(' -name *.rs -o -name *.ts -o -name *.tsx '\\)' -not -path */target/* -not -path */node_modules/* -not -path */dist/* -print0)",
+      "Bash(awk -F: '{s+=$2} END {print s\" lines with french chars\"}')"
     ]
   }
 }

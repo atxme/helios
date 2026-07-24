@@ -1,15 +1,15 @@
-//! Backend WireGuard **noyau** de la gateway, via `defguard_wireguard_rs`.
+//! Gateway's **kernel** WireGuard backend, via `defguard_wireguard_rs`.
 //!
-//! Derrière la feature `wireguard`. Il compile partout mais ne peut être
-//! *exercé* que là où le module noyau `wireguard` existe — pas sur WSL2. Même
-//! statut que la feature `netlink` de `helios-firewall`.
+//! Behind the `wireguard` feature. It compiles everywhere but can only be
+//! *exercised* where the `wireguard` kernel module exists — not on WSL2. Same
+//! status as `helios-firewall`'s `netlink` feature.
 //!
-//! # Mode serveur
+//! # Server mode
 //!
-//! Contrairement au backend d'Orion, la gateway **n'appelle jamais
-//! `set_endpoint`** sur ses pairs : les road-warriors roament et leur adresse
-//! source est découverte au premier handshake. Configurer un endpoint fixe
-//! empêcherait précisément le roaming.
+//! Unlike Orion's backend, the gateway **never calls `set_endpoint`** on its
+//! peers: road-warriors roam and their source address is discovered on the
+//! first handshake. Configuring a fixed endpoint would precisely prevent
+//! roaming.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,9 +26,9 @@ use crate::{InterfaceConfig, PeerConfig, PeerStatus, Result, WgError, WireguardB
 
 pub struct KernelBackend {
     ifname: String,
-    /// L'API `defguard` est synchrone et `create_interface` exige `&mut`.
-    /// Le `Mutex` fournit l'accès mutable derrière le `&self` du trait ; aucun
-    /// `await` n'est tenu pendant que le verrou est pris.
+    /// The `defguard` API is synchronous and `create_interface` requires
+    /// `&mut`. The `Mutex` provides mutable access behind the trait's
+    /// `&self`; no `await` is held while the lock is taken.
     api: Mutex<WGApi<Kernel>>,
     up: AtomicBool,
 }
@@ -51,15 +51,15 @@ impl KernelBackend {
         }
     }
 
-    /// Traduit un pair Helios en pair `defguard`. **Sans endpoint** : voir le
-    /// doc-comment du module.
+    /// Translates a Helios peer into a `defguard` peer. **Without an
+    /// endpoint**: see the module's doc-comment.
     fn build_peer(cfg: &PeerConfig) -> Result<Peer> {
         let key = Key::try_from(cfg.public_key.as_str())
-            .map_err(|e| WgError::BadKey(format!("{} : {e}", cfg.public_key)))?;
+            .map_err(|e| WgError::BadKey(format!("{}: {e}", cfg.public_key)))?;
         let mut peer = Peer::new(key);
 
         let allowed = IpAddrMask::from_str(&cfg.allowed_ips)
-            .map_err(|e| WgError::BadAddress(format!("{} : {e}", cfg.allowed_ips)))?;
+            .map_err(|e| WgError::BadAddress(format!("{}: {e}", cfg.allowed_ips)))?;
         peer.set_allowed_ips(vec![allowed]);
 
         if let Some(psk) = cfg
@@ -68,7 +68,7 @@ impl KernelBackend {
             .filter(|k| !k.trim().is_empty())
         {
             let psk = Key::try_from(psk)
-                .map_err(|e| WgError::BadKey(format!("PSK post-quantique : {e}")))?;
+                .map_err(|e| WgError::BadKey(format!("post-quantum PSK: {e}")))?;
             peer.preshared_key = Some(psk);
         }
         Ok(peer)
@@ -82,11 +82,11 @@ impl KernelBackend {
 #[async_trait]
 impl WireguardBackend for KernelBackend {
     async fn up(&self, config: &InterfaceConfig, peers: &[PeerConfig]) -> Result<()> {
-        // Tout ce qui peut échouer sans effet de bord se fait d'abord.
+        // Everything that can fail without side effects is done first.
         Key::try_from(config.private_key.as_str())
-            .map_err(|e| WgError::BadKey(format!("clé privée de la gateway : {e}")))?;
+            .map_err(|e| WgError::BadKey(format!("gateway private key: {e}")))?;
         let address = IpAddrMask::from_str(&config.address)
-            .map_err(|e| WgError::BadAddress(format!("{} : {e}", config.address)))?;
+            .map_err(|e| WgError::BadAddress(format!("{}: {e}", config.address)))?;
         let wg_peers = Self::build_peers(peers)?;
 
         let interface = InterfaceConfiguration {
@@ -107,7 +107,7 @@ impl WireguardBackend for KernelBackend {
             .map_err(|e| self.iface_err(e))?;
 
         info!(
-            "interface {} montée — écoute UDP {}, adresse {}, {} pair(s)",
+            "interface {} up — UDP listener {}, address {}, {} peer(s)",
             config.name,
             config.listen_port,
             config.address,
@@ -117,13 +117,13 @@ impl WireguardBackend for KernelBackend {
     }
 
     async fn down(&self) -> Result<()> {
-        // `mut` requis sur Windows (`remove_interface(&mut self)`), superflu ailleurs.
+        // `mut` required on Windows (`remove_interface(&mut self)`), superfluous elsewhere.
         #[allow(unused_mut)]
         let mut api = self.api.lock().unwrap();
         let result = api.remove_interface();
         self.up.store(false, Ordering::SeqCst);
         result.map_err(|e| self.iface_err(e))?;
-        info!("interface {} démontée", self.ifname);
+        info!("interface {} down", self.ifname);
         Ok(())
     }
 
@@ -133,26 +133,22 @@ impl WireguardBackend for KernelBackend {
 
         let host = api.read_interface_data().map_err(|e| self.iface_err(e))?;
 
-        // Retire les pairs qui ne sont plus autorisés (révocation).
+        // Removes peers that are no longer admitted (revocation).
         for existing in host.peers.keys() {
             if !wanted.iter().any(|p| &p.public_key == existing) {
                 match api.remove_peer(existing) {
-                    Ok(()) => info!("pair révoqué retiré de {}", self.ifname),
-                    Err(e) => warn!("retrait d'un pair révoqué impossible : {e}"),
+                    Ok(()) => info!("revoked peer removed from {}", self.ifname),
+                    Err(e) => warn!("could not remove a revoked peer: {e}"),
                 }
             }
         }
 
-        // Ajoute ou met à jour les pairs autorisés (`configure_peer` fait les deux).
+        // Adds or updates admitted peers (`configure_peer` does both).
         for peer in &wanted {
             api.configure_peer(peer).map_err(|e| self.iface_err(e))?;
         }
 
-        info!(
-            "{} pair(s) synchronisé(s) sur {}",
-            wanted.len(),
-            self.ifname
-        );
+        info!("{} peer(s) synchronized on {}", wanted.len(), self.ifname);
         Ok(())
     }
 
@@ -170,8 +166,8 @@ impl WireguardBackend for KernelBackend {
             .map(|p| PeerStatus {
                 public_key: p.public_key.as_slice().to_vec(),
                 allowed_ips: p.allowed_ips.iter().map(ToString::to_string).collect(),
-                // WireGuard rapporte l'epoch tant qu'aucun handshake n'a eu lieu :
-                // le traduire en `None` plutôt qu'en « il y a 55 ans ».
+                // WireGuard reports the epoch as long as no handshake has
+                // occurred: translate it to `None` rather than "55 years ago".
                 last_handshake: p.last_handshake.filter(|t| *t != std::time::UNIX_EPOCH),
                 endpoint: p.endpoint.map(|e| e.to_string()),
                 rx_bytes: p.rx_bytes,
@@ -195,9 +191,9 @@ mod tests {
 
     const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
-    /// Conversion pure : testable sans plan de données.
+    /// Pure conversion: testable without a data plane.
     #[test]
-    fn pair_gateway_sans_endpoint() {
+    fn gateway_peer_without_endpoint() {
         let peer = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
@@ -209,12 +205,12 @@ mod tests {
         assert_eq!(peer.allowed_ips[0].to_string(), "100.64.1.2/32");
         assert!(
             peer.endpoint.is_none(),
-            "la gateway ne fixe jamais d'endpoint : cela casserait le roaming"
+            "the gateway never sets an endpoint: that would break roaming"
         );
     }
 
     #[test]
-    fn psk_post_quantique_transmis() {
+    fn post_quantum_psk_transmitted() {
         let peer = KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
@@ -225,9 +221,9 @@ mod tests {
     }
 
     #[test]
-    fn cle_ou_vip_invalide_rejetee() {
+    fn invalid_key_or_vip_rejected() {
         assert!(KernelBackend::build_peer(&PeerConfig {
-            public_key: "pas-du-base64".into(),
+            public_key: "not-base64".into(),
             allowed_ips: "100.64.1.2/32".into(),
             preshared_key: None,
         })
@@ -235,7 +231,7 @@ mod tests {
 
         assert!(KernelBackend::build_peer(&PeerConfig {
             public_key: KEY_B.into(),
-            allowed_ips: "pas-une-adresse".into(),
+            allowed_ips: "not-an-address".into(),
             preshared_key: None,
         })
         .is_err());

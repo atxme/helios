@@ -147,7 +147,7 @@ export function FirewallView({ status, state }: Props) {
         <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic LAN autorisé uniquement après un handshake WireGuard frais</p>
       </div>
 
-      {/* Carte kill-switch */}
+      {/* Kill-switch card */}
       <div className={`rounded-xl border p-6 backdrop-blur-md transition-all duration-700 ${
         engaged ? 'border-red-500/30 bg-red-500/10' : 'border-emerald-500/30 bg-emerald-500/10 animate-glow-emerald'
       }`}>
@@ -180,9 +180,9 @@ export function FirewallView({ status, state }: Props) {
         </div>
       </div>
 
-      {/* Politique + SSH en grid */}
+      {/* Policy + SSH grid */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Politique pare-feu */}
+        {/* Firewall policy */}
         <div className="card p-5">
           <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-3">Politique appliquée</h2>
           {status ? (
@@ -223,10 +223,10 @@ export function FirewallView({ status, state }: Props) {
         </div>
       </div>
 
-      {/* Éditeur nftables */}
+      {/* nftables editor */}
       <NftablesEditor dryRun={status?.dry_run ?? true} />
 
-      {/* Placeholder compteurs */}
+      {/* Counters placeholder */}
       <div className="rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-dashed p-5">
         <div className="flex items-center gap-2 mb-2">
           <ShieldAlert className="h-3.5 w-3.5 text-slate-500 dark:text-slate-500" strokeWidth={1.5} />

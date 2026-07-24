@@ -1,0 +1,312 @@
+//! Orion client for authenticated pre-WireGuard key negotiation.
+//!
+//! The certificate and CA are public profile material. The PKCS#8 private key
+//! is supplied at connection time by the shell's protected identity store and
+//! is never serialized by this module.
+
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
+
+use aether::{
+    key_negotiation::{
+        authenticate_confirmation, authenticate_request, derive_negotiated_psk,
+        static_psk_fingerprint, KeyNegotiationRequest, PqCertificate, ProtectionMode,
+        KEY_NEGOTIATION_NONCE_LEN, KEY_NEGOTIATION_VERSION,
+    },
+    pq::{Kem, MlKem768Kem},
+    SecretString,
+};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use base64::Engine as _;
+use helios_key_negotiation::{client_endpoint, negotiate, ClientSession, TlsIdentity};
+use zeroize::Zeroizing;
+
+use crate::ClientProfile;
+
+/// Certificate chain and PKCS#8 key returned by a protected OS identity store.
+pub struct ClientIdentity {
+    pub certificate_chain: Vec<Vec<u8>>,
+    pub private_key: Vec<u8>,
+    /// JSON application certificate signed with ML-DSA-65.
+    pub pq_certificate: Vec<u8>,
+    /// Raw ML-DSA-65 key loaded from the protected store.
+    pub pq_private_key: Vec<u8>,
+}
+
+/// Boundary implemented by the Orion shell for Windows Credential Manager,
+/// DPAPI or an equivalent protected platform store.
+#[async_trait]
+pub trait IdentityProvider: Send + Sync {
+    async fn load(&self, identity: &str) -> Result<ClientIdentity>;
+}
+
+/// Public connection settings and protected client identity material.
+pub struct KeyNegotiationClient {
+    /// Public UDP endpoint of the gateway key-negotiation service.
+    pub remote: String,
+    /// DNS identity authenticated by the gateway certificate.
+    pub server_name: String,
+    /// Client leaf certificate followed by any intermediate certificates.
+    pub client_certificate_chain: Vec<Vec<u8>>,
+    /// Client PKCS#8 key loaded from an OS-protected store.
+    pub client_private_key: Vec<u8>,
+    /// JSON ML-DSA-65 client certificate.
+    pub client_pq_certificate: Vec<u8>,
+    /// Raw ML-DSA-65 client private key.
+    pub client_pq_private_key: Vec<u8>,
+    /// CA certificate that authenticates the gateway certificate.
+    pub gateway_ca: Vec<u8>,
+    /// Pinned self-signed ML-DSA-65 gateway certificate.
+    pub gateway_pq_certificate: PqCertificate,
+    /// Orion refuses any locally selected mode below this floor.
+    pub minimum_mode: ProtectionMode,
+}
+
+impl std::fmt::Debug for KeyNegotiationClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyNegotiationClient")
+            .field("remote", &self.remote)
+            .field("server_name", &self.server_name)
+            .field(
+                "client_certificate_chain",
+                &self.client_certificate_chain.len(),
+            )
+            .field("client_private_key", &"***")
+            .field("client_pq_certificate", &self.client_pq_certificate.len())
+            .field("client_pq_private_key", &"***")
+            .field("gateway_ca", &self.gateway_ca.len())
+            .field("gateway_pq_certificate", &"pinned")
+            .field("minimum_mode", &self.minimum_mode)
+            .finish()
+    }
+}
+
+/// Prepared WireGuard slot and an uncommitted server transaction.
+///
+/// Dropping this value without calling [`Self::confirm`] closes the QUIC
+/// stream. Helios then restores the peer's previous PSK slot.
+pub struct NegotiatedKey {
+    pub mode: ProtectionMode,
+    pub psk: Option<SecretString>,
+    pub confirmation_timeout: Duration,
+    session: ClientSession,
+    transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
+    client_pq_private_key: Zeroizing<Vec<u8>>,
+    gateway_pq_public_key: String,
+}
+
+impl NegotiatedKey {
+    /// Commits only after the caller has observed a fresh WireGuard handshake.
+    pub async fn confirm(self) -> Result<()> {
+        let confirmation =
+            authenticate_confirmation(self.transaction_id, self.client_pq_private_key.as_slice())
+                .context("signing the key-negotiation confirmation with ML-DSA-65")?;
+        let commit = self
+            .session
+            .confirm(confirmation)
+            .await
+            .context("confirming the key-negotiation transaction")?;
+        commit
+            .verify(&self.gateway_pq_public_key)
+            .context("verifying the gateway PQ commit acknowledgment")
+    }
+}
+
+/// Negotiates exactly the mode selected by Orion.
+///
+/// The response is bound to the transaction, both nonces and both WireGuard
+/// identities. A server response selecting a different mode is rejected.
+pub async fn prepare(
+    client: KeyNegotiationClient,
+    mode: ProtectionMode,
+    client_wg_public_key: &str,
+    expected_gateway_wg_public_key: &str,
+    static_psk: Option<&str>,
+) -> Result<NegotiatedKey> {
+    if !mode.satisfies(client.minimum_mode) {
+        anyhow::bail!("selected mode is below the profile security floor");
+    }
+    let identity = TlsIdentity {
+        certificate_chain: client.client_certificate_chain,
+        private_key: client.client_private_key,
+    };
+    aether::wg::validate_key(client_wg_public_key)
+        .context("invalid client WireGuard public key")?;
+    aether::wg::validate_key(expected_gateway_wg_public_key)
+        .context("invalid gateway WireGuard public key")?;
+
+    let transaction_id = random_identifier()?;
+    let client_nonce = random_identifier()?;
+    let mut kem_secret = None;
+    let (kem_public_key, static_psk_fingerprint) = match mode {
+        ProtectionMode::Classic => (None, None),
+        ProtectionMode::StaticPsk => {
+            let psk = static_psk.context("static mode requires a profile PSK")?;
+            (None, Some(static_psk_fingerprint(psk)?))
+        }
+        ProtectionMode::MlKem => {
+            let (secret, public) =
+                MlKem768Kem::generate().context("generating an ML-KEM-768 keypair")?;
+            kem_secret = Some(secret);
+            (Some(public), None)
+        }
+    };
+    let request = KeyNegotiationRequest {
+        protocol_version: KEY_NEGOTIATION_VERSION,
+        transaction_id,
+        mode,
+        client_wg_public_key: client_wg_public_key.to_string(),
+        client_nonce,
+        kem_public_key,
+        static_psk_fingerprint,
+    };
+    let client_pq_certificate: PqCertificate =
+        serde_json::from_slice(&client.client_pq_certificate)
+            .context("decoding the client PQ certificate")?;
+    let authenticated_request = authenticate_request(
+        request,
+        client_pq_certificate,
+        &client.client_pq_private_key,
+    )
+    .context("signing the key-negotiation request with ML-DSA-65")?;
+
+    let remote = resolve_remote(&client.remote).await?;
+    let bind_ip = match remote.ip() {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let endpoint = client_endpoint(SocketAddr::new(bind_ip, 0), &identity, client.gateway_ca)
+        .context("building the authenticated key-negotiation client")?;
+    let (authenticated_response, session) = negotiate(
+        &endpoint,
+        remote,
+        &client.server_name,
+        &authenticated_request,
+    )
+    .await
+    .context("performing key negotiation")?;
+    authenticated_response
+        .verify(
+            &authenticated_request.request,
+            &client.gateway_pq_certificate,
+            &client.server_name,
+            expected_gateway_wg_public_key,
+            unix_time_now()?,
+        )
+        .context("rejecting an invalid PQ-authenticated key-negotiation response")?;
+    let request = authenticated_request.request;
+    let response = authenticated_response.response;
+
+    let psk = match mode {
+        ProtectionMode::Classic => None,
+        ProtectionMode::StaticPsk => Some(SecretString::new(
+            static_psk
+                .context("static PSK disappeared during negotiation")?
+                .to_string(),
+        )),
+        ProtectionMode::MlKem => {
+            let secret_key = kem_secret.context("ML-KEM secret key is unavailable")?;
+            let ciphertext = response
+                .kem_ciphertext
+                .as_deref()
+                .context("ML-KEM response has no ciphertext")?;
+            let shared_secret = MlKem768Kem::decapsulate(&secret_key, ciphertext)
+                .context("decapsulating the ML-KEM-768 ciphertext")?;
+            let derived = derive_negotiated_psk(&shared_secret, &request, &response)
+                .context("deriving the WireGuard PSK")?;
+            Some(SecretString::new(
+                base64::engine::general_purpose::STANDARD.encode(derived.as_slice()),
+            ))
+        }
+    };
+
+    Ok(NegotiatedKey {
+        mode,
+        psk,
+        confirmation_timeout: Duration::from_secs(response.confirmation_timeout_secs.into()),
+        session,
+        transaction_id,
+        client_pq_private_key: Zeroizing::new(client.client_pq_private_key),
+        gateway_pq_public_key: client.gateway_pq_certificate.ml_dsa_65_public_key.clone(),
+    })
+}
+
+/// Loads the protected identity and prepares the profile's selected mode.
+pub async fn prepare_for_profile(
+    profile: &ClientProfile,
+    identities: &dyn IdentityProvider,
+) -> Result<NegotiatedKey> {
+    let settings = profile
+        .key_negotiation
+        .as_ref()
+        .context("profile has no key-negotiation settings")?;
+    let gateway_ca = base64::engine::general_purpose::STANDARD
+        .decode(settings.gateway_ca_der.trim())
+        .context("decoding the gateway CA certificate")?;
+    let gateway_pq_certificate: PqCertificate = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(settings.gateway_pq_certificate.trim())
+            .context("decoding the gateway PQ certificate")?,
+    )
+    .context("parsing the gateway PQ certificate")?;
+    let client_wg_public_key = profile
+        .public_key()
+        .context("deriving the client WireGuard public key")?;
+    let identity = identities
+        .load(&settings.identity)
+        .await
+        .with_context(|| format!("loading key-negotiation identity {}", settings.identity))?;
+    prepare(
+        KeyNegotiationClient {
+            remote: settings.endpoint.clone(),
+            server_name: settings.server_name.clone(),
+            client_certificate_chain: identity.certificate_chain,
+            client_private_key: identity.private_key,
+            client_pq_certificate: identity.pq_certificate,
+            client_pq_private_key: identity.pq_private_key,
+            gateway_ca,
+            gateway_pq_certificate,
+            minimum_mode: settings.minimum_mode,
+        },
+        settings.mode,
+        &client_wg_public_key,
+        &profile.peer_public_key,
+        profile.preshared_key.as_deref(),
+    )
+    .await
+}
+
+fn unix_time_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?
+        .as_secs())
+}
+
+async fn resolve_remote(value: &str) -> Result<SocketAddr> {
+    let mut addresses = tokio::net::lookup_host(value)
+        .await
+        .with_context(|| format!("resolving key-negotiation endpoint {value}"))?;
+    addresses
+        .find(|address| address.port() != 0)
+        .context("key-negotiation endpoint resolved to no usable address")
+}
+
+fn random_identifier() -> Result<[u8; KEY_NEGOTIATION_NONCE_LEN]> {
+    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
+
+    let mut value = [0u8; KEY_NEGOTIATION_NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut value)
+        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    if value.iter().all(|byte| *byte == 0) {
+        return Err(anyhow::anyhow!(
+            "system CSPRNG returned an invalid identifier"
+        ));
+    }
+    Ok(value)
+}

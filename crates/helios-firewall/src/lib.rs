@@ -1,17 +1,17 @@
-//! Plan de données firewall : le **kill-switch**.
+//! Firewall data plane: the **kill-switch**.
 //!
-//! Le moteur de rendu ([`ruleset`]) traduit une [`FirewallPolicy`] + un
-//! [`TunnelState`] en un jeu de règles déclaratif, indépendant du backend. Deux
-//! backends consomment ce jeu de règles :
+//! The rendering engine ([`ruleset`]) translates a [`FirewallPolicy`] + a
+//! [`TunnelState`] into a declarative ruleset, independent of the backend. Two
+//! backends consume this ruleset:
 //!
-//! * [`DryRunBackend`] — journalise les règles sans toucher au kernel. Backend
-//!   par défaut, utilisable partout (WSL2 compris).
-//! * `NetlinkBackend` (feature `netlink`) — applique les règles atomiquement via
-//!   l'API Netlink de nf_tables (crate `rustables`). Réservé à la cible.
+//! * [`DryRunBackend`] — logs the rules without touching the kernel. Default
+//!   backend, usable everywhere (including WSL2).
+//! * `NetlinkBackend` (feature `netlink`) — applies the rules atomically via
+//!   nf_tables' Netlink API (`rustables` crate). Target-only.
 //!
-//! Principe directeur : **fail-closed**. Au démarrage, avant tout réseau, on
-//! engage le kill-switch ; le trafic LAN n'est ouvert que lorsque l'état passe à
-//! `Up`.
+//! Guiding principle: **fail-closed**. At startup, before any network access,
+//! the kill-switch is engaged; LAN traffic is only opened once the state
+//! transitions to `Up`.
 
 pub mod ruleset;
 
@@ -28,18 +28,18 @@ pub use netlink::NetlinkBackend;
 use aether::{FirewallPolicy, Result, TunnelState};
 use async_trait::async_trait;
 
-/// Backend chargé d'imposer concrètement la politique de pare-feu.
+/// Backend responsible for concretely enforcing the firewall policy.
 #[async_trait]
 pub trait FirewallBackend: Send + Sync {
-    /// Applique le jeu de règles correspondant à l'état courant du tunnel.
+    /// Applies the ruleset matching the tunnel's current state.
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()>;
 
-    /// Engage le kill-switch (équivaut à `apply(policy, TunnelState::Down)`).
-    /// À appeler au démarrage du daemon, avant tout contact réseau.
+    /// Engages the kill-switch (equivalent to `apply(policy, TunnelState::Down)`).
+    /// To be called at daemon startup, before any network contact.
     async fn engage_kill_switch(&self, policy: &FirewallPolicy) -> Result<()> {
         self.apply(policy, TunnelState::Down).await
     }
 
-    /// Supprime entièrement la table Helios (nettoyage à l'arrêt).
+    /// Entirely removes the Helios table (cleanup at shutdown).
     async fn teardown(&self) -> Result<()>;
 }

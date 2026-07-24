@@ -7,83 +7,90 @@ use crate::policy::{FirewallPolicy, PolicyMode};
 
 const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
 
-/// Port TCP de l'API REST/WS (hardcodé, invariant d'architecture).
+/// TCP port of the REST/WS API (hardcoded, architectural invariant).
 pub const API_PORT: u16 = 8080;
-/// Adresse d'écoute du serveur HTTP en mode dégradé (pas d'interface tunnel).
+/// Listen address of the HTTP server in degraded mode (no tunnel interface).
 ///
-/// Boucle locale uniquement : sans tunnel, l'API n'a aucune raison d'être
-/// joignable de l'extérieur.
+/// Loopback only: without a tunnel, the API has no reason to be reachable
+/// from the outside.
 pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 
-/// Configuration réseau chargeable par l'opérateur via CLI ou interface graphique.
+/// Network configuration loadable by the operator via CLI or graphical interface.
 ///
-/// Persistée dans `/var/lib/helios/network.toml`. C'est le seul fichier de
-/// configuration fourni par l'opérateur — tous les autres paramètres (TPM,
-/// TPM, API et mode pare-feu) sont des constantes d'architecture.
+/// Persisted in `/var/lib/helios/network.toml`. It is the only configuration
+/// file provided by the operator — all other parameters (TPM, API and
+/// firewall mode) are architectural constants.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub wan_iface: String,
     #[serde(default)]
     pub lan_ifaces: Vec<String>,
-    /// CIDRs ou IPs autorisés en SSH d'administration, même kill-switch engagé.
+    /// CIDRs or IPs allowed for administrative SSH, even with the kill-switch engaged.
     #[serde(default)]
     pub allow_ssh_from: Vec<String>,
-    /// Autorise DHCP (UDP 67/68) sur l'interface WAN, kill-switch engagé.
+    /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
     ///
-    /// À activer quand l'adresse du WAN vient d'un bail. Voir
-    /// [`crate::FirewallPolicy::allow_dhcp_on_wan`] pour ce que coûte l'oubli.
+    /// Enable when the WAN address comes from a lease. See
+    /// [`crate::FirewallPolicy::allow_dhcp_on_wan`] for the cost of forgetting it.
     #[serde(default)]
     pub allow_dhcp_on_wan: bool,
-    /// Route le trafic des clients du tunnel vers Internet (forward + NAT).
+    /// Routes tunnel clients' traffic to the Internet (forward + NAT).
     ///
-    /// Fermé par défaut : une gateway d'accès à des ressources internes n'a
-    /// aucune raison de router Internet, et l'ouvrir élargirait sa surface pour
-    /// rien. Voir [`crate::FirewallPolicy::allow_client_internet`] pour ce que
-    /// cela couvre — et ce que cela ne couvre pas, notamment le DNS.
+    /// Closed by default: a gateway giving access to internal resources has
+    /// no reason to route Internet traffic, and opening it would widen its
+    /// attack surface for nothing. See [`crate::FirewallPolicy::allow_client_internet`]
+    /// for what this covers — and what it does not cover, namely DNS.
     #[serde(default)]
     pub allow_client_internet: bool,
-    /// Interface réseau exclusive pour l'accès à l'administration.
-    /// Doit être l'interface WireGuard (`wg_iface`) : l'API vit derrière le tunnel.
+    /// Exclusive network interface for administration access.
+    /// Must be the WireGuard interface (`wg_iface`): the API lives behind the tunnel.
     #[serde(default)]
     pub admin_iface: Option<String>,
-    /// CIDRs locaux bypassant le tunnel par défaut (split-tunneling statique).
+    /// Local CIDRs bypassing the tunnel by default (static split-tunneling).
     #[serde(default)]
     pub split_tunnel_cidrs: Vec<String>,
 
-    // ── Plan de données WireGuard (rôle serveur) ──────────────────────────────
-    /// Nom de l'interface WireGuard créée par la gateway.
+    // ── WireGuard data plane (server role) ──────────────────────────────
+    /// Name of the WireGuard interface created by the gateway.
     #[serde(default = "default_wg_iface")]
     pub wg_iface: String,
-    /// Clé privée Curve25519 de la gateway, en base64. **Secret.**
-    /// Vide = la gateway ne peut pas monter son interface.
+    /// Gateway's Curve25519 private key, in base64. **Secret.**
+    /// Empty = the gateway cannot bring up its interface.
     #[serde(default)]
     pub wg_private_key: String,
-    /// Adresse de la gateway dans le réseau du tunnel (CGNAT, ADR-001 §4).
+    /// Gateway's address in the tunnel network (CGNAT, ADR-001 §4).
     #[serde(default = "default_wg_address")]
     pub wg_address: String,
-    /// Port UDP d'écoute.
+    /// UDP listen port.
     #[serde(default = "default_wg_port")]
     pub wg_listen_port: u16,
-    /// Pairs autorisés. À terme alimentés par `helios-provisioning` à
-    /// l'enrôlement ; déclarables à la main en attendant.
+    /// Public UDP port of the authenticated key-negotiation service.
+    ///
+    /// `None` keeps the WAN port closed. A binary built with the
+    /// `key-negotiation` feature requires this value before it starts the
+    /// service, so the firewall never exposes an unserved socket.
+    #[serde(default)]
+    pub key_negotiation_port: Option<u16>,
+    /// Authorized peers. Eventually populated by `helios-provisioning` at
+    /// enrollment; declarable by hand in the meantime.
     #[serde(default)]
     pub peers: Vec<WgPeer>,
 
-    /// Pairs statiques joignables en sortie (site-à-site). Vide en road-warrior.
+    /// Static peers reachable outbound (site-to-site). Empty in road-warrior mode.
     #[serde(default)]
     pub static_peer_addrs: Vec<String>,
 
-    /// Clé **publique** X25519 de séquestre de l'opérateur, en base64.
+    /// Operator's **public** X25519 escrow key, in base64.
     ///
-    /// Quand elle est renseignée, la gateway chiffre une copie de sa clé privée
-    /// WireGuard vers cette clé à chaque scellement. Seul l'opérateur — qui
-    /// détient la moitié privée, gardée **hors** de la gateway — peut l'ouvrir.
+    /// When set, the gateway encrypts a copy of its WireGuard private key to
+    /// this key on every sealing. Only the operator — who holds the private
+    /// half, kept **outside** the gateway — can open it.
     ///
-    /// C'est ce qui permet de récupérer l'identité de la gateway après un
-    /// changement de PCR (nouveau kernel, bootloader, firmware) sans passer par
-    /// un accès SSH. Absente = pas de séquestre, la clé est alors définitivement
-    /// perdue dans ce cas.
+    /// This is what allows recovering the gateway's identity after a PCR
+    /// change (new kernel, bootloader, firmware) without going through SSH
+    /// access. Absent = no escrow, the key is then permanently lost in that
+    /// case.
     #[serde(default)]
     pub escrow_public_key: Option<String>,
 }
@@ -92,7 +99,7 @@ fn default_wg_iface() -> String {
     "helios0".to_string()
 }
 
-/// `100.64.0.1/10` : première adresse de la plage CGNAT partagée (RFC 6598).
+/// `100.64.0.1/10`: first address of the shared CGNAT range (RFC 6598).
 fn default_wg_address() -> String {
     "100.64.0.1/10".to_string()
 }
@@ -101,101 +108,140 @@ fn default_wg_port() -> u16 {
     51820
 }
 
-/// Un client WireGuard autorisé sur la gateway.
+/// An authorized WireGuard client on the gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgPeer {
-    /// Nom convivial (journalisation, IHM).
+    /// Friendly name (logging, UI).
     pub name: String,
-    /// Clé publique Curve25519 du client, en base64 — son identité.
+    /// Client's Curve25519 public key, in base64 — its identity.
     pub public_key: String,
-    /// VIP assignée, en notation CIDR (ex. `100.64.1.2/32`).
-    /// Dans WireGuard, `AllowedIPs` **est** la table de routage cryptographique.
+    /// Assigned VIP, in CIDR notation (e.g. `100.64.1.2/32`).
+    /// In WireGuard, `AllowedIPs` **is** the cryptographic routing table.
     pub address: String,
-    /// Autorise ce pair à muter le plan de contrôle et à piloter les mises à
-    /// jour. Le pair reste un client WireGuard ordinaire.
+    /// Authorizes this peer to mutate the control plane and drive updates.
+    /// The peer remains an ordinary WireGuard client.
     #[serde(default)]
     pub admin: bool,
-    /// PSK post-quantique dérivé de l'échange ML-KEM, en base64. **Secret.**
+    /// Post-quantum PSK derived from the ML-KEM exchange, in base64. **Secret.**
     #[serde(default)]
     pub preshared_key: Option<String>,
+    /// SHA-256 fingerprint of the client leaf certificate authorized for
+    /// public key negotiation. Public metadata; the certificate private key
+    /// remains on Orion.
+    #[serde(default)]
+    pub key_negotiation_certificate_sha256: Option<String>,
+    /// Fingerprint of the ML-DSA-65 application certificate admitted for
+    /// this WireGuard identity.
+    #[serde(default)]
+    pub key_negotiation_pq_certificate_sha256: Option<String>,
+    /// Lowest protection mode accepted for this peer. A network negotiation
+    /// can raise the mode but can never lower it below this policy.
+    #[serde(default)]
+    pub minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode,
 }
 
 impl NetworkConfig {
-    /// Chemin de configuration. `HELIOS_NETWORK_CONFIG` permet d'isoler les
-    /// essais manuels sans écrire dans `/var/lib/helios` ; le service de
-    /// production conserve le chemin système lorsqu'elle est absente.
+    /// Configuration path. `HELIOS_NETWORK_CONFIG` allows isolating manual
+    /// tests without writing to `/var/lib/helios`; the production service
+    /// keeps the system path when it is absent.
     pub fn path() -> PathBuf {
         std::env::var_os("HELIOS_NETWORK_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(NETWORK_CONFIG_PATH))
     }
 
-    /// Charge la config réseau depuis `/var/lib/helios/network.toml`.
-    /// Renvoie une config vide si le fichier n'existe pas encore.
+    /// Loads the network config from `/var/lib/helios/network.toml`.
+    /// Returns an empty config if the file does not exist yet.
     pub fn load() -> Result<Self> {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
             Ok(raw) => {
                 let config: Self =
                     toml::from_str(&raw).map_err(|e| HeliosError::Config(e.to_string()))?;
-                config.validate_peer_identities()?;
+                config.validate()?;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(HeliosError::Config(format!(
-                "lecture de {}: {e}",
+                "reading {}: {e}",
                 path.display()
             ))),
         }
     }
 
-    /// Persiste la config réseau de façon atomique (rename).
+    /// Persists the network config atomically (rename).
     pub fn save(&self) -> Result<()> {
-        self.validate_peer_identities()?;
+        self.validate()?;
         let path = Self::path();
         let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
         let tmp = path.with_extension("toml.tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| HeliosError::Config(format!("création répertoire: {e}")))?;
+                .map_err(|e| HeliosError::Config(format!("creating directory: {e}")))?;
         }
         std::fs::write(&tmp, raw.as_bytes())
-            .map_err(|e| HeliosError::Config(format!("écriture: {e}")))?;
+            .map_err(|e| HeliosError::Config(format!("writing: {e}")))?;
         std::fs::rename(&tmp, &path)
-            .map_err(|e| HeliosError::Config(format!("rename atomique: {e}")))?;
+            .map_err(|e| HeliosError::Config(format!("atomic rename: {e}")))?;
         Ok(())
     }
 
-    /// Valide la table d'identité utilisée par l'API pour rattacher l'adresse
-    /// source d'une requête au pair WireGuard qui l'a émise.
+    /// Validates the identity table used by the API to attach a request's
+    /// source address to the WireGuard peer that sent it.
     ///
-    /// Une VIP large ou dupliquée rendrait l'autorisation administrateur
-    /// ambiguë. Les clients Helios utilisent donc exclusivement une IPv4 hôte
-    /// en `/32`, cohérente avec leur `AllowedIPs` WireGuard.
+    /// A broad or duplicated VIP would make administrator authorization
+    /// ambiguous. Helios clients therefore exclusively use a `/32` host IPv4,
+    /// consistent with their WireGuard `AllowedIPs`.
     pub fn validate_peer_identities(&self) -> Result<()> {
         let mut addresses = HashSet::new();
         let mut public_keys = HashSet::new();
         for peer in &self.peers {
             let (host, prefix) = peer.address.split_once('/').ok_or_else(|| {
                 HeliosError::Config(format!(
-                    "VIP du pair {} sans préfixe /32 : {}",
+                    "peer {} VIP without /32 prefix: {}",
                     peer.name, peer.address
                 ))
             })?;
             if prefix != "32" || host.parse::<Ipv4Addr>().is_err() {
                 return Err(HeliosError::Config(format!(
-                    "VIP du pair {} invalide, une IPv4 /32 est exigée : {}",
+                    "invalid VIP for peer {}, a /32 IPv4 is required: {}",
                     peer.name, peer.address
                 )));
             }
             if !addresses.insert(host.to_string()) {
                 return Err(HeliosError::Config(format!(
-                    "VIP dupliquée dans la table de pairs : {host}/32"
+                    "duplicate VIP in the peer table: {host}/32"
                 )));
             }
             if !public_keys.insert(peer.public_key.as_str()) {
                 return Err(HeliosError::Config(format!(
-                    "clé publique WireGuard dupliquée pour le pair {}",
+                    "duplicate WireGuard public key for peer {}",
+                    peer.name
+                )));
+            }
+            let tls_identity = peer.key_negotiation_certificate_sha256.as_deref();
+            let pq_identity = peer.key_negotiation_pq_certificate_sha256.as_deref();
+            if tls_identity.is_some() != pq_identity.is_some() {
+                return Err(HeliosError::Config(format!(
+                    "peer {} has an incomplete TLS/PQ key-negotiation identity",
+                    peer.name
+                )));
+            }
+            for fingerprint in [tls_identity, pq_identity].into_iter().flatten() {
+                crate::key_negotiation::validate_certificate_fingerprint(fingerprint).map_err(
+                    |_| {
+                        HeliosError::Config(format!(
+                            "peer {} has an invalid key-negotiation certificate fingerprint",
+                            peer.name
+                        ))
+                    },
+                )?;
+            }
+            if peer.minimum_key_negotiation_mode != crate::key_negotiation::ProtectionMode::Classic
+                && pq_identity.is_none()
+            {
+                return Err(HeliosError::Config(format!(
+                    "peer {} requires a PQ key-negotiation identity for its security floor",
                     peer.name
                 )));
             }
@@ -203,53 +249,74 @@ impl NetworkConfig {
         Ok(())
     }
 
-    /// Pairs statiques joignables en sortie (site-à-site). Vide en road-warrior :
-    /// les clients arrivent en entrée, sur `wg_listen_port`.
+    /// Validates relationships that cannot be expressed by serde defaults.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_peer_identities()?;
+        if let Some(port) = self.key_negotiation_port {
+            if port == 0 {
+                return Err(HeliosError::Config(
+                    "key_negotiation_port must not be zero".into(),
+                ));
+            }
+            if port == self.wg_listen_port {
+                return Err(HeliosError::Config(
+                    "key_negotiation_port and wg_listen_port must be distinct".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Static peers reachable outbound (site-to-site). Empty in road-warrior
+    /// mode: clients arrive inbound, on `wg_listen_port`.
     pub fn wg_peers(&self) -> Vec<String> {
         self.static_peer_addrs.clone()
     }
 
-    /// La gateway est-elle configurée pour monter son interface WireGuard ?
+    /// Is the gateway configured to bring up its WireGuard interface?
     pub fn wireguard_ready(&self) -> bool {
         !self.wg_private_key.trim().is_empty() && !self.wg_address.trim().is_empty()
     }
 
-    /// Adresse d'écoute du serveur HTTP.
+    /// Listen address of the HTTP server.
     ///
-    /// **L'API doit écouter sur l'adresse du tunnel**, pas sur la boucle locale :
-    /// c'est par là que les clients Orion atteignent le provisioning et la
-    /// télémétrie. Une écoute sur `127.0.0.1` rendrait la règle de pare-feu
-    /// filtrant sur `admin_iface` inopérante — elle ne pourrait jamais
-    /// s'appliquer, faute de socket à atteindre.
+    /// **The API must listen on the tunnel address**, not on loopback: that
+    /// is how Orion clients reach provisioning and telemetry. Listening on
+    /// `127.0.0.1` would make the firewall rule filtering on `admin_iface`
+    /// inoperative — it could never apply, for lack of a socket to reach.
     ///
-    /// Le filtrage reste assuré par le pare-feu (`admin_iface`), pas par
-    /// l'adresse de bind : c'est nftables qui refuse les connexions venues
-    /// d'ailleurs que du tunnel.
+    /// Filtering is still enforced by the firewall (`admin_iface`), not by
+    /// the bind address: it is nftables that refuses connections coming
+    /// from anywhere other than the tunnel.
     ///
-    /// Sans gateway configurée, on retombe sur la boucle locale.
+    /// Without a configured gateway, we fall back to loopback.
     pub fn api_bind(&self) -> String {
         if !self.wireguard_ready() {
             return API_BIND_LOOPBACK.to_string();
         }
-        // `wg_address` est en CIDR (`100.64.0.1/10`) : on n'en garde que l'hôte.
+        // `wg_address` is in CIDR notation (`100.64.0.1/10`): keep only the host.
         match self.wg_address.split('/').next() {
             Some(host) if !host.trim().is_empty() => format!("{}:{}", host.trim(), API_PORT),
             _ => API_BIND_LOOPBACK.to_string(),
         }
     }
 
-    /// Projette la config réseau vers la politique de pare-feu déclarative.
-    /// Mode toujours `fail-closed` — invariant de sécurité non configurable.
+    /// Projects the network config onto the declarative firewall policy.
+    /// Mode always `fail-closed` — non-configurable security invariant.
     pub fn firewall_policy(&self) -> FirewallPolicy {
         let admin_port = self.admin_iface.as_ref().map(|_| API_PORT);
         FirewallPolicy {
             wan_iface: self.wan_iface.clone(),
             lan_ifaces: self.lan_ifaces.clone(),
             wg_peers: self.wg_peers(),
-            // Rôle serveur : on n'ouvre le port en entrée que si la gateway est
-            // réellement en mesure de monter son interface. Sinon on laisserait
-            // un port ouvert sans rien derrière.
+            // Server role: we only open the inbound port if the gateway is
+            // actually able to bring up its interface. Otherwise we'd leave
+            // a port open with nothing behind it.
             wg_listen_port: self.wireguard_ready().then_some(self.wg_listen_port),
+            key_negotiation_port: self
+                .wireguard_ready()
+                .then_some(self.key_negotiation_port)
+                .flatten(),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
@@ -269,18 +336,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_vide_par_defaut() {
+    fn config_empty_by_default() {
         let cfg = NetworkConfig::default();
         assert!(cfg.peers.is_empty());
         assert!(cfg.wan_iface.is_empty());
         assert!(
             !cfg.wireguard_ready(),
-            "sans clé privée, rien ne doit monter"
+            "without a private key, nothing should come up"
         );
     }
 
     #[test]
-    fn deserialise_config_gateway() {
+    fn deserializes_gateway_config() {
         let toml = r#"
             wan_iface = "eth0"
             lan_ifaces = ["eth1"]
@@ -295,7 +362,7 @@ mod tests {
         "#;
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.wan_iface, "eth0");
-        // Les défauts WireGuard s'appliquent sans être écrits.
+        // WireGuard defaults apply without being written.
         assert_eq!(cfg.wg_iface, "helios0");
         assert_eq!(cfg.wg_listen_port, 51820);
         assert_eq!(cfg.wg_address, "100.64.0.1/10");
@@ -306,23 +373,23 @@ mod tests {
 
         let policy = cfg.firewall_policy();
         assert!(policy.is_fail_closed());
-        // Rôle serveur : le port d'écoute doit être ouvert en entrée, sinon
-        // aucun client ne peut handshaker.
+        // Server role: the listen port must be open inbound, otherwise no
+        // client can handshake.
         assert_eq!(policy.wg_listen_port, Some(51820));
-        assert!(
-            policy.wg_peers.is_empty(),
-            "road-warrior : pas de pair sortant"
-        );
+        assert!(policy.wg_peers.is_empty(), "road-warrior: no outbound peer");
     }
 
     #[test]
-    fn identites_exigent_des_vip_hotes_uniques() {
+    fn identities_require_unique_host_vips() {
         let peer = |name: &str, key: &str, address: &str| WgPeer {
             name: name.into(),
             public_key: key.into(),
             address: address.into(),
             admin: false,
             preshared_key: None,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
         };
         let mut cfg = NetworkConfig {
             peers: vec![
@@ -340,11 +407,24 @@ mod tests {
         assert!(cfg.validate_peer_identities().is_ok());
     }
 
-    /// L'API doit écouter sur l'adresse du tunnel. Sur `127.0.0.1`, aucun client
-    /// Orion ne pourrait atteindre le provisioning, et la règle de pare-feu
-    /// filtrant sur `admin_iface` ne pourrait jamais s'appliquer.
     #[test]
-    fn l_api_ecoute_sur_l_adresse_du_tunnel() {
+    fn key_negotiation_requires_a_distinct_nonzero_udp_port() {
+        let mut config = NetworkConfig {
+            key_negotiation_port: Some(0),
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.key_negotiation_port = Some(config.wg_listen_port);
+        assert!(config.validate().is_err());
+        config.key_negotiation_port = Some(51821);
+        assert!(config.validate().is_ok());
+    }
+
+    /// The API must listen on the tunnel address. On `127.0.0.1`, no Orion
+    /// client could reach provisioning, and the firewall rule filtering on
+    /// `admin_iface` could never apply.
+    #[test]
+    fn the_api_listens_on_the_tunnel_address() {
         let cfg = NetworkConfig {
             wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             wg_address: "100.64.0.1/10".into(),
@@ -354,16 +434,16 @@ mod tests {
         assert_ne!(
             cfg.api_bind(),
             API_BIND_LOOPBACK,
-            "sur la boucle locale, le provisioning serait injoignable"
+            "on loopback, provisioning would be unreachable"
         );
     }
 
-    /// Sans gateway configurée, aucune raison d'exposer l'API : boucle locale.
+    /// Without a configured gateway, no reason to expose the API: loopback.
     #[test]
-    fn repli_sur_la_boucle_locale_sans_gateway() {
+    fn falls_back_to_loopback_without_a_gateway() {
         assert_eq!(NetworkConfig::default().api_bind(), API_BIND_LOOPBACK);
 
-        // Adresse malformée : on se replie plutôt que d'exposer n'importe quoi.
+        // Malformed address: we fall back rather than exposing anything.
         let cfg = NetworkConfig {
             wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             wg_address: "/10".into(),
@@ -373,8 +453,8 @@ mod tests {
     }
 
     #[test]
-    fn port_non_ouvert_si_la_gateway_n_est_pas_prete() {
-        // Pas de clé privée → on n'ouvre pas un port sans rien derrière.
+    fn port_not_opened_if_the_gateway_is_not_ready() {
+        // No private key -> we don't open a port with nothing behind it.
         let cfg = NetworkConfig {
             wan_iface: "eth0".into(),
             ..NetworkConfig::default()

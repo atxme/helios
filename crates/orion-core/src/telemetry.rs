@@ -1,12 +1,13 @@
-//! Consommation de l'API web de heliosd — **uniquement après montage du tunnel**.
+//! Consumption of heliosd's web API — **only after the tunnel is mounted**.
 //!
-//! Rappel de l'invariant : le serveur web de heliosd vit *derrière* WireGuard. Il
-//! n'est joignable que lorsque le tunnel est `Up`. Cette boucle n'est donc lancée
-//! par le shell que sur la transition vers `Up`, et annulée dès la déconnexion.
+//! Reminder of the invariant: heliosd's web server lives *behind* WireGuard.
+//! It's only reachable once the tunnel is `Up`. This loop is therefore only
+//! started by the shell on the transition to `Up`, and cancelled as soon as
+//! disconnection occurs.
 //!
-//! Pour le scaffold, on interroge `GET /api/status` (preuve de joignabilité) et
-//! on signale les transitions accessible/injoignable. Le flux télémétrie riche
-//! (WebSocket `/ws` → débits/SA) est un raffinement ultérieur.
+//! For the scaffold, we query `GET /api/status` (proof of reachability) and
+//! report reachable/unreachable transitions. The rich telemetry stream
+//! (WebSocket `/ws` → rates/SA) is a later refinement.
 
 use std::time::Duration;
 
@@ -15,16 +16,16 @@ use tokio::sync::watch;
 use crate::backend::EventSink;
 use crate::events::ClientEvent;
 
-/// Période de sondage de l'API heliosd interne.
+/// Polling period of the internal heliosd API.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Délai max d'une requête de statut.
+/// Max delay of a status request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Boucle de télémétrie : sonde `heliosd_url/api/status` jusqu'à annulation via
-/// `cancel`. N'émet un log que sur **changement** de joignabilité (anti-bruit).
+/// Telemetry loop: polls `heliosd_url/api/status` until cancelled via
+/// `cancel`. Only emits a log on a **change** of reachability (anti-noise).
 ///
-/// `heliosd_url` doit être l'URL interne joignable derrière le tunnel
-/// (ex. `http://10.10.0.1:8080`).
+/// `heliosd_url` must be the internal URL reachable behind the tunnel
+/// (e.g. `http://10.10.0.1:8080`).
 pub async fn run(heliosd_url: String, sink: EventSink, mut cancel: watch::Receiver<bool>) {
     let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
         Ok(c) => c,

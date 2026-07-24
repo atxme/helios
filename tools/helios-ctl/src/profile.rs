@@ -1,23 +1,24 @@
-//! Émission d'un profil client, au format lu par l'import Orion.
+//! Client profile emission, in the format read by Orion's import.
 //!
-//! Le document `orion-profile` v1 avait un consommateur
-//! (`orion_core::profile_import`) et aucun producteur : le profil se recopiait
-//! à la main. C'est ici que la boucle se ferme.
+//! The `orion-profile` v1 document had a consumer
+//! (`orion_core::profile_import`) and no producer: the profile had to be
+//! hand-copied. This is where the loop closes.
 //!
-//! # Deux modes, et pourquoi le défaut est le bon (ADR-004 §6)
+//! # Two modes, and why the default is the right one (ADR-004 §6)
 //!
-//! * **Invitation** — l'opérateur part de la clé **publique** que le client lui
-//!   a transmise. Il l'admet et renvoie tout sauf la clé privée, qu'il n'a
-//!   jamais détenue. Orion complète depuis le profil local de même nom.
-//! * **Assisté** (`--with-private-key`) — l'opérateur génère la paire et remet
-//!   un profil complet. C'est le seul chemin où une clé privée client existe
-//!   hors du poste client. Il est conservé parce qu'un parc où l'utilisateur ne
-//!   peut rien faire existe réellement, et que l'interdire ferait refaire la
-//!   même chose à la main, plus mal.
+//! * **Invitation** — the operator starts from the **public** key the client
+//!   sent them. It admits it and returns everything except the private key,
+//!   which the operator never held. Orion completes it from the local
+//!   profile of the same name.
+//! * **Assisted** (`--with-private-key`) — the operator generates the pair
+//!   and hands over a complete profile. This is the only path where a client
+//!   private key exists outside the client workstation. It is kept because a
+//!   fleet where the user can do nothing themselves really exists, and
+//!   forbidding it would just make people redo the same thing by hand, worse.
 //!
-//! Les deux modes admettent le pair : un profil émis pour une clé que la
-//! gateway ignore ne monterait aucun tunnel, et l'utilisateur n'aurait aucun
-//! moyen de comprendre pourquoi.
+//! Both modes admit the peer: a profile emitted for a key the gateway does
+//! not know would bring up no tunnel, and the user would have no way to
+//! understand why.
 
 use std::path::{Path, PathBuf};
 
@@ -27,22 +28,22 @@ use serde::Serialize;
 
 use crate::api;
 
-/// Identifiant et version du document, tels qu'`orion-core` les exige.
+/// Document identifier and version, as required by `orion-core`.
 const FORMAT: &str = "orion-profile";
 const VERSION: u16 = 1;
 
 pub struct EmitOptions {
-    /// Nom du profil, aussi utilisé comme nom du pair sur la gateway.
+    /// Profile name, also used as the peer name on the gateway.
     pub name: String,
-    /// Endpoint UDP public de la gateway (`IP:port` ou `FQDN:port`).
+    /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
     pub endpoint: String,
-    /// Clé publique du client, reçue hors bande. Mode invitation.
+    /// Client public key, received out of band. Invitation mode.
     pub public_key: Option<String>,
-    /// Génère la paire côté opérateur. Mode assisté.
+    /// Generate the pair on the operator side. Assisted mode.
     pub with_private_key: bool,
-    /// Admet le pair comme administrateur du plan de contrôle.
+    /// Admit the peer as a control-plane administrator.
     pub admin: bool,
-    /// Fichier de sortie. Absent : sortie standard.
+    /// Output file. Absent: standard output.
     pub output: Option<PathBuf>,
 }
 
@@ -53,8 +54,8 @@ struct Document<'a> {
     profile: Profile<'a>,
 }
 
-/// Le champ `private_key` est omis en mode invitation : `orion-core` le traite
-/// comme absent, pas comme vide, et complète depuis le profil local.
+/// The `private_key` field is omitted in invitation mode: `orion-core` treats
+/// it as absent, not empty, and completes it from the local profile.
 #[derive(Serialize)]
 struct Profile<'a> {
     name: &'a str,
@@ -76,8 +77,8 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         .clone()
         .filter(|k| !k.is_empty())
         .context(
-            "la gateway n'a pas encore d'identité WireGuard — jouer `heliosd init-identity` \
-         sur la gateway, avec accès console",
+            "the gateway does not have a WireGuard identity yet — run `heliosd init-identity` \
+         on the gateway, with console access",
         )?;
 
     let address = admit_or_reuse(client, base, &options, &public_key).await?;
@@ -94,12 +95,12 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
             heliosd_url: heliosd_url(&view.wg_address),
         },
     };
-    let json = serde_json::to_string_pretty(&document).context("sérialisation du profil")?;
+    let json = serde_json::to_string_pretty(&document).context("serializing the profile")?;
 
     match &options.output {
         Some(path) => {
-            // Un profil complet porte une clé privée : il naît en 0600, et ne
-            // remplace jamais un fichier existant en silence.
+            // A complete profile carries a private key: it is born at 0600,
+            // and never silently replaces an existing file.
             crate::files::write_new(path, json.as_bytes(), private_key.is_some())?;
             report(path, &options, &public_key);
         }
@@ -108,42 +109,43 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
     Ok(())
 }
 
-/// Choisit le mode et rend `(clé publique, clé privée éventuelle)`.
+/// Picks the mode and returns `(public key, optional private key)`.
 fn resolve_keys(options: &EmitOptions) -> Result<(String, Option<String>)> {
     match (&options.public_key, options.with_private_key) {
         (Some(_), true) => bail!(
-            "--public-key et --with-private-key s'excluent : soit le client détient déjà sa \
-             clé et fournit sa moitié publique, soit l'opérateur génère la paire"
+            "--public-key and --with-private-key are mutually exclusive: either the client \
+             already holds its key and supplies its public half, or the operator generates \
+             the pair"
         ),
         (Some(public_key), false) => {
             let public_key = public_key.trim().to_string();
-            aether::wg::validate_key(&public_key).context("clé publique du client invalide")?;
+            aether::wg::validate_key(&public_key).context("invalid client public key")?;
             Ok((public_key, None))
         }
         (None, true) => {
             let pair = aether::wg::generate_keypair()
-                .map_err(|e| anyhow::anyhow!("génération de la paire client : {e}"))?;
+                .map_err(|e| anyhow::anyhow!("generating the client key pair: {e}"))?;
             Ok((pair.public_key, Some(pair.private_key.expose().to_string())))
         }
         (None, false) => bail!(
-            "indiquer --public-key <clé publique du client> (mode recommandé : le secret du \
-             client ne voyage pas), ou --with-private-key pour que l'opérateur génère la paire"
+            "provide --public-key <client public key> (recommended: the client's secret never \
+             travels), or --with-private-key so the operator generates the pair"
         ),
     }
 }
 
-/// Admet le pair, ou réutilise son admission si elle correspond déjà.
+/// Admits the peer, or reuses its admission if it already matches.
 ///
-/// Réémettre un profil perdu est un besoin courant. Sans ce rattrapage, il
-/// faudrait révoquer le pair pour le réadmettre — donc couper l'utilisateur
-/// pour lui refabriquer le fichier qu'il a égaré.
+/// Re-emitting a lost profile is a common need. Without this fallback, the
+/// peer would have to be revoked to be re-admitted — cutting off the user to
+/// rebuild the file they misplaced.
 async fn admit_or_reuse(
     client: &Client,
     base: &str,
     options: &EmitOptions,
     public_key: &str,
 ) -> Result<String> {
-    match crate::peer::admit(client, base, &options.name, public_key, options.admin).await {
+    match crate::peer::admit(client, base, &options.name, public_key, options.admin, None).await {
         Ok(peer) => Ok(peer.address),
         Err(error) => {
             let view = api::network(client, base).await?;
@@ -154,26 +156,26 @@ async fn admit_or_reuse(
                 .ok_or(error)?;
             if existing.public_key.trim() != public_key {
                 bail!(
-                    "un pair « {} » est déjà admis avec une autre clé publique. Le révoquer \
-                     d'abord (`helios-ctl peer revoke --name {}`) si l'ancienne clé est \
-                     bien perdue : le client qui la détient tombera au prochain handshake.",
+                    "a peer named \"{}\" is already admitted with a different public key. \
+                     Revoke it first (`helios-ctl peer revoke --name {}`) if the old key is \
+                     indeed lost: the client holding it will drop at its next handshake.",
                     existing.name,
                     existing.name
                 );
             }
             eprintln!(
-                "  \x1b[2mpair déjà admis avec la même clé — profil réémis sur son adresse\x1b[0m"
+                "  \x1b[2mpeer already admitted with the same key — profile re-emitted for its address\x1b[0m"
             );
             Ok(existing.address.clone())
         }
     }
 }
 
-/// URL de l'API vue depuis le tunnel, dérivée de l'adresse de la gateway.
+/// API URL as seen from the tunnel, derived from the gateway address.
 ///
-/// Sert la télémétrie enrichie et le provisioning post-quantique du client.
-/// Absente si l'adresse est illisible : un profil sans cette URL fonctionne,
-/// il perd seulement l'enrichissement.
+/// Serves enriched telemetry and the client's post-quantum provisioning.
+/// Absent if the address is unreadable: a profile without this URL still
+/// works, it only loses the enrichment.
 fn heliosd_url(wg_address: &str) -> Option<String> {
     let host = wg_address.split('/').next()?.trim();
     host.parse::<std::net::Ipv4Addr>().ok()?;
@@ -182,7 +184,7 @@ fn heliosd_url(wg_address: &str) -> Option<String> {
 
 fn report(path: &Path, options: &EmitOptions, public_key: &str) {
     println!(
-        "{} profil « {} » écrit dans {}",
+        "{} profile \"{}\" written to {}",
         crate::ok(),
         options.name,
         path.display()
@@ -190,15 +192,15 @@ fn report(path: &Path, options: &EmitOptions, public_key: &str) {
     println!();
     if options.with_private_key {
         println!(
-            "  \x1b[33mCe fichier contient la clé privée du client.\x1b[0m Le remettre par un"
+            "  \x1b[33mThis file contains the client's private key.\x1b[0m Hand it over through a"
         );
-        println!("  canal maîtrisé, puis l'effacer du poste opérateur.");
+        println!("  controlled channel, then erase it from the operator workstation.");
     } else {
-        println!("  \x1b[2mAucune clé privée dans ce fichier : Orion complète depuis le\x1b[0m");
-        println!("  \x1b[2mprofil local de même nom, celui qui détient la clé.\x1b[0m");
+        println!("  \x1b[2mNo private key in this file: Orion completes it from the local\x1b[0m");
+        println!("  \x1b[2mprofile of the same name, the one that holds the key.\x1b[0m");
     }
     println!();
-    println!("  \x1b[2mClé publique admise : {public_key}\x1b[0m");
+    println!("  \x1b[2mAdmitted public key: {public_key}\x1b[0m");
 }
 
 #[cfg(test)]
@@ -217,38 +219,38 @@ mod tests {
     }
 
     #[test]
-    fn le_mode_invitation_ne_produit_aucune_cle_privee() {
+    fn invitation_mode_produces_no_private_key() {
         let pair = aether::wg::generate_keypair().unwrap();
         let (public_key, private_key) = resolve_keys(&EmitOptions {
             public_key: Some(pair.public_key.clone()),
             ..options()
         })
-        .expect("mode invitation");
+        .expect("invitation mode");
         assert_eq!(public_key, pair.public_key);
         assert!(
             private_key.is_none(),
-            "le secret du client ne doit pas être fabriqué par l'opérateur"
+            "the client's secret must not be manufactured by the operator"
         );
     }
 
     #[test]
-    fn le_mode_assiste_produit_une_paire_coherente() {
+    fn assisted_mode_produces_a_consistent_pair() {
         let (public_key, private_key) = resolve_keys(&EmitOptions {
             with_private_key: true,
             ..options()
         })
-        .expect("mode assisté");
-        let private_key = private_key.expect("clé privée générée");
+        .expect("assisted mode");
+        let private_key = private_key.expect("generated private key");
         assert_eq!(
             aether::wg::public_from_private(&private_key).unwrap(),
             public_key
         );
     }
 
-    /// Les deux modes sont exclusifs : les combiner signifierait admettre une
-    /// clé et en livrer une autre, donc un profil qui ne monte jamais.
+    /// The two modes are exclusive: combining them would mean admitting one
+    /// key and delivering another, hence a profile that never comes up.
     #[test]
-    fn les_deux_modes_ne_se_combinent_pas() {
+    fn the_two_modes_cannot_be_combined() {
         assert!(resolve_keys(&EmitOptions {
             public_key: Some(aether::wg::generate_keypair().unwrap().public_key),
             with_private_key: true,
@@ -258,38 +260,39 @@ mod tests {
     }
 
     #[test]
-    fn sans_mode_explicite_l_outil_refuse_plutot_que_de_choisir() {
-        let erreur = resolve_keys(&options()).unwrap_err().to_string();
-        assert!(erreur.contains("--public-key"), "message : {erreur}");
-        assert!(erreur.contains("--with-private-key"), "message : {erreur}");
+    fn without_an_explicit_mode_the_tool_refuses_rather_than_choosing() {
+        let error = resolve_keys(&options()).unwrap_err().to_string();
+        assert!(error.contains("--public-key"), "message: {error}");
+        assert!(error.contains("--with-private-key"), "message: {error}");
     }
 
     #[test]
-    fn une_cle_publique_invalide_est_refusee_avant_tout_appel() {
+    fn an_invalid_public_key_is_rejected_before_any_call() {
         assert!(resolve_keys(&EmitOptions {
-            public_key: Some("pas-une-cle".into()),
+            public_key: Some("not-a-key".into()),
             ..options()
         })
         .is_err());
     }
 
     #[test]
-    fn l_url_de_l_api_se_derive_de_l_adresse_de_la_gateway() {
+    fn the_api_url_is_derived_from_the_gateway_address() {
         assert_eq!(
             heliosd_url("100.64.0.1/10").as_deref(),
             Some("http://100.64.0.1:8080")
         );
-        assert_eq!(heliosd_url("pas-une-adresse").as_deref(), None);
+        assert_eq!(heliosd_url("not-an-address").as_deref(), None);
     }
 
-    /// Le document doit être relisible par l'import Orion : c'est le seul
-    /// critère qui compte, et le vérifier ici évite un aller-retour manuel.
+    /// The emitted document must be readable back by Orion's import: that is
+    /// the only criterion that matters, and checking it here avoids a manual
+    /// round trip.
     #[test]
-    fn le_document_emis_est_relu_par_l_import_orion() {
-        let cle_client = aether::wg::generate_keypair().unwrap();
-        let cle_gateway = aether::wg::generate_keypair().unwrap();
+    fn the_emitted_document_is_read_back_by_orion_import() {
+        let client_key = aether::wg::generate_keypair().unwrap();
+        let gateway_key = aether::wg::generate_keypair().unwrap();
 
-        for private_key in [None, Some(cle_client.private_key.expose())] {
+        for private_key in [None, Some(client_key.private_key.expose())] {
             let document = Document {
                 format: FORMAT,
                 version: VERSION,
@@ -297,19 +300,19 @@ mod tests {
                     name: "portable",
                     endpoint: "vpn.example.net:51820",
                     private_key,
-                    peer_public_key: &cle_gateway.public_key,
+                    peer_public_key: &gateway_key.public_key,
                     address: "100.64.1.2/32",
                     heliosd_url: heliosd_url("100.64.0.1/10"),
                 },
             };
             let json = serde_json::to_string(&document).unwrap();
-            let profil = orion_core::parse_profile_import(&json, "portable.json")
-                .expect("document relu par Orion");
+            let profile = orion_core::parse_profile_import(&json, "portable.json")
+                .expect("document read back by Orion");
 
-            assert_eq!(profil.name, "portable");
-            assert_eq!(profil.peer_public_key, cle_gateway.public_key);
-            assert_eq!(profil.address.as_deref(), Some("100.64.1.2/32"));
-            assert_eq!(profil.private_key.is_empty(), private_key.is_none());
+            assert_eq!(profile.name, "portable");
+            assert_eq!(profile.peer_public_key, gateway_key.public_key);
+            assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
+            assert_eq!(profile.private_key.is_empty(), private_key.is_none());
         }
     }
 }

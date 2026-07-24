@@ -5,28 +5,39 @@ au même risque et ne doivent pas être confondus.
 
 | Usage | Algorithme | Composition | État |
 |---|---|---|---|
-| Secret de session WireGuard | ML-KEM-768 | tunnel WireGuard classique puis PSK PQ | protocole implémenté, installation atomique du PSK gateway à terminer |
+| Secret de session WireGuard | ML-KEM-768 + HKDF-SHA-256 | transcript ML-DSA-65 sur QUIC/TLS puis PSK WireGuard | cœur et transaction implémentés ; intégration IHM Windows différée |
+| Identité de key-negotiation | ML-DSA-65 | certificat PQ applicatif et signatures requête/réponse/commit | implémenté |
 | Artefacts éditeur | ML-DSA-65 + Ed25519 | hybride AND obligatoire | billet TPM v2 implémenté ; récupération bloquée |
 
 ## PSK WireGuard dérivé par ML-KEM
 
-WireGuard n’est pas modifié. L’admission initiale utilise ses clés Curve25519
-classiques. Une fois ce tunnel établi, Orion et Helios exécutent ML-KEM-768 sur
-le canal HTTP interne :
+WireGuard n’est pas modifié. Avant son premier handshake, Orion et Helios
+exécutent la key-negotiation sur un port QUIC/mTLS distinct :
 
-1. Orion génère une paire ML-KEM éphémère et envoie la clé publique, son
-   identité WireGuard et un nonce ;
-2. Helios vérifie que le pair est déjà admis, encapsule un secret et renvoie le
-   ciphertext, son identité et un second nonce ;
-3. les deux côtés dérivent le même PSK de 32 octets en liant secret KEM,
-   identités, nonces et domaine de protocole ;
-4. le PSK doit ensuite être installé atomiquement dans le slot
-   `PresharedKey` du pair WireGuard.
+1. mTLS établit le transport QUIC, sans être l'unique ancre de sécurité ;
+2. les certificats applicatifs ML-DSA-65 lient les identités aux clés
+   WireGuard ;
+3. Orion choisit `classic`, `static_psk` ou `ml_kem` et signe le mode ainsi que
+   `kpub` ;
+4. en ML-KEM, Orion génère `kpub`/`kpriv`, Helios encapsule et signe le
+   ciphertext ;
+5. HKDF lie secret KEM, transaction, mode, nonces et identités WireGuard ;
+6. Helios pose son slot avant de répondre, Orion pose le sien puis attend un
+   handshake frais ;
+7. confirmation et ACK ML-DSA-65 commit la transaction ; toute fermeture ou
+   expiration restaure le slot précédent.
+
+Le plancher persistant `minimum_key_negotiation_mode` est vérifié séparément par
+Helios et Orion. Pour un pair PQ, `classic` et `static_psk` sont refusés avant
+toute pose. Chaque commit réussi élève le plancher Helios au mode utilisé et le
+persiste sans PSK ni clé privée ; le protocole ne sait jamais le diminuer. Les
+messages v1 sans signatures PQ sont incompatibles et rejetés.
 
 Le code utilise ML-KEM-768 d’`aws-lc-rs`. Les tests couvrent le round-trip, les
-clés/ciphertexts malformés, les mauvaises clés, les nonces, les identités et la
-séparation des concaténations. Le dernier câblage du plan de données reste hors
-du niveau de garantie production.
+clés/ciphertexts malformés, les mauvaises clés, les nonces, les identités, le
+refus de downgrade, substitution de `kpub`/ciphertext, signatures de commit,
+mTLS et rollback. Les PSK négociés restent
+uniquement en mémoire et dans les slots WireGuard.
 
 ## Signatures hybrides d’artefacts
 
@@ -80,7 +91,10 @@ limites et motifs sont conservés dans
 
 ## Limites explicites
 
-- le PSK PQ n’est pas encore installé de bout en bout dans la gateway réelle ;
+- le fournisseur de clé de certificat dans le shell Windows et son IHM seront
+  câblés dans le lot IHM ; le cœur impose déjà cette frontière protégée ;
+- l'effet réel sur WireGuard-NT, le noyau Linux, les redirections des deux ports
+  et le scellement TPM restent à valider sur les cibles matérielles ;
 - le fichier de récupération signé attend le choix du compteur anti-rejeu ;
 - ML-DSA ne signifie pas que le binaire est certifié FIPS 140-3 ;
 - SLH-DSA est extensible par le format mais n’est pas actuellement requis.

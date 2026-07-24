@@ -1,6 +1,6 @@
-// Couche d'accès au backend Rust via Tauri (invoke) + flux d'événements (listen).
-// La connexion monte WireGuard côté Rust. Seule la télémétrie/provisioning
-// post-tunnel utilise ensuite l'API HTTP interne d'Helios.
+// Access layer to the Rust backend via Tauri (invoke) + event stream (listen).
+// The connection mounts WireGuard on the Rust side. Only post-tunnel
+// telemetry/provisioning then uses Helios's internal HTTP API.
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -22,15 +22,15 @@ export const importProfilePath = (path?: string) =>
   invoke<ClientProfile | null>('import_profile_path', { path: path ?? null })
 
 /**
- * Relève les champs fautifs d'un profil en cours d'édition.
+ * Reports the faulty fields of a profile being edited.
  *
- * Les règles vivent dans `orion-core` : l'IHM surligne ce que le cœur refuse,
- * elle ne les réimplémente pas.
+ * The rules live in `orion-core`: the UI highlights what the core refuses,
+ * it doesn't reimplement them.
  */
 export const validateProfile = (profile: ClientProfile) =>
   invoke<ProfileIssues>('validate_profile', { profile })
 
-/** Clé publique dérivée du profil : la seule moitié à communiquer à l'opérateur. */
+/** Public key derived from the profile: the only half to send to the operator. */
 export const profilePublicKey = (profile: ClientProfile) =>
   invoke<string | null>('profile_public_key', { profile })
 
@@ -45,28 +45,28 @@ export const connect = (name?: string) => invoke<void>('connect', { name: name ?
 export const disconnect = () => invoke<void>('disconnect')
 
 /**
- * Ajuste la fenêtre à la vue affichée.
+ * Adjusts the window to the displayed view.
  *
- * Les dimensions sont décidées côté Rust : le frontend nomme la vue, il ne
- * dimensionne rien lui-même.
+ * Dimensions are decided on the Rust side: the frontend names the view, it
+ * doesn't size anything itself.
  */
 export const resizeForView = (view: string) => invoke<void>('resize_for_view', { view })
 
 /**
- * Écrit le journal sur disque et renvoie le chemin obtenu.
+ * Writes the log to disk and returns the resulting path.
  *
- * `stem` n'est qu'un libellé : le frontend le propose parce qu'il connaît
- * l'heure locale, mais Rust l'assainit et choisit seul le répertoire.
+ * `stem` is only a label: the frontend proposes it because it knows the
+ * local time, but Rust sanitizes it and picks the directory on its own.
  */
 export const exportLogs = (stem: string, contents: string) =>
   invoke<string>('export_logs', { stem, contents })
 
-/** Abonnement au flux d'événements temps réel du backend. */
+/** Subscription to the backend's real-time event stream. */
 export function onEvent(cb: (ev: ClientEvent) => void): Promise<UnlistenFn> {
   return listen<ClientEvent>('helios://event', (e) => cb(e.payload))
 }
 
-/** Un double-clic a ajouté un chemin à la file Rust d'import. */
+/** A double-click added a path to the Rust import queue. */
 export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
   return listen('helios://profile-path', cb)
 }

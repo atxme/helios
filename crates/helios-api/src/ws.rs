@@ -1,8 +1,8 @@
-//! Handler WebSocket : diffuse les [`HeliosEvent`] en JSON vers chaque client.
+//! WebSocket handler: streams [`HeliosEvent`] as JSON to each client.
 //!
-//! À la connexion, l'état courant est envoyé en premier pour que l'UI s'initialise
-//! sans attendre le prochain événement. On souscrit au broadcast AVANT de lire
-//! l'état pour éviter de manquer une transition simultanée.
+//! On connection, the current state is sent first so the UI can initialize
+//! without waiting for the next event. We subscribe to the broadcast BEFORE
+//! reading the state, to avoid missing a simultaneous transition.
 
 use aether::HeliosEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -17,7 +17,7 @@ pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> imp
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Souscrire d'abord, puis lire l'état : zéro risque de manquer une transition.
+    // Subscribe first, then read the state: zero risk of missing a transition.
     let mut rx = state.event_tx.subscribe();
 
     let current = *state.tunnel_state.read().await;

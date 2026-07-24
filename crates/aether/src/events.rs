@@ -5,7 +5,7 @@ use crate::config::NetworkConfig;
 use crate::secret::SecretString;
 use crate::state::TunnelState;
 
-/// Événements diffusés aux abonnés (WebSocket).
+/// Events broadcast to subscribers (WebSocket).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HeliosEvent {
@@ -16,7 +16,7 @@ pub enum HeliosEvent {
         level: String,
         message: String,
     },
-    /// Compteurs réseau lus depuis /proc/net/dev, émis toutes les secondes.
+    /// Network counters read from /proc/net/dev, emitted every second.
     Telemetry {
         iface: String,
         rx_bps: u64,
@@ -24,86 +24,87 @@ pub enum HeliosEvent {
         rx_pps: u64,
         tx_pps: u64,
     },
-    /// Portail captif interceptant le trafic HTTP détecté sur le réseau courant.
+    /// Captive portal intercepting HTTP traffic detected on the current network.
     CaptivePortalDetected {
         gateway: String,
     },
-    /// MTU optimal déterminé par PMTUD — règle MSS clamping appliquée.
+    /// Optimal MTU determined by PMTUD — MSS clamping rule applied.
     MtuDiscovered {
         mtu: u16,
         mss: u16,
     },
-    /// Liste des CIDRs en split-tunneling mise à jour.
+    /// List of split-tunneling CIDRs updated.
     SplitTunnelChanged {
         cidrs: Vec<String>,
     },
 }
 
-/// Commandes envoyées par l'interface web vers l'orchestrateur.
+/// Commands sent by the web interface to the orchestrator.
 #[derive(Debug, Clone)]
 pub enum OrchestratorCmd {
     Connect,
-    /// Remplace la clé privée WireGuard de la gateway et la scelle dans le TPM.
+    /// Replaces the gateway's WireGuard private key and seals it in the TPM.
     ///
-    /// Le secret de scellement ne quitte jamais `heliosd` : l'API ne fait que
-    /// transmettre la nouvelle clé, l'orchestrateur seul sait la sceller.
+    /// The sealing secret never leaves `heliosd`: the API only transmits the
+    /// new key, only the orchestrator knows how to seal it.
     ///
-    /// **Rotation d'identité** : après application, tous les clients doivent
-    /// mettre à jour leur `peer_public_key`.
+    /// **Identity rotation**: after applying, all clients must update their
+    /// `peer_public_key`.
     UpdateGatewayKey(String),
-    /// Applique un jeu de règles nftables brut (dry-run = log seulement).
+    /// Applies a raw nftables ruleset (dry-run = log only).
     ApplyFirewallRules(String),
     Disconnect,
-    /// L'utilisateur a accepté le portail captif dans son navigateur — relancer la connexion.
+    /// The user accepted the captive portal in their browser — restart the connection.
     AcknowledgeCaptivePortal,
-    /// Met à jour la liste des CIDRs bypassant le tunnel (split-tunneling dynamique).
+    /// Updates the list of CIDRs bypassing the tunnel (dynamic split-tunneling).
     SetSplitTunnel(Vec<String>),
-    /// Applique une valeur de MSS clamping issue de la sonde PMTUD (usage interne).
+    /// Applies an MSS clamping value from the PMTUD probe (internal use).
     SetMssClamp(u16),
-    /// État déduit du polling des handshakes WireGuard (**usage interne**).
+    /// State inferred from polling WireGuard handshakes (**internal use**).
     ///
-    /// Émise par le sondeur, jamais par l'API — aucune route ne la construit.
-    /// Elle existe parce que le sondeur ne détient ni le backend de pare-feu ni
-    /// la politique : écrire l'état lui-même laisserait le ruleset figé sur
-    /// l'état précédent. Passer par la boucle principale garantit qu'une
-    /// promotion vers `Up` ou une retombée vers `Connecting` re-rende toujours
-    /// le pare-feu.
+    /// Emitted by the prober, never by the API — no route builds it.
+    /// It exists because the prober holds neither the firewall backend nor
+    /// the policy: writing the state itself would leave the ruleset frozen
+    /// on the previous state. Going through the main loop guarantees that a
+    /// promotion to `Up` or a fallback to `Connecting` always re-renders the
+    /// firewall.
     TunnelStateInferred(TunnelState),
-    /// Recharge la configuration réseau à chaud (sans redémarrer le daemon).
-    /// Boxée : `NetworkConfig` est bien plus grosse que les autres variantes.
+    /// Reloads the network configuration hot (without restarting the daemon).
+    /// Boxed: `NetworkConfig` is far larger than the other variants.
     LoadNetworkConfig(Box<NetworkConfig>),
 }
 
-/// Demande d'installation d'un PSK post-quantique sur un pair du plan de
-/// données, émise par l'endpoint de provisioning vers l'orchestrateur.
+/// Request to install a post-quantum PSK on a data plane peer, emitted by
+/// the provisioning endpoint towards the orchestrator.
 ///
-/// # Pourquoi un canal dédié plutôt qu'une variante d'[`OrchestratorCmd`]
+/// # Why a dedicated channel rather than a variant of [`OrchestratorCmd`]
 ///
-/// Deux raisons, toutes deux structurelles :
+/// Two reasons, both structural:
 ///
-/// * cette demande porte un **secret** et attend une **réponse**, là où
-///   `OrchestratorCmd` est un flux d'ordres d'IHM sans retour — la doter d'un
-///   `oneshot` lui ferait perdre `Clone` ;
-/// * garder le PSK hors d'une énumération qui dérive `Debug` supprime toute
-///   possibilité de fuite par journalisation. Le champ est de surcroît un
-///   [`SecretString`], donc muet à l'affichage.
+/// * this request carries a **secret** and expects a **response**, whereas
+///   `OrchestratorCmd` is a stream of UI orders with no return — giving it a
+///   `oneshot` would make it lose `Clone`;
+/// * keeping the PSK out of an enum that derives `Debug` removes any
+///   possibility of leaking it through logging. The field is moreover a
+///   [`SecretString`], hence silent on display.
 ///
-/// # Pourquoi une réponse est indispensable
+/// # Why a response is essential
 ///
-/// WireGuard n'a qu'un seul slot PSK par pair : une valeur posée d'un seul côté
-/// fait échouer **tous** les handshakes suivants. L'endpoint ne doit donc
-/// annoncer le PSK au client qu'une fois la gateway certaine de l'avoir posé.
-/// Sans cet acquittement, un échec côté plan de données laisserait le client
-/// installer un PSK orphelin et tomber — sans canal de contrôle pour se
-/// rattraper, puisque ce canal vit dans le tunnel qui vient de mourir.
+/// WireGuard has only one PSK slot per peer: a value set on only one side
+/// makes **all** subsequent handshakes fail. The endpoint must therefore
+/// only announce the PSK to the client once the gateway is certain it has
+/// been set. Without this acknowledgment, a failure on the data plane side
+/// would leave the client installing an orphan PSK and falling — with no
+/// control channel to recover, since that channel lives in the tunnel that
+/// just died.
 #[derive(Debug)]
 pub struct InstallPskRequest {
-    /// Clé publique Curve25519 du pair concerné (base64) — son identité.
+    /// Curve25519 public key of the peer concerned (base64) — its identity.
     pub public_key: String,
-    /// VIP attribuée au pair, en notation CIDR (ex. `100.64.1.2/32`).
+    /// VIP assigned to the peer, in CIDR notation (e.g. `100.64.1.2/32`).
     pub address: String,
-    /// PSK dérivé de l'échange ML-KEM, en base64. **Secret.**
-    pub psk: SecretString,
-    /// Acquittement : `Ok` seulement si le PSK est réellement posé sur le pair.
+    /// PSK to install, in base64, or `None` to clear the slot. **Secret.**
+    pub psk: Option<SecretString>,
+    /// Acknowledgment: `Ok` only if the PSK is actually set on the peer.
     pub reply: oneshot::Sender<Result<(), String>>,
 }

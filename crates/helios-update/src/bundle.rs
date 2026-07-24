@@ -1,25 +1,26 @@
-//! Bundle d'installation : ce qu'on livre à une gateway neuve.
+//! Installation bundle: what is delivered to a fresh gateway.
 //!
-//! Un bundle est un répertoire — transporté sous forme d'archive — contenant
-//! les binaires, les unités systemd et un exemple de configuration, plus un
-//! [manifeste signé](aether::sig::BundlePayload) qui énumère **exhaustivement**
-//! son contenu avec les empreintes.
+//! A bundle is a directory — carried as an archive — containing the
+//! binaries, the systemd units and an example configuration, plus a
+//! [signed manifest](aether::sig::BundlePayload) that **exhaustively**
+//! enumerates its contents along with their digests.
 //!
-//! # Ce que ce module garantit, et ce qu'il ne garantit pas
+//! # What this module guarantees, and what it does not
 //!
-//! Il garantit qu'un bundle installé correspond octet pour octet à ce que
-//! l'éditeur a signé : ni fichier modifié, ni fichier ajouté, ni fichier
-//! manquant. C'est plus fort que la vérification de la mise à jour applicative
-//! (ADR-003), qui ne couvre que le binaire `heliosd` — un bundle porte aussi
-//! l'unité systemd, qui décide de la ligne de commande du daemon.
+//! It guarantees that an installed bundle matches byte for byte what the
+//! publisher signed: no modified file, no added file, no missing file. This
+//! is stronger than the applicative update verification (ADR-003), which
+//! only covers the `heliosd` binary — a bundle also carries the systemd
+//! unit, which decides the daemon's command line.
 //!
-//! Il ne garantit **pas** l'authenticité du programme qui exécute cette
-//! vérification lors du tout premier déploiement : à ce moment, `helios-installer`
-//! vient lui-même du bundle. La racine de confiance du premier pas est le canal
-//! par lequel l'opérateur a copié l'archive, et l'empreinte qu'il a comparée.
-//! Les installations suivantes, elles, sont vérifiées par un installateur déjà
-//! installé et vérifié. Ce qui débloquerait le premier pas : un paquet système
-//! signé par une distribution, hors périmètre ici.
+//! It does **not** guarantee the authenticity of the program that runs this
+//! verification on the very first deployment: at that point,
+//! `helios-installer` itself comes from the bundle. The trust root of that
+//! first step is the channel through which the operator copied the archive,
+//! and the digest they compared. Subsequent installations, on the other
+//! hand, are verified by an installer that is already installed and
+//! verified. What would unblock the first step: a system package signed by
+//! a distribution, out of scope here.
 
 use std::{
     collections::BTreeMap,
@@ -34,31 +35,30 @@ use aether::{
 
 use crate::{sha256_file, update_error, INSTALLER_VERSION, MAX_BINARY_SIZE};
 
-/// Nom du manifeste signé, à la racine du bundle.
+/// Name of the signed manifest, at the bundle's root.
 pub const BUNDLE_MANIFEST_FILE: &str = "manifest.json";
 
-/// Nombre maximal de fichiers dans un bundle.
+/// Maximum number of files in a bundle.
 ///
-/// Borne la mémoire et le temps de vérification d'une archive hostile : le
-/// bundle réel en compte moins d'une dizaine.
+/// Bounds the memory and verification time of a hostile archive: the real
+/// bundle has fewer than a dozen.
 pub const MAX_BUNDLE_FILES: usize = 256;
 
-/// Profondeur maximale de l'arborescence, pour la même raison.
+/// Maximum tree depth, for the same reason.
 pub const MAX_BUNDLE_DEPTH: usize = 4;
 
-/// Produit attendu dans le manifeste d'un bundle gateway.
+/// Expected product in a gateway bundle's manifest.
 pub const BUNDLE_PRODUCT: &str = "helios";
 
-/// Recense le contenu d'un répertoire de bundle, trié par chemin.
+/// Enumerates the contents of a bundle directory, sorted by path.
 ///
-/// Le manifeste lui-même est exclu : il ne peut pas contenir sa propre
-/// empreinte.
+/// The manifest itself is excluded: it cannot contain its own digest.
 pub fn collect(root: &Path) -> Result<Vec<BundleEntry>> {
     let mut entries = BTreeMap::new();
     walk(root, root, 0, &mut entries)?;
     if entries.len() > MAX_BUNDLE_FILES {
         return Err(update_error(format!(
-            "bundle de {} fichiers, maximum {MAX_BUNDLE_FILES}",
+            "bundle of {} files, maximum {MAX_BUNDLE_FILES}",
             entries.len()
         )));
     }
@@ -73,30 +73,29 @@ fn walk(
 ) -> Result<()> {
     if depth > MAX_BUNDLE_DEPTH {
         return Err(update_error(format!(
-            "arborescence de bundle trop profonde sous {}",
+            "bundle tree too deep under {}",
             dir.display()
         )));
     }
-    let listing = fs::read_dir(dir)
-        .map_err(|e| update_error(format!("lecture de {} : {e}", dir.display())))?;
+    let listing =
+        fs::read_dir(dir).map_err(|e| update_error(format!("reading {}: {e}", dir.display())))?;
     for item in listing {
-        let item =
-            item.map_err(|e| update_error(format!("parcours de {} : {e}", dir.display())))?;
+        let item = item.map_err(|e| update_error(format!("iterating {}: {e}", dir.display())))?;
         let path = item.path();
-        // `symlink_metadata` : un lien symbolique n'est pas suivi. Le suivre
-        // ferait entrer dans le bundle un fichier extérieur à sa racine, dont
-        // l'empreinte signée ne dirait rien de ce qui serait réellement
-        // installé.
+        // `symlink_metadata`: a symbolic link is not followed. Following it
+        // would let a file outside the bundle's root enter the bundle, whose
+        // signed digest would say nothing about what would actually be
+        // installed.
         let metadata = fs::symlink_metadata(&path)
-            .map_err(|e| update_error(format!("lecture de {} : {e}", path.display())))?;
+            .map_err(|e| update_error(format!("reading {}: {e}", path.display())))?;
         if metadata.is_dir() {
             walk(root, &path, depth + 1, entries)?;
             continue;
         }
         if !metadata.is_file() {
             return Err(update_error(format!(
-                "{} n'est ni un fichier ni un répertoire — un bundle ne contient ni lien \
-                 symbolique ni fichier spécial",
+                "{} is neither a file nor a directory — a bundle contains no symbolic \
+                 link or special file",
                 path.display()
             )));
         }
@@ -106,7 +105,7 @@ fn walk(
         }
         if metadata.len() > MAX_BINARY_SIZE {
             return Err(update_error(format!(
-                "{relative} : {} octets, maximum {MAX_BINARY_SIZE}",
+                "{relative}: {} bytes, maximum {MAX_BINARY_SIZE}",
                 metadata.len()
             )));
         }
@@ -121,7 +120,7 @@ fn walk(
         );
         if entries.len() > MAX_BUNDLE_FILES {
             return Err(update_error(format!(
-                "bundle de plus de {MAX_BUNDLE_FILES} fichiers"
+                "bundle of more than {MAX_BUNDLE_FILES} files"
             )));
         }
     }
@@ -131,7 +130,7 @@ fn walk(
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| update_error(format!("{} hors du bundle", path.display())))?;
+        .map_err(|_| update_error(format!("{} outside the bundle", path.display())))?;
     let mut segments = Vec::new();
     for component in relative.components() {
         match component {
@@ -139,13 +138,13 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
                 segment
                     .to_str()
                     .ok_or_else(|| {
-                        update_error(format!("nom de fichier non UTF-8 : {}", path.display()))
+                        update_error(format!("non-UTF-8 file name: {}", path.display()))
                     })?
                     .to_string(),
             ),
             _ => {
                 return Err(update_error(format!(
-                    "chemin de bundle inattendu : {}",
+                    "unexpected bundle path: {}",
                     path.display()
                 )))
             }
@@ -160,33 +159,32 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
     metadata.permissions().mode() & 0o111 != 0
 }
 
-/// Hors Unix, le bit exécutable n'existe pas : le manifeste porte alors la
-/// valeur voulue par le producteur, jamais une valeur devinée du système de
-/// fichiers. Un bundle gateway se construit de toute façon sous Linux.
+/// Outside Unix, the executable bit does not exist: the manifest then
+/// carries the value intended by the producer, never a value guessed from
+/// the filesystem. A gateway bundle is built under Linux anyway.
 #[cfg(not(unix))]
 fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-/// Chemin absolu d'une entrée du bundle, validé contre l'évasion de répertoire.
+/// Absolute path of a bundle entry, validated against directory escape.
 pub fn entry_path(root: &Path, entry: &BundleEntry) -> PathBuf {
     root.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
-/// Lit le manifeste signé à la racine d'un bundle.
+/// Reads the signed manifest at a bundle's root.
 pub fn read_manifest(root: &Path) -> Result<SignedBundle> {
     let path = root.join(BUNDLE_MANIFEST_FILE);
     let raw = fs::read(&path).map_err(|e| {
         update_error(format!(
-            "manifeste absent ou illisible ({}) : {e} — un bundle non signé ne s'installe pas",
+            "manifest missing or unreadable ({}): {e} — an unsigned bundle does not install",
             path.display()
         ))
     })?;
-    serde_json::from_slice(&raw)
-        .map_err(|e| update_error(format!("manifeste de bundle invalide : {e}")))
+    serde_json::from_slice(&raw).map_err(|e| update_error(format!("invalid bundle manifest: {e}")))
 }
 
-/// Vérifie les signatures et les métadonnées du manifeste.
+/// Verifies the manifest's signatures and metadata.
 pub fn verify_manifest(manifest: &SignedBundle, channel: &str, target: &str) -> Result<()> {
     verify_manifest_with_keyring(manifest, channel, target, PUBLISHER_KEYS)
 }
@@ -199,23 +197,23 @@ fn verify_manifest_with_keyring(
 ) -> Result<()> {
     manifest
         .verify(keyring)
-        .map_err(|e| update_error(format!("signature du bundle refusée : {e}")))?;
+        .map_err(|e| update_error(format!("bundle signature rejected: {e}")))?;
     let payload = &manifest.payload;
     if payload.product != BUNDLE_PRODUCT {
         return Err(update_error(format!(
-            "le manifeste ne cible pas {BUNDLE_PRODUCT} mais {}",
+            "manifest does not target {BUNDLE_PRODUCT} but {}",
             payload.product
         )));
     }
     if payload.channel != channel {
         return Err(update_error(format!(
-            "canal {} refusé, {channel} attendu",
+            "channel {} refused, {channel} expected",
             payload.channel
         )));
     }
     if payload.target != target {
         return Err(update_error(format!(
-            "target {} refusée, {target} attendue",
+            "target {} refused, {target} expected",
             payload.target
         )));
     }
@@ -223,31 +221,30 @@ fn verify_manifest_with_keyring(
         || payload.version.trim().is_empty()
         || payload.git_commit.trim().is_empty()
     {
-        return Err(update_error("métadonnées de bundle incomplètes"));
+        return Err(update_error("incomplete bundle metadata"));
     }
     if payload.minimum_installer_version > INSTALLER_VERSION {
         return Err(update_error(format!(
-            "installer v{} requis, v{INSTALLER_VERSION} présent",
+            "installer v{} required, v{INSTALLER_VERSION} present",
             payload.minimum_installer_version
         )));
     }
     payload
         .validate()
-        .map_err(|e| update_error(format!("contenu de bundle refusé : {e}")))?;
+        .map_err(|e| update_error(format!("bundle content rejected: {e}")))?;
     Ok(())
 }
 
-/// Vérifie que le contenu du répertoire correspond **exactement** au manifeste.
+/// Verifies that the directory's contents match the manifest **exactly**.
 ///
-/// L'égalité est stricte dans les deux sens : un fichier surnuméraire est un
-/// refus, pas une tolérance. Sans cette symétrie, une archive pourrait glisser
-/// un fichier non signé à côté de ceux qui le sont — un script, une unité
-/// systemd de plus — et l'installation le poserait sous une garantie qui ne le
-/// couvre pas.
+/// Equality is strict in both directions: an extra file is a refusal, not a
+/// tolerance. Without this symmetry, an archive could slip an unsigned file
+/// alongside signed ones — a script, one more systemd unit — and the
+/// installation would apply it under a guarantee that does not cover it.
 pub fn verify_contents(root: &Path, payload: &BundlePayload) -> Result<()> {
     payload
         .validate()
-        .map_err(|e| update_error(format!("contenu de bundle refusé : {e}")))?;
+        .map_err(|e| update_error(format!("bundle content rejected: {e}")))?;
     let actual = collect(root)?;
     if actual == payload.files {
         return Ok(());
@@ -257,25 +254,22 @@ pub fn verify_contents(root: &Path, payload: &BundlePayload) -> Result<()> {
         match actual.iter().find(|candidate| candidate.path == entry.path) {
             None => {
                 return Err(update_error(format!(
-                    "fichier absent du bundle : {}",
+                    "file missing from the bundle: {}",
                     entry.path
                 )))
             }
             Some(candidate) if candidate.sha256 != entry.sha256 => {
                 return Err(update_error(format!(
-                    "empreinte différente pour {} — contenu altéré",
+                    "digest mismatch for {} — content altered",
                     entry.path
                 )))
             }
             Some(candidate) if candidate.size != entry.size => {
-                return Err(update_error(format!(
-                    "taille différente pour {}",
-                    entry.path
-                )))
+                return Err(update_error(format!("size mismatch for {}", entry.path)))
             }
             Some(candidate) if candidate.executable != entry.executable => {
                 return Err(update_error(format!(
-                    "droit d'exécution différent pour {}",
+                    "execute permission mismatch for {}",
                     entry.path
                 )))
             }
@@ -287,29 +281,30 @@ pub fn verify_contents(root: &Path, payload: &BundlePayload) -> Result<()> {
         .find(|candidate| payload.entry(&candidate.path).is_none())
     {
         return Err(update_error(format!(
-            "fichier non signé présent dans le bundle : {}",
+            "unsigned file present in the bundle: {}",
             extra.path
         )));
     }
-    Err(update_error("contenu du bundle non conforme au manifeste"))
+    Err(update_error("bundle content does not match the manifest"))
 }
 
-/// Destinations système d'un bundle installé.
+/// System destinations of an installed bundle.
 ///
-/// Chaque chemin est surchargeable par variable d'environnement, comme
-/// [`crate::UpdateLayout`] : c'est ce qui rend l'installation complète
-/// vérifiable sur une machine de développement, sans droits root et sans
-/// toucher au système. Le service de production, lui, n'en définit aucune.
+/// Each path can be overridden by an environment variable, like
+/// [`crate::UpdateLayout`]: this is what makes the complete installation
+/// verifiable on a development machine, without root privileges and without
+/// touching the system. The production service, on the other hand, defines
+/// none of them.
 #[derive(Debug, Clone)]
 pub struct BootstrapLayout {
     pub update: crate::UpdateLayout,
-    /// Helper privilégié de mise à jour (`helios-installer`).
+    /// Privileged update helper (`helios-installer`).
     pub libexec_dir: PathBuf,
-    /// Outils d'exploitation (`helios-ctl`).
+    /// Operational tools (`helios-ctl`).
     pub bin_dir: PathBuf,
-    /// Unités systemd.
+    /// Systemd units.
     pub systemd_dir: PathBuf,
-    /// Configuration réseau, **jamais écrasée** si elle existe déjà.
+    /// Network configuration, **never overwritten** if it already exists.
     pub config_path: PathBuf,
 }
 
@@ -331,33 +326,33 @@ fn env_path(variable: &str, default: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(default))
 }
 
-/// Ce qu'une installation a réellement fait, pour le rapport à l'opérateur.
+/// What an installation actually did, for the report to the operator.
 #[derive(Debug)]
 pub struct InstallReport {
     pub version: String,
     pub release_sequence: u64,
     pub channel: String,
     pub installed: Vec<PathBuf>,
-    /// La configuration existait déjà et n'a pas été touchée.
+    /// The configuration already existed and was not touched.
     pub config_preserved: bool,
 }
 
-/// Destination d'un fichier du bundle.
+/// Destination of a bundle file.
 enum Destination {
-    /// Le daemon : versionné sous `install_root/<séquence>` et pointé par
-    /// `current`, comme une mise à jour applicative.
+    /// The daemon: versioned under `install_root/<sequence>` and pointed to
+    /// by `current`, like an applicative update.
     Daemon,
-    /// Un fichier ordinaire, remplacé s'il existe.
+    /// An ordinary file, replaced if it exists.
     Replace(PathBuf, u32),
-    /// La configuration : posée seulement si elle est absente.
+    /// The configuration: applied only if it is absent.
     ConfigIfAbsent(PathBuf, u32),
 }
 
-/// Où va chaque fichier déclaré. Un chemin inconnu est un refus.
+/// Where each declared file goes. An unknown path is a refusal.
 ///
-/// Ignorer un fichier non reconnu reviendrait à installer un bundle
-/// partiellement, en silence : l'opérateur croirait avoir déployé ce qu'il a
-/// signé.
+/// Ignoring an unrecognized file would amount to silently installing a
+/// bundle partially: the operator would believe they deployed what they
+/// signed.
 fn destination(path: &str, layout: &BootstrapLayout) -> Result<Destination> {
     match path {
         "heliosd" => Ok(Destination::Daemon),
@@ -378,18 +373,18 @@ fn destination(path: &str, layout: &BootstrapLayout) -> Result<Destination> {
                 Ok(Destination::Replace(layout.systemd_dir.join(unit), 0o644))
             }
             _ => Err(update_error(format!(
-                "fichier {other} sans destination connue — ce bundle a été produit par une \
-                 version différente de l'installateur"
+                "file {other} has no known destination — this bundle was produced by a \
+                 different version of the installer"
             ))),
         },
     }
 }
 
-/// Installe un bundle **vérifié** depuis un répertoire extrait.
+/// Installs a **verified** bundle from an extracted directory.
 ///
-/// L'ordre compte : tout est vérifié avant que quoi que ce soit ne soit écrit.
-/// Une installation qui échouerait à mi-parcours laisserait une gateway avec un
-/// daemon d'une version et une unité systemd d'une autre.
+/// Order matters: everything is verified before anything is written. An
+/// installation that failed halfway through would leave a gateway with a
+/// daemon of one version and a systemd unit of another.
 pub fn install(root: &Path, layout: &BootstrapLayout) -> Result<InstallReport> {
     install_with_keyring(root, layout, PUBLISHER_KEYS)
 }
@@ -412,14 +407,14 @@ fn install_with_keyring(
     let state = crate::read_state(&layout.update.state_path)?;
     crate::reject_rollback(payload.release_sequence, &state)?;
 
-    // Les destinations sont résolues avant la première écriture : un bundle
-    // portant un fichier inconnu doit être refusé entier, pas à moitié posé.
+    // Destinations are resolved before the first write: a bundle carrying an
+    // unknown file must be refused entirely, not partially applied.
     let mut plan = Vec::with_capacity(payload.files.len());
     for entry in &payload.files {
         plan.push((entry, destination(&entry.path, layout)?));
     }
     if !payload.files.iter().any(|entry| entry.path == "heliosd") {
-        return Err(update_error("bundle sans heliosd"));
+        return Err(update_error("bundle without heliosd"));
     }
 
     let mut installed = Vec::new();
@@ -471,11 +466,11 @@ fn install_with_keyring(
     })
 }
 
-/// Écrit une copie neuve puis la met en place par `rename`.
+/// Writes a fresh copy then puts it in place via `rename`.
 ///
-/// Le remplacement direct d'un exécutable en cours d'utilisation échouerait ou
-/// corromprait le processus vivant ; `rename` sur le même système de fichiers
-/// est atomique et laisse l'ancien inode aux processus qui l'ont ouvert.
+/// Directly replacing an executable in use would fail or corrupt the live
+/// process; `rename` on the same filesystem is atomic and leaves the old
+/// inode to the processes that opened it.
 fn replace_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -499,23 +494,23 @@ fn replace_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_dir(nom: &str) -> PathBuf {
+    fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "helios-bundle-{nom}-{}-{:?}",
+            "helios-bundle-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("répertoire de test");
+        fs::create_dir_all(&dir).expect("test directory");
         dir
     }
 
-    fn ecrire(root: &Path, relatif: &str, contenu: &[u8]) {
-        let path = root.join(relatif);
+    fn write_file(root: &Path, relative: &str, content: &[u8]) {
+        let path = root.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(path, contenu).unwrap();
+        fs::write(path, content).unwrap();
     }
 
     fn payload(files: Vec<BundleEntry>) -> BundlePayload {
@@ -532,327 +527,328 @@ mod tests {
     }
 
     #[test]
-    fn le_recensement_est_trie_et_ignore_le_manifeste() {
+    fn enumeration_is_sorted_and_ignores_the_manifest() {
         let dir = temp_dir("collect");
-        ecrire(&dir, "heliosd", b"binaire");
-        ecrire(&dir, "systemd/heliosd.service", b"unite");
-        ecrire(&dir, BUNDLE_MANIFEST_FILE, b"{}");
+        write_file(&dir, "heliosd", b"binary");
+        write_file(&dir, "systemd/heliosd.service", b"unit");
+        write_file(&dir, BUNDLE_MANIFEST_FILE, b"{}");
 
-        let entries = collect(&dir).expect("recensement");
-        let chemins: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(chemins, ["heliosd", "systemd/heliosd.service"]);
-        assert_eq!(entries[0].size, 7);
+        let entries = collect(&dir).expect("enumeration");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["heliosd", "systemd/heliosd.service"]);
+        assert_eq!(entries[0].size, 6);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn un_contenu_conforme_est_accepte() {
-        let dir = temp_dir("conforme");
-        ecrire(&dir, "heliosd", b"binaire");
+    fn matching_content_is_accepted() {
+        let dir = temp_dir("matching");
+        write_file(&dir, "heliosd", b"binary");
         let payload = payload(collect(&dir).unwrap());
         assert!(verify_contents(&dir, &payload).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn un_fichier_altere_est_refuse() {
-        let dir = temp_dir("altere");
-        ecrire(&dir, "heliosd", b"binaire");
+    fn an_altered_file_is_rejected() {
+        let dir = temp_dir("altered");
+        write_file(&dir, "heliosd", b"binary");
         let payload = payload(collect(&dir).unwrap());
-        ecrire(&dir, "heliosd", b"binaireX");
+        write_file(&dir, "heliosd", b"binaryX");
 
-        let erreur = verify_contents(&dir, &payload).unwrap_err().to_string();
-        assert!(erreur.contains("heliosd"), "message : {erreur}");
+        let error = verify_contents(&dir, &payload).unwrap_err().to_string();
+        assert!(error.contains("heliosd"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Le point qui distingue cette vérification d'un simple contrôle
-    /// d'empreintes : un fichier en plus est un refus.
+    /// The point that distinguishes this verification from a simple digest
+    /// check: an extra file is a refusal.
     #[test]
-    fn un_fichier_surnumeraire_est_refuse() {
-        let dir = temp_dir("surnumeraire");
-        ecrire(&dir, "heliosd", b"binaire");
+    fn an_extra_file_is_rejected() {
+        let dir = temp_dir("extra");
+        write_file(&dir, "heliosd", b"binary");
         let payload = payload(collect(&dir).unwrap());
-        ecrire(&dir, "systemd/pirate.service", b"unite non signee");
+        write_file(&dir, "systemd/pirate.service", b"unsigned unit");
 
-        let erreur = verify_contents(&dir, &payload).unwrap_err().to_string();
-        assert!(erreur.contains("pirate"), "message : {erreur}");
+        let error = verify_contents(&dir, &payload).unwrap_err().to_string();
+        assert!(error.contains("pirate"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn un_fichier_manquant_est_refuse() {
-        let dir = temp_dir("manquant");
-        ecrire(&dir, "heliosd", b"binaire");
-        ecrire(&dir, "helios-ctl", b"outil");
+    fn a_missing_file_is_rejected() {
+        let dir = temp_dir("missing");
+        write_file(&dir, "heliosd", b"binary");
+        write_file(&dir, "helios-ctl", b"tool");
         let payload = payload(collect(&dir).unwrap());
         fs::remove_file(dir.join("helios-ctl")).unwrap();
 
-        let erreur = verify_contents(&dir, &payload).unwrap_err().to_string();
-        assert!(erreur.contains("helios-ctl"), "message : {erreur}");
+        let error = verify_contents(&dir, &payload).unwrap_err().to_string();
+        assert!(error.contains("helios-ctl"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn le_bit_executable_fait_partie_de_ce_qui_est_verifie() {
+    fn the_executable_bit_is_part_of_what_is_verified() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("mode");
-        ecrire(&dir, "heliosd", b"binaire");
+        write_file(&dir, "heliosd", b"binary");
         fs::set_permissions(dir.join("heliosd"), fs::Permissions::from_mode(0o755)).unwrap();
         let payload = payload(collect(&dir).unwrap());
         assert!(payload.files[0].executable);
 
         fs::set_permissions(dir.join("heliosd"), fs::Permissions::from_mode(0o644)).unwrap();
-        let erreur = verify_contents(&dir, &payload).unwrap_err().to_string();
-        assert!(erreur.contains("exécution"), "message : {erreur}");
+        let error = verify_contents(&dir, &payload).unwrap_err().to_string();
+        assert!(error.contains("execute"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Un lien symbolique ferait entrer dans le bundle un fichier extérieur à
-    /// sa racine : l'empreinte signée ne dirait alors rien de ce qui est
-    /// réellement installé.
+    /// A symbolic link would let a file outside the bundle's root enter the
+    /// bundle: the signed digest would then say nothing about what is
+    /// actually installed.
     #[cfg(unix)]
     #[test]
-    fn un_lien_symbolique_est_refuse() {
-        let dir = temp_dir("lien");
-        ecrire(&dir, "heliosd", b"binaire");
+    fn a_symbolic_link_is_rejected() {
+        let dir = temp_dir("symlink");
+        write_file(&dir, "heliosd", b"binary");
         std::os::unix::fs::symlink("/etc/passwd", dir.join("secret")).unwrap();
 
-        let erreur = collect(&dir).unwrap_err().to_string();
-        assert!(erreur.contains("lien symbolique"), "message : {erreur}");
+        let error = collect(&dir).unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn un_manifeste_absent_est_un_refus_explicite() {
-        let dir = temp_dir("sans-manifeste");
-        ecrire(&dir, "heliosd", b"binaire");
-        let erreur = read_manifest(&dir).unwrap_err().to_string();
-        assert!(erreur.contains("non signé"), "message : {erreur}");
+    fn a_missing_manifest_is_an_explicit_refusal() {
+        let dir = temp_dir("no-manifest");
+        write_file(&dir, "heliosd", b"binary");
+        let error = read_manifest(&dir).unwrap_err().to_string();
+        assert!(error.contains("unsigned"), "message: {error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ─── Installation de bout en bout ────────────────────────────────────────
+    // ─── End-to-end installation ────────────────────────────────────────────
 
     use aether::sig::{PublisherPublicKeys, PublisherSigner};
 
-    /// Bundle complet, tel que `cargo xtask bundle` l'assemble.
-    fn bundle_complet(racine: &Path) {
-        ecrire(racine, "heliosd", b"le-daemon");
-        ecrire(racine, "helios-installer", b"l-installateur");
-        ecrire(racine, "helios-ctl", b"l-outil");
-        ecrire(racine, "systemd/heliosd.service", b"[Unit]");
-        ecrire(racine, "systemd/helios-update.service", b"[Unit]");
-        ecrire(racine, "systemd/helios-update.path", b"[Path]");
-        ecrire(racine, "network.toml.example", b"wan_iface = \"eth0\"");
+    /// Complete bundle, as `cargo xtask bundle` assembles it.
+    fn full_bundle(root: &Path) {
+        write_file(root, "heliosd", b"the-daemon");
+        write_file(root, "helios-installer", b"the-installer");
+        write_file(root, "helios-ctl", b"the-tool");
+        write_file(root, "systemd/heliosd.service", b"[Unit]");
+        write_file(root, "systemd/helios-update.service", b"[Unit]");
+        write_file(root, "systemd/helios-update.path", b"[Path]");
+        write_file(root, "network.toml.example", b"wan_iface = \"eth0\"");
     }
 
-    fn signer_bundle(racine: &Path, sequence: u64) -> PublisherPublicKeys {
+    fn sign_bundle(root: &Path, sequence: u64) -> PublisherPublicKeys {
         let signer = PublisherSigner::from_seed_material(1, &[3; 32], &[4; 32]).unwrap();
-        let mut payload = payload(collect(racine).unwrap());
+        let mut payload = payload(collect(root).unwrap());
         payload.release_sequence = sequence;
         payload.version = format!("0.{sequence}.0");
         let manifest = signer.sign(payload).unwrap();
         fs::write(
-            racine.join(BUNDLE_MANIFEST_FILE),
+            root.join(BUNDLE_MANIFEST_FILE),
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         signer.public_keys()
     }
 
-    /// Destinations détournées vers un répertoire jetable : l'installation
-    /// complète devient vérifiable sans droits root ni système à abîmer.
-    fn bootstrap_layout(cible: &Path) -> BootstrapLayout {
+    /// Destinations redirected to a throwaway directory: the complete
+    /// installation becomes verifiable without root privileges and without
+    /// touching the system.
+    fn bootstrap_layout(target: &Path) -> BootstrapLayout {
         let mut update = crate::UpdateLayout::system("testing");
-        update.staging_root = cible.join("var/lib/helios/updates");
+        update.staging_root = target.join("var/lib/helios/updates");
         update.state_path = update.staging_root.join("state.json");
         update.activation_path = update.staging_root.join("activate.json");
-        update.install_root = cible.join("opt/helios/releases");
-        update.current_link = cible.join("opt/helios/current");
+        update.install_root = target.join("opt/helios/releases");
+        update.current_link = target.join("opt/helios/current");
         update.target = crate::BUILD_TARGET.to_string();
         BootstrapLayout {
             update,
-            libexec_dir: cible.join("usr/libexec"),
-            bin_dir: cible.join("usr/local/bin"),
-            systemd_dir: cible.join("etc/systemd/system"),
-            config_path: cible.join("var/lib/helios/network.toml"),
+            libexec_dir: target.join("usr/libexec"),
+            bin_dir: target.join("usr/local/bin"),
+            systemd_dir: target.join("etc/systemd/system"),
+            config_path: target.join("var/lib/helios/network.toml"),
         }
     }
 
     #[test]
-    fn l_installation_pose_tout_le_bundle_et_bascule_le_lien() {
+    fn installation_applies_the_whole_bundle_and_switches_the_link() {
         let source = temp_dir("install-source");
-        let cible = temp_dir("install-cible");
-        bundle_complet(&source);
-        let keys = signer_bundle(&source, 7);
-        let layout = bootstrap_layout(&cible);
+        let target = temp_dir("install-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 7);
+        let layout = bootstrap_layout(&target);
 
-        let rapport = install_with_keyring(&source, &layout, &[keys]).expect("installation");
+        let report = install_with_keyring(&source, &layout, &[keys]).expect("installation");
 
-        assert_eq!(rapport.release_sequence, 7);
-        assert!(!rapport.config_preserved);
+        assert_eq!(report.release_sequence, 7);
+        assert!(!report.config_preserved);
         assert_eq!(
-            fs::read(cible.join("opt/helios/releases/7/heliosd")).unwrap(),
-            b"le-daemon"
+            fs::read(target.join("opt/helios/releases/7/heliosd")).unwrap(),
+            b"the-daemon"
         );
         assert_eq!(
-            fs::read(cible.join("usr/libexec/helios-installer")).unwrap(),
-            b"l-installateur"
+            fs::read(target.join("usr/libexec/helios-installer")).unwrap(),
+            b"the-installer"
         );
         assert_eq!(
-            fs::read(cible.join("usr/local/bin/helios-ctl")).unwrap(),
-            b"l-outil"
+            fs::read(target.join("usr/local/bin/helios-ctl")).unwrap(),
+            b"the-tool"
         );
-        assert!(cible.join("etc/systemd/system/heliosd.service").is_file());
-        assert!(cible
+        assert!(target.join("etc/systemd/system/heliosd.service").is_file());
+        assert!(target
             .join("etc/systemd/system/helios-update.path")
             .is_file());
-        assert!(cible.join("var/lib/helios/network.toml").is_file());
+        assert!(target.join("var/lib/helios/network.toml").is_file());
         assert_eq!(
-            fs::read_link(cible.join("opt/helios/current")).unwrap(),
-            cible.join("opt/helios/releases/7")
+            fs::read_link(target.join("opt/helios/current")).unwrap(),
+            target.join("opt/helios/releases/7")
         );
 
-        // L'état d'anti-rollback doit refléter ce qui vient d'être posé, sinon
-        // une mise à jour applicative plus ancienne serait acceptée ensuite.
+        // The anti-rollback state must reflect what was just applied,
+        // otherwise an older applicative update would be accepted afterwards.
         let state: crate::UpdateState =
             serde_json::from_slice(&fs::read(&layout.update.state_path).unwrap()).unwrap();
         assert_eq!(state.highest_confirmed_sequence, 7);
         assert_eq!(state.active_version.as_deref(), Some("0.7.0"));
 
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 
-    /// Réinstaller une séquence déjà posée ferait revenir une version que
-    /// l'anti-rollback de l'ADR-003 refuse par ailleurs : les deux chemins
-    /// doivent obéir au même compteur.
+    /// Reinstalling an already-applied sequence would bring back a version
+    /// that ADR-003's anti-rollback otherwise refuses: both paths must obey
+    /// the same counter.
     #[test]
-    fn une_sequence_deja_confirmee_est_refusee() {
+    fn an_already_confirmed_sequence_is_rejected() {
         let source = temp_dir("rollback-source");
-        let cible = temp_dir("rollback-cible");
-        bundle_complet(&source);
-        let keys = signer_bundle(&source, 5);
-        let layout = bootstrap_layout(&cible);
-        install_with_keyring(&source, &layout, &[keys]).expect("première installation");
+        let target = temp_dir("rollback-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 5);
+        let layout = bootstrap_layout(&target);
+        install_with_keyring(&source, &layout, &[keys]).expect("first installation");
 
-        let ancien = temp_dir("rollback-ancien");
-        bundle_complet(&ancien);
-        let keys = signer_bundle(&ancien, 4);
-        let erreur = install_with_keyring(&ancien, &layout, &[keys])
+        let old = temp_dir("rollback-old");
+        full_bundle(&old);
+        let keys = sign_bundle(&old, 4);
+        let error = install_with_keyring(&old, &layout, &[keys])
             .unwrap_err()
             .to_string();
-        assert!(erreur.contains("séquence 4 refusée"), "message : {erreur}");
+        assert!(error.contains("sequence 4 refused"), "message: {error}");
 
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
-        let _ = fs::remove_dir_all(&ancien);
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&old);
     }
 
-    /// La configuration porte l'identité du réseau et les pairs admis :
-    /// l'écraser à chaque mise à jour couperait le parc.
+    /// The configuration carries the network identity and the admitted
+    /// peers: overwriting it on every update would cut off the fleet.
     #[test]
-    fn une_configuration_existante_n_est_jamais_ecrasee() {
+    fn an_existing_configuration_is_never_overwritten() {
         let source = temp_dir("config-source");
-        let cible = temp_dir("config-cible");
-        bundle_complet(&source);
-        let keys = signer_bundle(&source, 3);
-        let layout = bootstrap_layout(&cible);
+        let target = temp_dir("config-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 3);
+        let layout = bootstrap_layout(&target);
         fs::create_dir_all(layout.config_path.parent().unwrap()).unwrap();
-        fs::write(&layout.config_path, b"wan_iface = \"deja-configure\"").unwrap();
+        fs::write(&layout.config_path, b"wan_iface = \"already-configured\"").unwrap();
 
-        let rapport = install_with_keyring(&source, &layout, &[keys]).expect("installation");
+        let report = install_with_keyring(&source, &layout, &[keys]).expect("installation");
 
-        assert!(rapport.config_preserved);
+        assert!(report.config_preserved);
         assert_eq!(
             fs::read(&layout.config_path).unwrap(),
-            b"wan_iface = \"deja-configure\""
+            b"wan_iface = \"already-configured\""
         );
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 
-    /// Rien ne doit être écrit tant que tout n'est pas vérifié : une
-    /// installation à moitié faite laisserait un daemon et une unité systemd de
-    /// versions différentes.
+    /// Nothing must be written until everything is verified: an installation
+    /// done halfway would leave a daemon and a systemd unit of different
+    /// versions.
     #[test]
-    fn un_bundle_altere_n_installe_rien() {
-        let source = temp_dir("altere-source");
-        let cible = temp_dir("altere-cible");
-        bundle_complet(&source);
-        let keys = signer_bundle(&source, 9);
-        ecrire(&source, "heliosd", b"le-daemon-remplace");
-        let layout = bootstrap_layout(&cible);
+    fn an_altered_bundle_installs_nothing() {
+        let source = temp_dir("altered-source");
+        let target = temp_dir("altered-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 9);
+        write_file(&source, "heliosd", b"the-daemon-replaced");
+        let layout = bootstrap_layout(&target);
 
         assert!(install_with_keyring(&source, &layout, &[keys]).is_err());
         assert!(
-            !cible.join("opt/helios").exists() && !cible.join("etc").exists(),
-            "une installation refusée ne doit rien avoir posé"
+            !target.join("opt/helios").exists() && !target.join("etc").exists(),
+            "a rejected installation must not have applied anything"
         );
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 
-    /// Un fichier signé mais dont l'installateur ne connaît pas la destination
-    /// doit faire échouer le bundle entier, pas être ignoré.
+    /// A signed file whose destination the installer does not know must fail
+    /// the whole bundle, not be ignored.
     #[test]
-    fn un_fichier_sans_destination_connue_refuse_tout_le_bundle() {
-        let source = temp_dir("inconnu-source");
-        let cible = temp_dir("inconnu-cible");
-        bundle_complet(&source);
-        ecrire(&source, "cron.d/helios", b"* * * * * root /bin/true");
-        let keys = signer_bundle(&source, 2);
-        let layout = bootstrap_layout(&cible);
+    fn a_file_without_a_known_destination_rejects_the_whole_bundle() {
+        let source = temp_dir("unknown-source");
+        let target = temp_dir("unknown-target");
+        full_bundle(&source);
+        write_file(&source, "cron.d/helios", b"* * * * * root /bin/true");
+        let keys = sign_bundle(&source, 2);
+        let layout = bootstrap_layout(&target);
 
-        let erreur = install_with_keyring(&source, &layout, &[keys])
+        let error = install_with_keyring(&source, &layout, &[keys])
             .unwrap_err()
             .to_string();
-        assert!(erreur.contains("destination"), "message : {erreur}");
-        assert!(!cible.join("opt/helios").exists());
+        assert!(error.contains("destination"), "message: {error}");
+        assert!(!target.join("opt/helios").exists());
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 
     #[test]
-    fn un_bundle_d_un_autre_canal_est_refuse() {
-        let source = temp_dir("canal-source");
-        let cible = temp_dir("canal-cible");
-        bundle_complet(&source);
-        let keys = signer_bundle(&source, 1);
-        let mut layout = bootstrap_layout(&cible);
+    fn a_bundle_from_another_channel_is_rejected() {
+        let source = temp_dir("channel-source");
+        let target = temp_dir("channel-target");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 1);
+        let mut layout = bootstrap_layout(&target);
         layout.update.channel = "production".into();
 
-        let erreur = install_with_keyring(&source, &layout, &[keys])
+        let error = install_with_keyring(&source, &layout, &[keys])
             .unwrap_err()
             .to_string();
         assert!(
-            erreur.contains("canal testing refusé"),
-            "message : {erreur}"
+            error.contains("channel testing refused"),
+            "message: {error}"
         );
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 
-    /// Une signature valide d'une autre époque que celle compilée dans le
-    /// binaire ne doit rien autoriser.
+    /// A signature valid for a different era than the one compiled into the
+    /// binary must authorize nothing.
     #[test]
-    fn un_bundle_signe_par_une_autre_cle_est_refuse() {
-        let source = temp_dir("cle-source");
-        let cible = temp_dir("cle-cible");
-        bundle_complet(&source);
-        signer_bundle(&source, 6);
-        let autre = PublisherSigner::from_seed_material(1, &[9; 32], &[8; 32])
+    fn a_bundle_signed_by_another_key_is_rejected() {
+        let source = temp_dir("key-source");
+        let target = temp_dir("key-target");
+        full_bundle(&source);
+        sign_bundle(&source, 6);
+        let other = PublisherSigner::from_seed_material(1, &[9; 32], &[8; 32])
             .unwrap()
             .public_keys();
-        let layout = bootstrap_layout(&cible);
+        let layout = bootstrap_layout(&target);
 
-        let erreur = install_with_keyring(&source, &layout, &[autre])
+        let error = install_with_keyring(&source, &layout, &[other])
             .unwrap_err()
             .to_string();
-        assert!(erreur.contains("signature"), "message : {erreur}");
+        assert!(error.contains("signature"), "message: {error}");
         let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir_all(&target);
     }
 }

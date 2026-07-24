@@ -4,37 +4,37 @@ import type { TunnelState } from '../types'
 import { postureMeta, stateMeta } from './state'
 
 /**
- * Pièce maîtresse de la vue Connexion.
+ * Centerpiece of the Connect view.
  *
- * Reprend la grammaire de `OrionMark` — anneau, ceinture, trajectoire — mais en
- * fait un instrument plutôt qu’un logo : chaque élément encode un fait.
+ * Reuses `OrionMark`'s grammar — ring, belt, trajectory — but turns it into
+ * an instrument rather than a logo: each element encodes a fact.
  *
- * - **l’anneau extérieur** porte la couleur de la *posture* (ce qui protège
- *   réellement le poste), pas celle de l’état du tunnel ;
- * - **deux trajectoires tournent en sens inverse**, vives et pointillées pendant
- *   la négociation, lentes et pleines une fois connecté. La couleur les sépare :
- *   ambre tant que rien n’est acquis, vert dès que le trafic passe. On ne
- *   confond pas « ça travaille » avec « c’est bon » ;
- * - **un satellite** parcourt la trajectoire principale : c’est lui qui donne la
- *   lecture du sens et de la vitesse ;
- * - **les trois étoiles de la ceinture** s’allument une à une avec la
- *   progression — endpoint joignable → handshake → trafic — et scintillent
- *   légèrement, en décalé, une fois le tunnel établi.
+ * - **the outer ring** carries the color of the *posture* (what actually
+ *   protects the machine), not that of the tunnel state;
+ * - **two trajectories rotate in opposite directions**, brisk and dashed
+ *   during negotiation, slow and solid once connected. Color separates them:
+ *   amber as long as nothing is secured, green as soon as traffic flows. We
+ *   don't confuse "it's working" with "it's good";
+ * - **a satellite** travels along the main trajectory: it gives the reading
+ *   of direction and speed;
+ * - **the belt's three stars** light up one by one with progress — reachable
+ *   endpoint → handshake → traffic — and twinkle slightly, staggered, once
+ *   the tunnel is established.
  *
- * **Coût.** Toutes ces animations ne touchent que `transform` et `opacity`, sur
- * des calques promus : le GPU les compose sans repeindre. Ce n’est pas leur
- * nombre qui coûte, c’est leur nature — le halo d’origine saccadait à lui seul
- * parce qu’il animait un `filter: blur()`, re-rastérisé à chaque frame.
+ * **Cost.** All these animations only touch `transform` and `opacity`, on
+ * promoted layers: the GPU composites them without repainting. It's not
+ * their number that costs, it's their nature — the original halo alone
+ * stuttered because it animated a `filter: blur()`, re-rasterized every frame.
  */
 
 interface Props {
   state: TunnelState
   adapterUp: boolean
-  /** Diamètre en pixels. */
+  /** Diameter in pixels. */
   size?: number
 }
 
-/** Combien d’étoiles de la ceinture sont allumées, dans l’ordre du montage. */
+/** How many belt stars are lit, in mounting order. */
 function litStars(state: TunnelState, adapterUp: boolean): number {
   if (state === 'up') return 3
   if (state === 'connecting' || state === 'captive_portal') return 2
@@ -58,7 +58,7 @@ const orbit = keyframes`
   to { transform: rotate(360deg); }
 `
 
-/** Sens inverse : deux plans qui se croisent lisent mieux qu’un seul. */
+/** Opposite direction: two crossing planes read better than one. */
 const counterOrbit = keyframes`
   from { transform: rotate(360deg); }
   to { transform: rotate(0deg); }
@@ -69,10 +69,10 @@ const twinkle = keyframes`
   50% { opacity: 1; }
 `
 
-/** Étoile non encore franchie — un gris papier, pas un gris d’écran sombre. */
+/** Star not yet crossed — a paper gray, not a dark-screen gray. */
 const UNLIT = '#CBD5D1'
 
-/** Point de la trajectoire au repos, avant l’inclinaison de 27°. */
+/** Trajectory point at rest, before the 27° tilt. */
 const SATELLITE_X = 44.5
 
 export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
@@ -80,8 +80,8 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
   const posture = postureMeta(state, adapterUp)
   const lit = litStars(state, adapterUp)
 
-  // Deux régimes, deux lectures. Le connecté tourne lentement : une rotation
-  // rapide y suggérerait une négociation encore en cours.
+  // Two regimes, two readings. Connected rotates slowly: a fast rotation
+  // would suggest a negotiation still in progress.
   const settled = state === 'up'
   const spinning = meta.transitioning || settled
   const mainPeriod = settled ? '22s' : '8s'
@@ -96,11 +96,11 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
             position: 'absolute',
             inset: 0,
             borderRadius: '50%',
-            // Halo « déjà dégradé » plutôt que `filter: blur()`. Le flou CSS est
-            // le filtre le plus coûteux, et l'animer force une re-rastérisation
-            // à chaque frame : sur WebView2 le halo saccadait toute l'IHM dès la
-            // connexion établie. Des paliers alpha donnent la même douceur pour
-            // un coût nul.
+            // "Already blurred" halo rather than `filter: blur()`. CSS blur is
+            // the most expensive filter, and animating it forces a
+            // re-rasterization every frame: on WebView2 the halo stuttered the
+            // whole UI as soon as the connection was established. Alpha steps
+            // give the same softness for zero cost.
             background: `radial-gradient(circle, ${posture.accent}3D 0%, ${posture.accent}1F 38%, transparent 72%)`,
             pointerEvents: 'none',
             willChange: 'opacity',
@@ -120,7 +120,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
         role="img"
         aria-label={`${meta.label} — ${posture.label}`}
       >
-        {/* Anneau de posture : la couleur qui compte pour la sécurité du poste. */}
+        {/* Posture ring: the color that matters for the machine's security. */}
         <circle
           cx="24"
           cy="24"
@@ -129,7 +129,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           strokeOpacity="0.7"
           strokeWidth="0.7"
         />
-        {/* Piste de fond de la trajectoire. */}
+        {/* Trajectory background track. */}
         <ellipse
           cx="24"
           cy="24"
@@ -141,7 +141,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           strokeWidth="0.8"
         />
 
-        {/* Second plan, en sens inverse — donne la profondeur sans bruit. */}
+        {/* Background layer, opposite direction — gives depth without noise. */}
         {spinning && (
           <Box
             component="g"
@@ -165,7 +165,7 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           </Box>
         )}
 
-        {/* Trajectoire principale, avec son satellite. */}
+        {/* Main trajectory, with its satellite. */}
         <Box
           component="g"
           sx={{
@@ -194,12 +194,12 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
           )}
         </Box>
 
-        {/* Lignes de constellation. */}
+        {/* Constellation lines. */}
         <g stroke={meta.color} strokeWidth="0.75" strokeOpacity="0.22" strokeLinecap="round">
           <line x1={BELT[0].x} y1={BELT[0].y} x2={BELT[2].x} y2={BELT[2].y} />
         </g>
 
-        {/* Ceinture — une étoile par étape franchie. */}
+        {/* Belt — one star per step crossed. */}
         <g>
           {BELT.map((star, index) => {
             const on = index < lit
@@ -213,8 +213,8 @@ export function StatusOrb({ state, adapterUp, size = 168 }: Props) {
                 fill={on ? meta.accent : UNLIT}
                 sx={{
                   transition: 'fill 400ms ease',
-                  // Scintillement décalé : trois étoiles qui pulseraient
-                  // ensemble feraient un clignotant, pas une constellation.
+                  // Staggered twinkle: three stars pulsing together would
+                  // make a blinker, not a constellation.
                   animation:
                     on && settled
                       ? `${twinkle} ${2.8 + index * 0.6}s ease-in-out ${index * 0.35}s infinite`

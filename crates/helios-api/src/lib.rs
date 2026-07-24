@@ -1,21 +1,21 @@
-//! Serveur HTTP du plan de contrôle : REST + WebSocket + interface web statique.
+//! Control-plane HTTP server: REST + WebSocket + static web interface.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! navigateur ──GET /──────────────────► fichiers statiques React (embed ou 503)
-//! navigateur ──GET /api/status────────► JSON état courant
-//! navigateur ──GET /api/trust─────────► ancre de confiance éditeur (ADR-002)
-//! navigateur ──GET /api/network───────► JSON config réseau courante
-//! navigateur ──POST /api/network──────► recharge la config réseau (JSON)
-//! navigateur ──POST /api/peers────────► admet un pair, VIP dérivée (ADR-004)
-//! navigateur ──POST /api/tunnel/start► commande vers l'orchestrateur (mpsc)
-//! navigateur ──WS /ws─────────────────► flux d'événements temps réel (broadcast)
+//! browser ──GET /──────────────────► static React files (embedded or 503)
+//! browser ──GET /api/status────────► JSON current state
+//! browser ──GET /api/trust─────────► publisher trust anchor (ADR-002)
+//! browser ──GET /api/network───────► JSON current network config
+//! browser ──POST /api/network──────► hot-reloads the network config (JSON)
+//! browser ──POST /api/peers────────► admits a peer, derived VIP (ADR-004)
+//! browser ──POST /api/tunnel/start► command to the orchestrator (mpsc)
+//! browser ──WS /ws─────────────────► real-time event stream (broadcast)
 //! ```
 //!
-//! [`AppState`] est le pivot partagé : il porte le canal d'événements
-//! (broadcast), le canal de commandes (mpsc) et l'état courant du tunnel
-//! (RwLock partagé avec l'orchestrateur).
+//! [`AppState`] is the shared pivot: it carries the event channel
+//! (broadcast), the command channel (mpsc), and the current tunnel state
+//! (RwLock shared with the orchestrator).
 
 pub mod auth;
 pub mod embed;
@@ -42,30 +42,30 @@ use axum::{
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
 
-/// État partagé entre tous les handlers Axum.
+/// State shared across all Axum handlers.
 #[derive(Clone)]
 pub struct AppState {
-    /// État courant du tunnel, mis à jour par l'orchestrateur.
+    /// Current tunnel state, updated by the orchestrator.
     pub tunnel_state: Arc<RwLock<TunnelState>>,
-    /// Émetteur d'événements vers les clients WebSocket.
+    /// Event emitter towards WebSocket clients.
     pub event_tx: broadcast::Sender<HeliosEvent>,
-    /// Canal de commandes vers l'orchestrateur (Start/Stop depuis l'UI).
+    /// Command channel towards the orchestrator (Start/Stop from the UI).
     pub cmd_tx: mpsc::Sender<OrchestratorCmd>,
-    /// Canal du provisioning : pose du PSK post-quantique sur le plan de
-    /// données. Séparé de `cmd_tx` parce qu'il porte un secret et attend un
-    /// acquittement (voir [`aether::InstallPskRequest`]).
+    /// Provisioning channel: installs the post-quantum PSK on the data
+    /// plane. Kept separate from `cmd_tx` because it carries a secret and
+    /// waits for an acknowledgement (see [`aether::InstallPskRequest`]).
     pub psk_tx: mpsc::Sender<InstallPskRequest>,
-    /// Configuration réseau courante (rechargeable à chaud).
+    /// Current network configuration (hot-reloadable).
     pub network: Arc<RwLock<NetworkConfig>>,
-    /// `true` = daemon en mode simulation (WSL2 ou --dev).
+    /// `true` = daemon running in simulation mode (WSL2 or --dev).
     pub dry_run: bool,
-    /// Politique de pare-feu courante (mise à jour par l'orchestrateur).
+    /// Current firewall policy (updated by the orchestrator).
     pub policy: Arc<RwLock<FirewallPolicy>>,
-    /// Staging applicatif signé. L’installation privilégiée reste hors du
-    /// processus API.
+    /// Signed application update staging. Privileged installation stays
+    /// outside the API process.
     pub updates: helios_update::UpdateStore,
-    /// Vrai dès que le socket API est effectivement lié. Le health check de
-    /// mise à jour ne confirme pas un daemon dont l’IHM resterait absente.
+    /// True as soon as the API socket is actually bound. The update health
+    /// check must not confirm a daemon whose UI would still be absent.
     pub api_ready: Arc<AtomicBool>,
 }
 
@@ -95,10 +95,10 @@ impl AppState {
     }
 }
 
-/// Construit le routeur HTTP complet.
+/// Builds the complete HTTP router.
 ///
-/// Exposé séparément de [`serve`] afin que les tests d'intégration traversent
-/// les mêmes routes et middlewares que le binaire réel.
+/// Exposed separately from [`serve`] so that integration tests exercise the
+/// same routes and middlewares as the real binary.
 pub fn router(state: AppState) -> Router {
     let admin = Router::new()
         .route("/api/network", post(routes::network_set))
@@ -133,7 +133,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/status", get(routes::status))
-        // Ancre de confiance éditeur compilée dans le binaire (ADR-002).
+        // Publisher trust anchor compiled into the binary (ADR-002).
         .route("/api/trust", get(routes::trust))
         .route("/api/network", get(routes::network_get))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
@@ -144,10 +144,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Barrière CSRF : un formulaire HTML tiers peut émettre un POST simple, mais
-/// pas un POST `application/json` sans pré-vérification CORS. Comme le serveur
-/// ne publie aucun en-tête CORS, cette combinaison interdit les commandes web
-/// cross-origin tout en conservant les clients natifs et le frontend same-origin.
+/// CSRF barrier: a third-party HTML form can issue a simple POST, but not a
+/// `application/json` POST without a CORS preflight. Since the server
+/// publishes no CORS header, this combination blocks cross-origin web
+/// commands while still allowing native clients and the same-origin frontend.
 async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Response {
     if matches!(
         *request.method(),
@@ -168,13 +168,13 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
     next.run(request).await
 }
 
-/// Lance le serveur HTTP et bloque jusqu'à son arrêt.
+/// Launches the HTTP server and blocks until it stops.
 pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     state.api_ready.store(true, Ordering::Release);
-    tracing::info!("interface web disponible sur http://{}", bind);
+    tracing::info!("web interface available at http://{}", bind);
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -196,29 +196,32 @@ mod security_tests {
     use tower::ServiceExt;
 
     const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    const PEER_PSK: &str = "psk-ultra-secret-ne-doit-jamais-sortir";
+    const PEER_PSK: &str = "ultra-secret-psk-must-never-leak";
 
     fn state() -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
-        state_avec_mode(true)
+        state_with_mode(true)
     }
 
-    /// Même état, mais en mode réel : la persistance des secrets n'y obéit pas
-    /// aux mêmes règles qu'en dry-run, où le TPM est absent.
-    fn state_reel() -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
-        state_avec_mode(false)
+    /// Same state, but in real mode: secret persistence there does not follow
+    /// the same rules as in dry-run, where the TPM is absent.
+    fn state_real() -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
+        state_with_mode(false)
     }
 
-    fn state_avec_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
+    fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
         let network = NetworkConfig {
             wan_iface: "eth0".into(),
             admin_iface: Some("helios0".into()),
             wg_private_key: PRIVATE_KEY.into(),
             peers: vec![aether::WgPeer {
-                name: "poste".into(),
+                name: "workstation".into(),
                 public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
                 address: "100.64.1.2/32".into(),
                 admin: true,
                 preshared_key: Some(PEER_PSK.into()),
+                key_negotiation_certificate_sha256: None,
+                key_negotiation_pq_certificate_sha256: None,
+                minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
             }],
             ..NetworkConfig::default()
         };
@@ -239,17 +242,17 @@ mod security_tests {
         )
     }
 
-    /// Sérialise les tests qui persistent `network.toml` et détourne le chemin
-    /// système vers un fichier jetable.
+    /// Serializes tests that persist `network.toml` and redirects the system
+    /// path to a disposable file.
     ///
-    /// `HELIOS_NETWORK_CONFIG` est un état de processus : sans ce verrou, deux
-    /// tests parallèles liraient le fichier de l'autre et échoueraient par
-    /// intermittence, ce qui est pire qu'un test absent.
-    async fn config_isolee() -> (tokio::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
-        // Verrou asynchrone : les tests qui le prennent traversent des `await`,
-        // ce qu'un `std::sync::Mutex` ne permet pas de tenir sainement.
-        static VERROU: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let guard = VERROU.lock().await;
+    /// `HELIOS_NETWORK_CONFIG` is process-wide state: without this lock, two
+    /// parallel tests would read each other's file and fail intermittently,
+    /// which is worse than a missing test.
+    async fn isolated_config() -> (tokio::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        // Async lock: the tests that take it cross `await` points, which a
+        // `std::sync::Mutex` cannot hold safely.
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = LOCK.lock().await;
         let path =
             std::env::temp_dir().join(format!("helios-api-network-{}.toml", std::process::id()));
         std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
@@ -257,13 +260,13 @@ mod security_tests {
         (guard, path)
     }
 
-    /// Requête admin authentifiée par la VIP du pair `poste`, qui est `admin`.
-    fn requete_admin(uri: &str, corps: &str) -> Request<Body> {
+    /// Admin request authenticated by the VIP of peer `workstation`, who is `admin`.
+    fn admin_request(uri: &str, body: &str) -> Request<Body> {
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(corps.to_string()))
+            .body(Body::from(body.to_string()))
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
             "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
@@ -271,11 +274,11 @@ mod security_tests {
         request
     }
 
-    /// Orchestrateur simulé qui acquitte toute installation de PSK.
+    /// Simulated orchestrator that acknowledges every PSK installation.
     ///
-    /// Ces tests portent sur le routeur et la rédaction des secrets, pas sur le
-    /// plan de données : sans ce puits, le canal serait fermé et le provisioning
-    /// échouerait pour une raison sans rapport avec ce qu'ils vérifient.
+    /// These tests exercise the router and the redaction of secrets, not the
+    /// data plane: without this sink, the channel would be closed and
+    /// provisioning would fail for a reason unrelated to what they verify.
     fn auto_ack_psk_channel() -> mpsc::Sender<InstallPskRequest> {
         let (tx, mut rx) = mpsc::channel::<InstallPskRequest>(8);
         tokio::spawn(async move {
@@ -287,7 +290,7 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn get_network_est_redige_dans_le_routeur_reel() {
+    async fn get_network_is_redacted_in_the_real_router() {
         let (state, _cmd_rx) = state();
         let response = router(state)
             .oneshot(
@@ -307,8 +310,8 @@ mod security_tests {
         assert_eq!(json["peers"][0]["preshared_key_configured"], true);
         assert!(!text.contains(PRIVATE_KEY));
         assert!(!text.contains(PEER_PSK));
-        // La moitié publique, elle, doit sortir : c'est le `peer_public_key`
-        // que l'opérateur met dans les profils clients.
+        // The public half, on the other hand, must come out: it is the
+        // `peer_public_key` the operator puts into client profiles.
         assert_eq!(
             json["wg_public_key"],
             aether::wg::public_from_private(PRIVATE_KEY).unwrap()
@@ -316,7 +319,7 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn mutations_refusent_formulaire_et_post_sans_type_json() {
+    async fn mutations_refuse_form_posts_and_posts_without_json_type() {
         for content_type in [
             None,
             Some("text/plain"),
@@ -339,7 +342,7 @@ mod security_tests {
     }
 
     #[tokio::test]
-    async fn mutation_exige_le_pair_admin_identifie_par_sa_vip() {
+    async fn mutation_requires_the_admin_peer_identified_by_its_vip() {
         let (non_admin_state, mut cmd_rx) = state();
         non_admin_state.network.write().await.peers[0].admin = false;
         let mut request = Request::builder()
@@ -373,18 +376,18 @@ mod security_tests {
         ));
     }
 
-    /// Clé publique de test, distincte de celle du pair déjà admis.
-    const NOUVELLE_CLE: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    /// Test public key, distinct from the already-admitted peer's.
+    const NEW_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
 
     #[tokio::test]
-    async fn admission_alloue_une_vip_et_notifie_l_orchestrateur() {
-        let (_verrou, _path) = config_isolee().await;
+    async fn admission_allocates_a_vip_and_notifies_the_orchestrator() {
+        let (_lock, _path) = isolated_config().await;
         let (state, mut cmd_rx) = state();
 
         let response = router(state)
-            .oneshot(requete_admin(
+            .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
             ))
             .await
             .unwrap();
@@ -392,164 +395,167 @@ mod security_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["name"], "portable");
+        assert_eq!(json["name"], "laptop");
         assert_eq!(json["admin"], false);
         assert_eq!(
             json["post_quantum"], false,
-            "l'admission ne pose pas de PSK"
+            "admission does not install a PSK"
         );
-        let adresse = json["address"].as_str().expect("adresse");
-        assert!(adresse.ends_with("/32"), "adresse : {adresse}");
-        assert!(adresse.starts_with("100."), "hors CGNAT : {adresse}");
+        let address = json["address"].as_str().expect("address");
+        assert!(address.ends_with("/32"), "address: {address}");
+        assert!(address.starts_with("100."), "outside CGNAT: {address}");
 
         match cmd_rx.recv().await {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
                 assert_eq!(config.peers.len(), 2);
                 assert_eq!(
                     config.wg_private_key, PRIVATE_KEY,
-                    "l'orchestrateur doit garder l'identité résolue"
+                    "the orchestrator must keep the resolved identity"
                 );
                 assert_eq!(
                     config.peers[0].preshared_key.as_deref(),
                     Some(PEER_PSK),
-                    "le PSK du pair existant doit survivre à l'admission"
+                    "the existing peer's PSK must survive admission"
                 );
             }
-            autre => panic!("commande inattendue : {autre:?}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
-    /// En mode réel, la clé vient du coffre scellé : la réécrire dans
-    /// `network.toml` annulerait le scellement. Les PSK, eux, ne sont jamais
-    /// persistés, quel que soit le mode.
+    /// In real mode, the key comes from the sealed vault: rewriting it into
+    /// `network.toml` would undo the sealing. PSKs, meanwhile, are never
+    /// persisted, regardless of the mode.
     #[tokio::test]
-    async fn la_persistance_reelle_ne_contient_ni_cle_privee_ni_psk() {
-        let (_verrou, path) = config_isolee().await;
-        let (state, mut cmd_rx) = state_reel();
+    async fn real_persistence_contains_neither_private_key_nor_psk() {
+        let (_lock, path) = isolated_config().await;
+        let (state, mut cmd_rx) = state_real();
 
         let response = router(state)
-            .oneshot(requete_admin(
+            .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let _ = cmd_rx.recv().await;
 
-        let persiste = std::fs::read_to_string(&path).expect("network.toml écrit");
+        let persisted = std::fs::read_to_string(&path).expect("network.toml written");
         assert!(
-            persiste.contains("portable"),
-            "le pair admis doit être persisté : {persiste}"
+            persisted.contains("laptop"),
+            "the admitted peer must be persisted: {persisted}"
         );
         assert!(
-            !persiste.contains(PRIVATE_KEY),
-            "clé privée écrite en clair : {persiste}"
+            !persisted.contains(PRIVATE_KEY),
+            "private key written in clear: {persisted}"
         );
         assert!(
-            !persiste.contains(PEER_PSK),
-            "PSK persisté sur disque : {persiste}"
+            !persisted.contains(PEER_PSK),
+            "PSK persisted to disk: {persisted}"
         );
     }
 
-    /// En dry-run il n'y a pas de coffre TPM : `network.toml` est le seul
-    /// endroit où l'identité puisse vivre. L'effacer ferait perdre son identité
-    /// à un daemon `--dev` au premier `peer add`, ce qui casse le banc de dev
-    /// sans message reliant la panne à sa cause.
+    /// In dry-run there is no TPM vault: `network.toml` is the only place
+    /// where the identity can live. Erasing it would make a `--dev` daemon
+    /// lose its identity on the first `peer add`, breaking the dev bench
+    /// without any message tying the failure to its cause.
     #[tokio::test]
-    async fn la_persistance_en_dry_run_conserve_l_identite_mais_pas_les_psk() {
-        let (_verrou, path) = config_isolee().await;
+    async fn dry_run_persistence_keeps_the_identity_but_not_the_psks() {
+        let (_lock, path) = isolated_config().await;
         let (state, mut cmd_rx) = state();
 
         let response = router(state)
-            .oneshot(requete_admin(
+            .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let _ = cmd_rx.recv().await;
 
-        let persiste = std::fs::read_to_string(&path).expect("network.toml écrit");
+        let persisted = std::fs::read_to_string(&path).expect("network.toml written");
         assert!(
-            persiste.contains(PRIVATE_KEY),
-            "le daemon --dev a perdu son identité en admettant un pair : {persiste}"
+            persisted.contains(PRIVATE_KEY),
+            "the --dev daemon lost its identity while admitting a peer: {persisted}"
         );
         assert!(
-            !persiste.contains(PEER_PSK),
-            "un PSK ne doit jamais atteindre le disque, même en dry-run : {persiste}"
+            !persisted.contains(PEER_PSK),
+            "a PSK must never reach disk, even in dry-run: {persisted}"
         );
     }
 
     #[tokio::test]
-    async fn admission_en_doublon_est_un_conflit() {
-        let (_verrou, _path) = config_isolee().await;
+    async fn duplicate_admission_is_a_conflict() {
+        let (_lock, _path) = isolated_config().await;
 
-        for (corps, attendu) in [
+        for (body, expected) in [
             (
-                format!(r#"{{"name":"poste","public_key":"{NOUVELLE_CLE}"}}"#),
+                format!(r#"{{"name":"workstation","public_key":"{NEW_KEY}"}}"#),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"autre","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#
+                r#"{"name":"other","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#
                     .to_string(),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"autre","public_key":"pas-une-cle"}"#.to_string(),
+                r#"{"name":"other","public_key":"not-a-key"}"#.to_string(),
                 StatusCode::BAD_REQUEST,
             ),
         ] {
             let (state, mut cmd_rx) = state();
             let response = router(state)
-                .oneshot(requete_admin("/api/peers", &corps))
+                .oneshot(admin_request("/api/peers", &body))
                 .await
                 .unwrap();
-            assert_eq!(response.status(), attendu, "corps : {corps}");
+            assert_eq!(response.status(), expected, "body: {body}");
             assert!(
                 cmd_rx.try_recv().is_err(),
-                "un refus ne doit rien envoyer à l'orchestrateur"
+                "a refusal must send nothing to the orchestrator"
             );
         }
     }
 
     #[tokio::test]
-    async fn revocation_retire_le_pair_et_refuse_un_inconnu() {
-        let (_verrou, _path) = config_isolee().await;
+    async fn revocation_removes_the_peer_and_refuses_an_unknown_one() {
+        let (_lock, _path) = isolated_config().await;
 
-        let (etat, mut cmd_rx) = state();
-        let response = router(etat)
-            .oneshot(requete_admin("/api/peers/revoke", r#"{"name":"poste"}"#))
+        let (first_state, mut cmd_rx) = state();
+        let response = router(first_state)
+            .oneshot(admin_request(
+                "/api/peers/revoke",
+                r#"{"name":"workstation"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         match cmd_rx.recv().await {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => assert!(config.peers.is_empty()),
-            autre => panic!("commande inattendue : {autre:?}"),
+            other => panic!("unexpected command: {other:?}"),
         }
 
-        let (etat_neuf, mut cmd_rx) = state();
-        let response = router(etat_neuf)
-            .oneshot(requete_admin("/api/peers/revoke", r#"{"name":"fantome"}"#))
+        let (fresh_state, mut cmd_rx) = state();
+        let response = router(fresh_state)
+            .oneshot(admin_request("/api/peers/revoke", r#"{"name":"ghost"}"#))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(cmd_rx.try_recv().is_err());
     }
 
-    /// L'admission mute le plan de contrôle : elle doit exiger le rôle admin,
-    /// comme les autres mutations (ADR-003 §3).
+    /// Admission mutates the control plane: it must require the admin role,
+    /// like other mutations (ADR-003 §3).
     #[tokio::test]
-    async fn l_admission_exige_le_role_admin() {
-        let (_verrou, _path) = config_isolee().await;
+    async fn admission_requires_the_admin_role() {
+        let (_lock, _path) = isolated_config().await;
         let (state, mut cmd_rx) = state();
         state.network.write().await.peers[0].admin = false;
 
         let response = router(state)
-            .oneshot(requete_admin(
+            .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"portable","public_key":"{NOUVELLE_CLE}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
             ))
             .await
             .unwrap();
@@ -558,17 +564,17 @@ mod security_tests {
         assert!(cmd_rx.try_recv().is_err());
     }
 
-    /// Le piège de l'ADR-004 §4, côté rechargement complet : une configuration
-    /// relue puis repostée revient sans secrets, et ne doit pas les effacer.
+    /// The ADR-004 §4 trap, on the full-reload side: a configuration read
+    /// back and reposted comes back without secrets, and must not erase them.
     #[tokio::test]
-    async fn un_rechargement_de_config_ne_perd_ni_identite_ni_psk() {
-        let (_verrou, _path) = config_isolee().await;
+    async fn a_config_reload_loses_neither_identity_nor_psk() {
+        let (_lock, _path) = isolated_config().await;
         let (state, mut cmd_rx) = state();
 
         let response = router(state)
-            .oneshot(requete_admin(
+            .oneshot(admin_request(
                 "/api/network",
-                r#"{"wan_iface":"eth1","peers":[{"name":"poste",
+                r#"{"wan_iface":"eth1","peers":[{"name":"workstation",
                     "public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
                     "address":"100.64.1.2/32","admin":true}]}"#,
             ))
@@ -578,23 +584,23 @@ mod security_tests {
 
         match cmd_rx.recv().await {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
-                assert_eq!(config.wan_iface, "eth1", "le réglage demandé s'applique");
+                assert_eq!(config.wan_iface, "eth1", "the requested setting applies");
                 assert_eq!(
                     config.wg_private_key, PRIVATE_KEY,
-                    "l'identité de la gateway a été effacée par un simple réglage"
+                    "the gateway's identity was erased by a plain setting change"
                 );
                 assert_eq!(
                     config.peers[0].preshared_key.as_deref(),
                     Some(PEER_PSK),
-                    "le PSK négocié a été effacé par un simple réglage"
+                    "the negotiated PSK was erased by a plain setting change"
                 );
             }
-            autre => panic!("commande inattendue : {autre:?}"),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn mutation_json_d_origine_croisee_est_refusee_sans_cors() {
+    async fn cross_origin_json_mutation_is_refused_without_cors() {
         let (state, mut cmd_rx) = state();
         let response = router(state)
             .oneshot(
@@ -602,7 +608,7 @@ mod security_tests {
                     .method(Method::POST)
                     .uri("/api/tunnel/start")
                     .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                    .header(header::ORIGIN, "https://site-malveillant.invalid")
+                    .header(header::ORIGIN, "https://malicious-site.invalid")
                     .body(Body::from("{}"))
                     .unwrap(),
             )

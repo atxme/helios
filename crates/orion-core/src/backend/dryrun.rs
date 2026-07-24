@@ -1,9 +1,9 @@
-//! Backend de simulation : monte un « faux » adaptateur WireGuard.
+//! Simulation backend: mounts a "fake" WireGuard adapter.
 //!
-//! C'est le backend par défaut sur WSL2/dev (aucune pile WireGuard requise). Il
-//! modélise fidèlement le **cycle de vie de l'adaptateur** — la propriété de
-//! sécurité d'Orion (ADR-001 §3 bis) — pour que l'invariante « jamais démonté
-//! sur échec » soit réellement testable sans matériel ni privilèges.
+//! This is the default backend on WSL2/dev (no WireGuard stack required). It
+//! faithfully models the **adapter lifecycle** — Orion's security property
+//! (ADR-001 §3 bis) — so that the "never unmounted on failure" invariant is
+//! actually testable without hardware or privileges.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,18 +16,18 @@ use crate::events::ClientEvent;
 
 use super::{EventSink, VpnBackend};
 
-/// Sentinelle : « aucun handshake » (impossible comme âge réel).
+/// Sentinel: "no handshake" (impossible as a real age).
 const NO_HANDSHAKE: u64 = u64::MAX;
 
-/// Backend simulant la montée du tunnel et l'état de l'adaptateur.
+/// Backend simulating tunnel mounting and adapter state.
 pub struct DryRunBackend {
-    /// Délai de handshake simulé (court en test).
+    /// Simulated handshake delay (short in tests).
     pub negotiate_delay: Duration,
-    /// `true` = `up()` échoue après avoir monté l'adaptateur (test d'invariante).
+    /// `true` = `up()` fails after mounting the adapter (invariant test).
     fail_after_adapter: bool,
-    /// L'adaptateur est-il monté ? Modélise Wintun / l'interface WireGuard.
+    /// Is the adapter mounted? Models Wintun / the WireGuard interface.
     adapter_up: AtomicBool,
-    /// Âge simulé du dernier handshake, en secondes.
+    /// Simulated age of the last handshake, in seconds.
     handshake_age_secs: AtomicU64,
 }
 
@@ -43,8 +43,8 @@ impl Default for DryRunBackend {
 }
 
 impl DryRunBackend {
-    /// Variante qui monte l'adaptateur puis échoue au handshake — reproduit le
-    /// scénario d'attaque « blocage de l'UDP 51820 » de l'ADR §3 bis.
+    /// Variant that mounts the adapter then fails at handshake — reproduces the
+    /// "UDP 51820 blocked" attack scenario from ADR §3 bis.
     pub fn failing() -> Self {
         Self {
             negotiate_delay: Duration::from_millis(10),
@@ -53,7 +53,7 @@ impl DryRunBackend {
         }
     }
 
-    /// Force l'âge du dernier handshake (pilotage des tests de polling).
+    /// Forces the age of the last handshake (drives polling tests).
     pub fn set_handshake_age(&self, age: Option<Duration>) {
         let v = age.map(|d| d.as_secs()).unwrap_or(NO_HANDSHAKE);
         self.handshake_age_secs.store(v, Ordering::SeqCst);
@@ -65,9 +65,9 @@ impl VpnBackend for DryRunBackend {
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
         profile.validate()?;
 
-        // 1. L'adaptateur monte AVANT toute tentative réseau : dès cet instant,
-        //    AllowedIPs = 0.0.0.0/0 capture le trafic et WireGuard le jette tant
-        //    que la session n'est pas établie. Rien ne peut fuir en clair.
+        // 1. The adapter mounts BEFORE any network attempt: from this instant,
+        //    AllowedIPs = 0.0.0.0/0 captures traffic and WireGuard drops it as
+        //    long as the session isn't established. Nothing can leak in clear.
         self.adapter_up.store(true, Ordering::SeqCst);
         sink(ClientEvent::state(TunnelState::Connecting));
         sink(ClientEvent::log(
@@ -80,17 +80,17 @@ impl VpnBackend for DryRunBackend {
 
         tokio::time::sleep(self.negotiate_delay).await;
 
-        // 2. Échec simulé : on renvoie une erreur SANS toucher à l'adaptateur.
+        // 2. Simulated failure: returns an error WITHOUT touching the adapter.
         if self.fail_after_adapter {
             anyhow::bail!("[dry-run] handshake impossible (UDP 51820 bloqué ?)");
         }
 
         self.handshake_age_secs.store(0, Ordering::SeqCst);
         sink(ClientEvent::state(TunnelState::Up));
-        let pq = if profile.is_post_quantum() {
-            "PSK post-quantique installé"
+        let pq = if profile.has_preshared_key() {
+            "slot PresharedKey renseigné"
         } else {
-            "tunnel classique (PSK PQ absent)"
+            "slot PresharedKey vide (Curve25519 seul)"
         };
         sink(ClientEvent::log(
             "info",
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn simulation_atteint_up() {
+    async fn simulation_reaches_up() {
         let backend = DryRunBackend {
             negotiate_delay: Duration::from_millis(10),
             ..DryRunBackend::default()
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn down_revient_a_down_et_demonte() {
+    async fn down_returns_to_down_and_unmounts() {
         let backend = DryRunBackend::default();
         let (sink, log) = collector();
         backend.up(&profile(), &sink).await.unwrap();
@@ -182,23 +182,23 @@ mod tests {
         assert!(backend.last_handshake_age().await.is_none());
     }
 
-    /// Le backend lui-même ne doit pas démonter sur échec (ADR-001 §3 bis).
+    /// The backend itself must not unmount on failure (ADR-001 §3 bis).
     #[tokio::test]
-    async fn echec_laisse_l_adaptateur_monte() {
+    async fn failure_leaves_the_adapter_mounted() {
         let backend = DryRunBackend::failing();
         let (sink, _log) = collector();
         assert!(backend.up(&profile(), &sink).await.is_err());
         assert!(
             backend.adapter_is_up(),
-            "l'adaptateur doit survivre à l'échec du handshake"
+            "the adapter must survive a handshake failure"
         );
     }
 
     #[tokio::test]
-    async fn profil_invalide_echoue_sans_monter_l_adaptateur() {
+    async fn invalid_profile_fails_without_mounting_the_adapter() {
         let backend = DryRunBackend::default();
         let (sink, _log) = collector();
-        // Profil vide : pas de clés → refus avant tout effet de bord.
+        // Empty profile: no keys → refused before any side effect.
         assert!(backend.up(&ClientProfile::default(), &sink).await.is_err());
         assert!(!backend.adapter_is_up());
     }

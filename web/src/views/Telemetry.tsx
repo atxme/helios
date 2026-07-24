@@ -18,7 +18,7 @@ export function TelemetryView({ samples, status }: Props) {
 
       <NetworkStats samples={samples} sparklineHeight={64} />
 
-      {/* Interface surveillée */}
+      {/* Monitored interface */}
       <div className="panel hud p-5 space-y-3">
         <h2 className="hud-title">Interface surveillée</h2>
         <div className="flex items-center gap-3">
@@ -31,7 +31,7 @@ export function TelemetryView({ samples, status }: Props) {
         </div>
       </div>
 
-      {/* Placeholder CPU / Mémoire */}
+      {/* CPU / Memory placeholder */}
       <div className="rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-dashed p-5">
         <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 dark:text-slate-500 mb-3">
           CPU · Mémoire · Température

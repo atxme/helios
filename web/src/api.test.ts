@@ -12,10 +12,10 @@ import {
   stageUpdate,
 } from './api'
 
-describe('client REST Helios', () => {
+describe('Helios REST client', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('retourne le statut JSON lorsque l’API répond avec succès', async () => {
+  it('returns the JSON status when the API responds successfully', async () => {
     const status = { state: 'up', version: '0.1.0' }
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(status), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
@@ -24,13 +24,13 @@ describe('client REST Helios', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/status', undefined)
   })
 
-  it('signale une réponse API en erreur au lieu de présenter un statut périmé', async () => {
+  it('reports an API error response instead of presenting a stale status', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 503 })))
 
     await expect(fetchStatus()).rejects.toThrow('HTTP 503')
   })
 
-  it('envoie les commandes de tunnel avec les méthodes et charges attendues', async () => {
+  it('sends tunnel commands with the expected methods and payloads', async () => {
     const fetchMock = vi.fn().mockImplementation(() =>
       Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 })),
     )
@@ -63,7 +63,7 @@ describe('client REST Helios', () => {
     })
   })
 
-  it('remonte le refus métier d’une commande', async () => {
+  it('surfaces a command\'s business rejection', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ ok: false, error: 'orchestrateur injoignable' }),
       { status: 200 },
@@ -72,7 +72,7 @@ describe('client REST Helios', () => {
     await expect(tunnelStart()).rejects.toThrow('orchestrateur injoignable')
   })
 
-  it('lit l’ancre de confiance compilée', async () => {
+  it('reads the compiled trust anchor', async () => {
     const trust = { required_algs: ['ed25519', 'ml-dsa-65'], publisher_keys: [] }
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
       new Response(JSON.stringify(trust), { status: 200 }),
@@ -81,7 +81,7 @@ describe('client REST Helios', () => {
     await expect(fetchTrust()).resolves.toEqual(trust)
   })
 
-  it('stage un manifeste signé uniquement sous forme JSON', async () => {
+  it('stages a signed manifest only as JSON', async () => {
     const release = { release_sequence: 7, version: '1.2.0', sha256: 'ab'.repeat(32) }
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ release }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
@@ -95,13 +95,13 @@ describe('client REST Helios', () => {
     })
   })
 
-  it('lit le canal et la séquence de mise à jour', async () => {
+  it('reads the update channel and sequence', async () => {
     const status = { channel: 'testing', highest_confirmed_sequence: 4 }
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(status), { status: 200 })))
     await expect(fetchUpdateStatus()).resolves.toEqual(status)
   })
 
-  it('choisit un WebSocket chiffré lorsque la page est en HTTPS', () => {
+  it('chooses an encrypted WebSocket when the page is served over HTTPS', () => {
     const WebSocketMock = vi.fn()
     vi.stubGlobal('WebSocket', WebSocketMock)
     vi.stubGlobal('window', { location: { protocol: 'https:', host: 'helios.test' } })

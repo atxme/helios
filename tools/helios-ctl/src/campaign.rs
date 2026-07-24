@@ -1,27 +1,27 @@
-//! Campagnes de bout en bout du provisioning post-quantique.
+//! End-to-end campaigns for post-quantum provisioning.
 //!
-//! # Un seul outil pour le dry-run et la cible
+//! # One tool for both dry-run and target
 //!
-//! Les scénarios sont écrits **contre l'API**, pas contre une implémentation :
-//! le même binaire s'exécute contre un `heliosd --dev` sur WSL2 et contre une
-//! gateway réelle. Seule la catégorie [`Category::PlanDeDonnees`] exige la
-//! cible, parce qu'elle lit l'état WireGuard du noyau — ce qu'aucune simulation
-//! ne peut prouver (voir `docs/testing/TESTING.md`).
+//! The scenarios are written **against the API**, not against an
+//! implementation: the same binary runs against a `heliosd --dev` on WSL2 and
+//! against a real gateway. Only the [`Category::PlanDeDonnees`] category
+//! requires the target, because it reads the kernel's WireGuard state —
+//! something no simulation can prove (see `docs/testing/TESTING.md`).
 //!
-//! # La campagne est un client, elle n'en simule pas un
+//! # The campaign is a client, it does not simulate one
 //!
-//! Les scénarios réseau passent par [`orion_core::provision`], le code que le
-//! client embarque réellement. Réécrire le protocole ici validerait cette
-//! réécriture, pas Orion. C'est aussi ce qui fait de la campagne un test **du
-//! client** autant que **du daemon** : une régression dans `orion-core` la fait
-//! tomber.
+//! The network scenarios go through [`orion_core::provision`], the code the
+//! client actually embeds. Reimplementing the protocol here would validate
+//! that reimplementation, not Orion. This is also what makes the campaign a
+//! test **of the client** as much as **of the daemon**: a regression in
+//! `orion-core` makes it fail.
 //!
-//! # Les scénarios ne modifient pas la configuration
+//! # The scenarios do not modify the configuration
 //!
-//! Aucun scénario ne déclare de pair ni ne touche à `network.toml`. L'admission
-//! reste hors bande : c'est un invariant d'architecture, pas une lacune de
-//! l'outil. Une campagne dont les clés ne sont pas admises **échoue** plutôt que
-//! de s'auto-admettre, ce qui reviendrait à tester une gateway complaisante.
+//! No scenario declares a peer or touches `network.toml`. Admission stays
+//! out of band: this is an architectural invariant, not a gap in the tool. A
+//! campaign whose keys are not admitted **fails** instead of self-admitting,
+//! which would amount to testing a complacent gateway.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,14 +35,14 @@ use reqwest::Client;
 
 use crate::{fail, ok};
 
-/// Familles de scénarios, selon ce qu'elles exigent de l'environnement.
+/// Scenario families, by what they require from the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Category {
-    /// Logique du client seule : aucun daemon requis. Tourne partout.
+    /// Client logic only: no daemon required. Runs everywhere.
     Client,
-    /// Client ↔ daemon par HTTP. Dry-run ou cible indifféremment.
+    /// Client ↔ daemon over HTTP. Dry-run or target, either way.
     Protocole,
-    /// Lecture du plan de données WireGuard. **Cible uniquement.**
+    /// Reads the WireGuard data plane. **Target only.**
     PlanDeDonnees,
 }
 
@@ -50,33 +50,33 @@ impl Category {
     fn label(self) -> &'static str {
         match self {
             Category::Client => "client",
-            Category::Protocole => "protocole",
-            Category::PlanDeDonnees => "plan de données",
+            Category::Protocole => "protocol",
+            Category::PlanDeDonnees => "data plane",
         }
     }
 }
 
-/// Paramètres d'une campagne.
+/// Parameters of a campaign.
 pub struct Options {
-    /// Clé privée WireGuard du client (base64). Son pair doit être **admis**
-    /// sur la gateway, sinon les scénarios réseau échouent — à raison.
+    /// Client WireGuard private key (base64). Its peer must be **admitted**
+    /// on the gateway, otherwise the network scenarios fail — rightly so.
     pub client_key: Option<String>,
-    /// Clé publique WireGuard de la gateway (base64), telle que le profil
-    /// l'attend. Sert à vérifier que la gateway est bien celle annoncée.
+    /// Gateway WireGuard public key (base64), as the profile expects it.
+    /// Used to verify the gateway really is the one announced.
     pub gateway_key: Option<String>,
-    /// Interface WireGuard à inspecter (`helios0`). Active la catégorie
-    /// [`Category::PlanDeDonnees`].
+    /// WireGuard interface to inspect (`helios0`). Enables the
+    /// [`Category::PlanDeDonnees`] category.
     pub wg_iface: Option<String>,
-    /// Ne joue qu'une catégorie.
+    /// Runs only one category.
     pub only: Option<Category>,
-    /// Nombre de passes. Au-delà de 1, c'est une campagne d'endurance : elle
-    /// révèle les fuites d'état que joue-une-fois ne montre pas (VIP qui
-    /// dérive, PSK qui se fige, table de pairs qui gonfle).
+    /// Number of passes. Beyond 1, this is an endurance campaign: it reveals
+    /// state leaks that a single run does not show (drifting VIP, a PSK that
+    /// freezes, a peer table that grows).
     pub repeat: u32,
 }
 
-/// Issue d'un scénario. `Skip` n'est pas un échec : un scénario hors de portée
-/// de l'environnement doit le **dire**, pas se taire ni mentir.
+/// Outcome of a scenario. `Skip` is not a failure: a scenario out of the
+/// environment's reach must **say so**, not stay silent or lie.
 enum Outcome {
     Pass(String),
     Skip(String),
@@ -93,75 +93,75 @@ impl Outcome {
     fn fail(reason: impl Into<String>) -> Self {
         Outcome::Fail(reason.into())
     }
-    /// Traduit une condition booléenne en issue, avec le message d'échec.
-    fn check(condition: bool, detail: impl Into<String>, echec: impl Into<String>) -> Self {
+    /// Translates a boolean condition into an outcome, with the failure message.
+    fn check(condition: bool, detail: impl Into<String>, failure: impl Into<String>) -> Self {
         if condition {
             Outcome::pass(detail)
         } else {
-            Outcome::fail(echec)
+            Outcome::fail(failure)
         }
     }
 }
 
-/// Génère une paire de clés WireGuard.
+/// Generates a WireGuard key pair.
 ///
-/// **La sortie standard ne porte que deux lignes `CLÉ=valeur`**, pour être
-/// consommable par `eval` sans parsing fragile ; toute la mise en forme part
-/// sur la sortie d'erreur. Mélanger les deux revient à faire dépendre un script
-/// de la ponctuation d'un texte d'aide — ce qui casse au premier reformatage.
+/// **Standard output carries only two `KEY=value` lines**, to be consumable
+/// by `eval` without fragile parsing; all the formatting goes to standard
+/// error. Mixing the two would make a script depend on the punctuation of
+/// help text — which breaks at the first reformatting.
 pub fn generate_keys() {
     let engine = base64::engine::general_purpose::STANDARD;
     let mut raw = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut raw).expect("CSPRNG système indisponible");
+    aws_lc_rs::rand::fill(&mut raw).expect("system CSPRNG unavailable");
     let secret = x25519_dalek::StaticSecret::from(raw);
     let public = x25519_dalek::PublicKey::from(&secret);
-    let (prive, publique) = (
+    let (private, public) = (
         engine.encode(secret.to_bytes()),
         engine.encode(public.as_bytes()),
     );
 
-    println!("WG_PRIVATE_KEY={prive}");
-    println!("WG_PUBLIC_KEY={publique}");
+    println!("WG_PRIVATE_KEY={private}");
+    println!("WG_PUBLIC_KEY={public}");
 
-    eprintln!("\n\x1b[1mPaire de clés WireGuard\x1b[0m");
+    eprintln!("\n\x1b[1mWireGuard key pair\x1b[0m");
     eprintln!("───────────────────────");
-    eprintln!("  Déclarer le pair sur la gateway (network.toml), puis relancer");
-    eprintln!("  la campagne avec --client-key :\n");
+    eprintln!("  Declare the peer on the gateway (network.toml), then rerun");
+    eprintln!("  the campaign with --client-key:\n");
     eprintln!("    [[peers]]");
-    eprintln!("    name = \"campagne\"");
-    eprintln!("    public_key = \"{publique}\"");
+    eprintln!("    name = \"campaign\"");
+    eprintln!("    public_key = \"{public}\"");
     eprintln!("    address = \"100.64.1.2/32\"\n");
 }
 
-/// Clé publique WireGuard dérivée d'une clé privée base64.
+/// WireGuard public key derived from a base64 private key.
 fn public_from_private(private_b64: &str) -> Result<String> {
     let engine = base64::engine::general_purpose::STANDARD;
     let raw: [u8; 32] = engine
         .decode(private_b64.trim())
-        .context("clé privée illisible (base64 attendu)")?
+        .context("unreadable private key (expected base64)")?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("clé privée de longueur invalide (32 octets attendus)"))?;
+        .map_err(|_| anyhow::anyhow!("private key has invalid length (32 bytes expected)"))?;
     let secret = x25519_dalek::StaticSecret::from(raw);
     Ok(engine.encode(x25519_dalek::PublicKey::from(&secret).as_bytes()))
 }
 
-/// Profil jetable pour les scénarios purement locaux.
+/// Disposable profile for purely local scenarios.
 ///
-/// Ces scénarios éprouvent la logique de validation du client — refus d'une
-/// gateway usurpée, d'un ciphertext malformé, d'une version inconnue. Aucun
-/// pair réel n'est impliqué, donc exiger des clés admises n'aurait aucun sens :
-/// la catégorie doit tourner partout, y compris dans la régression, sans
-/// gateway ni configuration préalable.
-fn profile_ephemere() -> ClientProfile {
+/// These scenarios exercise the client's validation logic — rejecting a
+/// spoofed gateway, a malformed ciphertext, an unknown version. No real peer
+/// is involved, so requiring admitted keys would make no sense: the category
+/// must run everywhere, including in regression, with no gateway or prior
+/// configuration.
+fn ephemeral_profile() -> ClientProfile {
     let engine = base64::engine::general_purpose::STANDARD;
     let mut client = [0u8; 32];
     let mut gateway = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut client).expect("CSPRNG système indisponible");
-    aws_lc_rs::rand::fill(&mut gateway).expect("CSPRNG système indisponible");
+    aws_lc_rs::rand::fill(&mut client).expect("system CSPRNG unavailable");
+    aws_lc_rs::rand::fill(&mut gateway).expect("system CSPRNG unavailable");
     let gateway_public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(gateway));
 
     ClientProfile {
-        name: "campagne-locale".into(),
+        name: "local-campaign".into(),
         endpoint: "127.0.0.1:51820".into(),
         private_key: engine.encode(client),
         peer_public_key: engine.encode(gateway_public.as_bytes()),
@@ -169,20 +169,20 @@ fn profile_ephemere() -> ClientProfile {
     }
 }
 
-/// Profil client de campagne, bâti depuis les options.
+/// Campaign client profile, built from the options.
 fn profile(opts: &Options, url: &str) -> Result<ClientProfile> {
     let client_key = opts
         .client_key
         .as_deref()
-        .context("--client-key requis pour les scénarios réseau")?;
+        .context("--client-key required for network scenarios")?;
     let gateway_key = opts
         .gateway_key
         .as_deref()
-        .context("--gateway-key requis pour vérifier l'identité de la gateway")?;
+        .context("--gateway-key required to verify the gateway's identity")?;
     Ok(ClientProfile {
-        name: "campagne".into(),
-        // L'endpoint UDP ne sert pas ici : la campagne parle à l'API dans le
-        // tunnel, elle ne monte pas le tunnel elle-même.
+        name: "campaign".into(),
+        // The UDP endpoint is unused here: the campaign talks to the API
+        // inside the tunnel, it does not bring up the tunnel itself.
         endpoint: "127.0.0.1:51820".into(),
         private_key: client_key.to_string(),
         peer_public_key: gateway_key.to_string(),
@@ -191,12 +191,12 @@ fn profile(opts: &Options, url: &str) -> Result<ClientProfile> {
     })
 }
 
-// ─── Scénarios : logique du client, sans daemon ───────────────────────────────
+// ─── Scenarios: client logic, no daemon ───────────────────────────────────────
 
-/// Construit une réponse de gateway plausible, signée d'aucune identité
-/// particulière — c'est au client de juger.
-fn reponse_pour(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
-    let (ciphertext, _) = MlKem768Kem::encapsulate(kem_public).expect("encapsulation ML-KEM");
+/// Builds a plausible gateway response, signed by no particular identity —
+/// it is up to the client to judge.
+fn response_for(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
+    let (ciphertext, _) = MlKem768Kem::encapsulate(kem_public).expect("ML-KEM encapsulation");
     ProvisionResponse {
         protocol_version: PROTOCOL_VERSION,
         kem_ciphertext: ciphertext,
@@ -207,445 +207,440 @@ fn reponse_pour(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
     }
 }
 
-/// Une gateway qui n'est pas celle du profil doit être refusée, même si sa
-/// cryptographie est parfaitement valide. Sans ce contrôle, une gateway
-/// compromise négocierait un PSK avec le client.
-fn scenario_identite_gateway(profil: &ClientProfile) -> Outcome {
+/// A gateway that is not the one from the profile must be rejected, even if
+/// its cryptography is perfectly valid. Without this check, a compromised
+/// gateway would negotiate a PSK with the client.
+fn scenario_gateway_identity(profile: &ClientProfile) -> Outcome {
     let (sk, pk) = match MlKem768Kem::generate() {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("génération ML-KEM impossible : {e}")),
+        Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };
-    let imposteur = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
-    let reponse = reponse_pour(&pk, imposteur);
+    let impostor = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    let response = response_for(&pk, impostor);
 
-    match finish(profil, &sk, &[42u8; 16], &reponse) {
+    match finish(profile, &sk, &[42u8; 16], &response) {
         Err(ProvisionError::GatewayIdentityMismatch { .. }) => {
-            Outcome::pass("gateway usurpée refusée")
+            Outcome::pass("spoofed gateway rejected")
         }
-        Err(e) => Outcome::fail(format!("refusée, mais pour la mauvaise raison : {e}")),
+        Err(e) => Outcome::fail(format!("rejected, but for the wrong reason: {e}")),
         Ok(_) => Outcome::fail(
-            "INVARIANTE VIOLÉE : le client a négocié un PSK avec une gateway \
-             dont l'identité ne correspond pas à son profil",
+            "INVARIANT VIOLATED: the client negotiated a PSK with a gateway \
+             whose identity does not match its profile",
         ),
     }
 }
 
-/// Un ciphertext malformé ne doit jamais produire de PSK.
-fn scenario_ciphertext_malforme(profil: &ClientProfile) -> Outcome {
+/// A malformed ciphertext must never produce a PSK.
+fn scenario_malformed_ciphertext(profile: &ClientProfile) -> Outcome {
     let (sk, pk) = match MlKem768Kem::generate() {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("génération ML-KEM impossible : {e}")),
+        Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };
-    let mut reponse = reponse_pour(&pk, &profil.peer_public_key);
-    reponse.kem_ciphertext = vec![0u8; 10];
+    let mut response = response_for(&pk, &profile.peer_public_key);
+    response.kem_ciphertext = vec![0u8; 10];
 
     Outcome::check(
-        finish(profil, &sk, &[42u8; 16], &reponse).is_err(),
-        "ciphertext tronqué refusé",
-        "un ciphertext de 10 octets a produit un PSK",
+        finish(profile, &sk, &[42u8; 16], &response).is_err(),
+        "truncated ciphertext rejected",
+        "a 10-byte ciphertext produced a PSK",
     )
 }
 
-/// Une version de protocole inconnue doit être refusée avant toute crypto.
-fn scenario_version_protocole(profil: &ClientProfile) -> Outcome {
+/// An unknown protocol version must be rejected before any crypto.
+fn scenario_protocol_version(profile: &ClientProfile) -> Outcome {
     let (sk, pk) = match MlKem768Kem::generate() {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("génération ML-KEM impossible : {e}")),
+        Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };
-    let mut reponse = reponse_pour(&pk, &profil.peer_public_key);
-    reponse.protocol_version = PROTOCOL_VERSION.wrapping_add(1);
+    let mut response = response_for(&pk, &profile.peer_public_key);
+    response.protocol_version = PROTOCOL_VERSION.wrapping_add(1);
 
     Outcome::check(
-        finish(profil, &sk, &[42u8; 16], &reponse).is_err(),
-        "version incompatible refusée",
-        "une version de protocole inconnue a été acceptée",
+        finish(profile, &sk, &[42u8; 16], &response).is_err(),
+        "incompatible version rejected",
+        "an unknown protocol version was accepted",
     )
 }
 
-// ─── Scénarios : client ↔ daemon ──────────────────────────────────────────────
+// ─── Scenarios: client ↔ daemon ───────────────────────────────────────────────
 
-/// Le tour nominal : un pair admis obtient un PSK exploitable.
-async fn scenario_provisioning_nominal(profil: &ClientProfile, url: &str) -> Outcome {
-    match orion_core::provision(profil, url).await {
+/// The nominal path: an admitted peer obtains a usable PSK.
+async fn scenario_provisioning_nominal(profile: &ClientProfile, url: &str) -> Outcome {
+    match orion_core::provision(profile, url).await {
         Err(e) => Outcome::fail(format!("{e}")),
         Ok(outcome) => {
             let engine = base64::engine::general_purpose::STANDARD;
-            let taille = engine.decode(&outcome.preshared_key).map(|k| k.len());
-            match taille {
+            let size = engine.decode(&outcome.preshared_key).map(|k| k.len());
+            match size {
                 Ok(32) if outcome.lifetime > Duration::ZERO => Outcome::pass(format!(
-                    "PSK 32 o, VIP {}, validité {} s",
+                    "PSK 32 B, VIP {}, lifetime {} s",
                     outcome.address,
                     outcome.lifetime.as_secs()
                 )),
                 Ok(n) => Outcome::fail(format!(
-                    "PSK de {n} octets : le slot WireGuard en exige exactement 32"
+                    "PSK of {n} bytes: the WireGuard slot requires exactly 32"
                 )),
-                Err(e) => Outcome::fail(format!("PSK non décodable en base64 : {e}")),
+                Err(e) => Outcome::fail(format!("PSK not decodable as base64: {e}")),
             }
         }
     }
 }
 
-/// Chaque session doit produire un PSK neuf : c'est ce qui borne la fenêtre
-/// d'exploitation d'un PSK compromis, et donc tout l'intérêt du provisioning
-/// face à un PSK statique.
-async fn scenario_psk_frais(profil: &ClientProfile, url: &str) -> Outcome {
-    let a = match orion_core::provision(profil, url).await {
+/// Every session must produce a fresh PSK: this bounds the exploitation
+/// window of a compromised PSK, and is thus the whole point of provisioning
+/// versus a static PSK.
+async fn scenario_fresh_psk(profile: &ClientProfile, url: &str) -> Outcome {
+    let a = match orion_core::provision(profile, url).await {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("première session : {e}")),
+        Err(e) => return Outcome::fail(format!("first session: {e}")),
     };
-    let b = match orion_core::provision(profil, url).await {
+    let b = match orion_core::provision(profile, url).await {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("seconde session : {e}")),
+        Err(e) => return Outcome::fail(format!("second session: {e}")),
     };
 
     Outcome::check(
         a.preshared_key != b.preshared_key,
-        "deux sessions, deux PSK distincts",
-        "PSK identique d'une session à l'autre : la rotation n'apporte rien \
-         et un PSK compromis le reste",
+        "two sessions, two distinct PSKs",
+        "identical PSK across sessions: rotation adds nothing and a \
+         compromised PSK stays compromised",
     )
 }
 
-/// La VIP dérive de la clé publique, pas de la session : elle doit être stable
-/// d'un provisioning à l'autre, sans état sur disque côté gateway.
-async fn scenario_vip_stable(profil: &ClientProfile, url: &str) -> Outcome {
-    let a = match orion_core::provision(profil, url).await {
+/// The VIP derives from the public key, not from the session: it must be
+/// stable across provisioning runs, with no state on disk on the gateway
+/// side.
+async fn scenario_stable_vip(profile: &ClientProfile, url: &str) -> Outcome {
+    let a = match orion_core::provision(profile, url).await {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("première session : {e}")),
+        Err(e) => return Outcome::fail(format!("first session: {e}")),
     };
-    let b = match orion_core::provision(profil, url).await {
+    let b = match orion_core::provision(profile, url).await {
         Ok(v) => v,
-        Err(e) => return Outcome::fail(format!("seconde session : {e}")),
+        Err(e) => return Outcome::fail(format!("second session: {e}")),
     };
 
     Outcome::check(
         a.address == b.address,
         format!("VIP {} stable", a.address),
         format!(
-            "VIP instable : {} puis {} — la dérivation ne peut pas dépendre de \
-             la session",
+            "unstable VIP: {} then {} — derivation cannot depend on the \
+             session",
             a.address, b.address
         ),
     )
 }
 
-/// Un pair jamais déclaré doit être refusé : le provisioning n'admet personne.
-async fn scenario_pair_non_admis(profil: &ClientProfile, url: &str) -> Outcome {
-    // Une clé fraîche, donc absente de `network.toml` par construction.
+/// A never-declared peer must be rejected: provisioning admits no one.
+async fn scenario_unadmitted_peer(profile: &ClientProfile, url: &str) -> Outcome {
+    // A fresh key, so absent from `network.toml` by construction.
     let mut raw = [0u8; 32];
     if aws_lc_rs::rand::fill(&mut raw).is_err() {
-        return Outcome::fail("CSPRNG système indisponible");
+        return Outcome::fail("system CSPRNG unavailable");
     }
     let engine = base64::engine::general_purpose::STANDARD;
-    let intrus = ClientProfile {
+    let intruder = ClientProfile {
         private_key: engine.encode(raw),
-        ..profil.clone()
+        ..profile.clone()
     };
 
-    match orion_core::provision(&intrus, url).await {
+    match orion_core::provision(&intruder, url).await {
         Err(ProvisionError::Rejected { status: 403, .. }) => {
-            Outcome::pass("pair inconnu refusé (403)")
+            Outcome::pass("unknown peer rejected (403)")
         }
         Err(ProvisionError::Rejected { status, .. }) => {
-            Outcome::fail(format!("refusé en {status} au lieu de 403"))
+            Outcome::fail(format!("rejected with {status} instead of 403"))
         }
-        Err(e) => Outcome::fail(format!("refusé, mais pour la mauvaise raison : {e}")),
+        Err(e) => Outcome::fail(format!("rejected, but for the wrong reason: {e}")),
         Ok(_) => Outcome::fail(
-            "INVARIANTE VIOLÉE : la gateway a provisionné une clé jamais \
-             déclarée — l'admission hors bande ne tient plus",
+            "INVARIANT VIOLATED: the gateway provisioned a key that was \
+             never declared — out-of-band admission no longer holds",
         ),
     }
 }
 
-/// Noms de champs qui ne doivent jamais être sérialisés par une lecture.
+/// Field names that must never be serialized by a read.
 ///
-/// La comparaison est **exacte**, pas par sous-chaîne : l'API expose
-/// légitimement `preshared_key_configured` et `wg_private_key_configured`, des
-/// booléens qui disent qu'un secret existe sans le divulguer. Les confondre
-/// ferait échouer l'outil sur une API correcte.
-const CHAMPS_SECRETS: [&str; 3] = ["preshared_key", "wg_private_key", "private_key"];
+/// The comparison is **exact**, not a substring match: the API legitimately
+/// exposes `preshared_key_configured` and `wg_private_key_configured`,
+/// booleans that say a secret exists without disclosing it. Confusing them
+/// would make the tool fail against a correct API.
+const SECRET_FIELDS: [&str; 3] = ["preshared_key", "wg_private_key", "private_key"];
 
-/// Cherche récursivement un champ secret sérialisé.
-fn champ_secret(valeur: &serde_json::Value) -> Option<String> {
-    match valeur {
+/// Recursively looks for a serialized secret field.
+fn secret_field(value: &serde_json::Value) -> Option<String> {
+    match value {
         serde_json::Value::Object(map) => {
-            for (cle, v) in map {
-                if CHAMPS_SECRETS.contains(&cle.as_str()) {
-                    return Some(cle.clone());
+            for (key, v) in map {
+                if SECRET_FIELDS.contains(&key.as_str()) {
+                    return Some(key.clone());
                 }
-                if let Some(trouve) = champ_secret(v) {
-                    return Some(trouve);
+                if let Some(found) = secret_field(v) {
+                    return Some(found);
                 }
             }
             None
         }
-        serde_json::Value::Array(items) => items.iter().find_map(champ_secret),
+        serde_json::Value::Array(items) => items.iter().find_map(secret_field),
         _ => None,
     }
 }
 
-/// Les lectures de l'API ne doivent jamais laisser filtrer un secret.
-async fn scenario_secrets_absents_de_l_api(client: &Client, base: &str) -> Outcome {
-    let corps: serde_json::Value = match client.get(format!("{base}/api/network")).send().await {
+/// API reads must never leak a secret.
+async fn scenario_no_secrets_in_api(client: &Client, base: &str) -> Outcome {
+    let body: serde_json::Value = match client.get(format!("{base}/api/network")).send().await {
         Ok(r) => match r.json().await {
             Ok(v) => v,
-            Err(e) => return Outcome::fail(format!("réponse JSON illisible : {e}")),
+            Err(e) => return Outcome::fail(format!("unreadable JSON response: {e}")),
         },
-        Err(e) => return Outcome::fail(format!("appel impossible : {e}")),
+        Err(e) => return Outcome::fail(format!("call failed: {e}")),
     };
 
-    match champ_secret(&corps) {
-        Some(champ) => Outcome::fail(format!(
-            "GET /api/network sérialise le champ `{champ}` — aucune lecture ne \
-             doit exposer de secret"
+    match secret_field(&body) {
+        Some(field) => Outcome::fail(format!(
+            "GET /api/network serializes the `{field}` field — no read should \
+             expose a secret"
         )),
-        None => Outcome::pass("aucun champ secret dans GET /api/network"),
+        None => Outcome::pass("no secret field in GET /api/network"),
     }
 }
 
-/// Les mutations exigent du JSON : un corps non typé doit être refusé.
-async fn scenario_mutation_sans_json(client: &Client, base: &str) -> Outcome {
-    let reponse = client
+/// Mutations require JSON: an untyped body must be rejected.
+async fn scenario_mutation_without_json(client: &Client, base: &str) -> Outcome {
+    let response = client
         .post(format!("{base}/api/tunnel/start"))
         .header("content-type", "text/plain")
         .body("connect")
         .send()
         .await;
 
-    match reponse {
-        Err(e) => Outcome::fail(format!("appel impossible : {e}")),
+    match response {
+        Err(e) => Outcome::fail(format!("call failed: {e}")),
         Ok(r) => Outcome::check(
             r.status() == 415,
-            "corps non-JSON refusé (415)",
-            format!("mutation acceptée en {} sans JSON", r.status()),
+            "non-JSON body rejected (415)",
+            format!("mutation accepted with {} without JSON", r.status()),
         ),
     }
 }
 
-// ─── Scénarios : plan de données (cible) ──────────────────────────────────────
+// ─── Scenarios: data plane (target) ───────────────────────────────────────────
 
-/// Lit `wg show <iface> dump` et renvoie les lignes de pairs.
+/// Reads `wg show <iface> dump` and returns the peer lines.
 ///
-/// Format : la première ligne décrit l'interface, les suivantes les pairs —
-/// `clé publique, PSK, endpoint, allowed-ips, dernier handshake, rx, tx,
-/// keepalive`.
+/// Format: the first line describes the interface, the following ones the
+/// peers — `public key, PSK, endpoint, allowed-ips, latest handshake, rx,
+/// tx, keepalive`.
 fn wg_dump(iface: &str) -> Result<Vec<Vec<String>>> {
-    let sortie = std::process::Command::new("wg")
+    let output = std::process::Command::new("wg")
         .args(["show", iface, "dump"])
         .output()
-        .context("`wg` introuvable — outil disponible uniquement sur la cible")?;
-    if !sortie.status.success() {
+        .context("`wg` not found — tool available on the target only")?;
+    if !output.status.success() {
         anyhow::bail!(
-            "`wg show {iface} dump` a échoué : {}",
-            String::from_utf8_lossy(&sortie.stderr).trim()
+            "`wg show {iface} dump` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&sortie.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .skip(1) // ligne d'interface
+        .skip(1) // interface line
         .map(|l| l.split('\t').map(str::to_string).collect())
         .collect())
 }
 
-/// Le PSK doit être **réellement** posé dans le slot WireGuard du noyau.
+/// The PSK must be **actually** installed in the kernel's WireGuard slot.
 ///
-/// C'est la seule preuve qui compte : tout le reste peut réussir alors que le
-/// plan de données n'a rien reçu. Aucune simulation ne peut l'établir.
-fn scenario_psk_sur_l_interface(iface: &str, pair: &str) -> Outcome {
-    let pairs = match wg_dump(iface) {
+/// This is the only proof that matters: everything else can succeed while
+/// the data plane received nothing. No simulation can establish it.
+fn scenario_psk_on_interface(iface: &str, peer: &str) -> Outcome {
+    let peers = match wg_dump(iface) {
         Ok(p) => p,
         Err(e) => return Outcome::fail(format!("{e}")),
     };
-    let Some(ligne) = pairs
+    let Some(line) = peers
         .iter()
-        .find(|c| c.first().map(String::as_str) == Some(pair))
+        .find(|c| c.first().map(String::as_str) == Some(peer))
     else {
         return Outcome::fail(format!(
-            "le pair {pair} est absent de {iface} : le provisioning ne l'a pas posé"
+            "peer {peer} is absent from {iface}: provisioning did not install it"
         ));
     };
-    let psk = ligne.get(1).map(String::as_str).unwrap_or("(none)");
+    let psk = line.get(1).map(String::as_str).unwrap_or("(none)");
 
     Outcome::check(
         psk != "(none)" && !psk.is_empty(),
-        "slot PresharedKey renseigné dans le noyau",
-        "slot PresharedKey vide : le tunnel repose sur Curve25519 seul, donc \
-         reste vulnérable au « récolter maintenant, déchiffrer plus tard »",
+        "PresharedKey slot populated in the kernel",
+        "empty PresharedKey slot: the tunnel relies on Curve25519 alone, so \
+         it remains vulnerable to \"harvest now, decrypt later\"",
     )
 }
 
-/// Un handshake récent prouve que le PSK posé n'a pas cassé la session — le
-/// risque exact d'un PSK unilatéral.
-fn scenario_handshake_recent(iface: &str, pair: &str) -> Outcome {
-    let pairs = match wg_dump(iface) {
+/// A recent handshake proves the installed PSK did not break the session —
+/// the exact risk of a one-sided PSK.
+fn scenario_recent_handshake(iface: &str, peer: &str) -> Outcome {
+    let peers = match wg_dump(iface) {
         Ok(p) => p,
         Err(e) => return Outcome::fail(format!("{e}")),
     };
-    let Some(ligne) = pairs
+    let Some(line) = peers
         .iter()
-        .find(|c| c.first().map(String::as_str) == Some(pair))
+        .find(|c| c.first().map(String::as_str) == Some(peer))
     else {
-        return Outcome::fail(format!("pair {pair} absent de {iface}"));
+        return Outcome::fail(format!("peer {peer} absent from {iface}"));
     };
-    let horodatage: u64 = ligne.get(4).and_then(|v| v.parse().ok()).unwrap_or(0);
-    if horodatage == 0 {
+    let timestamp: u64 = line.get(4).and_then(|v| v.parse().ok()).unwrap_or(0);
+    if timestamp == 0 {
         return Outcome::fail(
-            "aucun handshake depuis la pose du PSK — c'est la signature d'un \
-             PSK présent d'un seul côté",
+            "no handshake since the PSK was installed — the signature of a \
+             PSK present on only one side",
         );
     }
     let age = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().saturating_sub(horodatage))
+        .map(|d| d.as_secs().saturating_sub(timestamp))
         .unwrap_or(u64::MAX);
 
     Outcome::check(
         age < 180,
-        format!("dernier handshake il y a {age} s"),
-        format!("dernier handshake il y a {age} s (> REJECT_AFTER_TIME) : la session est morte"),
+        format!("last handshake {age} s ago"),
+        format!("last handshake {age} s ago (> REJECT_AFTER_TIME): the session is dead"),
     )
 }
 
-// ─── Exécution ────────────────────────────────────────────────────────────────
+// ─── Execution ────────────────────────────────────────────────────────────────
 
-/// Journalise une issue et indique si elle compte comme un échec.
-fn rapporter(nom: &str, issue: &Outcome) -> bool {
-    match issue {
+/// Logs an outcome and reports whether it counts as a failure.
+fn report(name: &str, outcome: &Outcome) -> bool {
+    match outcome {
         Outcome::Pass(d) => {
-            println!("  {} {nom:<38} \x1b[2m{d}\x1b[0m", ok());
+            println!("  {} {name:<38} \x1b[2m{d}\x1b[0m", ok());
             false
         }
         Outcome::Skip(r) => {
-            println!("  \x1b[90m—\x1b[0m {nom:<38} \x1b[90m{r}\x1b[0m");
+            println!("  \x1b[90m—\x1b[0m {name:<38} \x1b[90m{r}\x1b[0m");
             false
         }
         Outcome::Fail(r) => {
-            println!("  {} {nom:<38} \x1b[31m{r}\x1b[0m", fail());
+            println!("  {} {name:<38} \x1b[31m{r}\x1b[0m", fail());
             true
         }
     }
 }
 
-fn entete(categorie: Category) {
-    println!("\n\x1b[1m{}\x1b[0m", categorie.label());
-    println!("{}", "─".repeat(categorie.label().chars().count()));
+fn header(category: Category) {
+    println!("\n\x1b[1m{}\x1b[0m", category.label());
+    println!("{}", "─".repeat(category.label().chars().count()));
 }
 
-/// Exécute la campagne. Renvoie une erreur si au moins un scénario a échoué.
+/// Runs the campaign. Returns an error if at least one scenario failed.
 pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
-    let joue = |c: Category| opts.only.is_none_or(|only| only == c);
-    let mut echecs = 0usize;
-    let mut joues = 0usize;
+    let plays = |c: Category| opts.only.is_none_or(|only| only == c);
+    let mut failures = 0usize;
+    let mut played = 0usize;
 
-    println!("\n\x1b[1mCampagne de provisioning post-quantique\x1b[0m");
-    println!("  cible   {base}");
+    println!("\n\x1b[1mPost-quantum provisioning campaign\x1b[0m");
+    println!("  target  {base}");
     println!("  passes  {}", opts.repeat);
 
-    for passe in 1..=opts.repeat {
+    for pass in 1..=opts.repeat {
         if opts.repeat > 1 {
-            println!("\n\x1b[1m╌╌ passe {passe}/{} ╌╌\x1b[0m", opts.repeat);
+            println!("\n\x1b[1m╌╌ pass {pass}/{} ╌╌\x1b[0m", opts.repeat);
         }
 
-        // Le profil n'est requis que par les catégories réseau : une campagne
-        // `--only client` doit tourner sans aucune clé.
-        let profil = profile(&opts, base);
+        // The profile is only required by the network categories: a
+        // `--only client` campaign must run without any key.
+        let profile = profile(&opts, base);
 
-        if joue(Category::Client) {
-            entete(Category::Client);
-            // Ces scénarios n'impliquent aucun pair réel : à défaut de clés
-            // fournies, un profil jetable suffit et rend la catégorie
-            // exécutable partout.
-            let p = match &profil {
+        if plays(Category::Client) {
+            header(Category::Client);
+            // These scenarios involve no real peer: absent supplied keys, an
+            // ephemeral profile is enough and makes the category runnable
+            // everywhere.
+            let p = match &profile {
                 Ok(p) => p.clone(),
-                Err(_) => profile_ephemere(),
+                Err(_) => ephemeral_profile(),
             };
-            for (nom, issue) in [
+            for (name, outcome) in [
+                ("gateway identity verified", scenario_gateway_identity(&p)),
                 (
-                    "identité de gateway vérifiée",
-                    scenario_identite_gateway(&p),
+                    "malformed ciphertext rejected",
+                    scenario_malformed_ciphertext(&p),
                 ),
-                (
-                    "ciphertext malformé refusé",
-                    scenario_ciphertext_malforme(&p),
-                ),
-                (
-                    "version de protocole vérifiée",
-                    scenario_version_protocole(&p),
-                ),
+                ("protocol version verified", scenario_protocol_version(&p)),
             ] {
-                joues += 1;
-                echecs += usize::from(rapporter(nom, &issue));
+                played += 1;
+                failures += usize::from(report(name, &outcome));
             }
         }
 
-        if joue(Category::Protocole) {
-            entete(Category::Protocole);
-            match &profil {
+        if plays(Category::Protocole) {
+            header(Category::Protocole);
+            match &profile {
                 Err(e) => {
-                    rapporter("scénarios réseau", &Outcome::skip(format!("{e}")));
+                    report("network scenarios", &Outcome::skip(format!("{e}")));
                 }
                 Ok(p) => {
-                    let issues = vec![
+                    let outcomes = vec![
                         (
-                            "provisioning nominal",
+                            "nominal provisioning",
                             scenario_provisioning_nominal(p, base).await,
                         ),
-                        ("PSK frais par session", scenario_psk_frais(p, base).await),
+                        ("fresh PSK per session", scenario_fresh_psk(p, base).await),
                         (
-                            "VIP stable entre sessions",
-                            scenario_vip_stable(p, base).await,
+                            "stable VIP across sessions",
+                            scenario_stable_vip(p, base).await,
                         ),
                         (
-                            "pair non admis refusé",
-                            scenario_pair_non_admis(p, base).await,
+                            "unadmitted peer rejected",
+                            scenario_unadmitted_peer(p, base).await,
                         ),
                         (
-                            "aucun secret dans l'API",
-                            scenario_secrets_absents_de_l_api(client, base).await,
+                            "no secrets in the API",
+                            scenario_no_secrets_in_api(client, base).await,
                         ),
                         (
-                            "mutation sans JSON refusée",
-                            scenario_mutation_sans_json(client, base).await,
+                            "mutation without JSON rejected",
+                            scenario_mutation_without_json(client, base).await,
                         ),
                     ];
-                    for (nom, issue) in issues {
-                        joues += 1;
-                        echecs += usize::from(rapporter(nom, &issue));
+                    for (name, outcome) in outcomes {
+                        played += 1;
+                        failures += usize::from(report(name, &outcome));
                     }
                 }
             }
         }
 
-        if joue(Category::PlanDeDonnees) {
-            entete(Category::PlanDeDonnees);
-            match (&opts.wg_iface, &profil) {
+        if plays(Category::PlanDeDonnees) {
+            header(Category::PlanDeDonnees);
+            match (&opts.wg_iface, &profile) {
                 (None, _) => {
-                    rapporter(
-                        "plan de données",
-                        &Outcome::skip("--wg-iface absent (cible uniquement)"),
+                    report(
+                        "data plane",
+                        &Outcome::skip("--wg-iface absent (target only)"),
                     );
                 }
                 (Some(_), Err(e)) => {
-                    rapporter("plan de données", &Outcome::skip(format!("{e}")));
+                    report("data plane", &Outcome::skip(format!("{e}")));
                 }
                 (Some(iface), Ok(p)) => {
-                    let pair = match public_from_private(&p.private_key) {
+                    let peer = match public_from_private(&p.private_key) {
                         Ok(k) => k,
                         Err(e) => anyhow::bail!("{e}"),
                     };
-                    for (nom, issue) in [
+                    for (name, outcome) in [
                         (
-                            "PSK posé dans le noyau",
-                            scenario_psk_sur_l_interface(iface, &pair),
+                            "PSK installed in the kernel",
+                            scenario_psk_on_interface(iface, &peer),
                         ),
                         (
-                            "handshake vivant avec PSK",
-                            scenario_handshake_recent(iface, &pair),
+                            "live handshake with PSK",
+                            scenario_recent_handshake(iface, &peer),
                         ),
                     ] {
-                        joues += 1;
-                        echecs += usize::from(rapporter(nom, &issue));
+                        played += 1;
+                        failures += usize::from(report(name, &outcome));
                     }
                 }
             }
@@ -653,12 +648,15 @@ pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
     }
 
     println!();
-    if echecs == 0 {
-        println!("  {} campagne réussie — {joues} scénario(s)\n", ok());
+    if failures == 0 {
+        println!("  {} campaign passed — {played} scenario(s)\n", ok());
         Ok(())
     } else {
-        println!("  {} {echecs} échec(s) sur {joues} scénario(s)\n", fail());
-        anyhow::bail!("campagne en échec")
+        println!(
+            "  {} {failures} failure(s) out of {played} scenario(s)\n",
+            fail()
+        );
+        anyhow::bail!("campaign failed")
     }
 }
 
@@ -667,44 +665,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn la_cle_publique_derive_de_la_privee_et_est_stable() {
+    fn the_public_key_derives_from_the_private_key_and_is_stable() {
         const PRIV: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
         let a = public_from_private(PRIV).unwrap();
-        assert_eq!(a.len(), 44, "clé Curve25519 en base64");
-        assert_eq!(a, public_from_private(PRIV).unwrap(), "dérivation stable");
+        assert_eq!(a.len(), 44, "base64 Curve25519 key");
+        assert_eq!(a, public_from_private(PRIV).unwrap(), "stable derivation");
     }
 
     #[test]
-    fn cle_privee_invalide_signalee() {
-        assert!(public_from_private("pas-du-base64").is_err());
-        assert!(public_from_private("AAAA").is_err(), "longueur invalide");
+    fn invalid_private_key_is_reported() {
+        assert!(public_from_private("not-base64").is_err());
+        assert!(public_from_private("AAAA").is_err(), "invalid length");
     }
 
-    /// Un profil incomplet doit bloquer les scénarios réseau **avant** tout
-    /// appel : une campagne mal gréée doit le dire, pas échouer sur un timeout.
+    /// An incomplete profile must block the network scenarios **before** any
+    /// call: a misconfigured campaign must say so, not fail on a timeout.
     #[test]
-    fn profil_exige_les_deux_cles() {
-        let sans_rien = Options {
+    fn profile_requires_both_keys() {
+        let with_nothing = Options {
             client_key: None,
             gateway_key: None,
             wg_iface: None,
             only: None,
             repeat: 1,
         };
-        assert!(profile(&sans_rien, "http://x").is_err());
+        assert!(profile(&with_nothing, "http://x").is_err());
 
-        let sans_gateway = Options {
+        let without_gateway = Options {
             client_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into()),
-            ..sans_rien
+            ..with_nothing
         };
-        assert!(profile(&sans_gateway, "http://x").is_err());
+        assert!(profile(&without_gateway, "http://x").is_err());
     }
 
-    /// Les scénarios client doivent tourner sans réseau : ils sont la base
-    /// commune du dry-run et de la cible.
+    /// The client scenarios must run without a network: they are the common
+    /// base for both dry-run and target.
     #[test]
-    fn les_scenarios_client_detectent_une_gateway_usurpee() {
-        let profil = ClientProfile {
+    fn client_scenarios_detect_a_spoofed_gateway() {
+        let profile = ClientProfile {
             name: "t".into(),
             endpoint: "127.0.0.1:51820".into(),
             private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
@@ -712,50 +710,44 @@ mod tests {
             ..ClientProfile::default()
         };
         assert!(matches!(
-            scenario_identite_gateway(&profil),
+            scenario_gateway_identity(&profile),
             Outcome::Pass(_)
         ));
         assert!(matches!(
-            scenario_ciphertext_malforme(&profil),
+            scenario_malformed_ciphertext(&profile),
             Outcome::Pass(_)
         ));
         assert!(matches!(
-            scenario_version_protocole(&profil),
+            scenario_protocol_version(&profile),
             Outcome::Pass(_)
         ));
     }
 
-    /// Le détecteur de secrets doit distinguer un secret sérialisé d'un simple
-    /// indicateur de présence. Les confondre ferait échouer la campagne contre
-    /// une API parfaitement correcte — c'est exactement ce qui est arrivé à la
-    /// première version de ce scénario.
+    /// The secret detector must distinguish a serialized secret from a mere
+    /// presence indicator. Confusing them would make the campaign fail
+    /// against a perfectly correct API — exactly what happened to the first
+    /// version of this scenario.
     #[test]
-    fn indicateur_de_presence_n_est_pas_une_fuite() {
+    fn presence_indicator_is_not_a_leak() {
         let correct = serde_json::json!({
             "wg_private_key_configured": true,
-            "peers": [{ "name": "poste", "preshared_key_configured": true }]
+            "peers": [{ "name": "laptop", "preshared_key_configured": true }]
         });
-        assert_eq!(champ_secret(&correct), None, "faux positif sur un booléen");
+        assert_eq!(secret_field(&correct), None, "false positive on a boolean");
 
-        let fuite_racine = serde_json::json!({ "wg_private_key": "AAAA" });
-        assert_eq!(
-            champ_secret(&fuite_racine).as_deref(),
-            Some("wg_private_key")
-        );
+        let root_leak = serde_json::json!({ "wg_private_key": "AAAA" });
+        assert_eq!(secret_field(&root_leak).as_deref(), Some("wg_private_key"));
 
-        // La fuite peut être imbriquée dans un tableau : le parcours doit
-        // descendre, pas seulement regarder la racine.
-        let fuite_imbriquee = serde_json::json!({
-            "peers": [{ "name": "poste", "preshared_key": "secret" }]
+        // The leak can be nested in an array: the traversal must descend,
+        // not just look at the root.
+        let nested_leak = serde_json::json!({
+            "peers": [{ "name": "laptop", "preshared_key": "secret" }]
         });
-        assert_eq!(
-            champ_secret(&fuite_imbriquee).as_deref(),
-            Some("preshared_key")
-        );
+        assert_eq!(secret_field(&nested_leak).as_deref(), Some("preshared_key"));
     }
 
     #[test]
-    fn issue_check_traduit_la_condition() {
+    fn outcome_check_translates_the_condition() {
         assert!(matches!(Outcome::check(true, "d", "e"), Outcome::Pass(_)));
         assert!(matches!(Outcome::check(false, "d", "e"), Outcome::Fail(_)));
     }

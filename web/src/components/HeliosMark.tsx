@@ -1,18 +1,18 @@
 /**
- * Marque Helios — la gateway.
+ * Helios mark — the gateway.
  *
- * Grammaire commune aux deux marques du projet (cf. `OrionMark` côté client) :
- * un anneau de confinement, un centre plein, une trajectoire elliptique qui
- * passe *derrière* ce centre. Registre institutionnel aérospatial : monoline,
- * symétrique, aucune fioriture — la marque doit rester lisible à 20 px dans une
- * barre latérale comme à 400 px sur un écran de supervision.
+ * Grammar shared by the project's two marks (cf. `OrionMark` on the client
+ * side): a containment ring, a solid center, an elliptical trajectory that
+ * passes *behind* that center. Institutional aerospace register: monoline,
+ * symmetric, no frills — the mark must stay legible at 20 px in a sidebar
+ * as well as at 400 px on a supervision screen.
  *
- * Ici le centre est le disque solaire et sa couronne : Helios est la source,
- * le point fixe autour duquel les clients gravitent.
+ * Here the center is the solar disk and its corona: Helios is the source,
+ * the fixed point around which clients orbit.
  */
 
 const RAYS = 12
-/** Un rai sur trois est long — donne un rythme au lieu d'une roue dentée uniforme. */
+/** Every third ray is long — gives a rhythm instead of a uniform cogwheel. */
 const RAY_INNER = 11.5
 const RAY_LONG = 18
 const RAY_SHORT = 15.25
@@ -37,7 +37,7 @@ function rays() {
 
 interface Props {
   className?: string
-  /** Masque la trajectoire orbitale — version compacte pour les très petites tailles. */
+  /** Hides the orbital trajectory — compact version for very small sizes. */
   compact?: boolean
   title?: string
 }
@@ -54,15 +54,15 @@ export function HeliosMark({ className = '', compact = false, title }: Props) {
     >
       {title && <title>{title}</title>}
 
-      {/* Anneau de confinement — le cadre « sceau » institutionnel. */}
+      {/* Containment ring — the institutional "seal" frame. */}
       <circle cx="24" cy="24" r="22.25" stroke="currentColor" strokeOpacity="0.22" strokeWidth="1" />
 
-      {/* Couronne. */}
+      {/* Corona. */}
       <g stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeOpacity="0.9">
         {rays()}
       </g>
 
-      {/* Trajectoire — inclinée, elle traverse la couronne et disparaît sous le disque. */}
+      {/* Trajectory — tilted, it crosses the corona and disappears under the disk. */}
       {!compact && (
         <ellipse
           cx="24"
@@ -76,13 +76,13 @@ export function HeliosMark({ className = '', compact = false, title }: Props) {
         />
       )}
 
-      {/* Disque solaire — dessiné en dernier : il occulte la trajectoire, qui passe derrière. */}
+      {/* Solar disk — drawn last: it occults the trajectory, which passes behind. */}
       <circle cx="24" cy="24" r="8.75" fill="currentColor" />
     </svg>
   )
 }
 
-/** Marque + typographie, pour un en-tête. */
+/** Mark + typography, for a header. */
 export function HeliosLockup({ className = '' }: { className?: string }) {
   return (
     <div className={`flex items-center gap-3 ${className}`}>

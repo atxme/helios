@@ -1,43 +1,43 @@
-//! MTU du lien qui porte le tunnel, côté client.
+//! MTU of the link carrying the tunnel, on the client side.
 //!
-//! Le calcul lui-même vit dans [`aether::mtu`], partagé avec la gateway. Ce
-//! module ne fournit que l'entrée : le MTU du transport.
+//! The computation itself lives in [`aether::mtu`], shared with the gateway.
+//! This module only provides the input: the transport's MTU.
 //!
-//! # Pourquoi le client, et pas seulement la gateway
+//! # Why the client, and not just the gateway
 //!
-//! Le MTU WireGuard est **par interface**. La gateway n'en ayant qu'une pour
-//! tous ses clients, elle ne peut pas servir une valeur différente à chacun.
-//! Côté client, en revanche, une interface ne porte qu'un pair : son MTU peut
-//! donc coller exactement au chemin. C'est ce qui rend un poste sur un lien à
-//! 1500 et un autre à 1280 simultanément fonctionnels, sans configuration.
+//! WireGuard's MTU is **per interface**. Since the gateway only has one for
+//! all its clients, it can't serve a different value to each. On the client
+//! side, however, an interface only carries one peer: its MTU can therefore
+//! hug the path exactly. This is what makes a machine on a 1500 link and
+//! another on a 1280 link simultaneously functional, without configuration.
 //!
-//! # Limite connue : Linux seulement
+//! # Known limitation: Linux only
 //!
-//! La détection s'appuie sur `/proc/net/route` et `/sys/class/net`, absents
-//! ailleurs. Sur Windows et macOS, [`mtu_transport`] renvoie `None` et le
-//! backend laisse le défaut de WireGuard (1420) — le comportement d'avant ce
-//! module, correct tant que le transport est à 1500, et pris en défaut en
-//! dessous.
+//! Detection relies on `/proc/net/route` and `/sys/class/net`, absent
+//! elsewhere. On Windows and macOS, [`mtu_transport`] returns `None` and the
+//! backend keeps WireGuard's default (1420) — the behavior before this
+//! module, correct as long as the transport is at 1500, and falling short
+//! below that.
 //!
-//! Ce qui débloquerait ces plateformes : `GetIfEntry2` sur Windows,
-//! `getifaddrs` sur macOS, ou une dépendance d'énumération d'interfaces. Aucune
-//! n'est dans le workspace aujourd'hui, et aucune n'est vérifiable depuis la
-//! cible Linux d'essai — l'ajouter sans pouvoir l'exercer déplacerait le risque
-//! sans le réduire.
+//! What would unblock these platforms: `GetIfEntry2` on Windows,
+//! `getifaddrs` on macOS, or an interface-enumeration dependency. None is in
+//! the workspace today, and none is verifiable from the Linux test target —
+//! adding it without being able to exercise it would shift the risk without
+//! reducing it.
 
-/// MTU du lien portant la route par défaut, ou `None` si indéterminable.
+/// MTU of the link carrying the default route, or `None` if undeterminable.
 ///
-/// La route par défaut est le bon repère pour un client road-warrior : sa
-/// gateway est distante, donc joignable par elle. Un déploiement où la gateway
-/// est sur le LAN emprunterait une route connectée, mais son MTU est alors
-/// celui de la même interface physique.
+/// The default route is the right reference for a road-warrior client: its
+/// gateway is remote, hence reachable through it. A deployment where the
+/// gateway is on the LAN would take a connected route, but its MTU is then
+/// that of the same physical interface.
 pub fn mtu_transport() -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
         let table = std::fs::read_to_string("/proc/net/route").ok()?;
-        let iface = iface_route_defaut(&table)?;
-        let brut = std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu")).ok()?;
-        brut.trim().parse().ok()
+        let iface = default_route_iface(&table)?;
+        let raw = std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu")).ok()?;
+        raw.trim().parse().ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -45,22 +45,22 @@ pub fn mtu_transport() -> Option<u32> {
     }
 }
 
-/// Interface portant la route par défaut, extraite de `/proc/net/route`.
+/// Interface carrying the default route, extracted from `/proc/net/route`.
 ///
-/// Le format est tabulaire : `Iface Destination Gateway Flags …`, les adresses
-/// en hexadécimal petit-boutiste. La route par défaut est celle dont la
-/// destination vaut zéro.
+/// The format is tabular: `Iface Destination Gateway Flags …`, addresses in
+/// little-endian hexadecimal. The default route is the one whose
+/// destination is zero.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn iface_route_defaut(table: &str) -> Option<&str> {
+fn default_route_iface(table: &str) -> Option<&str> {
     table
         .lines()
-        .skip(1) // ligne d'en-tête
-        .filter_map(|ligne| {
-            let mut champs = ligne.split_whitespace();
-            let iface = champs.next()?;
-            let destination = champs.next()?;
-            // `u32::from_str_radix` plutôt qu'une comparaison à "00000000" :
-            // le noyau peut zéro-padder différemment selon les versions.
+        .skip(1) // header line
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let iface = fields.next()?;
+            let destination = fields.next()?;
+            // `u32::from_str_radix` rather than a comparison to "00000000":
+            // the kernel may zero-pad differently depending on the version.
             (u32::from_str_radix(destination, 16).ok()? == 0).then_some(iface)
         })
         .next()
@@ -76,32 +76,32 @@ eth0\t00000000\t01004E0A\t0003\t0\t0\t0\t00000000\t0\t0\t0
 eth0\t00004E0A\t00000000\t0001\t0\t0\t0\t00F0FFFF\t0\t0\t0";
 
     #[test]
-    fn la_route_par_defaut_est_reconnue() {
-        assert_eq!(iface_route_defaut(TABLE), Some("eth0"));
+    fn the_default_route_is_recognized() {
+        assert_eq!(default_route_iface(TABLE), Some("eth0"));
     }
 
     #[test]
-    fn une_table_sans_route_par_defaut_ne_renvoie_rien() {
-        let sans_defaut = "Iface\tDestination\tGateway\n\
+    fn a_table_without_a_default_route_returns_nothing() {
+        let no_default = "Iface\tDestination\tGateway\n\
              eth0\t00004E0A\t00000000\t0001\t0\t0\t0\t00F0FFFF\t0\t0\t0";
-        assert_eq!(iface_route_defaut(sans_defaut), None);
+        assert_eq!(default_route_iface(no_default), None);
     }
 
     #[test]
-    fn la_premiere_route_par_defaut_l_emporte() {
-        // Plusieurs défauts coexistent quand deux liens sont montés ; le noyau
-        // les ordonne par métrique croissante, donc le premier est l'actif.
-        let deux = "Iface\tDestination\tGateway\n\
+    fn the_first_default_route_wins() {
+        // Several defaults coexist when two links are up; the kernel orders
+        // them by increasing metric, so the first one is the active one.
+        let two = "Iface\tDestination\tGateway\n\
              wlan0\t00000000\t01004E0A\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
              eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0";
-        assert_eq!(iface_route_defaut(deux), Some("wlan0"));
+        assert_eq!(default_route_iface(two), Some("wlan0"));
     }
 
     #[test]
-    fn une_table_vide_ou_tronquee_ne_panique_pas() {
-        assert_eq!(iface_route_defaut(""), None);
-        assert_eq!(iface_route_defaut("Iface\tDestination"), None);
-        assert_eq!(iface_route_defaut("Iface\neth0"), None);
-        assert_eq!(iface_route_defaut("Iface\neth0\tPASDELHEXA"), None);
+    fn an_empty_or_truncated_table_does_not_panic() {
+        assert_eq!(default_route_iface(""), None);
+        assert_eq!(default_route_iface("Iface\tDestination"), None);
+        assert_eq!(default_route_iface("Iface\neth0"), None);
+        assert_eq!(default_route_iface("Iface\neth0\tPASDELHEXA"), None);
     }
 }

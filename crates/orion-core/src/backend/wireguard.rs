@@ -1,34 +1,34 @@
-//! Backend WireGuard réel, via `defguard_wireguard_rs`.
+//! Real WireGuard backend, via `defguard_wireguard_rs`.
 //!
-//! Compilé derrière la feature `wireguard`. Il **compile** partout, mais ne peut
-//! être *exercé* que sur une machine disposant du plan de données WireGuard —
-//! même statut que la feature `netlink` côté heliosd. Sur WSL2, il compile et
-//! échoue à l'exécution (pas de module `wireguard` dans le noyau).
+//! Compiled behind the `wireguard` feature. It **compiles** everywhere, but can
+//! only be *exercised* on a machine with a WireGuard data plane — same status
+//! as the `netlink` feature on the heliosd side. On WSL2, it compiles and
+//! fails at runtime (no `wireguard` kernel module).
 //!
-//! # Implémentation choisie par plateforme
+//! # Implementation chosen per platform
 //!
-//! `defguard_wireguard_rs` expose deux implémentations, et **toutes les
-//! plateformes n'ont pas le choix** :
+//! `defguard_wireguard_rs` exposes two implementations, and **not all
+//! platforms get to choose**:
 //!
-//! | Plateforme | Implémentation | Plan de données |
+//! | Platform | Implementation | Data plane |
 //! |---|---|---|
-//! | Linux   | `WGApi<Kernel>`    | module noyau `wireguard` (netlink) |
-//! | Windows | `WGApi<Kernel>`    | pilote noyau `wireguard-nt` |
-//! | macOS   | `WGApi<Userspace>` | BoringTun embarqué (`defguard_boringtun`) |
+//! | Linux   | `WGApi<Kernel>`    | `wireguard` kernel module (netlink) |
+//! | Windows | `WGApi<Kernel>`    | `wireguard-nt` kernel driver |
+//! | macOS   | `WGApi<Userspace>` | embedded BoringTun (`defguard_boringtun`) |
 //!
-//! ⚠️ **Écart assumé avec l'ADR-001 §1**, qui prévoyait « BoringTun (userspace) +
-//! Wintun » sur Windows : le module `wgapi_userspace` de defguard est
-//! `#[cfg(unix)]`, donc **indisponible sur Windows**. Ce crate n'y propose que le
-//! chemin noyau. Voir la note de vigilance de l'ADR : Wintun étant lui-même un
-//! pilote NDIS noyau, l'objectif « 100 % user-space » n'était de toute façon pas
-//! atteignable — on remplace un composant noyau par un autre.
+//! ⚠️ **Deliberate deviation from ADR-001 §1**, which planned "BoringTun
+//! (userspace) + Wintun" on Windows: defguard's `wgapi_userspace` module is
+//! `#[cfg(unix)]`, hence **unavailable on Windows**. This crate only offers
+//! the kernel path there. See the ADR's caution note: since Wintun is itself
+//! an NDIS kernel driver, the "100% user-space" goal wasn't achievable anyway
+//! — we're replacing one kernel component with another.
 //!
-//! # L'invariante de cycle de vie
+//! # The lifecycle invariant
 //!
-//! Ce backend applique la règle de [`super`] : l'interface est créée **avant**
-//! toute opération faillible, et **jamais retirée sur un chemin d'erreur**. Seul
-//! [`WireGuardBackend::down`] la supprime. Retirer cette propriété rouvrirait la
-//! fuite en clair décrite en ADR-001 §3 bis.
+//! This backend applies the rule from [`super`]: the interface is created
+//! **before** any fallible operation, and **never removed on an error path**.
+//! Only [`WireGuardBackend::down`] removes it. Removing this property would
+//! reopen the clear-text leak described in ADR-001 §3 bis.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,41 +46,41 @@ use crate::events::ClientEvent;
 
 use super::{EventSink, VpnBackend};
 
-/// Implémentation `defguard` retenue pour la plateforme courante (voir tableau
-/// en tête de module).
+/// `defguard` implementation chosen for the current platform (see table
+/// at the top of the module).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 type WgApiImpl = WGApi<defguard_wireguard_rs::Kernel>;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 type WgApiImpl = WGApi<defguard_wireguard_rs::Userspace>;
 
-/// Nom de l'interface WireGuard créée par Orion.
+/// Name of the WireGuard interface created by Orion.
 const DEFAULT_IFNAME: &str = "orion0";
 
-/// Port d'écoute local. `0` = port éphémère choisi par l'OS, ce qui est le
-/// comportement attendu d'un client road-warrior (il initie, il n'écoute pas).
+/// Local listen port. `0` = ephemeral port chosen by the OS, which is the
+/// expected behavior of a road-warrior client (it initiates, it doesn't listen).
 const CLIENT_LISTEN_PORT: u16 = 0;
 
 pub struct WireGuardBackend {
     ifname: String,
-    /// L'API `defguard` est **synchrone** et `create_interface` exige `&mut`.
-    /// D'où le `Mutex` : il fournit l'accès mutable derrière le `&self` du trait.
-    /// Aucun `await` n'est tenu pendant que le verrou est pris.
+    /// The `defguard` API is **synchronous** and `create_interface` requires
+    /// `&mut`. Hence the `Mutex`: it provides mutable access behind the
+    /// trait's `&self`. No `await` is held while the lock is taken.
     api: Mutex<WgApiImpl>,
-    /// Reflète l'existence de l'interface. Sert à vérifier l'invariante.
+    /// Reflects whether the interface exists. Used to check the invariant.
     adapter_up: AtomicBool,
-    /// Clé publique du pair, pour retrouver ses stats dans `read_interface_data`.
+    /// Peer's public key, to find its stats in `read_interface_data`.
     peer_key: Mutex<Option<Key>>,
 }
 
 impl WireGuardBackend {
-    /// Construit le backend pour l'interface `orion0`.
+    /// Builds the backend for the `orion0` interface.
     pub fn new() -> anyhow::Result<Self> {
         Self::with_ifname(DEFAULT_IFNAME)
     }
 
     pub fn with_ifname(ifname: &str) -> anyhow::Result<Self> {
         let api = WgApiImpl::new(ifname.to_string())
-            .map_err(|e| anyhow::anyhow!("initialisation de l'API WireGuard : {e}"))?;
+            .map_err(|e| anyhow::anyhow!("WireGuard API initialization: {e}"))?;
         Ok(Self {
             ifname: ifname.to_string(),
             api: Mutex::new(api),
@@ -89,7 +89,7 @@ impl WireGuardBackend {
         })
     }
 
-    /// Traduit le profil en pair WireGuard `defguard`.
+    /// Translates the profile into a `defguard` WireGuard peer.
     fn build_peer(profile: &ClientProfile) -> anyhow::Result<Peer> {
         let public_key = Key::try_from(profile.peer_public_key.as_str())
             .map_err(|e| anyhow::anyhow!("clé publique du pair invalide : {e}"))?;
@@ -105,14 +105,15 @@ impl WireGuardBackend {
 
         peer.persistent_keepalive_interval = Some(profile.persistent_keepalive);
 
-        // PSK post-quantique (ML-KEM). Absent = tunnel classique seul.
+        // The `PresharedKey` slot, regardless of the secret's origin: static
+        // on first mount, PQC on the remount performed by the ML-KEM upgrade.
+        // Empty = Curve25519 only.
         if let Some(psk) = profile
             .preshared_key
             .as_deref()
             .filter(|k| !k.trim().is_empty())
         {
-            let psk = Key::try_from(psk)
-                .map_err(|e| anyhow::anyhow!("PSK post-quantique invalide : {e}"))?;
+            let psk = Key::try_from(psk).map_err(|e| anyhow::anyhow!("PSK invalide : {e}"))?;
             peer.preshared_key = Some(psk);
         }
 
@@ -123,8 +124,8 @@ impl WireGuardBackend {
 #[async_trait]
 impl VpnBackend for WireGuardBackend {
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
-        // 1. Tout ce qui peut échouer sans effet de bord se fait AVANT de créer
-        //    l'interface : profil, clés, endpoint, adresse.
+        // 1. Everything that can fail without a side effect is done BEFORE
+        //    creating the interface: profile, keys, endpoint, address.
         profile.validate()?;
 
         let address = profile
@@ -137,9 +138,9 @@ impl VpnBackend for WireGuardBackend {
         let address = IpAddrMask::from_str(address)
             .map_err(|e| anyhow::anyhow!("adresse `{address}` invalide : {e}"))?;
 
-        // Valide le format de la clé privée MAINTENANT. `defguard` l'attend
-        // encodée dans `InterfaceConfiguration::prvkey` et ne la rejetterait
-        // qu'après création de l'interface — trop tard pour échouer proprement.
+        // Validates the private key format NOW. `defguard` expects it
+        // encoded in `InterfaceConfiguration::prvkey` and would only reject
+        // it after the interface is created — too late to fail cleanly.
         Key::try_from(profile.private_key.as_str())
             .map_err(|e| anyhow::anyhow!("clé privée du client invalide : {e}"))?;
 
@@ -152,11 +153,11 @@ impl VpnBackend for WireGuardBackend {
             addresses: vec![address],
             port: CLIENT_LISTEN_PORT as u32 as u16,
             peers: vec![peer.clone()],
-            // Le défaut de WireGuard (1420) suppose un transport à 1500. Sous
-            // ce seuil, les paquets chiffrés dépassent le MTU du lien et sont
-            // jetés en silence : le handshake et les requêtes courtes passent,
-            // seules les grosses disparaissent. Une interface cliente ne porte
-            // qu'un pair, donc son MTU peut coller au chemin réel.
+            // WireGuard's default (1420) assumes a 1500 transport. Below
+            // that threshold, encrypted packets exceed the link's MTU and
+            // are silently dropped: the handshake and short requests get
+            // through, only large ones disappear. A client interface only
+            // carries one peer, so its MTU can hug the real path.
             mtu: crate::mtu::mtu_transport().map(aether::mtu::tunnel_mtu),
             fwmark: None,
         };
@@ -165,9 +166,9 @@ impl VpnBackend for WireGuardBackend {
 
         let mut api = self.api.lock().unwrap();
 
-        // 2. Création de l'interface. Dès qu'elle réussit, `AllowedIPs` capture
-        //    le trafic : WireGuard le JETTE tant que la session n'est pas
-        //    établie. À partir d'ici, aucun chemin d'erreur ne doit la retirer.
+        // 2. Interface creation. As soon as it succeeds, `AllowedIPs` captures
+        //    traffic: WireGuard DROPS it as long as the session isn't
+        //    established. From here on, no error path must remove it.
         api.create_interface()
             .map_err(|e| anyhow::anyhow!("création de l'interface {} : {e}", self.ifname))?;
         self.adapter_up.store(true, Ordering::SeqCst);
@@ -179,37 +180,41 @@ impl VpnBackend for WireGuardBackend {
             ),
         ));
 
-        // 3. Configuration. En cas d'échec on remonte l'erreur SANS démonter :
-        //    une interface montée mais mal configurée ne laisse rien fuir, une
-        //    interface absente si (ADR-001 §3 bis).
+        // 3. Configuration. On failure we propagate the error WITHOUT
+        //    unmounting: an interface that's mounted but misconfigured leaks
+        //    nothing, an absent interface would (ADR-001 §3 bis).
         api.configure_interface(&config)
             .map_err(|e| anyhow::anyhow!("configuration de l'interface : {e}"))?;
         api.configure_peer_routing(&config.peers)
             .map_err(|e| anyhow::anyhow!("routage du pair : {e}"))?;
 
-        let pq = if profile.is_post_quantum() {
-            "PSK post-quantique actif"
+        // The backend sees a filled or empty slot, never where the secret
+        // came from. It's `upgrade_to_post_quantum` that later names it
+        // static PSK or PQC PSK; here, announcing "post-quantum" would be a
+        // claim we have no way to back up.
+        let pq = if profile.has_preshared_key() {
+            "slot PresharedKey renseigné"
         } else {
-            "tunnel classique (PSK PQ absent)"
+            "slot PresharedKey vide (Curve25519 seul)"
         };
         sink(ClientEvent::log(
             "info",
             format!("pair configuré vers {} — {pq}", profile.endpoint),
         ));
 
-        // On ne signale PAS `Up` ici : WireGuard est sans connexion, l'état se
-        // déduit d'un handshake frais. C'est `VpnController::poll_handshake` qui
-        // promeut `Connecting` → `Up` (ADR-001 §3).
+        // We do NOT signal `Up` here: WireGuard is connectionless, state is
+        // inferred from a fresh handshake. It's `VpnController::poll_handshake`
+        // that promotes `Connecting` → `Up` (ADR-001 §3).
         Ok(())
     }
 
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()> {
-        // Seul chemin autorisé à retirer l'interface.
+        // Only path allowed to remove the interface.
         //
-        // `mut` est requis sur Windows — `WireguardInterfaceApi::remove_interface`
-        // y prend `&mut self`, contre `&self` ailleurs. Le garder inconditionnel
-        // évite un `cfg` par plateforme ; d'où l'`allow` pour les cibles où il
-        // est superflu.
+        // `mut` is required on Windows — `WireguardInterfaceApi::remove_interface`
+        // takes `&mut self` there, versus `&self` elsewhere. Keeping it
+        // unconditional avoids a per-platform `cfg`; hence the `allow` for
+        // targets where it's superfluous.
         #[allow(unused_mut)]
         let mut api = self.api.lock().unwrap();
         let result = api.remove_interface();
@@ -231,8 +236,8 @@ impl VpnBackend for WireGuardBackend {
         let host = self.api.lock().unwrap().read_interface_data().ok()?;
         let last = host.peers.get(&peer_key)?.last_handshake?;
 
-        // WireGuard rapporte l'epoch tant qu'aucun handshake n'a eu lieu :
-        // le traiter comme « jamais » plutôt que comme « il y a 55 ans ».
+        // WireGuard reports the epoch as long as no handshake has happened:
+        // treat it as "never" rather than "55 years ago".
         if last == UNIX_EPOCH {
             return None;
         }
@@ -262,7 +267,7 @@ mod tests {
         ClientProfile {
             name: "test".into(),
             endpoint: "203.0.113.10:51820".into(),
-            // Clés Curve25519 valides en base64 (32 octets).
+            // Valid Curve25519 keys in base64 (32 bytes).
             private_key: "aAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAA=".into(),
             peer_public_key: "bBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBA=".into(),
             address: Some("100.64.1.2/32".into()),
@@ -270,10 +275,10 @@ mod tests {
         }
     }
 
-    /// La traduction profil → pair `defguard` doit être fidèle. Testable sans
-    /// aucun plan de données : c'est de la conversion pure.
+    /// The profile → `defguard` peer translation must be faithful. Testable
+    /// without any data plane: it's pure conversion.
     #[test]
-    fn construction_du_pair_depuis_le_profil() {
+    fn peer_construction_from_the_profile() {
         let p = profile();
         let peer = WireGuardBackend::build_peer(&p).unwrap();
 
@@ -281,31 +286,31 @@ mod tests {
         assert_eq!(peer.allowed_ips[0].to_string(), "0.0.0.0/0");
         assert_eq!(peer.persistent_keepalive_interval, Some(25));
         assert!(peer.endpoint.is_some());
-        assert!(peer.preshared_key.is_none(), "pas de PSK dans ce profil");
+        assert!(peer.preshared_key.is_none(), "no PSK in this profile");
     }
 
     #[test]
-    fn le_psk_post_quantique_est_transmis_au_pair() {
+    fn the_post_quantum_psk_is_passed_to_the_peer() {
         let mut p = profile();
         p.preshared_key = Some("cCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCA=".into());
         let peer = WireGuardBackend::build_peer(&p).unwrap();
         assert!(
             peer.preshared_key.is_some(),
-            "le PSK ML-KEM doit atteindre WireGuard"
+            "the ML-KEM PSK must reach WireGuard"
         );
     }
 
     #[test]
-    fn cle_de_pair_invalide_rejetee() {
+    fn invalid_peer_key_rejected() {
         let mut p = profile();
-        p.peer_public_key = "pas-du-base64-valide".into();
+        p.peer_public_key = "not-valid-base64".into();
         assert!(WireGuardBackend::build_peer(&p).is_err());
     }
 
     #[test]
-    fn endpoint_invalide_rejete() {
+    fn invalid_endpoint_rejected() {
         let mut p = profile();
-        p.endpoint = "je-ne-suis-pas-un-endpoint".into();
+        p.endpoint = "not-an-endpoint".into();
         assert!(WireGuardBackend::build_peer(&p).is_err());
     }
 }

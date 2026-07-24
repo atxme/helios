@@ -1,4 +1,4 @@
-//! Helper privilégié, local et sans réseau, des mises à jour applicatives.
+//! Privileged, local, network-free helper for application updates.
 
 use std::{
     fs,
@@ -20,7 +20,7 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Parser)]
 #[command(
     name = "helios-installer",
-    about = "Installe localement une release heliosd déjà signée et stagée"
+    about = "Locally installs an already signed and staged heliosd release"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,18 +29,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandKind {
-    /// Consomme `/var/lib/helios/updates/activate.json`.
+    /// Consumes `/var/lib/helios/updates/activate.json`.
     InstallPending,
-    /// Installe un bundle signé sur une gateway (ADR-004).
+    /// Installs a signed bundle on a gateway (ADR-004).
     ///
-    /// Premier déploiement comme réinstallation : le contenu est vérifié
-    /// entièrement — signature hybride, empreinte de chaque fichier, absence de
-    /// fichier surnuméraire — avant la moindre écriture.
+    /// First deployment and reinstallation alike: the content is fully
+    /// verified — hybrid signature, each file's fingerprint, absence of any
+    /// extra file — before the slightest write.
     Bootstrap {
-        /// Archive produite par `cargo xtask pack`.
+        /// Archive produced by `cargo xtask pack`.
         #[arg(long, conflicts_with = "dir")]
         archive: Option<PathBuf>,
-        /// Répertoire de bundle déjà extrait.
+        /// Already-extracted bundle directory.
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -53,11 +53,12 @@ fn main() -> Result<()> {
     }
 }
 
-/// Installe un bundle signé, puis rend la main à l'opérateur.
+/// Installs a signed bundle, then hands control back to the operator.
 ///
-/// La commande n'active aucun service et ne démarre rien : sur une gateway
-/// neuve, l'identité WireGuard n'existe pas encore et le kill-switch couperait
-/// l'accès. La séquence d'après appartient à l'opérateur, avec accès console.
+/// The command activates no service and starts nothing: on a fresh gateway,
+/// the WireGuard identity does not exist yet and the kill switch would cut
+/// off access. The next sequence belongs to the operator, with console
+/// access.
 fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     let update = UpdateLayout::for_daemon(false);
     let layout = BootstrapLayout::system(update);
@@ -68,11 +69,11 @@ fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
             (root, true)
         }
         (None, Some(dir)) => (dir, false),
-        (None, None) => bail!("indiquer --archive <fichier.tar.gz> ou --dir <répertoire>"),
+        (None, None) => bail!("provide --archive <file.tar.gz> or --dir <directory>"),
     };
 
     let report = bundle::install(&root, &layout)
-        .with_context(|| format!("installation du bundle {}", root.display()))?;
+        .with_context(|| format!("installing bundle {}", root.display()))?;
 
     if extracted {
         if let Some(parent) = root.parent() {
@@ -83,41 +84,40 @@ fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     let units_reloaded = reload_units();
 
     println!(
-        "helios {} séquence {} installé (canal {})",
+        "helios {} sequence {} installed (channel {})",
         report.version, report.release_sequence, report.channel
     );
     for path in &report.installed {
         println!("  {}", path.display());
     }
     if report.config_preserved {
-        println!("  {} conservée telle quelle", layout.config_path.display());
+        println!("  {} kept as is", layout.config_path.display());
     }
     if let Err(error) = units_reloaded {
-        // Les fichiers sont posés et vérifiés : échouer ici annoncerait une
-        // installation ratée alors qu'elle a réussi. On le dit fort, sans
-        // masquer, parce que les unités restent à recharger.
+        // The files are laid down and verified: failing here would announce
+        // a failed installation when it succeeded. We say so loudly, without
+        // hiding it, because the units still need reloading.
         eprintln!(
-            "\nATTENTION : les unités systemd n'ont pas été rechargées ({error:#}). \
-             Exécuter `systemctl daemon-reload` avant d'activer les services."
+            "\nWARNING: systemd units were not reloaded ({error:#}). \
+             Run `systemctl daemon-reload` before activating the services."
         );
     }
-    println!("\nSuite, avec accès console :");
-    println!("  sudo heliosd provision-tpm     # premier déploiement seulement");
-    println!("  sudo heliosd init-identity     # affiche la clé publique de la gateway");
-    println!("  sudo heliosd peer add --name <nom> --public-key <clé> --admin");
+    println!("\nNext, with console access:");
+    println!("  sudo heliosd provision-tpm     # first deployment only");
+    println!("  sudo heliosd init-identity     # shows the gateway's public key");
+    println!("  sudo heliosd peer add --name <name> --public-key <key> --admin");
     println!("  sudo systemctl enable --now heliosd helios-update.path");
     Ok(())
 }
 
-/// Extrait une archive dans un répertoire jetable et rend la racine du bundle.
+/// Extracts an archive into a disposable directory and returns the bundle root.
 fn extract(archive: &Path) -> Result<PathBuf> {
     if !archive.is_file() {
-        bail!("{} introuvable", archive.display());
+        bail!("{} not found", archive.display());
     }
     let workspace = std::env::temp_dir().join(format!("helios-bootstrap-{}", std::process::id()));
     let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace)
-        .with_context(|| format!("création de {}", workspace.display()))?;
+    fs::create_dir_all(&workspace).with_context(|| format!("creating {}", workspace.display()))?;
 
     let status = Command::new("tar")
         .arg("-xzf")
@@ -125,23 +125,23 @@ fn extract(archive: &Path) -> Result<PathBuf> {
         .arg("-C")
         .arg(&workspace)
         .status()
-        .context("exécution de tar")?;
+        .context("running tar")?;
     if !status.success() {
-        bail!("extraction de {} échouée ({status})", archive.display());
+        bail!("extraction of {} failed ({status})", archive.display());
     }
 
-    // L'archive contient un unique répertoire racine. Tout autre contenu est
-    // une archive qui n'a pas été produite par `cargo xtask pack`, et dont on
-    // ne devinera pas la disposition.
+    // The archive contains a single root directory. Any other content is an
+    // archive that was not produced by `cargo xtask pack`, and whose layout
+    // will not be guessed.
     let mut entries: Vec<PathBuf> = fs::read_dir(&workspace)
-        .with_context(|| format!("lecture de {}", workspace.display()))?
+        .with_context(|| format!("reading {}", workspace.display()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
     entries.sort();
     match entries.as_slice() {
         [only] if only.is_dir() => Ok(only.clone()),
         _ => bail!(
-            "archive inattendue : un unique répertoire racine est attendu, {} entrée(s) trouvée(s)",
+            "unexpected archive: a single root directory is expected, {} entry(ies) found",
             entries.len()
         ),
     }
@@ -151,37 +151,37 @@ fn reload_units() -> Result<()> {
     let status = Command::new("systemctl")
         .arg("daemon-reload")
         .status()
-        .context("exécution de systemctl daemon-reload")?;
+        .context("running systemctl daemon-reload")?;
     if !status.success() {
-        bail!("systemctl daemon-reload a échoué ({status})");
+        bail!("systemctl daemon-reload failed ({status})");
     }
     Ok(())
 }
 
 fn install_pending() -> Result<()> {
     let layout = UpdateLayout::for_daemon(false);
-    let request = read_activation(&layout.activation_path).context("lecture de l’activation")?;
+    let request = read_activation(&layout.activation_path).context("reading activation")?;
     wait_activation_delay(request.requested_at_unix, request.delay_seconds);
 
-    let guard = prepare_switch(&layout, request.release_sequence)
-        .context("préparation de la bascule atomique")?;
+    let guard =
+        prepare_switch(&layout, request.release_sequence).context("preparing the atomic switch")?;
     let outcome = activate_and_check(&layout, &guard);
     match outcome {
         Ok(()) => {
             if let Err(error) = guard.confirm(&layout.state_path) {
-                restore(&layout, &guard).context("rollback après échec de confirmation")?;
+                restore(&layout, &guard).context("rollback after confirmation failure")?;
                 clear_activation(&layout.activation_path)?;
-                return Err(error).context("persistance de la séquence confirmée");
+                return Err(error).context("persisting the confirmed sequence");
             }
             clear_activation(&layout.activation_path)?;
             println!(
-                "heliosd {} séquence {} confirmé",
+                "heliosd {} sequence {} confirmed",
                 guard.version, guard.sequence
             );
             Ok(())
         }
         Err(error) => {
-            restore(&layout, &guard).context("rollback du binaire précédent")?;
+            restore(&layout, &guard).context("rollback of the previous binary")?;
             clear_activation(&layout.activation_path)?;
             Err(error)
         }
@@ -192,9 +192,7 @@ fn activate_and_check(layout: &UpdateLayout, guard: &SwitchGuard) -> Result<()> 
     match fs::remove_file(&layout.ready_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).context("suppression de l’ancien marqueur de disponibilité")
-        }
+        Err(error) => return Err(error).context("removing the old readiness marker"),
     }
     restart_service()?;
     wait_ready(
@@ -214,7 +212,7 @@ fn restore(layout: &UpdateLayout, guard: &SwitchGuard) -> Result<()> {
     }
     restart_service()?;
     wait_ready(&layout.ready_path, HEALTH_TIMEOUT, None, true)
-        .context("l’ancienne version n’a pas retrouvé son état disponible")
+        .context("the previous version did not return to a ready state")
 }
 
 fn restart_service() -> Result<()> {
@@ -222,9 +220,9 @@ fn restart_service() -> Result<()> {
     let status = Command::new("systemctl")
         .args(["restart", &service])
         .status()
-        .with_context(|| format!("exécution de systemctl restart {service}"))?;
+        .with_context(|| format!("running systemctl restart {service}"))?;
     if !status.success() {
-        bail!("systemctl restart {service} a échoué avec {status}");
+        bail!("systemctl restart {service} failed with {status}");
     }
     Ok(())
 }
@@ -245,12 +243,18 @@ fn wait_ready(
         thread::sleep(Duration::from_millis(250));
     }
     bail!(
-        "heliosd n’a pas publié dans {} la version et le mode attendus sous {} secondes",
+        "heliosd did not publish the expected version and mode in {} within {} seconds",
         path.display(),
         timeout.as_secs()
     )
 }
 
+/// Reads the readiness marker written by `heliosd`.
+///
+/// `mode_reel` (real mode) is the wire literal `heliosd` writes to that
+/// marker file; it is kept as-is here because it is a cross-component
+/// protocol string, not a message — renaming it would require a matching
+/// change in `heliosd`, which is out of scope for this file.
 fn readiness_matches(content: &str, expected_version: Option<&str>, require_real: bool) -> bool {
     let version_ok = expected_version.is_none_or(|version| {
         content
@@ -277,7 +281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disponibilite_exige_version_et_mode_reel() {
+    fn readiness_requires_version_and_real_mode() {
         assert!(readiness_matches(
             "version=1.2.0\nmode_reel=true\n",
             Some("1.2.0"),

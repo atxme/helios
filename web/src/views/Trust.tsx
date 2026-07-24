@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { fetchTrust } from '../api'
 import type { Trust } from '../types'
 
-/** Libellés lisibles des algorithmes exigés, avec ce que chacun apporte. */
+/** Readable labels for the required algorithms, with what each one brings. */
 const ALG_LABEL: Record<string, { name: string; note: string }> = {
   ed25519: {
     name: 'Ed25519',
@@ -47,7 +47,7 @@ export function TrustView() {
 
       {trust && (
         <>
-          {/* Le signal opérationnel qui prime sur tout le reste. */}
+          {/* The operational signal that outweighs everything else. */}
           {trust.development_keys && <DevelopmentKeysBanner />}
 
           <Section
@@ -76,7 +76,7 @@ export function TrustView() {
               })}
             </div>
 
-            {/* La règle qui fait tout le travail : elle mérite d'être écrite noir sur blanc. */}
+            {/* The rule that does all the work: it deserves to be spelled out plainly. */}
             <div className="border-t border-slate-200/60 dark:border-slate-800/60 px-5 py-3.5 space-y-2">
               <Rule ok>Un algorithme exigé sans signature valide → rejet.</Rule>
               <Rule ok>Une signature présente mais invalide → rejet, même si les autres passent.</Rule>
@@ -197,7 +197,7 @@ function Field({ label, value }: { label: string; value: string }) {
   )
 }
 
-/** Découpe l'empreinte en groupes de 4 — comparable à l'œil, comme une empreinte SSH. */
+/** Splits the fingerprint into groups of 4 — visually comparable, like an SSH fingerprint. */
 function groupFingerprint(fingerprint: string): string {
   return (fingerprint.match(/.{1,4}/g) ?? [fingerprint]).join(' ')
 }

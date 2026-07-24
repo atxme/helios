@@ -4,6 +4,7 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  PskKind,
   TelemetrySample,
   TunnelState,
 } from '../types'
@@ -21,6 +22,9 @@ export function useClient() {
   const [telemetry, setTelemetry] = useState<TelemetrySample | null>(null)
   const [history, setHistory] = useState<TelemetrySample[]>([])
   const [upSince, setUpSince] = useState<number | null>(null)
+  // `null` = la connexion en cours n'a pas encore tranché. Surtout pas `'none'`
+  // par défaut : ce serait affirmer l'absence de PSK avant de le savoir.
+  const [psk, setPsk] = useState<PskKind | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
@@ -68,7 +72,14 @@ export function useClient() {
             // L'historique repart à zéro : recoller deux sessions produirait une
             // courbe continue qui n'a jamais existé.
             setHistory([])
+            // Le PSK PQC ne survit pas à la session : il n'est pas persisté et
+            // se renégocie au montage suivant. Le garder afficherait une
+            // protection qu'aucun tunnel ne porte plus.
+            setPsk(null)
           }
+          break
+        case 'protection':
+          setPsk(ev.psk)
           break
         case 'log':
           pushLog(ev.level, ev.message)
@@ -99,6 +110,11 @@ export function useClient() {
 
   const connect = useCallback(async (name?: string) => {
     setError(null)
+    // Nouvelle session, nouvelle négociation : on repart d'« inconnu ». Le
+    // remettre ici plutôt que sur la transition `connecting` est délibéré — un
+    // handshake périmé en cours de session repasse par `connecting` sans que la
+    // protection posée ait changé.
+    setPsk(null)
     try {
       await api.connect(name)
     } catch (e) {
@@ -169,6 +185,7 @@ export function useClient() {
     telemetry,
     history,
     upSince,
+    psk,
     error,
     selectedProfile,
     pathImportedProfile,

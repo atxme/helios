@@ -1,73 +1,80 @@
 use serde::{Deserialize, Serialize};
 
-/// Comportement du pare-feu lorsque le tunnel n'est pas opérationnel.
+/// Firewall behavior when the tunnel is not operational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PolicyMode {
-    /// Kill-switch : on bloque tout (sauf IKE) tant que le tunnel n'est pas Up.
+    /// Kill-switch: block everything (except IKE) as long as the tunnel is not Up.
     #[default]
     FailClosed,
-    /// Mode dégradé : on laisse passer en clair si le tunnel tombe (déconseillé).
+    /// Degraded mode: let traffic through in the clear if the tunnel drops (not recommended).
     FailOpen,
 }
 
-/// Description de haut niveau de ce que le pare-feu doit imposer.
+/// High-level description of what the firewall must enforce.
 ///
-/// C'est l'entrée du moteur de rendu de règles ([`crate`] consommé par
-/// `helios-firewall`). Elle est volontairement déclarative : on décrit l'intention,
-/// pas la syntaxe nftables.
+/// This is the input to the rule-rendering engine ([`crate`] consumed by
+/// `helios-firewall`). It is deliberately declarative: it describes the
+/// intent, not nftables syntax.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallPolicy {
-    /// Interface vers Internet (ex. `eth0`, le contrôleur Realtek RTL8111HS).
+    /// Interface towards the Internet (e.g. `eth0`, the Realtek RTL8111HS controller).
     pub wan_iface: String,
-    /// Interfaces côté LAN dont le trafic doit transiter par le tunnel.
+    /// LAN-side interfaces whose traffic must go through the tunnel.
     pub lan_ifaces: Vec<String>,
-    /// Pairs (adresses IP) joignables en clair pour le transport WireGuard
-    /// (UDP 51820). Seul trafic autorisé à **sortir** du WAN hors tunnel.
-    /// Utile pour des pairs statiques (site-à-site) ; vide en pur road-warrior.
+    /// Peers (IP addresses) reachable in the clear for WireGuard transport
+    /// (UDP 51820). The only traffic allowed to leave the WAN outside the
+    /// tunnel. Useful for static peers (site-to-site); empty in pure
+    /// road-warrior mode.
     pub wg_peers: Vec<String>,
-    /// Port UDP sur lequel la gateway **écoute** les clients WireGuard.
+    /// UDP port on which the gateway **listens** for WireGuard clients.
     ///
-    /// `Some(port)` ouvre ce port en **entrée** depuis n'importe quelle source :
-    /// les road-warriors roament, leur IP est inconnue à l'avance. C'est la
-    /// seule ouverture entrante du modèle fail-closed, et elle est indispensable
-    /// — sans elle aucun client ne peut handshaker. `None` = pas de rôle serveur.
+    /// `Some(port)` opens this port **inbound** from any source: road
+    /// warriors roam, their IP is unknown in advance. This is the only
+    /// inbound opening of the fail-closed model, and it is essential —
+    /// without it no client can handshake. `None` = no server role.
     pub wg_listen_port: Option<u16>,
-    /// Comportement hors tunnel.
+    /// Public UDP port of the pre-WireGuard key-negotiation service.
+    ///
+    /// It is deliberately separate from the kernel-owned WireGuard socket.
+    /// `None` means that no key-negotiation listener is ready and the firewall
+    /// must keep the port closed.
+    pub key_negotiation_port: Option<u16>,
+    /// Behavior outside the tunnel.
     pub mode: PolicyMode,
-    /// CIDR ou IPs autorisés sur le port 22 (SSH d'administration),
-    /// même lorsque le kill-switch est engagé.
+    /// CIDR or IPs allowed on port 22 (administrative SSH), even when the
+    /// kill-switch is engaged.
     pub allow_ssh_from: Vec<String>,
-    /// Autorise DHCP (UDP 67/68) sur l'interface WAN, kill-switch engagé.
+    /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
     ///
-    /// Une gateway a normalement une adresse fixe, d'où le défaut à `false`.
-    /// Mais une gateway placée derrière une box tient souvent son adresse d'un
-    /// bail : sans cette ouverture, elle perd son adresse au premier
-    /// renouvellement — donc son tunnel et son administration à la fois, et
-    /// plusieurs heures après un démarrage qui semblait réussi.
+    /// A gateway normally has a fixed address, hence the default of `false`.
+    /// But a gateway placed behind a box often gets its address from a
+    /// lease: without this opening, it loses its address at the first
+    /// renewal — hence its tunnel and its administration at the same time,
+    /// and several hours after a startup that seemed to succeed.
     pub allow_dhcp_on_wan: bool,
-    /// Route le trafic des clients du tunnel vers Internet : forward
-    /// `wg_iface -> wan_iface` et masquerade, **uniquement** dans un état où le
-    /// trafic est autorisé.
+    /// Routes tunnel clients' traffic to the Internet: forward
+    /// `wg_iface -> wan_iface` and masquerade, **only** in a state where
+    /// traffic is allowed.
     ///
-    /// Fermé par défaut. Ce que cela ne couvre pas : le DNS. Le client garde
-    /// son résolveur, donc ses requêtes sortent hors du tunnel — un profil
-    /// Orion ne sait pas encore pousser de résolveur.
+    /// Closed by default. What this does not cover: DNS. The client keeps
+    /// its resolver, so its requests leave outside the tunnel — an Orion
+    /// profile does not yet know how to push a resolver.
     pub allow_client_internet: bool,
-    /// Interface WireGuard, source du trafic client à router.
+    /// WireGuard interface, source of client traffic to route.
     pub wg_iface: String,
-    /// Port TCP de l'interface d'administration REST/WS.
+    /// TCP port of the REST/WS administration interface.
     pub admin_port: Option<u16>,
-    /// Interface réseau exclusive pour l'accès à l'administration (ex. `helios0`).
+    /// Exclusive network interface for administration access (e.g. `helios0`).
     pub admin_iface: Option<String>,
-    /// CIDRs locaux bypassant le tunnel (split-tunneling dynamique).
-    /// Vide = tout le trafic WAN passe par le tunnel (comportement par défaut).
+    /// Local CIDRs bypassing the tunnel (dynamic split-tunneling).
+    /// Empty = all WAN traffic goes through the tunnel (default behavior).
     pub split_tunnel_cidrs: Vec<String>,
-    /// MSS clamping post-PMTUD (octets). `None` = pas de clamping.
-    /// Calculé automatiquement au lancement du tunnel.
+    /// Post-PMTUD MSS clamping (bytes). `None` = no clamping.
+    /// Computed automatically when the tunnel starts.
     pub mss_clamp: Option<u16>,
-    /// IP de la passerelle du portail captif.
-    /// Renseigné lors de la détection ; HTTP/HTTPS vers cette IP sont autorisés.
+    /// IP of the captive portal gateway.
+    /// Set upon detection; HTTP/HTTPS towards this IP are allowed.
     pub captive_portal_gateway: Option<String>,
 }
 

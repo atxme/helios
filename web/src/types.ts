@@ -1,6 +1,6 @@
 export type TunnelState = 'down' | 'connecting' | 'up' | 'failed' | 'captive_portal'
 
-/** Pair WireGuard admis par la gateway. Le PSK n'est jamais exposé. */
+/** WireGuard peer admitted by the gateway. The PSK is never exposed. */
 export interface PeerSummary {
   name: string
   public_key: string
@@ -9,13 +9,13 @@ export interface PeerSummary {
   admin: boolean
 }
 
-/** Contrat exact de GET /api/status. */
+/** Exact contract of GET /api/status. */
 export interface Status {
   state: TunnelState
   version: string
   wan_iface: string
   lan_ifaces: string[]
-  /** Pairs statiques sortants (site-à-site), distincts des clients admis. */
+  /** Static outbound peers (site-to-site), distinct from admitted clients. */
   wg_peers: string[]
   allow_ssh_from: string[]
   peers: PeerSummary[]
@@ -27,15 +27,15 @@ export interface Status {
   captive_portal_gateway: string | null
 }
 
-/** Une époque du trousseau éditeur. La clé n'est jamais exposée, seulement son empreinte. */
+/** An epoch of the publisher keyring. The key is never exposed, only its fingerprint. */
 export interface PublisherKey {
   key_epoch: number
   fingerprint: string
 }
 
 /**
- * Contrat de GET /api/trust — l'ancre de confiance compilée dans le binaire (ADR-002).
- * Tout y est constante de compilation : rien ici ne se reconfigure à chaud.
+ * Contract of GET /api/trust — the trust anchor compiled into the binary (ADR-002).
+ * Everything here is a compile-time constant: nothing is reconfigured at runtime.
  */
 export interface Trust {
   required_algs: string[]
@@ -60,7 +60,7 @@ export interface TelemetrySample {
   tx_pps: number
 }
 
-/** Événements affichés dans le terminal — hors télémétrie (streamée séparément). */
+/** Events displayed in the terminal — excluding telemetry (streamed separately). */
 export type DisplayEvent = Exclude<HeliosEvent, { type: 'telemetry' }>
 
 export interface FirewallRules {

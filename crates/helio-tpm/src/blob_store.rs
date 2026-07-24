@@ -5,17 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{reseal_ticket::ResealTicket, tpm_interface::SealedBlob, Result, TpmError};
 
-/// État persistant minimal : compteur de version anti-rejeu des billets.
+/// Minimal persistent state: anti-replay version counter for tickets.
 ///
-/// Sur la cible durcie, ce compteur devrait résider dans une zone NVRAM verrouillée
-/// du TPM ; ici il est stocké à côté du blob (suffisant pour le modèle WSL2/dev).
+/// On the hardened target, this counter should live in a locked NVRAM area
+/// of the TPM; here it is stored next to the blob (sufficient for the
+/// WSL2/dev model).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct TpmState {
     #[serde(default)]
     pub version: u64,
 }
 
-/// Accès à la partition de configuration : blob scellé, billet, état.
+/// Access to the configuration partition: sealed blob, ticket, state.
 pub(crate) struct BlobStore<'a> {
     cfg: &'a TpmSettings,
 }
@@ -25,7 +26,7 @@ impl<'a> BlobStore<'a> {
         Self { cfg }
     }
 
-    // ── Blob scellé ──────────────────────────────────────────────────────────
+    // ── Sealed blob ──────────────────────────────────────────────────────────
 
     pub(crate) fn load_blob(&self) -> Result<Option<SealedBlob>> {
         match std::fs::read(&self.cfg.sealed_blob_path) {
@@ -39,7 +40,7 @@ impl<'a> BlobStore<'a> {
         atomic_write(&self.cfg.sealed_blob_path, blob.as_bytes())
     }
 
-    // ── Billet de rescellement ───────────────────────────────────────────────
+    // ── Reseal ticket ────────────────────────────────────────────────────────
 
     pub(crate) fn load_ticket(&self) -> Result<Option<ResealTicket>> {
         match std::fs::read(&self.cfg.ticket_path) {
@@ -49,7 +50,7 @@ impl<'a> BlobStore<'a> {
         }
     }
 
-    /// Supprime le billet après usage (anti-rejeu — un billet ne sert qu'une fois).
+    /// Removes the ticket after use (anti-replay — a ticket is only usable once).
     pub(crate) fn consume_ticket(&self) -> Result<()> {
         match std::fs::remove_file(&self.cfg.ticket_path) {
             Ok(()) => Ok(()),
@@ -58,7 +59,7 @@ impl<'a> BlobStore<'a> {
         }
     }
 
-    // ── État (compteur de version) ───────────────────────────────────────────
+    // ── State (version counter) ─────────────────────────────────────────────
 
     pub(crate) fn load_state(&self) -> Result<TpmState> {
         match std::fs::read(&self.cfg.state_path) {
@@ -81,8 +82,8 @@ fn io_err(path: &str, e: std::io::Error) -> TpmError {
     }
 }
 
-/// Écriture atomique : fichier temporaire + rename, pour ne jamais laisser un
-/// blob/état tronqué en cas de coupure (le démarrage suivant en dépend).
+/// Atomic write: temp file + rename, so a power cut never leaves a
+/// truncated blob/state (the next boot depends on it).
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
     let p = Path::new(path);
     if let Some(parent) = p.parent() {

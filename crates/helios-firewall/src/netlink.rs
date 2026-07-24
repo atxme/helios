@@ -1,8 +1,8 @@
-//! Backend Netlink réel, basé sur `rustables` (nf_tables).
+//! Real Netlink backend, based on `rustables` (nf_tables).
 //!
-//! ⚠️ **Cible uniquement.** Ce module se compile partout, mais ne peut être
-//! *exercé* que sur un kernel disposant de `nf_tables` — pas WSL2. À valider sur
-//! la machine dédiée :
+//! ⚠️ **Target-only.** This module compiles everywhere, but can only be
+//! *exercised* on a kernel with `nf_tables` — not WSL2. To validate on the
+//! dedicated machine:
 //!
 //! ```sh
 //! cargo build -p heliosd --features netlink
@@ -10,30 +10,30 @@
 //! sudo nft list table inet helios
 //! ```
 //!
-//! # Atomicité et fail-closed
+//! # Atomicity and fail-closed
 //!
-//! Toute l'application passe par **une seule transaction Netlink** (`Batch`) :
-//! le kernel l'applique en entier ou pas du tout. Il n'existe donc aucun instant
-//! où la table serait à moitié peuplée — c'est-à-dire aucun instant où le
-//! kill-switch serait partiellement levé.
+//! The whole application goes through **a single Netlink transaction**
+//! (`Batch`): the kernel applies it entirely or not at all. So there is no
+//! instant where the table would be half-populated — i.e. no instant where
+//! the kill-switch would be partially lifted.
 //!
-//! La table est **recréée à chaque application** (`Add`, `Del`, puis `Add` dans
-//! la même transaction) : c'est le seul moyen d'obtenir un remplacement atomique
-//! sans laisser traîner d'anciennes règles.
+//! The table is **recreated on every application** (`Add`, `Del`, then `Add`
+//! within the same transaction): this is the only way to get an atomic
+//! replacement without leaving stale rules behind.
 //!
-//! Le premier `Add` garantit l'existence de la table avant sa suppression. Le
-//! noyau ne tolère **pas** un `Del` sur une table absente : il répond `ENOENT`
-//! et rejette la transaction entière. Sans ce `Add`, aucun kill-switch n'était
-//! posé au tout premier démarrage d'une machine et heliosd s'arrêtait — un
-//! comportement que seul un essai sur cible réelle pouvait révéler.
+//! The first `Add` guarantees the table exists before it is deleted. The
+//! kernel does **not** tolerate a `Del` on an absent table: it responds
+//! `ENOENT` and rejects the whole transaction. Without this `Add`, no
+//! kill-switch was applied on a machine's very first startup and heliosd
+//! would stop — a behavior only a real-target trial could reveal.
 //!
-//! # Limite connue : MSS clamping
+//! # Known limitation: MSS clamping
 //!
-//! `Ruleset::mss_clamp` n'est **pas** appliqué ici : réécrire l'option TCP MSS
-//! est une action de *mangle* que l'API haut niveau de `rustables` n'expose pas.
-//! C'est une optimisation de performance (éviter la fragmentation), pas une
-//! règle de sécurité : son absence ne laisse aucune brèche. Elle est journalisée
-//! en `warn` pour ne pas disparaître en silence.
+//! `Ruleset::mss_clamp` is **not** applied here: rewriting the TCP MSS option
+//! is a *mangle* action that `rustables`' high-level API does not expose.
+//! This is a performance optimization (avoiding fragmentation), not a
+//! security rule: its absence leaves no gap. It is logged at `warn` level so
+//! it does not silently disappear.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -74,7 +74,7 @@ impl NetlinkBackend {
         }
     }
 
-    /// Applique un critère à une règle en construction.
+    /// Applies a match to a rule under construction.
     fn apply_match(rule: NfRule, m: &Match) -> Result<NfRule> {
         let proto = |p: L4| match p {
             L4::Tcp => Protocol::TCP,
@@ -88,7 +88,7 @@ impl NetlinkBackend {
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
             Match::DestPortSet { .. } => {
                 return Err(Self::err(
-                    "ensemble de ports : doit être éclaté par expand_port_sets avant traduction",
+                    "port set: must be expanded by expand_port_sets before translation",
                 ))
             }
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
@@ -96,11 +96,11 @@ impl NetlinkBackend {
         })
     }
 
-    /// Applique un match d'adresse, en acceptant IP simple ou CIDR.
+    /// Applies an address match, accepting either a plain IP or a CIDR.
     fn match_net(rule: NfRule, addr: &str, source: bool) -> Result<NfRule> {
         if addr.contains('/') {
             let net = ipnetwork::IpNetwork::from_str(addr)
-                .map_err(|e| Self::err(format!("CIDR `{addr}` invalide : {e}")))?;
+                .map_err(|e| Self::err(format!("invalid CIDR `{addr}`: {e}")))?;
             let r = if source {
                 rule.snetwork(net)
             } else {
@@ -109,7 +109,7 @@ impl NetlinkBackend {
             r.map_err(Self::err)
         } else {
             let ip = IpAddr::from_str(addr)
-                .map_err(|e| Self::err(format!("IP `{addr}` invalide : {e}")))?;
+                .map_err(|e| Self::err(format!("invalid IP `{addr}`: {e}")))?;
             Ok(if source {
                 rule.saddr(ip)
             } else {
@@ -118,8 +118,8 @@ impl NetlinkBackend {
         }
     }
 
-    /// Éclate un `DestPortSet` en une liste de jeux de critères à port unique.
-    /// Le filtrage résultant est identique.
+    /// Expands a `DestPortSet` into a list of single-port match sets.
+    /// The resulting filtering is identical.
     fn expand_port_sets(matches: &[Match]) -> Vec<Vec<Match>> {
         let Some(idx) = matches
             .iter()
@@ -144,36 +144,36 @@ impl NetlinkBackend {
             .collect()
     }
 
-    /// Séquence de messages appliquée à la table elle-même, dans cet ordre.
+    /// Sequence of messages applied to the table itself, in this order.
     ///
-    /// Le `Add` initial n'est pas décoratif : sans lui, le `Del` porte sur une
-    /// table absente au tout premier démarrage, le noyau répond `ENOENT` et
-    /// rejette la transaction entière — donc pas de kill-switch, et heliosd
-    /// s'arrête. Constaté sur cible réelle ; le dry-run ne pouvait pas le voir.
+    /// The initial `Add` is not decorative: without it, the `Del` targets an
+    /// absent table on the very first startup, the kernel responds `ENOENT`
+    /// and rejects the whole transaction — so no kill-switch, and heliosd
+    /// stops. Observed on a real target; dry-run could not see it.
     const SEQUENCE_TABLE: [MsgType; 3] = [MsgType::Add, MsgType::Del, MsgType::Add];
 
-    /// Construit la transaction complète pour ce jeu de règles.
+    /// Builds the complete transaction for this ruleset.
     ///
-    /// Ne touche à rien : en cas d'erreur de traduction, on renvoie `Err` sans
-    /// avoir rien envoyé au kernel — la politique précédente reste en place, ce
-    /// qui est le comportement fail-closed attendu.
+    /// Touches nothing: on translation error, `Err` is returned without
+    /// having sent anything to the kernel — the previous policy stays in
+    /// place, which is the expected fail-closed behavior.
     fn build_batch(&self, rs: &Ruleset) -> Result<Batch> {
         let mut batch = Batch::new();
         let table = Table::new(ProtocolFamily::Inet).with_name(self.table_name.clone());
 
-        // Remplacement atomique : retrait de l'ancienne table et recréation dans
-        // la même transaction.
+        // Atomic replacement: removal of the old table and recreation within
+        // the same transaction.
         //
-        // Le premier `Add` n'est pas redondant. Contrairement à ce qu'on
-        // pourrait attendre, le noyau ne tolère pas un `Del` sur une table
-        // absente : il répond `ENOENT` et **rejette la transaction entière**.
-        // Sur une machine où `inet helios` n'a jamais existé — donc à tout
-        // premier démarrage — le pare-feu ne s'appliquait pas et heliosd
-        // s'arrêtait sur « application du pare-feu ».
+        // The first `Add` is not redundant. Contrary to what one might
+        // expect, the kernel does not tolerate a `Del` on an absent table: it
+        // responds `ENOENT` and **rejects the whole transaction**. On a
+        // machine where `inet helios` never existed — i.e. on a very first
+        // startup — the firewall would not apply and heliosd would stop
+        // during "firewall application".
         //
-        // L'idiome nftables consiste à garantir l'existence de la table avant
-        // de la supprimer : `Add` (no-op si présente), `Del` (désormais sûr),
-        // puis `Add` pour repartir d'une table vide.
+        // The nftables idiom is to guarantee the table exists before
+        // deleting it: `Add` (no-op if present), `Del` (now safe), then
+        // `Add` to start over from an empty table.
         for msg in Self::SEQUENCE_TABLE {
             batch.add(&table, msg);
         }
@@ -205,21 +205,22 @@ impl NetlinkBackend {
             }
         }
 
-        // ── Masquerade des clients du tunnel ─────────────────────────────────
-        // Chaîne d'un autre type (`nat`) et d'un autre hook (`postrouting`), donc
-        // hors de la boucle ci-dessus. Elle vit dans la **même** transaction :
-        // le NAT et le filtrage doivent apparaître et disparaître ensemble, sinon
-        // il existe un instant où l'un protège sans l'autre.
+        // ── Masquerade of tunnel clients ─────────────────────────────────────
+        // A chain of a different type (`nat`) and a different hook
+        // (`postrouting`), so outside the loop above. It lives in the
+        // **same** transaction: NAT and filtering must appear and disappear
+        // together, otherwise there is an instant where one protects without
+        // the other.
         //
-        // Priorité 100 (`NF_IP_PRI_NAT_SRC`) : c'est la place attendue d'un
-        // source-NAT, après le filtrage.
+        // Priority 100 (`NF_IP_PRI_NAT_SRC`): this is the expected place for
+        // a source-NAT, after filtering.
         if let Some(out_iface) = &rs.masquerade_out {
             let chain = Chain::new(&table)
                 .with_name("postrouting")
                 .with_hook(Hook::new(HookClass::PostRouting, 100))
                 .with_type(ChainType::Nat)
-                // Pas de politique par défaut sur une chaîne NAT : elle ne rend
-                // pas de verdict de filtrage, elle réécrit ou laisse passer.
+                // No default policy on a NAT chain: it does not render a
+                // filtering verdict, it rewrites or lets through.
                 .add_to_batch(&mut batch);
 
             NfRule::new(&chain)
@@ -238,21 +239,21 @@ impl NetlinkBackend {
 
         if let Some(mss) = rs.mss_clamp {
             warn!(
-                "MSS clamping ({mss} octets) non appliqué : action de mangle non exprimable \
-                 via rustables. Optimisation de performance, aucune brèche de sécurité."
+                "MSS clamping ({mss} bytes) not applied: mangle action not expressible \
+                 via rustables. Performance optimization, no security gap."
             );
         }
 
         let batch = self.build_batch(&rs)?;
         batch.send().map_err(|e| {
             Self::err(format!(
-                "transaction Netlink refusée (table {} inchangée) : {e}",
+                "Netlink transaction rejected (table {} unchanged): {e}",
                 self.table_name
             ))
         })?;
 
         info!(
-            "table inet {} appliquée — politique {:?}, {} règle(s), état {:?}",
+            "table inet {} applied — policy {:?}, {} rule(s), state {:?}",
             self.table_name,
             rs.default_verdict,
             rs.rules.len(),
@@ -275,11 +276,11 @@ impl FirewallBackend for NetlinkBackend {
     }
 
     async fn teardown(&self) -> Result<()> {
-        // Le kill-switch est laissé **engagé** à l'arrêt : on ne supprime jamais
-        // la table (invariant fail-closed). Cette méthode n'existe que pour la
-        // symétrie du trait.
+        // The kill-switch is left **engaged** at shutdown: the table is
+        // never removed (fail-closed invariant). This method exists only for
+        // trait symmetry.
         warn!(
-            "teardown ignoré : la table inet {} est laissée en place (fail-closed)",
+            "teardown ignored: table inet {} is left in place (fail-closed)",
             self.table_name
         );
         Ok(())
@@ -291,7 +292,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn les_ensembles_de_ports_sont_eclates() {
+    fn port_sets_are_expanded() {
         let matches = vec![
             Match::OutIface("eth0".into()),
             Match::DestPortSet {
@@ -309,39 +310,40 @@ mod tests {
             port: 443,
             proto: L4::Tcp
         }));
-        // Les autres critères sont préservés dans chaque règle produite.
+        // The other matches are preserved in each produced rule.
         assert!(expanded[0].contains(&Match::OutIface("eth0".into())));
     }
 
     #[test]
-    fn la_table_est_creee_avant_d_etre_supprimee() {
-        // Non-régression : `Del` d'abord échouait en `ENOENT` sur une machine
-        // où `inet helios` n'avait jamais existé, et le noyau rejetait toute
-        // la transaction — aucun kill-switch posé, démarrage impossible.
+    fn table_is_created_before_being_deleted() {
+        // Regression test: `Del` first used to fail with `ENOENT` on a
+        // machine where `inet helios` had never existed, and the kernel
+        // rejected the whole transaction — no kill-switch applied, startup
+        // impossible.
         let seq = NetlinkBackend::SEQUENCE_TABLE;
-        assert_eq!(seq[0], MsgType::Add, "la table doit exister avant le Del");
+        assert_eq!(seq[0], MsgType::Add, "the table must exist before Del");
         let del = seq
             .iter()
             .position(|m| *m == MsgType::Del)
-            .expect("un Del est attendu");
-        assert!(del > 0, "aucun Add ne précède le Del");
+            .expect("a Del is expected");
+        assert!(del > 0, "no Add precedes the Del");
         assert_eq!(
             seq[del + 1],
             MsgType::Add,
-            "la table doit être recréée après le Del"
+            "the table must be recreated after Del"
         );
     }
 
     #[test]
-    fn un_jeu_sans_ensemble_reste_intact() {
+    fn a_set_without_expansion_stays_intact() {
         let matches = vec![Match::InIface("lo".into())];
         assert_eq!(NetlinkBackend::expand_port_sets(&matches), vec![matches]);
     }
 
     #[test]
-    fn parsing_des_adresses() {
+    fn address_parsing() {
         assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
         assert!(IpAddr::from_str("203.0.113.10").is_ok());
-        assert!(ipnetwork::IpNetwork::from_str("pas-un-cidr").is_err());
+        assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
     }
 }

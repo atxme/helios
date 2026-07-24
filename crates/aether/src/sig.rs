@@ -1,9 +1,9 @@
-//! Signatures hybrides des artefacts de confiance de l'éditeur.
+//! Hybrid signatures of the publisher's trust artifacts.
 //!
-//! La politique est volontairement non configurable : Ed25519 **et**
-//! ML-DSA-65 doivent vérifier le même message canonique. Les algorithmes
-//! supplémentaires inconnus sont ignorés pour permettre une extension future,
-//! mais retirer l'une des deux signatures requises est toujours un rejet.
+//! The policy is deliberately non-configurable: Ed25519 **and** ML-DSA-65
+//! must both verify the same canonical message. Unknown additional
+//! algorithms are ignored to allow future extension, but removing one of
+//! the two required signatures is always a rejection.
 
 use std::collections::HashSet;
 
@@ -16,19 +16,19 @@ use fips204::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Taille d'une clé publique Ed25519 brute.
+/// Size of a raw Ed25519 public key.
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
-/// Taille d'une signature Ed25519.
+/// Size of an Ed25519 signature.
 pub const ED25519_SIGNATURE_LEN: usize = 64;
-/// Taille d'une clé publique ML-DSA-65 sérialisée (FIPS 204).
+/// Size of a serialized ML-DSA-65 public key (FIPS 204).
 pub const ML_DSA_65_PUBLIC_KEY_LEN: usize = ml_dsa_65::PK_LEN;
-/// Taille d'une clé privée ML-DSA-65 sérialisée (outil éditeur uniquement).
+/// Size of a serialized ML-DSA-65 private key (publisher tool only).
 #[cfg(feature = "publisher-signing")]
 pub const ML_DSA_65_PRIVATE_KEY_LEN: usize = ml_dsa_65::SK_LEN;
-/// Taille d'une signature ML-DSA-65.
+/// Size of an ML-DSA-65 signature.
 pub const ML_DSA_65_SIGNATURE_LEN: usize = ml_dsa_65::SIG_LEN;
 
-/// Algorithmes compris par ce vérificateur.
+/// Algorithms understood by this verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlgId {
     Ed25519,
@@ -58,10 +58,10 @@ impl std::fmt::Display for AlgId {
     }
 }
 
-/// Politique anti-downgrade compilée dans tous les vérificateurs.
+/// Anti-downgrade policy compiled into every verifier.
 pub const REQUIRED_ALGS: &[AlgId] = &[AlgId::Ed25519, AlgId::MlDsa65];
 
-/// Clés publiques d'une époque éditeur.
+/// Publisher public keys for one epoch.
 #[derive(Clone, Copy)]
 pub struct PublisherPublicKeys {
     pub key_epoch: u32,
@@ -70,14 +70,14 @@ pub struct PublisherPublicKeys {
 }
 
 impl PublisherPublicKeys {
-    /// Empreinte affichable de l'ancre de confiance, pour comparaison visuelle
-    /// avec ce que l'éditeur publie hors bande.
+    /// Displayable fingerprint of the trust anchor, for visual comparison
+    /// with what the publisher publishes out-of-band.
     ///
-    /// Les deux clés sont hachées **ensemble** : l'empreinte identifie l'époque
-    /// dans son entier, pas l'une de ses moitiés. Un opérateur qui la compare ne
-    /// peut donc pas valider un trousseau dont seule la partie Ed25519 est la
-    /// bonne. Tronquée à 128 bits — c'est un aide-mémoire de comparaison, pas un
-    /// contrôle de sécurité : la vraie ancre est compilée dans le binaire.
+    /// Both keys are hashed **together**: the fingerprint identifies the
+    /// epoch as a whole, not one of its halves. An operator comparing it
+    /// therefore cannot validate a keyring where only the Ed25519 part is
+    /// correct. Truncated to 128 bits — this is a comparison memory aid, not
+    /// a security check: the real anchor is compiled into the binary.
     pub fn fingerprint(&self) -> String {
         let mut material = Vec::with_capacity(ED25519_PUBLIC_KEY_LEN + ML_DSA_65_PUBLIC_KEY_LEN);
         material.extend_from_slice(&self.ed25519);
@@ -87,11 +87,11 @@ impl PublisherPublicKeys {
     }
 }
 
-// Généré depuis le fichier public désigné au build. En release, le build script
-// refuse le trousseau de développement livré avec les tests.
+// Generated from the public file designated at build time. In release, the
+// build script refuses the development keyring shipped with the tests.
 include!(concat!(env!("OUT_DIR"), "/publisher_keyring.rs"));
 
-/// Une signature encodée en base64 dans l'enveloppe JSON.
+/// A signature encoded in base64 in the JSON envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactSignature {
@@ -99,7 +99,7 @@ pub struct ArtifactSignature {
     pub sig: String,
 }
 
-/// Enveloppe commune à tous les artefacts signés.
+/// Envelope common to every signed artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedEnvelope<P> {
@@ -108,18 +108,18 @@ pub struct SignedEnvelope<P> {
     pub signatures: Vec<ArtifactSignature>,
 }
 
-/// Sérialisation canonique et domaine propres à un artefact.
+/// Canonical serialization and domain specific to an artifact.
 pub trait ArtifactPayload {
-    /// Domaine complet, distinct pour chaque type d'artefact.
+    /// Full domain, distinct for each artifact type.
     const DOMAIN: &'static [u8];
-    /// Version de format encodée sur 32 bits big-endian dans le message.
+    /// Format version encoded as 32-bit big-endian in the message.
     const FORMAT_VERSION: u32;
 
-    /// Ajoute le payload canonique à `output`, sans passer par JSON.
+    /// Appends the canonical payload to `output`, without going through JSON.
     fn encode_canonical(&self, output: &mut Vec<u8>);
 }
 
-/// Backend de vérification d'un algorithme de signature.
+/// Verification backend for a signature algorithm.
 pub trait SignatureSuite {
     const ALGORITHM: AlgId;
 
@@ -141,9 +141,10 @@ impl SignatureSuite for Ed25519Suite {
     }
 }
 
-/// AWS-LC 1.17.1 accepte notamment une forge avec clé et `R` au point identité.
-/// Ces précontrôles conservent donc explicitement les garanties de
-/// `ed25519-dalek::verify_strict()` avant de déléguer l'équation à AWS-LC.
+/// AWS-LC 1.17.1 notably accepts a forgery with the key and `R` at the
+/// identity point. These pre-checks explicitly preserve the guarantees of
+/// `ed25519-dalek::verify_strict()` before delegating the equation to
+/// AWS-LC.
 fn ed25519_inputs_are_strict(public_key: &[u8], signature: &[u8]) -> bool {
     let Ok(public_key) = <[u8; ED25519_PUBLIC_KEY_LEN]>::try_from(public_key) else {
         return false;
@@ -188,29 +189,29 @@ impl SignatureSuite for MlDsa65Suite {
     }
 }
 
-/// Erreurs fail-closed de l'enveloppe hybride.
+/// Fail-closed errors of the hybrid envelope.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SignatureError {
-    #[error("époque de clé éditeur inconnue : {0}")]
+    #[error("unknown publisher key epoch: {0}")]
     UnknownKeyEpoch(u32),
-    #[error("signature requise absente : {0}")]
+    #[error("required signature missing: {0}")]
     MissingRequiredAlgorithm(AlgId),
-    #[error("algorithme de signature dupliqué : {0}")]
+    #[error("duplicate signature algorithm: {0}")]
     DuplicateAlgorithm(AlgId),
-    #[error("signature {0} mal encodée")]
+    #[error("signature {0} malformed")]
     InvalidEncoding(AlgId),
-    #[error("signature {0} invalide")]
+    #[error("signature {0} invalid")]
     InvalidSignature(AlgId),
     #[cfg(feature = "publisher-signing")]
-    #[error("clé privée éditeur invalide : {0}")]
+    #[error("invalid publisher private key: {0}")]
     InvalidPrivateKey(&'static str),
     #[cfg(feature = "publisher-signing")]
-    #[error("opération de signature éditeur échouée : {0}")]
+    #[error("publisher signing operation failed: {0}")]
     Signing(&'static str),
 }
 
 impl<P: ArtifactPayload> SignedEnvelope<P> {
-    /// Vérifie l'époque authentifiée puis toutes les signatures requises.
+    /// Verifies the authenticated epoch then every required signature.
     pub fn verify(&self, keyring: &[PublisherPublicKeys]) -> Result<(), SignatureError> {
         let keys = keyring
             .iter()
@@ -221,7 +222,7 @@ impl<P: ArtifactPayload> SignedEnvelope<P> {
 
         for entry in &self.signatures {
             let Some(algorithm) = AlgId::parse(&entry.alg) else {
-                // Extension avant : la politique compilée décidera quand elle devient requise.
+                // Forward extension: the compiled policy will decide when it becomes required.
                 continue;
             };
             if !seen.insert(algorithm) {
@@ -248,7 +249,7 @@ impl<P: ArtifactPayload> SignedEnvelope<P> {
     }
 }
 
-/// Octets signés : domaine || version format || époque || payload canonique.
+/// Signed bytes: domain || format version || epoch || canonical payload.
 pub fn signing_bytes<P: ArtifactPayload>(payload: &P, key_epoch: u32) -> Vec<u8> {
     let mut message = Vec::with_capacity(P::DOMAIN.len() + 8 + 64);
     message.extend_from_slice(P::DOMAIN);
@@ -258,7 +259,7 @@ pub fn signing_bytes<P: ArtifactPayload>(payload: &P, key_epoch: u32) -> Vec<u8>
     message
 }
 
-/// Payload du billet de rescellement TPM v2.
+/// Payload of the TPM v2 reseal ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResealPayload {
@@ -289,7 +290,7 @@ impl ArtifactPayload for ResealPayload {
 
 pub type SignedResealTicket = SignedEnvelope<ResealPayload>;
 
-/// Métadonnées signées d’un binaire `heliosd` distribuable.
+/// Signed metadata of a distributable `heliosd` binary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BinaryReleasePayload {
@@ -332,11 +333,11 @@ impl ArtifactPayload for BinaryReleasePayload {
 
 pub type SignedBinaryRelease = SignedEnvelope<BinaryReleasePayload>;
 
-/// Un fichier du bundle, désigné par son chemin relatif et son empreinte.
+/// A bundle file, designated by its relative path and its digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleEntry {
-    /// Chemin **relatif** à la racine du bundle, séparateurs `/`.
+    /// Path **relative** to the bundle root, `/`-separated.
     pub path: String,
     pub size: u64,
     #[serde(
@@ -344,24 +345,24 @@ pub struct BundleEntry {
         deserialize_with = "deserialize_digest"
     )]
     pub sha256: [u8; 32],
-    /// Fichier exécutable : installé en 0755, sinon en 0644.
+    /// Executable file: installed as 0755, otherwise as 0644.
     pub executable: bool,
 }
 
-/// Métadonnées signées d’un bundle d’installation complet.
+/// Signed metadata of a complete installation bundle.
 ///
-/// # Pourquoi un second type d’artefact plutôt que le manifeste binaire
+/// # Why a second artifact type rather than the binary manifest
 ///
-/// [`BinaryReleasePayload`] authentifie **un** exécutable : c’est ce dont la
-/// mise à jour applicative (ADR-003) a besoin, et rien de plus. Un bundle
-/// d’installation porte aussi le programme d’installation, l’outil
-/// d’exploitation et les unités systemd. Les livrer sous l’autorité d’une
-/// signature qui ne les couvre pas reviendrait à afficher une garantie fausse :
-/// l’unité systemd décide de la ligne de commande du daemon, elle est aussi
-/// sensible que le binaire qu’elle lance.
+/// [`BinaryReleasePayload`] authenticates **one** executable: that is what
+/// the application update mechanism (ADR-003) needs, and nothing more. An
+/// installation bundle also carries the installer program, the operations
+/// tool and the systemd units. Shipping them under the authority of a
+/// signature that does not cover them would amount to displaying a false
+/// guarantee: the systemd unit decides the daemon's command line, it is just
+/// as sensitive as the binary it launches.
 ///
-/// Le domaine est distinct (`helios-bundle-v1`), donc la signature d’un bundle
-/// ne peut pas être rejouée comme signature de release binaire, ni l’inverse
+/// The domain is distinct (`helios-bundle-v1`), so a bundle's signature
+/// cannot be replayed as a binary release signature, nor the reverse
 /// (ADR-002 §3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -373,29 +374,29 @@ pub struct BundlePayload {
     pub git_commit: String,
     pub target: String,
     pub minimum_installer_version: u32,
-    /// Contenu exhaustif, trié par chemin. Un fichier présent dans l’archive
-    /// mais absent d’ici doit faire échouer l’installation.
+    /// Exhaustive content, sorted by path. A file present in the archive but
+    /// absent here must make installation fail.
     pub files: Vec<BundleEntry>,
 }
 
-/// Refus d’un contenu de bundle, avant même de regarder les signatures.
+/// Rejection of bundle content, before even looking at the signatures.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BundleError {
-    #[error("bundle sans aucun fichier déclaré")]
+    #[error("bundle with no declared file")]
     Empty,
-    #[error("chemin de bundle invalide : {0}")]
+    #[error("invalid bundle path: {0}")]
     Path(String),
-    #[error("liste de fichiers non triée ou dupliquée à « {0} »")]
+    #[error("file list not sorted or duplicated at \"{0}\"")]
     Order(String),
 }
 
 impl BundlePayload {
-    /// Valide la forme de la liste de fichiers.
+    /// Validates the shape of the file list.
     ///
-    /// À appeler **avant** d’extraire quoi que ce soit. Un chemin absolu ou
-    /// remontant (`..`) écrirait hors de la destination prévue ; une liste non
-    /// triée rendrait l’encodage canonique ambigu, et un doublon permettrait de
-    /// déclarer deux empreintes pour le même fichier.
+    /// Call **before** extracting anything. An absolute or ascending path
+    /// (`..`) would write outside the intended destination; an unsorted list
+    /// would make the canonical encoding ambiguous, and a duplicate would
+    /// allow declaring two digests for the same file.
     pub fn validate(&self) -> Result<(), BundleError> {
         if self.files.is_empty() {
             return Err(BundleError::Empty);
@@ -413,7 +414,7 @@ impl BundlePayload {
         Ok(())
     }
 
-    /// Entrée correspondant à un chemin relatif, si elle est déclarée.
+    /// Entry matching a relative path, if declared.
     pub fn entry(&self, path: &str) -> Option<&BundleEntry> {
         self.files.iter().find(|entry| entry.path == path)
     }
@@ -483,7 +484,7 @@ where
     hex::decode(encoded)
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| serde::de::Error::custom("SHA-256 hex invalide"))
+        .ok_or_else(|| serde::de::Error::custom("invalid SHA-256 hex"))
 }
 
 fn serialize_optional_digest<S>(digest: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
@@ -503,7 +504,7 @@ where
             hex::decode(value)
                 .ok()
                 .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .ok_or_else(|| serde::de::Error::custom("digest PCR hex invalide"))
+                .ok_or_else(|| serde::de::Error::custom("invalid PCR digest hex"))
         })
         .transpose()
 }
@@ -518,7 +519,7 @@ mod signing {
 
     use super::*;
 
-    /// Paire de clés privées chargée uniquement par l'outil éditeur.
+    /// Private key pair loaded only by the publisher tool.
     pub struct PublisherSigner {
         key_epoch: u32,
         ed25519: Ed25519KeyPair,
@@ -526,7 +527,7 @@ mod signing {
     }
 
     impl PublisherSigner {
-        /// Charge deux clés privées sérialisées et cohérentes avec une époque.
+        /// Loads two serialized private keys consistent with an epoch.
         pub fn from_private_keys(
             key_epoch: u32,
             ed25519_pkcs8: &[u8],
@@ -535,7 +536,7 @@ mod signing {
             let ed25519 = Ed25519KeyPair::from_pkcs8(ed25519_pkcs8)
                 .map_err(|_| SignatureError::InvalidPrivateKey("Ed25519 PKCS#8"))?;
             let ml_dsa_65 = <[u8; ml_dsa_65::SK_LEN]>::try_from(ml_dsa_65)
-                .map_err(|_| SignatureError::InvalidPrivateKey("longueur ML-DSA-65"))?;
+                .map_err(|_| SignatureError::InvalidPrivateKey("ML-DSA-65 length"))?;
             let ml_dsa_65 =
                 PrivateKey::try_from_bytes(ml_dsa_65).map_err(SignatureError::InvalidPrivateKey)?;
             Ok(Self {
@@ -545,15 +546,15 @@ mod signing {
             })
         }
 
-        /// Reconstruit deux clés depuis leurs graines brutes de 32 octets.
-        /// Préférer PKCS#8 et [`Self::from_private_keys`] pour le stockage réel.
+        /// Rebuilds both keys from their raw 32-byte seeds.
+        /// Prefer PKCS#8 and [`Self::from_private_keys`] for real storage.
         pub fn from_seed_material(
             key_epoch: u32,
             ed25519_seed: &[u8; 32],
             ml_dsa_65_seed: &[u8; 32],
         ) -> Result<Self, SignatureError> {
             let ed25519 = Ed25519KeyPair::from_seed_unchecked(ed25519_seed)
-                .map_err(|_| SignatureError::InvalidPrivateKey("graine Ed25519"))?;
+                .map_err(|_| SignatureError::InvalidPrivateKey("Ed25519 seed"))?;
             let (_, ml_dsa_65) = ml_dsa_65::KG::keygen_from_seed(ml_dsa_65_seed);
             Ok(Self {
                 key_epoch,
@@ -562,10 +563,10 @@ mod signing {
             })
         }
 
-        /// Génère hors gateway les deux paires de clés d'une nouvelle époque.
+        /// Generates off-gateway both key pairs for a new epoch.
         pub fn generate(key_epoch: u32) -> Result<Self, SignatureError> {
             let ed25519 = Ed25519KeyPair::generate()
-                .map_err(|_| SignatureError::Signing("génération Ed25519"))?;
+                .map_err(|_| SignatureError::Signing("Ed25519 generation"))?;
             let (_, ml_dsa_65) = ml_dsa_65::try_keygen().map_err(SignatureError::Signing)?;
             Ok(Self {
                 key_epoch,
@@ -578,14 +579,14 @@ mod signing {
             self.key_epoch
         }
 
-        /// Extrait les clés publiques destinées au trousseau compilé.
+        /// Extracts the public keys destined for the compiled keyring.
         pub fn public_keys(&self) -> PublisherPublicKeys {
             let ed25519 = self
                 .ed25519
                 .public_key()
                 .as_ref()
                 .try_into()
-                .expect("AWS-LC garantit 32 octets pour Ed25519");
+                .expect("AWS-LC guarantees 32 bytes for Ed25519");
             let ml_dsa_65 = self.ml_dsa_65.get_public_key().into_bytes();
             PublisherPublicKeys {
                 key_epoch: self.key_epoch,
@@ -594,17 +595,17 @@ mod signing {
             }
         }
 
-        /// Sérialise les secrets pour leur stockage hors ligne.
+        /// Serializes the secrets for offline storage.
         pub fn private_key_bytes(&self) -> Result<(Vec<u8>, Vec<u8>), SignatureError> {
             let ed25519 = self
                 .ed25519
                 .to_pkcs8()
-                .map_err(|_| SignatureError::Signing("sérialisation Ed25519 PKCS#8"))?;
+                .map_err(|_| SignatureError::Signing("Ed25519 PKCS#8 serialization"))?;
             let ml_dsa_65 = self.ml_dsa_65.clone().into_bytes();
             Ok((ed25519.as_ref().to_vec(), ml_dsa_65.to_vec()))
         }
 
-        /// Produit l'enveloppe hybride ; les deux signatures couvrent les mêmes octets.
+        /// Produces the hybrid envelope; both signatures cover the same bytes.
         pub fn sign<P: ArtifactPayload>(
             &self,
             payload: P,
@@ -684,7 +685,7 @@ mod tests {
         )
     }
 
-    fn entree(path: &str) -> BundleEntry {
+    fn entry(path: &str) -> BundleEntry {
         BundleEntry {
             path: path.to_string(),
             size: 10,
@@ -706,11 +707,11 @@ mod tests {
         }
     }
 
-    /// Un chemin absolu ou remontant écrirait hors de la destination : c'est
-    /// une écriture arbitraire déguisée en installation.
+    /// An absolute or ascending path would write outside the destination:
+    /// this is an arbitrary write disguised as an installation.
     #[test]
-    fn un_chemin_de_bundle_hors_de_la_racine_est_refuse() {
-        for chemin in [
+    fn a_bundle_path_outside_the_root_is_rejected() {
+        for path in [
             "/etc/systemd/system/heliosd.service",
             "../../etc/passwd",
             "bin/../../../root/.ssh/authorized_keys",
@@ -721,68 +722,73 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    bundle(vec![entree(chemin)]).validate(),
+                    bundle(vec![entry(path)]).validate(),
                     Err(BundleError::Path(_))
                 ),
-                "chemin accepté à tort : {chemin:?}"
+                "path wrongly accepted: {path:?}"
             );
         }
     }
 
     #[test]
-    fn une_liste_non_triee_ou_dupliquee_est_refusee() {
+    fn an_unsorted_or_duplicated_list_is_rejected() {
         assert!(matches!(
-            bundle(vec![entree("b"), entree("a")]).validate(),
+            bundle(vec![entry("b"), entry("a")]).validate(),
             Err(BundleError::Order(_))
         ));
         assert!(matches!(
-            bundle(vec![entree("a"), entree("a")]).validate(),
+            bundle(vec![entry("a"), entry("a")]).validate(),
             Err(BundleError::Order(_))
         ));
         assert_eq!(bundle(vec![]).validate(), Err(BundleError::Empty));
-        assert_eq!(bundle(vec![entree("a"), entree("b/c")]).validate(), Ok(()));
+        assert_eq!(bundle(vec![entry("a"), entry("b/c")]).validate(), Ok(()));
     }
 
-    /// Le domaine sépare les artefacts : la signature d'un bundle ne doit pas
-    /// pouvoir servir de signature de release binaire (ADR-002 §3).
+    /// The domain separates artifacts: a bundle's signature must not be
+    /// usable as a binary release signature (ADR-002 §3).
     #[test]
-    fn le_domaine_du_bundle_est_distinct_des_autres_artefacts() {
-        let octets = signing_bytes(&bundle(vec![entree("heliosd")]), 1);
-        assert!(octets.starts_with(b"helios-bundle-v1"));
+    fn the_bundle_domain_is_distinct_from_other_artifacts() {
+        let bytes = signing_bytes(&bundle(vec![entry("heliosd")]), 1);
+        assert!(bytes.starts_with(b"helios-bundle-v1"));
         assert_ne!(BundlePayload::DOMAIN, BinaryReleasePayload::DOMAIN);
         assert_ne!(BundlePayload::DOMAIN, ResealPayload::DOMAIN);
     }
 
-    /// Chaque champ du contenu doit entrer dans les octets signés : un fichier
-    /// dont on pourrait changer l'empreinte ou le bit exécutable sans invalider
-    /// la signature ne serait pas protégé du tout.
+    /// Every content field must enter the signed bytes: a file whose digest
+    /// or executable bit could change without invalidating the signature
+    /// would not be protected at all.
     #[test]
-    fn toute_alteration_du_contenu_change_les_octets_signes() {
-        let reference = signing_bytes(&bundle(vec![entree("heliosd")]), 1);
+    fn any_content_alteration_changes_the_signed_bytes() {
+        let reference = signing_bytes(&bundle(vec![entry("heliosd")]), 1);
 
-        let mut autre_empreinte = entree("heliosd");
-        autre_empreinte.sha256 = [2u8; 32];
-        let mut autre_taille = entree("heliosd");
-        autre_taille.size = 11;
-        let mut autre_mode = entree("heliosd");
-        autre_mode.executable = true;
+        let mut different_digest = entry("heliosd");
+        different_digest.sha256 = [2u8; 32];
+        let mut different_size = entry("heliosd");
+        different_size.size = 11;
+        let mut different_mode = entry("heliosd");
+        different_mode.executable = true;
 
-        for modifie in [autre_empreinte, autre_taille, autre_mode, entree("autre")] {
+        for modified in [
+            different_digest,
+            different_size,
+            different_mode,
+            entry("autre"),
+        ] {
             assert_ne!(
-                signing_bytes(&bundle(vec![modifie]), 1),
+                signing_bytes(&bundle(vec![modified]), 1),
                 reference,
-                "une modification du contenu n'a pas changé les octets signés"
+                "a content modification did not change the signed bytes"
             );
         }
         assert_ne!(
-            signing_bytes(&bundle(vec![entree("heliosd")]), 2),
+            signing_bytes(&bundle(vec![entry("heliosd")]), 2),
             reference,
-            "l'époque de clé doit être signée (ADR-002 amendement 3)"
+            "the key epoch must be signed (ADR-002 amendment 3)"
         );
     }
 
     #[test]
-    fn les_deux_signatures_valides_sont_requises() {
+    fn both_valid_signatures_are_required() {
         let (envelope, keys) = signed(
             ResealPayload {
                 version: 3,
@@ -805,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn une_signature_connue_invalide_est_un_rejet() {
+    fn a_known_but_invalid_signature_is_a_rejection() {
         let (envelope, keys) = signed(
             ResealPayload {
                 version: 3,
@@ -831,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn algorithme_inconnu_ignore_mais_doublon_connu_rejete() {
+    fn unknown_algorithm_ignored_but_known_duplicate_rejected() {
         let (mut envelope, keys) = signed(
             ResealPayload {
                 version: 1,
@@ -841,7 +847,7 @@ mod tests {
         );
         envelope.signatures.push(ArtifactSignature {
             alg: "slh-dsa-128s-futur".into(),
-            sig: "même pas du base64".into(),
+            sig: "not even base64".into(),
         });
         assert_eq!(envelope.verify(&[keys]), Ok(()));
 
@@ -853,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn manifeste_binaire_a_un_encodage_canonique_strict() {
+    fn binary_manifest_has_a_strict_canonical_encoding() {
         let payload = BinaryReleasePayload {
             product: "heliosd".into(),
             channel: "testing".into(),
@@ -879,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn epoque_inconnue_et_reecriture_de_lepoque_sont_rejetees() {
+    fn unknown_epoch_and_epoch_rewriting_are_rejected() {
         let (mut envelope, keys) = signed(
             ResealPayload {
                 version: 1,
@@ -904,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_du_payload_est_rejetee() {
+    fn payload_mutation_is_rejected() {
         let (mut envelope, keys) = signed(
             ResealPayload {
                 version: 1,
@@ -920,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn domaine_et_version_de_format_font_partie_de_la_signature() {
+    fn domain_and_format_version_are_part_of_the_signature() {
         #[derive(Clone)]
         struct OtherArtifact(ResealPayload);
 
@@ -952,8 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_rejette_les_encodages_non_canoniques_et_les_points_faibles() {
-        let message = b"preuve du chemin strict AWS-LC";
+    fn ed25519_rejects_non_canonical_encodings_and_weak_points() {
+        let message = b"proof of the AWS-LC strict path";
         let ed = Ed25519KeyPair::from_seed_unchecked(&ED_SEED).unwrap();
         let signature = ed.sign(message);
         assert!(Ed25519Suite::verify(
@@ -962,7 +968,7 @@ mod tests {
             signature.as_ref()
         ));
 
-        // S = ordre du sous-groupe (non canonique, il faut S < L).
+        // S = subgroup order (non-canonical, S < L is required).
         let mut non_canonical_s: [u8; 64] = signature.as_ref().try_into().unwrap();
         non_canonical_s[32..].copy_from_slice(&[
             0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
@@ -974,8 +980,8 @@ mod tests {
             &non_canonical_s
         ));
 
-        // Clé publique et R au point identité : une vérification non stricte
-        // pourrait accepter cette forge triviale avec S = 0.
+        // Public key and R at the identity point: a non-strict verification
+        // could accept this trivial forgery with S = 0.
         let mut identity = [0u8; 32];
         identity[0] = 1;
         let mut weak_signature = [0u8; 64];
@@ -984,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn json_reordonne_ne_change_pas_les_octets_canoniques() {
+    fn reordered_json_does_not_change_the_canonical_bytes() {
         let first: SignedResealTicket = serde_json::from_str(
             r#"{"payload":{"version":9,"expected_pcr_digest":null},"key_epoch":1,"signatures":[]}"#,
         )
@@ -1000,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn encodage_base64_invalide_et_signature_vide_sont_fail_closed() {
+    fn invalid_base64_encoding_and_empty_signature_are_fail_closed() {
         let (envelope, keys) = signed(
             ResealPayload {
                 version: 5,
@@ -1025,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn json_refuse_tout_champ_non_authentifie() {
+    fn json_rejects_any_unauthenticated_field() {
         for json in [
             r#"{"payload":{"version":9,"expected_pcr_digest":null},"key_epoch":1,"signatures":[],"selector":"attaquant"}"#,
             r#"{"payload":{"version":9,"expected_pcr_digest":null,"ignored":true},"key_epoch":1,"signatures":[]}"#,
@@ -1036,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn empreinte_identifie_les_deux_moitie_du_trousseau() {
+    fn fingerprint_identifies_both_halves_of_the_keyring() {
         let (_, keys) = signed(
             ResealPayload {
                 version: 1,

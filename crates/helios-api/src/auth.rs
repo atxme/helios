@@ -1,8 +1,8 @@
-//! Identité et autorisation du pair WireGuard appelant.
+//! Identity and authorization of the calling WireGuard peer.
 //!
-//! WireGuard authentifie la source contre les `AllowedIPs`. L’API rattache
-//! donc l’adresse source réelle du socket à l’unique VIP `/32` de la
-//! configuration. Aucun en-tête de proxy n’est consulté.
+//! WireGuard authenticates the source against `AllowedIPs`. The API therefore
+//! ties the socket's real source address to the configuration's single `/32`
+//! VIP. No proxy header is ever consulted.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -15,7 +15,7 @@ use axum::{
 
 use crate::AppState;
 
-/// Identité authentifiée d’un appelant de l’API.
+/// Authenticated identity of an API caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub source: IpAddr,
@@ -29,7 +29,7 @@ impl Caller {
     fn dev() -> Self {
         Self {
             source: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            name: "boucle-locale-dev".into(),
+            name: "dev-loopback".into(),
             public_key: None,
             admin: true,
             dev_loopback: true,
@@ -37,8 +37,8 @@ impl Caller {
     }
 }
 
-/// Exige un pair WireGuard connu. En `--dev`, la boucle locale constitue une
-/// identité simulée explicite afin que l’IHM et les campagnes restent jouables.
+/// Requires a known WireGuard peer. In `--dev`, the loopback address stands in
+/// as an explicit simulated identity so the UI and campaigns stay usable.
 pub async fn require_peer(
     State(state): State<AppState>,
     mut request: Request,
@@ -50,20 +50,21 @@ pub async fn require_peer(
             next.run(request).await
         }
         None => {
-            // Un refus est la seule trace exploitable d'une tentative d'accès :
-            // le module noyau WireGuard, lui, rejette les handshakes inconnus
-            // sans rien remonter. Sans cette ligne, l'opérateur ne verrait rien.
+            // A refusal is the only actionable trace of an access attempt: the
+            // WireGuard kernel module rejects unknown handshakes without
+            // reporting anything back up. Without this line, the operator
+            // would see nothing at all.
             tracing::warn!(
                 source = ?source_of(&request),
                 uri = %request.uri(),
-                "accès refusé : adresse source non rattachée à un pair admis"
+                "access denied: source address not tied to an admitted peer"
             );
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
 }
 
-/// Exige en plus la permission `admin` et une origine navigateur cohérente.
+/// Additionally requires the `admin` permission and a consistent browser origin.
 pub async fn require_admin(
     State(state): State<AppState>,
     mut request: Request,
@@ -77,7 +78,7 @@ pub async fn require_admin(
             tracing::info!(
                 pair = %caller.name,
                 source = %caller.source,
-                "commande d’administration authentifiée par WireGuard"
+                "admin command authenticated via WireGuard"
             );
             request.extensions_mut().insert(caller);
             next.run(request).await
@@ -87,7 +88,7 @@ pub async fn require_admin(
                 pair = %caller.name,
                 source = %caller.source,
                 uri = %request.uri(),
-                "mutation refusée : pair admis mais non administrateur"
+                "mutation denied: peer admitted but not an administrator"
             );
             StatusCode::FORBIDDEN.into_response()
         }
@@ -95,7 +96,7 @@ pub async fn require_admin(
             tracing::warn!(
                 source = ?source_of(&request),
                 uri = %request.uri(),
-                "mutation refusée : adresse source non rattachée à un pair admis"
+                "mutation denied: source address not tied to an admitted peer"
             );
             StatusCode::UNAUTHORIZED.into_response()
         }
@@ -133,8 +134,8 @@ async fn resolve(state: &AppState, source: Option<IpAddr>) -> Option<Caller> {
     })
 }
 
-/// Avec une requête de navigateur, l’origine doit être exactement l’autorité
-/// du `Host`. Les clients natifs sans `Origin` restent admis.
+/// For a browser request, the origin must exactly match the `Host`
+/// authority. Native clients without `Origin` remain admitted.
 fn same_origin(request: &Request) -> bool {
     let Some(origin) = request.headers().get(header::ORIGIN) else {
         return true;
@@ -164,11 +165,14 @@ mod tests {
     fn state(admin: bool, dry_run: bool) -> AppState {
         let network = NetworkConfig {
             peers: vec![WgPeer {
-                name: "poste".into(),
-                public_key: "cle-publique".into(),
+                name: "workstation".into(),
+                public_key: "public-key".into(),
                 address: "100.64.1.2/32".into(),
                 admin,
                 preshared_key: None,
+                key_negotiation_certificate_sha256: None,
+                key_negotiation_pq_certificate_sha256: None,
+                minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
             }],
             ..NetworkConfig::default()
         };
@@ -190,22 +194,22 @@ mod tests {
     fn request(source: &str) -> Request {
         let mut request = Request::new(Body::empty());
         request.extensions_mut().insert(ConnectInfo(
-            source.parse::<SocketAddr>().expect("adresse de test"),
+            source.parse::<SocketAddr>().expect("test address"),
         ));
         request
     }
 
     #[tokio::test]
-    async fn rattache_la_vip_a_la_cle_wireguard() {
+    async fn ties_the_vip_to_the_wireguard_key() {
         let caller = resolve(&state(true, false), source_of(&request("100.64.1.2:4242")))
             .await
-            .expect("pair attendu");
-        assert_eq!(caller.public_key.as_deref(), Some("cle-publique"));
+            .expect("expected peer");
+        assert_eq!(caller.public_key.as_deref(), Some("public-key"));
         assert!(caller.admin);
     }
 
     #[tokio::test]
-    async fn pair_inconnu_et_boucle_reelle_refuses() {
+    async fn unknown_peer_and_real_loopback_are_refused() {
         assert!(
             resolve(&state(true, false), source_of(&request("100.64.1.3:4242")))
                 .await
@@ -219,16 +223,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boucle_dev_est_un_admin_simule() {
+    async fn dev_loopback_is_a_simulated_admin() {
         let caller = resolve(&state(false, true), source_of(&request("127.0.0.1:4242")))
             .await
-            .expect("identité dev");
+            .expect("dev identity");
         assert!(caller.admin);
         assert!(caller.dev_loopback);
     }
 
     #[test]
-    fn origine_croisee_refusee() {
+    fn cross_origin_is_refused() {
         let request = Request::builder()
             .header(header::HOST, "100.64.0.1:8080")
             .header(header::ORIGIN, "https://hostile.example")

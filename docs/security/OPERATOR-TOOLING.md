@@ -105,7 +105,77 @@ canal de rattrapage.
 Retirer un pair n'est pas une révocation cryptographique : il tombe à son
 prochain handshake, il n'existe pas de liste de révocation.
 
-## 5. Profil client
+## 5. PKI et key-negotiation
+
+Créer l’autorité cliente sur le poste opérateur, jamais sur la gateway :
+
+```sh
+helios-ctl key-nego init-client-ca \
+  --name helios-orion-clients --output-dir ./orion-client-ca
+```
+
+La commande crée simultanément l'autorité TLS et l'autorité ML-DSA-65. Copier
+seulement leurs parties publiques `orion-client-ca.der` et
+`orion-client-pq-ca-public.bin` sur la gateway, puis créer les identités serveur
+localement. Les clés privées TLS et PQ naissent en mémoire et sont scellées au
+TPM :
+
+```sh
+sudo heliosd init-key-negotiation \
+  --server-name vpn.example.net \
+  --client-ca ./orion-client-ca/orion-client-ca.der \
+  --client-pq-ca ./orion-client-ca/orion-client-pq-ca-public.bin
+```
+
+Récupérer les deux certificats publics indiqués par la commande. Le certificat
+PQ JSON est épinglé dans le profil Orion. Émettre ensuite les deux certificats
+du client, liés à sa même clé publique WireGuard :
+
+```sh
+helios-ctl key-nego issue-client \
+  --name portable \
+  --wireguard-public-key <clé publique WireGuard> \
+  --ca-certificate ./orion-client-ca/orion-client-ca.der \
+  --ca-private-key ./orion-client-ca/orion-client-ca-key.der \
+  --ca-pq-private-key ./orion-client-ca/orion-client-pq-ca-private.bin \
+  --output-dir ./portable-key-nego
+
+helios-ctl peer add --name portable \
+  --public-key <clé publique WireGuard> \
+  --key-negotiation-certificate-sha256 <empreinte TLS affichée> \
+  --key-negotiation-pq-certificate-sha256 <empreinte PQ affichée> \
+  --minimum-mode ml-kem
+```
+
+Sans `--minimum-mode`, la présence de l'empreinte PQ choisit déjà `ml-kem`.
+L'option explicite rend la politique visible dans les scripts. Une
+renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.
+
+Les deux clés clientes produites en `0600` servent au transfert initial vers le
+stockage protégé du poste Orion, puis doivent être effacées du poste opérateur.
+Le câblage de ce stockage dans le shell Windows et les écrans d’import sont le
+lot IHM suivant. Pour valider mTLS, ML-DSA et les messages sans modifier
+durablement un slot :
+
+```sh
+helios-ctl key-nego probe \
+  --endpoint vpn.example.net:51821 \
+  --server-name vpn.example.net \
+  --gateway-certificate key-negotiation-cert.der \
+  --gateway-pq-certificate key-negotiation-pq-cert.json \
+  --client-certificate portable-key-nego/orion-client-cert.der \
+  --client-private-key portable-key-nego/orion-client-key.der \
+  --client-pq-certificate portable-key-nego/orion-client-pq-cert.json \
+  --client-pq-private-key portable-key-nego/orion-client-pq-private.bin \
+  --client-wg-private-key-file ./portable-wg-private-key \
+  --gateway-wg-public-key <clé publique WireGuard Helios> \
+  --mode ml-kem
+```
+
+Le probe ferme volontairement la transaction sans confirmation ; Helios
+restaure donc le slot précédent.
+
+## 6. Profil client
 
 Mode recommandé — le client détient déjà sa clé et communique sa moitié
 publique (visible dans Orion, écran *Profils*) :

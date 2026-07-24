@@ -1,37 +1,36 @@
-//! Provisioning côté client : obtenir le PSK post-quantique auprès de la gateway.
+//! Client-side provisioning: obtaining the post-quantum PSK from the gateway.
 //!
-//! # Quand cela tourne
+//! # When this runs
 //!
-//! **Uniquement une fois le tunnel classique monté**, comme la télémétrie. La
-//! cinématique de l'ADR-001 :
+//! **Only once the classic tunnel is mounted**, like telemetry. ADR-001's
+//! timeline:
 //!
 //! ```text
-//! 1. Tunnel WireGuard classique (Curve25519) monté -> état Connecting,
-//!    kill-switch engagé, aucun trafic utilisateur.
-//! 2. CE MODULE : requête de provisioning vers la gateway, DANS le tunnel.
-//!    -> échange ML-KEM -> PSK dérivé des deux côtés.
-//! 3. PSK installé -> le handshake suivant réussit -> Up.
+//! 1. Classic WireGuard tunnel (Curve25519) mounted -> Connecting state,
+//!    kill-switch engaged, no user traffic.
+//! 2. THIS MODULE: provisioning request to the gateway, INSIDE the tunnel.
+//!    -> ML-KEM exchange -> PSK derived on both sides.
+//! 3. PSK installed -> next handshake succeeds -> Up.
 //! ```
 //!
-//! # Pourquoi pas de TLS ici
+//! # Why no TLS here
 //!
-//! Le canal vit **à l'intérieur** du tunnel WireGuard, qui fournit déjà la
-//! confidentialité *et* l'authentification mutuelle : chaque bout connaît la clé
-//! publique statique de l'autre (`peer_public_key` côté client, table de pairs
-//! côté gateway). Une couche TLS supplémentaire n'ajouterait ni l'une ni
-//! l'autre.
+//! The channel lives **inside** the WireGuard tunnel, which already provides
+//! confidentiality *and* mutual authentication: each end knows the other's
+//! static public key (`peer_public_key` on the client side, peer table on the
+//! gateway side). An additional TLS layer would add neither.
 //!
-//! Et même si le tunnel classique était rompu plus tard par un adversaire
-//! quantique, cela ne compromettrait pas le PSK : l'attaquant ne verrait que la
-//! clé publique ML-KEM et le ciphertext — exactement ce que voit l'observateur
-//! passif d'un échange ML-KEM mené en clair, ce à quoi ML-KEM résiste par
+//! And even if the classic tunnel were later broken by a quantum adversary,
+//! that wouldn't compromise the PSK: the attacker would only see the ML-KEM
+//! public key and the ciphertext — exactly what a passive observer of an
+//! ML-KEM exchange conducted in the clear sees, which ML-KEM resists by
 //! construction.
 //!
-//! # Ce que ce module ne fait pas
+//! # What this module doesn't do
 //!
-//! Il n'enrôle pas un client inconnu. Si la gateway ne connaît pas encore la clé
-//! publique WireGuard du client, le tunnel classique ne monte pas et ce code
-//! n'est jamais atteint. L'admission est hors bande (voir
+//! It doesn't enroll an unknown client. If the gateway doesn't yet know the
+//! client's WireGuard public key, the classic tunnel doesn't mount and this
+//! code is never reached. Admission is out of band (see
 //! `helios_provisioning`).
 
 use std::time::Duration;
@@ -43,23 +42,23 @@ use aether::pq::{Kem, MlKem768Kem};
 
 use crate::config::ClientProfile;
 
-/// Délai max d'une requête de provisioning.
+/// Max delay of a provisioning request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Résultat d'un provisioning réussi.
+/// Result of a successful provisioning.
 #[derive(Debug)]
 pub struct ProvisionOutcome {
-    /// PSK post-quantique, en base64, prêt pour le slot `PresharedKey`.
+    /// Post-quantum PSK, in base64, ready for the `PresharedKey` slot.
     pub preshared_key: String,
-    /// VIP attribuée par la gateway (CIDR).
+    /// VIP assigned by the gateway (CIDR).
     pub address: String,
-    /// Clé publique WireGuard de la gateway, telle qu'elle se déclare.
+    /// Gateway's WireGuard public key, as it declares itself.
     pub gateway_public_key: String,
-    /// Durée de validité annoncée du PSK.
+    /// Announced validity duration of the PSK.
     pub lifetime: Duration,
 }
 
-/// Erreurs du provisioning côté client.
+/// Client-side provisioning errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
     #[error("le profil n'est pas exploitable : {0}")]
@@ -74,15 +73,15 @@ pub enum ProvisionError {
     Protocol(#[from] EnrollError),
     #[error("échange ML-KEM impossible : {0}")]
     Kem(String),
-    /// La gateway ne s'annonce pas avec la clé publique attendue par le profil.
+    /// The gateway doesn't announce the public key expected by the profile.
     #[error("identité de gateway inattendue : le profil attend `{expected}`, la gateway annonce `{announced}`")]
     GatewayIdentityMismatch { expected: String, announced: String },
 }
 
-/// Construit la requête et la paire ML-KEM éphémère associée.
+/// Builds the request and its associated ephemeral ML-KEM pair.
 ///
-/// La paire est **éphémère par session** : le secret ne survit pas au
-/// provisioning, ce qui borne l'impact d'une compromission ultérieure du client.
+/// The pair is **ephemeral per session**: the secret doesn't survive
+/// provisioning, which bounds the impact of a later client compromise.
 fn build_request(
     profile: &ClientProfile,
 ) -> Result<(<MlKem768Kem as Kem>::SecretKey, [u8; 16], ProvisionRequest), ProvisionError> {
@@ -99,10 +98,10 @@ fn build_request(
     Ok((secret_key, client_nonce, request))
 }
 
-/// Dérive le PSK depuis la réponse de la gateway.
+/// Derives the PSK from the gateway's response.
 ///
-/// Séparé du transport pour être testable sans réseau — c'est ici que vit toute
-/// la logique cryptographique.
+/// Separated from transport to be testable without a network — this is
+/// where all the cryptographic logic lives.
 pub fn finish(
     profile: &ClientProfile,
     secret_key: &<MlKem768Kem as Kem>::SecretKey,
@@ -111,9 +110,10 @@ pub fn finish(
 ) -> Result<ProvisionOutcome, ProvisionError> {
     response.validate()?;
 
-    // La gateway doit être celle que le profil attend. Sans cette vérification,
-    // une gateway compromise pourrait se substituer et négocier un PSK avec nous
-    // — même si le tunnel WireGuard rend déjà ce scénario très improbable.
+    // The gateway must be the one the profile expects. Without this check, a
+    // compromised gateway could substitute itself and negotiate a PSK with
+    // us — even though the WireGuard tunnel already makes this scenario
+    // very unlikely.
     if response.gateway_wg_public_key != profile.peer_public_key {
         return Err(ProvisionError::GatewayIdentityMismatch {
             expected: profile.peer_public_key.clone(),
@@ -140,10 +140,10 @@ pub fn finish(
     })
 }
 
-/// Exécute un provisioning complet contre la gateway.
+/// Runs a complete provisioning against the gateway.
 ///
-/// `gateway_url` est l'URL interne, joignable **uniquement dans le tunnel**
-/// (ex. `http://100.64.0.1:8080`).
+/// `gateway_url` is the internal URL, reachable **only inside the tunnel**
+/// (e.g. `http://100.64.0.1:8080`).
 pub async fn provision(
     profile: &ClientProfile,
     gateway_url: &str,
@@ -180,21 +180,21 @@ pub async fn provision(
     finish(profile, &secret_key, &client_nonce, &response)
 }
 
-/// Tire un nonce de session depuis le CSPRNG du système.
+/// Draws a session nonce from the system's CSPRNG.
 fn fresh_nonce() -> [u8; 16] {
     use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
     let mut nonce = [0u8; 16];
     SystemRandom::new()
         .fill(&mut nonce)
-        .expect("CSPRNG système indisponible — impossible de provisionner sûrement");
+        .expect("system CSPRNG unavailable — cannot provision safely");
     nonce
 }
 
 impl ClientProfile {
-    /// Clé publique WireGuard du client, dérivée de sa clé privée.
+    /// Client's WireGuard public key, derived from its private key.
     ///
-    /// C'est l'identité que la gateway connaît. On la recalcule plutôt que de la
-    /// stocker : impossible qu'elle diverge de la clé privée réellement utilisée.
+    /// This is the identity the gateway knows. We recompute it rather than
+    /// store it: it can never diverge from the private key actually used.
     pub fn wg_public_key(&self) -> Result<String, ProvisionError> {
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD
@@ -204,7 +204,7 @@ impl ClientProfile {
             .try_into()
             .map_err(|_| ProvisionError::Profile("clé privée de longueur invalide".into()))?;
 
-        // Curve25519 : clé publique = base * clé privée (clampée).
+        // Curve25519: public key = base * private key (clamped).
         let secret = x25519_dalek::StaticSecret::from(raw);
         let public = x25519_dalek::PublicKey::from(&secret);
         Ok(base64::engine::general_purpose::STANDARD.encode(public.as_bytes()))
@@ -230,29 +230,29 @@ mod tests {
     }
 
     #[test]
-    fn la_cle_publique_derive_de_la_cle_privee() {
+    fn the_public_key_is_derived_from_the_private_key() {
         let pk = profile().wg_public_key().unwrap();
-        assert_eq!(pk.len(), 44, "clé Curve25519 en base64");
-        // Déterministe : deux appels donnent la même identité.
+        assert_eq!(pk.len(), 44, "Curve25519 key in base64");
+        // Deterministic: two calls give the same identity.
         assert_eq!(pk, profile().wg_public_key().unwrap());
     }
 
     #[test]
-    fn cle_privee_invalide_rejetee() {
+    fn invalid_private_key_rejected() {
         let mut p = profile();
-        p.private_key = "pas-du-base64".into();
+        p.private_key = "not-base64".into();
         assert!(matches!(p.wg_public_key(), Err(ProvisionError::Profile(_))));
     }
 
-    /// Le tour complet côté client, sans réseau : on simule la gateway avec la
-    /// vraie crypto ML-KEM et on vérifie que le PSK dérivé est exploitable.
+    /// The full client-side round trip, without a network: we simulate the
+    /// gateway with real ML-KEM crypto and check the derived PSK is usable.
     #[test]
-    fn provisioning_complet_produit_un_psk_utilisable() {
+    fn full_provisioning_produces_a_usable_psk() {
         let profile = profile();
         let (secret_key, client_nonce, request) = build_request(&profile).unwrap();
         request.validate().unwrap();
 
-        // ── Gateway simulée ──
+        // ── Simulated gateway ──
         let gateway_nonce = [7u8; NONCE_LEN];
         let (ciphertext, kem_secret) = MlKem768Kem::encapsulate(&request.kem_public_key).unwrap();
         let expected_psk = derive_psk(
@@ -273,20 +273,20 @@ mod tests {
             psk_lifetime_secs: 3600,
         };
 
-        // ── Retour côté client ──
+        // ── Client-side return ──
         let outcome = finish(&profile, &secret_key, &client_nonce, &response).unwrap();
         assert_eq!(
             outcome.preshared_key,
             aether::enroll::psk_to_base64(&expected_psk),
-            "le client doit dériver exactement le PSK que la gateway a calculé"
+            "the client must derive exactly the PSK the gateway computed"
         );
         assert_eq!(outcome.address, "100.64.1.2/32");
         assert_eq!(outcome.lifetime, Duration::from_secs(3600));
     }
 
-    /// Une gateway qui n'est pas celle du profil doit être rejetée.
+    /// A gateway that isn't the profile's must be rejected.
     #[test]
-    fn gateway_inattendue_refusee() {
+    fn unexpected_gateway_rejected() {
         let profile = profile();
         let (secret_key, client_nonce, request) = build_request(&profile).unwrap();
         let (ciphertext, _) = MlKem768Kem::encapsulate(&request.kem_public_key).unwrap();
@@ -296,7 +296,7 @@ mod tests {
             kem_ciphertext: ciphertext,
             gateway_nonce: [0; NONCE_LEN],
             assigned_address: "100.64.1.2/32".into(),
-            // Une autre identité que celle attendue par le profil.
+            // A different identity than the one expected by the profile.
             gateway_wg_public_key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into(),
             psk_lifetime_secs: 3600,
         };
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn ciphertext_malforme_rejete() {
+    fn malformed_ciphertext_rejected() {
         let profile = profile();
         let (secret_key, client_nonce, _) = build_request(&profile).unwrap();
         let response = ProvisionResponse {
@@ -323,14 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn deux_sessions_utilisent_des_paires_kem_distinctes() {
+    fn two_sessions_use_distinct_kem_pairs() {
         let p = profile();
         let (_, n1, r1) = build_request(&p).unwrap();
         let (_, n2, r2) = build_request(&p).unwrap();
         assert_ne!(
             r1.kem_public_key, r2.kem_public_key,
-            "paire éphémère par session"
+            "ephemeral pair per session"
         );
-        assert_ne!(n1, n2, "nonce frais par session");
+        assert_ne!(n1, n2, "fresh nonce per session");
     }
 }

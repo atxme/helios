@@ -1,6 +1,8 @@
-//! `heliosd` — daemon orchestrateur du plan de contrôle.
+//! `heliosd` — control plane orchestrator daemon.
 
 mod gateway_key;
+#[cfg(feature = "key-negotiation")]
+mod key_negotiation;
 mod orchestrator;
 
 use std::sync::Arc;
@@ -9,24 +11,23 @@ use aether::{
     HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK,
 };
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use helio_tpm::{BootController, BootDecision, TpmSettings};
 use helios_api::AppState;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// Nombre d'essais de mise en écoute de l'API avant abandon.
+/// Number of API listen attempts before giving up.
 ///
-/// L'adresse d'écoute appartient à l'interface WireGuard, créée par
-/// l'orchestrateur après le lancement du serveur : les premiers essais échouent
-/// nécessairement. La borne évite une boucle infinie si l'adresse ne vient
-/// jamais — une configuration erronée doit rester visible, pas être masquée par
-/// des tentatives silencieuses.
-const API_BIND_TENTATIVES: u32 = 20;
+/// The listening address belongs to the WireGuard interface, created by the
+/// orchestrator after the server starts: the first attempts necessarily
+/// fail. The bound avoids an infinite loop if the address never comes —
+/// a misconfiguration must stay visible, not be masked by silent retries.
+const API_BIND_ATTEMPTS: u32 = 20;
 
-/// Attente entre deux essais de mise en écoute de l'API.
-const API_BIND_DELAI: std::time::Duration = std::time::Duration::from_millis(500);
+/// Wait between two API listen attempts.
+const API_BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Parser)]
 #[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
@@ -37,41 +38,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Lance le daemon (kill-switch + orchestration + interface web).
+    /// Launches the daemon (kill-switch + orchestration + web interface).
     Run {
-        /// Mode développement : simule WireGuard, nftables et TPM.
-        /// Activé automatiquement sur WSL2 si WireGuard noyau est absent.
+        /// Development mode: simulates WireGuard, nftables and TPM.
+        /// Enabled automatically on WSL2 if the kernel WireGuard module is
+        /// absent.
         #[arg(long)]
         dev: bool,
     },
-    /// Affiche la configuration résolue et l'état du système.
+    /// Displays the resolved configuration and system state.
     Status,
-    /// Vérifie la disponibilité d'une mise à jour.
+    /// Checks whether an update is available.
     CheckUpdate,
-    /// Provisionne le coffre TPM au premier déploiement.
+    /// Provisions the TPM vault on first deployment.
     ///
-    /// À jouer **une seule fois**, à l'installation, avec accès console. Sur le
-    /// terrain, un coffre absent est une anomalie de sécurité : le démarrage
-    /// nominal refuse donc de provisionner de lui-même, et cette commande est le
-    /// seul chemin explicite pour le faire.
+    /// To be run **only once**, at install time, with console access. In the
+    /// field, an absent vault is a security anomaly: nominal startup
+    /// therefore refuses to provision on its own, and this command is the
+    /// only explicit path to do so.
     ProvisionTpm,
-    /// Crée l'identité WireGuard de la gateway et la scelle (ADR-004 §3).
+    /// Creates the gateway's WireGuard identity and seals it (ADR-004 §3).
     ///
-    /// À jouer après `provision-tpm`, avec accès console. La clé privée est
-    /// générée en mémoire et scellée sans jamais toucher le disque en clair ;
-    /// seule la clé publique est affichée, à remettre aux clients.
+    /// To be run after `provision-tpm`, with console access. The private key
+    /// is generated in memory and sealed without ever touching the disk in
+    /// the clear; only the public key is displayed, to hand to clients.
     InitIdentity {
-        /// Remplace une identité déjà scellée. **Tous les clients devront
-        /// mettre à jour `peer_public_key`** : ce n'est pas une reprise, c'est
-        /// un changement d'identité de la gateway.
+        /// Replaces an already-sealed identity. **All clients will have to
+        /// update `peer_public_key`**: this is not a recovery, it is a
+        /// change of the gateway's identity.
         #[arg(long)]
         rotate: bool,
     },
-    /// Admission locale des clients, avec accès console.
+    /// Creates and seals the gateway's key-negotiation TLS identity.
+    #[cfg(feature = "key-negotiation")]
+    InitKeyNegotiation {
+        /// DNS name or IP address clients use to authenticate this gateway.
+        #[arg(long)]
+        server_name: String,
+        /// DER certificate of the CA authorized to issue Orion certificates.
+        #[arg(long)]
+        client_ca: std::path::PathBuf,
+        /// Raw ML-DSA-65 public key of the CA issuing Orion PQ certificates.
+        #[arg(long)]
+        client_pq_ca: std::path::PathBuf,
+        /// Explicitly replaces the existing identity and public certificates.
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Local client admission, with console access.
     ///
-    /// Sert au bootstrap du premier pair administrateur — sans lui, aucune
-    /// mutation distante n'est autorisée (ADR-003 §3) — et au dépannage. Le
-    /// chemin nominal ensuite est `helios-ctl peer`, à travers le tunnel.
+    /// Used to bootstrap the first administrator peer — without it, no
+    /// remote mutation is authorized (ADR-003 §3) — and for troubleshooting.
+    /// The nominal path afterwards is `helios-ctl peer`, through the tunnel.
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
@@ -80,25 +98,51 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PeerCommand {
-    /// Admet un client et lui attribue sa VIP.
+    /// Admits a client and assigns it its VIP.
     Add {
-        /// Nom convivial, unique sur la gateway.
+        /// Friendly name, unique on the gateway.
         #[arg(long)]
         name: String,
-        /// Clé publique Curve25519 du client, en base64.
+        /// Client's Curve25519 public key, in base64.
         #[arg(long)]
         public_key: String,
-        /// Autorise ce pair à muter le plan de contrôle et les mises à jour.
+        /// Authorizes this peer to mutate the control plane and updates.
         #[arg(long)]
         admin: bool,
+        /// SHA-256 fingerprint of the client's key-negotiation certificate.
+        #[arg(long)]
+        key_negotiation_certificate_sha256: Option<String>,
+        /// SHA-256 fingerprint of the client's ML-DSA-65 certificate.
+        #[arg(long)]
+        key_negotiation_pq_certificate_sha256: Option<String>,
+        /// Refuses future negotiations below this protection level.
+        #[arg(long, value_enum)]
+        minimum_mode: Option<NegotiationMode>,
     },
-    /// Liste les pairs admis.
+    /// Lists admitted peers.
     List,
-    /// Retire un pair de l'admission.
+    /// Removes a peer from admission.
     Remove {
         #[arg(long)]
         name: String,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum NegotiationMode {
+    Classic,
+    StaticPsk,
+    MlKem,
+}
+
+impl From<NegotiationMode> for aether::key_negotiation::ProtectionMode {
+    fn from(value: NegotiationMode) -> Self {
+        match value {
+            NegotiationMode::Classic => Self::Classic,
+            NegotiationMode::StaticPsk => Self::StaticPsk,
+            NegotiationMode::MlKem => Self::MlKem,
+        }
+    }
 }
 
 #[tokio::main]
@@ -108,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let network = NetworkConfig::load().context("chargement de la config réseau")?;
+    let network = NetworkConfig::load().context("loading the network config")?;
 
     match cli.command {
         Command::Run { dev } => {
@@ -125,47 +169,82 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ProvisionTpm => provision_tpm(),
         Command::InitIdentity { rotate } => init_identity(&network, rotate),
+        #[cfg(feature = "key-negotiation")]
+        Command::InitKeyNegotiation {
+            server_name,
+            client_ca,
+            client_pq_ca,
+            rotate,
+        } => init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate),
         Command::Peer { command } => peer_command(network, command),
     }
 }
 
-/// Crée et scelle l'identité WireGuard de la gateway.
+#[cfg(feature = "key-negotiation")]
+fn init_key_negotiation(
+    network: &NetworkConfig,
+    server_name: &str,
+    client_ca: &std::path::Path,
+    client_pq_ca: &std::path::Path,
+    rotate: bool,
+) -> anyhow::Result<()> {
+    let boot = BootController::unlock(&TpmSettings::default())
+        .context("unlocking the TPM vault for key-negotiation identity creation")?;
+    let resolved = gateway_key::resolve(network, &boot);
+    let gateway_wg_public_key = aether::wg::public_from_private(&resolved.private_key)
+        .context("gateway WireGuard identity is unavailable")?;
+    let result = key_negotiation::initialize(
+        server_name,
+        &gateway_wg_public_key,
+        client_ca,
+        client_pq_ca,
+        &boot,
+        rotate,
+    )?;
+    println!("certificate: {}", result.certificate_path.display());
+    println!("sha256: {}", result.certificate_sha256);
+    println!("PQ certificate: {}", result.pq_certificate_path.display());
+    println!("PQ sha256: {}", result.pq_certificate_sha256);
+    info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
+    Ok(())
+}
+
+/// Creates and seals the gateway's WireGuard identity.
 ///
-/// Le déscellement passe par le même `BootController` que le démarrage
-/// nominal : si l'intégrité de la chaîne de démarrage n'est pas confirmée, il
-/// n'y a pas de secret, donc pas de scellement — et pas d'identité créée à
-/// moitié.
+/// Unsealing goes through the same `BootController` as nominal startup: if
+/// the boot chain's integrity is not confirmed, there is no secret, hence no
+/// sealing — and no half-created identity.
 fn init_identity(network: &NetworkConfig, rotate: bool) -> anyhow::Result<()> {
     let tpm = TpmSettings::default();
     let boot = BootController::unlock(&tpm).map_err(|e| {
         anyhow::anyhow!(
-            "déscellement TPM échoué : {e}. Provisionner le coffre d'abord \
+            "TPM unsealing failed: {e}. Provision the vault first \
              (`heliosd provision-tpm`)."
         )
     })?;
 
     let public_key = gateway_key::initialize(network, &boot, rotate)
-        .map_err(|e| anyhow::anyhow!("initialisation de l'identité impossible : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not initialize the identity: {e}"))?;
 
     println!("{public_key}");
     info!(
-        "clé publique de la gateway ci-dessus — c'est la valeur `peer_public_key` \
-         des profils clients. La clé privée reste scellée et n'est jamais affichée."
+        "gateway's public key above — this is the `peer_public_key` value \
+         for client profiles. The private key stays sealed and is never displayed."
     );
     Ok(())
 }
 
-/// Admission locale : lit, modifie et réécrit `network.toml`.
+/// Local admission: reads, modifies and rewrites `network.toml`.
 ///
-/// Le daemon garde sa configuration en mémoire : une modification par ce chemin
-/// ne prend effet qu'au prochain démarrage. C'est assumé — cette commande vise
-/// le bootstrap et le dépannage console, pas l'exploitation courante, qui passe
-/// par l'API (`helios-ctl peer`).
+/// The daemon keeps its configuration in memory: a modification through this
+/// path only takes effect on the next startup. This is accepted — this
+/// command targets bootstrap and console troubleshooting, not routine
+/// operations, which go through the API (`helios-ctl peer`).
 fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Result<()> {
     match command {
         PeerCommand::List => {
             if network.peers.is_empty() {
-                println!("aucun pair admis");
+                println!("no admitted peers");
                 return Ok(());
             }
             for peer in &network.peers {
@@ -186,100 +265,118 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             name,
             public_key,
             admin,
+            key_negotiation_certificate_sha256,
+            key_negotiation_pq_certificate_sha256,
+            minimum_mode,
         } => {
-            let peer = helios_provisioning::admit(&mut network, &name, &public_key, admin)
-                .map_err(|e| anyhow::anyhow!("admission refusée : {e}"))?;
+            let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
+                if key_negotiation_pq_certificate_sha256.is_some() {
+                    aether::key_negotiation::ProtectionMode::MlKem
+                } else {
+                    aether::key_negotiation::ProtectionMode::Classic
+                }
+            });
+            let peer = helios_provisioning::admit_with_key_negotiation(
+                &mut network,
+                &name,
+                &public_key,
+                admin,
+                key_negotiation_certificate_sha256.as_deref(),
+                key_negotiation_pq_certificate_sha256.as_deref(),
+                minimum_mode,
+            )
+            .map_err(|e| anyhow::anyhow!("admission refused: {e}"))?;
             network
                 .save()
-                .context("écriture de la configuration réseau")?;
+                .context("writing the network configuration")?;
             println!("{}\t{}", peer.name, peer.address);
-            info!("pair admis — la modification prendra effet au prochain démarrage de heliosd");
+            info!("peer admitted — the change will take effect on heliosd's next startup");
             Ok(())
         }
         PeerCommand::Remove { name } => {
             let peer = helios_provisioning::revoke(&mut network, &name)
-                .map_err(|e| anyhow::anyhow!("révocation refusée : {e}"))?;
+                .map_err(|e| anyhow::anyhow!("revocation refused: {e}"))?;
             network
                 .save()
-                .context("écriture de la configuration réseau")?;
-            println!("{} retiré", peer.name);
+                .context("writing the network configuration")?;
+            println!("{} removed", peer.name);
             warn!(
-                "le pair tombera à son prochain handshake ; aucune révocation \
-                 cryptographique n'existe (ADR-004)"
+                "the peer will drop at its next handshake; no cryptographic \
+                 revocation exists (ADR-004)"
             );
             Ok(())
         }
     }
 }
 
-/// Scelle un secret neuf dans le TPM, au premier déploiement seulement.
+/// Seals a fresh secret into the TPM, on first deployment only.
 ///
-/// `TpmSettings::default()` porte `allow_provisioning = false` : c'est
-/// délibéré, un coffre absent sur le terrain signale qu'on a pu l'effacer pour
-/// forcer un faux premier boot. Le démarrage nominal doit donc s'arrêter là.
+/// `TpmSettings::default()` carries `allow_provisioning = false`: this is
+/// deliberate, an absent vault in the field signals it may have been erased
+/// to force a fake first boot. Nominal startup must therefore stop there.
 ///
-/// Il faut malgré tout un chemin pour le premier scellement, sans quoi une
-/// gateway compilée avec la feature `tpm` ne peut jamais démarrer. Cette
-/// commande est ce chemin : explicite, distincte du démarrage, et refusant
-/// d'écraser un coffre existant — un écrasement détruirait l'identité de la
-/// gateway sans possibilité de retour.
+/// A path for the first sealing is nonetheless needed, without which a
+/// gateway built with the `tpm` feature could never start. This command is
+/// that path: explicit, distinct from startup, and refusing to overwrite an
+/// existing vault — an overwrite would destroy the gateway's identity with
+/// no way back.
 fn provision_tpm() -> anyhow::Result<()> {
     let mut tpm = TpmSettings::default();
 
     if !tpm.enabled {
         anyhow::bail!(
-            "binaire compilé sans la feature `tpm` : aucun scellement possible. \
-             Recompiler avec --features tpm sur la cible."
+            "binary built without the `tpm` feature: no sealing possible. \
+             Rebuild with --features tpm on the target."
         );
     }
 
     if std::path::Path::new(&tpm.sealed_blob_path).exists() {
         anyhow::bail!(
-            "un coffre existe déjà dans {} — refus d'écraser. Le supprimer ferait \
-             perdre l'identité scellée de la gateway.",
+            "a vault already exists in {} — refusing to overwrite it. Deleting it \
+             would lose the gateway's sealed identity.",
             tpm.sealed_blob_path
         );
     }
 
     tpm.allow_provisioning = true;
-    match BootController::unlock(&tpm).map_err(|e| anyhow::anyhow!("scellement échoué : {e}"))? {
+    match BootController::unlock(&tpm).map_err(|e| anyhow::anyhow!("sealing failed: {e}"))? {
         BootDecision::Provisioned(_) => {
             info!(
-                "coffre TPM provisionné dans {} — lié aux PCR {:?} de la banque {}",
+                "TPM vault provisioned in {} — bound to PCR {:?} of bank {}",
                 tpm.sealed_blob_path, tpm.pcr_selection, tpm.pcr_bank
             );
             info!(
-                "démarrer heliosd : la clé WireGuard en clair de network.toml sera \
-                 scellée automatiquement, après quoi `wg_private_key` peut en être retiré"
+                "start heliosd: the plaintext WireGuard key from network.toml will be \
+                 sealed automatically, after which `wg_private_key` can be removed from it"
             );
             Ok(())
         }
-        autre => anyhow::bail!("provisionnement attendu, obtenu : {autre:?}"),
+        other => anyhow::bail!("expected provisioning, got: {other:?}"),
     }
 }
 
-/// Détermine si on est sous WSL2 (noyau Microsoft).
+/// Determines whether we are under WSL2 (Microsoft kernel).
 fn is_wsl2() -> bool {
     std::fs::read_to_string("/proc/version")
         .map(|v| v.to_ascii_lowercase().contains("microsoft"))
         .unwrap_or(false)
 }
 
-/// Vérifie si le module WireGuard noyau est chargé.
+/// Checks whether the kernel WireGuard module is loaded.
 fn wireguard_module_present() -> bool {
     std::path::Path::new("/sys/module/wireguard").exists()
 }
 
-/// Résout le mode dry-run : explicite (`--dev`) ou auto-détecté (WSL2 sans WireGuard).
+/// Resolves dry-run mode: explicit (`--dev`) or auto-detected (WSL2 without WireGuard).
 fn resolve_dry_run(explicit_dev: bool) -> bool {
     if explicit_dev {
-        info!("mode --dev activé : simulation WireGuard, nftables et TPM");
+        info!("--dev mode enabled: simulating WireGuard, nftables and TPM");
         return true;
     }
     if is_wsl2() && !wireguard_module_present() {
         warn!(
-            "WSL2 détecté sans module WireGuard — bascule automatique en mode dev \
-             (simulation sans crypto)"
+            "WSL2 detected without the WireGuard module — automatically switching \
+             to dev mode (simulation without crypto)"
         );
         return true;
     }
@@ -287,60 +384,71 @@ fn resolve_dry_run(explicit_dev: bool) -> bool {
 }
 
 async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
-    // Validation d'intégrité TPM — AVANT tout réseau.
+    #[cfg(not(feature = "key-negotiation"))]
+    anyhow::ensure!(
+        network.key_negotiation_port.is_none(),
+        "key_negotiation_port is configured but this heliosd binary was built without \
+         the key-negotiation feature"
+    );
+
+    // TPM integrity validation — BEFORE any network access.
     let tpm = TpmSettings::default();
     let boot = BootController::unlock(&tpm)
-        .map_err(|e| anyhow::anyhow!("déscellement TPM échoué — arrêt : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("TPM unsealing failed — stopping: {e}"))?;
     match &boot {
         BootDecision::Disabled => {}
-        BootDecision::Bypassed => warn!("intégrité TPM non vérifiée (enforce=false)"),
-        BootDecision::Unsealed(_) => info!("intégrité du démarrage confirmée (TPM)"),
-        BootDecision::Provisioned(_) => warn!("premier boot : provisionnement TOFU effectué"),
-        BootDecision::Resealed(_) => warn!("rescellement post-OTA effectué (billet valide)"),
+        BootDecision::Bypassed => warn!("TPM integrity not verified (enforce=false)"),
+        BootDecision::Unsealed(_) => info!("boot integrity confirmed (TPM)"),
+        BootDecision::Provisioned(_) => warn!("first boot: TOFU provisioning performed"),
+        BootDecision::Resealed(_) => warn!("post-OTA resealing performed (valid ticket)"),
     }
-    // La clé privée WireGuard vient du coffre scellé TPM, pas de network.toml.
-    // Voir `gateway_key` : en clair sur disque, elle suffirait à usurper la
-    // gateway. La config n'en porte plus qu'un éventuel repli hérité.
+    // The WireGuard private key comes from the sealed TPM vault, not from
+    // network.toml. See `gateway_key`: in the clear on disk, it would be
+    // enough to impersonate the gateway. The config now only carries a
+    // possible legacy fallback.
     let mut network = network;
     let resolved = gateway_key::resolve(&network, &boot);
     match resolved.origin {
         gateway_key::KeyOrigin::Sealed => {}
         gateway_key::KeyOrigin::Recovered => warn!(
-            "identité restaurée depuis le séquestre après un changement de PCR — \
-             vérifier que le fichier de récupération a bien été effacé"
+            "identity restored from escrow after a PCR change — \
+             check that the recovery file was indeed erased"
         ),
         gateway_key::KeyOrigin::PlaintextConfig => warn!(
-            "identité de la gateway en clair sur disque — sceller la clé puis retirer \
-             `wg_private_key` de network.toml"
+            "gateway identity in the clear on disk — seal the key then remove \
+             `wg_private_key` from network.toml"
         ),
         gateway_key::KeyOrigin::Missing => warn!(
-            "aucune clé privée WireGuard : la gateway démarre en fail-closed sans \
-             monter d'interface. Fournir une clé (POST /api/gateway/wireguard-key)."
+            "no WireGuard private key: the gateway starts fail-closed without \
+             bringing up an interface. Provide a key (POST /api/gateway/wireguard-key)."
         ),
     }
     network.wg_private_key = resolved.private_key;
 
     let (event_tx, _) = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);
-    // Canal dédié au provisioning : il porte un secret et attend un
-    // acquittement, contrairement au flux d'ordres d'IHM.
+    // Dedicated provisioning channel: it carries a secret and awaits an
+    // acknowledgment, unlike the UI order flow.
     let (psk_tx, psk_rx) = mpsc::channel::<InstallPskRequest>(8);
     let tunnel_state = Arc::new(RwLock::new(TunnelState::Down));
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy = Arc::new(RwLock::new(shared_network.read().await.firewall_policy()));
 
-    // L'API écoute sur l'adresse du tunnel : c'est par là que les clients Orion
-    // atteignent le provisioning et la télémétrie. Le filtrage reste assuré par
-    // le pare-feu (`admin_iface`), pas par l'adresse de bind.
-    // Une simulation ne crée pas réellement l'adresse WireGuard. Elle écoute
-    // donc uniquement en local, ce qui rend le test manuel possible sans
-    // exposer l'API de développement sur le réseau de la machine.
+    #[cfg(feature = "key-negotiation")]
+    key_negotiation::start(Arc::clone(&shared_network), psk_tx.clone(), &boot, dry_run).await?;
+
+    // The API listens on the tunnel's address: this is how Orion clients
+    // reach provisioning and telemetry. Filtering is still enforced by the
+    // firewall (`admin_iface`), not by the bind address.
+    // A simulation does not actually create the WireGuard address. It
+    // therefore only listens locally, which makes manual testing possible
+    // without exposing the development API on the machine's network.
     let api_bind = if dry_run {
         API_BIND_LOOPBACK.to_string()
     } else {
         shared_network.read().await.api_bind()
     };
-    info!("interface web sur http://{api_bind}");
+    info!("web interface on http://{api_bind}");
 
     let state = AppState::new(
         Arc::clone(&shared_network),
@@ -353,25 +461,25 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     );
     let api_ready = Arc::clone(&state.api_ready);
     tokio::spawn(async move {
-        // Hors simulation, l'API écoute sur l'adresse WireGuard — que
-        // l'orchestrateur, démarré juste après, n'a pas encore assignée à
-        // l'interface. Le premier `bind` échoue donc en « Cannot assign
-        // requested address », et sans réessai la gateway tournait pour de
-        // bon sans API : ni provisioning, ni télémétrie, pour une course
-        // perdue de quelques dizaines de millisecondes.
-        for tentative in 1..=API_BIND_TENTATIVES {
+        // Outside simulation, the API listens on the WireGuard address —
+        // which the orchestrator, started right after, has not yet assigned
+        // to the interface. The first `bind` therefore fails with "Cannot
+        // assign requested address", and without a retry the gateway would
+        // run for good without an API: no provisioning, no telemetry, for a
+        // race lost by a few dozen milliseconds.
+        for attempt in 1..=API_BIND_ATTEMPTS {
             match helios_api::serve(state.clone(), &api_bind).await {
                 Ok(()) => return,
-                Err(e) if tentative < API_BIND_TENTATIVES => {
+                Err(e) if attempt < API_BIND_ATTEMPTS => {
                     warn!(
-                        "serveur API indisponible (tentative {tentative}/{API_BIND_TENTATIVES}), \
-                         nouvel essai : {e:#}"
+                        "API server unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                         retrying: {e:#}"
                     );
-                    tokio::time::sleep(API_BIND_DELAI).await;
+                    tokio::time::sleep(API_BIND_DELAY).await;
                 }
                 Err(e) => {
                     tracing::error!(
-                        "serveur API abandonné après {API_BIND_TENTATIVES} tentatives : {e:#}"
+                        "API server given up after {API_BIND_ATTEMPTS} attempts: {e:#}"
                     );
                 }
             }
