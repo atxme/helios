@@ -92,7 +92,7 @@ unique, pas deux intégrations séparées.
 
 On ne touche **pas** au handshake WireGuard. Le message d'initiation fait 148
 octets à disposition fixe, un seul datagramme UDP, jamais fragmenté, avec
-MAC1/MAC2 calculés sur ce layout exact. ML-KEM-768 (clé publique 1 184 o,
+MAC1/MAC2 calculés sur ce layout exact. ML-KEM-1024 (clé publique 1 184 o,
 ciphertext 1 088 o) **n'y rentre pas** : l'« injecter » signifierait redéfinir le
 format de message, fragmenter sur UDP et reconstruire la logique anti-DoS —
 c'est-à-dire écrire un protocole cryptographique nouveau, sans interopérabilité
@@ -101,7 +101,7 @@ ni revue externe.
 À la place : le secret ML-KEM alimente le slot **`PresharedKey`**, qui existe
 déjà dans le format de fil et est déjà mélangé au handshake Noise.
 
-Implémentation : **`aws-lc-rs`** (AWS-LC), **sans la feature `fips`**. ML-KEM-768
+Implémentation : **`aws-lc-rs`** (AWS-LC), **sans la feature `fips`**. ML-KEM-1024
 (FIPS 203) vit dans l'API `kem` standard, pas derrière FIPS. Concrètement, dans
 `aether::pq` derrière le trait `Kem` (module `pq`, testé sur WSL2).
 
@@ -145,7 +145,7 @@ F*), ne toucherait que `aether::pq`.
 > Rosenpass. Rosenpass est un protocole UDP dédié avec sa propre preuve, sa
 > vérification symbolique, Classic McEliece pour l'authenticité et des cookies
 > anti *state-disruption*. Ce qu'on obtient ici n'est pas une preuve formelle :
-> ML-KEM-768 établit le secret et ML-DSA-65 authentifie chaque message de la
+> ML-KEM-1024 établit le secret et ML-DSA-65 authentifie chaque message de la
 > transaction. TLS reste une enveloppe QUIC de défense en profondeur, pas
 > l'ancre cryptographique du protocole.
 >
@@ -401,7 +401,7 @@ modes ; Helios les supporte tous sans en substituer un autre :
 |---|---|
 | `classic` | vide |
 | `static_psk` | PSK statique déjà configuré, après comparaison de son empreinte |
-| `ml_kem` | PSK frais dérivé d'une encapsulation ML-KEM-768 |
+| `ml_kem` | PSK frais dérivé d'une encapsulation ML-KEM-1024 |
 
 ### Authentification et échange
 

@@ -4,7 +4,12 @@
 //! provide DER identities and a transaction handler. This separation keeps
 //! the public parser and TLS boundary independently testable.
 
-use std::{any::Any, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aether::key_negotiation::{
     derive_negotiated_psk, static_psk_fingerprint, AuthenticatedKeyNegotiationCommit,
@@ -12,7 +17,7 @@ use aether::key_negotiation::{
     AuthenticatedKeyNegotiationResponse, KeyNegotiationRequest, KeyNegotiationResponse,
     ProtectionMode, KEY_NEGOTIATION_VERSION, MAX_KEY_NEGOTIATION_MESSAGE_BYTES,
 };
-use aether::pq::{Kem, MlKem768Kem};
+use aether::pq::{Kem, MlKem1024Kem};
 use aether::SecretString;
 use async_trait::async_trait;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
@@ -30,6 +35,21 @@ pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/2";
 pub const DEFAULT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(180);
 /// Bounds authenticated connection tasks exposed on the public WAN port.
 pub const MAX_ACTIVE_NEGOTIATIONS: usize = 128;
+
+/// Handshakes accepted per source address and per window, once its address is
+/// validated.
+///
+/// Address validation stops spoofed floods; it does nothing against an
+/// attacker using its own address, which can still make the gateway run TLS
+/// handshakes and ML-DSA verifications. This second bound makes that cost
+/// linear in the number of addresses an attacker actually holds.
+pub const MAX_HANDSHAKES_PER_SOURCE: u32 = 8;
+
+/// Window over which [`MAX_HANDSHAKES_PER_SOURCE`] is counted.
+///
+/// A legitimate client negotiates once per connection, so eight attempts a
+/// minute leaves ample room for retries on a lossy link.
+pub const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Secret configuration prepared for the WireGuard peer.
 ///
@@ -92,7 +112,7 @@ pub fn prepare_key_material(
                 .as_deref()
                 .ok_or(PublicError::Protocol)?;
             let (ciphertext, shared_secret) =
-                MlKem768Kem::encapsulate(public_key).map_err(|_| PublicError::Protocol)?;
+                MlKem1024Kem::encapsulate(public_key).map_err(|_| PublicError::Protocol)?;
             response.kem_ciphertext = Some(ciphertext);
             let psk = derive_negotiated_psk(&shared_secret, request, &response)
                 .map_err(|_| PublicError::Protocol)?;
@@ -249,9 +269,76 @@ pub fn client_endpoint(
 }
 
 /// Serves connections until the endpoint is closed.
+/// Counts recent handshakes per source address.
+///
+/// Deliberately a plain map behind a mutex rather than a background sweeper:
+/// entries are pruned on insertion, so an address that stops talking costs
+/// nothing, and the map never outgrows the number of addresses seen within one
+/// window.
+#[derive(Default)]
+struct SourceLimiter {
+    seen: std::collections::HashMap<std::net::IpAddr, (Instant, u32)>,
+}
+
+impl SourceLimiter {
+    /// `true` if this address may open one more handshake.
+    fn admit(&mut self, source: std::net::IpAddr, now: Instant) -> bool {
+        self.seen
+            .retain(|_, (started, _)| now.duration_since(*started) < SOURCE_RATE_WINDOW);
+        let entry = self.seen.entry(source).or_insert((now, 0));
+        if now.duration_since(entry.0) >= SOURCE_RATE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= MAX_HANDSHAKES_PER_SOURCE
+    }
+}
+
+/// Serves the public negotiation port.
+///
+/// # Cost before authentication
+///
+/// Everything this port does — TLS 1.3, ML-DSA-65 verification, ML-KEM
+/// encapsulation — is expensive, and all of it happens before the gateway
+/// knows whether the peer is legitimate. That asymmetry is the DoS: a few
+/// spoofed packets buy an attacker a lot of gateway CPU.
+///
+/// Two bounds, in the order that matters:
+///
+/// 1. **Address validation (QUIC Retry).** An `Incoming` whose address is not
+///    yet validated is answered with a Retry packet, which costs a token and
+///    no state. The peer must echo the token from that same address, so a
+///    spoofed source never reaches the TLS handshake at all.
+/// 2. **Per-source rate limit.** Validation proves the address is real, not
+///    that it is friendly. Beyond [`MAX_HANDSHAKES_PER_SOURCE`] per window,
+///    further handshakes from that address are refused.
+///
+/// [`MAX_ACTIVE_NEGOTIATIONS`] then bounds concurrency for what gets through.
 pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
     let capacity = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_NEGOTIATIONS));
+    let limiter = Arc::new(std::sync::Mutex::new(SourceLimiter::default()));
+
     while let Some(incoming) = endpoint.accept().await {
+        // Before any allocation or cryptography: prove the address is real.
+        if !incoming.remote_address_validated() {
+            if incoming.retry().is_err() {
+                tracing::debug!("key-negotiation retry refused for an already-validated peer");
+            }
+            continue;
+        }
+
+        let source = incoming.remote_address().ip();
+        let admitted = limiter
+            .lock()
+            .map(|mut limiter| limiter.admit(source, Instant::now()))
+            // A poisoned lock must not open the port wide: refuse instead.
+            .unwrap_or(false);
+        if !admitted {
+            tracing::warn!(%source, "key-negotiation handshake rate exceeded for this address");
+            incoming.refuse();
+            continue;
+        }
+
         let permit = match Arc::clone(&capacity).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -521,6 +608,16 @@ pub enum TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Horloge des tests : les requêtes doivent être fraîches pour passer la
+    /// fenêtre anti-rejeu.
+    fn test_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     use aether::key_negotiation::{
         authenticate_commit, authenticate_confirmation, authenticate_request,
         authenticate_response, generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate,
@@ -536,6 +633,38 @@ mod tests {
     const CLIENT_WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const GATEWAY_WG_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
+    /// Address validation proves an address is real, not that it is
+    /// friendly. This bound is what keeps a validated attacker's CPU cost
+    /// linear in the number of addresses it actually holds.
+    #[test]
+    fn a_single_source_cannot_buy_unlimited_handshakes() {
+        let mut limiter = SourceLimiter::default();
+        let attacker: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let bystander: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let start = Instant::now();
+
+        for attempt in 1..=MAX_HANDSHAKES_PER_SOURCE {
+            assert!(
+                limiter.admit(attacker, start),
+                "attempt {attempt} is within the budget"
+            );
+        }
+        assert!(
+            !limiter.admit(attacker, start),
+            "the budget must run out for this address"
+        );
+        // One noisy address must not deny the service to everyone else.
+        assert!(limiter.admit(bystander, start));
+
+        // The window slides: the budget comes back rather than banning.
+        let later = start + SOURCE_RATE_WINDOW + Duration::from_secs(1);
+        assert!(limiter.admit(attacker, later));
+        assert!(
+            limiter.seen.len() <= 2,
+            "expired entries must be pruned rather than accumulate"
+        );
+    }
+
     #[test]
     fn all_modes_prepare_exactly_one_wireguard_slot_state() {
         let static_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
@@ -546,6 +675,7 @@ mod tests {
             mode: ProtectionMode::Classic,
             client_wg_public_key: CLIENT_WG_KEY.into(),
             client_nonce: [2; 16],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: None,
         };
@@ -572,7 +702,7 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.psk.unwrap().expose(), static_psk);
 
-        let (_secret_key, public_key) = MlKem768Kem::generate().unwrap();
+        let (_secret_key, public_key) = MlKem1024Kem::generate().unwrap();
         let mut kem_request = classic;
         kem_request.mode = ProtectionMode::MlKem;
         kem_request.kem_public_key = Some(public_key);
@@ -598,6 +728,7 @@ mod tests {
             mode: ProtectionMode::StaticPsk,
             client_wg_public_key: CLIENT_WG_KEY.into(),
             client_nonce: [2; 16],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: Some(static_psk_fingerprint(&other).unwrap()),
         };
@@ -787,6 +918,7 @@ mod tests {
             mode: ProtectionMode::Classic,
             client_wg_public_key: CLIENT_WG_KEY.into(),
             client_nonce: [2; KEY_NEGOTIATION_NONCE_LEN],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: None,
         };
@@ -852,6 +984,7 @@ mod tests {
             mode: ProtectionMode::Classic,
             client_wg_public_key: CLIENT_WG_KEY.into(),
             client_nonce: [5; KEY_NEGOTIATION_NONCE_LEN],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: None,
         };

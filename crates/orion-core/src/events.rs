@@ -10,7 +10,7 @@ use serde::Serialize;
 ///
 /// **A PSK is not a PQC PSK.** Both live in the same WireGuard slot and look
 /// alike on disk — 32 bytes in base64 — but don't mean the same thing: one
-/// was copied by hand into the profile, the other comes from an ML-KEM-768
+/// was copied by hand into the profile, the other comes from an ML-KEM-1024
 /// exchange conducted on every connection. The profile alone can't
 /// distinguish them, since the negotiated PSK is never persisted; only the
 /// client core knows which one it set, hence this event.
@@ -23,7 +23,7 @@ pub enum PskKind {
     /// against "harvest now, decrypt later", but it doesn't rotate and its
     /// presence disables ML-KEM negotiation.
     Static,
-    /// PSK derived from an ML-KEM-768 exchange on this connection, and
+    /// PSK derived from an ML-KEM-1024 exchange on this connection, and
     /// renewed on the next one.
     MlKem,
 }

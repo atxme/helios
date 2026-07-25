@@ -278,8 +278,8 @@ Sur le poste Windows :
    gateway et rien d'autre ;
 3. supprimer le fichier d'enrôlement, puis connecter : la négociation doit
    aboutir sans lui, l'identité étant scellée au compte Windows ;
-4. l'écran *Connexion* doit afficher `négociation ML-KEM-768` puis, une fois le
-   handshake obtenu, la puce `PSK PQC · ML-KEM-768` ;
+4. l'écran *Connexion* doit afficher `négociation ML-KEM-1024` puis, une fois le
+   handshake obtenu, la puce `PSK PQC · ML-KEM-1024` ;
 5. côté gateway, `helios-ctl peer list` doit montrer le plancher monté à
    `ml_kem` pour ce pair ;
 6. rejouer une connexion après avoir forcé `--mode classic` dans l'écran

@@ -232,7 +232,7 @@ async fn upgrade_to_post_quantum(
             sink(ClientEvent::log(
                 "info",
                 format!(
-                    "PSK PQC installé (ML-KEM-768, valable {} s) — \
+                    "PSK PQC installé (ML-KEM-1024, valable {} s) — \
                      le prochain handshake sera protégé",
                     outcome.lifetime.as_secs()
                 ),
@@ -440,6 +440,44 @@ impl VpnController {
     }
 }
 
+/// Negotiations attempted before giving up.
+///
+/// Three, because the failure this exists for is a **lost message**, and a
+/// lost message is not repeated by a fourth try if the first two retries did
+/// not carry it.
+#[cfg(feature = "key-negotiation")]
+const KEY_NEGOTIATION_ATTEMPTS: u32 = 3;
+
+/// Pause between two negotiations.
+///
+/// Long enough for a transient loss to clear, short enough that the user does
+/// not read the wait as a hang.
+#[cfg(feature = "key-negotiation")]
+const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Negotiates, mounts, and recovers from a desynchronised slot.
+///
+/// # The failure this guards against
+///
+/// The transaction is only committed once Helios receives the signed
+/// confirmation. If that message — or the commit answering it — is lost, the
+/// two ends disagree in the worst possible way: Helios restores the previous
+/// slot while Orion keeps the PSK it just installed. Every WireGuard handshake
+/// then fails, and nothing in either log says why, because **both sides did
+/// exactly what they were supposed to do**.
+///
+/// Retrying resolves it, because a fresh negotiation installs a new PSK on
+/// both ends at once. Without this loop the tunnel stayed dead until the user
+/// happened to disconnect and reconnect by hand.
+///
+/// Preparation failures are **not** retried: nothing has been installed yet,
+/// so there is nothing to resynchronise, and repeating a missing identity
+/// three times would only delay an error the user needs now.
+///
+/// If every attempt fails, the adapter deliberately stays mounted with its
+/// desynchronised PSK: WireGuard drops the packets, which is the anti-leak
+/// invariant of this module. A dead tunnel is the correct outcome — a leaking
+/// one would not be.
 #[cfg(feature = "key-negotiation")]
 async fn connect_with_key_negotiation(
     backend: &Arc<dyn VpnBackend>,
@@ -449,37 +487,88 @@ async fn connect_with_key_negotiation(
 ) -> anyhow::Result<()> {
     let identities = identities
         .context("the Orion shell did not provide a protected key-negotiation identity store")?;
-    let negotiated = crate::key_negotiation::prepare_for_profile(profile, identities).await?;
-    let mode = negotiated.mode;
-    let confirmation_timeout = negotiated.confirmation_timeout;
-    let prepared_at = tokio::time::Instant::now();
-    let negotiated_profile = ClientProfile {
-        preshared_key: negotiated
-            .psk
-            .as_ref()
-            .map(|secret| secret.expose().to_string()),
-        ..profile.clone()
-    };
 
-    backend.up(&negotiated_profile, sink).await?;
+    let mut last_error = None;
+    for attempt in 1..=KEY_NEGOTIATION_ATTEMPTS {
+        // Outside the retry: a preparation that fails installed nothing.
+        let negotiated = crate::key_negotiation::prepare_for_profile(profile, identities).await?;
+        let mode = negotiated.mode;
+        let confirmation_timeout = negotiated.confirmation_timeout;
+        let prepared_at = tokio::time::Instant::now();
+        let negotiated_profile = ClientProfile {
+            preshared_key: negotiated
+                .psk
+                .as_ref()
+                .map(|secret| secret.expose().to_string()),
+            ..profile.clone()
+        };
+
+        match commit_negotiated_slot(
+            backend,
+            &negotiated_profile,
+            sink,
+            negotiated,
+            prepared_at,
+            confirmation_timeout,
+        )
+        .await
+        {
+            Ok(()) => {
+                let protection = match mode {
+                    aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
+                    aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
+                    aether::key_negotiation::ProtectionMode::MlKem => PskKind::MlKem,
+                };
+                sink(ClientEvent::protection(protection));
+                sink(ClientEvent::log(
+                    "info",
+                    format!(
+                        "key negotiation committed after a fresh WireGuard handshake ({mode:?})"
+                    ),
+                ));
+                return Ok(());
+            }
+            Err(error) => {
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "key negotiation attempt {attempt}/{KEY_NEGOTIATION_ATTEMPTS} did not \
+                         commit: {error}. The gateway restored its previous slot; renegotiating \
+                         to put both ends back in step."
+                    ),
+                ));
+                last_error = Some(error);
+                if attempt < KEY_NEGOTIATION_ATTEMPTS {
+                    tokio::time::sleep(KEY_NEGOTIATION_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("key negotiation failed without a reported cause")))
+}
+
+/// Installs the negotiated slot and commits it, or reports why it could not.
+///
+/// Split out so the caller can tell a failure that left the slot
+/// desynchronised — everything below — from one that touched nothing.
+#[cfg(feature = "key-negotiation")]
+async fn commit_negotiated_slot(
+    backend: &Arc<dyn VpnBackend>,
+    negotiated_profile: &ClientProfile,
+    sink: &EventSink,
+    negotiated: crate::key_negotiation::NegotiatedKey,
+    prepared_at: tokio::time::Instant,
+    confirmation_timeout: Duration,
+) -> anyhow::Result<()> {
+    backend.up(negotiated_profile, sink).await?;
     if !wait_for_new_handshake(backend, prepared_at, confirmation_timeout).await {
         anyhow::bail!(
             "no fresh WireGuard handshake before the key-negotiation transaction expired"
         );
     }
-    negotiated.confirm().await?;
-
-    let protection = match mode {
-        aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
-        aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
-        aether::key_negotiation::ProtectionMode::MlKem => PskKind::MlKem,
-    };
-    sink(ClientEvent::protection(protection));
-    sink(ClientEvent::log(
-        "info",
-        format!("key negotiation committed after a fresh WireGuard handshake ({mode:?})"),
-    ));
-    Ok(())
+    negotiated.confirm().await
 }
 
 #[cfg(feature = "key-negotiation")]

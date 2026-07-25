@@ -26,6 +26,6 @@ pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, InstallPskRequest, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
-pub use pq::{Kem, MlKem768Kem, PqError, SharedSecret};
+pub use pq::{Kem, MlKem1024Kem, PqError, SharedSecret};
 pub use secret::SecretString;
 pub use state::{TunnelEvent, TunnelState};

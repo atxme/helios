@@ -38,7 +38,7 @@ use std::time::Duration;
 use aether::enroll::{
     derive_psk, EnrollError, ProvisionRequest, ProvisionResponse, PROTOCOL_VERSION,
 };
-use aether::pq::{Kem, MlKem768Kem};
+use aether::pq::{Kem, MlKem1024Kem};
 
 use crate::config::ClientProfile;
 
@@ -84,9 +84,9 @@ pub enum ProvisionError {
 /// provisioning, which bounds the impact of a later client compromise.
 fn build_request(
     profile: &ClientProfile,
-) -> Result<(<MlKem768Kem as Kem>::SecretKey, [u8; 16], ProvisionRequest), ProvisionError> {
+) -> Result<(<MlKem1024Kem as Kem>::SecretKey, [u8; 16], ProvisionRequest), ProvisionError> {
     let (secret_key, kem_public_key) =
-        MlKem768Kem::generate().map_err(|e| ProvisionError::Kem(e.to_string()))?;
+        MlKem1024Kem::generate().map_err(|e| ProvisionError::Kem(e.to_string()))?;
 
     let client_nonce = fresh_nonce();
     let request = ProvisionRequest {
@@ -104,7 +104,7 @@ fn build_request(
 /// where all the cryptographic logic lives.
 pub fn finish(
     profile: &ClientProfile,
-    secret_key: &<MlKem768Kem as Kem>::SecretKey,
+    secret_key: &<MlKem1024Kem as Kem>::SecretKey,
     client_nonce: &[u8; 16],
     response: &ProvisionResponse,
 ) -> Result<ProvisionOutcome, ProvisionError> {
@@ -121,7 +121,7 @@ pub fn finish(
         });
     }
 
-    let kem_secret = MlKem768Kem::decapsulate(secret_key, &response.kem_ciphertext)
+    let kem_secret = MlKem1024Kem::decapsulate(secret_key, &response.kem_ciphertext)
         .map_err(|e| ProvisionError::Kem(e.to_string()))?;
 
     let psk = derive_psk(
@@ -254,7 +254,7 @@ mod tests {
 
         // ── Simulated gateway ──
         let gateway_nonce = [7u8; NONCE_LEN];
-        let (ciphertext, kem_secret) = MlKem768Kem::encapsulate(&request.kem_public_key).unwrap();
+        let (ciphertext, kem_secret) = MlKem1024Kem::encapsulate(&request.kem_public_key).unwrap();
         let expected_psk = derive_psk(
             &kem_secret,
             &client_nonce,
@@ -289,7 +289,7 @@ mod tests {
     fn unexpected_gateway_rejected() {
         let profile = profile();
         let (secret_key, client_nonce, request) = build_request(&profile).unwrap();
-        let (ciphertext, _) = MlKem768Kem::encapsulate(&request.kem_public_key).unwrap();
+        let (ciphertext, _) = MlKem1024Kem::encapsulate(&request.kem_public_key).unwrap();
 
         let response = ProvisionResponse {
             protocol_version: PROTOCOL_VERSION,

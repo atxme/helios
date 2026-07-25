@@ -5,7 +5,7 @@ au même risque et ne doivent pas être confondus.
 
 | Usage | Algorithme | Composition | État |
 |---|---|---|---|
-| Secret de session WireGuard | ML-KEM-768 + HKDF-SHA-256 | transcript ML-DSA-65 sur QUIC/TLS puis PSK WireGuard | cœur et transaction implémentés ; intégration IHM Windows différée |
+| Secret de session WireGuard | ML-KEM-1024 + HKDF-SHA-512 | transcript ML-DSA-65 sur QUIC/TLS puis PSK WireGuard | de bout en bout ; scellement DPAPI non exerçable en WSL2 |
 | Identité de key-negotiation | ML-DSA-65 | certificat PQ applicatif et signatures requête/réponse/commit | implémenté |
 | Artefacts éditeur | ML-DSA-65 + Ed25519 | hybride AND obligatoire | billet TPM v2 implémenté ; récupération bloquée |
 
@@ -33,7 +33,7 @@ toute pose. Chaque commit réussi élève le plancher Helios au mode utilisé et
 persiste sans PSK ni clé privée ; le protocole ne sait jamais le diminuer. Les
 messages v1 sans signatures PQ sont incompatibles et rejetés.
 
-Le code utilise ML-KEM-768 d’`aws-lc-rs`. Les tests couvrent le round-trip, les
+Le code utilise ML-KEM-1024 d’`aws-lc-rs`. Les tests couvrent le round-trip, les
 clés/ciphertexts malformés, les mauvaises clés, les nonces, les identités, le
 refus de downgrade, substitution de `kpub`/ciphertext, signatures de commit,
 mTLS et rollback. Les PSK négociés restent

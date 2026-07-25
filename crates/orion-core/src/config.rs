@@ -5,7 +5,7 @@
 //! cryptographic proposal to choose — WireGuard only has one suite.
 //!
 //! Post-quantum protection goes through the `PresharedKey` slot, but it is
-//! **not** stored in this file: the PQC PSK is negotiated with ML-KEM-768 on
+//! **not** stored in this file: the PQC PSK is negotiated with ML-KEM-1024 on
 //! each connection and is never persisted. What the profile can carry is a
 //! *static* PSK entered by hand, which disables this negotiation.
 //!
@@ -142,7 +142,7 @@ fn mode_label(mode: ProtectionMode) -> &'static str {
     match mode {
         ProtectionMode::Classic => "classique",
         ProtectionMode::StaticPsk => "PSK statique",
-        ProtectionMode::MlKem => "ML-KEM-768",
+        ProtectionMode::MlKem => "ML-KEM-1024",
     }
 }
 

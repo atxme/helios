@@ -10,7 +10,7 @@ function shortKey(key: string): string {
  * How a floor reads on screen.
  *
  * The floor is not the mode currently in use — the gateway doesn't keep one —
- * it's what this peer can no longer fall back below. Saying "ML-KEM-768"
+ * it's what this peer can no longer fall back below. Saying "ML-KEM-1024"
  * alone would suggest an observed state; the label says "minimum".
  */
 const FLOOR: Record<ProtectionMode, { label: string; hint: string; tone: string }> = {
@@ -25,7 +25,7 @@ const FLOOR: Record<ProtectionMode, { label: string; hint: string; tone: string 
     tone: 'border-amber-500/40 text-amber-600 dark:text-amber-400 bg-amber-500/5',
   },
   ml_kem: {
-    label: 'plancher : ML-KEM-768',
+    label: 'plancher : ML-KEM-1024',
     hint: 'Ni classique ni PSK statique ne sont acceptés pour ce pair. Seule une édition locale de network.toml peut redescendre ce plancher.',
     tone: 'border-violet-500/40 text-violet-600 dark:text-violet-400 bg-violet-500/5',
   },
@@ -105,7 +105,7 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
           />
           <Field
             label="Établissement du secret"
-            value="ML-KEM-768"
+            value="ML-KEM-1024"
             note="Orion génère la paire éphémère, Helios encapsule. HKDF lie le PSK à la version, au mode, à la transaction, aux deux nonces et aux deux identités WireGuard."
           />
           <Field
@@ -160,7 +160,7 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
         </div>
 
         <dl className="px-5 py-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <Field label="Échange de clés" value="ML-KEM-768" note="Le secret alimente le slot PresharedKey de WireGuard, sans toucher au handshake." />
+          <Field label="Échange de clés" value="ML-KEM-1024" note="Le secret alimente le slot PresharedKey de WireGuard, sans toucher au handshake." />
           <Field label="Plage d’adressage" value="100.64.0.0/10" note="VIP CGNAT dérivée de la clé publique du pair. Aucun état sur disque." />
           <Field label="Durée de vie du PSK" value="3600 s" note="Au-delà, le client redemande un PSK par un nouvel échange." />
         </dl>
@@ -174,7 +174,7 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
           </p>
           <p>
             <strong className="text-slate-600 dark:text-slate-400">Provisioning post-quantique.</strong>{' '}
-            Le PSK est dérivé par ML-KEM-768 puis posé sur le pair <em>avant</em> d’être annoncé au
+            Le PSK est dérivé par ML-KEM-1024 puis posé sur le pair <em>avant</em> d’être annoncé au
             client : un PSK présent d’un seul côté ferait échouer tous les handshakes. En cas d’échec,
             la demande est refusée et le tunnel reste classique.
           </p>

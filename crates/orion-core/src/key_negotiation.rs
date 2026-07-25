@@ -15,7 +15,7 @@ use aether::{
         static_psk_fingerprint, KeyNegotiationRequest, PqCertificate, ProtectionMode,
         KEY_NEGOTIATION_NONCE_LEN, KEY_NEGOTIATION_VERSION,
     },
-    pq::{Kem, MlKem768Kem},
+    pq::{Kem, MlKem1024Kem},
     SecretString,
 };
 use anyhow::{Context, Result};
@@ -183,7 +183,7 @@ pub async fn prepare(
         }
         ProtectionMode::MlKem => {
             let (secret, public) =
-                MlKem768Kem::generate().context("generating an ML-KEM-768 keypair")?;
+                MlKem1024Kem::generate().context("generating an ML-KEM-1024 keypair")?;
             kem_secret = Some(secret);
             (Some(public), None)
         }
@@ -194,6 +194,11 @@ pub async fn prepare(
         mode,
         client_wg_public_key: client_wg_public_key.to_string(),
         client_nonce,
+        // Signed and bound into the derivation: the gateway refuses a request
+        // whose clock drifts too far, which bounds replay in time rather than
+        // in cache size. A machine with a wrong clock is refused with a
+        // message naming the clock.
+        timestamp_unix: unix_time_now()?,
         kem_public_key,
         static_psk_fingerprint,
     };
@@ -247,8 +252,8 @@ pub async fn prepare(
                 .kem_ciphertext
                 .as_deref()
                 .context("ML-KEM response has no ciphertext")?;
-            let shared_secret = MlKem768Kem::decapsulate(&secret_key, ciphertext)
-                .context("decapsulating the ML-KEM-768 ciphertext")?;
+            let shared_secret = MlKem1024Kem::decapsulate(&secret_key, ciphertext)
+                .context("decapsulating the ML-KEM-1024 ciphertext")?;
             let derived = derive_negotiated_psk(&shared_secret, &request, &response)
                 .context("deriving the WireGuard PSK")?;
             Some(SecretString::new(

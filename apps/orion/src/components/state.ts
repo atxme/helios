@@ -140,7 +140,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
  * **A PSK is not a PQC PSK**, and the UI must not confuse them: the first is
  * a secret copied by hand, shared out of band, that never rotates and whose
  * presence *disables* ML-KEM negotiation; the second is derived from an
- * ML-KEM-768 exchange replayed on every connection. Both hold up against
+ * ML-KEM-1024 exchange replayed on every connection. Both hold up against
  * "harvest now, decrypt later" — calling the first one "post-quantum" wasn't
  * wrong, it was imprecise, and the imprecision hid that no rotation happens.
  *
@@ -167,7 +167,7 @@ export interface ProtectionMeta {
 }
 
 const PQC_DETAIL =
-  'Secret ML-KEM-768 négocié à cette connexion et posé dans le slot PresharedKey. ' +
+  'Secret ML-KEM-1024 négocié à cette connexion et posé dans le slot PresharedKey. ' +
   'Il est renouvelé au prochain montage : un trafic enregistré aujourd’hui reste ' +
   'illisible pour un adversaire quantique.'
 
@@ -186,12 +186,12 @@ const PQC_DETAIL =
  * emprunte ce chemin et ne passe jamais par l'upgrade.
  */
 const PQC_NEGOTIATED_DETAIL =
-  'Secret ML-KEM-768 négocié sur le port dédié AVANT le premier handshake, puis ' +
+  'Secret ML-KEM-1024 négocié sur le port dédié AVANT le premier handshake, puis ' +
   'posé dans le slot PresharedKey. Aucun handshake de ce tunnel n’a eu lieu sans ' +
   'lui : rien d’enregistrable aujourd’hui ne sera déchiffrable demain.'
 
 const PQC_UPGRADED_DETAIL =
-  'Secret ML-KEM-768 obtenu par l’API interne APRÈS le montage d’un tunnel ' +
+  'Secret ML-KEM-1024 obtenu par l’API interne APRÈS le montage d’un tunnel ' +
   'classique. Les échanges suivants sont protégés, mais le premier handshake a eu ' +
   'lieu sans PSK : lui reste exposé au « récolter maintenant, déchiffrer plus tard ». ' +
   'Un profil enrôlé avec négociation supprime cette fenêtre.'
@@ -276,7 +276,7 @@ const MODE_META: Record<ProtectionMode, ModeMeta> = {
       'Le PSK du profil est retrouvé par comparaison d’empreinte — la valeur ne circule jamais. Il protège du « récolter maintenant, déchiffrer plus tard », mais il ne tourne pas.',
   },
   ml_kem: {
-    label: 'ML-KEM-768',
+    label: 'ML-KEM-1024',
     detail:
       'Un PSK frais est dérivé à chaque connexion et n’est jamais écrit sur disque. Helios le pose avant de répondre, et le retire si le handshake n’aboutit pas.',
   },

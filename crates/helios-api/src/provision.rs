@@ -209,7 +209,7 @@ fn gateway_public_key(private_key_b64: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use aether::enroll::{derive_psk, ProvisionRequest, NONCE_LEN, PROTOCOL_VERSION};
-    use aether::pq::{Kem, MlKem768Kem};
+    use aether::pq::{Kem, MlKem1024Kem};
     use aether::{NetworkConfig, TunnelState};
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
@@ -267,11 +267,11 @@ mod tests {
 
     /// Builds a real provisioning request, as Orion would.
     fn client_request() -> (
-        <MlKem768Kem as Kem>::SecretKey,
+        <MlKem1024Kem as Kem>::SecretKey,
         [u8; NONCE_LEN],
         ProvisionRequest,
     ) {
-        let (dk, ek) = MlKem768Kem::generate().unwrap();
+        let (dk, ek) = MlKem1024Kem::generate().unwrap();
         let nonce = [42u8; NONCE_LEN];
         (
             dk,
@@ -320,7 +320,7 @@ mod tests {
         );
 
         // Client side: independent decapsulation and derivation.
-        let kem_secret = MlKem768Kem::decapsulate(&dk, &response.kem_ciphertext).unwrap();
+        let kem_secret = MlKem1024Kem::decapsulate(&dk, &response.kem_ciphertext).unwrap();
         let client_psk = derive_psk(
             &kem_secret,
             &client_nonce,

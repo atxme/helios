@@ -626,6 +626,16 @@ fn write_public_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Horloge des tests : les requêtes doivent être fraîches pour passer la
+    /// fenêtre anti-rejeu.
+    fn test_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     use aether::key_negotiation::{
         authenticate_request, generate_ml_dsa_65_keypair, issue_pq_certificate,
         AuthenticatedKeyNegotiationRequest, KeyNegotiationRequest, PqCertificate,
@@ -706,6 +716,7 @@ mod tests {
             mode: ProtectionMode::Classic,
             client_wg_public_key: CLIENT_KEY.to_string(),
             client_nonce: [2; 16],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: None,
         };

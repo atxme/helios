@@ -20,18 +20,18 @@ use crate::pq::SharedSecret;
 /// Default UDP port of the key-negotiation service.
 pub const DEFAULT_KEY_NEGOTIATION_PORT: u16 = 51821;
 /// Current wire protocol version.
-pub const KEY_NEGOTIATION_VERSION: u16 = 2;
+pub const KEY_NEGOTIATION_VERSION: u16 = 3;
 /// Upper bound for one framed protocol message.
 pub const MAX_KEY_NEGOTIATION_MESSAGE_BYTES: usize = 64 * 1024;
 /// Length of transaction identifiers and nonces.
 pub const KEY_NEGOTIATION_NONCE_LEN: usize = 16;
 
-const KEY_NEGOTIATION_DOMAIN: &[u8] = b"helios-key-negotiation-psk-v1";
+const KEY_NEGOTIATION_DOMAIN: &[u8] = b"helios-key-negotiation-psk-v3";
 const PQ_CERTIFICATE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-certificate-v1";
-const PQ_REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-pq-request-v2";
-const PQ_RESPONSE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-response-v2";
-const PQ_CONFIRMATION_DOMAIN: &[u8] = b"helios-key-negotiation-pq-confirmation-v2";
-const PQ_COMMIT_DOMAIN: &[u8] = b"helios-key-negotiation-pq-commit-v2";
+const PQ_REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-pq-request-v3";
+const PQ_RESPONSE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-response-v3";
+const PQ_CONFIRMATION_DOMAIN: &[u8] = b"helios-key-negotiation-pq-confirmation-v3";
+const PQ_COMMIT_DOMAIN: &[u8] = b"helios-key-negotiation-pq-commit-v3";
 pub const PQ_CERTIFICATE_VERSION: u16 = 1;
 
 /// Protection selected by Orion for the upcoming WireGuard session.
@@ -43,7 +43,7 @@ pub enum ProtectionMode {
     Classic,
     /// A preconfigured PSK identified by its fingerprint.
     StaticPsk,
-    /// A fresh PSK derived from an ML-KEM-768 encapsulation.
+    /// A fresh PSK derived from an ML-KEM-1024 encapsulation.
     MlKem,
 }
 
@@ -186,6 +186,9 @@ impl AuthenticatedKeyNegotiationRequest {
         now_unix: u64,
     ) -> Result<(), KeyNegotiationError> {
         self.request.validate()?;
+        // Freshness first: it costs a subtraction, while everything below is
+        // an ML-DSA verification. A stale request must not buy that work.
+        self.request.assert_fresh(now_unix)?;
         self.certificate.verify(
             issuer_public_key,
             PqCertificateRole::Client,
@@ -252,11 +255,29 @@ pub struct KeyNegotiationRequest {
     /// WireGuard identity bound to the authenticated client certificate.
     pub client_wg_public_key: String,
     pub client_nonce: [u8; KEY_NEGOTIATION_NONCE_LEN],
-    /// ML-KEM-768 encapsulation key. Present only in `ml_kem` mode.
+    /// Unix time at which the client signed this request.
+    ///
+    /// Covered by the ML-DSA signature and by the PSK derivation, so it can be
+    /// neither stripped nor edited. It bounds replay in time, independently of
+    /// how big the anti-replay cache is — a cache is finite, so an attacker
+    /// able to fill it can evict an old identifier and replay the transaction
+    /// it belonged to. A clock cannot be evicted.
+    pub timestamp_unix: u64,
+    /// ML-KEM-1024 encapsulation key. Present only in `ml_kem` mode.
     pub kem_public_key: Option<Vec<u8>>,
     /// Lowercase SHA-256 fingerprint. Present only in `static_psk` mode.
     pub static_psk_fingerprint: Option<String>,
 }
+
+/// Accepted drift between the client's clock and the gateway's.
+///
+/// Thirty seconds each way: wide enough for hosts synchronised by NTP over a
+/// slow link, narrow enough that a captured request stops being replayable
+/// long before an attacker could exhaust the anti-replay cache.
+///
+/// A client whose clock is off by more is refused with a message that says so
+/// — an unexplained refusal here would be diagnosed as anything but a clock.
+pub const MAX_REQUEST_CLOCK_SKEW_SECS: u64 = 30;
 
 impl KeyNegotiationRequest {
     /// Rejects ambiguous mode payloads before any cryptographic operation.
@@ -271,6 +292,9 @@ impl KeyNegotiationRequest {
             .map_err(|_| KeyNegotiationError::InvalidWireGuardKey)?;
         if self.transaction_id.iter().all(|byte| *byte == 0) {
             return Err(KeyNegotiationError::ZeroTransaction);
+        }
+        if self.timestamp_unix == 0 {
+            return Err(KeyNegotiationError::MissingTimestamp);
         }
 
         match self.mode {
@@ -304,6 +328,28 @@ impl KeyNegotiationRequest {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Rejects a request whose clock is too far from the verifier's.
+    ///
+    /// Bounds replay **in time**, where the anti-replay cache bounds it in
+    /// count. The two are complementary and neither replaces the other: the
+    /// cache stops an immediate replay of a live transaction, this stops the
+    /// replay of a transaction captured long ago — including after an
+    /// attacker has flushed the cache with traffic of its own.
+    ///
+    /// Symmetric: a request from the future is as suspect as one from the
+    /// past, and accepting it would let an attacker bank a transaction for
+    /// later.
+    pub fn assert_fresh(&self, now_unix: u64) -> Result<(), KeyNegotiationError> {
+        let drift = now_unix.abs_diff(self.timestamp_unix);
+        if drift > MAX_REQUEST_CLOCK_SKEW_SECS {
+            return Err(KeyNegotiationError::StaleRequest {
+                drift_secs: drift,
+                tolerance_secs: MAX_REQUEST_CLOCK_SKEW_SECS,
+            });
         }
         Ok(())
     }
@@ -431,6 +477,19 @@ impl AuthenticatedKeyNegotiationCommit {
 }
 
 /// Derives the WireGuard PSK while binding the complete negotiation context.
+/// Output length of the derivation: one WireGuard `PresharedKey`.
+///
+/// HKDF's expand length is normally taken from the digest, which would give
+/// SHA-512's 64 bytes. The PSK slot holds 32, so the length is stated here
+/// rather than truncated at the call site.
+struct PskLength;
+
+impl hkdf::KeyType for PskLength {
+    fn len(&self) -> usize {
+        crate::pq::SHARED_SECRET_LEN
+    }
+}
+
 pub fn derive_negotiated_psk(
     shared_secret: &SharedSecret,
     request: &KeyNegotiationRequest,
@@ -445,7 +504,7 @@ pub fn derive_negotiated_psk(
     salt.extend_from_slice(&request.transaction_id);
     salt.extend_from_slice(&request.client_nonce);
     salt.extend_from_slice(&response.gateway_nonce);
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt);
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA512, &salt);
     let prk = salt.extract(shared_secret.as_slice());
 
     let client = request.client_wg_public_key.as_bytes();
@@ -453,16 +512,28 @@ pub fn derive_negotiated_psk(
     let client_len = (client.len() as u16).to_be_bytes();
     let gateway_len = (gateway.len() as u16).to_be_bytes();
     let mode = [request.mode.security_level()];
-    let info: [&[u8]; 6] = [
+    let version = request.protocol_version.to_be_bytes();
+    // The timestamp is bound in: a request replayed with an edited clock would
+    // derive a different PSK, so the transcript cannot be reused in time any
+    // more than it can across peers.
+    let timestamp = request.timestamp_unix.to_be_bytes();
+    // Both WireGuard keys are length-prefixed: no two field boundaries can be
+    // shifted to produce the same concatenation.
+    let info: [&[u8]; 8] = [
         KEY_NEGOTIATION_DOMAIN,
+        &version,
         &mode,
+        &timestamp,
         &client_len,
         client,
         &gateway_len,
         gateway,
     ];
+    // The output length is the PSK slot's, not the digest's: expanding to
+    // SHA-512's 64 bytes and truncating would be the same secret, but it
+    // would leave the caller to do the truncating.
     let okm = prk
-        .expand(&info, hkdf::HKDF_SHA256)
+        .expand(&info, PskLength)
         .map_err(|_| KeyNegotiationError::Kdf)?;
     let mut psk = Zeroizing::new([0u8; 32]);
     okm.fill(psk.as_mut_slice())
@@ -753,6 +824,16 @@ pub enum KeyNegotiationError {
     InvalidWireGuardKey,
     #[error("transaction identifier must not be all zeroes")]
     ZeroTransaction,
+    #[error("request carries no signing timestamp")]
+    MissingTimestamp,
+    #[error(
+        "request clock is off by {drift_secs}s, more than the {tolerance_secs}s tolerated; \
+         synchronise the client clock (NTP)"
+    )]
+    StaleRequest {
+        drift_secs: u64,
+        tolerance_secs: u64,
+    },
     #[error("mode-specific material is inconsistent with the selected mode")]
     UnexpectedModeMaterial,
     #[error("static PSK fingerprint is missing")]
@@ -800,7 +881,104 @@ pub enum KeyNegotiationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq::{Kem, MlKem768Kem};
+
+    /// Horloge des tests : les requêtes doivent être fraîches pour passer la
+    /// fenêtre anti-rejeu.
+    fn test_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Le cache anti-rejeu est borné, donc évinçable : un attaquant capable de
+    /// le remplir ferait oublier un vieil identifiant et rejouerait la
+    /// transaction correspondante. Une horloge, elle, ne s'évince pas.
+    #[test]
+    fn a_request_outside_the_clock_window_is_refused() {
+        let now = test_now();
+        let fresh = KeyNegotiationRequest {
+            timestamp_unix: now,
+            ..request(ProtectionMode::Classic)
+        };
+        assert!(fresh.assert_fresh(now).is_ok());
+
+        // Aux bornes exactes : accepté, la tolérance est inclusive.
+        assert!(fresh
+            .assert_fresh(now + MAX_REQUEST_CLOCK_SKEW_SECS)
+            .is_ok());
+        assert!(fresh
+            .assert_fresh(now - MAX_REQUEST_CLOCK_SKEW_SECS)
+            .is_ok());
+
+        // Au-delà, dans les deux sens : une requête venue du futur est aussi
+        // suspecte qu'une vieille, et l'accepter permettrait d'en mettre une
+        // de côté pour plus tard.
+        for drift in [
+            MAX_REQUEST_CLOCK_SKEW_SECS + 1,
+            MAX_REQUEST_CLOCK_SKEW_SECS + 3600,
+        ] {
+            assert!(matches!(
+                fresh.assert_fresh(now + drift),
+                Err(KeyNegotiationError::StaleRequest { .. })
+            ));
+            assert!(matches!(
+                fresh.assert_fresh(now - drift),
+                Err(KeyNegotiationError::StaleRequest { .. })
+            ));
+        }
+
+        // Un horodatage absent ne doit pas passer pour l'époque Unix.
+        let undated = KeyNegotiationRequest {
+            timestamp_unix: 0,
+            ..request(ProtectionMode::Classic)
+        };
+        assert_eq!(
+            undated.validate(),
+            Err(KeyNegotiationError::MissingTimestamp)
+        );
+    }
+
+    /// L'horodatage entre dans la dérivation : une transcription rejouée avec
+    /// une horloge retouchée ne peut pas produire le même PSK.
+    #[test]
+    fn the_timestamp_is_bound_into_the_derived_psk() {
+        let (secret_key, public_key) = MlKem1024Kem::generate().unwrap();
+        let mut request = request(ProtectionMode::MlKem);
+        request.kem_public_key = Some(public_key);
+        let (ciphertext, gateway_secret) =
+            MlKem1024Kem::encapsulate(request.kem_public_key.as_ref().unwrap()).unwrap();
+        let response = KeyNegotiationResponse {
+            protocol_version: KEY_NEGOTIATION_VERSION,
+            transaction_id: request.transaction_id,
+            selected_mode: ProtectionMode::MlKem,
+            gateway_wg_public_key: GATEWAY_WG_KEY.to_string(),
+            gateway_nonce: [9; KEY_NEGOTIATION_NONCE_LEN],
+            kem_ciphertext: Some(ciphertext.clone()),
+            confirmation_timeout_secs: 180,
+        };
+
+        let client_secret = MlKem1024Kem::decapsulate(&secret_key, &ciphertext).unwrap();
+        let reference = derive_negotiated_psk(&gateway_secret, &request, &response).unwrap();
+        assert_eq!(
+            *reference,
+            *derive_negotiated_psk(&client_secret, &request, &response).unwrap(),
+            "les deux bouts doivent dériver le même PSK"
+        );
+        assert_eq!(reference.len(), 32, "un slot PresharedKey fait 32 octets");
+
+        let replayed = KeyNegotiationRequest {
+            timestamp_unix: request.timestamp_unix + 1,
+            ..request.clone()
+        };
+        assert_ne!(
+            *reference,
+            *derive_negotiated_psk(&gateway_secret, &replayed, &response).unwrap(),
+            "changer l'horodatage doit changer le PSK"
+        );
+    }
+
+    use crate::pq::{Kem, MlKem1024Kem};
 
     const CLIENT_WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const GATEWAY_WG_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -812,6 +990,7 @@ mod tests {
             mode,
             client_wg_public_key: CLIENT_WG_KEY.into(),
             client_nonce: [2; KEY_NEGOTIATION_NONCE_LEN],
+            timestamp_unix: test_now(),
             kem_public_key: None,
             static_psk_fingerprint: None,
         }
@@ -870,9 +1049,9 @@ mod tests {
 
     #[test]
     fn ml_kem_round_trip_derives_the_same_context_bound_psk() {
-        let (secret_key, public_key) = MlKem768Kem::generate().unwrap();
-        let (ciphertext, server_secret) = MlKem768Kem::encapsulate(&public_key).unwrap();
-        let client_secret = MlKem768Kem::decapsulate(&secret_key, &ciphertext).unwrap();
+        let (secret_key, public_key) = MlKem1024Kem::generate().unwrap();
+        let (ciphertext, server_secret) = MlKem1024Kem::encapsulate(&public_key).unwrap();
+        let client_secret = MlKem1024Kem::decapsulate(&secret_key, &ciphertext).unwrap();
 
         let mut request = request(ProtectionMode::MlKem);
         request.kem_public_key = Some(public_key);
@@ -958,7 +1137,7 @@ mod tests {
                 wireguard_public_key: wireguard_key.into(),
                 ml_dsa_65_public_key: STANDARD.encode(subject_public_key),
                 not_before_unix: 1,
-                not_after_unix: 10_000,
+                not_after_unix: u64::MAX,
                 ml_dsa_65_signature: String::new(),
             },
             issuer_private_key,
@@ -983,11 +1162,13 @@ mod tests {
         plain.kem_public_key = Some(vec![3; crate::pq::PUBLIC_KEY_LEN]);
         let mut authenticated =
             authenticate_request(plain, certificate, client_private.as_slice()).unwrap();
-        authenticated.verify(&ca_public, &fingerprint, 100).unwrap();
+        authenticated
+            .verify(&ca_public, &fingerprint, test_now())
+            .unwrap();
 
         authenticated.request.kem_public_key.as_mut().unwrap()[0] ^= 1;
         assert_eq!(
-            authenticated.verify(&ca_public, &fingerprint, 100),
+            authenticated.verify(&ca_public, &fingerprint, test_now()),
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
         );
     }

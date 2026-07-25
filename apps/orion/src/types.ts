@@ -138,7 +138,7 @@ export interface ProfileIssues {
  * `orion_core::events::PskKind`.
  *
  * A PSK is not a PQC PSK: both live in the same WireGuard slot, but one was
- * copied by hand and never rotates, the other comes from an ML-KEM-768
+ * copied by hand and never rotates, the other comes from an ML-KEM-1024
  * exchange replayed on every connection. The profile can't distinguish them,
  * since the latter is never persisted — only the client core knows which
  * one it set.

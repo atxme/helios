@@ -26,7 +26,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether::enroll::{ProvisionResponse, PROTOCOL_VERSION};
-use aether::pq::{Kem, MlKem768Kem};
+use aether::pq::{Kem, MlKem1024Kem};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use orion_core::provisioning::{finish, ProvisionError};
@@ -196,7 +196,7 @@ fn profile(opts: &Options, url: &str) -> Result<ClientProfile> {
 /// Builds a plausible gateway response, signed by no particular identity —
 /// it is up to the client to judge.
 fn response_for(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
-    let (ciphertext, _) = MlKem768Kem::encapsulate(kem_public).expect("ML-KEM encapsulation");
+    let (ciphertext, _) = MlKem1024Kem::encapsulate(kem_public).expect("ML-KEM encapsulation");
     ProvisionResponse {
         protocol_version: PROTOCOL_VERSION,
         kem_ciphertext: ciphertext,
@@ -211,7 +211,7 @@ fn response_for(kem_public: &[u8], gateway_key: &str) -> ProvisionResponse {
 /// its cryptography is perfectly valid. Without this check, a compromised
 /// gateway would negotiate a PSK with the client.
 fn scenario_gateway_identity(profile: &ClientProfile) -> Outcome {
-    let (sk, pk) = match MlKem768Kem::generate() {
+    let (sk, pk) = match MlKem1024Kem::generate() {
         Ok(v) => v,
         Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };
@@ -232,7 +232,7 @@ fn scenario_gateway_identity(profile: &ClientProfile) -> Outcome {
 
 /// A malformed ciphertext must never produce a PSK.
 fn scenario_malformed_ciphertext(profile: &ClientProfile) -> Outcome {
-    let (sk, pk) = match MlKem768Kem::generate() {
+    let (sk, pk) = match MlKem1024Kem::generate() {
         Ok(v) => v,
         Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };
@@ -248,7 +248,7 @@ fn scenario_malformed_ciphertext(profile: &ClientProfile) -> Outcome {
 
 /// An unknown protocol version must be rejected before any crypto.
 fn scenario_protocol_version(profile: &ClientProfile) -> Outcome {
-    let (sk, pk) = match MlKem768Kem::generate() {
+    let (sk, pk) = match MlKem1024Kem::generate() {
         Ok(v) => v,
         Err(e) => return Outcome::fail(format!("ML-KEM generation failed: {e}")),
     };

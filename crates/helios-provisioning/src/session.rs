@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use aether::enroll::{
     derive_psk, EnrollError, ProvisionRequest, ProvisionResponse, Psk, NONCE_LEN, PROTOCOL_VERSION,
 };
-use aether::pq::{Kem, MlKem768Kem};
+use aether::pq::{Kem, MlKem1024Kem};
 
 use crate::ipam::{assign_vip, PeerTable, MAX_VIP_PROBES};
 
@@ -91,7 +91,7 @@ where
     // 4. ML-KEM encapsulation towards the client's ephemeral key. It is the
     //    gateway that encapsulates: the secret's freshness therefore does
     //    not depend on a potentially compromised client.
-    let (ciphertext, kem_secret) = MlKem768Kem::encapsulate(&request.kem_public_key)
+    let (ciphertext, kem_secret) = MlKem1024Kem::encapsulate(&request.kem_public_key)
         .map_err(|_| EnrollError::BadKemPublicKey(request.kem_public_key.len()))?;
 
     // 5. PSK bound to both nonces and both identities.
@@ -180,11 +180,11 @@ mod tests {
 
     /// Simulates the client: generates its ephemeral ML-KEM pair and its request.
     fn client_request() -> (
-        <MlKem768Kem as Kem>::SecretKey,
+        <MlKem1024Kem as Kem>::SecretKey,
         [u8; NONCE_LEN],
         ProvisionRequest,
     ) {
-        let (dk, ek) = MlKem768Kem::generate().unwrap();
+        let (dk, ek) = MlKem1024Kem::generate().unwrap();
         let client_nonce = [42u8; NONCE_LEN];
         let req = ProvisionRequest {
             protocol_version: PROTOCOL_VERSION,
@@ -207,7 +207,7 @@ mod tests {
         out.response.validate().unwrap();
 
         // ── Client side: decapsulates and derives independently ──
-        let kem_secret = MlKem768Kem::decapsulate(&dk, &out.response.kem_ciphertext).unwrap();
+        let kem_secret = MlKem1024Kem::decapsulate(&dk, &out.response.kem_ciphertext).unwrap();
         let client_psk = derive_psk(
             &kem_secret,
             &client_nonce,

@@ -45,7 +45,7 @@ premier handshake nu.
 |---|---|
 | `classic` | vidé |
 | `static_psk` | PSK déjà configuré, retrouvé par comparaison d'empreinte |
-| `ml_kem` | PSK frais dérivé d'une encapsulation ML-KEM-768 |
+| `ml_kem` | PSK frais dérivé d'une encapsulation ML-KEM-1024 |
 
 Orion choisit ; Helios exécute exactement le mode demandé ou refuse. Une
 réponse qui sélectionnerait un autre mode est rejetée par le client, le mode
@@ -88,16 +88,75 @@ En mode ML-KEM, Orion génère une paire éphémère, envoie `kpub`, conserve
 même secret, puis dérivent :
 
 ```
-PSK = HKDF-SHA-256(
-        secret ML-KEM,
-        version ‖ mode ‖ identifiant de transaction
-              ‖ nonce client ‖ nonce gateway
-              ‖ clé WireGuard client ‖ clé WireGuard gateway )
+sel = identifiant de transaction ‖ nonce client ‖ nonce gateway
+
+PSK = HKDF-SHA-512(
+        sel,
+        secret ML-KEM-1024,
+        domaine ‖ version ‖ mode ‖ horodatage
+              ‖ len(clé WG client)  ‖ clé WireGuard client
+              ‖ len(clé WG gateway) ‖ clé WireGuard gateway,
+        32 octets )
 ```
 
 Lier ces éléments rend inutilisable un ciphertext rejoué, destiné à un autre
-pair, ou associé à un autre mode. Le PSK fait 32 octets et n'est **jamais**
-écrit sur disque, d'aucun côté.
+pair, associé à un autre mode ou **réémis à un autre instant**. Les deux clés
+WireGuard sont préfixées de leur longueur : aucun décalage de frontière entre
+champs ne peut produire la même concaténation. Le PSK fait 32 octets et n'est
+**jamais** écrit sur disque, d'aucun côté.
+
+#### Choix des paramètres
+
+**ML-KEM-1024** (catégorie NIST 5) plutôt que 768 (catégorie 3). Ce que ce KEM
+produit devient un PSK WireGuard, c'est-à-dire exactement ce qu'un adversaire
+« récolter maintenant, déchiffrer plus tard » conserve : le secret vaut, en
+durée, bien plus que la session. Payer 384 octets de clé publique et 480 de
+ciphertext de plus, une fois par connexion, est un mauvais prix à ne pas payer
+pour rester une catégorie en dessous. La taille du secret, elle, ne change
+pas : 32 octets quel que soit le jeu de paramètres.
+
+**HKDF-SHA-512** plutôt que SHA-256. L'argument n'est pas que SHA-256 serait
+le maillon faible — face à Grover, une préimage SHA-256 coûte 2¹²⁸, au-dessus
+de ce qu'exige la catégorie 3 — mais qu'à partir du moment où le KEM vise la
+catégorie 5, un KDF à 2¹²⁸ deviendrait le plafond du protocole. SHA-512 porte
+la dérivation à 2²⁵⁶ et referme la question, pour deux lignes de différence et
+aucune dépendance nouvelle : `aws-lc-rs` le fournit déjà.
+
+Il faut être exact sur ce que cela apporte : **la sécurité effective du tunnel
+ne bouge pas**, parce que WireGuard mélange ensuite le PSK avec BLAKE2s-256 et
+plafonne de toute façon vers 2¹²⁸ post-quantiques. Ce choix aligne les
+catégories du protocole de négociation ; il ne rend pas le tunnel plus fort.
+
+**KMAC256 a été étudié et écarté.** L'idée — réutiliser le cœur Keccak déjà
+présent via ML-KEM et ML-DSA — est saine, mais aucune implémentation validée
+n'était atteignable : `aws-lc-rs` n'expose pas KMAC, la crate `sha3` fournit
+cSHAKE mais pas KMAC, et l'écrire à la main aurait remplacé une primitive
+validée par une primitive maison. La piste wolfCrypt en FFI a été examinée
+sérieusement : elle apporte bien un KMAC natif testé sur les vecteurs
+SP 800-185, mais wolfCrypt est sous GPLv2 ou licence commerciale, ce qui est
+incompatible avec le MIT/Apache-2.0 de ce dépôt, et sa validation FIPS 140-3
+des algorithmes PQ n'est à ce jour qu'une validation **CAVP** d'algorithmes,
+la soumission **CMVP** de module étant en cours. Si une exigence FIPS apparaît,
+la réponse est la feature `fips` d'`aws-lc-rs`, pas un second moteur.
+
+#### Horodatage : borner le rejeu dans le temps
+
+La requête porte un horodatage Unix, couvert par la signature ML-DSA **et** par
+la dérivation. Helios refuse au-delà de trente secondes de dérive, dans les
+deux sens, **avant** toute vérification de signature — le contrôle coûte une
+soustraction là où le reste coûte une vérification post-quantique.
+
+Ce contrôle ne double pas le cache anti-rejeu, il le complète là où celui-ci
+est structurellement faible. Un cache est **borné** : à 4096 entrées, un pair
+capable d'ouvrir des transactions légitimes finit par en faire oublier
+d'anciennes, et une transaction capturée jadis redevient rejouable. Une horloge
+ne s'évince pas. Le cache arrête le rejeu immédiat d'une transaction vivante ;
+l'horodatage arrête le rejeu différé d'une transaction ancienne.
+
+Une requête venue du futur est refusée aussi : l'accepter permettrait de
+constituer d'avance une transaction signée à rejouer plus tard. Un poste dont
+l'horloge dérive reçoit un message qui **nomme l'horloge** — une erreur
+générique serait ici diagnostiquée comme tout sauf un problème de NTP.
 
 ### 4. Ordre de pose : poser, puis annoncer
 
@@ -118,6 +177,32 @@ manque. Si le plan de données refuse la pose, aucune réponse de succès ne par
 Si la session QUIC se ferme, si le handshake n'arrive pas dans le délai, ou si
 la confirmation est invalide, Helios **restaure le slot précédent**. Les
 transactions sont sérialisées par pair.
+
+#### Étape 8 — rattrapage d'une désynchronisation
+
+La restauration côté gateway crée un cas que le protocole seul ne referme pas.
+Si la confirmation — ou le commit qui y répond — se perd sur le réseau, les
+deux bouts divergent de la pire manière : Helios restaure l'ancien slot pendant
+qu'Orion conserve le PSK qu'il vient de poser. Tous les handshakes échouent
+ensuite, et **aucun journal ne dit pourquoi**, puisque chaque côté a fait
+exactement ce qu'il devait.
+
+```
+8. Si l'étape 6 ou 7 n'aboutit pas, Orion renégocie entièrement — jusqu'à
+   trois tentatives, espacées de deux secondes. Une négociation neuve pose un
+   PSK neuf des deux côtés simultanément, ce qui remet les bouts en phase.
+```
+
+Trois tentatives, parce que la panne visée est un **message perdu** : ce qu'une
+deuxième tentative ne rattrape pas, une quatrième ne le rattrapera pas non
+plus. Un échec de *préparation* n'est en revanche jamais réessayé — rien n'a
+été posé, donc rien n'est à resynchroniser, et répéter une identité absente ne
+ferait que retarder l'erreur utile.
+
+Si les trois tentatives échouent, l'adaptateur reste monté avec son PSK
+désynchronisé : WireGuard jette les paquets, ce qui est l'invariant anti-fuite
+du client. Un tunnel mort est le bon résultat ; un tunnel qui fuit ne le serait
+pas.
 
 ### 5. Plancher anti-downgrade, qui ne monte que
 
@@ -176,10 +261,14 @@ console — la commande prévue pour l'amorçage. Le certificat PQ portant le su
 
 | Attaque | Ce qui l'arrête |
 |---|---|
-| Récolte passive, déchiffrement quantique différé | PSK ML-KEM-768 dans le slot dès le premier handshake |
+| Récolte passive, déchiffrement quantique différé | PSK ML-KEM-1024 dans le slot dès le premier handshake |
 | Substitution de `kpub` ou du ciphertext | Signature ML-DSA-65 couvrant requête et réponse |
 | Rupture future d'ECDSA / de l'échange TLS | L'ancre est ML-DSA-65 ; TLS n'est qu'un transport |
-| Rejeu d'une transaction | Identifiant de transaction, cache anti-rejeu borné, nonces liés au PSK |
+| Rejeu immédiat d'une transaction | Identifiant de transaction, cache anti-rejeu, nonces liés au PSK |
+| Rejeu différé après éviction du cache | Horodatage signé, fenêtre de 30 s, lié à la dérivation |
+| Flood CPU par source falsifiée | Validation d'adresse QUIC (Retry) avant toute allocation ou cryptographie |
+| Flood CPU par une adresse réelle | Huit handshakes par minute et par adresse |
+| Perte du dernier message (désynchronisation) | Renégociation automatique côté client, jusqu'à trois fois |
 | Confusion de pair | Les deux identités WireGuard entrent dans la dérivation |
 | Downgrade forcé par le réseau | Plancher persistant des deux côtés, refus avant toute pose |
 | Client non admis | Empreinte du certificat PQ vérifiée contre la table des pairs |
@@ -188,10 +277,13 @@ console — la commande prévue pour l'amorçage. Le certificat PQ portant le su
 
 ### Ce qu'elle n'arrête pas
 
-- **Le déni de service.** Un attaquant qui joint le port peut ouvrir des
-  transactions. Les limites (connexions globales, verrou par pair, messages
-  bornés à 64 Kio, cache anti-rejeu borné) contiennent la consommation, elles
-  n'empêchent pas la saturation du lien.
+- **La saturation du lien.** La validation d'adresse et la limite par source
+  contiennent le coût CPU, elles ne créent pas de bande passante : un
+  attaquant qui sature le lien montant coupe l'accès, comme il couperait
+  n'importe quel service. Seul l'opérateur réseau peut y répondre.
+- **Un attaquant disposant de nombreuses adresses.** La limite est par
+  adresse ; un botnet la contourne par le nombre. Elle rend l'attaque
+  proportionnelle à ce que l'attaquant possède vraiment, pas gratuite.
 - **La compromission d'un poste client.** Une identité scellée reste
   utilisable par un code s'exécutant sous le compte de l'utilisateur. DPAPI
   protège contre le vol du fichier, pas contre l'exécution locale.
@@ -206,11 +298,34 @@ console — la commande prévue pour l'amorçage. Le certificat PQ portant le su
 
 ### Surface exposée
 
-Le port applique, dans cet ordre : mTLS avant tout protocole, un ALPN dédié,
-des messages JSON stricts (`deny_unknown_fields`) bornés à 64 Kio, une limite
-globale de connexions, un verrou par pair, un cache anti-rejeu borné. Les
-erreurs publiques restent volontairement peu détaillées — elles ne distinguent
-pas un pair inconnu d'une signature invalide.
+Le port applique, dans cet ordre : validation d'adresse QUIC, limite par
+adresse source, limite globale de connexions, mTLS avant tout protocole, un
+ALPN dédié, des messages JSON stricts (`deny_unknown_fields`) bornés à 64 Kio,
+un verrou par pair, un cache anti-rejeu borné. Les erreurs publiques restent
+volontairement peu détaillées — elles ne distinguent pas un pair inconnu d'une
+signature invalide.
+
+#### Coût avant authentification
+
+Tout ce que fait ce port est cher — TLS 1.3, vérification ML-DSA-65,
+encapsulation ML-KEM — et tout cela précède le moment où la gateway sait si le
+pair est légitime. Cette asymétrie **est** le déni de service : quelques
+paquets falsifiés achètent beaucoup de CPU.
+
+Deux bornes, dans l'ordre qui compte :
+
+1. **Validation d'adresse (QUIC Retry).** Une connexion entrante dont
+   l'adresse n'est pas validée reçoit un paquet Retry — un jeton, aucun état
+   alloué. Le pair doit renvoyer ce jeton depuis la même adresse : une source
+   falsifiée n'atteint donc **jamais** le handshake TLS.
+2. **Limite par adresse source.** La validation prouve qu'une adresse est
+   réelle, pas qu'elle est amicale. Au-delà de huit handshakes par minute et
+   par adresse, les suivants sont refusés — le coût pour un attaquant devient
+   linéaire dans le nombre d'adresses qu'il détient réellement.
+
+Ces deux bornes précèdent toute allocation et toute cryptographie. La limite
+globale de connexions ne borne ensuite que ce qui a franchi les deux
+premières.
 
 ## Conséquences
 
@@ -250,6 +365,15 @@ la cause.
   ([TESTING](../testing/TESTING.md)).
 - **Aucune rotation automatique des certificats.** Ils valent 825 jours ; leur
   expiration se traite en réémettant. Rien n'avertit à l'approche de l'échéance.
+- **Les catégories NIST ne sont pas homogènes.** Le KEM est en catégorie 5
+  (ML-KEM-1024) et le KDF au-dessus, mais l'authentification reste en
+  catégorie 3 (ML-DSA-65) : c'est désormais elle le maillon le plus bas du
+  protocole. La conséquence est bornée — casser ML-DSA-65 permettrait de
+  substituer `kpub` sur une négociation **en cours**, pas de déchiffrer un
+  enregistrement passé, que seul le KEM protège. Passer en ML-DSA-87
+  (catégorie 5) est possible sans changement de structure, mais impose de
+  réémettre toute la PKI, gateway et clients : c'est une décision d'exploitation
+  autant que de cryptographie, et elle n'est pas prise ici.
 - **Le profil hérité reste servi.** Un profil sans bloc `key_negotiation`
   emprunte l'ancien provisioning, dont le premier handshake n'est pas protégé.
   Supprimer ce chemin exige que tous les profils déployés aient été réenrôlés.

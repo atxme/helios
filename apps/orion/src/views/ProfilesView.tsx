@@ -627,7 +627,7 @@ export function ProfilesView({
                   />
                   {staticPsk && (
                     <Caution>
-                      Laisser vide pour obtenir un <strong>PSK PQC</strong> négocié en ML-KEM-768 à
+                      Laisser vide pour obtenir un <strong>PSK PQC</strong> négocié en ML-KEM-1024 à
                       chaque connexion. Une valeur ici la <strong>désactive</strong> : le secret ne
                       tourne plus et les deux pairs doivent porter la même valeur.
                     </Caution>
