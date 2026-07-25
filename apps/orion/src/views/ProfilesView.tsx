@@ -34,6 +34,7 @@ import { GUTTER } from '../theme'
 import type {
   ClientConfig,
   ClientProfile,
+  ImportOutcome,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
   ProfileIssues,
@@ -59,7 +60,7 @@ interface Props {
   config: ClientConfig
   pathImport: ClientProfile | null
   onPathImportHandled: () => void
-  onImport: (contents: string, fileName: string) => Promise<ClientProfile>
+  onImport: (contents: string, fileName: string) => Promise<ImportOutcome>
   onSave: (profile: ClientProfile) => Promise<void>
   onDelete: (name: string) => Promise<void>
   onSelect: (name: string) => Promise<void>
@@ -131,6 +132,7 @@ export function ProfilesView({
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
   const [fingerprint, setFingerprint] = useState<string | null>(null)
+  const [identitySealed, setIdentitySealed] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
 
   // A build fact, not a profile one: asked once.
@@ -166,6 +168,23 @@ export function ProfilesView({
       cancelled = true
     }
   }, [draft])
+
+  // Re-asked on every import notice: sealing happens during import, so the
+  // answer changes at exactly that moment.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .keyNegotiationIdentitySealed(draft)
+      .then((sealed) => {
+        if (!cancelled) setIdentitySealed(sealed)
+      })
+      .catch(() => {
+        if (!cancelled) setIdentitySealed(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [draft, importNotice])
 
   // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
   // incomplete private key mid-entry simply yields an absent value.
@@ -323,18 +342,32 @@ export function ProfilesView({
 
     setImporting(true)
     try {
-      const profile = await onImport(await file.text(), file.name)
+      const imported = await onImport(await file.text(), file.name)
+      const profile = imported.profile
       const existing = config.profiles.find((candidate) => candidate.name === profile.name)
 
       setDraft(profile)
       setHistory([])
       setDirty(true)
-      setImportNotice({
-        tone: 'success',
-        message: existing
-          ? `« ${profile.name} » chargé. Enregistrer remplacera le profil existant.`
-          : `« ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.`,
-      })
+      // The identity failing to seal outranks the profile loading fine: the
+      // profile is visible on screen, whereas an unsealed identity only
+      // shows up much later, as a connection that fails before WireGuard.
+      if (imported.identity_error) {
+        setImportNotice({
+          tone: 'error',
+          message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}`,
+        })
+      } else {
+        const sealed = imported.identity_sealed
+          ? ' Identité scellée dans le stockage protégé : le fichier peut être détruit.'
+          : ''
+        setImportNotice({
+          tone: 'success',
+          message: existing
+            ? `« ${profile.name} » chargé. Enregistrer remplacera le profil existant.${sealed}`
+            : `« ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.${sealed}`,
+        })
+      }
     } catch (cause) {
       setImportNotice({ tone: 'error', message: `Import impossible : ${String(cause)}` })
     } finally {
@@ -611,6 +644,7 @@ export function ProfilesView({
             issue={issues.key_negotiation}
             support={support}
             fingerprint={fingerprint}
+            identitySealed={identitySealed}
             onModeChange={setMode}
           />
         </Box>
@@ -705,12 +739,15 @@ function KeyNegotiation({
   issue,
   support,
   fingerprint,
+  identitySealed,
   onModeChange,
 }: {
   settings: KeyNegotiationSettings | null
   issue?: string | null
   support: KeyNegotiationSupport | null
   fingerprint: string | null
+  /** The identity this profile names is sealed on this machine. */
+  identitySealed: boolean
   onModeChange: (mode: ProtectionMode) => void
 }) {
   const title = (
@@ -802,13 +839,32 @@ function KeyNegotiation({
       >
         <Detail label="endpoint" value={settings.endpoint} />
         <Detail label="serveur" value={settings.server_name} />
-        <Detail label="identité protégée" value={settings.identity} />
+        <Detail
+          label="identité protégée"
+          value={identitySealed ? `${settings.identity} · scellée` : `${settings.identity} · absente`}
+          hint={
+            identitySealed
+              ? 'Certificat client scellé au compte Windows par DPAPI. Le fichier d’enrôlement n’est plus nécessaire.'
+              : 'Aucune identité de ce nom sur ce poste : importer le fichier d’enrôlement produit par « helios-ctl enroll ».'
+          }
+        />
         <Detail
           label="empreinte PQ"
           value={fingerprint ?? 'illisible'}
           hint="Certificat ML-DSA-65 épinglé de la gateway. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil importé à la bonne gateway."
         />
       </Box>
+
+      {/* The missing identity outranks everything else this block says: the
+          mode, the floor and the fingerprint are all moot if the client has
+          no certificate to present. */}
+      {!identitySealed && (
+        <Caution>
+          Aucune identité protégée nommée <strong>{settings.identity}</strong> sur ce poste : la
+          connexion échouera <strong>avant</strong> WireGuard. Importer le fichier d’enrôlement
+          fourni par l’opérateur — il scelle le certificat client et peut être détruit ensuite.
+        </Caution>
+      )}
 
       {issue && (
         <Alert severity="error" variant="outlined" sx={{ py: 0, fontSize: 11 }}>

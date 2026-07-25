@@ -58,6 +58,46 @@ pub struct CmdResp {
     pub error: Option<String>,
 }
 
+/// Public key-negotiation material served by `GET /api/key-negotiation`.
+///
+/// These are the exact values an Orion profile pins. Fetching them from the
+/// gateway rather than from files on the operator workstation removes the
+/// failure this tooling saw most: a profile pinned to a certificate the
+/// gateway has since rotated.
+#[derive(Debug, Deserialize)]
+pub struct KeyNegotiationView {
+    pub port: Option<u16>,
+    pub server_name: String,
+    pub gateway_ca_der: String,
+    pub gateway_pq_certificate: String,
+    pub pq_certificate_sha256: String,
+    pub wireguard_public_key: String,
+}
+
+/// Reads the negotiation material, or `None` if the gateway serves none.
+///
+/// The absence is a legitimate configuration — an older gateway, or one
+/// without the feature — so it is returned rather than raised: the caller
+/// decides whether it can proceed without it.
+pub async fn key_negotiation(client: &Client, base: &str) -> Result<Option<KeyNegotiationView>> {
+    let response = client
+        .get(format!("{base}/api/key-negotiation"))
+        .send()
+        .await
+        .context("connection refused — is heliosd reachable through the tunnel?")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = response.status();
+    let text = response.text().await.context("unreadable response body")?;
+    if !status.is_success() {
+        anyhow::bail!("{} : {}", status, text.trim());
+    }
+    serde_json::from_str(&text)
+        .map(Some)
+        .context("unexpected JSON response from /api/key-negotiation")
+}
+
 pub async fn network(client: &Client, base: &str) -> Result<NetworkConfigView> {
     client
         .get(format!("{base}/api/network"))

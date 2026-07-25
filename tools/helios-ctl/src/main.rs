@@ -24,6 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod api;
 mod campaign;
+mod enroll;
 mod escrow;
 mod files;
 mod key_nego;
@@ -77,6 +78,46 @@ enum Cmd {
     Profile {
         #[command(subcommand)]
         command: ProfileCmd,
+    },
+    /// Enrolls a client in one go: keys, certificates, admission, profile.
+    ///
+    /// The gateway supplies everything it knows — its WireGuard identity, its
+    /// negotiation certificates and the port they answer on — so the only
+    /// things to state are the client's name and the public endpoint. The
+    /// resulting file carries the client's private keys: it is born at 0600
+    /// and must be destroyed once Orion has imported it.
+    Enroll {
+        /// Profile name, also used as the peer name on the gateway.
+        #[arg(long)]
+        name: String,
+        /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
+        #[arg(long)]
+        endpoint: String,
+        /// Directory of the operator client CA (`key-nego init-client-ca`).
+        #[arg(long, default_value = "./orion-client-ca")]
+        client_ca_dir: PathBuf,
+        /// Client public key, when the client already holds its own pair.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Negotiation mode, which also becomes the peer's floor.
+        #[arg(long, value_enum, default_value = "ml-kem")]
+        mode: key_nego::Mode,
+        /// Negotiation endpoint. Defaults to the tunnel host with the port
+        /// the gateway publishes.
+        #[arg(long)]
+        negotiation_endpoint: Option<String>,
+        /// Name of the protected store entry. Defaults to `orion-<name>`.
+        #[arg(long)]
+        identity: Option<String>,
+        /// Admit the peer as a control-plane administrator.
+        #[arg(long)]
+        admin: bool,
+        /// Revoke a peer of the same name before admitting this identity.
+        #[arg(long)]
+        replace: bool,
+        /// Output file.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Escrow of the gateway identity — **operator workstation**.
     ///
@@ -743,6 +784,39 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Cmd::Enroll {
+            name,
+            endpoint,
+            client_ca_dir,
+            public_key,
+            mode,
+            negotiation_endpoint,
+            identity,
+            admin,
+            replace,
+            output,
+        } => {
+            // Checked before the gateway is contacted: a missing CA must not
+            // be discovered after a peer has been admitted.
+            enroll::check_client_ca(&client_ca_dir)?;
+            enroll::run(
+                &client,
+                base,
+                enroll::EnrollOptions {
+                    name,
+                    endpoint,
+                    client_ca_dir,
+                    public_key,
+                    mode: mode.into(),
+                    negotiation_endpoint,
+                    identity,
+                    admin,
+                    replace,
+                    output,
+                },
+            )
+            .await
+        }
         Cmd::Escrow { command } => match command {
             EscrowCmd::Keygen { output_dir } => escrow::keygen(&output_dir),
             EscrowCmd::Open {

@@ -108,9 +108,13 @@ pub async fn cmd_add(
     Ok(())
 }
 
+/// Removes a peer from admission.
+pub async fn revoke(client: &Client, base: &str, name: &str) -> Result<PeerSummary> {
+    api::post_json(client, base, "/api/peers/revoke", &RevokeBody { name }).await
+}
+
 pub async fn cmd_revoke(client: &Client, base: &str, name: &str) -> Result<()> {
-    let peer: PeerSummary =
-        api::post_json(client, base, "/api/peers/revoke", &RevokeBody { name }).await?;
+    let peer = revoke(client, base, name).await?;
     println!("{} {} removed from admission", crate::ok(), peer.name);
     println!("\n  \x1b[2mThe peer will drop at its next handshake; there is no\x1b[0m");
     println!("  \x1b[2mcryptographic revocation (ADR-004).\x1b[0m");

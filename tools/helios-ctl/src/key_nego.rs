@@ -256,23 +256,36 @@ fn init_client_ca(name: &str, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn issue_client(
+/// The four artifacts of a client identity, still in memory.
+///
+/// Kept as one value because they are only ever useful together: a
+/// certificate without its private key authenticates nothing, and a key
+/// without its certificate cannot be presented. Callers either write them to
+/// four files (`issue-client`) or seal them into one bundle (`enroll`).
+pub struct ClientMaterial {
+    pub certificate_der: Vec<u8>,
+    pub private_key_der: Zeroizing<Vec<u8>>,
+    pub pq_certificate_json: Vec<u8>,
+    pub pq_private_key: Zeroizing<Vec<u8>>,
+    /// SHA-256 of the DER certificate — declared at admission.
+    pub certificate_sha256: String,
+    /// SHA-256 of the PQ certificate — declared at admission, and the value
+    /// that actually anchors authentication.
+    pub pq_certificate_sha256: String,
+}
+
+/// Issues a client identity from the operator CA, without touching the disk.
+///
+/// Both `issue-client` and `enroll` go through here: two issuance paths would
+/// eventually disagree on validity, on the WireGuard binding, or on the role
+/// byte — and the divergence would only show up as a refused negotiation.
+pub fn issue_client_material(
     name: &str,
     wireguard_public_key: &str,
     ca_certificate_path: &Path,
     ca_private_key_path: &Path,
     ca_pq_private_key_path: &Path,
-    output_dir: &Path,
-) -> Result<()> {
-    reject_existing(
-        output_dir,
-        &[
-            CLIENT_CERTIFICATE_FILE,
-            CLIENT_PRIVATE_KEY_FILE,
-            CLIENT_PQ_CERTIFICATE_FILE,
-            CLIENT_PQ_PRIVATE_KEY_FILE,
-        ],
-    )?;
+) -> Result<ClientMaterial> {
     check_private_permissions(ca_private_key_path)?;
     check_private_permissions(ca_pq_private_key_path)?;
     aether::wg::validate_key(wireguard_public_key).context("invalid WireGuard public key")?;
@@ -300,16 +313,6 @@ fn issue_client(
         .signed_by(&key, &ca, &ca_key)
         .context("issuing the Orion client certificate")?;
 
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("creating {}", output_dir.display()))?;
-    write_public(
-        &output_dir.join(CLIENT_CERTIFICATE_FILE),
-        certificate.der().as_ref(),
-    )?;
-    write_secret(
-        &output_dir.join(CLIENT_PRIVATE_KEY_FILE),
-        &key.serialize_der(),
-    )?;
     let ca_pq_private_key = Zeroizing::new(read(ca_pq_private_key_path)?);
     let (client_pq_private_key, client_pq_public_key) =
         generate_ml_dsa_65_keypair().context("generating the Orion PQ identity")?;
@@ -331,23 +334,69 @@ fn issue_client(
         ca_pq_private_key.as_slice(),
     )
     .context("issuing the Orion PQ certificate")?;
+
+    Ok(ClientMaterial {
+        certificate_sha256: helios_key_negotiation::certificate_fingerprint_der(
+            certificate.der().as_ref(),
+        ),
+        pq_certificate_sha256: pq_certificate.fingerprint()?,
+        certificate_der: certificate.der().to_vec(),
+        private_key_der: Zeroizing::new(key.serialize_der()),
+        pq_certificate_json: serde_json::to_vec_pretty(&pq_certificate)
+            .context("encoding the Orion PQ certificate")?,
+        pq_private_key: client_pq_private_key,
+    })
+}
+
+fn issue_client(
+    name: &str,
+    wireguard_public_key: &str,
+    ca_certificate_path: &Path,
+    ca_private_key_path: &Path,
+    ca_pq_private_key_path: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    reject_existing(
+        output_dir,
+        &[
+            CLIENT_CERTIFICATE_FILE,
+            CLIENT_PRIVATE_KEY_FILE,
+            CLIENT_PQ_CERTIFICATE_FILE,
+            CLIENT_PQ_PRIVATE_KEY_FILE,
+        ],
+    )?;
+    let material = issue_client_material(
+        name,
+        wireguard_public_key,
+        ca_certificate_path,
+        ca_private_key_path,
+        ca_pq_private_key_path,
+    )?;
+
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating {}", output_dir.display()))?;
+    write_public(
+        &output_dir.join(CLIENT_CERTIFICATE_FILE),
+        &material.certificate_der,
+    )?;
+    write_secret(
+        &output_dir.join(CLIENT_PRIVATE_KEY_FILE),
+        &material.private_key_der,
+    )?;
     write_public(
         &output_dir.join(CLIENT_PQ_CERTIFICATE_FILE),
-        &serde_json::to_vec_pretty(&pq_certificate).context("encoding the Orion PQ certificate")?,
+        &material.pq_certificate_json,
     )?;
     write_secret(
         &output_dir.join(CLIENT_PQ_PRIVATE_KEY_FILE),
-        client_pq_private_key.as_slice(),
+        &material.pq_private_key,
     )?;
     println!(
         "certificate: {}",
         output_dir.join(CLIENT_CERTIFICATE_FILE).display()
     );
-    println!(
-        "sha256: {}",
-        helios_key_negotiation::certificate_fingerprint_der(certificate.der().as_ref())
-    );
-    println!("PQ certificate sha256: {}", pq_certificate.fingerprint()?);
+    println!("sha256: {}", material.certificate_sha256);
+    println!("PQ certificate sha256: {}", material.pq_certificate_sha256);
     Ok(())
 }
 

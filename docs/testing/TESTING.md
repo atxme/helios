@@ -104,6 +104,10 @@ Valider avec accès console :
 - association Orion : double-clic sur `.orionprofile` au premier lancement puis
   avec l'application déjà ouverte, une seule instance et reprise de la clé
   privée locale de même nom ;
+- identité cliente sous Windows : un document produit par `helios-ctl enroll`
+  est importé, l'écran *Profils* annonce l'identité **scellée**, la connexion
+  négocie en ML-KEM après suppression du fichier d'enrôlement, et la même
+  identité recopiée sur un autre compte Windows échoue au descellement ;
 - paquet Orion Debian : `getcap /usr/bin/orion` annonce
   `cap_net_admin=ep`, puis WebKitGTK démarre sans dépendre de
   `LD_LIBRARY_PATH` ;
@@ -452,8 +456,10 @@ confirmés puis corrigés avec test de non-régression :
 - l’effet de la key-negotiation sur WireGuard-NT et le backend noyau Helios
   exige deux machines et les deux redirections UDP ; les tests WSL2 couvrent la
   transaction mais pas ces effets matériels ;
-- le stockage protégé des clés TLS et ML-DSA clientes dans le shell Windows et
-  l’IHM sont le lot suivant ; `orion-core` en expose déjà l’interface obligatoire ;
+- le scellement DPAPI de l’identité cliente ne se compile ni ne s’exerce en
+  WSL2 : hors Windows, `orion_core::identity_store` échoue explicitement
+  (`UnsupportedPlatform`) au lieu d’écrire ces clés en clair, et c’est cette
+  propriété-là que la régression vérifie ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
 - le chemin Tauri Linux ne valide pas Windows/WireGuard-NT ;
 - une campagne verte réduit le risque de régression, elle ne constitue ni audit

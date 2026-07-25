@@ -450,7 +450,8 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     };
     info!("web interface on http://{api_bind}");
 
-    let state = AppState::new(
+    #[allow(unused_mut)]
+    let mut state = AppState::new(
         Arc::clone(&shared_network),
         dry_run,
         Arc::clone(&tunnel_state),
@@ -459,6 +460,13 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         psk_tx,
         Arc::clone(&shared_policy),
     );
+    // Published for the operator tooling: `helios-ctl` builds a complete
+    // Orion profile from the gateway rather than making the operator copy
+    // certificates out of /var/lib/helios by hand.
+    #[cfg(feature = "key-negotiation")]
+    if let Some(material) = key_negotiation::public_material()? {
+        state = state.with_key_negotiation(material);
+    }
     let api_ready = Arc::clone(&state.api_ready);
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —

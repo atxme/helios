@@ -8,6 +8,7 @@ import type {
   ClientConfig,
   ClientEvent,
   ClientProfile,
+  ImportOutcome,
   KeyNegotiationSupport,
   ProfileIssues,
   TunnelState,
@@ -17,10 +18,22 @@ export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
 export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
+
+/**
+ * Imports a document and seals any identity it carries.
+ *
+ * The sealing happens on the Rust side, at import time: it is the only moment
+ * the private material exists in the clear, and the shorter that moment is
+ * the better.
+ */
 export const importProfile = (contents: string, fileName: string) =>
-  invoke<ClientProfile>('import_profile', { contents, fileName })
+  invoke<ImportOutcome>('import_profile', { contents, fileName })
 export const importProfilePath = (path?: string) =>
-  invoke<ClientProfile | null>('import_profile_path', { path: path ?? null })
+  invoke<ImportOutcome | null>('import_profile_path', { path: path ?? null })
+
+/** Is this profile's identity already sealed on this machine? */
+export const keyNegotiationIdentitySealed = (profile: ClientProfile) =>
+  invoke<boolean>('key_negotiation_identity_sealed', { profile })
 
 /**
  * Reports the faulty fields of a profile being edited.

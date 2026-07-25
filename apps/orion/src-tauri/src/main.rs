@@ -27,7 +27,7 @@ use aether::TunnelState;
 use orion_core::{
     backend::EventSink, complete_profile_import, default_backend, inspect_profile,
     parse_profile_import, read_profile_import_path, telemetry, ClientConfig, ClientEvent,
-    ClientProfile, ProfileIssues, VpnController,
+    ClientProfile, ProfileIssues, ProtectedIdentityStore, VpnController,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
@@ -198,6 +198,20 @@ fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport 
     }
 }
 
+/// Is this profile's identity already sealed on this machine?
+///
+/// Answered without unsealing: the screen needs to know whether the import
+/// still has to happen, and that question must not depend on the session
+/// being able to decrypt. `false` also covers "no negotiation block" — a
+/// profile that needs no identity needs no import either.
+#[tauri::command]
+fn key_negotiation_identity_sealed(profile: ClientProfile) -> bool {
+    let Some(settings) = profile.key_negotiation.as_ref() else {
+        return false;
+    };
+    ProtectedIdentityStore::for_current_user().is_ok_and(|store| store.contains(&settings.identity))
+}
+
 /// Fingerprint of the gateway PQ certificate pinned by a profile.
 ///
 /// Same reasoning as [`profile_public_key`]: the value is derived on the Rust
@@ -216,19 +230,64 @@ async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> 
     Ok(state.config.lock().await.clone())
 }
 
+/// Result of an import: the draft profile, and what became of the identity.
+///
+/// The identity's fate is reported rather than raised because the two are
+/// independent: a profile stays perfectly importable on a machine that cannot
+/// seal, and hiding the profile behind that failure would leave the user with
+/// nothing at all — not even the endpoint to check.
+#[derive(serde::Serialize)]
+struct ImportOutcome {
+    profile: ClientProfile,
+    /// `true` when the document carried an identity **and** it was sealed.
+    identity_sealed: bool,
+    /// Why sealing failed, when the document carried one and it did not.
+    identity_error: Option<String>,
+}
+
+/// Seals the identity shipped with a document, if any.
+///
+/// Import is where this happens because it is the only moment the plaintext
+/// exists: from here on the material lives sealed in the store, and the
+/// profile keeps nothing but the name of the entry.
+fn seal_identity(identity: Option<orion_core::ClientIdentityBundle>) -> (bool, Option<String>) {
+    let Some(identity) = identity else {
+        return (false, None);
+    };
+    let sealed = ProtectedIdentityStore::for_current_user()
+        .and_then(|store| store.store(&identity))
+        .map(|_| ());
+    match sealed {
+        Ok(()) => (true, None),
+        // `{:#}` keeps the anyhow context chain: the platform reason is the
+        // useful half of the message.
+        Err(error) => (false, Some(format!("{error:#}"))),
+    }
+}
+
 /// Decodes a document chosen by the user without persisting it.
 ///
 /// The UI displays the result as a draft: a valid file therefore never
-/// silently replaces a profile with the same name.
+/// silently replaces a profile with the same name. The identity, on the other
+/// hand, is sealed straight away — it is a secret, and the shorter it stays
+/// in memory the better.
 #[tauri::command]
 async fn import_profile(
     state: State<'_, AppState>,
     contents: String,
     file_name: String,
-) -> Result<ClientProfile, String> {
-    let profile = parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
+) -> Result<ImportOutcome, String> {
+    let imported =
+        parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
+    let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let config = state.config.lock().await;
-    complete_profile_import(profile, &config).map_err(|error| error.to_string())
+    let profile =
+        complete_profile_import(imported.profile, &config).map_err(|error| error.to_string())?;
+    Ok(ImportOutcome {
+        profile,
+        identity_sealed,
+        identity_error,
+    })
 }
 
 /// Rereads a profile whose path comes from the system association.
@@ -241,7 +300,7 @@ async fn import_profile(
 async fn import_profile_path(
     state: State<'_, AppState>,
     path: Option<String>,
-) -> Result<Option<ClientProfile>, String> {
+) -> Result<Option<ImportOutcome>, String> {
     let path = match path {
         Some(path) => PathBuf::from(path),
         None => match state.pending_profile_paths.lock().unwrap().pop_front() {
@@ -252,11 +311,16 @@ async fn import_profile_path(
     if !is_associated_profile_path(&path) {
         return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
     }
-    let profile = read_profile_import_path(&path).map_err(|error| error.to_string())?;
+    let imported = read_profile_import_path(&path).map_err(|error| error.to_string())?;
+    let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let config = state.config.lock().await;
-    complete_profile_import(profile, &config)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let profile =
+        complete_profile_import(imported.profile, &config).map_err(|error| error.to_string())?;
+    Ok(Some(ImportOutcome {
+        profile,
+        identity_sealed,
+        identity_error,
+    }))
 }
 
 /// Public key corresponding to a profile's private key.
@@ -585,7 +649,21 @@ fn main() {
     let backend = default_backend().expect(
         "real WireGuard backend unavailable — Orion refuses to start with implicit simulation",
     );
-    let controller = Arc::new(VpnController::new(backend));
+    let controller = VpnController::new(backend);
+    // The protected store is the shell's job: `orion-core` states the
+    // boundary, the platform implementation lives with the platform.
+    #[cfg(feature = "key-negotiation")]
+    let controller = match ProtectedIdentityStore::for_current_user() {
+        Ok(store) => controller.with_key_negotiation_identities(Arc::new(store)),
+        Err(error) => {
+            // Not fatal: profiles without negotiation still connect, and the
+            // Profiles screen reports the missing store rather than letting
+            // the failure surface as an unexplained refused connection.
+            tracing::warn!(%error, "no protected identity store on this machine");
+            controller
+        }
+    };
+    let controller = Arc::new(controller);
     let config = ClientConfig::load().unwrap_or_default();
 
     tauri::Builder::default()
@@ -627,6 +705,7 @@ fn main() {
             validate_profile,
             key_negotiation_support,
             key_negotiation_fingerprint,
+            key_negotiation_identity_sealed,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");

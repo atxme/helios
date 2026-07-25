@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aether::key_negotiation::ProtectionMode;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Serialize;
@@ -57,15 +58,58 @@ struct Document<'a> {
 /// The `private_key` field is omitted in invitation mode: `orion-core` treats
 /// it as absent, not empty, and completes it from the local profile.
 #[derive(Serialize)]
-struct Profile<'a> {
-    name: &'a str,
-    endpoint: &'a str,
+pub struct Profile<'a> {
+    pub name: &'a str,
+    pub endpoint: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    private_key: Option<&'a str>,
-    peer_public_key: &'a str,
-    address: &'a str,
+    pub private_key: Option<&'a str>,
+    pub peer_public_key: &'a str,
+    pub address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    heliosd_url: Option<String>,
+    pub heliosd_url: Option<String>,
+    /// Public negotiation settings. Absent when the gateway serves none:
+    /// the profile then falls back to the legacy path, whose first handshake
+    /// is unprotected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_negotiation: Option<KeyNegotiation>,
+    /// Client identity. **Secret** — only `enroll` fills it in, and the file
+    /// it produces is born at 0600.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_negotiation_identity: Option<orion_core::ClientIdentityBundle>,
+}
+
+/// Public negotiation block, as `orion-core` reads it back.
+#[derive(Serialize)]
+pub struct KeyNegotiation {
+    pub mode: ProtectionMode,
+    /// Written explicitly even though `orion-core` would default it to
+    /// `mode`: a floor that is visible in the document is one an operator can
+    /// audit without knowing the defaulting rule.
+    pub minimum_mode: ProtectionMode,
+    pub endpoint: String,
+    pub server_name: String,
+    pub gateway_ca_der: String,
+    pub gateway_pq_certificate: String,
+    pub identity: String,
+}
+
+/// Renders the document, and checks it against the consumer before writing.
+///
+/// The round-trip through `orion_core::parse_profile_import` is the point:
+/// this tool and Orion must agree on the format, and the only way to be sure
+/// is to have the actual consumer accept the actual bytes. A document that
+/// Orion would refuse must never reach a user's machine.
+pub fn render(profile: Profile<'_>) -> Result<String> {
+    let json = serde_json::to_string_pretty(&Document {
+        format: FORMAT,
+        version: VERSION,
+        profile,
+    })
+    .context("serializing the profile")?;
+
+    orion_core::parse_profile_import(&json, "profile.json")
+        .context("the emitted profile is not readable by Orion — this is a tooling bug")?;
+    Ok(json)
 }
 
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
@@ -83,19 +127,20 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
 
     let address = admit_or_reuse(client, base, &options, &public_key).await?;
 
-    let document = Document {
-        format: FORMAT,
-        version: VERSION,
-        profile: Profile {
-            name: &options.name,
-            endpoint: &options.endpoint,
-            private_key: private_key.as_deref(),
-            peer_public_key: &gateway_public_key,
-            address: &address,
-            heliosd_url: heliosd_url(&view.wg_address),
-        },
-    };
-    let json = serde_json::to_string_pretty(&document).context("serializing the profile")?;
+    let json = render(Profile {
+        name: &options.name,
+        endpoint: &options.endpoint,
+        private_key: private_key.as_deref(),
+        peer_public_key: &gateway_public_key,
+        address: &address,
+        heliosd_url: heliosd_url(&view.wg_address),
+        // `emit` never ships an identity: it is the path that keeps the
+        // document free of secrets. Wiring the negotiation from here would
+        // therefore hand out a profile whose connection fails for lack of a
+        // certificate — `enroll` is the command that does both at once.
+        key_negotiation: None,
+        key_negotiation_identity: None,
+    })?;
 
     match &options.output {
         Some(path) => {
@@ -176,7 +221,7 @@ async fn admit_or_reuse(
 /// Serves enriched telemetry and the client's post-quantum provisioning.
 /// Absent if the address is unreadable: a profile without this URL still
 /// works, it only loses the enrichment.
-fn heliosd_url(wg_address: &str) -> Option<String> {
+pub fn heliosd_url(wg_address: &str) -> Option<String> {
     let host = wg_address.split('/').next()?.trim();
     host.parse::<std::net::Ipv4Addr>().ok()?;
     Some(format!("http://{host}:{}", aether::API_PORT))
@@ -293,26 +338,109 @@ mod tests {
         let gateway_key = aether::wg::generate_keypair().unwrap();
 
         for private_key in [None, Some(client_key.private_key.expose())] {
-            let document = Document {
-                format: FORMAT,
-                version: VERSION,
-                profile: Profile {
-                    name: "portable",
-                    endpoint: "vpn.example.net:51820",
-                    private_key,
-                    peer_public_key: &gateway_key.public_key,
-                    address: "100.64.1.2/32",
-                    heliosd_url: heliosd_url("100.64.0.1/10"),
-                },
-            };
-            let json = serde_json::to_string(&document).unwrap();
-            let profile = orion_core::parse_profile_import(&json, "portable.json")
-                .expect("document read back by Orion");
+            // `render` itself replays the document through Orion's import:
+            // reaching this point already proves the two agree on the format.
+            let json = render(Profile {
+                name: "portable",
+                endpoint: "vpn.example.net:51820",
+                private_key,
+                peer_public_key: &gateway_key.public_key,
+                address: "100.64.1.2/32",
+                heliosd_url: heliosd_url("100.64.0.1/10"),
+                key_negotiation: None,
+                key_negotiation_identity: None,
+            })
+            .expect("document read back by Orion");
+            let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
 
-            assert_eq!(profile.name, "portable");
-            assert_eq!(profile.peer_public_key, gateway_key.public_key);
-            assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
-            assert_eq!(profile.private_key.is_empty(), private_key.is_none());
+            assert_eq!(imported.profile.name, "portable");
+            assert_eq!(imported.profile.peer_public_key, gateway_key.public_key);
+            assert_eq!(imported.profile.address.as_deref(), Some("100.64.1.2/32"));
+            assert_eq!(
+                imported.profile.private_key.is_empty(),
+                private_key.is_none()
+            );
+            assert!(imported.identity.is_none(), "emit ships no secret");
         }
+    }
+
+    /// The full `enroll` document — profile, negotiation block and identity —
+    /// must be read back by Orion in one go.
+    ///
+    /// This is the contract that actually matters: the tooling and the client
+    /// are two binaries that never meet, and a disagreement on this document
+    /// would only surface on a user's machine, as a profile that imports and
+    /// never connects.
+    #[test]
+    fn the_enrollment_document_is_read_back_whole() {
+        use aether::key_negotiation::{
+            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            PQ_CERTIFICATE_VERSION,
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let client_key = aether::wg::generate_keypair().unwrap();
+        let gateway_key = aether::wg::generate_keypair().unwrap();
+        let (gateway_pq_private, gateway_pq_public) = generate_ml_dsa_65_keypair().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let gateway_certificate = issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [3u8; 16],
+                subject: "vpn.example.net".into(),
+                issuer: "vpn.example.net".into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: gateway_key.public_key.clone(),
+                ml_dsa_65_public_key: STANDARD.encode(&gateway_pq_public),
+                not_before_unix: now - 60,
+                not_after_unix: now + 3600,
+                ml_dsa_65_signature: String::new(),
+            },
+            &gateway_pq_private,
+        )
+        .unwrap();
+
+        let json = render(Profile {
+            name: "portable",
+            endpoint: "vpn.example.net:51820",
+            private_key: Some(client_key.private_key.expose()),
+            peer_public_key: &gateway_key.public_key,
+            address: "100.64.1.2/32",
+            heliosd_url: heliosd_url("100.64.0.1/10"),
+            key_negotiation: Some(KeyNegotiation {
+                mode: ProtectionMode::MlKem,
+                minimum_mode: ProtectionMode::MlKem,
+                endpoint: "vpn.example.net:51821".into(),
+                server_name: "vpn.example.net".into(),
+                gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
+                gateway_pq_certificate: STANDARD
+                    .encode(serde_json::to_vec(&gateway_certificate).unwrap()),
+                identity: "orion-portable".into(),
+            }),
+            key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
+                identity: "orion-portable".into(),
+                certificate_chain: vec![STANDARD.encode([0x30, 0x82, 0x02, 0x00])],
+                private_key: STANDARD.encode([0x30, 0x81, 0x87, 0x02]),
+                pq_certificate: STANDARD.encode(br#"{"version":1}"#),
+                pq_private_key: STANDARD.encode([9u8; 64]),
+            }),
+        })
+        .expect("enrollment document read back by Orion");
+
+        let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        let settings = imported.profile.key_negotiation.expect("negotiation block");
+        assert_eq!(settings.mode, ProtectionMode::MlKem);
+        assert_eq!(settings.minimum_mode, ProtectionMode::MlKem);
+        assert_eq!(settings.identity, "orion-portable");
+        // The pinned certificate must verify against the gateway key the
+        // profile talks to — that check is the whole reason it is shipped.
+        assert!(settings.gateway_pq_fingerprint().is_some());
+        assert_eq!(
+            imported.identity.expect("identity shipped").identity,
+            "orion-portable"
+        );
     }
 }

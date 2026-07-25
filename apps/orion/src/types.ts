@@ -52,6 +52,21 @@ export interface KeyNegotiationSupport {
   identity_store: boolean
 }
 
+/**
+ * Result of importing a document — mirror of the shell's `ImportOutcome`.
+ *
+ * The identity's fate is reported next to the profile rather than replacing
+ * it: a profile stays importable on a machine that cannot seal, and hiding it
+ * behind that failure would leave the user with nothing to look at.
+ */
+export interface ImportOutcome {
+  profile: ClientProfile
+  /** The document carried an identity **and** it was sealed. */
+  identity_sealed: boolean
+  /** Why sealing failed, when the document carried one and it did not. */
+  identity_error: string | null
+}
+
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP
 // endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
 // one suite.

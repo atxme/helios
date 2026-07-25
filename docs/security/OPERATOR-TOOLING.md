@@ -151,10 +151,14 @@ Sans `--minimum-mode`, la présence de l'empreinte PQ choisit déjà `ml-kem`.
 L'option explicite rend la politique visible dans les scripts. Une
 renégociation réseau vers `static_psk` ou `classic` sera ensuite refusée.
 
-Les deux clés clientes produites en `0600` servent au transfert initial vers le
-stockage protégé du poste Orion, puis doivent être effacées du poste opérateur.
-Le câblage de ce stockage dans le shell Windows reste à faire : Orion l’annonce
-sur son écran *Profils* et refuse la connexion plutôt que de la tenter. Pour
+Ces quatre commandes restent utiles pour inspecter la PKI ou réémettre un
+certificat seul ; pour admettre un client, `helios-ctl enroll` (section 6) les
+enchaîne et évite de recopier deux empreintes à la main.
+
+Les deux clés clientes produites en `0600` servent au transfert vers le stockage
+protégé du poste Orion, puis doivent être effacées du poste opérateur. Orion les
+scelle par DPAPI, liées au compte Windows de l'utilisateur ; sur toute autre
+plateforme, il refuse franchement plutôt que de les écrire en clair. Pour
 valider mTLS, ML-DSA et les messages sans modifier durablement un slot :
 
 ```sh
@@ -207,31 +211,48 @@ Les deux modes admettent le pair au passage. Réémettre un profil pour une clé
 déjà admise réutilise son adresse ; changer de clé pour un nom existant exige
 une révocation explicite.
 
-### Bloc de négociation dans le profil
+### Enrôlement complet — une seule commande
 
-`profile emit` n'écrit pas encore ce bloc : il se colle dans le document émis,
-sous `profile`, à côté des champs WireGuard. Il ne porte que du public — le
-certificat client et sa clé privée vont dans le stockage protégé du poste, le
-document n'en nomme que l'entrée :
+`profile emit` ne met **pas** de bloc de négociation : c'est le chemin qui ne
+produit aucun secret, et un profil qui réclamerait un certificat sans le livrer
+ne se connecterait pas. Pour un client qui négocie avant WireGuard, une seule
+commande fait tout :
 
-```json
-"key_negotiation": {
-  "mode": "ml_kem",
-  "minimum_mode": "ml_kem",
-  "endpoint": "vpn.example.net:51821",
-  "server_name": "vpn.example.net",
-  "gateway_ca_der": "<base64 de key-negotiation-cert.der>",
-  "gateway_pq_certificate": "<base64 de key-negotiation-pq-cert.json>",
-  "identity": "orion-portable"
-}
+```sh
+helios-ctl enroll --name portable \
+  --endpoint vpn.example.net:51820 \
+  --client-ca-dir ./orion-client-ca \
+  --output portable.orionprofile
 ```
 
-`minimum_mode` est facultatif : absent, il prend la valeur de `mode`, car un
-profil qui demande ML-KEM aujourd'hui et accepterait le classique demain ne
-protège rien. Un `mode` sous son propre plancher fait refuser l'import. Orion
-vérifie à l'import que le certificat PQ est bien épinglé à la clé WireGuard de
-cette gateway, et affiche son empreinte sur l'écran *Profils* : c'est la valeur
-qu'a imprimée `heliosd init-key-negotiation`.
+Elle enchaîne ce que la section 5 sépare : elle lit sur la gateway sa clé
+publique WireGuard, ses certificats de négociation et le port qu'ils écoutent
+(`GET /api/key-negotiation`), génère la paire WireGuard du client, émet ses deux
+certificats depuis la CA opérateur, admet le pair avec les deux empreintes et
+le plancher, puis écrit **un** document qui porte le profil et l'identité.
+
+Options utiles : `--public-key` si le client détient déjà sa clé WireGuard,
+`--mode classic` pour un pair qui ne peut pas encore faire ML-KEM,
+`--negotiation-endpoint` si le port de négociation est redirigé ailleurs que le
+tunnel, `--identity` pour nommer l'entrée du stockage protégé (par défaut
+`orion-<nom>`), et `--replace` pour ré-enrôler un pair existant — ce qui révoque
+l'ancienne identité, donc coupe le poste qui la détenait.
+
+Le fichier produit **contient les clés privées du client**. Il naît en `0600`,
+se remet par un canal maîtrisé et s'efface des deux postes après import : Orion
+scelle l'identité au compte Windows et n'a plus besoin du fichier. C'est le même
+régime que `profile emit --with-private-key`.
+
+La commande refuse d'avancer si la gateway ne sert aucun matériel de
+négociation, et si son certificat est épinglé à une autre identité WireGuard que
+celle qu'elle utilise — cas d'une identité pivotée sans réémission du
+certificat, qui ferait échouer tous les clients bâtis ensuite.
+
+Orion vérifie à l'import que le certificat PQ est bien épinglé à la clé
+WireGuard de cette gateway, scelle l'identité et affiche son empreinte sur
+l'écran *Profils* : c'est la valeur qu'a imprimée `heliosd
+init-key-negotiation`. Les comparer de vive voix est ce qui rattache le profil à
+la bonne gateway.
 
 ## Ce que cet outillage ne fait pas
 

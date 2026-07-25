@@ -491,10 +491,33 @@ plancher connu — y compris en supprimant le bloc — et une négociation about
 élève le plancher du profil, comme la gateway élève le sien. Descendre exige
 d'éditer `profiles.toml`.
 
-**Limite connue.** Le câblage Windows du stockage protégé d'identité reste à
-faire : sans lui, un profil porteur du bloc échoue avant WireGuard. Orion le dit
-sur l'écran *Profils* plutôt que de le laisser découvrir à la connexion, et
-`helios-ctl key-nego probe` exerce le protocole sans committer le slot.
+### Identité cliente et enrôlement
+
+L'identité cliente — certificat TLS et certificat ML-DSA-65, avec leurs deux
+clés privées — naît sur le poste opérateur et ne voyage qu'une fois. Elle est
+scellée par **DPAPI**, liée au compte Windows de l'utilisateur et à une entropie
+propre à cet usage. Le Credential Manager a été écarté : il plafonne un secret à
+2560 octets quand la seule clé privée ML-DSA-65 en fait 4032.
+
+Le profil ne porte que le **nom** de l'entrée. Le document d'échange, lui, peut
+transporter l'identité une fois : `orion-profile` gagne un champ
+`key_negotiation_identity` que l'import scelle immédiatement et qui n'atteint
+jamais `ClientProfile`, donc jamais `profiles.toml`. Un document qui le porte est
+un secret au même titre qu'un profil émis avec clé privée.
+
+Côté outillage, `helios-ctl enroll` fait l'enrôlement d'un trait : il lit sur la
+gateway sa clé publique, ses certificats de négociation et leur port
+(`GET /api/key-negotiation`, matériel public), émet les certificats clients,
+admet le pair avec les deux empreintes et le plancher, et écrit ce document
+unique. Le producteur relit systématiquement ce qu'il écrit avec le parseur
+d'Orion : les deux binaires ne se rencontrent jamais, et un désaccord de format
+n'apparaîtrait sinon que sur le poste d'un utilisateur.
+
+**Limite connue — vérification matérielle.** DPAPI ne se compile ni ne s'exerce
+en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement
+(`IdentityStoreError::UnsupportedPlatform`) plutôt que d'écrire ces clés en
+clair. Débloquer Linux suppose `libsecret`, macOS le Keychain. Voir
+[TESTING](../testing/TESTING.md).
 
 ## Conséquences sur le workspace
 

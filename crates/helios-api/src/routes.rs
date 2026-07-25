@@ -251,6 +251,70 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
+/// Public key-negotiation material, as an Orion profile pins it.
+///
+/// Distinct from the WireGuard identity: this one authenticates the
+/// *negotiation*, not the tunnel. Everything here is a certificate — nothing
+/// in this view is secret, and the sealed private halves cannot reach it.
+#[derive(Serialize)]
+pub struct KeyNegotiationView {
+    pub port: Option<u16>,
+    /// Name the gateway certificate authenticates, read from the PQ
+    /// certificate's subject rather than reconfigured: the two could not
+    /// disagree without the pinning failing anyway.
+    pub server_name: String,
+    /// DER gateway certificate, base64 — Orion's `gateway_ca_der`.
+    pub gateway_ca_der: String,
+    /// JSON ML-DSA-65 gateway certificate, base64 — Orion's
+    /// `gateway_pq_certificate`.
+    pub gateway_pq_certificate: String,
+    /// Fingerprint the operator compares with what Orion displays.
+    pub pq_certificate_sha256: String,
+    /// WireGuard public key this certificate is bound to. A profile pinning
+    /// it against another peer key is refused by Orion at import.
+    pub wireguard_public_key: String,
+}
+
+/// Publishes the negotiation certificates, or explains their absence.
+///
+/// `404` rather than an empty body: a tool that received `null` would have to
+/// guess between "feature absent", "not initialized yet" and "read failure",
+/// and would end up emitting a profile whose pinning could never succeed.
+pub async fn key_negotiation_get(
+    State(s): State<AppState>,
+) -> Result<Json<KeyNegotiationView>, (StatusCode, String)> {
+    use base64::Engine as _;
+
+    let material = s.key_negotiation.as_ref().ok_or((
+        StatusCode::NOT_FOUND,
+        "this gateway runs no key-negotiation service — build heliosd with the \
+         `key-negotiation` feature, then run `heliosd init-key-negotiation`"
+            .to_string(),
+    ))?;
+    let certificate: aether::key_negotiation::PqCertificate =
+        serde_json::from_slice(&material.pq_certificate_json).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the gateway PQ certificate on disk is unreadable".to_string(),
+            )
+        })?;
+    let fingerprint = certificate.fingerprint().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the gateway PQ certificate cannot be fingerprinted".to_string(),
+        )
+    })?;
+    let encoder = base64::engine::general_purpose::STANDARD;
+    Ok(Json(KeyNegotiationView {
+        port: s.network.read().await.key_negotiation_port,
+        server_name: certificate.subject.clone(),
+        gateway_ca_der: encoder.encode(&material.certificate_der),
+        gateway_pq_certificate: encoder.encode(&material.pq_certificate_json),
+        pq_certificate_sha256: fingerprint,
+        wireguard_public_key: certificate.wireguard_public_key,
+    }))
+}
+
 /// Returns the current network configuration without any secret.
 pub async fn network_get(State(s): State<AppState>) -> Json<NetworkConfigView> {
     let network = s.network.read().await;

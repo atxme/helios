@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use aether::key_negotiation::ProtectionMode;
 
 use crate::{
-    config::validate_key_negotiation, ClientConfig, ClientProfile, KeyNegotiationSettings,
-    DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
+    config::validate_key_negotiation, identity_store::ClientIdentityBundle, ClientConfig,
+    ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
 
 /// Stable identifier of the JSON document exchangeable with Orion.
@@ -75,6 +75,13 @@ struct JsonProfile {
     /// names the entry to look up.
     #[serde(default)]
     key_negotiation: Option<JsonKeyNegotiation>,
+    /// Client identity, when the operator ships it with the profile.
+    ///
+    /// **Never lands in [`ClientProfile`]**: it goes to the machine's
+    /// protected store and the profile keeps only the entry name. A
+    /// document carrying it is a secret and must be destroyed after import.
+    #[serde(default)]
+    key_negotiation_identity: Option<ClientIdentityBundle>,
 }
 
 #[derive(Deserialize)]
@@ -131,11 +138,24 @@ impl From<JsonProfile> for ClientProfile {
     }
 }
 
+/// A decoded document: the profile, and the identity that came with it.
+///
+/// The two are returned separately because they have opposite destinies —
+/// the profile is persisted in `profiles.toml`, the identity is sealed into
+/// the protected store and the plaintext is dropped. Returning one value that
+/// mixed them would make it far too easy to write the secret to disk.
+#[derive(Debug)]
+pub struct ProfileImport {
+    pub profile: ClientProfile,
+    /// Present only when the operator shipped the identity in the document.
+    pub identity: Option<ClientIdentityBundle>,
+}
+
 /// Decodes an imported profile without writing it to disk.
 ///
 /// The file suffix picks the parser; for a suffix-less file, the first
 /// meaningful character lets us recognize JSON or wg-quick.
-pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientProfile> {
+pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileImport> {
     if contents.len() > MAX_PROFILE_IMPORT_BYTES {
         anyhow::bail!(
             "fichier trop volumineux (maximum {} Kio)",
@@ -145,21 +165,39 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientPro
 
     let lower_name = file_name.to_ascii_lowercase();
     let trimmed = contents.trim_start_matches('\u{feff}').trim_start();
-    let profile = if lower_name.ends_with(".json") || trimmed.starts_with('{') {
+    // wg-quick has no notion of a client identity: only the Orion document
+    // can carry one.
+    let (profile, identity) = if lower_name.ends_with(".json") || trimmed.starts_with('{') {
         parse_json(trimmed)?
     } else if lower_name.ends_with(".conf") || trimmed.starts_with('[') {
-        parse_wg_quick(trimmed, file_name)?
+        (parse_wg_quick(trimmed, file_name)?, None)
     } else {
         anyhow::bail!("format inconnu : choisir un fichier Orion .json ou WireGuard .conf");
     };
 
-    validate_imported_profile(profile)
+    let profile = validate_imported_profile(profile)?;
+    if let Some(identity) = &identity {
+        identity.validate()?;
+        // A document shipping an identity for an entry the profile does not
+        // name would seal a secret nothing would ever read.
+        let expected = profile
+            .key_negotiation
+            .as_ref()
+            .map(|settings| settings.identity.trim());
+        if expected != Some(identity.identity.trim()) {
+            anyhow::bail!(
+                "l'identité fournie (« {} ») ne correspond pas à celle que le profil désigne",
+                identity.identity
+            );
+        }
+    }
+    Ok(ProfileImport { profile, identity })
 }
 
 /// Reads a profile from a path without ever allocating more than the import
 /// limit. The check applies to bytes actually read: a size derived from
 /// metadata wouldn't suffice against a file modified during reading.
-pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
+pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
     let file = File::open(path).with_context(|| format!("ouverture de {}", path.display()))?;
     let mut bytes = Vec::with_capacity(MAX_PROFILE_IMPORT_BYTES.min(4096));
     file.take((MAX_PROFILE_IMPORT_BYTES + 1) as u64)
@@ -205,7 +243,7 @@ pub fn complete_profile_import(
     Ok(profile)
 }
 
-fn parse_json(contents: &str) -> Result<ClientProfile> {
+fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
     // Reading the header first guarantees an intelligible version error even
     // if a future version entirely changes the shape of `profile`.
     let header: JsonHeader =
@@ -224,7 +262,12 @@ fn parse_json(contents: &str) -> Result<ClientProfile> {
     }
     let envelope: JsonEnvelope =
         serde_json::from_str(contents).context("document JSON Orion invalide")?;
-    Ok(envelope.profile.into())
+    let mut profile = envelope.profile;
+    // Taken out before the conversion: `ClientProfile` has no field for it,
+    // and that is the property worth keeping — the secret cannot reach
+    // `profiles.toml` by way of a struct update.
+    let identity = profile.key_negotiation_identity.take();
+    Ok((profile.into(), identity))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -885,7 +928,7 @@ mod tests {
         let settings = gateway_settings(ProtectionMode::MlKem);
         let raw = document_with(serde_json::to_value(&settings).unwrap());
 
-        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
         let imported = profile.key_negotiation.expect("block expected");
         assert_eq!(imported.mode, ProtectionMode::MlKem);
         assert_eq!(imported.minimum_mode, ProtectionMode::MlKem);
@@ -905,7 +948,9 @@ mod tests {
             .remove("minimum_mode")
             .expect("the fixture carries a floor");
 
-        let profile = parse_profile_import(&document_with(settings), "portable.json").unwrap();
+        let profile = parse_profile_import(&document_with(settings), "portable.json")
+            .unwrap()
+            .profile;
         assert_eq!(
             profile.key_negotiation.unwrap().minimum_mode,
             ProtectionMode::MlKem
@@ -964,6 +1009,60 @@ mod tests {
         assert_eq!(inspect_profile(&sound).key_negotiation, None);
     }
 
+    #[cfg(feature = "key-negotiation")]
+    fn identity_bundle(name: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::STANDARD;
+
+        serde_json::json!({
+            "identity": name,
+            "certificate_chain": [STANDARD.encode([0x30, 0x82, 0x01, 0x00])],
+            "private_key": STANDARD.encode([0x30, 0x81, 0x87, 0x02]),
+            "pq_certificate": STANDARD.encode(br#"{"version":1}"#),
+            "pq_private_key": STANDARD.encode([7u8; 64]),
+        })
+    }
+
+    /// The identity travels with the profile so the user has **one** file to
+    /// import — but it must come back separately, because the two have
+    /// opposite destinies: one is persisted, the other is sealed.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn the_shipped_identity_is_returned_apart_from_the_profile() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["key_negotiation_identity"] = identity_bundle(&settings.identity);
+
+        let imported = parse_profile_import(&document.to_string(), "portable.json").unwrap();
+        let identity = imported.identity.expect("identity expected");
+        assert_eq!(identity.identity, settings.identity);
+
+        // The decisive property: nothing of the secret can reach the profile,
+        // hence nothing can reach `profiles.toml`.
+        let persisted = toml::to_string(&imported.profile).unwrap();
+        assert!(!persisted.contains("pq_private_key"), "{persisted}");
+        assert!(
+            !persisted.contains(&identity.pq_private_key),
+            "the PQ private key must not be persistable"
+        );
+    }
+
+    /// An identity sealed under a name the profile never looks up would be a
+    /// secret stored for nothing.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn an_identity_naming_another_entry_is_refused() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["key_negotiation_identity"] = identity_bundle("un-autre-poste");
+
+        let error = parse_profile_import(&document.to_string(), "portable.json")
+            .expect_err("mismatched identity must be refused")
+            .to_string();
+        assert!(error.contains("un-autre-poste"), "message : {error}");
+    }
+
     #[test]
     fn imports_versioned_json_with_defaults() {
         let raw = format!(
@@ -981,7 +1080,7 @@ mod tests {
             }}"#
         );
 
-        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
         assert_eq!(profile.name, "portable");
         assert_eq!(profile.allowed_ips, DEFAULT_ALLOWED_IPS);
         assert_eq!(profile.persistent_keepalive, DEFAULT_KEEPALIVE_SECS);
@@ -1007,7 +1106,7 @@ mod tests {
             }}"#
         );
 
-        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
         assert!(
             profile.private_key.is_empty(),
             "the invitation must carry no private key"
@@ -1111,7 +1210,9 @@ mod tests {
             "#
         );
 
-        let profile = parse_profile_import(&raw, r"C:\Profils\site-labo.conf").unwrap();
+        let profile = parse_profile_import(&raw, r"C:\Profils\site-labo.conf")
+            .unwrap()
+            .profile;
         assert_eq!(profile.name, "site-labo");
         assert_eq!(profile.endpoint, "203.0.113.10:51820");
         assert_eq!(profile.private_key, CLIENT_PRIVATE);
@@ -1234,7 +1335,10 @@ mod tests {
         );
         std::fs::write(&profile_path, raw).unwrap();
         assert_eq!(
-            read_profile_import_path(&profile_path).unwrap().name,
+            read_profile_import_path(&profile_path)
+                .unwrap()
+                .profile
+                .name,
             "portable"
         );
 

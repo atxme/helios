@@ -192,7 +192,9 @@
       "Bash(git submodule *)",
       "Bash(echo \"EXIT:$?\")",
       "Bash(git check-ignore *)",
-      "Bash(npx eslint *)"
+      "Bash(npx eslint *)",
+      "Bash(rustup target *)",
+      "Bash(echo \"FMT=$?\")"
     ]
   }
 }

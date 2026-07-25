@@ -43,6 +43,39 @@ pub trait IdentityProvider: Send + Sync {
     async fn load(&self, identity: &str) -> Result<ClientIdentity>;
 }
 
+/// Reads the identity from the machine's protected store.
+///
+/// The decoding lives here rather than in the store because it is the
+/// protocol side that knows what shape each half must take: the store only
+/// guarantees the bytes came back exactly as they were sealed.
+#[async_trait]
+impl IdentityProvider for crate::identity_store::ProtectedIdentityStore {
+    async fn load(&self, identity: &str) -> Result<ClientIdentity> {
+        let bundle = self.load(identity)?;
+        let decoder = base64::engine::general_purpose::STANDARD;
+        Ok(ClientIdentity {
+            certificate_chain: bundle
+                .certificate_chain
+                .iter()
+                .map(|certificate| {
+                    decoder
+                        .decode(certificate.trim())
+                        .context("decoding a client certificate of the protected identity")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            private_key: decoder
+                .decode(bundle.private_key.trim())
+                .context("decoding the client private key of the protected identity")?,
+            pq_certificate: decoder
+                .decode(bundle.pq_certificate.trim())
+                .context("decoding the client PQ certificate of the protected identity")?,
+            pq_private_key: decoder
+                .decode(bundle.pq_private_key.trim())
+                .context("decoding the client PQ private key of the protected identity")?,
+        })
+    }
+}
+
 /// Public connection settings and protected client identity material.
 pub struct KeyNegotiationClient {
     /// Public UDP endpoint of the gateway key-negotiation service.

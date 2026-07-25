@@ -382,6 +382,26 @@ pub async fn start(
     Ok(())
 }
 
+/// Reads the public certificates the API republishes to the operator tooling.
+///
+/// Deliberately independent from [`start`]: it opens neither the TPM nor the
+/// sealed keystore, and only touches files that are public by construction.
+/// A gateway whose identity has not been created yet simply has nothing to
+/// publish — that is `None`, not an error, because it is the ordinary state
+/// before `heliosd init-key-negotiation`.
+pub fn public_material() -> Result<Option<helios_api::KeyNegotiationMaterial>> {
+    let (Ok(certificate_der), Ok(pq_certificate_json)) = (
+        std::fs::read(CERTIFICATE_PATH),
+        std::fs::read(PQ_CERTIFICATE_PATH),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(helios_api::KeyNegotiationMaterial {
+        certificate_der,
+        pq_certificate_json,
+    }))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredPrivateIdentity {

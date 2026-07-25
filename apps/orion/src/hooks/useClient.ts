@@ -36,10 +36,18 @@ export function useClient() {
 
   const consumeProfilePath = useCallback(async () => {
     try {
-      const profile = await api.importProfilePath()
-      if (profile) {
+      const imported = await api.importProfilePath()
+      if (imported) {
         setError(null)
-        setPathImportedProfile(profile)
+        setPathImportedProfile(imported.profile)
+        // A double-click has no import panel to carry the notice, so the
+        // identity failure goes to the global error: the profile is there
+        // but would not connect, and that must not stay silent.
+        if (imported.identity_error) {
+          setError(`Identité non scellée : ${imported.identity_error}`)
+        } else if (imported.identity_sealed) {
+          pushLog('info', 'identité de négociation scellée dans le stockage protégé')
+        }
       }
     } catch (cause) {
       const message = `Import du profil associé impossible : ${String(cause)}`

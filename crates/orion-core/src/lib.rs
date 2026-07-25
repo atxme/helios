@@ -24,6 +24,7 @@
 pub mod backend;
 pub mod config;
 pub mod events;
+pub mod identity_store;
 #[cfg(feature = "key-negotiation")]
 pub mod key_negotiation;
 pub mod mtu;
@@ -37,6 +38,7 @@ pub use config::{
     DEFAULT_KEEPALIVE_SECS,
 };
 pub use events::{ClientEvent, PskKind};
+pub use identity_store::{ClientIdentityBundle, IdentityStoreError, ProtectedIdentityStore};
 pub use profile_import::{
     complete_profile_import, inspect_profile, parse_profile_import, read_profile_import_path,
     ProfileIssues, MAX_PROFILE_IMPORT_BYTES,

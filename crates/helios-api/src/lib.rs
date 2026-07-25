@@ -67,6 +67,24 @@ pub struct AppState {
     /// True as soon as the API socket is actually bound. The update health
     /// check must not confirm a daemon whose UI would still be absent.
     pub api_ready: Arc<AtomicBool>,
+    /// Public material of the key-negotiation service, `None` when the
+    /// gateway does not run it. Published so the operator tooling can build
+    /// a complete Orion profile from the gateway itself, instead of copying
+    /// certificate files off `/var/lib/helios` by hand.
+    pub key_negotiation: Option<Arc<KeyNegotiationMaterial>>,
+}
+
+/// Public key-negotiation material, exactly as an Orion profile pins it.
+///
+/// Everything here is a **certificate**: public by construction. The TLS and
+/// ML-DSA private keys stay sealed to the TPM and never reach this process's
+/// serialization path — which is why this type holds bytes it read from the
+/// public files, not the identity the service runs on.
+pub struct KeyNegotiationMaterial {
+    /// DER gateway certificate, used by Orion as its trust anchor.
+    pub certificate_der: Vec<u8>,
+    /// JSON ML-DSA-65 gateway certificate, as written on disk.
+    pub pq_certificate_json: Vec<u8>,
 }
 
 impl AppState {
@@ -91,7 +109,18 @@ impl AppState {
                 dry_run,
             )),
             api_ready: Arc::new(AtomicBool::new(false)),
+            key_negotiation: None,
         }
+    }
+
+    /// Publishes the key-negotiation certificates read from disk at startup.
+    ///
+    /// A builder rather than a `new` parameter: a gateway built without the
+    /// feature, or not yet initialized, is the ordinary case and must not
+    /// have to name an absent value.
+    pub fn with_key_negotiation(mut self, material: KeyNegotiationMaterial) -> Self {
+        self.key_negotiation = Some(Arc::new(material));
+        self
     }
 }
 
@@ -136,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         // Publisher trust anchor compiled into the binary (ADR-002).
         .route("/api/trust", get(routes::trust))
         .route("/api/network", get(routes::network_get))
+        .route("/api/key-negotiation", get(routes::key_negotiation_get))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .merge(admin)
         .merge(authenticated_peer)
