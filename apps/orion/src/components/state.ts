@@ -171,6 +171,31 @@ const PQC_DETAIL =
   'Il est renouvelé au prochain montage : un trafic enregistré aujourd’hui reste ' +
   'illisible pour un adversaire quantique.'
 
+/**
+ * Deux PSK ML-KEM, deux propriétés de sécurité différentes.
+ *
+ * Le même `PskKind::MlKem` est émis par les deux chemins du cœur : la
+ * négociation préalable (`connect_with_key_negotiation`) et l'ancien
+ * provisioning par l'API interne (`upgrade_to_post_quantum`). Le secret est
+ * de même qualité, mais **le premier handshake ne l'est pas** : dans le
+ * second cas il a eu lieu sans PSK, donc il est enregistrable et déchiffrable
+ * plus tard. C'est précisément ce que la négociation existe pour empêcher, et
+ * l'afficher identiquement effacerait la seule différence qui compte.
+ *
+ * Le profil suffit à trancher : porteur d'un bloc de négociation, le cœur
+ * emprunte ce chemin et ne passe jamais par l'upgrade.
+ */
+const PQC_NEGOTIATED_DETAIL =
+  'Secret ML-KEM-768 négocié sur le port dédié AVANT le premier handshake, puis ' +
+  'posé dans le slot PresharedKey. Aucun handshake de ce tunnel n’a eu lieu sans ' +
+  'lui : rien d’enregistrable aujourd’hui ne sera déchiffrable demain.'
+
+const PQC_UPGRADED_DETAIL =
+  'Secret ML-KEM-768 obtenu par l’API interne APRÈS le montage d’un tunnel ' +
+  'classique. Les échanges suivants sont protégés, mais le premier handshake a eu ' +
+  'lieu sans PSK : lui reste exposé au « récolter maintenant, déchiffrer plus tard ». ' +
+  'Un profil enrôlé avec négociation supprime cette fenêtre.'
+
 const STATIC_DETAIL =
   'PSK statique inscrit au profil, partagé hors bande. Il protège du « récolter ' +
   'maintenant, déchiffrer plus tard », mais il ne tourne jamais et sa présence ' +
@@ -185,7 +210,11 @@ export function protectionMeta(
   observed: PskKind | null,
   state: TunnelState,
 ): ProtectionMeta {
-  if (observed === 'ml_kem') return { tone: 'pqc', label: 'PSK PQC · ML-KEM-768', detail: PQC_DETAIL }
+  if (observed === 'ml_kem') {
+    return profile?.key_negotiation
+      ? { tone: 'pqc', label: 'PSK PQC · négocié', detail: PQC_NEGOTIATED_DETAIL }
+      : { tone: 'pqc', label: 'PSK PQC · après tunnel', detail: PQC_UPGRADED_DETAIL }
+  }
   if (observed === 'static') return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
   if (observed === 'none') return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
 

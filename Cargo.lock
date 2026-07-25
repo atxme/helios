@@ -2200,6 +2200,7 @@ dependencies = [
  "helios-provisioning",
  "helios-update",
  "helios-wireguard",
+ "orion-core",
  "rcgen",
  "rustls",
  "serde",

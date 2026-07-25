@@ -379,6 +379,10 @@ reconnexion pouvant différer.
 
 ## Amendement du 24 juillet 2026 — port public de key-negotiation
 
+> Cet amendement est désormais détaillé, avec son modèle de menace complet,
+> dans [ADR-005](ADR-005-NEGOCIATION-DE-CLE.md). Ce qui suit reste le résumé
+> vu depuis le transport WireGuard.
+
 La cinématique classique-puis-upgrade est conservée comme compatibilité pour les
 anciens profils, mais elle n'est plus le chemin nominal. Le choix initial de ne
 jamais exposer de contrôle avant WireGuard empêchait précisément de négocier le
@@ -512,6 +516,19 @@ admet le pair avec les deux empreintes et le plancher, et écrit ce document
 unique. Le producteur relit systématiquement ce qu'il écrit avec le parseur
 d'Orion : les deux binaires ne se rencontrent jamais, et un désaccord de format
 n'apparaîtrait sinon que sur le poste d'un utilisateur.
+
+**L'enrôlement ne suppose aucune connexion préalable.** L'API de contrôle vit
+derrière le tunnel : l'atteindre suppose d'être déjà connecté, ce qui est sans
+conséquence au quotidien et absurde au premier enrôlement — la négociation qui
+protège le premier handshake dépendrait d'un premier handshake. Le protocole,
+lui, n'a jamais eu cette dépendance : Orion compose le port public avant de
+monter quoi que ce soit. C'est donc l'outillage qui a été corrigé.
+`helios-ctl enroll` accepte les matériaux en fichiers
+(`--gateway-certificate`, `--gateway-pq-certificate`, `--address`) : l'opérateur
+tient déjà une session SSH, qui suffit à lire deux certificats publics et à
+admettre le pair par `heliosd peer add` — la commande console prévue pour
+l'amorçage. Le certificat PQ porte le sujet **et** la clé WireGuard épinglée :
+rien n'est retapé, donc rien ne peut être mal recopié.
 
 **Limite connue — vérification matérielle.** DPAPI ne se compile ni ne s'exerce
 en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement

@@ -99,6 +99,16 @@ enum Cmd {
         /// Client public key, when the client already holds its own pair.
         #[arg(long)]
         public_key: Option<String>,
+        /// Fichier contenant la clé privée WireGuard du client, quand
+        /// l'appelant a généré la paire lui-même. Un fichier, pas un
+        /// argument : `ps` expose l'argv de tout processus.
+        #[arg(long)]
+        private_key_file: Option<PathBuf>,
+        /// Répertoire d'une identité déjà émise par `key-nego issue-client`.
+        /// Obligatoire quand l'admission a eu lieu séparément : la gateway
+        /// connaît les empreintes de CES certificats-là.
+        #[arg(long)]
+        client_pki_dir: Option<PathBuf>,
         /// Negotiation mode, which also becomes the peer's floor.
         #[arg(long, value_enum, default_value = "ml-kem")]
         mode: key_nego::Mode,
@@ -118,6 +128,24 @@ enum Cmd {
         /// Output file.
         #[arg(long)]
         output: PathBuf,
+
+        // ── Enrôlement hors API ──────────────────────────────────────────
+        // L'API vit derrière le tunnel : l'atteindre suppose déjà une
+        // connexion. Pour le PREMIER enrôlement, ces trois options prennent
+        // le relais — l'opérateur a déjà une session SSH, qui suffit à lire
+        // deux certificats publics et à admettre le pair en console.
+        /// `key-negotiation-cert.der` de la gateway, récupéré par SSH.
+        #[arg(long, requires = "gateway_pq_certificate", requires = "address")]
+        gateway_certificate: Option<PathBuf>,
+        /// `key-negotiation-pq-cert.json` de la gateway, récupéré par SSH.
+        #[arg(long, requires = "gateway_certificate")]
+        gateway_pq_certificate: Option<PathBuf>,
+        /// VIP affichée par `heliosd peer add`, qui a fait l'admission.
+        #[arg(long)]
+        address: Option<String>,
+        /// URL de l'API interne, pour la seule télémétrie.
+        #[arg(long)]
+        heliosd_url: Option<String>,
     },
     /// Escrow of the gateway identity — **operator workstation**.
     ///
@@ -789,16 +817,35 @@ async fn main() -> Result<()> {
             endpoint,
             client_ca_dir,
             public_key,
+            private_key_file,
+            client_pki_dir,
             mode,
             negotiation_endpoint,
             identity,
             admin,
             replace,
             output,
+            gateway_certificate,
+            gateway_pq_certificate,
+            address,
+            heliosd_url,
         } => {
             // Checked before the gateway is contacted: a missing CA must not
             // be discovered after a peer has been admitted.
             enroll::check_client_ca(&client_ca_dir)?;
+            let offline = match (gateway_certificate, gateway_pq_certificate, address) {
+                (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
+                    Some(enroll::OfflineInputs {
+                        gateway_certificate,
+                        gateway_pq_certificate,
+                        address,
+                        heliosd_url,
+                    })
+                }
+                // `requires` in the parser already rules out partial
+                // combinations; this arm is the online path.
+                _ => None,
+            };
             enroll::run(
                 &client,
                 base,
@@ -807,12 +854,15 @@ async fn main() -> Result<()> {
                     endpoint,
                     client_ca_dir,
                     public_key,
+                    private_key_file,
+                    client_pki_dir,
                     mode: mode.into(),
                     negotiation_endpoint,
                     identity,
                     admin,
                     replace,
                     output,
+                    offline,
                 },
             )
             .await

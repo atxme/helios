@@ -53,3 +53,11 @@ rustls = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The gateway does not depend on the client — but their interoperability has to
+# be proven somewhere, and the only honest place is against the real client
+# code. `orion-core` is therefore a **test-only** dependency: it verifies that
+# both ends derive the same PSK, which no unit test on either side can show.
+orion-core = { workspace = true, features = ["key-negotiation"] }
+rcgen = { workspace = true }

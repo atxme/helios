@@ -194,7 +194,15 @@
       "Bash(git check-ignore *)",
       "Bash(npx eslint *)",
       "Bash(rustup target *)",
-      "Bash(echo \"FMT=$?\")"
+      "Bash(echo \"FMT=$?\")",
+      "Bash(chmod +x scripts/key-negotiation-setup.sh)",
+      "Bash(bash -n scripts/key-negotiation-setup.sh)",
+      "Bash(echo \"CHECK=$?\")",
+      "Bash(timeout 1800 cargo xtask bundle --skip-frontend)",
+      "Bash(HELIOS_PUBLISHER_KEYRING_PATH=/home/christophe/.helios/publisher-epoch-1/publisher-keyring.json timeout 1800 cargo xtask bundle --skip-frontend)",
+      "Bash(target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu/heliosd --help)",
+      "Bash(timeout 900 npx tauri build --features wireguard,key-negotiation --bundles msi)",
+      "Bash(HELIOS_PUBLISHER_KEYRING_PATH=/home/christophe/.helios/publisher-epoch-1/publisher-keyring.json timeout 1800 cargo build --release -p orion --features wireguard,key-negotiation)"
     ]
   }
 }

@@ -64,9 +64,22 @@ describe('Orion UI state', () => {
     expect(protectionMeta(profile(), 'static', 'up').tone).toBe('static')
     expect(protectionMeta(profile(), 'none', 'up').tone).toBe('classic')
 
-    const pqc = protectionMeta(profile(), 'ml_kem', 'up')
-    expect(pqc.label).toContain('ML-KEM-768')
     expect(protectionMeta(profile(), 'static', 'up').label).not.toContain('ML-KEM')
+  })
+
+  it('distinguishes a negotiated PQC PSK from one obtained after the tunnel', () => {
+    // Same secret, different security property: the upgrade path let the
+    // FIRST handshake happen without any PSK, which is exactly the window
+    // negotiation exists to close. Showing them identically would erase the
+    // only difference that matters.
+    const negotiated = protectionMeta(negotiating('ml_kem'), 'ml_kem', 'up')
+    const upgraded = protectionMeta(profile({ heliosd_url: 'http://100.64.0.1:8080' }), 'ml_kem', 'up')
+
+    expect(negotiated.tone).toBe('pqc')
+    expect(upgraded.tone).toBe('pqc')
+    expect(negotiated.label).not.toBe(upgraded.label)
+    expect(negotiated.detail).toContain('AVANT')
+    expect(upgraded.detail).toContain('premier handshake a eu lieu sans PSK')
   })
 
   it('reads the PQC PSK from the event, never from the profile', () => {

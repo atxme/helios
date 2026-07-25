@@ -196,8 +196,28 @@ Sur le poste de build Windows, préparer les DLL puis produire un bundle signé 
 cargo xtask orion-deps
 $env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_ESPACES"
 $env:ORION_TIMESTAMP_URL = "https://tsa.interne.example/rfc3161"
-npm run tauri build --prefix apps/orion -- --features wireguard
+npm run build:msi --prefix apps/orion
 ```
+
+`build:msi` fixe les deux features qui décident de ce que le binaire sait
+faire : `wireguard` (backend réel — sans elle Orion refuse de démarrer plutôt
+que de simuler) et `key-negotiation` (négociation PQC avant le premier
+handshake ; sans elle, un profil qui en porte une échoue et l'écran *Profils*
+l'annonce). Elle ne produit que le MSI ; retirer `--bundles msi` pour avoir
+aussi le NSIS.
+
+Pour un MSI de test, sans certificat Authenticode :
+
+```powershell
+$env:ORION_UNSIGNED_FOR_OFFLINE_SIGNING = "1"
+npm run build:msi --prefix apps/orion
+```
+
+Ce chemin est bruyant par construction : chaque artefact est annoncé comme non
+signé. Il sert à éprouver l'installation et la négociation, jamais à
+distribuer — Windows affichera un avertissement SmartScreen à l'installation.
+
+Le MSI est produit dans `target/release/bundle/msi/`.
 
 Après installation sur une machine propre :
 
@@ -209,6 +229,70 @@ Après installation sur une machine propre :
    profil local de même nom et le refus si ce profil local n'existe pas ;
 6. connecter réellement le tunnel et contrôler handshake, routes et retrait
    uniquement après déconnexion explicite.
+
+### Négociation de clé PQC, de bout en bout
+
+Prérequis : la gateway tourne un `heliosd` bâti avec `key-negotiation` (c'est le
+cas depuis que `cargo xtask bundle` l'inclut ; `./scripts/deploy.sh` la met à
+jour), et les deux ports UDP sont redirigés par la box — 51820 pour WireGuard,
+51821 pour la négociation.
+
+Depuis le poste opérateur, une seule commande produit les deux fichiers de
+configuration :
+
+```sh
+./scripts/key-negotiation-setup.sh christophe@192.168.1.44 --nom portable
+```
+
+Pour **ajouter la négociation à un profil Orion déjà en place**, repartir de sa
+clé publique — celle qu'affiche l'écran *Profils* sous « Votre clé publique » :
+
+```sh
+./scripts/key-negotiation-setup.sh --nom Helios-gateway \
+  --public-key zU0Edj1phreNdcsrFujZRi+U7wrV607a...
+```
+
+Le document produit ne porte alors aucune clé privée WireGuard : à l'import,
+Orion reprend celle du profil local de même nom et ne fait que lui ajouter le
+bloc de négociation. L'admission déjà en place sur la gateway reste valable,
+puisque la clé ne change pas.
+
+Elle crée la CA opérateur si besoin, fait naître l'identité de négociation
+**sur** la gateway (scellée au TPM), ouvre le port dans son `network.toml`, émet
+les certificats du client, admet le pair par `heliosd peer add` et assemble le
+profil. Le profil produit porte les clés privées du client : le transférer par
+un canal maîtrisé et le détruire des deux côtés après import.
+
+Tout passe par SSH, **jamais par l'API de contrôle** : celle-ci vit derrière le
+tunnel, et l'exiger reviendrait à faire dépendre d'une première connexion la
+négociation qui protège précisément la première connexion. C'est aussi pourquoi
+l'admission emprunte la console (`heliosd peer add`) plutôt que `POST
+/api/peers`, réservé à un pair admin déjà connecté.
+
+Sur le poste Windows :
+
+1. importer le `.orionprofile` ; l'écran *Profils* doit annoncer
+   **identité protégée · scellée** ;
+2. comparer l'empreinte PQ affichée avec celle qu'a imprimée
+   `heliosd init-key-negotiation` — c'est ce qui rattache le profil à cette
+   gateway et rien d'autre ;
+3. supprimer le fichier d'enrôlement, puis connecter : la négociation doit
+   aboutir sans lui, l'identité étant scellée au compte Windows ;
+4. l'écran *Connexion* doit afficher `négociation ML-KEM-768` puis, une fois le
+   handshake obtenu, la puce `PSK PQC · ML-KEM-768` ;
+5. côté gateway, `helios-ctl peer list` doit montrer le plancher monté à
+   `ml_kem` pour ce pair ;
+6. rejouer une connexion après avoir forcé `--mode classic` dans l'écran
+   *Profils* : le mode doit être **indisponible**, le plancher ayant monté.
+
+Contrôles négatifs, qui valent plus que le chemin nominal :
+
+- copier le dossier `identities` scellé vers un autre compte Windows : le
+  descellement doit échouer et la connexion être refusée avant WireGuard ;
+- couper la redirection UDP 51821 : la connexion doit échouer explicitement,
+  sans repli silencieux vers un premier handshake nu ;
+- sur la gateway, `sudo ss -lun | grep 51821` doit montrer le port ouvert
+  seulement quand `key_negotiation_port` est déclaré.
 
 Sur une cible Debian, installer le `.deb`, puis vérifier :
 

@@ -260,13 +260,20 @@ export function ProfilesView({
    * core refuses it too, before any network access, and the screen must not
    * promise what the connection would reject.
    */
-  const setMode = (mode: ProtectionMode) => {
+  const setNegotiation = <Key extends keyof KeyNegotiationSettings>(
+    key: Key,
+    value: KeyNegotiationSettings[Key],
+  ) => {
     const settings = draft.key_negotiation
-    if (!settings || !modeAllowed(mode, settings.minimum_mode)) return
+    if (!settings) return
+    // The floor is the one thing this screen cannot lower: it is enforced
+    // identically by the gateway, and offering the gesture would only produce
+    // a connection refused a second later.
+    if (key === 'mode' && !modeAllowed(value as ProtectionMode, settings.minimum_mode)) return
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
     setDraft((profile) =>
       profile.key_negotiation
-        ? { ...profile, key_negotiation: { ...profile.key_negotiation, mode } }
+        ? { ...profile, key_negotiation: { ...profile.key_negotiation, [key]: value } }
         : profile,
     )
     setDirty(true)
@@ -645,7 +652,9 @@ export function ProfilesView({
             support={support}
             fingerprint={fingerprint}
             identitySealed={identitySealed}
-            onModeChange={setMode}
+            profileName={draft.name}
+            publicKey={publicKey}
+            onChange={setNegotiation}
           />
         </Box>
       </Box>
@@ -740,7 +749,9 @@ function KeyNegotiation({
   support,
   fingerprint,
   identitySealed,
-  onModeChange,
+  profileName,
+  publicKey,
+  onChange,
 }: {
   settings: KeyNegotiationSettings | null
   issue?: string | null
@@ -748,7 +759,13 @@ function KeyNegotiation({
   fingerprint: string | null
   /** The identity this profile names is sealed on this machine. */
   identitySealed: boolean
-  onModeChange: (mode: ProtectionMode) => void
+  profileName: string
+  /** This profile's WireGuard public key, to be enrolled unchanged. */
+  publicKey: string | null
+  onChange: <Key extends keyof KeyNegotiationSettings>(
+    key: Key,
+    value: KeyNegotiationSettings[Key],
+  ) => void
 }) {
   const title = (
     <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
@@ -763,9 +780,37 @@ function KeyNegotiation({
         <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
           Ce profil n’en fait pas. Il monte un tunnel classique, puis demande un PSK
           post-quantique par l’API interne : son <strong>premier handshake</strong> n’est donc pas
-          protégé. Le bloc de négociation arrive avec le profil fourni par l’opérateur — il porte
-          le certificat épinglé de la gateway, qui ne se saisit pas à la main.
+          protégé.
         </Typography>
+        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
+          Le bloc ne se saisit pas ici : il porte le certificat épinglé de la gateway et le
+          certificat client, que l’opérateur émet. Lui demander un profil <em>enrôlé</em> —
+          en repartant de la clé publique ci-dessus, l’enrôlement conserve l’identité WireGuard
+          de ce profil et l’import remplacera celui-ci :
+        </Typography>
+        <Box
+          component="pre"
+          sx={{
+            m: 0,
+            px: 1,
+            py: 0.75,
+            borderRadius: 1,
+            border: '1px solid',
+            borderColor: 'divider',
+            bgcolor: 'action.hover',
+            fontFamily: 'monospace',
+            fontSize: 10,
+            lineHeight: 1.6,
+            overflowX: 'auto',
+            userSelect: 'text',
+          }}
+        >
+          {`helios-ctl enroll --name ${profileName || '<profil>'} \\\n`}
+          {`  --endpoint <gateway>:51820 \\\n`}
+          {`  --public-key ${publicKey ?? '<votre clé publique>'} \\\n`}
+          {`  --client-ca-dir ./orion-client-ca \\\n`}
+          {`  --output ${profileName || 'profil'}.orionprofile`}
+        </Box>
       </Box>
     )
   }
@@ -803,7 +848,7 @@ function KeyNegotiation({
         size="small"
         value={settings.mode}
         onChange={(_event, value: ProtectionMode | null) => {
-          if (value) onModeChange(value)
+          if (value) onChange('mode', value)
         }}
         aria-label="Mode de négociation"
         sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
@@ -829,6 +874,34 @@ function KeyNegotiation({
         {selected.detail}
       </Typography>
 
+      {/* Editable: where to reach the service, and which sealed entry to
+          present. Both are local facts — a lab endpoint differs from the
+          public one, and an identity may have been sealed under another
+          name. Neither is covered by the pinned certificate, so changing
+          them breaks nothing cryptographic. */}
+      <Box
+        sx={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+          gap: 1.5,
+        }}
+      >
+        <Field
+          label="Endpoint de négociation"
+          placeholder="gateway:51821"
+          value={settings.endpoint}
+          onChange={(value) => onChange('endpoint', value)}
+        />
+        <Field
+          label="Identité protégée"
+          value={settings.identity}
+          onChange={(value) => onChange('identity', value)}
+        />
+      </Box>
+
+      {/* Read-only: pinned by the gateway certificate. `server_name` is the
+          subject Orion verifies it against, so a typo here would not
+          "fix" anything — it would only turn a sound pin into a refusal. */}
       <Box
         sx={{
           display: 'grid',
@@ -837,11 +910,14 @@ function KeyNegotiation({
           rowGap: 0.4,
         }}
       >
-        <Detail label="endpoint" value={settings.endpoint} />
-        <Detail label="serveur" value={settings.server_name} />
         <Detail
-          label="identité protégée"
-          value={identitySealed ? `${settings.identity} · scellée` : `${settings.identity} · absente`}
+          label="serveur"
+          value={settings.server_name}
+          hint="Nom que le certificat de la gateway authentifie. Épinglé : il ne se modifie qu’en réémettant le certificat côté gateway."
+        />
+        <Detail
+          label="identité"
+          value={identitySealed ? 'scellée' : 'absente de ce poste'}
           hint={
             identitySealed
               ? 'Certificat client scellé au compte Windows par DPAPI. Le fichier d’enrôlement n’est plus nécessaire.'

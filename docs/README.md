@@ -21,6 +21,10 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [adr/ADR-004-CHAINE-DE-LIVRAISON.md](adr/ADR-004-CHAINE-DE-LIVRAISON.md) —
   cycle de vie des secrets, admission, profils clients et livraison
   d'artefacts.
+- [adr/ADR-005-NEGOCIATION-DE-CLE.md](adr/ADR-005-NEGOCIATION-DE-CLE.md) —
+  spécification et modèle de menace de la négociation de clé pré-WireGuard :
+  port public, PKI ML-DSA-65, PSK ML-KEM du **premier** handshake, plancher
+  anti-downgrade et identité cliente scellée.
 
 ## Sécurité
 

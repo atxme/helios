@@ -382,6 +382,9 @@ mod dpapi {
         format!("code {}", unsafe { GetLastError() })
     }
 
+    // Win32 names are imposed by the ABI: renaming them to snake_case would
+    // simply fail to link.
+    #[allow(non_snake_case)]
     #[link(name = "crypt32")]
     extern "system" {
         pub fn CryptProtectData(
@@ -405,6 +408,7 @@ mod dpapi {
         ) -> i32;
     }
 
+    #[allow(non_snake_case)]
     #[link(name = "kernel32")]
     extern "system" {
         pub fn LocalFree(mem: *mut c_void) -> *mut c_void;

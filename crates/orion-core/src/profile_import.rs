@@ -1047,6 +1047,40 @@ mod tests {
         );
     }
 
+    /// Adding negotiation to a profile that already exists must not disturb
+    /// its WireGuard identity.
+    ///
+    /// This is the ordinary upgrade path: a client enrolled long ago is
+    /// re-enrolled from its **public** key, so the document carries no
+    /// private key and completion takes the local one. Regenerating a key
+    /// here would silently break an admission the gateway already holds.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn enrolling_an_existing_profile_keeps_its_wireguard_identity() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        // Invitation form: `helios-ctl enroll --public-key <clé existante>`.
+        document["profile"]["private_key"] = serde_json::Value::String(String::new());
+
+        let imported = parse_profile_import(&document.to_string(), "portable.json").unwrap();
+        assert!(imported.profile.private_key.is_empty());
+
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            name: "portable".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        });
+
+        let completed = complete_profile_import(imported.profile, &config).unwrap();
+        assert_eq!(completed.private_key, CLIENT_PRIVATE);
+        assert!(
+            completed.key_negotiation.is_some(),
+            "the negotiation block must survive completion"
+        );
+    }
+
     /// An identity sealed under a name the profile never looks up would be a
     /// secret stored for nothing.
     #[cfg(feature = "key-negotiation")]

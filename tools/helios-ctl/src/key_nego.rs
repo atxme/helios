@@ -348,6 +348,28 @@ pub fn issue_client_material(
     })
 }
 
+/// Reloads an identity already written by `issue-client`.
+///
+/// Needed whenever admission and profile assembly are two separate steps: the
+/// gateway was admitted against *these* fingerprints, so reissuing fresh
+/// certificates in between would hand the client an identity the gateway does
+/// not know — and the refusal would come much later, with nothing pointing
+/// back to the reissue.
+pub fn load_client_material(directory: &Path) -> Result<ClientMaterial> {
+    let certificate_der = read(&directory.join(CLIENT_CERTIFICATE_FILE))?;
+    let pq_certificate_json = read(&directory.join(CLIENT_PQ_CERTIFICATE_FILE))?;
+    let pq_certificate: PqCertificate = serde_json::from_slice(&pq_certificate_json)
+        .context("the client PQ certificate is not a readable JSON document")?;
+    Ok(ClientMaterial {
+        certificate_sha256: helios_key_negotiation::certificate_fingerprint_der(&certificate_der),
+        pq_certificate_sha256: pq_certificate.fingerprint()?,
+        certificate_der,
+        private_key_der: Zeroizing::new(read(&directory.join(CLIENT_PRIVATE_KEY_FILE))?),
+        pq_certificate_json,
+        pq_private_key: Zeroizing::new(read(&directory.join(CLIENT_PQ_PRIVATE_KEY_FILE))?),
+    })
+}
+
 fn issue_client(
     name: &str,
     wireguard_public_key: &str,
