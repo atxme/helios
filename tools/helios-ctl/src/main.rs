@@ -227,6 +227,15 @@ enum PeerCmd {
 
 #[derive(Subcommand)]
 enum ProfileCmd {
+    /// Relit un document avec le parseur d'Orion, sans rien installer.
+    ///
+    /// Diagnostic : quand un import échoue, cette commande dit si le document
+    /// est en cause ou si le problème est ailleurs — sans avoir à lancer
+    /// Orion, ni à ouvrir un fichier qui contient des secrets.
+    Check {
+        /// Document à relire (`.orionprofile`, `.json` ou `.conf`).
+        path: PathBuf,
+    },
     /// Emits a client profile readable by Orion's import.
     Emit {
         /// Profile name, also used as the peer name on the gateway.
@@ -789,6 +798,7 @@ async fn main() -> Result<()> {
             PeerCmd::Revoke { name } => peer::cmd_revoke(&client, base, &name).await,
         },
         Cmd::Profile { command } => match command {
+            ProfileCmd::Check { path } => profile::check(&path),
             ProfileCmd::Emit {
                 name,
                 endpoint,

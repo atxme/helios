@@ -478,7 +478,13 @@ export function ProfilesView({
               component="input"
               ref={fileInput}
               type="file"
-              accept=".json,.conf,application/json,text/plain"
+              // `.orionprofile` d'abord : c'est l'extension que produit
+              // `helios-ctl enroll` et celle qu'Orion associe au double-clic.
+              // Son absence ici la grisait dans le sélecteur, ce qui donnait à
+              // penser que le format n'était pas supporté — alors que le
+              // parseur l'accepte depuis toujours (il reconnaît le JSON à son
+              // premier caractère, pas au suffixe).
+              accept=".orionprofile,.json,.conf,application/json,text/plain"
               onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                 void importFile(event.target.files?.[0])
               }

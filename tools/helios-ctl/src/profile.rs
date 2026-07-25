@@ -112,6 +112,60 @@ pub fn render(profile: Profile<'_>) -> Result<String> {
     Ok(json)
 }
 
+/// Relit un document exactement comme Orion le fera.
+///
+/// Le même code que l'import client, donc un verdict qui vaut : si cette
+/// commande accepte, Orion accepte. Rien n'est affiché du contenu secret —
+/// seulement ce qu'il faut pour situer un échec.
+pub fn check(path: &Path) -> Result<()> {
+    let imported = orion_core::read_profile_import_path(path)
+        .with_context(|| format!("relecture de {}", path.display()))?;
+    let profile = &imported.profile;
+
+    println!("{} document lisible par Orion", crate::ok());
+    println!();
+    println!("  profil          : {}", profile.name);
+    println!("  endpoint        : {}", profile.endpoint);
+    println!(
+        "  adresse         : {}",
+        profile.address.as_deref().unwrap_or("—")
+    );
+    println!(
+        "  clé privée      : {}",
+        if profile.private_key.is_empty() {
+            "absente — Orion reprendra celle du profil local de même nom"
+        } else {
+            "présente"
+        }
+    );
+
+    match &profile.key_negotiation {
+        Some(settings) => {
+            println!("  négociation     : {:?}", settings.mode);
+            println!("  plancher        : {:?}", settings.minimum_mode);
+            println!("  endpoint négo   : {}", settings.endpoint);
+            println!("  serveur épinglé : {}", settings.server_name);
+            println!(
+                "  empreinte PQ    : {}",
+                settings
+                    .gateway_pq_fingerprint()
+                    .unwrap_or_else(|| "illisible".into())
+            );
+            println!("  identité        : {}", settings.identity);
+        }
+        None => println!("  négociation     : aucune (chemin hérité)"),
+    }
+    println!(
+        "  identité jointe : {}",
+        if imported.identity.is_some() {
+            "oui — scellée à l'import, détruire le fichier ensuite"
+        } else {
+            "non"
+        }
+    );
+    Ok(())
+}
+
 pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<()> {
     let (public_key, private_key) = resolve_keys(&options)?;
 
