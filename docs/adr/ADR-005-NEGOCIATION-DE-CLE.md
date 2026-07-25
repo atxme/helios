@@ -204,6 +204,32 @@ désynchronisé : WireGuard jette les paquets, ce qui est l'invariant anti-fuite
 du client. Un tunnel mort est le bon résultat ; un tunnel qui fuit ne le serait
 pas.
 
+### 4 bis. La session reste ouverte : fin de tunnel immédiate
+
+WireGuard est sans connexion. Quand un bout s'en va, l'autre ne l'apprend que
+lorsque les handshakes cessent d'être répondus — jusqu'à 150 secondes plus
+tard. Pendant toute cette fenêtre, Orion affiche un tunnel déjà mort et Helios
+conserve un secret post-quantique pour un pair qui n'est plus là.
+
+La connexion QUIC qui a porté la négociation résout cela sans rien ajouter :
+elle est authentifiée, elle est déjà là, et **sa fermeture est un signal**. Elle
+est donc conservée aussi longtemps que le tunnel.
+
+- Orion se déconnecte → il raccroche → Helios libère le slot PSK aussitôt.
+- Orion s'arrête brutalement → QUIC ferme quand même → même effet. C'est
+  l'avantage décisif sur un message d'adieu explicite, qu'un processus tué
+  n'envoie jamais.
+- Helios s'arrête ou révoque → Orion voit le lien tomber sans attendre.
+
+Libérer le slot ne peut bloquer personne : le plancher du pair étant à
+`ml_kem`, son prochain tunnel doit de toute façon négocier un PSK neuf. Un lien
+qui tombe seul conduit le client à renégocier, et les deux bouts convergent sur
+un nouveau secret.
+
+Le permis de concurrence est relâché **avant** cette attente : la phase coûteuse
+est finie, et un tunnel de longue durée n'a pas à retenir un jeton qui n'existe
+que pour borner le coût des handshakes.
+
 ### 5. Plancher anti-downgrade, qui ne monte que
 
 L'ordre des modes est monotone : `classic < static_psk < ml_kem`. Chaque pair
@@ -269,6 +295,7 @@ console — la commande prévue pour l'amorçage. Le certificat PQ portant le su
 | Flood CPU par source falsifiée | Validation d'adresse QUIC (Retry) avant toute allocation ou cryptographie |
 | Flood CPU par une adresse réelle | Huit handshakes par minute et par adresse |
 | Perte du dernier message (désynchronisation) | Renégociation automatique côté client, jusqu'à trois fois |
+| Slot PSK conservé pour un pair disparu | Fermeture du lien QUIC détectée en un aller-retour, pas en 150 s |
 | Confusion de pair | Les deux identités WireGuard entrent dans la dérivation |
 | Downgrade forcé par le réseau | Plancher persistant des deux côtés, refus avant toute pose |
 | Client non admis | Empreinte du certificat PQ vérifiée contre la table des pairs |

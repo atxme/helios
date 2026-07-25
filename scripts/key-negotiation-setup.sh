@@ -38,6 +38,10 @@ MODE="ml-kem"
 REMPLACER=0
 CIBLE=""
 PUBLIC_KEY=""
+ADMIN=0
+GATEWAY_ONLY=0
+SKIP_NETWORK=0
+CLIENT_ONLY=0
 
 usage() {
     cat >&2 <<'EOF'
@@ -56,6 +60,10 @@ Usage : ./scripts/key-negotiation-setup.sh [hôte-ssh] [options]
                      (défaut : <server-name>:51820)
   --port-nego P      Port UDP de négociation (défaut : 51821)
   --mode M           ml-kem (défaut) ou classic
+  --admin            Admit the peer as a control-plane administrator
+  --gateway-only     Configure only the gateway and fetch its certificates
+  --skip-network     Keep network.toml unchanged
+  --client-only      Reuse gateway material already fetched locally
   --remplacer        Ré-enrôle un client existant : révoque son identité
                      précédente, donc coupe le poste qui la détenait
   --rotate-gateway   Remplace l'identité de négociation de la gateway
@@ -74,6 +82,10 @@ while [ $# -gt 0 ]; do
         --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
         --port-nego) PORT_NEGO="${2:-}"; shift 2 ;;
         --mode) MODE="${2:-}"; shift 2 ;;
+        --admin) ADMIN=1; shift ;;
+        --gateway-only) GATEWAY_ONLY=1; shift ;;
+        --skip-network) SKIP_NETWORK=1; shift ;;
+        --client-only) CLIENT_ONLY=1; shift ;;
         --remplacer) REMPLACER=1; shift ;;
         --rotate-gateway) ROTATE_GW=1; shift ;;
         -h|--help) usage ;;
@@ -96,10 +108,18 @@ HOTE="${CIBLE#*@}"
 [ -n "$ENDPOINT" ] || ENDPOINT="$SERVER_NAME:$PORT_WG"
 
 mkdir -p "$SORTIE"
+HELIOSD='$(command -v heliosd || echo /opt/helios/current/heliosd)'
+CONF_GW="/var/lib/helios/network.toml"
+
+if [ "$CLIENT_ONLY" -eq 1 ] && [ "$GATEWAY_ONLY" -eq 1 ]; then
+    echo "--client-only and --gateway-only are mutually exclusive" >&2
+    exit 2
+fi
 
 # ── 1. CA opérateur ──────────────────────────────────────────────────────────
 # Créée une seule fois, réutilisée pour tous les clients. La recréer invaliderait
 # tous les certificats déjà émis.
+if [ "$CLIENT_ONLY" -eq 0 ]; then
 if [ -f "$CA_DIR/orion-client-ca.der" ]; then
     echo "==> CA opérateur : réutilisée ($CA_DIR)"
 else
@@ -122,18 +142,26 @@ ARG_ROTATE=""
 # part où s'afficher et la commande échoue sans dire pourquoi (même raison que
 # dans deploy.sh). Le binaire n'est pas dans le PATH : l'installateur le pose
 # sous /opt/helios/current.
-HELIOSD='$(command -v heliosd || echo /opt/helios/current/heliosd)'
 # Une identité déjà en place n'est pas une erreur : c'est le cas nominal dès le
 # deuxième client. La rotation reste un geste explicite.
-if ! ssh -t "$CIBLE" "sudo \"$HELIOSD\" init-key-negotiation \
-        --server-name '$SERVER_NAME' \
-        --client-ca /tmp/orion-client-ca.der \
-        --client-pq-ca /tmp/orion-client-pq-ca-public.bin $ARG_ROTATE" 2>&1 \
-        | tee "$SORTIE/init-key-negotiation.log"; then
-    if grep -q "already exists" "$SORTIE/init-key-negotiation.log"; then
-        echo "    identité déjà en place — conservée (--rotate-gateway pour la remplacer)"
-    else
-        echo "ÉCHEC de l'initialisation ; voir $SORTIE/init-key-negotiation.log" >&2
+if [ "$ROTATE_GW" -eq 0 ] &&
+   ssh "$CIBLE" "test -f /var/lib/helios/key-negotiation-cert.der &&
+       test -f /var/lib/helios/key-negotiation-pq-cert.json &&
+       test -f /var/lib/helios/key-negotiation-key.sealed &&
+       test -f /var/lib/helios/key-negotiation-client-ca.der &&
+       test -f /var/lib/helios/key-negotiation-client-pq-ca-public.bin"; then
+    echo "    existing gateway identity reused"
+else
+    if ! ssh -t "$CIBLE" "sudo \"$HELIOSD\" init-key-negotiation \
+            --server-name '$SERVER_NAME' \
+            --client-ca /tmp/orion-client-ca.der \
+            --client-pq-ca /tmp/orion-client-pq-ca-public.bin $ARG_ROTATE" 2>&1 \
+            | tee "$SORTIE/init-key-negotiation.log"; then
+        if grep -q "already exists" "$SORTIE/init-key-negotiation.log"; then
+            echo "    existing partial identity detected; inspect /var/lib/helios/key-negotiation-*"
+        else
+            echo "FAIL: gateway key-negotiation identity initialization failed." >&2
+        fi
         exit 1
     fi
 fi
@@ -150,10 +178,10 @@ ssh "$CIBLE" "rm -f /tmp/orion-client-ca.der /tmp/orion-client-pq-ca-public.bin"
 #     pour tous les pairs.
 #
 # L'opération est idempotente et sauvegarde l'existant.
-CONF_GW="/var/lib/helios/network.toml"
 echo "==> Ouverture du port $PORT_NEGO dans $CONF_GW"
 # Le script part par scp plutôt que par l'entrée standard : `ssh -t` occupe
 # stdin avec le terminal qu'exige l'invite sudo, les deux ne cohabitent pas.
+if [ "$SKIP_NETWORK" -eq 0 ]; then
 cat > "$SORTIE/ouvrir-port.sh" <<EOF
 set -eu
 CONF="$CONF_GW"
@@ -164,40 +192,110 @@ if [ ! -f "$CONF" ]; then
     echo "$CONF introuvable : la gateway n'est pas installée." >&2
     exit 1
 fi
-actuel=$(sed -n 's/^[[:space:]]*key_negotiation_port[[:space:]]*=[[:space:]]*//p' "$CONF" | head -1)
-if [ "$actuel" = "$PORT" ]; then
-    echo "    port déjà déclaré : $actuel"
-    exit 0
-fi
 cp -a "$CONF" "$CONF.bak"
-if [ -n "$actuel" ]; then
-    sed -i "s/^[[:space:]]*key_negotiation_port[[:space:]]*=.*/key_negotiation_port = $PORT/" "$CONF"
-    echo "    port $actuel remplacé par $PORT (sauvegarde : $CONF.bak)"
-else
-    printf '\n# Ajouté par scripts/key-negotiation-setup.sh\nkey_negotiation_port = %s\n' "$PORT" >> "$CONF"
-    echo "    port $PORT ajouté (sauvegarde : $CONF.bak)"
-fi
-systemctl restart heliosd
+TMP="${CONF}.key-negotiation.tmp"
+awk -v port="$PORT" '
+    /^[[:space:]]*\[\[peers\]\][[:space:]]*$/ {
+        if (!declared) {
+            print "key_negotiation_port = " port
+            print ""
+        }
+        declared = 1
+        in_peers = 1
+        print
+        next
+    }
+    /^[[:space:]]*key_negotiation_port[[:space:]]*=/ {
+        if (!in_peers && !declared) {
+            print "key_negotiation_port = " port
+            declared = 1
+        }
+        next
+    }
+    { print }
+    END {
+        if (!declared) {
+            print ""
+            print "key_negotiation_port = " port
+        }
+    }
+' "$CONF" > "$TMP"
+chmod --reference="$CONF" "$TMP"
+chown --reference="$CONF" "$TMP"
+mv "$TMP" "$CONF"
+echo "    key-negotiation port set to $PORT (backup: $CONF.bak)"
 EOF
 scp -q "$SORTIE/ouvrir-port.sh" "$CIBLE:/tmp/helios-ouvrir-port.sh"
-ssh -t "$CIBLE" "sudo sh /tmp/helios-ouvrir-port.sh; rm -f /tmp/helios-ouvrir-port.sh"
-
-# Copie locale, pour garder trace de ce que la gateway porte réellement.
-ssh -t "$CIBLE" "sudo cat $CONF_GW" > "$SORTIE/network.toml" 2>/dev/null || true
+ssh -t "$CIBLE" "sudo sh /tmp/helios-ouvrir-port.sh && rm -f /tmp/helios-ouvrir-port.sh"
+rm -f "$SORTIE/ouvrir-port.sh"
+else
+    echo "    network configuration already managed by deploy"
+fi
 
 # ── 4. Matériel public de la gateway ─────────────────────────────────────────
 # Récupéré par SSH, pas par l'API : l'API vit derrière le tunnel, et exiger une
 # connexion pour mettre en place ce qui protège la PREMIÈRE connexion serait
 # circulaire. Ces deux fichiers sont des certificats — publics par construction.
 echo "==> Récupération des certificats publics de la gateway"
-ssh -t "$CIBLE" "sudo cat /var/lib/helios/key-negotiation-cert.der" \
-    > "$SORTIE/gateway-cert.der"
-ssh -t "$CIBLE" "sudo cat /var/lib/helios/key-negotiation-pq-cert.json" \
-    > "$SORTIE/gateway-pq-cert.json"
+REMOTE_PUBLIC_DIR="/tmp/helios-key-negotiation-public"
+ssh -t "$CIBLE" "
+    set -e
+    install -d -m 700 '$REMOTE_PUBLIC_DIR'
+    sudo install -m 600 /var/lib/helios/key-negotiation-cert.der \
+        '$REMOTE_PUBLIC_DIR/gateway-cert.der'
+    sudo install -m 600 /var/lib/helios/key-negotiation-pq-cert.json \
+        '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json'
+    sudo install -m 600 /var/lib/helios/key-negotiation-client-ca.der \
+        '$REMOTE_PUBLIC_DIR/client-ca.der'
+    sudo install -m 600 /var/lib/helios/key-negotiation-client-pq-ca-public.bin \
+        '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin'
+    sudo /opt/helios/current/heliosd peer list \
+        > '$REMOTE_PUBLIC_DIR/peer-list.log'
+    sudo chown \$(id -u):\$(id -g) '$REMOTE_PUBLIC_DIR/'*
+"
+scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-cert.der" "$SORTIE/gateway-cert.der"
+scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-pq-cert.json" "$SORTIE/gateway-pq-cert.json"
+scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-ca.der" "$SORTIE/installed-client-ca.der"
+scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin" \
+    "$SORTIE/installed-client-pq-ca-public.bin"
+scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/peer-list.log" "$SORTIE/peer-list.log"
+ssh "$CIBLE" "rm -f '$REMOTE_PUBLIC_DIR/gateway-cert.der' \
+    '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json' \
+    '$REMOTE_PUBLIC_DIR/client-ca.der' \
+    '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin' \
+    '$REMOTE_PUBLIC_DIR/peer-list.log'; rmdir '$REMOTE_PUBLIC_DIR'"
 [ -s "$SORTIE/gateway-cert.der" ] && [ -s "$SORTIE/gateway-pq-cert.json" ] || {
     echo "ÉCHEC : certificats de négociation vides ou absents sur la gateway." >&2
     exit 1
 }
+
+LOCAL_TLS_CA_SHA="$(sha256sum "$CA_DIR/orion-client-ca.der" | awk '{print $1}')"
+REMOTE_TLS_CA_SHA="$(sha256sum "$SORTIE/installed-client-ca.der" | awk '{print $1}')"
+LOCAL_PQ_CA_SHA="$(sha256sum "$CA_DIR/orion-client-pq-ca-public.bin" | awk '{print $1}')"
+REMOTE_PQ_CA_SHA="$(sha256sum "$SORTIE/installed-client-pq-ca-public.bin" | awk '{print $1}')"
+rm -f "$SORTIE/installed-client-ca.der" "$SORTIE/installed-client-pq-ca-public.bin"
+if [ "$LOCAL_TLS_CA_SHA" != "$REMOTE_TLS_CA_SHA" ] ||
+   [ "$LOCAL_PQ_CA_SHA" != "$REMOTE_PQ_CA_SHA" ]; then
+    echo "FAIL: local operator PKI does not match the authorities installed on the gateway." >&2
+    echo "      Restore the original PKI; do not rotate the gateway identity." >&2
+    exit 1
+fi
+
+if [ "$GATEWAY_ONLY" -eq 1 ]; then
+    echo "==> Gateway identity ready; public certificates are in $SORTIE"
+    exit 0
+fi
+else
+    for REQUIRED in \
+        "$CA_DIR/orion-client-ca.der" \
+        "$CA_DIR/orion-client-ca-key.der" \
+        "$CA_DIR/orion-client-pq-ca-private.bin" \
+        "$SORTIE/gateway-cert.der" \
+        "$SORTIE/gateway-pq-cert.json"; do
+        [ -s "$REQUIRED" ] ||
+            { echo "client-only input is missing: $REQUIRED" >&2; exit 1; }
+    done
+fi
 
 # ── 5. Clé WireGuard du client et certificats ────────────────────────────────
 # La paire naît ici quand le client n'en a pas : c'est le poste opérateur qui
@@ -239,23 +337,49 @@ SHA_PQ="$(sed -n 's/^PQ certificate sha256: //p' "$SORTIE/issue-client.log")"
 # `heliosd peer add` existe précisément pour amorcer sans tunnel : la mutation
 # par API exige d'être un pair admin, donc déjà connecté.
 echo "==> Admission du pair sur la gateway"
-if [ "$REMPLACER" -eq 1 ]; then
-    ssh -t "$CIBLE" "sudo \"$HELIOSD\" peer remove --name '$NOM'" > /dev/null 2>&1 || true
+ARG_ADMIN=""
+[ "$ADMIN" -eq 1 ] && ARG_ADMIN="--admin"
+BACKUP_GW="/var/lib/helios/network.toml.before-key-negotiation-enroll"
+case "$NOM:$PUBLIC_KEY:$SHA_TLS:$SHA_PQ" in
+    *[!A-Za-z0-9._:+/=:-]*) echo "unsafe enrollment value" >&2; exit 1 ;;
+esac
+case "$MODE" in
+    classic|static_psk|ml-kem|ml_kem) ;;
+    *) echo "unsupported key-negotiation mode: $MODE" >&2; exit 1 ;;
+esac
+
+LOCAL_ADMISSION_SCRIPT="$SORTIE/admit-peer.sh"
+REMOTE_ADMISSION_SCRIPT="/tmp/helios-admit-peer.sh"
+cat > "$LOCAL_ADMISSION_SCRIPT" <<EOF
+set -eu
+restore_network() {
+    cp -a '$BACKUP_GW' '$CONF_GW'
+}
+cp -a '$CONF_GW' '$BACKUP_GW'
+trap restore_network EXIT HUP INT TERM
+if [ '$REMPLACER' -eq 1 ]; then
+    /opt/helios/current/heliosd peer remove --name '$NOM' >/dev/null 2>&1 || true
 fi
-ssh -t "$CIBLE" "sudo \"$HELIOSD\" peer add \
-    --name '$NOM' --public-key '$PUBLIC_KEY' \
+/opt/helios/current/heliosd peer add \
+    --name '$NOM' \
+    --public-key '$PUBLIC_KEY' \
     --key-negotiation-certificate-sha256 '$SHA_TLS' \
     --key-negotiation-pq-certificate-sha256 '$SHA_PQ' \
-    --minimum-mode '$MODE'" 2>&1 | tee "$SORTIE/peer-add.log"
-VIP="$(grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$SORTIE/peer-add.log" | head -1)"
-if [ -z "$VIP" ]; then
-    # Le pair existait déjà : sa VIP est stable, on la relit dans la config.
-    VIP="$(ssh -t "$CIBLE" "sudo grep -A3 'name = \"$NOM\"' $CONF_GW" 2>/dev/null \
-        | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -1)"
+    --minimum-mode '$MODE' $ARG_ADMIN
+rm -f '$BACKUP_GW'
+trap - EXIT HUP INT TERM
+EOF
+scp -q "$LOCAL_ADMISSION_SCRIPT" "$CIBLE:$REMOTE_ADMISSION_SCRIPT"
+rm -f "$LOCAL_ADMISSION_SCRIPT"
+if ! ssh -t "$CIBLE" "sudo sh '$REMOTE_ADMISSION_SCRIPT'; \
+    STATUS=\$?; rm -f '$REMOTE_ADMISSION_SCRIPT'; exit \$STATUS" 2>&1 |
+    tee "$SORTIE/peer-add.log"; then
+    echo "FAIL: admission refused; the previous peer table was restored." >&2
+    exit 1
 fi
+VIP="$(grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$SORTIE/peer-add.log" | head -1)"
 [ -n "$VIP" ] || {
     echo "ÉCHEC : VIP introuvable ; voir $SORTIE/peer-add.log" >&2
-    echo "        (relancer avec --remplacer si le pair existe déjà)" >&2
     exit 1
 }
 echo "    VIP : $VIP"
@@ -285,8 +409,7 @@ rm -f "$FICHIER_CLE"
 cat <<EOF
 
 ──────────────────────────────────────────────────────────────────────────────
-Gateway   $CONF_GW — déjà en place, heliosd redémarré.
-          Copie locale pour référence : $SORTIE/network.toml
+Gateway   $CONF_GW — already updated; restart is handled by deploy.sh.
 
   Orion     $PROFIL
             double-clic, ou écran « Profils » → Importer.

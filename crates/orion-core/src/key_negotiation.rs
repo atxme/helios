@@ -21,7 +21,7 @@ use aether::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
-use helios_key_negotiation::{client_endpoint, negotiate, ClientSession, TlsIdentity};
+use helios_key_negotiation::{client_endpoint, negotiate, ClientSession, SessionLink, TlsIdentity};
 use zeroize::Zeroizing;
 
 use crate::ClientProfile;
@@ -134,18 +134,24 @@ pub struct NegotiatedKey {
 
 impl NegotiatedKey {
     /// Commits only after the caller has observed a fresh WireGuard handshake.
-    pub async fn confirm(self) -> Result<()> {
+    ///
+    /// Returns the live link: as long as it is held, the gateway considers
+    /// this tunnel alive. Closing it — or dropping it, or crashing — tells the
+    /// gateway to release the slot at once instead of waiting for handshakes
+    /// to go stale.
+    pub async fn confirm(self) -> Result<SessionLink> {
         let confirmation =
             authenticate_confirmation(self.transaction_id, self.client_pq_private_key.as_slice())
                 .context("signing the key-negotiation confirmation with ML-DSA-65")?;
-        let commit = self
+        let (commit, link) = self
             .session
             .confirm(confirmation)
             .await
             .context("confirming the key-negotiation transaction")?;
         commit
             .verify(&self.gateway_pq_public_key)
-            .context("verifying the gateway PQ commit acknowledgment")
+            .context("verifying the gateway PQ commit acknowledgment")?;
+        Ok(link)
     }
 }
 

@@ -183,6 +183,13 @@ pub trait NegotiationHandler: Send + Sync + 'static {
     ) -> Result<AuthenticatedKeyNegotiationCommit, PublicError>;
 
     async fn rollback(&self, transaction_id: [u8; 16]);
+
+    /// The client hung up after a committed transaction.
+    ///
+    /// Distinct from [`Self::rollback`], which undoes a transaction that never
+    /// completed: here the tunnel existed and is now over. The gateway can
+    /// release the slot immediately instead of waiting for handshakes to stop.
+    async fn disconnected(&self, transaction_id: [u8; 16]);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,8 +355,7 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = handle_connection(incoming, handler).await {
+            if let Err(error) = handle_connection(incoming, handler, permit).await {
                 tracing::warn!("key-negotiation connection rejected: {error}");
             }
         });
@@ -359,6 +365,7 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
 async fn handle_connection(
     incoming: quinn::Incoming,
     handler: Arc<dyn NegotiationHandler>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), TransportError> {
     let connection = incoming.await.map_err(TransportError::Connection)?;
     let fingerprint = peer_certificate_sha256(&connection)?;
@@ -424,10 +431,51 @@ async fn handle_connection(
                 .await
                 .map_err(|_| TransportError::CommitDeliveryTimeout)?
                 .map_err(TransportError::Stopped)?;
+
+            // The expensive part is over: release the concurrency permit
+            // before waiting, so a long-lived tunnel does not hold a slot
+            // that only exists to bound handshake cost.
+            drop(permit);
+
+            // From here the connection is a liveness link. Its closure — an
+            // explicit disconnect, a crash, or a dead network — is what tells
+            // the gateway to release the slot without waiting 150 s for
+            // handshakes to go stale.
+            connection.closed().await;
+            handler.disconnected(transaction_id).await;
         }
         _ => handler.rollback(transaction_id).await,
     }
     Ok(())
+}
+
+/// Live link kept open for as long as the tunnel is meant to exist.
+///
+/// # Why the session outlives the negotiation
+///
+/// WireGuard is connectionless: when one end goes away, the other only finds
+/// out when handshakes stop being answered — up to 150 s later. For that whole
+/// window Orion shows a tunnel that is already dead, and Helios keeps a PSK
+/// slot for a peer that is gone.
+///
+/// The QUIC connection that carried the negotiation solves this for free. It
+/// is authenticated, it is already there, and **its closure is a signal**:
+/// whoever hangs up — deliberately, or by crashing — is noticed by the other
+/// end within a round-trip rather than within two and a half minutes.
+pub struct SessionLink {
+    connection: Connection,
+}
+
+impl SessionLink {
+    /// Resolves as soon as the peer closes the link, whatever the reason.
+    pub async fn closed(&self) {
+        self.connection.closed().await;
+    }
+
+    /// Hangs up, telling the peer the tunnel is going down now.
+    pub fn close(&self) {
+        self.connection.close(0u32.into(), b"tunnel closed by peer");
+    }
 }
 
 /// Active client session. Confirmation consumes it to prevent duplicate commit.
@@ -443,7 +491,7 @@ impl ClientSession {
     pub async fn confirm(
         mut self,
         confirmation: AuthenticatedKeyNegotiationConfirmation,
-    ) -> Result<AuthenticatedKeyNegotiationCommit, TransportError> {
+    ) -> Result<(AuthenticatedKeyNegotiationCommit, SessionLink), TransportError> {
         if confirmation.confirmation.protocol_version != KEY_NEGOTIATION_VERSION
             || confirmation.confirmation.transaction_id != self.transaction_id
         {
@@ -470,8 +518,14 @@ impl ClientSession {
                 ))
             }
         };
-        let _keep_alive = self.connection;
-        Ok(commit)
+        // The connection is handed back rather than dropped: from here on it
+        // is the link whose closure tells the gateway this tunnel is over.
+        Ok((
+            commit,
+            SessionLink {
+                connection: self.connection,
+            },
+        ))
     }
 }
 
@@ -840,6 +894,7 @@ mod tests {
         expected_fingerprint: String,
         confirmed: AtomicBool,
         rolled_back: AtomicBool,
+        disconnected: AtomicBool,
         gateway_pq_certificate: PqCertificate,
         gateway_pq_private_key: Vec<u8>,
     }
@@ -885,6 +940,10 @@ mod tests {
             .map_err(|_| PublicError::Protocol)
         }
 
+        async fn disconnected(&self, _transaction_id: [u8; 16]) {
+            self.disconnected.store(true, Ordering::SeqCst);
+        }
+
         async fn rollback(&self, _transaction_id: [u8; 16]) {
             self.rolled_back.store(true, Ordering::SeqCst);
         }
@@ -904,6 +963,7 @@ mod tests {
             expected_fingerprint: pki.client_fingerprint,
             confirmed: AtomicBool::new(false),
             rolled_back: AtomicBool::new(false),
+            disconnected: AtomicBool::new(false),
             gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
             gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
         });
@@ -938,7 +998,7 @@ mod tests {
             .unwrap();
         let confirmation =
             authenticate_confirmation(request.transaction_id, &pki.client_pq_private_key).unwrap();
-        let commit = session.confirm(confirmation).await.unwrap();
+        let (commit, link) = session.confirm(confirmation).await.unwrap();
         commit
             .verify(&pki.gateway_pq_certificate.ml_dsa_65_public_key)
             .unwrap();
@@ -951,6 +1011,27 @@ mod tests {
         .await
         .unwrap();
         assert!(!handler.rolled_back.load(Ordering::SeqCst));
+
+        // The link is what tells the gateway the tunnel is over. Closing it
+        // must be noticed within a round-trip — the whole point is not waiting
+        // 150 s for WireGuard handshakes to go stale.
+        assert!(
+            !handler.disconnected.load(Ordering::SeqCst),
+            "a live link must not look like a departure"
+        );
+        link.close();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handler.disconnected.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the link must be seen at once");
+        assert!(
+            !handler.rolled_back.load(Ordering::SeqCst),
+            "a committed tunnel ending is not a rollback"
+        );
+
         client.close(0u32.into(), b"test complete");
         task.abort();
     }
@@ -969,6 +1050,7 @@ mod tests {
             expected_fingerprint: pki.client_fingerprint,
             confirmed: AtomicBool::new(false),
             rolled_back: AtomicBool::new(false),
+            disconnected: AtomicBool::new(false),
             gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
             gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
         });

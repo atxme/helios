@@ -469,6 +469,45 @@ mod tests {
         assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
     }
 
+    /// Adding negotiation to a profile that had none must survive the save
+    /// **and** the round-trip through `profiles.toml`.
+    ///
+    /// This is the upgrade path a user actually walks: a profile enrolled long
+    /// ago, re-enrolled with a negotiation block. If the block were dropped by
+    /// the ratchet, by serialization, or by a default, the Profiles screen
+    /// would keep saying "this profile does not negotiate" with no way to tell
+    /// whether the import or the display was at fault.
+    ///
+    /// Serialized in place rather than through `save`/`load`: those go through
+    /// `ORION_CONFIG`, a process-wide variable that parallel tests would fight
+    /// over. The property under test is the encoding, not the file path.
+    #[test]
+    fn a_negotiation_block_survives_save_and_reload() {
+        let mut cfg = ClientConfig::default();
+        // The profile as it exists before enrollment: no block at all.
+        cfg.upsert(ClientProfile {
+            name: "poste".into(),
+            endpoint: "vpn.example.net:51820".into(),
+            private_key: "cHJpdmF0ZQ==".into(),
+            ..ClientProfile::default()
+        });
+        assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
+
+        // Re-enrolled: same name, now carrying negotiation.
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: ClientConfig = toml::from_str(&encoded).unwrap();
+        let settings = reloaded
+            .find("poste")
+            .expect("profile kept")
+            .key_negotiation
+            .as_ref()
+            .expect("the negotiation block must survive the round-trip");
+        assert_eq!(settings.mode, ProtectionMode::MlKem);
+        assert_eq!(settings.identity, "orion-poste");
+    }
+
     /// A floor still at `classic` carries no promise: nothing to preserve.
     #[test]
     fn a_classic_floor_does_not_pin_the_block() {

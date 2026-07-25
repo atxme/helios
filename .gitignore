@@ -8,3 +8,11 @@
 # Artefacts Python (scripts/target_campaign.py)
 __pycache__/
 *.py[cod]
+
+# Autorité cliente de key-negotiation : deux clés PRIVÉES (TLS et ML-DSA-65)
+# qui émettent des identités clientes valides. Elles se créent par défaut dans
+# ~/.helios/orion-client-ca, hors du dépôt ; ce motif rattrape le cas où
+# `--client-ca-dir` a pointé ici.
+/orion-client-ca
+**/orion-client-ca-key.der
+**/orion-client-pq-ca-private.bin

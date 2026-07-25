@@ -82,7 +82,7 @@ EPOQUE_N="$(sed -n 's/.*"key_epoch"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' \
 
 # ── Traçabilité : un arbre modifié ne doit pas se faire passer pour un commit ─
 COMMIT="$(git rev-parse --short=16 HEAD)"
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if [ -n "$(git status --porcelain)" ]; then
     COMMIT="${COMMIT}-dirty"
     echo "⚠  Arbre de travail modifié : le manifeste portera « $COMMIT »." >&2
 fi
@@ -99,14 +99,14 @@ echo "==> Release   $VERSION séquence $SEQUENCE canal $CANAL"
 echo "==> Commit    $COMMIT"
 echo
 
-echo "==> 1/5  Construction"
+echo "==> 1/6  Construction"
 # `xtask bundle` rappelle les deux commandes suivantes à taper : elles sont
 # redondantes ici, ce script les enchaîne. On coupe à partir de ce rappel.
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOQUE/publisher-keyring.json" \
     cargo xtask bundle --target "$CIBLE_TRIPLE" \
     | sed '/^Signer sur le poste éditeur/,$d'
 
-echo "==> 2/5  Signature hors ligne (époque $EPOQUE_N)"
+echo "==> 2/6  Signature hors ligne (époque $EPOQUE_N)"
 cargo run --quiet -p helios-publisher -- bundle \
     --dir "$REP" \
     --key-epoch "$EPOQUE_N" \
@@ -119,12 +119,12 @@ cargo run --quiet -p helios-publisher -- bundle \
     --ml-dsa-65-private-key "$EPOQUE/ml-dsa-65-private.bin" \
     --keyring "$EPOQUE/publisher-keyring.json" > /dev/null
 
-echo "==> 3/5  Archivage"
+echo "==> 3/6  Archivage"
 EMPREINTE="$(cargo xtask pack --dir "$REP" 2>/dev/null | awk 'NF==2 {print $1; exit}')"
 [ -n "$EMPREINTE" ] || { echo "empreinte de l'archive illisible" >&2; exit 1; }
 echo "    $EMPREINTE"
 
-echo "==> 4/5  Copie vers $CIBLE"
+echo "==> 4/6  Copie vers $CIBLE"
 scp -q "$ARCHIVE" "$CIBLE:~/"
 DISTANTE="$(ssh "$CIBLE" "sha256sum ~/$NOM.tar.gz" | awk '{print $1}')"
 if [ "$DISTANTE" != "$EMPREINTE" ]; then
@@ -142,7 +142,7 @@ if [ "$INSTALLER" = "0" ]; then
     exit 0
 fi
 
-echo "==> 5/5  Installation privilégiée (mot de passe sudo de la gateway)"
+echo "==> 5/6  Installation privilégiée (mot de passe sudo de la gateway)"
 # `-t` alloue un terminal : sans lui, l'invite de mot de passe de sudo n'a nulle
 # part où s'afficher et la commande échoue sans dire pourquoi.
 # L'ancien répertoire extrait est retiré d'abord : sinon on lancerait
@@ -155,15 +155,15 @@ ssh -t "$CIBLE" "
     rm -rf ~/$NOM
 "
 
+echo "==> 6/6  Network, TPM, PKI and Orion identity bootstrap"
+./scripts/target-bootstrap.sh "$CIBLE"
+
 cat <<EOF
 
 ──────────────────────────────────────────────────────────────
   Déployé : $VERSION séquence $SEQUENCE sur $CIBLE
 
-  Le service n'est pas activé. Pour un essai surveillé :
-    ssh -t $CIBLE 'sudo /opt/helios/current/heliosd run'
-
-  Une fois validé, pour qu'il survive au redémarrage :
-    ssh -t $CIBLE 'sudo systemctl enable --now heliosd helios-update.path'
+  Network, TPM, internal PKI and the first Orion profile are managed in the
+  target state directory printed above. The service is enabled and running.
 ──────────────────────────────────────────────────────────────
 EOF

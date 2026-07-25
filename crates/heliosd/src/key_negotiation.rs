@@ -51,6 +51,12 @@ struct Transaction {
 #[derive(Default)]
 struct TransactionState {
     active: HashMap<[u8; 16], Transaction>,
+    /// Tunnels whose transaction committed and whose link is still open.
+    ///
+    /// Kept so the slot can be released the moment the client hangs up:
+    /// `active` is emptied at commit, and without this the gateway would have
+    /// nothing left to tie a closing link to.
+    committed: HashMap<[u8; 16], (String, String)>,
     peers: HashSet<String>,
     replay_order: VecDeque<[u8; 16]>,
     replay_set: HashSet<[u8; 16]>,
@@ -308,11 +314,46 @@ impl NegotiationHandler for GatewayHandler {
             .verify(&client_pq_public_key)
             .map_err(|_| PublicError::IdentityMismatch)?;
         self.raise_security_floor(&public_key, mode).await?;
-        self.release_peer(transaction_id)
+        let transaction = self
+            .release_peer(transaction_id)
             .await
             .ok_or(PublicError::Rejected)?;
+        self.transactions.lock().await.committed.insert(
+            transaction_id,
+            (transaction.public_key.clone(), transaction.address.clone()),
+        );
         authenticate_commit(transaction_id, self.gateway_pq_private_key.as_slice())
             .map_err(|_| PublicError::Protocol)
+    }
+
+    /// Releases the slot as soon as the client hangs up.
+    ///
+    /// The alternative is waiting for WireGuard handshakes to go stale — up to
+    /// 150 s during which the gateway holds a post-quantum secret for a peer
+    /// that is gone. The link closing is a far better signal than silence, and
+    /// it also covers a client that crashed rather than disconnected cleanly.
+    ///
+    /// Clearing the slot is safe because it cannot strand anybody: the peer's
+    /// floor is at `ml_kem`, so its next tunnel has to negotiate a fresh PSK
+    /// anyway. A link that dropped on its own leads the client to renegotiate,
+    /// and both ends converge on a new secret.
+    async fn disconnected(&self, transaction_id: [u8; 16]) {
+        let Some((public_key, address)) = self
+            .transactions
+            .lock()
+            .await
+            .committed
+            .remove(&transaction_id)
+        else {
+            return;
+        };
+        tracing::info!(
+            peer = %public_key,
+            "key-negotiation link closed: releasing the PSK slot without waiting for handshakes"
+        );
+        if self.install(public_key, address, None).await.is_err() {
+            tracing::warn!("could not release the PSK slot after the client disconnected");
+        }
     }
 
     async fn rollback(&self, transaction_id: [u8; 16]) {

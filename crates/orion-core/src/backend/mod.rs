@@ -262,6 +262,14 @@ pub struct VpnController {
     backend: Arc<dyn VpnBackend>,
     state: Arc<RwLock<TunnelState>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Live negotiation link of the current tunnel.
+    ///
+    /// Held here rather than in the connection task because it must outlive
+    /// it: the task ends once the tunnel is up, while the link must stay open
+    /// for as long as the tunnel does. Closing it on `disconnect` is what
+    /// spares the gateway from waiting for stale handshakes.
+    #[cfg(feature = "key-negotiation")]
+    link_slot: Arc<Mutex<Option<helios_key_negotiation::SessionLink>>>,
     #[cfg(feature = "key-negotiation")]
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
@@ -272,6 +280,8 @@ impl VpnController {
             backend,
             state: Arc::new(RwLock::new(TunnelState::Down)),
             task: Mutex::new(None),
+            #[cfg(feature = "key-negotiation")]
+            link_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "key-negotiation")]
             key_negotiation_identities: None,
         }
@@ -347,12 +357,19 @@ impl VpnController {
         let backend = Arc::clone(&self.backend);
         #[cfg(feature = "key-negotiation")]
         let identities = self.key_negotiation_identities.clone();
+        #[cfg(feature = "key-negotiation")]
+        let link_slot = Arc::clone(&self.link_slot);
         let handle = tokio::spawn(async move {
             #[cfg(feature = "key-negotiation")]
             if profile.key_negotiation.is_some() {
-                if let Err(error) =
-                    connect_with_key_negotiation(&backend, &profile, &sink, identities.as_deref())
-                        .await
+                if let Err(error) = connect_with_key_negotiation(
+                    &backend,
+                    &profile,
+                    &sink,
+                    identities.as_deref(),
+                    &link_slot,
+                )
+                .await
                 {
                     sink(ClientEvent::state(TunnelState::Failed));
                     sink(ClientEvent::Error {
@@ -391,6 +408,13 @@ impl VpnController {
     /// Unmounts the tunnel — **the only path allowed to remove the adapter**.
     pub async fn disconnect(&self, user_sink: EventSink) {
         self.abort_task().await;
+        // Hang up before unmounting: the gateway releases its PSK slot on the
+        // spot instead of inferring the departure from handshakes that stop
+        // coming, up to 150 s later.
+        #[cfg(feature = "key-negotiation")]
+        if let Some(link) = self.link_slot.lock().await.take() {
+            link.close();
+        }
         let sink = self.wrap_sink(user_sink);
         if let Err(e) = self.backend.down(&sink).await {
             sink(ClientEvent::Error {
@@ -484,6 +508,7 @@ async fn connect_with_key_negotiation(
     profile: &ClientProfile,
     sink: &EventSink,
     identities: Option<&dyn crate::key_negotiation::IdentityProvider>,
+    link_slot: &Mutex<Option<helios_key_negotiation::SessionLink>>,
 ) -> anyhow::Result<()> {
     let identities = identities
         .context("the Orion shell did not provide a protected key-negotiation identity store")?;
@@ -513,7 +538,10 @@ async fn connect_with_key_negotiation(
         )
         .await
         {
-            Ok(()) => {
+            Ok(link) => {
+                // Replaces any previous link: a renegotiation supersedes the
+                // tunnel the old one described.
+                *link_slot.lock().await = Some(link);
                 let protection = match mode {
                     aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
                     aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
@@ -561,7 +589,7 @@ async fn commit_negotiated_slot(
     negotiated: crate::key_negotiation::NegotiatedKey,
     prepared_at: tokio::time::Instant,
     confirmation_timeout: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<helios_key_negotiation::SessionLink> {
     backend.up(negotiated_profile, sink).await?;
     if !wait_for_new_handshake(backend, prepared_at, confirmation_timeout).await {
         anyhow::bail!(
