@@ -189,6 +189,16 @@ pub struct CompletedImport {
     pub private_key_missing: Option<String>,
 }
 
+/// Suffixes of an Orion document.
+///
+/// `.orionprofile` is **ours**: it is what `helios-ctl enroll` writes and what
+/// Windows associates with Orion. Leaving it out made its recognition rest
+/// entirely on the first character, so the slightest disturbance at the head
+/// of the file — a byte-order mark from a copy through PowerShell, a stray
+/// blank line — produced «format inconnu» about the very extension the tool
+/// distributes.
+const ORION_SUFFIXES: &[&str] = &[".orionprofile", ".json"];
+
 /// Decodes an imported profile without writing it to disk.
 ///
 /// The file suffix picks the parser; for a suffix-less file, the first
@@ -203,14 +213,20 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
 
     let lower_name = file_name.to_ascii_lowercase();
     let trimmed = contents.trim_start_matches('\u{feff}').trim_start();
+    let named_orion = ORION_SUFFIXES
+        .iter()
+        .any(|suffix| lower_name.ends_with(suffix));
     // wg-quick has no notion of a client identity: only the Orion document
     // can carry one.
-    let (profile, identity) = if lower_name.ends_with(".json") || trimmed.starts_with('{') {
+    let (profile, identity) = if named_orion || trimmed.starts_with('{') {
         parse_json(trimmed)?
     } else if lower_name.ends_with(".conf") || trimmed.starts_with('[') {
         (parse_wg_quick(trimmed, file_name)?, None)
     } else {
-        anyhow::bail!("format inconnu : choisir un fichier Orion .json ou WireGuard .conf");
+        anyhow::bail!(
+            "format inconnu : « {file_name} » ne commence ni par « {{ » (document Orion) ni par « [ » (profil WireGuard) — {}",
+            describe_head(trimmed)
+        );
     };
 
     let profile = validate_imported_profile(profile)?;
@@ -247,12 +263,80 @@ pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
             MAX_PROFILE_IMPORT_BYTES / 1024
         );
     }
-    let contents = String::from_utf8(bytes).context("le profil n'est pas encodé en UTF-8")?;
+    let contents = decode_document(&bytes)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("le nom du profil n'est pas représentable en UTF-8")?;
     parse_profile_import(&contents, file_name)
+}
+
+/// Decodes a document whatever byte-order mark it carries.
+///
+/// A profile is a file a human carries from one machine to another, and that
+/// trip re-encodes it: Windows PowerShell's `Out-File` writes UTF-16LE by
+/// default, Notepad long prefixed UTF-8 with a BOM. Refusing those would be
+/// technically defensible and practically useless — the document is intact,
+/// only its clothing changed. What is **not** accepted is anything else: a
+/// silent lossy conversion would turn a base64 key into a key that no longer
+/// decodes, and the failure would surface much later, as a handshake that
+/// never happens.
+///
+/// The frontend does the same thing on the file-picker path, where the bytes
+/// never reach Rust (`apps/orion/src/profileDocument.ts`). The two must
+/// accept the same files: an import that works by double-click and fails
+/// through the button is impossible to explain to the person doing it.
+fn decode_document(bytes: &[u8]) -> Result<String> {
+    fn from_utf16(bytes: &[u8], little_endian: bool) -> Result<String> {
+        if !bytes.len().is_multiple_of(2) {
+            anyhow::bail!("le profil est encodé en UTF-16 mais tronqué (nombre impair d'octets)");
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| {
+                if little_endian {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&units).context("le profil n'est pas un texte UTF-16 valide")
+    }
+
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => from_utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => from_utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => {
+            String::from_utf8(rest.to_vec()).context("le profil n'est pas encodé en UTF-8")
+        }
+        _ => String::from_utf8(bytes.to_vec()).context("le profil n'est pas encodé en UTF-8"),
+    }
+}
+
+/// Says what the document starts with, for a format error.
+///
+/// «format inconnu» alone leaves the user re-reading a file that looks right
+/// to them. Quoting the head is what distinguishes an empty file from an
+/// HTML error page saved by mistake, or from a text mangled by an encoding
+/// conversion.
+fn describe_head(trimmed: &str) -> String {
+    if trimmed.is_empty() {
+        return "le fichier est vide".to_string();
+    }
+    // U+FFFD is what a UTF-8 decoder leaves behind when handed UTF-16: the
+    // document is intact, its encoding is not the expected one.
+    if trimmed.starts_with('\u{fffd}') || trimmed.contains('\0') {
+        return "le fichier n'est pas du texte UTF-8 : le réenregistrer en UTF-8, ou le recopier \
+                sans passer par un éditeur"
+            .to_string();
+    }
+    let head: String = trimmed
+        .chars()
+        .take(24)
+        .flat_map(char::escape_debug)
+        .collect();
+    format!("il commence par « {head} »")
 }
 
 /// Completes an invitation document from the local profile that holds the
@@ -789,6 +873,21 @@ mod tests {
 
     const CLIENT_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const GATEWAY_PUBLIC: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+
+    /// Temporary directory of the calling test.
+    ///
+    /// Named after the process **and** the thread: the suite runs in
+    /// parallel, and two tests writing `portable.orionprofile` in one shared
+    /// directory would delete each other's file.
+    fn temp_directory(prefix: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
 
     fn complete_profile() -> ClientProfile {
         ClientProfile {
@@ -1494,6 +1593,102 @@ mod tests {
             .contains("supérieur à zéro"));
     }
 
+    /// `.orionprofile` is the extension the tooling distributes: recognizing
+    /// it must not depend on the first character surviving the trip.
+    #[test]
+    fn the_orionprofile_suffix_selects_the_orion_parser() {
+        let raw = format!(
+            r#"{{
+                "format": "orion-profile",
+                "version": 1,
+                "profile": {{
+                    "name": "portable",
+                    "endpoint": "vpn.example.net:51820",
+                    "private_key": "{CLIENT_PRIVATE}",
+                    "peer_public_key": "{GATEWAY_PUBLIC}",
+                    "address": "100.64.1.2/32"
+                }}
+            }}"#
+        );
+
+        // Leading blank lines: the head no longer decides, the suffix does.
+        let padded = format!("\n\n{raw}");
+        assert_eq!(
+            parse_profile_import(&padded, "poste-windows.orionprofile")
+                .unwrap()
+                .profile
+                .name,
+            "portable"
+        );
+        assert_eq!(
+            parse_profile_import(&raw, "POSTE-WINDOWS.ORIONPROFILE")
+                .unwrap()
+                .profile
+                .name,
+            "portable"
+        );
+    }
+
+    /// A document is carried by hand from one machine to another, and that
+    /// trip re-encodes it: PowerShell's `Out-File` writes UTF-16LE, Notepad
+    /// long prefixed UTF-8 with a BOM. The content is intact; refusing it
+    /// only strands the user.
+    #[test]
+    fn reads_a_document_whatever_byte_order_mark_it_carries() {
+        let raw = format!(
+            r#"{{"format":"orion-profile","version":1,"profile":{{"name":"portable","endpoint":"vpn.example.net:51820","private_key":"{CLIENT_PRIVATE}","peer_public_key":"{GATEWAY_PUBLIC}","address":"100.64.1.2/32"}}}}"#
+        );
+
+        let utf16le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(raw.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let utf16be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(raw.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let utf8_bom: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(raw.bytes()).collect();
+
+        for (label, bytes) in [
+            ("UTF-8", raw.clone().into_bytes()),
+            ("UTF-8 + BOM", utf8_bom),
+            ("UTF-16LE", utf16le),
+            ("UTF-16BE", utf16be),
+        ] {
+            let directory = temp_directory("orion-import-encoding");
+            let path = directory.join("portable.orionprofile");
+            std::fs::write(&path, &bytes).unwrap();
+            let imported = read_profile_import_path(&path)
+                .unwrap_or_else(|error| panic!("{label} should have been read: {error:#}"));
+            assert_eq!(imported.profile.name, "portable", "{label}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// «format inconnu» alone leaves the user re-reading a file that looks
+    /// right to them: the message must say what was actually seen.
+    #[test]
+    fn an_unrecognized_document_says_what_it_starts_with() {
+        let empty = parse_profile_import("   ", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("vide"), "message : {empty}");
+
+        let html = parse_profile_import("<!DOCTYPE html>", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(html.contains("<!DOCTYPE html>"), "message : {html}");
+        assert!(html.contains("profil.txt"), "message : {html}");
+
+        // What a UTF-8 decoder leaves when handed UTF-16: the encoding is
+        // named, because "unknown format" would send the user looking for a
+        // fault in a document that has none.
+        let mangled = parse_profile_import("\u{fffd}\u{fffd}{\0", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(mangled.contains("UTF-8"), "message : {mangled}");
+    }
+
     #[test]
     fn refuses_an_oversized_document() {
         let raw = " ".repeat(MAX_PROFILE_IMPORT_BYTES + 1);
@@ -1505,12 +1700,7 @@ mod tests {
 
     #[test]
     fn reading_by_path_reuses_the_parser_and_the_limit() {
-        let directory = std::env::temp_dir().join(format!(
-            "orion-import-path-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = temp_directory("orion-import-path");
         let profile_path = directory.join("portable.orionprofile");
         let raw = format!(
             r#"{{

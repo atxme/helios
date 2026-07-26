@@ -30,6 +30,7 @@ import {
   Upload,
 } from 'lucide-react'
 import * as api from '../api'
+import { readProfileDocument } from '../profileDocument'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import { GUTTER } from '../theme'
 import type {
@@ -433,7 +434,7 @@ export function ProfilesView({
 
     setImporting(true)
     try {
-      const imported = await onImport(await file.text(), file.name)
+      const imported = await onImport(await readProfileDocument(file), file.name)
       const profile = imported.profile
       const existing = config.profiles.find((candidate) => candidate.name === profile.name)
 
