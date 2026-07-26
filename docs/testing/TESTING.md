@@ -10,6 +10,17 @@ Elle doit être verte avant fusion ou livraison. Elle utilise les lockfiles,
 interdit les avertissements Clippy et couvre les features matérielles au niveau
 compilation/tests sans exécuter d’effet réel.
 
+**En intégration continue, elle ne se déclenche que pour `main`** : sur les
+poussées vers cette branche et sur les PR qui la visent. Une branche de travail
+ne la déclenche donc plus à chaque commit — la campagne coûte plusieurs minutes
+et n’apprend rien de plus que la même commande jouée localement, qui exécute
+exactement les mêmes étapes. Pour la lancer malgré tout sur une branche :
+l’action *Régression* accepte un déclenchement manuel (`workflow_dispatch`).
+
+Cela déplace une responsabilité : sur une branche de travail, la campagne est
+**au développeur**, plus à la CI. Une branche poussée sans l’avoir jouée n’est
+vérifiée qu’au moment de la PR.
+
 ## Matrice automatisée
 
 | Couche | Contrôles |

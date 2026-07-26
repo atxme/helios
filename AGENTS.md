@@ -32,18 +32,28 @@ expose enfin le séquestre.
 La négociation de clé pré-WireGuard (ADR-001, amendement du 24 juillet 2026)
 existe de bout en bout : port UDP dédié, authentification ML-DSA-65, trois modes
 et plancher anti-downgrade qui monte seul et ne redescend pas. Les deux IHM
-l’exposent — plancher par pair côté gateway, choix du mode, empreinte du
-certificat épinglé et état de l’identité côté Orion. L’identité cliente est
-scellée par DPAPI au compte Windows ; `helios-ctl enroll` fait l’enrôlement d’un
-trait (clés, certificats, admission, profil et identité en un document) en
-lisant le matériel public de la gateway par `GET /api/key-negotiation`.
+l’exposent — plancher par pair côté gateway ; côté Orion l’écran *Profils*
+édite tout le bloc, certificats compris, avec empreinte PQ dérivée en Rust et
+état de l’identité. Seul le plancher n’y est pas librement modifiable : il ne
+descend jamais sous la valeur avec laquelle le profil a été chargé.
+L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
+enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
+identité en un document) en lisant le matériel public de la gateway par
+`GET /api/key-negotiation`.
 **Limite connue** : DPAPI ne se compile ni ne s’exerce en WSL2 — hors Windows le
 scellement échoue explicitement plutôt que d’écrire ces clés en clair.
+
+Une invitation (`enroll --public-key`) ne porte pas de clé privée : l’import la
+reprend du profil local qui détient la **clé admise**, quel que soit son nom —
+la correspondance se fait sur la clé, jamais sur le nom. À défaut, le brouillon
+s’affiche quand même et le message nomme la clé attendue, celle qu’imprime
+`helios-ctl profile check`.
 
 La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
 `helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
 `helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
-compile plus rien. Les installateurs Orion (lot 3) restent à faire.
+compile plus rien. L’installateur Orion se bâtit par `cargo xtask orion-msi`,
+sur Windows uniquement — WiX n’a pas d’équivalent croisé.
 
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
 lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
@@ -121,7 +131,9 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
 - `xtask` : fabrique de bundles d’installation (poste de build, jamais la
-  gateway) — `cargo xtask bundle`, `cargo xtask pack`.
+  gateway) — `cargo xtask bundle`, `cargo xtask pack`, et
+  `cargo xtask orion-msi` pour l’installateur Windows (même commande que la CI
+  de release : les features y sont tenues en un seul endroit).
 - `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
   bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
   profils clients (`profile`) et séquestre (`escrow`) ;

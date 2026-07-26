@@ -130,14 +130,22 @@ pub fn check(path: &Path) -> Result<()> {
         "  adresse         : {}",
         profile.address.as_deref().unwrap_or("—")
     );
-    println!(
-        "  clé privée      : {}",
-        if profile.private_key.is_empty() {
-            "absente — Orion reprendra celle du profil local de même nom"
-        } else {
-            "présente"
-        }
-    );
+    // Ce que l'import fera de la clé privée absente est la question qu'on
+    // pose le plus souvent à cette commande : la clé admise est ce qui
+    // désigne le profil local à compléter, et l'afficher permet de la
+    // comparer à ce qu'Orion montre dans « Votre clé publique ».
+    match (
+        profile.private_key.is_empty(),
+        imported.admitted_public_key(),
+    ) {
+        (false, _) => println!("  clé privée      : présente"),
+        (true, Some(admitted)) => println!(
+            "  clé privée      : absente — Orion reprendra celle du profil local\n                    portant la clé admise {admitted}"
+        ),
+        (true, None) => println!(
+            "  clé privée      : absente — Orion reprendra celle du profil local de même nom"
+        ),
+    }
 
     match &profile.key_negotiation {
         Some(settings) => {

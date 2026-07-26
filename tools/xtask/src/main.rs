@@ -100,6 +100,25 @@ enum Cmd {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Builds the Orion Windows installer (MSI) on this machine.
+    ///
+    /// Same features and same checks as the CI job, so a local build and a
+    /// release build produce the same binary — the point being to find out
+    /// here, in seconds, what would otherwise cost a CI round-trip.
+    OrionMsi {
+        /// Produce an **unsigned** installer, for testing only.
+        ///
+        /// Without it, an Authenticode certificate and an RFC 3161 timestamp
+        /// server are required, and the build stops if either is missing.
+        #[arg(long)]
+        unsigned: bool,
+        /// Also produce the NSIS installer.
+        #[arg(long)]
+        with_nsis: bool,
+        /// Skip `npm ci` when `node_modules` is already installed.
+        #[arg(long)]
+        skip_npm_ci: bool,
+    },
     /// Archives a **signed** bundle.
     Pack {
         /// Directory produced by `bundle`, containing `manifest.json`.
@@ -119,6 +138,11 @@ fn main() -> Result<()> {
             skip_frontend,
             output,
         } => bundle(target, skip_frontend, output),
+        Cmd::OrionMsi {
+            unsigned,
+            with_nsis,
+            skip_npm_ci,
+        } => orion_msi(unsigned, with_nsis, skip_npm_ci),
         Cmd::Pack { dir, output } => pack(&dir, output),
     }
 }
@@ -234,6 +258,138 @@ fn extract_wireguard_files(archive: &Path, destination: &Path) -> Result<()> {
         std::fs::rename(&temporary, &output)
             .with_context(|| format!("validating {}", output.display()))?;
         println!("  {}", output.display());
+    }
+    Ok(())
+}
+
+/// Features the Orion installer must carry.
+///
+/// `wireguard` for the real data plane — without it Orion refuses to start
+/// rather than simulate — and `key-negotiation` for the pre-WireGuard PQC
+/// exchange. Omitting the second produces a client that imports a negotiating
+/// profile and then fails to connect, which is a slow way to discover a build
+/// flag.
+const ORION_FEATURES: &str = "wireguard,key-negotiation";
+
+/// Builds the Orion MSI locally, with the checks that make it worth trusting.
+///
+/// Every prerequisite is verified **before** the compilation starts. A build
+/// that runs for minutes and then stops on a missing environment variable is
+/// the exact waste this command exists to remove.
+fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let orion = root.join("apps").join("orion");
+
+    // WiX has no cross-compiler: the MSI is produced by Windows tooling on
+    // Windows. Saying so here beats letting the Tauri CLI report that `msi`
+    // is not among its bundle targets.
+    if !cfg!(windows) {
+        bail!(
+            "an MSI can only be built on Windows: WiX and the MSVC linker have no cross-target \
+             equivalent. On this machine, `cargo build -p orion --features {ORION_FEATURES}` \
+             checks that everything compiles; the installer itself is built on the Windows \
+             workstation or by the `release` CI job."
+        );
+    }
+
+    // Same anchor as the gateway bundle: a release build refuses the
+    // development keyring, and finds out in `aether`'s build script — several
+    // minutes in.
+    let keyring = std::env::var("HELIOS_PUBLISHER_KEYRING_PATH").map_err(|_| {
+        anyhow::anyhow!(
+            "HELIOS_PUBLISHER_KEYRING_PATH must point to the publisher's public keyring: \
+             a release build refuses the development anchor"
+        )
+    })?;
+    if !Path::new(&keyring).is_file() {
+        bail!("public keyring not found: {keyring}");
+    }
+
+    // Signing is required unless explicitly waived, and the waiver is loud:
+    // the signing script itself announces every unsigned artifact.
+    if unsigned {
+        println!("==> UNSIGNED build: this installer must not be distributed");
+        std::env::set_var("ORION_UNSIGNED_FOR_OFFLINE_SIGNING", "1");
+    } else {
+        for variable in ["ORION_SIGNING_CERT_SHA1", "ORION_TIMESTAMP_URL"] {
+            if std::env::var(variable).is_err() {
+                bail!(
+                    "{variable} is required to sign the installer. Set the Authenticode \
+                     thumbprint and an RFC 3161 timestamp server, or pass --unsigned to \
+                     produce a test installer that must not be distributed."
+                );
+            }
+        }
+    }
+
+    println!("==> WireGuardNT dependencies");
+    orion_deps()?;
+
+    if skip_npm_ci && orion.join("node_modules").is_dir() {
+        println!("==> npm: existing node_modules reused (--skip-npm-ci)");
+    } else {
+        println!("==> npm dependencies");
+        run(&orion, "npm", &["ci"])?;
+    }
+
+    // `--bundles msi` alone, unless NSIS is asked for: `targets: "all"` would
+    // also build it, doubling a wait this command is meant to shorten.
+    let bundles = if with_nsis { "msi,nsis" } else { "msi" };
+    println!("==> Orion installer ({ORION_FEATURES}, bundles: {bundles})");
+    run(
+        &orion,
+        "npm",
+        &[
+            "run",
+            "tauri",
+            "--",
+            "build",
+            "--features",
+            ORION_FEATURES,
+            "--bundles",
+            bundles,
+        ],
+    )?;
+
+    report_installers(&root.join("target").join("release").join("bundle"))
+}
+
+/// Lists what was produced, with a fingerprint for each artifact.
+///
+/// The fingerprint is what the operator compares after transferring the
+/// installer; printing it here saves computing it by hand later.
+fn report_installers(bundle_dir: &Path) -> Result<()> {
+    let mut found = Vec::new();
+    for kind in ["msi", "nsis"] {
+        let directory = bundle_dir.join(kind);
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "msi" | "exe"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    if found.is_empty() {
+        bail!(
+            "no installer found under {} — the Tauri build reported success but produced nothing",
+            bundle_dir.display()
+        );
+    }
+
+    println!();
+    println!("==> Installer(s) produced");
+    for path in found {
+        let digest = helios_update::sha256_file(&path)
+            .map_err(|e| anyhow::anyhow!("fingerprint of {}: {e}", path.display()))?;
+        println!("    {}", path.display());
+        println!("    sha256 {}", hex(&digest));
     }
     Ok(())
 }
@@ -556,6 +712,47 @@ mod tests {
                 "feature {feature} missing from the production bundle"
             );
         }
+    }
+
+    /// The installer must carry what makes Orion usable.
+    ///
+    /// `wireguard` because a client without it refuses to start rather than
+    /// simulate; `key-negotiation` because without it a negotiating profile
+    /// imports fine and then fails to connect — a build flag discovered
+    /// through a support call rather than a compiler error.
+    #[test]
+    fn the_orion_installer_carries_the_features_that_matter() {
+        for feature in ["wireguard", "key-negotiation"] {
+            assert!(
+                ORION_FEATURES.split(',').any(|f| f == feature),
+                "feature {feature} missing from the Orion installer"
+            );
+        }
+    }
+
+    /// The CI must build the installer through this tool.
+    ///
+    /// It used to spell the feature list out itself, and drifted: it shipped
+    /// installers without `key-negotiation` long after the client needed it.
+    /// Keeping a single source for the flags is what stops that from
+    /// happening again.
+    #[test]
+    fn the_release_workflow_builds_orion_through_xtask() {
+        let workflow = std::fs::read_to_string(
+            workspace_root()
+                .unwrap()
+                .join(".github/workflows/release.yml"),
+        )
+        .expect("the release workflow must exist");
+
+        assert!(
+            workflow.contains("cargo xtask orion-msi"),
+            "the release job must build the installer through `xtask orion-msi`"
+        );
+        assert!(
+            !workflow.contains("tauri build"),
+            "the release job must not spell out its own Tauri invocation: the features would drift"
+        );
     }
 
     /// The units and the example configuration must exist in the repo: a

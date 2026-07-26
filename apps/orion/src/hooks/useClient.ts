@@ -40,10 +40,12 @@ export function useClient() {
       if (imported) {
         setError(null)
         setPathImportedProfile(imported.profile)
-        // A double-click has no import panel to carry the notice, so the
-        // identity failure goes to the global error: the profile is there
-        // but would not connect, and that must not stay silent.
-        if (imported.identity_error) {
+        // A double-click has no import panel to carry the notice, so what
+        // would keep the profile from connecting goes to the global error:
+        // it is there on screen, and that must not stay silent.
+        if (imported.private_key_missing) {
+          setError(imported.private_key_missing)
+        } else if (imported.identity_error) {
           setError(`Identité non scellée : ${imported.identity_error}`)
         } else if (imported.identity_sealed) {
           pushLog('info', 'identité de négociation scellée dans le stockage protégé')

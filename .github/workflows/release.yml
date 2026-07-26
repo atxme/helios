@@ -9,6 +9,14 @@ name: Bundle de release
 # construit sous Linux, les installateurs Orion sous Windows, parce que le
 # bundling MSI/NSIS et l'édition de liens MSVC n'y ont pas d'équivalent
 # croisé. Aucun des deux ne demande quoi que ce soit à l'utilisateur final.
+#
+# Les deux jobs restent **indépendants** — aucun `needs` — donc parallèles :
+# la durée du workflow est celle du plus long, pas leur somme. Windows est
+# déclaré en premier parce que c'est ce plus long (toolchain MSVC, `npm ci`,
+# téléchargement de WireGuardNT, bundling WiX) et que l'ordonnanceur suit
+# l'ordre de déclaration quand les exécutants ne sont pas tous disponibles
+# d'un coup : le chemin critique démarre alors le premier au lieu d'attendre
+# que Linux ait pris sa place.
 on:
   push:
     tags:
@@ -19,6 +27,103 @@ permissions:
   contents: read
 
 jobs:
+  orion-windows:
+    name: Installateurs Orion (Windows)
+    # Le bundling MSI/NSIS et l'édition de liens MSVC n'existent que sur
+    # Windows : ce job est la seule façon de produire un installateur Orion
+    # sans machine Windows manuelle.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/orion/package-lock.json
+
+      # Orion dépend d'`aether`, dont le build script refuse le trousseau de
+      # développement en profil release. Un installateur se construit donc avec
+      # la même ancre publique que la gateway — sans elle, le build échoue.
+      - name: Ancre de confiance éditeur
+        shell: pwsh
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KEYRING)) {
+            Write-Output "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente. Y placer le contenu du trousseau PUBLIC de production."
+            exit 1
+          }
+          $path = Join-Path $env:RUNNER_TEMP "publisher-keyring.json"
+          [System.IO.File]::WriteAllText($path, $env:KEYRING)
+          if (Select-String -Path $path -Pattern "private" -Quiet) {
+            Write-Output "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          }
+
+      - name: Dépendances npm
+        run: npm ci --prefix apps/orion
+
+      # `beforeBuildCommand` déclenche `cargo xtask orion-deps`, qui télécharge
+      # WireGuardNT et vérifie son empreinte épinglée. La DLL entre dans
+      # l'installateur : l'utilisateur final ne télécharge jamais rien.
+      #
+      # Les features passent par `cargo xtask orion-msi`, qui les tient en un
+      # seul endroit (`ORION_FEATURES`) : une CI et un poste de build qui les
+      # énuméreraient chacun de leur côté finiraient par diverger, et la
+      # divergence ne se verrait qu'à l'usage — un installateur qui refuse un
+      # profil négociant, sans rien dire du drapeau manquant.
+      - name: Construction des installateurs
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+        run: cargo xtask orion-msi --unsigned --with-nsis --skip-npm-ci
+
+      # Le suffixe `-unsigned` est posé avant toute publication : un MSI sans
+      # signature ne doit pas pouvoir être confondu avec une release au moment
+      # où quelqu'un le récupère.
+      - name: Marquage et empreintes
+        shell: pwsh
+        run: |
+          $bundle = "target/release/bundle"
+          Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe | ForEach-Object {
+            $destination = Join-Path $_.DirectoryName "$($_.BaseName)-unsigned$($_.Extension)"
+            Move-Item -LiteralPath $_.FullName -Destination $destination
+          }
+
+          $artifacts = Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe
+          if ($artifacts.Count -eq 0) {
+            Write-Output "::error::Aucun installateur produit."
+            exit 1
+          }
+
+          # Garde-fou du chemin non signé : il doit avoir réellement laissé les
+          # artefacts nus. Un artefact à moitié signé serait le pire des deux.
+          $signed = $artifacts | Where-Object {
+            (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne "NotSigned"
+          }
+          if ($signed) {
+            Write-Output "::error::Artefact signé alors que la CI ne doit rien signer : $($signed.Name -join ', ')"
+            exit 1
+          }
+
+          $artifacts |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path -Leaf $_.Path) } |
+            Tee-Object -FilePath (Join-Path $bundle "SHA256SUMS")
+
+      # À télécharger sur le poste de signature, signer avec
+      # `windows/sign-orion.ps1`, puis distribuer.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installateurs-orion-windows-non-signes
+          path: |
+            target/release/bundle/msi/
+            target/release/bundle/nsis/
+            target/release/bundle/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
   bundle:
     name: Assemblage du bundle gateway
     runs-on: ubuntu-24.04
@@ -76,97 +181,5 @@ jobs:
           name: bundle-gateway
           path: |
             target/bundle/
-          if-no-files-found: error
-          retention-days: 14
-
-  orion-windows:
-    name: Installateurs Orion (Windows)
-    # Le bundling MSI/NSIS et l'édition de liens MSVC n'existent que sur
-    # Windows : ce job est la seule façon de produire un installateur Orion
-    # sans machine Windows manuelle.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: apps/orion/package-lock.json
-
-      # Orion dépend d'`aether`, dont le build script refuse le trousseau de
-      # développement en profil release. Un installateur se construit donc avec
-      # la même ancre publique que la gateway — sans elle, le build échoue.
-      - name: Ancre de confiance éditeur
-        shell: pwsh
-        env:
-          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:KEYRING)) {
-            Write-Output "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente. Y placer le contenu du trousseau PUBLIC de production."
-            exit 1
-          }
-          $path = Join-Path $env:RUNNER_TEMP "publisher-keyring.json"
-          [System.IO.File]::WriteAllText($path, $env:KEYRING)
-          if (Select-String -Path $path -Pattern "private" -Quiet) {
-            Write-Output "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
-            exit 1
-          }
-
-      - name: Dépendances npm
-        run: npm ci --prefix apps/orion
-
-      # `beforeBuildCommand` déclenche `cargo xtask orion-deps`, qui télécharge
-      # WireGuardNT et vérifie son empreinte épinglée. La DLL entre dans
-      # l'installateur : l'utilisateur final ne télécharge jamais rien.
-      - name: Construction des installateurs
-        env:
-          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
-          ORION_UNSIGNED_FOR_OFFLINE_SIGNING: "1"
-        run: npm run tauri build --prefix apps/orion -- --features wireguard
-
-      # Le suffixe `-unsigned` est posé avant toute publication : un MSI sans
-      # signature ne doit pas pouvoir être confondu avec une release au moment
-      # où quelqu'un le récupère.
-      - name: Marquage et empreintes
-        shell: pwsh
-        run: |
-          $bundle = "target/release/bundle"
-          Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe | ForEach-Object {
-            $destination = Join-Path $_.DirectoryName "$($_.BaseName)-unsigned$($_.Extension)"
-            Move-Item -LiteralPath $_.FullName -Destination $destination
-          }
-
-          $artifacts = Get-ChildItem -Path $bundle -Recurse -Include *.msi, *.exe
-          if ($artifacts.Count -eq 0) {
-            Write-Output "::error::Aucun installateur produit."
-            exit 1
-          }
-
-          # Garde-fou du chemin non signé : il doit avoir réellement laissé les
-          # artefacts nus. Un artefact à moitié signé serait le pire des deux.
-          $signed = $artifacts | Where-Object {
-            (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne "NotSigned"
-          }
-          if ($signed) {
-            Write-Output "::error::Artefact signé alors que la CI ne doit rien signer : $($signed.Name -join ', ')"
-            exit 1
-          }
-
-          $artifacts |
-            Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path -Leaf $_.Path) } |
-            Tee-Object -FilePath (Join-Path $bundle "SHA256SUMS")
-
-      # À télécharger sur le poste de signature, signer avec
-      # `windows/sign-orion.ps1`, puis distribuer.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: installateurs-orion-windows-non-signes
-          path: |
-            target/release/bundle/msi/
-            target/release/bundle/nsis/
-            target/release/bundle/SHA256SUMS
           if-no-files-found: error
           retention-days: 14

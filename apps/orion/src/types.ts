@@ -65,6 +65,14 @@ export interface ImportOutcome {
   identity_sealed: boolean
   /** Why sealing failed, when the document carried one and it did not. */
   identity_error: string | null
+  /**
+   * Why the draft has no private key.
+   *
+   * An invitation carries none, by design: the operator never held it. When
+   * no local profile holds the admitted half either, the draft is still
+   * shown — with this explanation — rather than refused.
+   */
+  private_key_missing: string | null
 }
 
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP

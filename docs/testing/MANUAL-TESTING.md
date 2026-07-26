@@ -190,34 +190,48 @@ séparément selon la plateforme.
 
 ### Installateurs Orion
 
-Sur le poste de build Windows, préparer les DLL puis produire un bundle signé :
+Sur le poste de build **Windows**, une seule commande :
 
 ```powershell
-cargo xtask orion-deps
+$env:HELIOS_PUBLISHER_KEYRING_PATH = "C:\chemin\publisher-keyring.json"
 $env:ORION_SIGNING_CERT_SHA1 = "EMPREINTE_SHA1_SANS_ESPACES"
 $env:ORION_TIMESTAMP_URL = "https://tsa.interne.example/rfc3161"
-npm run build:msi --prefix apps/orion
+cargo xtask orion-msi
 ```
 
-`build:msi` fixe les deux features qui décident de ce que le binaire sait
-faire : `wireguard` (backend réel — sans elle Orion refuse de démarrer plutôt
-que de simuler) et `key-negotiation` (négociation PQC avant le premier
-handshake ; sans elle, un profil qui en porte une échoue et l'écran *Profils*
-l'annonce). Elle ne produit que le MSI ; retirer `--bundles msi` pour avoir
-aussi le NSIS.
+C'est la **même** commande que joue la CI de release : les features y sont
+tenues en un seul endroit (`ORION_FEATURES`), donc un installateur bâti ici et
+un installateur bâti par la CI portent les mêmes drapeaux. Ces deux features
+décident de ce que le binaire sait faire — `wireguard` (backend réel ; sans
+elle Orion refuse de démarrer plutôt que de simuler) et `key-negotiation`
+(négociation PQC avant le premier handshake ; sans elle, un profil qui en porte
+une s'importe puis échoue à se connecter).
 
-Pour un MSI de test, sans certificat Authenticode :
+Tous les prérequis sont vérifiés **avant** la compilation : trousseau éditeur,
+certificat de signature, horodateur. Un build qui tourne plusieurs minutes puis
+s'arrête sur une variable manquante est exactement ce que cette commande évite.
+
+Pour un installateur de test, sans certificat Authenticode :
 
 ```powershell
-$env:ORION_UNSIGNED_FOR_OFFLINE_SIGNING = "1"
-npm run build:msi --prefix apps/orion
+cargo xtask orion-msi --unsigned
 ```
 
 Ce chemin est bruyant par construction : chaque artefact est annoncé comme non
 signé. Il sert à éprouver l'installation et la négociation, jamais à
-distribuer — Windows affichera un avertissement SmartScreen à l'installation.
+distribuer — Windows affichera un avertissement SmartScreen.
 
-Le MSI est produit dans `target/release/bundle/msi/`.
+Options : `--with-nsis` pour produire aussi le NSIS, `--skip-npm-ci` quand
+`node_modules` est déjà installé. La commande termine en affichant le chemin et
+l'empreinte SHA-256 de chaque artefact — la valeur à comparer après transfert.
+
+Sur une machine qui n'est pas Windows, la commande **refuse immédiatement** en
+expliquant pourquoi : WiX et l'éditeur de liens MSVC n'ont pas d'équivalent
+croisé. Ce qui reste vérifiable ailleurs, c'est la compilation :
+
+```sh
+HELIOS_PUBLISHER_KEYRING_PATH=... cargo build -p orion --features wireguard,key-negotiation
+```
 
 Après installation sur une machine propre :
 
@@ -226,7 +240,9 @@ Après installation sur une machine propre :
 3. importer un profil `.orionprofile` par double-clic quand Orion est arrêté ;
 4. recommencer avec Orion ouvert et confirmer qu'une seule fenêtre subsiste ;
 5. pour une invitation sans clé privée, confirmer la reprise de la clé du
-   profil local de même nom et le refus si ce profil local n'existe pas ;
+   profil local qui détient la **clé admise** — quel que soit son nom — et,
+   si aucun profil local ne la détient, l'affichage du brouillon accompagné
+   du message nommant cette clé ;
 6. connecter réellement le tunnel et contrôler handshake, routes et retrait
    uniquement après déconnexion explicite.
 
@@ -253,9 +269,14 @@ clé publique — celle qu'affiche l'écran *Profils* sous « Votre clé publiqu
 ```
 
 Le document produit ne porte alors aucune clé privée WireGuard : à l'import,
-Orion reprend celle du profil local de même nom et ne fait que lui ajouter le
-bloc de négociation. L'admission déjà en place sur la gateway reste valable,
-puisque la clé ne change pas.
+Orion reprend celle du profil local qui détient cette clé publique et ne fait
+que lui ajouter le bloc de négociation. L'admission déjà en place sur la
+gateway reste valable, puisque la clé ne change pas.
+
+La correspondance se fait sur la **clé**, pas sur le nom : le poste nomme
+rarement son profil comme l'opérateur nomme le pair, et exiger l'égalité des
+deux refusait des documents pourtant valables. La clé admise est celle
+qu'affiche `helios-ctl profile check <fichier>`.
 
 Elle crée la CA opérateur si besoin, fait naître l'identité de négociation
 **sur** la gateway (scellée au TPM), ouvre le port dans son `network.toml`, émet
@@ -283,7 +304,12 @@ Sur le poste Windows :
 5. côté gateway, `helios-ctl peer list` doit montrer le plancher monté à
    `ml_kem` pour ce pair ;
 6. rejouer une connexion après avoir forcé `--mode classic` dans l'écran
-   *Profils* : le mode doit être **indisponible**, le plancher ayant monté.
+   *Profils* : le mode doit être **indisponible**, le plancher ayant monté ;
+7. toujours dans *Profils*, éprouver l'édition du bloc : coller un certificat
+   PQ tronqué doit afficher l'empreinte « illisible », signaler le bloc en
+   erreur et désactiver *Enregistrer* ; le *Plancher* ne doit proposer que
+   des valeurs supérieures ou égales à celle du profil chargé, et *Retirer*
+   doit disparaître dès que ce plancher dépasse « Classique ».
 
 Contrôles négatifs, qui valent plus que le chemin nominal :
 
@@ -321,9 +347,12 @@ Vérifier ensuite, dans l'onglet **Profils** :
 - importer `lab.invitation.json` (sans clé privée) alors qu'un profil `lab`
   existe déjà localement : la clé privée locale doit être reprise
   silencieusement, sans que l'utilisateur ait à la ressaisir ;
-- importer ce même fichier d'invitation sur un profil **inconnu** (renommer le
-  champ `name`) : l'import doit être refusé avec un message expliquant qu'il
-  faut l'importer sur le poste qui détient la clé, et ne modifier aucun profil.
+- importer ce même fichier d'invitation en ayant renommé le profil local :
+  la clé doit être reprise quand même, la correspondance se faisant sur la
+  clé admise ;
+- importer une invitation dont **aucun** profil local ne détient la clé : le
+  brouillon doit s'afficher, le champ *Clé privée* rester vide et le message
+  nommer la clé attendue, sans qu'aucun profil enregistré ne soit modifié.
 
 ### Le chemin manuel
 

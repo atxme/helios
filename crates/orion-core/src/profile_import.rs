@@ -53,8 +53,8 @@ struct JsonProfile {
     endpoint: String,
     /// Absent in an invitation profile: the operator doesn't hold the
     /// client's private key and therefore has nothing to send back
-    /// (ADR-004 §6). The UI then completes it from the local profile of the
-    /// same name.
+    /// (ADR-004 §6). [`complete_profile_import`] then takes it from the local
+    /// profile holding the admitted key.
     #[serde(default)]
     private_key: String,
     peer_public_key: String,
@@ -151,6 +151,44 @@ pub struct ProfileImport {
     pub identity: Option<ClientIdentityBundle>,
 }
 
+impl ProfileImport {
+    /// WireGuard public key the gateway admitted for this document.
+    ///
+    /// Read from the client PQ certificate that travels with the identity:
+    /// admission is bound to **that** key, so it is what says which local
+    /// private key completes an invitation. The profile name never proved
+    /// anything — the same client is routinely named differently on the
+    /// operator's side and on the user's machine.
+    ///
+    /// `None` when the document ships no identity, or when its certificate
+    /// carries no key: completion then falls back to the name.
+    pub fn admitted_public_key(&self) -> Option<String> {
+        let identity = self.identity.as_ref()?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(identity.pq_certificate.trim())
+            .ok()?;
+        let certificate: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let key = certificate.get("wireguard_public_key")?.as_str()?.trim();
+        (!key.is_empty()).then(|| key.to_string())
+    }
+}
+
+/// A decoded document, completed against the local configuration.
+///
+/// The private key is reported missing rather than raised as an error: the
+/// rest of the document is sound and worth showing — endpoint, virtual
+/// address, pinned certificate — and a screen that displays it lets the user
+/// paste the key or re-enroll. Refusing outright left them with nothing to
+/// look at and no idea which key was expected.
+#[derive(Debug)]
+pub struct CompletedImport {
+    pub profile: ClientProfile,
+    /// User-facing explanation when no local profile holds the private half.
+    /// The profile is then handed over with an empty `private_key`, and
+    /// stays unconnectable until it is filled in.
+    pub private_key_missing: Option<String>,
+}
+
 /// Decodes an imported profile without writing it to disk.
 ///
 /// The file suffix picks the parser; for a suffix-less file, the first
@@ -217,30 +255,67 @@ pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
     parse_profile_import(&contents, file_name)
 }
 
-/// Completes an invitation document from the local profile of the same name.
+/// Completes an invitation document from the local profile that holds the
+/// admitted key.
 ///
-/// Both file-picker and system-association imports call this function. An
-/// invitation received on another machine is explicitly refused: fabricating
-/// a new private key would break the admission already tied to the original
-/// public key.
+/// Both file-picker and system-association imports call this function. No
+/// private key is ever fabricated here: a new one would break the admission
+/// the gateway already granted to the original public key.
+///
+/// `admitted_public_key` — see [`ProfileImport::admitted_public_key`] — is
+/// what designates the local profile. It is matched by **key**, not by name:
+/// `helios-ctl enroll --public-key` is normally run for a client that already
+/// exists locally under another name, and the name rule alone refused those
+/// documents. When the document names no key, the name stays the only
+/// available criterion.
 pub fn complete_profile_import(
     mut profile: ClientProfile,
     config: &ClientConfig,
-) -> Result<ClientProfile> {
-    if profile.private_key.is_empty() {
-        let existing = config
-            .find(&profile.name)
-            .filter(|candidate| !candidate.private_key.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "ce profil ne contient pas de clé privée et aucun profil local « {} » n'en fournit une ; l'importer sur le poste qui a généré la clé ou demander un profil complet à l'opérateur",
-                    profile.name
-                )
-            })?;
-        profile.private_key = existing.private_key.clone();
+    admitted_public_key: Option<&str>,
+) -> Result<CompletedImport> {
+    if !profile.private_key.is_empty() {
+        profile.validate()?;
+        return Ok(CompletedImport {
+            profile,
+            private_key_missing: None,
+        });
     }
+
+    let local = match admitted_public_key {
+        // A same-name profile holding *another* key is not a match: it was
+        // never admitted, and its tunnel would fail at the first handshake
+        // without saying why.
+        Some(admitted) => config
+            .profiles
+            .iter()
+            .find(|candidate| candidate.public_key().as_deref() == Some(admitted)),
+        None => config
+            .find(&profile.name)
+            .filter(|candidate| !candidate.private_key.trim().is_empty()),
+    };
+
+    let Some(existing) = local else {
+        let missing = match admitted_public_key {
+            Some(admitted) => format!(
+                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil de ce poste ne détient la clé admise « {admitted} ». Coller la clé privée correspondante, ou demander un profil complet à l'opérateur."
+            ),
+            None => format!(
+                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil local « {} » n'en fournit une. Coller la clé privée correspondante, ou demander un profil complet à l'opérateur.",
+                profile.name
+            ),
+        };
+        return Ok(CompletedImport {
+            profile,
+            private_key_missing: Some(missing),
+        });
+    };
+
+    profile.private_key = existing.private_key.clone();
     profile.validate()?;
-    Ok(profile)
+    Ok(CompletedImport {
+        profile,
+        private_key_missing: None,
+    })
 }
 
 fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
@@ -1073,12 +1148,85 @@ mod tests {
             ..complete_profile()
         });
 
-        let completed = complete_profile_import(imported.profile, &config).unwrap();
+        let completed = complete_profile_import(imported.profile, &config, None)
+            .unwrap()
+            .profile;
         assert_eq!(completed.private_key, CLIENT_PRIVATE);
         assert!(
             completed.key_negotiation.is_some(),
             "the negotiation block must survive completion"
         );
+    }
+
+    /// The decisive case of an enrolled client: the operator names it
+    /// `poste-windows`, the machine kept it under another name, and the
+    /// admitted key is the same on both sides. Matching by name refused the
+    /// document; matching by key is what makes it importable.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn an_invitation_is_completed_by_the_admitted_key_whatever_the_name() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let admitted = ClientProfile {
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        }
+        .public_key()
+        .unwrap();
+
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["private_key"] = serde_json::Value::String(String::new());
+        let mut bundle = identity_bundle(&settings.identity);
+        bundle["pq_certificate"] = serde_json::Value::String(STANDARD.encode(
+            serde_json::json!({ "version": 1, "wireguard_public_key": admitted }).to_string(),
+        ));
+        document["profile"]["key_negotiation_identity"] = bundle;
+
+        let imported =
+            parse_profile_import(&document.to_string(), "portable.orionprofile").unwrap();
+        assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
+
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            // Same client, other name: the situation the name rule refused.
+            name: "poste-de-christophe".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        });
+
+        let admitted_key = imported.admitted_public_key();
+        let completed =
+            complete_profile_import(imported.profile, &config, admitted_key.as_deref()).unwrap();
+        assert_eq!(completed.private_key_missing, None);
+        assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
+        assert_eq!(completed.profile.name, "portable");
+    }
+
+    /// A same-name profile holding **another** key is not a match: it was
+    /// never admitted, and using it would produce a tunnel that handshakes
+    /// with nobody.
+    #[cfg(feature = "key-negotiation")]
+    #[test]
+    fn a_local_profile_holding_another_key_does_not_complete_an_invitation() {
+        let invitation = ClientProfile {
+            private_key: String::new(),
+            ..complete_profile()
+        };
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
+            ..complete_profile()
+        });
+
+        let completed =
+            complete_profile_import(invitation, &config, Some("une-autre-clé-publique")).unwrap();
+        let message = completed
+            .private_key_missing
+            .expect("an unadmitted local key must not complete the document");
+        assert!(message.contains("une-autre-clé-publique"), "{message}");
+        assert!(completed.profile.private_key.is_empty());
     }
 
     /// An identity sealed under a name the profile never looks up would be a
@@ -1171,12 +1319,13 @@ mod tests {
             selected: None,
         };
 
-        let completed = complete_profile_import(invitation, &config).unwrap();
-        assert_eq!(completed.private_key, CLIENT_PRIVATE);
+        let completed = complete_profile_import(invitation, &config, None).unwrap();
+        assert_eq!(completed.private_key_missing, None);
+        assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
     }
 
     #[test]
-    fn refuses_an_invitation_without_a_matching_local_key() {
+    fn reports_an_invitation_without_a_matching_local_key() {
         let invitation = ClientProfile {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -1185,8 +1334,17 @@ mod tests {
             ..ClientProfile::default()
         };
 
-        let error = complete_profile_import(invitation, &ClientConfig::default()).unwrap_err();
-        assert!(error.to_string().contains("aucun profil local"));
+        // Reported, not raised: the draft stays visible so the user sees
+        // which endpoint and which address were issued, and can paste the
+        // key rather than being told to start over.
+        let completed =
+            complete_profile_import(invitation, &ClientConfig::default(), None).unwrap();
+        let message = completed
+            .private_key_missing
+            .expect("the absence of a key must be reported");
+        assert!(message.contains("aucun profil local"), "{message}");
+        assert!(completed.profile.private_key.is_empty());
+        assert_eq!(completed.profile.name, "portable");
     }
 
     /// Tolerating the absence of a private key must not tolerate a truncated

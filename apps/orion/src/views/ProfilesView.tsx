@@ -25,11 +25,12 @@ import {
   Plus,
   RotateCcw,
   Save,
+  ShieldPlus,
   Trash2,
   Upload,
 } from 'lucide-react'
 import * as api from '../api'
-import { modeAllowed, modeMeta, PROTECTION_MODES } from '../components/state'
+import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import { GUTTER } from '../theme'
 import type {
   ClientConfig,
@@ -44,10 +45,17 @@ import type {
 /**
  * Profiles view — master-detail.
  *
- * The stance comes from actual usage: **a profile is imported, not typed**.
- * Nobody enters a base64 key by hand. The screen therefore favors choosing
- * and importing, not filling in; the four settings almost never touched
- * live under "Advanced".
+ * The stance comes from actual usage: **a profile is normally imported, not
+ * typed**. The screen therefore favors choosing and importing, and keeps the
+ * four settings almost never touched under "Advanced".
+ *
+ * "Normally" is not "only", and that is the difference with the first
+ * version: everything a profile holds is editable here, key negotiation
+ * included. A document that arrives with the wrong negotiation endpoint, or
+ * a gateway whose certificate has been reissued, used to leave the user with
+ * a read-only block and a command line to run elsewhere. The **one** thing
+ * this screen still cannot do is lower the anti-downgrade floor — that is an
+ * invariant, not an ergonomic choice.
  *
  * Warnings are **conditional** rather than permanent: a paragraph shown at
  * all times becomes invisible from being there. The one about `AllowedIPs`
@@ -77,8 +85,9 @@ function blankProfile(): ClientProfile {
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
     heliosd_url: null,
-    // Negotiation material comes from the operator, never from a blank form:
-    // it carries a pinned certificate nobody types by hand.
+    // No negotiation by default: its material comes from the operator, and a
+    // block full of empty certificates would report itself faulty from the
+    // first render. Adding one is one click away in the block below.
     key_negotiation: null,
   }
 }
@@ -107,6 +116,26 @@ const VALIDATION_DELAY_MS = 500
  */
 const HISTORY_LIMIT = 50
 
+/**
+ * Negotiation settings for a block being created by hand.
+ *
+ * The floor starts at `classic` because nothing has been negotiated yet: it
+ * is raised by the first committed negotiation, and by this screen, but it
+ * would be a lie to start it at the mode merely *wished for*. The mode, on
+ * the other hand, starts at the strongest — that is what one comes here for.
+ */
+function blankNegotiation(): KeyNegotiationSettings {
+  return {
+    mode: 'ml_kem',
+    minimum_mode: 'classic',
+    endpoint: '',
+    server_name: '',
+    gateway_ca_der: '',
+    gateway_pq_certificate: '',
+    identity: '',
+  }
+}
+
 export function ProfilesView({
   config,
   pathImport,
@@ -116,11 +145,21 @@ export function ProfilesView({
   onDelete,
   onSelect,
 }: Props) {
-  const [draft, setDraft] = useState<ClientProfile>(
-    () =>
-      config.profiles.find((profile) => profile.name === config.selected) ??
-      config.profiles[0] ??
-      blankProfile(),
+  const initial =
+    config.profiles.find((profile) => profile.name === config.selected) ??
+    config.profiles[0] ??
+    blankProfile()
+  const [draft, setDraft] = useState<ClientProfile>(initial)
+  /**
+   * Floor this profile arrived with — the one the screen may not go under.
+   *
+   * It is captured whenever a profile is *loaded* rather than read from the
+   * draft: the draft is exactly what the user is allowed to raise, so
+   * comparing it to itself would authorize a slow slide back down, one save
+   * at a time.
+   */
+  const [floorBaseline, setFloorBaseline] = useState<ProtectionMode | null>(
+    initial.key_negotiation?.minimum_mode ?? null,
   )
   const [dirty, setDirty] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -224,18 +263,30 @@ export function ProfilesView({
     }
   }, [draft])
 
+  /**
+   * Replaces the draft wholesale.
+   *
+   * Selecting, importing, reverting and starting fresh all go through here:
+   * each of them also resets the undo history and re-arms the floor ratchet,
+   * and doing that at four call sites is how one of them ends up forgetting.
+   */
+  const loadDraft = useCallback((profile: ClientProfile) => {
+    setDraft(profile)
+    setHistory([])
+    setFloorBaseline(profile.key_negotiation?.minimum_mode ?? null)
+  }, [])
+
   useEffect(() => {
     if (dirty) return
     const selected =
       config.profiles.find((profile) => profile.name === config.selected) ?? config.profiles[0]
-    if (selected) setDraft(selected)
-  }, [config, dirty])
+    if (selected) loadDraft(selected)
+  }, [config, dirty, loadDraft])
 
   useEffect(() => {
     if (!pathImport) return
     const replaces = config.profiles.some((candidate) => candidate.name === pathImport.name)
-    setDraft(pathImport)
-    setHistory([])
+    loadDraft(pathImport)
     setDirty(true)
     setImportNotice({
       tone: 'success',
@@ -244,7 +295,7 @@ export function ProfilesView({
         : `« ${pathImport.name} » chargé. Vérifiez-le puis enregistrez-le.`,
     })
     onPathImportHandled()
-  }, [config.profiles, onPathImportHandled, pathImport])
+  }, [config.profiles, loadDraft, onPathImportHandled, pathImport])
 
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
@@ -253,29 +304,63 @@ export function ProfilesView({
     setImportNotice(null)
   }
 
-  /**
-   * Selects the negotiated mode.
-   *
-   * A mode under the floor is refused here rather than silently written: the
-   * core refuses it too, before any network access, and the screen must not
-   * promise what the connection would reject.
-   */
+  /** Writes one field of the negotiation block. */
   const setNegotiation = <Key extends keyof KeyNegotiationSettings>(
     key: Key,
     value: KeyNegotiationSettings[Key],
   ) => {
     const settings = draft.key_negotiation
     if (!settings) return
-    // The floor is the one thing this screen cannot lower: it is enforced
-    // identically by the gateway, and offering the gesture would only produce
-    // a connection refused a second later.
+    // A mode under the floor is refused here rather than silently written:
+    // the core refuses it too, before any network access, and the screen must
+    // not promise what the connection would reject.
     if (key === 'mode' && !modeAllowed(value as ProtectionMode, settings.minimum_mode)) return
+    editNegotiation({ [key]: value } as Partial<KeyNegotiationSettings>)
+  }
+
+  /**
+   * Raises the anti-downgrade floor.
+   *
+   * Only upward, and only above the value the profile was loaded with: the
+   * gateway holds the same ratchet per peer, so a floor lowered here would
+   * merely produce a negotiation refused at the other end. Raising it past
+   * the selected mode pulls the mode along — leaving a mode below its own
+   * floor would just make the profile invalid on the spot.
+   */
+  const raiseFloor = (floor: ProtectionMode) => {
+    const settings = draft.key_negotiation
+    if (!settings) return
+    if (floorBaseline && !modeAllowed(floor, floorBaseline)) return
+    editNegotiation({
+      minimum_mode: floor,
+      ...(modeAllowed(settings.mode, floor) ? {} : { mode: floor }),
+    })
+  }
+
+  const editNegotiation = (patch: Partial<KeyNegotiationSettings>) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
     setDraft((profile) =>
       profile.key_negotiation
-        ? { ...profile, key_negotiation: { ...profile.key_negotiation, [key]: value } }
+        ? { ...profile, key_negotiation: { ...profile.key_negotiation, ...patch } }
         : profile,
     )
+    setDirty(true)
+    setImportNotice(null)
+  }
+
+  /**
+   * Adds a negotiation block to a profile that had none, or removes it.
+   *
+   * Removal is a downgrade — the tunnel then goes back to mounting before
+   * anything is authenticated — so it is offered only while nothing has been
+   * negotiated yet. Once a floor exists, that floor is what forbids it.
+   */
+  const toggleNegotiation = (enabled: boolean) => {
+    if (!enabled && floorBaseline && modeLevel(floorBaseline) > 0) return
+    setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
+    const settings = enabled ? blankNegotiation() : null
+    setDraft((profile) => ({ ...profile, key_negotiation: settings }))
+    setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
     setImportNotice(null)
   }
@@ -296,8 +381,7 @@ export function ProfilesView({
       config.profiles.find((profile) => profile.name === config.selected) ??
       config.profiles[0]
     if (!saved) return
-    setDraft(saved)
-    setHistory([])
+    loadDraft(saved)
     setDirty(false)
     setImportNotice(null)
   }
@@ -353,13 +437,18 @@ export function ProfilesView({
       const profile = imported.profile
       const existing = config.profiles.find((candidate) => candidate.name === profile.name)
 
-      setDraft(profile)
-      setHistory([])
+      loadDraft(profile)
       setDirty(true)
+      // A missing private key outranks the rest: the profile is on screen but
+      // WireGuard has nothing to sign with, and the message says which key is
+      // expected — that is what lets the user act.
+      if (imported.private_key_missing) {
+        setImportNotice({ tone: 'error', message: imported.private_key_missing })
+      }
       // The identity failing to seal outranks the profile loading fine: the
       // profile is visible on screen, whereas an unsealed identity only
       // shows up much later, as a connection that fails before WireGuard.
-      if (imported.identity_error) {
+      else if (imported.identity_error) {
         setImportNotice({
           tone: 'error',
           message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}`,
@@ -425,8 +514,7 @@ export function ProfilesView({
                 <Box component="li" key={profile.name}>
                   <ButtonBase
                     onClick={() => {
-                      setDraft(profile)
-                      setHistory([])
+                      loadDraft(profile)
                       setDirty(false)
                       setImportNotice(null)
                       void onSelect(profile.name).catch(() => {})
@@ -505,8 +593,7 @@ export function ProfilesView({
               color="inherit"
               startIcon={<Plus size={15} aria-hidden />}
               onClick={() => {
-                setDraft(blankProfile())
-                setHistory([])
+                loadDraft(blankProfile())
                 setDirty(true)
                 setImportNotice(null)
               }}
@@ -654,13 +741,14 @@ export function ProfilesView({
 
           <KeyNegotiation
             settings={draft.key_negotiation}
+            floorBaseline={floorBaseline}
             issue={issues.key_negotiation}
             support={support}
             fingerprint={fingerprint}
             identitySealed={identitySealed}
-            profileName={draft.name}
-            publicKey={publicKey}
             onChange={setNegotiation}
+            onRaiseFloor={raiseFloor}
+            onToggle={toggleNegotiation}
           />
         </Box>
       </Box>
@@ -735,43 +823,48 @@ export function ProfilesView({
 }
 
 /**
- * Key negotiation — the only screen where the user chooses a level of
+ * Key negotiation — the only place where the user chooses a level of
  * protection rather than an address.
  *
- * Everything here except the mode is **received**, not typed: endpoint,
- * server name, pinned certificate and identity name come from the operator's
- * document. They are shown read-only, because their only real use is to be
- * compared — a fingerprint read out loud is what ties the imported material
- * to the right gateway.
+ * The block is normally **received**: `helios-ctl enroll` fills it, and
+ * nobody types a certificate by hand. But received is not immutable — a
+ * negotiation endpoint moves, a gateway certificate gets reissued, a lab
+ * differs from production — so every field is editable here, certificates
+ * included. What guards against a bad edit is not a read-only attribute: it
+ * is the core, which re-verifies the pinned certificate against the peer key
+ * of this very profile and reports the block as faulty.
  *
- * The mode is the one editable decision, and it only goes **up**: the floor
+ * One exception, and it is not ergonomic: the **floor only goes up**. It
  * rises by itself after each committed negotiation, on this side as on the
- * gateway's. Lower modes are therefore shown disabled rather than hidden —
- * seeing what one has left behind is the whole point of a ratchet.
+ * gateway's, and the gateway would refuse a weaker mode anyway. Modes below
+ * it are shown disabled rather than hidden — seeing what one has left behind
+ * is the whole point of a ratchet.
  */
 function KeyNegotiation({
   settings,
+  floorBaseline,
   issue,
   support,
   fingerprint,
   identitySealed,
-  profileName,
-  publicKey,
   onChange,
+  onRaiseFloor,
+  onToggle,
 }: {
   settings: KeyNegotiationSettings | null
+  /** Floor the profile was loaded with: the screen never goes under it. */
+  floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
-  fingerprint: string | null
   /** The identity this profile names is sealed on this machine. */
   identitySealed: boolean
-  profileName: string
-  /** This profile's WireGuard public key, to be enrolled unchanged. */
-  publicKey: string | null
+  fingerprint: string | null
   onChange: <Key extends keyof KeyNegotiationSettings>(
     key: Key,
     value: KeyNegotiationSettings[Key],
   ) => void
+  onRaiseFloor: (floor: ProtectionMode) => void
+  onToggle: (enabled: boolean) => void
 }) {
   const title = (
     <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
@@ -781,115 +874,77 @@ function KeyNegotiation({
 
   if (!settings) {
     return (
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
         {title}
-        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-          Ce profil n’en fait pas. Il monte un tunnel classique, puis demande un PSK
-          post-quantique par l’API interne : son <strong>premier handshake</strong> n’est donc pas
-          protégé.
+        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.5 }}>
+          Aucune : le tunnel monte d’abord, le PSK post-quantique n’arrive
+          qu’ensuite par l’API. Le <strong>premier handshake</strong> n’est donc pas protégé.
         </Typography>
-        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-          Le bloc ne se saisit pas ici : il porte le certificat épinglé de la gateway et le
-          certificat client, que l’opérateur émet. Lui demander un profil <em>enrôlé</em> —
-          en repartant de la clé publique ci-dessus, l’enrôlement conserve l’identité WireGuard
-          de ce profil et l’import remplacera celui-ci :
-        </Typography>
-        <Box
-          component="pre"
-          sx={{
-            m: 0,
-            px: 1,
-            py: 0.75,
-            borderRadius: 1,
-            border: '1px solid',
-            borderColor: 'divider',
-            bgcolor: 'action.hover',
-            fontFamily: 'monospace',
-            fontSize: 10,
-            lineHeight: 1.6,
-            overflowX: 'auto',
-            userSelect: 'text',
-          }}
+        <Button
+          size="small"
+          variant="outlined"
+          startIcon={<ShieldPlus size={14} aria-hidden />}
+          onClick={() => onToggle(true)}
+          sx={{ ml: 'auto', flexShrink: 0 }}
         >
-          {`helios-ctl enroll --name ${profileName || '<profil>'} \\\n`}
-          {`  --endpoint <gateway>:51820 \\\n`}
-          {`  --public-key ${publicKey ?? '<votre clé publique>'} \\\n`}
-          {`  --client-ca-dir ./orion-client-ca \\\n`}
-          {`  --output ${profileName || 'profil'}.orionprofile`}
-        </Box>
+          Ajouter
+        </Button>
       </Box>
     )
   }
 
-  const floor = modeMeta(settings.minimum_mode)
   const selected = modeMeta(settings.mode)
   const unusable = support && (!support.compiled || !support.identity_store)
+  // Removing the block is a downgrade. It stays possible while nothing has
+  // been negotiated — a block just added by hand, typically — and the floor
+  // is what closes the door as soon as something has.
+  const removable = !floorBaseline || modeLevel(floorBaseline) === 0
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        {/* No floor chip here: the "Plancher" row below states it, and
+            saying it twice is how a screen ends up unreadable. */}
         {title}
-        <Tooltip
-          title={`Les modes sous « ${floor.label} » sont refusés avant tout accès réseau. Ce plancher monte seul après chaque négociation aboutie et ne redescend pas depuis cet écran.`}
-        >
-          <Typography
-            sx={{
-              px: 0.75,
-              py: 0.15,
-              border: '1px solid',
-              borderColor: 'divider',
-              borderRadius: 1,
-              color: 'text.secondary',
-              fontFamily: 'monospace',
-              fontSize: 10,
-            }}
-          >
-            plancher : {floor.label}
-          </Typography>
-        </Tooltip>
+        {removable && (
+          <Tooltip title="Retirer la négociation : le tunnel remonterait sans protection avant le premier handshake.">
+            <Button
+              size="small"
+              variant="text"
+              color="inherit"
+              onClick={() => onToggle(false)}
+              sx={{ ml: 'auto', color: 'text.secondary', fontSize: 11 }}
+            >
+              Retirer
+            </Button>
+          </Tooltip>
+        )}
       </Box>
 
-      <ToggleButtonGroup
-        exclusive
-        size="small"
+      <ModeChoice
+        label="Mode"
         value={settings.mode}
-        onChange={(_event, value: ProtectionMode | null) => {
-          if (value) onChange('mode', value)
-        }}
-        aria-label="Mode de négociation"
-        sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
-      >
-        {PROTECTION_MODES.map((mode) => {
-          const meta = modeMeta(mode)
-          const allowed = modeAllowed(mode, settings.minimum_mode)
-          return (
-            <ToggleButton
-              key={mode}
-              value={mode}
-              disabled={!allowed}
-              aria-label={meta.label}
-              title={allowed ? meta.detail : `Sous le plancher : ${floor.label}.`}
-            >
-              {meta.label}
-            </ToggleButton>
-          )
-        })}
-      </ToggleButtonGroup>
-
+        floor={settings.minimum_mode}
+        onChange={(mode) => onChange('mode', mode)}
+      />
       <Typography color="text.secondary" sx={{ fontSize: 11, lineHeight: 1.55 }}>
         {selected.detail}
       </Typography>
 
-      {/* Editable: where to reach the service, and which sealed entry to
-          present. Both are local facts — a lab endpoint differs from the
-          public one, and an identity may have been sealed under another
-          name. Neither is covered by the pinned certificate, so changing
-          them breaks nothing cryptographic. */}
+      <ModeChoice
+        label="Plancher"
+        value={settings.minimum_mode}
+        floor={floorBaseline ?? 'classic'}
+        hint="Mode sous lequel ce profil refuse de négocier, avant tout accès réseau. Il ne redescend pas : le relever engage les connexions suivantes."
+        onChange={onRaiseFloor}
+      />
+
       <Box
         sx={{
           display: 'grid',
           gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
           gap: 1.5,
+          mt: 0.5,
         }}
       >
         <Field
@@ -899,48 +954,54 @@ function KeyNegotiation({
           onChange={(value) => onChange('endpoint', value)}
         />
         <Field
+          label="Nom du serveur"
+          placeholder="nom porté par le certificat"
+          value={settings.server_name}
+          onChange={(value) => onChange('server_name', value)}
+        />
+        <Field
           label="Identité protégée"
+          placeholder="orion-poste"
           value={settings.identity}
           onChange={(value) => onChange('identity', value)}
         />
+        <Box sx={{ display: 'flex', alignItems: 'center' }}>
+          <Detail
+            label="identité"
+            value={identitySealed ? 'scellée' : 'absente de ce poste'}
+            hint={
+              identitySealed
+                ? 'Certificat client scellé au compte Windows par DPAPI. Le fichier d’enrôlement n’est plus nécessaire.'
+                : 'Aucune identité de ce nom sur ce poste : importer le fichier d’enrôlement produit par « helios-ctl enroll ».'
+            }
+          />
+        </Box>
       </Box>
 
-      {/* Read-only: pinned by the gateway certificate. `server_name` is the
-          subject Orion verifies it against, so a typo here would not
-          "fix" anything — it would only turn a sound pin into a refusal. */}
-      <Box
-        sx={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-          columnGap: 1.5,
-          rowGap: 0.4,
-        }}
-      >
-        <Detail
-          label="serveur"
-          value={settings.server_name}
-          hint="Nom que le certificat de la gateway authentifie. Épinglé : il ne se modifie qu’en réémettant le certificat côté gateway."
-        />
-        <Detail
-          label="identité"
-          value={identitySealed ? 'scellée' : 'absente de ce poste'}
-          hint={
-            identitySealed
-              ? 'Certificat client scellé au compte Windows par DPAPI. Le fichier d’enrôlement n’est plus nécessaire.'
-              : 'Aucune identité de ce nom sur ce poste : importer le fichier d’enrôlement produit par « helios-ctl enroll ».'
-          }
-        />
-        <Detail
-          label="empreinte PQ"
-          value={fingerprint ?? 'illisible'}
-          hint="Certificat ML-DSA-65 épinglé de la gateway. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil importé à la bonne gateway."
-        />
-      </Box>
+      {/* The certificates are pasted like everything else. The screen does no
+          crypto: the fingerprint below is derived by the core, and an
+          unreadable certificate shows up there as "illisible" and in the
+          block's error — never as a plausible-looking hash. */}
+      <Blob
+        label="CA TLS de la gateway (DER base64)"
+        value={settings.gateway_ca_der}
+        onChange={(value) => onChange('gateway_ca_der', value)}
+      />
+      <Blob
+        label="Certificat PQ épinglé (base64)"
+        value={settings.gateway_pq_certificate}
+        onChange={(value) => onChange('gateway_pq_certificate', value)}
+      />
+      <Detail
+        label="empreinte PQ"
+        value={fingerprint ?? 'illisible'}
+        hint="Empreinte SHA-256 du certificat ML-DSA-65 collé ci-dessus. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
+      />
 
       {/* The missing identity outranks everything else this block says: the
           mode, the floor and the fingerprint are all moot if the client has
           no certificate to present. */}
-      {!identitySealed && (
+      {!identitySealed && settings.identity.trim() !== '' && (
         <Caution>
           Aucune identité protégée nommée <strong>{settings.identity}</strong> sur ce poste : la
           connexion échouera <strong>avant</strong> WireGuard. Importer le fichier d’enrôlement
@@ -962,6 +1023,105 @@ function KeyNegotiation({
         </Caution>
       )}
     </Box>
+  )
+}
+
+/**
+ * Choice among the three modes, ordered and floored.
+ *
+ * What is under the floor is disabled rather than absent: a ratchet one
+ * cannot see having climbed teaches nothing.
+ */
+function ModeChoice({
+  label,
+  value,
+  floor,
+  hint,
+  onChange,
+}: {
+  label: string
+  value: ProtectionMode
+  /** Nothing below this is selectable. */
+  floor: ProtectionMode
+  hint?: string
+  onChange: (mode: ProtectionMode) => void
+}) {
+  const group = (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+      <Typography
+        color="text.disabled"
+        sx={{
+          width: 62,
+          flexShrink: 0,
+          fontFamily: 'monospace',
+          fontSize: 9.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+        }}
+      >
+        {label}
+      </Typography>
+      <ToggleButtonGroup
+        exclusive
+        size="small"
+        value={value}
+        onChange={(_event, next: ProtectionMode | null) => {
+          if (next) onChange(next)
+        }}
+        aria-label={label}
+        sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
+      >
+        {PROTECTION_MODES.map((mode) => {
+          const meta = modeMeta(mode)
+          const allowed = modeAllowed(mode, floor)
+          return (
+            <ToggleButton
+              key={mode}
+              value={mode}
+              disabled={!allowed}
+              aria-label={meta.label}
+              title={allowed ? meta.detail : `Sous le plancher : ${modeMeta(floor).label}.`}
+            >
+              {meta.label}
+            </ToggleButton>
+          )
+        })}
+      </ToggleButtonGroup>
+    </Box>
+  )
+  return hint ? <Tooltip title={hint}>{group}</Tooltip> : group
+}
+
+/**
+ * Long public value — a certificate, an authority.
+ *
+ * Shown in full over two lines rather than masked: none of this is secret,
+ * and what one does with it is compare it, or paste a new one.
+ */
+function Blob({
+  label,
+  value,
+  onChange,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+}) {
+  return (
+    <TextField
+      fullWidth
+      multiline
+      minRows={2}
+      maxRows={4}
+      size="small"
+      label={label}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      slotProps={{ htmlInput: { spellCheck: false, autoCorrect: 'off', autoCapitalize: 'off' } }}
+      sx={{
+        '& textarea': { fontFamily: 'monospace', fontSize: 10, lineHeight: 1.45, wordBreak: 'break-all' },
+      }}
+    />
   )
 }
 

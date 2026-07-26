@@ -243,6 +243,9 @@ struct ImportOutcome {
     identity_sealed: bool,
     /// Why sealing failed, when the document carried one and it did not.
     identity_error: Option<String>,
+    /// Why the draft has no private key, when the document was an invitation
+    /// and no local profile held the admitted half.
+    private_key_missing: Option<String>,
 }
 
 /// Seals the identity shipped with a document, if any.
@@ -279,15 +282,8 @@ async fn import_profile(
 ) -> Result<ImportOutcome, String> {
     let imported =
         parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
-    let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let config = state.config.lock().await;
-    let profile =
-        complete_profile_import(imported.profile, &config).map_err(|error| error.to_string())?;
-    Ok(ImportOutcome {
-        profile,
-        identity_sealed,
-        identity_error,
-    })
+    finish_import(imported, &config)
 }
 
 /// Rereads a profile whose path comes from the system association.
@@ -312,15 +308,32 @@ async fn import_profile_path(
         return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
     }
     let imported = read_profile_import_path(&path).map_err(|error| error.to_string())?;
-    let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let config = state.config.lock().await;
-    let profile =
-        complete_profile_import(imported.profile, &config).map_err(|error| error.to_string())?;
-    Ok(Some(ImportOutcome {
-        profile,
+    finish_import(imported, &config).map(Some)
+}
+
+/// Seals the identity, completes the draft, and reports both fates.
+///
+/// Shared by the two import paths on purpose: the file picker and the system
+/// association must not differ by one gesture — a document that seals its
+/// identity on a double-click and not through the button would be
+/// impossible to explain.
+fn finish_import(
+    imported: orion_core::ProfileImport,
+    config: &ClientConfig,
+) -> Result<ImportOutcome, String> {
+    // Read before the bundle is consumed by sealing: it is the certificate
+    // that says which key was admitted.
+    let admitted = imported.admitted_public_key();
+    let (identity_sealed, identity_error) = seal_identity(imported.identity);
+    let completed = complete_profile_import(imported.profile, config, admitted.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(ImportOutcome {
+        profile: completed.profile,
         identity_sealed,
         identity_error,
-    }))
+        private_key_missing: completed.private_key_missing,
+    })
 }
 
 /// Public key corresponding to a profile's private key.

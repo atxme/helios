@@ -203,7 +203,9 @@
       "Bash(target/bundle/helios-0.1.0-x86_64-unknown-linux-gnu/heliosd --help)",
       "Bash(timeout 900 npx tauri build --features wireguard,key-negotiation --bundles msi)",
       "Bash(HELIOS_PUBLISHER_KEYRING_PATH=/home/christophe/.helios/publisher-epoch-1/publisher-keyring.json timeout 1800 cargo build --release -p orion --features wireguard,key-negotiation)",
-      "Bash(cargo tree *)"
+      "Bash(cargo tree *)",
+      "Bash(echo \"--- exit=$?\")",
+      "Bash(grep -vE \"^\\\\+.*\\(# |name:|runs-on:|uses:|with:|run:|env:|shell:|steps:|- |cache|node-version|path|if-no-files|retention|KEYRING|HELIOS_PUB|^\\\\+$\\)\")"
     ]
   }
 }
