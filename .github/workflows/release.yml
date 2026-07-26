@@ -65,9 +65,12 @@ jobs:
       - name: Dépendances npm
         run: npm ci --prefix apps/orion
 
-      # `beforeBuildCommand` déclenche `cargo xtask orion-deps`, qui télécharge
-      # WireGuardNT et vérifie son empreinte épinglée. La DLL entre dans
-      # l'installateur : l'utilisateur final ne télécharge jamais rien.
+      # `cargo xtask orion-msi` télécharge WireGuardNT et vérifie son empreinte
+      # épinglée avant d'appeler Tauri. La DLL entre dans l'installateur :
+      # l'utilisateur final ne télécharge jamais rien. Le `beforeBuildCommand`
+      # de Tauri sait qu'elle est déjà là (`ORION_DEPS_READY`) et ne rappelle
+      # pas `cargo` — sous Windows, relier `xtask.exe` pendant qu'il tourne est
+      # refusé par le système.
       #
       # Les features passent par `cargo xtask orion-msi`, qui les tient en un
       # seul endroit (`ORION_FEATURES`) : une CI et un poste de build qui les

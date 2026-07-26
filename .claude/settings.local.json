@@ -205,7 +205,9 @@
       "Bash(HELIOS_PUBLISHER_KEYRING_PATH=/home/christophe/.helios/publisher-epoch-1/publisher-keyring.json timeout 1800 cargo build --release -p orion --features wireguard,key-negotiation)",
       "Bash(cargo tree *)",
       "Bash(echo \"--- exit=$?\")",
-      "Bash(grep -vE \"^\\\\+.*\\(# |name:|runs-on:|uses:|with:|run:|env:|shell:|steps:|- |cache|node-version|path|if-no-files|retention|KEYRING|HELIOS_PUB|^\\\\+$\\)\")"
+      "Bash(grep -vE \"^\\\\+.*\\(# |name:|runs-on:|uses:|with:|run:|env:|shell:|steps:|- |cache|node-version|path|if-no-files|retention|KEYRING|HELIOS_PUB|^\\\\+$\\)\")",
+      "Bash(node apps/orion/scripts/orion-deps.mjs)",
+      "Bash(ORION_DEPS_READY=1 node apps/orion/scripts/orion-deps.mjs)"
     ]
   }
 }

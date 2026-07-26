@@ -129,7 +129,9 @@ Le socle d’accessibilité comprend :
 L’intégration est configurée dans `src-tauri/tauri.conf.json` :
 
 - `beforeDevCommand` lance Vite sur le port 1420 ;
-- `beforeBuildCommand` exécute `npm run build` ;
+- `beforeBuildCommand` exécute `npm run build` — précédé, sous Windows
+  (`tauri.windows.conf.json`), de `npm run orion-deps`, qui met WireGuardNT en
+  place à moins que `cargo xtask orion-msi` ne s’en soit déjà chargé ;
 - `frontendDist: ../dist` embarque le résultat dans l’application native.
 - une CSP restrictive est injectée, sans `unsafe-eval`, et
   `freezePrototype` est activé ;

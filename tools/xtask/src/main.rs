@@ -337,6 +337,14 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     println!("==> WireGuardNT dependencies");
     orion_deps()?;
 
+    // Tauri's `beforeBuildCommand` fetches those same dependencies, so that a
+    // plain `npm run tauri build` also produces a complete installer. They are
+    // in place by now, and letting the hook redo it would re-enter `cargo`
+    // from inside this running process: on Windows, relinking `xtask.exe`
+    // while it executes fails with `Access is denied (os error 5)` — minutes
+    // in, after the download and the whole workspace build.
+    std::env::set_var("ORION_DEPS_READY", "1");
+
     if skip_npm_ci && orion.join("node_modules").is_dir() {
         println!("==> npm: existing node_modules reused (--skip-npm-ci)");
     } else {
