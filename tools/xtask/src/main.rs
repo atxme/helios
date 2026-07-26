@@ -40,6 +40,18 @@ use clap::{Parser, Subcommand};
 /// first handshake with no way to tell why from the target.
 const GATEWAY_FEATURES: &str = "netlink,wireguard,tpm,embed-ui,key-negotiation";
 
+/// How npm is spawned on this platform.
+///
+/// On Windows npm is a `.cmd` shim, and [`Command`] only appends `.exe` to a
+/// program without an extension — it never consults `PATHEXT`, unlike a
+/// shell. Spawning a plain `npm` there fails with «program not found», and
+/// it fails *late*: after the toolchain, the WireGuardNT download and the
+/// whole workspace build. Naming the shim is the entire fix.
+#[cfg(windows)]
+const NPM: &str = "npm.cmd";
+#[cfg(not(windows))]
+const NPM: &str = "npm";
+
 /// Systemd units shipped with the gateway.
 const SYSTEMD_UNITS: &[&str] = &[
     "heliosd.service",
@@ -329,7 +341,7 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
         println!("==> npm: existing node_modules reused (--skip-npm-ci)");
     } else {
         println!("==> npm dependencies");
-        run(&orion, "npm", &["ci"])?;
+        run(&orion, NPM, &["ci"])?;
     }
 
     // `--bundles msi` alone, unless NSIS is asked for: `targets: "all"` would
@@ -338,7 +350,7 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     println!("==> Orion installer ({ORION_FEATURES}, bundles: {bundles})");
     run(
         &orion,
-        "npm",
+        NPM,
         &[
             "run",
             "tauri",
@@ -419,8 +431,8 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         println!("==> Frontend: reused as is (--skip-frontend)");
     } else {
         println!("==> Embedded frontend");
-        run(&root, "npm", &["ci", "--prefix", "web"])?;
-        run(&root, "npm", &["run", "build", "--prefix", "web"])?;
+        run(&root, NPM, &["ci", "--prefix", "web"])?;
+        run(&root, NPM, &["run", "build", "--prefix", "web"])?;
     }
 
     println!("==> heliosd ({GATEWAY_FEATURES})");
