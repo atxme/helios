@@ -17,7 +17,7 @@ helio-tpm.workspace = true
 # La campagne agit comme un **vrai** client : elle emprunte le chemin de
 # provisioning d'Orion plutôt que de le réimplémenter, sans quoi elle
 # validerait sa propre copie du protocole et non le code livré.
-orion-core = { workspace = true, features = ["key-negotiation"] }
+orion-core = { workspace = true }
 helios-key-negotiation.workspace = true
 base64.workspace = true
 x25519-dalek.workspace = true

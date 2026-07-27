@@ -334,41 +334,7 @@ pub async fn network_set(
     // the sealed vault and every negotiated PSK — the gateway would stay up,
     // then every handshake would fail with nothing tying the failure to the
     // setting that caused it.
-    {
-        let current = s.network.read().await;
-        if new_config.wg_private_key.trim().is_empty() {
-            new_config
-                .wg_private_key
-                .clone_from(&current.wg_private_key);
-        }
-        if new_config.key_negotiation_port.is_none() {
-            new_config.key_negotiation_port = current.key_negotiation_port;
-        }
-        for peer in &mut new_config.peers {
-            if let Some(known) = current
-                .peers
-                .iter()
-                .find(|known| known.public_key == peer.public_key)
-            {
-                if peer.preshared_key.is_none() {
-                    peer.preshared_key.clone_from(&known.preshared_key);
-                }
-                if peer.key_negotiation_certificate_sha256.is_none() {
-                    peer.key_negotiation_certificate_sha256
-                        .clone_from(&known.key_negotiation_certificate_sha256);
-                }
-                if peer.key_negotiation_pq_certificate_sha256.is_none() {
-                    peer.key_negotiation_pq_certificate_sha256
-                        .clone_from(&known.key_negotiation_pq_certificate_sha256);
-                }
-                if peer.minimum_key_negotiation_mode.security_level()
-                    < known.minimum_key_negotiation_mode.security_level()
-                {
-                    peer.minimum_key_negotiation_mode = known.minimum_key_negotiation_mode;
-                }
-            }
-        }
-    }
+    new_config.adopt_runtime_secrets_from(&*s.network.read().await);
     apply_network(&s, new_config).await?;
     Ok(Json(CmdResponse::ok()))
 }

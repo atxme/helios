@@ -44,10 +44,14 @@ export interface KeyNegotiationSettings {
   identity: string
 }
 
-/** What this Orion build can actually do with the negotiation port. */
+/**
+ * What this machine can actually do with the negotiation port.
+ *
+ * The negotiation itself is not a build option: every Orion carries it. Only
+ * the protected identity store is conditional — it is the machine's, and
+ * DPAPI exists only on Windows.
+ */
 export interface KeyNegotiationSupport {
-  /** The binary was compiled with the `key-negotiation` feature. */
-  compiled: boolean
   /** A protected identity store is wired into the client core. */
   identity_store: boolean
 }

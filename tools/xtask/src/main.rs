@@ -32,13 +32,14 @@ use clap::{Parser, Subcommand};
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
 /// real target, and discovering that there costs a trip.
 ///
-/// `key-negotiation` is in the list even though it opens a second UDP port,
-/// because the port only opens when `network.toml` declares
-/// `key_negotiation_port`. Leaving the feature out would instead make the
-/// setting silently inert — the gateway would accept the configuration, log
-/// nothing, and every Orion profile pinning a certificate would fail its
-/// first handshake with no way to tell why from the target.
-const GATEWAY_FEATURES: &str = "netlink,wireguard,tpm,embed-ui,key-negotiation";
+/// The key negotiation is no longer among them: like Orion, every heliosd
+/// carries it. It used to be a flag on the grounds that it opens a second UDP
+/// port — but the port only opens when `network.toml` declares
+/// `key_negotiation_port`, so the flag decided nothing except whether the
+/// setting would be silently inert. A gateway that accepts the configuration,
+/// logs nothing, and fails every pinned client's first handshake is not a
+/// gateway anyone can debug from the target.
+const GATEWAY_FEATURES: &str = "netlink,wireguard,tpm,embed-ui";
 
 /// How npm is spawned on this platform.
 ///
@@ -276,12 +277,12 @@ fn extract_wireguard_files(archive: &Path, destination: &Path) -> Result<()> {
 
 /// Features the Orion installer must carry.
 ///
-/// `wireguard` for the real data plane — without it Orion refuses to start
-/// rather than simulate — and `key-negotiation` for the pre-WireGuard PQC
-/// exchange. Omitting the second produces a client that imports a negotiating
-/// profile and then fails to connect, which is a slow way to discover a build
-/// flag.
-const ORION_FEATURES: &str = "wireguard,key-negotiation";
+/// Only `wireguard`, for the real data plane — without it Orion refuses to
+/// start rather than simulate. The pre-WireGuard PQC exchange used to be a
+/// second flag here; it is now compiled into every build, precisely because
+/// omitting it produced a client that imported a negotiating profile and then
+/// failed to connect — a slow way to discover a build flag.
+const ORION_FEATURES: &str = "wireguard";
 
 /// Builds the Orion MSI locally, with the checks that make it worth trusting.
 ///
@@ -718,36 +719,40 @@ mod tests {
         assert!(BINARIES.contains(&"heliosd"));
         assert!(BINARIES.contains(&"helios-installer"));
         assert_eq!(SYSTEMD_UNITS.len(), 3);
-        for feature in [
-            "netlink",
-            "wireguard",
-            "tpm",
-            "embed-ui",
-            // Without it, `key_negotiation_port` in network.toml is inert and
-            // the gateway says nothing about it.
-            "key-negotiation",
-        ] {
+        for feature in ["netlink", "wireguard", "tpm", "embed-ui"] {
             assert!(
                 GATEWAY_FEATURES.split(',').any(|f| f == feature),
                 "feature {feature} missing from the production bundle"
             );
         }
+        // And not the key negotiation: every heliosd carries it, exactly as
+        // every Orion does. Making it a flag again would restore the failure
+        // it was removed for — a `key_negotiation_port` accepted, inert, and
+        // silent.
+        assert!(
+            !GATEWAY_FEATURES.contains("key-negotiation"),
+            "key negotiation must not be a build flag: every heliosd carries it"
+        );
     }
 
     /// The installer must carry what makes Orion usable.
     ///
-    /// `wireguard` because a client without it refuses to start rather than
-    /// simulate; `key-negotiation` because without it a negotiating profile
-    /// imports fine and then fails to connect — a build flag discovered
-    /// through a support call rather than a compiler error.
+    /// `wireguard`, because a client without it refuses to start rather than
+    /// simulate. And **not** `key-negotiation`: the pre-WireGuard exchange is
+    /// compiled into every build now. Re-introducing it as a flag would bring
+    /// back the failure mode it was removed for — a binary that imports a
+    /// pinned profile, looks perfectly healthy, and fails to connect for a
+    /// reason no user can see.
     #[test]
     fn the_orion_installer_carries_the_features_that_matter() {
-        for feature in ["wireguard", "key-negotiation"] {
-            assert!(
-                ORION_FEATURES.split(',').any(|f| f == feature),
-                "feature {feature} missing from the Orion installer"
-            );
-        }
+        assert!(
+            ORION_FEATURES.split(',').any(|f| f == "wireguard"),
+            "feature wireguard missing from the Orion installer"
+        );
+        assert!(
+            !ORION_FEATURES.contains("key-negotiation"),
+            "key negotiation must not be a build flag: every Orion carries it"
+        );
     }
 
     /// The CI must build the installer through this tool.

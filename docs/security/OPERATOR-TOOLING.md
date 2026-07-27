@@ -111,8 +111,18 @@ Créer l’autorité cliente sur le poste opérateur, jamais sur la gateway :
 
 ```sh
 helios-ctl key-nego init-client-ca \
-  --name helios-orion-clients --output-dir ./orion-client-ca
+  --name helios-orion-clients --output-dir ~/.helios/certs/internal-ca
 ```
+
+**Un seul emplacement, une seule autorité.** `~/.helios/certs/internal-ca` est
+celui qu’emploient `target-bootstrap.sh` et `key-negotiation-setup.sh` ; c’est
+aussi celui qu’il faut sauvegarder. Une gateway ne fait confiance qu’à
+l’autorité dont elle détient les parties publiques : en créer une seconde
+ailleurs ne donne pas une PKI neuve, ça donne une PKI qui ne signe plus rien
+d’acceptable pour cette gateway. Les scripts reprennent une autorité laissée
+par un workflow antérieur (`./orion-client-ca`, `~/.helios/orion-client-ca`)
+plutôt que d’en fabriquer une autre, et retirent celle qu’ils viennent de créer
+si la gateway la refuse.
 
 La commande crée simultanément l'autorité TLS et l'autorité ML-DSA-65. Copier
 seulement leurs parties publiques `orion-client-ca.der` et

@@ -73,6 +73,22 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   sur déconnexion explicite.
 - Un Orion compilé avec `wireguard` refuse de démarrer si le backend réel est
   indisponible ; aucun repli implicite vers le dry-run.
+- La négociation de clé n’est **pas** une feature de compilation, ni côté
+  Orion ni côté `heliosd` : tout binaire la porte. Un client d’apparence
+  normale qui importe un profil épinglé puis échoue avant WireGuard est
+  indiscernable, côté utilisateur, d’une gateway en panne ; et une gateway qui
+  accepte `key_negotiation_port` sans le servir l’est tout autant. Seul
+  `key_negotiation_port` décide de l’ouverture du service — absent, il reste
+  fermé, sans erreur. Côté Orion, seul le stockage protégé d’identité reste
+  conditionnel : il est propre à la machine, pas à la compilation.
+- `network.toml` est relu à chaud : le démon le surveille et réapplique la
+  table de pairs sans redémarrer (`orchestrator::spawn_network_config_watcher`).
+  Toute relecture doit passer par `NetworkConfig::adopt_runtime_secrets_from` —
+  le fichier ne contient ni la clé privée scellée ni les PSK négociés, et les
+  appliquer tels quels retirerait son identité à la gateway et casserait tous
+  les handshakes. **Limite connue** : ce qui ne peut pas changer sous le plan
+  de données en marche — nom d’interface, port d’écoute, adresse d’API — exige
+  toujours un redémarrage.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.

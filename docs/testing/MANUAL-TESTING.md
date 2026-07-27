@@ -201,11 +201,12 @@ cargo xtask orion-msi
 
 C'est la **même** commande que joue la CI de release : les features y sont
 tenues en un seul endroit (`ORION_FEATURES`), donc un installateur bâti ici et
-un installateur bâti par la CI portent les mêmes drapeaux. Ces deux features
-décident de ce que le binaire sait faire — `wireguard` (backend réel ; sans
-elle Orion refuse de démarrer plutôt que de simuler) et `key-negotiation`
-(négociation PQC avant le premier handshake ; sans elle, un profil qui en porte
-une s'importe puis échoue à se connecter).
+un installateur bâti par la CI portent les mêmes drapeaux. Il n'en reste
+qu'une, `wireguard` (backend réel ; sans elle Orion refuse de démarrer plutôt
+que de simuler). La négociation PQC, elle, n'est plus une option de
+compilation : tout Orion la porte, parce qu'un binaire d'apparence normale qui
+importe un profil épinglé puis échoue à se connecter est indiscernable, pour
+l'utilisateur, d'une gateway en panne.
 
 Tous les prérequis sont vérifiés **avant** la compilation : trousseau éditeur,
 certificat de signature, horodateur. Un build qui tourne plusieurs minutes puis
@@ -230,7 +231,7 @@ expliquant pourquoi : WiX et l'éditeur de liens MSVC n'ont pas d'équivalent
 croisé. Ce qui reste vérifiable ailleurs, c'est la compilation :
 
 ```sh
-HELIOS_PUBLISHER_KEYRING_PATH=... cargo build -p orion --features wireguard,key-negotiation
+HELIOS_PUBLISHER_KEYRING_PATH=... cargo build -p orion --features wireguard
 ```
 
 Après installation sur une machine propre :

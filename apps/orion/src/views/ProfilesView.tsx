@@ -895,7 +895,7 @@ function KeyNegotiation({
   }
 
   const selected = modeMeta(settings.mode)
-  const unusable = support && (!support.compiled || !support.identity_store)
+  const unusable = support && !support.identity_store
   // Removing the block is a downgrade. It stays possible while nothing has
   // been negotiated — a block just added by hand, typically — and the floor
   // is what closes the door as soon as something has.
@@ -1018,9 +1018,9 @@ function KeyNegotiation({
 
       {unusable && (
         <Caution>
-          {!support?.compiled
-            ? 'Cette version d’Orion a été compilée sans la négociation de clé : la connexion échouera avant WireGuard. Il faut une version bâtie avec la feature « key-negotiation ».'
-            : 'Aucun stockage protégé d’identité n’est câblé dans cette version : le certificat client ne peut pas être lu et la connexion échouera avant WireGuard.'}
+          Aucun stockage protégé d’identité sur ce poste : le certificat client ne peut pas
+          être scellé ni relu, et la connexion échouera <strong>avant</strong> WireGuard. Le
+          scellement passe par DPAPI, qui n’existe que sous Windows.
         </Caution>
       )}
     </Box>

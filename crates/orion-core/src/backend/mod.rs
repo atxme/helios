@@ -29,7 +29,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aether::TunnelState;
-#[cfg(feature = "key-negotiation")]
 use anyhow::Context as _;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -268,9 +267,7 @@ pub struct VpnController {
     /// it: the task ends once the tunnel is up, while the link must stay open
     /// for as long as the tunnel does. Closing it on `disconnect` is what
     /// spares the gateway from waiting for stale handshakes.
-    #[cfg(feature = "key-negotiation")]
     link_slot: Arc<Mutex<Option<helios_key_negotiation::SessionLink>>>,
-    #[cfg(feature = "key-negotiation")]
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
@@ -280,15 +277,12 @@ impl VpnController {
             backend,
             state: Arc::new(RwLock::new(TunnelState::Down)),
             task: Mutex::new(None),
-            #[cfg(feature = "key-negotiation")]
             link_slot: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "key-negotiation")]
             key_negotiation_identities: None,
         }
     }
 
     /// Supplies the protected client-certificate store used before WireGuard.
-    #[cfg(feature = "key-negotiation")]
     pub fn with_key_negotiation_identities(
         mut self,
         identities: Arc<dyn crate::key_negotiation::IdentityProvider>,
@@ -297,22 +291,14 @@ impl VpnController {
         self
     }
 
-    /// Can this build actually negotiate a key before WireGuard?
+    /// Can this client actually negotiate a key before WireGuard?
     ///
-    /// Two conditions, and the UI must not confuse them: the binary must be
-    /// compiled with the `key-negotiation` feature, and the shell must have
-    /// supplied a protected identity store. A profile carrying the block
-    /// would otherwise fail at connection time, after the user has been
-    /// promised a mode the client cannot honor.
+    /// One condition, now that the negotiation is part of every build: the
+    /// shell must have supplied a protected identity store. A profile
+    /// carrying the block would otherwise fail at connection time, after the
+    /// user has been promised a mode the client cannot honor.
     pub fn key_negotiation_ready(&self) -> bool {
-        #[cfg(feature = "key-negotiation")]
-        {
-            self.key_negotiation_identities.is_some()
-        }
-        #[cfg(not(feature = "key-negotiation"))]
-        {
-            false
-        }
+        self.key_negotiation_identities.is_some()
     }
 
     /// Current tunnel state.
@@ -355,12 +341,9 @@ impl VpnController {
         self.abort_task().await;
         let sink = self.wrap_sink(user_sink);
         let backend = Arc::clone(&self.backend);
-        #[cfg(feature = "key-negotiation")]
         let identities = self.key_negotiation_identities.clone();
-        #[cfg(feature = "key-negotiation")]
         let link_slot = Arc::clone(&self.link_slot);
         let handle = tokio::spawn(async move {
-            #[cfg(feature = "key-negotiation")]
             if profile.key_negotiation.is_some() {
                 if let Err(error) = connect_with_key_negotiation(
                     &backend,
@@ -376,15 +359,6 @@ impl VpnController {
                         message: format!("key negotiation failed: {error}"),
                     });
                 }
-                return;
-            }
-            #[cfg(not(feature = "key-negotiation"))]
-            if profile.key_negotiation.is_some() {
-                sink(ClientEvent::state(TunnelState::Failed));
-                sink(ClientEvent::Error {
-                    message: "this Orion binary was built without key-negotiation support"
-                        .to_string(),
-                });
                 return;
             }
 
@@ -411,7 +385,6 @@ impl VpnController {
         // Hang up before unmounting: the gateway releases its PSK slot on the
         // spot instead of inferring the departure from handshakes that stop
         // coming, up to 150 s later.
-        #[cfg(feature = "key-negotiation")]
         if let Some(link) = self.link_slot.lock().await.take() {
             link.close();
         }
@@ -469,14 +442,12 @@ impl VpnController {
 /// Three, because the failure this exists for is a **lost message**, and a
 /// lost message is not repeated by a fourth try if the first two retries did
 /// not carry it.
-#[cfg(feature = "key-negotiation")]
 const KEY_NEGOTIATION_ATTEMPTS: u32 = 3;
 
 /// Pause between two negotiations.
 ///
 /// Long enough for a transient loss to clear, short enough that the user does
 /// not read the wait as a hang.
-#[cfg(feature = "key-negotiation")]
 const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Negotiates, mounts, and recovers from a desynchronised slot.
@@ -502,7 +473,6 @@ const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// desynchronised PSK: WireGuard drops the packets, which is the anti-leak
 /// invariant of this module. A dead tunnel is the correct outcome — a leaking
 /// one would not be.
-#[cfg(feature = "key-negotiation")]
 async fn connect_with_key_negotiation(
     backend: &Arc<dyn VpnBackend>,
     profile: &ClientProfile,
@@ -581,7 +551,6 @@ async fn connect_with_key_negotiation(
 ///
 /// Split out so the caller can tell a failure that left the slot
 /// desynchronised — everything below — from one that touched nothing.
-#[cfg(feature = "key-negotiation")]
 async fn commit_negotiated_slot(
     backend: &Arc<dyn VpnBackend>,
     negotiated_profile: &ClientProfile,
@@ -599,7 +568,6 @@ async fn commit_negotiated_slot(
     negotiated.confirm().await
 }
 
-#[cfg(feature = "key-negotiation")]
 async fn wait_for_new_handshake(
     backend: &Arc<dyn VpnBackend>,
     prepared_at: tokio::time::Instant,

@@ -25,7 +25,6 @@ pub mod backend;
 pub mod config;
 pub mod events;
 pub mod identity_store;
-#[cfg(feature = "key-negotiation")]
 pub mod key_negotiation;
 pub mod mtu;
 pub mod profile_import;

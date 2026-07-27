@@ -17,21 +17,33 @@
 # produit à l'étape 5 contient des secrets clients : il est en 0600 et doit être
 # détruit après import dans Orion.
 #
-# Ce script ne construit ni ne déploie heliosd. Le binaire installé doit déjà
-# porter la feature `key-negotiation` — c'est le cas depuis que
-# `cargo xtask bundle` l'inclut. Pour mettre la gateway à jour : ./scripts/deploy.sh
+# Ce script ne construit ni ne déploie heliosd. La négociation de clé n'est
+# plus une feature de compilation : tout heliosd la porte, et seul
+# `key_negotiation_port` décide de son ouverture. Pour mettre la gateway à
+# jour : ./scripts/deploy.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 # La CA opérateur vit HORS du dépôt : c'est une clé privée, elle n'a rien à
 # faire dans un arbre versionné où un `git add -A` finirait par l'attraper.
-CA_DIR="${HELIOS_CLIENT_CA_DIR:-$HOME/.helios/orion-client-ca}"
+#
+# Un seul emplacement, et c'est celui de `target-bootstrap.sh` : la gateway ne
+# fait confiance qu'à UNE autorité, alors que ce script en cherchait une à un
+# troisième endroit. Ne l'y trouvant pas, il en fabriquait une seconde, puis
+# échouait contre celle que la gateway détenait déjà — en laissant derrière lui
+# une CA neuve que la fois suivante aurait « réutilisée » sans rien dire.
+CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
+CA_DIR="${HELIOS_CLIENT_CA_DIR:-$CERTS_ROOT/internal-ca}"
+# Vrai seulement si la CA est née de cette exécution : c'est ce qui autorise à
+# la retirer quand la gateway la refuse.
+CA_CREEE=0
 SORTIE="${HELIOS_KEYNEGO_OUT:-$PWD/target/key-negotiation}"
 ETAT="${HELIOS_DEPLOY_STATE:-$HOME/.helios/deploy.conf}"
 NOM="portable"
 SERVER_NAME=""
 ENDPOINT=""
+ENDPOINT_NEGO=""
 PORT_WG="51820"
 PORT_NEGO="51821"
 MODE="ml-kem"
@@ -55,9 +67,19 @@ Usage : ./scripts/key-negotiation-setup.sh [hôte-ssh] [options]
                      local de même nom. C'est le chemin pour ajouter la
                      négociation à un profil existant sans le recréer.
   --server-name N    Nom/IP que le certificat gateway authentifie
-                     (défaut : l'hôte SSH)
-  --endpoint H:P     Endpoint WireGuard public vu par le client
-                     (défaut : <server-name>:51820)
+                     (défaut : l'hôte SSH). C'est une IDENTITÉ, pas une
+                     adresse : le client la vérifie dans le certificat sans
+                     jamais s'y connecter. Elle peut donc rester l'IP LAN
+                     alors que les endpoints ci-dessous sont publics.
+  --endpoint H:P     Endpoint WireGuard par lequel le client joint la gateway
+                     (défaut : <server-name>:51820). Pour un poste hors du
+                     LAN, c'est l'adresse publique ou le DynDNS de la box,
+                     pas l'IP privée de la machine.
+  --negotiation-endpoint H:P
+                     Endpoint de négociation (défaut : l'hôte d'--endpoint
+                     avec le port de négociation — les deux services vivent
+                     sur la même machine, donc ce qui joint l'un joint
+                     l'autre)
   --port-nego P      Port UDP de négociation (défaut : 51821)
   --mode M           ml-kem (défaut) ou classic
   --admin            Admit the peer as a control-plane administrator
@@ -80,6 +102,7 @@ while [ $# -gt 0 ]; do
         --public-key) PUBLIC_KEY="${2:-}"; shift 2 ;;
         --server-name) SERVER_NAME="${2:-}"; shift 2 ;;
         --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
+        --negotiation-endpoint) ENDPOINT_NEGO="${2:-}"; shift 2 ;;
         --port-nego) PORT_NEGO="${2:-}"; shift 2 ;;
         --mode) MODE="${2:-}"; shift 2 ;;
         --admin) ADMIN=1; shift ;;
@@ -94,6 +117,49 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+FICHIERS_CA="orion-client-ca.der orion-client-ca-key.der \
+orion-client-pq-ca-public.bin orion-client-pq-ca-private.bin"
+
+# Reprend une CA laissée par un workflow antérieur plutôt que d'en créer une
+# seconde.
+#
+# La gateway ne connaît qu'une autorité ; en fabriquer une nouvelle parce que
+# le chemin par défaut a changé ne produit pas une PKI neuve, ça produit une
+# PKI qui ne signe plus rien d'utilisable. La source est **laissée en place** :
+# c'est une clé privée, et la déplacer sans que l'opérateur l'ait vu ferait
+# disparaître sa seule copie.
+adopter_ca() {
+    for HERITEE in "$PWD/orion-client-ca" "$HOME/.helios/orion-client-ca"; do
+        COMPLETE=1
+        for FICHIER in $FICHIERS_CA; do
+            [ -f "$HERITEE/$FICHIER" ] || COMPLETE=0
+        done
+        [ "$COMPLETE" -eq 1 ] || continue
+        mkdir -p "$CA_DIR"
+        chmod 700 "$CA_DIR"
+        install -m 644 "$HERITEE/orion-client-ca.der" "$CA_DIR/"
+        install -m 600 "$HERITEE/orion-client-ca-key.der" "$CA_DIR/"
+        install -m 644 "$HERITEE/orion-client-pq-ca-public.bin" "$CA_DIR/"
+        install -m 600 "$HERITEE/orion-client-pq-ca-private.bin" "$CA_DIR/"
+        echo "==> CA opérateur : reprise de $HERITEE"
+        echo "    source conservée ; la supprimer à la main une fois la copie vérifiée"
+        return 0
+    done
+    return 1
+}
+
+# Retire une CA née de cette exécution et que la gateway refuse.
+#
+# La laisser serait pire que l'échec : l'exécution suivante la trouverait,
+# annoncerait « CA opérateur : réutilisée » et échouerait au même endroit, sans
+# que rien ne rappelle qu'elle a été fabriquée par erreur.
+retirer_ca_creee() {
+    for FICHIER in $FICHIERS_CA; do
+        rm -f "$CA_DIR/$FICHIER"
+    done
+    rmdir "$CA_DIR" 2>/dev/null || true
+}
+
 if [ -z "$CIBLE" ] && [ -f "$ETAT" ]; then
     CIBLE="$(sed -n 's/^cible=//p' "$ETAT")"
 fi
@@ -106,6 +172,12 @@ fi
 HOTE="${CIBLE#*@}"
 [ -n "$SERVER_NAME" ] || SERVER_NAME="$HOTE"
 [ -n "$ENDPOINT" ] || ENDPOINT="$SERVER_NAME:$PORT_WG"
+# La négociation suit l'endpoint WireGuard, pas le nom du certificat : les deux
+# services tournent sur la même machine, donc l'hôte qui joint l'un joint
+# l'autre. Les faire suivre `--server-name` produisait un profil qui pointe sur
+# l'IP LAN de la gateway — injoignable depuis un poste distant, alors même que
+# l'opérateur avait pris soin de passer une adresse publique à `--endpoint`.
+[ -n "$ENDPOINT_NEGO" ] || ENDPOINT_NEGO="${ENDPOINT%:*}:$PORT_NEGO"
 
 mkdir -p "$SORTIE"
 HELIOSD='$(command -v heliosd || echo /opt/helios/current/heliosd)'
@@ -122,10 +194,13 @@ fi
 if [ "$CLIENT_ONLY" -eq 0 ]; then
 if [ -f "$CA_DIR/orion-client-ca.der" ]; then
     echo "==> CA opérateur : réutilisée ($CA_DIR)"
+elif adopter_ca; then
+    :
 else
     echo "==> CA opérateur : création"
     cargo run --quiet -p helios-ctl -- key-nego init-client-ca \
         --name "helios-orion-clients" --output-dir "$CA_DIR"
+    CA_CREEE=1
 fi
 
 # ── 2. Identité de négociation de la gateway ─────────────────────────────────
@@ -259,6 +334,11 @@ scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-ca.der" "$SORTIE/installed-client-ca.de
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin" \
     "$SORTIE/installed-client-pq-ca-public.bin"
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/peer-list.log" "$SORTIE/peer-list.log"
+# La liste vient d'être relue : elle décrit la gateway telle qu'elle est, pas
+# telle qu'elle était au dernier passage. C'est ce qui autorise à s'y fier pour
+# refuser tôt (§4 bis) ; un fichier laissé par une exécution précédente ne le
+# permettrait pas.
+PEER_LIST_FRAICHE=1
 ssh "$CIBLE" "rm -f '$REMOTE_PUBLIC_DIR/gateway-cert.der' \
     '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json' \
     '$REMOTE_PUBLIC_DIR/client-ca.der' \
@@ -276,8 +356,27 @@ REMOTE_PQ_CA_SHA="$(sha256sum "$SORTIE/installed-client-pq-ca-public.bin" | awk 
 rm -f "$SORTIE/installed-client-ca.der" "$SORTIE/installed-client-pq-ca-public.bin"
 if [ "$LOCAL_TLS_CA_SHA" != "$REMOTE_TLS_CA_SHA" ] ||
    [ "$LOCAL_PQ_CA_SHA" != "$REMOTE_PQ_CA_SHA" ]; then
-    echo "FAIL: local operator PKI does not match the authorities installed on the gateway." >&2
-    echo "      Restore the original PKI; do not rotate the gateway identity." >&2
+    echo "ÉCHEC : la PKI opérateur locale ne correspond pas aux autorités installées" >&2
+    echo "        sur la gateway." >&2
+    echo "          CA TLS locale   : $LOCAL_TLS_CA_SHA" >&2
+    echo "          CA TLS gateway  : $REMOTE_TLS_CA_SHA" >&2
+    echo "          CA PQ  locale   : $LOCAL_PQ_CA_SHA" >&2
+    echo "          CA PQ  gateway  : $REMOTE_PQ_CA_SHA" >&2
+    if [ "$CA_CREEE" -eq 1 ]; then
+        retirer_ca_creee
+        echo "        La CA venait d'être créée par cette exécution : elle est retirée," >&2
+        echo "        sinon la prochaine l'aurait « réutilisée » et aurait échoué ici même." >&2
+        echo "        Restaurer la vraie CA dans $CA_DIR — c'est la seule qui signe des" >&2
+        echo "        certificats que cette gateway accepte. Chercher une sauvegarde de" >&2
+        echo "        $CERTS_ROOT, ou les emplacements des workflows précédents :" >&2
+        echo "          $PWD/orion-client-ca" >&2
+        echo "          $HOME/.helios/orion-client-ca" >&2
+        echo "        À défaut, réenrôler TOUS les clients après avoir réinstallé une CA" >&2
+        echo "        neuve sur la gateway : leurs certificats actuels deviendront caducs." >&2
+    else
+        echo "        Restaurer la PKI d'origine ; ne pas faire tourner l'identité de la" >&2
+        echo "        gateway." >&2
+    fi
     exit 1
 fi
 
@@ -295,6 +394,39 @@ else
         [ -s "$REQUIRED" ] ||
             { echo "client-only input is missing: $REQUIRED" >&2; exit 1; }
     done
+fi
+
+# ── 4 bis. Un pair de ce nom est-il déjà admis ? ─────────────────────────────
+#
+# La gateway refuse une seconde admission du même nom, et elle a raison : la
+# remplacer révoque l'identité du poste qui la détient. Mais elle ne le disait
+# qu'à l'étape 6, après deux mots de passe sudo, l'émission des certificats
+# client et un aller-retour SSH — pour une réponse qui tenait déjà dans la
+# liste des pairs relue à l'étape précédente.
+if [ "$REMPLACER" -eq 0 ] && [ "${PEER_LIST_FRAICHE:-0}" -eq 1 ]; then
+    CLE_ADMISE="$(awk -F'\t' -v nom="$NOM" \
+        '$1 == nom { split($3, champ, " "); print champ[1]; exit }' \
+        "$SORTIE/peer-list.log")"
+    if [ -n "$CLE_ADMISE" ]; then
+        echo "ÉCHEC : un pair « $NOM » est déjà admis sur cette gateway." >&2
+        echo "        clé admise : $CLE_ADMISE" >&2
+        if [ -z "$PUBLIC_KEY" ]; then
+            echo "        Relancer avec --remplacer pour lui réémettre une identité, ou" >&2
+            echo "        choisir un autre --nom. Sans --public-key, --remplacer lui" >&2
+            echo "        fabriquera aussi une clé WireGuard neuve." >&2
+        elif [ "$PUBLIC_KEY" = "$CLE_ADMISE" ]; then
+            echo "        C'est bien ce poste : sa clé WireGuard est celle passée à" >&2
+            echo "        --public-key, et --remplacer la conservera. Ce qu'il perdra," >&2
+            echo "        c'est son identité de négociation : le profil déjà importé" >&2
+            echo "        cessera d'être accepté, il faudra importer le nouveau." >&2
+            echo "        Relancer avec --remplacer." >&2
+        else
+            echo "        Ce n'est PAS la clé passée à --public-key : --remplacer" >&2
+            echo "        couperait le poste qui détient $CLE_ADMISE." >&2
+            echo "        Vérifier le nom du pair avant de continuer." >&2
+        fi
+        exit 1
+    fi
 fi
 
 # ── 5. Clé WireGuard du client et certificats ────────────────────────────────
@@ -392,7 +524,7 @@ cargo run --quiet -p helios-ctl -- enroll \
     --name "$NOM" \
     --endpoint "$ENDPOINT" \
     --client-ca-dir "$CA_DIR" \
-    --negotiation-endpoint "$SERVER_NAME:$PORT_NEGO" \
+    --negotiation-endpoint "$ENDPOINT_NEGO" \
     --mode "$MODE" \
     --gateway-certificate "$SORTIE/gateway-cert.der" \
     --gateway-pq-certificate "$SORTIE/gateway-pq-cert.json" \
@@ -409,7 +541,9 @@ rm -f "$FICHIER_CLE"
 cat <<EOF
 
 ──────────────────────────────────────────────────────────────────────────────
-Gateway   $CONF_GW — already updated; restart is handled by deploy.sh.
+Gateway   $CONF_GW — mis à jour ; le démon relit le fichier tout seul,
+          en quelques secondes, sans redémarrage ni coupure des clients
+          déjà connectés.
 
   Orion     $PROFIL
             double-clic, ou écran « Profils » → Importer.

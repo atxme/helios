@@ -20,7 +20,7 @@ pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 /// Persisted in `/var/lib/helios/network.toml`. It is the only configuration
 /// file provided by the operator — all other parameters (TPM, API and
 /// firewall mode) are architectural constants.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub wan_iface: String,
@@ -109,7 +109,7 @@ fn default_wg_port() -> u16 {
 }
 
 /// An authorized WireGuard client on the gateway.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WgPeer {
     /// Friendly name (logging, UI).
     pub name: String,
@@ -184,6 +184,59 @@ impl NetworkConfig {
         std::fs::rename(&tmp, &path)
             .map_err(|e| HeliosError::Config(format!("atomic rename: {e}")))?;
         Ok(())
+    }
+
+    /// Restores what a configuration coming from outside the daemon cannot
+    /// carry.
+    ///
+    /// Two sources feed the running configuration, and **neither** holds the
+    /// runtime secrets: `GET /api/network` redacts them by design, and
+    /// `network.toml` is written without them for the same reason — the
+    /// WireGuard private key lives sealed in the TPM vault and the
+    /// post-quantum PSKs are renegotiated on each enrollment. Applying either
+    /// as-is would erase both: the gateway would lose the identity it brings
+    /// its interface up with, and every peer would keep a PSK slot filled on
+    /// one side only — which fails every handshake, with no recovery channel.
+    ///
+    /// The anti-downgrade floor is treated the same way, for the same reason:
+    /// it only ever goes up. Reloading a file must not become the way to
+    /// lower it.
+    ///
+    /// Everything else — the peer list itself, addresses, flags, ports —
+    /// comes from the incoming configuration. That is the point: this is how
+    /// a peer admitted on the console reaches the running gateway.
+    pub fn adopt_runtime_secrets_from(&mut self, current: &Self) {
+        if self.wg_private_key.trim().is_empty() {
+            self.wg_private_key.clone_from(&current.wg_private_key);
+        }
+        if self.key_negotiation_port.is_none() {
+            self.key_negotiation_port = current.key_negotiation_port;
+        }
+        for peer in &mut self.peers {
+            let Some(known) = current
+                .peers
+                .iter()
+                .find(|known| known.public_key == peer.public_key)
+            else {
+                continue;
+            };
+            if peer.preshared_key.is_none() {
+                peer.preshared_key.clone_from(&known.preshared_key);
+            }
+            if peer.key_negotiation_certificate_sha256.is_none() {
+                peer.key_negotiation_certificate_sha256
+                    .clone_from(&known.key_negotiation_certificate_sha256);
+            }
+            if peer.key_negotiation_pq_certificate_sha256.is_none() {
+                peer.key_negotiation_pq_certificate_sha256
+                    .clone_from(&known.key_negotiation_pq_certificate_sha256);
+            }
+            if peer.minimum_key_negotiation_mode.security_level()
+                < known.minimum_key_negotiation_mode.security_level()
+            {
+                peer.minimum_key_negotiation_mode = known.minimum_key_negotiation_mode;
+            }
+        }
     }
 
     /// Validates the identity table used by the API to attach a request's
@@ -334,6 +387,85 @@ impl NetworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configuration reloaded from disk carries no secret — by design.
+    ///
+    /// This is the accident the merge exists to prevent: `network.toml` is
+    /// written without the sealed private key and without the negotiated
+    /// PSKs, so applying it as-is would take the gateway's identity away and
+    /// leave every peer with a PSK slot filled on one side only. Every
+    /// handshake would then fail, with no recovery channel.
+    #[test]
+    fn a_reloaded_config_keeps_the_secrets_the_file_never_held() {
+        let running = NetworkConfig {
+            wg_private_key: "SECRET-DE-LA-GATEWAY".into(),
+            key_negotiation_port: Some(51821),
+            peers: vec![WgPeer {
+                name: "poste".into(),
+                public_key: "CLE-PUBLIQUE-DU-POSTE".into(),
+                address: "100.64.1.2/32".into(),
+                admin: false,
+                preshared_key: Some("PSK-NEGOCIE".into()),
+                key_negotiation_certificate_sha256: Some("empreinte-tls".into()),
+                key_negotiation_pq_certificate_sha256: Some("empreinte-pq".into()),
+                minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+            }],
+            ..NetworkConfig::default()
+        };
+
+        // What `heliosd peer add` leaves on disk: the same peer, a new one,
+        // and nothing secret.
+        let mut from_disk = NetworkConfig {
+            peers: vec![
+                WgPeer {
+                    preshared_key: None,
+                    key_negotiation_certificate_sha256: None,
+                    key_negotiation_pq_certificate_sha256: None,
+                    // A file that asks for less than what was reached: the
+                    // floor must not follow it down.
+                    minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+                    ..running.peers[0].clone()
+                },
+                WgPeer {
+                    name: "nouveau".into(),
+                    public_key: "CLE-DU-NOUVEAU".into(),
+                    address: "100.64.1.3/32".into(),
+                    admin: false,
+                    preshared_key: None,
+                    key_negotiation_certificate_sha256: None,
+                    key_negotiation_pq_certificate_sha256: None,
+                    minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+                },
+            ],
+            ..NetworkConfig::default()
+        };
+
+        from_disk.adopt_runtime_secrets_from(&running);
+
+        assert_eq!(from_disk.wg_private_key, "SECRET-DE-LA-GATEWAY");
+        assert_eq!(from_disk.key_negotiation_port, Some(51821));
+        assert_eq!(
+            from_disk.peers[0].preshared_key.as_deref(),
+            Some("PSK-NEGOCIE"),
+            "the negotiated PSK must survive a reload"
+        );
+        assert_eq!(
+            from_disk.peers[0]
+                .key_negotiation_certificate_sha256
+                .as_deref(),
+            Some("empreinte-tls")
+        );
+        assert_eq!(
+            from_disk.peers[0].minimum_key_negotiation_mode,
+            crate::key_negotiation::ProtectionMode::MlKem,
+            "the anti-downgrade floor only ever goes up"
+        );
+
+        // And the point of the whole exercise: the new peer is there.
+        assert_eq!(from_disk.peers.len(), 2);
+        assert_eq!(from_disk.peers[1].name, "nouveau");
+        assert_eq!(from_disk.peers[1].preshared_key, None);
+    }
 
     #[test]
     fn config_empty_by_default() {

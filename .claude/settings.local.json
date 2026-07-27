@@ -207,7 +207,15 @@
       "Bash(echo \"--- exit=$?\")",
       "Bash(grep -vE \"^\\\\+.*\\(# |name:|runs-on:|uses:|with:|run:|env:|shell:|steps:|- |cache|node-version|path|if-no-files|retention|KEYRING|HELIOS_PUB|^\\\\+$\\)\")",
       "Bash(node apps/orion/scripts/orion-deps.mjs)",
-      "Bash(ORION_DEPS_READY=1 node apps/orion/scripts/orion-deps.mjs)"
+      "Bash(ORION_DEPS_READY=1 node apps/orion/scripts/orion-deps.mjs)",
+      "Bash(grep *)",
+      "Bash(command -v shellcheck)",
+      "Bash(shellcheck -S warning scripts/key-negotiation-setup.sh)",
+      "Bash(openssl x509 *)",
+      "Bash(awk -F'\\\\t' -v nom=\"poste-windows\" '$1 == nom { split\\($3, k, \" \"\\); print k[1]; exit }' target/key-negotiation/peer-list.log)",
+      "Bash(awk -F'\\\\t' -v nom=\"autre\" '$1 == nom { split\\($3, k, \" \"\\); print k[1]; exit }' target/key-negotiation/peer-list.log)",
+      "Bash(HELIOS_NETWORK_CONFIG=/tmp/claude-1000/-home-christophe-helios/d13ee951-9ea0-4c35-92f7-c75343bd842a/scratchpad/reload/network.toml target/debug/heliosd peer add --name deuxieme --public-key AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=)",
+      "Bash(pkill -9 -f \"heliosd run --dev\")"
     ]
   }
 }

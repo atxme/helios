@@ -1035,7 +1035,6 @@ mod tests {
     /// Gateway material as the operator distributes it: public certificate,
     /// public CA, and the name of the protected store entry — never the
     /// client's own private key.
-    #[cfg(feature = "key-negotiation")]
     fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
         use aether::key_negotiation::{
             generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
@@ -1076,7 +1075,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "key-negotiation")]
     fn document_with(settings: serde_json::Value) -> String {
         serde_json::json!({
             "format": PROFILE_IMPORT_FORMAT,
@@ -1096,7 +1094,6 @@ mod tests {
     /// The operator document is the vehicle for the negotiation settings:
     /// without it, the screen would have nothing to display and the user
     /// would have to retype a certificate by hand.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn imports_the_key_negotiation_block_of_an_operator_document() {
         let settings = gateway_settings(ProtectionMode::MlKem);
@@ -1112,7 +1109,6 @@ mod tests {
 
     /// An absent floor is not "no floor": accepting a classic negotiation
     /// tomorrow would void the mode chosen today.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn an_imported_block_without_a_floor_takes_its_selected_mode_as_floor() {
         let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
@@ -1133,7 +1129,6 @@ mod tests {
 
     /// A document that asks for less than its own floor is contradictory:
     /// import refuses it rather than silently picking a side.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn a_mode_below_the_declared_floor_is_refused_at_import() {
         let mut settings = gateway_settings(ProtectionMode::Classic);
@@ -1149,7 +1144,6 @@ mod tests {
     /// A certificate pinned to another gateway must not pass for this one:
     /// it's the only check that ties the imported material to the peer key
     /// the profile is about to talk to.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn a_certificate_pinned_to_another_gateway_is_refused() {
         let settings = gateway_settings(ProtectionMode::MlKem);
@@ -1163,7 +1157,6 @@ mod tests {
 
     /// The three modes don't take the same profile material, and the fault
     /// is a relation between two fields — the block carries it as a whole.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn a_psk_that_contradicts_the_mode_is_reported_on_the_block() {
         let profile = ClientProfile {
@@ -1183,7 +1176,6 @@ mod tests {
         assert_eq!(inspect_profile(&sound).key_negotiation, None);
     }
 
-    #[cfg(feature = "key-negotiation")]
     fn identity_bundle(name: &str) -> serde_json::Value {
         use base64::engine::general_purpose::STANDARD;
 
@@ -1199,7 +1191,6 @@ mod tests {
     /// The identity travels with the profile so the user has **one** file to
     /// import — but it must come back separately, because the two have
     /// opposite destinies: one is persisted, the other is sealed.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn the_shipped_identity_is_returned_apart_from_the_profile() {
         let settings = gateway_settings(ProtectionMode::MlKem);
@@ -1228,7 +1219,6 @@ mod tests {
     /// re-enrolled from its **public** key, so the document carries no
     /// private key and completion takes the local one. Regenerating a key
     /// here would silently break an admission the gateway already holds.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn enrolling_an_existing_profile_keeps_its_wireguard_identity() {
         let settings = gateway_settings(ProtectionMode::MlKem);
@@ -1261,7 +1251,6 @@ mod tests {
     /// `poste-windows`, the machine kept it under another name, and the
     /// admitted key is the same on both sides. Matching by name refused the
     /// document; matching by key is what makes it importable.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn an_invitation_is_completed_by_the_admitted_key_whatever_the_name() {
         use base64::engine::general_purpose::STANDARD;
@@ -1306,7 +1295,6 @@ mod tests {
     /// A same-name profile holding **another** key is not a match: it was
     /// never admitted, and using it would produce a tunnel that handshakes
     /// with nobody.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn a_local_profile_holding_another_key_does_not_complete_an_invitation() {
         let invitation = ClientProfile {
@@ -1330,7 +1318,6 @@ mod tests {
 
     /// An identity sealed under a name the profile never looks up would be a
     /// secret stored for nothing.
-    #[cfg(feature = "key-negotiation")]
     #[test]
     fn an_identity_naming_another_entry_is_refused() {
         let settings = gateway_settings(ProtectionMode::MlKem);

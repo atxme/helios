@@ -1,7 +1,6 @@
 //! `heliosd` — control plane orchestrator daemon.
 
 mod gateway_key;
-#[cfg(feature = "key-negotiation")]
 mod key_negotiation;
 mod orchestrator;
 
@@ -70,7 +69,6 @@ enum Command {
         rotate: bool,
     },
     /// Creates and seals the gateway's key-negotiation TLS identity.
-    #[cfg(feature = "key-negotiation")]
     InitKeyNegotiation {
         /// DNS name or IP address clients use to authenticate this gateway.
         #[arg(long)]
@@ -169,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ProvisionTpm => provision_tpm(),
         Command::InitIdentity { rotate } => init_identity(&network, rotate),
-        #[cfg(feature = "key-negotiation")]
         Command::InitKeyNegotiation {
             server_name,
             client_ca,
@@ -180,7 +177,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "key-negotiation")]
 fn init_key_negotiation(
     network: &NetworkConfig,
     server_name: &str,
@@ -236,10 +232,14 @@ fn init_identity(network: &NetworkConfig, rotate: bool) -> anyhow::Result<()> {
 
 /// Local admission: reads, modifies and rewrites `network.toml`.
 ///
-/// The daemon keeps its configuration in memory: a modification through this
-/// path only takes effect on the next startup. This is accepted — this
-/// command targets bootstrap and console troubleshooting, not routine
-/// operations, which go through the API (`helios-ctl peer`).
+/// This command runs in its own process and only knows the file. A running
+/// daemon picks the change up on its own — it watches `network.toml`
+/// (`orchestrator::spawn_network_config_watcher`) and re-applies it without a
+/// restart. Admitting a peer therefore no longer costs the connection of
+/// every peer already admitted.
+///
+/// The secrets are not in the file, and must not be: the daemon restores its
+/// sealed private key and its negotiated PSKs from memory when it reloads.
 fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Result<()> {
     match command {
         PeerCommand::List => {
@@ -290,7 +290,7 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
                 .save()
                 .context("writing the network configuration")?;
             println!("{}\t{}", peer.name, peer.address);
-            info!("peer admitted — the change will take effect on heliosd's next startup");
+            info!("peer admitted — a running heliosd applies it within seconds, without restart");
             Ok(())
         }
         PeerCommand::Remove { name } => {
@@ -384,12 +384,10 @@ fn resolve_dry_run(explicit_dev: bool) -> bool {
 }
 
 async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
-    #[cfg(not(feature = "key-negotiation"))]
-    anyhow::ensure!(
-        network.key_negotiation_port.is_none(),
-        "key_negotiation_port is configured but this heliosd binary was built without \
-         the key-negotiation feature"
-    );
+    // The guard that used to stand here — refusing to start when
+    // `key_negotiation_port` was set on a binary built without the feature —
+    // no longer has a case to catch: every heliosd serves that port. The
+    // setting alone decides whether it opens.
 
     // TPM integrity validation — BEFORE any network access.
     let tpm = TpmSettings::default();
@@ -434,7 +432,6 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy = Arc::new(RwLock::new(shared_network.read().await.firewall_policy()));
 
-    #[cfg(feature = "key-negotiation")]
     key_negotiation::start(Arc::clone(&shared_network), psk_tx.clone(), &boot, dry_run).await?;
 
     // The API listens on the tunnel's address: this is how Orion clients
@@ -463,7 +460,6 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // Published for the operator tooling: `helios-ctl` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
-    #[cfg(feature = "key-negotiation")]
     if let Some(material) = key_negotiation::public_material()? {
         state = state.with_key_negotiation(material);
     }

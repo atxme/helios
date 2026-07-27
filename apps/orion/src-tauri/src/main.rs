@@ -177,23 +177,23 @@ fn adapter_is_up(state: State<'_, AppState>) -> bool {
     state.controller.adapter_is_up()
 }
 
-/// What this build can do with the gateway's key-negotiation port.
+/// What this machine can do with the gateway's key-negotiation port.
 ///
-/// The two facts are reported separately because they fail differently: a
-/// binary compiled without the feature will never negotiate, while a build
-/// that has it still needs the machine's protected certificate store to be
-/// wired in. The screen states whichever is missing instead of letting the
-/// user discover it when the connection fails.
+/// The negotiation itself is no longer a build option — it is compiled into
+/// every Orion, because a binary that looks normal and refuses every pinned
+/// profile at connection time is indistinguishable, for the user, from a
+/// broken gateway. What remains conditional is the **machine**: the protected
+/// certificate store is supplied by the shell, and DPAPI exists only on
+/// Windows. The screen says so instead of letting the user find out when the
+/// connection fails.
 #[derive(serde::Serialize)]
 struct KeyNegotiationSupport {
-    compiled: bool,
     identity_store: bool,
 }
 
 #[tauri::command]
 fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport {
     KeyNegotiationSupport {
-        compiled: cfg!(feature = "key-negotiation"),
         identity_store: state.controller.key_negotiation_ready(),
     }
 }
@@ -665,7 +665,6 @@ fn main() {
     let controller = VpnController::new(backend);
     // The protected store is the shell's job: `orion-core` states the
     // boundary, the platform implementation lives with the platform.
-    #[cfg(feature = "key-negotiation")]
     let controller = match ProtectedIdentityStore::for_current_user() {
         Ok(store) => controller.with_key_negotiation_identities(Arc::new(store)),
         Err(error) => {

@@ -381,9 +381,19 @@ pub async fn start(
 ) -> Result<()> {
     let (port, gateway_private_key, static_psks) = {
         let network = network.read().await;
-        let port = network
-            .key_negotiation_port
-            .context("key-negotiation feature enabled but key_negotiation_port is absent")?;
+        // No port declared, no service. This used to be an error, back when
+        // the negotiation was a build flag: a binary carrying the feature and
+        // a configuration ignoring it looked like a contradiction worth
+        // refusing to start over. Every binary carries it now, so the absence
+        // of a port is simply the ordinary state of a gateway that has not
+        // opened it — and refusing to start would take down every gateway
+        // that upgrades.
+        let Some(port) = network.key_negotiation_port else {
+            tracing::info!(
+                "key_negotiation_port absent: the pre-WireGuard negotiation stays closed"
+            );
+            return Ok(());
+        };
         let static_psks = network
             .peers
             .iter()
