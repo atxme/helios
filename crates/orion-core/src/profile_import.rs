@@ -134,6 +134,9 @@ impl From<JsonProfile> for ClientProfile {
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
             key_negotiation: profile.key_negotiation.map(KeyNegotiationSettings::from),
+            // A document is a configuration: any PSK it carries was shared
+            // out of band, never negotiated.
+            preshared_key_is_negotiated: false,
         }
     }
 }
@@ -531,6 +534,7 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
         persistent_keepalive: keepalive,
         heliosd_url: None,
         key_negotiation: None,
+        preshared_key_is_negotiated: false,
     })
 }
 
@@ -1174,6 +1178,37 @@ mod tests {
             ..complete_profile()
         };
         assert_eq!(inspect_profile(&sound).key_negotiation, None);
+    }
+
+    /// The PSK that ML-KEM just produced is not the PSK this rule forbids.
+    ///
+    /// Both sit in the same slot, and telling them apart is the difference
+    /// between a negotiation that commits and one that cannot: `up()`
+    /// validates the profile it mounts, and that profile carries the freshly
+    /// negotiated secret. Judging it as a static PSK made every ML-KEM
+    /// connection fail — three attempts, then «un PSK de profil n'est valable
+    /// qu'avec le mode PSK statique», on a profile the user never touched.
+    #[test]
+    fn a_negotiated_psk_does_not_contradict_the_ml_kem_mode() {
+        let mounted = ClientProfile {
+            preshared_key: Some("cHNr".into()),
+            preshared_key_is_negotiated: true,
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            mounted.validate().is_ok(),
+            "the profile handed to up() after a negotiation must be mountable: {:?}",
+            mounted.validate().unwrap_err()
+        );
+
+        // The same secret, declared static: still refused, and that check is
+        // the one worth keeping.
+        let configured = ClientProfile {
+            preshared_key_is_negotiated: false,
+            ..mounted
+        };
+        assert!(configured.validate().is_err());
     }
 
     fn identity_bundle(name: &str) -> serde_json::Value {

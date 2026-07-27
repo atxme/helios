@@ -184,6 +184,20 @@ pub struct ClientProfile {
     /// Authenticated public negotiation performed before WireGuard is mounted.
     #[serde(default)]
     pub key_negotiation: Option<KeyNegotiationSettings>,
+    /// The `preshared_key` above holds a **negotiated** secret, not a static
+    /// one.
+    ///
+    /// Never persisted, and that is the whole point: a profile read back from
+    /// disk carrying a PSK necessarily carries a static one. The flag is set
+    /// only by the core, on the ephemeral copy it hands to the backend once
+    /// ML-KEM has produced a key.
+    ///
+    /// Without it, that copy contradicted its own settings — a PSK plus a
+    /// non-static mode — and [`ClientProfile::validate`], called by every
+    /// `up()`, refused the very tunnel the negotiation had just succeeded in
+    /// preparing. The negotiation could never commit.
+    #[serde(skip)]
+    pub preshared_key_is_negotiated: bool,
 }
 
 fn default_allowed_ips() -> String {
@@ -229,9 +243,21 @@ impl ClientProfile {
             anyhow::bail!("la clé publique de la gateway est requise");
         }
         if let Some(settings) = &self.key_negotiation {
-            validate_key_negotiation(settings, &self.peer_public_key, self.has_preshared_key())?;
+            // Only a **static** PSK contradicts a negotiating mode. The one
+            // ML-KEM just produced is the expected outcome of that very mode,
+            // and judging it by the same rule refused every commit.
+            validate_key_negotiation(settings, &self.peer_public_key, self.has_static_psk())?;
         }
         Ok(())
+    }
+
+    /// Does the profile carry a PSK **shared out of band**?
+    ///
+    /// The distinction [`Self::has_preshared_key`] cannot make: same slot,
+    /// opposite meanings. A static PSK excludes the negotiation; a negotiated
+    /// one is its result.
+    pub fn has_static_psk(&self) -> bool {
+        self.has_preshared_key() && !self.preshared_key_is_negotiated
     }
 
     /// Public key corresponding to the profile's private key.
@@ -272,6 +298,7 @@ impl Default for ClientProfile {
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
             key_negotiation: None,
+            preshared_key_is_negotiated: false,
         }
     }
 }

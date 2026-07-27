@@ -72,7 +72,14 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   modification. L’adaptateur reste monté sur échec et `down()` n’est appelé que
   sur déconnexion explicite.
 - Un Orion compilé avec `wireguard` refuse de démarrer si le backend réel est
-  indisponible ; aucun repli implicite vers le dry-run.
+  indisponible ; aucun repli implicite vers le dry-run. Réciproquement, un
+  Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
+  vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
+  en affichant un profil et un mode négocié.
+- Un PSK négocié n’est pas un PSK statique, bien qu’ils occupent le même slot.
+  Le profil éphémère passé au backend porte `preshared_key_is_negotiated` ;
+  sans lui, `validate()` refuse le tunnel que la négociation vient de préparer.
+  Toute copie qui installe un PSK à l’exécution doit poser ce drapeau.
 - La négociation de clé n’est **pas** une feature de compilation, ni côté
   Orion ni côté `heliosd` : tout binaire la porte. Un client d’apparence
   normale qui importe un profil épinglé puis échoue avant WireGuard est

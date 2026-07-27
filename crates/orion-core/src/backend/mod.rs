@@ -222,6 +222,9 @@ async fn upgrade_to_post_quantum(
 
     let upgraded = ClientProfile {
         preshared_key: Some(outcome.preshared_key.clone()),
+        // Same rule as the pre-WireGuard negotiation: this PSK is the result
+        // of an ML-KEM exchange, not a secret typed into the profile.
+        preshared_key_is_negotiated: true,
         ..profile.clone()
     };
 
@@ -495,6 +498,11 @@ async fn connect_with_key_negotiation(
                 .psk
                 .as_ref()
                 .map(|secret| secret.expose().to_string()),
+            // Says where that PSK comes from. Without it, the copy
+            // contradicted its own settings — a PSK plus a non-static mode —
+            // and the `validate()` inside every `up()` refused the tunnel the
+            // negotiation had just succeeded in preparing.
+            preshared_key_is_negotiated: negotiated.psk.is_some(),
             ..profile.clone()
         };
 

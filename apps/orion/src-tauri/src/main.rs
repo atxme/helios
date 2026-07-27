@@ -10,6 +10,23 @@
 //! 3. start heliosd telemetry **only** when the tunnel goes `Up`
 //!    (the web server lives behind WireGuard) and stop it on disconnection.
 
+/// Windows is the target platform: nothing is simulated there.
+///
+/// Without the `wireguard` feature, [`orion_core::default_backend`] falls back
+/// to the dry-run backend — legitimate on WSL2, where the data plane does not
+/// exist, and nowhere else. An installed Orion that mounts nothing while
+/// displaying a profile, an address and a negotiated mode is a client that
+/// protects nothing and says so only in a corner of the Connection screen.
+///
+/// Refusing at compile time rather than at startup is deliberate: the flag is
+/// a build decision, and the person who forgot it is the one building. Use
+/// `cargo xtask orion-msi`, which carries the features in one place.
+#[cfg(all(target_os = "windows", not(feature = "wireguard")))]
+compile_error!(
+    "Orion for Windows must be built with --features wireguard: without it the shell falls \
+     back to the simulated backend, which encrypts nothing. Build with `cargo xtask orion-msi`."
+);
+
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
