@@ -312,6 +312,40 @@ Sur le poste Windows :
    des valeurs supérieures ou égales à celle du profil chargé, et *Retirer*
    doit disparaître dès que ce plancher dépasse « Classique ».
 
+#### La campagne automatique
+
+Ce qui précède se joue à la main une fois ; la campagne se rejoue à chaque
+build. Depuis le poste Windows enrôlé, à la racine du dépôt :
+
+```powershell
+pwsh scripts/campaign-windows.ps1 -Profile poste-windows
+pwsh scripts/campaign-windows.ps1 -Profile poste-windows -Soak   # + scénarios lents
+```
+
+Ou directement l'outil, si l'on ne veut qu'une famille :
+
+```powershell
+cargo run -p helios-ctl -- campaign --only negociation-de-cle
+cargo run -p helios-ctl -- campaign --only negociation-de-cle --profile poste-windows --soak
+```
+
+Trois familles, par ce qu'elles exigent :
+
+| famille | exige | ce qu'elle prend |
+|---|---|---|
+| crypto | rien | ML-KEM aller-retour, secret implicite d'une clé étrangère, PSK lié à la transcription, dérivation refusée hors ML-KEM, signature ML-DSA-65 altérée, certificat épinglé (clé, nom, rôle, date) |
+| profil | le profil enrôlé + l'identité scellée | bloc valide face à sa gateway, identité scellée émise pour **cette** clé WireGuard, plancher tenu avant tout réseau |
+| gateway | la gateway joignable | négociation nominale, PSK frais à chaque fois, abandon qui libère le pair, **lien de vivacité maintenu 40 s** (`--soak`) |
+
+La famille crypto tourne aussi dans `cargo test` : une primitive cassée est
+prise par la régression, sans attendre que quelqu'un lance la campagne. Les
+deux autres ne peuvent pas l'être — DPAPI et la gateway n'existent pas sous
+WSL2 — et c'est précisément le trou que cette campagne comble.
+
+**La famille gateway négocie pour de vrai** : la gateway pose puis retire un
+PSK sur le plan de données. Un Orion connecté avec le même profil perd son
+tunnel. À jouer quand le poste ne sert pas.
+
 Contrôles négatifs, qui valent plus que le chemin nominal :
 
 - copier le dossier `identities` scellé vers un autre compte Windows : le

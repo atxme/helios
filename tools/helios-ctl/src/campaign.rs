@@ -44,6 +44,10 @@ pub enum Category {
     Protocole,
     /// Reads the WireGuard data plane. **Target only.**
     PlanDeDonnees,
+    /// Pre-WireGuard key negotiation: crypto primitives, the enrolled
+    /// profile, then the real service. **Windows workstation**, where the
+    /// protected identity store lives.
+    NegociationDeCle,
 }
 
 impl Category {
@@ -52,6 +56,7 @@ impl Category {
             Category::Client => "client",
             Category::Protocole => "protocol",
             Category::PlanDeDonnees => "data plane",
+            Category::NegociationDeCle => "key negotiation",
         }
     }
 }
@@ -73,28 +78,39 @@ pub struct Options {
     /// state leaks that a single run does not show (drifting VIP, a PSK that
     /// freezes, a peer table that grows).
     pub repeat: u32,
+    /// Orion profile to negotiate with, by name, as this workstation holds it.
+    ///
+    /// Required by [`Category::NegociationDeCle`] beyond its crypto scenarios:
+    /// the negotiation needs a pinned certificate and an identity sealed in
+    /// the machine's protected store. Absent, the category runs its offline
+    /// half and says why it stopped there.
+    pub profile: Option<String>,
+    /// Runs the scenarios that have to wait — the liveness link holds one
+    /// tunnel silent for forty seconds.
+    pub soak: bool,
 }
 
 /// Outcome of a scenario. `Skip` is not a failure: a scenario out of the
 /// environment's reach must **say so**, not stay silent or lie.
-enum Outcome {
+#[derive(Debug)]
+pub enum Outcome {
     Pass(String),
     Skip(String),
     Fail(String),
 }
 
 impl Outcome {
-    fn pass(detail: impl Into<String>) -> Self {
+    pub fn pass(detail: impl Into<String>) -> Self {
         Outcome::Pass(detail.into())
     }
-    fn skip(reason: impl Into<String>) -> Self {
+    pub fn skip(reason: impl Into<String>) -> Self {
         Outcome::Skip(reason.into())
     }
-    fn fail(reason: impl Into<String>) -> Self {
+    pub fn fail(reason: impl Into<String>) -> Self {
         Outcome::Fail(reason.into())
     }
     /// Translates a boolean condition into an outcome, with the failure message.
-    fn check(condition: bool, detail: impl Into<String>, failure: impl Into<String>) -> Self {
+    pub fn check(condition: bool, detail: impl Into<String>, failure: impl Into<String>) -> Self {
         if condition {
             Outcome::pass(detail)
         } else {
@@ -645,6 +661,53 @@ pub async fn run(client: &Client, base: &str, opts: Options) -> Result<()> {
                 }
             }
         }
+
+        if plays(Category::NegociationDeCle) {
+            header(Category::NegociationDeCle);
+            // The crypto half depends on nothing: it runs on the build
+            // machine as well as on the enrolled workstation.
+            for (name, outcome) in crate::campaign_key_nego::crypto_scenarios() {
+                played += 1;
+                failures += usize::from(report(name, &outcome));
+            }
+
+            match opts.profile.as_deref() {
+                None => {
+                    report(
+                        "enrolled profile",
+                        &Outcome::skip("--profile <nom> required to reach the gateway"),
+                    );
+                }
+                Some(name) => match crate::campaign_key_nego::load_enrolled(name) {
+                    Err(error) => {
+                        report("enrolled profile", &Outcome::fail(format!("{error:#}")));
+                        failures += 1;
+                        played += 1;
+                    }
+                    Ok(enrolled) => {
+                        for (name, outcome) in
+                            crate::campaign_key_nego::profile_scenarios(&enrolled).await
+                        {
+                            played += 1;
+                            failures += usize::from(report(name, &outcome));
+                        }
+                        // Announced before, not after: the operator must be
+                        // able to stop here rather than discover afterwards
+                        // that a connected Orion lost its tunnel.
+                        println!(
+                            "  \x1b[90m…\x1b[0m négociations réelles — le PSK du pair est \
+                             renégocié puis relâché"
+                        );
+                        for (name, outcome) in
+                            crate::campaign_key_nego::gateway_scenarios(&enrolled, opts.soak).await
+                        {
+                            played += 1;
+                            failures += usize::from(report(name, &outcome));
+                        }
+                    }
+                },
+            }
+        }
     }
 
     println!();
@@ -688,6 +751,8 @@ mod tests {
             wg_iface: None,
             only: None,
             repeat: 1,
+            profile: None,
+            soak: false,
         };
         assert!(profile(&with_nothing, "http://x").is_err());
 

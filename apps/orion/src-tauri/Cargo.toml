@@ -25,6 +25,9 @@ tracing-subscriber = { workspace = true }
 aether = { workspace = true }
 orion-core = { path = "../../../crates/orion-core" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
 [features]
 default = []
 # Relais de la feature du backend WireGuard réel vers orion-core (target-only).

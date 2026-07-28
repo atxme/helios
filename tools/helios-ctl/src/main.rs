@@ -24,6 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod api;
 mod campaign;
+mod campaign_key_nego;
 mod enroll;
 mod escrow;
 mod files;
@@ -190,6 +191,18 @@ enum Cmd {
         /// Generates a key pair to declare, then exits.
         #[arg(long)]
         generate_keys: bool,
+        /// Orion profile of this workstation, for the key-negotiation
+        /// scenarios. Its identity must be sealed here.
+        ///
+        /// **The campaign negotiates for real**: the peer's PSK is
+        /// renegotiated then released, so an Orion connected with this same
+        /// profile loses its tunnel.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Also runs the scenarios that have to wait — the liveness link
+        /// holds a session silent for forty seconds to prove it survives.
+        #[arg(long)]
+        soak: bool,
     },
 }
 
@@ -898,6 +911,8 @@ async fn main() -> Result<()> {
             only,
             repeat,
             generate_keys,
+            profile,
+            soak,
         } => {
             if generate_keys {
                 campaign::generate_keys();
@@ -912,6 +927,8 @@ async fn main() -> Result<()> {
                     wg_iface,
                     only,
                     repeat,
+                    profile,
+                    soak,
                 },
             )
             .await

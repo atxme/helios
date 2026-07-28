@@ -46,6 +46,12 @@ use orion_core::{
     parse_profile_import, read_profile_import_path, telemetry, ClientConfig, ClientEvent,
     ClientProfile, ProfileIssues, ProtectedIdentityStore, VpnController,
 };
+#[cfg(target_os = "windows")]
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    WindowEvent,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
@@ -174,6 +180,83 @@ fn emit_sink(app: AppHandle) -> EventSink {
     Arc::new(move |ev: ClientEvent| {
         let _ = app.emit("helios://event", &ev);
     })
+}
+
+/// Shows the main window after it was hidden in the Windows notification area.
+fn reveal_main_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+const TRAY_OPEN_MENU_ID: &str = "orion-tray-open";
+#[cfg(target_os = "windows")]
+const TRAY_QUIT_MENU_ID: &str = "orion-tray-quit";
+
+/// Installs Orion in the Windows notification area.
+///
+/// Hiding the window deliberately leaves the process and VPN controller
+/// untouched. The tunnel and its key-negotiation liveness link therefore keep
+/// running exactly as they did while the window was visible.
+#[cfg(target_os = "windows")]
+fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
+    let open_item = MenuItem::with_id(app, TRAY_OPEN_MENU_ID, "Ouvrir Orion", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, "Quitter Orion", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Orion's default window icon is unavailable"))?;
+
+    TrayIconBuilder::with_id("orion-notification-area")
+        .icon(icon)
+        .tooltip("Orion VPN")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id() == TRAY_OPEN_MENU_ID {
+                if let Err(error) = reveal_main_window(app) {
+                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
+                }
+            } else if event.id() == TRAY_QUIT_MENU_ID {
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                if let Err(error) = reveal_main_window(tray.app_handle()) {
+                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+/// Turns the Windows title-bar close button into a hide-to-tray action.
+#[cfg(target_os = "windows")]
+fn hide_main_window_on_close(window: &tauri::Window, event: &WindowEvent) {
+    if window.label() != "main" {
+        return;
+    }
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();
+        if let Err(error) = window.hide() {
+            tracing::warn!(%error, "unable to hide Orion in the notification area");
+        }
+    }
 }
 
 // ─── Commands invoked by the frontend ───────────────────────────────────────
@@ -711,9 +794,8 @@ fn main() {
                 state.pending_profile_paths.lock().unwrap().extend(paths);
                 let _ = app.emit("helios://profile-path", ());
             }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+            if let Err(error) = reveal_main_window(app) {
+                tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
         .manage(AppState {
@@ -721,6 +803,17 @@ fn main() {
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
+        })
+        .setup(|_app| {
+            #[cfg(target_os = "windows")]
+            configure_windows_tray(_app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "windows")]
+            hide_main_window_on_close(window, event);
+            #[cfg(not(target_os = "windows"))]
+            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
