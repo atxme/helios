@@ -436,7 +436,8 @@ rejouée, destinée à un autre pair ou sélectionnant un autre mode est refusé
 3. Helios vérifie certificat PQ, signature et plancher anti-downgrade
 4. Helios pose le slot choisi sur son plan de données
 5. Helios signe et renvoie le ciphertext et le contexte
-6. Orion vérifie, pose le même slot et attend un handshake WireGuard frais
+6. Orion vérifie, pose le même slot et attend qu'un handshake WireGuard
+   réussisse avec ce PSK
 7. Orion confirme par signature ; Helios commit et signe l'ACK
 ```
 

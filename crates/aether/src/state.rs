@@ -161,7 +161,7 @@ mod tests {
     fn handshake_expiry_returns_to_connecting() {
         let s = TunnelState::Up.on(TunnelEvent::HandshakeExpired).unwrap();
         assert_eq!(s, TunnelState::Connecting);
-        // A fresh new handshake restores Up.
+        // A new handshake restores Up.
         let s = s.on(TunnelEvent::HandshakeEstablished).unwrap();
         assert_eq!(s, TunnelState::Up);
     }

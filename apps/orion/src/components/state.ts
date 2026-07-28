@@ -122,7 +122,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
       label: 'Protégé',
       // "Tout" would be a word too many: DNS queries leave outside the
       // tunnel, a documented limit the posture panel states in full.
-      detail: 'Handshake frais : le trafic IP passe par la gateway.',
+      detail: 'Handshake réussi il y a moins de 150 s : le trafic IP passe par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }

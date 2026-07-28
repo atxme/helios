@@ -22,8 +22,8 @@ exécutent la key-negotiation sur un port QUIC/mTLS distinct :
 4. en ML-KEM, Orion génère `kpub`/`kpriv`, Helios encapsule et signe le
    ciphertext ;
 5. HKDF lie secret KEM, transaction, mode, nonces et identités WireGuard ;
-6. Helios pose son slot avant de répondre, Orion pose le sien puis attend un
-   handshake frais ;
+6. Helios pose son slot avant de répondre, Orion pose le sien puis attend qu'un
+   handshake réussisse avec ce PSK ;
 7. confirmation et ACK ML-DSA-65 commit la transaction ; toute fermeture ou
    expiration restaure le slot précédent.
 

@@ -102,7 +102,7 @@ impl RotationState {
 
     /// A handshake succeeded: the active PSK is confirmed.
     ///
-    /// **Idempotent.** The poller signals a fresh handshake on every tick:
+    /// **Idempotent.** The poller reports a successful handshake on every tick:
     /// this method must only touch the state if there is actually a
     /// rotation to confirm. Taking the state unconditionally (`mem::replace`)
     /// would lose the PSK starting on the second call.
@@ -247,7 +247,7 @@ mod tests {
         );
     }
 
-    /// The poller signals a fresh handshake on EVERY tick (every 10 s):
+    /// The poller reports a successful handshake on EVERY tick (every 10 s):
     /// confirming an already-confirmed PSK must absolutely not lose it.
     #[test]
     fn repeated_confirmations_are_idempotent() {

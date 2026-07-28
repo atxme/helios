@@ -245,7 +245,7 @@ impl VpnBackend for WireGuardBackend {
         ));
 
         // We do NOT signal `Up` here: WireGuard is connectionless, state is
-        // inferred from a fresh handshake. It's `VpnController::poll_handshake`
+        // inferred from a recent handshake. It's `VpnController::poll_handshake`
         // that promotes `Connecting` → `Up` (ADR-001 §3).
         Ok(())
     }

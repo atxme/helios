@@ -419,7 +419,8 @@ impl KeyNegotiationResponse {
     }
 }
 
-/// Final acknowledgment sent after Orion observes a fresh WireGuard handshake.
+/// Final acknowledgment, sent once Orion has seen a WireGuard handshake
+/// succeed **with the newly installed PSK**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyNegotiationConfirmation {

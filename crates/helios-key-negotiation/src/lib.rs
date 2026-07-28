@@ -33,8 +33,9 @@ use zeroize::Zeroize as _;
 pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/2";
 /// Confirmation is bounded independently from transport idle time.
 ///
-/// The client confirms as soon as it sees a fresh WireGuard handshake, which
-/// takes a second or two. This bound is therefore not a wait anyone lives
+/// The client confirms as soon as a WireGuard handshake succeeds with the PSK
+/// it has just installed, which takes a second or two. This bound is
+/// therefore not a wait anyone lives
 /// through — it is how long a **failed** attempt keeps the peer's transaction
 /// slot, during which every new negotiation from that client is refused as
 /// busy. Three minutes of that was a client locked out for three minutes by a

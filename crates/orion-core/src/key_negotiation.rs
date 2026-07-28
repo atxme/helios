@@ -132,7 +132,8 @@ pub struct NegotiatedKey {
 }
 
 impl NegotiatedKey {
-    /// Commits only after the caller has observed a fresh WireGuard handshake.
+    /// Commits only after the caller has seen a WireGuard handshake succeed
+    /// with the PSK this negotiation just installed.
     ///
     /// Returns the live link: as long as it is held, the gateway considers
     /// this tunnel alive. Closing it — or dropping it, or crashing — tells the

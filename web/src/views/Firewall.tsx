@@ -144,7 +144,7 @@ export function FirewallView({ status, state }: Props) {
     <div className="space-y-4 max-w-4xl">
       <div>
         <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-200 tracking-wide">Pare-feu · Kill-switch</h1>
-        <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic LAN autorisé uniquement après un handshake WireGuard frais</p>
+        <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic LAN autorisé uniquement tant qu'un handshake WireGuard date de moins de 150 s</p>
       </div>
 
       {/* Kill-switch card */}

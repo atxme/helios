@@ -87,7 +87,7 @@ QUIC devient un lien de vivacité conservé pendant toute la durée du tunnel.
 | découverte de MTU | désactivée | évite `WSAEMSGSIZE` après capture de route par WireGuard |
 | connexion QUIC | 10 s au plus | erreur rapide si le port dédié n'est pas joignable |
 | réponse de préparation | 15 s au plus | couvre ML-KEM, ML-DSA et la pose sur le plan de données |
-| confirmation WireGuard | 45 s au plus | rollback si aucun handshake frais n'est observé |
+| confirmation WireGuard | 45 s au plus | rollback si aucun handshake ne réussit avec le PSK posé |
 | ACK de commit | 5 s au plus | borne la dernière phase transactionnelle |
 | keep-alive / expiration du lien | 10 s / 35 s | trois battements manqués avant libération du slot |
 
@@ -287,7 +287,7 @@ sequenceDiagram
     O->>O: vérifie certificat épinglé,<br/>signature, mode, transaction et clé WG
     O->>O: retrouve ou dérive le même slot
     O->>C: monte ou reconfigure l'adaptateur<br/>preshared_key_is_negotiated = true si PSK
-    C->>G: handshake WireGuard frais
+    C->>G: handshake WireGuard avec le PSK posé
     G-->>C: handshake accepté
     O->>H: confirmation ML-DSA-65 signée
     H->>H: élève et persiste le plancher
@@ -354,7 +354,7 @@ qu'Orion conserve le PSK qu'il vient de poser. Tous les handshakes échouent
 ensuite, et **aucun journal ne dit pourquoi**, puisque chaque côté a fait
 exactement ce qu'il devait.
 
-Si la pose Orion, le handshake frais, la confirmation ou le commit n'aboutit
+Si la pose Orion, le handshake avec ce PSK, la confirmation ou le commit n'aboutit
 pas, Orion renégocie entièrement — jusqu'à trois tentatives, espacées de deux
 secondes. Une négociation neuve pose un PSK neuf des deux côtés, ce qui remet
 les bouts en phase.

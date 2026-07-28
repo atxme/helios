@@ -132,7 +132,8 @@ Valider avec accès console :
   doit rester en tunnel classique opérationnel, sans PSK orphelin ;
 - key-negotiation : rediriger UDP 51821 et UDP 51820 séparément, vérifier les
   trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
-  avant confirmation, le timeout, puis un handshake frais et l’ACK de commit ;
+  avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
+  et l’ACK de commit ;
 - identité key-negotiation : `heliosd init-key-negotiation` scelle réellement la
   clé serveur, refuse l’écrasement sans `--rotate` et redémarre avec le même
   certificat et la même clé descellée ;

@@ -111,7 +111,7 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
           <Field
             label="Ordre de pose"
             value="poser puis annoncer"
-            note="Le slot est posé sur le plan de données avant la réponse. Sans handshake frais puis confirmation signée, Helios restaure le slot précédent."
+            note="Le slot est posé sur le plan de données avant la réponse. Si aucun handshake ne réussit avec ce PSK, puis n'est confirmé par signature, Helios restaure le slot précédent."
           />
         </dl>
 

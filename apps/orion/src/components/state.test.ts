@@ -39,7 +39,7 @@ const negotiating = (mode: ProtectionMode, minimum_mode: ProtectionMode = 'class
   })
 
 describe('Orion UI state', () => {
-  it('only indicates active traffic on a fresh WireGuard handshake', () => {
+  it('only indicates active traffic on a recent WireGuard handshake', () => {
     expect(stateMeta('up')).toMatchObject({ active: true, transitioning: false })
     for (const state of ['down', 'connecting', 'failed', 'captive_portal'] as const) {
       expect(stateMeta(state).active).toBe(false)

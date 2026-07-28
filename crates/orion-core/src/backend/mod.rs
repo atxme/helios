@@ -117,7 +117,8 @@ pub fn default_backend() -> anyhow::Result<Arc<dyn VpnBackend>> {
     Ok(Arc::new(dryrun::DryRunBackend::default()))
 }
 
-/// Waits for a fresh handshake to prove the classic tunnel carries traffic.
+/// Waits for a handshake recent enough to prove the classic tunnel carries
+/// traffic.
 ///
 /// Returns `false` if the timeout expires: the caller must then give up on
 /// provisioning without breaking anything.
@@ -535,7 +536,8 @@ async fn connect_with_key_negotiation(
             "info",
             format!(
                 "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : accord obtenu ({mode:?}) — \
-                 pose du PSK puis attente d'un handshake WireGuard frais ({} s au plus)",
+                 pose du PSK puis attente d'un handshake WireGuard réussi avec ce PSK \
+                 ({} s au plus)",
                 negotiated.confirmation_timeout.as_secs()
             ),
         ));
@@ -584,12 +586,13 @@ async fn connect_with_key_negotiation(
                 sink(ClientEvent::log(
                     "info",
                     format!(
-                        "négociation confirmée ({mode:?}) après un handshake WireGuard frais — \
-                         tunnel établi"
+                        "négociation confirmée ({mode:?}) — un handshake WireGuard a réussi \
+                         avec le PSK négocié, tunnel établi"
                     ),
                 ));
-                // The commit's precondition was a **fresh** handshake, observed
-                // a second ago: the tunnel is up, and saying so now spares the
+                // The commit's precondition was a handshake that succeeded
+                // with this PSK, a second ago: the tunnel is up, and saying
+                // so now spares the
                 // user the ten seconds the state poller would have taken to
                 // reach the same conclusion.
                 sink(ClientEvent::state(TunnelState::Up));
@@ -668,9 +671,9 @@ async fn commit_negotiated_slot(
         .context("installing the negotiated PSK on the data plane")?;
     if !wait_for_new_handshake(backend, prepared_at, confirmation_timeout).await {
         anyhow::bail!(
-            "no fresh WireGuard handshake within {} s: the gateway either did not receive the \
-             client's handshakes, or answered with a PSK that does not match — check UDP {} \
-             reaches the gateway",
+            "no WireGuard handshake succeeded with the negotiated PSK within {} s: the gateway \
+             either did not receive the client's handshakes, or answered with a PSK that does \
+             not match — check UDP {} reaches the gateway",
             confirmation_timeout.as_secs(),
             negotiated_profile
                 .endpoint

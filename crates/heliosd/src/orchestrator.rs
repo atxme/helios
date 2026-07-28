@@ -266,9 +266,9 @@ pub async fn run(
                     Some(OrchestratorCmd::TunnelStateInferred(state)) => {
                         transition(&shared_state, &event_tx, state, fw.as_ref(), &policy).await?;
                         let msg = if state == TunnelState::Up {
-                            "Peer connected — fresh WireGuard handshake, firewall reapplied"
+                            "Peer connected — recent WireGuard handshake, firewall reapplied"
                         } else {
-                            "No more fresh handshakes — kill-switch re-engaged"
+                            "Every peer handshake has gone stale — kill-switch re-engaged"
                         };
                         emit_log(&event_tx, "info", msg);
                     }
@@ -820,7 +820,7 @@ async fn log_peer_transitions(
                 emit_log(
                     event_tx,
                     "info",
-                    &format!("peer \"{name}\" inactive — no more fresh handshake"),
+                    &format!("peer \"{name}\" inactive — its handshake has gone stale"),
                 );
             }
             // A peer never seen fresh that stays stale has nothing to
@@ -957,7 +957,8 @@ fn spawn_network_config_watcher(
 /// Periodically polls peer handshakes to infer the state.
 ///
 /// WireGuard is connectionless: `Up` is never received, it is inferred. The
-/// gateway is `Up` as soon as **at least one** peer has a fresh handshake.
+/// gateway is `Up` as soon as **at least one** peer has handshaked less than
+/// [`HANDSHAKE_STALE_AFTER`] ago.
 fn spawn_handshake_poller(
     wg: Arc<dyn WireguardBackend>,
     shared: Arc<RwLock<TunnelState>>,

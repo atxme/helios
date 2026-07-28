@@ -20,7 +20,7 @@ pub struct DryRunBackend {
     up: AtomicBool,
     iface: Mutex<Option<String>>,
     peers: Mutex<Vec<PeerConfig>>,
-    /// If `true`, the simulated peers report a fresh handshake (useful for
+    /// If `true`, the simulated peers report a recent handshake (useful for
     /// exercising state inference without a data plane).
     simulate_handshakes: bool,
     /// If `true`, [`WireguardBackend::sync_peers`] systematically fails.
