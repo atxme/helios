@@ -227,6 +227,37 @@ pub enum PublicError {
 }
 
 /// Builds a QUIC server requiring a client certificate rooted in `client_ca`.
+/// Transport of an exchange that carries **large** material over an unknown
+/// path.
+///
+/// A negotiation moves several kilobytes in a couple of round-trips: an
+/// ML-KEM-1024 ciphertext, an ML-DSA-65 signature of 3 309 bytes, two
+/// certificates. QUIC cuts all that into datagrams, and their size is the
+/// whole question — throughput is irrelevant here, reaching the other end is
+/// not.
+///
+/// quinn probes upward by default (up to 1 452 bytes). That probe succeeds on
+/// a LAN and then betrays: the client mounts its WireGuard interface, which
+/// captures the route with a smaller MTU, and every datagram sized by the
+/// earlier probe comes back as `WSAEMSGSIZE` — an exchange that worked in the
+/// lab and fails at the customer's, on the renegotiation rather than the
+/// first attempt.
+///
+/// Pinning the size to 1 200 bytes removes the question. It is the floor
+/// RFC 9000 §14 imposes on every QUIC path: a network unable to carry it
+/// cannot carry QUIC at all. The cost is a few extra datagrams for the PQ
+/// material, on an exchange that happens once per connection.
+fn pinned_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    transport.initial_mtu(SAFE_UDP_PAYLOAD);
+    transport.min_mtu(SAFE_UDP_PAYLOAD);
+    transport
+}
+
+/// Datagram size every QUIC path must carry (RFC 9000 §14).
+const SAFE_UDP_PAYLOAD: u16 = 1200;
+
 pub fn server_endpoint(
     bind: SocketAddr,
     identity: &TlsIdentity,
@@ -247,9 +278,12 @@ pub fn server_endpoint(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let transport = Arc::get_mut(&mut config.transport)
-        .ok_or_else(|| TransportError::Tls("shared transport config".into()))?;
+    let mut transport = pinned_transport();
     transport.max_concurrent_bidi_streams(1u32.into());
+    // The gateway answers with the bulkiest half of the exchange — ciphertext
+    // and signature — so the size limit matters at least as much here as on
+    // the client side.
+    config.transport = Arc::new(transport);
     Endpoint::server(config, bind).map_err(TransportError::Io)
 }
 
@@ -271,7 +305,9 @@ pub fn client_endpoint(
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let mut endpoint = Endpoint::client(bind).map_err(TransportError::Io)?;
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+    client_config.transport_config(Arc::new(pinned_transport()));
+    endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
 

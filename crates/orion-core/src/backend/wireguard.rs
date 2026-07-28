@@ -89,6 +89,29 @@ impl WireGuardBackend {
         })
     }
 
+    /// Access to the `defguard` API, poisoning included.
+    ///
+    /// A panic inside `wireguard-nt` — the crate asserts on some driver
+    /// answers — poisons this mutex. `unwrap()` then turned that single
+    /// failure into a client that panics on **every** subsequent call:
+    /// impossible to disconnect, impossible to reconnect, and above all
+    /// impossible to unmount the adapter. The lock protects a handle, not an
+    /// invariant that a panic could have broken halfway; taking it back is
+    /// strictly better than dying with it.
+    fn api(&self) -> anyhow::Result<std::sync::MutexGuard<'_, WgApiImpl>> {
+        Ok(self
+            .api
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// Same reasoning for the peer key: an `Option<Key>`, nothing to corrupt.
+    fn peer_key(&self) -> std::sync::MutexGuard<'_, Option<Key>> {
+        self.peer_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Translates the profile into a `defguard` WireGuard peer.
     fn build_peer(profile: &ClientProfile) -> anyhow::Result<Peer> {
         let public_key = Key::try_from(profile.peer_public_key.as_str())
@@ -145,7 +168,7 @@ impl VpnBackend for WireGuardBackend {
             .map_err(|e| anyhow::anyhow!("clé privée du client invalide : {e}"))?;
 
         let peer = Self::build_peer(profile)?;
-        *self.peer_key.lock().unwrap() = Some(peer.public_key.clone());
+        *self.peer_key() = Some(peer.public_key.clone());
 
         let config = InterfaceConfiguration {
             name: self.ifname.clone(),
@@ -164,21 +187,36 @@ impl VpnBackend for WireGuardBackend {
 
         sink(ClientEvent::state(TunnelState::Connecting));
 
-        let mut api = self.api.lock().unwrap();
+        let mut api = self.api()?;
 
-        // 2. Interface creation. As soon as it succeeds, `AllowedIPs` captures
-        //    traffic: WireGuard DROPS it as long as the session isn't
-        //    established. From here on, no error path must remove it.
-        api.create_interface()
-            .map_err(|e| anyhow::anyhow!("création de l'interface {} : {e}", self.ifname))?;
-        self.adapter_up.store(true, Ordering::SeqCst);
-        sink(ClientEvent::log(
-            "info",
-            format!(
-                "interface {} montée ({}) — le trafic hors tunnel est jeté",
-                self.ifname, profile.allowed_ips
-            ),
-        ));
+        // 2. Interface creation — **only if it does not exist yet**. `up()` is
+        //    documented as idempotent, and the negotiation calls it again on
+        //    each attempt: on Windows, recreating an adapter already opened by
+        //    this process leaves `wireguard-nt` with a handle onto a device
+        //    that no longer answers ("Failed to connect to adapter
+        //    interface"), and its next configuration read panics inside the
+        //    crate — taking the Tokio worker and our mutexes with it.
+        //
+        //    As soon as the interface exists, `AllowedIPs` captures traffic:
+        //    WireGuard DROPS it as long as the session isn't established. From
+        //    here on, no error path must remove it.
+        if self.adapter_up.load(Ordering::SeqCst) {
+            sink(ClientEvent::log(
+                "info",
+                format!("interface {} déjà montée — reconfiguration", self.ifname),
+            ));
+        } else {
+            api.create_interface()
+                .map_err(|e| anyhow::anyhow!("création de l'interface {} : {e}", self.ifname))?;
+            self.adapter_up.store(true, Ordering::SeqCst);
+            sink(ClientEvent::log(
+                "info",
+                format!(
+                    "interface {} montée ({}) — le trafic hors tunnel est jeté",
+                    self.ifname, profile.allowed_ips
+                ),
+            ));
+        }
 
         // 3. Configuration. On failure we propagate the error WITHOUT
         //    unmounting: an interface that's mounted but misconfigured leaks
@@ -216,10 +254,10 @@ impl VpnBackend for WireGuardBackend {
         // unconditional avoids a per-platform `cfg`; hence the `allow` for
         // targets where it's superfluous.
         #[allow(unused_mut)]
-        let mut api = self.api.lock().unwrap();
+        let mut api = self.api()?;
         let result = api.remove_interface();
         self.adapter_up.store(false, Ordering::SeqCst);
-        *self.peer_key.lock().unwrap() = None;
+        *self.peer_key() = None;
         drop(api);
 
         sink(ClientEvent::log(
@@ -232,8 +270,8 @@ impl VpnBackend for WireGuardBackend {
     }
 
     async fn last_handshake_age(&self) -> Option<Duration> {
-        let peer_key = self.peer_key.lock().unwrap().clone()?;
-        let host = self.api.lock().unwrap().read_interface_data().ok()?;
+        let peer_key = self.peer_key().clone()?;
+        let host = self.api().ok()?.read_interface_data().ok()?;
         let last = host.peers.get(&peer_key)?.last_handshake?;
 
         // WireGuard reports the epoch as long as no handshake has happened:

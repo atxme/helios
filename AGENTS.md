@@ -76,6 +76,12 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
   vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
   en affichant un profil et un mode négocié.
+- Négociation de clé : datagrammes QUIC **épinglés à 1200 octets**, découverte
+  de MTU désactivée des deux côtés. Le matériel PQ pèse plusieurs kilooctets et
+  quinn sonde jusqu’à 1452 par défaut — une taille qui passe en labo puis
+  échoue chez le client dès que l’interface WireGuard capte la route avec un
+  MTU plus petit (`WSAEMSGSIZE`). 1200 est le plancher que RFC 9000 §14 impose
+  à tout chemin QUIC.
 - Un PSK négocié n’est pas un PSK statique, bien qu’ils occupent le même slot.
   Le profil éphémère passé au backend porte `preshared_key_is_negotiated` ;
   sans lui, `validate()` refuse le tunnel que la négociation vient de préparer.
