@@ -76,6 +76,12 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
   vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
   en affichant un profil et un mode négocié.
+- La session QUIC de négociation **survit à l’échange** : c’est le lien de
+  vivacité dont la fermeture dit à la gateway de libérer le PSK. Elle ne porte
+  alors plus rien, d’où des keep-alives obligatoires (`LINK_KEEP_ALIVE`) :
+  sans eux QUIC déclare la connexion morte au bout de 30 s, la gateway retire
+  le PSK, et le tunnel meurt au renouvellement de clé WireGuard suivant — deux
+  à trois minutes plus tard, sans que rien ne relie les deux événements.
 - Négociation de clé : datagrammes QUIC **épinglés à 1200 octets**, découverte
   de MTU désactivée des deux côtés. Le matériel PQ pèse plusieurs kilooctets et
   quinn sonde jusqu’à 1452 par défaut — une taille qui passe en labo puis

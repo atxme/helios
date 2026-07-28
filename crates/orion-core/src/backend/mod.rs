@@ -59,6 +59,15 @@ const PROVISION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Handshake polling period during the wait above.
 const PROVISION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Handshake polling period while a negotiation waits to be confirmed.
+///
+/// Four times a second rather than once: here the poll is on the critical
+/// path of the connection — the confirmation cannot be sent before a fresh
+/// handshake is seen, so every tick spent waiting is a tick the user spends
+/// looking at «connexion…». The read is a local query on the interface, and
+/// the wait it shortens lasts a second or two.
+const NEGOTIATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Event sink: the backend pushes its state transitions and logs here.
 /// The Tauri shell provides an implementation that relays to the frontend.
 pub type EventSink = Arc<dyn Fn(ClientEvent) + Send + Sync>;
@@ -556,6 +565,13 @@ async fn connect_with_key_negotiation(
         .await
         {
             Ok(link) => {
+                // Watches the liveness link. Its closure means the gateway has
+                // released the PSK slot: the tunnel still carries traffic, and
+                // will keep doing so until the next WireGuard rekey — then die
+                // without either end having said anything. Saying it here is
+                // what turns an unexplained drop two minutes later into a
+                // diagnosable event.
+                spawn_link_watch(link.clone(), Arc::clone(sink));
                 // Replaces any previous link: a renegotiation supersedes the
                 // tunnel the old one described.
                 *link_slot.lock().await = Some(link);
@@ -568,9 +584,15 @@ async fn connect_with_key_negotiation(
                 sink(ClientEvent::log(
                     "info",
                     format!(
-                        "key negotiation committed after a fresh WireGuard handshake ({mode:?})"
+                        "négociation confirmée ({mode:?}) après un handshake WireGuard frais — \
+                         tunnel établi"
                     ),
                 ));
+                // The commit's precondition was a **fresh** handshake, observed
+                // a second ago: the tunnel is up, and saying so now spares the
+                // user the ten seconds the state poller would have taken to
+                // reach the same conclusion.
+                sink(ClientEvent::state(TunnelState::Up));
                 return Ok(());
             }
             Err(error) => {
@@ -608,6 +630,24 @@ async fn connect_with_key_negotiation(
         ),
     ));
     Err(error)
+}
+
+/// Reports the death of the liveness link, which nothing else would announce.
+///
+/// The gateway releases the PSK slot as soon as this link closes. The tunnel
+/// survives on the current WireGuard session and dies at the next rekey, two
+/// to three minutes later — long enough that nobody connects the two events.
+fn spawn_link_watch(link: helios_key_negotiation::SessionLink, sink: EventSink) {
+    tokio::spawn(async move {
+        link.closed().await;
+        sink(ClientEvent::log(
+            "warn",
+            "le lien de session avec la gateway est tombé : elle a libéré le PSK négocié. \
+             Le tunnel tient jusqu'au prochain renouvellement de clé WireGuard (≤ 2 min), \
+             puis cessera. Se reconnecter renégocie."
+                .to_string(),
+        ));
+    });
 }
 
 /// Installs the negotiated slot and commits it, or reports why it could not.
@@ -662,7 +702,7 @@ async fn wait_for_new_handshake(
         ) {
             return true;
         }
-        tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+        tokio::time::sleep(NEGOTIATION_POLL_INTERVAL).await;
     }
     false
 }

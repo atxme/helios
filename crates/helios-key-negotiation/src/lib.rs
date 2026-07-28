@@ -32,7 +32,15 @@ use zeroize::Zeroize as _;
 /// credentials and messages by accident.
 pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/2";
 /// Confirmation is bounded independently from transport idle time.
-pub const DEFAULT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(180);
+///
+/// The client confirms as soon as it sees a fresh WireGuard handshake, which
+/// takes a second or two. This bound is therefore not a wait anyone lives
+/// through — it is how long a **failed** attempt keeps the peer's transaction
+/// slot, during which every new negotiation from that client is refused as
+/// busy. Three minutes of that was a client locked out for three minutes by a
+/// session that had already died; forty-five seconds still leaves twenty
+/// times the room a handshake needs.
+pub const DEFAULT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(45);
 /// Bounds authenticated connection tasks exposed on the public WAN port.
 pub const MAX_ACTIVE_NEGOTIATIONS: usize = 128;
 
@@ -252,11 +260,42 @@ fn pinned_transport() -> quinn::TransportConfig {
     transport.mtu_discovery_config(None);
     transport.initial_mtu(SAFE_UDP_PAYLOAD);
     transport.min_mtu(SAFE_UDP_PAYLOAD);
+    // The connection outlives the exchange: once committed, it becomes the
+    // liveness link whose closure tells the gateway to release the PSK slot
+    // ([`SessionLink`]). It then carries **nothing** — which QUIC, left to its
+    // defaults, reads as death after 30 seconds of silence.
+    //
+    // That is exactly what happened: the gateway released the slot half a
+    // minute into every tunnel, the client kept its own, and the session went
+    // on working until the next WireGuard rekey — then died, two to three
+    // minutes in, for no reason either end announced. Keep-alives are what
+    // make silence mean "still here".
+    transport.keep_alive_interval(Some(LINK_KEEP_ALIVE));
+    transport.max_idle_timeout(Some(
+        LINK_IDLE_TIMEOUT
+            .try_into()
+            .expect("the idle timeout fits QUIC's varint"),
+    ));
     transport
 }
 
 /// Datagram size every QUIC path must carry (RFC 9000 §14).
 const SAFE_UDP_PAYLOAD: u16 = 1200;
+
+/// Beat that keeps the liveness link alive.
+///
+/// Comfortably under [`LINK_IDLE_TIMEOUT`] so that losing one or two beats
+/// does not kill a tunnel. Two small datagrams per ten seconds and per client
+/// is a negligible price for the property they buy: the gateway holds the PSK
+/// for exactly as long as the client is there, and not one second less.
+const LINK_KEEP_ALIVE: Duration = Duration::from_secs(10);
+
+/// Silence after which the link is considered dead.
+///
+/// Three missed beats. Short enough that the gateway frees the slot of a
+/// client that truly vanished — a crash, a laptop lid — rather than waiting
+/// for handshakes to go stale 150 s later.
+const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Time allowed for the QUIC handshake with the negotiation service.
 ///
@@ -514,6 +553,7 @@ async fn handle_connection(
 /// is authenticated, it is already there, and **its closure is a signal**:
 /// whoever hangs up — deliberately, or by crashing — is noticed by the other
 /// end within a round-trip rather than within two and a half minutes.
+#[derive(Clone)]
 pub struct SessionLink {
     connection: Connection,
 }

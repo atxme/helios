@@ -62,7 +62,13 @@ struct AppState {
 /// WireGuard is connectionless: the `Up` state is inferred from handshake
 /// freshness, it's never notified (ADR-001 §3). Without this loop, the UI
 /// would stay stuck on the last known state.
-const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// Three seconds rather than ten: this loop is what turns a tunnel that has
+/// stopped answering into a visible state change, and ten seconds of a
+/// screen claiming a dead tunnel is alive is ten seconds too many. A
+/// negotiated connection no longer waits on it at all — the negotiation
+/// announces `Up` itself, having just observed the handshake.
+const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(debug_assertions)]
 const FRONTEND_DEV_PORT: u16 = 1420;
