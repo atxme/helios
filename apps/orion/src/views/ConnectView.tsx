@@ -9,7 +9,6 @@ import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../ty
 import {
   elapsed,
   formatBps,
-  modeMeta,
   postureMeta,
   protectionMeta,
   stateMeta,
@@ -38,7 +37,6 @@ interface Props {
   upSince: number | null
   telemetry: TelemetrySample | null
   history: TelemetrySample[]
-  backend: string
   adapterUp: boolean
   /** Kind of PSK set for the current session. `null` = not yet decided. */
   psk: PskKind | null
@@ -73,7 +71,6 @@ export function ConnectView({
   upSince,
   telemetry,
   history,
-  backend,
   adapterUp,
   psk,
   onConnect,
@@ -91,7 +88,6 @@ export function ConnectView({
 
   const duration = elapsed(upSince, now)
   const protection = protectionMeta(profile, psk, state)
-  const negotiation = profile?.key_negotiation
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
   // Only "held" deserves a sentence: it's the one counter-intuitive case,
@@ -124,6 +120,17 @@ export function ConnectView({
           >
             {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
           </Typography>
+          {/* The virtual address earns its place next to the endpoint only
+              while the tunnel carries it: announcing an address the machine
+              does not hold yet would read as a promise. */}
+          {meta.active && profile?.address && (
+            <Typography
+              color="text.disabled"
+              sx={{ mt: 0.3, fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}
+            >
+              {profile.address}
+            </Typography>
+          )}
           {duration && (
             <Typography
               color="text.disabled"
@@ -182,7 +189,10 @@ export function ConnectView({
         </Box>
       )}
 
-      {/* Characteristics: reference material, not a headline. Discreet by choice. */}
+      {/* The one characteristic that belongs on this screen: what protects
+          the traffic. Address, captured range, backend and negotiation
+          endpoint are reference material — they live in the posture panel,
+          one click away on the header chip, and are not repeated here. */}
       <Box sx={{ pt: 1.5 }}>
         <Tooltip title={protection.detail}>
           <Box
@@ -213,22 +223,6 @@ export function ConnectView({
             </Typography>
           </Box>
         </Tooltip>
-
-        <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.4, mt: 1 }}>
-          <Fact label="adresse" value={profile?.address ?? '—'} />
-          <Fact label="capté" value={profile?.allowed_ips ?? '—'} />
-          <Fact label="backend" value={backend || '—'} />
-          {/* Where the PSK comes from — the chip above says its nature, not
-              its origin. Absent from the line when the profile negotiates
-              nothing: a permanent "aucune" would be noise. */}
-          {negotiation && (
-            <Fact
-              label="négociation"
-              value={modeMeta(negotiation.mode).label}
-              hint={`Échange authentifié en ML-DSA-65 sur ${negotiation.endpoint}, avant le montage de WireGuard. ${modeMeta(negotiation.mode).detail}`}
-            />
-          )}
-        </Box>
       </Box>
 
       <Stack spacing={0.75} sx={{ pt: 1.75 }}>
@@ -271,27 +265,6 @@ export function ConnectView({
 /** Scale shared by both series — see `Sparkline`'s doc-comment. */
 function ceilingOf(history: TelemetrySample[]): number {
   return Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
-}
-
-function Fact({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  const fact = (
-    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.5, minWidth: 0 }}>
-      <Typography
-        color="text.disabled"
-        sx={{ fontFamily: 'monospace', fontSize: 9.5, letterSpacing: '0.1em', textTransform: 'uppercase' }}
-      >
-        {label}
-      </Typography>
-      <Typography
-        noWrap
-        color="text.secondary"
-        sx={{ fontFamily: 'monospace', fontSize: 10.5, mr: 1 }}
-      >
-        {value}
-      </Typography>
-    </Box>
-  )
-  return hint ? <Tooltip title={hint}>{fact}</Tooltip> : fact
 }
 
 function Series({

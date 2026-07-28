@@ -6,13 +6,14 @@ import ButtonBase from '@mui/material/ButtonBase'
 import IconButton from '@mui/material/IconButton'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { Radio, Settings2, Terminal, X } from 'lucide-react'
+import { ChevronDown, Radio, Settings2, Terminal, X } from 'lucide-react'
 import * as api from './api'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
 import { EventLog } from './components/EventLog'
 import { OrionMark } from './components/OrionMark'
+import { PosturePanel } from './components/PosturePanel'
 import { postureMeta } from './components/state'
 import { GUTTER, PINE } from './theme'
 
@@ -43,6 +44,7 @@ export default function App() {
   const c = useClient()
   const [view, setView] = useState<View>('connect')
   const [navOpen, setNavOpen] = useState(false)
+  const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
   const posture = postureMeta(c.state, c.adapterUp)
 
   useEffect(() => {
@@ -85,10 +87,14 @@ export default function App() {
         </Typography>
 
         {/* Sole carrier of posture in the UI: the Connect view no longer
-            repeats it. The explanation is there, as a tooltip, without clutter. */}
+            repeats it. One word here, the grounds behind it in the panel —
+            which is also the only place stating that DNS leaves the tunnel. */}
         <Tooltip title={posture.detail}>
-          <Box
-            aria-label={`${posture.label}. ${posture.detail}`}
+          <ButtonBase
+            onClick={(event) => setPostureAnchor(event.currentTarget)}
+            aria-haspopup="dialog"
+            aria-expanded={Boolean(postureAnchor)}
+            aria-label={`${posture.label}. ${posture.detail} Ouvrir le détail de la posture.`}
             sx={{
               display: 'flex',
               alignItems: 'center',
@@ -99,6 +105,8 @@ export default function App() {
               borderRadius: 5,
               border: `1px solid ${posture.color}33`,
               bgcolor: `${posture.accent}14`,
+              '&:hover': { bgcolor: `${posture.accent}24` },
+              '&.Mui-focusVisible': { outline: `2px solid ${posture.color}`, outlineOffset: 2 },
             }}
           >
             <Box
@@ -108,9 +116,20 @@ export default function App() {
             <Typography sx={{ color: posture.color, fontSize: 11.5, fontWeight: 650 }}>
               {posture.label}
             </Typography>
-          </Box>
+            <ChevronDown size={13} aria-hidden style={{ color: posture.color }} />
+          </ButtonBase>
         </Tooltip>
       </Box>
+
+      <PosturePanel
+        anchor={postureAnchor}
+        onClose={() => setPostureAnchor(null)}
+        state={c.state}
+        adapterUp={c.adapterUp}
+        profile={c.selectedProfile}
+        psk={c.psk}
+        backend={c.backend}
+      />
 
       {c.error ? (
         <Alert
@@ -238,7 +257,6 @@ export default function App() {
                 upSince={c.upSince}
                 telemetry={c.telemetry}
                 history={c.history}
-                backend={c.backend}
                 adapterUp={c.adapterUp}
                 psk={c.psk}
                 onConnect={() => c.connect(c.selectedProfile?.name)}

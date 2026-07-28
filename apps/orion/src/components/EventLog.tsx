@@ -6,6 +6,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { Check, ClipboardCopy, Download } from 'lucide-react'
 import { exportLogs } from '../api'
+import { copyText } from '../clipboard'
 import { EMERALD, GUTTER, PINE } from '../theme'
 import type { LogLine } from '../types'
 
@@ -44,31 +45,6 @@ function exportStem(): string {
   return `orion-journal-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(
     d.getHours(),
   )}${pad(d.getMinutes())}${pad(d.getSeconds())}`
-}
-
-/**
- * Copy via the clipboard API, falling back to selecting a textarea.
- * WebView2 refuses `navigator.clipboard` in some contexts; without a
- * fallback, the button would fail silently.
- */
-async function copyText(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text)
-    return
-  } catch {
-    const area = document.createElement('textarea')
-    area.value = text
-    area.setAttribute('readonly', '')
-    area.style.position = 'fixed'
-    area.style.opacity = '0'
-    document.body.appendChild(area)
-    area.select()
-    try {
-      document.execCommand('copy')
-    } finally {
-      document.body.removeChild(area)
-    }
-  }
 }
 
 export function EventLog({ logs }: { logs: LogLine[] }) {

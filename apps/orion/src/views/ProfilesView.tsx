@@ -22,6 +22,7 @@ import {
   ChevronRight,
   Eye,
   EyeOff,
+  FileCode2,
   Plus,
   RotateCcw,
   Save,
@@ -31,6 +32,7 @@ import {
 } from 'lucide-react'
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
+import { CopyButton } from '../components/CopyButton'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import { GUTTER } from '../theme'
 import type {
@@ -93,7 +95,18 @@ function blankProfile(): ClientProfile {
   }
 }
 
-type ImportNotice = { tone: 'success' | 'error'; message: string }
+/**
+ * What the screen has to say about the last action it took.
+ *
+ * `transient` separates two kinds: an import notice states a *situation* the
+ * user must act on and stays until the next edit clears it, whereas a save
+ * confirmation states a *fact* already true — leaving it on screen would soon
+ * describe a draft that has since moved on.
+ */
+type Notice = { tone: 'success' | 'error'; message: string; transient?: boolean }
+
+/** How long a transient notice stays, in milliseconds. */
+const NOTICE_MS = 3000
 
 const MAX_IMPORT_BYTES = 64 * 1024
 
@@ -164,7 +177,7 @@ export function ProfilesView({
   )
   const [dirty, setDirty] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [importNotice, setImportNotice] = useState<ImportNotice | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
   const [publicKey, setPublicKey] = useState<string | null>(null)
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
@@ -174,6 +187,12 @@ export function ProfilesView({
   const [fingerprint, setFingerprint] = useState<string | null>(null)
   const [identitySealed, setIdentitySealed] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!notice?.transient) return
+    const id = setTimeout(() => setNotice(null), NOTICE_MS)
+    return () => clearTimeout(id)
+  }, [notice])
 
   // A build fact, not a profile one: asked once.
   useEffect(() => {
@@ -224,7 +243,7 @@ export function ProfilesView({
     return () => {
       cancelled = true
     }
-  }, [draft, importNotice])
+  }, [draft, notice])
 
   // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
   // incomplete private key mid-entry simply yields an absent value.
@@ -289,7 +308,7 @@ export function ProfilesView({
     const replaces = config.profiles.some((candidate) => candidate.name === pathImport.name)
     loadDraft(pathImport)
     setDirty(true)
-    setImportNotice({
+    setNotice({
       tone: 'success',
       message: replaces
         ? `« ${pathImport.name} » chargé. Enregistrer remplacera le profil existant.`
@@ -302,7 +321,7 @@ export function ProfilesView({
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
     setDraft((profile) => ({ ...profile, [key]: value }))
     setDirty(true)
-    setImportNotice(null)
+    setNotice(null)
   }
 
   /** Writes one field of the negotiation block. */
@@ -346,7 +365,7 @@ export function ProfilesView({
         : profile,
     )
     setDirty(true)
-    setImportNotice(null)
+    setNotice(null)
   }
 
   /**
@@ -363,7 +382,7 @@ export function ProfilesView({
     setDraft((profile) => ({ ...profile, key_negotiation: settings }))
     setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
-    setImportNotice(null)
+    setNotice(null)
   }
 
   /** Undoes the last field modification. */
@@ -372,7 +391,7 @@ export function ProfilesView({
     setDraft(history[history.length - 1])
     setHistory((past) => past.slice(0, -1))
     setDirty(true)
-    setImportNotice(null)
+    setNotice(null)
   }, [history])
 
   /** Reverts to the profile as saved, in one go. */
@@ -384,7 +403,7 @@ export function ProfilesView({
     if (!saved) return
     loadDraft(saved)
     setDirty(false)
-    setImportNotice(null)
+    setNotice(null)
   }
 
   useEffect(() => {
@@ -407,7 +426,14 @@ export function ProfilesView({
     try {
       await onSave(draft)
       setDirty(false)
-      setImportNotice(null)
+      // Saving is the one action here with no visible consequence: the form
+      // shows exactly what it showed a moment earlier. Without a word, one
+      // presses the button again to be sure.
+      setNotice({
+        tone: 'success',
+        message: `« ${draft.name} » enregistré.`,
+        transient: true,
+      })
     } catch {
       // The global error keeps the draft intact to allow a correction.
     }
@@ -425,9 +451,9 @@ export function ProfilesView({
 
   const importFile = async (file: File | undefined) => {
     if (!file) return
-    setImportNotice(null)
+    setNotice(null)
     if (file.size > MAX_IMPORT_BYTES) {
-      setImportNotice({ tone: 'error', message: 'Fichier trop volumineux (maximum 64 Kio).' })
+      setNotice({ tone: 'error', message: 'Fichier trop volumineux (maximum 64 Kio).' })
       if (fileInput.current) fileInput.current.value = ''
       return
     }
@@ -444,13 +470,13 @@ export function ProfilesView({
       // WireGuard has nothing to sign with, and the message says which key is
       // expected — that is what lets the user act.
       if (imported.private_key_missing) {
-        setImportNotice({ tone: 'error', message: imported.private_key_missing })
+        setNotice({ tone: 'error', message: imported.private_key_missing })
       }
       // The identity failing to seal outranks the profile loading fine: the
       // profile is visible on screen, whereas an unsealed identity only
       // shows up much later, as a connection that fails before WireGuard.
       else if (imported.identity_error) {
-        setImportNotice({
+        setNotice({
           tone: 'error',
           message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}`,
         })
@@ -458,7 +484,7 @@ export function ProfilesView({
         const sealed = imported.identity_sealed
           ? ' Identité scellée dans le stockage protégé : le fichier peut être détruit.'
           : ''
-        setImportNotice({
+        setNotice({
           tone: 'success',
           message: existing
             ? `« ${profile.name} » chargé. Enregistrer remplacera le profil existant.${sealed}`
@@ -466,7 +492,7 @@ export function ProfilesView({
         })
       }
     } catch (cause) {
-      setImportNotice({ tone: 'error', message: `Import impossible : ${String(cause)}` })
+      setNotice({ tone: 'error', message: `Import impossible : ${String(cause)}` })
     } finally {
       setImporting(false)
       if (fileInput.current) fileInput.current.value = ''
@@ -517,7 +543,7 @@ export function ProfilesView({
                     onClick={() => {
                       loadDraft(profile)
                       setDirty(false)
-                      setImportNotice(null)
+                      setNotice(null)
                       void onSelect(profile.name).catch(() => {})
                     }}
                     aria-current={active ? 'true' : undefined}
@@ -596,7 +622,7 @@ export function ProfilesView({
               onClick={() => {
                 loadDraft(blankProfile())
                 setDirty(true)
-                setImportNotice(null)
+                setNotice(null)
               }}
               sx={{ color: 'text.secondary' }}
             >
@@ -609,14 +635,14 @@ export function ProfilesView({
             Vertical scrolling is allowed here, and only here: a clipped
             certificate warning would be worse than a scrollbar. */}
         <Box sx={{ minWidth: 0, overflowX: 'hidden', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
-          {importNotice && (
+          {notice && (
             <Alert
-              severity={importNotice.tone}
+              severity={notice.tone}
               variant="outlined"
-              role={importNotice.tone === 'error' ? 'alert' : 'status'}
+              role={notice.tone === 'error' ? 'alert' : 'status'}
               sx={{ mb: 1.5, py: 0, fontSize: 12 }}
             >
-              {importNotice.message}
+              {notice.message}
             </Alert>
           )}
 
@@ -979,24 +1005,19 @@ function KeyNegotiation({
         </Box>
       </Box>
 
-      {/* The certificates are pasted like everything else. The screen does no
-          crypto: the fingerprint below is derived by the core, and an
-          unreadable certificate shows up there as "illisible" and in the
-          block's error — never as a plausible-looking hash. */}
-      <Blob
-        label="CA TLS de la gateway (DER base64)"
-        value={settings.gateway_ca_der}
-        onChange={(value) => onChange('gateway_ca_der', value)}
-      />
-      <Blob
-        label="Certificat PQ épinglé (base64)"
-        value={settings.gateway_pq_certificate}
-        onChange={(value) => onChange('gateway_pq_certificate', value)}
-      />
+      {/* The fingerprint is what one reads; the base64 behind it is what one
+          pastes, once, on the rare day a certificate is reissued. Only the
+          first belongs in the flow. */}
       <Detail
         label="empreinte PQ"
         value={fingerprint ?? 'illisible'}
-        hint="Empreinte SHA-256 du certificat ML-DSA-65 collé ci-dessus. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
+        copyable={Boolean(fingerprint)}
+        hint="Empreinte SHA-256 du certificat ML-DSA-65 épinglé. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
+      />
+      <EncodedData
+        caDer={settings.gateway_ca_der}
+        pqCertificate={settings.gateway_pq_certificate}
+        onChange={onChange}
       />
 
       {/* The missing identity outranks everything else this block says: the
@@ -1094,6 +1115,94 @@ function ModeChoice({
 }
 
 /**
+ * The gateway's encoded material, behind a door.
+ *
+ * Neither blob is secret and both stay fully editable — a reissued
+ * certificate has to be pasteable, and that is why they were in the flow to
+ * begin with. But two kilobytes of base64 sitting permanently between the
+ * fields one actually edits is what made this screen read as a dump rather
+ * than as a form. Here the flow states what matters — present or absent, and
+ * the fingerprint just above — and the data itself is one click away.
+ */
+function EncodedData({
+  caDer,
+  pqCertificate,
+  onChange,
+}: {
+  caDer: string
+  pqCertificate: string
+  onChange: <Key extends keyof KeyNegotiationSettings>(
+    key: Key,
+    value: KeyNegotiationSettings[Key],
+  ) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const summary = [
+    caDer.trim() ? 'CA TLS présente' : 'CA TLS absente',
+    pqCertificate.trim() ? 'certificat PQ présent' : 'certificat PQ absent',
+  ].join(' · ')
+  const missing = !caDer.trim() || !pqCertificate.trim()
+
+  return (
+    <>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+        <Typography
+          noWrap
+          color={missing ? 'warning.main' : 'text.secondary'}
+          sx={{ minWidth: 0, fontFamily: 'monospace', fontSize: 10.5 }}
+        >
+          {summary}
+        </Typography>
+        <Button
+          size="small"
+          variant="text"
+          color="inherit"
+          startIcon={<FileCode2 size={14} aria-hidden />}
+          onClick={() => setOpen(true)}
+          sx={{ ml: 'auto', flexShrink: 0, color: 'text.secondary', fontSize: 11 }}
+        >
+          Afficher les données encodées
+        </Button>
+      </Box>
+
+      <Dialog
+        open={open}
+        onClose={() => setOpen(false)}
+        maxWidth="sm"
+        fullWidth
+        aria-labelledby="encoded-data-title"
+      >
+        <DialogTitle id="encoded-data-title" sx={{ fontSize: 15 }}>
+          Données encodées de la gateway
+        </DialogTitle>
+        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          <DialogContentText sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
+            Rien ici n’est secret : ce matériel est public et sert à épingler la gateway. Le
+            remplacer n’a de sens qu’après une réémission de certificat — le cœur revérifie
+            l’épinglage et signale le bloc comme fautif si la valeur ne correspond plus.
+          </DialogContentText>
+          <Blob
+            label="CA TLS de la gateway (DER base64)"
+            value={caDer}
+            onChange={(value) => onChange('gateway_ca_der', value)}
+          />
+          <Blob
+            label="Certificat PQ épinglé (base64)"
+            value={pqCertificate}
+            onChange={(value) => onChange('gateway_pq_certificate', value)}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button variant="contained" onClick={() => setOpen(false)}>
+            Fermer
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </>
+  )
+}
+
+/**
  * Long public value — a certificate, an authority.
  *
  * Shown in full over two lines rather than masked: none of this is secret,
@@ -1109,25 +1218,52 @@ function Blob({
   onChange: (value: string) => void
 }) {
   return (
-    <TextField
-      fullWidth
-      multiline
-      minRows={2}
-      maxRows={4}
-      size="small"
-      label={label}
-      value={value}
-      onChange={(event) => onChange(event.target.value)}
-      slotProps={{ htmlInput: { spellCheck: false, autoCorrect: 'off', autoCapitalize: 'off' } }}
-      sx={{
-        '& textarea': { fontFamily: 'monospace', fontSize: 10, lineHeight: 1.45, wordBreak: 'break-all' },
-      }}
-    />
+    <Box>
+      <TextField
+        fullWidth
+        multiline
+        minRows={3}
+        maxRows={7}
+        size="small"
+        label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        slotProps={{ htmlInput: { spellCheck: false, autoCorrect: 'off', autoCapitalize: 'off' } }}
+        sx={{
+          '& textarea': { fontFamily: 'monospace', fontSize: 10, lineHeight: 1.45, wordBreak: 'break-all' },
+        }}
+      />
+      {/* Below rather than inside: an adornment floating over base64 that
+          wraps at every character is a click one aims at and misses. */}
+      {value.trim() !== '' && (
+        <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 0.25 }}>
+          <CopyButton value={value} label={label.toLowerCase()} />
+        </Box>
+      )}
+    </Box>
   )
 }
 
-/** Received value, read-only: it is meant to be compared, not edited. */
-function Detail({ label, value, hint }: { label: string; value: string; hint?: string }) {
+/**
+ * Received value, read-only: it is meant to be compared, not edited.
+ *
+ * Compared *elsewhere*, which is why `copyable` exists. A fingerprint one
+ * must hold against what `heliosd init-key-negotiation` printed, shown
+ * truncated and selectable only by dragging across monospace text, is a
+ * verification nobody performs.
+ */
+function Detail({
+  label,
+  value,
+  hint,
+  copyable,
+}: {
+  label: string
+  value: string
+  hint?: string
+  /** The value carries out of Orion — offer the clipboard. */
+  copyable?: boolean
+}) {
   const row = (
     <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, minWidth: 0 }}>
       <Typography
@@ -1149,6 +1285,7 @@ function Detail({ label, value, hint }: { label: string; value: string; hint?: s
       >
         {value}
       </Typography>
+      {copyable && <CopyButton value={value} label={label} />}
     </Box>
   )
   return hint ? <Tooltip title={hint}>{row}</Tooltip> : row
@@ -1221,7 +1358,16 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
       size="small"
       label={label}
       value={value}
-      slotProps={{ htmlInput: { readOnly: true } }}
+      slotProps={{
+        htmlInput: { readOnly: true },
+        input: {
+          endAdornment: (
+            <InputAdornment position="end">
+              <CopyButton value={value} label={label.toLowerCase()} />
+            </InputAdornment>
+          ),
+        },
+      }}
       sx={{ '& input': { fontFamily: 'monospace', fontSize: 12, opacity: 0.72 } }}
     />
   )

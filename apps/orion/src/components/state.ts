@@ -120,7 +120,9 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
     return {
       posture: 'protected',
       label: 'Protégé',
-      detail: 'Handshake frais : tout passe par la gateway.',
+      // "Tout" would be a word too many: DNS queries leave outside the
+      // tunnel, a documented limit the posture panel states in full.
+      detail: 'Handshake frais : le trafic IP passe par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }
