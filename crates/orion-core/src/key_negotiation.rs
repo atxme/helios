@@ -140,17 +140,35 @@ impl NegotiatedKey {
     /// gateway to release the slot at once instead of waiting for handshakes
     /// to go stale.
     pub async fn confirm(self) -> Result<SessionLink> {
+        let transaction = hex_prefix(&self.transaction_id);
         let confirmation =
             authenticate_confirmation(self.transaction_id, self.client_pq_private_key.as_slice())
                 .context("signing the key-negotiation confirmation with ML-DSA-65")?;
-        let (commit, link) = self
-            .session
-            .confirm(confirmation)
-            .await
-            .context("confirming the key-negotiation transaction")?;
+        tracing::info!(
+            %transaction,
+            "key negotiation: sending the confirmation over the QUIC session"
+        );
+        let started = std::time::Instant::now();
+        let (commit, link) = self.session.confirm(confirmation).await.with_context(|| {
+            // This is where a session that was fine at negotiation time dies:
+            // the WireGuard interface has come up in between, and the route to
+            // the gateway is no longer the one this connection was opened on.
+            // Saying how long we waited separates a refusal from a silence.
+            format!(
+                "confirming the key-negotiation transaction {transaction} \
+                 (no answer after {} ms — the QUIC session opened before the \
+                 tunnel came up may no longer be routable)",
+                started.elapsed().as_millis()
+            )
+        })?;
         commit
             .verify(&self.gateway_pq_public_key)
             .context("verifying the gateway PQ commit acknowledgment")?;
+        tracing::info!(
+            %transaction,
+            elapsed_ms = started.elapsed().as_millis(),
+            "key negotiation: gateway committed the slot"
+        );
         Ok(link)
     }
 }
@@ -225,6 +243,22 @@ pub async fn prepare(
     };
     let endpoint = client_endpoint(SocketAddr::new(bind_ip, 0), &identity, client.gateway_ca)
         .context("building the authenticated key-negotiation client")?;
+    // Everything needed to tell a routing problem from a refusal: where we
+    // dial, under which name the certificate is checked, and what the request
+    // weighs — the PQ material is what makes these datagrams large.
+    tracing::info!(
+        endpoint = %client.remote,
+        resolved = %remote,
+        server_name = %client.server_name,
+        ?mode,
+        floor = ?client.minimum_mode,
+        transaction = %hex_prefix(&transaction_id),
+        request_bytes = serde_json::to_vec(&authenticated_request)
+            .map(|raw| raw.len())
+            .unwrap_or_default(),
+        "key negotiation: dialing the gateway"
+    );
+    let started = std::time::Instant::now();
     let (authenticated_response, session) = negotiate(
         &endpoint,
         remote,
@@ -232,7 +266,19 @@ pub async fn prepare(
         &authenticated_request,
     )
     .await
-    .context("performing key negotiation")?;
+    .with_context(|| {
+        format!(
+            "performing key negotiation with {remote} (server name {}, after {} ms)",
+            client.server_name,
+            started.elapsed().as_millis()
+        )
+    })?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        selected_mode = ?authenticated_response.response.selected_mode,
+        confirmation_timeout_s = authenticated_response.response.confirmation_timeout_secs,
+        "key negotiation: gateway answered"
+    );
     authenticated_response
         .verify(
             &authenticated_request.request,
@@ -300,10 +346,19 @@ pub async fn prepare_for_profile(
     let client_wg_public_key = profile
         .public_key()
         .context("deriving the client WireGuard public key")?;
-    let identity = identities
-        .load(&settings.identity)
-        .await
-        .with_context(|| format!("loading key-negotiation identity {}", settings.identity))?;
+    tracing::info!(
+        identity = %settings.identity,
+        endpoint = %settings.endpoint,
+        mode = ?settings.mode,
+        floor = ?settings.minimum_mode,
+        "key negotiation: loading the protected identity"
+    );
+    let identity = identities.load(&settings.identity).await.with_context(|| {
+        format!(
+            "loading key-negotiation identity {} from the machine's protected store",
+            settings.identity
+        )
+    })?;
     prepare(
         KeyNegotiationClient {
             remote: settings.endpoint.clone(),
@@ -322,6 +377,18 @@ pub async fn prepare_for_profile(
         profile.preshared_key.as_deref(),
     )
     .await
+}
+
+/// First bytes of an identifier, for correlating with the gateway's logs.
+///
+/// A prefix rather than the whole value: it is long enough to pair two lines
+/// in the same session, and short enough to be read out loud.
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn unix_time_now() -> Result<u64> {

@@ -258,6 +258,22 @@ fn pinned_transport() -> quinn::TransportConfig {
 /// Datagram size every QUIC path must carry (RFC 9000 §14).
 const SAFE_UDP_PAYLOAD: u16 = 1200;
 
+/// Time allowed for the QUIC handshake with the negotiation service.
+///
+/// Generous for a mutual-TLS handshake on a residential link, and short
+/// enough that an unreachable port is reported rather than waited on: this is
+/// the very first thing a client does, and the port is not the WireGuard one
+/// — forgetting to forward it is the ordinary mistake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for the gateway's negotiation answer.
+///
+/// It covers an ML-KEM-1024 encapsulation, an ML-DSA-65 signature and, above
+/// all, installing the PSK on the data plane — which the gateway does
+/// **before** answering. Fifteen seconds leaves room for a loaded machine
+/// without ever looking like a hang.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn server_endpoint(
     bind: SocketAddr,
     identity: &TlsIdentity,
@@ -575,17 +591,28 @@ pub async fn negotiate(
         .request
         .validate()
         .map_err(|error| TransportError::Protocol(error.to_string()))?;
-    let connection = endpoint
+    // Bounded, both of them. QUIC only gives up on its own when *nothing*
+    // arrives; a gateway whose service answers at the transport level and
+    // then says nothing — because it is holding a stale transaction for this
+    // peer, say — leaves the client waiting for good. That wait has no
+    // visible end: the interface is up, the UI announces «connexion…», and
+    // nothing ever contradicts it.
+    let connecting = endpoint
         .connect(remote, server_name)
-        .map_err(TransportError::Connect)?
+        .map_err(TransportError::Connect)?;
+    let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
+        .map_err(|_| TransportError::ConnectTimeout(remote, CONNECT_TIMEOUT.as_secs()))?
         .map_err(TransportError::Connection)?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(TransportError::Connection)?;
     write_frame(&mut send, request).await?;
-    match read_frame::<ServerMessage>(&mut recv).await? {
+    let answer = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame::<ServerMessage>(&mut recv))
+        .await
+        .map_err(|_| TransportError::ResponseTimeout(RESPONSE_TIMEOUT.as_secs()))??;
+    match answer {
         ServerMessage::Response { response } => Ok((
             *response,
             ClientSession {
@@ -681,6 +708,16 @@ pub enum TransportError {
     Write(quinn::WriteError),
     #[error("QUIC read failed: {0}")]
     Read(quinn::ReadExactError),
+    #[error(
+        "no answer from the key-negotiation service at {0} after {1} s — check that its UDP port \
+         is reachable (it is a port of its own, distinct from WireGuard's)"
+    )]
+    ConnectTimeout(SocketAddr, u64),
+    #[error(
+        "the gateway accepted the connection but did not answer the negotiation request within \
+         {0} s"
+    )]
+    ResponseTimeout(u64),
     #[error("timed out while waiting for the key-negotiation commit acknowledgment")]
     CommitTimeout,
     #[error("timed out while delivering the key-negotiation commit acknowledgment")]

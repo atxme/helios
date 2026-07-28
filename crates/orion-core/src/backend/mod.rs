@@ -486,11 +486,50 @@ async fn connect_with_key_negotiation(
     let identities = identities
         .context("the Orion shell did not provide a protected key-negotiation identity store")?;
 
+    let endpoint = profile
+        .key_negotiation
+        .as_ref()
+        .map(|settings| settings.endpoint.clone())
+        .unwrap_or_default();
+
     let mut last_error = None;
     for attempt in 1..=KEY_NEGOTIATION_ATTEMPTS {
-        // Outside the retry: a preparation that fails installed nothing.
-        let negotiated = crate::key_negotiation::prepare_for_profile(profile, identities).await?;
+        sink(ClientEvent::log(
+            "info",
+            format!("négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : ouverture vers {endpoint}"),
+        ));
+        // A failed preparation installed nothing — but it is retried all the
+        // same. It used to abort the loop outright, so a transient failure on
+        // the second attempt discarded the third: the log showed one warning
+        // then a final error, and the retry the user was promised never
+        // happened.
+        let negotiated =
+            match crate::key_negotiation::prepare_for_profile(profile, identities).await {
+                Ok(negotiated) => negotiated,
+                Err(error) => {
+                    sink(ClientEvent::log(
+                        "warn",
+                        format!(
+                        "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : accord non conclu — \
+                         {error:#}. Rien n'a été posé sur le plan de données."
+                    ),
+                    ));
+                    last_error = Some(error);
+                    if attempt < KEY_NEGOTIATION_ATTEMPTS {
+                        tokio::time::sleep(KEY_NEGOTIATION_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+            };
         let mode = negotiated.mode;
+        sink(ClientEvent::log(
+            "info",
+            format!(
+                "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : accord obtenu ({mode:?}) — \
+                 pose du PSK puis attente d'un handshake WireGuard frais ({} s au plus)",
+                negotiated.confirmation_timeout.as_secs()
+            ),
+        ));
         let confirmation_timeout = negotiated.confirmation_timeout;
         let prepared_at = tokio::time::Instant::now();
         let negotiated_profile = ClientProfile {
@@ -535,12 +574,15 @@ async fn connect_with_key_negotiation(
                 return Ok(());
             }
             Err(error) => {
+                // `{error:#}` and not `{error}`: anyhow only prints the outermost
+                // context by default, so the message read «confirming the
+                // key-negotiation transaction» and dropped the cause — the one
+                // thing worth reading.
                 sink(ClientEvent::log(
                     "warn",
                     format!(
-                        "key negotiation attempt {attempt}/{KEY_NEGOTIATION_ATTEMPTS} did not \
-                         commit: {error}. The gateway restored its previous slot; renegotiating \
-                         to put both ends back in step."
+                        "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : non confirmée — \
+                         {error:#}. La gateway a restauré son slot précédent."
                     ),
                 ));
                 last_error = Some(error);
@@ -551,8 +593,21 @@ async fn connect_with_key_negotiation(
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("key negotiation failed without a reported cause")))
+    let error = last_error
+        .unwrap_or_else(|| anyhow::anyhow!("key negotiation failed without a reported cause"));
+    // What the user is left with, said plainly: the client holds a PSK the
+    // gateway does not. WireGuard will drop everything — which is the
+    // anti-leak invariant working as intended, not a bug to hunt.
+    sink(ClientEvent::log(
+        "error",
+        format!(
+            "négociation abandonnée après {KEY_NEGOTIATION_ATTEMPTS} tentatives : {error:#}. \
+             Le slot PSK reste posé côté client alors que la gateway a restauré le sien : \
+             aucun handshake n'aboutira tant qu'une négociation n'a pas abouti. Se déconnecter \
+             puis se reconnecter en repart proprement."
+        ),
+    ));
+    Err(error)
 }
 
 /// Installs the negotiated slot and commits it, or reports why it could not.
@@ -567,12 +622,30 @@ async fn commit_negotiated_slot(
     prepared_at: tokio::time::Instant,
     confirmation_timeout: Duration,
 ) -> anyhow::Result<helios_key_negotiation::SessionLink> {
-    backend.up(negotiated_profile, sink).await?;
+    backend
+        .up(negotiated_profile, sink)
+        .await
+        .context("installing the negotiated PSK on the data plane")?;
     if !wait_for_new_handshake(backend, prepared_at, confirmation_timeout).await {
         anyhow::bail!(
-            "no fresh WireGuard handshake before the key-negotiation transaction expired"
+            "no fresh WireGuard handshake within {} s: the gateway either did not receive the \
+             client's handshakes, or answered with a PSK that does not match — check UDP {} \
+             reaches the gateway",
+            confirmation_timeout.as_secs(),
+            negotiated_profile
+                .endpoint
+                .rsplit_once(':')
+                .map(|(_, port)| port)
+                .unwrap_or("51820")
         );
     }
+    sink(ClientEvent::log(
+        "info",
+        format!(
+            "handshake WireGuard obtenu en {} s — envoi de la confirmation",
+            prepared_at.elapsed().as_secs()
+        ),
+    ));
     negotiated.confirm().await
 }
 

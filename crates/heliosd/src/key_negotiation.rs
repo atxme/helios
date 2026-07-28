@@ -163,17 +163,40 @@ impl NegotiationHandler for GatewayHandler {
         authenticated: AuthenticatedKeyNegotiationRequest,
     ) -> Result<PreparedNegotiation, PublicError> {
         let request = &authenticated.request;
-        request.validate().map_err(|_| PublicError::Protocol)?;
+        // The gateway used to refuse in silence: the client received a code,
+        // the operator saw nothing at all, and the two halves of the same
+        // failure could not be put side by side. Every refusal below now says
+        // which peer, which transaction and — above all — why.
+        let transaction = hex_prefix(&request.transaction_id);
+        let peer_key = request.client_wg_public_key.clone();
+        request.validate().map_err(|_| {
+            tracing::warn!(%transaction, peer = %peer_key, "key negotiation refused: malformed request");
+            PublicError::Protocol
+        })?;
         let (address, previous_psk, pq_fingerprint, minimum_mode) = {
             let network = self.network.read().await;
             let peer = network
                 .peers
                 .iter()
                 .find(|peer| peer.public_key == request.client_wg_public_key)
-                .ok_or(PublicError::Rejected)?;
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        %transaction,
+                        peer = %peer_key,
+                        "key negotiation refused: this WireGuard key is not admitted"
+                    );
+                    PublicError::Rejected
+                })?;
             if peer.key_negotiation_certificate_sha256.as_deref()
                 != Some(certificate_sha256.as_str())
             {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer.name,
+                    presented = %certificate_sha256,
+                    admitted = peer.key_negotiation_certificate_sha256.as_deref().unwrap_or("aucune"),
+                    "key negotiation refused: client certificate does not match the admitted one"
+                );
                 return Err(PublicError::IdentityMismatch);
             }
             (
@@ -186,6 +209,13 @@ impl NegotiationHandler for GatewayHandler {
             )
         };
         if !request.mode.satisfies(minimum_mode) {
+            tracing::warn!(
+                %transaction,
+                peer = %peer_key,
+                requested = ?request.mode,
+                floor = ?minimum_mode,
+                "key negotiation refused: mode below this peer's floor"
+            );
             return Err(PublicError::Downgrade);
         }
         authenticated
@@ -194,7 +224,16 @@ impl NegotiationHandler for GatewayHandler {
                 &pq_fingerprint,
                 unix_time_now().map_err(|_| PublicError::Protocol)?,
             )
-            .map_err(|_| PublicError::IdentityMismatch)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    %error,
+                    "key negotiation refused: ML-DSA-65 authentication failed \
+                     (signature, PQ certificate, or a clock too far off)"
+                );
+                PublicError::IdentityMismatch
+            })?;
         let baseline_static_psk = self
             .static_psks
             .read()
@@ -218,9 +257,24 @@ impl NegotiationHandler for GatewayHandler {
         {
             let mut state = self.transactions.lock().await;
             if state.replay_set.contains(&request.transaction_id) {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: transaction identifier already seen (replay)"
+                );
                 return Err(PublicError::Rejected);
             }
             if !state.peers.insert(request.client_wg_public_key.clone()) {
+                // The case that leaves a client stuck without either end
+                // saying so: a previous session died without closing, its
+                // transaction still holds the peer, and every new attempt is
+                // refused until that one is released.
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    "key negotiation refused: a transaction is already in flight for this peer — \
+                     the previous session has not been released yet"
+                );
                 return Err(PublicError::Busy);
             }
             state.replay_set.insert(request.transaction_id);
@@ -242,6 +296,12 @@ impl NegotiationHandler for GatewayHandler {
         ) {
             Ok(material) => material,
             Err(error) => {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    ?error,
+                    "key negotiation refused: preparing the key material failed"
+                );
                 let mut state = self.transactions.lock().await;
                 state.peers.remove(&request.client_wg_public_key);
                 return Err(error);
@@ -256,10 +316,25 @@ impl NegotiationHandler for GatewayHandler {
             )
             .await
         {
+            // Posed **before** answering, always: a client that received a PSK
+            // the data plane refused would handshake with nobody.
+            tracing::warn!(
+                %transaction,
+                peer = %peer_key,
+                ?error,
+                "key negotiation refused: installing the PSK on the data plane failed"
+            );
             let mut state = self.transactions.lock().await;
             state.peers.remove(&request.client_wg_public_key);
             return Err(error);
         }
+        tracing::info!(
+            %transaction,
+            peer = %peer_key,
+            mode = ?request.mode,
+            confirmation_timeout_s = DEFAULT_CONFIRMATION_TIMEOUT.as_secs(),
+            "key negotiation prepared: PSK installed, awaiting the client's confirmation"
+        );
         if request.mode == ProtectionMode::StaticPsk && current_matches_static_request {
             if let Some(static_psk) = previous_psk.clone() {
                 self.static_psks
@@ -360,6 +435,15 @@ impl NegotiationHandler for GatewayHandler {
         let Some(transaction) = self.release_peer(transaction_id).await else {
             return;
         };
+        // The counterpart of the client's «non confirmée»: this line says the
+        // gateway did put its slot back, so the desynchronisation the user
+        // then observes is on the client side only.
+        tracing::info!(
+            transaction = %hex_prefix(&transaction_id),
+            peer = %transaction.public_key,
+            restored = transaction.previous_psk.is_some(),
+            "key negotiation rolled back: the peer's previous PSK slot is restored"
+        );
         let psk = transaction.previous_psk.map(SecretString::new);
         if self
             .install(transaction.public_key, transaction.address, psk)
@@ -528,6 +612,19 @@ fn check_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn check_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// First bytes of a transaction identifier.
+///
+/// The client prints the same prefix: it is what lets an operator put the two
+/// halves of one negotiation side by side, on two machines whose clocks are
+/// never quite aligned.
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn random_nonce() -> Result<[u8; 16]> {
