@@ -1,61 +1,61 @@
-//! Rendu d'une politique + d'un état en un jeu de règles **structuré**.
+//! Rendering of a policy + a state into a **structured** ruleset.
 //!
-//! Le jeu de règles est une structure de données, pas du texte : c'est elle que
-//! le backend Netlink traduit en expressions, et dont le [`crate::DryRunBackend`]
-//! et l'API dérivent la syntaxe nftables lisible via [`Display`]. L'inverse —
-//! produire du texte puis le re-parser — serait fragile et ferait diverger
-//! silencieusement l'affichage de ce qui est réellement appliqué.
+//! The ruleset is a data structure, not text: it is what the Netlink backend
+//! translates into expressions, and from which [`crate::DryRunBackend`] and the
+//! API derive human-readable nftables syntax via [`Display`]. The reverse —
+//! producing text then re-parsing it — would be fragile and would silently
+//! let the display diverge from what is actually applied.
 //!
-//! Chaque règle porte la **chaîne à hook** à laquelle elle appartient : le
-//! trafic destiné à la gateway elle-même (écoute WireGuard, API, SSH) va dans
-//! `input`, le trafic du LAN qui la traverse dans `forward`, et le trafic
-//! qu'elle émet dans `output`. Les confondre laisserait passer — ou bloquerait —
-//! le mauvais trafic.
+//! Each rule carries the **hooked chain** it belongs to: traffic destined for
+//! the gateway itself (WireGuard listener, API, SSH) goes into `input`, LAN
+//! traffic passing through it into `forward`, and traffic it emits into
+//! `output`. Confusing them would let through — or block — the wrong traffic.
 //!
-//! # Sortie Internet des clients du tunnel
+//! # Internet egress for tunnel clients
 //!
-//! Deux formes coexistent, et elles n'ouvrent pas les mêmes chemins :
+//! Two forms coexist, and they do not open the same paths:
 //!
-//! * **site-à-site**, toujours actif : `forward` de `lan_ifaces` vers
-//!   `wan_iface`, pour des postes situés *derrière* la gateway ;
-//! * **road-warrior**, derrière `allow_client_internet` : `forward` de
-//!   `wg_iface` vers `wan_iface`, plus un masquerade en `postrouting`, pour un
-//!   client qui arrive *par* le tunnel.
+//! * **site-to-site**, always active: `forward` from `lan_ifaces` to
+//!   `wan_iface`, for hosts located *behind* the gateway;
+//! * **road-warrior**, behind `allow_client_internet`: `forward` from
+//!   `wg_iface` to `wan_iface`, plus a masquerade in `postrouting`, for a
+//!   client arriving *through* the tunnel.
 //!
-//! La seconde est fermée par défaut. Une gateway d'accès à des ressources
-//! internes n'a aucune raison de router Internet, et l'ouvrir élargirait sa
-//! surface sans contrepartie. Les deux ne valent que dans un état où le trafic
-//! est autorisé : le NAT est posé et retiré avec le tunnel, sans quoi le
-//! kill-switch laisserait sortir en clair ce qu'il vient de couper.
+//! The second is closed by default. A gateway granting access to internal
+//! resources has no reason to route Internet traffic, and opening it would
+//! widen its surface with no benefit. Both only hold in a state where traffic
+//! is allowed: NAT is applied and removed together with the tunnel, otherwise
+//! the kill-switch would let out in the clear what it just cut off.
 //!
-//! # Limite connue : le DNS n'est pas tunnelé
+//! # Known limitation: DNS is not tunneled
 //!
-//! Même `allow_client_internet` actif, le client garde son propre résolveur :
-//! ses requêtes DNS sortent hors du tunnel et révèlent les noms qu'il consulte,
-//! alors que le reste de son trafic est protégé. Ce qui débloquerait : un champ
-//! de résolveur dans le document `orion-profile` — que `orion-core` refuse
-//! aujourd'hui, y compris la clé `DNS` d'un fichier `wg-quick` — et le choix
-//! d'un résolveur joignable dans le tunnel. Voir le lot 5 de l'ADR-004.
+//! Even with `allow_client_internet` active, the client keeps its own
+//! resolver: its DNS queries leave outside the tunnel and reveal the names it
+//! looks up, while the rest of its traffic is protected. What would unblock
+//! this: a resolver field in the `orion-profile` document — which
+//! `orion-core` currently rejects, including the `DNS` key of a `wg-quick`
+//! file — and the choice of a resolver reachable inside the tunnel. See
+//! ADR-004 batch 5.
 
 use std::fmt;
 
 use aether::{FirewallPolicy, TunnelState};
 
-/// Verdict d'une règle ou politique par défaut d'une chaîne.
+/// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Accept,
     Drop,
 }
 
-/// Chaîne à hook Netfilter.
+/// Netfilter hooked chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainKind {
-    /// Trafic à destination de la gateway elle-même.
+    /// Traffic destined for the gateway itself.
     Input,
-    /// Trafic qui traverse la gateway (LAN -> WAN).
+    /// Traffic passing through the gateway (LAN -> WAN).
     Forward,
-    /// Trafic émis par la gateway.
+    /// Traffic emitted by the gateway.
     Output,
 }
 
@@ -69,7 +69,7 @@ impl ChainKind {
     }
 }
 
-/// Protocole de transport pour un match de port.
+/// Transport protocol for a port match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L4 {
     Tcp,
@@ -85,7 +85,7 @@ impl L4 {
     }
 }
 
-/// Un critère de correspondance.
+/// A match criterion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
     /// `ct state established,related`
@@ -96,11 +96,11 @@ pub enum Match {
     OutIface(String),
     /// `<proto> dport <port>`
     DestPort { port: u16, proto: L4 },
-    /// `<proto> dport { a, b }` — ensemble de ports.
+    /// `<proto> dport { a, b }` — set of ports.
     DestPortSet { ports: Vec<u16>, proto: L4 },
-    /// `ip daddr <addr>` — IP ou CIDR.
+    /// `ip daddr <addr>` — IP or CIDR.
     DestNet(String),
-    /// `ip saddr <addr>` — IP ou CIDR.
+    /// `ip saddr <addr>` — IP or CIDR.
     SourceNet(String),
 }
 
@@ -121,13 +121,13 @@ impl fmt::Display for Match {
     }
 }
 
-/// Une règle : une chaîne, des critères, un verdict.
+/// A rule: a chain, matches, a verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub chain: ChainKind,
     pub matches: Vec<Match>,
     pub verdict: Verdict,
-    /// Justification, pour la lecture humaine. Aucun effet sur le filtrage.
+    /// Justification, for human reading. No effect on filtering.
     pub note: Option<String>,
 }
 
@@ -159,53 +159,53 @@ impl fmt::Display for Rule {
     }
 }
 
-/// Jeu de règles complet de la table `inet helios`.
+/// Complete ruleset of the `inet helios` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
-    /// Politique par défaut des chaînes à hook (`Drop` = fail-closed).
+    /// Default policy of hooked chains (`Drop` = fail-closed).
     pub default_verdict: Verdict,
     pub rules: Vec<Rule>,
-    /// MSS clamping demandé, le cas échéant.
+    /// Requested MSS clamping, if any.
     ///
-    /// Volontairement **hors** de `rules` : c'est une action de *mangle*
-    /// (réécriture d'option TCP), pas un verdict de filtrage, et l'API haut
-    /// niveau de `rustables` ne l'exprime pas. Voir le backend Netlink.
+    /// Deliberately **outside** of `rules`: it is a *mangle* action (TCP
+    /// option rewrite), not a filtering verdict, and `rustables`' high-level
+    /// API does not express it. See the Netlink backend.
     pub mss_clamp: Option<u16>,
-    /// Interface de sortie sur laquelle masquer la source du trafic client.
+    /// Egress interface on which to masquerade the source of client traffic.
     ///
-    /// Hors de `rules` pour la même raison que `mss_clamp` : ce n'est pas un
-    /// verdict de filtrage mais une réécriture d'adresse, qui vit dans une
-    /// chaîne d'un autre type (`nat`) et d'un autre hook (`postrouting`).
-    /// Contrairement au MSS clamping, `rustables` sait l'exprimer : le backend
-    /// Netlink l'applique réellement.
+    /// Outside of `rules` for the same reason as `mss_clamp`: it is not a
+    /// filtering verdict but an address rewrite, which lives in a chain of a
+    /// different type (`nat`) and a different hook (`postrouting`). Unlike
+    /// MSS clamping, `rustables` can express it: the Netlink backend actually
+    /// applies it.
     ///
-    /// `None` hors des états où le trafic est autorisé — le NAT ne doit jamais
-    /// survivre à la chute du tunnel, sinon le kill-switch laisse fuir ce qu'il
-    /// est censé retenir.
+    /// `None` outside of states where traffic is allowed — NAT must never
+    /// survive the tunnel going down, otherwise the kill-switch would leak
+    /// what it is supposed to hold back.
     pub masquerade_out: Option<String>,
 }
 
 impl Ruleset {
-    /// Règles d'une chaîne donnée, dans l'ordre.
+    /// Rules of a given chain, in order.
     pub fn chain(&self, kind: ChainKind) -> impl Iterator<Item = &Rule> {
         self.rules.iter().filter(move |r| r.chain == kind)
     }
 }
 
-/// Construit le jeu de règles pour `(policy, state)`.
+/// Builds the ruleset for `(policy, state)`.
 ///
-/// Invariants, quel que soit l'état :
-/// * loopback et trafic établi/connexe toujours acceptés ;
-/// * le port d'écoute WireGuard reste joignable, sans quoi aucun client ne
-///   pourrait (re)monter le tunnel ;
-/// * le forward LAN -> WAN n'est ouvert que dans l'état `Up`.
+/// Invariants, regardless of state:
+/// * loopback and established/related traffic always accepted;
+/// * the WireGuard listening port stays reachable, without which no client
+///   could (re)establish the tunnel;
+/// * LAN -> WAN forwarding is only open in the `Up` state.
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     use ChainKind::{Forward, Input, Output};
     let mut rules = Vec::new();
     let wan = policy.wan_iface.clone();
 
-    // ── Administration : l'API ne doit être joignable qu'à travers le tunnel ──
-    // En tête de chaîne, avant même le loopback.
+    // ── Administration: the API must only be reachable through the tunnel ──
+    // At the head of the chain, even before loopback.
     if let (Some(port), Some(iface)) = (policy.admin_port, policy.admin_iface.as_deref()) {
         rules.push(
             Rule::new(
@@ -219,7 +219,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 ],
                 Verdict::Accept,
             )
-            .with_note("API d'administration : uniquement via l'interface du tunnel"),
+            .with_note("administration API: only via the tunnel interface"),
         );
         rules.push(
             Rule::new(
@@ -231,33 +231,34 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 Verdict::Drop,
             )
             .with_note(
-                "toute autre origine est refusée. Pas de `ct state new` : le drop couvre \
-                 aussi les connexions déjà établies depuis une autre interface — plus \
-                 strict, et exprimable en Netlink",
+                "any other origin is refused. No `ct state new`: the drop also covers \
+                 connections already established from another interface — stricter, \
+                 and expressible in Netlink",
             ),
         );
     }
 
-    // ── Toujours autorisé ────────────────────────────────────────────────────
+    // ── Always allowed ───────────────────────────────────────────────────────
     for chain in [Input, Forward, Output] {
-        // Le loopback se désigne par l'interface d'*entrée* en input et forward,
-        // mais de *sortie* en output : un paquet généré localement n'a pas
-        // d'interface d'entrée. Un `iifname "lo"` sur le hook output ne matche
-        // donc jamais, et tout le trafic local tombe sous la politique `drop` —
-        // y compris l'API de la gateway sur 127.0.0.1. Constaté sur cible.
-        let boucle = if chain == Output {
+        // Loopback is designated by the *ingress* interface in input and
+        // forward, but by the *egress* interface in output: a locally
+        // generated packet has no ingress interface. An `iifname "lo"` on the
+        // output hook therefore never matches, and all local traffic falls
+        // under the `drop` policy — including the gateway's API on
+        // 127.0.0.1. Observed on target.
+        let loopback = if chain == Output {
             Match::OutIface("lo".into())
         } else {
             Match::InIface("lo".into())
         };
-        rules.push(Rule::new(chain, vec![boucle], Verdict::Accept));
+        rules.push(Rule::new(chain, vec![loopback], Verdict::Accept));
         rules.push(Rule::new(chain, vec![Match::Established], Verdict::Accept));
     }
 
-    // ── Écoute WireGuard (rôle serveur) ──────────────────────────────────────
-    // Les clients road-warrior arrivent depuis des IP inconnues et changeantes :
-    // impossible de scoper par source. C'est l'unique ouverture entrante du
-    // modèle fail-closed, et elle est indispensable au handshake.
+    // ── WireGuard listener (server role) ─────────────────────────────────────
+    // Road-warrior clients arrive from unknown, changing IPs: impossible to
+    // scope by source. This is the sole inbound opening of the fail-closed
+    // model, and it is indispensable for the handshake.
     if let Some(port) = policy.wg_listen_port {
         rules.push(
             Rule::new(
@@ -271,13 +272,34 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 ],
                 Verdict::Accept,
             )
-            .with_note("écoute WireGuard — sans cette règle, aucun client ne peut handshaker"),
+            .with_note("WireGuard listener — without this rule, no client can handshake"),
         );
     }
 
-    // ── Transport WireGuard sortant vers des pairs statiques (site-à-site) ───
-    // Scopé par destination : ouvrir 51820 en sortie sans restreindre la
-    // destination serait une fuite.
+    // ── Key-negotiation listener ─────────────────────────────────────────────
+    // This public QUIC endpoint authenticates peers before the first
+    // WireGuard handshake. It is opened only when the configured service is
+    // ready; the administration API remains restricted to the tunnel.
+    if let Some(port) = policy.key_negotiation_port {
+        rules.push(
+            Rule::new(
+                Input,
+                vec![
+                    Match::InIface(wan.clone()),
+                    Match::DestPort {
+                        port,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note("authenticated key-negotiation QUIC listener"),
+        );
+    }
+
+    // ── Outbound WireGuard transport to static peers (site-to-site) ─────────
+    // Scoped by destination: opening 51820 outbound without restricting the
+    // destination would be a leak.
     for peer in &policy.wg_peers {
         rules.push(Rule::new(
             Output,
@@ -293,11 +315,12 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
-    // ── Renouvellement du bail DHCP sur le WAN ───────────────────────────────
-    // Scopé à l'interface WAN et aux deux ports du protocole. Le trafic est
-    // local au lien : le client émet vers 67, le serveur répond vers 68. La
-    // réponse n'est pas laissée à `ct state established` — un DHCPDISCOVER part
-    // en diffusion et la réponse ne se rattache pas toujours à un flux suivi.
+    // ── DHCP lease renewal on the WAN ────────────────────────────────────────
+    // Scoped to the WAN interface and to the protocol's two ports. Traffic is
+    // local to the link: the client sends to 67, the server replies to 68.
+    // The reply is not left to `ct state established` — a DHCPDISCOVER goes
+    // out as a broadcast and the reply does not always attach to a tracked
+    // flow.
     if policy.allow_dhcp_on_wan {
         rules.push(
             Rule::new(
@@ -311,7 +334,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 ],
                 Verdict::Accept,
             )
-            .with_note("DHCP : sans renouvellement, la gateway perd son adresse WAN"),
+            .with_note("DHCP: without renewal, the gateway loses its WAN address"),
         );
         rules.push(Rule::new(
             Input,
@@ -326,7 +349,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
-    // ── SSH d'administration, quel que soit l'état du tunnel ─────────────────
+    // ── Administrative SSH, regardless of tunnel state ───────────────────────
     for src in &policy.allow_ssh_from {
         rules.push(Rule::new(
             Input,
@@ -342,7 +365,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     }
 
     if state.captive_portal_active() {
-        // Portail captif : on lève le kill-switch pour HTTP/HTTPS seulement.
+        // Captive portal: the kill-switch is lifted for HTTP/HTTPS only.
         let ports = Match::DestPortSet {
             ports: vec![80, 443],
             proto: L4::Tcp,
@@ -360,13 +383,13 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                             ],
                             Verdict::Accept,
                         )
-                        .with_note(format!("portail captif : HTTP/HTTPS vers {gw}")),
+                        .with_note(format!("captive portal: HTTP/HTTPS to {gw}")),
                     );
                 }
             }
             None => {
-                // Passerelle inconnue : on laisse le navigateur atteindre la
-                // page d'accueil du portail, quelle qu'en soit la destination.
+                // Unknown gateway: let the browser reach the portal's landing
+                // page, whatever its destination.
                 for chain in [Output, Forward] {
                     rules.push(
                         Rule::new(
@@ -374,13 +397,13 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                             vec![Match::OutIface(wan.clone()), ports.clone()],
                             Verdict::Accept,
                         )
-                        .with_note("portail captif : passerelle inconnue"),
+                        .with_note("captive portal: unknown gateway"),
                     );
                 }
             }
         }
     } else if state.traffic_allowed() {
-        // Split-tunneling : les CIDRs locaux contournent le tunnel.
+        // Split-tunneling: local CIDRs bypass the tunnel.
         for cidr in &policy.split_tunnel_cidrs {
             rules.push(Rule::new(
                 Forward,
@@ -389,8 +412,8 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             ));
         }
 
-        // Tunnel opérationnel : on forwarde le LAN. WireGuard chiffre en sortie ;
-        // un paquet non capturé par l'interface du tunnel ne sortira pas.
+        // Tunnel operational: forward the LAN. WireGuard encrypts on egress;
+        // a packet not captured by the tunnel interface will not go out.
         for lan in &policy.lan_ifaces {
             rules.push(Rule::new(
                 Forward,
@@ -399,10 +422,10 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             ));
         }
 
-        // Sortie Internet des clients du tunnel. Le retour est couvert par la
-        // règle `ct state established,related` de la chaîne forward : ouvrir
-        // l'aller suffit, et scoper au seul sens client -> WAN évite d'exposer
-        // le LAN de la gateway aux clients.
+        // Internet egress for tunnel clients. The return path is covered by
+        // the forward chain's `ct state established,related` rule: opening
+        // the outbound direction is enough, and scoping to the client -> WAN
+        // direction only avoids exposing the gateway's LAN to clients.
         if policy.allow_client_internet && !policy.wg_iface.is_empty() {
             rules.push(
                 Rule::new(
@@ -413,12 +436,12 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                     ],
                     Verdict::Accept,
                 )
-                .with_note("sortie Internet des clients du tunnel (masquerade en postrouting)"),
+                .with_note("Internet egress for tunnel clients (masquerade in postrouting)"),
             );
         }
     }
 
-    // En fail-open, la politique par défaut devient accept hors tunnel (déconseillé).
+    // In fail-open, the default policy becomes accept outside the tunnel (not recommended).
     let default_verdict = if policy.is_fail_closed() || state.traffic_allowed() {
         Verdict::Drop
     } else {
@@ -432,9 +455,9 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             .traffic_allowed()
             .then_some(policy.mss_clamp)
             .flatten(),
-        // Le NAT suit exactement l'état du tunnel : posé avec lui, retiré avec
-        // lui. Un masquerade qui survivrait à la chute laisserait sortir en
-        // clair ce que le kill-switch vient de couper.
+        // NAT follows the tunnel state exactly: applied with it, removed with
+        // it. A masquerade that survived the tunnel going down would let out
+        // in the clear what the kill-switch just cut off.
         masquerade_out: (state.traffic_allowed()
             && policy.allow_client_internet
             && !policy.wg_iface.is_empty()
@@ -454,6 +477,7 @@ mod tests {
             lan_ifaces: vec!["eth1".into()],
             wg_peers: vec!["203.0.113.10".into()],
             wg_listen_port: Some(51820),
+            key_negotiation_port: Some(51821),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
             allow_dhcp_on_wan: false,
@@ -467,7 +491,7 @@ mod tests {
         }
     }
 
-    /// Rendu textuel d'une chaîne, pour des assertions lisibles.
+    /// Textual rendering of a chain, for readable assertions.
     fn text(rs: &Ruleset, kind: ChainKind) -> Vec<String> {
         rs.chain(kind).map(|r| r.to_string()).collect()
     }
@@ -481,41 +505,42 @@ mod tests {
             .any(|r| r.contains("iifname \"eth1\"")));
     }
 
-    /// Sans cette règle, aucun client road-warrior ne peut handshaker : le
-    /// fail-closed jette les paquets entrants. C'est la condition d'accès.
+    /// Without this rule, no road-warrior client can handshake: fail-closed
+    /// drops inbound packets. This is the condition for access.
     #[test]
-    fn le_port_d_ecoute_est_ouvert_en_entree() {
+    fn listen_port_is_open_inbound() {
         for st in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
             let rs = render(&policy(), st);
             assert!(
                 text(&rs, ChainKind::Input)
                     .iter()
                     .any(|r| r == "iifname \"eth0\" udp dport 51820 accept"),
-                "état {st:?} : le port d'écoute WireGuard doit rester joignable"
+                "state {st:?}: the WireGuard listening port must stay reachable"
             );
         }
     }
 
-    /// Le défaut reste fermé : une gateway a normalement une adresse fixe, et
-    /// ouvrir DHCP sans raison élargirait le fail-closed pour rien.
+    /// The default stays closed: a gateway normally has a fixed address, and
+    /// opening DHCP without reason would widen fail-closed for nothing.
     #[test]
-    fn dhcp_est_ferme_par_defaut() {
+    fn dhcp_is_closed_by_default() {
         let rs = render(&policy(), TunnelState::Down);
         for kind in [ChainKind::Input, ChainKind::Output] {
             assert!(
                 !text(&rs, kind)
                     .iter()
                     .any(|r| r.contains("dport 67") || r.contains("dport 68")),
-                "DHCP ouvert sans que la configuration le demande"
+                "DHCP open without the configuration requesting it"
             );
         }
     }
 
-    /// Sans ces deux règles, une gateway adressée par bail perd son adresse au
-    /// premier renouvellement — donc son tunnel et son administration —,
-    /// plusieurs heures après un démarrage qui semblait réussi.
+    /// Without these two rules, a gateway addressed by lease loses its
+    /// address on the first renewal — hence its tunnel and its
+    /// administration — several hours after a startup that seemed
+    /// successful.
     #[test]
-    fn dhcp_autorise_reste_scope_au_wan() {
+    fn allowed_dhcp_stays_scoped_to_wan() {
         let mut p = policy();
         p.allow_dhcp_on_wan = true;
 
@@ -525,41 +550,44 @@ mod tests {
                 text(&rs, ChainKind::Output)
                     .iter()
                     .any(|r| r.starts_with("oifname \"eth0\" udp dport 67 accept")),
-                "état {st:?} : la demande de renouvellement doit pouvoir sortir"
+                "state {st:?}: the renewal request must be able to go out"
             );
             assert!(
                 text(&rs, ChainKind::Input)
                     .iter()
                     .any(|r| r.starts_with("iifname \"eth0\" udp dport 68 accept")),
-                "état {st:?} : la réponse du serveur doit pouvoir entrer"
+                "state {st:?}: the server's reply must be able to come in"
             );
-            // L'ouverture ne doit exister que sur le WAN : sur le LAN elle
-            // laisserait un client parler DHCP à travers la gateway.
+            // The opening must only exist on the WAN: on the LAN it would let
+            // a client speak DHCP through the gateway.
             assert!(
                 !text(&rs, ChainKind::Forward)
                     .iter()
                     .any(|r| r.contains("dport 67") || r.contains("dport 68")),
-                "état {st:?} : DHCP ne doit pas traverser la gateway"
+                "state {st:?}: DHCP must not traverse the gateway"
             );
         }
     }
 
-    /// Fermé par défaut : une gateway d'accès à des ressources internes n'a
-    /// aucune raison de router Internet.
+    /// Closed by default: a gateway granting access to internal resources has
+    /// no reason to route Internet traffic.
     #[test]
-    fn la_sortie_internet_des_clients_est_fermee_par_defaut() {
+    fn client_internet_egress_is_closed_by_default() {
         let rs = render(&policy(), TunnelState::Up);
-        assert!(rs.masquerade_out.is_none(), "NAT posé sans le demander");
+        assert!(
+            rs.masquerade_out.is_none(),
+            "NAT applied without requesting it"
+        );
         assert!(!text(&rs, ChainKind::Forward)
             .iter()
             .any(|r| r.contains("iifname \"helios0\"")));
     }
 
-    /// Le NAT et le forward doivent apparaître **et disparaître** avec le
-    /// tunnel. Un masquerade qui survivrait à la chute laisserait sortir en
-    /// clair ce que le kill-switch vient de couper.
+    /// NAT and forward must appear **and disappear** together with the
+    /// tunnel. A masquerade that survived the tunnel going down would let out
+    /// in the clear what the kill-switch just cut off.
     #[test]
-    fn la_sortie_internet_suit_exactement_l_etat_du_tunnel() {
+    fn client_internet_egress_follows_tunnel_state_exactly() {
         let mut p = policy();
         p.allow_client_internet = true;
 
@@ -569,7 +597,7 @@ mod tests {
             text(&up, ChainKind::Forward)
                 .iter()
                 .any(|r| r == "iifname \"helios0\" oifname \"eth0\" accept"),
-            "forward client absent dans l'état Up : {:?}",
+            "client forward rule missing in the Up state: {:?}",
             text(&up, ChainKind::Forward)
         );
 
@@ -581,21 +609,22 @@ mod tests {
             let rs = render(&p, st);
             assert!(
                 rs.masquerade_out.is_none(),
-                "état {st:?} : le NAT ne doit pas exister hors tunnel"
+                "state {st:?}: NAT must not exist outside the tunnel"
             );
             assert!(
                 !text(&rs, ChainKind::Forward)
                     .iter()
                     .any(|r| r.contains("iifname \"helios0\"")),
-                "état {st:?} : le trafic client ne doit pas traverser"
+                "state {st:?}: client traffic must not traverse"
             );
         }
     }
 
-    /// L'ouverture est unidirectionnelle : le client sort, mais rien n'entre
-    /// vers le LAN de la gateway. Le retour est couvert par `established`.
+    /// The opening is unidirectional: the client goes out, but nothing comes
+    /// in towards the gateway's LAN. The return path is covered by
+    /// `established`.
     #[test]
-    fn la_sortie_internet_n_ouvre_pas_le_lan_aux_clients() {
+    fn client_internet_egress_does_not_open_lan_to_clients() {
         let mut p = policy();
         p.allow_client_internet = true;
         let rs = render(&p, TunnelState::Up);
@@ -604,12 +633,12 @@ mod tests {
             !text(&rs, ChainKind::Forward)
                 .iter()
                 .any(|r| r.starts_with("iifname \"helios0\" oifname \"eth1\"")),
-            "un client ne doit pas atteindre le LAN de la gateway"
+            "a client must not reach the gateway's LAN"
         );
     }
 
     #[test]
-    fn pas_d_ouverture_entrante_sans_role_serveur() {
+    fn no_inbound_opening_without_server_role() {
         let mut p = policy();
         p.wg_listen_port = None;
         let rs = render(&p, TunnelState::Down);
@@ -618,22 +647,24 @@ mod tests {
             .any(|r| r.contains("udp dport 51820")));
     }
 
-    /// L'écoute WireGuard est en `input` (trafic vers la gateway), le forward
-    /// LAN en `forward`. Les confondre bloquerait ou ouvrirait le mauvais trafic.
+    /// The WireGuard listener is in `input` (traffic towards the gateway),
+    /// LAN forward in `forward`. Confusing them would block or open the
+    /// wrong traffic.
     #[test]
-    fn le_loopback_est_accepte_selon_la_direction_de_la_chaine() {
-        // Non-régression : `iif "lo"` était posé sur les trois chaînes. Sur le
-        // hook output, un paquet généré localement n'a pas d'interface
-        // d'entrée : la règle ne matchait jamais et tout le trafic loopback
-        // sortant tombait sous `policy drop`. Symptôme observé sur cible —
-        // toute connexion vers 127.0.0.1 restait suspendue, sans refus.
+    fn loopback_is_accepted_according_to_chain_direction() {
+        // Regression test: `iif "lo"` used to be applied on all three
+        // chains. On the output hook, a locally generated packet has no
+        // ingress interface: the rule never matched and all outbound
+        // loopback traffic fell under `policy drop`. Symptom observed on
+        // target — any connection to 127.0.0.1 stayed hung, without being
+        // refused.
         let rs = render(&policy(), TunnelState::Down);
 
         assert!(
             rs.chain(ChainKind::Output)
                 .any(|r| r.matches == vec![Match::OutIface("lo".into())]
                     && r.verdict == Verdict::Accept),
-            "la chaîne output doit accepter le loopback par son interface de sortie"
+            "the output chain must accept loopback via its egress interface"
         );
 
         for kind in [ChainKind::Input, ChainKind::Forward] {
@@ -641,13 +672,13 @@ mod tests {
                 rs.chain(kind)
                     .any(|r| r.matches == vec![Match::InIface("lo".into())]
                         && r.verdict == Verdict::Accept),
-                "{kind:?} doit accepter le loopback par son interface d'entrée"
+                "{kind:?} must accept loopback via its ingress interface"
             );
         }
     }
 
     #[test]
-    fn les_regles_sont_dans_la_bonne_chaine() {
+    fn rules_are_in_the_right_chain() {
         let rs = render(&policy(), TunnelState::Up);
         assert!(text(&rs, ChainKind::Input)
             .iter()
@@ -655,7 +686,7 @@ mod tests {
         assert!(text(&rs, ChainKind::Forward)
             .iter()
             .any(|r| r.contains("iifname \"eth1\" oifname \"eth0\"")));
-        // Le transport sortant vers un pair statique est en `output`.
+        // Outbound transport to a static peer is in `output`.
         assert!(text(&rs, ChainKind::Output)
             .iter()
             .any(|r| r.contains("ip daddr 203.0.113.10")));
@@ -681,20 +712,23 @@ mod tests {
     }
 
     #[test]
-    fn admin_api_restreinte_a_l_interface_du_tunnel() {
+    fn admin_api_restricted_to_tunnel_interface() {
         let mut p = policy();
         p.admin_port = Some(8080);
         p.admin_iface = Some("helios0".into());
         let rs = render(&p, TunnelState::Up);
         let input = text(&rs, ChainKind::Input);
 
-        // L'accept scopé doit précéder le drop générique.
+        // The scoped accept must precede the generic drop.
         let accept = input.iter().position(|r| r.contains("helios0")).unwrap();
         let drop = input
             .iter()
             .position(|r| r == "tcp dport 8080 drop")
             .unwrap();
-        assert!(accept < drop, "l'accept scopé doit primer sur le drop");
+        assert!(
+            accept < drop,
+            "the scoped accept must take precedence over the drop"
+        );
     }
 
     #[test]
@@ -732,10 +766,10 @@ mod tests {
         assert!(fwd.iter().any(|r| r.contains("iifname \"eth1\"")));
     }
 
-    /// Le MSS clamping est une action de mangle, pas un verdict : il vit hors
-    /// de `rules` et n'est retenu que tunnel opérationnel.
+    /// MSS clamping is a mangle action, not a verdict: it lives outside of
+    /// `rules` and is only retained while the tunnel is operational.
     #[test]
-    fn mss_clamping_hors_des_regles_et_seulement_up() {
+    fn mss_clamping_outside_rules_and_only_when_up() {
         let mut p = policy();
         p.mss_clamp = Some(1380);
         assert_eq!(render(&p, TunnelState::Up).mss_clamp, Some(1380));

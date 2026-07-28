@@ -1,6 +1,6 @@
 {
   "build": {
-    "beforeBuildCommand": "cargo xtask orion-deps && npm run build"
+    "beforeBuildCommand": "npm run orion-deps && npm run build"
   },
   "bundle": {
     "resources": {

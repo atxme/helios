@@ -21,6 +21,14 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [adr/ADR-004-CHAINE-DE-LIVRAISON.md](adr/ADR-004-CHAINE-DE-LIVRAISON.md) —
   cycle de vie des secrets, admission, profils clients et livraison
   d'artefacts.
+- [adr/ADR-005-NEGOCIATION-DE-CLE.md](adr/ADR-005-NEGOCIATION-DE-CLE.md) —
+  spécification et modèle de menace de la négociation de clé pré-WireGuard :
+  port public, PKI ML-DSA-65, PSK ML-KEM du **premier** handshake, plancher
+  anti-downgrade et identité cliente scellée.
+- [adr/ADR-006-SECRETS-AU-REPOS.md](adr/ADR-006-SECRETS-AU-REPOS.md) —
+  chiffrement AES-256-GCM des secrets sur disque, hiérarchie de clés Orion liée
+  au TPM, hygiène mémoire et modèle de menace du stockage local. Le chiffrement
+  de volume (BitLocker / dm-crypt) y devient un **prérequis d'installation**.
 
 ## Sécurité
 

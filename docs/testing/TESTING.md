@@ -10,6 +10,17 @@ Elle doit être verte avant fusion ou livraison. Elle utilise les lockfiles,
 interdit les avertissements Clippy et couvre les features matérielles au niveau
 compilation/tests sans exécuter d’effet réel.
 
+**En intégration continue, elle ne se déclenche que pour `main`** : sur les
+poussées vers cette branche et sur les PR qui la visent. Une branche de travail
+ne la déclenche donc plus à chaque commit — la campagne coûte plusieurs minutes
+et n’apprend rien de plus que la même commande jouée localement, qui exécute
+exactement les mêmes étapes. Pour la lancer malgré tout sur une branche :
+l’action *Régression* accepte un déclenchement manuel (`workflow_dispatch`).
+
+Cela déplace une responsabilité : sur une branche de travail, la campagne est
+**au développeur**, plus à la CI. Une branche poussée sans l’avoir jouée n’est
+vérifiée qu’au moment de la PR.
+
 ## Matrice automatisée
 
 | Couche | Contrôles |
@@ -24,6 +35,7 @@ compilation/tests sans exécuter d’effet réel.
 | Éditeur | permissions 0700/0600, auto-vérification, clés cohérentes et refus d’écrasement |
 | Réseau | états, expiration de handshake, règles fail-closed et transaction préparée avant application, ouverture DHCP scopée au WAN et fermée par défaut |
 | Provisioning PQ | tour ML-KEM complet via l’endpoint, PSK posé avant d’être annoncé, refus fail-closed si la pose échoue, annulation en mémoire et restauration du PSK précédent, adaptateur client jamais démonté |
+| Key-negotiation | JSON strict et borné, anti-downgrade/rejeu, mTLS en enveloppe, certificats et transcripts ML-DSA-65, substitution `kpub`/ciphertext, trois modes, pose gateway avant réponse, handshake client frais, ACK signé, rollback |
 | Mise à jour applicative | manifeste `helios-binary-release-v1` : signature hybride, altération du binaire, anti-rollback de `release_sequence`, staging borné et restauration du lien `current` (ADR-003) |
 | Autorisation | routes de mutation réservées aux pairs `admin`, résolution par VIP source en `/32`, refus d'un pair ordinaire, en-têtes de proxy ignorés (ADR-003) |
 | Admission | VIP dérivée de la clé publique, adresse de la gateway réservée, doublons de nom et de clé refusés, PSK des autres pairs préservés, persistance sans clé privée ni PSK (ADR-004) |
@@ -103,6 +115,10 @@ Valider avec accès console :
 - association Orion : double-clic sur `.orionprofile` au premier lancement puis
   avec l'application déjà ouverte, une seule instance et reprise de la clé
   privée locale de même nom ;
+- identité cliente sous Windows : un document produit par `helios-ctl enroll`
+  est importé, l'écran *Profils* annonce l'identité **scellée**, la connexion
+  négocie en ML-KEM après suppression du fichier d'enrôlement, et la même
+  identité recopiée sur un autre compte Windows échoue au descellement ;
 - paquet Orion Debian : `getcap /usr/bin/orion` annonce
   `cap_net_admin=ep`, puis WebKitGTK démarre sans dépendre de
   `LD_LIBRARY_PATH` ;
@@ -114,6 +130,13 @@ Valider avec accès console :
   et `wg show` confirme le slot renseigné sur la gateway comme sur le client ;
 - provisioning PQ, chemin dégradé : gateway dont `sync_peers` échoue — le client
   doit rester en tunnel classique opérationnel, sans PSK orphelin ;
+- key-negotiation : rediriger UDP 51821 et UDP 51820 séparément, vérifier les
+  trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
+  avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
+  et l’ACK de commit ;
+- identité key-negotiation : `heliosd init-key-negotiation` scelle réellement la
+  clé serveur, refuse l’écrasement sans `--rotate` et redémarre avec le même
+  certificat et la même clé descellée ;
 - mise à jour applicative ([ADR-003](../adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md)) :
   transfert du manifeste et du binaire par fragments JSON, refus d'une signature
   altérée, refus d'une `release_sequence` inférieure ou égale à la dernière
@@ -442,7 +465,13 @@ confirmés puis corrigés avec test de non-régression :
 ## Limites connues
 
 - le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;
-- le flux PSK ML-KEM n’est pas encore installé atomiquement de bout en bout ;
+- l’effet de la key-negotiation sur WireGuard-NT et le backend noyau Helios
+  exige deux machines et les deux redirections UDP ; les tests WSL2 couvrent la
+  transaction mais pas ces effets matériels ;
+- le scellement DPAPI de l’identité cliente ne se compile ni ne s’exerce en
+  WSL2 : hors Windows, `orion_core::identity_store` échoue explicitement
+  (`UnsupportedPlatform`) au lieu d’écrire ces clés en clair, et c’est cette
+  propriété-là que la régression vérifie ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
 - le chemin Tauri Linux ne valide pas Windows/WireGuard-NT ;
 - une campagne verte réduit le risque de régression, elle ne constitue ni audit

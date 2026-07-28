@@ -1,11 +1,11 @@
-//! Sert les fichiers statiques de l'app React.
+//! Serves the React app's static files.
 //!
-//! Avec la feature `embed-ui` : les fichiers de `web/dist/` sont embarqués dans
-//! le binaire à la compilation (via `rust-embed`). Toute route inconnue renvoie
-//! `index.html` (SPA fallback).
+//! With the `embed-ui` feature: the files under `web/dist/` are embedded into
+//! the binary at compile time (via `rust-embed`). Any unknown route falls back
+//! to `index.html` (SPA fallback).
 //!
-//! Sans la feature : renvoie 503 avec un message d'aide — pratique en dev où
-//! Vite tourne séparément et proxy vers heliosd.
+//! Without the feature: returns 503 with a helpful message — convenient in dev
+//! where Vite runs separately and proxies to heliosd.
 
 use axum::{
     http::{StatusCode, Uri},
@@ -26,8 +26,8 @@ pub async fn static_handler(uri: Uri) -> Response {
         let _ = uri;
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "UI non intégrée. En dev : lancez `npm run dev` dans web/. \
-             En prod : exécutez `npm run build` puis recompilez avec --features embed-ui.",
+            "UI not embedded. In dev: run `npm run dev` in web/. \
+             In prod: run `npm run build` then recompile with --features embed-ui.",
         )
             .into_response()
     }

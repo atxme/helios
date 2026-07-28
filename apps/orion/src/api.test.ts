@@ -25,10 +25,10 @@ import {
   selectProfile,
 } from './api'
 
-describe('pont Tauri Orion', () => {
+describe('Orion Tauri bridge', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  it('utilise uniquement les commandes explicitement autorisées', async () => {
+  it('only uses explicitly authorized commands', async () => {
     mocks.invoke.mockResolvedValue(undefined)
     const profile = { name: 'portable' }
 
@@ -69,7 +69,7 @@ describe('pont Tauri Orion', () => {
     ])
   })
 
-  it('ne relaie que la charge utile de l’événement backend', async () => {
+  it('only relays the backend event payload', async () => {
     const unlisten = vi.fn()
     mocks.listen.mockImplementation(async (_name, handler) => {
       handler({ payload: { type: 'state_changed', state: 'up' } })
@@ -82,7 +82,7 @@ describe('pont Tauri Orion', () => {
     expect(callback).toHaveBeenCalledWith({ type: 'state_changed', state: 'up' })
   })
 
-  it('signale les chemins de profil sans exposer de lecture JavaScript', async () => {
+  it('reports profile paths without exposing a JavaScript read', async () => {
     const unlisten = vi.fn()
     const callback = vi.fn()
     mocks.listen.mockImplementation(async (_name, handler) => {

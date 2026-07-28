@@ -8,6 +8,7 @@ members = [
     "crates/helio-tpm",
     "crates/helios-provisioning",
     "crates/helios-wireguard",
+    "crates/helios-key-negotiation",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -31,6 +32,7 @@ default-members = [
     "crates/helio-tpm",
     "crates/helios-provisioning",
     "crates/helios-wireguard",
+    "crates/helios-key-negotiation",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -71,6 +73,10 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", features = ["x509-parser"] }
+time = "0.3"
 futures-util = "0.3"
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # Backend crypto : AWS-LC (aws-lc-sys), non-FIPS → statique, builder `cc`, aucune
@@ -100,6 +106,7 @@ defguard_wireguard_rs = "0.11"
 aether = { path = "crates/aether" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
+helios-key-negotiation = { path = "crates/helios-key-negotiation" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }

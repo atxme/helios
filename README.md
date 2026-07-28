@@ -35,8 +35,8 @@ un handshake vieux de moins de 150 secondes.
 La machine à états est commune aux deux applications :
 
 - `down` : interface arrêtée ;
-- `connecting` : interface montée, en attente d’un handshake frais ;
-- `up` : handshake frais observé ;
+- `connecting` : interface montée, aucun handshake de moins de 150 s ;
+- `up` : un handshake a réussi il y a moins de 150 s ;
 - `failed` : échec opérationnel ;
 - `captive_portal` : ouverture temporaire limitée au portail captif.
 

@@ -1,29 +1,30 @@
-//! Backend TPM2 **réel** — scellement/déscellement durci (cible uniquement).
+//! **Real** TPM2 backend — hardened sealing/unsealing (target only).
 //!
-//! ⚠️ **Module critique de sécurité, validable uniquement sur matériel TPM.**
-//! Comme `helios-firewall/src/netlink.rs`, ce code ne compile qu'avec `--features
-//! tpm` (libtss2-esys présente) et ne peut être exercé ni sur WSL2 ni par la CI.
-//! Les invariants ci-dessous doivent être revérifiés lors du bring-up matériel.
+//! Warning: **security-critical module, validatable only on real TPM hardware.**
+//! Like `helios-firewall/src/netlink.rs`, this code only compiles with
+//! `--features tpm` (libtss2-esys present) and cannot be exercised on WSL2
+//! nor by CI. The invariants below must be re-checked during hardware bring-up.
 //!
-//! ## Mesures de durcissement appliquées
+//! ## Hardening measures applied
 //!
-//! 1. **Liaison aux PCR par politique (PolicyPCR)** : le secret n'est descellable
-//!    que si PCR 0/4/7 (banque SHA-256) sont identiques au scellement. Un kernel
-//!    ou bootloader altéré change les PCR → `TPM2_RC_POLICY_FAIL`.
-//! 2. **Sessions salées + chiffrées (anti-sniffing du bus SPI/I2C)** : les sessions
-//!    qui transportent le secret (Create, Unseal) sont *salées* par la clé primaire
-//!    ECC et portent les attributs `decrypt|encrypt`. Le secret ne transite jamais
-//!    en clair sur le bus matériel — mitigation directe de l'attaque MITM décrite
-//!    dans le modèle de menaces.
-//! 3. **Objet non duplicable** : `fixedTPM` + `fixedParent` lient le blob à *ce*
-//!    TPM ; il est inutilisable ailleurs même copié.
-//! 4. **Autorisation par politique seule** : `userWithAuth = false` interdit le
-//!    déscellement par simple mot de passe ; seule la politique PCR ouvre l'objet.
-//! 5. **Banque faible refusée** : SHA-1 est rejeté ; seule SHA-256 est acceptée.
-//! 6. **Hygiène des handles** : sessions et objets transitoires sont systématiquement
-//!    purgés (`flush_context`), y compris sur chemin d'erreur.
-//! 7. **Secret minimisé en mémoire** : la donnée descellée est immédiatement copiée
-//!    dans [`SecretKey`] (zeroïsé au drop) et les tampons intermédiaires effacés.
+//! 1. **PCR binding by policy (PolicyPCR)**: the secret is only unsealable if
+//!    PCR 0/4/7 (SHA-256 bank) are identical to sealing time. A tampered
+//!    kernel or bootloader changes the PCRs -> `TPM2_RC_POLICY_FAIL`.
+//! 2. **Salted + encrypted sessions (anti-sniffing on the SPI/I2C bus)**:
+//!    the sessions carrying the secret (Create, Unseal) are *salted* by the
+//!    ECC primary key and carry the `decrypt|encrypt` attributes. The secret
+//!    never transits in the clear on the hardware bus — a direct mitigation
+//!    of the MITM attack described in the threat model.
+//! 3. **Non-duplicable object**: `fixedTPM` + `fixedParent` bind the blob to
+//!    *this* TPM; it is unusable elsewhere even if copied.
+//! 4. **Authorization by policy alone**: `userWithAuth = false` forbids
+//!    unsealing by simple password; only the PCR policy opens the object.
+//! 5. **Weak bank refused**: SHA-1 is rejected; only SHA-256 is accepted.
+//! 6. **Handle hygiene**: transient sessions and objects are systematically
+//!    purged (`flush_context`), including on the error path.
+//! 7. **Secret minimized in memory**: the unsealed data is immediately
+//!    copied into [`SecretKey`] (zeroized on drop) and intermediate buffers
+//!    are wiped.
 
 use std::str::FromStr;
 
@@ -55,8 +56,8 @@ use crate::{
     Result, TpmError,
 };
 
-/// En-tête du blob persistant : magie + version + banque + sélection PCR.
-/// Stocker la sélection rend le déscellement auto-cohérent même si la config dérive.
+/// Header of the persistent blob: magic + version + bank + PCR selection.
+/// Storing the selection keeps unsealing self-consistent even if the config drifts.
 const BLOB_MAGIC: &[u8; 4] = b"HTPM";
 const BLOB_VERSION: u8 = 1;
 const BANK_SHA256: u8 = 1;
@@ -69,7 +70,7 @@ pub(crate) struct TpmDevice {
 
 impl TpmDevice {
     pub(crate) fn new(cfg: &crate::settings::TpmSettings) -> Result<Self> {
-        // Refus immédiat des banques faibles (SHA-1) — défense en profondeur.
+        // Immediate refusal of weak banks (SHA-1) — defense in depth.
         hash_alg_from_bank(&cfg.pcr_bank)?;
         Ok(Self {
             device_path: cfg.device.clone(),
@@ -90,8 +91,8 @@ impl TpmSealer for TpmDevice {
             cause: e.to_string(),
         })?;
 
-        // Empreinte d'identité de l'état PCR (sert à lier le billet de rescellement) :
-        // SHA-256 de la concaténation des valeurs PCR lues, dans l'ordre.
+        // Identity digest of the PCR state (used to bind the reseal ticket):
+        // SHA-256 of the concatenation of the PCR values read, in order.
         let mut hasher = Sha256::new();
         for d in digests.value() {
             hasher.update(d.value());
@@ -104,18 +105,18 @@ impl TpmSealer for TpmDevice {
         let alg = hash_alg_from_bank(&self.bank)?;
         let selection = pcr_selection(alg, &self.indices)?;
 
-        // Clé primaire ECC (hiérarchie Owner) : sert à la fois de parent du blob et
-        // de clé de sel des sessions chiffrées. Déterministe pour ce TPM.
+        // ECC primary key (Owner hierarchy): serves both as the blob's parent
+        // and as the salt key for encrypted sessions. Deterministic for this TPM.
         let primary = create_primary(&mut ctx)?;
 
         let outcome = (|| {
-            // authPolicy = digest de la politique PCR calculé par le TPM sur les PCR
-            // courants (session d'essai → le digest n'est pas secret).
+            // authPolicy = PCR policy digest computed by the TPM over the
+            // current PCRs (trial session -> the digest is not secret).
             let auth_policy = compute_pcr_policy_digest(&mut ctx, alg, &selection)?;
             let public = sealed_template(auth_policy)?;
 
-            // Session HMAC salée + chiffrée : protège le secret (paramètre de commande)
-            // contre l'écoute du bus pendant TPM2_Create.
+            // Salted + encrypted HMAC session: protects the secret (command
+            // parameter) against bus eavesdropping during TPM2_Create.
             let session = start_salted_session(&mut ctx, primary.key_handle, SessionType::Hmac)?;
 
             let mut sensitive_bytes = secret.as_bytes().to_vec();
@@ -156,14 +157,14 @@ impl TpmSealer for TpmDevice {
         let primary = create_primary(&mut ctx)?;
 
         let outcome = (|| {
-            // Chargement de l'objet scellé sous la primaire (auth parent = null).
+            // Loads the sealed object under the primary (parent auth = null).
             let object: ObjectHandle = ctx
                 .execute_with_nullauth_session(|ctx| ctx.load(primary.key_handle, private, public))
                 .map_err(|e| TpmError::Connection(format!("load (unseal): {e}")))?
                 .into();
 
-            // Session de politique salée + chiffrée : PolicyPCR lit les PCR courants,
-            // et l'attribut `encrypt` chiffre le secret renvoyé sur le bus.
+            // Salted + encrypted policy session: PolicyPCR reads the current
+            // PCRs, and the `encrypt` attribute encrypts the secret returned on the bus.
             let session = start_salted_session(&mut ctx, primary.key_handle, SessionType::Policy)?;
             let policy_session = PolicySession::try_from(session)
                 .map_err(|e| TpmError::Connection(format!("policy session: {e}")))?;
@@ -175,8 +176,8 @@ impl TpmSealer for TpmDevice {
             let unsealed = policy_step.and_then(|()| {
                 ctx.execute_with_session(Some(session), |ctx| ctx.unseal(object))
                     .map_err(|e| {
-                        // PCR modifiés → TPM2_RC_POLICY_FAIL : c'est le signal d'un OTA
-                        // (rescellement sous billet) ou d'une altération (refus).
+                        // PCRs changed -> TPM2_RC_POLICY_FAIL: this is the
+                        // signal of an OTA (resealing under ticket) or of tampering (refusal).
                         if is_policy_fail(&e) {
                             TpmError::UnsealPolicyFail
                         } else {
@@ -205,12 +206,12 @@ fn open_context(device: &str) -> Result<Context> {
     Context::new(tcti).map_err(|e| TpmError::Connection(e.to_string()))
 }
 
-/// Refuse toute banque autre que SHA-256 (SHA-1 obsolète = vecteur d'attaque).
+/// Refuses any bank other than SHA-256 (obsolete SHA-1 = attack vector).
 fn hash_alg_from_bank(bank: &str) -> Result<HashingAlgorithm> {
     match bank.to_ascii_lowercase().as_str() {
         "sha256" => Ok(HashingAlgorithm::Sha256),
         other => Err(TpmError::Connection(format!(
-            "banque PCR refusée : {other} (seule sha256 est autorisée)"
+            "PCR bank refused: {other} (only sha256 is allowed)"
         ))),
     }
 }
@@ -234,7 +235,7 @@ fn pcr_selection(
             other => {
                 return Err(TpmError::PcrRead {
                     index: *other,
-                    cause: "index PCR non supporté (0–7 attendus)".into(),
+                    cause: "unsupported PCR index (0-7 expected)".into(),
                 })
             }
         })
@@ -243,16 +244,16 @@ fn pcr_selection(
     PcrSelectionListBuilder::new()
         .with_selection(alg, &slots)
         .build()
-        .map_err(|e| TpmError::Connection(format!("sélection PCR: {e}")))
+        .map_err(|e| TpmError::Connection(format!("PCR selection: {e}")))
 }
 
 fn empty_digest() -> Result<Digest> {
     Digest::try_from(Vec::<u8>::new())
-        .map_err(|e| TpmError::Connection(format!("digest vide: {e}")))
+        .map_err(|e| TpmError::Connection(format!("empty digest: {e}")))
 }
 
-/// Gabarit de la clé primaire ECC P-256 (clé de stockage restreinte).
-/// Déterministe : recréée à l'identique au déscellement → même parent.
+/// Template of the ECC P-256 primary key (restricted storage key).
+/// Deterministic: recreated identically at unseal time -> same parent.
 fn primary_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -263,7 +264,7 @@ fn primary_template() -> Result<Public> {
         .with_decrypt(true)
         .with_sign_encrypt(false)
         .build()
-        .map_err(|e| TpmError::Connection(format!("attributs primaire: {e}")))?;
+        .map_err(|e| TpmError::Connection(format!("primary attributes: {e}")))?;
 
     let ecc = PublicEccParametersBuilder::new()
         .with_ecc_scheme(EccScheme::Null)
@@ -271,13 +272,13 @@ fn primary_template() -> Result<Public> {
         .with_is_decryption_key(true)
         .with_restricted(true)
         .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null)
-        // Schéma symétrique de la clé de stockage : AES-128-CFB.
+        // Symmetric scheme of the storage key: AES-128-CFB.
         .with_symmetric(SymmetricDefinitionObject::Aes {
             key_bits: AesKeyBits::Aes128,
             mode: tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
         })
         .build()
-        .map_err(|e| TpmError::Connection(format!("params ECC primaire: {e}")))?;
+        .map_err(|e| TpmError::Connection(format!("primary ECC params: {e}")))?;
 
     PublicBuilder::new()
         .with_public_algorithm(PublicAlgorithm::Ecc)
@@ -286,17 +287,17 @@ fn primary_template() -> Result<Public> {
         .with_ecc_parameters(ecc)
         .with_ecc_unique_identifier(EccPoint::default())
         .build()
-        .map_err(|e| TpmError::Connection(format!("template primaire: {e}")))
+        .map_err(|e| TpmError::Connection(format!("primary template: {e}")))
 }
 
-/// Gabarit de l'objet scellé (keyedhash, donnée fournie) lié à `auth_policy`.
+/// Template of the sealed object (keyedhash, supplied data) bound to `auth_policy`.
 fn sealed_template(auth_policy: Digest) -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
-        // On fournit la donnée → l'origine n'est pas le TPM.
+        // We supply the data -> the origin is not the TPM.
         .with_sensitive_data_origin(false)
-        // Pas d'auth par mot de passe : seule la politique PCR ouvre l'objet.
+        // No password auth: only the PCR policy opens the object.
         .with_user_with_auth(false)
         .with_admin_with_policy(true)
         .with_no_da(true)
@@ -304,7 +305,7 @@ fn sealed_template(auth_policy: Digest) -> Result<Public> {
         .with_decrypt(false)
         .with_sign_encrypt(false)
         .build()
-        .map_err(|e| TpmError::Connection(format!("attributs scellé: {e}")))?;
+        .map_err(|e| TpmError::Connection(format!("sealed attributes: {e}")))?;
 
     PublicBuilder::new()
         .with_public_algorithm(PublicAlgorithm::KeyedHash)
@@ -314,7 +315,7 @@ fn sealed_template(auth_policy: Digest) -> Result<Public> {
         .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
         .with_keyed_hash_unique_identifier(empty_digest()?)
         .build()
-        .map_err(|e| TpmError::Connection(format!("template scellé: {e}")))
+        .map_err(|e| TpmError::Connection(format!("sealed template: {e}")))
 }
 
 fn create_primary(ctx: &mut Context) -> Result<tss_esapi::structures::CreatePrimaryKeyResult> {
@@ -325,10 +326,10 @@ fn create_primary(ctx: &mut Context) -> Result<tss_esapi::structures::CreatePrim
     .map_err(|e| TpmError::Connection(format!("create_primary: {e}")))
 }
 
-/// Session salée (par la primaire ECC) avec chiffrement de paramètres.
+/// Salted session (by the ECC primary) with parameter encryption.
 ///
-/// Le sel rend la clé de session inaccessible à une écoute passive du bus ;
-/// `decrypt|encrypt` chiffrent les paramètres sensibles (secret) dans les deux sens.
+/// The salt makes the session key inaccessible to passive bus eavesdropping;
+/// `decrypt|encrypt` encrypt the sensitive parameters (secret) in both directions.
 fn start_salted_session(
     ctx: &mut Context,
     salt_key: KeyHandle,
@@ -336,7 +337,7 @@ fn start_salted_session(
 ) -> Result<AuthSession> {
     let session = ctx
         .start_auth_session(
-            Some(salt_key), // clé de sel → résistance au sniffing du bus
+            Some(salt_key), // salt key -> resistance to bus sniffing
             None,
             None,
             session_type,
@@ -344,7 +345,7 @@ fn start_salted_session(
             HashingAlgorithm::Sha256,
         )
         .map_err(|e| TpmError::Connection(format!("start_auth_session: {e}")))?
-        .ok_or_else(|| TpmError::Connection("session d'autorisation vide".into()))?;
+        .ok_or_else(|| TpmError::Connection("empty authorization session".into()))?;
 
     let (attrs, mask) = SessionAttributesBuilder::new()
         .with_decrypt(true)
@@ -352,12 +353,12 @@ fn start_salted_session(
         .with_continue_session(true)
         .build();
     ctx.tr_sess_set_attributes(session, attrs, mask)
-        .map_err(|e| TpmError::Connection(format!("attributs session: {e}")))?;
+        .map_err(|e| TpmError::Connection(format!("session attributes: {e}")))?;
 
     Ok(session)
 }
 
-/// Calcule le digest de la politique PCR via une session d'essai (digest public).
+/// Computes the PCR policy digest via a trial session (public digest).
 fn compute_pcr_policy_digest(
     ctx: &mut Context,
     _alg: HashingAlgorithm,
@@ -373,14 +374,14 @@ fn compute_pcr_policy_digest(
             HashingAlgorithm::Sha256,
         )
         .map_err(|e| TpmError::Connection(format!("trial session: {e}")))?
-        .ok_or_else(|| TpmError::Connection("session d'essai vide".into()))?;
+        .ok_or_else(|| TpmError::Connection("empty trial session".into()))?;
 
     let result = (|| {
         let policy_session = PolicySession::try_from(session)
             .map_err(|e| TpmError::Connection(format!("policy session: {e}")))?;
-        // pcrDigest vide → le TPM intègre les valeurs PCR courantes.
+        // Empty pcrDigest -> the TPM incorporates the current PCR values.
         ctx.policy_pcr(policy_session, empty_digest()?, selection.clone())
-            .map_err(|e| TpmError::Connection(format!("policy_pcr (essai): {e}")))?;
+            .map_err(|e| TpmError::Connection(format!("policy_pcr (trial): {e}")))?;
         ctx.policy_get_digest(policy_session)
             .map_err(|e| TpmError::Connection(format!("policy_get_digest: {e}")))
     })();
@@ -393,7 +394,7 @@ fn to_secret_key(sensitive: SensitiveData) -> Result<SecretKey> {
     let bytes = sensitive.value();
     if bytes.len() != 32 {
         return Err(TpmError::Connection(format!(
-            "secret descellé de taille inattendue : {} octets (32 attendus)",
+            "unsealed secret of unexpected size: {} bytes (32 expected)",
             bytes.len()
         )));
     }
@@ -404,13 +405,13 @@ fn to_secret_key(sensitive: SensitiveData) -> Result<SecretKey> {
     Ok(secret)
 }
 
-// ───────────────────────────── (Dé)sérialisation du blob ─────────────────────────────
+// ───────────────────────────── Blob (de)serialization ─────────────────────────────
 
 fn marshal_blob(indices: &[u8], public: &Public, private: &Private) -> Result<Vec<u8>> {
     let pub_bytes = public
         .marshall()
         .map_err(|e| TpmError::Serde(format!("marshall public: {e}")))?;
-    // `Private` est déjà un TPM2B opaque (format fil) → octets bruts directs.
+    // `Private` is already an opaque TPM2B (wire format) -> direct raw bytes.
     let priv_bytes = private.value().to_vec();
 
     let mut out = Vec::new();
@@ -431,7 +432,7 @@ fn unmarshal_blob(bytes: &[u8]) -> Result<(Vec<u8>, Public, Private)> {
 
     let take = |cur: &mut &[u8], n: usize| -> Result<Vec<u8>> {
         if cur.len() < n {
-            return Err(TpmError::Serde("blob tronqué".into()));
+            return Err(TpmError::Serde("truncated blob".into()));
         }
         let (head, tail) = cur.split_at(n);
         *cur = tail;
@@ -443,13 +444,13 @@ fn unmarshal_blob(bytes: &[u8]) -> Result<(Vec<u8>, Public, Private)> {
     };
 
     if take(&mut cur, 4)? != BLOB_MAGIC {
-        return Err(TpmError::Serde("magie du blob invalide".into()));
+        return Err(TpmError::Serde("invalid blob magic".into()));
     }
     if take(&mut cur, 1)?[0] != BLOB_VERSION {
-        return Err(TpmError::Serde("version de blob non supportée".into()));
+        return Err(TpmError::Serde("unsupported blob version".into()));
     }
     if take(&mut cur, 1)?[0] != BANK_SHA256 {
-        return Err(TpmError::Serde("banque du blob non supportée".into()));
+        return Err(TpmError::Serde("unsupported blob bank".into()));
     }
     let n = take(&mut cur, 1)?[0] as usize;
     let indices = take(&mut cur, n)?;
@@ -466,11 +467,11 @@ fn unmarshal_blob(bytes: &[u8]) -> Result<(Vec<u8>, Public, Private)> {
     Ok((indices, public, private))
 }
 
-/// Détecte TPM2_RC_POLICY_FAIL (PCR ne correspondant plus à l'authPolicy).
+/// Detects TPM2_RC_POLICY_FAIL (PCRs no longer matching the authPolicy).
 ///
-/// Détection via le `Debug` de l'erreur pour ne pas dépendre du chemin exact des
-/// enums de `tss-esapi` (à confirmer au bring-up). Seul ce cas déclenche la voie
-/// de rescellement ; toute autre erreur reste une erreur dure.
+/// Detection via the error's `Debug` to avoid depending on the exact enum
+/// path of `tss-esapi` (to confirm at bring-up). Only this case triggers the
+/// resealing path; any other error remains a hard error.
 fn is_policy_fail(e: &tss_esapi::Error) -> bool {
     let s = format!("{e:?}");
     s.contains("PolicyFail") || s.contains("policy_fail")

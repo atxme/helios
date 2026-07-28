@@ -1,21 +1,20 @@
-/// Paramètres du contrôleur TPM — constantes d'architecture de l'appliance.
+/// TPM controller parameters — appliance architecture constants.
 ///
-/// Tous les choix (banque PCR, sélection, chemins de persistance) sont des
-/// décisions d'architecture figées pour la durée de vie du produit. Seul `enabled`
-/// varie : il est positionné à `true` uniquement si la feature `tpm` est compilée
-/// (cible physique).
+/// All choices (PCR bank, selection, persistence paths) are architecture
+/// decisions frozen for the product's lifetime. Only `enabled` varies: it is
+/// set to `true` only if the `tpm` feature is compiled in (physical target).
 pub struct TpmSettings {
-    /// Active le scellement/déscellement. `false` = bypass (WSL2 / dev).
+    /// Enables sealing/unsealing. `false` = bypass (WSL2 / dev).
     pub enabled: bool,
-    /// `false` = log seulement en cas d'échec (RÉSERVÉ AU DÉBOGAGE).
+    /// `false` = log only on failure (DEBUG ONLY).
     pub enforce: bool,
-    /// Autorise le provisionnement TOFU si aucun blob scellé n'existe.
-    /// `true` uniquement en usine (premier boot). Sur le terrain, un blob absent
-    /// est une anomalie de sécurité.
+    /// Allows TOFU provisioning if no sealed blob exists.
+    /// `true` only at the factory (first boot). In the field, a missing blob
+    /// is a security anomaly.
     pub allow_provisioning: bool,
     pub device: String,
     pub pcr_bank: String,
-    /// PCR liés au scellement : 0=firmware, 4=bootloader, 7=Secure Boot.
+    /// PCRs bound to sealing: 0=firmware, 4=bootloader, 7=Secure Boot.
     pub pcr_selection: Vec<u8>,
     pub sealed_blob_path: String,
     pub ticket_path: String,

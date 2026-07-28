@@ -39,6 +39,24 @@ wg_address = "100.64.0.1/10"
 # Port UDP d'écoute. C'est la seule ouverture entrante du modèle fail-closed.
 wg_listen_port = 51820
 
+# Port UDP public de key-nego (QUIC + PKI). Il doit être redirigé séparément
+# par la box vers cette gateway — au même titre que `wg_listen_port`, et sans
+# lui les clients ne négocient rien.
+#
+# Ce port ne transporte aucun trafic utilisateur : il prépare le slot PSK du
+# PREMIER handshake WireGuard (ADR-001, amendement du 24 juillet 2026).
+# L'authentification y est ML-DSA-65 ; TLS 1.3 n'est que le transport QUIC.
+#
+# Le commenter referme le port. La gateway n'a alors plus de négociation, et un
+# profil Orion qui en réclame une échoue avant WireGuard — ce qui est le
+# comportement voulu : pas de repli silencieux vers un premier handshake nu.
+#
+# Après avoir activé ce port, créer l'identité de négociation SUR la gateway :
+#   sudo heliosd init-key-negotiation --server-name <nom ou IP> \
+#     --client-ca orion-client-ca.der --client-pq-ca orion-client-pq-ca-public.bin
+# `scripts/key-negotiation-setup.sh` enchaîne tout cela.
+key_negotiation_port = 51821
+
 # L'API web vit DERRIÈRE le tunnel : on la restreint à l'interface WireGuard.
 admin_iface = "helios0"
 
@@ -116,12 +134,15 @@ admin_iface = "helios0"
 # `address` est la VIP du client : dans WireGuard, AllowedIPs EST la table de
 # routage cryptographique — deux pairs ne peuvent pas revendiquer la même.
 #
-# `preshared_key` porte le secret post-quantique issu de l'échange ML-KEM.
-# Absent = tunnel classique Curve25519 seul (pas de protection PQ).
+# Les PSK ML-KEM sont éphémères et ne doivent jamais être écrits ici.
+# `minimum_key_negotiation_mode = "ml_kem"` interdit une reconnexion classique
+# ou statique. Les deux empreintes lient les identités TLS et ML-DSA du client.
 
 # [[peers]]
 # name = "poste-christophe"
 # public_key = "<clé publique du client, base64>"
 # address = "100.64.1.2/32"
 # admin = true
-# preshared_key = "<PSK ML-KEM, base64>"
+# key_negotiation_certificate_sha256 = "<empreinte TLS>"
+# key_negotiation_pq_certificate_sha256 = "<empreinte certificat ML-DSA>"
+# minimum_key_negotiation_mode = "ml_kem"

@@ -33,7 +33,7 @@ interface Props {
   wsStatus: WsStatus
 }
 
-// Sélecteur de thème flottant — segment LIGHT / DARK à la maquette.
+// Floating theme selector — LIGHT / DARK segment per the mockup.
 function ThemeSwitch({ dark, toggle }: { dark: boolean; toggle: () => void }) {
   return (
     <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30">
@@ -65,10 +65,10 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
 
   return (
     <div className="relative flex h-screen overflow-hidden">
-      {/* Scène 3D — soleil ambre + réseau cyber (derrière tout) */}
+      {/* 3D scene — amber sun + cyber network (behind everything) */}
       <Background dark={dark} />
 
-      {/* ── Sidebar — verre cyber, identité soleil Helios ── */}
+      {/* ── Sidebar — cyber glass, Helios sun identity ── */}
       <aside className="panel relative z-20 m-2 w-14 lg:w-56 shrink-0 flex flex-col rounded-xl">
         {/* Logo */}
         <div className="h-14 flex items-center gap-3 px-3 lg:px-4 border-b border-[var(--panel-border)] shrink-0">
@@ -109,7 +109,7 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
           })}
         </nav>
 
-        {/* Pied de sidebar */}
+        {/* Sidebar footer */}
         <div className="border-t border-[var(--panel-border)] px-3 lg:px-4 py-3 space-y-2 shrink-0">
           <div className="flex items-center gap-2 justify-center lg:justify-start">
             <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${ws.dot}`} />
@@ -128,9 +128,9 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
         </div>
       </aside>
 
-      {/* ── Zone principale ── */}
+      {/* ── Main area ── */}
       <div className="relative z-10 flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* Bannière erreur daemon */}
+        {/* Daemon error banner */}
         {error && (
           <div className="shrink-0 m-2 mb-0 rounded-lg border border-red-500/30 bg-red-500/10 backdrop-blur-sm">
             <div className="px-5 py-2.5 flex items-center gap-2.5">
@@ -140,7 +140,7 @@ export function Layout({ children, nav, onNav, status, error, wsStatus }: Props)
           </div>
         )}
 
-        {/* Contenu vue active */}
+        {/* Active view content */}
         <main className="flex-1 overflow-y-auto px-6 py-5 pb-16">
           {children}
         </main>

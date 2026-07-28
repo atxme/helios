@@ -1,8 +1,25 @@
 name: Régression
 
+# Ce que la campagne garde, c'est `main` : elle tourne donc sur ce qui y entre,
+# et pas sur chaque poussée d'une branche de travail. Une campagne complète
+# coûte plusieurs minutes d'exécutant, et la jouer à chaque commit intermédiaire
+# n'apprend rien que le développeur ne puisse obtenir localement — la référence
+# reste `bash scripts/regression.sh`, qui joue exactement les mêmes étapes.
+#
+# `pull_request` est conservé volontairement : une PR vers `main` est le dernier
+# moment où la branche peut être arrêtée avant d'y entrer. La retirer laisserait
+# `main` sans filet, ce qui est l'inverse du but.
+#
+# `workflow_dispatch` reste ouvert à toutes les branches : une campagne à la
+# demande sur une branche de travail est possible, elle n'est simplement plus
+# automatique.
 on:
   push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:

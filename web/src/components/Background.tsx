@@ -1,11 +1,11 @@
 import { lazy, Suspense, useMemo } from 'react'
 
-// La scène three.js est code-splittée : son chunk ne pèse plus sur le premier rendu.
+// The three.js scene is code-split: its chunk no longer weighs on first render.
 const BackgroundScene = lazy(() => import('./BackgroundScene'))
 
-// Repli CSS — soleil ambre à droite. Affiché instantanément (premier rendu),
-// pendant le chargement du chunk 3D, et définitivement si WebGL est absent
-// (sécurité webview Tauri / vieux GPU).
+// CSS fallback — amber sun on the right. Shown instantly (first render),
+// while the 3D chunk loads, and permanently if WebGL is unavailable
+// (Tauri webview safety net / old GPU).
 function Nebula({ dark }: { dark: boolean }) {
   return (
     <div className="fixed inset-0" style={{

@@ -1,17 +1,17 @@
-//! Secret transporté entre composants internes, dont l'affichage ne fuit pas.
+//! Secret carried between internal components, whose display does not leak.
 //!
-//! Un `String` nu portant un PSK finit tôt ou tard dans un `Debug` dérivé, donc
-//! dans un log. [`SecretString`] rend cette fuite impossible par construction :
-//! son `Debug` n'imprime jamais la valeur, et il faut appeler [`SecretString::expose`]
-//! — nommé pour être visible en revue — pour l'obtenir.
+//! A bare `String` carrying a PSK ends up sooner or later in a derived
+//! `Debug`, hence in a log. [`SecretString`] makes this leak impossible by
+//! construction: its `Debug` never prints the value, and one must call
+//! [`SecretString::expose`] — named to stand out in review — to obtain it.
 //!
-//! Ce type ne remplace pas [`zeroize`] : il protège de l'affichage accidentel,
-//! pas de la rémanence mémoire. Pour un secret dont la durée de vie doit être
-//! bornée en mémoire, préférer `Zeroizing` (voir [`crate::enroll::Psk`]).
+//! This type does not replace [`zeroize`]: it protects against accidental
+//! display, not memory remanence. For a secret whose in-memory lifetime must
+//! be bounded, prefer `Zeroizing` (see [`crate::enroll::Psk`]).
 
 use std::fmt;
 
-/// Une chaîne secrète (PSK base64, clé privée…) qui ne s'imprime jamais.
+/// A secret string (base64 PSK, private key…) that never prints itself.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
 
@@ -20,13 +20,13 @@ impl SecretString {
         Self(value.into())
     }
 
-    /// Donne accès à la valeur en clair. Le nom est délibérément explicite :
-    /// chaque appel est un point à justifier en revue.
+    /// Gives access to the value in the clear. The name is deliberately
+    /// explicit: every call is a point to justify in review.
     pub fn expose(&self) -> &str {
         &self.0
     }
 
-    /// Le secret est-il vide ? Utile pour valider sans exposer.
+    /// Is the secret empty? Useful for validating without exposing.
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
     }
@@ -34,15 +34,14 @@ impl SecretString {
 
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Ni la valeur, ni sa longueur : une longueur renseigne déjà sur la
-        // nature du secret.
+        // Neither the value nor its length: a length already reveals
+        // something about the nature of the secret.
         f.write_str("SecretString(***)")
     }
 }
 
-/// `Display` est volontairement **non implémenté** : un secret ne doit pas
-/// pouvoir se retrouver dans un `format!` par inadvertance. Utiliser
-/// [`SecretString::expose`].
+/// `Display` is deliberately **not implemented**: a secret must not be able
+/// to end up in a `format!` by accident. Use [`SecretString::expose`].
 impl From<String> for SecretString {
     fn from(value: String) -> Self {
         Self(value)
@@ -54,26 +53,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn le_debug_ne_revele_ni_la_valeur_ni_sa_longueur() {
+    fn debug_reveals_neither_the_value_nor_its_length() {
         let secret = SecretString::new("psk-ultra-confidentiel-en-base64");
-        let rendu = format!("{secret:?}");
+        let rendered = format!("{secret:?}");
         assert!(
-            !rendu.contains("psk-ultra"),
-            "le Debug a fuité le secret : {rendu}"
+            !rendered.contains("psk-ultra"),
+            "Debug leaked the secret: {rendered}"
         );
         assert!(
-            !rendu.contains("32"),
-            "le Debug a fuité la longueur du secret : {rendu}"
+            !rendered.contains("32"),
+            "Debug leaked the secret's length: {rendered}"
         );
-        assert_eq!(rendu, "SecretString(***)");
+        assert_eq!(rendered, "SecretString(***)");
     }
 
-    /// Le `Debug` d'une structure englobante ne doit pas fuiter non plus :
-    /// c'est le cas d'usage réel (une commande dérivant `Debug`).
+    /// The `Debug` of an enclosing structure must not leak either: this is
+    /// the real use case (a command deriving `Debug`).
     #[test]
-    fn le_debug_derive_d_une_structure_englobante_ne_fuite_pas() {
-        // Les champs ne sont lus que par le `Debug` dérivé, ce que l'analyse de
-        // code mort ne compte pas comme un usage.
+    fn the_derived_debug_of_an_enclosing_structure_does_not_leak() {
+        // The fields are only read by the derived `Debug`, which dead-code
+        // analysis does not count as a use.
         #[derive(Debug)]
         #[allow(dead_code)]
         struct Commande {
@@ -84,21 +83,24 @@ mod tests {
             pair: "cle-publique".into(),
             psk: SecretString::new("secret-a-ne-pas-logger"),
         };
-        let rendu = format!("{cmd:?}");
+        let rendered = format!("{cmd:?}");
         assert!(
-            rendu.contains("cle-publique"),
-            "le reste doit rester lisible"
+            rendered.contains("cle-publique"),
+            "the rest must stay readable"
         );
-        assert!(!rendu.contains("secret-a-ne-pas-logger"), "fuite : {rendu}");
+        assert!(
+            !rendered.contains("secret-a-ne-pas-logger"),
+            "leak: {rendered}"
+        );
     }
 
     #[test]
-    fn expose_rend_bien_la_valeur() {
+    fn expose_returns_the_value_correctly() {
         assert_eq!(SecretString::new("valeur").expose(), "valeur");
     }
 
     #[test]
-    fn vide_detecte_sans_exposer() {
+    fn empty_is_detected_without_exposing() {
         assert!(SecretString::new("   ").is_empty());
         assert!(!SecretString::new("x").is_empty());
     }

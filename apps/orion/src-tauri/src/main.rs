@@ -1,14 +1,31 @@
-// Empêche l'ouverture d'une console Windows en mode release.
+// Prevents opening a Windows console in release mode.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Shell Tauri du client VPN Orion.
+//! Tauri shell of the Orion VPN client.
 //!
-//! Mince couche de câblage : il ne contient aucune logique WireGuard (déléguée à
-//! `orion-core`). Son rôle est de :
-//! 1. exposer des commandes `invoke` au frontend (connect/disconnect, CRUD profils) ;
-//! 2. relayer les [`ClientEvent`] du cœur vers le frontend (`emit`) ;
-//! 3. démarrer la télémétrie heliosd **uniquement** quand le tunnel passe `Up`
-//!    (le serveur web vit derrière WireGuard) et l'arrêter à la déconnexion.
+//! Thin wiring layer: it contains no WireGuard logic (delegated to
+//! `orion-core`). Its role is to:
+//! 1. expose `invoke` commands to the frontend (connect/disconnect, profile CRUD);
+//! 2. relay the core's [`ClientEvent`]s to the frontend (`emit`);
+//! 3. start heliosd telemetry **only** when the tunnel goes `Up`
+//!    (the web server lives behind WireGuard) and stop it on disconnection.
+
+/// Windows is the target platform: nothing is simulated there.
+///
+/// Without the `wireguard` feature, [`orion_core::default_backend`] falls back
+/// to the dry-run backend — legitimate on WSL2, where the data plane does not
+/// exist, and nowhere else. An installed Orion that mounts nothing while
+/// displaying a profile, an address and a negotiated mode is a client that
+/// protects nothing and says so only in a corner of the Connection screen.
+///
+/// Refusing at compile time rather than at startup is deliberate: the flag is
+/// a build decision, and the person who forgot it is the one building. Use
+/// `cargo xtask orion-msi`, which carries the features in one place.
+#[cfg(all(target_os = "windows", not(feature = "wireguard")))]
+compile_error!(
+    "Orion for Windows must be built with --features wireguard: without it the shell falls \
+     back to the simulated backend, which encrypts nothing. Build with `cargo xtask orion-msi`."
+);
 
 use std::{
     collections::VecDeque,
@@ -25,33 +42,47 @@ use std::{
 
 use aether::TunnelState;
 use orion_core::{
-    backend::EventSink, complete_profile_import, default_backend, parse_profile_import,
-    read_profile_import_path, telemetry, ClientConfig, ClientEvent, ClientProfile, VpnController,
+    backend::EventSink, complete_profile_import, default_backend, inspect_profile,
+    parse_profile_import, read_profile_import_path, telemetry, ClientConfig, ClientEvent,
+    ClientProfile, ProfileIssues, ProtectedIdentityStore, VpnController,
+};
+#[cfg(target_os = "windows")]
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    WindowEvent,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
-/// État applicatif partagé, injecté dans chaque commande via [`State`].
+/// Shared application state, injected into each command via [`State`].
 struct AppState {
     controller: Arc<VpnController>,
-    config: Mutex<ClientConfig>,
+    config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
 }
 
-/// Intervalle d'interrogation du dernier handshake WireGuard.
+/// Polling interval for the last WireGuard handshake.
 ///
-/// WireGuard est sans connexion : l'état `Up` s'infère de la fraîcheur du
-/// handshake, il n'est jamais notifié (ADR-001 §3). Sans cette boucle, l'IHM
-/// resterait bloquée sur le dernier état connu.
-const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// WireGuard is connectionless: the `Up` state is inferred from handshake
+/// freshness, it's never notified (ADR-001 §3). Without this loop, the UI
+/// would stay stuck on the last known state.
+///
+/// Three seconds rather than ten: this loop is what turns a tunnel that has
+/// stopped answering into a visible state change, and ten seconds of a
+/// screen claiming a dead tunnel is alive is ten seconds too many. A
+/// negotiated connection no longer waits on it at all — the negotiation
+/// announces `Up` itself, having just observed the handshake.
+const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(debug_assertions)]
 const FRONTEND_DEV_PORT: u16 = 1420;
 
-/// Serveur Vite lancé par Orion lorsque le binaire de développement est exécuté
-/// directement avec Cargo. La CLI Tauri le démarre déjà via `beforeDevCommand` ;
-/// dans ce cas, Orion détecte le port ouvert et ne crée aucun second processus.
+/// Vite server launched by Orion when the development binary is run
+/// directly with Cargo. The Tauri CLI already starts it via
+/// `beforeDevCommand`; in that case, Orion detects the open port and
+/// doesn't create a second process.
 #[cfg(debug_assertions)]
 struct FrontendDevServer {
     child: Child,
@@ -62,7 +93,7 @@ impl Drop for FrontendDevServer {
     fn drop(&mut self) {
         if let Err(error) = self.child.kill() {
             if error.kind() != std::io::ErrorKind::InvalidInput {
-                tracing::warn!(%error, "impossible d'arrêter le serveur Vite d'Orion");
+                tracing::warn!(%error, "unable to stop Orion's Vite server");
             }
         }
         let _ = self.child.wait();
@@ -75,11 +106,11 @@ fn frontend_dev_is_ready() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
 }
 
-/// Garantit que la `devUrl` Tauri répond avant la création de la fenêtre.
+/// Guarantees Tauri's `devUrl` responds before the window is created.
 ///
-/// `cargo run` ne connaît pas `beforeDevCommand`, contrairement à la CLI Tauri.
-/// Sans ce pont, WebKit charge `localhost:1420` alors qu'aucun frontend n'écoute
-/// et l'utilisateur obtient une fenêtre vide.
+/// `cargo run` doesn't know about `beforeDevCommand`, unlike the Tauri CLI.
+/// Without this bridge, WebKit loads `localhost:1420` while no frontend is
+/// listening and the user gets an empty window.
 #[cfg(debug_assertions)]
 fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
     if frontend_dev_is_ready() {
@@ -88,15 +119,13 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 
     let frontend_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("répertoire frontend Orion introuvable"))?;
+        .ok_or_else(|| anyhow::anyhow!("Orion frontend directory not found"))?;
     let vite_entrypoint = frontend_dir.join("node_modules/vite/bin/vite.js");
     if !vite_entrypoint.is_file() {
-        anyhow::bail!(
-            "Vite est absent ; exécutez `npm ci --prefix apps/orion` avant de lancer Orion"
-        );
+        anyhow::bail!("Vite is missing; run `npm ci --prefix apps/orion` before launching Orion");
     }
 
-    tracing::info!("démarrage automatique du frontend Vite d'Orion");
+    tracing::info!("automatically starting Orion's Vite frontend");
     let mut child = Command::new("node")
         .arg(vite_entrypoint)
         .args(["--host", "127.0.0.1", "--port"])
@@ -104,7 +133,7 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
         .arg("--strictPort")
         .current_dir(frontend_dir)
         .spawn()
-        .map_err(|error| anyhow::anyhow!("impossible de démarrer Vite avec Node.js : {error}"))?;
+        .map_err(|error| anyhow::anyhow!("unable to start Vite with Node.js: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -112,25 +141,25 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
             return Ok(Some(FrontendDevServer { child }));
         }
         if let Some(status) = child.try_wait()? {
-            anyhow::bail!("Vite s'est arrêté avant de servir l'IHM Orion ({status})");
+            anyhow::bail!("Vite stopped before serving the Orion UI ({status})");
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("Vite n'a pas ouvert le port 1420 dans le délai de 15 secondes");
+            anyhow::bail!("Vite did not open port 1420 within the 15-second timeout");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Gère le cycle de vie de la tâche de télémétrie (une seule active à la fois).
+/// Manages the telemetry task's lifecycle (only one active at a time).
 #[derive(Default)]
 struct TelemetryManager {
     cancel: StdMutex<Option<watch::Sender<bool>>>,
 }
 
 impl TelemetryManager {
-    /// Démarre une boucle de télémétrie vers `url`, en annulant l'éventuelle précédente.
+    /// Starts a telemetry loop toward `url`, cancelling any previous one.
     fn start(&self, url: String, sink: EventSink) {
         self.stop();
         let (tx, rx) = watch::channel(false);
@@ -138,7 +167,7 @@ impl TelemetryManager {
         tokio::spawn(telemetry::run(url, sink, rx));
     }
 
-    /// Annule la boucle de télémétrie en cours, le cas échéant.
+    /// Cancels the current telemetry loop, if any.
     fn stop(&self) {
         if let Some(tx) = self.cancel.lock().unwrap().take() {
             let _ = tx.send(true);
@@ -146,19 +175,96 @@ impl TelemetryManager {
     }
 }
 
-/// Construit un puits qui relaie chaque événement du cœur vers le frontend.
+/// Builds a sink that relays each core event to the frontend.
 fn emit_sink(app: AppHandle) -> EventSink {
     Arc::new(move |ev: ClientEvent| {
         let _ = app.emit("helios://event", &ev);
     })
 }
 
-// ─── Commandes invoquées par le frontend ───────────────────────────────────────
+/// Shows the main window after it was hidden in the Windows notification area.
+fn reveal_main_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
 
-// WireGuard n'a qu'une seule suite (ChaCha20-Poly1305). La protection
-// post-quantique vient du PSK ML-KEM, négocié automatiquement après montage du
-// tunnel classique dès que le profil porte une URL Helios interne — voir
-// `orion_core::backend::upgrade_to_post_quantum`.
+#[cfg(target_os = "windows")]
+const TRAY_OPEN_MENU_ID: &str = "orion-tray-open";
+#[cfg(target_os = "windows")]
+const TRAY_QUIT_MENU_ID: &str = "orion-tray-quit";
+
+/// Installs Orion in the Windows notification area.
+///
+/// Hiding the window deliberately leaves the process and VPN controller
+/// untouched. The tunnel and its key-negotiation liveness link therefore keep
+/// running exactly as they did while the window was visible.
+#[cfg(target_os = "windows")]
+fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
+    let open_item = MenuItem::with_id(app, TRAY_OPEN_MENU_ID, "Ouvrir Orion", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, "Quitter Orion", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Orion's default window icon is unavailable"))?;
+
+    TrayIconBuilder::with_id("orion-notification-area")
+        .icon(icon)
+        .tooltip("Orion VPN")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id() == TRAY_OPEN_MENU_ID {
+                if let Err(error) = reveal_main_window(app) {
+                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
+                }
+            } else if event.id() == TRAY_QUIT_MENU_ID {
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                if let Err(error) = reveal_main_window(tray.app_handle()) {
+                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+/// Turns the Windows title-bar close button into a hide-to-tray action.
+#[cfg(target_os = "windows")]
+fn hide_main_window_on_close(window: &tauri::Window, event: &WindowEvent) {
+    if window.label() != "main" {
+        return;
+    }
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        api.prevent_close();
+        if let Err(error) = window.hide() {
+            tracing::warn!(%error, "unable to hide Orion in the notification area");
+        }
+    }
+}
+
+// ─── Commands invoked by the frontend ───────────────────────────────────────
+
+// WireGuard has only one suite (ChaCha20-Poly1305). Post-quantum protection
+// comes from the ML-KEM PSK, automatically negotiated after the classic
+// tunnel is mounted as soon as the profile carries an internal Helios URL —
+// see `orion_core::backend::upgrade_to_post_quantum`.
 
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> String {
@@ -170,11 +276,59 @@ fn backend_kind(state: State<'_, AppState>) -> &'static str {
     state.controller.backend_kind()
 }
 
-/// Indique si l'adaptateur WireGuard est toujours monté. En cas d'échec, il
-/// doit rester debout pour capter les routes et empêcher une fuite en clair.
+/// Indicates whether the WireGuard adapter is still mounted. On failure, it
+/// must remain up to capture routes and prevent a clear-text leak.
 #[tauri::command]
 fn adapter_is_up(state: State<'_, AppState>) -> bool {
     state.controller.adapter_is_up()
+}
+
+/// What this machine can do with the gateway's key-negotiation port.
+///
+/// The negotiation itself is no longer a build option — it is compiled into
+/// every Orion, because a binary that looks normal and refuses every pinned
+/// profile at connection time is indistinguishable, for the user, from a
+/// broken gateway. What remains conditional is the **machine**: the protected
+/// certificate store is supplied by the shell, and DPAPI exists only on
+/// Windows. The screen says so instead of letting the user find out when the
+/// connection fails.
+#[derive(serde::Serialize)]
+struct KeyNegotiationSupport {
+    identity_store: bool,
+}
+
+#[tauri::command]
+fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport {
+    KeyNegotiationSupport {
+        identity_store: state.controller.key_negotiation_ready(),
+    }
+}
+
+/// Is this profile's identity already sealed on this machine?
+///
+/// Answered without unsealing: the screen needs to know whether the import
+/// still has to happen, and that question must not depend on the session
+/// being able to decrypt. `false` also covers "no negotiation block" — a
+/// profile that needs no identity needs no import either.
+#[tauri::command]
+fn key_negotiation_identity_sealed(profile: ClientProfile) -> bool {
+    let Some(settings) = profile.key_negotiation.as_ref() else {
+        return false;
+    };
+    ProtectedIdentityStore::for_current_user().is_ok_and(|store| store.contains(&settings.identity))
+}
+
+/// Fingerprint of the gateway PQ certificate pinned by a profile.
+///
+/// Same reasoning as [`profile_public_key`]: the value is derived on the Rust
+/// side and displayed so the user can compare it, out loud or by phone, with
+/// what `heliosd init-key-negotiation` printed on the gateway.
+#[tauri::command]
+fn key_negotiation_fingerprint(profile: ClientProfile) -> Option<String> {
+    profile
+        .key_negotiation
+        .as_ref()
+        .and_then(|settings| settings.gateway_pq_fingerprint())
 }
 
 #[tauri::command]
@@ -182,32 +336,73 @@ async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> 
     Ok(state.config.lock().await.clone())
 }
 
-/// Décode un document choisi par l'utilisateur sans le persister.
+/// Result of an import: the draft profile, and what became of the identity.
 ///
-/// L'IHM affiche le résultat comme brouillon : un fichier valide ne remplace
-/// donc jamais silencieusement un profil portant le même nom.
+/// The identity's fate is reported rather than raised because the two are
+/// independent: a profile stays perfectly importable on a machine that cannot
+/// seal, and hiding the profile behind that failure would leave the user with
+/// nothing at all — not even the endpoint to check.
+#[derive(serde::Serialize)]
+struct ImportOutcome {
+    profile: ClientProfile,
+    /// `true` when the document carried an identity **and** it was sealed.
+    identity_sealed: bool,
+    /// Why sealing failed, when the document carried one and it did not.
+    identity_error: Option<String>,
+    /// Why the draft has no private key, when the document was an invitation
+    /// and no local profile held the admitted half.
+    private_key_missing: Option<String>,
+}
+
+/// Seals the identity shipped with a document, if any.
+///
+/// Import is where this happens because it is the only moment the plaintext
+/// exists: from here on the material lives sealed in the store, and the
+/// profile keeps nothing but the name of the entry.
+fn seal_identity(identity: Option<orion_core::ClientIdentityBundle>) -> (bool, Option<String>) {
+    let Some(identity) = identity else {
+        return (false, None);
+    };
+    let sealed = ProtectedIdentityStore::for_current_user()
+        .and_then(|store| store.store(&identity))
+        .map(|_| ());
+    match sealed {
+        Ok(()) => (true, None),
+        // `{:#}` keeps the anyhow context chain: the platform reason is the
+        // useful half of the message.
+        Err(error) => (false, Some(format!("{error:#}"))),
+    }
+}
+
+/// Decodes a document chosen by the user without persisting it.
+///
+/// The UI displays the result as a draft: a valid file therefore never
+/// silently replaces a profile with the same name. The identity, on the other
+/// hand, is sealed straight away — it is a secret, and the shorter it stays
+/// in memory the better.
 #[tauri::command]
 async fn import_profile(
     state: State<'_, AppState>,
     contents: String,
     file_name: String,
-) -> Result<ClientProfile, String> {
-    let profile = parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
+) -> Result<ImportOutcome, String> {
+    let imported =
+        parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
     let config = state.config.lock().await;
-    complete_profile_import(profile, &config).map_err(|error| error.to_string())
+    finish_import(imported, &config)
 }
 
-/// Relit un profil dont le chemin vient de l'association système.
+/// Rereads a profile whose path comes from the system association.
 ///
-/// `path = None` consomme le prochain chemin mis en attente au démarrage ou
-/// transmis par le plugin single-instance. Le frontend appelle cette forme
-/// après avoir installé son écouteur, ce qui rend le premier double-clic aussi
-/// fiable que les suivants.
+/// `path = None` consumes the next path queued at startup or forwarded by
+/// the single-instance plugin. The frontend calls this form after
+/// installing its listener, which makes the first double-click as reliable
+/// as subsequent ones.
 #[tauri::command]
 async fn import_profile_path(
     state: State<'_, AppState>,
     path: Option<String>,
-) -> Result<Option<ClientProfile>, String> {
+) -> Result<Option<ImportOutcome>, String> {
     let path = match path {
         Some(path) => PathBuf::from(path),
         None => match state.pending_profile_paths.lock().unwrap().pop_front() {
@@ -218,18 +413,40 @@ async fn import_profile_path(
     if !is_associated_profile_path(&path) {
         return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
     }
-    let profile = read_profile_import_path(&path).map_err(|error| error.to_string())?;
+    let imported = read_profile_import_path(&path).map_err(|error| error.to_string())?;
     let config = state.config.lock().await;
-    complete_profile_import(profile, &config)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    finish_import(imported, &config).map(Some)
 }
 
-/// Clé publique correspondant à la clé privée d'un profil.
+/// Seals the identity, completes the draft, and reports both fates.
 ///
-/// C'est ce que l'utilisateur communique à l'opérateur pour être admis sur la
-/// gateway (ADR-004 §6) : la dériver ici évite de lui faire manipuler sa clé
-/// privée dans un terminal pour obtenir une valeur qui, elle, est publique.
+/// Shared by the two import paths on purpose: the file picker and the system
+/// association must not differ by one gesture — a document that seals its
+/// identity on a double-click and not through the button would be
+/// impossible to explain.
+fn finish_import(
+    imported: orion_core::ProfileImport,
+    config: &ClientConfig,
+) -> Result<ImportOutcome, String> {
+    // Read before the bundle is consumed by sealing: it is the certificate
+    // that says which key was admitted.
+    let admitted = imported.admitted_public_key();
+    let (identity_sealed, identity_error) = seal_identity(imported.identity);
+    let completed = complete_profile_import(imported.profile, config, admitted.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(ImportOutcome {
+        profile: completed.profile,
+        identity_sealed,
+        identity_error,
+        private_key_missing: completed.private_key_missing,
+    })
+}
+
+/// Public key corresponding to a profile's private key.
+///
+/// This is what the user communicates to the operator to be admitted on the
+/// gateway (ADR-004 §6): deriving it here avoids making them manipulate
+/// their private key in a terminal to obtain a value that is, itself, public.
 #[tauri::command]
 fn profile_public_key(profile: ClientProfile) -> Option<String> {
     profile.public_key()
@@ -279,16 +496,29 @@ async fn connect(
         .ok_or_else(|| "aucun profil sélectionné".to_string())?
     };
 
-    // Valide le profil WireGuard (endpoint + clés) AVANT tout effet de bord.
+    // Validates the WireGuard profile (endpoint + keys) BEFORE any side effect.
     profile.validate().map_err(|e| e.to_string())?;
 
-    // Puits combinant relais vers le frontend ET pilotage de la télémétrie :
-    // la télémétrie ne démarre QUE sur passage à Up (web derrière le tunnel).
+    // Sink combining relay to the frontend AND telemetry control: telemetry
+    // only starts on transition to Up (web behind the tunnel).
     let base = emit_sink(app.clone());
     let telemetry = Arc::clone(&state.telemetry);
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
+    let negotiating = profile.key_negotiation.is_some();
+    let negotiated_profile = profile.name.clone();
+    let config = Arc::clone(&state.config);
     let sink: EventSink = Arc::new(move |ev: ClientEvent| {
+        // Mirror of the gateway rule: a committed negotiation raises this
+        // profile's floor for good. Helios does the same on its side and
+        // would refuse a weaker mode afterwards — a client that kept
+        // offering one would only produce a failed connection the user
+        // couldn't explain.
+        if negotiating {
+            if let ClientEvent::Protection { psk } = &ev {
+                raise_key_negotiation_floor(Arc::clone(&config), negotiated_profile.clone(), *psk);
+            }
+        }
         if let ClientEvent::StateChanged { state } = &ev {
             match state {
                 TunnelState::Up => {
@@ -305,15 +535,15 @@ async fn connect(
 
     state.controller.connect(profile, sink.clone()).await;
 
-    // Boucle d'inférence d'état : WireGuard ne notifie rien, on interroge l'âge
-    // du dernier handshake. Ne touche jamais à l'adaptateur (ADR-001 §3 bis).
+    // State inference loop: WireGuard notifies nothing, we poll the age of
+    // the last handshake. Never touches the adapter (ADR-001 §3 bis).
     let controller = Arc::clone(&state.controller);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HANDSHAKE_POLL_INTERVAL);
         loop {
             ticker.tick().await;
             if controller.state() == TunnelState::Down {
-                break; // déconnexion explicite : plus rien à inférer
+                break; // explicit disconnection: nothing left to infer
             }
             controller.poll_handshake(sink.clone()).await;
         }
@@ -322,11 +552,140 @@ async fn connect(
     Ok(())
 }
 
+/// Persists a floor raise announced by a committed negotiation.
+///
+/// Runs in a task because the sink is synchronous while the configuration is
+/// behind an async lock. A failed write is logged and nothing else: the
+/// session in progress stays valid, and the gateway keeps its own floor —
+/// which is the one that actually refuses a downgrade.
+fn raise_key_negotiation_floor(
+    config: Arc<Mutex<ClientConfig>>,
+    name: String,
+    observed: orion_core::PskKind,
+) {
+    use aether::key_negotiation::ProtectionMode;
+
+    let reached = match observed {
+        orion_core::PskKind::MlKem => ProtectionMode::MlKem,
+        orion_core::PskKind::Static => ProtectionMode::StaticPsk,
+        // Classic commits nothing to raise.
+        orion_core::PskKind::None => return,
+    };
+    tokio::spawn(async move {
+        let mut cfg = config.lock().await;
+        let Some(settings) = cfg
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.name == name)
+            .and_then(|profile| profile.key_negotiation.as_mut())
+        else {
+            return;
+        };
+        if settings.minimum_mode.satisfies(reached) {
+            return;
+        }
+        settings.minimum_mode = reached;
+        if let Err(error) = cfg.save() {
+            tracing::warn!(%error, "unable to persist the raised key-negotiation floor");
+        }
+    });
+}
+
 #[tauri::command]
 async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.telemetry.stop();
     state.controller.disconnect(emit_sink(app)).await;
     Ok(())
+}
+
+/// Reports the faulty fields of a profile being edited.
+///
+/// Validation stays **on the Rust side**: the UI highlights what the core
+/// refuses, it doesn't reimplement its rules. Two rule sets would eventually
+/// diverge, and the UI would accept values the connection rejects.
+#[tauri::command]
+fn validate_profile(profile: ClientProfile) -> ProfileIssues {
+    inspect_profile(&profile)
+}
+
+/// Window dimensions depending on the displayed view.
+///
+/// Each view has different needs: connection fits in a narrow column, the
+/// profile form needs two columns, the log wants width so it doesn't wrap
+/// its lines. A single window would force taking the maximum of the three
+/// at all times.
+///
+/// An unknown view falls back to the "connection" size: it's the startup
+/// view, and a default size is better than an error for a label only the
+/// UI produces.
+fn window_size_for(view: &str) -> (f64, f64) {
+    match view {
+        "profiles" => (800.0, 720.0),
+        "logs" => (760.0, 640.0),
+        // Connection has only an orb, a state, and a button: giving it the
+        // height of the other views only produced a hole in the middle.
+        _ => (520.0, 560.0),
+    }
+}
+
+/// Adjusts the window to the requested view.
+///
+/// Resizing lives **on the Rust side** because exposing it to the frontend
+/// would require `core:window:allow-set-size` in the capabilities — a
+/// general right over the window for three sizes known at compile time.
+#[tauri::command]
+fn resize_for_view(app: AppHandle, view: String) -> Result<(), String> {
+    let (width, height) = window_size_for(&view);
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "fenêtre principale introuvable".to_string())?;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| format!("redimensionnement de la fenêtre : {e}"))
+}
+
+/// Export bound. The frontend log is capped at 80 lines, but the command
+/// doesn't trust that bound: it comes from the caller.
+const MAX_LOG_EXPORT_BYTES: usize = 512 * 1024;
+
+/// Reduces a label proposed by the frontend to a safe file name.
+///
+/// The frontend picks the label — it's the only one that knows the local
+/// time — but never the path. Only ordinary name characters survive, which
+/// at once eliminates separators, `..`, and disguised extensions: an export
+/// must not be able to write anywhere but the directory the command chose.
+fn sanitize_stem(proposed: &str) -> String {
+    let cleaned: String = proposed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "orion-journal".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Writes the log to a file and returns its path.
+///
+/// Goes through a command rather than the `dialog`/`fs` plugins: Orion only
+/// grants `core:default` as a capability, and opening general disk access
+/// to the frontend for a simple export would be disproportionate.
+#[tauri::command]
+fn export_logs(app: AppHandle, stem: String, contents: String) -> Result<String, String> {
+    if contents.len() > MAX_LOG_EXPORT_BYTES {
+        return Err("journal trop volumineux pour être exporté".to_string());
+    }
+    let dir = app
+        .path()
+        .document_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("aucun répertoire d'export disponible : {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("création de {} : {e}", dir.display()))?;
+    let path = dir.join(format!("{}.log", sanitize_stem(&stem)));
+    std::fs::write(&path, contents).map_err(|e| format!("écriture de {} : {e}", path.display()))?;
+    Ok(path.display().to_string())
 }
 
 fn is_associated_profile_path(path: &Path) -> bool {
@@ -351,9 +710,9 @@ fn associated_profile_paths(args: &[String], cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `defguard_wireguard_rs 0.11.0` ouvre WireGuardNT par un chemin relatif fixé
-/// dans sa source. Un double-clic donne à Orion un répertoire courant qui peut
-/// être celui du profil ; on le remplace donc avant de construire le backend.
+/// `defguard_wireguard_rs 0.11.0` opens WireGuardNT via a relative path fixed
+/// in its source. A double-click gives Orion a current directory that may
+/// be the profile's; we replace it before building the backend.
 #[cfg(all(target_os = "windows", feature = "wireguard"))]
 fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
     #[cfg(target_arch = "x86_64")]
@@ -364,24 +723,24 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
     let executable_dir = std::env::current_exe()?
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow::anyhow!("répertoire du binaire Orion introuvable"))?;
+        .ok_or_else(|| anyhow::anyhow!("Orion binary directory not found"))?;
     let source_dir = if executable_dir.join(DLL).is_file() {
         executable_dir
     } else {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
-            .ok_or_else(|| anyhow::anyhow!("racine du workspace Orion introuvable"))?;
+            .ok_or_else(|| anyhow::anyhow!("Orion workspace root not found"))?;
         if !workspace.join(DLL).is_file() {
             anyhow::bail!(
-                "WireGuardNT est absent ({DLL}) ; exécuter `cargo xtask orion-deps` avant Orion"
+                "WireGuardNT is missing ({DLL}); run `cargo xtask orion-deps` before Orion"
             );
         }
         workspace.to_path_buf()
     };
     std::env::set_current_dir(&source_dir).map_err(|error| {
         anyhow::anyhow!(
-            "impossible de sélectionner les ressources WireGuardNT dans {} : {error}",
+            "unable to select WireGuardNT resources in {}: {error}",
             source_dir.display()
         )
     })
@@ -396,7 +755,7 @@ fn main() {
 
     #[cfg(debug_assertions)]
     let _frontend_dev_server =
-        ensure_frontend_dev_server().expect("impossible de préparer l'IHM de développement Orion");
+        ensure_frontend_dev_server().expect("unable to prepare Orion's development UI");
 
     let startup_cwd = std::env::current_dir().unwrap_or_default();
     let startup_args: Vec<String> = std::env::args().collect();
@@ -404,17 +763,30 @@ fn main() {
 
     #[cfg(all(target_os = "windows", feature = "wireguard"))]
     prepare_wireguard_nt_working_directory()
-        .expect("impossible de préparer la DLL WireGuardNT livrée avec Orion");
+        .expect("unable to prepare the WireGuardNT DLL shipped with Orion");
 
     let backend = default_backend().expect(
-        "backend WireGuard réel indisponible — Orion refuse de démarrer en simulation implicite",
+        "real WireGuard backend unavailable — Orion refuses to start with implicit simulation",
     );
-    let controller = Arc::new(VpnController::new(backend));
+    let controller = VpnController::new(backend);
+    // The protected store is the shell's job: `orion-core` states the
+    // boundary, the platform implementation lives with the platform.
+    let controller = match ProtectedIdentityStore::for_current_user() {
+        Ok(store) => controller.with_key_negotiation_identities(Arc::new(store)),
+        Err(error) => {
+            // Not fatal: profiles without negotiation still connect, and the
+            // Profiles screen reports the missing store rather than letting
+            // the failure surface as an unexplained refused connection.
+            tracing::warn!(%error, "no protected identity store on this machine");
+            controller
+        }
+    };
+    let controller = Arc::new(controller);
     let config = ClientConfig::load().unwrap_or_default();
 
     tauri::Builder::default()
-        // Doit rester le premier plugin enregistré : il intercepte l'instance
-        // secondaire avant que les autres plugins puissent agir.
+        // Must stay the first plugin registered: it intercepts the secondary
+        // instance before other plugins can act.
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             let paths = associated_profile_paths(&args, Path::new(&cwd));
             if !paths.is_empty() {
@@ -422,16 +794,26 @@ fn main() {
                 state.pending_profile_paths.lock().unwrap().extend(paths);
                 let _ = app.emit("helios://profile-path", ());
             }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+            if let Err(error) = reveal_main_window(app) {
+                tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
         .manage(AppState {
             controller,
-            config: Mutex::new(config),
+            config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
+        })
+        .setup(|_app| {
+            #[cfg(target_os = "windows")]
+            configure_windows_tray(_app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "windows")]
+            hide_main_window_on_close(window, event);
+            #[cfg(not(target_os = "windows"))]
+            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -446,17 +828,71 @@ fn main() {
             select_profile,
             connect,
             disconnect,
+            export_logs,
+            resize_for_view,
+            validate_profile,
+            key_negotiation_support,
+            key_negotiation_fingerprint,
+            key_negotiation_identity_sealed,
         ])
         .run(tauri::generate_context!())
-        .expect("erreur au lancement de Tauri");
+        .expect("error while launching Tauri");
 }
 
 #[cfg(test)]
 mod security_tests {
-    use super::{associated_profile_paths, Path, PathBuf};
+    use super::{associated_profile_paths, sanitize_stem, window_size_for, Path, PathBuf};
+
+    /// Each view has its size, and an unexpected label must not produce a
+    /// degenerate window: it falls back to the startup view.
+    #[test]
+    fn each_view_has_its_size_and_unknown_falls_back_to_connect() {
+        let connect = window_size_for("connect");
+        assert_eq!(window_size_for("unknown"), connect);
+        assert_ne!(window_size_for("profiles"), connect);
+        assert_ne!(window_size_for("logs"), connect);
+        // The profile form is the most demanding view of the three.
+        for view in ["connect", "logs"] {
+            assert!(window_size_for("profiles").0 >= window_size_for(view).0);
+        }
+        // No size drops below the minimum declared in tauri.conf.json.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let window = &config["app"]["windows"][0];
+        let (min_w, min_h) = (
+            window["minWidth"].as_f64().expect("minWidth"),
+            window["minHeight"].as_f64().expect("minHeight"),
+        );
+        for view in ["connect", "profiles", "logs"] {
+            let (w, h) = window_size_for(view);
+            assert!(w >= min_w, "{view} : {w} < {min_w}");
+            assert!(h >= min_h, "{view} : {h} < {min_h}");
+        }
+    }
+
+    /// The frontend names the export, it doesn't place it. Anything that
+    /// could designate another directory must disappear from the label.
+    #[test]
+    fn the_export_name_cannot_designate_another_path() {
+        assert_eq!(
+            sanitize_stem("orion-journal-2026-07-23"),
+            "orion-journal-2026-07-23"
+        );
+        assert_eq!(sanitize_stem("../../etc/passwd"), "etcpasswd");
+        assert_eq!(
+            sanitize_stem("C:\\Windows\\System32\\x"),
+            "CWindowsSystem32x"
+        );
+        assert_eq!(sanitize_stem("journal.log.exe"), "journallogexe");
+        // An empty or entirely filtered label falls back to a default name
+        // rather than producing a hidden ".log" file.
+        assert_eq!(sanitize_stem(""), "orion-journal");
+        assert_eq!(sanitize_stem("../.."), "orion-journal");
+        assert_eq!(sanitize_stem(&"a".repeat(200)).len(), 64);
+    }
 
     #[test]
-    fn serveur_cargo_run_aligne_avec_la_dev_url_tauri() {
+    fn cargo_run_server_aligns_with_the_tauri_dev_url() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let expected = format!("http://localhost:{}", super::FRONTEND_DEV_PORT);
@@ -465,11 +901,11 @@ mod security_tests {
     }
 
     #[test]
-    fn configuration_tauri_impose_une_csp_et_fige_les_prototypes() {
+    fn tauri_configuration_enforces_a_csp_and_freezes_prototypes() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let security = &config["app"]["security"];
-        let csp = security["csp"].as_str().expect("CSP Tauri obligatoire");
+        let csp = security["csp"].as_str().expect("Tauri CSP required");
 
         assert_eq!(security["freezePrototype"], true);
         assert!(csp.contains("default-src 'self'"));
@@ -480,7 +916,7 @@ mod security_tests {
     }
 
     #[test]
-    fn bundle_declare_association_et_capability_linux() {
+    fn bundle_declares_association_and_linux_capability() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let association = &config["bundle"]["fileAssociations"][0];
@@ -499,7 +935,7 @@ mod security_tests {
     }
 
     #[test]
-    fn bundle_windows_livre_wireguard_et_impose_signtool_horodate() {
+    fn windows_bundle_ships_wireguard_and_requires_timestamped_signtool() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
         assert_eq!(
@@ -512,12 +948,12 @@ mod security_tests {
         assert!(args.iter().any(|arg| arg == "windows/sign-orion.ps1"));
         let signer = include_str!("../windows/sign-orion.ps1");
         for required in ["ORION_TIMESTAMP_URL", "/tr", "/td", "SHA256", "/tw"] {
-            assert!(signer.contains(required), "élément absent : {required}");
+            assert!(signer.contains(required), "missing element: {required}");
         }
     }
 
     #[test]
-    fn capabilities_tauri_restent_minimales() {
+    fn tauri_capabilities_stay_minimal() {
         let capabilities: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
         assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
@@ -528,12 +964,12 @@ mod security_tests {
     }
 
     #[test]
-    fn association_ne_transmet_que_les_profils_orion() {
+    fn association_only_forwards_orion_profiles() {
         let args = vec![
             "orion.exe".to_string(),
             "invitation.orionprofile".to_string(),
-            "--inattendu".to_string(),
-            "autre.json".to_string(),
+            "--unexpected".to_string(),
+            "other.json".to_string(),
         ];
         assert_eq!(
             associated_profile_paths(&args, Path::new("/profils")),
@@ -542,7 +978,7 @@ mod security_tests {
     }
 
     #[test]
-    fn manifeste_windows_exige_les_privileges_administrateur() {
+    fn windows_manifest_requires_administrator_privileges() {
         let manifest = include_str!("../windows/orion-manifest.xml");
         assert!(manifest.contains("requireAdministrator"));
         assert!(manifest.contains("Microsoft.Windows.Common-Controls"));

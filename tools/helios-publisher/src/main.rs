@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(
     name = "helios-publisher",
-    about = "Outil hors gateway pour les clés et artefacts signés de l'éditeur"
+    about = "Off-gateway tool for the publisher's signed keys and artifacts"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -26,14 +26,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Génère une nouvelle époque Ed25519 + ML-DSA-65 dans un répertoire neuf.
+    /// Generates a new Ed25519 + ML-DSA-65 epoch in a fresh directory.
     Keygen {
         #[arg(long, value_parser = positive_u32)]
         key_epoch: u32,
         #[arg(long)]
         output_dir: PathBuf,
     },
-    /// Signe un billet de rescellement TPM v2 avec les deux algorithmes.
+    /// Signs a TPM v2 resealing ticket with both algorithms.
     ResealTicket {
         #[arg(long, value_parser = positive_u32)]
         key_epoch: u32,
@@ -45,13 +45,13 @@ enum Command {
         ed25519_private_key: PathBuf,
         #[arg(long)]
         ml_dsa_65_private_key: PathBuf,
-        /// Trousseau public qui sera compilé dans le firmware cible.
+        /// Public keyring that will be compiled into the target firmware.
         #[arg(long)]
         keyring: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
-    /// Signe le manifeste d’un binaire heliosd déjà construit.
+    /// Signs the manifest of an already-built heliosd binary.
     BinaryRelease {
         #[arg(long, value_parser = positive_u32)]
         key_epoch: u32,
@@ -78,13 +78,13 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Signe le contenu d’un bundle d’installation déjà assemblé.
+    /// Signs the content of an already-assembled installation bundle.
     ///
-    /// Écrit `manifest.json` à la racine du répertoire. Le manifeste énumère
-    /// exhaustivement le contenu : un fichier ajouté ou modifié après coup fait
-    /// échouer l’installation.
+    /// Writes `manifest.json` at the root of the directory. The manifest
+    /// exhaustively enumerates the content: a file added or modified
+    /// afterward makes the installation fail.
     Bundle {
-        /// Répertoire assemblé par `cargo xtask bundle`.
+        /// Directory assembled by `cargo xtask bundle`.
         #[arg(long)]
         dir: PathBuf,
         #[arg(long, value_parser = positive_u32)]
@@ -193,12 +193,12 @@ fn main() -> Result<()> {
     }
 }
 
-/// Signe le contenu d’un répertoire de bundle.
+/// Signs the content of a bundle directory.
 ///
-/// Le binaire `heliosd` est revalidé comme ELF de la target déclarée avant
-/// signature : signer un bundle dont l’exécutable ne correspond pas à sa cible
-/// produirait un artefact authentique et pourtant ininstallable, découvert
-/// seulement sur la gateway.
+/// The `heliosd` binary is revalidated as an ELF for the declared target
+/// before signing: signing a bundle whose executable does not match its
+/// target would produce an authentic yet uninstallable artifact, discovered
+/// only on the gateway.
 #[allow(clippy::too_many_arguments)]
 fn sign_bundle(
     dir: &Path,
@@ -215,21 +215,21 @@ fn sign_bundle(
     use helios_update::bundle;
 
     if version.trim().is_empty() || git_commit.trim().is_empty() || target.trim().is_empty() {
-        bail!("version, commit et target doivent être renseignés");
+        bail!("version, commit, and target must be provided");
     }
     let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
 
     let heliosd = dir.join("heliosd");
     if !heliosd.is_file() {
         bail!(
-            "{} absent : un bundle gateway contient toujours le daemon",
+            "{} missing: a gateway bundle always contains the daemon",
             heliosd.display()
         );
     }
     helios_update::verify_elf(&heliosd, &target)
-        .with_context(|| format!("validation ELF de {}", heliosd.display()))?;
+        .with_context(|| format!("ELF validation of {}", heliosd.display()))?;
 
-    let files = bundle::collect(dir).context("recensement du contenu du bundle")?;
+    let files = bundle::collect(dir).context("listing the bundle's content")?;
     let payload = aether::sig::BundlePayload {
         product: bundle::BUNDLE_PRODUCT.to_string(),
         channel,
@@ -242,22 +242,22 @@ fn sign_bundle(
     };
     payload
         .validate()
-        .map_err(|e| anyhow::anyhow!("contenu de bundle refusé : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("bundle content rejected: {e}"))?;
 
     let manifest = signer
         .sign(payload)
-        .context("signature hybride du manifeste de bundle")?;
+        .context("hybrid signature of the bundle manifest")?;
     let keyring = load_keyring(keyring_path)?;
     manifest
         .verify(&keyring)
-        .context("auto-vérification du manifeste produit")?;
+        .context("self-verification of the produced manifest")?;
 
-    let json = serde_json::to_vec_pretty(&manifest).context("sérialisation du manifeste")?;
+    let json = serde_json::to_vec_pretty(&manifest).context("serializing the manifest")?;
     let output = dir.join(bundle::BUNDLE_MANIFEST_FILE);
     write_new(&output, &json, false)?;
 
     println!(
-        "bundle {} séquence {}, {} fichier(s), écrit dans {}",
+        "bundle {} sequence {}, {} file(s), written to {}",
         manifest.payload.version,
         release_sequence,
         manifest.payload.files.len(),
@@ -271,10 +271,10 @@ fn sign_bundle(
 
 fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {
     create_private_dir(output_dir)?;
-    let signer = PublisherSigner::generate(key_epoch).context("génération des clés éditeur")?;
+    let signer = PublisherSigner::generate(key_epoch).context("generating publisher keys")?;
     let (ed25519, ml_dsa_65) = signer
         .private_key_bytes()
-        .context("sérialisation des clés privées")?;
+        .context("serializing private keys")?;
     let public = signer.public_keys();
 
     write_new_secret(&output_dir.join("ed25519-private.pk8"), &ed25519)?;
@@ -284,15 +284,15 @@ fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {
         ed25519: STANDARD.encode(public.ed25519),
         ml_dsa_65: STANDARD.encode(public.ml_dsa_65),
     }];
-    let json = serde_json::to_vec_pretty(&keyring).context("sérialisation du trousseau")?;
+    let json = serde_json::to_vec_pretty(&keyring).context("serializing the keyring")?;
     write_new(&output_dir.join("publisher-keyring.json"), &json, false)?;
 
     println!(
-        "époque {key_epoch} générée dans {} ; conserver les deux fichiers privés hors ligne",
+        "epoch {key_epoch} generated in {}; keep both private files offline",
         output_dir.display()
     );
     println!(
-        "compiler le firmware avec HELIOS_PUBLISHER_KEYRING_PATH={}",
+        "build the firmware with HELIOS_PUBLISHER_KEYRING_PATH={}",
         output_dir.join("publisher-keyring.json").display()
     );
     Ok(())
@@ -309,28 +309,28 @@ fn sign_reseal_ticket(
     output: &Path,
 ) -> Result<()> {
     let ed25519 =
-        fs::read(ed25519_path).with_context(|| format!("lecture de {}", ed25519_path.display()))?;
+        fs::read(ed25519_path).with_context(|| format!("reading {}", ed25519_path.display()))?;
     let ml_dsa_65 = fs::read(ml_dsa_65_path)
-        .with_context(|| format!("lecture de {}", ml_dsa_65_path.display()))?;
+        .with_context(|| format!("reading {}", ml_dsa_65_path.display()))?;
     if ml_dsa_65.len() != ML_DSA_65_PRIVATE_KEY_LEN {
         bail!(
-            "clé privée ML-DSA-65 : {} octets au lieu de {}",
+            "ML-DSA-65 private key: {} bytes instead of {}",
             ml_dsa_65.len(),
             ML_DSA_65_PRIVATE_KEY_LEN
         );
     }
     let signer = PublisherSigner::from_private_keys(key_epoch, &ed25519, &ml_dsa_65)
-        .context("chargement des clés privées éditeur")?;
+        .context("loading publisher private keys")?;
     let keyring = load_keyring(keyring_path)?;
     let expected_keys = keyring
         .iter()
         .find(|keys| keys.key_epoch == key_epoch)
-        .with_context(|| format!("époque {key_epoch} absente du trousseau public"))?;
+        .with_context(|| format!("epoch {key_epoch} missing from the public keyring"))?;
     let actual_keys = signer.public_keys();
     if expected_keys.ed25519 != actual_keys.ed25519
         || expected_keys.ml_dsa_65 != actual_keys.ml_dsa_65
     {
-        bail!("les clés privées ne correspondent pas à l'époque {key_epoch} du trousseau public");
+        bail!("private keys do not match epoch {key_epoch} of the public keyring");
     }
 
     let ticket = signer
@@ -338,14 +338,14 @@ fn sign_reseal_ticket(
             version,
             expected_pcr_digest,
         })
-        .context("signature hybride du billet")?;
+        .context("hybrid signature of the ticket")?;
     ticket
         .verify(&keyring)
-        .context("auto-vérification du billet produit")?;
-    let json = serde_json::to_vec_pretty(&ticket).context("sérialisation du billet")?;
+        .context("self-verification of the produced ticket")?;
+    let json = serde_json::to_vec_pretty(&ticket).context("serializing the ticket")?;
     write_new(output, &json, true)?;
     println!(
-        "billet v2 version {version}, époque {key_epoch}, écrit dans {}",
+        "v2 ticket version {version}, epoch {key_epoch}, written to {}",
         output.display()
     );
     Ok(())
@@ -367,24 +367,24 @@ fn sign_binary_release(
     output: &Path,
 ) -> Result<()> {
     if version.trim().is_empty() || git_commit.trim().is_empty() || target.trim().is_empty() {
-        bail!("version, commit et target doivent être renseignés");
+        bail!("version, commit, and target must be provided");
     }
     if features.iter().any(|feature| feature.trim().is_empty()) {
-        bail!("une feature vide est interdite");
+        bail!("an empty feature is not allowed");
     }
     features.sort();
     features.dedup();
 
     let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
     let metadata = fs::metadata(binary)
-        .with_context(|| format!("lecture des métadonnées de {}", binary.display()))?;
+        .with_context(|| format!("reading metadata of {}", binary.display()))?;
     if metadata.len() == 0 || metadata.len() > helios_update::MAX_BINARY_SIZE {
-        bail!("taille du binaire hors limite : {} octets", metadata.len());
+        bail!("binary size out of bounds: {} bytes", metadata.len());
     }
     helios_update::verify_elf(binary, &target)
-        .with_context(|| format!("validation ELF de {}", binary.display()))?;
+        .with_context(|| format!("ELF validation of {}", binary.display()))?;
     let sha256 = helios_update::sha256_file(binary)
-        .with_context(|| format!("SHA-256 de {}", binary.display()))?;
+        .with_context(|| format!("SHA-256 of {}", binary.display()))?;
     let manifest = signer
         .sign(BinaryReleasePayload {
             product: "heliosd".into(),
@@ -398,15 +398,15 @@ fn sign_binary_release(
             sha256,
             minimum_installer_version: helios_update::INSTALLER_VERSION,
         })
-        .context("signature hybride du manifeste binaire")?;
+        .context("hybrid signature of the binary manifest")?;
     let keyring = load_keyring(keyring_path)?;
     manifest
         .verify(&keyring)
-        .context("auto-vérification du manifeste produit")?;
-    let json = serde_json::to_vec_pretty(&manifest).context("sérialisation du manifeste")?;
+        .context("self-verification of the produced manifest")?;
+    let json = serde_json::to_vec_pretty(&manifest).context("serializing the manifest")?;
     write_new(output, &json, true)?;
     println!(
-        "release {} séquence {}, SHA-256 {}, écrite dans {}",
+        "release {} sequence {}, SHA-256 {}, written to {}",
         manifest.payload.version,
         release_sequence,
         hex::encode(manifest.payload.sha256),
@@ -422,44 +422,44 @@ fn load_signer(
     keyring_path: &Path,
 ) -> Result<PublisherSigner> {
     let ed25519 =
-        fs::read(ed25519_path).with_context(|| format!("lecture de {}", ed25519_path.display()))?;
+        fs::read(ed25519_path).with_context(|| format!("reading {}", ed25519_path.display()))?;
     let ml_dsa_65 = fs::read(ml_dsa_65_path)
-        .with_context(|| format!("lecture de {}", ml_dsa_65_path.display()))?;
+        .with_context(|| format!("reading {}", ml_dsa_65_path.display()))?;
     if ml_dsa_65.len() != ML_DSA_65_PRIVATE_KEY_LEN {
         bail!(
-            "clé privée ML-DSA-65 : {} octets au lieu de {}",
+            "ML-DSA-65 private key: {} bytes instead of {}",
             ml_dsa_65.len(),
             ML_DSA_65_PRIVATE_KEY_LEN
         );
     }
     let signer = PublisherSigner::from_private_keys(key_epoch, &ed25519, &ml_dsa_65)
-        .context("chargement des clés privées éditeur")?;
+        .context("loading publisher private keys")?;
     let keyring = load_keyring(keyring_path)?;
     let expected_keys = keyring
         .iter()
         .find(|keys| keys.key_epoch == key_epoch)
-        .with_context(|| format!("époque {key_epoch} absente du trousseau public"))?;
+        .with_context(|| format!("epoch {key_epoch} missing from the public keyring"))?;
     let actual_keys = signer.public_keys();
     if expected_keys.ed25519 != actual_keys.ed25519
         || expected_keys.ml_dsa_65 != actual_keys.ml_dsa_65
     {
-        bail!("les clés privées ne correspondent pas à l’époque {key_epoch} du trousseau public");
+        bail!("private keys do not match epoch {key_epoch} of the public keyring");
     }
     Ok(signer)
 }
 
 fn load_keyring(path: &Path) -> Result<Vec<PublisherPublicKeys>> {
-    let bytes = fs::read(path).with_context(|| format!("lecture de {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let wire: Vec<PublicKeyWire> =
-        serde_json::from_slice(&bytes).context("trousseau public JSON invalide")?;
+        serde_json::from_slice(&bytes).context("invalid public keyring JSON")?;
     if wire.is_empty() {
-        bail!("le trousseau public est vide");
+        bail!("the public keyring is empty");
     }
     let mut epochs = HashSet::new();
     wire.into_iter()
         .map(|entry| {
             if !epochs.insert(entry.key_epoch) {
-                bail!("époque {} dupliquée dans le trousseau", entry.key_epoch);
+                bail!("epoch {} duplicated in the keyring", entry.key_epoch);
             }
             let ed25519 = decode_public_key::<ED25519_PUBLIC_KEY_LEN>(
                 &entry.ed25519,
@@ -483,11 +483,11 @@ fn load_keyring(path: &Path) -> Result<Vec<PublisherPublicKeys>> {
 fn decode_public_key<const N: usize>(encoded: &str, name: &str, epoch: u32) -> Result<[u8; N]> {
     STANDARD
         .decode(encoded)
-        .with_context(|| format!("clé publique {name} base64 invalide, époque {epoch}"))?
+        .with_context(|| format!("invalid base64 {name} public key, epoch {epoch}"))?
         .try_into()
         .map_err(|bytes: Vec<u8>| {
             anyhow::anyhow!(
-                "clé publique {name} de {} octets au lieu de {N}, époque {epoch}",
+                "{name} public key of {} bytes instead of {N}, epoch {epoch}",
                 bytes.len()
             )
         })
@@ -500,12 +500,12 @@ fn create_private_dir(path: &Path) -> Result<()> {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(path)
-            .with_context(|| format!("création du répertoire privé {}", path.display()))
+            .with_context(|| format!("creating private directory {}", path.display()))
     }
     #[cfg(not(unix))]
     {
         fs::create_dir(path)
-            .with_context(|| format!("création du répertoire privé {}", path.display()))
+            .with_context(|| format!("creating private directory {}", path.display()))
     }
 }
 
@@ -523,11 +523,11 @@ fn write_new(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     }
     let mut file = options
         .open(path)
-        .with_context(|| format!("création exclusive de {}", path.display()))?;
+        .with_context(|| format!("exclusive creation of {}", path.display()))?;
     file.write_all(bytes)
-        .with_context(|| format!("écriture de {}", path.display()))?;
+        .with_context(|| format!("writing {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("synchronisation de {}", path.display()))?;
+        .with_context(|| format!("syncing {}", path.display()))?;
     Ok(())
 }
 
@@ -535,26 +535,26 @@ fn positive_u32(value: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
         .map_err(|e| e.to_string())
-        .and_then(|value| (value != 0).then_some(value).ok_or("doit être > 0".into()))
+        .and_then(|value| (value != 0).then_some(value).ok_or("must be > 0".into()))
 }
 
 fn positive_u64(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|e| e.to_string())
-        .and_then(|value| (value != 0).then_some(value).ok_or("doit être > 0".into()))
+        .and_then(|value| (value != 0).then_some(value).ok_or("must be > 0".into()))
 }
 
 fn parse_digest(value: &str) -> Result<[u8; 32], String> {
     hex::decode(value)
         .map_err(|e| e.to_string())?
         .try_into()
-        .map_err(|bytes: Vec<u8>| format!("{} octets au lieu de 32", bytes.len()))
+        .map_err(|bytes: Vec<u8>| format!("{} bytes instead of 32", bytes.len()))
 }
 
 fn release_channel(value: &str) -> Result<String, String> {
     match value {
         "testing" | "production" => Ok(value.to_string()),
-        _ => Err("canal attendu : testing ou production".into()),
+        _ => Err("expected channel: testing or production".into()),
     }
 }

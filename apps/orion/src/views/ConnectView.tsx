@@ -1,9 +1,35 @@
 import { useEffect, useState } from 'react'
-import { ArrowDown, ArrowUp, Info, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
-import type { ClientProfile, TelemetrySample, TunnelState } from '../types'
-import { elapsed, formatBps, postureMeta, stateMeta } from '../components/state'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Stack from '@mui/material/Stack'
+import Tooltip from '@mui/material/Tooltip'
+import Typography from '@mui/material/Typography'
+import { ArrowDown, ArrowUp, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
+import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../types'
+import {
+  elapsed,
+  formatBps,
+  postureMeta,
+  protectionMeta,
+  stateMeta,
+  type ProtectionTone,
+} from '../components/state'
 import { Sparkline } from '../components/Sparkline'
 import { StatusOrb } from '../components/StatusOrb'
+import { EMERALD, GUTTER, PINE } from '../theme'
+
+/** Transition amber — same tint as the "Connecting…" state, readable on paper. */
+const AMBER = '#A16207'
+
+/**
+ * Connect view — the screen that answers the only question that matters:
+ * "is my traffic protected?"
+ *
+ * Deliberate hierarchy: the orb and the state occupy the optical center,
+ * technical characteristics stay at the bottom and small. Nothing scrolls;
+ * what doesn't deserve its place on screen isn't there — and what the
+ * header already says isn't repeated here.
+ */
 
 interface Props {
   state: TunnelState
@@ -11,8 +37,9 @@ interface Props {
   upSince: number | null
   telemetry: TelemetrySample | null
   history: TelemetrySample[]
-  backend: string
   adapterUp: boolean
+  /** Kind of PSK set for the current session. `null` = not yet decided. */
+  psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
 }
@@ -23,14 +50,29 @@ const POSTURE_ICON = {
   exposed: ShieldAlert,
 } as const
 
+/**
+ * Styling of the protection chip.
+ *
+ * Three visual levels for three distinct facts, and the gap between `pqc`
+ * and `static` is intentional: the static PSK protects, but it doesn't
+ * rotate. Giving it the same solid green as the PQC PSK would erase the
+ * only difference that matters.
+ */
+const PROTECTION_SKIN: Record<ProtectionTone, { border: string; fill: string; text: string }> = {
+  pqc: { border: `${EMERALD}66`, fill: `${EMERALD}14`, text: 'primary.main' },
+  static: { border: `${PINE}44`, fill: 'transparent', text: 'primary.main' },
+  pending: { border: `${AMBER}55`, fill: `${AMBER}12`, text: AMBER },
+  classic: { border: 'divider', fill: 'transparent', text: 'text.secondary' },
+}
+
 export function ConnectView({
   state,
   profile,
   upSince,
   telemetry,
   history,
-  backend,
   adapterUp,
+  psk,
   onConnect,
   onDisconnect,
 }: Props) {
@@ -45,133 +87,184 @@ export function ConnectView({
   }, [upSince])
 
   const duration = elapsed(upSince, now)
-  const pq = Boolean(profile?.preshared_key?.trim())
+  const protection = protectionMeta(profile, psk, state)
   const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
+  // Only "held" deserves a sentence: it's the one counter-intuitive case,
+  // where the user believes they're leaking while WireGuard drops their
+  // packets. "Protected" and "in clear" are already said by the header
+  // chip, word for word — repeating them here would just be filler.
+  const explain = posture.posture === 'held'
+  // Throughput is only shown if it truly exists. As long as telemetry
+  // emits nothing, an empty card would be an unfulfilled promise.
+  const hasThroughput = meta.active && history.length >= 2
 
   return (
-    <div className="flex h-full flex-col gap-5 overflow-y-auto px-6 py-6">
-      {/* ── Instrument principal ── */}
-      <div className="flex flex-col items-center gap-4">
-        <StatusOrb state={state} adapterUp={adapterUp} />
-
-        <div className="text-center">
-          <div className="text-xl font-semibold tracking-tight" style={{ color: meta.color }}>
-            {meta.label}
-          </div>
-          <div className="mt-1 font-mono text-xs text-slate-400">
-            {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
-          </div>
-          {duration && (
-            <div className="mt-1 font-mono text-[11px] tabular-nums text-slate-500">{duration}</div>
-          )}
-        </div>
-      </div>
-
-      {/* ── Posture : ce qui protège réellement le poste (ADR-001 §3 bis) ── */}
-      <div
-        className="flex items-start gap-3 rounded-xl border px-4 py-3"
-        style={{ borderColor: `${posture.color}44`, background: `${posture.color}0e` }}
+    <Stack sx={{ height: '100%', px: GUTTER, py: GUTTER }}>
+      <Stack
+        spacing={1.25}
+        sx={{ alignItems: 'center', justifyContent: 'center', flex: 1, minHeight: 0 }}
       >
-        <PostureIcon size={17} className="mt-0.5 shrink-0" style={{ color: posture.color }} />
-        <div className="min-w-0">
-          <div className="text-[13px] font-medium" style={{ color: posture.color }}>
+        <StatusOrb state={state} adapterUp={adapterUp} size={150} />
+
+        <Box sx={{ textAlign: 'center' }} aria-live="polite" aria-atomic="true">
+          <Typography
+            component="h2"
+            sx={{ color: meta.color, fontSize: 24, fontWeight: 700, letterSpacing: '-0.02em', lineHeight: 1.1 }}
+          >
+            {meta.label}
+          </Typography>
+          <Typography
+            color="text.secondary"
+            sx={{ mt: 0.6, fontFamily: 'monospace', fontSize: 12, overflowWrap: 'anywhere' }}
+          >
+            {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
+          </Typography>
+          {/* The virtual address earns its place next to the endpoint only
+              while the tunnel carries it: announcing an address the machine
+              does not hold yet would read as a promise. */}
+          {meta.active && profile?.address && (
+            <Typography
+              color="text.disabled"
+              sx={{ mt: 0.3, fontFamily: 'monospace', fontSize: 11, overflowWrap: 'anywhere' }}
+            >
+              {profile.address}
+            </Typography>
+          )}
+          {duration && (
+            <Typography
+              color="text.disabled"
+              sx={{ mt: 0.3, fontFamily: 'monospace', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}
+            >
+              {duration}
+            </Typography>
+          )}
+        </Box>
+      </Stack>
+
+      {/* Posture: only "held". The other two states are already stated
+          identically by the header chip; only this one says something the
+          chip doesn't — that WireGuard drops the packets and that the
+          adapter must absolutely not be unmounted. */}
+      {explain && (
+        <Box
+          sx={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: 0.75,
+            mt: 1.5,
+          }}
+        >
+          <PostureIcon size={15} aria-hidden style={{ color: posture.color, flexShrink: 0 }} />
+          <Typography sx={{ color: posture.color, fontSize: 12, fontWeight: 650 }}>
             {posture.label}
-          </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-slate-400">{posture.detail}</p>
-        </div>
-      </div>
+          </Typography>
+          <Typography color="text.secondary" sx={{ fontSize: 12, lineHeight: 1.5 }}>
+            {posture.detail}
+          </Typography>
+        </Box>
+      )}
 
-      {/* ── Débit ── */}
-      {meta.active && <Throughput telemetry={telemetry} history={history} />}
+      {hasThroughput && (
+        <Box
+          aria-label="Débit du tunnel"
+          sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 1, mt: 1.25 }}
+        >
+          <Series
+            icon={ArrowDown}
+            label="Réception"
+            value={telemetry ? formatBps(telemetry.rx_bps) : '—'}
+            points={history.map((sample) => sample.rx_bps)}
+            ceiling={ceilingOf(history)}
+          />
+          <Series
+            icon={ArrowUp}
+            label="Émission"
+            value={telemetry ? formatBps(telemetry.tx_bps) : '—'}
+            points={history.map((sample) => sample.tx_bps)}
+            ceiling={ceilingOf(history)}
+          />
+        </Box>
+      )}
 
-      {/* ── Caractéristiques du profil ── */}
-      <div className="grid grid-cols-2 gap-2">
-        <Tile
-          label="Protection"
-          value={pq ? 'PSK post-quantique' : 'WireGuard classique'}
-          accent={pq}
-          hint={
-            pq
-              ? 'Le secret ML-KEM-768 alimente le slot PresharedKey — un enregistrement du trafic reste illisible pour un adversaire quantique.'
-              : 'Sans PSK, la confidentialité repose sur Curve25519 seul : vulnérable au « récolter maintenant, déchiffrer plus tard ».'
-          }
-        />
-        <Tile label="Adresse virtuelle" value={profile?.address ?? 'assignée à l’enrôlement'} mono />
-        <Tile label="Trafic capté" value={profile?.allowed_ips ?? '—'} mono />
-        <Tile label="Backend" value={backend || '—'} mono />
-      </div>
+      {/* The one characteristic that belongs on this screen: what protects
+          the traffic. Address, captured range, backend and negotiation
+          endpoint are reference material — they live in the posture panel,
+          one click away on the header chip, and are not repeated here. */}
+      <Box sx={{ pt: 1.5 }}>
+        <Tooltip title={protection.detail}>
+          <Box
+            aria-label={`${protection.label}. ${protection.detail}`}
+            sx={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 0.75,
+              px: 1,
+              py: 0.4,
+              borderRadius: 1,
+              border: '1px solid',
+              borderColor: PROTECTION_SKIN[protection.tone].border,
+              bgcolor: PROTECTION_SKIN[protection.tone].fill,
+            }}
+          >
+            <Typography
+              sx={{
+                color: PROTECTION_SKIN[protection.tone].text,
+                fontFamily: 'monospace',
+                fontSize: 10.5,
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                letterSpacing: '0.04em',
+              }}
+            >
+              {protection.label}
+            </Typography>
+          </Box>
+        </Tooltip>
+      </Box>
 
-      {/* ── Action ── */}
-      <div className="mt-auto flex flex-col gap-2 pt-1">
+      <Stack spacing={0.75} sx={{ pt: 1.75 }}>
         {meta.active || meta.transitioning ? (
-          <button
-            className="btn flex items-center justify-center gap-2 border border-red-500/30 bg-red-950/50 text-red-200 hover:bg-red-900/60"
+          <Button
+            fullWidth
+            variant="outlined"
+            color="error"
+            startIcon={<Power size={17} aria-hidden />}
             onClick={onDisconnect}
           >
-            <Power size={15} />
             {state === 'connecting' ? 'Annuler et démonter' : 'Déconnecter'}
-          </button>
+          </Button>
         ) : (
-          <button
-            className="btn flex items-center justify-center gap-2 border border-node/30 bg-node/15 text-node hover:bg-node/25"
+          <Button
+            fullWidth
+            variant="contained"
+            startIcon={<Power size={17} aria-hidden />}
             onClick={onConnect}
             disabled={!ready}
           >
-            <Power size={15} />
             Connecter
-          </button>
+          </Button>
         )}
 
         {!ready && profile && (
-          <p className="text-center text-[11px] text-amber-400/80">
-            Profil incomplet — endpoint, clé privée et clé publique de la gateway sont requis.
-          </p>
+          <Typography
+            role="status"
+            color="warning.main"
+            sx={{ textAlign: 'center', fontSize: 11 }}
+          >
+            Profil incomplet : endpoint, clé privée et clé publique de la gateway sont requis.
+          </Typography>
         )}
-
-        {/* Le geste que l'invariante fail-open interdit, dit explicitement. */}
-        {posture.posture === 'held' && (
-          <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-slate-500">
-            <Info size={12} className="mt-0.5 shrink-0" />
-            Déconnecter démonte l’adaptateur et rend la route par défaut au trafic en clair. Pour
-            relancer une négociation, laissez Orion réessayer.
-          </p>
-        )}
-      </div>
-    </div>
+      </Stack>
+    </Stack>
   )
 }
 
-function Throughput({
-  telemetry,
-  history,
-}: {
-  telemetry: TelemetrySample | null
-  history: TelemetrySample[]
-}) {
-  // Échelle commune aux deux séries — voir le doc-comment de Sparkline.
-  const ceiling = Math.max(1, ...history.map((s) => Math.max(s.rx_bps, s.tx_bps)))
-
-  return (
-    <div className="grid grid-cols-2 gap-2">
-      <Series
-        icon={ArrowDown}
-        label="Réception"
-        value={telemetry ? formatBps(telemetry.rx_bps) : '—'}
-        points={history.map((s) => s.rx_bps)}
-        ceiling={ceiling}
-        color="#28e4a0"
-      />
-      <Series
-        icon={ArrowUp}
-        label="Émission"
-        value={telemetry ? formatBps(telemetry.tx_bps) : '—'}
-        points={history.map((s) => s.tx_bps)}
-        ceiling={ceiling}
-        color="#22d3ee"
-      />
-    </div>
-  )
+/** Scale shared by both series — see `Sparkline`'s doc-comment. */
+function ceilingOf(history: TelemetrySample[]): number {
+  return Math.max(1, ...history.map((sample) => Math.max(sample.rx_bps, sample.tx_bps)))
 }
 
 function Series({
@@ -180,52 +273,43 @@ function Series({
   value,
   points,
   ceiling,
-  color,
 }: {
   icon: React.ElementType
   label: string
   value: string
   points: number[]
   ceiling: number
-  color: string
 }) {
   return (
-    <div className="rounded-xl border border-white/5 bg-black/20 px-3 pb-1 pt-2.5">
-      <div className="flex items-baseline gap-1.5">
-        <Icon size={11} style={{ color }} />
-        <span className="text-[9px] uppercase tracking-[0.14em] text-slate-500">{label}</span>
-        <span className="ml-auto font-mono text-[11px] tabular-nums" style={{ color }}>
+    <Box
+      sx={{
+        minWidth: 0,
+        px: 1.25,
+        pt: 0.9,
+        pb: 0.4,
+        borderRadius: 2,
+        border: '1px solid',
+        borderColor: 'divider',
+      }}
+    >
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6 }}>
+        <Icon size={12} aria-hidden style={{ color: EMERALD }} />
+        <Typography variant="overline" color="text.disabled" sx={{ fontSize: 9 }}>
+          {label}
+        </Typography>
+        <Typography
+          sx={{
+            ml: 'auto',
+            color: 'primary.main',
+            fontFamily: 'monospace',
+            fontSize: 11,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
           {value}
-        </span>
-      </div>
-      <Sparkline points={points} ceiling={ceiling} color={color} label={label} />
-    </div>
-  )
-}
-
-function Tile({
-  label,
-  value,
-  mono = false,
-  accent = false,
-  hint,
-}: {
-  label: string
-  value: string
-  mono?: boolean
-  accent?: boolean
-  hint?: string
-}) {
-  return (
-    <div className="rounded-xl border border-white/5 bg-black/20 px-3 py-2.5" title={hint}>
-      <div className="text-[9px] uppercase tracking-[0.14em] text-slate-500">{label}</div>
-      <div
-        className={`mt-1 truncate text-[11px] ${mono ? 'font-mono' : ''} ${
-          accent ? 'text-node' : 'text-slate-300'
-        }`}
-      >
-        {value}
-      </div>
-    </div>
+        </Typography>
+      </Box>
+      <Sparkline points={points} ceiling={ceiling} color={EMERALD} label={label} />
+    </Box>
   )
 }

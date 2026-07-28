@@ -4,12 +4,13 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  PskKind,
   TelemetrySample,
   TunnelState,
 } from '../types'
 
 const MAX_LOGS = 80
-/** Fenêtre de la courbe de débit. À un échantillon par seconde, ~1 minute. */
+/** Throughput curve window. At one sample per second, ~1 minute. */
 const MAX_SAMPLES = 60
 
 export function useClient() {
@@ -21,6 +22,9 @@ export function useClient() {
   const [telemetry, setTelemetry] = useState<TelemetrySample | null>(null)
   const [history, setHistory] = useState<TelemetrySample[]>([])
   const [upSince, setUpSince] = useState<number | null>(null)
+  // `null` = the ongoing connection hasn't decided yet. Definitely not
+  // `'none'` by default: that would assert the absence of a PSK before knowing.
+  const [psk, setPsk] = useState<PskKind | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
@@ -32,10 +36,20 @@ export function useClient() {
 
   const consumeProfilePath = useCallback(async () => {
     try {
-      const profile = await api.importProfilePath()
-      if (profile) {
+      const imported = await api.importProfilePath()
+      if (imported) {
         setError(null)
-        setPathImportedProfile(profile)
+        setPathImportedProfile(imported.profile)
+        // A double-click has no import panel to carry the notice, so what
+        // would keep the profile from connecting goes to the global error:
+        // it is there on screen, and that must not stay silent.
+        if (imported.private_key_missing) {
+          setError(imported.private_key_missing)
+        } else if (imported.identity_error) {
+          setError(`Identité non scellée : ${imported.identity_error}`)
+        } else if (imported.identity_sealed) {
+          pushLog('info', 'identité de négociation scellée dans le stockage protégé')
+        }
       }
     } catch (cause) {
       const message = `Import du profil associé impossible : ${String(cause)}`
@@ -44,7 +58,7 @@ export function useClient() {
     }
   }, [pushLog])
 
-  // Chargement initial + abonnement aux événements du backend.
+  // Initial load + subscription to backend events.
   useEffect(() => {
     api.getConfig().then(setConfig).catch((e) => setError(String(e)))
     api.getState().then(setState).catch(() => {})
@@ -65,10 +79,17 @@ export function useClient() {
             upSinceRef.current = null
             setUpSince(null)
             setTelemetry(null)
-            // L'historique repart à zéro : recoller deux sessions produirait une
-            // courbe continue qui n'a jamais existé.
+            // History resets to zero: stitching two sessions together would
+            // produce a continuous curve that never existed.
             setHistory([])
+            // The PQC PSK doesn't survive the session: it isn't persisted and
+            // gets renegotiated on the next mount. Keeping it would display a
+            // protection that no tunnel carries anymore.
+            setPsk(null)
           }
+          break
+        case 'protection':
+          setPsk(ev.psk)
           break
         case 'log':
           pushLog(ev.level, ev.message)
@@ -88,8 +109,8 @@ export function useClient() {
     const unlistenProfilePath = api.onProfilePath(() => {
       void consumeProfilePath()
     })
-    // Le premier lancement a pu recevoir son argv avant que React installe
-    // l'écouteur. La commande consomme alors le chemin conservé côté Rust.
+    // The first launch may have received its argv before React installs the
+    // listener. The command then consumes the path kept on the Rust side.
     void unlistenProfilePath.then(() => consumeProfilePath())
     return () => {
       unlisten.then((f) => f())
@@ -99,6 +120,11 @@ export function useClient() {
 
   const connect = useCallback(async (name?: string) => {
     setError(null)
+    // New session, new negotiation: we start over from "unknown". Resetting
+    // it here rather than on the `connecting` transition is deliberate — a
+    // stale handshake mid-session goes back through `connecting` without the
+    // set protection having changed.
+    setPsk(null)
     try {
       await api.connect(name)
     } catch (e) {
@@ -169,6 +195,7 @@ export function useClient() {
     telemetry,
     history,
     upSince,
+    psk,
     error,
     selectedProfile,
     pathImportedProfile,

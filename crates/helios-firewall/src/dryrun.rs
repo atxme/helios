@@ -5,10 +5,10 @@ use tracing::info;
 use crate::ruleset::{render, ChainKind};
 use crate::FirewallBackend;
 
-/// Backend qui journalise le jeu de règles sans toucher au kernel.
+/// Backend that logs the ruleset without touching the kernel.
 ///
-/// C'est le backend par défaut sur WSL2 : il permet de valider toute la logique
-/// d'orchestration (transitions, rendu de règles) sans nf_tables.
+/// This is the default backend on WSL2: it lets the orchestration logic
+/// (transitions, rule rendering) be validated without nf_tables.
 pub struct DryRunBackend;
 
 #[async_trait]
@@ -16,7 +16,7 @@ impl FirewallBackend for DryRunBackend {
     async fn apply(&self, policy: &FirewallPolicy, state: TunnelState) -> Result<()> {
         let rs = render(policy, state);
         info!(
-            "table inet helios (politique par défaut : {:?}) — état tunnel {:?}",
+            "table inet helios (default policy: {:?}) — tunnel state {:?}",
             rs.default_verdict, state
         );
         for kind in [ChainKind::Input, ChainKind::Forward, ChainKind::Output] {
@@ -25,7 +25,7 @@ impl FirewallBackend for DryRunBackend {
             }
         }
         if let Some(out) = &rs.masquerade_out {
-            info!("  [postrouting] oifname \"{out}\" masquerade  # sortie Internet des clients");
+            info!("  [postrouting] oifname \"{out}\" masquerade  # client Internet egress");
         }
         if let Some(mss) = rs.mss_clamp {
             info!("  (mangle) MSS clamping = {mss}");
@@ -34,7 +34,7 @@ impl FirewallBackend for DryRunBackend {
     }
 
     async fn teardown(&self) -> Result<()> {
-        info!("[dry-run] suppression de la table inet helios");
+        info!("[dry-run] removing the inet helios table");
         Ok(())
     }
 }

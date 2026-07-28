@@ -92,7 +92,7 @@ unique, pas deux intégrations séparées.
 
 On ne touche **pas** au handshake WireGuard. Le message d'initiation fait 148
 octets à disposition fixe, un seul datagramme UDP, jamais fragmenté, avec
-MAC1/MAC2 calculés sur ce layout exact. ML-KEM-768 (clé publique 1 184 o,
+MAC1/MAC2 calculés sur ce layout exact. ML-KEM-1024 (clé publique 1 184 o,
 ciphertext 1 088 o) **n'y rentre pas** : l'« injecter » signifierait redéfinir le
 format de message, fragmenter sur UDP et reconstruire la logique anti-DoS —
 c'est-à-dire écrire un protocole cryptographique nouveau, sans interopérabilité
@@ -101,7 +101,7 @@ ni revue externe.
 À la place : le secret ML-KEM alimente le slot **`PresharedKey`**, qui existe
 déjà dans le format de fil et est déjà mélangé au handshake Noise.
 
-Implémentation : **`aws-lc-rs`** (AWS-LC), **sans la feature `fips`**. ML-KEM-768
+Implémentation : **`aws-lc-rs`** (AWS-LC), **sans la feature `fips`**. ML-KEM-1024
 (FIPS 203) vit dans l'API `kem` standard, pas derrière FIPS. Concrètement, dans
 `aether::pq` derrière le trait `Kem` (module `pq`, testé sur WSL2).
 
@@ -144,8 +144,10 @@ F*), ne toucherait que `aether::pq`.
 > **Ne pas revendiquer une preuve de sécurité formelle.** Ce design n'est **pas**
 > Rosenpass. Rosenpass est un protocole UDP dédié avec sa propre preuve, sa
 > vérification symbolique, Classic McEliece pour l'authenticité et des cookies
-> anti *state-disruption*. Ce qu'on obtient ici, c'est la garantie du canal TLS
-> plus celle de ML-KEM — solide et suffisant, mais à énoncer honnêtement.
+> anti *state-disruption*. Ce qu'on obtient ici n'est pas une preuve formelle :
+> ML-KEM-1024 établit le secret et ML-DSA-65 authentifie chaque message de la
+> transaction. TLS reste une enveloppe QUIC de défense en profondeur, pas
+> l'ancre cryptographique du protocole.
 >
 > Rosenpass a été évalué et écarté : clés publiques McEliece de l'ordre du
 > méga-octet, démon séparé, et il ne résout pas l'enrôlement (VIP, identité) —
@@ -316,12 +318,12 @@ IKEv2 fournissait nativement deux choses que WireGuard **n'a pas** :
 Le nouveau crate `helios-provisioning` porte donc : enrôlement, authentification,
 adressage, échange ML-KEM et rotation du PSK.
 
-**Authentification.** Le canal TLS 1.3 est ancré dans le TPM **côté gateway** :
-le secret descellé par `helio-tpm` (scellé sur PCR 0/4/7 — firmware, bootloader,
-Secure Boot) déchiffre la clé privée TLS d'Helios. Le client, lui, est identifié
-par sa **clé publique Curve25519 statique** — le seul modèle d'identité qu'ait
-WireGuard. Orion n'a **aucune** intégration TPM, et n'en aura pas : cela
-demanderait l'API TBS de Windows, un chantier sans rapport.
+**Authentification.** Le transport TLS 1.3 et l'identité applicative ML-DSA-65
+de la gateway sont ancrés dans le TPM : le secret descellé par `helio-tpm`
+(PCR 0/4/7 — firmware, bootloader, Secure Boot) ouvre leurs deux clés privées.
+Orion présente un certificat ML-DSA-65 liant sa clé de signature à sa clé
+WireGuard ; sa clé privée reste dans le stockage protégé Windows. Orion n'a pas
+d'intégration TPM : cette frontière relève du shell et non du protocole.
 
 **Adressage CGNAT déterministe (IPAM sans état).** Le tunnel adopte la plage
 partagée RFC 6598 — **`100.64.0.0/10`** — pour éliminer les collisions de routage
@@ -375,66 +377,165 @@ reconnexion pouvant différer.
 > recherché, c'est **aucun état d'adressage persistant sur disque** — pas de SQL,
 > pas de fichier, rien à sauvegarder, rien à corrompre, rien à migrer.
 
-## Cinématique de montée — le point clé
+## Amendement du 24 juillet 2026 — port public de key-negotiation
 
-**L'invariant « le canal de contrôle vit derrière le tunnel » est préservé.** Il
-n'y a **aucune** fenêtre TLS pré-tunnel, aucun service exposé sur l'Internet
-public avant que le tunnel ne soit monté.
+> Cet amendement est désormais détaillé, avec son modèle de menace complet,
+> dans [ADR-005](ADR-005-NEGOCIATION-DE-CLE.md). Ce qui suit reste le résumé
+> vu depuis le transport WireGuard.
 
-C'est possible parce que **le PSK WireGuard est optionnel** : sans PSK, WireGuard
-fonctionne sur les clés statiques Curve25519, en sécurité classique. On monte donc
-classique, puis on **upgrade en PQ** :
+La cinématique classique-puis-upgrade est conservée comme compatibilité pour les
+anciens profils, mais elle n'est plus le chemin nominal. Le choix initial de ne
+jamais exposer de contrôle avant WireGuard empêchait précisément de négocier le
+slot PSK qui doit protéger le **premier** handshake.
+
+Le chemin nominal utilise donc deux ports UDP redirigés par la box :
+
+- `key_negotiation_port`, 51821 par défaut : QUIC avec TLS 1.3 mutuel ;
+- `wg_listen_port`, 51820 par défaut : transport WireGuard inchangé.
+
+Le premier ne transporte aucun trafic utilisateur. Il ne fait que préparer une
+transaction de clé pour le second. Orion choisit explicitement l'un des trois
+modes ; Helios les supporte tous sans en substituer un autre :
+
+| Mode Orion | Slot WireGuard préparé par Helios |
+|---|---|
+| `classic` | vide |
+| `static_psk` | PSK statique déjà configuré, après comparaison de son empreinte |
+| `ml_kem` | PSK frais dérivé d'une encapsulation ML-KEM-1024 |
+
+### Authentification et échange
+
+TLS 1.3 est imposé par QUIC, mais ses certificats classiques ne sont plus
+l'ancre de sécurité. Le protocole v2 ajoute une PKI applicative ML-DSA-65 :
+
+- le certificat PQ serveur naît sur la gateway ; sa clé privée est scellée au
+  TPM avec la clé TLS ;
+- le certificat PQ Orion est signé par l'autorité ML-DSA-65 du poste opérateur,
+  lie sa clé de signature à sa clé WireGuard et son empreinte est admise dans
+  la table des pairs ;
+- la requête entière, notamment le mode et `kpub`, est signée par Orion ;
+- la réponse entière, notamment le ciphertext, est signée par Helios ;
+- confirmation et ACK de commit portent également une signature ML-DSA-65.
+
+Une rupture future d'ECDSA ou de l'échange de clés TLS ne permet donc ni de
+substituer `kpub`, ni de modifier le ciphertext, ni de forger le commit. Les
+certificats X.509/mTLS restent une première barrière actuelle et réduisent
+l'exposition du parseur applicatif.
+
+En mode ML-KEM, Orion génère une paire éphémère, envoie `kpub` et conserve
+`kpriv`. Helios encapsule, renvoie le ciphertext et les deux côtés obtiennent le
+même secret. HKDF-SHA-256 lie au PSK la version, le mode, l'identifiant de
+transaction, les deux nonces et les deux identités WireGuard. Une réponse
+rejouée, destinée à un autre pair ou sélectionnant un autre mode est refusée.
+
+### Transaction et ordre de pose
 
 ```
-1. WG monte SANS PSK (Curve25519 statique)
-      état → Connecting
-      kill-switch ENGAGÉ — aucun trafic utilisateur ne sort
-2. Canal TLS (À L'INTÉRIEUR du tunnel, ancré TPM)
-      échange ML-KEM-768 → PSK dérivé des deux côtés
-3. PSK installé. Handshake WG suivant (≤ 2 min) réussit avec PSK
-      état → Up
-      kill-switch levé — le trafic passe, protégé PQ
+1. mTLS établit le transport QUIC
+2. Orion signe en ML-DSA-65 le mode, son identité WireGuard et `kpub`
+3. Helios vérifie certificat PQ, signature et plancher anti-downgrade
+4. Helios pose le slot choisi sur son plan de données
+5. Helios signe et renvoie le ciphertext et le contexte
+6. Orion vérifie, pose le même slot et attend qu'un handshake WireGuard
+   réussisse avec ce PSK
+7. Orion confirme par signature ; Helios commit et signe l'ACK
 ```
 
-### Pourquoi ce n'est pas un cercle vicieux cryptographique
+Helios sérialise les transactions par pair. Si le plan de données refuse la
+pose, aucune réponse de succès ne part. Si la session QUIC se ferme, si le
+handshake n'arrive pas dans le délai ou si la confirmation est invalide, Helios
+restaure le slot précédent. Le PSK ML-KEM ne touche jamais le disque.
 
-Objection naturelle : « l'échange ML-KEM voyage dans un tunnel protégé seulement
-par X25519 ; un attaquant quantique casse X25519 plus tard, lit le tunnel, et
-récupère le PSK ».
+Le port public applique mTLS avant le protocole, un ALPN dédié, des messages
+JSON stricts bornés à 64 Kio, une limite globale de connexions, un verrou par
+pair et un cache anti-rejeu borné. Les erreurs publiques restent volontairement
+peu détaillées.
 
-Non. En cassant le tunnel, l'attaquant voit la **clé publique ML-KEM et le
-ciphertext** — exactement ce que voit un attaquant passif d'un échange ML-KEM
-mené en clair. ML-KEM résiste précisément à ça : sans la clé privée, le secret
-partagé reste hors d'atteinte. **Le PSK est post-quantique même livré dans un
-tunnel classique.**
+### Plancher anti-downgrade
 
-Le seul trafic exposé au *harvest-now-decrypt-later* pendant la fenêtre classique
-est l'échange ML-KEM lui-même, que ça n'affecte pas. Le trafic utilisateur ne
-passe pas : le kill-switch est engagé jusqu'à `Up`.
+Chaque pair Helios et chaque profil Orion portent un
+`minimum_key_negotiation_mode`. L'ordre est monotone :
+`classic < static_psk < ml_kem`. Une requête située sous le plancher est
+refusée avant toute modification du plan de données. Le mode est aussi couvert
+par les signatures et Helios n'en substitue jamais un autre dans sa réponse.
 
-Effet de bord bienvenu : **`Connecting` retrouve un sens fort**. Ce n'est plus
-« on attend », c'est « tunnel classique monté, upgrade PQ en cours, trafic
-interdit ».
+L'admission avec un certificat PQ choisit `ml_kem` comme plancher par défaut.
+En outre, chaque commit réussi élève automatiquement et persiste le plancher au
+mode utilisé : un pair classique peut passer à statique puis ML-KEM, jamais
+revenir dans l'autre sens, y compris après redémarrage. Le hot-reload refuse
+également de recopier un plancher inférieur depuis une vue expurgée. Descendre
+ce plancher exige une intervention locale explicite sur la configuration ;
+aucun message réseau ni mécanisme de renégociation ne peut le faire. Le passage
+au protocole v2 est une rupture volontaire : les messages v1 non signés sont
+refusés.
 
-### Rotation du PSK sans brique
+### Compatibilité et limite d'intégration
 
-Changer le PSK d'un pair vivant **ne casse pas la session en cours** : les clés
-de session sont déjà dérivées. Le nouveau PSK ne sert qu'au handshake suivant,
-soit ≤ 2 min plus tard — d'où une fenêtre confortable pour synchroniser les deux
-bouts.
+Un profil sans bloc `key_negotiation` emprunte encore l'ancien provisioning
+HTTP interne après un tunnel classique. Cette compatibilité permet la migration
+mais ne protège pas son premier handshake. La suppression de ce chemin exige
+que les profils existants aient reçu certificat, empreinte et second endpoint.
 
-En cas de désynchronisation, chaque côté applique un **revert local sur timeout**,
-sans avoir besoin de communiquer :
+Le cœur Orion expose le fournisseur d'identité protégée et toute la transaction.
 
-> pas de handshake réussi 180 s après l'installation de `PSK_new` → retour à
-> `PSK_old`.
+### Lot IHM
 
-Deux timers locaux et déterministes convergent. Dernier filet : retour au mode
-sans PSK → le tunnel classique remonte → le canal de contrôle redevient joignable
-→ resynchronisation. Le kill-switch reste engagé pendant toute la séquence.
+Les deux interfaces disent maintenant ce que le protocole fait. Côté gateway,
+l'écran *WireGuard* publie le second port, le plancher de chaque pair et le fait
+que l'ancre d'authentification est ML-DSA-65, pas TLS. Côté Orion, l'écran
+*Profils* porte le choix du mode : les modes sous le plancher sont montrés
+désactivés plutôt que masqués, et l'empreinte du certificat PQ épinglé est
+affichée pour être comparée à celle qu'a imprimée `heliosd
+init-key-negotiation`. Le document `orion-profile` transporte désormais le bloc
+`key_negotiation` ; un bloc sans plancher explicite prend son propre mode comme
+plancher, car accepter demain une négociation classique viderait de sens le mode
+choisi aujourd'hui.
 
-**Le pire cas est un DoS, pas une brique et pas une fuite.** C'est acceptable :
-un DoS est de toute façon toujours disponible contre un VPN.
+Le cliquet existe des deux côtés : `ClientConfig::upsert` refuse d'abaisser un
+plancher connu — y compris en supprimant le bloc — et une négociation aboutie
+élève le plancher du profil, comme la gateway élève le sien. Descendre exige
+d'éditer `profiles.toml`.
+
+### Identité cliente et enrôlement
+
+L'identité cliente — certificat TLS et certificat ML-DSA-65, avec leurs deux
+clés privées — naît sur le poste opérateur et ne voyage qu'une fois. Elle est
+scellée par **DPAPI**, liée au compte Windows de l'utilisateur et à une entropie
+propre à cet usage. Le Credential Manager a été écarté : il plafonne un secret à
+2560 octets quand la seule clé privée ML-DSA-65 en fait 4032.
+
+Le profil ne porte que le **nom** de l'entrée. Le document d'échange, lui, peut
+transporter l'identité une fois : `orion-profile` gagne un champ
+`key_negotiation_identity` que l'import scelle immédiatement et qui n'atteint
+jamais `ClientProfile`, donc jamais `profiles.toml`. Un document qui le porte est
+un secret au même titre qu'un profil émis avec clé privée.
+
+Côté outillage, `helios-ctl enroll` fait l'enrôlement d'un trait : il lit sur la
+gateway sa clé publique, ses certificats de négociation et leur port
+(`GET /api/key-negotiation`, matériel public), émet les certificats clients,
+admet le pair avec les deux empreintes et le plancher, et écrit ce document
+unique. Le producteur relit systématiquement ce qu'il écrit avec le parseur
+d'Orion : les deux binaires ne se rencontrent jamais, et un désaccord de format
+n'apparaîtrait sinon que sur le poste d'un utilisateur.
+
+**L'enrôlement ne suppose aucune connexion préalable.** L'API de contrôle vit
+derrière le tunnel : l'atteindre suppose d'être déjà connecté, ce qui est sans
+conséquence au quotidien et absurde au premier enrôlement — la négociation qui
+protège le premier handshake dépendrait d'un premier handshake. Le protocole,
+lui, n'a jamais eu cette dépendance : Orion compose le port public avant de
+monter quoi que ce soit. C'est donc l'outillage qui a été corrigé.
+`helios-ctl enroll` accepte les matériaux en fichiers
+(`--gateway-certificate`, `--gateway-pq-certificate`, `--address`) : l'opérateur
+tient déjà une session SSH, qui suffit à lire deux certificats publics et à
+admettre le pair par `heliosd peer add` — la commande console prévue pour
+l'amorçage. Le certificat PQ porte le sujet **et** la clé WireGuard épinglée :
+rien n'est retapé, donc rien ne peut être mal recopié.
+
+**Limite connue — vérification matérielle.** DPAPI ne se compile ni ne s'exerce
+en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement
+(`IdentityStoreError::UnsupportedPlatform`) plutôt que d'écrire ces clés en
+clair. Débloquer Linux suppose `libsecret`, macOS le Keychain. Voir
+[TESTING](../testing/TESTING.md).
 
 ## Conséquences sur le workspace
 
@@ -490,9 +591,10 @@ protocole cryptographique nouveau, non interopérable et non revu. Écarté (§2
 McEliece de l'ordre du Mo, démon séparé, et ne résout pas l'enrôlement. Écarté
 (§2).
 
-**Fenêtre TLS pré-tunnel pour le bootstrap** — casse l'invariant « le canal de
-contrôle vit derrière le tunnel » et expose un service sur l'Internet public.
-Rendu inutile par la cinématique classique-puis-upgrade. Écarté.
+**Réutiliser le port WireGuard pour key-negotiation** — exigerait de
+démultiplexer un protocole applicatif et les datagrammes WireGuard avant le
+backend noyau, augmenterait la surface du chemin de données et casserait
+l'interopérabilité. Écarté au profit de deux ports UDP explicites.
 
 **`oqs` / liboqs, `aws-lc-rs` FIPS** — toolchain CMake/Go. Écarté (§2).
 

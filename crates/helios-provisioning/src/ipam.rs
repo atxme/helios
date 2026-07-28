@@ -1,67 +1,66 @@
-//! Attribution d'adresses virtuelles (VIP) déterministe et **sans état sur
-//! disque** (ADR-001, §4).
+//! Deterministic, **stateless** virtual address (VIP) assignment (ADR-001, §4).
 //!
-//! WireGuard n'a pas de Config Payload : la gateway doit choisir la VIP du
-//! client. Plutôt que de tenir une base de données (SQL/fichier) à sauvegarder,
-//! migrer et corrompre, on **dérive** la VIP du seul identifiant stable et unique
-//! d'un pair WireGuard : sa clé publique Curve25519.
+//! WireGuard has no Config Payload: the gateway must choose the client's
+//! VIP. Rather than keeping a database (SQL/file) to back up, migrate, and
+//! corrupt, we **derive** the VIP from the one stable and unique identifier
+//! of a WireGuard peer: its Curve25519 public key.
 //!
 //! ```text
-//! VIP = 100.64.0.0/10 | BLAKE3(clé_publique)[0..22 bits]
+//! VIP = 100.64.0.0/10 | BLAKE3(public_key)[0..22 bits]
 //! ```
 //!
-//! Le seul « état » est la table de pairs vivante du noyau, consultée à
-//! l'enrôlement pour lever les rares collisions (§4). Rien n'est persisté :
-//! après un redémarrage, chaque client retrouve sa VIP par re-dérivation.
+//! The only "state" is the kernel's live peer table, consulted at enrollment
+//! to resolve the rare collisions (§4). Nothing is persisted: after a
+//! restart, every client recovers its VIP by re-derivation.
 
 use std::net::Ipv4Addr;
 
-/// Plage partagée RFC 6598 (CGNAT) : `100.64.0.0/10`, ~4,19 M d'adresses.
+/// RFC 6598 (CGNAT) shared range: `100.64.0.0/10`, ~4.19M addresses.
 ///
-/// Choisie pour ne collisionner ni avec les box résidentielles (`192.168/16`)
-/// ni avec les réseaux d'entreprise (`10/8`). Un `/16` avait été envisagé puis
-/// rejeté : 7,3 % de collision à 100 clients (ADR-001, §4).
+/// Chosen to collide with neither residential routers (`192.168/16`) nor
+/// enterprise networks (`10/8`). A `/16` was considered then rejected: 7.3%
+/// collision rate at 100 clients (ADR-001, §4).
 const CGNAT_BASE: u32 = 0x6440_0000; // 100.64.0.0
-/// Préfixe /10 → 22 bits d'hôte utilisables.
+/// /10 prefix → 22 usable host bits.
 const HOST_BITS: u32 = 22;
 const HOST_MASK: u32 = (1 << HOST_BITS) - 1;
 
-/// Nombre d'adresses assignables dans la plage, hors réservées (voir plus bas).
+/// Number of assignable addresses in the range, excluding reserved ones (see below).
 pub const POOL_SIZE: u32 = 1 << HOST_BITS;
 
-/// Nombre de sondes d'anti-collision de VIP.
+/// Number of VIP anti-collision probes.
 ///
-/// Partagé par l'enrôlement et l'admission : deux bornes différentes rendraient
-/// l'adresse choisie dépendante du chemin emprunté, alors que tout l'intérêt de
-/// la dérivation est qu'elle soit la même partout.
+/// Shared by enrollment and admission: two different bounds would make the
+/// chosen address depend on the path taken, whereas the whole point of
+/// derivation is that it's the same everywhere.
 pub const MAX_VIP_PROBES: u32 = 64;
 
-/// Vue en lecture seule de la table de pairs WireGuard vivante.
+/// Read-only view of the kernel's live WireGuard peer table.
 ///
-/// Abstraite en trait pour rester **testable sur WSL2** : l'implémentation réelle
-/// (cible) interrogera le noyau via `defguard_wireguard_rs` ; les tests
-/// fournissent une fausse table en mémoire. La gateway ne persiste jamais cette
-/// information — elle se reconstruit à mesure que les clients se reconnectent.
+/// Abstracted as a trait to stay **testable on WSL2**: the real
+/// (target) implementation will query the kernel via
+/// `defguard_wireguard_rs`; tests supply a fake in-memory table. The gateway
+/// never persists this information — it gets rebuilt as clients reconnect.
 pub trait PeerTable {
-    /// La VIP `addr` est-elle déjà attribuée à un pair dont la clé publique
-    /// **diffère** de `pubkey` ? (Un pair ne collisionne jamais avec lui-même.)
+    /// Is VIP `addr` already assigned to a peer whose public key **differs**
+    /// from `pubkey`? (A peer never collides with itself.)
     fn is_taken_by_other(&self, addr: Ipv4Addr, pubkey: &[u8]) -> bool;
 }
 
-/// Erreurs d'attribution.
+/// Assignment errors.
 #[derive(Debug, thiserror::Error)]
 pub enum IpamError {
-    /// Le pool est saturé, ou la résolution de collision a épuisé ses essais.
-    #[error("aucune VIP libre après {0} tentatives")]
+    /// The pool is saturated, or collision resolution ran out of attempts.
+    #[error("no free VIP after {0} attempts")]
     Exhausted(u32),
 }
 
-/// Dérive l'adresse candidate n° `counter` pour cette clé publique.
+/// Derives candidate address n° `counter` for this public key.
 ///
-/// Déterministe : même `(pubkey, counter)` ⇒ même adresse, sur toutes les
-/// gateways et après tout redémarrage. Le `counter` n'intervient que pour
-/// contourner une collision (cas rare) ; à `counter = 0` on obtient la VIP
-/// « naturelle » du client.
+/// Deterministic: the same `(pubkey, counter)` ⇒ the same address, on every
+/// gateway and after every restart. `counter` only comes into play to work
+/// around a collision (rare case); at `counter = 0` we get the client's
+/// "natural" VIP.
 pub fn derive_cgnat_ip(pubkey: &[u8], counter: u32) -> Ipv4Addr {
     let mut hasher = blake3::Hasher::new();
     hasher.update(pubkey);
@@ -75,9 +74,9 @@ pub fn derive_cgnat_ip(pubkey: &[u8], counter: u32) -> Ipv4Addr {
     Ipv4Addr::from(CGNAT_BASE | normalize_host(host))
 }
 
-/// Écarte les hôtes réservés du `/10` : `.0` (adresse réseau) et l'hôte tout-à-1
-/// (broadcast). On remappe déterministement ces deux cas vers des hôtes valides
-/// plutôt que de les tirer, pour ne jamais attribuer une VIP inutilisable.
+/// Discards the reserved hosts of the `/10`: `.0` (network address) and the
+/// all-ones host (broadcast). These two cases are deterministically remapped
+/// to valid hosts rather than drawn again, so an unusable VIP is never assigned.
 fn normalize_host(host: u32) -> u32 {
     match host {
         0 => 1,
@@ -86,12 +85,12 @@ fn normalize_host(host: u32) -> u32 {
     }
 }
 
-/// Attribue une VIP à `pubkey`, en évitant les collisions avec la table vivante.
+/// Assigns a VIP to `pubkey`, avoiding collisions with the live table.
 ///
-/// Sonde `derive_cgnat_ip(pubkey, i)` pour `i = 0, 1, 2, …` et renvoie la
-/// première adresse non détenue par une **autre** clé. `max_probes` borne la
-/// boucle (collision astronomiquement improbable, mais on ne boucle jamais sans
-/// fin). Sans disque : l'unique source de vérité est `table`.
+/// Probes `derive_cgnat_ip(pubkey, i)` for `i = 0, 1, 2, …` and returns the
+/// first address not held by an **other** key. `max_probes` bounds the loop
+/// (collision astronomically unlikely, but we never loop forever). Stateless:
+/// the only source of truth is `table`.
 pub fn assign_vip<T: PeerTable>(
     table: &T,
     pubkey: &[u8],
@@ -104,7 +103,7 @@ pub fn assign_vip<T: PeerTable>(
                 tracing::warn!(
                     counter = i,
                     vip = %candidate,
-                    "collision VIP résolue par re-dérivation"
+                    "VIP collision resolved via re-derivation"
                 );
             }
             return Ok(candidate);
@@ -118,7 +117,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Fausse table de pairs en mémoire : `VIP -> clé publique propriétaire`.
+    /// Fake in-memory peer table: `VIP -> owner public key`.
     #[derive(Default)]
     struct FakeTable {
         owners: HashMap<Ipv4Addr, Vec<u8>>,
@@ -138,21 +137,21 @@ mod tests {
     }
 
     #[test]
-    fn vip_dans_la_plage_cgnat() {
-        // Tout ce qui sort doit appartenir à 100.64.0.0/10.
+    fn vip_within_the_cgnat_range() {
+        // Everything that comes out must belong to 100.64.0.0/10.
         for seed in 0u8..50 {
             let vip = derive_cgnat_ip(&[seed; 32], 0);
             let oct = vip.octets();
             assert_eq!(oct[0], 100, "vip={vip}");
-            assert!((64..=127).contains(&oct[1]), "vip={vip} hors /10");
+            assert!((64..=127).contains(&oct[1]), "vip={vip} outside /10");
         }
     }
 
     #[test]
-    fn derivation_deterministe() {
+    fn deterministic_derivation() {
         let pk = [7u8; 32];
         assert_eq!(derive_cgnat_ip(&pk, 0), derive_cgnat_ip(&pk, 0));
-        // Deux clés différentes ⇒ (quasi toujours) deux VIP différentes.
+        // Two different keys ⇒ (almost always) two different VIPs.
         assert_ne!(
             derive_cgnat_ip(&[1u8; 32], 0),
             derive_cgnat_ip(&[2u8; 32], 0)
@@ -160,36 +159,39 @@ mod tests {
     }
 
     #[test]
-    fn meme_client_recupere_sa_vip_apres_reboot() {
-        // Table vide = état « après redémarrage » : aucune persistance.
+    fn same_client_recovers_its_vip_after_a_reboot() {
+        // Empty table = "after restart" state: no persistence.
         let table = FakeTable::default();
         let pk = [42u8; 32];
-        let avant = assign_vip(&table, &pk, 64).unwrap();
-        let apres = assign_vip(&FakeTable::default(), &pk, 64).unwrap();
-        assert_eq!(avant, apres, "la VIP doit être stable sans état sur disque");
-    }
-
-    #[test]
-    fn collision_resolue_par_re_derivation() {
-        let pk_a = [1u8; 32];
-        let pk_b = [2u8; 32];
-        // On force une collision : on occupe la VIP naturelle de B avec A.
-        let vip_b_naturelle = derive_cgnat_ip(&pk_b, 0);
-        let mut table = FakeTable::default();
-        table.insert(vip_b_naturelle, &pk_a);
-
-        let vip_b = assign_vip(&table, &pk_b, 64).unwrap();
-        assert_ne!(vip_b, vip_b_naturelle, "B doit éviter la VIP prise par A");
+        let before = assign_vip(&table, &pk, 64).unwrap();
+        let after = assign_vip(&FakeTable::default(), &pk, 64).unwrap();
         assert_eq!(
-            vip_b,
-            derive_cgnat_ip(&pk_b, 1),
-            "B bascule sur le compteur 1"
+            before, after,
+            "the VIP must be stable without state on disk"
         );
     }
 
     #[test]
-    fn client_ne_collisionne_pas_avec_lui_meme() {
-        // Si la VIP est déjà à MOI (reconnexion), je la garde — pas de dérive.
+    fn collision_resolved_by_re_derivation() {
+        let pk_a = [1u8; 32];
+        let pk_b = [2u8; 32];
+        // Force a collision: occupy B's natural VIP with A.
+        let vip_b_natural = derive_cgnat_ip(&pk_b, 0);
+        let mut table = FakeTable::default();
+        table.insert(vip_b_natural, &pk_a);
+
+        let vip_b = assign_vip(&table, &pk_b, 64).unwrap();
+        assert_ne!(vip_b, vip_b_natural, "B must avoid the VIP taken by A");
+        assert_eq!(
+            vip_b,
+            derive_cgnat_ip(&pk_b, 1),
+            "B falls back to counter 1"
+        );
+    }
+
+    #[test]
+    fn client_does_not_collide_with_itself() {
+        // If the VIP is already MINE (reconnection), I keep it — no drift.
         let pk = [9u8; 32];
         let vip = derive_cgnat_ip(&pk, 0);
         let mut table = FakeTable::default();
@@ -198,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn jamais_d_hote_reserve() {
+    fn never_a_reserved_host() {
         assert_eq!(normalize_host(0), 1);
         assert_eq!(normalize_host(HOST_MASK), HOST_MASK - 1);
         assert_eq!(normalize_host(1234), 1234);

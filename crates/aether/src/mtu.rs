@@ -1,61 +1,63 @@
-//! Calcul du MTU d'un tunnel WireGuard.
+//! WireGuard tunnel MTU computation.
 //!
-//! WireGuard laisse 1420 par défaut, ce qui suppose un transport à 1500. Dès
-//! que le lien qui porte le tunnel est plus étroit — WSL2 à 1280, PPPoE à 1492,
-//! tunnels IPv6, réseaux mobiles — les paquets chiffrés dépassent le MTU du
-//! transport et sont **jetés en silence**.
+//! WireGuard defaults to 1420, which assumes a 1500-byte transport. As soon
+//! as the link carrying the tunnel is narrower — WSL2 at 1280, PPPoE at
+//! 1492, IPv6 tunnels, mobile networks — encrypted packets exceed the
+//! transport MTU and are **silently dropped**.
 //!
-//! Le symptôme égare : le handshake passe (petits paquets), les requêtes
-//! courtes aussi, et seules les grosses disparaissent — un ciphertext ML-KEM,
-//! par exemple. Le diagnostic ressemble alors à une panne applicative.
+//! The symptom is misleading: the handshake goes through (small packets),
+//! short requests too, and only large ones disappear — an ML-KEM
+//! ciphertext, for example. The diagnosis then looks like an application
+//! failure.
 //!
-//! # Pourquoi le calcul est ici
+//! # Why the computation lives here
 //!
-//! Les deux bouts en ont besoin et doivent s'accorder : la gateway pour son
-//! interface, Orion pour la sienne. Le partager évite deux arithmétiques qui
-//! divergent.
+//! Both ends need it and must agree: the gateway for its interface, Orion
+//! for its own. Sharing it avoids two arithmetics that diverge.
 //!
-//! # Ce que ce module ne résout pas
+//! # What this module does not solve
 //!
-//! Le MTU WireGuard est **par interface, pas par pair**. La gateway n'ayant
-//! qu'une interface pour tous ses clients, elle ne peut pas servir un MTU
-//! différent à chacun : elle prend une valeur dérivée de son WAN, et les
-//! clients dont le chemin est plus étroit relèvent du MSS clamping (TCP) ou du
-//! PMTUD (UDP). Côté client, en revanche, une interface ne porte qu'un pair :
-//! le MTU y est donc exactement celui du chemin.
+//! WireGuard's MTU is **per interface, not per peer**. Since the gateway has
+//! only one interface for all its clients, it cannot serve a different MTU
+//! to each: it takes a value derived from its WAN, and clients whose path is
+//! narrower fall under MSS clamping (TCP) or PMTUD (UDP). On the client
+//! side, however, an interface carries only one peer: the MTU there is
+//! therefore exactly that of the path.
 //!
-//! Les jumbo frames ne sont pas traitées : un jumbo n'existe que si *chaque*
-//! saut l'accepte, ce qui exclut un client road-warrior joignant la gateway par
-//! Internet, où le PMTU est en pratique ≤ 1500.
+//! Jumbo frames are not handled: a jumbo frame only exists if *every* hop
+//! accepts it, which excludes a road-warrior client reaching the gateway
+//! over the Internet, where the PMTU is in practice ≤ 1500.
 
-/// Surcoût d'encapsulation WireGuard, en octets.
+/// WireGuard encapsulation overhead, in bytes.
 ///
-/// Détail : en-tête IPv6 (40) + UDP (8) + en-tête WireGuard (16) + tag
-/// Poly1305 (16). En IPv4 l'en-tête n'est que de 20 octets, soit 60 au total.
+/// Breakdown: IPv6 header (40) + UDP (8) + WireGuard header (16) + Poly1305
+/// tag (16). In IPv4 the header is only 20 bytes, i.e. 60 in total.
 ///
-/// On retient systématiquement le cas IPv6, le plus coûteux. Distinguer les
-/// deux familles gagnerait 20 octets de charge utile, au prix d'une décision
-/// prise à l'exécution sur l'adresse du pair — se tromper coûte un tunnel qui
-/// perd silencieusement ses gros paquets, ce qui n'en vaut pas la peine.
+/// We systematically keep the IPv6 case, the costlier one. Distinguishing
+/// the two families would gain 20 bytes of payload, at the cost of a
+/// decision made at runtime based on the peer's address — getting it wrong
+/// costs a tunnel that silently loses its large packets, which is not worth
+/// it.
 pub const SURCOUT_WIREGUARD: u32 = 80;
 
-/// MTU plancher, en octets.
+/// Floor MTU, in bytes.
 ///
-/// 576 est le minimum qu'un hôte IPv4 doit accepter (RFC 791). Un plancher à
-/// 1280 — minimum IPv6 — serait ici contre-productif : sur un transport déjà à
-/// 1280, il annulerait le calcul et reproduirait exactement la panne que ce
-/// module corrige.
+/// 576 is the minimum an IPv4 host must accept (RFC 791). A floor at 1280 —
+/// the IPv6 minimum — would here be counterproductive: on a transport
+/// already at 1280, it would cancel out the computation and reproduce
+/// exactly the failure this module fixes.
 pub const MTU_PLANCHER: u32 = 576;
 
-/// MTU par défaut d'un transport dont on n'a pas su lire la valeur.
+/// Default MTU of a transport whose value could not be read.
 pub const MTU_TRANSPORT_DEFAUT: u32 = 1500;
 
-/// MTU à poser sur l'interface WireGuard, déduit du MTU du lien qui la porte.
+/// MTU to set on the WireGuard interface, derived from the MTU of the link
+/// carrying it.
 ///
 /// ```
 /// use aether::mtu::tunnel_mtu;
-/// assert_eq!(tunnel_mtu(1500), 1420); // Ethernet : la valeur usuelle
-/// assert_eq!(tunnel_mtu(1280), 1200); // WSL2 : là où le défaut échoue
+/// assert_eq!(tunnel_mtu(1500), 1420); // Ethernet: the usual value
+/// assert_eq!(tunnel_mtu(1280), 1200); // WSL2: where the default fails
 /// ```
 pub fn tunnel_mtu(mtu_transport: u32) -> u32 {
     mtu_transport
@@ -68,45 +70,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn le_cas_ethernet_donne_la_valeur_usuelle() {
-        // 1420 est le défaut de WireGuard : sur un transport à 1500, le calcul
-        // doit retomber dessus, sinon il change le comportement nominal.
+    fn the_ethernet_case_gives_the_usual_value() {
+        // 1420 is WireGuard's default: on a transport at 1500, the
+        // computation must fall back to it, otherwise it changes nominal
+        // behavior.
         assert_eq!(tunnel_mtu(1500), 1420);
     }
 
     #[test]
-    fn un_transport_etroit_est_reduit_et_non_planche_a_1280() {
-        // Non-régression du bug constaté sur cible : un plancher à 1280 aurait
-        // laissé 1280 ici, soit exactement le MTU du transport — donc des
-        // paquets chiffrés systématiquement trop gros.
+    fn a_narrow_transport_is_reduced_and_not_floored_at_1280() {
+        // Non-regression of the bug observed on target: a floor at 1280
+        // would have left 1280 here, i.e. exactly the transport's MTU —
+        // hence encrypted packets systematically too large.
         assert_eq!(tunnel_mtu(1280), 1200);
         assert!(tunnel_mtu(1280) < 1280);
     }
 
     #[test]
-    fn le_surcout_couvre_la_mesure_sur_materiel() {
-        // Mesuré sur cible, transport à 1280 : 1220 passe, 1221 échoue. Le
-        // surcoût réel en IPv4 est donc de 60 octets, et la valeur retenue doit
-        // rester sous cette limite pour couvrir aussi IPv6.
-        let limite_ipv4_mesuree = 1280 - 60;
-        assert!(tunnel_mtu(1280) <= limite_ipv4_mesuree);
+    fn the_overhead_covers_the_measurement_on_hardware() {
+        // Measured on target, transport at 1280: 1220 passes, 1221 fails.
+        // The real IPv4 overhead is therefore 60 bytes, and the chosen value
+        // must stay under this limit to also cover IPv6.
+        let measured_ipv4_limit = 1280 - 60;
+        assert!(tunnel_mtu(1280) <= measured_ipv4_limit);
     }
 
     #[test]
-    fn le_pppoe_est_pris_en_compte() {
+    fn pppoe_is_accounted_for() {
         assert_eq!(tunnel_mtu(1492), 1412);
     }
 
     #[test]
-    fn un_transport_absurde_ne_deborde_pas() {
+    fn an_absurd_transport_does_not_overflow() {
         assert_eq!(tunnel_mtu(0), MTU_PLANCHER);
         assert_eq!(tunnel_mtu(10), MTU_PLANCHER);
     }
 
     #[test]
-    fn un_jumbo_local_est_transmis_sans_plafonnement() {
-        // Gateway et client sur un même LAN jumbo : le calcul ne doit pas
-        // brider ce que le lien permet réellement.
+    fn a_local_jumbo_frame_is_passed_through_uncapped() {
+        // Gateway and client on the same jumbo LAN: the computation must not
+        // cap what the link actually allows.
         assert_eq!(tunnel_mtu(9000), 8920);
     }
 }

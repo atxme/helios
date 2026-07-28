@@ -1,22 +1,33 @@
-//! Import de profils Orion depuis un document d'échange.
+//! Import of Orion profiles from an exchange document.
 //!
-//! Deux formats sont acceptés : le JSON Orion versionné, destiné aux outils
-//! Helios, et le format `wg-quick` à un seul pair. L'import ne persiste rien :
-//! il produit un [`ClientProfile`] validé que l'IHM présente comme brouillon.
+//! Two formats are accepted: versioned Orion JSON, intended for Helios tools,
+//! and the single-peer `wg-quick` format. Import persists nothing: it
+//! produces a validated [`ClientProfile`] that the UI presents as a draft.
 
-use std::{collections::HashMap, fs::File, io::Read, net::IpAddr, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{ClientConfig, ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
+use aether::key_negotiation::ProtectionMode;
 
-/// Identifiant stable du document JSON échangeable avec Orion.
+use crate::{
+    config::validate_key_negotiation, identity_store::ClientIdentityBundle, ClientConfig,
+    ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
+};
+
+/// Stable identifier of the JSON document exchangeable with Orion.
 pub const PROFILE_IMPORT_FORMAT: &str = "orion-profile";
-/// Version courante du document JSON échangeable avec Orion.
+/// Current version of the JSON document exchangeable with Orion.
 pub const PROFILE_IMPORT_VERSION: u16 = 1;
-/// Taille maximale d'un profil importé. Un profil normal tient dans quelques Ko.
+/// Maximum size of an imported profile. A normal profile fits in a few KB.
 pub const MAX_PROFILE_IMPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -40,9 +51,10 @@ struct JsonHeader {
 struct JsonProfile {
     name: String,
     endpoint: String,
-    /// Absente dans un profil d'invitation : l'opérateur ne détient pas la clé
-    /// privée du client et n'a donc rien à lui renvoyer (ADR-004 §6). L'IHM
-    /// complète alors depuis le profil local de même nom.
+    /// Absent in an invitation profile: the operator doesn't hold the
+    /// client's private key and therefore has nothing to send back
+    /// (ADR-004 §6). [`complete_profile_import`] then takes it from the local
+    /// profile holding the admitted key.
     #[serde(default)]
     private_key: String,
     peer_public_key: String,
@@ -56,6 +68,53 @@ struct JsonProfile {
     persistent_keepalive: Option<u16>,
     #[serde(default)]
     heliosd_url: Option<String>,
+    /// Public key-negotiation material distributed with the profile.
+    ///
+    /// The client's own certificate and private key never travel here: they
+    /// go into the machine's protected identity store, and the document only
+    /// names the entry to look up.
+    #[serde(default)]
+    key_negotiation: Option<JsonKeyNegotiation>,
+    /// Client identity, when the operator ships it with the profile.
+    ///
+    /// **Never lands in [`ClientProfile`]**: it goes to the machine's
+    /// protected store and the profile keeps only the entry name. A
+    /// document carrying it is a secret and must be destroyed after import.
+    #[serde(default)]
+    key_negotiation_identity: Option<ClientIdentityBundle>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonKeyNegotiation {
+    mode: ProtectionMode,
+    #[serde(default)]
+    minimum_mode: Option<ProtectionMode>,
+    endpoint: String,
+    server_name: String,
+    gateway_ca_der: String,
+    gateway_pq_certificate: String,
+    identity: String,
+}
+
+impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
+    fn from(value: JsonKeyNegotiation) -> Self {
+        Self {
+            mode: value.mode,
+            // An absent floor is not "no floor": a document asking for ML-KEM
+            // that would accept a classic negotiation tomorrow protects
+            // nothing. The floor therefore starts at the mode the operator
+            // chose, and an explicit floor is honored as-is — including a
+            // contradictory one, which import then rejects rather than
+            // silently repairs.
+            minimum_mode: value.minimum_mode.unwrap_or(value.mode),
+            endpoint: value.endpoint,
+            server_name: value.server_name,
+            gateway_ca_der: value.gateway_ca_der,
+            gateway_pq_certificate: value.gateway_pq_certificate,
+            identity: value.identity,
+        }
+    }
 }
 
 impl From<JsonProfile> for ClientProfile {
@@ -74,15 +133,80 @@ impl From<JsonProfile> for ClientProfile {
                 .persistent_keepalive
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
+            key_negotiation: profile.key_negotiation.map(KeyNegotiationSettings::from),
+            // A document is a configuration: any PSK it carries was shared
+            // out of band, never negotiated.
+            preshared_key_is_negotiated: false,
         }
     }
 }
 
-/// Décode un profil importé sans l'écrire sur disque.
+/// A decoded document: the profile, and the identity that came with it.
 ///
-/// Le suffixe du fichier choisit le parseur ; pour un fichier sans suffixe,
-/// le premier caractère significatif permet de reconnaître JSON ou wg-quick.
-pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientProfile> {
+/// The two are returned separately because they have opposite destinies —
+/// the profile is persisted in `profiles.toml`, the identity is sealed into
+/// the protected store and the plaintext is dropped. Returning one value that
+/// mixed them would make it far too easy to write the secret to disk.
+#[derive(Debug)]
+pub struct ProfileImport {
+    pub profile: ClientProfile,
+    /// Present only when the operator shipped the identity in the document.
+    pub identity: Option<ClientIdentityBundle>,
+}
+
+impl ProfileImport {
+    /// WireGuard public key the gateway admitted for this document.
+    ///
+    /// Read from the client PQ certificate that travels with the identity:
+    /// admission is bound to **that** key, so it is what says which local
+    /// private key completes an invitation. The profile name never proved
+    /// anything — the same client is routinely named differently on the
+    /// operator's side and on the user's machine.
+    ///
+    /// `None` when the document ships no identity, or when its certificate
+    /// carries no key: completion then falls back to the name.
+    pub fn admitted_public_key(&self) -> Option<String> {
+        let identity = self.identity.as_ref()?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(identity.pq_certificate.trim())
+            .ok()?;
+        let certificate: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let key = certificate.get("wireguard_public_key")?.as_str()?.trim();
+        (!key.is_empty()).then(|| key.to_string())
+    }
+}
+
+/// A decoded document, completed against the local configuration.
+///
+/// The private key is reported missing rather than raised as an error: the
+/// rest of the document is sound and worth showing — endpoint, virtual
+/// address, pinned certificate — and a screen that displays it lets the user
+/// paste the key or re-enroll. Refusing outright left them with nothing to
+/// look at and no idea which key was expected.
+#[derive(Debug)]
+pub struct CompletedImport {
+    pub profile: ClientProfile,
+    /// User-facing explanation when no local profile holds the private half.
+    /// The profile is then handed over with an empty `private_key`, and
+    /// stays unconnectable until it is filled in.
+    pub private_key_missing: Option<String>,
+}
+
+/// Suffixes of an Orion document.
+///
+/// `.orionprofile` is **ours**: it is what `helios-ctl enroll` writes and what
+/// Windows associates with Orion. Leaving it out made its recognition rest
+/// entirely on the first character, so the slightest disturbance at the head
+/// of the file — a byte-order mark from a copy through PowerShell, a stray
+/// blank line — produced «format inconnu» about the very extension the tool
+/// distributes.
+const ORION_SUFFIXES: &[&str] = &[".orionprofile", ".json"];
+
+/// Decodes an imported profile without writing it to disk.
+///
+/// The file suffix picks the parser; for a suffix-less file, the first
+/// meaningful character lets us recognize JSON or wg-quick.
+pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileImport> {
     if contents.len() > MAX_PROFILE_IMPORT_BYTES {
         anyhow::bail!(
             "fichier trop volumineux (maximum {} Kio)",
@@ -92,22 +216,45 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ClientPro
 
     let lower_name = file_name.to_ascii_lowercase();
     let trimmed = contents.trim_start_matches('\u{feff}').trim_start();
-    let profile = if lower_name.ends_with(".json") || trimmed.starts_with('{') {
+    let named_orion = ORION_SUFFIXES
+        .iter()
+        .any(|suffix| lower_name.ends_with(suffix));
+    // wg-quick has no notion of a client identity: only the Orion document
+    // can carry one.
+    let (profile, identity) = if named_orion || trimmed.starts_with('{') {
         parse_json(trimmed)?
     } else if lower_name.ends_with(".conf") || trimmed.starts_with('[') {
-        parse_wg_quick(trimmed, file_name)?
+        (parse_wg_quick(trimmed, file_name)?, None)
     } else {
-        anyhow::bail!("format inconnu : choisir un fichier Orion .json ou WireGuard .conf");
+        anyhow::bail!(
+            "format inconnu : « {file_name} » ne commence ni par « {{ » (document Orion) ni par « [ » (profil WireGuard) — {}",
+            describe_head(trimmed)
+        );
     };
 
-    validate_imported_profile(profile)
+    let profile = validate_imported_profile(profile)?;
+    if let Some(identity) = &identity {
+        identity.validate()?;
+        // A document shipping an identity for an entry the profile does not
+        // name would seal a secret nothing would ever read.
+        let expected = profile
+            .key_negotiation
+            .as_ref()
+            .map(|settings| settings.identity.trim());
+        if expected != Some(identity.identity.trim()) {
+            anyhow::bail!(
+                "l'identité fournie (« {} ») ne correspond pas à celle que le profil désigne",
+                identity.identity
+            );
+        }
+    }
+    Ok(ProfileImport { profile, identity })
 }
 
-/// Lit un profil depuis un chemin sans jamais allouer plus que la borne
-/// d'import. La vérification porte sur les octets réellement lus : une taille
-/// issue des métadonnées ne suffirait pas face à un fichier modifié en cours de
-/// lecture.
-pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
+/// Reads a profile from a path without ever allocating more than the import
+/// limit. The check applies to bytes actually read: a size derived from
+/// metadata wouldn't suffice against a file modified during reading.
+pub fn read_profile_import_path(path: &Path) -> Result<ProfileImport> {
     let file = File::open(path).with_context(|| format!("ouverture de {}", path.display()))?;
     let mut bytes = Vec::with_capacity(MAX_PROFILE_IMPORT_BYTES.min(4096));
     file.take((MAX_PROFILE_IMPORT_BYTES + 1) as u64)
@@ -119,7 +266,7 @@ pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
             MAX_PROFILE_IMPORT_BYTES / 1024
         );
     }
-    let contents = String::from_utf8(bytes).context("le profil n'est pas encodé en UTF-8")?;
+    let contents = decode_document(&bytes)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -127,35 +274,140 @@ pub fn read_profile_import_path(path: &Path) -> Result<ClientProfile> {
     parse_profile_import(&contents, file_name)
 }
 
-/// Complète un document d'invitation depuis le profil local de même nom.
+/// Decodes a document whatever byte-order mark it carries.
 ///
-/// Les imports par sélecteur de fichier et par association système appellent
-/// tous deux cette fonction. Une invitation reçue sur une autre machine est
-/// refusée explicitement : fabriquer une nouvelle clé privée romprait
-/// l'admission déjà liée à la clé publique originale.
+/// A profile is a file a human carries from one machine to another, and that
+/// trip re-encodes it: Windows PowerShell's `Out-File` writes UTF-16LE by
+/// default, Notepad long prefixed UTF-8 with a BOM. Refusing those would be
+/// technically defensible and practically useless — the document is intact,
+/// only its clothing changed. What is **not** accepted is anything else: a
+/// silent lossy conversion would turn a base64 key into a key that no longer
+/// decodes, and the failure would surface much later, as a handshake that
+/// never happens.
+///
+/// The frontend does the same thing on the file-picker path, where the bytes
+/// never reach Rust (`apps/orion/src/profileDocument.ts`). The two must
+/// accept the same files: an import that works by double-click and fails
+/// through the button is impossible to explain to the person doing it.
+fn decode_document(bytes: &[u8]) -> Result<String> {
+    fn from_utf16(bytes: &[u8], little_endian: bool) -> Result<String> {
+        if !bytes.len().is_multiple_of(2) {
+            anyhow::bail!("le profil est encodé en UTF-16 mais tronqué (nombre impair d'octets)");
+        }
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| {
+                if little_endian {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&units).context("le profil n'est pas un texte UTF-16 valide")
+    }
+
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => from_utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => from_utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => {
+            String::from_utf8(rest.to_vec()).context("le profil n'est pas encodé en UTF-8")
+        }
+        _ => String::from_utf8(bytes.to_vec()).context("le profil n'est pas encodé en UTF-8"),
+    }
+}
+
+/// Says what the document starts with, for a format error.
+///
+/// «format inconnu» alone leaves the user re-reading a file that looks right
+/// to them. Quoting the head is what distinguishes an empty file from an
+/// HTML error page saved by mistake, or from a text mangled by an encoding
+/// conversion.
+fn describe_head(trimmed: &str) -> String {
+    if trimmed.is_empty() {
+        return "le fichier est vide".to_string();
+    }
+    // U+FFFD is what a UTF-8 decoder leaves behind when handed UTF-16: the
+    // document is intact, its encoding is not the expected one.
+    if trimmed.starts_with('\u{fffd}') || trimmed.contains('\0') {
+        return "le fichier n'est pas du texte UTF-8 : le réenregistrer en UTF-8, ou le recopier \
+                sans passer par un éditeur"
+            .to_string();
+    }
+    let head: String = trimmed
+        .chars()
+        .take(24)
+        .flat_map(char::escape_debug)
+        .collect();
+    format!("il commence par « {head} »")
+}
+
+/// Completes an invitation document from the local profile that holds the
+/// admitted key.
+///
+/// Both file-picker and system-association imports call this function. No
+/// private key is ever fabricated here: a new one would break the admission
+/// the gateway already granted to the original public key.
+///
+/// `admitted_public_key` — see [`ProfileImport::admitted_public_key`] — is
+/// what designates the local profile. It is matched by **key**, not by name:
+/// `helios-ctl enroll --public-key` is normally run for a client that already
+/// exists locally under another name, and the name rule alone refused those
+/// documents. When the document names no key, the name stays the only
+/// available criterion.
 pub fn complete_profile_import(
     mut profile: ClientProfile,
     config: &ClientConfig,
-) -> Result<ClientProfile> {
-    if profile.private_key.is_empty() {
-        let existing = config
-            .find(&profile.name)
-            .filter(|candidate| !candidate.private_key.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "ce profil ne contient pas de clé privée et aucun profil local « {} » n'en fournit une ; l'importer sur le poste qui a généré la clé ou demander un profil complet à l'opérateur",
-                    profile.name
-                )
-            })?;
-        profile.private_key = existing.private_key.clone();
+    admitted_public_key: Option<&str>,
+) -> Result<CompletedImport> {
+    if !profile.private_key.is_empty() {
+        profile.validate()?;
+        return Ok(CompletedImport {
+            profile,
+            private_key_missing: None,
+        });
     }
+
+    let local = match admitted_public_key {
+        // A same-name profile holding *another* key is not a match: it was
+        // never admitted, and its tunnel would fail at the first handshake
+        // without saying why.
+        Some(admitted) => config
+            .profiles
+            .iter()
+            .find(|candidate| candidate.public_key().as_deref() == Some(admitted)),
+        None => config
+            .find(&profile.name)
+            .filter(|candidate| !candidate.private_key.trim().is_empty()),
+    };
+
+    let Some(existing) = local else {
+        let missing = match admitted_public_key {
+            Some(admitted) => format!(
+                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil de ce poste ne détient la clé admise « {admitted} ». Coller la clé privée correspondante, ou demander un profil complet à l'opérateur."
+            ),
+            None => format!(
+                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil local « {} » n'en fournit une. Coller la clé privée correspondante, ou demander un profil complet à l'opérateur.",
+                profile.name
+            ),
+        };
+        return Ok(CompletedImport {
+            profile,
+            private_key_missing: Some(missing),
+        });
+    };
+
+    profile.private_key = existing.private_key.clone();
     profile.validate()?;
-    Ok(profile)
+    Ok(CompletedImport {
+        profile,
+        private_key_missing: None,
+    })
 }
 
-fn parse_json(contents: &str) -> Result<ClientProfile> {
-    // Lire d'abord l'en-tête garantit une erreur de version intelligible même
-    // si une version future modifie entièrement la forme de `profile`.
+fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
+    // Reading the header first guarantees an intelligible version error even
+    // if a future version entirely changes the shape of `profile`.
     let header: JsonHeader =
         serde_json::from_str(contents).context("document JSON Orion invalide")?;
     if header.format != PROFILE_IMPORT_FORMAT {
@@ -172,7 +424,12 @@ fn parse_json(contents: &str) -> Result<ClientProfile> {
     }
     let envelope: JsonEnvelope =
         serde_json::from_str(contents).context("document JSON Orion invalide")?;
-    Ok(envelope.profile.into())
+    let mut profile = envelope.profile;
+    // Taken out before the conversion: `ClientProfile` has no field for it,
+    // and that is the property worth keeping — the secret cannot reach
+    // `profiles.toml` by way of a struct update.
+    let identity = profile.key_negotiation_identity.take();
+    Ok((profile.into(), identity))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -276,6 +533,8 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
             .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),
         persistent_keepalive: keepalive,
         heliosd_url: None,
+        key_negotiation: None,
+        preshared_key_is_negotiated: false,
     })
 }
 
@@ -321,6 +580,99 @@ fn profile_name_from_file(file_name: &str) -> String {
     }
 }
 
+/// Field-by-field diagnostic of a profile being edited.
+///
+/// `None` = nothing to report. Each field is independent of the others.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIssues {
+    pub name: Option<String>,
+    pub endpoint: Option<String>,
+    pub private_key: Option<String>,
+    pub peer_public_key: Option<String>,
+    pub preshared_key: Option<String>,
+    pub address: Option<String>,
+    pub allowed_ips: Option<String>,
+    pub persistent_keepalive: Option<String>,
+    pub heliosd_url: Option<String>,
+    /// Fault of the key-negotiation block as a whole.
+    ///
+    /// Deliberately a single message rather than one per sub-field: what
+    /// makes the block wrong is almost always a relation — a mode below the
+    /// floor, a PSK that contradicts the mode, a certificate pinned to
+    /// another gateway. Reporting the fault on one sub-field would designate
+    /// the wrong culprit.
+    pub key_negotiation: Option<String>,
+}
+
+impl ProfileIssues {
+    /// `true` if at least one field is faulty.
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Reports **all** faulty fields of a profile being edited.
+///
+/// Unlike [`parse_profile_import`], which refuses a document at the first
+/// fault, this inspection doesn't stop: the UI must be able to highlight
+/// every field in one pass, rather than discovering one at a time on each
+/// save attempt.
+///
+/// **An empty field is not reported.** While typing, "not filled in yet" is
+/// not "impossible" — marking a fresh profile red would be noise.
+/// Completeness is judged elsewhere, at connection time.
+///
+/// The validators are the same as import's: that's deliberate. Two rule sets,
+/// one for import and one for editing, would eventually diverge and the UI
+/// would accept values the core refuses.
+pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
+    /// Only validates if the value is filled in.
+    fn when_filled(value: &str, check: impl Fn(&str) -> Result<()>) -> Option<String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        check(trimmed).err().map(|error| error.to_string())
+    }
+
+    ProfileIssues {
+        name: None,
+        endpoint: when_filled(&profile.endpoint, validate_endpoint),
+        private_key: when_filled(&profile.private_key, |value| {
+            validate_wg_key(value, "clé privée")
+        }),
+        peer_public_key: when_filled(&profile.peer_public_key, |value| {
+            validate_wg_key(value, "clé publique de la gateway")
+        }),
+        preshared_key: profile
+            .preshared_key
+            .as_deref()
+            .and_then(|value| when_filled(value, |value| validate_wg_key(value, "PSK"))),
+        address: profile.address.as_deref().and_then(|value| {
+            when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
+        }),
+        allowed_ips: when_filled(&profile.allowed_ips, |value| {
+            validate_cidr(value, "trafic capté")
+        }),
+        // Zero is not "empty": it's a value, and it disables keepalive while
+        // a client behind NAT depends on it.
+        persistent_keepalive: (profile.persistent_keepalive == 0)
+            .then(|| "le keepalive doit être supérieur à zéro".to_string()),
+        heliosd_url: profile
+            .heliosd_url
+            .as_deref()
+            .and_then(|value| when_filled(value, validate_heliosd_url)),
+        // The block is only judged once the gateway key it is pinned to is
+        // readable: without it, every certificate would look wrong while the
+        // profile is merely incomplete.
+        key_negotiation: profile.key_negotiation.as_ref().and_then(|settings| {
+            when_filled(&profile.peer_public_key, |peer_public_key| {
+                validate_key_negotiation(settings, peer_public_key, profile.has_preshared_key())
+            })
+        }),
+    }
+}
+
 fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile> {
     profile.name = profile.name.trim().to_string();
     profile.endpoint = profile.endpoint.trim().to_string();
@@ -335,10 +687,10 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
         anyhow::bail!("le nom du profil est requis");
     }
     validate_endpoint(&profile.endpoint)?;
-    // Un profil d'invitation arrive sans clé privée : l'opérateur n'a jamais
-    // détenu celle du client, c'est précisément ce qui rend ce mode sûr. Le
-    // document reste rejeté si la clé est présente mais malformée — une clé
-    // tronquée n'est pas une invitation, c'est une erreur.
+    // An invitation profile arrives without a private key: the operator
+    // never held the client's, which is precisely what makes this mode safe.
+    // The document is still rejected if the key is present but malformed —
+    // a truncated key isn't an invitation, it's an error.
     if !profile.private_key.is_empty() {
         validate_wg_key(&profile.private_key, "clé privée du client")?;
     }
@@ -361,6 +713,22 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     if let Some(url) = &profile.heliosd_url {
         validate_heliosd_url(url)?;
     }
+    // Taken out of the profile: the block is validated against the peer key
+    // and the PSK of the very profile that carries it.
+    if let Some(mut settings) = profile.key_negotiation.take() {
+        settings.endpoint = settings.endpoint.trim().to_string();
+        settings.server_name = settings.server_name.trim().to_string();
+        settings.gateway_ca_der = settings.gateway_ca_der.trim().to_string();
+        settings.gateway_pq_certificate = settings.gateway_pq_certificate.trim().to_string();
+        settings.identity = settings.identity.trim().to_string();
+        validate_endpoint(&settings.endpoint).context("endpoint de négociation de clé invalide")?;
+        validate_key_negotiation(
+            &settings,
+            &profile.peer_public_key,
+            profile.has_preshared_key(),
+        )?;
+        profile.key_negotiation = Some(settings);
+    }
     Ok(profile)
 }
 
@@ -371,12 +739,28 @@ fn non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Length of a WireGuard key: 32 raw bytes…
+const WG_KEY_BYTES: usize = 32;
+/// …i.e. exactly 44 characters once base64-encoded.
+const WG_KEY_BASE64_LEN: usize = 44;
+
+/// Validates a base64-encoded Curve25519 key.
+///
+/// The messages say what's expected, not just that it's refused: "base64
+/// expected" doesn't help anyone see that a character is missing at the end
+/// of a truncated copy-paste. The observed length is given so it can be
+/// compared at a glance to the expected 44 characters.
 fn validate_wg_key(value: &str, label: &str) -> Result<()> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .with_context(|| format!("{label} invalide : base64 attendu"))?;
-    if decoded.len() != 32 {
-        anyhow::bail!("{label} invalide : 32 octets attendus");
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) else {
+        anyhow::bail!(
+            "{label} : caractères invalides. Une clé WireGuard fait {WG_KEY_BASE64_LEN} caractères base64 (A–Z, a–z, 0–9, + et /) et se termine par « = »."
+        );
+    };
+    if decoded.len() != WG_KEY_BYTES {
+        anyhow::bail!(
+            "{label} : {} caractères au lieu de {WG_KEY_BASE64_LEN}. Une clé WireGuard fait {WG_KEY_BYTES} octets et se termine par « = » — vérifier que le copier-coller est complet.",
+            value.chars().count()
+        );
     }
     Ok(())
 }
@@ -402,6 +786,56 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
         .context("Endpoint invalide : port UDP non numérique")?;
     if port == 0 {
         anyhow::bail!("Endpoint invalide : le port UDP doit être supérieur à zéro");
+    }
+    validate_endpoint_host(host)
+}
+
+/// Validates an endpoint's host: IPv6 literal in brackets, IPv4 address, or
+/// hostname.
+///
+/// The case that motivates this function: `86.229.1286` is **neither** a
+/// valid IPv4 (1286 exceeds 255) **nor** a legitimate hostname — RFC 1123
+/// forbids a last label from being entirely numeric, precisely so the two
+/// can't be confused. Without this rule, a mistyped IPv4 passes for a domain
+/// name and the defect only shows up at the first handshake, as a failing
+/// DNS resolution.
+fn validate_endpoint_host(host: &str) -> Result<()> {
+    if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return inner
+            .parse::<Ipv6Addr>()
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("Endpoint invalide : adresse IPv6 illisible"));
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+
+    if host.len() > 253 {
+        anyhow::bail!("Endpoint invalide : nom d'hôte trop long");
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for label in &labels {
+        if label.is_empty() {
+            anyhow::bail!("Endpoint invalide : nom d'hôte mal formé");
+        }
+        if label.len() > 63 {
+            anyhow::bail!("Endpoint invalide : partie de nom d'hôte trop longue");
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            anyhow::bail!("Endpoint invalide : caractère interdit dans le nom d'hôte");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!("Endpoint invalide : nom d'hôte mal formé");
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
+    {
+        anyhow::bail!("Endpoint invalide : adresse IP mal formée");
     }
     Ok(())
 }
@@ -444,8 +878,496 @@ mod tests {
     const CLIENT_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const GATEWAY_PUBLIC: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
 
+    /// Temporary directory of the calling test.
+    ///
+    /// Named after the process **and** the thread: the suite runs in
+    /// parallel, and two tests writing `portable.orionprofile` in one shared
+    /// directory would delete each other's file.
+    fn temp_directory(prefix: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn complete_profile() -> ClientProfile {
+        ClientProfile {
+            name: "poste".into(),
+            endpoint: "vpn.example.net:51820".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            peer_public_key: GATEWAY_PUBLIC.into(),
+            address: Some("100.64.1.2/32".into()),
+            allowed_ips: "0.0.0.0/0".into(),
+            persistent_keepalive: 25,
+            ..ClientProfile::default()
+        }
+    }
+
+    /// A mistyped IPv4 must not pass for a domain name.
+    ///
+    /// `86.229.1286` is the real case: 1286 exceeds 255, but the string
+    /// remains syntactically acceptable as a sequence of labels. Without the
+    /// RFC 1123 rule on the numeric last label, the defect only showed up at
+    /// the first handshake, as a failing DNS resolution.
     #[test]
-    fn importe_json_versionne_avec_defauts() {
+    fn a_malformed_ip_address_does_not_pass_for_a_hostname() {
+        for accepted in [
+            "86.229.12.86:51820",
+            "vpn.example.net:51820",
+            "gateway:51820",
+            "[2a01:cb1e:101d:4b5c::1]:51820",
+        ] {
+            let profile = ClientProfile {
+                endpoint: accepted.into(),
+                ..complete_profile()
+            };
+            assert_eq!(
+                inspect_profile(&profile).endpoint,
+                None,
+                "{accepted} should have been accepted"
+            );
+        }
+
+        for refused in [
+            "86.229.1286:51820",
+            "256.1.1.1:51820",
+            "10.0.0:51820",
+            "[zz::1]:51820",
+            "-mauvais.example.net:51820",
+            "vpn..example.net:51820",
+        ] {
+            let profile = ClientProfile {
+                endpoint: refused.into(),
+                ..complete_profile()
+            };
+            assert!(
+                inspect_profile(&profile).endpoint.is_some(),
+                "{refused} should have been refused"
+            );
+        }
+    }
+
+    /// The message must say **what's expected**, not just that it's refused.
+    /// "base64 expected" doesn't help see that a copy-paste was truncated;
+    /// the observed length against the expected 44 characters does.
+    #[test]
+    fn the_message_for_an_invalid_key_gives_the_expected_length() {
+        let truncated = &CLIENT_PRIVATE[..CLIENT_PRIVATE.len() - 4];
+        let profile = ClientProfile {
+            private_key: truncated.into(),
+            ..complete_profile()
+        };
+        let message = inspect_profile(&profile)
+            .private_key
+            .expect("a truncated key must be refused");
+        assert!(message.contains("44"), "message: {message}");
+        assert!(message.contains("clé privée"), "message: {message}");
+
+        let profile = ClientProfile {
+            peer_public_key: "not base64 at all!".into(),
+            ..complete_profile()
+        };
+        let message = inspect_profile(&profile)
+            .peer_public_key
+            .expect("forbidden characters must be refused");
+        assert!(message.contains("44"), "message: {message}");
+    }
+
+    #[test]
+    fn a_valid_profile_reports_no_field() {
+        assert!(!inspect_profile(&complete_profile()).any());
+    }
+
+    /// While typing, "not filled in yet" is not "impossible": marking a
+    /// fresh profile red would be noise.
+    #[test]
+    fn empty_fields_are_not_reported() {
+        let issues = inspect_profile(&ClientProfile::default());
+        assert_eq!(issues.endpoint, None);
+        assert_eq!(issues.private_key, None);
+        assert_eq!(issues.peer_public_key, None);
+        assert_eq!(issues.address, None);
+    }
+
+    /// The point of inspection versus import: it doesn't stop at the first
+    /// fault, otherwise the UI would discover one per attempt.
+    #[test]
+    fn all_faulty_fields_are_reported_in_one_pass() {
+        let profile = ClientProfile {
+            endpoint: "https://vpn.example.net".into(),
+            private_key: "not-base64".into(),
+            peer_public_key: "AAAA".into(),
+            address: Some("100.64.1.2".into()),
+            allowed_ips: "0.0.0.0/33".into(),
+            persistent_keepalive: 0,
+            heliosd_url: Some("100.64.0.1:8080".into()),
+            ..complete_profile()
+        };
+        let issues = inspect_profile(&profile);
+
+        assert!(issues.any());
+        for (field, value) in [
+            ("endpoint", &issues.endpoint),
+            ("private_key", &issues.private_key),
+            ("peer_public_key", &issues.peer_public_key),
+            ("address", &issues.address),
+            ("allowed_ips", &issues.allowed_ips),
+            ("persistent_keepalive", &issues.persistent_keepalive),
+            ("heliosd_url", &issues.heliosd_url),
+        ] {
+            assert!(value.is_some(), "{field} should have been reported");
+        }
+    }
+
+    /// Zero is not "empty": it's a value, and it cuts off the keepalive a
+    /// client behind NAT depends on.
+    #[test]
+    fn a_zero_keepalive_is_reported_while_an_absent_psk_is_not() {
+        let profile = ClientProfile {
+            persistent_keepalive: 0,
+            preshared_key: None,
+            ..complete_profile()
+        };
+        let issues = inspect_profile(&profile);
+        assert!(issues.persistent_keepalive.is_some());
+        assert_eq!(issues.preshared_key, None);
+    }
+
+    /// Gateway material as the operator distributes it: public certificate,
+    /// public CA, and the name of the protected store entry — never the
+    /// client's own private key.
+    fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
+        use aether::key_negotiation::{
+            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            PQ_CERTIFICATE_VERSION,
+        };
+        use base64::engine::general_purpose::STANDARD;
+
+        let (private_key, public_key) = generate_ml_dsa_65_keypair().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let certificate = issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [7u8; 16],
+                subject: "vpn.example.net".into(),
+                issuer: "vpn.example.net".into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: GATEWAY_PUBLIC.into(),
+                ml_dsa_65_public_key: STANDARD.encode(&public_key),
+                not_before_unix: now - 60,
+                not_after_unix: now + 3600,
+                ml_dsa_65_signature: String::new(),
+            },
+            &private_key,
+        )
+        .unwrap();
+
+        KeyNegotiationSettings {
+            mode,
+            minimum_mode: mode,
+            endpoint: "vpn.example.net:51821".into(),
+            server_name: "vpn.example.net".into(),
+            gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
+            gateway_pq_certificate: STANDARD.encode(serde_json::to_vec(&certificate).unwrap()),
+            identity: "orion-portable".into(),
+        }
+    }
+
+    fn document_with(settings: serde_json::Value) -> String {
+        serde_json::json!({
+            "format": PROFILE_IMPORT_FORMAT,
+            "version": PROFILE_IMPORT_VERSION,
+            "profile": {
+                "name": "portable",
+                "endpoint": "vpn.example.net:51820",
+                "private_key": CLIENT_PRIVATE,
+                "peer_public_key": GATEWAY_PUBLIC,
+                "address": "100.64.1.2/32",
+                "key_negotiation": settings,
+            }
+        })
+        .to_string()
+    }
+
+    /// The operator document is the vehicle for the negotiation settings:
+    /// without it, the screen would have nothing to display and the user
+    /// would have to retype a certificate by hand.
+    #[test]
+    fn imports_the_key_negotiation_block_of_an_operator_document() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let raw = document_with(serde_json::to_value(&settings).unwrap());
+
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
+        let imported = profile.key_negotiation.expect("block expected");
+        assert_eq!(imported.mode, ProtectionMode::MlKem);
+        assert_eq!(imported.minimum_mode, ProtectionMode::MlKem);
+        assert_eq!(imported.endpoint, "vpn.example.net:51821");
+        assert!(imported.gateway_pq_fingerprint().is_some());
+    }
+
+    /// An absent floor is not "no floor": accepting a classic negotiation
+    /// tomorrow would void the mode chosen today.
+    #[test]
+    fn an_imported_block_without_a_floor_takes_its_selected_mode_as_floor() {
+        let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+        settings
+            .as_object_mut()
+            .unwrap()
+            .remove("minimum_mode")
+            .expect("the fixture carries a floor");
+
+        let profile = parse_profile_import(&document_with(settings), "portable.json")
+            .unwrap()
+            .profile;
+        assert_eq!(
+            profile.key_negotiation.unwrap().minimum_mode,
+            ProtectionMode::MlKem
+        );
+    }
+
+    /// A document that asks for less than its own floor is contradictory:
+    /// import refuses it rather than silently picking a side.
+    #[test]
+    fn a_mode_below_the_declared_floor_is_refused_at_import() {
+        let mut settings = gateway_settings(ProtectionMode::Classic);
+        settings.minimum_mode = ProtectionMode::MlKem;
+        let raw = document_with(serde_json::to_value(&settings).unwrap());
+
+        let error = parse_profile_import(&raw, "portable.json")
+            .expect_err("a mode below the floor must be refused")
+            .to_string();
+        assert!(error.contains("plancher"), "message : {error}");
+    }
+
+    /// A certificate pinned to another gateway must not pass for this one:
+    /// it's the only check that ties the imported material to the peer key
+    /// the profile is about to talk to.
+    #[test]
+    fn a_certificate_pinned_to_another_gateway_is_refused() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["peer_public_key"] =
+            serde_json::Value::String(CLIENT_PRIVATE.to_string());
+
+        assert!(parse_profile_import(&document.to_string(), "portable.json").is_err());
+    }
+
+    /// The three modes don't take the same profile material, and the fault
+    /// is a relation between two fields — the block carries it as a whole.
+    #[test]
+    fn a_psk_that_contradicts_the_mode_is_reported_on_the_block() {
+        let profile = ClientProfile {
+            preshared_key: Some("cHNr".into()),
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        let message = inspect_profile(&profile)
+            .key_negotiation
+            .expect("a PSK is only valid in static mode");
+        assert!(message.contains("PSK statique"), "message : {message}");
+
+        let sound = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&sound).key_negotiation, None);
+    }
+
+    /// The PSK that ML-KEM just produced is not the PSK this rule forbids.
+    ///
+    /// Both sit in the same slot, and telling them apart is the difference
+    /// between a negotiation that commits and one that cannot: `up()`
+    /// validates the profile it mounts, and that profile carries the freshly
+    /// negotiated secret. Judging it as a static PSK made every ML-KEM
+    /// connection fail — three attempts, then «un PSK de profil n'est valable
+    /// qu'avec le mode PSK statique», on a profile the user never touched.
+    #[test]
+    fn a_negotiated_psk_does_not_contradict_the_ml_kem_mode() {
+        let mounted = ClientProfile {
+            preshared_key: Some("cHNr".into()),
+            preshared_key_is_negotiated: true,
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            mounted.validate().is_ok(),
+            "the profile handed to up() after a negotiation must be mountable: {:?}",
+            mounted.validate().unwrap_err()
+        );
+
+        // The same secret, declared static: still refused, and that check is
+        // the one worth keeping.
+        let configured = ClientProfile {
+            preshared_key_is_negotiated: false,
+            ..mounted
+        };
+        assert!(configured.validate().is_err());
+    }
+
+    fn identity_bundle(name: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::STANDARD;
+
+        serde_json::json!({
+            "identity": name,
+            "certificate_chain": [STANDARD.encode([0x30, 0x82, 0x01, 0x00])],
+            "private_key": STANDARD.encode([0x30, 0x81, 0x87, 0x02]),
+            "pq_certificate": STANDARD.encode(br#"{"version":1}"#),
+            "pq_private_key": STANDARD.encode([7u8; 64]),
+        })
+    }
+
+    /// The identity travels with the profile so the user has **one** file to
+    /// import — but it must come back separately, because the two have
+    /// opposite destinies: one is persisted, the other is sealed.
+    #[test]
+    fn the_shipped_identity_is_returned_apart_from_the_profile() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["key_negotiation_identity"] = identity_bundle(&settings.identity);
+
+        let imported = parse_profile_import(&document.to_string(), "portable.json").unwrap();
+        let identity = imported.identity.expect("identity expected");
+        assert_eq!(identity.identity, settings.identity);
+
+        // The decisive property: nothing of the secret can reach the profile,
+        // hence nothing can reach `profiles.toml`.
+        let persisted = toml::to_string(&imported.profile).unwrap();
+        assert!(!persisted.contains("pq_private_key"), "{persisted}");
+        assert!(
+            !persisted.contains(&identity.pq_private_key),
+            "the PQ private key must not be persistable"
+        );
+    }
+
+    /// Adding negotiation to a profile that already exists must not disturb
+    /// its WireGuard identity.
+    ///
+    /// This is the ordinary upgrade path: a client enrolled long ago is
+    /// re-enrolled from its **public** key, so the document carries no
+    /// private key and completion takes the local one. Regenerating a key
+    /// here would silently break an admission the gateway already holds.
+    #[test]
+    fn enrolling_an_existing_profile_keeps_its_wireguard_identity() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        // Invitation form: `helios-ctl enroll --public-key <clé existante>`.
+        document["profile"]["private_key"] = serde_json::Value::String(String::new());
+
+        let imported = parse_profile_import(&document.to_string(), "portable.json").unwrap();
+        assert!(imported.profile.private_key.is_empty());
+
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            name: "portable".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        });
+
+        let completed = complete_profile_import(imported.profile, &config, None)
+            .unwrap()
+            .profile;
+        assert_eq!(completed.private_key, CLIENT_PRIVATE);
+        assert!(
+            completed.key_negotiation.is_some(),
+            "the negotiation block must survive completion"
+        );
+    }
+
+    /// The decisive case of an enrolled client: the operator names it
+    /// `poste-windows`, the machine kept it under another name, and the
+    /// admitted key is the same on both sides. Matching by name refused the
+    /// document; matching by key is what makes it importable.
+    #[test]
+    fn an_invitation_is_completed_by_the_admitted_key_whatever_the_name() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let admitted = ClientProfile {
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        }
+        .public_key()
+        .unwrap();
+
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["private_key"] = serde_json::Value::String(String::new());
+        let mut bundle = identity_bundle(&settings.identity);
+        bundle["pq_certificate"] = serde_json::Value::String(STANDARD.encode(
+            serde_json::json!({ "version": 1, "wireguard_public_key": admitted }).to_string(),
+        ));
+        document["profile"]["key_negotiation_identity"] = bundle;
+
+        let imported =
+            parse_profile_import(&document.to_string(), "portable.orionprofile").unwrap();
+        assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
+
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            // Same client, other name: the situation the name rule refused.
+            name: "poste-de-christophe".into(),
+            private_key: CLIENT_PRIVATE.into(),
+            ..complete_profile()
+        });
+
+        let admitted_key = imported.admitted_public_key();
+        let completed =
+            complete_profile_import(imported.profile, &config, admitted_key.as_deref()).unwrap();
+        assert_eq!(completed.private_key_missing, None);
+        assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
+        assert_eq!(completed.profile.name, "portable");
+    }
+
+    /// A same-name profile holding **another** key is not a match: it was
+    /// never admitted, and using it would produce a tunnel that handshakes
+    /// with nobody.
+    #[test]
+    fn a_local_profile_holding_another_key_does_not_complete_an_invitation() {
+        let invitation = ClientProfile {
+            private_key: String::new(),
+            ..complete_profile()
+        };
+        let mut config = ClientConfig::default();
+        config.upsert(ClientProfile {
+            private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
+            ..complete_profile()
+        });
+
+        let completed =
+            complete_profile_import(invitation, &config, Some("une-autre-clé-publique")).unwrap();
+        let message = completed
+            .private_key_missing
+            .expect("an unadmitted local key must not complete the document");
+        assert!(message.contains("une-autre-clé-publique"), "{message}");
+        assert!(completed.profile.private_key.is_empty());
+    }
+
+    /// An identity sealed under a name the profile never looks up would be a
+    /// secret stored for nothing.
+    #[test]
+    fn an_identity_naming_another_entry_is_refused() {
+        let settings = gateway_settings(ProtectionMode::MlKem);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&document_with(serde_json::to_value(&settings).unwrap())).unwrap();
+        document["profile"]["key_negotiation_identity"] = identity_bundle("un-autre-poste");
+
+        let error = parse_profile_import(&document.to_string(), "portable.json")
+            .expect_err("mismatched identity must be refused")
+            .to_string();
+        assert!(error.contains("un-autre-poste"), "message : {error}");
+    }
+
+    #[test]
+    fn imports_versioned_json_with_defaults() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -461,18 +1383,19 @@ mod tests {
             }}"#
         );
 
-        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
         assert_eq!(profile.name, "portable");
         assert_eq!(profile.allowed_ips, DEFAULT_ALLOWED_IPS);
         assert_eq!(profile.persistent_keepalive, DEFAULT_KEEPALIVE_SECS);
         assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
     }
 
-    /// Profil d'invitation (ADR-004 §6) : l'opérateur admet la clé publique que
-    /// le client lui a transmise et renvoie tout **sauf** la clé privée, qu'il
-    /// n'a jamais détenue. L'IHM la reprend du profil local de même nom.
+    /// Invitation profile (ADR-004 §6): the operator admits the public key
+    /// the client sent, and returns everything **except** the private key,
+    /// which it never held. The UI takes it back from the local profile of
+    /// the same name.
     #[test]
-    fn importe_une_invitation_sans_cle_privee() {
+    fn imports_an_invitation_without_a_private_key() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -486,21 +1409,21 @@ mod tests {
             }}"#
         );
 
-        let profile = parse_profile_import(&raw, "portable.json").unwrap();
+        let profile = parse_profile_import(&raw, "portable.json").unwrap().profile;
         assert!(
             profile.private_key.is_empty(),
-            "l'invitation ne doit porter aucune clé privée"
+            "the invitation must carry no private key"
         );
         assert_eq!(profile.peer_public_key, GATEWAY_PUBLIC);
         assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
         assert!(
             profile.validate().is_err(),
-            "une invitation seule ne doit pas être présentée comme connectable"
+            "an invitation alone must not be presented as connectable"
         );
     }
 
     #[test]
-    fn complete_une_invitation_avec_la_cle_locale_de_meme_nom() {
+    fn completes_an_invitation_with_the_local_key_of_the_same_name() {
         let invitation = ClientProfile {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -517,12 +1440,13 @@ mod tests {
             selected: None,
         };
 
-        let completed = complete_profile_import(invitation, &config).unwrap();
-        assert_eq!(completed.private_key, CLIENT_PRIVATE);
+        let completed = complete_profile_import(invitation, &config, None).unwrap();
+        assert_eq!(completed.private_key_missing, None);
+        assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
     }
 
     #[test]
-    fn refuse_une_invitation_sans_cle_locale_correspondante() {
+    fn reports_an_invitation_without_a_matching_local_key() {
         let invitation = ClientProfile {
             name: "portable".into(),
             endpoint: "vpn.example.net:51820".into(),
@@ -531,14 +1455,23 @@ mod tests {
             ..ClientProfile::default()
         };
 
-        let error = complete_profile_import(invitation, &ClientConfig::default()).unwrap_err();
-        assert!(error.to_string().contains("aucun profil local"));
+        // Reported, not raised: the draft stays visible so the user sees
+        // which endpoint and which address were issued, and can paste the
+        // key rather than being told to start over.
+        let completed =
+            complete_profile_import(invitation, &ClientConfig::default(), None).unwrap();
+        let message = completed
+            .private_key_missing
+            .expect("the absence of a key must be reported");
+        assert!(message.contains("aucun profil local"), "{message}");
+        assert!(completed.profile.private_key.is_empty());
+        assert_eq!(completed.profile.name, "portable");
     }
 
-    /// Tolérer l'absence de clé privée ne doit pas faire tolérer une clé
-    /// tronquée : ce n'est pas une invitation, c'est une corruption.
+    /// Tolerating the absence of a private key must not tolerate a truncated
+    /// key: that's not an invitation, it's a corruption.
     #[test]
-    fn une_cle_privee_presente_mais_malformee_reste_refusee() {
+    fn a_private_key_present_but_malformed_stays_refused() {
         let raw = r#"{
             "format": "orion-profile",
             "version": 1,
@@ -550,18 +1483,15 @@ mod tests {
                 "address": "100.64.1.2/32"
             }
         }"#;
-        let erreur = parse_profile_import(raw, "portable.json").unwrap_err();
-        assert!(
-            erreur.to_string().contains("clé privée"),
-            "message : {erreur}"
-        );
+        let error = parse_profile_import(raw, "portable.json").unwrap_err();
+        assert!(error.to_string().contains("clé privée"), "message: {error}");
     }
 
-    /// `wg-quick` n'a pas de notion d'invitation : un fichier sans `PrivateKey`
-    /// est un fichier incomplet, et le dire tôt évite un tunnel qui ne monte
-    /// jamais sans explication.
+    /// `wg-quick` has no notion of invitation: a file without `PrivateKey`
+    /// is an incomplete file, and saying so early avoids a tunnel that never
+    /// mounts without explanation.
     #[test]
-    fn wg_quick_sans_cle_privee_reste_refuse() {
+    fn wg_quick_without_a_private_key_stays_refused() {
         let raw = format!(
             r#"
                 [Interface]
@@ -572,18 +1502,15 @@ mod tests {
                 Endpoint = vpn.example.net:51820
             "#
         );
-        let erreur = parse_profile_import(&raw, "portable.conf").unwrap_err();
-        assert!(
-            erreur.to_string().contains("PrivateKey"),
-            "message : {erreur}"
-        );
+        let error = parse_profile_import(&raw, "portable.conf").unwrap_err();
+        assert!(error.to_string().contains("PrivateKey"), "message: {error}");
     }
 
     #[test]
-    fn importe_wg_quick_a_un_pair() {
+    fn imports_wg_quick_with_one_peer() {
         let raw = format!(
             r#"
-                # profil émis par l'administrateur
+                # profile issued by the administrator
                 [Interface]
                 PrivateKey = {CLIENT_PRIVATE}
                 Address = 100.64.1.2/32
@@ -596,7 +1523,9 @@ mod tests {
             "#
         );
 
-        let profile = parse_profile_import(&raw, r"C:\Profils\site-labo.conf").unwrap();
+        let profile = parse_profile_import(&raw, r"C:\Profils\site-labo.conf")
+            .unwrap()
+            .profile;
         assert_eq!(profile.name, "site-labo");
         assert_eq!(profile.endpoint, "203.0.113.10:51820");
         assert_eq!(profile.private_key, CLIENT_PRIVATE);
@@ -605,13 +1534,13 @@ mod tests {
     }
 
     #[test]
-    fn refuse_json_inconnu_ou_champ_imprevu() {
+    fn refuses_unknown_json_or_unexpected_field() {
         let wrong_version = r#"{
             "format": "orion-profile",
             "version": 2,
             "profile": {}
         }"#;
-        assert!(parse_profile_import(wrong_version, "profil.json")
+        assert!(parse_profile_import(wrong_version, "profile.json")
             .unwrap_err()
             .to_string()
             .contains("version"));
@@ -629,11 +1558,11 @@ mod tests {
                 }}
             }}"#
         );
-        assert!(parse_profile_import(&unknown_field, "profil.json").is_err());
+        assert!(parse_profile_import(&unknown_field, "profile.json").is_err());
     }
 
     #[test]
-    fn refuse_plusieurs_pairs_et_options_non_appliquees() {
+    fn refuses_multiple_peers_and_unapplied_options() {
         let multiple = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\n[Peer]\nPublicKey={GATEWAY_PUBLIC}"
         );
@@ -652,11 +1581,11 @@ mod tests {
     }
 
     #[test]
-    fn refuse_cles_et_endpoint_invalides() {
+    fn refuses_invalid_keys_and_endpoint() {
         let bad_key = format!(
-            "[Interface]\nPrivateKey=court\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+            "[Interface]\nPrivateKey=short\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&bad_key, "invalide.conf").is_err());
+        assert!(parse_profile_import(&bad_key, "invalid.conf").is_err());
 
         let url = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=https://vpn.example.net"
@@ -668,11 +1597,11 @@ mod tests {
     }
 
     #[test]
-    fn refuse_un_profil_incomplet_ou_non_routable() {
+    fn refuses_an_incomplete_or_unroutable_profile() {
         let no_address = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&no_address, "sans-adresse.conf")
+        assert!(parse_profile_import(&no_address, "no-address.conf")
             .unwrap_err()
             .to_string()
             .contains("adresse virtuelle"));
@@ -680,29 +1609,120 @@ mod tests {
         let no_keepalive = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nPersistentKeepalive=0"
         );
-        assert!(parse_profile_import(&no_keepalive, "sans-keepalive.conf")
+        assert!(parse_profile_import(&no_keepalive, "no-keepalive.conf")
             .unwrap_err()
             .to_string()
             .contains("supérieur à zéro"));
     }
 
+    /// `.orionprofile` is the extension the tooling distributes: recognizing
+    /// it must not depend on the first character surviving the trip.
     #[test]
-    fn refuse_un_document_demesure() {
+    fn the_orionprofile_suffix_selects_the_orion_parser() {
+        let raw = format!(
+            r#"{{
+                "format": "orion-profile",
+                "version": 1,
+                "profile": {{
+                    "name": "portable",
+                    "endpoint": "vpn.example.net:51820",
+                    "private_key": "{CLIENT_PRIVATE}",
+                    "peer_public_key": "{GATEWAY_PUBLIC}",
+                    "address": "100.64.1.2/32"
+                }}
+            }}"#
+        );
+
+        // Leading blank lines: the head no longer decides, the suffix does.
+        let padded = format!("\n\n{raw}");
+        assert_eq!(
+            parse_profile_import(&padded, "poste-windows.orionprofile")
+                .unwrap()
+                .profile
+                .name,
+            "portable"
+        );
+        assert_eq!(
+            parse_profile_import(&raw, "POSTE-WINDOWS.ORIONPROFILE")
+                .unwrap()
+                .profile
+                .name,
+            "portable"
+        );
+    }
+
+    /// A document is carried by hand from one machine to another, and that
+    /// trip re-encodes it: PowerShell's `Out-File` writes UTF-16LE, Notepad
+    /// long prefixed UTF-8 with a BOM. The content is intact; refusing it
+    /// only strands the user.
+    #[test]
+    fn reads_a_document_whatever_byte_order_mark_it_carries() {
+        let raw = format!(
+            r#"{{"format":"orion-profile","version":1,"profile":{{"name":"portable","endpoint":"vpn.example.net:51820","private_key":"{CLIENT_PRIVATE}","peer_public_key":"{GATEWAY_PUBLIC}","address":"100.64.1.2/32"}}}}"#
+        );
+
+        let utf16le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(raw.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let utf16be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(raw.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let utf8_bom: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(raw.bytes()).collect();
+
+        for (label, bytes) in [
+            ("UTF-8", raw.clone().into_bytes()),
+            ("UTF-8 + BOM", utf8_bom),
+            ("UTF-16LE", utf16le),
+            ("UTF-16BE", utf16be),
+        ] {
+            let directory = temp_directory("orion-import-encoding");
+            let path = directory.join("portable.orionprofile");
+            std::fs::write(&path, &bytes).unwrap();
+            let imported = read_profile_import_path(&path)
+                .unwrap_or_else(|error| panic!("{label} should have been read: {error:#}"));
+            assert_eq!(imported.profile.name, "portable", "{label}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// «format inconnu» alone leaves the user re-reading a file that looks
+    /// right to them: the message must say what was actually seen.
+    #[test]
+    fn an_unrecognized_document_says_what_it_starts_with() {
+        let empty = parse_profile_import("   ", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("vide"), "message : {empty}");
+
+        let html = parse_profile_import("<!DOCTYPE html>", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(html.contains("<!DOCTYPE html>"), "message : {html}");
+        assert!(html.contains("profil.txt"), "message : {html}");
+
+        // What a UTF-8 decoder leaves when handed UTF-16: the encoding is
+        // named, because "unknown format" would send the user looking for a
+        // fault in a document that has none.
+        let mangled = parse_profile_import("\u{fffd}\u{fffd}{\0", "profil.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(mangled.contains("UTF-8"), "message : {mangled}");
+    }
+
+    #[test]
+    fn refuses_an_oversized_document() {
         let raw = " ".repeat(MAX_PROFILE_IMPORT_BYTES + 1);
-        assert!(parse_profile_import(&raw, "gros.json")
+        assert!(parse_profile_import(&raw, "big.json")
             .unwrap_err()
             .to_string()
             .contains("trop volumineux"));
     }
 
     #[test]
-    fn lecture_par_chemin_reutilise_le_parseur_et_la_borne() {
-        let directory = std::env::temp_dir().join(format!(
-            "orion-import-chemin-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+    fn reading_by_path_reuses_the_parser_and_the_limit() {
+        let directory = temp_directory("orion-import-path");
         let profile_path = directory.join("portable.orionprofile");
         let raw = format!(
             r#"{{
@@ -719,11 +1739,14 @@ mod tests {
         );
         std::fs::write(&profile_path, raw).unwrap();
         assert_eq!(
-            read_profile_import_path(&profile_path).unwrap().name,
+            read_profile_import_path(&profile_path)
+                .unwrap()
+                .profile
+                .name,
             "portable"
         );
 
-        let oversized_path = directory.join("trop-grand.orionprofile");
+        let oversized_path = directory.join("too-big.orionprofile");
         std::fs::write(&oversized_path, vec![b' '; MAX_PROFILE_IMPORT_BYTES + 1]).unwrap();
         assert!(read_profile_import_path(&oversized_path)
             .unwrap_err()

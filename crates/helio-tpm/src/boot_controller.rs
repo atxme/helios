@@ -6,23 +6,23 @@ use crate::{
     TpmError,
 };
 
-/// Issue de la séquence de déverrouillage au démarrage.
+/// Outcome of the boot-time unlock sequence.
 #[derive(Debug)]
 pub enum BootDecision {
-    /// Validation désactivée (`tpm.enabled = false`) — dev/WSL2, aucun secret.
+    /// Validation disabled (`tpm.enabled = false`) — dev/WSL2, no secret.
     Disabled,
-    /// Échec ignoré car `enforce = false` (DÉBOGAGE) — aucun secret.
+    /// Failure ignored because `enforce = false` (DEBUG) — no secret.
     Bypassed,
-    /// Déscellement nominal : intégrité confirmée, secret existant récupéré.
+    /// Nominal unseal: integrity confirmed, existing secret retrieved.
     Unsealed(SecretKey),
-    /// Premier boot : secret provisionné (TOFU). À (re)chiffrer les identifiants.
+    /// First boot: secret provisioned (TOFU). Credentials must be (re)encrypted.
     Provisioned(SecretKey),
-    /// Rescellement post-OTA autorisé : nouveau secret. À (re)chiffrer les identifiants.
+    /// Post-OTA resealing authorized: new secret. Credentials must be (re)encrypted.
     Resealed(SecretKey),
 }
 
 impl BootDecision {
-    /// Secret de déverrouillage si disponible (déchiffrement des secrets WireGuard).
+    /// Unlock secret if available (used to decrypt the WireGuard secrets).
     pub fn secret(&self) -> Option<&SecretKey> {
         match self {
             BootDecision::Unsealed(s)
@@ -33,15 +33,15 @@ impl BootDecision {
     }
 }
 
-/// Contrôleur de flux : point d'entrée unique de la validation d'intégrité.
+/// Flow controller: single entry point of the integrity validation.
 ///
-/// À appeler **en premier** dans `heliosd::run()`, avant toute initialisation réseau.
+/// Must be called **first** in `heliosd::run()`, before any network initialization.
 pub struct BootController;
 
 impl BootController {
     pub fn unlock(cfg: &TpmSettings) -> Result<BootDecision> {
         if !cfg.enabled {
-            info!("scellement TPM désactivé (tpm.enabled = false) — démarrage sans vérification");
+            info!("TPM sealing disabled (tpm.enabled = false) — booting without verification");
             return Ok(BootDecision::Disabled);
         }
 
@@ -49,13 +49,13 @@ impl BootController {
             Ok(decision) => Ok(decision),
             Err(e) if !cfg.enforce => {
                 warn!(
-                    "échec TPM ignoré (enforce=false, RÉSERVÉ AU DÉBOGAGE — \
-                     ne jamais utiliser en production) : {e}"
+                    "TPM failure ignored (enforce=false, DEBUG ONLY — \
+                     never use in production): {e}"
                 );
                 Ok(BootDecision::Bypassed)
             }
             Err(e) => {
-                error!("VALIDATION D'INTÉGRITÉ ÉCHOUÉE — arrêt : {e}");
+                error!("INTEGRITY VALIDATION FAILED — stopping: {e}");
                 Err(e)
             }
         }
@@ -67,28 +67,28 @@ impl BootController {
         Self::run_flow(cfg, &mut tpm, &store)
     }
 
-    /// Logique de décision, générique sur le backend TPM (testable avec `DryRunTpm`).
+    /// Decision logic, generic over the TPM backend (testable with `DryRunTpm`).
     fn run_flow<T: TpmSealer>(
         cfg: &TpmSettings,
         tpm: &mut T,
         store: &BlobStore<'_>,
     ) -> Result<BootDecision> {
         match store.load_blob()? {
-            // Blob présent → tentative de déscellement (cas nominal).
+            // Blob present -> attempt unseal (nominal case).
             Some(blob) => match tpm.unseal(&blob) {
                 Ok(secret) => {
-                    info!("déscellement réussi — intégrité du démarrage confirmée");
+                    info!("unseal succeeded — boot integrity confirmed");
                     Ok(BootDecision::Unsealed(secret))
                 }
                 Err(TpmError::UnsealPolicyFail) => {
-                    // PCR modifiés : OTA légitime (billet) ou attaque (refus).
-                    warn!("déscellement refusé (PCR modifiés) — recherche d'un billet de rescellement");
+                    // PCRs changed: legitimate OTA (ticket) or attack (refusal).
+                    warn!("unseal refused (PCRs changed) — looking for a reseal ticket");
                     let secret = provisioning::reseal(tpm, store)?;
                     Ok(BootDecision::Resealed(secret))
                 }
                 Err(e) => Err(e),
             },
-            // Pas de blob → provisionnement seulement si explicitement autorisé.
+            // No blob -> provisioning only if explicitly allowed.
             None => {
                 if cfg.allow_provisioning {
                     let secret = provisioning::provision(tpm, store)?;
@@ -101,7 +101,7 @@ impl BootController {
     }
 }
 
-/// Ouvre le backend TPM : réel sur la cible (`feature tpm`), simulé sinon.
+/// Opens the TPM backend: real on target (`feature tpm`), simulated otherwise.
 fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
     #[cfg(feature = "tpm")]
     {
@@ -124,7 +124,7 @@ mod tests {
     const DEV_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-dev-seed-001";
     const DEV_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-dev-seed-001";
 
-    /// Construit une config TPM pointant vers un répertoire temporaire.
+    /// Builds a TPM config pointing to a temporary directory.
     fn test_cfg(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
         TpmSettings {
             enabled: true,
@@ -139,7 +139,7 @@ mod tests {
         }
     }
 
-    /// Écrit un billet signé par la clé de développement sur le disque.
+    /// Writes a ticket signed by the development key to disk.
     fn write_ticket(path: &std::path::Path, version: u64, expected_pcr_digest: Option<[u8; 32]>) {
         let signer = PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED).unwrap();
         let ticket = signer
@@ -152,17 +152,17 @@ mod tests {
     }
 
     #[test]
-    fn provisionnement_puis_unseal_nominal() {
+    fn provisioning_then_nominal_unseal() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path(), true);
         let store = BlobStore::new(&cfg);
 
-        // Premier boot : pas de blob → provisionnement.
+        // First boot: no blob -> provisioning.
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         let d = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
         assert!(matches!(d, BootDecision::Provisioned(_)));
 
-        // Boot suivant, mêmes PCR → déscellement nominal, même secret.
+        // Next boot, same PCRs -> nominal unseal, same secret.
         let secret1 = d.secret().unwrap().as_bytes().to_vec();
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         let d2 = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
@@ -171,9 +171,9 @@ mod tests {
     }
 
     #[test]
-    fn blob_absent_sur_le_terrain_rejete() {
+    fn missing_blob_in_field_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(dir.path(), false); // provisionnement interdit
+        let cfg = test_cfg(dir.path(), false); // provisioning forbidden
         let store = BlobStore::new(&cfg);
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         assert!(matches!(
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn pcr_modifies_sans_billet_rejete() {
+    fn changed_pcrs_without_ticket_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path(), true);
         let store = BlobStore::new(&cfg);
@@ -191,7 +191,7 @@ mod tests {
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         BootController::run_flow(&cfg, &mut tpm, &store).unwrap(); // provision
 
-        // Kernel modifié (PCR différents) sans billet → refus.
+        // Modified kernel (different PCRs) without ticket -> refusal.
         let mut tpm = DryRunTpm::with_digest([2u8; 32]);
         assert!(matches!(
             BootController::run_flow(&cfg, &mut tpm, &store),
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn ota_avec_billet_valide_rescelle() {
+    fn ota_with_valid_ticket_reseals() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path(), true);
         let store = BlobStore::new(&cfg);
@@ -208,20 +208,20 @@ mod tests {
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         BootController::run_flow(&cfg, &mut tpm, &store).unwrap(); // provision, version 0
 
-        // OTA : nouveaux PCR + billet signé version 1.
+        // OTA: new PCRs + signed ticket version 1.
         write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
         let mut tpm = DryRunTpm::with_digest([2u8; 32]);
         let d = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
         assert!(matches!(d, BootDecision::Resealed(_)));
 
-        // Billet consommé ; boot suivant sur les mêmes nouveaux PCR → unseal nominal.
+        // Ticket consumed; next boot on the same new PCRs -> nominal unseal.
         let mut tpm = DryRunTpm::with_digest([2u8; 32]);
         let d2 = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
         assert!(matches!(d2, BootDecision::Unsealed(_)));
     }
 
     #[test]
-    fn billet_rejoue_rejete() {
+    fn replayed_ticket_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path(), true);
         let store = BlobStore::new(&cfg);
@@ -229,12 +229,12 @@ mod tests {
         let mut tpm = DryRunTpm::with_digest([1u8; 32]);
         BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
 
-        // Premier rescellement avec billet version 1 → état version 1.
+        // First resealing with ticket version 1 -> state version 1.
         write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
         let mut tpm = DryRunTpm::with_digest([2u8; 32]);
         BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
 
-        // Rejeu du même billet version 1 sur de nouveaux PCR → anti-rollback.
+        // Replay of the same version-1 ticket on new PCRs -> anti-rollback.
         write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
         let mut tpm = DryRunTpm::with_digest([3u8; 32]);
         assert!(matches!(

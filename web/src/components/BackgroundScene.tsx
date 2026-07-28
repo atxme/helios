@@ -3,10 +3,10 @@ import { EffectComposer, Bloom } from '@react-three/postprocessing'
 import { useMemo, useRef } from 'react'
 import * as THREE from 'three'
 
-// ─── Palette + direction artistique par thème ────────────────────────────────
-// Sombre = espace profond néon (blending additif + bloom).
-// Clair  = ciel diurne, réseau dessiné à l'encre saturée (blending normal, pas
-//          de bloom) → lisible et élégant. Le soleil reste ambre : ADN Helios.
+// ─── Palette + art direction per theme ────────────────────────────────
+// Dark  = deep neon space (additive blending + bloom).
+// Light = daytime sky, network drawn in saturated ink (normal blending, no
+//         bloom) → readable and elegant. The sun stays amber: Helios DNA.
 type Pal = {
   bg: string
   node: string; flux: string; line: string
@@ -37,7 +37,7 @@ const PALETTE: Record<'dark' | 'light', Pal> = {
     bg: '#dce7fa',
     node: '#0e7490', flux: '#9333ea', line: '#0f766e',
     sun: '#f59e0b', corona: '#fb923c', sunGlow: 0.5,
-    // Anneaux ambre foncé en blending normal → visibles et nets sur ciel clair.
+    // Dark amber rings with normal blending → visible and crisp against a light sky.
     ring: '#b45309', ringOpacity: 0.72,
     wire: '#1e3a8a', wireOpacity: 0.07,
     stars: 0, starColor: '#ffffff',
@@ -48,7 +48,7 @@ const PALETTE: Record<'dark' | 'light', Pal> = {
   },
 }
 
-// Texture de halo radial doux (couronne solaire + sprites d'étoiles).
+// Soft radial halo texture (solar corona + star sprites).
 function useGlowTexture() {
   return useMemo(() => {
     const size = 128
@@ -68,7 +68,7 @@ function useGlowTexture() {
 
 const SUN_POS: [number, number, number] = [17, 6, -14]
 
-// ─── Le Soleil — astre ambre + couronne + anneaux orbitaux ────────────────────
+// ─── The Sun — amber body + corona + orbital rings ────────────────────
 function Sun({ pal }: { pal: Pal }) {
   const glow = useGlowTexture()
   const coronaRef = useRef<THREE.Group>(null)
@@ -81,13 +81,13 @@ function Sun({ pal }: { pal: Pal }) {
 
   return (
     <group position={SUN_POS}>
-      {/* Cœur lumineux */}
+      {/* Glowing core */}
       <mesh>
         <sphereGeometry args={[3.4, 48, 48]} />
         <meshBasicMaterial color={pal.sun} toneMapped={false} />
       </mesh>
 
-      {/* Couronne — deux couches */}
+      {/* Corona — two layers */}
       <group ref={coronaRef}>
         <sprite scale={[20, 20, 1]}>
           <spriteMaterial map={glow} color={pal.corona} transparent opacity={pal.sunGlow}
@@ -99,7 +99,7 @@ function Sun({ pal }: { pal: Pal }) {
         </sprite>
       </group>
 
-      {/* Anneaux orbitaux — système incliné cohérent (type Saturne) */}
+      {/* Orbital rings — coherent tilted system (Saturn-like) */}
       <group ref={ringsRef} rotation={[Math.PI / 2.45, 0.18, 0]}>
         {[5.2, 6.0, 6.9, 8.1, 9.4].map((r, i) => (
           <mesh key={i}>
@@ -114,7 +114,7 @@ function Sun({ pal }: { pal: Pal }) {
   )
 }
 
-// ─── Dôme géodésique filaire englobant — « champ de confinement » ─────────────
+// ─── Enclosing wireframe geodesic dome — "containment field" ─────────────
 function WireDome({ pal }: { pal: Pal }) {
   const ref = useRef<THREE.Mesh>(null)
   useFrame((_, dt) => {
@@ -132,7 +132,7 @@ function WireDome({ pal }: { pal: Pal }) {
   )
 }
 
-// ─── Champ d'étoiles maison (fog désactivé → pas d'artefacts de blobs) ────────
+// ─── Custom starfield (fog disabled → no blob artifacts) ────────
 function Starfield({ pal }: { pal: Pal }) {
   const glow = useGlowTexture()
   const positions = useMemo(() => {
@@ -160,7 +160,7 @@ function Starfield({ pal }: { pal: Pal }) {
   )
 }
 
-// ─── Le réseau — nœuds instanciés (cyan/magenta) + liens entre voisins ────────
+// ─── The network — instanced nodes (cyan/magenta) + links between neighbors ────────
 const NODE_COUNT = 250
 
 function Network({ pal }: { pal: Pal }) {
@@ -242,7 +242,7 @@ function Network({ pal }: { pal: Pal }) {
   )
 }
 
-// Léger flottement de caméra pour donner vie à la scène.
+// Slight camera drift to bring the scene to life.
 function CameraDrift() {
   const { camera } = useThree()
   useFrame((state) => {
@@ -274,7 +274,7 @@ function Scene({ dark }: { dark: boolean }) {
   )
 }
 
-// Module lourd (three.js) — chargé en lazy par Background.tsx.
+// Heavy module (three.js) — lazy-loaded by Background.tsx.
 export default function BackgroundScene({ dark }: { dark: boolean }) {
   return (
     <div className="fixed inset-0" style={{ zIndex: 0 }}>

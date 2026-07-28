@@ -1,6 +1,6 @@
 use crate::{secret::SecretKey, Result};
 
-/// Blob scellé opaque, tel que stocké sur la partition de configuration.
+/// Opaque sealed blob, as stored on the configuration partition.
 #[derive(Debug, Clone)]
 pub(crate) struct SealedBlob(pub Vec<u8>);
 
@@ -13,29 +13,29 @@ impl SealedBlob {
     }
 }
 
-/// Primitives de scellement exposées par le TPM (réel ou simulé).
+/// Sealing primitives exposed by the TPM (real or simulated).
 ///
-/// Les index/banque PCR sont portés par l'implémentation (depuis la config), pas
-/// passés à `seal` : le scellement et le déscellement restent ainsi cohérents.
+/// PCR indices/bank are carried by the implementation (from config), not
+/// passed to `seal`: sealing and unsealing thus stay consistent.
 pub(crate) trait TpmSealer {
-    /// Empreinte d'identité de l'état PCR courant (sert à lier le billet de rescellement).
+    /// Identity digest of the current PCR state (used to bind the reseal ticket).
     fn current_pcr_digest(&mut self) -> Result<[u8; 32]>;
-    /// Scelle `secret` contre la politique PCR courante ; renvoie le blob à persister.
+    /// Seals `secret` against the current PCR policy; returns the blob to persist.
     fn seal(&mut self, secret: &SecretKey) -> Result<SealedBlob>;
-    /// Tente de desceller le blob ; `UnsealPolicyFail` si les PCR ont changé.
+    /// Attempts to unseal the blob; `UnsealPolicyFail` if the PCRs changed.
     fn unseal(&mut self, blob: &SealedBlob) -> Result<SecretKey>;
 }
 
-// ───────────────────────── Backend simulé (WSL2 / dev) ─────────────────────────
+// ───────────────────────── Simulated backend (WSL2 / dev) ─────────────────────────
 
-/// TPM simulé : reproduit fidèlement la sémantique de liaison aux PCR sans matériel.
+/// Simulated TPM: faithfully reproduces PCR-binding semantics without hardware.
 ///
-/// `seal` enregistre l'empreinte PCR courante dans le blob ; `unseal` ne rend le
-/// secret que si l'empreinte courante est identique. Modifier `pcr_digest` entre
-/// deux instances simule un changement de kernel/bootloader (OTA ou attaque).
+/// `seal` records the current PCR digest in the blob; `unseal` only returns
+/// the secret if the current digest is identical. Changing `pcr_digest`
+/// between two instances simulates a kernel/bootloader change (OTA or attack).
 ///
-/// **Non sécurisé** (le secret est en clair dans le blob) — réservé au dev/tests.
-/// Compilé hors `feature tpm` (backend par défaut) et pour les tests.
+/// **Not secure** (the secret is in the clear in the blob) — reserved for
+/// dev/tests. Compiled outside `feature tpm` (default backend) and for tests.
 #[cfg(any(not(feature = "tpm"), test))]
 pub(crate) struct DryRunTpm {
     pcr_digest: [u8; 32],
@@ -43,7 +43,7 @@ pub(crate) struct DryRunTpm {
 
 #[cfg(any(not(feature = "tpm"), test))]
 impl DryRunTpm {
-    /// Construit depuis l'environnement : `HELIOS_TPM_FAKE_PCR` (hex 32 octets) ou zéros.
+    /// Builds from the environment: `HELIOS_TPM_FAKE_PCR` (32-byte hex) or zeros.
     #[cfg(not(feature = "tpm"))]
     pub(crate) fn from_env() -> Self {
         let pcr_digest = std::env::var("HELIOS_TPM_FAKE_PCR")
@@ -52,8 +52,8 @@ impl DryRunTpm {
             .and_then(|v| <[u8; 32]>::try_from(v).ok())
             .unwrap_or([0u8; 32]);
         tracing::warn!(
-            "TPM simulé (feature 'tpm' non compilée) — AUCUNE garantie matérielle. \
-             Recompiler avec --features tpm sur la cible."
+            "simulated TPM ('tpm' feature not compiled) — NO hardware guarantee. \
+             Recompile with --features tpm on the target."
         );
         Self { pcr_digest }
     }
@@ -84,7 +84,7 @@ impl TpmSealer for DryRunTpm {
         }
         let bound = &bytes[..32];
         if bound != self.pcr_digest {
-            // PCR courants différents de ceux du scellement → le TPM refuserait.
+            // Current PCRs differ from those at sealing time -> the TPM would refuse.
             return Err(crate::TpmError::UnsealPolicyFail);
         }
         let mut key = [0u8; 32];
@@ -93,10 +93,10 @@ impl TpmSealer for DryRunTpm {
     }
 }
 
-// ───────────────────────── Backend réel (cible, feature tpm) ─────────────────────────
+// ───────────────────────── Real backend (target, feature tpm) ─────────────────────────
 //
-// L'implémentation TPM2 réelle (scellement/déscellement durcis, sessions chiffrées)
-// vit dans `tpm_real.rs` pour garder ce fichier lisible. Réexportée ici pour que
-// `boot_controller` conserve le chemin `crate::tpm_interface::TpmDevice`.
+// The real TPM2 implementation (hardened sealing/unsealing, encrypted
+// sessions) lives in `tpm_real.rs` to keep this file readable. Re-exported
+// here so `boot_controller` keeps the `crate::tpm_interface::TpmDevice` path.
 #[cfg(feature = "tpm")]
 pub(crate) use crate::tpm_real::TpmDevice;

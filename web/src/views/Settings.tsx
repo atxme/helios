@@ -57,6 +57,11 @@ export function SettingsView({ status, onSplitTunnelChange }: Props) {
           <h2 className="hud-title">Gateway</h2>
           <Row icon={Wifi} label="Interface" value={status.wg_iface} />
           <Row icon={Network} label="Port" value={status.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'non ouvert'} />
+          <Row
+            icon={Network}
+            label="Négociation"
+            value={status.key_negotiation_port ? `UDP ${status.key_negotiation_port}` : 'inactive'}
+          />
           <Row icon={Server} label="Pairs admis" value={String(status.peers.length)} />
           <Row icon={Shield} label="MSS clamp" value={status.mss_clamp ? `${status.mss_clamp}` : 'automatique / absent'} />
         </div>

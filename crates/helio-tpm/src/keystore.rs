@@ -1,35 +1,37 @@
-//! Coffre de secrets chiffré par le secret scellé dans le TPM.
+//! Secrets vault encrypted by the secret sealed in the TPM.
 //!
-//! # Rôle
+//! # Role
 //!
-//! Le secret descellé au boot n'est pas qu'une porte : il **chiffre les secrets
-//! opérationnels de la gateway**. Depuis la bascule WireGuard, le secret à
-//! protéger est la **clé privée Curve25519** de la gateway — son identité
-//! cryptographique réelle, celle qui authentifie chaque handshake.
+//! The secret unsealed at boot is not just a gate: it **encrypts the
+//! gateway's operational secrets**. Since the WireGuard switch, the secret
+//! to protect is the gateway's **Curve25519 private key** — its actual
+//! cryptographic identity, the one that authenticates every handshake.
 //!
-//! Sans ce coffre, cette clé vit en clair dans `network.toml` : un disque volé
-//! suffit à usurper la gateway. Avec, le déchiffrement exige un déscellement
-//! TPM réussi, donc une chaîne de démarrage non altérée (PCR 0/4/7).
+//! Without this vault, this key lives in the clear in `network.toml`: a
+//! stolen disk is enough to impersonate the gateway. With it, decryption
+//! requires a successful TPM unseal, hence an untampered boot chain
+//! (PCR 0/4/7).
 //!
-//! # Chaînage des protections
+//! # Chaining of protections
 //!
 //! ```text
-//! PCR 0/4/7 inchangés ──► TPM descelle le secret ──► déchiffre la clé WireGuard
-//!      (matériel)              (256 bits)               (AES-256-GCM)
+//! PCR 0/4/7 unchanged ──► TPM unseals the secret ──► decrypts the WireGuard key
+//!      (hardware)              (256 bits)               (AES-256-GCM)
 //! ```
 //!
-//! Modifier le kernel ou le bootloader casse le premier maillon : le secret
-//! reste verrouillé, la clé WireGuard reste chiffrée. La garantie est
-//! matérielle, pas logicielle — remplacer le binaire `heliosd` ne donne rien.
+//! Modifying the kernel or bootloader breaks the first link: the secret
+//! stays locked, the WireGuard key stays encrypted. The guarantee is
+//! hardware-based, not software-based — replacing the `heliosd` binary
+//! yields nothing.
 //!
-//! # ⚠️ Interaction avec le rescellement post-OTA
+//! # Warning: interaction with post-OTA resealing
 //!
-//! Un rescellement (`BootDecision::Resealed`) génère un **nouveau** secret :
-//! l'ancien est définitivement perdu, donc **tout contenu de ce coffre devient
-//! irrécupérable**. Ce n'est pas un défaut d'implémentation, c'est la
-//! conséquence directe du modèle anti-rollback. Voir [`KeystoreError::Undecipherable`]
-//! et la note dans `heliosd` : après une OTA, la clé WireGuard doit être
-//! re-fournie par l'opérateur.
+//! A resealing (`BootDecision::Resealed`) generates a **new** secret: the
+//! old one is permanently lost, so **any content of this vault becomes
+//! unrecoverable**. This is not an implementation flaw, it is the direct
+//! consequence of the anti-rollback model. See
+//! [`KeystoreError::Undecipherable`] and the note in `heliosd`: after an
+//! OTA, the WireGuard key must be re-supplied by the operator.
 
 use std::path::{Path, PathBuf};
 
@@ -39,35 +41,35 @@ use zeroize::Zeroizing;
 
 use crate::{secret::SecretKey, Result, TpmError};
 
-/// Magie de fichier : distingue un coffre d'un blob quelconque.
+/// File magic: distinguishes a vault from any other blob.
 const MAGIC: &[u8; 4] = b"HKS1";
-/// Version de format. Un coffre d'une autre version est refusé plutôt
-/// qu'interprété de travers.
+/// Format version. A vault of another version is rejected rather than
+/// misinterpreted.
 const VERSION: u8 = 1;
-/// Données authentifiées : lient le chiffré à son usage. Un coffre ne peut pas
-/// être détourné vers un autre contexte du projet.
+/// Authenticated data: binds the ciphertext to its usage. A vault cannot
+/// be repurposed toward another context in the project.
 const AAD: &[u8] = b"helios-keystore-v1";
 
-/// En-tête : magie + version + nonce.
+/// Header: magic + version + nonce.
 const HEADER_LEN: usize = 4 + 1 + NONCE_LEN;
 
-/// Erreurs propres au coffre.
+/// Errors specific to the vault.
 #[derive(Debug, thiserror::Error)]
 pub enum KeystoreError {
-    /// Le contenu ne peut pas être déchiffré avec ce secret.
+    /// The content cannot be decrypted with this secret.
     ///
-    /// Cas typique : le secret a changé (rescellement post-OTA). Le contenu est
-    /// alors **définitivement perdu** — il faut re-provisionner.
+    /// Typical case: the secret changed (post-OTA resealing). The content
+    /// is then **permanently lost** — re-provisioning is required.
     #[error(
-        "coffre indéchiffrable avec le secret courant — un rescellement a-t-il eu lieu ? \
-         Le contenu est irrécupérable, la clé doit être re-fournie"
+        "vault undecryptable with the current secret — did a resealing occur? \
+         The content is unrecoverable, the key must be re-supplied"
     )]
     Undecipherable,
-    #[error("format de coffre invalide : {0}")]
+    #[error("invalid vault format: {0}")]
     Format(String),
 }
 
-/// Coffre chiffré adossé à un fichier.
+/// Encrypted vault backed by a file.
 pub struct SealedKeystore {
     path: PathBuf,
 }
@@ -81,23 +83,23 @@ impl SealedKeystore {
         &self.path
     }
 
-    /// Le coffre existe-t-il sur disque ?
+    /// Does the vault exist on disk?
     pub fn exists(&self) -> bool {
         self.path.exists()
     }
 
-    /// Chiffre `plaintext` avec `secret` et persiste le coffre **atomiquement**.
+    /// Encrypts `plaintext` with `secret` and persists the vault **atomically**.
     ///
-    /// L'écriture passe par un fichier temporaire puis un `rename` : une
-    /// coupure de courant en cours d'écriture laisse l'ancien coffre intact
-    /// plutôt qu'un fichier tronqué — donc une gateway qui redémarre encore.
+    /// The write goes through a temp file then a `rename`: a power cut
+    /// mid-write leaves the old vault intact rather than a truncated file —
+    /// so the gateway can still restart.
     pub fn store(&self, secret: &SecretKey, plaintext: &[u8]) -> Result<()> {
         let key = aead_key(secret)?;
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce_bytes)
-            .map_err(|_| TpmError::Rng("CSPRNG indisponible pour le nonce".into()))?;
+            .map_err(|_| TpmError::Rng("CSPRNG unavailable for nonce".into()))?;
 
         let mut in_out = plaintext.to_vec();
         key.seal_in_place_append_tag(
@@ -105,7 +107,7 @@ impl SealedKeystore {
             Aad::from(AAD),
             &mut in_out,
         )
-        .map_err(|_| TpmError::Serde("chiffrement du coffre échoué".into()))?;
+        .map_err(|_| TpmError::Serde("vault encryption failed".into()))?;
 
         let mut blob = Vec::with_capacity(HEADER_LEN + in_out.len());
         blob.extend_from_slice(MAGIC);
@@ -116,7 +118,7 @@ impl SealedKeystore {
         self.write_atomic(&blob)
     }
 
-    /// Déchiffre le coffre avec `secret`.
+    /// Decrypts the vault with `secret`.
     pub fn load(&self, secret: &SecretKey) -> Result<Zeroizing<Vec<u8>>> {
         let blob = std::fs::read(&self.path).map_err(|e| TpmError::Io {
             path: self.path.display().to_string(),
@@ -124,13 +126,13 @@ impl SealedKeystore {
         })?;
 
         if blob.len() < HEADER_LEN {
-            return Err(KeystoreError::Format("coffre tronqué".into()).into());
+            return Err(KeystoreError::Format("truncated vault".into()).into());
         }
         if &blob[..4] != MAGIC {
-            return Err(KeystoreError::Format("magie invalide".into()).into());
+            return Err(KeystoreError::Format("invalid magic".into()).into());
         }
         if blob[4] != VERSION {
-            return Err(KeystoreError::Format(format!("version {} non supportée", blob[4])).into());
+            return Err(KeystoreError::Format(format!("unsupported version {}", blob[4])).into());
         }
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -144,14 +146,14 @@ impl SealedKeystore {
                 Aad::from(AAD),
                 &mut in_out,
             )
-            // Un échec ici signifie « mauvais secret » ou « contenu altéré ».
-            // Les deux méritent le même refus net : on ne devine pas.
+            // A failure here means "wrong secret" or "tampered content".
+            // Both deserve the same clean refusal: we do not guess.
             .map_err(|_| KeystoreError::Undecipherable)?;
 
         Ok(Zeroizing::new(plaintext.to_vec()))
     }
 
-    /// Supprime le coffre. Utilisé quand son contenu est devenu irrécupérable.
+    /// Removes the vault. Used when its content has become unrecoverable.
     pub fn remove(&self) -> Result<()> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -182,10 +184,10 @@ impl SealedKeystore {
     }
 }
 
-/// Construit la clé AEAD depuis le secret descellé.
+/// Builds the AEAD key from the unsealed secret.
 fn aead_key(secret: &SecretKey) -> Result<LessSafeKey> {
     let unbound = UnboundKey::new(&AES_256_GCM, secret.as_bytes())
-        .map_err(|_| TpmError::Serde("clé AEAD invalide".into()))?;
+        .map_err(|_| TpmError::Serde("invalid AEAD key".into()))?;
     Ok(LessSafeKey::new(unbound))
 }
 
@@ -204,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn aller_retour_chiffre_dechiffre() {
+    fn encrypt_decrypt_round_trip() {
         let ks = SealedKeystore::new(tmp_path("roundtrip"));
         let wg_key = b"une-cle-privee-wireguard-32-oct!";
 
@@ -216,25 +218,25 @@ mod tests {
         ks.remove().unwrap();
     }
 
-    /// Le cœur de la protection : sans le bon secret — donc sans déscellement
-    /// TPM réussi — le contenu reste inaccessible.
+    /// The heart of the protection: without the right secret — hence
+    /// without a successful TPM unseal — the content stays inaccessible.
     #[test]
-    fn un_mauvais_secret_ne_dechiffre_pas() {
+    fn a_wrong_secret_does_not_decrypt() {
         let ks = SealedKeystore::new(tmp_path("wrongkey"));
         ks.store(&secret(1), b"secret").unwrap();
 
         let err = ks.load(&secret(2));
         assert!(
             matches!(err, Err(TpmError::Keystore(KeystoreError::Undecipherable))),
-            "un secret différent (ex. après rescellement) doit échouer nettement"
+            "a different secret (e.g. after resealing) must fail cleanly"
         );
         ks.remove().unwrap();
     }
 
-    /// L'AEAD doit détecter toute altération du chiffré, pas seulement une
-    /// mauvaise clé : un disque modifié ne doit pas produire un faux plaintext.
+    /// AEAD must detect any tampering of the ciphertext, not just a wrong
+    /// key: a modified disk must not produce a fake plaintext.
     #[test]
-    fn une_alteration_est_detectee() {
+    fn tampering_is_detected() {
         let path = tmp_path("tamper");
         let ks = SealedKeystore::new(&path);
         ks.store(&secret(1), b"secret").unwrap();
@@ -244,43 +246,40 @@ mod tests {
         blob[last] ^= 0xff;
         std::fs::write(&path, &blob).unwrap();
 
-        assert!(
-            ks.load(&secret(1)).is_err(),
-            "l'altération doit être détectée"
-        );
+        assert!(ks.load(&secret(1)).is_err(), "tampering must be detected");
         ks.remove().unwrap();
     }
 
     #[test]
-    fn deux_ecritures_du_meme_contenu_different() {
+    fn two_writes_of_the_same_content_differ() {
         let ks = SealedKeystore::new(tmp_path("nonce"));
         ks.store(&secret(1), b"secret").unwrap();
         let first = std::fs::read(ks.path()).unwrap();
         ks.store(&secret(1), b"secret").unwrap();
         let second = std::fs::read(ks.path()).unwrap();
-        assert_ne!(first, second, "le nonce doit être frais à chaque écriture");
+        assert_ne!(first, second, "the nonce must be fresh on each write");
         ks.remove().unwrap();
     }
 
     #[test]
-    fn formats_invalides_refuses() {
+    fn invalid_formats_are_rejected() {
         let path = tmp_path("badformat");
         let ks = SealedKeystore::new(&path);
 
         std::fs::write(&path, b"xx").unwrap();
-        assert!(ks.load(&secret(1)).is_err(), "trop court");
+        assert!(ks.load(&secret(1)).is_err(), "too short");
 
         std::fs::write(&path, b"NOPE\x01aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        assert!(ks.load(&secret(1)).is_err(), "mauvaise magie");
+        assert!(ks.load(&secret(1)).is_err(), "wrong magic");
 
         std::fs::write(&path, b"HKS1\x09aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        assert!(ks.load(&secret(1)).is_err(), "version inconnue");
+        assert!(ks.load(&secret(1)).is_err(), "unknown version");
 
         ks.remove().unwrap();
     }
 
     #[test]
-    fn suppression_idempotente() {
+    fn removal_is_idempotent() {
         let ks = SealedKeystore::new(tmp_path("gone"));
         ks.remove().unwrap();
         ks.remove().unwrap();

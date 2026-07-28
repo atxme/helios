@@ -1,9 +1,9 @@
-//! Backend de simulation : tient l'état de l'interface et des pairs en mémoire.
+//! Simulation backend: keeps the interface and peer state in memory.
 //!
-//! Backend par défaut sur WSL2/dev. Il ne touche à aucun plan de données mais
-//! reproduit fidèlement la sémantique observable — interface montée/démontée,
-//! liste de pairs, handshakes — pour que l'orchestrateur, l'IPAM et l'API soient
-//! pleinement exerçables sans noyau WireGuard ni privilèges.
+//! Default backend on WSL2/dev. It touches no data plane at all but
+//! faithfully reproduces the observable semantics — interface up/down, peer
+//! list, handshakes — so that the orchestrator, the IPAM and the API are
+//! fully exercisable without a WireGuard kernel or privileges.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -20,12 +20,12 @@ pub struct DryRunBackend {
     up: AtomicBool,
     iface: Mutex<Option<String>>,
     peers: Mutex<Vec<PeerConfig>>,
-    /// Si `true`, les pairs simulés rapportent un handshake frais (utile pour
-    /// exercer l'inférence d'état sans plan de données).
+    /// If `true`, the simulated peers report a recent handshake (useful for
+    /// exercising state inference without a data plane).
     simulate_handshakes: bool,
-    /// Si `true`, [`WireguardBackend::sync_peers`] échoue systématiquement.
-    /// Sert à exercer les chemins de rattrapage de l'orchestrateur — notamment
-    /// l'annulation d'une pose de PSK que le plan de données a refusée.
+    /// If `true`, [`WireguardBackend::sync_peers`] systematically fails.
+    /// Used to exercise the orchestrator's recovery paths — notably the
+    /// rollback of a PSK application that the data plane refused.
     fail_sync: bool,
 }
 
@@ -34,7 +34,7 @@ impl DryRunBackend {
         Self::default()
     }
 
-    /// Variante dont les pairs rapportent un handshake à l'instant présent.
+    /// Variant whose peers report a handshake at the present instant.
     pub fn with_handshakes() -> Self {
         Self {
             simulate_handshakes: true,
@@ -42,8 +42,8 @@ impl DryRunBackend {
         }
     }
 
-    /// Variante dont `sync_peers` échoue toujours : simule un plan de données
-    /// qui refuse une reconfiguration.
+    /// Variant whose `sync_peers` always fails: simulates a data plane that
+    /// refuses a reconfiguration.
     pub fn failing_sync() -> Self {
         Self {
             fail_sync: true,
@@ -54,15 +54,12 @@ impl DryRunBackend {
     fn decode_key(b64: &str) -> Result<Vec<u8>> {
         base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .map_err(|e| WgError::BadKey(format!("`{b64}` : {e}")))
+            .map_err(|e| WgError::BadKey(format!("`{b64}`: {e}")))
             .and_then(|k| {
                 if k.len() == 32 {
                     Ok(k)
                 } else {
-                    Err(WgError::BadKey(format!(
-                        "longueur {} au lieu de 32",
-                        k.len()
-                    )))
+                    Err(WgError::BadKey(format!("length {} instead of 32", k.len())))
                 }
             })
     }
@@ -71,11 +68,11 @@ impl DryRunBackend {
 #[async_trait]
 impl WireguardBackend for DryRunBackend {
     async fn up(&self, config: &InterfaceConfig, peers: &[PeerConfig]) -> Result<()> {
-        // Valide comme le ferait le backend réel : une config qui passe en
-        // dry-run doit passer sur la cible.
+        // Validates like the real backend would: a config that passes in
+        // dry-run must pass on the target.
         Self::decode_key(&config.private_key)?;
         if config.address.trim().is_empty() {
-            return Err(WgError::BadAddress("adresse de gateway vide".into()));
+            return Err(WgError::BadAddress("empty gateway address".into()));
         }
         for p in peers {
             Self::decode_key(&p.public_key)?;
@@ -86,7 +83,7 @@ impl WireguardBackend for DryRunBackend {
         self.up.store(true, Ordering::SeqCst);
 
         info!(
-            "[dry-run] interface {} montée — écoute UDP {}, adresse {}, {} pair(s)",
+            "[dry-run] interface {} up — UDP listener {}, address {}, {} peer(s)",
             config.name,
             config.listen_port,
             config.address,
@@ -99,14 +96,14 @@ impl WireguardBackend for DryRunBackend {
         let name = self.iface.lock().unwrap().take();
         self.peers.lock().unwrap().clear();
         self.up.store(false, Ordering::SeqCst);
-        info!("[dry-run] interface {} démontée", name.unwrap_or_default());
+        info!("[dry-run] interface {} down", name.unwrap_or_default());
         Ok(())
     }
 
     async fn sync_peers(&self, peers: &[PeerConfig]) -> Result<()> {
         if self.fail_sync {
             return Err(WgError::Unavailable(
-                "[dry-run] synchronisation des pairs refusée (panne simulée)".into(),
+                "[dry-run] peer synchronization refused (simulated failure)".into(),
             ));
         }
         for p in peers {
@@ -115,7 +112,7 @@ impl WireguardBackend for DryRunBackend {
         let mut slot = self.peers.lock().unwrap();
         let before = slot.len();
         *slot = peers.to_vec();
-        info!("[dry-run] pairs synchronisés : {before} -> {}", peers.len());
+        info!("[dry-run] peers synchronized: {before} -> {}", peers.len());
         Ok(())
     }
 
@@ -188,31 +185,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_peers_remplace_la_liste() {
+    async fn sync_peers_replaces_the_list() {
         let be = DryRunBackend::new();
         be.up(&iface(), &[peer(KEY_B, "100.64.1.2/32")])
             .await
             .unwrap();
 
         be.sync_peers(&[]).await.unwrap();
-        assert!(be.peers().await.unwrap().is_empty(), "révocation appliquée");
+        assert!(be.peers().await.unwrap().is_empty(), "revocation applied");
     }
 
     #[tokio::test]
-    async fn cle_invalide_refusee_des_le_dry_run() {
+    async fn invalid_key_rejected_from_dry_run() {
         let be = DryRunBackend::new();
         let mut cfg = iface();
-        cfg.private_key = "pas-du-base64".into();
+        cfg.private_key = "not-base64".into();
         assert!(be.up(&cfg, &[]).await.is_err());
-        assert!(!be.is_up(), "aucune interface montée sur config invalide");
+        assert!(!be.is_up(), "no interface up on invalid config");
 
-        // Une clé de pair trop courte est rejetée aussi.
+        // A peer key that is too short is also rejected.
         let bad = peer("AAAA", "100.64.1.2/32");
         assert!(be.up(&iface(), &[bad]).await.is_err());
     }
 
     #[tokio::test]
-    async fn instantane_alimente_l_ipam() {
+    async fn snapshot_feeds_the_ipam() {
         use helios_provisioning::PeerTable;
 
         let be = DryRunBackend::with_handshakes();

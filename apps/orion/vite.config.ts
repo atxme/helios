@@ -1,10 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// Configuration Vite pour Tauri : port fixe 1420, pas de masquage d'erreurs.
-// Aucune proxy /api ici — contrairement à l'app web de heliosd, le client ne
-// parle pas à un serveur web pour se connecter : c'est le backend Rust (Tauri)
-// qui monte WireGuard. La télémétrie heliosd (post-tunnel) est gérée côté Rust.
+// Vite configuration for Tauri: fixed port 1420, no error masking.
+// No /api proxy here — unlike heliosd's web app, the client doesn't talk to
+// a web server to connect: it's the Rust backend (Tauri) that mounts
+// WireGuard. heliosd telemetry (post-tunnel) is handled on the Rust side.
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,

@@ -29,10 +29,31 @@ et `helios-ctl peer` admettent les clients par le **même** code
 document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
 expose enfin le séquestre.
 
+La négociation de clé pré-WireGuard (ADR-001, amendement du 24 juillet 2026)
+existe de bout en bout : port UDP dédié, authentification ML-DSA-65, trois modes
+et plancher anti-downgrade qui monte seul et ne redescend pas. Les deux IHM
+l’exposent — plancher par pair côté gateway ; côté Orion l’écran *Profils*
+édite tout le bloc, certificats compris, avec empreinte PQ dérivée en Rust et
+état de l’identité. Seul le plancher n’y est pas librement modifiable : il ne
+descend jamais sous la valeur avec laquelle le profil a été chargé.
+L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
+enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
+identité en un document) en lisant le matériel public de la gateway par
+`GET /api/key-negotiation`.
+**Limite connue** : DPAPI ne se compile ni ne s’exerce en WSL2 — hors Windows le
+scellement échoue explicitement plutôt que d’écrire ces clés en clair.
+
+Une invitation (`enroll --public-key`) ne porte pas de clé privée : l’import la
+reprend du profil local qui détient la **clé admise**, quel que soit son nom —
+la correspondance se fait sur la clé, jamais sur le nom. À défaut, le brouillon
+s’affiche quand même et le message nomme la clé attendue, celle qu’imprime
+`helios-ctl profile check`.
+
 La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
 `helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
 `helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
-compile plus rien. Les installateurs Orion (lot 3) restent à faire.
+compile plus rien. L’installateur Orion se bâtit par `cargo xtask orion-msi`,
+sur Windows uniquement — WiX n’a pas d’équivalent croisé.
 
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
 lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
@@ -51,7 +72,42 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   modification. L’adaptateur reste monté sur échec et `down()` n’est appelé que
   sur déconnexion explicite.
 - Un Orion compilé avec `wireguard` refuse de démarrer si le backend réel est
-  indisponible ; aucun repli implicite vers le dry-run.
+  indisponible ; aucun repli implicite vers le dry-run. Réciproquement, un
+  Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
+  vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
+  en affichant un profil et un mode négocié.
+- La session QUIC de négociation **survit à l’échange** : c’est le lien de
+  vivacité dont la fermeture dit à la gateway de libérer le PSK. Elle ne porte
+  alors plus rien, d’où des keep-alives obligatoires (`LINK_KEEP_ALIVE`) :
+  sans eux QUIC déclare la connexion morte au bout de 30 s, la gateway retire
+  le PSK, et le tunnel meurt au renouvellement de clé WireGuard suivant — deux
+  à trois minutes plus tard, sans que rien ne relie les deux événements.
+- Négociation de clé : datagrammes QUIC **épinglés à 1200 octets**, découverte
+  de MTU désactivée des deux côtés. Le matériel PQ pèse plusieurs kilooctets et
+  quinn sonde jusqu’à 1452 par défaut — une taille qui passe en labo puis
+  échoue chez le client dès que l’interface WireGuard capte la route avec un
+  MTU plus petit (`WSAEMSGSIZE`). 1200 est le plancher que RFC 9000 §14 impose
+  à tout chemin QUIC.
+- Un PSK négocié n’est pas un PSK statique, bien qu’ils occupent le même slot.
+  Le profil éphémère passé au backend porte `preshared_key_is_negotiated` ;
+  sans lui, `validate()` refuse le tunnel que la négociation vient de préparer.
+  Toute copie qui installe un PSK à l’exécution doit poser ce drapeau.
+- La négociation de clé n’est **pas** une feature de compilation, ni côté
+  Orion ni côté `heliosd` : tout binaire la porte. Un client d’apparence
+  normale qui importe un profil épinglé puis échoue avant WireGuard est
+  indiscernable, côté utilisateur, d’une gateway en panne ; et une gateway qui
+  accepte `key_negotiation_port` sans le servir l’est tout autant. Seul
+  `key_negotiation_port` décide de l’ouverture du service — absent, il reste
+  fermé, sans erreur. Côté Orion, seul le stockage protégé d’identité reste
+  conditionnel : il est propre à la machine, pas à la compilation.
+- `network.toml` est relu à chaud : le démon le surveille et réapplique la
+  table de pairs sans redémarrer (`orchestrator::spawn_network_config_watcher`).
+  Toute relecture doit passer par `NetworkConfig::adopt_runtime_secrets_from` —
+  le fichier ne contient ni la clé privée scellée ni les PSK négociés, et les
+  appliquer tels quels retirerait son identité à la gateway et casserait tous
+  les handshakes. **Limite connue** : ce qui ne peut pas changer sous le plan
+  de données en marche — nom d’interface, port d’écoute, adresse d’API — exige
+  toujours un redémarrage.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.
@@ -110,7 +166,9 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
 - `xtask` : fabrique de bundles d’installation (poste de build, jamais la
-  gateway) — `cargo xtask bundle`, `cargo xtask pack`.
+  gateway) — `cargo xtask bundle`, `cargo xtask pack`, et
+  `cargo xtask orion-msi` pour l’installateur Windows (même commande que la CI
+  de release : les features y sont tenues en un seul endroit).
 - `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
   bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
   profils clients (`profile`) et séquestre (`escrow`) ;
@@ -131,11 +189,11 @@ npm run dev --prefix web
 `scripts/regression.sh` est la référence : fmt, Clippy/tests toutes features,
 audits Cargo/npm, Vitest et builds frontend.
 
-**Langue.** Le code est en **anglais** : noms de fonctions, de types, de champs
-et de variables (`render`, `assign_vip`, `verify_manifest`). Les commentaires,
-les doc-comments, les messages de journal et la documentation sont en
-**français**. Les noms de tests suivent le français, comme la documentation
-qu'ils constituent.
+**Langue.** Tout ce qui est du code est en **anglais** : noms de fonctions, de
+types, de champs et de variables (`render`, `assign_vip`, `verify_manifest`),
+mais aussi les commentaires, les doc-comments, les messages de journal et les
+noms de tests. Seule la documentation sous `docs/` (ADR, guides, `TESTING.md`)
+reste en **français**.
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

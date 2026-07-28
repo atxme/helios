@@ -47,7 +47,7 @@ const STATE_UI: Record<TunnelState, {
     border: 'border-emerald-500/25',
     dot: 'bg-emerald-500 animate-pulse',
     label: 'HANDSHAKE ACTIF',
-    detail: 'Au moins un pair WireGuard possède un handshake frais',
+    detail: 'Au moins un pair WireGuard a handshaké il y a moins de 150 s',
   },
   connecting: {
     Icon: Shield,

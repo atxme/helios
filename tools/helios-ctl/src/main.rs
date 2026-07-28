@@ -1,7 +1,7 @@
-//! `helios-ctl` — outil de développement et de contrôle de heliosd.
+//! `helios-ctl` — development and control tool for heliosd.
 //!
 //! ```sh
-//! cargo run -p heliosd -- run --dev          # daemon en mode dev
+//! cargo run -p heliosd -- run --dev          # daemon in dev mode
 //! cargo run -p helios-ctl -- status
 //! cargo run -p helios-ctl -- watch
 //! cargo run -p helios-ctl -- network show
@@ -24,8 +24,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod api;
 mod campaign;
+mod campaign_key_nego;
+mod enroll;
 mod escrow;
 mod files;
+mod key_nego;
 mod peer;
 mod profile;
 
@@ -34,9 +37,9 @@ mod profile;
 #[derive(Parser)]
 #[command(
     name = "helios-ctl",
-    about = "Outil de test et de contrôle de heliosd",
+    about = "Test and control tool for heliosd",
     after_help = "\
-EXEMPLES:
+EXAMPLES:
   cargo run -p helios-ctl -- status
   cargo run -p helios-ctl -- watch
   cargo run -p helios-ctl -- network show
@@ -54,88 +57,181 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Affiche l'état courant du daemon.
+    /// Shows the daemon's current state.
     Status,
-    /// Connecte le tunnel VPN.
+    /// Connects the VPN tunnel.
     Connect,
-    /// Déconnecte le tunnel (kill-switch engagé).
+    /// Disconnects the tunnel (kill switch engaged).
     Disconnect,
-    /// Flux d'événements temps réel via WebSocket. Ctrl-C pour quitter.
+    /// Real-time event stream over WebSocket. Ctrl-C to quit.
     Watch,
-    /// Gestion de la configuration réseau.
+    /// Network configuration management.
     Network {
         #[command(subcommand)]
         command: NetworkCmd,
     },
-    /// Admission des clients sur la gateway (ADR-004 §4).
+    /// Client admission on the gateway (ADR-004 §4).
     Peer {
         #[command(subcommand)]
         command: PeerCmd,
     },
-    /// Profils clients Orion (ADR-004 §6).
+    /// Orion client profiles (ADR-004 §6).
     Profile {
         #[command(subcommand)]
         command: ProfileCmd,
     },
-    /// Séquestre de l'identité de la gateway — **poste opérateur**.
+    /// Enrolls a client in one go: keys, certificates, admission, profile.
     ///
-    /// Ces commandes sont hors ligne : elles n'utilisent pas `--url`. La clé
-    /// privée de séquestre ne doit jamais se trouver sur la gateway qu'elle
-    /// secourt.
+    /// The gateway supplies everything it knows — its WireGuard identity, its
+    /// negotiation certificates and the port they answer on — so the only
+    /// things to state are the client's name and the public endpoint. The
+    /// resulting file carries the client's private keys: it is born at 0600
+    /// and must be destroyed once Orion has imported it.
+    Enroll {
+        /// Profile name, also used as the peer name on the gateway.
+        #[arg(long)]
+        name: String,
+        /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
+        #[arg(long)]
+        endpoint: String,
+        /// Directory of the operator client CA (`key-nego init-client-ca`).
+        #[arg(long, default_value = "./orion-client-ca")]
+        client_ca_dir: PathBuf,
+        /// Client public key, when the client already holds its own pair.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Fichier contenant la clé privée WireGuard du client, quand
+        /// l'appelant a généré la paire lui-même. Un fichier, pas un
+        /// argument : `ps` expose l'argv de tout processus.
+        #[arg(long)]
+        private_key_file: Option<PathBuf>,
+        /// Répertoire d'une identité déjà émise par `key-nego issue-client`.
+        /// Obligatoire quand l'admission a eu lieu séparément : la gateway
+        /// connaît les empreintes de CES certificats-là.
+        #[arg(long)]
+        client_pki_dir: Option<PathBuf>,
+        /// Negotiation mode, which also becomes the peer's floor.
+        #[arg(long, value_enum, default_value = "ml-kem")]
+        mode: key_nego::Mode,
+        /// Negotiation endpoint. Defaults to the tunnel host with the port
+        /// the gateway publishes.
+        #[arg(long)]
+        negotiation_endpoint: Option<String>,
+        /// Name of the protected store entry. Defaults to `orion-<name>`.
+        #[arg(long)]
+        identity: Option<String>,
+        /// Admit the peer as a control-plane administrator.
+        #[arg(long)]
+        admin: bool,
+        /// Revoke a peer of the same name before admitting this identity.
+        #[arg(long)]
+        replace: bool,
+        /// Output file.
+        #[arg(long)]
+        output: PathBuf,
+
+        // ── Enrôlement hors API ──────────────────────────────────────────
+        // L'API vit derrière le tunnel : l'atteindre suppose déjà une
+        // connexion. Pour le PREMIER enrôlement, ces trois options prennent
+        // le relais — l'opérateur a déjà une session SSH, qui suffit à lire
+        // deux certificats publics et à admettre le pair en console.
+        /// `key-negotiation-cert.der` de la gateway, récupéré par SSH.
+        #[arg(long, requires = "gateway_pq_certificate", requires = "address")]
+        gateway_certificate: Option<PathBuf>,
+        /// `key-negotiation-pq-cert.json` de la gateway, récupéré par SSH.
+        #[arg(long, requires = "gateway_certificate")]
+        gateway_pq_certificate: Option<PathBuf>,
+        /// VIP affichée par `heliosd peer add`, qui a fait l'admission.
+        #[arg(long)]
+        address: Option<String>,
+        /// URL de l'API interne, pour la seule télémétrie.
+        #[arg(long)]
+        heliosd_url: Option<String>,
+    },
+    /// Escrow of the gateway identity — **operator workstation**.
+    ///
+    /// These commands are offline: they do not use `--url`. The escrow
+    /// private key must never be located on the gateway it rescues.
     Escrow {
         #[command(subcommand)]
         command: EscrowCmd,
     },
-    /// Exécute un scénario de test prédéfini.
+    /// Offline PKI and authenticated key-negotiation diagnostics.
+    KeyNego {
+        #[command(subcommand)]
+        command: key_nego::KeyNegoCmd,
+    },
+    /// Runs a predefined test scenario.
     Scenario {
         #[arg(default_value = "nominal")]
         name: String,
     },
-    /// Campagne de bout en bout du provisioning post-quantique.
+    /// End-to-end campaign for post-quantum provisioning.
     ///
-    /// Le même binaire vaut pour le dry-run et pour la cible : seuls les
-    /// scénarios de plan de données exigent `--wg-iface` et un noyau réel.
+    /// The same binary serves both dry-run and target: only the data-plane
+    /// scenarios require `--wg-iface` and a real kernel.
     Campaign {
-        /// Clé privée WireGuard du client (base64). Le pair correspondant doit
-        /// être **admis** sur la gateway : l'admission reste hors bande.
+        /// Client WireGuard private key (base64). The matching peer must be
+        /// **admitted** on the gateway: admission stays out of band.
         #[arg(long, env = "HELIOS_CAMPAIGN_CLIENT_KEY")]
         client_key: Option<String>,
-        /// Clé publique WireGuard de la gateway (base64).
+        /// Gateway WireGuard public key (base64).
         #[arg(long, env = "HELIOS_CAMPAIGN_GATEWAY_KEY")]
         gateway_key: Option<String>,
-        /// Interface WireGuard à inspecter (ex. `helios0`). Active les
-        /// scénarios de plan de données — **cible uniquement**.
+        /// WireGuard interface to inspect (e.g. `helios0`). Enables the
+        /// data-plane scenarios — **target only**.
         #[arg(long)]
         wg_iface: Option<String>,
-        /// Ne joue qu'une catégorie de scénarios.
+        /// Runs only one category of scenarios.
         #[arg(long, value_enum)]
         only: Option<campaign::Category>,
-        /// Nombre de passes (campagne d'endurance au-delà de 1).
+        /// Number of passes (endurance campaign beyond 1).
         #[arg(long, default_value_t = 1)]
         repeat: u32,
-        /// Génère une paire de clés à déclarer, puis quitte.
+        /// Generates a key pair to declare, then exits.
         #[arg(long)]
         generate_keys: bool,
+        /// Orion profile of this workstation, for the key-negotiation
+        /// scenarios. Its identity must be sealed here.
+        ///
+        /// **The campaign negotiates for real**: the peer's PSK is
+        /// renegotiated then released, so an Orion connected with this same
+        /// profile loses its tunnel.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Also runs the scenarios that have to wait — the liveness link
+        /// holds a session silent for forty seconds to prove it survives.
+        #[arg(long)]
+        soak: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum PeerCmd {
-    /// Liste les pairs admis.
+    /// Lists admitted peers.
     List,
-    /// Admet un client et lui attribue sa VIP.
+    /// Admits a client and assigns its VIP.
     Add {
-        /// Nom convivial, unique sur la gateway.
+        /// Friendly name, unique on the gateway.
         #[arg(long)]
         name: String,
-        /// Clé publique Curve25519 du client, en base64.
+        /// Client's Curve25519 public key, base64.
         #[arg(long)]
         public_key: String,
-        /// Autorise ce pair à muter le plan de contrôle et les mises à jour.
+        /// Allows this peer to mutate the control plane and updates.
         #[arg(long)]
         admin: bool,
+        /// SHA-256 fingerprint of the client's key-negotiation certificate.
+        #[arg(long)]
+        key_negotiation_certificate_sha256: Option<String>,
+        /// SHA-256 fingerprint of the client's ML-DSA-65 certificate.
+        #[arg(long)]
+        key_negotiation_pq_certificate_sha256: Option<String>,
+        /// Refuses every future network negotiation below this mode.
+        #[arg(long, value_enum)]
+        minimum_mode: Option<key_nego::Mode>,
     },
-    /// Retire un pair de l'admission.
+    /// Removes a peer from admission.
     Revoke {
         #[arg(long)]
         name: String,
@@ -144,26 +240,36 @@ enum PeerCmd {
 
 #[derive(Subcommand)]
 enum ProfileCmd {
-    /// Émet un profil client lisible par l'import Orion.
+    /// Relit un document avec le parseur d'Orion, sans rien installer.
+    ///
+    /// Diagnostic : quand un import échoue, cette commande dit si le document
+    /// est en cause ou si le problème est ailleurs — sans avoir à lancer
+    /// Orion, ni à ouvrir un fichier qui contient des secrets.
+    Check {
+        /// Document à relire (`.orionprofile`, `.json` ou `.conf`).
+        path: PathBuf,
+    },
+    /// Emits a client profile readable by Orion's import.
     Emit {
-        /// Nom du profil, aussi utilisé comme nom du pair sur la gateway.
+        /// Profile name, also used as the peer name on the gateway.
         #[arg(long)]
         name: String,
-        /// Endpoint UDP public de la gateway (`IP:port` ou `FQDN:port`).
+        /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
         #[arg(long)]
         endpoint: String,
-        /// Clé publique du client, reçue hors bande. **Mode recommandé** : le
-        /// secret du client ne voyage pas.
+        /// Client public key, received out of band. **Recommended mode**:
+        /// the client's secret never travels.
         #[arg(long)]
         public_key: Option<String>,
-        /// L'opérateur génère la paire et livre un profil complet. Le seul
-        /// chemin où une clé privée client existe hors du poste client.
+        /// The operator generates the pair and delivers a complete profile.
+        /// The only path where a client private key exists outside the
+        /// client workstation.
         #[arg(long)]
         with_private_key: bool,
-        /// Admet le pair comme administrateur du plan de contrôle.
+        /// Admits the peer as a control-plane administrator.
         #[arg(long)]
         admin: bool,
-        /// Fichier de sortie. Absent : sortie standard.
+        /// Output file. Absent: standard output.
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -171,21 +277,21 @@ enum ProfileCmd {
 
 #[derive(Subcommand)]
 enum EscrowCmd {
-    /// Génère la paire de séquestre de l'opérateur.
+    /// Generates the operator's escrow key pair.
     Keygen {
-        /// Répertoire à créer. La clé privée y reste, hors ligne.
+        /// Directory to create. The private key stays there, offline.
         #[arg(long)]
         output_dir: PathBuf,
     },
-    /// Ouvre un séquestre et écrit le fichier de récupération.
+    /// Opens an escrow and writes the recovery file.
     Open {
-        /// Séquestre récupéré sur la gateway (`wg-key.escrow`).
+        /// Escrow retrieved from the gateway (`wg-key.escrow`).
         #[arg(long)]
         escrow: PathBuf,
-        /// Clé privée de séquestre de l'opérateur.
+        /// Operator's escrow private key.
         #[arg(long)]
         private_key: PathBuf,
-        /// Fichier de récupération à produire.
+        /// Recovery file to produce.
         #[arg(long)]
         output: PathBuf,
     },
@@ -193,16 +299,16 @@ enum EscrowCmd {
 
 #[derive(Subcommand)]
 enum NetworkCmd {
-    /// Affiche la configuration réseau courante.
+    /// Shows the current network configuration.
     Show,
-    /// Charge une configuration réseau depuis un fichier TOML.
+    /// Loads a network configuration from a TOML file.
     Load {
-        /// Chemin vers le fichier TOML de config réseau.
+        /// Path to the network config TOML file.
         file: PathBuf,
     },
 }
 
-// ─── Types API ────────────────────────────────────────────────────────────────
+// ─── API types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct Status {
@@ -231,7 +337,7 @@ struct PeerSummary {
 
 use crate::api::{CmdResp, NetworkConfigView};
 
-// ─── Affichage ────────────────────────────────────────────────────────────────
+// ─── Display ──────────────────────────────────────────────────────────────────
 
 fn colored_state(s: &str) -> String {
     match s {
@@ -281,10 +387,10 @@ async fn api_status(client: &Client, base: &str) -> Result<Status> {
         .get(format!("{base}/api/status"))
         .send()
         .await
-        .context("connexion refusée — heliosd tourne-t-il ? (cargo run -p heliosd -- run --dev)")?
+        .context("connection refused — is heliosd running? (cargo run -p heliosd -- run --dev)")?
         .json::<Status>()
         .await
-        .context("réponse JSON inattendue")
+        .context("unexpected JSON response")
 }
 
 async fn api_post(client: &Client, base: &str, path: &str) -> Result<CmdResp> {
@@ -293,10 +399,10 @@ async fn api_post(client: &Client, base: &str, path: &str) -> Result<CmdResp> {
         .json(&serde_json::json!({}))
         .send()
         .await
-        .context("connexion refusée")?
+        .context("connection refused")?
         .json::<CmdResp>()
         .await
-        .context("réponse JSON inattendue")
+        .context("unexpected JSON response")
 }
 
 fn ws_url(base: &str) -> String {
@@ -305,7 +411,7 @@ fn ws_url(base: &str) -> String {
         + "/ws"
 }
 
-// ─── Commandes ────────────────────────────────────────────────────────────────
+// ─── Commands ─────────────────────────────────────────────────────────────────
 
 async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     let s = api_status(client, base).await?;
@@ -327,21 +433,21 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
         s.wg_iface,
         s.wg_listen_port
             .map(|port| format!(" (UDP {port})"))
-            .unwrap_or_else(|| " (port fermé)".to_string())
+            .unwrap_or_else(|| " (port closed)".to_string())
     );
     for peer in &s.peers {
         let pq = if peer.post_quantum { " [PQ]" } else { "" };
         let key = peer.public_key.get(..8).unwrap_or(&peer.public_key);
         println!(
             "  {:<14} {} → {} ({key}…){pq}",
-            "Pair", peer.name, peer.address
+            "Peer", peer.name, peer.address
         );
     }
     if !s.wg_peers.is_empty() {
-        println!("  {:<14} {}", "Site-à-site", s.wg_peers.join(", "));
+        println!("  {:<14} {}", "Site-to-site", s.wg_peers.join(", "));
     }
     if !s.allow_ssh_from.is_empty() {
-        println!("  {:<14} {}", "SSH autorisé", s.allow_ssh_from.join(", "));
+        println!("  {:<14} {}", "SSH allowed", s.allow_ssh_from.join(", "));
     }
     if !s.split_tunnel_cidrs.is_empty() {
         println!(
@@ -354,7 +460,7 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
         println!("  {:<14} {}", "MSS clamp", mss);
     }
     if let Some(gateway) = &s.captive_portal_gateway {
-        println!("  {:<14} {}", "Portail captif", gateway);
+        println!("  {:<14} {}", "Captive portal", gateway);
     }
     println!();
     Ok(())
@@ -363,9 +469,9 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
 async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
     let r = api_post(client, base, "/api/tunnel/start").await?;
     if r.ok {
-        println!("{} commande de connexion envoyée", ok());
+        println!("{} connect command sent", ok());
     } else {
-        println!("{} refusé : {}", fail(), r.error.as_deref().unwrap_or("?"));
+        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
     }
     Ok(())
 }
@@ -373,9 +479,9 @@ async fn cmd_connect(client: &Client, base: &str) -> Result<()> {
 async fn cmd_disconnect(client: &Client, base: &str) -> Result<()> {
     let r = api_post(client, base, "/api/tunnel/stop").await?;
     if r.ok {
-        println!("{} déconnexion envoyée — kill-switch engagé", ok());
+        println!("{} disconnect sent — kill switch engaged", ok());
     } else {
-        println!("{} refusé : {}", fail(), r.error.as_deref().unwrap_or("?"));
+        println!("{} refused: {}", fail(), r.error.as_deref().unwrap_or("?"));
     }
     Ok(())
 }
@@ -385,8 +491,8 @@ async fn cmd_watch(base: &str) -> Result<()> {
     println!("\x1b[2m↳ {url}\x1b[0m");
     let (mut stream, _) = connect_async(&url)
         .await
-        .context("impossible de se connecter — heliosd tourne-t-il ?")?;
-    println!("\x1b[2m↳ connecté — Ctrl-C pour quitter\x1b[0m\n");
+        .context("could not connect — is heliosd running?")?;
+    println!("\x1b[2m↳ connected — Ctrl-C to quit\x1b[0m\n");
 
     while let Some(msg) = stream.next().await {
         if let Ok(Message::Text(text)) = msg {
@@ -402,19 +508,19 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
         .get(format!("{base}/api/network"))
         .send()
         .await
-        .context("connexion refusée")?
+        .context("connection refused")?
         .json()
         .await
-        .context("réponse JSON inattendue")?;
+        .context("unexpected JSON response")?;
 
     println!();
-    println!("  \x1b[1mConfig réseau\x1b[0m");
+    println!("  \x1b[1mNetwork config\x1b[0m");
     println!();
     println!(
         "  {:<16} {}",
         "WAN",
         if cfg.wan_iface.is_empty() {
-            "(non défini)"
+            "(not set)"
         } else {
             &cfg.wan_iface
         }
@@ -423,7 +529,7 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
         "  {:<16} {}",
         "LAN",
         if cfg.lan_ifaces.is_empty() {
-            "(aucune)".to_string()
+            "(none)".to_string()
         } else {
             cfg.lan_ifaces.join(", ")
         }
@@ -431,28 +537,35 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
     if !cfg.allow_ssh_from.is_empty() {
         println!(
             "  {:<16} {}",
-            "SSH autorisé de",
+            "SSH allowed from",
             cfg.allow_ssh_from.join(", ")
         );
     }
     if let Some(ref iface) = cfg.admin_iface {
-        println!("  {:<16} {}", "Iface admin", iface);
+        println!("  {:<16} {}", "Admin iface", iface);
     }
     println!(
         "  {:<16} {} (UDP {})",
-        "Interface WG", cfg.wg_iface, cfg.wg_listen_port
+        "WG interface", cfg.wg_iface, cfg.wg_listen_port
     );
     println!(
         "  {:<16} {}",
-        "Clé privée",
+        "Key negotiation",
+        cfg.key_negotiation_port
+            .map(|port| format!("UDP {port}"))
+            .unwrap_or_else(|| "disabled".to_string())
+    );
+    println!(
+        "  {:<16} {}",
+        "Private key",
         if cfg.wg_private_key_configured {
-            "configurée (masquée)"
+            "configured (hidden)"
         } else {
-            "absente"
+            "absent"
         }
     );
-    println!("  {:<16} {}", "Adresse WG", cfg.wg_address);
-    println!("  {:<16} {}", "Pairs", cfg.peers.len());
+    println!("  {:<16} {}", "WG address", cfg.wg_address);
+    println!("  {:<16} {}", "Peers", cfg.peers.len());
     for p in &cfg.peers {
         let pq = if p.preshared_key_configured {
             "  [PQ]"
@@ -468,10 +581,10 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
 async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result<()> {
     let raw = tokio::fs::read_to_string(file)
         .await
-        .with_context(|| format!("impossible de lire {}", file.display()))?;
+        .with_context(|| format!("could not read {}", file.display()))?;
 
     let config: NetworkConfig =
-        toml::from_str(&raw).with_context(|| format!("TOML invalide dans {}", file.display()))?;
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", file.display()))?;
 
     let body = serde_json::to_string(&config)?;
     let resp: CmdResp = client
@@ -480,20 +593,20 @@ async fn cmd_network_load(client: &Client, base: &str, file: &PathBuf) -> Result
         .body(body)
         .send()
         .await
-        .context("connexion refusée")?
+        .context("connection refused")?
         .json()
         .await
-        .context("réponse JSON inattendue")?;
+        .context("unexpected JSON response")?;
 
     if resp.ok {
         println!(
-            "{} config réseau chargée ({} pair(s))",
+            "{} network config loaded ({} peer(s))",
             ok(),
             config.peers.len()
         );
     } else {
         println!(
-            "{} refusé : {}",
+            "{} refused: {}",
             fail(),
             resp.error.as_deref().unwrap_or("?")
         );
@@ -521,7 +634,7 @@ fn print_ws_event(ts: &str, v: &Value) {
     }
 }
 
-// ─── Scénarios ────────────────────────────────────────────────────────────────
+// ─── Scenarios ────────────────────────────────────────────────────────────────
 
 async fn wait_state(
     client: &Client,
@@ -534,7 +647,7 @@ async fn wait_state(
     loop {
         let elapsed = start.elapsed();
         if elapsed > timeout {
-            anyhow::bail!("timeout : état '{target}' non atteint en {timeout_secs}s");
+            anyhow::bail!("timeout: state '{target}' not reached within {timeout_secs}s");
         }
         if api_status(client, base).await?.state == target {
             return Ok(elapsed);
@@ -545,43 +658,43 @@ async fn wait_state(
 
 async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
     let t0 = Instant::now();
-    println!("\n\x1b[1mScénario nominal\x1b[0m");
+    println!("\n\x1b[1mNominal scenario\x1b[0m");
     println!("────────────────");
 
     let s = api_status(client, base).await?;
     println!(
-        "  1/4  état initial              {} ({})",
+        "  1/4  initial state              {} ({})",
         ok(),
         colored_state(&s.state)
     );
 
     let response = api_post(client, base, "/api/tunnel/start").await?;
-    ensure_command(response, "montée de l'interface")?;
-    println!("  2/4  connexion…                {} commande envoyée", ok());
+    ensure_command(response, "bringing up the interface")?;
+    println!("  2/4  connecting…               {} command sent", ok());
     let target = if s.dry_run { "connecting" } else { "up" };
     let t = wait_state(client, base, target, 5).await?;
     println!(
-        "       état {target:<10}          {} en {:.0}ms",
+        "       state {target:<10}          {} in {:.0}ms",
         ok(),
         t.as_millis()
     );
 
-    println!("  3/4  pause 2s…");
+    println!("  3/4  2s pause…");
     tokio::time::sleep(Duration::from_secs(2)).await;
     println!("       {}  ok", ok());
 
     let response = api_post(client, base, "/api/tunnel/stop").await?;
-    ensure_command(response, "arrêt de l'interface")?;
-    println!("  4/4  déconnexion…              {} commande envoyée", ok());
+    ensure_command(response, "stopping the interface")?;
+    println!("  4/4  disconnecting…            {} command sent", ok());
     let t = wait_state(client, base, "down", 5).await?;
     println!(
-        "       kill-switch               {} en {:.0}ms",
+        "       kill switch               {} in {:.0}ms",
         ok(),
         t.as_millis()
     );
 
     println!(
-        "\n  {} nominal terminé en \x1b[1m{:.2}s\x1b[0m\n",
+        "\n  {} nominal completed in \x1b[1m{:.2}s\x1b[0m\n",
         ok(),
         t0.elapsed().as_secs_f32()
     );
@@ -591,7 +704,7 @@ async fn scenario_nominal(client: &Client, base: &str) -> Result<()> {
 async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
     let t0 = Instant::now();
     let cycles = 5u32;
-    println!("\n\x1b[1mScénario flap\x1b[0m (×{cycles})");
+    println!("\n\x1b[1mFlap scenario\x1b[0m (×{cycles})");
     println!("─────────────");
 
     let mut up_times = Vec::new();
@@ -604,12 +717,12 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
 
     for i in 1..=cycles {
         let response = api_post(client, base, "/api/tunnel/start").await?;
-        ensure_command(response, "montée de l'interface")?;
+        ensure_command(response, "bringing up the interface")?;
         let tu = wait_state(client, base, target, 5).await?;
         up_times.push(tu.as_millis());
 
         let response = api_post(client, base, "/api/tunnel/stop").await?;
-        ensure_command(response, "arrêt de l'interface")?;
+        ensure_command(response, "stopping the interface")?;
         let td = wait_state(client, base, "down", 5).await?;
         down_times.push(td.as_millis());
 
@@ -627,10 +740,10 @@ async fn scenario_flap(client: &Client, base: &str) -> Result<()> {
     let max_down = down_times.iter().max().copied().unwrap_or(0);
 
     println!();
-    println!("  moyenne  up={avg_up}ms  down={avg_down}ms");
+    println!("  average  up={avg_up}ms  down={avg_down}ms");
     println!("  max      up={max_up}ms  down={max_down}ms");
     println!(
-        "\n  {} flap terminé en \x1b[1m{:.2}s\x1b[0m\n",
+        "\n  {} flap completed in \x1b[1m{:.2}s\x1b[0m\n",
         ok(),
         t0.elapsed().as_secs_f32()
     );
@@ -642,8 +755,8 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "{action} refusée : {}",
-        response.error.as_deref().unwrap_or("erreur inconnue")
+        "{action} refused: {}",
+        response.error.as_deref().unwrap_or("unknown error")
     )
 }
 
@@ -670,10 +783,35 @@ async fn main() -> Result<()> {
                 name,
                 public_key,
                 admin,
-            } => peer::cmd_add(&client, base, &name, &public_key, admin).await,
+                key_negotiation_certificate_sha256,
+                key_negotiation_pq_certificate_sha256,
+                minimum_mode,
+            } => {
+                let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
+                    if key_negotiation_pq_certificate_sha256.is_some() {
+                        aether::key_negotiation::ProtectionMode::MlKem
+                    } else {
+                        aether::key_negotiation::ProtectionMode::Classic
+                    }
+                });
+                peer::cmd_add(
+                    &client,
+                    base,
+                    &name,
+                    &public_key,
+                    admin,
+                    peer::KeyNegotiationAdmission {
+                        tls_certificate_sha256: key_negotiation_certificate_sha256.as_deref(),
+                        pq_certificate_sha256: key_negotiation_pq_certificate_sha256.as_deref(),
+                        minimum_mode,
+                    },
+                )
+                .await
+            }
             PeerCmd::Revoke { name } => peer::cmd_revoke(&client, base, &name).await,
         },
         Cmd::Profile { command } => match command {
+            ProfileCmd::Check { path } => profile::check(&path),
             ProfileCmd::Emit {
                 name,
                 endpoint,
@@ -697,6 +835,61 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Cmd::Enroll {
+            name,
+            endpoint,
+            client_ca_dir,
+            public_key,
+            private_key_file,
+            client_pki_dir,
+            mode,
+            negotiation_endpoint,
+            identity,
+            admin,
+            replace,
+            output,
+            gateway_certificate,
+            gateway_pq_certificate,
+            address,
+            heliosd_url,
+        } => {
+            // Checked before the gateway is contacted: a missing CA must not
+            // be discovered after a peer has been admitted.
+            enroll::check_client_ca(&client_ca_dir)?;
+            let offline = match (gateway_certificate, gateway_pq_certificate, address) {
+                (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
+                    Some(enroll::OfflineInputs {
+                        gateway_certificate,
+                        gateway_pq_certificate,
+                        address,
+                        heliosd_url,
+                    })
+                }
+                // `requires` in the parser already rules out partial
+                // combinations; this arm is the online path.
+                _ => None,
+            };
+            enroll::run(
+                &client,
+                base,
+                enroll::EnrollOptions {
+                    name,
+                    endpoint,
+                    client_ca_dir,
+                    public_key,
+                    private_key_file,
+                    client_pki_dir,
+                    mode: mode.into(),
+                    negotiation_endpoint,
+                    identity,
+                    admin,
+                    replace,
+                    output,
+                    offline,
+                },
+            )
+            .await
+        }
         Cmd::Escrow { command } => match command {
             EscrowCmd::Keygen { output_dir } => escrow::keygen(&output_dir),
             EscrowCmd::Open {
@@ -705,10 +898,11 @@ async fn main() -> Result<()> {
                 output,
             } => escrow::open(&escrow, &private_key, &output),
         },
+        Cmd::KeyNego { command } => key_nego::run(command).await,
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
             "flap" => scenario_flap(&client, base).await,
-            other => anyhow::bail!("scénario inconnu '{other}'. Disponibles : nominal, flap"),
+            other => anyhow::bail!("unknown scenario '{other}'. Available: nominal, flap"),
         },
         Cmd::Campaign {
             client_key,
@@ -717,6 +911,8 @@ async fn main() -> Result<()> {
             only,
             repeat,
             generate_keys,
+            profile,
+            soak,
         } => {
             if generate_keys {
                 campaign::generate_keys();
@@ -731,6 +927,8 @@ async fn main() -> Result<()> {
                     wg_iface,
                     only,
                     repeat,
+                    profile,
+                    soak,
                 },
             )
             .await
@@ -743,7 +941,7 @@ mod tests {
     use super::Status;
 
     #[test]
-    fn statut_wireguard_courant_est_deserialisable() {
+    fn current_wireguard_status_is_deserializable() {
         let raw = r#"{
             "state":"down","version":"0.1.0","wan_iface":"eth0",
             "lan_ifaces":["eth1"],"wg_peers":[],"allow_ssh_from":[],
@@ -751,7 +949,7 @@ mod tests {
             "wg_iface":"helios0","wg_listen_port":51820,"dry_run":true,
             "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null
         }"#;
-        let status: Status = serde_json::from_str(raw).expect("statut valide");
+        let status: Status = serde_json::from_str(raw).expect("valid status");
         assert_eq!(status.wg_iface, "helios0");
         assert_eq!(status.peers[0].name, "orion");
     }
