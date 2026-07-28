@@ -348,6 +348,38 @@ pub fn client_endpoint(
     identity: &TlsIdentity,
     gateway_ca: Vec<u8>,
 ) -> Result<Endpoint, TransportError> {
+    let mut endpoint = Endpoint::client(bind).map_err(TransportError::Io)?;
+    endpoint.set_default_client_config(client_config(identity, gateway_ca)?);
+    Ok(endpoint)
+}
+
+/// Same, on a socket the caller has already opened **and configured**.
+///
+/// Orion needs this because binding is not the whole story on Windows: the
+/// session has to survive its own tunnel coming up, and only a socket forced
+/// onto a chosen interface does. Letting the caller hand over a ready socket
+/// keeps every platform quirk on its side of the boundary — this crate speaks
+/// QUIC, it does not enumerate routing tables.
+pub fn client_endpoint_on_socket(
+    socket: std::net::UdpSocket,
+    identity: &TlsIdentity,
+    gateway_ca: Vec<u8>,
+) -> Result<Endpoint, TransportError> {
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(TransportError::Io)?;
+    endpoint.set_default_client_config(client_config(identity, gateway_ca)?);
+    Ok(endpoint)
+}
+
+fn client_config(
+    identity: &TlsIdentity,
+    gateway_ca: Vec<u8>,
+) -> Result<quinn::ClientConfig, TransportError> {
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(gateway_ca))
@@ -359,11 +391,9 @@ pub fn client_endpoint(
     tls.alpn_protocols = vec![KEY_NEGOTIATION_ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
-    let mut endpoint = Endpoint::client(bind).map_err(TransportError::Io)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(pinned_transport()));
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
+    Ok(client_config)
 }
 
 /// Serves connections until the endpoint is closed.

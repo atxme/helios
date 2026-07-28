@@ -54,7 +54,11 @@ type WgApiImpl = WGApi<defguard_wireguard_rs::Kernel>;
 type WgApiImpl = WGApi<defguard_wireguard_rs::Userspace>;
 
 /// Name of the WireGuard interface created by Orion.
-const DEFAULT_IFNAME: &str = "orion0";
+///
+/// Defined in `net_pin` because the key-negotiation socket must name the
+/// interface it has to avoid even on a build carrying no WireGuard backend —
+/// the negotiation is not a compile-time feature.
+use crate::net_pin::TUNNEL_IFNAME as DEFAULT_IFNAME;
 
 /// Local listen port. `0` = ephemeral port chosen by the OS, which is the
 /// expected behavior of a road-warrior client (it initiates, it doesn't listen).

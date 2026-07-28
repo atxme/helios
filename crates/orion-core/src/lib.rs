@@ -27,6 +27,7 @@ pub mod events;
 pub mod identity_store;
 pub mod key_negotiation;
 pub mod mtu;
+pub mod net_pin;
 pub mod profile_import;
 pub mod provisioning;
 pub mod telemetry;

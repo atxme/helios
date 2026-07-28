@@ -33,6 +33,17 @@ defguard_wireguard_rs = { workspace = true, optional = true }
 # Non optionnelle : voir la note sur `aether` ci-dessus.
 helios-key-negotiation = { workspace = true }
 
+# Épinglage de la socket de négociation hors tunnel (`net_pin`). Pas plus
+# optionnel que le reste de la négociation : sans lui, la session QUIC change
+# d'interface quand WireGuard capte la route, et la confirmation se perd.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+] }
+
 [features]
 default = []
 # Backend WireGuard réel via `defguard_wireguard_rs` (noyau Linux/Windows, ou

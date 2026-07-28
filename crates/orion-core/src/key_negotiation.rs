@@ -4,10 +4,7 @@
 //! is supplied at connection time by the shell's protected identity store and
 //! is never serialized by this module.
 
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
 use aether::{
     key_negotiation::{
@@ -21,7 +18,9 @@ use aether::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
-use helios_key_negotiation::{client_endpoint, negotiate, ClientSession, SessionLink, TlsIdentity};
+use helios_key_negotiation::{
+    client_endpoint_on_socket, negotiate, ClientSession, SessionLink, TlsIdentity,
+};
 use zeroize::Zeroizing;
 
 use crate::ClientProfile;
@@ -237,11 +236,14 @@ pub async fn prepare(
     .context("signing the key-negotiation request with ML-DSA-65")?;
 
     let remote = resolve_remote(&client.remote).await?;
-    let bind_ip = match remote.ip() {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    };
-    let endpoint = client_endpoint(SocketAddr::new(bind_ip, 0), &identity, client.gateway_ca)
+    // Pinned off the tunnel before anything is sent. This session opens
+    // before the WireGuard interface exists and has to outlive it coming up;
+    // a socket left on the wildcard address changes egress interface at that
+    // moment, and the gateway sees a QUIC migration mid-transaction. See
+    // `crate::net_pin`.
+    let socket = crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
+        .context("opening the key-negotiation socket")?;
+    let endpoint = client_endpoint_on_socket(socket, &identity, client.gateway_ca)
         .context("building the authenticated key-negotiation client")?;
     // Everything needed to tell a routing problem from a refusal: where we
     // dial, under which name the certificate is checked, and what the request
