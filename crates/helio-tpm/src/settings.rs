@@ -36,3 +36,23 @@ impl Default for TpmSettings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_bind_the_expected_boot_chain_and_storage_paths() {
+        let settings = TpmSettings::default();
+
+        assert_eq!(settings.enabled, cfg!(feature = "tpm"));
+        assert!(settings.enforce);
+        assert!(!settings.allow_provisioning);
+        assert_eq!(settings.device, "/dev/tpmrm0");
+        assert_eq!(settings.pcr_bank, "sha256");
+        assert_eq!(settings.pcr_selection, [0, 4, 7]);
+        assert_eq!(settings.sealed_blob_path, "/var/lib/helios/sealed.key");
+        assert_eq!(settings.ticket_path, "/var/lib/helios/reseal-ticket.json");
+        assert_eq!(settings.state_path, "/var/lib/helios/tpm-state.json");
+    }
+}

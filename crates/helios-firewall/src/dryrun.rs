@@ -38,3 +38,42 @@ impl FirewallBackend for DryRunBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::PolicyMode;
+
+    fn policy() -> FirewallPolicy {
+        FirewallPolicy {
+            wan_iface: "eth0".into(),
+            lan_ifaces: vec!["eth1".into()],
+            wg_peers: vec!["203.0.113.10".into()],
+            wg_listen_port: Some(51820),
+            key_negotiation_port: Some(51821),
+            mode: PolicyMode::FailClosed,
+            allow_ssh_from: vec![],
+            allow_dhcp_on_wan: false,
+            allow_client_internet: true,
+            wg_iface: "helios0".into(),
+            admin_port: Some(8080),
+            admin_iface: Some("helios0".into()),
+            split_tunnel_cidrs: vec![],
+            mss_clamp: Some(1360),
+            captive_portal_gateway: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_rendered_rules_and_tears_down_without_kernel_access() {
+        let backend = DryRunBackend;
+
+        backend.apply(&policy(), TunnelState::Up).await.unwrap();
+        backend.teardown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_kill_switch_path_applies_the_down_state() {
+        DryRunBackend.engage_kill_switch(&policy()).await.unwrap();
+    }
+}

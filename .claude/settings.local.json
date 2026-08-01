@@ -240,7 +240,8 @@
       "Bash(timeout 2400 cargo llvm-cov -p heliosd --all-features --summary-only)",
       "Bash(awk '{printf \"%-46s lignes %s  fonctions %s\\\\n\", $1, $4, $7}')",
       "Bash(awk -F'[ ;]' '{s+=$4; if\\($6>0\\) f+=$6} END {print s\" tests, \"\\(f+0\\)\" échecs\"}')",
-      "Bash(timeout 2400 cargo llvm-cov -p heliosd --all-features --summary-only --jobs 2)"
+      "Bash(timeout 2400 cargo llvm-cov -p heliosd --all-features --summary-only --jobs 2)",
+      "Bash(echo \"=== exit=$? ===\")"
     ]
   }
 }

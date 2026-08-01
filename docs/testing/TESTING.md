@@ -53,6 +53,36 @@ et suivis dans [SECURITY.md](../security/SECURITY.md), car `--deny warnings` ren
 inexécutable tant que Tauri Linux dépend de GTK3. Les audits ne détectent pas une
 erreur de conception ; les tests d’invariants restent obligatoires.
 
+## Mesure de couverture
+
+La mesure locale complète se lance depuis la racine du dépôt :
+
+```sh
+bash scripts/coverage.sh
+```
+
+Elle produit trois résultats séparés, afin qu’une moyenne du workspace ne
+masque pas un produit ou une couche peu exercée :
+
+- **Orion Rust** : `orion-core` et les commandes Tauri ;
+- **Helios Rust** : tous les autres crates et outils Rust ;
+- **Orion UI** : toutes les sources TypeScript/React, y compris celles que les
+  tests n’importent jamais et qui doivent donc compter pour zéro.
+
+Les rapports navigables sont écrits dans
+`target/coverage/rust-html/html/index.html` et
+`target/coverage/orion-ui/index.html`. Le résumé JSON Rust reste dans
+`target/coverage/workspace.json`, ce qui permet de comparer deux campagnes sans
+dépendre d’un répertoire temporaire.
+
+Cette commande mesure ce que l’hôte a réellement compilé. Sous Linux, un
+module Windows peut afficher une couverture élevée parce que seul son refus
+`cfg(not(windows))` est présent ; le code Win32 exclu n’entre pas dans le
+dénominateur. De même, l’exécution d’un simulateur ne valide pas les effets
+TPM, Netlink, WireGuard noyau ou WireGuard-NT. Ces chemins restent soumis à la
+recette cible ci-dessous : augmenter leur pourcentage depuis WSL2 produirait un
+indicateur trompeur, pas une validation supplémentaire.
+
 ## Invariants de sécurité verrouillés
 
 1. Seul `TunnelState::Up` autorise le trafic gateway.

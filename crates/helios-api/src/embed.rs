@@ -54,3 +54,28 @@ async fn serve_embedded(uri: Uri) -> Response {
         },
     }
 }
+
+#[cfg(all(test, feature = "embed-ui"))]
+mod tests {
+    use super::*;
+    use axum::http::header;
+
+    #[tokio::test]
+    async fn serves_the_embedded_index_at_the_root() {
+        let response = static_handler(Uri::from_static("/")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_fall_back_to_the_spa_index() {
+        let response = static_handler(Uri::from_static("/profiles/portable")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+    }
+}
