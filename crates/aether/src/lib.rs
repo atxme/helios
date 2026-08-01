@@ -14,6 +14,7 @@ pub mod enroll;
 pub mod error;
 pub mod events;
 pub mod key_negotiation;
+pub mod locked;
 pub mod mtu;
 pub mod policy;
 pub mod pq;

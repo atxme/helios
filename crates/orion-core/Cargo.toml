@@ -56,6 +56,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Com",
   # `CREDUI_INFOW` porte un `HBITMAP` : sans GDI, la structure est absente.
   "Win32_Graphics_Gdi",
+  # `WerRegisterExcludedMemoryBlock` : exclusion des pages secrètes des
+  # rapports d'erreur Windows (ADR-006 §5).
+  "Win32_System_ErrorReporting",
 ] }
 # WMI (posture BitLocker) : `windows-sys` n'expose aucune interface COM, seul
 # le crate `windows` le fait. Il est déjà présent dans le lockfile.

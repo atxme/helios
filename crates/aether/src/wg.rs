@@ -49,7 +49,10 @@ pub enum WgKeyError {
 ///
 /// The private key is wrapped in [`SecretString`]: it cannot land in a log
 /// through a derived `Debug`.
-#[derive(Debug, Clone)]
+/// Deliberately not `Clone`: it carries a private key, and ADR-006 §5 puts the
+/// rule on the type rather than on `Drop`. Duplicating one goes through
+/// [`SecretString::duplicate`], which shows up in a diff.
+#[derive(Debug)]
 pub struct Keypair {
     pub private_key: SecretString,
     pub public_key: String,

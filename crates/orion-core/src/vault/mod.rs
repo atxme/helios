@@ -263,6 +263,8 @@ pub enum VaultError {
          antérieur a été remis en place"
     )]
     GenerationWentBackwards { observed: u64, offered: u64 },
+    #[error("hygiène mémoire : {0}")]
+    MemoryHygiene(&'static str),
     #[error(transparent)]
     Container(helios_vault::VaultError),
 }

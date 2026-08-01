@@ -270,18 +270,26 @@ fn load_legacy(secret: &SecretKey, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     nonce_bytes.copy_from_slice(&blob[5..LEGACY_HEADER_LEN]);
 
     let key = aead_key(secret)?;
-    let mut in_out = blob[LEGACY_HEADER_LEN..].to_vec();
-    let plaintext = key
+    // `Zeroizing` **before** the AEAD call, not after it. `open_in_place`
+    // decrypts into the very buffer it is given: copying the plaintext into a
+    // second `Vec` and dropping the first would leave the secret in a freed,
+    // unwiped allocation — the pattern ADR-006 §5 forbids by name.
+    let mut in_out = Zeroizing::new(blob[LEGACY_HEADER_LEN..].to_vec());
+    let length = key
         .open_in_place(
             Nonce::assume_unique_for_key(nonce_bytes),
             Aad::from(LEGACY_AAD),
-            &mut in_out,
+            in_out.as_mut(),
         )
-        .map_err(|_| KeystoreError::Undecipherable)?;
+        .map_err(|_| KeystoreError::Undecipherable)?
+        .len();
+    // Truncating keeps the plaintext inside the same wiped allocation; the
+    // tag bytes past `length` are already zeroed by the drop that follows.
+    in_out.truncate(length);
     tracing::info!(
         "legacy HKS1 vault read — it will be rewritten in the HVLT format on the next store"
     );
-    Ok(Zeroizing::new(plaintext.to_vec()))
+    Ok(in_out)
 }
 
 /// Builds the AEAD key from the unsealed secret — **legacy path only**.

@@ -8,7 +8,8 @@
 //!   envelope of the root;
 //! * [`bitlocker`] — the volume-encryption posture that gates import, migration
 //!   and auto-connect;
-//! * [`prompt`] — the native passphrase dialog for the `nomade` profile.
+//! * [`prompt`] — the native passphrase dialog for the `nomade` profile;
+//! * [`dumps`] — excluding secret pages from Windows Error Reporting.
 //!
 //! Each module compiles everywhere and **refuses** off Windows rather than
 //! offering a software substitute. The refusal is the specified behaviour, not
@@ -17,6 +18,7 @@
 
 pub mod bitlocker;
 pub mod dpapi;
+pub mod dumps;
 pub mod prompt;
 pub mod tpm;
 
