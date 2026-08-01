@@ -47,6 +47,38 @@ use tracing::{info, warn};
 /// Location of the vault containing the WireGuard private key.
 const KEYSTORE_PATH: &str = "/var/lib/helios/wg-key.sealed";
 
+/// Directory holding the three identity files, overridable for tests.
+///
+/// Same pattern, and same reason, as `HELIOS_NETWORK_CONFIG`: the production
+/// service keeps the system path when the variable is absent, and a test can
+/// exercise the real write paths without touching `/var/lib/helios`. Without
+/// it, everything that actually puts bytes on disk — the escrow, the atomic
+/// write — is reachable only on a provisioned gateway.
+fn path_of(default: &str, variable: &str) -> String {
+    match std::env::var_os(variable) {
+        Some(directory) => std::path::Path::new(&directory)
+            .join(default.rsplit('/').next().unwrap_or(default))
+            .to_string_lossy()
+            .into_owned(),
+        None => default.to_string(),
+    }
+}
+
+/// Root under which the three identity files live.
+const IDENTITY_DIR_ENV: &str = "HELIOS_IDENTITY_DIR";
+
+fn keystore_path() -> String {
+    path_of(KEYSTORE_PATH, IDENTITY_DIR_ENV)
+}
+
+fn escrow_path() -> String {
+    path_of(ESCROW_PATH, IDENTITY_DIR_ENV)
+}
+
+fn recovery_path() -> String {
+    path_of(RECOVERY_PATH, IDENTITY_DIR_ENV)
+}
+
 /// Escrow: copy of the key encrypted to the operator's public key.
 ///
 /// Rewritten on every sealing. The operator retrieves it and keeps it; only
@@ -83,7 +115,7 @@ pub struct ResolvedKey {
 
 fn keystore() -> SealedKeystore {
     SealedKeystore::new(
-        PathBuf::from(KEYSTORE_PATH),
+        PathBuf::from(keystore_path()),
         helio_tpm::DOMAIN_GATEWAY_WG_KEY,
     )
 }
@@ -165,10 +197,10 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
     };
 
     match helio_tpm::escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
-        Ok(blob) => match write_atomic(ESCROW_PATH, &blob) {
+        Ok(blob) => match write_atomic(&escrow_path(), &blob) {
             Ok(()) => info!(
-                "WireGuard key escrow written to {ESCROW_PATH} — \
-                 retrieve it and keep it off the gateway"
+                path = %escrow_path(),
+                "WireGuard key escrow written — retrieve it and keep it off the gateway"
             ),
             Err(e) => warn!("could not write escrow: {e}"),
         },
@@ -182,7 +214,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 /// stray recovery file must never be able to replace the key in effect —
 /// that would be an identity substitution vector.
 fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
-    let path = PathBuf::from(RECOVERY_PATH);
+    let path = PathBuf::from(recovery_path());
     if !path.exists() {
         return None;
     }
@@ -480,6 +512,7 @@ pub fn validate_wg_key(key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     const VALID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -602,33 +635,126 @@ mod tests {
         assert!(error.contains("public key"), "message: {error}");
     }
 
+    /// Serialises the tests that drive `HELIOS_IDENTITY_DIR`.
+    ///
+    /// The variable is process-wide, so two tests setting it would point each
+    /// other's writes at the wrong directory under the parallel harness.
+    static IDENTITY_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with the identity files redirected into a fresh directory.
+    fn in_identity_dir<T>(name: &str, body: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = IDENTITY_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "helios-identity-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test directory");
+        std::env::set_var(IDENTITY_DIR_ENV, &dir);
+        let outcome = body(&dir);
+        std::env::remove_var(IDENTITY_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    /// The escrow is the only recovery channel after a PCR change, and the
+    /// gateway itself must be unable to open it — that is the whole design.
+    /// This exercises the real write path, then opens the result as the
+    /// operator would.
+    #[test]
+    fn the_escrow_is_written_and_only_the_operator_can_open_it() {
+        let (private_key, public_key) =
+            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+        let network = NetworkConfig {
+            escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
+            ..NetworkConfig::default()
+        };
+        let (wg_private, _) = keypair();
+
+        in_identity_dir("escrow-write", |dir| {
+            write_escrow(&network, &wg_private);
+            let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
+            assert!(
+                !blob
+                    .windows(wg_private.len())
+                    .any(|w| w == wg_private.as_bytes()),
+                "the escrow holds the key in the clear"
+            );
+            let opened = helio_tpm::escrow::open_as_operator(private_key.as_ref(), &blob)
+                .expect("the operator must be able to open it");
+            assert_eq!(opened.as_slice(), wg_private.as_bytes());
+        });
+    }
+
+    /// Rewritten on every sealing: a stale escrow would restore an identity
+    /// no client expects anymore.
+    #[test]
+    fn the_escrow_is_replaced_rather_than_appended() {
+        let (_, public_key) =
+            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+        let network = NetworkConfig {
+            escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
+            ..NetworkConfig::default()
+        };
+        let (first, _) = keypair();
+        let (second, _) = keypair();
+
+        in_identity_dir("escrow-replace", |dir| {
+            write_escrow(&network, &first);
+            let before = std::fs::read(dir.join("wg-key.escrow")).expect("first escrow");
+            write_escrow(&network, &second);
+            let after = std::fs::read(dir.join("wg-key.escrow")).expect("second escrow");
+            assert_ne!(before, after, "the escrow was not rewritten");
+        });
+    }
+
     /// A missing escrow key removes a recovery option; it must not stop the
     /// gateway, and it must not write anything either.
     #[test]
     fn an_absent_escrow_key_is_reported_without_writing() {
-        // No `escrow_public_key`: the function returns before touching any
-        // path, which is what makes this testable without a filesystem.
-        write_escrow(&NetworkConfig::default(), VALID);
-        write_escrow(
-            &NetworkConfig {
-                escrow_public_key: Some("   ".into()),
-                ..NetworkConfig::default()
-            },
-            VALID,
-        );
+        in_identity_dir("escrow-absent", |dir| {
+            write_escrow(&NetworkConfig::default(), VALID);
+            write_escrow(
+                &NetworkConfig {
+                    escrow_public_key: Some("   ".into()),
+                    ..NetworkConfig::default()
+                },
+                VALID,
+            );
+            assert!(
+                !dir.join("wg-key.escrow").exists(),
+                "nothing must be written without an escrow key"
+            );
+        });
     }
 
     /// An unreadable escrow key is reported, never fatal: it costs a recovery
     /// option, not the gateway's ability to start.
     #[test]
     fn an_unreadable_escrow_key_does_not_panic() {
-        write_escrow(
-            &NetworkConfig {
-                escrow_public_key: Some("pas-du-base64-!!".into()),
-                ..NetworkConfig::default()
-            },
-            VALID,
-        );
+        in_identity_dir("escrow-invalid", |dir| {
+            write_escrow(
+                &NetworkConfig {
+                    escrow_public_key: Some("pas-du-base64-!!".into()),
+                    ..NetworkConfig::default()
+                },
+                VALID,
+            );
+            assert!(!dir.join("wg-key.escrow").exists());
+            // A syntactically valid but wrong-sized key: base64 decodes, the
+            // sealing refuses. Reported, never fatal.
+            write_escrow(
+                &NetworkConfig {
+                    escrow_public_key: Some(
+                        base64::engine::general_purpose::STANDARD.encode([7u8; 8]),
+                    ),
+                    ..NetworkConfig::default()
+                },
+                VALID,
+            );
+            assert!(!dir.join("wg-key.escrow").exists());
+        });
     }
 
     #[test]
