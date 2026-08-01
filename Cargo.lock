@@ -2099,6 +2099,7 @@ dependencies = [
  "async-trait",
  "ipnetwork",
  "rustables",
+ "tokio",
  "toml 0.8.2",
  "tracing",
 ]
@@ -2213,6 +2214,7 @@ dependencies = [
  "helios-key-negotiation",
  "helios-provisioning",
  "helios-update",
+ "helios-vault",
  "helios-wireguard",
  "libc",
  "orion-core",
@@ -2220,6 +2222,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tracing",

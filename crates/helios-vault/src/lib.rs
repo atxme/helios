@@ -60,7 +60,7 @@ use std::{
 
 use aws_lc_rs::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN},
-    pbkdf2,
+    hkdf, pbkdf2,
     rand::{SecureRandom as _, SystemRandom},
 };
 use zeroize::Zeroizing;
@@ -145,6 +145,10 @@ mod kdf {
 
     /// PBKDF2-HMAC-SHA-512, 600 000 iterations.
     pub const PBKDF2_HMAC_SHA512: u8 = 2;
+
+    /// HKDF-SHA-256 from caller-supplied input keying material, using the
+    /// container's own fresh salt and a caller-supplied `info` label.
+    pub const HKDF_SHA256: u8 = 3;
 }
 
 /// How the 256-bit AEAD key is obtained.
@@ -159,6 +163,26 @@ pub enum Unlock<'a> {
     Key(&'a [u8; KEY_LEN]),
     /// A passphrase, stretched with PBKDF2-HMAC-SHA-512.
     Passphrase(&'a str),
+    /// A key derived from other key material this caller already holds.
+    ///
+    /// For a vault whose key must **live and die with another secret** rather
+    /// than with the machine. ADR-006 §4 needs exactly that for the gateway's
+    /// static-PSK table: sealing it under the general TPM secret would make it
+    /// unrecoverable after a PCR change, since the escrow restores only the
+    /// WireGuard identity. Deriving it from that identity instead ties the two
+    /// together — the table survives a resealing if and only if the identity
+    /// does.
+    ///
+    /// The salt is the container's own, drawn fresh at every seal, so two
+    /// vaults sealed from the same `ikm` never share a key. `info` separates
+    /// uses and is a caller-side constant, reproduced at open time exactly as
+    /// the domain is.
+    Derived {
+        /// Input keying material. **Secret** — it is another secret's bytes.
+        ikm: &'a [u8],
+        /// Domain label of this derivation, e.g. `b"helios/static-psk-map/v1"`.
+        info: &'a [u8],
+    },
 }
 
 impl Unlock<'_> {
@@ -166,6 +190,7 @@ impl Unlock<'_> {
         match self {
             Self::Key(_) => kdf::RAW,
             Self::Passphrase(_) => kdf::PBKDF2_HMAC_SHA512,
+            Self::Derived { .. } => kdf::HKDF_SHA256,
         }
     }
 }
@@ -445,7 +470,7 @@ fn parse(blob: &[u8]) -> Result<Parsed<'_>> {
     if kdf_id == kdf::BURNED_PBKDF2_HMAC_SHA256 {
         return Err(VaultError::BurnedKdf(kdf_id));
     }
-    if kdf_id != kdf::RAW && kdf_id != kdf::PBKDF2_HMAC_SHA512 {
+    if kdf_id != kdf::RAW && kdf_id != kdf::PBKDF2_HMAC_SHA512 && kdf_id != kdf::HKDF_SHA256 {
         return Err(VaultError::UnsupportedKdf(kdf_id));
     }
     let domain_len = blob[6] as usize;
@@ -515,6 +540,18 @@ fn derive_key_material(
                 passphrase.as_bytes(),
                 derived.as_mut(),
             );
+            derived
+        }
+        Unlock::Derived { ikm, info } => {
+            // The container's own fresh salt, so two vaults sealed from the
+            // same input keying material never share a key — which is what
+            // makes re-sealing under an unchanged identity safe.
+            let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(ikm);
+            let mut derived = Zeroizing::new([0u8; KEY_LEN]);
+            prk.expand(&[info], hkdf::HKDF_SHA256)
+                .map_err(|_| VaultError::Derive)?
+                .fill(derived.as_mut())
+                .map_err(|_| VaultError::Derive)?;
             derived
         }
     };
@@ -680,6 +717,7 @@ mod tests {
     fn no_live_kdf_reuses_the_burned_identifier() {
         assert_ne!(kdf::RAW, kdf::BURNED_PBKDF2_HMAC_SHA256);
         assert_ne!(kdf::PBKDF2_HMAC_SHA512, kdf::BURNED_PBKDF2_HMAC_SHA256);
+        assert_ne!(kdf::HKDF_SHA256, kdf::BURNED_PBKDF2_HMAC_SHA256);
         assert_eq!(
             Unlock::Passphrase("x").id(),
             kdf::PBKDF2_HMAC_SHA512,
@@ -877,6 +915,97 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
             .collect()
+    }
+
+    const PSK_MAP_INFO: &[u8] = b"helios/static-psk-map/v1";
+
+    fn derived_unlock(ikm: &[u8]) -> Unlock<'_> {
+        Unlock::Derived {
+            ikm,
+            info: PSK_MAP_INFO,
+        }
+    }
+
+    #[test]
+    fn a_derived_key_round_trips() {
+        let ikm = [9u8; 32];
+        let ctx = context("gateway");
+        let blob = seal(DOMAIN, &ctx, &derived_unlock(&ikm), b"table").expect("seal");
+        assert_eq!(
+            open(DOMAIN, &ctx, &derived_unlock(&ikm), &blob)
+                .expect("open")
+                .as_slice(),
+            b"table"
+        );
+    }
+
+    /// The property ADR-006 §4 relies on: the vault lives and dies with the
+    /// key material it was derived from. Another identity opens nothing.
+    #[test]
+    fn another_input_keying_material_opens_nothing() {
+        let ctx = context("gateway");
+        let blob = seal(DOMAIN, &ctx, &derived_unlock(&[9u8; 32]), b"table").expect("seal");
+        assert!(matches!(
+            open(DOMAIN, &ctx, &derived_unlock(&[8u8; 32]), &blob),
+            Err(VaultError::Undecipherable)
+        ));
+    }
+
+    /// `info` separates uses: the same material under another label is another
+    /// key, so a PSK table cannot be opened as anything else.
+    #[test]
+    fn another_info_label_opens_nothing() {
+        let ikm = [9u8; 32];
+        let ctx = context("gateway");
+        let blob = seal(DOMAIN, &ctx, &derived_unlock(&ikm), b"table").expect("seal");
+        let other = Unlock::Derived {
+            ikm: &ikm,
+            info: b"helios/autre-usage/v1",
+        };
+        assert!(matches!(
+            open(DOMAIN, &ctx, &other, &blob),
+            Err(VaultError::Undecipherable)
+        ));
+    }
+
+    /// Two seals of the same material must not share a key: the container's
+    /// fresh salt is what makes re-sealing safe.
+    #[test]
+    fn two_derived_seals_use_different_salts() {
+        let ikm = [9u8; 32];
+        let ctx = context("gateway");
+        let a = seal(DOMAIN, &ctx, &derived_unlock(&ikm), b"table").expect("seal a");
+        let b = seal(DOMAIN, &ctx, &derived_unlock(&ikm), b"table").expect("seal b");
+        let salt_at = FIXED_HEADER_LEN + DOMAIN.len() + ctx.as_bytes().len();
+        assert_ne!(
+            a[salt_at..salt_at + SALT_LEN],
+            b[salt_at..salt_at + SALT_LEN]
+        );
+    }
+
+    #[test]
+    fn a_derived_vault_is_not_openable_with_a_raw_key() {
+        let ctx = context("gateway");
+        let blob = seal(DOMAIN, &ctx, &derived_unlock(&[9u8; 32]), b"table").expect("seal");
+        assert!(matches!(
+            open(DOMAIN, &ctx, &key_unlock(), &blob),
+            Err(VaultError::UnlockMismatch)
+        ));
+    }
+
+    /// Pins the PRF, the salt placement and the `info` handling against an
+    /// implementation written outside this crate. A round trip would agree
+    /// with itself under any consistent KDF.
+    #[test]
+    fn the_derived_kdf_matches_its_reference_vector() {
+        let salt: [u8; SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let derived = derive_key_material(&derived_unlock(&[9u8; 32]), &salt).expect("derive");
+        assert_eq!(
+            derived.as_ref(),
+            hex_to_bytes("78934c37a46e3380f05143199ac623e8acc02236d6ccc24528d5a6210a8804e1")
+                .as_slice(),
+            "the derived KDF is no longer HKDF-SHA-256 over the container salt"
+        );
     }
 
     #[test]

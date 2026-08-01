@@ -21,3 +21,5 @@ ipnetwork = { version = "0.21", optional = true }
 
 [dev-dependencies]
 toml.workspace = true
+# `FirewallBackend` is async, so its tests need an executor.
+tokio = { workspace = true, features = ["macros", "rt"] }

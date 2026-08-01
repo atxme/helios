@@ -3,6 +3,7 @@
 mod gateway_key;
 mod key_negotiation;
 mod orchestrator;
+mod static_psk;
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use helio_tpm::{BootController, BootDecision, TpmSettings};
 use helios_api::AppState;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Number of API listen attempts before giving up.
@@ -296,6 +297,28 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
         PeerCommand::Remove { name } => {
             let peer = helios_provisioning::revoke(&mut network, &name)
                 .map_err(|e| anyhow::anyhow!("revocation refused: {e}"))?;
+            // The peer leaves the table too. Leaving its PSK behind would keep
+            // a shared secret alive for an identity nobody admits any more —
+            // and would make it slide back onto that public key if it were
+            // ever re-admitted.
+            let table = static_psk::default_path();
+            let identity = network.wg_private_key.trim().to_string();
+            if !identity.is_empty() {
+                match static_psk::load(&table, &identity) {
+                    Ok(mut map) => {
+                        if map.remove(&peer.public_key) {
+                            static_psk::store(&table, &identity, &map).map_err(|e| {
+                                anyhow::anyhow!("writing the static PSK table: {e}")
+                            })?;
+                            info!("static PSK removed with the peer");
+                        }
+                    }
+                    // Not fatal: the peer is revoked either way, and refusing
+                    // here would leave it admitted because a table we cannot
+                    // read might hold a secret for it.
+                    Err(error) => warn!(%error, "static PSK table unreadable — entry not removed"),
+                }
+            }
             network
                 .save()
                 .context("writing the network configuration")?;
@@ -462,6 +485,34 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         ),
     }
     network.wg_private_key = resolved.private_key;
+
+    // Static PSKs move out of `network.toml` and into the sealed table
+    // (ADR-006 §4). The value is moved, not dropped: the running config is
+    // refilled from the table, because the data plane reads it and a peer
+    // without its PSK fails every handshake with no recovery channel.
+    //
+    // Not fatal when it cannot be read: `Undecipherable` means the identity
+    // changed without the table being re-wrapped, and the ADR forbids both
+    // starting without the PSK and falling back to classic mode. So the
+    // affected peers keep no PSK and stay unable to handshake, which is the
+    // fail-closed outcome — announced loudly rather than silently degraded.
+    if !network.wg_private_key.trim().is_empty() {
+        let table = static_psk::default_path();
+        let identity = network.wg_private_key.clone();
+        match static_psk::adopt_from_config(&mut network, &table, &identity) {
+            Ok(0) => {}
+            Ok(adopted) => warn!(
+                adopted,
+                "PSK statiques repris de network.toml vers la table scellée — \
+                 retirer `preshared_key` du fichier"
+            ),
+            Err(error) => error!(
+                %error,
+                "table des PSK statiques inutilisable — les pairs concernés resteront \
+                 sans PSK et ne pourront pas établir de handshake"
+            ),
+        }
+    }
 
     let (event_tx, _) = broadcast::channel::<HeliosEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<OrchestratorCmd>(32);

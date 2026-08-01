@@ -484,6 +484,31 @@ pub fn update_sealed(
         .secret()
         .ok_or_else(|| "no TPM secret available: cannot seal".to_string())?;
 
+    // The static-PSK table is keyed by the identity, so it must be re-wrapped
+    // **before** the new key is published — ADR-006 §4. Doing it after would
+    // leave a window where the old identity is gone and the table still needs
+    // it: every static peer would stop handshaking, with no way back.
+    //
+    // A failure here aborts the rotation rather than proceeding: an identity
+    // replaced while its PSK table stayed behind is exactly the silent
+    // half-migration the ADR forbids.
+    let old_key = network.wg_private_key.trim();
+    if !old_key.is_empty() && old_key != key {
+        match crate::static_psk::rotate(&crate::static_psk::default_path(), old_key, key) {
+            Ok(0) => {}
+            Ok(carried) => info!(
+                carried,
+                "PSK statiques ré-enveloppés sous la nouvelle identité"
+            ),
+            Err(e) => {
+                return Err(format!(
+                    "rotation refusée : la table des PSK statiques n'a pas pu être \
+                     ré-enveloppée ({e}). L'identité n'a pas été remplacée."
+                ))
+            }
+        }
+    }
+
     let context = identity_context(key)?;
     keystore()
         .store(secret, &context, key.as_bytes())
