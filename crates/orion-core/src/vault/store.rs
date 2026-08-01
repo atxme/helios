@@ -386,6 +386,13 @@ impl ProfileStore {
     /// shows the missing hardware root in that case, and inventing profile
     /// names from an unreadable registry would be worse than saying nothing.
     pub fn posture(&self) -> super::VaultPosture {
+        // The root is obtained **before** `hardware_backed` is read, and that
+        // order is the whole point: the answer is a measurement, and asking a
+        // provider that has never been used would report "not yet measured"
+        // as "no hardware" — or, before this was a measurement at all, "no
+        // TPM" as "TPM fine". A failure is ignored here on purpose; the panel
+        // reports it through the field itself.
+        let _ = self.root();
         let volume = super::windows::bitlocker::protection_of(&self.dir);
         // A small probe: the lock privilege is the same for every buffer, so
         // one page answers for all of them without holding a secret.

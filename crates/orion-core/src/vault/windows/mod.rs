@@ -47,14 +47,47 @@ pub struct PlatformRootKeyProvider {
     /// rollback and a domain administrator holding DPAPI backup keys is
     /// withdrawn with it.
     software_only: bool,
+    /// Outcome of the last **real** attempt to obtain the root.
+    ///
+    /// `hardware_backed` used to answer from `cfg!(windows)` and this flag
+    /// alone, which verified nothing: on a Windows machine whose TPM was
+    /// absent, cleared or refusing the key, the posture panel displayed
+    /// "scellés au TPM" while every profile failed to open — the screen
+    /// promising exactly what nothing backed.
+    ///
+    /// The four checks ADR-006 §3 demands live in [`tpm::verify`] and run on
+    /// the key's use, so this records whether that path actually succeeded.
+    /// Unknown reads as **not** hardware-backed: a measurement that has not
+    /// been taken is not a guarantee.
+    hardware: std::sync::atomic::AtomicU8,
 }
+
+/// No attempt has been made yet.
+const HARDWARE_UNKNOWN: u8 = 0;
+/// A root was obtained through the TPM, with [`tpm::verify`] satisfied.
+const HARDWARE_VERIFIED: u8 = 1;
+/// An attempt was made and hardware did not back it.
+const HARDWARE_ABSENT: u8 = 2;
 
 impl PlatformRootKeyProvider {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             path: path.into(),
             software_only: false,
+            hardware: std::sync::atomic::AtomicU8::new(HARDWARE_UNKNOWN),
         }
+    }
+
+    /// Records what the last attempt actually established.
+    fn record(&self, verified: bool) {
+        self.hardware.store(
+            if verified {
+                HARDWARE_VERIFIED
+            } else {
+                HARDWARE_ABSENT
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Enables the degraded mode. Callers must surface it in the posture panel
@@ -68,9 +101,14 @@ impl PlatformRootKeyProvider {
     fn create(&self) -> Result<DeviceRootKey, VaultError> {
         let root = DeviceRootKey::generate()?;
         let wrapped = if self.software_only {
+            self.record(false);
             root.expose_for_wrapping().to_vec()
         } else {
-            tpm::wrap_root(root.expose_for_wrapping())?
+            // Recorded on both outcomes: a failure here is precisely what the
+            // panel must stop calling "scellés au TPM".
+            let wrapped = tpm::wrap_root(root.expose_for_wrapping());
+            self.record(wrapped.is_ok());
+            wrapped?
         };
         let sealed = dpapi::protect(&wrapped)?;
         if let Some(parent) = self.path.parent() {
@@ -97,13 +135,16 @@ impl PlatformRootKeyProvider {
         })?;
         let wrapped = dpapi::unprotect(&sealed)?;
         if self.software_only {
+            self.record(false);
             let bytes: [u8; KEY_LEN] = wrapped
                 .as_slice()
                 .try_into()
                 .map_err(|_| VaultError::Tpm("stored root has the wrong length".into()))?;
             return Ok(DeviceRootKey::from_unwrapped(Zeroizing::new(bytes)));
         }
-        Ok(DeviceRootKey::from_unwrapped(tpm::unwrap_root(&wrapped)?))
+        let unwrapped = tpm::unwrap_root(&wrapped);
+        self.record(unwrapped.is_ok());
+        Ok(DeviceRootKey::from_unwrapped(unwrapped?))
     }
 }
 
@@ -117,9 +158,15 @@ impl RootKeyProvider for PlatformRootKeyProvider {
     }
 
     fn hardware_backed(&self) -> bool {
-        // Never `true` in software mode, and never `true` off Windows: the
-        // posture panel must not be able to display "TPM" where there is none.
-        !self.software_only && cfg!(windows)
+        // A measured fact, not a compile-time one. `cfg!(windows)` used to
+        // stand in for it, which meant the answer was `true` on any Windows
+        // build whose flag was off — TPM working or not.
+        //
+        // `HARDWARE_UNKNOWN` reads as `false`: nothing has been measured yet,
+        // and the panel must never state a guarantee it has not established.
+        // `ProfileStore::posture` therefore obtains the root before asking.
+        !self.software_only
+            && self.hardware.load(std::sync::atomic::Ordering::Relaxed) == HARDWARE_VERIFIED
     }
 }
 
@@ -131,15 +178,65 @@ mod tests {
     /// have, in either direction.
     #[test]
     fn the_degraded_mode_never_claims_hardware() {
-        let provider = PlatformRootKeyProvider::new("/tmp/unused-root");
-        assert_eq!(provider.hardware_backed(), cfg!(windows));
-
         let degraded =
             PlatformRootKeyProvider::new("/tmp/unused-root").allowing_software_keystore(true);
         assert!(
             !degraded.hardware_backed(),
             "danger_allow_software_keystore must withdraw the hardware claim"
         );
+    }
+
+    /// A guarantee that has not been measured is not a guarantee.
+    ///
+    /// This is the defect the field replaced: the answer came from
+    /// `cfg!(windows)` and the flag, so any Windows build with the flag off
+    /// claimed hardware — TPM present, absent, cleared or refusing alike.
+    #[test]
+    fn an_unmeasured_provider_never_claims_hardware() {
+        let provider = PlatformRootKeyProvider::new("/tmp/unused-root");
+        assert!(
+            !provider.hardware_backed(),
+            "a provider that has never obtained a root must not claim a TPM"
+        );
+    }
+
+    /// The claim follows the **last** measurement, in both directions.
+    ///
+    /// Recording only the success would let a provider that once verified a
+    /// TPM keep claiming one after the hardware went away.
+    #[test]
+    fn the_claim_follows_the_last_measurement() {
+        let provider = PlatformRootKeyProvider::new("/tmp/unused-root");
+        assert!(!provider.hardware_backed(), "unmeasured");
+
+        provider.record(true);
+        assert!(provider.hardware_backed(), "a verified TPM is claimed");
+
+        provider.record(false);
+        assert!(
+            !provider.hardware_backed(),
+            "hardware that went away must withdraw the claim, not keep it"
+        );
+    }
+
+    /// A failed attempt must leave the claim withdrawn.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_failed_attempt_withdraws_the_claim() {
+        let dir = std::env::temp_dir().join(format!(
+            "orion-hardware-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let provider = PlatformRootKeyProvider::new(dir.join("device-root"));
+
+        assert!(provider.root_key().is_err(), "no TPM off Windows");
+        assert!(
+            !provider.hardware_backed(),
+            "a refused root must not leave a hardware claim standing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(windows))]
