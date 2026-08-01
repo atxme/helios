@@ -503,3 +503,159 @@ fn check_private_permissions(path: &Path) -> Result<()> {
 fn check_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "helios-ctl-key-nego-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
+    #[test]
+    fn cli_modes_map_one_to_one_to_protocol_modes() {
+        assert_eq!(ProtectionMode::from(Mode::Classic), ProtectionMode::Classic);
+        assert_eq!(
+            ProtectionMode::from(Mode::StaticPsk),
+            ProtectionMode::StaticPsk
+        );
+        assert_eq!(ProtectionMode::from(Mode::MlKem), ProtectionMode::MlKem);
+    }
+
+    #[test]
+    fn existing_identity_material_is_never_overwritten() {
+        let directory = test_directory("reject-existing");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("private.key"), b"keep").unwrap();
+
+        let error = reject_existing(&directory, &["absent", "private.key"])
+            .expect_err("existing material must be refused");
+        assert!(error.to_string().contains("private.key"));
+        assert_eq!(
+            std::fs::read(directory.join("private.key")).unwrap(),
+            b"keep"
+        );
+        assert!(reject_existing(&directory, &["absent"]).is_ok());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_writer_and_permission_check_enforce_private_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = test_directory("permissions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("secret");
+        write_secret(&secret, b"sensitive").unwrap();
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(check_private_permissions(&secret).is_ok());
+        assert!(write_secret(&secret, b"replacement").is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"sensitive");
+
+        let exposed = directory.join("exposed");
+        std::fs::write(&exposed, b"secret").unwrap();
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = check_private_permissions(&exposed).expect_err("world-readable secret");
+        assert!(error.to_string().contains("permissions are 644"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn client_ca_and_bound_client_identity_round_trip_through_files() {
+        let root = test_directory("issuance");
+        let ca = root.join("ca");
+        let client = root.join("client");
+        init_client_ca("  Orion test CA  ", &ca).expect("create client CA");
+
+        let keypair = aether::wg::generate_keypair().unwrap();
+        issue_client(
+            "  portable  ",
+            &keypair.public_key,
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            &client,
+        )
+        .expect("issue client identity");
+
+        let loaded = load_client_material(&client).expect("reload issued identity");
+        assert!(!loaded.certificate_der.is_empty());
+        assert!(!loaded.private_key_der.is_empty());
+        assert!(!loaded.pq_private_key.is_empty());
+        assert_eq!(
+            loaded.certificate_sha256,
+            helios_key_negotiation::certificate_fingerprint_der(&loaded.certificate_der)
+        );
+        let pq_certificate: PqCertificate =
+            serde_json::from_slice(&loaded.pq_certificate_json).unwrap();
+        assert_eq!(pq_certificate.subject, "portable");
+        assert_eq!(pq_certificate.role, PqCertificateRole::Client);
+        assert_eq!(pq_certificate.wireguard_public_key, keypair.public_key);
+        assert_eq!(
+            loaded.pq_certificate_sha256,
+            pq_certificate.fingerprint().unwrap()
+        );
+
+        assert!(
+            issue_client(
+                "portable",
+                &keypair.public_key,
+                &ca.join(CA_CERTIFICATE_FILE),
+                &ca.join(CA_PRIVATE_KEY_FILE),
+                &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+                &client,
+            )
+            .is_err(),
+            "issuing again must not replace the admitted identity"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_wireguard_identity_is_refused_before_client_files_exist() {
+        let root = test_directory("invalid-wg");
+        let ca = root.join("ca");
+        let client = root.join("client");
+        init_client_ca("Orion test CA", &ca).unwrap();
+
+        let error = issue_client(
+            "portable",
+            "not-a-wireguard-key",
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            &client,
+        )
+        .expect_err("invalid peer identity");
+        assert!(error.to_string().contains("invalid WireGuard public key"));
+        assert!(!client.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn helpers_report_missing_files_and_generate_fresh_serials() {
+        let directory = test_directory("helpers");
+        let missing = directory.join("missing");
+        let error = read(&missing).expect_err("missing file");
+        assert!(error.to_string().contains(&missing.display().to_string()));
+
+        let first = random_serial().unwrap();
+        let second = random_serial().unwrap();
+        assert_ne!(first, second);
+        assert!(unix_time_now().unwrap() > 1_700_000_000);
+    }
+}

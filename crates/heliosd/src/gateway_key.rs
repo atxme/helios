@@ -99,6 +99,43 @@ fn identity_context(private_key: &str) -> Result<helio_tpm::Context, String> {
     Ok(helio_tpm::Context::new().field("wg_public_key", public.as_bytes()))
 }
 
+/// What a vault's declared context says about the key it contains.
+#[derive(Debug, PartialEq, Eq)]
+enum ContextVerdict {
+    /// The context names the public key the private key derives to. This vault
+    /// belongs to this identity.
+    Matches,
+    /// A legacy `HKS1` vault, which predates object contexts. Accepted so a
+    /// gateway updating in place keeps its identity; the next sealing binds one.
+    Legacy,
+    /// The context names another public key: the blob comes from another
+    /// gateway, or the key inside was substituted.
+    Foreign,
+    /// The recovered key cannot even be parsed, so nothing can be verified.
+    UnusableKey(String),
+}
+
+/// Decides whether a vault's context describes the key it gave back.
+///
+/// Extracted from [`resolve`] because it is the security decision of the whole
+/// function, and inline it was reachable only with a TPM secret and a real
+/// vault — neither of which a test can build. The AEAD already proves nobody
+/// rewrote the context; this proves the context is not describing *another*
+/// gateway's key (ADR-006 §2).
+fn verify_declared_context(declared: &[u8], private_key: &str) -> ContextVerdict {
+    match identity_context(private_key) {
+        Err(cause) => ContextVerdict::UnusableKey(cause),
+        // An empty declared context is the **legacy format**, not a mismatch.
+        // Collapsing the two would refuse every gateway that has not resealed
+        // yet, turning a routine update into a loss of identity. The arm's
+        // position is not what matters — `expected` is never empty, so the
+        // comparison above could not claim it — but its *existence* is.
+        Ok(_) if declared.is_empty() => ContextVerdict::Legacy,
+        Ok(expected) if expected.as_bytes() == declared => ContextVerdict::Matches,
+        Ok(_) => ContextVerdict::Foreign,
+    }
+}
+
 /// Writes the escrow of `private_key` to the operator's public key.
 ///
 /// No fatal error: a missing escrow does not prevent the gateway from
@@ -227,20 +264,13 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                 Ok((declared, bytes)) => match String::from_utf8(bytes.to_vec()) {
                     Ok(key) => {
                         let key = key.trim().to_string();
-                        // The context names the public key this vault belongs
-                        // to; the private key inside determines it. They must
-                        // agree, or the blob came from another gateway. A
-                        // legacy `HKS1` vault carries no context and is
-                        // accepted until the next store rewrites it.
-                        match identity_context(&key) {
-                            Ok(expected) if declared.is_empty() => {
-                                let _ = expected;
-                                warn!(
-                                    "legacy vault without object context — it will be bound \
-                                     on the next sealing"
-                                );
-                            }
-                            Ok(expected) if expected.as_bytes() != declared => {
+                        match verify_declared_context(&declared, &key) {
+                            ContextVerdict::Matches => {}
+                            ContextVerdict::Legacy => warn!(
+                                "legacy vault without object context — it will be bound \
+                                 on the next sealing"
+                            ),
+                            ContextVerdict::Foreign => {
                                 warn!(
                                     "vault context does not match the key it contains — \
                                      refusing this identity"
@@ -250,9 +280,8 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                                     origin: KeyOrigin::Missing,
                                 };
                             }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("unusable vault content ({e})");
+                            ContextVerdict::UnusableKey(cause) => {
+                                warn!("unusable vault content ({cause})");
                                 return ResolvedKey {
                                     private_key: String::new(),
                                     origin: KeyOrigin::Missing,
@@ -453,6 +482,154 @@ mod tests {
     use super::*;
 
     const VALID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    /// A real Curve25519 pair, so the derivation is genuinely exercised.
+    fn keypair() -> (String, String) {
+        let pair = aether::wg::generate_keypair().expect("keypair");
+        (
+            pair.private_key.expose().to_string(),
+            pair.public_key.clone(),
+        )
+    }
+
+    fn context_of(public_key: &str) -> Vec<u8> {
+        helio_tpm::Context::new()
+            .field("wg_public_key", public_key.as_bytes())
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// The context must name the public key the private key derives to.
+    #[test]
+    fn a_context_naming_its_own_key_is_accepted() {
+        let (private_key, public_key) = keypair();
+        assert_eq!(
+            verify_declared_context(&context_of(&public_key), &private_key),
+            ContextVerdict::Matches
+        );
+    }
+
+    /// The property the object context exists for: a vault copied from another
+    /// gateway must not be adopted, even if it decrypts.
+    #[test]
+    fn a_context_naming_another_gateway_is_refused() {
+        let (private_key, _) = keypair();
+        let (_, other_public) = keypair();
+        assert_eq!(
+            verify_declared_context(&context_of(&other_public), &private_key),
+            ContextVerdict::Foreign
+        );
+    }
+
+    /// A legacy `HKS1` vault carries no context. Confusing "absent" with
+    /// "wrong" would refuse every gateway that has not resealed yet — the
+    /// update turning into a loss of identity.
+    #[test]
+    fn a_legacy_vault_without_context_is_accepted_not_refused() {
+        let (private_key, _) = keypair();
+        assert_eq!(
+            verify_declared_context(&[], &private_key),
+            ContextVerdict::Legacy
+        );
+    }
+
+    /// Nothing can be verified against a key that will not parse, so the
+    /// identity is refused rather than accepted on a failed comparison.
+    #[test]
+    fn an_unparsable_key_is_refused_rather_than_compared() {
+        let verdict = verify_declared_context(&context_of("peu-importe"), "pas-du-base64");
+        assert!(
+            matches!(verdict, ContextVerdict::UnusableKey(_)),
+            "obtained: {verdict:?}"
+        );
+        // And an empty context does not turn an unusable key into a legacy
+        // vault: the key is checked first.
+        assert!(matches!(
+            verify_declared_context(&[], "pas-du-base64"),
+            ContextVerdict::UnusableKey(_)
+        ));
+    }
+
+    /// A truncated or padded context must not pass: the comparison is on the
+    /// whole canonical encoding, not a prefix.
+    #[test]
+    fn a_truncated_or_extended_context_is_refused() {
+        let (private_key, public_key) = keypair();
+        let full = context_of(&public_key);
+
+        assert_eq!(
+            verify_declared_context(&full[..full.len() - 1], &private_key),
+            ContextVerdict::Foreign
+        );
+        let mut extended = full.clone();
+        extended.push(0);
+        assert_eq!(
+            verify_declared_context(&extended, &private_key),
+            ContextVerdict::Foreign
+        );
+    }
+
+    /// The label is part of the context, so a value carried under another
+    /// label is not the same context.
+    #[test]
+    fn a_context_under_another_label_is_refused() {
+        let (private_key, public_key) = keypair();
+        let mislabelled = helio_tpm::Context::new()
+            .field("public_key", public_key.as_bytes())
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            verify_declared_context(&mislabelled, &private_key),
+            ContextVerdict::Foreign
+        );
+    }
+
+    #[test]
+    fn the_context_is_deterministic_and_separates_identities() {
+        let (private_key, _) = keypair();
+        let (other_private, _) = keypair();
+        let first = identity_context(&private_key).expect("context");
+        let second = identity_context(&private_key).expect("context");
+        let foreign = identity_context(&other_private).expect("context");
+
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_ne!(first.as_bytes(), foreign.as_bytes());
+    }
+
+    #[test]
+    fn a_context_cannot_be_built_from_an_invalid_key() {
+        let error = identity_context("pas-du-base64").expect_err("must fail");
+        assert!(error.contains("public key"), "message: {error}");
+    }
+
+    /// A missing escrow key removes a recovery option; it must not stop the
+    /// gateway, and it must not write anything either.
+    #[test]
+    fn an_absent_escrow_key_is_reported_without_writing() {
+        // No `escrow_public_key`: the function returns before touching any
+        // path, which is what makes this testable without a filesystem.
+        write_escrow(&NetworkConfig::default(), VALID);
+        write_escrow(
+            &NetworkConfig {
+                escrow_public_key: Some("   ".into()),
+                ..NetworkConfig::default()
+            },
+            VALID,
+        );
+    }
+
+    /// An unreadable escrow key is reported, never fatal: it costs a recovery
+    /// option, not the gateway's ability to start.
+    #[test]
+    fn an_unreadable_escrow_key_does_not_panic() {
+        write_escrow(
+            &NetworkConfig {
+                escrow_public_key: Some("pas-du-base64-!!".into()),
+                ..NetworkConfig::default()
+            },
+            VALID,
+        );
+    }
 
     #[test]
     fn key_validation() {

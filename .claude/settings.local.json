@@ -230,7 +230,15 @@
       "Bash(strip /tmp/claude-1000/-home-christophe-helios/c1f5cd84-b398-493a-b7f9-136b5a3e6eb0/scratchpad/h)",
       "Bash(awk '{print \"strippé: \"$5}')",
       "Bash(bash -n scripts/campaign.sh)",
-      "Bash(git status *)"
+      "Bash(git status *)",
+      "Bash(command -v cargo-llvm-cov cargo-tarpaulin)",
+      "Bash(rustup component *)",
+      "Bash(timeout 600 cargo install cargo-llvm-cov --locked)",
+      "Bash(timeout 2400 cargo llvm-cov --workspace --all-features --summary-only)",
+      "Bash(awk '{printf \"%-56s %s\\\\n\", $1, $4}')",
+      "Bash(sort -t'%' -k1)",
+      "Bash(timeout 2400 cargo llvm-cov -p heliosd --all-features --summary-only)",
+      "Bash(awk '{printf \"%-46s lignes %s  fonctions %s\\\\n\", $1, $4, $7}')"
     ]
   }
 }

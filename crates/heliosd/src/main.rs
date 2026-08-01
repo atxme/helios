@@ -543,3 +543,163 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_parses_every_offline_command_and_rejects_unknown_modes() {
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "run", "--dev"])
+                .unwrap()
+                .command,
+            Command::Run { dev: true }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "status"]).unwrap().command,
+            Command::Status
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "check-update"])
+                .unwrap()
+                .command,
+            Command::CheckUpdate
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "provision-tpm"])
+                .unwrap()
+                .command,
+            Command::ProvisionTpm
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "init-identity", "--rotate"])
+                .unwrap()
+                .command,
+            Command::InitIdentity { rotate: true }
+        ));
+        assert!(Cli::try_parse_from([
+            "heliosd",
+            "peer",
+            "add",
+            "--name",
+            "portable",
+            "--public-key",
+            "public",
+            "--minimum-mode",
+            "unknown"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn peer_commands_keep_all_security_parameters() {
+        let cli = Cli::try_parse_from([
+            "heliosd",
+            "peer",
+            "add",
+            "--name",
+            "admin",
+            "--public-key",
+            "public",
+            "--admin",
+            "--key-negotiation-certificate-sha256",
+            "tls",
+            "--key-negotiation-pq-certificate-sha256",
+            "pq",
+            "--minimum-mode",
+            "ml-kem",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Peer {
+                command:
+                    PeerCommand::Add {
+                        name,
+                        public_key,
+                        admin,
+                        key_negotiation_certificate_sha256,
+                        key_negotiation_pq_certificate_sha256,
+                        minimum_mode,
+                    },
+            } => {
+                assert_eq!(name, "admin");
+                assert_eq!(public_key, "public");
+                assert!(admin);
+                assert_eq!(key_negotiation_certificate_sha256.as_deref(), Some("tls"));
+                assert_eq!(key_negotiation_pq_certificate_sha256.as_deref(), Some("pq"));
+                assert!(matches!(minimum_mode, Some(NegotiationMode::MlKem)));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "peer", "list"])
+                .unwrap()
+                .command,
+            Command::Peer {
+                command: PeerCommand::List
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "peer", "remove", "--name", "portable"])
+                .unwrap()
+                .command,
+            Command::Peer {
+                command: PeerCommand::Remove { name }
+            } if name == "portable"
+        ));
+    }
+
+    #[test]
+    fn negotiation_mode_conversion_is_exhaustive() {
+        use aether::key_negotiation::ProtectionMode;
+
+        assert_eq!(
+            ProtectionMode::from(NegotiationMode::Classic),
+            ProtectionMode::Classic
+        );
+        assert_eq!(
+            ProtectionMode::from(NegotiationMode::StaticPsk),
+            ProtectionMode::StaticPsk
+        );
+        assert_eq!(
+            ProtectionMode::from(NegotiationMode::MlKem),
+            ProtectionMode::MlKem
+        );
+    }
+
+    #[test]
+    fn explicit_development_mode_always_wins_auto_detection() {
+        assert!(resolve_dry_run(true));
+    }
+
+    #[test]
+    fn listing_peers_is_safe_for_empty_and_populated_configuration() {
+        peer_command(NetworkConfig::default(), PeerCommand::List).unwrap();
+        let network = NetworkConfig {
+            peers: vec![aether::WgPeer {
+                name: "portable".into(),
+                public_key: "public".into(),
+                address: "100.64.1.2/32".into(),
+                admin: true,
+                preshared_key: Some("secret".into()),
+                key_negotiation_certificate_sha256: None,
+                key_negotiation_pq_certificate_sha256: None,
+                minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+            }],
+            ..NetworkConfig::default()
+        };
+        peer_command(network, PeerCommand::List).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_is_made_non_dumpable_before_loading_secrets() {
+        forbid_core_dumps(false).expect("this process must control its dumpability");
+        // SAFETY: PR_GET_DUMPABLE has no pointer argument and only reads the
+        // current test process attribute.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+    }
+}
