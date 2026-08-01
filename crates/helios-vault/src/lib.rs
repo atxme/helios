@@ -17,6 +17,7 @@
 //! AAD = "helios-vault/v1" ‖ <tout l'en-tête, de HVLT au nonce inclus>
 //! ```
 //!
+//!
 //! `domain` separates **uses**; `object_context` separates **instances of one
 //! use**. Without the second, two blobs of the same kind stay interchangeable:
 //! Alice's profile could be opened as Bob's under a shared root key. Contexts

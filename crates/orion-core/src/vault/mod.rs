@@ -34,12 +34,14 @@ pub mod keys;
 pub mod manifest;
 pub mod passphrase;
 pub mod registry;
+pub mod settings;
 pub mod store;
 pub mod windows;
 
 pub use keys::{DeviceRootKey, KEY_LEN};
 pub use manifest::{ProfileManifest, SecurityGeneration, MAX_MANIFEST_BYTES};
 pub use registry::{Registry, RegistryEntry};
+pub use settings::LocalSettings;
 pub use store::{Bootstrap, MigrationReport, ProfileStore};
 
 use helios_vault::Context;
@@ -443,6 +445,12 @@ pub struct VaultPosture {
     /// `danger_allow_software_keystore` is on. A **downgrade**, not a recovery:
     /// resistance to inter-machine copying, hardware rollback and a domain
     /// administrator holding DPAPI backup keys is withdrawn with it.
+    ///
+    /// Distinct from `!hardware_backed` on purpose, and the distinction is the
+    /// point: a machine with no TPM and no flag is a **refusal**, not a
+    /// downgrade. Conflating them would report an ordinary failure as a
+    /// deliberate operator choice, and hide the choice where it was really
+    /// made.
     pub software_keystore: bool,
     /// Volume-encryption posture of the disk holding the profiles.
     pub volume: &'static str,

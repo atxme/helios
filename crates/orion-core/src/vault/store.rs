@@ -85,6 +85,15 @@ pub struct MigrationReport {
 pub struct ProfileStore {
     dir: std::path::PathBuf,
     provider: Box<dyn RootKeyProvider>,
+    /// The operator waived the hardware requirement (ADR-006 §3).
+    ///
+    /// Held here rather than inferred from `provider.hardware_backed()`,
+    /// because the two answer different questions: the provider says whether
+    /// hardware **is** backing the root, this says whether its absence was
+    /// **chosen**. A machine with no TPM and no flag is a refusal, and
+    /// reporting it as a downgrade would credit the operator with a decision
+    /// they never made.
+    software_keystore: bool,
 }
 
 impl ProfileStore {
@@ -92,7 +101,15 @@ impl ProfileStore {
         Self {
             dir: dir.into(),
             provider,
+            software_keystore: false,
         }
+    }
+
+    /// Records that the hardware requirement was waived on purpose.
+    #[must_use]
+    pub fn allowing_software_keystore(mut self, allowed: bool) -> Self {
+        self.software_keystore = allowed;
+        self
     }
 
     /// Default location, beside the legacy file it replaces.
@@ -193,7 +210,7 @@ impl ProfileStore {
             version: BOOTSTRAP_VERSION,
             install_id: id.to_hex(),
             key_slot: super::windows::tpm::KEY_NAME.to_string(),
-            software_keystore: !self.provider.hardware_backed(),
+            software_keystore: self.software_keystore,
         })?;
         Ok(id.as_bytes().to_vec())
     }
@@ -379,7 +396,7 @@ impl ProfileStore {
 
         super::VaultPosture {
             hardware_backed: self.provider.hardware_backed(),
-            software_keystore: !self.provider.hardware_backed(),
+            software_keystore: self.software_keystore,
             volume: volume.detail(),
             volume_protected: volume.allows_secrets(),
             memory_locked: lock.holds(),
@@ -549,6 +566,49 @@ mod tests {
             address: Some("100.64.1.2/32".into()),
             ..ClientProfile::default()
         }
+    }
+
+    /// A refusal and a deliberate downgrade must not look alike.
+    ///
+    /// Off Windows `hardware_backed()` is false either way, so the flag is the
+    /// only thing that distinguishes "this machine has no TPM" from "the
+    /// operator chose to do without one". Reporting the first as the second
+    /// would credit them with a decision they never made — and would hide the
+    /// real one where it was actually taken.
+    #[test]
+    fn the_posture_separates_a_missing_tpm_from_a_waived_one() {
+        let (dir, strict) = store("posture-strict");
+        let posture = strict.posture();
+        assert!(
+            !posture.software_keystore,
+            "no flag set: the absence of hardware is a refusal, not a downgrade"
+        );
+
+        let waived = ProfileStore::new(dir.clone(), Box::new(FixedRoot([4u8; KEY_LEN])))
+            .allowing_software_keystore(true);
+        let posture = waived.posture();
+        assert!(posture.software_keystore);
+        assert!(
+            !posture.hardware_backed,
+            "waiving the requirement must never produce a hardware claim"
+        );
+        assert!(!posture.is_clean());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bootstrap records the choice, not the outcome: it is what an
+    /// auditor reads to know whether the downgrade was deliberate.
+    #[test]
+    fn the_bootstrap_records_whether_the_downgrade_was_chosen() {
+        let (dir, store) = store("bootstrap-flag");
+        store.save_profile(&profile("poste")).unwrap();
+        let raw = std::fs::read_to_string(dir.join(BOOTSTRAP_FILE)).unwrap();
+        let bootstrap: Bootstrap = toml::from_str(&raw).unwrap();
+        assert!(
+            !bootstrap.software_keystore,
+            "no flag set: the bootstrap must not claim a waiver"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

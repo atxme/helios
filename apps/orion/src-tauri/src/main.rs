@@ -812,15 +812,50 @@ fn main() {
     // protection que l'écran promettrait sans la rendre.
     let store_dir = orion_core::vault::ProfileStore::default_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let store = Arc::new(orion_core::vault::ProfileStore::new(
-        store_dir.clone(),
-        Box::new(orion_core::vault::windows::PlatformRootKeyProvider::new(
-            store_dir.join("device-root"),
-        )),
-    ));
-    if !store.hardware_backed() {
+
+    // Le contournement matériel est un choix local, lu à chaque démarrage. Un
+    // fichier illisible ne l'active jamais : appliquer la valeur permissive
+    // parce qu'une lecture a échoué est la façon dont une dégradation arrive
+    // sans que personne l'ait décidée.
+    let (settings, complaint) = orion_core::vault::LocalSettings::load(&store_dir);
+    if let Some(complaint) = complaint {
+        tracing::warn!(%complaint, "réglages locaux du coffre");
+    }
+    let waived = settings.danger_allow_software_keystore;
+
+    let store = Arc::new(
+        orion_core::vault::ProfileStore::new(
+            store_dir.clone(),
+            Box::new(
+                orion_core::vault::windows::PlatformRootKeyProvider::new(
+                    store_dir.join("device-root"),
+                )
+                .allowing_software_keystore(waived),
+            ),
+        )
+        .allowing_software_keystore(waived),
+    );
+
+    // Deux situations opposées, deux messages. Les confondre créditerait
+    // l'opérateur d'une décision qu'il n'a pas prise, ou masquerait celle
+    // qu'il a prise (ADR-006 §3).
+    if waived {
+        // À **chaque** démarrage, pas seulement à l'activation : une
+        // dégradation qui ne se rappelle plus finit par être oubliée.
         tracing::warn!(
-            "SÉCURITÉ MATÉRIELLE DÉSACTIVÉE — la racine d'installation n'est pas liée au TPM"
+            "SÉCURITÉ MATÉRIELLE DÉSACTIVÉE par danger_allow_software_keystore — \
+             la résistance à la copie inter-machine, au rollback matériel et à un \
+             administrateur de domaine détenant les clés DPAPI n'est plus assurée"
+        );
+    } else if !store.hardware_backed() {
+        tracing::error!(
+            "aucune racine matérielle sur ce poste et aucun contournement déclaré — \
+             Orion refuse de conserver des secrets. Poser \
+             `danger_allow_software_keystore = true` dans {} l'autorise \
+             explicitement, en retirant les garanties correspondantes",
+            store_dir
+                .join(orion_core::vault::settings::SETTINGS_FILE)
+                .display()
         );
     }
     // Une configuration héritée est reprise dans le coffre avant tout usage, et
