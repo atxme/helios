@@ -222,7 +222,15 @@
       "Bash(awk '{print \"HEAD \\(sans mes changements\\):\", $5, \"octets\"}')",
       "Bash(umask)",
       "Bash(systemd-analyze verify *)",
-      "Bash(systemctl --version)"
+      "Bash(systemctl --version)",
+      "Bash(awk -F'[ ;]' '{s+=$4} END {print s\" tests Rust au vert\"}')",
+      "Bash(awk -F'[ ;]' '{s+=$4} END {print s\" tests Rust\"}')",
+      "Bash(command -v strip objcopy llvm-strip)",
+      "Bash(awk '{print \"debug:   \"$5}')",
+      "Bash(strip /tmp/claude-1000/-home-christophe-helios/c1f5cd84-b398-493a-b7f9-136b5a3e6eb0/scratchpad/h)",
+      "Bash(awk '{print \"strippé: \"$5}')",
+      "Bash(bash -n scripts/campaign.sh)",
+      "Bash(git status *)"
     ]
   }
 }
