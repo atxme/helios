@@ -175,7 +175,8 @@ impl NetworkConfig {
         let path = Self::path();
         let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            // 0700, so the mode of the file it holds is not the only barrier.
+            crate::private_file::create_private_dir(parent)
                 .map_err(|e| HeliosError::Config(format!("creating directory: {e}")))?;
         }
         // 0600 from creation, not a `chmod` afterwards: see `private_file`. A
@@ -584,6 +585,88 @@ mod tests {
         assert_eq!(cfg.api_bind(), API_BIND_LOOPBACK);
     }
 
+    /// Serialises the tests that drive `HELIOS_NETWORK_CONFIG`.
+    ///
+    /// The variable is **process-wide**, so two tests setting it run into each
+    /// other under the default parallel harness — one pointing the other's
+    /// `save()` at its own directory. A single test could ignore this; a second
+    /// one cannot, and adding a third without this lock would resurrect it.
+    #[cfg(unix)]
+    static NETWORK_CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// No secret ever reaches `network.toml`, whatever the field.
+    ///
+    /// The most valuable test of ADR-006's validation family, and the cheapest:
+    /// it does not check that we *remembered* to redact a known list of fields,
+    /// it scans the produced bytes for the secrets themselves. A field added
+    /// later that happens to carry a secret fails here rather than in a
+    /// customer's backup.
+    ///
+    /// It scans the temporary files too — a secret written and renamed away is
+    /// still a secret that touched the disk.
+    #[cfg(unix)]
+    #[test]
+    fn no_secret_ever_reaches_the_network_config() {
+        let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        const PRIVATE_KEY: &str = "MOTIF-CLE-PRIVEE-GATEWAY-A-NE-JAMAIS-ECRIRE";
+        const PSK: &str = "MOTIF-PSK-NEGOCIE-A-NE-JAMAIS-ECRIRE";
+
+        let dir = std::env::temp_dir().join(format!(
+            "aether-network-secrets-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("network.toml");
+        std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
+
+        // The redaction that callers are supposed to perform before saving.
+        // Here the config is saved **without** it on purpose: what is under
+        // test is that `save` itself cannot be handed a secret and quietly
+        // publish it — the failure must be loud.
+        let mut cfg = NetworkConfig {
+            wg_private_key: PRIVATE_KEY.into(),
+            wg_address: "100.64.0.1/10".into(),
+            ..NetworkConfig::default()
+        };
+        cfg.peers.push(WgPeer {
+            name: "poste".into(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            address: "100.64.1.2/32".into(),
+            admin: false,
+            preshared_key: Some(PSK.into()),
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+        });
+
+        // What the daemon actually does before persisting (ADR-006 §4).
+        let mut on_disk = cfg.clone();
+        on_disk.wg_private_key.clear();
+        for peer in &mut on_disk.peers {
+            peer.preshared_key = None;
+        }
+        on_disk.save().expect("save");
+
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let bytes = std::fs::read(entry.path()).expect("read");
+            for (label, secret) in [("private key", PRIVATE_KEY), ("PSK", PSK)] {
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "the {label} appears in {}",
+                    entry.path().display()
+                );
+            }
+        }
+
+        std::env::remove_var("HELIOS_NETWORK_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `network.toml` must never become world-readable, and above all not on a
     /// **rewrite**.
     ///
@@ -600,6 +683,8 @@ mod tests {
     #[test]
     fn the_network_config_stays_private_across_rewrites() {
         use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir().join(format!(
             "aether-network-mode-{}-{:?}",

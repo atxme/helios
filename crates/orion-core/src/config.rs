@@ -343,7 +343,7 @@ impl ClientConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            aether::private_file::create_private_dir(parent)
                 .with_context(|| format!("création de {}", parent.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("sérialisation TOML")?;

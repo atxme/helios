@@ -383,7 +383,47 @@ fn resolve_dry_run(explicit_dev: bool) -> bool {
     false
 }
 
+/// Makes the process non-dumpable, **before** the first key is loaded.
+///
+/// `LimitCORE=0` in the unit covers the service started by systemd; this covers
+/// every other way `heliosd` is launched, and it also removes the ptrace
+/// attachability that `PR_SET_DUMPABLE=1` grants to same-uid processes.
+///
+/// Fatal outside `--dev`: a daemon that cannot make itself non-dumpable would
+/// hold the gateway identity in a process anyone of the same user can dump, and
+/// that is not a warning-level fact (ADR-006 §6).
+#[cfg(unix)]
+fn forbid_core_dumps(dry_run: bool) -> anyhow::Result<()> {
+    // SAFETY: `prctl` with PR_SET_DUMPABLE takes an int and touches only this
+    // process's own attributes.
+    let applied = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+    if applied != 0 {
+        let cause = std::io::Error::last_os_error();
+        if dry_run {
+            warn!("PR_SET_DUMPABLE refused ({cause}) — tolerated in --dev only");
+            return Ok(());
+        }
+        anyhow::bail!("PR_SET_DUMPABLE refused: {cause}");
+    }
+    // Reading it back rather than trusting the return code: the value is what
+    // the kernel will actually honour on a crash.
+    let effective = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+    anyhow::ensure!(
+        effective == 0,
+        "PR_SET_DUMPABLE accepted but PR_GET_DUMPABLE reports {effective}"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
+    Ok(())
+}
+
 async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
+    // Before the TPM unseal below, which is where the first key appears.
+    forbid_core_dumps(dry_run)?;
+
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —
     // no longer has a case to catch: every heliosd serves that port. The
