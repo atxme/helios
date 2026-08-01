@@ -3,7 +3,7 @@ import Divider from '@mui/material/Divider'
 import Popover from '@mui/material/Popover'
 import Typography from '@mui/material/Typography'
 import { AlertTriangle } from 'lucide-react'
-import type { ClientProfile, PskKind, TunnelState } from '../types'
+import type { ClientProfile, PskKind, TunnelState, VaultPosture } from '../types'
 import { modeMeta, postureMeta, protectionMeta, stateMeta } from './state'
 import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
@@ -38,9 +38,27 @@ interface Props {
   profile: ClientProfile | null
   psk: PskKind | null
   backend: string
+  /**
+   * What the vault can claim about itself. `null` while it is being read, or
+   * when it could not be — in which case the rows simply do not appear.
+   *
+   * Passed in rather than fetched here: this component is presentational, and
+   * the shell already owns every other fact it displays. Fetching inside would
+   * also make it untestable without a Tauri runtime.
+   */
+  vault: VaultPosture | null
 }
 
-export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, backend }: Props) {
+export function PosturePanel({
+  anchor,
+  onClose,
+  state,
+  adapterUp,
+  profile,
+  psk,
+  backend,
+  vault,
+}: Props) {
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const negotiation = profile?.key_negotiation
@@ -122,6 +140,64 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
         />
         <Row label="backend" value={backend || '—'} />
       </Box>
+
+      {vault && (
+        <>
+          <Divider />
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
+            <Row
+              label="secrets"
+              value={vault.hardwareBacked ? 'scellés au TPM' : 'scellés au compte uniquement'}
+              tone={vault.hardwareBacked ? undefined : AMBER}
+              note={
+                vault.hardwareBacked
+                  ? 'Clé non exportable du TPM : copiés sur une autre machine, ils y sont \
+                     définitivement illisibles.'
+                  : 'Sécurité matérielle désactivée. La résistance à la copie inter-machine et \
+                     à un administrateur de domaine détenant les clés DPAPI n’est plus assurée.'
+              }
+            />
+            <Row
+              label="volume"
+              value={vault.volumeProtected ? 'chiffré' : 'non couvert'}
+              tone={vault.volumeProtected ? undefined : AMBER}
+              note={vault.volume}
+            />
+            <Row
+              label="mémoire"
+              value={vault.memoryLocked ? 'verrouillée' : 'non verrouillée'}
+              tone={vault.memoryLocked ? undefined : AMBER}
+              note={vault.memory}
+            />
+            {/* Defence in depth, so it is stated without an amber tone: the
+                exclusion covers WER reports only, never a debugger. */}
+            <Row
+              label="vidages"
+              value={vault.dumpsExcluded ? 'exclus' : 'non exclus'}
+              note={vault.dumps}
+            />
+            {vault.legacyPresent && (
+              <Row
+                label="migration"
+                value="fichier en clair présent"
+                tone={AMBER}
+                note="Un profils.toml hérité n’a pas encore été repris dans le coffre."
+              />
+            )}
+            {vault.rotationRequired.length > 0 && (
+              <Row
+                label="rotation"
+                value={vault.rotationRequired.join(', ')}
+                tone={AMBER}
+                note="La clé de ces profils a vécu en clair : elle est présumée compromise, et \
+                     sceller le fichier ne rappelle pas les copies déjà parties en sauvegarde. \
+                     Ils ne se connecteront qu’après génération d’une nouvelle clé et sa \
+                     réadmission par l’opérateur."
+              />
+            )}
+          </Box>
+        </>
+      )}
     </Popover>
   )
 }

@@ -18,11 +18,18 @@ import {
   getState,
   importProfile,
   importProfilePath,
+  keyNegotiationFingerprint,
+  keyNegotiationIdentitySealed,
+  keyNegotiationSupport,
   onEvent,
   onProfilePath,
   profilePublicKey,
+  resizeForView,
   saveProfile,
   selectProfile,
+  validateProfile,
+  vaultPosture,
+  exportLogs,
 } from './api'
 
 describe('Orion Tauri bridge', () => {
@@ -38,13 +45,21 @@ describe('Orion Tauri bridge', () => {
     await getConfig()
     await importProfile('{"format":"orion-profile"}', 'portable.json')
     await importProfilePath('C:\\Profils\\portable.orionprofile')
+    await importProfilePath()
+    await keyNegotiationIdentitySealed(profile as never)
+    await validateProfile(profile as never)
+    await vaultPosture()
     await profilePublicKey(profile as never)
+    await keyNegotiationSupport()
+    await keyNegotiationFingerprint(profile as never)
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
     await connect('portable')
     await connect()
     await disconnect()
+    await resizeForView('profiles')
+    await exportLogs('orion-log', 'contents')
 
     expect(mocks.invoke.mock.calls).toEqual([
       ['get_state'],
@@ -59,13 +74,21 @@ describe('Orion Tauri bridge', () => {
         'import_profile_path',
         { path: 'C:\\Profils\\portable.orionprofile' },
       ],
+      ['import_profile_path', { path: null }],
+      ['key_negotiation_identity_sealed', { profile }],
+      ['validate_profile', { profile }],
+      ['vault_posture'],
       ['profile_public_key', { profile }],
+      ['key_negotiation_support'],
+      ['key_negotiation_fingerprint', { profile }],
       ['save_profile', { profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],
       ['connect', { name: 'portable' }],
       ['connect', { name: null }],
       ['disconnect'],
+      ['resize_for_view', { view: 'profiles' }],
+      ['export_logs', { stem: 'orion-log', contents: 'contents' }],
     ])
   })
 

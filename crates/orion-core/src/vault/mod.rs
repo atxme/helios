@@ -427,3 +427,102 @@ mod tests {
         ));
     }
 }
+
+/// What the vault can honestly claim about itself, for the posture panel.
+///
+/// Aggregated in one place, and **derived from what was actually verified**
+/// rather than from what the configuration asked for. Each field is a fact the
+/// UI is allowed to state; a field that could not be established says so
+/// instead of defaulting to the reassuring answer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultPosture {
+    /// The installation root is bound to a TPM key that was checked — provider,
+    /// non-exportability, ACL, modulus. Never `true` on a claim alone.
+    pub hardware_backed: bool,
+    /// `danger_allow_software_keystore` is on. A **downgrade**, not a recovery:
+    /// resistance to inter-machine copying, hardware rollback and a domain
+    /// administrator holding DPAPI backup keys is withdrawn with it.
+    pub software_keystore: bool,
+    /// Volume-encryption posture of the disk holding the profiles.
+    pub volume: &'static str,
+    pub volume_protected: bool,
+    /// Whether secret pages are held out of swap and hibernation.
+    pub memory_locked: bool,
+    pub memory: &'static str,
+    /// Whether secret pages are excluded from Windows Error Reporting dumps.
+    pub dumps_excluded: bool,
+    pub dumps: &'static str,
+    /// Profiles whose key once lived in plaintext and is presumed compromised.
+    /// They stay unconnectable until a new key is admitted.
+    pub rotation_required: Vec<String>,
+    /// A plaintext `profiles.toml` is still present and not yet migrated.
+    pub legacy_present: bool,
+}
+
+impl VaultPosture {
+    /// `true` when nothing is withheld — every claim the panel can make holds.
+    pub fn is_clean(&self) -> bool {
+        self.hardware_backed
+            && !self.software_keystore
+            && self.volume_protected
+            && self.memory_locked
+            && self.rotation_required.is_empty()
+            && !self.legacy_present
+    }
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+
+    type PostureMutation = fn(&mut VaultPosture);
+
+    fn clean() -> VaultPosture {
+        VaultPosture {
+            hardware_backed: true,
+            software_keystore: false,
+            volume: "",
+            volume_protected: true,
+            memory_locked: true,
+            memory: "",
+            dumps_excluded: true,
+            dumps: "",
+            rotation_required: Vec::new(),
+            legacy_present: false,
+        }
+    }
+
+    /// Every withheld guarantee must show. A posture that reported itself clean
+    /// while one of them was missing would be the screen keeping a promise
+    /// nothing backs — the failure ADR-006 §3 names explicitly.
+    #[test]
+    fn any_missing_guarantee_makes_the_posture_unclean() {
+        assert!(clean().is_clean());
+
+        let cases: [(&str, PostureMutation); 6] = [
+            ("no hardware root", |p| p.hardware_backed = false),
+            ("software keystore", |p| p.software_keystore = true),
+            ("volume unprotected", |p| p.volume_protected = false),
+            ("memory not locked", |p| p.memory_locked = false),
+            ("rotation pending", |p| {
+                p.rotation_required = vec!["poste".into()]
+            }),
+            ("legacy file", |p| p.legacy_present = true),
+        ];
+        for (label, break_it) in cases {
+            let mut posture = clean();
+            break_it(&mut posture);
+            assert!(!posture.is_clean(), "{label} was reported as clean");
+        }
+    }
+
+    /// The WER exclusion is defence in depth, not a guarantee the panel gates
+    /// on: it covers WER reports only, never a debugger or an injection.
+    #[test]
+    fn the_dump_exclusion_alone_does_not_make_the_posture_unclean() {
+        let mut posture = clean();
+        posture.dumps_excluded = false;
+        assert!(posture.is_clean());
+    }
+}

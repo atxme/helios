@@ -12,6 +12,7 @@ import type {
   KeyNegotiationSupport,
   ProfileIssues,
   TunnelState,
+  VaultPosture,
 } from './types'
 
 export const getState = () => invoke<TunnelState>('get_state')
@@ -103,3 +104,12 @@ export function onEvent(cb: (ev: ClientEvent) => void): Promise<UnlistenFn> {
 export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
   return listen('helios://profile-path', cb)
 }
+
+/**
+ * Reads the vault's posture.
+ *
+ * Asked on every panel opening rather than cached: BitLocker can be suspended
+ * and the memory-lock privilege can change while Orion runs, so a value read
+ * once at startup would eventually claim a protection that has since gone.
+ */
+export const vaultPosture = () => invoke<VaultPosture>('vault_posture')

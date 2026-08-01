@@ -175,3 +175,39 @@ export interface TelemetrySample {
   rx_bps: number
   tx_bps: number
 }
+
+/**
+ * What the vault can honestly claim about itself (ADR-006 §3).
+ *
+ * Every field is **measured**, never assumed. A guarantee that could not be
+ * established is reported as absent rather than defaulted to the reassuring
+ * answer — a panel that promised what nothing backs is the failure the ADR
+ * names, not a cosmetic one.
+ */
+export interface VaultPosture {
+  /** Installation root bound to a TPM key whose properties were verified. */
+  hardwareBacked: boolean
+  /**
+   * `danger_allow_software_keystore` is on. A **downgrade**, not a recovery:
+   * resistance to inter-machine copying and to a domain administrator holding
+   * DPAPI backup keys is withdrawn with it.
+   */
+  softwareKeystore: boolean
+  /** Volume-encryption posture of the disk holding the profiles. */
+  volume: string
+  volumeProtected: boolean
+  /** Secret pages held out of swap and of the hibernation file. */
+  memoryLocked: boolean
+  memory: string
+  /** Secret pages excluded from Windows Error Reporting dumps. */
+  dumpsExcluded: boolean
+  dumps: string
+  /**
+   * Profiles whose key once lived in plaintext. Presumed compromised — sealing
+   * the file does not recall the copies already in backups — and unconnectable
+   * until a new key is admitted.
+   */
+  rotationRequired: string[]
+  /** A plaintext `profiles.toml` is still present and not yet migrated. */
+  legacyPresent: boolean
+}

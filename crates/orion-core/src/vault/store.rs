@@ -362,6 +362,35 @@ impl ProfileStore {
         self.store_registry(&root, &registry)
     }
 
+    /// Everything the posture panel is allowed to state about this store.
+    ///
+    /// Each field is measured, not assumed. `rotation_required` falls back to
+    /// an empty list when the registry cannot be opened — the panel already
+    /// shows the missing hardware root in that case, and inventing profile
+    /// names from an unreadable registry would be worse than saying nothing.
+    pub fn posture(&self) -> super::VaultPosture {
+        let volume = super::windows::bitlocker::protection_of(&self.dir);
+        // A small probe: the lock privilege is the same for every buffer, so
+        // one page answers for all of them without holding a secret.
+        let probe = aether::locked::LockedSecret::with_capacity(32);
+        let lock = probe.lock_state();
+        let exclusion = super::windows::dumps::exclude(probe.expose());
+        super::windows::dumps::release(probe.expose());
+
+        super::VaultPosture {
+            hardware_backed: self.provider.hardware_backed(),
+            software_keystore: !self.provider.hardware_backed(),
+            volume: volume.detail(),
+            volume_protected: volume.allows_secrets(),
+            memory_locked: lock.holds(),
+            memory: lock.detail(),
+            dumps_excluded: exclusion.holds(),
+            dumps: exclusion.detail(),
+            rotation_required: self.rotation_required().unwrap_or_default(),
+            legacy_present: self.legacy_present(),
+        }
+    }
+
     /// Moves a plaintext configuration into the vault.
     ///
     /// Idempotent: a second call on an already-migrated installation finds no

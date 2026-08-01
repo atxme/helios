@@ -451,6 +451,18 @@ fn finish_import(
 /// This is what the user communicates to the operator to be admitted on the
 /// gateway (ADR-004 §6): deriving it here avoids making them manipulate
 /// their private key in a terminal to obtain a value that is, itself, public.
+/// What the vault can honestly claim about itself (ADR-006 §3).
+///
+/// Read on every call rather than cached: BitLocker can be suspended and the
+/// memory-lock privilege can change while Orion runs, and a posture panel that
+/// showed a stale "protected" would be worse than one that showed nothing.
+#[tauri::command]
+async fn vault_posture(
+    state: State<'_, AppState>,
+) -> Result<orion_core::vault::VaultPosture, String> {
+    Ok(state.store.posture())
+}
+
 #[tauri::command]
 fn profile_public_key(profile: ClientProfile) -> Option<String> {
     profile.public_key()
@@ -878,6 +890,7 @@ fn main() {
             key_negotiation_support,
             key_negotiation_fingerprint,
             key_negotiation_identity_sealed,
+            vault_posture,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");

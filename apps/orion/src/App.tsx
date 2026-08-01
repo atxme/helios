@@ -8,6 +8,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { ChevronDown, Radio, Settings2, Terminal, X } from 'lucide-react'
 import * as api from './api'
+import type { VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
@@ -45,6 +46,26 @@ export default function App() {
   const [view, setView] = useState<View>('connect')
   const [navOpen, setNavOpen] = useState(false)
   const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
+  // Read on every opening rather than once at startup: BitLocker can be
+  // suspended and the memory-lock privilege can change while Orion runs, so a
+  // cached value would eventually claim a protection that has since gone.
+  // A failure leaves it `null` — unknown, never "fine".
+  const [vault, setVault] = useState<VaultPosture | null>(null)
+  useEffect(() => {
+    if (!postureAnchor) return
+    let cancelled = false
+    api
+      .vaultPosture()
+      .then((found) => {
+        if (!cancelled) setVault(found)
+      })
+      .catch(() => {
+        if (!cancelled) setVault(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [postureAnchor])
   const posture = postureMeta(c.state, c.adapterUp)
 
   useEffect(() => {
@@ -129,6 +150,7 @@ export default function App() {
         profile={c.selectedProfile}
         psk={c.psk}
         backend={c.backend}
+        vault={vault}
       />
 
       {c.error ? (
