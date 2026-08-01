@@ -82,7 +82,21 @@ pub struct ResolvedKey {
 }
 
 fn keystore() -> SealedKeystore {
-    SealedKeystore::new(PathBuf::from(KEYSTORE_PATH))
+    SealedKeystore::new(
+        PathBuf::from(KEYSTORE_PATH),
+        helio_tpm::DOMAIN_GATEWAY_WG_KEY,
+    )
+}
+
+/// Object context of the gateway identity vault: its own WireGuard public key.
+///
+/// It is what stops a vault from being opened as another gateway's, and it is
+/// derivable from the very secret the vault holds — which is why reading goes
+/// through `load_declared` and compares afterwards (ADR-006 §2).
+fn identity_context(private_key: &str) -> Result<helio_tpm::Context, String> {
+    let public = aether::wg::public_from_private(private_key)
+        .map_err(|e| format!("deriving the gateway public key: {e}"))?;
+    Ok(helio_tpm::Context::new().field("wg_public_key", public.as_bytes()))
 }
 
 /// Writes the escrow of `private_key` to the operator's public key.
@@ -151,7 +165,14 @@ fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
     }
 
     // Reseals immediately under the new TPM secret.
-    if let Err(e) = keystore().store(secret, key.as_bytes()) {
+    let context = match identity_context(&key) {
+        Ok(context) => context,
+        Err(e) => {
+            warn!("recovered key unusable ({e}) — ignored, not consumed");
+            return None;
+        }
+    };
+    if let Err(e) = keystore().store(secret, &context, key.as_bytes()) {
         warn!("could not reseal the recovered key: {e}");
         return None;
     }
@@ -202,11 +223,43 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                      (tpm.enabled=false or enforce=false) — key inaccessible"
                 );
             }
-            Some(secret) => match store.load(secret) {
-                Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
+            Some(secret) => match store.load_declared(secret) {
+                Ok((declared, bytes)) => match String::from_utf8(bytes.to_vec()) {
                     Ok(key) => {
-                        info!("WireGuard key loaded from the sealed TPM vault");
                         let key = key.trim().to_string();
+                        // The context names the public key this vault belongs
+                        // to; the private key inside determines it. They must
+                        // agree, or the blob came from another gateway. A
+                        // legacy `HKS1` vault carries no context and is
+                        // accepted until the next store rewrites it.
+                        match identity_context(&key) {
+                            Ok(expected) if declared.is_empty() => {
+                                let _ = expected;
+                                warn!(
+                                    "legacy vault without object context — it will be bound \
+                                     on the next sealing"
+                                );
+                            }
+                            Ok(expected) if expected.as_bytes() != declared => {
+                                warn!(
+                                    "vault context does not match the key it contains — \
+                                     refusing this identity"
+                                );
+                                return ResolvedKey {
+                                    private_key: String::new(),
+                                    origin: KeyOrigin::Missing,
+                                };
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("unusable vault content ({e})");
+                                return ResolvedKey {
+                                    private_key: String::new(),
+                                    origin: KeyOrigin::Missing,
+                                };
+                            }
+                        }
+                        info!("WireGuard key loaded from the sealed TPM vault");
                         // Escrow follows the key: if the escrow configuration
                         // was just added, it is created on this very startup.
                         write_escrow(network, &key);
@@ -254,7 +307,17 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
              enough to impersonate the gateway. Automatic sealing into the TPM vault…"
         );
         if let Some(secret) = secret {
-            match store.store(secret, plain.as_bytes()) {
+            let context = match identity_context(plain) {
+                Ok(context) => context,
+                Err(e) => {
+                    warn!("plaintext key unusable ({e}) — not sealed");
+                    return ResolvedKey {
+                        private_key: String::new(),
+                        origin: KeyOrigin::Missing,
+                    };
+                }
+            };
+            match store.store(secret, &context, plain.as_bytes()) {
                 Ok(()) => {
                     info!(
                         "key sealed into {KEYSTORE_PATH} — remove `wg_private_key` from network.toml"
@@ -307,8 +370,9 @@ pub fn initialize(
     })?;
 
     let keypair = aether::wg::generate_keypair().map_err(|e| e.to_string())?;
+    let context = identity_context(keypair.private_key.expose())?;
     store
-        .store(secret, keypair.private_key.expose().as_bytes())
+        .store(secret, &context, keypair.private_key.expose().as_bytes())
         .map_err(|e| format!("could not seal the identity: {e}"))?;
     write_escrow(network, keypair.private_key.expose());
 
@@ -359,8 +423,9 @@ pub fn update_sealed(
         .secret()
         .ok_or_else(|| "no TPM secret available: cannot seal".to_string())?;
 
+    let context = identity_context(key)?;
     keystore()
-        .store(secret, key.as_bytes())
+        .store(secret, &context, key.as_bytes())
         .map_err(|e| format!("could not seal the new key: {e}"))?;
 
     // Escrow must follow the new key: otherwise a post-OTA recovery would

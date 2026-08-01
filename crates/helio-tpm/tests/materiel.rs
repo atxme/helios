@@ -210,11 +210,15 @@ fn the_wireguard_key_survives_a_sealed_round_trip() {
     // A WireGuard private key is 32 bytes; we verify it comes back intact
     // from the vault encrypted by the TPM-derived secret.
     let key: Vec<u8> = (0u8..32).collect();
-    let vault = SealedKeystore::new(dir.join("wg-key.sealed"));
-    vault.store(&secret, &key).expect("sealing the key");
+    let vault = SealedKeystore::new(dir.join("wg-key.sealed"), helio_tpm::DOMAIN_GATEWAY_WG_KEY);
+    vault
+        .store(&secret, &helio_tpm::Context::new(), &key)
+        .expect("sealing the key");
     assert!(vault.exists(), "the vault was not written");
 
-    let reread = vault.load(&secret).expect("re-reading the key");
+    let reread = vault
+        .load(&secret, &helio_tpm::Context::new())
+        .expect("re-reading the key");
     assert_eq!(reread.as_slice(), key.as_slice(), "WireGuard key tampered");
 
     vault.remove().expect("removing the vault");

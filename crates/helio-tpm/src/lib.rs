@@ -41,7 +41,9 @@ mod tpm_real;
 
 pub use boot_controller::{BootController, BootDecision};
 pub use escrow::EscrowError;
-pub use keystore::{KeystoreError, SealedKeystore};
+pub use keystore::{
+    Context, KeystoreError, SealedKeystore, DOMAIN_GATEWAY_WG_KEY, DOMAIN_KEY_NEGOTIATION_IDENTITY,
+};
 pub use secret::SecretKey;
 pub use settings::TpmSettings;
 

@@ -284,6 +284,11 @@ mod tests {
     /// The full end-to-end scenario: an OTA changes the kernel, the TPM
     /// secret is regenerated, the vault becomes unreadable — and the
     /// operator still recovers the gateway's identity through escrow.
+    /// Object context used by the gateway identity vault in these tests.
+    fn ctx() -> crate::Context {
+        crate::Context::new().field("wg_public_key", b"cle-publique-de-test")
+    }
+
     #[test]
     fn full_recovery_after_a_pcr_change() {
         use crate::keystore::SealedKeystore;
@@ -291,21 +296,24 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("helios-escrow-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let store = SealedKeystore::new(dir.join("wg-key.sealed"));
+        let store = SealedKeystore::new(dir.join("wg-key.sealed"), crate::DOMAIN_GATEWAY_WG_KEY);
 
         let wg_key = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let (operator_private, operator_public) = generate_operator_keypair().unwrap();
 
         // ── Normal operation: the key is sealed, and escrowed ──
         let secret_before = SecretKey::from_bytes([1u8; 32]);
-        store.store(&secret_before, wg_key).unwrap();
+        store.store(&secret_before, &ctx(), wg_key).unwrap();
         let escrow_blob = seal_to_operator(&operator_public, wg_key).unwrap();
-        assert_eq!(store.load(&secret_before).unwrap().as_slice(), wg_key);
+        assert_eq!(
+            store.load(&secret_before, &ctx()).unwrap().as_slice(),
+            wg_key
+        );
 
         // ── OTA with a new kernel: PCR 4 moves, secret regenerated ──
         let secret_after = SecretKey::from_bytes([2u8; 32]);
         assert!(
-            store.load(&secret_after).is_err(),
+            store.load(&secret_after, &ctx()).is_err(),
             "the vault must be unreadable with the new secret"
         );
 
@@ -314,8 +322,11 @@ mod tests {
         assert_eq!(recovered.as_slice(), wg_key, "identity recovered");
 
         // ── The gateway reseals under the new secret ──
-        store.store(&secret_after, &recovered).unwrap();
-        assert_eq!(store.load(&secret_after).unwrap().as_slice(), wg_key);
+        store.store(&secret_after, &ctx(), &recovered).unwrap();
+        assert_eq!(
+            store.load(&secret_after, &ctx()).unwrap().as_slice(),
+            wg_key
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
