@@ -174,15 +174,15 @@ impl NetworkConfig {
         self.validate()?;
         let path = Self::path();
         let raw = toml::to_string_pretty(self).map_err(|e| HeliosError::Config(e.to_string()))?;
-        let tmp = path.with_extension("toml.tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| HeliosError::Config(format!("creating directory: {e}")))?;
         }
-        std::fs::write(&tmp, raw.as_bytes())
-            .map_err(|e| HeliosError::Config(format!("writing: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| HeliosError::Config(format!("atomic rename: {e}")))?;
+        // 0600 from creation, not a `chmod` afterwards: see `private_file`. A
+        // plain write here handed the file back to the umask on every save,
+        // undoing the install-time hardening (ADR-006).
+        crate::private_file::write_private_atomic(&path, raw.as_bytes())
+            .map_err(|e| HeliosError::Config(format!("private atomic write: {e}")))?;
         Ok(())
     }
 
@@ -582,6 +582,50 @@ mod tests {
             ..NetworkConfig::default()
         };
         assert_eq!(cfg.api_bind(), API_BIND_LOOPBACK);
+    }
+
+    /// `network.toml` must never become world-readable, and above all not on a
+    /// **rewrite**.
+    ///
+    /// This is the regression ADR-006 opens on: `save()` used to write its
+    /// temporary file with a plain `std::fs::write`, whose mode came from the
+    /// umask — 0644 for a daemon running as root. The `rename` carried that
+    /// mode onto the final file, silently undoing the `chmod 600` applied by
+    /// `scripts/target-bootstrap.sh`. The gateway lost it at its first peer
+    /// admission, and nothing said so.
+    ///
+    /// Goes through `HELIOS_NETWORK_CONFIG`, which no other test in this crate
+    /// touches: there is nothing here to race against.
+    #[cfg(unix)]
+    #[test]
+    fn the_network_config_stays_private_across_rewrites() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aether-network-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("network.toml");
+        std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
+
+        let cfg = NetworkConfig {
+            wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            wg_address: "100.64.0.1/10".into(),
+            ..NetworkConfig::default()
+        };
+        cfg.save().expect("first save");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "mode after the first save");
+
+        cfg.save().expect("rewrite");
+        assert_eq!(mode(&path), 0o600, "mode after a rewrite");
+
+        std::env::remove_var("HELIOS_NETWORK_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

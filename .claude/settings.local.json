@@ -219,7 +219,10 @@
       "Bash(echo \"FMT_EXIT=$?\")",
       "Bash(awk '{print $5, $9}')",
       "Bash(git worktree *)",
-      "Bash(awk '{print \"HEAD \\(sans mes changements\\):\", $5, \"octets\"}')"
+      "Bash(awk '{print \"HEAD \\(sans mes changements\\):\", $5, \"octets\"}')",
+      "Bash(umask)",
+      "Bash(systemd-analyze verify *)",
+      "Bash(systemctl --version)"
     ]
   }
 }

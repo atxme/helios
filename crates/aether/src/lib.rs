@@ -17,6 +17,7 @@ pub mod key_negotiation;
 pub mod mtu;
 pub mod policy;
 pub mod pq;
+pub mod private_file;
 pub mod secret;
 pub mod sig;
 pub mod state;

@@ -347,10 +347,10 @@ impl ClientConfig {
                 .with_context(|| format!("création de {}", parent.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("sérialisation TOML")?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw.as_bytes())
-            .with_context(|| format!("écriture de {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).context("rename atomique")?;
+        // 0600 from creation on Unix — see `aether::private_file`, including
+        // why Windows gets nothing here and what actually protects it (ADR-006).
+        aether::private_file::write_private_atomic(&path, raw.as_bytes())
+            .with_context(|| format!("écriture privée de {}", path.display()))?;
         Ok(())
     }
 
@@ -581,6 +581,20 @@ mod tests {
         assert_eq!(p.persistent_keepalive, DEFAULT_KEEPALIVE_SECS);
         assert!(p.has_preshared_key());
         assert_eq!(loaded.selected.as_deref(), Some("site-a"));
+
+        // The file carries a private key and a PSK: it must never be readable
+        // by anyone else. Asserted on the SECOND write too, because that is the
+        // one that used to hand the mode back to the umask (ADR-006).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&path), 0o600, "mode after the first save");
+            cfg.save().unwrap();
+            assert_eq!(mode(&path), 0o600, "mode after a rewrite");
+        }
 
         std::env::remove_var("ORION_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
