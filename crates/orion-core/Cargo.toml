@@ -32,6 +32,11 @@ x25519-dalek = { workspace = true }
 defguard_wireguard_rs = { workspace = true, optional = true }
 # Non optionnelle : voir la note sur `aether` ci-dessus.
 helios-key-negotiation = { workspace = true }
+# Conteneur AEAD partagé des secrets au repos (ADR-006 §2).
+helios-vault = { workspace = true }
+# Normalisation NFC de la passphrase `nomade` : sans elle, la même phrase
+# saisie sur deux systèmes dérive deux clés différentes (ADR-006 §3).
+unicode-normalization = "0.1"
 
 # Épinglage de la socket de négociation hors tunnel (`net_pin`). Pas plus
 # optionnel que le reste de la négociation : sans lui, la session QUIC change
@@ -39,9 +44,29 @@ helios-key-negotiation = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  # Épinglage de la socket de négociation hors tunnel (`net_pin`).
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
+  # Couches plateforme du coffre (ADR-006 §3) : clé TPM non exportable via CNG,
+  # enveloppe DPAPI, et boîte de saisie native de la passphrase `nomade`.
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
+  "Win32_System_Com",
+  # `CREDUI_INFOW` porte un `HBITMAP` : sans GDI, la structure est absente.
+  "Win32_Graphics_Gdi",
+] }
+# WMI (posture BitLocker) : `windows-sys` n'expose aucune interface COM, seul
+# le crate `windows` le fait. Il est déjà présent dans le lockfile.
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Rpc",
+  "Win32_System_Variant",
+  "Win32_System_Wmi",
+  # `VARIANT` n'existe qu'avec Com **et** Ole.
+  "Win32_System_Ole",
 ] }
 
 [features]

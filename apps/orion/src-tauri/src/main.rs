@@ -58,6 +58,10 @@ use tokio::sync::{watch, Mutex};
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
     controller: Arc<VpnController>,
+    /// Vault-backed store. `config` below is the in-memory view the UI reads;
+    /// this is what actually persists, and it never writes a secret in the
+    /// clear (ADR-006 §3).
+    store: Arc<orion_core::vault::ProfileStore>,
     config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
@@ -459,25 +463,32 @@ async fn save_profile(
 ) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
     let selected = profile.name.clone();
+    state
+        .store
+        .save_profile(&profile)
+        .map_err(|e| e.to_string())?;
     cfg.upsert(profile);
-    cfg.selected = Some(selected);
-    cfg.save().map_err(|e| e.to_string())?;
+    cfg.selected = Some(selected.clone());
+    state.store.select(&selected).map_err(|e| e.to_string())?;
     Ok(cfg.clone())
 }
 
 #[tauri::command]
 async fn delete_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
+    state
+        .store
+        .remove_profile(&name)
+        .map_err(|e| e.to_string())?;
     cfg.remove(&name);
-    cfg.save().map_err(|e| e.to_string())?;
     Ok(cfg.clone())
 }
 
 #[tauri::command]
 async fn select_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
     let mut cfg = state.config.lock().await;
+    state.store.select(&name).map_err(|e| e.to_string())?;
     cfg.selected = Some(name);
-    cfg.save().map_err(|e| e.to_string())?;
     Ok(cfg.clone())
 }
 
@@ -782,7 +793,39 @@ fn main() {
         }
     };
     let controller = Arc::new(controller);
-    let config = ClientConfig::load().unwrap_or_default();
+
+    // Le stockage des profils passe par le coffre (ADR-006 §3) : `profiles.toml`
+    // n'est plus qu'un format d'import. Hors Windows le fournisseur refuse, et
+    // c'est le comportement spécifié — écrire la racine en clair offrirait une
+    // protection que l'écran promettrait sans la rendre.
+    let store_dir = orion_core::vault::ProfileStore::default_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let store = Arc::new(orion_core::vault::ProfileStore::new(
+        store_dir.clone(),
+        Box::new(orion_core::vault::windows::PlatformRootKeyProvider::new(
+            store_dir.join("device-root"),
+        )),
+    ));
+    if !store.hardware_backed() {
+        tracing::warn!(
+            "SÉCURITÉ MATÉRIELLE DÉSACTIVÉE — la racine d'installation n'est pas liée au TPM"
+        );
+    }
+    // Une configuration héritée est reprise dans le coffre avant tout usage, et
+    // ses profils restent bloqués jusqu'à rotation de clé : le sceller ne
+    // rappelle pas les copies déjà parties en sauvegarde.
+    match store.migrate_legacy() {
+        Ok(report) if !report.migrated.is_empty() => tracing::warn!(
+            profils = ?report.rotation_required,
+            "profils repris du fichier en clair — rotation de clé obligatoire"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "migration du fichier hérité impossible"),
+    }
+    let config = store.load().unwrap_or_else(|error| {
+        tracing::error!(%error, "coffre illisible — aucun profil chargé");
+        ClientConfig::default()
+    });
 
     tauri::Builder::default()
         // Must stay the first plugin registered: it intercepts the secondary
@@ -800,6 +843,7 @@ fn main() {
         }))
         .manage(AppState {
             controller,
+            store,
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),

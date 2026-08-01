@@ -31,6 +31,7 @@ pub mod net_pin;
 pub mod profile_import;
 pub mod provisioning;
 pub mod telemetry;
+pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
 pub use config::{
