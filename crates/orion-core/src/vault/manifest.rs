@@ -123,6 +123,51 @@ impl ProfileManifest {
         }
     }
 
+    /// Digest of everything whose change is a **security event**.
+    ///
+    /// ADR-006 §2 names four triggers for raising the generation: a key
+    /// rotation, a PSK change, a trust-anchor change and a floor change. The
+    /// key rotation is tracked separately — the registry already holds the
+    /// client public key — so this digest covers the other three, and nothing
+    /// else. Endpoint, display name and `allowed_ips` deliberately stay out:
+    /// they belong to the sealed manifest, they are not what the generation
+    /// counter is for, and raising it on an ordinary edit would make a real
+    /// rollback indistinguishable from a renamed profile.
+    ///
+    /// The PSK is covered by its **value**, not merely its presence: swapping
+    /// one static PSK for another is exactly the change the ADR lists.
+    /// Hashing it is what lets the registry witness that change without ever
+    /// holding the secret — the registry carries no PSK, and must not start.
+    pub fn security_digest(&self) -> [u8; 32] {
+        // Length-prefixed like every other canonical encoding here: without it
+        // an empty CA followed by a certificate would hash like the reverse.
+        let mut input = Zeroizing::new(Vec::with_capacity(512));
+        let mut field = |value: &[u8]| {
+            input.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            input.extend_from_slice(value);
+        };
+        match &self.preshared_key {
+            None => field(b""),
+            Some(psk) => field(psk.as_bytes()),
+        }
+        match &self.key_negotiation {
+            None => {
+                field(b"");
+                field(b"");
+                field(b"");
+            }
+            Some(settings) => {
+                field(settings.gateway_ca_der.as_bytes());
+                field(settings.gateway_pq_certificate.as_bytes());
+                field(&[mode_id(settings.minimum_mode)]);
+            }
+        }
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(digest.as_ref());
+        out
+    }
+
     /// Encodes into a bounded, zeroizing buffer.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let mut out = Zeroizing::new(Vec::with_capacity(1024));

@@ -212,12 +212,9 @@ impl ProtectedIdentityStore {
         );
         let sealed = seal(&plaintext)?;
 
-        std::fs::create_dir_all(&self.directory)
+        aether::private_file::create_private_dir(&self.directory)
             .with_context(|| format!("création de {}", self.directory.display()))?;
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, &sealed)
-            .with_context(|| format!("écriture de {}", temporary.display()))?;
-        std::fs::rename(&temporary, &path)
+        aether::private_file::write_private_atomic(&path, &sealed)
             .with_context(|| format!("remplacement atomique de {}", path.display()))?;
         Ok(path)
     }
@@ -597,6 +594,88 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    /// Exercises the actual Windows account boundary rather than the
+    /// non-Windows refusal compiled on the Linux runner.
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_sealing_round_trips_and_hides_the_plaintext() {
+        let plaintext = b"orion identity private material";
+        let sealed = seal(plaintext).expect("DPAPI must seal for the current test account");
+
+        assert_ne!(sealed, plaintext);
+        assert!(
+            !sealed
+                .windows(plaintext.len())
+                .any(|window| window == plaintext),
+            "the DPAPI envelope must not contain the plaintext"
+        );
+        assert_eq!(unseal(&sealed).unwrap().as_slice(), plaintext);
+    }
+
+    /// Covers validation, DPAPI, the atomic replacement and decoding as one
+    /// operation on the platform Orion actually ships for.
+    #[cfg(windows)]
+    #[test]
+    fn protected_store_round_trips_and_replaces_an_identity() {
+        let directory = test_directory("windows-round-trip");
+        let store = ProtectedIdentityStore::at(directory.clone());
+        let first = bundle();
+
+        let path = store.store(&first).unwrap();
+        let ciphertext = std::fs::read(&path).unwrap();
+        assert!(!ciphertext
+            .windows(first.private_key.len())
+            .any(|window| { window == first.private_key.as_bytes() }));
+        assert!(store.contains(&first.identity));
+        let loaded = store.load(&first.identity).unwrap();
+        assert_eq!(loaded.private_key, first.private_key);
+        assert_eq!(loaded.pq_private_key, first.pq_private_key);
+
+        let mut replacement = first;
+        replacement.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+        store.store(&replacement).unwrap();
+        assert_eq!(
+            store.load(&replacement.identity).unwrap().pq_private_key,
+            replacement.pq_private_key
+        );
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// DPAPI authentication must turn a modified blob into an explicit
+    /// decryption failure, never partially decoded identity material.
+    #[cfg(windows)]
+    #[test]
+    fn a_tampered_identity_blob_is_refused() {
+        let directory = test_directory("windows-tamper");
+        let store = ProtectedIdentityStore::at(directory.clone());
+        let identity = bundle();
+        let path = store.store(&identity).unwrap();
+        let mut sealed = std::fs::read(&path).unwrap();
+        let last = sealed.last_mut().expect("DPAPI produced a non-empty blob");
+        *last ^= 0x80;
+        std::fs::write(&path, sealed).unwrap();
+
+        let error = store
+            .load(&identity.identity)
+            .expect_err("modified DPAPI material must not open");
+        assert!(
+            error
+                .downcast_ref::<IdentityStoreError>()
+                .is_some_and(|error| matches!(error, IdentityStoreError::Unseal(_))),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The refusal must be explicit rather than a silent plaintext fallback:

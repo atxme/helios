@@ -14,9 +14,10 @@ import {
 const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'site-a',
   endpoint: '203.0.113.10:51820',
-  private_key: '',
   peer_public_key: '',
-  preshared_key: null,
+  public_key: null,
+  has_private_key: false,
+  has_static_psk: false,
   address: null,
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
@@ -89,8 +90,9 @@ describe('Orion UI state', () => {
     const helios = profile({ heliosd_url: 'http://100.64.0.1:8080' })
     expect(protectionMeta(helios, 'ml_kem', 'up').tone).toBe('pqc')
 
-    // And the reverse: a filled-in `preshared_key` always denotes a static one.
-    const manual = profile({ preshared_key: 'cHNr' })
+    // And the reverse: the presence flag always denotes a static one, without
+    // carrying the value across the IPC boundary.
+    const manual = profile({ has_static_psk: true })
     expect(protectionMeta(manual, null, 'down').tone).toBe('static')
   })
 

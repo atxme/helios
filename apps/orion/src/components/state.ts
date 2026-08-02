@@ -242,8 +242,11 @@ export function protectionMeta(
     return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
   }
 
-  const staticPsk = Boolean(profile?.preshared_key?.trim())
-  if (staticPsk) return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
+  // The presence flag, not the value: the profile no longer carries either
+  // secret across the IPC (ADR-006 §5). Presence is all this ever needed.
+  if (profile?.has_static_psk) {
+    return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
+  }
 
   if (profile?.heliosd_url?.trim()) return pending('PSK PQC', PQC_DETAIL)
 

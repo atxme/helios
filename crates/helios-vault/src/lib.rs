@@ -340,11 +340,15 @@ pub fn seal(
     blob.extend_from_slice(&nonce);
 
     let key = derive(unlock, &salt)?;
-    let mut in_out = plaintext.to_vec();
+    // `Zeroizing`, like the open path: `seal_in_place_append_tag` needs an owned
+    // buffer, so this copy holds the plaintext for the length of the call. A
+    // plain `Vec` would leave it in a freed, unwiped allocation — the very
+    // remanence ADR-006 §5 puts on the buffers, not only on the types.
+    let mut in_out = Zeroizing::new(plaintext.to_vec());
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::from(aad(&blob)),
-        &mut in_out,
+        &mut *in_out,
     )
     .map_err(|_| VaultError::Undecipherable)?;
 
@@ -408,17 +412,18 @@ pub fn peek_context(blob: &[u8]) -> Result<Vec<u8>> {
     Ok(parse(blob)?.context.to_vec())
 }
 
-/// Opens a vault stored at `path`, bounding the read **before** it happens.
+/// Reads a vault file into memory, bounding the read **before** it happens.
+///
+/// The one entry point for getting a vault off a disk. It is public because
+/// [`open_file`] cannot serve every caller: the static-PSK table has to
+/// [`peek_context`] its blob before it can name the context to open it with,
+/// and a caller that reached for `std::fs::read` to do so would reintroduce
+/// exactly the unbounded allocation this function exists to prevent.
 ///
 /// The size is checked on the metadata, then the read is itself capped: a file
 /// that grows between the two, or a sparse file that costs nothing to create
 /// and everything to read, is refused rather than allocated.
-pub fn open_file(
-    path: &Path,
-    domain: &str,
-    context: &Context,
-    unlock: &Unlock<'_>,
-) -> Result<Zeroizing<Vec<u8>>> {
+pub fn read_file_bounded(path: &Path) -> Result<Vec<u8>> {
     let io = |cause: std::io::Error| VaultError::Io {
         path: path.to_path_buf(),
         cause: cause.to_string(),
@@ -437,7 +442,17 @@ pub fn open_file(
     if blob.len() > MAX_VAULT_BYTES {
         return Err(VaultError::TooLarge(blob.len() as u64));
     }
-    open(domain, context, unlock, &blob)
+    Ok(blob)
+}
+
+/// Opens a vault stored at `path`, bounding the read **before** it happens.
+pub fn open_file(
+    path: &Path,
+    domain: &str,
+    context: &Context,
+    unlock: &Unlock<'_>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    open(domain, context, unlock, &read_file_bounded(path)?)
 }
 
 /// Header fields, all bounds already checked.
@@ -1055,6 +1070,47 @@ mod tests {
             open_file(&path, DOMAIN, &context("alice"), &key_unlock()),
             Err(VaultError::TooLarge(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound belongs to the **reader**, so a caller that peeks before it
+    /// opens gets it too. `static_psk` is exactly that caller: it cannot name
+    /// its context before reading the blob, so it must not be forced back onto
+    /// `std::fs::read` to do so.
+    #[test]
+    fn the_bounded_reader_refuses_a_sparse_file_on_its_own() {
+        let dir = tmp_dir("bounded-reader");
+        let path = dir.join("huge.hvlt");
+        let file = File::create(&path).unwrap();
+        file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        drop(file);
+
+        assert!(matches!(
+            read_file_bounded(&path),
+            Err(VaultError::TooLarge(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bounded_reader_returns_a_blob_the_parser_accepts() {
+        let dir = tmp_dir("bounded-roundtrip");
+        let path = dir.join("vault.hvlt");
+        let ctx = context("alice");
+        std::fs::write(
+            &path,
+            seal(DOMAIN, &ctx, &key_unlock(), b"secret").expect("seal"),
+        )
+        .unwrap();
+
+        let blob = read_file_bounded(&path).expect("read");
+        assert_eq!(peek_context(&blob).expect("peek"), ctx.as_bytes());
+        assert_eq!(
+            open(DOMAIN, &ctx, &key_unlock(), &blob)
+                .expect("open")
+                .as_slice(),
+            b"secret"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

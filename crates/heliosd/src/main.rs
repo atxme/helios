@@ -270,13 +270,10 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             key_negotiation_pq_certificate_sha256,
             minimum_mode,
         } => {
-            let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
-                if key_negotiation_pq_certificate_sha256.is_some() {
-                    aether::key_negotiation::ProtectionMode::MlKem
-                } else {
-                    aether::key_negotiation::ProtectionMode::Classic
-                }
-            });
+            let minimum_mode = admission_floor(
+                minimum_mode,
+                key_negotiation_pq_certificate_sha256.is_some(),
+            );
             let peer = helios_provisioning::admit_with_key_negotiation(
                 &mut network,
                 &name,
@@ -332,6 +329,20 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
     }
 }
 
+/// Derives the safe default without hiding an explicit operator floor.
+fn admission_floor(
+    explicit: Option<NegotiationMode>,
+    has_pq_certificate: bool,
+) -> aether::key_negotiation::ProtectionMode {
+    explicit.map(Into::into).unwrap_or_else(|| {
+        if has_pq_certificate {
+            aether::key_negotiation::ProtectionMode::MlKem
+        } else {
+            aether::key_negotiation::ProtectionMode::Classic
+        }
+    })
+}
+
 /// Seals a fresh secret into the TPM, on first deployment only.
 ///
 /// `TpmSettings::default()` carries `allow_provisioning = false`: this is
@@ -346,20 +357,7 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
 fn provision_tpm() -> anyhow::Result<()> {
     let mut tpm = TpmSettings::default();
 
-    if !tpm.enabled {
-        anyhow::bail!(
-            "binary built without the `tpm` feature: no sealing possible. \
-             Rebuild with --features tpm on the target."
-        );
-    }
-
-    if std::path::Path::new(&tpm.sealed_blob_path).exists() {
-        anyhow::bail!(
-            "a vault already exists in {} — refusing to overwrite it. Deleting it \
-             would lose the gateway's sealed identity.",
-            tpm.sealed_blob_path
-        );
-    }
+    validate_provisioning_request(&tpm)?;
 
     tpm.allow_provisioning = true;
     match BootController::unlock(&tpm).map_err(|e| anyhow::anyhow!("sealing failed: {e}"))? {
@@ -376,6 +374,25 @@ fn provision_tpm() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("expected provisioning, got: {other:?}"),
     }
+}
+
+/// Refuses unsafe provisioning requests before opening the TPM device.
+fn validate_provisioning_request(tpm: &TpmSettings) -> anyhow::Result<()> {
+    if !tpm.enabled {
+        anyhow::bail!(
+            "binary built without the `tpm` feature: no sealing possible. \
+             Rebuild with --features tpm on the target."
+        );
+    }
+
+    if std::path::Path::new(&tpm.sealed_blob_path).exists() {
+        anyhow::bail!(
+            "a vault already exists in {} — refusing to overwrite it. Deleting it \
+             would lose the gateway's sealed identity.",
+            tpm.sealed_blob_path
+        );
+    }
+    Ok(())
 }
 
 /// Determines whether we are under WSL2 (Microsoft kernel).
@@ -504,7 +521,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             Ok(adopted) => warn!(
                 adopted,
                 "PSK statiques repris de network.toml vers la table scellée — \
-                 retirer `preshared_key` du fichier"
+                 `preshared_key` retiré du fichier"
             ),
             Err(error) => error!(
                 %error,
@@ -722,8 +739,62 @@ mod tests {
     }
 
     #[test]
+    fn admission_floor_defaults_to_the_strongest_available_identity() {
+        use aether::key_negotiation::ProtectionMode;
+
+        assert_eq!(admission_floor(None, false), ProtectionMode::Classic);
+        assert_eq!(admission_floor(None, true), ProtectionMode::MlKem);
+        assert_eq!(
+            admission_floor(Some(NegotiationMode::StaticPsk), true),
+            ProtectionMode::StaticPsk,
+            "an explicit floor must not be replaced by inference"
+        );
+    }
+
+    #[test]
     fn explicit_development_mode_always_wins_auto_detection() {
         assert!(resolve_dry_run(true));
+    }
+
+    #[test]
+    fn automatic_development_mode_matches_the_detected_kernel() {
+        assert_eq!(
+            resolve_dry_run(false),
+            is_wsl2() && !wireguard_module_present()
+        );
+    }
+
+    #[test]
+    fn provisioning_refuses_a_disabled_tpm_and_an_existing_vault() {
+        let disabled = TpmSettings {
+            enabled: false,
+            ..TpmSettings::default()
+        };
+        assert!(validate_provisioning_request(&disabled)
+            .unwrap_err()
+            .to_string()
+            .contains("without the `tpm` feature"));
+
+        let directory = std::env::temp_dir().join(format!(
+            "helios-provisioning-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let blob = directory.join("sealed.key");
+        std::fs::write(&blob, b"existing vault").unwrap();
+        let existing = TpmSettings {
+            enabled: true,
+            sealed_blob_path: blob.to_string_lossy().into_owned(),
+            ..TpmSettings::default()
+        };
+        assert!(validate_provisioning_request(&existing)
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

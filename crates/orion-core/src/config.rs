@@ -251,6 +251,55 @@ impl ClientProfile {
         Ok(())
     }
 
+    /// Validates a profile **about to be installed on the data plane**.
+    ///
+    /// # The gap this closes
+    ///
+    /// [`Self::validate`] runs on the profile as the user edits and stores it,
+    /// where an ML-KEM profile legitimately holds **no** PSK: the PSK does not
+    /// exist yet, it is what the negotiation produces. That leniency is right
+    /// there and wrong here — applied unchanged at mount time it accepts a
+    /// profile whose mode announces ML-KEM while the `PresharedKey` slot is
+    /// empty. WireGuard would then come up on the static key pair alone, a
+    /// perfectly functional tunnel with none of the post-quantum protection
+    /// the screen claims and the floor promised. Nothing downstream would say
+    /// so: the handshake succeeds, the state goes `Up`, and the only trace is
+    /// a `PskKind` nobody cross-checks.
+    ///
+    /// So the data plane asks a stricter question: *is the secret that mode
+    /// requires actually here*. In ML-KEM mode the answer must be a PSK
+    /// carrying [`Self::preshared_key_is_negotiated`] — a static one is not
+    /// interchangeable, it is the operator's out-of-band value and would mean
+    /// the negotiation never happened.
+    ///
+    /// The client's WireGuard private key is required either way and is not
+    /// what this arbitrates: WireGuard's handshake needs it in every mode. The
+    /// negotiated PSK is mixed **in addition** to it, and this is what refuses
+    /// to mount when that addition is missing.
+    pub fn validate_for_data_plane(&self) -> Result<()> {
+        self.validate()?;
+        let Some(settings) = &self.key_negotiation else {
+            return Ok(());
+        };
+        if settings.mode != ProtectionMode::MlKem {
+            return Ok(());
+        }
+        if !self.has_preshared_key() {
+            anyhow::bail!(
+                "mode ML-KEM sans PSK négocié : monter le tunnel maintenant l'établirait sur la \
+                 seule paire de clés statique, sans la protection post-quantique annoncée. \
+                 La négociation doit aboutir avant la pose."
+            );
+        }
+        if !self.preshared_key_is_negotiated {
+            anyhow::bail!(
+                "mode ML-KEM avec un PSK statique : un PSK partagé hors bande n'est pas le \
+                 secret que la négociation produit, et ne peut pas en tenir lieu"
+            );
+        }
+        Ok(())
+    }
+
     /// Does the profile carry a PSK **shared out of band**?
     ///
     /// The distinction [`Self::has_preshared_key`] cannot make: same slot,
@@ -338,8 +387,21 @@ impl ClientConfig {
         }
     }
 
-    /// Persists the config atomically (temporary write + rename), same
-    /// scheme as [`aether::NetworkConfig::save`].
+    /// Writes `profiles.toml` — **test-only, and deliberately so**.
+    ///
+    /// # Why this is not a production path any more
+    ///
+    /// This wrote the private key and the static PSK in the clear, and that is
+    /// exactly the file ADR-006 §3 retires: `profiles.toml` is now an *import*
+    /// format the migration consumes and deletes, never something Orion
+    /// produces. [`crate::vault::ProfileStore::save_profile`] is the writer.
+    ///
+    /// It is `cfg(test)` rather than deleted because the migration tests need
+    /// to *create* a legacy file to migrate. Keeping it callable from the
+    /// shipped binary is what let a floor raise silently recreate that file
+    /// after every negotiated connection — the compiler now refuses that,
+    /// which is a stronger guarantee than a comment asking nobody to call it.
+    #[cfg(test)]
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {

@@ -780,6 +780,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_regression_workflow_executes_and_measures_orion_on_windows() {
+        let workflow = std::fs::read_to_string(
+            workspace_root()
+                .unwrap()
+                .join(".github/workflows/regression.yml"),
+        )
+        .expect("the regression workflow must exist");
+
+        for required in [
+            "orion-windows:",
+            "runs-on: windows-2025",
+            "cargo clippy -p orion-core -p orion --all-targets --all-features",
+            "cargo llvm-cov --package orion-core --package orion --all-features",
+            "coverage-orion-windows",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "Windows security regression is missing `{required}`"
+            );
+        }
+    }
+
     /// The units and the example configuration must exist in the repo: a
     /// dead reference would break the factory at the worst moment.
     #[test]

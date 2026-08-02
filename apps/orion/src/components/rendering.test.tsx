@@ -18,9 +18,10 @@ import { StatusOrb } from './StatusOrb'
 const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'portable',
   endpoint: '203.0.113.10:51820',
-  private_key: 'private',
   peer_public_key: 'gateway-public',
-  preshared_key: null,
+  public_key: 'client-public',
+  has_private_key: true,
+  has_static_psk: false,
   address: '100.64.1.2/32',
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
@@ -114,7 +115,7 @@ describe('Orion presentational branches', () => {
       )
 
     expect(render('down', null)).toContain('aucun profil sélectionné')
-    expect(render('down', profile({ private_key: '' }))).toContain('Profil incomplet')
+    expect(render('down', profile({ has_private_key: false }))).toContain('Profil incomplet')
     expect(render('failed', profile())).toContain('Rien ne fuit')
     expect(render('connecting', profile())).toContain('Annuler et démonter')
     const active = render('up', profile(), [

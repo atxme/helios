@@ -153,7 +153,14 @@ impl VpnBackend for WireGuardBackend {
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
         // 1. Everything that can fail without a side effect is done BEFORE
         //    creating the interface: profile, keys, endpoint, address.
-        profile.validate()?;
+        //
+        //    `validate_for_data_plane` and not `validate`: the second accepts
+        //    an ML-KEM profile with an empty PSK slot, because that is its
+        //    state at rest. Mounting in that state would establish the tunnel
+        //    on the static key pair alone — WireGuard would handshake, the
+        //    state would go `Up`, and the post-quantum protection the profile
+        //    announces would simply not be there.
+        profile.validate_for_data_plane()?;
 
         let address = profile
             .address

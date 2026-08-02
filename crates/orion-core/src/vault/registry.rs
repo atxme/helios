@@ -31,7 +31,13 @@
 use super::{codec, ProfileId, SecurityGeneration, VaultError};
 
 /// Registry encoding version. Any other value is refused, never guessed.
-const REGISTRY_VERSION: u8 = 1;
+///
+/// Raised to 2 when `security_digest` entered the entry. Version 1 is refused
+/// rather than read with a zero digest: a zero would mean "no security state
+/// ever observed", which would let the first save after an update look like a
+/// change and raise every generation — or, worse, look like no change when one
+/// had happened.
+const REGISTRY_VERSION: u8 = 2;
 
 /// Bound on a decoded registry, checked before allocation.
 pub const MAX_REGISTRY_BYTES: usize = 256 * 1024;
@@ -49,6 +55,15 @@ pub struct RegistryEntry {
     pub gateway_public_key: String,
     /// Highest generation ever observed for this profile.
     pub generation: SecurityGeneration,
+    /// Digest of the profile's security-relevant state, as
+    /// [`crate::vault::ProfileManifest::security_digest`] computes it.
+    ///
+    /// Kept here so a change of PSK, of trust anchor or of floor can be
+    /// **detected** across sessions and raise the generation. Without it the
+    /// counter only ever moved on a WireGuard key rotation, and the three
+    /// other triggers ADR-006 §2 names went unwitnessed. It is a hash, so the
+    /// registry still holds no secret.
+    pub security_digest: [u8; 32],
     /// The profile came from a plaintext file and its key is presumed
     /// compromised. It stays unconnectable until a new key is admitted
     /// (ADR-006 §3, migration).
@@ -110,6 +125,7 @@ impl Registry {
             codec::put(&mut out, entry.client_public_key.as_bytes())?;
             codec::put(&mut out, entry.gateway_public_key.as_bytes())?;
             out.extend_from_slice(&entry.generation.0.to_be_bytes());
+            out.extend_from_slice(&entry.security_digest);
             out.push(u8::from(entry.rotation_required));
         }
         match self.selected {
@@ -143,6 +159,7 @@ impl Registry {
                 client_public_key: cursor.text()?,
                 gateway_public_key: cursor.text()?,
                 generation: SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?)),
+                security_digest: cursor.array::<32>()?,
                 rotation_required: match cursor.byte()? {
                     0 => false,
                     1 => true,
@@ -179,6 +196,7 @@ mod tests {
             client_public_key: format!("client-{name}"),
             gateway_public_key: format!("gateway-{name}"),
             generation: SecurityGeneration(generation),
+            security_digest: [id; 32],
             rotation_required: false,
         }
     }

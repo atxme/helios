@@ -23,7 +23,6 @@ import {
   keyNegotiationSupport,
   onEvent,
   onProfilePath,
-  profilePublicKey,
   resizeForView,
   saveProfile,
   selectProfile,
@@ -49,7 +48,6 @@ describe('Orion Tauri bridge', () => {
     await keyNegotiationIdentitySealed(profile as never)
     await validateProfile(profile as never)
     await vaultPosture()
-    await profilePublicKey(profile as never)
     await keyNegotiationSupport()
     await keyNegotiationFingerprint(profile as never)
     await saveProfile(profile as never)
@@ -75,13 +73,12 @@ describe('Orion Tauri bridge', () => {
         { path: 'C:\\Profils\\portable.orionprofile' },
       ],
       ['import_profile_path', { path: null }],
-      ['key_negotiation_identity_sealed', { profile }],
-      ['validate_profile', { profile }],
+      ['key_negotiation_identity_sealed', { keyNegotiation: profile }],
+      ['validate_profile', { draft: profile }],
       ['vault_posture'],
-      ['profile_public_key', { profile }],
       ['key_negotiation_support'],
-      ['key_negotiation_fingerprint', { profile }],
-      ['save_profile', { profile }],
+      ['key_negotiation_fingerprint', { keyNegotiation: profile }],
+      ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],
       ['connect', { name: 'portable' }],

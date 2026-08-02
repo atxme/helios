@@ -75,6 +75,16 @@ Les rapports navigables sont écrits dans
 `target/coverage/workspace.json`, ce qui permet de comparer deux campagnes sans
 dépendre d’un répertoire temporaire.
 
+La CI publie le répertoire complet comme artefact `coverage-linux`. Un second
+job, exécuté sur `windows-2025`, compile Orion avec toutes ses features, joue
+les tests Rust et React puis publie `coverage-orion-windows`. Ce rapport Windows
+est le seul pourcentage qui inclut réellement les branches `cfg(windows)` :
+DPAPI, composition du coffre logiciel explicitement autorisé, interrogation
+BitLocker, exclusion WER et sélection de route hors tunnel. Aucun seuil global
+n’est imposé : le contrôle porte sur l’exécution des branches et la conservation
+des rapports séparés, sans transformer les chemins matériels absents de la CI
+en échecs artificiels.
+
 Cette commande mesure ce que l’hôte a réellement compilé. Sous Linux, un
 module Windows peut afficher une couverture élevée parce que seul son refus
 `cfg(not(windows))` est présent ; le code Win32 exclu n’entre pas dans le
@@ -82,6 +92,17 @@ dénominateur. De même, l’exécution d’un simulateur ne valide pas les effe
 TPM, Netlink, WireGuard noyau ou WireGuard-NT. Ces chemins restent soumis à la
 recette cible ci-dessous : augmenter leur pourcentage depuis WSL2 produirait un
 indicateur trompeur, pas une validation supplémentaire.
+
+La campagne d’un poste Windows enrôlé commence également par
+`cargo test -p orion-core --all-features` et
+`cargo test -p orion --all-features` avant de toucher la gateway :
+
+```powershell
+.\scripts\campaign-windows.ps1 -Profile poste-windows
+```
+
+Elle ajoute aux tests CI le vrai WireGuard-NT, l’identité déjà scellée de ce
+poste et la négociation avec une gateway réelle.
 
 ## Invariants de sécurité verrouillés
 
@@ -498,12 +519,16 @@ confirmés puis corrigés avec test de non-régression :
 - l’effet de la key-negotiation sur WireGuard-NT et le backend noyau Helios
   exige deux machines et les deux redirections UDP ; les tests WSL2 couvrent la
   transaction mais pas ces effets matériels ;
-- le scellement DPAPI de l’identité cliente ne se compile ni ne s’exerce en
-  WSL2 : hors Windows, `orion_core::identity_store` échoue explicitement
-  (`UnsupportedPlatform`) au lieu d’écrire ces clés en clair, et c’est cette
-  propriété-là que la régression vérifie ;
+- le scellement DPAPI de l’identité cliente ne s’exerce pas en WSL2 : la CI
+  Windows vérifie le tour complet, l’altération et le remplacement atomique ;
+  la copie vers un autre compte reste une recette cible, car elle exige deux
+  sessions Windows distinctes. Hors Windows, `orion_core::identity_store`
+  échoue explicitement (`UnsupportedPlatform`) au lieu d’écrire ces clés en
+  clair ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
-- le chemin Tauri Linux ne valide pas Windows/WireGuard-NT ;
+- le job Windows valide les chemins Tauri et Win32 compilables sans matériel ;
+  WireGuard-NT, le TPM physique, BitLocker réellement actif et les effets WER
+  dans un vidage exigent toujours la campagne sur cible ;
 - une campagne verte réduit le risque de régression, elle ne constitue ni audit
   externe ni preuve formelle.
 

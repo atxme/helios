@@ -88,7 +88,9 @@ export function ConnectView({
 
   const duration = elapsed(upSince, now)
   const protection = protectionMeta(profile, psk, state)
-  const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
+  // `has_private_key` rather than the key itself: the screen needs to know a
+  // key exists, and never needed to hold one (ADR-006 §5).
+  const ready = Boolean(profile?.endpoint && profile.has_private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
   // Only "held" deserves a sentence: it's the one counter-intuitive case,
   // where the user believes they're leaking while WireGuard drops their

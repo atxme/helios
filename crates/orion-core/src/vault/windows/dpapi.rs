@@ -153,3 +153,35 @@ mod tests {
         assert!(matches!(unprotect(b"x"), Err(VaultError::NoHardwareRoot)));
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn account_scoped_envelopes_round_trip_without_plaintext() {
+        let plaintext = b"device root material with enough bytes";
+        let first = protect(plaintext).expect("DPAPI must be available to a Windows test account");
+        let second = protect(plaintext).expect("a second DPAPI envelope must succeed");
+
+        assert_ne!(first, second, "DPAPI envelopes must be randomized");
+        for ciphertext in [&first, &second] {
+            assert!(
+                !ciphertext
+                    .windows(plaintext.len())
+                    .any(|window| window == plaintext),
+                "the account envelope must not expose the root"
+            );
+            assert_eq!(unprotect(ciphertext).unwrap().as_slice(), plaintext);
+        }
+    }
+
+    #[test]
+    fn modified_envelopes_are_rejected() {
+        let mut ciphertext = protect(b"authenticated device root").unwrap();
+        let middle = ciphertext.len() / 2;
+        ciphertext[middle] ^= 0x40;
+
+        assert!(matches!(unprotect(&ciphertext), Err(VaultError::Dpapi(_))));
+    }
+}

@@ -20,8 +20,6 @@ import Typography from '@mui/material/Typography'
 import {
   AlertTriangle,
   ChevronRight,
-  Eye,
-  EyeOff,
   FileCode2,
   Plus,
   RotateCcw,
@@ -41,6 +39,7 @@ import type {
   ImportOutcome,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
+  ProfileDraft,
   ProfileIssues,
   ProtectionMode,
 } from '../types'
@@ -72,7 +71,7 @@ interface Props {
   pathImport: ClientProfile | null
   onPathImportHandled: () => void
   onImport: (contents: string, fileName: string) => Promise<ImportOutcome>
-  onSave: (profile: ClientProfile) => Promise<void>
+  onSave: (draft: ProfileDraft) => Promise<void>
   onDelete: (name: string) => Promise<void>
   onSelect: (name: string) => Promise<void>
 }
@@ -81,9 +80,12 @@ function blankProfile(): ClientProfile {
   return {
     name: 'nouveau',
     endpoint: '',
-    private_key: '',
     peer_public_key: '',
-    preshared_key: null,
+    // A brand-new profile has no key yet: Rust draws one when it is first
+    // saved. Nothing here ever holds one (ADR-006 §5).
+    public_key: null,
+    has_private_key: false,
+    has_static_psk: false,
     address: null,
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
@@ -178,7 +180,15 @@ export function ProfilesView({
   const [dirty, setDirty] = useState(false)
   const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
-  const [publicKey, setPublicKey] = useState<string | null>(null)
+  /**
+   * Secret-touching **intents**, not values.
+   *
+   * The screen can ask Rust to draw a new key or to drop the static PSK; it
+   * cannot supply either. Holding them as booleans beside the draft is what
+   * keeps the form a description of public state.
+   */
+  const [rotateKey, setRotateKey] = useState(false)
+  const [clearPsk, setClearPsk] = useState(false)
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -216,7 +226,7 @@ export function ProfilesView({
   useEffect(() => {
     let cancelled = false
     api
-      .keyNegotiationFingerprint(draft)
+      .keyNegotiationFingerprint(draft.key_negotiation)
       .then((found) => {
         if (!cancelled) setFingerprint(found)
       })
@@ -233,7 +243,7 @@ export function ProfilesView({
   useEffect(() => {
     let cancelled = false
     api
-      .keyNegotiationIdentitySealed(draft)
+      .keyNegotiationIdentitySealed(draft.key_negotiation)
       .then((sealed) => {
         if (!cancelled) setIdentitySealed(sealed)
       })
@@ -245,22 +255,32 @@ export function ProfilesView({
     }
   }, [draft, notice])
 
-  // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
-  // incomplete private key mid-entry simply yields an absent value.
-  useEffect(() => {
-    let cancelled = false
-    api
-      .profilePublicKey(draft)
-      .then((key) => {
-        if (!cancelled) setPublicKey(key)
-      })
-      .catch(() => {
-        if (!cancelled) setPublicKey(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [draft])
+  /**
+   * The draft in the shape the shell accepts: public fields plus intents.
+   *
+   * Built here, once, so the two callers that send it — validation and save —
+   * cannot drift. Note what it does *not* contain, and cannot: neither secret
+   * is reachable from this module.
+   */
+  const toDraft = useCallback(
+    (profile: ClientProfile): ProfileDraft => ({
+      name: profile.name,
+      endpoint: profile.endpoint,
+      peer_public_key: profile.peer_public_key,
+      address: profile.address,
+      allowed_ips: profile.allowed_ips,
+      persistent_keepalive: profile.persistent_keepalive,
+      heliosd_url: profile.heliosd_url,
+      key_negotiation: profile.key_negotiation,
+      generatePrivateKey: rotateKey,
+      clearPresharedKey: clearPsk,
+    }),
+    [clearPsk, rotateKey],
+  )
+
+  // The public key is no longer derived on demand: it comes down with the
+  // profile, because the private half it derives from never leaves Rust.
+  const publicKey = draft.public_key
 
   // The rules live in `orion-core`: we query the core rather than duplicate
   // its validation grammar in the UI. The call is deferred until typing
@@ -269,7 +289,7 @@ export function ProfilesView({
     let cancelled = false
     const timer = setTimeout(() => {
       api
-        .validateProfile(draft)
+        .validateProfile(toDraft(draft))
         .then((found) => {
           if (!cancelled) setIssues(found)
         })
@@ -281,7 +301,7 @@ export function ProfilesView({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [draft])
+  }, [draft, toDraft])
 
   /**
    * Replaces the draft wholesale.
@@ -294,6 +314,11 @@ export function ProfilesView({
     setDraft(profile)
     setHistory([])
     setFloorBaseline(profile.key_negotiation?.minimum_mode ?? null)
+    // Intents belong to the edit in progress, never to the profile: carrying a
+    // pending rotation onto the next profile loaded would rotate a key the
+    // user never asked about.
+    setRotateKey(false)
+    setClearPsk(false)
   }, [])
 
   useEffect(() => {
@@ -424,8 +449,10 @@ export function ProfilesView({
 
   const save = async () => {
     try {
-      await onSave(draft)
+      await onSave(toDraft(draft))
       setDirty(false)
+      setRotateKey(false)
+      setClearPsk(false)
       // Saving is the one action here with no visible consequence: the form
       // shows exactly what it showed a moment earlier. Without a word, one
       // presses the button again to be sure.
@@ -501,7 +528,7 @@ export function ProfilesView({
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
   const narrowed = draft.allowed_ips.trim() !== CAPTURE_ALL
-  const staticPsk = Boolean(draft.preshared_key?.trim())
+  const staticPsk = draft.has_static_psk && !clearPsk
   const invalid = Object.values(issues).some(Boolean)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty
   // field would stay invisible until someone thinks to open it.
@@ -664,11 +691,31 @@ export function ProfilesView({
                 value={draft.endpoint}
                 onChange={(value) => set('endpoint', value)}
               />
-              <Secret
+              {/* The private key is stated, never shown. It used to be a text
+                  field with a reveal button, which put it in the WebView DOM
+                  and in a JavaScript string nothing can wipe — see the note on
+                  the shell's `ProfileView`. It arrives by enrolment or is drawn
+                  in Rust; either way it does not come through here. */}
+              <SecretState
                 label="Clé privée"
+                present={draft.has_private_key || rotateKey}
                 error={issues.private_key}
-                value={draft.private_key}
-                onChange={(value) => set('private_key', value)}
+                presentLabel={rotateKey ? 'nouvelle clé à l’enregistrement' : 'scellée dans le coffre'}
+                absentLabel="aucune — importer un document d’enrôlement ou en générer une"
+                action={{
+                  label: draft.has_private_key ? 'Générer une nouvelle clé' : 'Générer une clé',
+                  onClick: () => {
+                    setRotateKey(true)
+                    setDirty(true)
+                    setNotice({
+                      tone: 'success',
+                      message:
+                        'Une nouvelle clé sera tirée à l’enregistrement. Sa clé publique devra être réadmise par l’opérateur avant la prochaine connexion.',
+                    })
+                  },
+                  disabled: rotateKey,
+                }}
+                hint="Elle ne quitte jamais le poste : ni cet écran, ni un message interne ne la transportent."
               />
               <Field
                 label="Clé publique gateway"
@@ -739,11 +786,28 @@ export function ProfilesView({
                     value={String(draft.persistent_keepalive)}
                     onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
                   />
-                  <Secret
+                  {/* Same rule as the private key, and one more: a static PSK
+                      is an out-of-band value. It arrives through the enrolment
+                      document, so the screen can drop it but never set it. */}
+                  <SecretState
                     label="PSK statique"
-                error={issues.preshared_key}
-                    value={draft.preshared_key ?? ''}
-                    onChange={(value) => set('preshared_key', value || null)}
+                    present={staticPsk}
+                    error={issues.preshared_key}
+                    presentLabel="scellé dans le coffre"
+                    absentLabel="aucun — PSK négocié en ML-KEM à chaque connexion"
+                    action={
+                      staticPsk
+                        ? {
+                            label: 'Retirer le PSK statique',
+                            onClick: () => {
+                              setClearPsk(true)
+                              setDirty(true)
+                            },
+                            disabled: clearPsk,
+                          }
+                        : undefined
+                    }
+                    hint="Un PSK statique se pose à l’enrôlement, hors bande : cet écran ne peut que le retirer."
                   />
                   {staticPsk && (
                     <Caution>
@@ -1375,51 +1439,90 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
 }
 
 /** Secret field: masked by default, revealable without forcing blind entry. */
-function Secret({
+/**
+ * States that a secret exists, without being able to carry it.
+ *
+ * # What this replaces, and why
+ *
+ * A `TextField` holding the WireGuard private key, with a button to reveal it.
+ * That single component was the widest hole in ADR-006: the value had to be
+ * serialised across the Tauri IPC to be displayed, parsed into a JavaScript
+ * string nothing can wipe, and kept in a DOM node's `value` for the life of
+ * the screen — where a screenshot, an accessibility client, or anything with
+ * access to the WebView could read it. Sealing a key on disk and then showing
+ * it in a browser engine protects the quiet half of its life.
+ *
+ * There is deliberately **no `value` prop**. The component cannot display a
+ * secret because it is never given one, which is a stronger guarantee than a
+ * component that merely chooses not to. What the user acts on is an *intent* —
+ * generate, clear — carried out in Rust.
+ */
+function SecretState({
   label,
-  value,
-  onChange,
+  present,
+  presentLabel,
+  absentLabel,
+  action,
   error,
+  hint,
 }: {
   label: string
-  value: string
-  onChange: (value: string) => void
+  present: boolean
+  /** What to say when the secret is there. Never the secret. */
+  presentLabel: string
+  absentLabel: string
+  action?: { label: string; onClick: () => void; disabled?: boolean }
   /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
+  hint?: string
 }) {
-  const [visible, setVisible] = useState(false)
   return (
-    <TextField
-      fullWidth
-      size="small"
-      label={label}
-      type={visible ? 'text' : 'password'}
-      value={value}
-      error={Boolean(error)}
-      helperText={error ?? undefined}
-      onChange={(event) => onChange(event.target.value)}
-      slotProps={{
-        input: {
-          endAdornment: (
-            <InputAdornment position="end">
-              <Tooltip title={visible ? 'Masquer la valeur' : 'Afficher la valeur'}>
-                <IconButton
-                  edge="end"
-                  size="small"
-                  onClick={() => setVisible((shown) => !shown)}
-                  aria-label={visible ? 'Masquer la valeur' : 'Afficher la valeur'}
-                >
-                  {visible ? <EyeOff size={15} aria-hidden /> : <Eye size={15} aria-hidden />}
-                </IconButton>
-              </Tooltip>
-            </InputAdornment>
-          ),
-        },
-      }}
-      sx={{
-        '& input': { fontFamily: 'monospace', fontSize: 12 },
-        '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
-      }}
-    />
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+        <Typography
+          color="text.disabled"
+          sx={{
+            width: 110,
+            flexShrink: 0,
+            fontFamily: 'monospace',
+            fontSize: 9.5,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          {label}
+        </Typography>
+        <Typography
+          sx={{
+            minWidth: 0,
+            color: error ? 'error.main' : present ? 'text.primary' : 'text.secondary',
+            fontFamily: 'monospace',
+            fontSize: 11.5,
+            overflowWrap: 'anywhere',
+          }}
+        >
+          {present ? presentLabel : absentLabel}
+        </Typography>
+      </Box>
+      {action && (
+        <Button
+          size="small"
+          variant="text"
+          onClick={action.onClick}
+          disabled={action.disabled}
+          sx={{ ml: '118px', mt: 0.25, fontSize: 11, textTransform: 'none' }}
+        >
+          {action.label}
+        </Button>
+      )}
+      {(error || hint) && (
+        <Typography
+          color={error ? 'error' : 'text.secondary'}
+          sx={{ mt: 0.25, ml: '118px', fontSize: 10.5, lineHeight: 1.4 }}
+        >
+          {error ?? hint}
+        </Typography>
+      )}
+    </Box>
   )
 }

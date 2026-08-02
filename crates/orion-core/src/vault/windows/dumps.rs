@@ -160,4 +160,26 @@ mod tests {
             Err(VaultError::MemoryHygiene(_))
         ));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_accepts_empty_regions_without_calling_wer() {
+        assert_eq!(exclude(&[]), Exclusion::Registered);
+        assert!(require(&[]).is_ok());
+        release(&[]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wer_registration_reports_its_real_outcome() {
+        let region = [0x5au8; 64];
+        let outcome = exclude(&region);
+        assert!(matches!(
+            outcome,
+            Exclusion::Registered | Exclusion::Refused
+        ));
+        if outcome == Exclusion::Registered {
+            release(&region);
+        }
+    }
 }

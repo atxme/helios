@@ -7,9 +7,10 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   ClientConfig,
   ClientEvent,
-  ClientProfile,
   ImportOutcome,
+  KeyNegotiationSettings,
   KeyNegotiationSupport,
+  ProfileDraft,
   ProfileIssues,
   TunnelState,
   VaultPosture,
@@ -32,9 +33,16 @@ export const importProfile = (contents: string, fileName: string) =>
 export const importProfilePath = (path?: string) =>
   invoke<ImportOutcome | null>('import_profile_path', { path: path ?? null })
 
-/** Is this profile's identity already sealed on this machine? */
-export const keyNegotiationIdentitySealed = (profile: ClientProfile) =>
-  invoke<boolean>('key_negotiation_identity_sealed', { profile })
+/**
+ * Is this profile's identity already sealed on this machine?
+ *
+ * Takes the negotiation block alone, not the profile: the answer depends on one
+ * field, and passing the whole profile would have meant shipping its secrets
+ * across the IPC to read it.
+ */
+export const keyNegotiationIdentitySealed = (
+  keyNegotiation: KeyNegotiationSettings | null,
+) => invoke<boolean>('key_negotiation_identity_sealed', { keyNegotiation })
 
 /**
  * Reports the faulty fields of a profile being edited.
@@ -42,12 +50,8 @@ export const keyNegotiationIdentitySealed = (profile: ClientProfile) =>
  * The rules live in `orion-core`: the UI highlights what the core refuses,
  * it doesn't reimplement them.
  */
-export const validateProfile = (profile: ClientProfile) =>
-  invoke<ProfileIssues>('validate_profile', { profile })
-
-/** Public key derived from the profile: the only half to send to the operator. */
-export const profilePublicKey = (profile: ClientProfile) =>
-  invoke<string | null>('profile_public_key', { profile })
+export const validateProfile = (draft: ProfileDraft) =>
+  invoke<ProfileIssues>('validate_profile', { draft })
 
 /**
  * What this build can do with the negotiation port.
@@ -65,11 +69,12 @@ export const keyNegotiationSupport = () =>
  * Read out loud against what the gateway printed, it is what proves the
  * imported material comes from the right gateway.
  */
-export const keyNegotiationFingerprint = (profile: ClientProfile) =>
-  invoke<string | null>('key_negotiation_fingerprint', { profile })
+export const keyNegotiationFingerprint = (
+  keyNegotiation: KeyNegotiationSettings | null,
+) => invoke<string | null>('key_negotiation_fingerprint', { keyNegotiation })
 
-export const saveProfile = (profile: ClientProfile) =>
-  invoke<ClientConfig>('save_profile', { profile })
+export const saveProfile = (draft: ProfileDraft) =>
+  invoke<ClientConfig>('save_profile', { draft })
 export const deleteProfile = (name: string) =>
   invoke<ClientConfig>('delete_profile', { name })
 export const selectProfile = (name: string) =>

@@ -54,6 +54,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security_Credentials",
   "Win32_Security_Cryptography",
   "Win32_System_Com",
+  # `GetCurrentProcess`, pour comparer le propriétaire de la clé TPM au compte
+  # qui l'utilise (vérification d'ACL, ADR-006 §3).
+  "Win32_System_Threading",
   # `CREDUI_INFOW` porte un `HBITMAP` : sans GDI, la structure est absente.
   "Win32_Graphics_Gdi",
   # `WerRegisterExcludedMemoryBlock` : exclusion des pages secrètes des

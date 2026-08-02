@@ -9,7 +9,6 @@ const api = vi.hoisted(() => ({
   keyNegotiationFingerprint: vi.fn(),
   keyNegotiationIdentitySealed: vi.fn(),
   keyNegotiationSupport: vi.fn(),
-  profilePublicKey: vi.fn(),
   validateProfile: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
@@ -22,9 +21,10 @@ import { ProfilesView } from './ProfilesView'
 const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'portable',
   endpoint: '203.0.113.10:51820',
-  private_key: 'private',
   peer_public_key: 'gateway-public',
-  preshared_key: null,
+  public_key: 'client-public',
+  has_private_key: true,
+  has_static_psk: false,
   address: '100.64.1.2/32',
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
@@ -61,7 +61,6 @@ beforeEach(() => {
   api.keyNegotiationFingerprint.mockResolvedValue('sha256:fingerprint')
   api.keyNegotiationIdentitySealed.mockResolvedValue(false)
   api.keyNegotiationSupport.mockResolvedValue({ identity_store: false })
-  api.profilePublicKey.mockResolvedValue('client-public')
   api.validateProfile.mockResolvedValue(noIssues)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
 })
@@ -73,7 +72,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
         pathImport={null}
         {...handlers}
       />,
@@ -95,12 +94,11 @@ describe('ProfilesView interactions', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
     fireEvent.change(screen.getByLabelText('Trafic capté'), { target: { value: '100.64.0.0/10' } })
-    fireEvent.change(screen.getByLabelText('PSK statique'), { target: { value: 'static-secret' } })
     expect(screen.getByText(/ce qui en sort part/)).toBeTruthy()
     expect(screen.getByText(/Une valeur ici la/)).toBeTruthy()
-
-    fireEvent.click(screen.getAllByRole('button', { name: 'Afficher la valeur' })[0])
-    expect(screen.getByLabelText('Clé privée').getAttribute('type')).toBe('text')
+    expect(screen.queryByDisplayValue('static-secret')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Ajouter' }))
     expect(screen.getByText(/CA TLS absente/)).toBeTruthy()
@@ -122,6 +120,82 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(screen.getByText(/« workstation » enregistré/)).toBeTruthy()
+  })
+
+  /**
+   * The property the whole redaction exists for, asserted on the DOM.
+   *
+   * The screen used to hold the WireGuard private key in a `TextField` with a
+   * reveal button. Nothing here may put a secret in a node's value again, and
+   * the check is on the rendered document rather than on a component we
+   * remembered not to use.
+   */
+  it('never renders a secret and never sends one back', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    // No masked field at all: a `type="password"` input is how a secret used
+    // to get here, and there is no longer any secret for one to hold.
+    expect(document.querySelectorAll('input[type="password"]').length).toBe(0)
+    // Nor a way to reveal one.
+    expect(screen.queryByLabelText('Afficher la valeur')).toBeNull()
+
+    // The two secrets are *stated*, never shown.
+    expect(screen.getByText('scellée dans le coffre')).toBeTruthy()
+    expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
+
+    // And what leaves the screen carries neither, in either direction.
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'vpn.example:51820' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+
+    const sent = handlers.onSave.mock.calls[0][0]
+    expect(sent).not.toHaveProperty('private_key')
+    expect(sent).not.toHaveProperty('preshared_key')
+    expect(sent).not.toHaveProperty('public_key')
+    expect(sent.endpoint).toBe('vpn.example:51820')
+
+    const validated = api.validateProfile.mock.calls[api.validateProfile.mock.calls.length - 1]?.[0]
+    expect(validated).not.toHaveProperty('private_key')
+    expect(validated).not.toHaveProperty('preshared_key')
+  })
+
+  /**
+   * The intents are the only way the screen touches a secret, and they are
+   * requests, not values.
+   */
+  it('asks Rust to draw a key and to drop a PSK, without carrying either', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
+    expect(screen.getByText(/réadmise par l’opérateur/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+
+    const sent = handlers.onSave.mock.calls[0][0]
+    expect(sent.generatePrivateKey).toBe(true)
+    expect(sent.clearPresharedKey).toBe(true)
+    // Still no value anywhere near it.
+    expect(JSON.stringify(sent)).not.toContain('client-public')
   })
 
   it('selects, creates and deletes profiles through explicit actions', async () => {
@@ -189,7 +263,7 @@ describe('ProfilesView interactions', () => {
 
   it('loads an associated profile and explains a failed identity seal', async () => {
     const handlers = callbacks()
-    const associated = profile({ name: 'portable', private_key: '' })
+    const associated = profile({ name: 'portable', has_private_key: false })
     render(
       <ProfilesView
         config={{ profiles: [profile()], selected: 'portable' }}

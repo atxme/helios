@@ -1211,6 +1211,82 @@ mod tests {
         assert!(configured.validate().is_err());
     }
 
+    /// An ML-KEM profile must never reach the data plane without its PSK.
+    ///
+    /// `validate()` accepts that shape on purpose — it is the profile's state
+    /// at rest, before any negotiation. What must not accept it is `up()`:
+    /// mounting there would bring WireGuard up on the static key pair alone.
+    /// The handshake would succeed, the state would go `Up`, and the
+    /// post-quantum protection the profile announces would simply be absent,
+    /// with nothing on screen saying so.
+    #[test]
+    fn an_ml_kem_profile_without_its_negotiated_psk_never_reaches_the_data_plane() {
+        let at_rest = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            at_rest.validate().is_ok(),
+            "au repos, un profil ML-KEM n'a légitimement pas encore de PSK"
+        );
+
+        let refused = at_rest
+            .validate_for_data_plane()
+            .expect_err("le plan de données doit refuser un mode ML-KEM sans PSK négocié");
+        assert!(
+            refused.to_string().contains("sans PSK négocié"),
+            "message obtenu : {refused}"
+        );
+
+        // A static PSK is not a substitute: it is the operator's out-of-band
+        // value, and its presence would mean the negotiation never happened.
+        let smuggled = ClientProfile {
+            preshared_key: Some("cHNrLXN0YXRpcXVl".into()),
+            preshared_key_is_negotiated: false,
+            ..ClientProfile {
+                key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+                ..complete_profile()
+            }
+        };
+        assert!(
+            smuggled.validate_for_data_plane().is_err(),
+            "un PSK statique ne peut pas tenir lieu de PSK négocié"
+        );
+
+        // And what the negotiation actually hands to `up()` passes.
+        let negotiated = ClientProfile {
+            preshared_key: Some("cHNrLW5lZ29jaWU=".into()),
+            preshared_key_is_negotiated: true,
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            negotiated.validate_for_data_plane().is_ok(),
+            "le profil éphémère issu de la négociation doit être montable : {:?}",
+            negotiated.validate_for_data_plane().unwrap_err()
+        );
+    }
+
+    /// The other two modes keep their existing contract unchanged.
+    #[test]
+    fn the_data_plane_rule_only_constrains_ml_kem() {
+        let classic = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::Classic)),
+            ..complete_profile()
+        };
+        assert!(classic.validate_for_data_plane().is_ok());
+
+        let static_psk = ClientProfile {
+            preshared_key: Some("cHNrLXN0YXRpcXVl".into()),
+            key_negotiation: Some(gateway_settings(ProtectionMode::StaticPsk)),
+            ..complete_profile()
+        };
+        assert!(static_psk.validate_for_data_plane().is_ok());
+
+        // A profile with no negotiation block at all is untouched by the rule.
+        assert!(complete_profile().validate_for_data_plane().is_ok());
+    }
+
     fn identity_bundle(name: &str) -> serde_json::Value {
         use base64::engine::general_purpose::STANDARD;
 

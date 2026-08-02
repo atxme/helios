@@ -36,20 +36,92 @@ pub const KEY_NAME: &str = "Helios Orion device root v1";
 /// Minimum modulus. Below it, refuse.
 pub const MIN_RSA_BITS: u32 = 3072;
 
+/// Who the persisted key belongs to, as the platform reports it.
+///
+/// The fourth check of ADR-006 §3, and the one that was missing: provider,
+/// non-exportability and modulus say the key is *good*, none of them says it is
+/// **ours**. A key persisted under our name but owned by another principal
+/// would still satisfy the other three while letting that principal use the
+/// installation root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum KeyOwnership {
+    /// The security descriptor's owner is the account running this process.
+    CurrentUser,
+    /// It is somebody else. Refused rather than used.
+    AnotherPrincipal,
+    /// The descriptor, the owner or the process token could not be read.
+    ///
+    /// Refused too: ADR-006 §3 states that a property which cannot be verified
+    /// is not a guarantee, and this enum exists so that stays a decision rather
+    /// than an omission.
+    Unverifiable,
+}
+
+/// Checks the security properties independently of the Win32 property reader.
+///
+/// Keeping the decision pure lets every refusal branch run on every host,
+/// while the Windows suite separately exercises the CNG calls that obtain the
+/// values.
+#[cfg(any(windows, test))]
+fn validate_key_properties(
+    hardware_backed: bool,
+    export_allowed: bool,
+    bits: u32,
+    ownership: KeyOwnership,
+) -> Result<(), VaultError> {
+    if !hardware_backed {
+        return Err(VaultError::Tpm(
+            "the provider answered but the key is not hardware-backed".into(),
+        ));
+    }
+    if export_allowed {
+        return Err(VaultError::Tpm(
+            "the key is exportable — the machine binding it exists for would not hold".into(),
+        ));
+    }
+    if bits < MIN_RSA_BITS {
+        return Err(VaultError::Tpm(format!(
+            "modulus of {bits} bits below the {MIN_RSA_BITS} floor — refused rather than lowered"
+        )));
+    }
+    match ownership {
+        KeyOwnership::CurrentUser => Ok(()),
+        KeyOwnership::AnotherPrincipal => Err(VaultError::Tpm(
+            "the TPM key is owned by another principal — a key persisted under our name that we \
+             do not own is refused, not adopted"
+                .into(),
+        )),
+        KeyOwnership::Unverifiable => Err(VaultError::Tpm(
+            "the TPM key's owner could not be read — an unverifiable ACL is not an ACL".into(),
+        )),
+    }
+}
+
 #[cfg(windows)]
 pub use imp::{unwrap_root, wrap_root};
 
 #[cfg(windows)]
 mod imp {
-    use super::{VaultError, Zeroizing, KEY_LEN, KEY_NAME, MIN_RSA_BITS};
+    use super::{
+        validate_key_properties, KeyOwnership, VaultError, Zeroizing, KEY_LEN, KEY_NAME,
+        MIN_RSA_BITS,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey,
         NCryptFreeObject, NCryptGetProperty, NCryptOpenKey, NCryptOpenStorageProvider,
         NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
         MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_EXPORT_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
         NCRYPT_HANDLE, NCRYPT_IMPL_HARDWARE_FLAG, NCRYPT_IMPL_TYPE_PROPERTY,
-        NCRYPT_LENGTH_PROPERTY, NCRYPT_PAD_OAEP_FLAG, NCRYPT_SILENT_FLAG,
+        NCRYPT_LENGTH_PROPERTY, NCRYPT_PAD_OAEP_FLAG, NCRYPT_SECURITY_DESCR_PROPERTY,
+        NCRYPT_SILENT_FLAG,
     };
+    use windows_sys::Win32::Security::{
+        EqualSid, GetSecurityDescriptorOwner, GetTokenInformation, OpenProcessToken, TokenUser,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     /// Frees an `NCRYPT_*` handle on every exit path, including a `?`.
     struct Handle(usize);
@@ -110,26 +182,133 @@ mod imp {
     /// it would be exactly the silent downgrade the ADR forbids.
     fn verify(key: usize) -> Result<(), VaultError> {
         let implementation = read_u32(key, NCRYPT_IMPL_TYPE_PROPERTY)?;
-        if implementation & NCRYPT_IMPL_HARDWARE_FLAG == 0 {
-            return Err(VaultError::Tpm(
-                "the provider answered but the key is not hardware-backed".into(),
-            ));
-        }
-
         let export = read_u32(key, NCRYPT_EXPORT_POLICY_PROPERTY)?;
-        if export & NCRYPT_ALLOW_EXPORT_FLAG != 0 {
-            return Err(VaultError::Tpm(
-                "the key is exportable — the machine binding it exists for would not hold".into(),
-            ));
+        let bits = read_u32(key, NCRYPT_LENGTH_PROPERTY)?;
+        validate_key_properties(
+            implementation & NCRYPT_IMPL_HARDWARE_FLAG != 0,
+            export & NCRYPT_ALLOW_EXPORT_FLAG != 0,
+            bits,
+            ownership_of(key),
+        )
+    }
+
+    /// SID of the account this process runs as, owned for the call's duration.
+    ///
+    /// The buffer is variable-length — a `SID` grows with its sub-authorities —
+    /// so `GetTokenInformation` is called twice: once for the size, once for
+    /// the value. The `PSID` inside points **into** the returned buffer, which
+    /// is why the buffer is handed back with it rather than dropped.
+    fn current_user_sid() -> Option<(Vec<u8>, PSID)> {
+        struct Token(HANDLE);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { CloseHandle(self.0) };
+                }
+            }
         }
 
-        let bits = read_u32(key, NCRYPT_LENGTH_PROPERTY)?;
-        if bits < MIN_RSA_BITS {
-            return Err(VaultError::Tpm(format!(
-                "modulus of {bits} bits below the {MIN_RSA_BITS} floor — refused rather than lowered"
-            )));
+        let mut raw: HANDLE = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close;
+        // `raw` is a valid out-pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+            return None;
         }
-        Ok(())
+        let token = Token(raw);
+
+        let mut needed = 0u32;
+        // First call sizes the buffer; it is expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER, so only `needed` is trusted here.
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        // SAFETY: the buffer is exactly the size the call just asked for.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // SAFETY: on success the buffer starts with a `TOKEN_USER`, whose
+        // `User.Sid` points inside that same buffer.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if sid.is_null() {
+            return None;
+        }
+        Some((buffer, sid))
+    }
+
+    /// Reads the key's owner and compares it to the current account.
+    ///
+    /// Every failure collapses into [`KeyOwnership::Unverifiable`], which
+    /// `validate_key_properties` refuses: distinguishing "no descriptor" from
+    /// "unreadable token" would change the log and not the decision, and a
+    /// branch that answered `CurrentUser` on a technicality would cost the
+    /// whole check.
+    fn ownership_of(key: usize) -> KeyOwnership {
+        let mut needed = 0u32;
+        // Sizing pass. The descriptor is variable-length like the SID above.
+        let status = unsafe {
+            NCryptGetProperty(
+                key as NCRYPT_HANDLE,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+                OWNER_SECURITY_INFORMATION,
+            )
+        };
+        if status != 0 || needed == 0 {
+            return KeyOwnership::Unverifiable;
+        }
+        let mut descriptor = vec![0u8; needed as usize];
+        let status = unsafe {
+            NCryptGetProperty(
+                key as NCRYPT_HANDLE,
+                NCRYPT_SECURITY_DESCR_PROPERTY,
+                descriptor.as_mut_ptr(),
+                needed,
+                &mut needed,
+                OWNER_SECURITY_INFORMATION,
+            )
+        };
+        if status != 0 {
+            return KeyOwnership::Unverifiable;
+        }
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut defaulted = 0i32;
+        // SAFETY: `descriptor` holds a self-relative security descriptor the
+        // provider just wrote; `owner` points into it on success.
+        let ok = unsafe {
+            GetSecurityDescriptorOwner(
+                descriptor.as_ptr() as PSECURITY_DESCRIPTOR,
+                &mut owner,
+                &mut defaulted,
+            )
+        };
+        if ok == 0 || owner.is_null() {
+            return KeyOwnership::Unverifiable;
+        }
+
+        let Some((_token_buffer, ours)) = current_user_sid() else {
+            return KeyOwnership::Unverifiable;
+        };
+        // SAFETY: both SIDs are valid for the duration of this scope —
+        // `owner` inside `descriptor`, `ours` inside `_token_buffer`.
+        if unsafe { EqualSid(owner, ours) } != 0 {
+            KeyOwnership::CurrentUser
+        } else {
+            KeyOwnership::AnotherPrincipal
+        }
     }
 
     fn open_existing() -> Result<Option<(Handle, Handle)>, VaultError> {
@@ -305,6 +484,54 @@ mod imp {
         let mut root = Zeroizing::new([0u8; KEY_LEN]);
         root.copy_from_slice(&plaintext[..KEY_LEN]);
         Ok(root)
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+
+    #[test]
+    fn only_hardware_non_exportable_keys_at_the_rsa_floor_are_accepted() {
+        let ours = KeyOwnership::CurrentUser;
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS, ours).is_ok());
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS + 1024, ours).is_ok());
+
+        let software = validate_key_properties(false, false, MIN_RSA_BITS, ours).unwrap_err();
+        assert!(
+            matches!(software, VaultError::Tpm(message) if message.contains("not hardware-backed"))
+        );
+
+        let exportable = validate_key_properties(true, true, MIN_RSA_BITS, ours).unwrap_err();
+        assert!(matches!(exportable, VaultError::Tpm(message) if message.contains("exportable")));
+
+        let weak = validate_key_properties(true, false, MIN_RSA_BITS - 1, ours).unwrap_err();
+        assert!(matches!(weak, VaultError::Tpm(message) if message.contains("below")));
+    }
+
+    /// The fourth check ADR-006 §3 demands, and the one that was absent.
+    ///
+    /// Provider, non-exportability and modulus establish that the key is
+    /// *sound*; none of them establishes that it is **ours**. Both non-`ours`
+    /// answers must refuse — including the unreadable one, because the ADR is
+    /// explicit that a property which cannot be verified is not a guarantee.
+    #[test]
+    fn a_key_that_is_not_ours_is_refused_even_when_every_other_property_holds() {
+        let sound = |ownership| validate_key_properties(true, false, MIN_RSA_BITS, ownership);
+
+        assert!(sound(KeyOwnership::CurrentUser).is_ok());
+
+        let foreign = sound(KeyOwnership::AnotherPrincipal).unwrap_err();
+        assert!(
+            matches!(foreign, VaultError::Tpm(ref message) if message.contains("another principal")),
+            "obtenu : {foreign}"
+        );
+
+        let unknown = sound(KeyOwnership::Unverifiable).unwrap_err();
+        assert!(
+            matches!(unknown, VaultError::Tpm(ref message) if message.contains("could not be read")),
+            "obtenu : {unknown}"
+        );
     }
 }
 

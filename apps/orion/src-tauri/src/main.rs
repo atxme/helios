@@ -65,6 +65,21 @@ struct AppState {
     config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
+    /// Imported profiles the user has not saved yet, keyed by display name.
+    ///
+    /// # Why the secret waits here rather than on screen
+    ///
+    /// An import produces a **draft**: the user reviews the endpoint and the
+    /// pinned fingerprint before committing, and a valid file must not silently
+    /// replace a profile of the same name. That review used to happen with the
+    /// private key sitting in a WebView text field, because the draft was
+    /// returned whole to JavaScript.
+    ///
+    /// The draft still goes to the screen — redacted — and the key it carries
+    /// waits here instead, for the one gesture that follows. `save_profile`
+    /// takes it; anything else drops it when Orion closes, which loses nothing:
+    /// the document can be imported again.
+    pending_imports: Arc<Mutex<std::collections::HashMap<String, ClientProfile>>>,
 }
 
 /// Polling interval for the last WireGuard handshake.
@@ -315,8 +330,13 @@ fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport 
 /// being able to decrypt. `false` also covers "no negotiation block" — a
 /// profile that needs no identity needs no import either.
 #[tauri::command]
-fn key_negotiation_identity_sealed(profile: ClientProfile) -> bool {
-    let Some(settings) = profile.key_negotiation.as_ref() else {
+fn key_negotiation_identity_sealed(
+    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+) -> bool {
+    // Takes the block alone rather than a whole profile: this answers a
+    // question about the negotiation identity, and passing the profile would
+    // have meant shipping its secrets across the IPC to read one field.
+    let Some(settings) = key_negotiation else {
         return false;
     };
     ProtectedIdentityStore::for_current_user().is_ok_and(|store| store.contains(&settings.identity))
@@ -328,16 +348,160 @@ fn key_negotiation_identity_sealed(profile: ClientProfile) -> bool {
 /// side and displayed so the user can compare it, out loud or by phone, with
 /// what `heliosd init-key-negotiation` printed on the gateway.
 #[tauri::command]
-fn key_negotiation_fingerprint(profile: ClientProfile) -> Option<String> {
-    profile
-        .key_negotiation
-        .as_ref()
-        .and_then(|settings| settings.gateway_pq_fingerprint())
+fn key_negotiation_fingerprint(
+    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+) -> Option<String> {
+    key_negotiation.and_then(|settings| settings.gateway_pq_fingerprint())
+}
+
+/// A profile **as the interface is allowed to see it** (ADR-006 §5).
+///
+/// # Why the WireGuard private key is not in here
+///
+/// It used to be. `get_config` cloned the whole `ClientProfile` across the
+/// Tauri IPC, and the Profiles screen put it in a text field with a button to
+/// reveal it. That single path defeated most of what the vault buys: the key
+/// was serialised into a JSON message, parsed into a JavaScript `String` —
+/// immutable, garbage-collected, impossible to wipe — held in a DOM node's
+/// value for as long as the screen lived, and readable by anything that could
+/// reach the WebView. Sealing a secret on disk and then handing it to a
+/// browser engine is protecting the quiet half of its life.
+///
+/// ADR-006 §5 already forbids exactly this for the `nomade` passphrase — "ni le
+/// DOM WebView2, ni JavaScript, ni un message Tauri sérialisé". The private key
+/// is the secret that actually brings the tunnel up. The same rule applies, and
+/// applies more.
+///
+/// What the screen genuinely needs is here: everything it displays or edits,
+/// plus the **public** key it exists to show the operator, plus two booleans
+/// saying whether the secrets are present. Nothing it needs requires the
+/// secret itself.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProfileView {
+    name: String,
+    endpoint: String,
+    peer_public_key: String,
+    address: Option<String>,
+    allowed_ips: String,
+    persistent_keepalive: u16,
+    heliosd_url: Option<String>,
+    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+    /// Public half of the profile's WireGuard key. The one value of the pair
+    /// that is *meant* to leave the machine — it is what the operator admits.
+    public_key: Option<String>,
+    /// Whether a private key is stored. The screen shows a state, not a value.
+    has_private_key: bool,
+    /// Whether a **static** PSK is stored. A negotiated one is never at rest.
+    has_static_psk: bool,
+}
+
+impl From<&ClientProfile> for ProfileView {
+    fn from(profile: &ClientProfile) -> Self {
+        Self {
+            name: profile.name.clone(),
+            endpoint: profile.endpoint.clone(),
+            peer_public_key: profile.peer_public_key.clone(),
+            address: profile.address.clone(),
+            allowed_ips: profile.allowed_ips.clone(),
+            persistent_keepalive: profile.persistent_keepalive,
+            heliosd_url: profile.heliosd_url.clone(),
+            key_negotiation: profile.key_negotiation.clone(),
+            public_key: profile.public_key(),
+            has_private_key: !profile.private_key.trim().is_empty(),
+            has_static_psk: profile.has_static_psk(),
+        }
+    }
+}
+
+/// The configuration as the interface sees it: profiles, redacted.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ConfigView {
+    profiles: Vec<ProfileView>,
+    selected: Option<String>,
+}
+
+impl From<&ClientConfig> for ConfigView {
+    fn from(config: &ClientConfig) -> Self {
+        Self {
+            profiles: config.profiles.iter().map(ProfileView::from).collect(),
+            selected: config.selected.clone(),
+        }
+    }
+}
+
+/// What the screen sends back when the user saves.
+///
+/// The secrets are **write-only and optional**: the interface never received
+/// them, so it cannot send them back, and `None` therefore means *keep what is
+/// stored*. That asymmetry is deliberate — it is what lets a profile be edited
+/// without its private key ever making the round trip.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileDraft {
+    name: String,
+    endpoint: String,
+    peer_public_key: String,
+    address: Option<String>,
+    allowed_ips: String,
+    persistent_keepalive: u16,
+    heliosd_url: Option<String>,
+    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+    /// Draws a fresh WireGuard key pair **in Rust** and adopts it.
+    ///
+    /// The only way this build creates a key. It never travels: the screen
+    /// asks, `orion-core` generates, the vault seals, and the answer that comes
+    /// back is the public half. A user who wants a new key gets one without any
+    /// part of the pair crossing the IPC.
+    #[serde(default)]
+    generate_private_key: bool,
+    /// Clears the stored static PSK. There is deliberately no field to *set*
+    /// one from the screen: a static PSK is an out-of-band value, and the
+    /// enrolment document is what carries it.
+    #[serde(default)]
+    clear_preshared_key: bool,
+}
+
+impl ProfileDraft {
+    /// Merges the draft onto what is stored, keeping every secret in Rust.
+    ///
+    /// `stored` is `None` for a profile the user is creating, which is the one
+    /// case where a key must be generated: refusing instead would leave the
+    /// screen with no way at all to make a profile, and inventing an empty key
+    /// would produce one that fails `validate` with a message about enrolment.
+    fn merge(self, stored: Option<&ClientProfile>) -> Result<ClientProfile, String> {
+        let mut profile = match stored {
+            Some(profile) => profile.clone(),
+            None => ClientProfile {
+                name: self.name.clone(),
+                ..ClientProfile::default()
+            },
+        };
+        if self.generate_private_key || stored.is_none() {
+            let pair = aether::wg::generate_keypair()
+                .map_err(|error| format!("génération de la paire de clés : {error}"))?;
+            profile.private_key = pair.private_key.expose().to_string();
+        }
+        if self.clear_preshared_key {
+            profile.preshared_key = None;
+        }
+        profile.name = self.name;
+        profile.endpoint = self.endpoint;
+        profile.peer_public_key = self.peer_public_key;
+        profile.address = self.address;
+        profile.allowed_ips = self.allowed_ips;
+        profile.persistent_keepalive = self.persistent_keepalive;
+        profile.heliosd_url = self.heliosd_url;
+        profile.key_negotiation = self.key_negotiation;
+        // A stored profile never carries a negotiated PSK: that one only ever
+        // exists in the ephemeral copy the backend mounts.
+        profile.preshared_key_is_negotiated = false;
+        Ok(profile)
+    }
 }
 
 #[tauri::command]
-async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> {
-    Ok(state.config.lock().await.clone())
+async fn get_config(state: State<'_, AppState>) -> Result<ConfigView, String> {
+    Ok(ConfigView::from(&*state.config.lock().await))
 }
 
 /// Result of an import: the draft profile, and what became of the identity.
@@ -348,7 +512,8 @@ async fn get_config(state: State<'_, AppState>) -> Result<ClientConfig, String> 
 /// nothing at all — not even the endpoint to check.
 #[derive(serde::Serialize)]
 struct ImportOutcome {
-    profile: ClientProfile,
+    /// The draft, redacted. Its private key waits in `pending_imports`.
+    profile: ProfileView,
     /// `true` when the document carried an identity **and** it was sealed.
     identity_sealed: bool,
     /// Why sealing failed, when the document carried one and it did not.
@@ -392,8 +557,7 @@ async fn import_profile(
 ) -> Result<ImportOutcome, String> {
     let imported =
         parse_profile_import(&contents, &file_name).map_err(|error| error.to_string())?;
-    let config = state.config.lock().await;
-    finish_import(imported, &config)
+    finish_import(&state, imported).await
 }
 
 /// Rereads a profile whose path comes from the system association.
@@ -418,8 +582,7 @@ async fn import_profile_path(
         return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
     }
     let imported = read_profile_import_path(&path).map_err(|error| error.to_string())?;
-    let config = state.config.lock().await;
-    finish_import(imported, &config).map(Some)
+    finish_import(&state, imported).await.map(Some)
 }
 
 /// Seals the identity, completes the draft, and reports both fates.
@@ -428,18 +591,32 @@ async fn import_profile_path(
 /// association must not differ by one gesture — a document that seals its
 /// identity on a double-click and not through the button would be
 /// impossible to explain.
-fn finish_import(
+async fn finish_import(
+    state: &State<'_, AppState>,
     imported: orion_core::ProfileImport,
-    config: &ClientConfig,
 ) -> Result<ImportOutcome, String> {
     // Read before the bundle is consumed by sealing: it is the certificate
     // that says which key was admitted.
     let admitted = imported.admitted_public_key();
     let (identity_sealed, identity_error) = seal_identity(imported.identity);
-    let completed = complete_profile_import(imported.profile, config, admitted.as_deref())
-        .map_err(|error| error.to_string())?;
+    let completed = {
+        let config = state.config.lock().await;
+        complete_profile_import(imported.profile, &config, admitted.as_deref())
+            .map_err(|error| error.to_string())?
+    };
+
+    // The draft goes to the screen redacted; its private key stays here until
+    // the user saves. Returning it whole is what put a WireGuard private key
+    // into the WebView in the first place (ADR-006 §5).
+    let view = ProfileView::from(&completed.profile);
+    state
+        .pending_imports
+        .lock()
+        .await
+        .insert(completed.profile.name.clone(), completed.profile);
+
     Ok(ImportOutcome {
-        profile: completed.profile,
+        profile: view,
         identity_sealed,
         identity_error,
         private_key_missing: completed.private_key_missing,
@@ -463,17 +640,27 @@ async fn vault_posture(
     Ok(state.store.posture())
 }
 
-#[tauri::command]
-fn profile_public_key(profile: ClientProfile) -> Option<String> {
-    profile.public_key()
-}
-
+/// Merges a draft onto the stored profile and seals the result.
+///
+/// The volume-encryption gate is here rather than in the store because this is
+/// the moment a secret is about to be written: ADR-006 §3 makes BitLocker a
+/// **verified prerequisite**, not a recommendation, because application
+/// encryption reaches neither the old SSD blocks nor the hibernation file.
 #[tauri::command]
 async fn save_profile(
     state: State<'_, AppState>,
-    profile: ClientProfile,
-) -> Result<ClientConfig, String> {
+    draft: ProfileDraft,
+) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
+    require_protected_volume(&state)?;
+    // A profile already stored wins over a pending import of the same name:
+    // editing an existing profile must not silently adopt the key of a
+    // document imported earlier in the session and never saved.
+    let stored = match cfg.find(&draft.name).cloned() {
+        Some(profile) => Some(profile),
+        None => state.pending_imports.lock().await.remove(&draft.name),
+    };
+    let profile = draft.merge(stored.as_ref())?;
     let selected = profile.name.clone();
     state
         .store
@@ -482,26 +669,42 @@ async fn save_profile(
     cfg.upsert(profile);
     cfg.selected = Some(selected.clone());
     state.store.select(&selected).map_err(|e| e.to_string())?;
-    Ok(cfg.clone())
+    Ok(ConfigView::from(&*cfg))
 }
 
 #[tauri::command]
-async fn delete_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
+async fn delete_profile(state: State<'_, AppState>, name: String) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     state
         .store
         .remove_profile(&name)
         .map_err(|e| e.to_string())?;
     cfg.remove(&name);
-    Ok(cfg.clone())
+    Ok(ConfigView::from(&*cfg))
 }
 
 #[tauri::command]
-async fn select_profile(state: State<'_, AppState>, name: String) -> Result<ClientConfig, String> {
+async fn select_profile(state: State<'_, AppState>, name: String) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     state.store.select(&name).map_err(|e| e.to_string())?;
     cfg.selected = Some(name);
-    Ok(cfg.clone())
+    Ok(ConfigView::from(&*cfg))
+}
+
+/// Refuses to write a secret onto a volume nothing encrypts (ADR-006 §3).
+///
+/// `Indeterminate` refuses just like `Unprotected`: a posture we cannot
+/// establish is a posture we cannot promise, and the failure mode of guessing
+/// "probably fine" is a user believing their disk is protected when it is not.
+fn require_protected_volume(state: &State<'_, AppState>) -> Result<(), String> {
+    let posture = state.store.posture();
+    if posture.volume_protected {
+        return Ok(());
+    }
+    Err(format!(
+        "{} Orion refuse d'écrire un secret tant que le volume n'est pas chiffré.",
+        posture.volume
+    ))
 }
 
 #[tauri::command]
@@ -522,6 +725,23 @@ async fn connect(
     // Validates the WireGuard profile (endpoint + keys) BEFORE any side effect.
     profile.validate().map_err(|e| e.to_string())?;
 
+    // A key that once lived in plaintext is presumed compromised, and sealing
+    // the file did not recall the copies already in backups or roaming
+    // profiles. ADR-006 §3 makes such a profile unconnectable until a new key
+    // is generated and re-admitted — and the posture panel already tells the
+    // user exactly that. Until this check existed, the panel said it and
+    // nothing enforced it: the profile connected on the compromised key while
+    // the screen claimed it would not.
+    let rotation_required = state.store.rotation_required().unwrap_or_default();
+    if rotation_required.contains(&profile.name) {
+        return Err(format!(
+            "« {} » a été repris d'un fichier en clair : sa clé privée est présumée compromise. \
+             Générer une nouvelle clé et la faire admettre par l'opérateur avant de vous \
+             connecter.",
+            profile.name
+        ));
+    }
+
     // Sink combining relay to the frontend AND telemetry control: telemetry
     // only starts on transition to Up (web behind the tunnel).
     let base = emit_sink(app.clone());
@@ -531,6 +751,7 @@ async fn connect(
     let negotiating = profile.key_negotiation.is_some();
     let negotiated_profile = profile.name.clone();
     let config = Arc::clone(&state.config);
+    let store = Arc::clone(&state.store);
     let sink: EventSink = Arc::new(move |ev: ClientEvent| {
         // Mirror of the gateway rule: a committed negotiation raises this
         // profile's floor for good. Helios does the same on its side and
@@ -539,7 +760,12 @@ async fn connect(
         // couldn't explain.
         if negotiating {
             if let ClientEvent::Protection { psk } = &ev {
-                raise_key_negotiation_floor(Arc::clone(&config), negotiated_profile.clone(), *psk);
+                raise_key_negotiation_floor(
+                    Arc::clone(&config),
+                    Arc::clone(&store),
+                    negotiated_profile.clone(),
+                    *psk,
+                );
             }
         }
         if let ClientEvent::StateChanged { state } = &ev {
@@ -581,8 +807,19 @@ async fn connect(
 /// behind an async lock. A failed write is logged and nothing else: the
 /// session in progress stays valid, and the gateway keeps its own floor —
 /// which is the one that actually refuses a downgrade.
+///
+/// # Why this goes through the vault and not through `ClientConfig::save`
+///
+/// It used to call `cfg.save()`, which writes `profiles.toml` — the **legacy
+/// plaintext file** ADR-006 exists to retire, in the very directory the store
+/// occupies. Every negotiated connection that raised a floor therefore rewrote
+/// the client's private key and static PSK in the clear on disk, undoing the
+/// whole lot; the next start then found the file, migrated it again, and
+/// marked the profile as having lived in plaintext. Raising a floor is a
+/// security event, and it must be recorded the way every other one is.
 fn raise_key_negotiation_floor(
     config: Arc<Mutex<ClientConfig>>,
+    store: Arc<orion_core::vault::ProfileStore>,
     name: String,
     observed: orion_core::PskKind,
 ) {
@@ -596,19 +833,21 @@ fn raise_key_negotiation_floor(
     };
     tokio::spawn(async move {
         let mut cfg = config.lock().await;
-        let Some(settings) = cfg
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.name == name)
-            .and_then(|profile| profile.key_negotiation.as_mut())
-        else {
+        let Some(profile) = cfg.profiles.iter_mut().find(|profile| profile.name == name) else {
+            return;
+        };
+        let Some(settings) = profile.key_negotiation.as_mut() else {
             return;
         };
         if settings.minimum_mode.satisfies(reached) {
             return;
         }
         settings.minimum_mode = reached;
-        if let Err(error) = cfg.save() {
+        // Cloned out of the guard so the sealed write does not hold the lock
+        // across an I/O the UI is waiting behind.
+        let raised = profile.clone();
+        drop(cfg);
+        if let Err(error) = store.save_profile(&raised) {
             tracing::warn!(%error, "unable to persist the raised key-negotiation floor");
         }
     });
@@ -627,8 +866,24 @@ async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
 /// refuses, it doesn't reimplement its rules. Two rule sets would eventually
 /// diverge, and the UI would accept values the connection rejects.
 #[tauri::command]
-fn validate_profile(profile: ClientProfile) -> ProfileIssues {
-    inspect_profile(&profile)
+async fn validate_profile(
+    state: State<'_, AppState>,
+    draft: ProfileDraft,
+) -> Result<ProfileIssues, String> {
+    // Merged against what is stored before judging: the draft carries no
+    // private key by construction, so inspecting it on its own would report
+    // "clé privée requise" on every profile that has one — a red field the
+    // user cannot clear, on a value they are not allowed to see.
+    let cfg = state.config.lock().await;
+    let stored = match cfg.find(&draft.name).cloned() {
+        Some(profile) => Some(profile),
+        // Peeked, not removed: validation runs on every keystroke, and
+        // consuming the import here would make the third character typed lose
+        // the key the first two had.
+        None => state.pending_imports.lock().await.get(&draft.name).cloned(),
+    };
+    let profile = draft.merge(stored.as_ref())?;
+    Ok(inspect_profile(&profile))
 }
 
 /// Window dimensions depending on the displayed view.
@@ -861,13 +1116,28 @@ fn main() {
     // Une configuration héritée est reprise dans le coffre avant tout usage, et
     // ses profils restent bloqués jusqu'à rotation de clé : le sceller ne
     // rappelle pas les copies déjà parties en sauvegarde.
-    match store.migrate_legacy() {
-        Ok(report) if !report.migrated.is_empty() => tracing::warn!(
-            profils = ?report.rotation_required,
-            "profils repris du fichier en clair — rotation de clé obligatoire"
-        ),
-        Ok(_) => {}
-        Err(error) => tracing::error!(%error, "migration du fichier hérité impossible"),
+    //
+    // La migration est conditionnée au chiffrement du volume (ADR-006 §3) :
+    // elle réécrit le secret ailleurs sur le même disque, et sur un volume nu
+    // cela le recopie sans retirer l'ancien. Mieux vaut laisser le fichier
+    // hérité en place, visible dans la posture, que produire une seconde copie
+    // en croyant l'avoir protégée.
+    let volume = orion_core::vault::windows::bitlocker::protection_of(&store_dir);
+    if !volume.allows_secrets() {
+        tracing::error!(
+            détail = volume.detail(),
+            "migration du fichier hérité suspendue : chiffrement de volume absent ou \
+             indéterminable"
+        );
+    } else {
+        match store.migrate_legacy() {
+            Ok(report) if !report.migrated.is_empty() => tracing::warn!(
+                profils = ?report.rotation_required,
+                "profils repris du fichier en clair — rotation de clé obligatoire"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "migration du fichier hérité impossible"),
+        }
     }
     let config = store.load().unwrap_or_else(|error| {
         tracing::error!(%error, "coffre illisible — aucun profil chargé");
@@ -894,6 +1164,7 @@ fn main() {
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
+            pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
@@ -913,7 +1184,6 @@ fn main() {
             get_config,
             import_profile,
             import_profile_path,
-            profile_public_key,
             save_profile,
             delete_profile,
             select_profile,
@@ -933,7 +1203,147 @@ fn main() {
 
 #[cfg(test)]
 mod security_tests {
-    use super::{associated_profile_paths, sanitize_stem, window_size_for, Path, PathBuf};
+    use super::{
+        associated_profile_paths, sanitize_stem, window_size_for, ClientProfile, ConfigView, Path,
+        PathBuf, ProfileDraft, ProfileView,
+    };
+
+    fn profile(name: &str) -> ClientProfile {
+        let pair = aether::wg::generate_keypair().expect("keypair");
+        let gateway = aether::wg::generate_keypair().expect("keypair");
+        ClientProfile {
+            name: name.into(),
+            endpoint: "203.0.113.10:51820".into(),
+            private_key: pair.private_key.expose().to_string(),
+            peer_public_key: gateway.public_key,
+            preshared_key: Some("cHNrLXN0YXRpcXVlLWhvcnMtYmFuZGU=".into()),
+            address: Some("100.64.1.2/32".into()),
+            ..ClientProfile::default()
+        }
+    }
+
+    fn draft(name: &str) -> ProfileDraft {
+        ProfileDraft {
+            name: name.into(),
+            endpoint: "203.0.113.10:51820".into(),
+            peer_public_key: "cHVibGlj".into(),
+            address: None,
+            allowed_ips: "0.0.0.0/0".into(),
+            persistent_keepalive: 25,
+            heliosd_url: None,
+            key_negotiation: None,
+            generate_private_key: false,
+            clear_preshared_key: false,
+        }
+    }
+
+    /// **The** property of this lot: no secret crosses the Tauri IPC.
+    ///
+    /// The check is on the serialised bytes rather than on a list of fields we
+    /// remembered to omit. A field added later that happens to carry a secret
+    /// fails here, not in a WebView memory dump.
+    #[test]
+    fn no_secret_is_ever_serialised_towards_the_interface() {
+        let profile = profile("poste");
+        let private_key = profile.private_key.clone();
+        let psk = profile.preshared_key.clone().expect("psk");
+
+        let config = super::ClientConfig {
+            profiles: vec![profile],
+            selected: Some("poste".into()),
+        };
+        let json = serde_json::to_string(&ConfigView::from(&config)).expect("serialise");
+
+        assert!(
+            !json.contains(&private_key),
+            "la clé privée traverse l'IPC :\n{json}"
+        );
+        assert!(!json.contains(&psk), "le PSK statique traverse l'IPC");
+        // What the screen legitimately needs is still there.
+        assert!(json.contains("publicKey") || json.contains("public_key"));
+        assert!(json.contains("203.0.113.10:51820"));
+    }
+
+    /// The view states the *presence* of a secret, never its value.
+    #[test]
+    fn the_view_reports_presence_and_the_public_half() {
+        let profile = profile("poste");
+        let expected = profile.public_key().expect("public key");
+        let view = ProfileView::from(&profile);
+
+        assert!(view.has_private_key);
+        assert!(view.has_static_psk);
+        assert_eq!(view.public_key.as_deref(), Some(expected.as_str()));
+
+        let bare = ClientProfile {
+            name: "vide".into(),
+            ..ClientProfile::default()
+        };
+        let view = ProfileView::from(&bare);
+        assert!(!view.has_private_key);
+        assert!(!view.has_static_psk);
+        assert_eq!(view.public_key, None);
+    }
+
+    /// A draft that never carried the secret must not erase it on save.
+    ///
+    /// This is what makes the redaction usable rather than merely safe: the
+    /// user edits an endpoint, the screen sends back everything it knows —
+    /// which excludes the key — and the stored key survives untouched.
+    #[test]
+    fn editing_a_profile_keeps_the_secrets_it_never_saw() {
+        let stored = profile("poste");
+        let key = stored.private_key.clone();
+        let psk = stored.preshared_key.clone();
+
+        let mut edit = draft("poste");
+        edit.endpoint = "198.51.100.7:51820".into();
+        let merged = edit.merge(Some(&stored)).expect("merge");
+
+        assert_eq!(merged.private_key, key, "la clé stockée a été perdue");
+        assert_eq!(merged.preshared_key, psk, "le PSK stocké a été perdu");
+        assert_eq!(merged.endpoint, "198.51.100.7:51820");
+    }
+
+    /// A new profile gets a key drawn in Rust, and so does an explicit rotation.
+    #[test]
+    fn a_key_is_drawn_in_rust_and_never_travels() {
+        let created = draft("nouveau").merge(None).expect("merge");
+        assert!(
+            !created.private_key.trim().is_empty(),
+            "un profil neuf doit recevoir une clé"
+        );
+        assert!(created.public_key().is_some(), "la clé doit être valide");
+
+        let mut rotation = draft("poste");
+        rotation.generate_private_key = true;
+        let rotated = rotation.merge(Some(&created)).expect("merge");
+        assert_ne!(
+            rotated.private_key, created.private_key,
+            "une rotation demandée doit produire une nouvelle clé"
+        );
+    }
+
+    /// Clearing a static PSK is explicit, and is the only way to touch it.
+    #[test]
+    fn a_static_psk_can_only_be_cleared_never_set_from_the_screen() {
+        let stored = profile("poste");
+        let mut clearing = draft("poste");
+        clearing.clear_preshared_key = true;
+        assert_eq!(
+            clearing.merge(Some(&stored)).expect("merge").preshared_key,
+            None
+        );
+
+        // And a merge never marks a stored PSK as negotiated: that flag belongs
+        // to the ephemeral profile the backend mounts, nowhere else.
+        assert!(
+            !draft("poste")
+                .merge(Some(&stored))
+                .expect("merge")
+                .preshared_key_is_negotiated
+        );
+    }
 
     /// Each view has its size, and an unexpected label must not produce a
     /// degenerate window: it falls back to the startup view.

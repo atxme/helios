@@ -28,9 +28,10 @@ import { useClient } from './useClient'
 const portable: ClientProfile = {
   name: 'portable',
   endpoint: '203.0.113.10:51820',
-  private_key: 'private',
   peer_public_key: 'gateway-public',
-  preshared_key: null,
+  public_key: 'client-public',
+  has_private_key: true,
+  has_static_psk: false,
   address: '100.64.1.2/32',
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,

@@ -258,10 +258,12 @@ impl ProfileStore {
         root: &DeviceRootKey,
         entry: &RegistryEntry,
     ) -> Result<ProfileManifest, VaultError> {
-        let blob = std::fs::read(self.manifest_path(entry.id)).map_err(|e| VaultError::Io {
-            path: self.manifest_path(entry.id),
-            cause: e.to_string(),
-        })?;
+        // `read_file_bounded` and not `std::fs::read`: ADR-006 §2 requires the
+        // size to be checked before the blob is allocated, and says in as many
+        // words that a bound applied after a `std::fs::read` is a bound that
+        // already lost. A sparse manifest file costs an attacker nothing.
+        let blob = helios_vault::read_file_bounded(&self.manifest_path(entry.id))
+            .map_err(VaultError::Container)?;
         let manifest = open_manifest(
             root,
             entry.id,
@@ -327,8 +329,19 @@ impl ProfileStore {
         let rotated = previous
             .as_ref()
             .is_some_and(|entry| entry.client_public_key != client_public_key);
+
+        // The generation counts **security events**, and ADR-006 §2 lists four:
+        // a key rotation, a PSK change, a trust-anchor change and a floor
+        // change. Only the first was tracked before, so swapping the pinned CA
+        // or lowering the stored floor left the counter still — and a restored
+        // older manifest with the old anchor passed the registry check.
+        let digest =
+            ProfileManifest::from_profile(profile, SecurityGeneration(0)).security_digest();
+        let security_changed = previous
+            .as_ref()
+            .is_some_and(|entry| entry.security_digest != digest);
         let generation = match &previous {
-            Some(entry) if rotated => entry.generation.next(),
+            Some(entry) if rotated || security_changed => entry.generation.next(),
             Some(entry) => entry.generation,
             None => SecurityGeneration(1),
         };
@@ -343,6 +356,7 @@ impl ProfileStore {
             client_public_key,
             gateway_public_key: profile.peer_public_key.clone(),
             generation,
+            security_digest: digest,
             // A rotation is what closes the migration: the key that had lived
             // in the clear is no longer the one in use.
             rotation_required: previous
@@ -469,10 +483,8 @@ impl ProfileStore {
             // Reopen and verify **before** publishing anything (ADR-006 §3).
             // Trusting the write would mean discovering an unreadable vault on
             // the day the legacy file no longer exists.
-            let written = std::fs::read(self.manifest_path(id)).map_err(|e| VaultError::Io {
-                path: self.manifest_path(id),
-                cause: e.to_string(),
-            })?;
+            let written = helios_vault::read_file_bounded(&self.manifest_path(id))
+                .map_err(VaultError::Container)?;
             let reopened = open_manifest(
                 &root,
                 id,
@@ -490,6 +502,7 @@ impl ProfileStore {
                 client_public_key,
                 gateway_public_key: profile.peer_public_key.clone(),
                 generation: SecurityGeneration(1),
+                security_digest: manifest.security_digest(),
                 // The key lived in plaintext. Sealing it does not recall the
                 // copies already in backups and roaming profiles.
                 rotation_required: true,
@@ -694,6 +707,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Raising a floor must not resurrect the plaintext file.
+    ///
+    /// This is the shape of the defect the shell carried: a committed
+    /// negotiation raised `minimum_mode`, and the raise was persisted with
+    /// `ClientConfig::save` — which writes `profiles.toml`, in this very
+    /// directory, with the private key in the clear. The whole vault was
+    /// undone by the ordinary success path, once per connection.
+    ///
+    /// The test drives the store the way the shell now does, and then asserts
+    /// on the directory: no legacy file, and the secret nowhere in it.
+    #[test]
+    fn raising_a_floor_writes_no_plaintext_file() {
+        use aether::key_negotiation::ProtectionMode;
+
+        let (dir, store) = store("floor-raise");
+        let mut profile = profile("poste");
+        profile.key_negotiation = Some(negotiation());
+        store.save_profile(&profile).unwrap();
+
+        // What the negotiation sink does after a committed ML-KEM exchange.
+        if let Some(settings) = profile.key_negotiation.as_mut() {
+            settings.minimum_mode = ProtectionMode::MlKem;
+        }
+        store.save_profile(&profile).unwrap();
+
+        assert!(
+            !store.legacy_present(),
+            "une montée de plancher a recréé {}",
+            LEGACY_FILE
+        );
+        let secret = profile.private_key.as_bytes();
+        for path in walk(&dir) {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(secret.len()).any(|window| window == secret),
+                "la clé privée apparaît dans {}",
+                path.display()
+            );
+        }
+
+        // And the raise is genuinely persisted, sealed.
+        let reloaded = store.load().unwrap();
+        assert_eq!(
+            reloaded
+                .find("poste")
+                .unwrap()
+                .key_negotiation
+                .as_ref()
+                .unwrap()
+                .minimum_mode,
+            ProtectionMode::MlKem
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Rewriting with a new WireGuard key is a rotation: the generation rises.
     #[test]
     fn a_key_rotation_raises_the_generation() {
@@ -711,6 +779,109 @@ mod tests {
         let root = store.root().unwrap();
         let entry = store.load_registry(&root).unwrap();
         assert_eq!(entry.find_by_name("poste").unwrap().generation.0, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Key negotiation block whose anchor and floor a test can move.
+    fn negotiation() -> crate::config::KeyNegotiationSettings {
+        use aether::key_negotiation::ProtectionMode;
+        crate::config::KeyNegotiationSettings {
+            mode: ProtectionMode::MlKem,
+            minimum_mode: ProtectionMode::Classic,
+            endpoint: "203.0.113.10:51821".into(),
+            server_name: "gw.example".into(),
+            gateway_ca_der: "Q0EtT1JJR0lORQ==".into(),
+            gateway_pq_certificate: "Q0VSVC1PUklHSU5F".into(),
+            identity: "poste".into(),
+        }
+    }
+
+    /// ADR-006 §2 names four triggers, not one.
+    ///
+    /// Before the security digest entered the registry, only a WireGuard key
+    /// rotation moved the counter. Swapping the pinned trust anchor or lowering
+    /// the stored floor left it still — so a restored manifest carrying the old
+    /// anchor passed the registry's freshness check untouched. Each case here
+    /// is one of those triggers, exercised on its own.
+    #[test]
+    fn every_security_change_raises_the_generation() {
+        use aether::key_negotiation::ProtectionMode;
+
+        type Change = fn(&mut ClientProfile);
+        let cases: [(&str, Change); 4] = [
+            ("clé WireGuard", |profile| {
+                profile.private_key = aether::wg::generate_keypair()
+                    .unwrap()
+                    .private_key
+                    .expose()
+                    .to_string();
+            }),
+            ("PSK statique", |profile| {
+                profile.preshared_key = Some("cHNrLXJlbXBsYWNhbnQtMzItb2N0ZXRz".into());
+            }),
+            ("ancre de confiance", |profile| {
+                if let Some(settings) = profile.key_negotiation.as_mut() {
+                    settings.gateway_ca_der = "Q0EtUkVNUExBQ0FOVEU=".into();
+                }
+            }),
+            ("plancher", |profile| {
+                if let Some(settings) = profile.key_negotiation.as_mut() {
+                    settings.minimum_mode = ProtectionMode::MlKem;
+                }
+            }),
+        ];
+
+        for (label, apply) in cases {
+            let (dir, store) = store(&format!("generation-{}", label.replace(' ', "-")));
+            let mut original = profile("poste");
+            original.key_negotiation = Some(negotiation());
+            store.save_profile(&original).unwrap();
+
+            apply(&mut original);
+            store.save_profile(&original).unwrap();
+
+            let root = store.root().unwrap();
+            assert_eq!(
+                store
+                    .load_registry(&root)
+                    .unwrap()
+                    .find_by_name("poste")
+                    .unwrap()
+                    .generation
+                    .0,
+                2,
+                "un changement de {label} doit être un événement de sécurité"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The registry witnesses the change without ever holding the secret.
+    #[test]
+    fn the_registry_records_a_digest_and_never_the_psk() {
+        let (dir, store) = store("digest-no-secret");
+        let mut original = profile("poste");
+        original.preshared_key = Some("cHNrLXNlY3JldC1xdWktbmUtc29ydC1wYXM=".into());
+        store.save_profile(&original).unwrap();
+
+        let root = store.root().unwrap();
+        let entry = store
+            .load_registry(&root)
+            .unwrap()
+            .find_by_name("poste")
+            .unwrap()
+            .clone();
+        assert_ne!(entry.security_digest, [0u8; 32], "digest non calculé");
+
+        let psk = original.preshared_key.as_deref().unwrap().as_bytes();
+        for path in walk(&dir) {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(psk.len()).any(|window| window == psk),
+                "le PSK apparaît dans {}",
+                path.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

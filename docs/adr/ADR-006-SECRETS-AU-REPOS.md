@@ -408,6 +408,17 @@ les **types et les flux**, puis sur `Drop` :
   manifeste secret est encodé directement dans un tampon `Zeroizing` borné ;
 * la passphrase `nomade` est saisie par une boîte native protégée. Elle ne traverse
   ni le DOM WebView2, ni JavaScript, ni un message Tauri sérialisé ;
+* **la même règle vaut pour la clé privée WireGuard et le PSK statique**
+  (amendement du 2 août 2026). L'IPC Tauri ne transporte plus qu'une vue
+  expurgée : clé **publique**, et deux booléens de présence. L'écran *Profils*
+  n'a plus de champ masqué ni de bouton « afficher » — le composant qui les
+  affichait n'accepte plus de valeur du tout. Les deux secrets n'arrivent que
+  par un document d'enrôlement, analysé et scellé en Rust, ou par une clé tirée
+  en Rust ; l'écran n'émet que des **intentions** (« générer », « retirer »).
+  La règle initiale ne visait que la passphrase, ce qui laissait la clé qui
+  monte réellement le tunnel sérialisée dans un message, recopiée dans une
+  `String` JavaScript que rien n'efface, et résidente dans un nœud du DOM tant
+  que l'écran vivait ;
 * sous Windows, les pages sensibles stables sont verrouillées avec `VirtualLock`,
   protégées avec `CryptProtectMemory` lorsqu'elles sont résidentes mais inutilisées,
   puis effacées avec une primitive que le compilateur ne peut élider ; sous Linux,
@@ -416,11 +427,29 @@ les **types et les flux**, puis sur `Drop` :
   `nomade`, averti pour `service`, où le chiffrement de volume reste obligatoire.
 
 Durée de vie minimale : ouvrir, valider contexte et génération, installer dans le
-plan de données, effacer. La gateway ne conserve plus la clé privée ni les PSK
-dans `NetworkConfig` partagé après leur installation ; l'état de relecture à chaud
-est expurgé. Le noyau ou WireGuard-NT garde nécessairement le secret installé :
-son espace mémoire est une frontière distincte que `zeroize` utilisateur ne peut
-pas nettoyer.
+plan de données, effacer. Le noyau ou WireGuard-NT garde nécessairement le secret
+installé : son espace mémoire est une frontière distincte que `zeroize`
+utilisateur ne peut pas nettoyer.
+
+**Limite connue — la gateway conserve ses secrets en mémoire de processus.** La
+décision initiale exigeait que `NetworkConfig` partagé soit expurgé après
+installation. Ce n'est pas tenu, et l'expurger tel quel casserait la relecture à
+chaud : `orchestrator::spawn_network_config_watcher` réapplique la table de pairs
+sans redémarrer, et `key_negotiation` relit `wg_private_key` à chaque
+négociation. Les deux ont besoin du matériel après la pose. La levée passe par un
+détenteur dédié — un type qui prête le secret le temps d'un appel au lieu de le
+publier dans l'état partagé — et non par un effacement qui rendrait son identité
+à la gateway au premier rechargement. Le risque résiduel est borné par `T10` :
+un root sur la gateway lit déjà cette mémoire. Voir aussi le durcissement §6, qui
+est ce qui la protège aujourd'hui.
+
+**Limite connue — `CryptProtectMemory` et le verrouillage de pages.**
+`aether::locked::LockedSecret` existe, verrouille (`VirtualLock` / `mlock`),
+efface au `Drop` et **rapporte** son échec dans la posture. Aucun secret réel n'y
+vit encore : il ne sert que de sonde de privilège pour le panneau. Chiffrer les
+pages résidentes inutilisées avec `CryptProtectMemory` n'est pas implémenté.
+Les deux relèvent du même lot que le profil `nomade`, et ne sont éprouvables que
+sur cible Windows.
 
 `WerRegisterExcludedMemoryBlock` et `CryptProtectMemory` sont des défenses en
 profondeur, pas une frontière contre un débogueur, une injection ou un malware du
@@ -585,6 +614,14 @@ remplace pas.
   du propriétaire : le profil devient définitivement illisible et doit être
   ré-enrôlé. DPAPI ne constitue pas une récupération. C'est affiché avant
   activation et dans la posture.
+* **Le profil `nomade` n'est pas câblé.** La politique de passphrase
+  (`vault::passphrase`), la boîte de saisie native (`vault::windows::prompt`) et
+  le `Unlock::Passphrase` du conteneur existent et sont testés, mais aucun
+  `ProfileMode` ne les relie : pas de `IKM = profile_root_key ‖ passphrase_key`,
+  pas de sel de passphrase dans le key-slot, pas de re-saisie après veille ou
+  verrouillage de session. Tant que ce lot n'est pas fait, **le seul mode servi
+  est `service`** et le tableau des deux profils décrit une cible, pas l'état
+  livré.
 * **Orion Linux et macOS restent sans stockage protégé.** Câbler Secret Service
   (`libsecret`) et le Keychain relève d'un lot distinct ; le refus explicite actuel
   reste le bon comportement en attendant.

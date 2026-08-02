@@ -102,13 +102,16 @@ impl PlatformRootKeyProvider {
         let root = DeviceRootKey::generate()?;
         let wrapped = if self.software_only {
             self.record(false);
-            root.expose_for_wrapping().to_vec()
+            // `Zeroizing`: in the degraded mode this buffer *is* the root key in
+            // the clear, on its way to DPAPI. A plain `Vec` would leave it in a
+            // freed allocation nothing wipes (ADR-006 §5).
+            Zeroizing::new(root.expose_for_wrapping().to_vec())
         } else {
             // Recorded on both outcomes: a failure here is precisely what the
             // panel must stop calling "scellés au TPM".
             let wrapped = tpm::wrap_root(root.expose_for_wrapping());
             self.record(wrapped.is_ok());
-            wrapped?
+            Zeroizing::new(wrapped?)
         };
         let sealed = dpapi::protect(&wrapped)?;
         if let Some(parent) = self.path.parent() {
@@ -129,10 +132,10 @@ impl PlatformRootKeyProvider {
     }
 
     fn open(&self) -> Result<DeviceRootKey, VaultError> {
-        let sealed = std::fs::read(&self.path).map_err(|e| VaultError::Io {
-            path: self.path.clone(),
-            cause: e.to_string(),
-        })?;
+        // Same bound as every other sealed file: the wrapped root is a few
+        // hundred bytes, and the path is one an attacker with local write
+        // access can point at something enormous (ADR-006 §2).
+        let sealed = helios_vault::read_file_bounded(&self.path).map_err(VaultError::Container)?;
         let wrapped = dpapi::unprotect(&sealed)?;
         if self.software_only {
             self.record(false);
@@ -260,5 +263,61 @@ mod tests {
             "a refused root must leave nothing behind for a later run to adopt"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    fn test_root_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "orion-platform-root-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .join("device-root")
+    }
+
+    /// The explicit degraded mode still has a real Windows account boundary:
+    /// it is DPAPI-only, not plaintext-only.
+    #[cfg(windows)]
+    #[test]
+    fn software_keystore_creates_and_reopens_the_same_dpapi_root() {
+        let path = test_root_path("round-trip");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let provider = PlatformRootKeyProvider::new(&path).allowing_software_keystore(true);
+
+        let first = provider.root_key().unwrap();
+        let expected = *first.expose_for_wrapping();
+        drop(first);
+        let sealed = std::fs::read(&path).unwrap();
+        assert!(
+            !sealed
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "DPAPI-only mode must not write the root in plaintext"
+        );
+        let reopened = provider.root_key().unwrap();
+        assert_eq!(reopened.expose_for_wrapping(), &expected);
+        assert!(!provider.hardware_backed());
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A valid DPAPI envelope with the wrong payload shape must be refused;
+    /// otherwise a truncated root could silently become key material.
+    #[cfg(windows)]
+    #[test]
+    fn software_keystore_rejects_a_root_with_the_wrong_length() {
+        let path = test_root_path("wrong-length");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, dpapi::protect(&[7u8; KEY_LEN - 1]).unwrap()).unwrap();
+        let provider = PlatformRootKeyProvider::new(&path).allowing_software_keystore(true);
+
+        assert!(
+            matches!(provider.root_key(), Err(VaultError::Tpm(message)) if message.contains("wrong length"))
+        );
+        assert!(!provider.hardware_backed());
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

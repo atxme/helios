@@ -303,7 +303,11 @@ pub fn load(
         return Ok(StaticPskMap::default());
     }
     let ikm = identity_material(gateway_private_key)?;
-    let blob = std::fs::read(path).map_err(|e| StaticPskError::Io {
+    // Bounded on the metadata **before** the allocation, not after: ADR-006 §2
+    // is explicit that a `std::fs::read` followed by a length check is not the
+    // rule being asked for. The table is read at every start, from a path a
+    // local attacker can replace with a sparse file.
+    let blob = helios_vault::read_file_bounded(path).map_err(|e| StaticPskError::Io {
         path: path.display().to_string(),
         cause: e.to_string(),
     })?;
@@ -409,7 +413,11 @@ pub fn adopt_from_config(
         }
     }
     if adopted > 0 {
+        // Sealed table first, file second. The reverse order has a window in
+        // which the PSK exists nowhere: a crash between the two would lose it
+        // for good, and a static PSK has no recovery channel.
         store(path, gateway_private_key, &map)?;
+        strip_from_file()?;
     }
 
     // Refill the running config: the data plane reads it, and a peer left
@@ -420,6 +428,46 @@ pub fn adopt_from_config(
         }
     }
     Ok(adopted)
+}
+
+/// Removes every `preshared_key` from `network.toml`, and nothing else.
+///
+/// ADR-006 §4 says the file never carries a static PSK. Warning the operator
+/// to delete it by hand left the secret on disk for as long as nobody read the
+/// log — which is to say, indefinitely.
+///
+/// It re-reads the file rather than persisting the running configuration, and
+/// that is the whole care of this function. By the time it is called the
+/// in-memory config holds the **unsealed** gateway private key, which
+/// `gateway_key::resolve` put there; saving it would write that key back in the
+/// clear. Re-reading touches one field and leaves `wg_private_key` exactly as
+/// the file holds it — including the legacy plaintext case, where erasing it
+/// would take the gateway's identity away.
+fn strip_from_file() -> Result<(), StaticPskError> {
+    let path = aether::NetworkConfig::path();
+    if !path.exists() {
+        // Nothing on disk to redact: a gateway configured entirely through the
+        // API has no file yet, and creating one here would be a surprise.
+        return Ok(());
+    }
+    let mut on_disk = aether::NetworkConfig::load().map_err(|e| StaticPskError::Io {
+        path: path.display().to_string(),
+        cause: e.to_string(),
+    })?;
+    if on_disk
+        .peers
+        .iter()
+        .all(|peer| peer.preshared_key.is_none())
+    {
+        return Ok(());
+    }
+    for peer in &mut on_disk.peers {
+        peer.preshared_key = None;
+    }
+    on_disk.save().map_err(|e| StaticPskError::Io {
+        path: path.display().to_string(),
+        cause: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -447,6 +495,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("test directory");
         dir
+    }
+
+    /// Serialises the tests that drive `HELIOS_NETWORK_CONFIG`.
+    ///
+    /// The variable is process-wide, so two tests setting it would point each
+    /// other's redaction at the wrong file — and a test that left it unset
+    /// would aim `strip_from_file` at the real `/var/lib/helios/network.toml`.
+    static NETWORK_CONFIG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `network.toml` inside `dir` for the duration of a test.
+    fn with_network_config<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+        let _guard = NETWORK_CONFIG_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let path = dir.join("network.toml");
+        std::env::set_var("HELIOS_NETWORK_CONFIG", &path);
+        let outcome = body();
+        std::env::remove_var("HELIOS_NETWORK_CONFIG");
+        outcome
     }
 
     fn table(peers: &[(&str, &str)]) -> StaticPskMap {
@@ -673,7 +738,8 @@ mod tests {
         };
 
         assert_eq!(
-            adopt_from_config(&mut network, &path, &gateway).expect("adopt"),
+            with_network_config(&dir, || adopt_from_config(&mut network, &path, &gateway))
+                .expect("adopt"),
             1
         );
         // Back in the running config, so the data plane still works…
@@ -694,7 +760,8 @@ mod tests {
         // Idempotent: a restart adopts nothing and still refills.
         network.peers[0].preshared_key = None;
         assert_eq!(
-            adopt_from_config(&mut network, &path, &gateway).expect("second adopt"),
+            with_network_config(&dir, || adopt_from_config(&mut network, &path, &gateway))
+                .expect("second adopt"),
             0
         );
         assert_eq!(
@@ -727,7 +794,8 @@ mod tests {
             }],
             ..aether::NetworkConfig::default()
         };
-        adopt_from_config(&mut network, &path, &gateway).expect("adopt");
+        with_network_config(&dir, || adopt_from_config(&mut network, &path, &gateway))
+            .expect("adopt");
         assert_eq!(
             load(&path, &gateway)
                 .expect("load")
@@ -735,6 +803,78 @@ mod tests {
                 .expect("psk")
                 .expose(),
             "bm91dmVhdQ=="
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-006 §4: `network.toml` never carries a static PSK.
+    ///
+    /// Warning the operator to delete it by hand left the secret on disk for
+    /// as long as nobody read the log. The file is redacted in place — and
+    /// **only** of its PSKs: `wg_private_key` is left exactly as the file holds
+    /// it, because at this point the running config carries the *unsealed* key
+    /// and persisting that would write the gateway identity in the clear.
+    #[test]
+    fn adopting_removes_the_psk_from_the_file_and_leaves_the_identity_alone() {
+        let dir = dir("adopt-strip");
+        let table_path = dir.join("static-psk.hvlt");
+        let gateway = identity();
+        let alice = peer();
+        const LEGACY_IDENTITY: &str = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
+
+        let on_disk = aether::NetworkConfig {
+            wg_private_key: LEGACY_IDENTITY.into(),
+            wg_address: "100.64.0.1/10".into(),
+            peers: vec![aether::WgPeer {
+                name: "alice".into(),
+                public_key: alice.clone(),
+                address: "100.64.1.2/32".into(),
+                admin: false,
+                preshared_key: Some("cHNrLXN0YXRpcXVlLWVuLWNsYWly".into()),
+                key_negotiation_certificate_sha256: None,
+                key_negotiation_pq_certificate_sha256: None,
+                minimum_key_negotiation_mode: Default::default(),
+            }],
+            ..aether::NetworkConfig::default()
+        };
+
+        let network_path = dir.join("network.toml");
+        with_network_config(&dir, || {
+            on_disk.save().expect("write the legacy file");
+            // What the daemon holds by then: the identity already resolved from
+            // the sealed vault, not the one the file carries.
+            let mut running = aether::NetworkConfig {
+                wg_private_key: "REMPLACEE-PAR-LE-COFFRE".into(),
+                ..on_disk.clone()
+            };
+            assert_eq!(
+                adopt_from_config(&mut running, &table_path, &gateway).expect("adopt"),
+                1
+            );
+        });
+
+        let raw = std::fs::read_to_string(&network_path).expect("reread");
+        assert!(
+            !raw.contains("cHNrLXN0YXRpcXVlLWVuLWNsYWly"),
+            "le PSK statique est resté dans network.toml :\n{raw}"
+        );
+        assert!(
+            !raw.contains("REMPLACEE-PAR-LE-COFFRE"),
+            "la clé descellée a été persistée dans network.toml :\n{raw}"
+        );
+        assert!(
+            raw.contains(LEGACY_IDENTITY),
+            "l'expurgation a emporté l'identité que le fichier portait :\n{raw}"
+        );
+
+        // And the PSK is still readable where it now lives.
+        assert_eq!(
+            load(&table_path, &gateway)
+                .expect("load")
+                .get(&alice)
+                .expect("psk")
+                .expose(),
+            "cHNrLXN0YXRpcXVlLWVuLWNsYWly"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -759,5 +899,25 @@ mod tests {
         assert!(map.remove(&alice));
         assert!(!map.remove(&alice));
         assert!(map.is_empty());
+    }
+
+    /// The table is read at every start, from a path a local attacker can
+    /// replace. A sparse file costs nothing to create and would cost the
+    /// gateway its address space if the bound came after the read — which is
+    /// precisely what ADR-006 §2 refuses.
+    #[test]
+    fn a_sparse_table_is_refused_without_being_read() {
+        let dir = dir("sparse");
+        let path = dir.join("static-psk.hvlt");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(2 * 1024 * 1024 * 1024).expect("set_len");
+        drop(file);
+
+        let error = load(&path, &identity()).expect_err("an oversized table must be refused");
+        assert!(
+            matches!(error, StaticPskError::Io { .. }),
+            "obtenu : {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -82,22 +82,39 @@ export interface ImportOutcome {
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP
 // endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
 // one suite.
+//
+// **No secret in this type, by construction** (ADR-006 §5). The shell's
+// `ProfileView` is the mirror of it, and it carries neither the private key nor
+// the static PSK: both stay in Rust, sealed in the vault. Anything that reached
+// this interface would have been serialised into a Tauri message, parsed into a
+// JavaScript `String` nothing can wipe, and held in a DOM node for as long as
+// the screen lives.
+//
+// What the screen actually needs is the **public** half — the one value meant
+// to leave the machine — plus a boolean saying whether each secret is present.
 export interface ClientProfile {
   name: string
   /** Gateway's UDP endpoint: `IP:port` or `FQDN:port`. */
   endpoint: string
-  /** Client's Curve25519 private key (base64). Secret. */
-  private_key: string
   /** Gateway's Curve25519 public key (base64). */
   peer_public_key: string
   /**
-   * **Static** PSK shared out of band (base64). Secret.
+   * Public half of the profile's WireGuard key.
+   *
+   * `null` while the profile has no key yet. This is what the user hands to
+   * the operator to be admitted (ADR-004 §6).
+   */
+  public_key: string | null
+  /** A private key is stored. The screen shows the state, never the value. */
+  has_private_key: boolean
+  /**
+   * A **static** PSK is stored.
    *
    * The PQC PSK from ML-KEM never lands here: it isn't persisted and gets
-   * renegotiated on every connection. `null` is therefore the normal case
+   * renegotiated on every connection. `false` is therefore the normal case
    * for a Helios profile — see `PskKind`.
    */
-  preshared_key: string | null
+  has_static_psk: boolean
   /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
   /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0`. */
@@ -117,6 +134,32 @@ export interface ClientProfile {
 export interface ClientConfig {
   profiles: ClientProfile[]
   selected: string | null
+}
+
+/**
+ * What the screen sends back on save — mirror of the shell's `ProfileDraft`.
+ *
+ * Everything the user can edit, and **no secret**. The two secret-touching
+ * fields are intents rather than values: the interface asks Rust to draw a key
+ * or to clear a PSK, it never carries either.
+ *
+ * There is deliberately no way to *set* a private key or a static PSK from
+ * here. Both arrive through an enrolment document, which `orion-core` parses
+ * and seals without the value ever reaching JavaScript (ADR-004 §6, ADR-006 §5).
+ */
+export interface ProfileDraft {
+  name: string
+  endpoint: string
+  peer_public_key: string
+  address: string | null
+  allowed_ips: string
+  persistent_keepalive: number
+  heliosd_url: string | null
+  key_negotiation: KeyNegotiationSettings | null
+  /** Draw a fresh WireGuard key pair in Rust and adopt it. */
+  generatePrivateKey?: boolean
+  /** Drop the stored static PSK. */
+  clearPresharedKey?: boolean
 }
 
 /**

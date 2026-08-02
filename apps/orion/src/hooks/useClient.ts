@@ -4,6 +4,7 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  ProfileDraft,
   PskKind,
   TelemetrySample,
   TunnelState,
@@ -141,10 +142,10 @@ export function useClient() {
     }
   }, [])
 
-  const saveProfile = useCallback(async (p: ClientProfile) => {
+  const saveProfile = useCallback(async (draft: ProfileDraft) => {
     try {
       setError(null)
-      setConfig(await api.saveProfile(p))
+      setConfig(await api.saveProfile(draft))
     } catch (cause) {
       setError(String(cause))
       throw cause

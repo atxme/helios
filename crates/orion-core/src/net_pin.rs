@@ -279,6 +279,10 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::matches_prefix;
+    #[cfg(windows)]
+    use super::negotiation_socket;
+    #[cfg(windows)]
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn prefix_comparison_accepts_the_default_route() {
@@ -317,5 +321,38 @@ mod tests {
         // negotiation down with it.
         assert!(!matches_prefix(&[10, 0, 0, 1], &[10, 0, 0, 1], 64));
         assert!(!matches_prefix(&[10, 0, 0, 1], &[10, 0], 24));
+        assert!(!matches_prefix(&[10], &[10], 9));
+        assert!(!matches_prefix(&[10, 1], &[11, 1], 9));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn negotiation_socket_uses_the_remote_address_family() {
+        let socket = negotiation_socket(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+            "orion-adapter-that-does-not-exist",
+        )
+        .unwrap();
+
+        assert!(socket.local_addr().unwrap().is_ipv4());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_route_lookup_handles_absent_and_avoided_interfaces() {
+        assert_eq!(
+            super::windows_impl::interface_index("orion-adapter-that-does-not-exist"),
+            None
+        );
+        let route =
+            super::windows_impl::best_interface_avoiding(IpAddr::V4(Ipv4Addr::LOCALHOST), None)
+                .unwrap();
+        let avoided = route.expect("Windows must have a route to its loopback");
+        let alternative = super::windows_impl::best_interface_avoiding(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(avoided),
+        )
+        .unwrap();
+        assert_ne!(alternative, Some(avoided));
     }
 }

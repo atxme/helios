@@ -104,7 +104,7 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&tmp, path) {
+    if let Err(error) = publish_temporary(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
@@ -112,6 +112,45 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // The rename itself is a directory operation: without this, a power loss
     // can leave the directory entry pointing at neither name.
     sync_parent(path)
+}
+
+/// Publishes a complete temporary file, replacing the previous generation.
+#[cfg(not(windows))]
+fn publish_temporary(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+/// Windows `std::fs::rename` refuses an existing destination. `MoveFileExW`
+/// supplies the same replace operation the Unix rename path provides, on the
+/// same volume, and asks the filesystem to flush it before returning.
+#[cfg(windows)]
+fn publish_temporary(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Builds a temporary path nobody else is using.

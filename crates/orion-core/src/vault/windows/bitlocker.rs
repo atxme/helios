@@ -211,6 +211,30 @@ mod imp {
             _ => VolumeProtection::Indeterminate,
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn volume_letters_are_normalized_before_entering_wql() {
+            assert_eq!(volume_of(Path::new(r"c:\Users\Orion")), Some("C:".into()));
+            assert_eq!(volume_of(Path::new(r"Z:\")), Some("Z:".into()));
+            assert_eq!(volume_of(Path::new("relative")), None);
+            assert_eq!(volume_of(Path::new(r"1:\data")), None);
+        }
+
+        #[test]
+        fn the_windows_query_fails_closed_for_the_current_volume() {
+            let executable = std::env::current_exe().unwrap();
+            let posture = protection_of(&executable);
+            assert!(!posture.detail().is_empty());
+            assert_eq!(
+                posture.allows_secrets(),
+                posture == VolumeProtection::Protected
+            );
+        }
+    }
 }
 
 #[cfg(not(windows))]
