@@ -20,6 +20,7 @@ import Typography from '@mui/material/Typography'
 import {
   AlertTriangle,
   ChevronRight,
+  KeyRound,
   FileCode2,
   Plus,
   RotateCcw,
@@ -81,8 +82,9 @@ function blankProfile(): ClientProfile {
     name: 'nouveau',
     endpoint: '',
     peer_public_key: '',
-    // A brand-new profile has no key yet: Rust draws one when it is first
-    // saved. Nothing here ever holds one (ADR-006 §5).
+    // A brand-new profile has no key yet. The identity block above is where
+    // one is obtained — generated or imported — and only its public half ever
+    // reaches this object (ADR-006 §5).
     public_key: null,
     has_private_key: false,
     has_static_psk: false,
@@ -181,13 +183,18 @@ export function ProfilesView({
   const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   /**
-   * Secret-touching **intents**, not values.
+   * Public key of the pair staged in Rust, once one has been drawn or pasted.
    *
-   * The screen can ask Rust to draw a new key or to drop the static PSK; it
-   * cannot supply either. Holding them as booleans beside the draft is what
-   * keeps the form a description of public state.
+   * `null` means "no new key this session" — the profile keeps whatever it
+   * already had. Holding the **public** half here is what lets the screen show
+   * and copy it straight away: admission is out of band, so the user needs the
+   * value before the profile can work, not after saving it.
    */
-  const [rotateKey, setRotateKey] = useState(false)
+  const [stagedPublicKey, setStagedPublicKey] = useState<string | null>(null)
+  /** The paste field is open. It holds a secret, so it is never left mounted. */
+  const [pasting, setPasting] = useState(false)
+  const [pasted, setPasted] = useState('')
+  const [keyBusy, setKeyBusy] = useState(false)
   const [clearPsk, setClearPsk] = useState(false)
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
@@ -272,15 +279,16 @@ export function ProfilesView({
       persistent_keepalive: profile.persistent_keepalive,
       heliosd_url: profile.heliosd_url,
       key_negotiation: profile.key_negotiation,
-      generatePrivateKey: rotateKey,
+      useStagedKey: stagedPublicKey !== null,
       clearPresharedKey: clearPsk,
     }),
-    [clearPsk, rotateKey],
+    [clearPsk, stagedPublicKey],
   )
 
-  // The public key is no longer derived on demand: it comes down with the
-  // profile, because the private half it derives from never leaves Rust.
-  const publicKey = draft.public_key
+  // A staged key wins over the stored one: it is what a save is about to
+  // adopt, so it is what the user must copy and hand to the operator.
+  const publicKey = stagedPublicKey ?? draft.public_key
+  const hasKey = stagedPublicKey !== null || draft.has_private_key
 
   // The rules live in `orion-core`: we query the core rather than duplicate
   // its validation grammar in the UI. The call is deferred until typing
@@ -315,9 +323,12 @@ export function ProfilesView({
     setHistory([])
     setFloorBaseline(profile.key_negotiation?.minimum_mode ?? null)
     // Intents belong to the edit in progress, never to the profile: carrying a
-    // pending rotation onto the next profile loaded would rotate a key the
-    // user never asked about.
-    setRotateKey(false)
+    // staged key onto the next profile loaded would attach it to an identity
+    // the operator never admitted.
+    setStagedPublicKey(null)
+    setPasting(false)
+    setPasted('')
+    void api.discardStagedKey().catch(() => {})
     setClearPsk(false)
   }, [])
 
@@ -451,7 +462,11 @@ export function ProfilesView({
     try {
       await onSave(toDraft(draft))
       setDirty(false)
-      setRotateKey(false)
+      // The key has become the profile's: the slot is empty on the Rust side
+      // too, and keeping it here would re-send it at the next save.
+      setStagedPublicKey(null)
+      setPasting(false)
+      setPasted('')
       setClearPsk(false)
       // Saving is the one action here with no visible consequence: the form
       // shows exactly what it showed a moment earlier. Without a word, one
@@ -463,6 +478,49 @@ export function ProfilesView({
       })
     } catch {
       // The global error keeps the draft intact to allow a correction.
+    }
+  }
+
+  /** Draws a pair in Rust and shows the public half at once. */
+  const generateKey = async () => {
+    setKeyBusy(true)
+    try {
+      setStagedPublicKey(await api.generatePrivateKey())
+      setPasting(false)
+      setPasted('')
+      setDirty(true)
+      setNotice({
+        tone: 'success',
+        message:
+          'Clé générée. Transmettre la clé publique à l’opérateur, puis enregistrer.',
+      })
+    } catch (cause) {
+      setNotice({ tone: 'error', message: `Génération impossible : ${String(cause)}` })
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  /**
+   * Hands a pasted key to Rust, which validates it and answers its public half.
+   *
+   * The input is cleared on both outcomes. It is the only field in this screen
+   * that ever holds a secret, and it must not outlive the gesture.
+   */
+  const adoptKey = async () => {
+    setKeyBusy(true)
+    try {
+      const publicHalf = await api.adoptPrivateKey(pasted)
+      setPasted('')
+      setPasting(false)
+      setStagedPublicKey(publicHalf)
+      setDirty(true)
+      setNotice({ tone: 'success', message: 'Clé privée importée.' })
+    } catch (cause) {
+      setPasted('')
+      setNotice({ tone: 'error', message: String(cause) })
+    } finally {
+      setKeyBusy(false)
     }
   }
 
@@ -673,6 +731,114 @@ export function ProfilesView({
             </Alert>
           )}
 
+          {/* ── Identity ─────────────────────────────────────────────────
+              Its own block, full width, above the rest. It used to be two
+              rows lost inside the two-column grid — a state line that read
+              like a broken label, and a public key showing a dash because no
+              key existed yet. Both belong to one act: obtain an identity, then
+              hand its public half to the operator. Admission is out of band
+              (ADR-004 §6), so this is the step everything else waits on. */}
+          <Box
+            sx={{
+              mb: 1.5,
+              p: 1.5,
+              border: 1,
+              borderColor: 'divider',
+              borderRadius: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1.25,
+            }}
+          >
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Typography sx={{ fontSize: 12, fontWeight: 700 }}>
+                Identité de ce poste
+              </Typography>
+              <Typography
+                sx={{
+                  fontSize: 10.5,
+                  fontFamily: 'monospace',
+                  color: hasKey ? 'success.main' : 'text.disabled',
+                }}
+              >
+                {stagedPublicKey
+                  ? 'nouvelle clé — à enregistrer'
+                  : hasKey
+                    ? 'clé scellée dans le coffre'
+                    : 'aucune clé'}
+              </Typography>
+            </Box>
+
+            <ReadOnlyField
+              label="Votre clé publique"
+              value={publicKey ?? '—'}
+              hint="À transmettre à l’opérateur : l’admission est hors bande, elle doit être déclarée sur Helios avant le premier handshake."
+            />
+
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
+              <Button
+                size="small"
+                variant="outlined"
+                color="inherit"
+                disabled={keyBusy}
+                onClick={generateKey}
+                startIcon={<KeyRound size={14} aria-hidden />}
+                sx={{ fontSize: 11.5, textTransform: 'none' }}
+              >
+                {hasKey ? 'Générer une nouvelle clé' : 'Générer une clé'}
+              </Button>
+              <Button
+                size="small"
+                variant="text"
+                color="inherit"
+                disabled={keyBusy}
+                onClick={() => setPasting((open) => !open)}
+                sx={{ fontSize: 11.5, textTransform: 'none', color: 'text.secondary' }}
+              >
+                {pasting ? 'Annuler l’import' : 'Importer une clé privée'}
+              </Button>
+              {issues.private_key && (
+                <Typography color="error" sx={{ fontSize: 10.5 }}>
+                  {issues.private_key}
+                </Typography>
+              )}
+            </Box>
+
+            {/* Mounted only while it is being used. This is the single field in
+                the screen that carries a secret, and it travels **inbound**
+                only: Rust validates it, answers with the public half, and the
+                input is cleared on both outcomes (ADR-006 §5). */}
+            {pasting && (
+              <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  label="Clé privée WireGuard (base64)"
+                  value={pasted}
+                  onChange={(event) => setPasted(event.target.value)}
+                  helperText="Collée une fois, jamais réaffichée. Sortie de `wg genkey` ou d’un fichier wg-quick."
+                  sx={{
+                    '& input': { fontFamily: 'monospace', fontSize: 12 },
+                    '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
+                  }}
+                />
+                <Button
+                  size="small"
+                  variant="contained"
+                  disableElevation
+                  disabled={keyBusy || pasted.trim().length === 0}
+                  onClick={adoptKey}
+                  sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
+                >
+                  Valider
+                </Button>
+              </Box>
+            )}
+          </Box>
+
           <Box
             sx={{
               display: 'grid',
@@ -691,32 +857,6 @@ export function ProfilesView({
                 value={draft.endpoint}
                 onChange={(value) => set('endpoint', value)}
               />
-              {/* The private key is stated, never shown. It used to be a text
-                  field with a reveal button, which put it in the WebView DOM
-                  and in a JavaScript string nothing can wipe — see the note on
-                  the shell's `ProfileView`. It arrives by enrolment or is drawn
-                  in Rust; either way it does not come through here. */}
-              <SecretState
-                label="Clé privée"
-                present={draft.has_private_key || rotateKey}
-                error={issues.private_key}
-                presentLabel={rotateKey ? 'nouvelle clé à l’enregistrement' : 'scellée dans le coffre'}
-                absentLabel="aucune — importer un profil ou en générer une"
-                action={{
-                  label: draft.has_private_key ? 'Générer une nouvelle clé' : 'Générer une clé',
-                  onClick: () => {
-                    setRotateKey(true)
-                    setDirty(true)
-                    setNotice({
-                      tone: 'success',
-                      message:
-                        'Nouvelle clé à l’enregistrement. Sa clé publique devra être réadmise par l’opérateur.',
-                    })
-                  },
-                  disabled: rotateKey,
-                }}
-                hint="Elle ne quitte jamais le poste."
-              />
               <Field
                 label="Clé publique gateway"
                 error={issues.peer_public_key}
@@ -733,12 +873,6 @@ export function ProfilesView({
                 value={draft.address ?? ''}
                 onChange={(value) => set('address', value || null)}
               />
-              <ReadOnlyField
-                label="Votre clé publique"
-                value={publicKey ?? '—'}
-                hint="À transmettre à l’opérateur : l’admission est hors bande, elle doit être déclarée sur Helios avant le premier handshake."
-              />
-
               <ButtonBase
                 onClick={() => setAdvanced((open) => !open)}
                 aria-expanded={advanced}

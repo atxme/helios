@@ -80,6 +80,39 @@ struct AppState {
     /// takes it; anything else drops it when Orion closes, which loses nothing:
     /// the document can be imported again.
     pending_imports: Arc<Mutex<std::collections::HashMap<String, ClientProfile>>>,
+    /// The key the user just generated or pasted, waiting to be saved.
+    ///
+    /// # The workflow this exists for
+    ///
+    /// Admission is out of band (ADR-004 §6): the user needs a **public** key
+    /// to hand the operator *before* a profile can be completed, since the
+    /// gateway must admit it before the first handshake. Producing that key
+    /// only at save time made the screen show a dash where the value belonged,
+    /// and left no way to copy it.
+    ///
+    /// So the key is drawn on the spot and its public half returned at once —
+    /// visible, copiable, and stable until the profile is saved. The private
+    /// half stays here. One slot rather than a map: the screen edits one
+    /// profile at a time, and a slot that could hold two keys would eventually
+    /// attach the wrong one.
+    staged_key: Arc<Mutex<Option<StagedKey>>>,
+}
+
+/// A WireGuard key pair held between its creation and its save.
+///
+/// Never `Clone`, never `Serialize`: only [`StagedKey::public_key`] is meant to
+/// leave this process, and it does so as a plain `String` the caller asks for
+/// explicitly (ADR-006 §5).
+struct StagedKey {
+    private_key: String,
+    public_key: String,
+}
+
+impl Drop for StagedKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.private_key.zeroize();
+    }
 }
 
 /// Polling interval for the last WireGuard handshake.
@@ -446,14 +479,13 @@ struct ProfileDraft {
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-    /// Draws a fresh WireGuard key pair **in Rust** and adopts it.
+    /// Adopts the key sitting in [`AppState::staged_key`].
     ///
-    /// The only way this build creates a key. It never travels: the screen
-    /// asks, `orion-core` generates, the vault seals, and the answer that comes
-    /// back is the public half. A user who wants a new key gets one without any
-    /// part of the pair crossing the IPC.
+    /// Set by the screen after `generate_private_key` or `adopt_private_key`
+    /// has already produced one and shown its **public** half. The private half
+    /// never travels back: it waited in Rust the whole time.
     #[serde(default)]
-    generate_private_key: bool,
+    use_staged_key: bool,
     /// Clears the stored static PSK. There is deliberately no field to *set*
     /// one from the screen: a static PSK is an out-of-band value, and the
     /// enrolment document is what carries it.
@@ -468,7 +500,11 @@ impl ProfileDraft {
     /// case where a key must be generated: refusing instead would leave the
     /// screen with no way at all to make a profile, and inventing an empty key
     /// would produce one that fails `validate` with a message about enrolment.
-    fn merge(self, stored: Option<&ClientProfile>) -> Result<ClientProfile, String> {
+    fn merge(
+        self,
+        stored: Option<&ClientProfile>,
+        staged: Option<&StagedKey>,
+    ) -> Result<ClientProfile, String> {
         let mut profile = match stored {
             Some(profile) => profile.clone(),
             None => ClientProfile {
@@ -476,10 +512,25 @@ impl ProfileDraft {
                 ..ClientProfile::default()
             },
         };
-        if self.generate_private_key || stored.is_none() {
-            let pair = aether::wg::generate_keypair()
-                .map_err(|error| format!("génération de la paire de clés : {error}"))?;
-            profile.private_key = pair.private_key.expose().to_string();
+        if self.use_staged_key {
+            let staged = staged.ok_or(
+                "aucune clé en attente : générer ou importer une clé privée avant d'enregistrer",
+            )?;
+            // The public half was shown, copied, and handed to the operator for
+            // admission. Saving a private key that derives to anything else
+            // would produce a profile whose handshakes never succeed, with
+            // nothing on either side naming the cause — the gateway admitted a
+            // key this profile does not hold. Re-deriving costs microseconds.
+            let derived = aether::wg::public_from_private(&staged.private_key)
+                .map_err(|error| format!("clé en attente illisible : {error}"))?;
+            if derived != staged.public_key {
+                return Err(
+                    "la clé en attente ne correspond plus à la clé publique affichée — \
+                     regénérer avant d'enregistrer"
+                        .into(),
+                );
+            }
+            profile.private_key = staged.private_key.clone();
         }
         if self.clear_preshared_key {
             profile.preshared_key = None;
@@ -640,6 +691,71 @@ async fn vault_posture(
     Ok(state.store.posture())
 }
 
+/// Draws a WireGuard key pair and returns its **public** half.
+///
+/// The private half stays in [`AppState::staged_key`] until the profile is
+/// saved. Returning the public key straight away is what makes the enrolment
+/// workflow possible at all: the user copies it, hands it to the operator, and
+/// receives an admitted profile — none of which can happen if the key only
+/// comes into existence when the form is submitted.
+#[tauri::command]
+async fn generate_private_key(state: State<'_, AppState>) -> Result<String, String> {
+    let pair = aether::wg::generate_keypair()
+        .map_err(|error| format!("génération de la paire de clés : {error}"))?;
+    let public_key = pair.public_key.clone();
+    *state.staged_key.lock().await = Some(StagedKey {
+        private_key: pair.private_key.expose().to_string(),
+        public_key: public_key.clone(),
+    });
+    Ok(public_key)
+}
+
+/// Adopts a private key the user supplies, and returns its public half.
+///
+/// # Why this exists, having been refused once
+///
+/// An earlier revision removed every way of entering a key, on the grounds
+/// that one arriving through the interface has crossed JavaScript. That is
+/// true, and it is a real cost — but it left no path for the ordinary case of
+/// a key produced by `wg genkey` or carried by an existing `wg-quick` file, and
+/// a client that cannot accept an existing identity is not a client.
+///
+/// The direction is what makes this acceptable. A key **entering** crosses the
+/// IPC once, at an explicit gesture, and the field is cleared immediately
+/// after. A key **leaving** would sit in the DOM for as long as the screen
+/// lives, on every render, for a value nobody asked to see. ADR-006 §5 forbids
+/// the second; this is not it.
+///
+/// Validation happens here rather than on screen: `orion-core` owns the rules,
+/// and a key the interface accepted but the core refuses would be a profile
+/// that fails at connection time with a message about enrolment.
+#[tauri::command]
+async fn adopt_private_key(
+    state: State<'_, AppState>,
+    private_key: String,
+) -> Result<String, String> {
+    let private_key = private_key.trim().to_string();
+    let public_key = aether::wg::public_from_private(&private_key).map_err(|_| {
+        "clé privée invalide : une clé WireGuard est 32 octets encodés en base64 \
+         (44 caractères finissant par « = »)"
+            .to_string()
+    })?;
+    *state.staged_key.lock().await = Some(StagedKey {
+        private_key,
+        public_key: public_key.clone(),
+    });
+    Ok(public_key)
+}
+
+/// Drops the staged key without saving it.
+#[tauri::command]
+async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
+    // `Drop` zeroizes it: cancelling must not leave the key in memory for the
+    // rest of the session.
+    state.staged_key.lock().await.take();
+    Ok(())
+}
+
 /// Merges a draft onto the stored profile and seals the result.
 ///
 /// The volume-encryption gate is here rather than in the store because this is
@@ -660,7 +776,10 @@ async fn save_profile(
         Some(profile) => Some(profile),
         None => state.pending_imports.lock().await.remove(&draft.name),
     };
-    let profile = draft.merge(stored.as_ref())?;
+    // Taken, not peeked: the key is now the profile's, and leaving a copy in
+    // the slot would let the next profile saved adopt it too.
+    let staged = state.staged_key.lock().await.take();
+    let profile = draft.merge(stored.as_ref(), staged.as_ref())?;
     let selected = profile.name.clone();
     state
         .store
@@ -881,7 +1000,9 @@ async fn validate_profile(
         // the key the first two had.
         None => state.pending_imports.lock().await.get(&draft.name).cloned(),
     };
-    let profile = draft.merge(stored.as_ref())?;
+    // Validation runs on every keystroke: the staged key is read, never taken.
+    let staged = state.staged_key.lock().await;
+    let profile = draft.merge(stored.as_ref(), staged.as_ref())?;
     Ok(inspect_profile(&profile))
 }
 
@@ -1177,6 +1298,7 @@ fn main() {
             telemetry: Arc::new(TelemetryManager::default()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            staged_key: Arc::new(Mutex::new(None)),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
@@ -1197,6 +1319,9 @@ fn main() {
             import_profile,
             import_profile_path,
             save_profile,
+            generate_private_key,
+            adopt_private_key,
+            discard_staged_key,
             delete_profile,
             select_profile,
             connect,
@@ -1217,7 +1342,7 @@ fn main() {
 mod security_tests {
     use super::{
         associated_profile_paths, sanitize_stem, window_size_for, ClientProfile, ConfigView, Path,
-        PathBuf, ProfileDraft, ProfileView,
+        PathBuf, ProfileDraft, ProfileView, StagedKey,
     };
 
     fn profile(name: &str) -> ClientProfile {
@@ -1244,7 +1369,7 @@ mod security_tests {
             persistent_keepalive: 25,
             heliosd_url: None,
             key_negotiation: None,
-            generate_private_key: false,
+            use_staged_key: false,
             clear_preshared_key: false,
         }
     }
@@ -1310,30 +1435,44 @@ mod security_tests {
 
         let mut edit = draft("poste");
         edit.endpoint = "198.51.100.7:51820".into();
-        let merged = edit.merge(Some(&stored)).expect("merge");
+        let merged = edit.merge(Some(&stored), None).expect("merge");
 
         assert_eq!(merged.private_key, key, "la clé stockée a été perdue");
         assert_eq!(merged.preshared_key, psk, "le PSK stocké a été perdu");
         assert_eq!(merged.endpoint, "198.51.100.7:51820");
     }
 
-    /// A new profile gets a key drawn in Rust, and so does an explicit rotation.
+    /// The staged key is what a save adopts, and only when asked.
+    ///
+    /// The pair is drawn — or parsed — by the commands, which return the
+    /// **public** half; the private one waits in `AppState`. `merge` is the
+    /// step that attaches it, and it must refuse to invent one.
     #[test]
-    fn a_key_is_drawn_in_rust_and_never_travels() {
-        let created = draft("nouveau").merge(None).expect("merge");
-        assert!(
-            !created.private_key.trim().is_empty(),
-            "un profil neuf doit recevoir une clé"
-        );
-        assert!(created.public_key().is_some(), "la clé doit être valide");
+    fn only_a_staged_key_becomes_a_profile_key() {
+        let pair = aether::wg::generate_keypair().expect("keypair");
+        let staged = StagedKey {
+            private_key: pair.private_key.expose().to_string(),
+            public_key: pair.public_key.clone(),
+        };
 
-        let mut rotation = draft("poste");
-        rotation.generate_private_key = true;
-        let rotated = rotation.merge(Some(&created)).expect("merge");
-        assert_ne!(
-            rotated.private_key, created.private_key,
-            "une rotation demandée doit produire une nouvelle clé"
+        let mut adopting = draft("nouveau");
+        adopting.use_staged_key = true;
+        let created = adopting.merge(None, Some(&staged)).expect("merge");
+        assert_eq!(created.private_key, staged.private_key);
+        assert_eq!(
+            created.public_key().as_deref(),
+            Some(pair.public_key.as_str())
         );
+
+        // Asking for a staged key that does not exist is an error, not a
+        // silently invented identity the operator never admitted.
+        let mut orphan = draft("nouveau");
+        orphan.use_staged_key = true;
+        assert!(orphan.merge(None, None).is_err());
+
+        // And without the intent, a stored key is left exactly as it was.
+        let kept = draft("poste").merge(Some(&created), Some(&staged));
+        assert_eq!(kept.expect("merge").private_key, created.private_key);
     }
 
     /// Clearing a static PSK is explicit, and is the only way to touch it.
@@ -1343,7 +1482,10 @@ mod security_tests {
         let mut clearing = draft("poste");
         clearing.clear_preshared_key = true;
         assert_eq!(
-            clearing.merge(Some(&stored)).expect("merge").preshared_key,
+            clearing
+                .merge(Some(&stored), None)
+                .expect("merge")
+                .preshared_key,
             None
         );
 
@@ -1351,7 +1493,7 @@ mod security_tests {
         // to the ephemeral profile the backend mounts, nowhere else.
         assert!(
             !draft("poste")
-                .merge(Some(&stored))
+                .merge(Some(&stored), None)
                 .expect("merge")
                 .preshared_key_is_negotiated
         );

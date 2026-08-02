@@ -10,6 +10,9 @@ const api = vi.hoisted(() => ({
   keyNegotiationIdentitySealed: vi.fn(),
   keyNegotiationSupport: vi.fn(),
   validateProfile: vi.fn(),
+  generatePrivateKey: vi.fn(),
+  adoptPrivateKey: vi.fn(),
+  discardStagedKey: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -62,6 +65,9 @@ beforeEach(() => {
   api.keyNegotiationIdentitySealed.mockResolvedValue(false)
   api.keyNegotiationSupport.mockResolvedValue({ identity_store: false })
   api.validateProfile.mockResolvedValue(noIssues)
+  api.generatePrivateKey.mockResolvedValue('clé-publique-générée')
+  api.adoptPrivateKey.mockResolvedValue('clé-publique-importée')
+  api.discardStagedKey.mockResolvedValue(undefined)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
 })
 
@@ -142,15 +148,19 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
 
-    // No masked field at all: a `type="password"` input is how a secret used
-    // to get here, and there is no longer any secret for one to hold.
+    // Nothing masked is mounted while nobody is entering a key: the paste
+    // field is the only one, and it appears on demand.
     expect(document.querySelectorAll('input[type="password"]').length).toBe(0)
-    // Nor a way to reveal one.
+    // And no way to reveal a stored value, in either direction.
     expect(screen.queryByLabelText('Afficher la valeur')).toBeNull()
 
-    // The two secrets are *stated*, never shown.
-    expect(screen.getByText('scellée dans le coffre')).toBeTruthy()
+    // The secrets are *stated*, never shown — and the public half, which is
+    // meant to leave the machine, is the one value on screen.
+    expect(screen.getByText('clé scellée dans le coffre')).toBeTruthy()
     expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
+    expect((screen.getByLabelText('Votre clé publique') as HTMLInputElement).value).toBe(
+      'client-public',
+    )
 
     // And what leaves the screen carries neither, in either direction.
     fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'vpn.example:51820' } })
@@ -169,10 +179,14 @@ describe('ProfilesView interactions', () => {
   })
 
   /**
-   * The intents are the only way the screen touches a secret, and they are
-   * requests, not values.
+   * The enrolment workflow, which is what the identity block exists for.
+   *
+   * Generating must yield a **public** key on the spot — copiable, and handed
+   * to the operator — because admission is out of band and everything else
+   * waits on it. Producing the key only at save time showed a dash where that
+   * value belonged and left nothing to copy.
    */
-  it('asks Rust to draw a key and to drop a PSK, without carrying either', async () => {
+  it('shows and stages a generated public key without ever holding the private one', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -182,20 +196,86 @@ describe('ProfilesView interactions', () => {
       />,
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
-    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
-    expect(screen.getByText(/réadmise par l’opérateur/)).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
+    await waitFor(() =>
+      expect((screen.getByLabelText('Votre clé publique') as HTMLInputElement).value).toBe(
+        'clé-publique-générée',
+      ),
+    )
+    expect(screen.getByText('nouvelle clé — à enregistrer')).toBeTruthy()
 
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
 
     const sent = handlers.onSave.mock.calls[0][0]
-    expect(sent.generatePrivateKey).toBe(true)
+    expect(sent.useStagedKey).toBe(true)
     expect(sent.clearPresharedKey).toBe(true)
-    // Still no value anywhere near it.
-    expect(JSON.stringify(sent)).not.toContain('client-public')
+    // The pair itself stayed in Rust: only the intent travelled.
+    expect(sent).not.toHaveProperty('private_key')
+  })
+
+  /**
+   * Importing an existing key: the one inbound path, and it must not linger.
+   *
+   * The field is cleared as soon as Rust answers, and Rust answers with the
+   * public half — so the value the user gives the operator is the one that
+   * will actually be saved.
+   */
+  it('imports a pasted private key and clears the field at once', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Importer une clé privée' }))
+    const field = screen.getByLabelText('Clé privée WireGuard (base64)') as HTMLInputElement
+    expect(field.type).toBe('password')
+
+    fireEvent.change(field, { target: { value: 'cGFzdGVkLXByaXZhdGUta2V5' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Valider' }))
+
+    await waitFor(() =>
+      expect(api.adoptPrivateKey).toHaveBeenCalledWith('cGFzdGVkLXByaXZhdGUta2V5'),
+    )
+    // The field is gone, and the public half is on screen.
+    await waitFor(() =>
+      expect(screen.queryByLabelText('Clé privée WireGuard (base64)')).toBeNull(),
+    )
+    expect((screen.getByLabelText('Votre clé publique') as HTMLInputElement).value).toBe(
+      'clé-publique-importée',
+    )
+    expect(document.body.innerHTML).not.toContain('cGFzdGVkLXByaXZhdGUta2V5')
+  })
+
+  /** A rejected key must not stay in the field either. */
+  it('clears the paste field when Rust refuses the key', async () => {
+    api.adoptPrivateKey.mockRejectedValueOnce('clé privée invalide')
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Importer une clé privée' }))
+    fireEvent.change(screen.getByLabelText('Clé privée WireGuard (base64)'), {
+      target: { value: 'pas-une-cle' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Valider' }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('invalide'))
+    expect(document.body.innerHTML).not.toContain('pas-une-cle')
   })
 
   it('selects, creates and deletes profiles through explicit actions', async () => {

@@ -156,8 +156,13 @@ export interface ProfileDraft {
   persistent_keepalive: number
   heliosd_url: string | null
   key_negotiation: KeyNegotiationSettings | null
-  /** Draw a fresh WireGuard key pair in Rust and adopt it. */
-  generatePrivateKey?: boolean
+  /**
+   * Adopt the key staged by `generatePrivateKey` or `adoptPrivateKey`.
+   *
+   * The pair already exists in Rust and its public half is on screen; this
+   * only says "keep it". Without it, a save leaves the stored key untouched.
+   */
+  useStagedKey?: boolean
   /** Drop the stored static PSK. */
   clearPresharedKey?: boolean
 }

@@ -73,6 +73,30 @@ export const keyNegotiationFingerprint = (
   keyNegotiation: KeyNegotiationSettings | null,
 ) => invoke<string | null>('key_negotiation_fingerprint', { keyNegotiation })
 
+/**
+ * Draws a WireGuard key pair in Rust and returns its **public** half.
+ *
+ * The private half never comes back — it waits in the shell until the profile
+ * is saved. The public one is returned at once because it is what the user
+ * hands the operator: admission is out of band, and it has to happen before
+ * the profile can work at all.
+ */
+export const generatePrivateKey = () => invoke<string>('generate_private_key')
+
+/**
+ * Hands an existing private key to Rust, which validates it and answers with
+ * its public half.
+ *
+ * This is the one place a secret travels **towards** the shell, at an explicit
+ * gesture. The caller must clear its input immediately afterwards: a value
+ * left in a field stays in the DOM for as long as the screen lives.
+ */
+export const adoptPrivateKey = (privateKey: string) =>
+  invoke<string>('adopt_private_key', { privateKey })
+
+/** Drops the staged key. Called when an edit is abandoned. */
+export const discardStagedKey = () => invoke<void>('discard_staged_key')
+
 export const saveProfile = (draft: ProfileDraft) =>
   invoke<ClientConfig>('save_profile', { draft })
 export const deleteProfile = (name: string) =>
