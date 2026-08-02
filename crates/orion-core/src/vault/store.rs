@@ -23,14 +23,20 @@
 //! auto-connect blocked — or wholly new and verifiable. There is no window in
 //! which a half-migrated profile is presented as sound.
 //!
-//! # Rotation, not deletion
+//! # Rotation, advised — not imposed
 //!
-//! A key that ever lived in plaintext is presumed compromised: it may sit in a
-//! roaming profile, a backup or a system image, and encrypting it now does not
-//! recall those copies. Migration therefore seals it *and* marks the profile
-//! `rotation_required`, which keeps it unconnectable until a new key has been
-//! generated and re-admitted. Sealing ends the exposure of the *file*; only
-//! rotation ends the exposure of the *key*.
+//! A key that lived in plaintext may sit in a roaming profile, a backup or a
+//! system image, and encrypting it now does not recall those copies. Migration
+//! therefore seals it *and* flags the profile, so the posture and the log say
+//! so and the Profiles screen offers the rotation in one gesture.
+//!
+//! The flag does **not** block the connection. This module observes the history
+//! of a *file*; it knows nothing about the key itself, which may never have
+//! left the machine. Refusing someone their own tunnel on that presumption
+//! oversteps what a client arbitrates — revoking an admission belongs to the
+//! operator, who alone has the means (ADR-006 §3, arbitrage du 2 août 2026).
+
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
@@ -99,6 +105,8 @@ pub struct ProfileStore {
     /// Same distinction as above, for the same reason: an unencrypted volume is
     /// a refusal, and only this flag turns it into a stated choice.
     unencrypted_volume: bool,
+    /// Installation root, unwrapped once. See [`ProfileStore::root`].
+    root_cache: std::sync::Mutex<Option<Arc<DeviceRootKey>>>,
 }
 
 impl ProfileStore {
@@ -108,6 +116,7 @@ impl ProfileStore {
             provider,
             software_keystore: false,
             unencrypted_volume: false,
+            root_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -259,8 +268,48 @@ impl ProfileStore {
         Ok(id.as_bytes().to_vec())
     }
 
-    fn root(&self) -> Result<DeviceRootKey, VaultError> {
-        self.provider.root_key()
+    /// The installation root, unwrapped **once** per process.
+    ///
+    /// # Why this is cached
+    ///
+    /// Every vault operation needs it, and each miss is a TPM RSA decrypt —
+    /// roughly 250 ms on ordinary hardware. Uncached, a single connection paid
+    /// six of them: posture, migration, load, `rotation_required`, save,
+    /// selection. Beyond the latency, a TPM is a rate-limited device: some
+    /// chips enter anti-hammering lockout under exactly this kind of drumming,
+    /// and the failure mode is a machine that stops opening its own vault.
+    ///
+    /// # Why caching costs nothing here
+    ///
+    /// ADR-006 §5 asks for minimal secret lifetime, and this is a deliberate
+    /// exception rather than an oversight. The root is not a tunnel key: it is
+    /// the vault's key-encryption root, needed for every read and write, and it
+    /// was already resident during each of those six operations. What an
+    /// attacker gains from it being resident *between* them is nothing they did
+    /// not already have — under T9 they run as the account, so they can ask the
+    /// TPM to unwrap it themselves. The TPM key is non-exportable; it is not
+    /// unusable.
+    ///
+    /// `Arc` rather than `Clone`: [`DeviceRootKey`] deliberately has no `Clone`,
+    /// and sharing a pointer keeps that true — there is still exactly one copy
+    /// of the key material, zeroized when the last holder drops it.
+    ///
+    /// # Limite connue
+    ///
+    /// There is no way to drop it before the process ends. The `nomade` profile
+    /// will need one — locking the session must forget the root — and that is
+    /// part of the lot which is not built (ADR-006 §3, limites connues).
+    fn root(&self) -> Result<Arc<DeviceRootKey>, VaultError> {
+        let mut cache = self
+            .root_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(root) = cache.as_ref() {
+            return Ok(Arc::clone(root));
+        }
+        let root = Arc::new(self.provider.root_key()?);
+        *cache = Some(Arc::clone(&root));
+        Ok(root)
     }
 
     fn load_registry(&self, root: &DeviceRootKey) -> Result<Registry, VaultError> {
@@ -623,6 +672,69 @@ mod tests {
         fn hardware_backed(&self) -> bool {
             false
         }
+    }
+
+    /// Counts how many times the root was actually unwrapped.
+    ///
+    /// Stands in for the TPM, whose every unwrap is an RSA decrypt costing
+    /// roughly 250 ms on real hardware — and which some chips rate-limit into
+    /// an anti-hammering lockout.
+    #[derive(Default)]
+    struct CountingRoot(std::sync::atomic::AtomicUsize);
+
+    impl RootKeyProvider for CountingRoot {
+        fn root_key(&self) -> Result<DeviceRootKey, VaultError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DeviceRootKey::from_unwrapped(Zeroizing::new(
+                [4u8; KEY_LEN],
+            )))
+        }
+        fn hardware_backed(&self) -> bool {
+            true
+        }
+    }
+
+    /// The root is unwrapped **once**, however many operations follow.
+    ///
+    /// Uncached, one connection cost six TPM unwraps — posture, migration,
+    /// load, `rotation_required`, save, selection — each around 250 ms, on a
+    /// device that is rate-limited by design.
+    #[test]
+    fn the_installation_root_is_unwrapped_once_per_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "orion-store-root-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let counter = Arc::new(CountingRoot::default());
+        struct Shared(Arc<CountingRoot>);
+        impl RootKeyProvider for Shared {
+            fn root_key(&self) -> Result<DeviceRootKey, VaultError> {
+                self.0.root_key()
+            }
+            fn hardware_backed(&self) -> bool {
+                self.0.hardware_backed()
+            }
+        }
+        let store = ProfileStore::new(dir.clone(), Box::new(Shared(Arc::clone(&counter))));
+
+        // The sequence a single connection actually performs.
+        assert!(store.probe_hardware_root());
+        store.save_profile(&profile("poste")).unwrap();
+        let _ = store.load().unwrap();
+        let _ = store.rotation_required().unwrap();
+        let _ = store.posture();
+        store.select("poste").unwrap();
+
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "le TPM ne doit être sollicité qu'une fois par processus"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn store(name: &str) -> (std::path::PathBuf, ProfileStore) {
