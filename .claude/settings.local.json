@@ -246,7 +246,8 @@
       "Bash(magick montage *)",
       "Bash(magick small-16.png -filter point -resize 400% zoom16.png)",
       "Bash(magick small-24.png -filter point -resize 400% zoom24.png)",
-      "Bash(magick identify *)"
+      "Bash(magick identify *)",
+      "Bash(HELIOS_PUBLISHER_KEYRING_PATH=__TRACKED_VAR__/keys/publisher-keyring.json cargo build --release -p orion)"
     ]
   }
 }

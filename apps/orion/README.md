@@ -38,11 +38,33 @@ Un profil contient :
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
 
-Les clés privées et PSK sont masqués dans les représentations `Debug`, mais ils
-sont actuellement persistés dans le fichier de profils local. La configuration
-est stockée dans le répertoire applicatif de l’OS sous `net/helios/orion`. La
-variable `ORION_CONFIG` permet de surcharger le chemin en test ou en
-développement.
+Les clés privées et PSK sont scellés dans le coffre ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md)) :
+ni l’IHM ni un message Tauri ne les transportent, et l’écran n’affiche que la clé
+**publique**. Le stockage vit dans le répertoire applicatif de l’OS sous
+`net/helios/orion` ; `ORION_CONFIG` surcharge le chemin du fichier hérité en test.
+
+## Construire et lancer
+
+```sh
+cargo run -p orion --features wireguard              # développement
+cargo build --release -p orion --features wireguard  # binaire seul
+cargo xtask orion-msi                                # installateur Windows
+```
+
+Les deux premières commandes suffisent au quotidien : **l’installateur n’est pas
+nécessaire pour tester**. Le nom, l’icône et l’interface sont ceux du code dans
+les trois cas, et `build.rs` s’en charge.
+
+- **En debug**, l’IHM est servie par Vite : Orion le démarre lui-même s’il ne
+  tourne pas, et toute modification de `src/` est visible au rechargement.
+- **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
+  Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
+  quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
+  qui se lance, s’affiche, et ment. Prérequis : `npm ci --prefix apps/orion`.
+- **L’icône et le nom** viennent de `tauri.conf.json` et de `icons/icon.ico`,
+  déclarés en `rerun-if-changed` : les remplacer suffit à ce que la prochaine
+  compilation les embarque, exécutable, fenêtre et zone de notification
+  comprises.
 
 ### Importer plutôt que ressaisir
 

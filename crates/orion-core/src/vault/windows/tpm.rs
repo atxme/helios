@@ -118,10 +118,10 @@ mod imp {
         NCRYPT_SILENT_FLAG,
     };
     use windows_sys::Win32::Security::{
-        EqualSid, GetSecurityDescriptorOwner, GetTokenInformation, OpenProcessToken, TokenUser,
+        EqualSid, GetSecurityDescriptorOwner, GetTokenInformation, TokenUser,
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Frees an `NCRYPT_*` handle on every exit path, including a `?`.
     struct Handle(usize);
