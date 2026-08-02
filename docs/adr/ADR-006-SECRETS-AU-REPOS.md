@@ -228,8 +228,31 @@ La hiérarchie est une conjonction, jamais une liste de voies de récupération 
    DEK de profil ne permet pas de calculer la racine, le registre ou un autre
    profil.
 2. Une clé asymétrique non exportable est créée dans le *Microsoft Platform
-   Crypto Provider*. Orion vérifie le fournisseur, la non-exportabilité, l'ACL
-   utilisateur et le résultat de l'opération avant de persister quoi que ce soit.
+   Crypto Provider*. Orion vérifie le fournisseur, la non-exportabilité et le
+   résultat de l'opération avant de persister quoi que ce soit.
+
+   **L'ACL n'est plus une garde** (amendement du 2 août 2026). Elle était
+   implémentée en comparant le propriétaire du descripteur de sécurité au SID
+   du jeton du processus, et refusait toute clé sur matériel réel — parce que
+   la prémisse était fausse : sous Windows, le **propriétaire** d'un
+   descripteur n'est pas l'ensemble des principaux autorisés à s'en servir. Les
+   clés CNG appartiennent couramment à `SYSTEM` ou à `Administrators` pendant
+   que la DACL accorde son accès à l'utilisateur, exactement comme un fichier
+   de votre profil peut appartenir à Administrators et rester le vôtre. Un écart
+   ne dit donc rien, et refuser dessus bloquait un TPM qui fonctionnait.
+
+   Ce qui lie réellement la clé au compte est **le conteneur d'où elle est
+   ouverte** : `NCryptOpenKey` et `NCryptCreatePersistedKey` sont appelés sans
+   `NCRYPT_MACHINE_KEY_FLAG`, donc dans celui de l'utilisateur courant. La clé
+   d'un autre compte n'est pas refusée, elle est invisible.
+
+   Ce qui rétablirait un contrôle : parcourir la **DACL** et refuser toute
+   entrée d'autorisation dont le SID n'est ni l'utilisateur courant, ni
+   `SYSTEM`, ni `Administrators`. C'est la bonne question ; elle reste sans
+   réponse plutôt que mal répondue, parce qu'elle demande une page de FFI
+   `unsafe` que l'hôte de développement ne peut ni compiler ni éprouver — et
+   que la livrer non testée est précisément ce qui a produit trois démarrages
+   ratés.
    L'enveloppe est OAEP-SHA-256 ; le module est **demandé à 3072 et planché à
    2048** (amendement du 2 août 2026). La décision initiale exigeait 3072 et
    refusait tout TPM qui ne le portait pas : le *TPM 2.0 PC Client Profile*

@@ -13,13 +13,17 @@
 //! running as the same account can observe it at that moment (T9). The TPM
 //! bounds a compromise in time and space; it does not prevent one.
 //!
-//! # Four verifications, before anything is persisted
+//! # What is verified, before anything is persisted
 //!
-//! ADR-006 §3 requires checking the provider, the non-exportability, the ACL
-//! and the operation result **before** writing. The order matters: a key
-//! created and then found wanting must not have left a file behind that a later
-//! run would adopt. So the checks happen on the freshly finalised handle, and
-//! the material is only written once they pass.
+//! Provider type, non-exportability, modulus and the operation result, on the
+//! freshly finalised handle — a key created and then found wanting must not
+//! leave a file behind that a later run would adopt.
+//!
+//! The **ACL** ADR-006 §3 also names is *observed and logged*, not enforced:
+//! see [`KeyOwnership`] for why the owner SID is the wrong question on Windows,
+//! and what a real DACL walk would take. The account binding that does hold is
+//! the per-user key container these calls open, without
+//! `NCRYPT_MACHINE_KEY_FLAG`.
 //!
 //! OAEP-SHA-256 over RSA. The modulus is **preferred** at 3072 and **floored**
 //! at 2048 — see [`MIN_RSA_BITS`] for why the hardware settled that argument.
@@ -61,37 +65,49 @@ pub const PREFERRED_RSA_BITS: u32 = 3072;
 /// l'ADR-006 exige entre dégrader et se taire.
 pub const MIN_RSA_BITS: u32 = 2048;
 
-/// Who the persisted key belongs to, as the platform reports it.
+/// What the key's security descriptor says about its owner — **observed, not
+/// enforced**.
 ///
-/// The fourth check of ADR-006 §3, and the one that was missing: provider,
-/// non-exportability and modulus say the key is *good*, none of them says it is
-/// **ours**. A key persisted under our name but owned by another principal
-/// would still satisfy the other three while letting that principal use the
-/// installation root.
+/// # Why this stopped being a gate (amendement du 2 août 2026)
+///
+/// It was written as the fourth check of ADR-006 §3, comparing the descriptor's
+/// owner SID to the process token's user SID and refusing on a mismatch. On
+/// real hardware that refused every key, and the reason is that the premise was
+/// wrong: on Windows the **owner** of a security descriptor is not the list of
+/// principals allowed to use the object. CNG keys are routinely owned by
+/// `SYSTEM` or by `Administrators` while the DACL grants the user their access
+/// — exactly as a file in your own profile can be owned by Administrators and
+/// still be yours to open. A mismatch therefore says nothing, and refusing on
+/// it blocked a working TPM.
+///
+/// What actually binds the key to the account is **where it is opened from**:
+/// `NCryptOpenKey` and `NCryptCreatePersistedKey` are called without
+/// `NCRYPT_MACHINE_KEY_FLAG`, so the container searched is the current user's.
+/// Another account's key is not merely refused, it is not visible.
+///
+/// # What would restore a real check
+///
+/// Walking the **DACL** — `GetSecurityDescriptorDacl`, then every ACE — and
+/// refusing any access-allowed entry whose SID is neither the current user,
+/// `SYSTEM`, nor `Administrators`. That is the question worth asking, and it is
+/// deliberately not answered here rather than answered wrongly: it is a page of
+/// `unsafe` FFI that cannot be compiled or exercised from the development host
+/// (see `docs/testing/TESTING.md`), and shipping it untested is what produced
+/// three failed starts on the user's machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum KeyOwnership {
-    /// The security descriptor's owner is the account running this process.
+    /// The descriptor's owner is the account running this process.
     CurrentUser,
-    /// It is somebody else. Refused rather than used.
+    /// The descriptor names another principal — commonly `SYSTEM` or
+    /// `Administrators`, which is the ordinary shape of a CNG key and says
+    /// nothing about who may use it. Recorded, not refused.
     AnotherPrincipal,
     /// The provider does not expose a security descriptor at all
     /// (`NTE_NOT_SUPPORTED`).
-    ///
-    /// **Accepted**, and the reason is not resignation. The key is created and
-    /// opened without `NCRYPT_MACHINE_KEY_FLAG`, so it lives in the *current
-    /// user's* container: we did not find it somewhere and then ask who owns
-    /// it, we asked the user's own store for it by name. The descriptor was
-    /// defence in depth on top of that, and a TPM provider that declines the
-    /// question has not weakened where the key lives.
     NotExposed,
     /// The descriptor exists but could not be read, or the process token could
     /// not be obtained.
-    ///
-    /// Refused: ADR-006 §3 is that a property which *should* be verifiable and
-    /// is not is no guarantee. Distinct from [`Self::NotExposed`] because the
-    /// two say different things — one is "no such question here", the other is
-    /// "the question failed".
     Unverifiable,
 }
 
@@ -122,17 +138,17 @@ fn validate_key_properties(
             "modulus of {bits} bits below the {MIN_RSA_BITS} floor — refused rather than lowered"
         )));
     }
-    match ownership {
-        KeyOwnership::CurrentUser | KeyOwnership::NotExposed => Ok(()),
-        KeyOwnership::AnotherPrincipal => Err(VaultError::Tpm(
-            "the TPM key is owned by another principal — a key persisted under our name that we \
-             do not own is refused, not adopted"
-                .into(),
-        )),
-        KeyOwnership::Unverifiable => Err(VaultError::Tpm(
-            "the TPM key's owner could not be read — an unverifiable ACL is not an ACL".into(),
-        )),
+    // Observed, never refused — see `KeyOwnership`. The binding to the account
+    // comes from the per-user container the key is opened from, not from a
+    // descriptor whose owner is `SYSTEM` on perfectly ordinary machines.
+    if ownership != KeyOwnership::CurrentUser {
+        tracing::debug!(
+            ?ownership,
+            "propriétaire du descripteur de la clé TPM non concluant ; la liaison au compte \
+             tient au conteneur utilisateur dans lequel la clé est ouverte"
+        );
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -641,57 +657,48 @@ mod property_tests {
         assert!(matches!(weak, VaultError::Tpm(message) if message.contains("below")));
     }
 
-    /// The fourth check ADR-006 §3 demands, and the one that was absent.
+    /// The descriptor's owner is **recorded, never enforced**.
     ///
-    /// Provider, non-exportability and modulus establish that the key is
-    /// *sound*; none of them establishes that it is **ours**. Both non-`ours`
-    /// answers must refuse — including the unreadable one, because the ADR is
-    /// explicit that a property which cannot be verified is not a guarantee.
+    /// This used to refuse on a mismatch, and refused every key on real
+    /// hardware. The premise was wrong: on Windows the owner of a security
+    /// descriptor is not the set of principals allowed to use the object. CNG
+    /// keys are commonly owned by `SYSTEM` or `Administrators` while the DACL
+    /// grants the user their access — so a mismatch carries no information,
+    /// and gating on it only broke working machines.
+    ///
+    /// What binds the key to the account is the per-user container it is
+    /// opened from, which no descriptor can contradict. The four outcomes must
+    /// therefore all pass, and the type keeps them distinct only so the log can
+    /// say which one was seen.
     #[test]
-    fn a_key_that_is_not_ours_is_refused_even_when_every_other_property_holds() {
+    fn the_descriptor_owner_is_observed_and_never_blocks() {
         let sound = |ownership| validate_key_properties(true, false, MIN_RSA_BITS, ownership);
 
-        assert!(sound(KeyOwnership::CurrentUser).is_ok());
-
-        let foreign = sound(KeyOwnership::AnotherPrincipal).unwrap_err();
-        assert!(
-            matches!(foreign, VaultError::Tpm(ref message) if message.contains("another principal")),
-            "obtenu : {foreign}"
-        );
-
-        let unknown = sound(KeyOwnership::Unverifiable).unwrap_err();
-        assert!(
-            matches!(unknown, VaultError::Tpm(ref message) if message.contains("could not be read")),
-            "obtenu : {unknown}"
-        );
-    }
-
-    /// A provider that declines the question is not a provider that failed it.
-    ///
-    /// `NTE_NOT_SUPPORTED` on the security descriptor is common on the Platform
-    /// Crypto Provider, and refusing on it made the vault unopenable on working
-    /// hardware. What still holds is *where* the key lives: opened from the
-    /// current user's container, by name, without `NCRYPT_MACHINE_KEY_FLAG`.
-    ///
-    /// The distinction has to survive: an unreadable descriptor is still a
-    /// refusal, and only the "not exposed at all" case passes.
-    #[test]
-    fn a_provider_without_a_security_descriptor_is_accepted_but_a_failed_read_is_not() {
-        let sound = |ownership| validate_key_properties(true, false, MIN_RSA_BITS, ownership);
-
-        assert!(
-            sound(KeyOwnership::NotExposed).is_ok(),
-            "un fournisseur qui n'expose pas de descripteur ne doit pas bloquer le coffre"
-        );
-        assert!(
-            sound(KeyOwnership::Unverifiable).is_err(),
-            "une lecture échouée reste un refus"
-        );
-        assert_ne!(
+        for ownership in [
+            KeyOwnership::CurrentUser,
+            KeyOwnership::AnotherPrincipal,
             KeyOwnership::NotExposed,
             KeyOwnership::Unverifiable,
-            "les deux cas ne doivent jamais être confondus"
-        );
+        ] {
+            assert!(
+                sound(ownership).is_ok(),
+                "le propriétaire du descripteur ne doit plus bloquer le coffre : {ownership:?}"
+            );
+        }
+
+        // The cases stay distinguishable: they mean different things, and the
+        // day a real DACL walk lands it will need them apart.
+        assert_ne!(KeyOwnership::NotExposed, KeyOwnership::Unverifiable);
+        assert_ne!(KeyOwnership::CurrentUser, KeyOwnership::AnotherPrincipal);
+    }
+
+    /// The properties that *do* gate are unaffected.
+    #[test]
+    fn the_real_gates_still_refuse() {
+        let ours = KeyOwnership::CurrentUser;
+        assert!(validate_key_properties(false, false, MIN_RSA_BITS, ours).is_err());
+        assert!(validate_key_properties(true, true, MIN_RSA_BITS, ours).is_err());
+        assert!(validate_key_properties(true, false, MIN_RSA_BITS - 1, ours).is_err());
     }
 }
 

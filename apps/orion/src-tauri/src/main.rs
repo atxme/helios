@@ -96,6 +96,14 @@ struct AppState {
     /// profile at a time, and a slot that could hold two keys would eventually
     /// attach the wrong one.
     staged_key: Arc<Mutex<Option<StagedKey>>>,
+    /// Why the vault could not be opened at startup, if it could not.
+    ///
+    /// Orion keeps running — the screen is more useful than a blank window —
+    /// but on an empty profile list, and that emptiness poisons every later
+    /// diagnosis. An import then concludes that no key of this machine matches
+    /// the admitted one, which is false: the machine's keys were never read.
+    /// Carrying the cause lets those messages say so.
+    vault_error: Option<String>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -716,6 +724,19 @@ async fn finish_import(
         }
     }
 
+    // The vault never opened: the profile list this import was matched against
+    // is empty because nothing was read, not because nothing matches. Blaming
+    // the document here sends the user to look for a key they may well have.
+    if completed.private_key_missing.is_some() {
+        if let Some(cause) = &state.vault_error {
+            completed.private_key_missing = Some(format!(
+                "le coffre de ce poste n'a pas pu être ouvert ({cause}), donc aucun profil \
+                 enregistré n'a été lu : le document n'est pas en cause. Corriger l'accès au \
+                 coffre, puis réimporter."
+            ));
+        }
+    }
+
     // The draft goes to the screen redacted; its private key stays here until
     // the user saves. Returning it whole is what put a WireGuard private key
     // into the WebView in the first place (ADR-006 §5).
@@ -1333,8 +1354,15 @@ fn main() {
             Err(error) => tracing::error!(%error, "migration du fichier hérité impossible"),
         }
     }
+    // A vault that would not open leaves Orion running on an **empty** profile
+    // list, and every later message then reasons from that emptiness: an import
+    // reports that no key of this machine matches the admitted one, when the
+    // truth is that the machine's keys were never read. The cause is recorded
+    // so those messages can name it instead of blaming the document.
+    let mut vault_error = None;
     let config = store.load().unwrap_or_else(|error| {
         tracing::error!(%error, "coffre illisible — aucun profil chargé");
+        vault_error = Some(error.to_string());
         ClientConfig::default()
     });
 
@@ -1360,6 +1388,7 @@ fn main() {
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
+            vault_error,
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
