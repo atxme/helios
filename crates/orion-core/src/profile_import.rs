@@ -49,14 +49,25 @@ struct JsonHeader {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonProfile {
+    /// The one required field: it is the key the profile is stored under.
     name: String,
+    /// `default`, like everything below it.
+    ///
+    /// An operator hands out what they know, and a document is allowed to be
+    /// partial. Refusing to **parse** one returned the user to a file picker
+    /// with a sentence, when the useful outcome is a form with one field left
+    /// to fill. [`complete_profile_import`] names what is missing, and
+    /// [`ClientProfile::validate`] is what refuses a tunnel — parsing only
+    /// decides whether the document is intelligible.
+    #[serde(default)]
     endpoint: String,
     /// Absent in an invitation profile: the operator doesn't hold the
     /// client's private key and therefore has nothing to send back
     /// (ADR-004 §6). [`complete_profile_import`] then takes it from the local
-    /// profile holding the admitted key.
+    /// profile holding the admitted key, or from a key just generated.
     #[serde(default)]
     private_key: String,
+    #[serde(default)]
     peer_public_key: String,
     #[serde(default)]
     preshared_key: Option<String>,
@@ -190,6 +201,15 @@ pub struct CompletedImport {
     /// The profile is then handed over with an empty `private_key`, and
     /// stays unconnectable until it is filled in.
     pub private_key_missing: Option<String>,
+    /// Why the document is not yet connectable, when something **other** than
+    /// the private key is missing.
+    ///
+    /// Same reasoning as the field above, generalised: an operator sends what
+    /// they know, and a document without an endpoint or without a pinned
+    /// gateway key is still worth showing. Refusing to import it returned the
+    /// user to a file picker with a sentence, instead of to a form with one
+    /// field left to fill.
+    pub incomplete: Option<String>,
 }
 
 /// Suffixes of an Orion document.
@@ -361,10 +381,11 @@ pub fn complete_profile_import(
     admitted_public_key: Option<&str>,
 ) -> Result<CompletedImport> {
     if !profile.private_key.is_empty() {
-        profile.validate()?;
+        let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
             private_key_missing: None,
+            incomplete,
         });
     }
 
@@ -391,18 +412,51 @@ pub fn complete_profile_import(
                 profile.name
             ),
         };
+        let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
             private_key_missing: Some(missing),
+            incomplete,
         });
     };
 
     profile.private_key = existing.private_key.clone();
-    profile.validate()?;
+    let incomplete = advisory(&profile);
     Ok(CompletedImport {
         profile,
         private_key_missing: None,
+        incomplete,
     })
+}
+
+/// What still stands between this profile and a tunnel, if anything.
+///
+/// The rules [`ClientProfile::validate`] enforces, **reported** instead of
+/// raised. A document is imported for the user to look at and finish; the
+/// refusal belongs at the moment they press Connect, not at the moment they
+/// open a file.
+///
+/// The virtual address is checked here and not in `validate`, because the two
+/// answer different questions. `validate` asks whether the *core* may mount
+/// this profile, and the dry-run backend mounts perfectly well without a VIP;
+/// this asks whether the **document** is finished, and a real tunnel needs one.
+/// Folding it into `validate` would refuse simulations that have every right
+/// to run.
+fn advisory(profile: &ClientProfile) -> Option<String> {
+    if let Err(error) = profile.validate() {
+        return Some(format!("{error:#}"));
+    }
+    if profile
+        .address
+        .as_deref()
+        .is_none_or(|address| address.trim().is_empty())
+    {
+        return Some(
+            "l'adresse virtuelle est absente : elle est attribuée par la gateway à l'admission"
+                .into(),
+        );
+    }
+    None
 }
 
 fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
@@ -686,26 +740,33 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     if profile.name.is_empty() {
         anyhow::bail!("le nom du profil est requis");
     }
-    validate_endpoint(&profile.endpoint)?;
+    // Absent fields are tolerated; **malformed** ones are not. The distinction
+    // is the whole rule here: a document that leaves a field out is a partial
+    // document the user finishes on screen, whereas a truncated key or an
+    // endpoint typed as a URL is an error that would otherwise surface much
+    // later, as a tunnel that never mounts.
+    if !profile.endpoint.is_empty() {
+        validate_endpoint(&profile.endpoint)?;
+    }
     // An invitation profile arrives without a private key: the operator
     // never held the client's, which is precisely what makes this mode safe.
-    // The document is still rejected if the key is present but malformed —
-    // a truncated key isn't an invitation, it's an error.
     if !profile.private_key.is_empty() {
         validate_wg_key(&profile.private_key, "clé privée du client")?;
     }
-    validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
+    if !profile.peer_public_key.is_empty() {
+        validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
+    }
     if let Some(psk) = &profile.preshared_key {
         validate_wg_key(psk, "PresharedKey")?;
     }
     if profile.allowed_ips.is_empty() {
         anyhow::bail!("AllowedIPs ne peut pas être vide");
     }
-    let address = profile
-        .address
-        .as_deref()
-        .context("l'adresse virtuelle du client est requise")?;
-    validate_cidr(address, "adresse virtuelle")?;
+    // Absent is tolerated, malformed is not — the VIP is assigned by the
+    // gateway at admission, so an invitation legitimately arrives without one.
+    if let Some(address) = profile.address.as_deref() {
+        validate_cidr(address, "adresse virtuelle")?;
+    }
     validate_cidr(&profile.allowed_ips, "AllowedIPs")?;
     if profile.persistent_keepalive == 0 {
         anyhow::bail!("PersistentKeepalive doit être supérieur à zéro");
@@ -1287,6 +1348,62 @@ mod tests {
         assert!(complete_profile().validate_for_data_plane().is_ok());
     }
 
+    /// A document may leave fields out; it is loaded, not refused.
+    ///
+    /// The operator sends what they know. Refusing to *parse* an invitation
+    /// with no endpoint returned the user to a file picker with a sentence,
+    /// instead of to a form with one field left to fill. `validate` is what
+    /// decides whether a tunnel may mount — parsing only decides whether the
+    /// document is intelligible.
+    #[test]
+    fn a_partial_document_is_loaded_and_its_gap_named() {
+        let document = serde_json::json!({
+            "format": "orion-profile",
+            "version": 1,
+            "profile": { "name": "poste" },
+        })
+        .to_string();
+
+        let imported = parse_profile_import(&document, "poste.orionprofile")
+            .expect("un document partiel doit se lire");
+        assert_eq!(imported.profile.name, "poste");
+        // The defaults are applied rather than left empty.
+        assert_eq!(imported.profile.allowed_ips, DEFAULT_ALLOWED_IPS);
+        assert_eq!(
+            imported.profile.persistent_keepalive,
+            DEFAULT_KEEPALIVE_SECS
+        );
+
+        let completed = complete_profile_import(imported.profile, &ClientConfig::default(), None)
+            .expect("l'import ne refuse pas un document incomplet");
+        assert!(
+            completed.private_key_missing.is_some(),
+            "l'absence de clé privée doit être nommée"
+        );
+        assert!(
+            completed.incomplete.is_some(),
+            "ce qui reste à compléter doit être nommé, pas tu"
+        );
+    }
+
+    /// A complete document reports nothing to fill in.
+    #[test]
+    fn a_complete_document_reports_no_gap() {
+        let pair = aether::wg::generate_keypair().expect("keypair");
+        let profile = ClientProfile {
+            private_key: pair.private_key.expose().to_string(),
+            ..complete_profile()
+        };
+        let completed =
+            complete_profile_import(profile, &ClientConfig::default(), None).expect("import");
+        assert!(completed.private_key_missing.is_none());
+        assert!(
+            completed.incomplete.is_none(),
+            "obtenu : {:?}",
+            completed.incomplete
+        );
+    }
+
     fn identity_bundle(name: &str) -> serde_json::Value {
         use base64::engine::general_purpose::STANDARD;
 
@@ -1672,16 +1789,37 @@ mod tests {
             .contains("pas une URL"));
     }
 
+    /// Absent is tolerated; **malformed** is refused.
+    ///
+    /// The document used to be rejected for a missing virtual address, which
+    /// an invitation legitimately lacks — the VIP is assigned by the gateway
+    /// at admission. What must still be refused is an address that is present
+    /// and wrong: absent, the user fills it in; wrong, it produces a tunnel
+    /// that never routes and nothing says why.
     #[test]
-    fn refuses_an_incomplete_or_unroutable_profile() {
+    fn an_absent_address_is_tolerated_but_a_malformed_one_is_not() {
         let no_address = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&no_address, "no-address.conf")
-            .unwrap_err()
-            .to_string()
-            .contains("adresse virtuelle"));
+        let imported = parse_profile_import(&no_address, "no-address.conf")
+            .expect("une invitation sans VIP doit se charger");
+        assert_eq!(imported.profile.address, None);
+        // …and the gap is named rather than passed over in silence.
+        let completed =
+            complete_profile_import(imported.profile, &ClientConfig::default(), None).unwrap();
+        assert!(completed
+            .incomplete
+            .expect("le manque doit être nommé")
+            .contains("adresse"));
 
+        let bad_address = format!(
+            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=pas-un-cidr\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+        );
+        assert!(parse_profile_import(&bad_address, "bad-address.conf").is_err());
+    }
+
+    #[test]
+    fn refuses_an_unroutable_profile() {
         let no_keepalive = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nPersistentKeepalive=0"
         );

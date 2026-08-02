@@ -311,6 +311,7 @@ describe('ProfilesView interactions', () => {
       identity_sealed: true,
       identity_error: null,
       private_key_missing: null,
+      incomplete: null,
       ...overrides,
     })
     handlers.onImport.mockResolvedValueOnce(outcome())

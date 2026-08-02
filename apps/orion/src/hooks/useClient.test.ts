@@ -45,6 +45,7 @@ const imported = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
   identity_sealed: false,
   identity_error: null,
   private_key_missing: null,
+  incomplete: null,
   ...overrides,
 })
 

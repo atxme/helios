@@ -557,6 +557,14 @@ export function ProfilesView({
       if (imported.private_key_missing) {
         setNotice({ tone: 'error', message: imported.private_key_missing })
       }
+      // A partial document is loaded, not refused: the gap is named so the
+      // user can close it in the form they are already looking at.
+      else if (imported.incomplete) {
+        setNotice({
+          tone: 'error',
+          message: `« ${profile.name} » chargé, à compléter : ${imported.incomplete}`,
+        })
+      }
       // The identity failing to seal outranks the profile loading fine: the
       // profile is visible on screen, whereas an unsealed identity only
       // shows up much later, as a connection that fails before WireGuard.

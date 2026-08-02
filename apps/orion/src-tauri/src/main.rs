@@ -468,8 +468,20 @@ impl From<&ClientConfig> for ConfigView {
 /// them, so it cannot send them back, and `None` therefore means *keep what is
 /// stored*. That asymmetry is deliberate — it is what lets a profile be edited
 /// without its private key ever making the round trip.
+/// # Naming, and the bug it caused
+///
+/// The profile fields keep serde's **snake_case**, because that is what
+/// `ClientProfile` and `KeyNegotiationSettings` use on the wire and what the
+/// screen echoes back after receiving a [`ProfileView`]. A blanket
+/// `rename_all = "camelCase"` here made every one of them a different name —
+/// `save_profile` then refused the payload with `missing field peerPublicKey`,
+/// and no test caught it: the TypeScript suite mocks the command, and the Rust
+/// suite builds the struct directly. Neither crossed the boundary where the
+/// names actually have to agree. [`the_frontend_payload_deserialises`] does.
+///
+/// Only the two **intents** are camelCase, because they exist nowhere else and
+/// the screen writes them by hand.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ProfileDraft {
     name: String,
     endpoint: String,
@@ -484,12 +496,12 @@ struct ProfileDraft {
     /// Set by the screen after `generate_private_key` or `adopt_private_key`
     /// has already produced one and shown its **public** half. The private half
     /// never travels back: it waited in Rust the whole time.
-    #[serde(default)]
+    #[serde(default, rename = "useStagedKey")]
     use_staged_key: bool,
     /// Clears the stored static PSK. There is deliberately no field to *set*
     /// one from the screen: a static PSK is an out-of-band value, and the
     /// enrolment document is what carries it.
-    #[serde(default)]
+    #[serde(default, rename = "clearPresharedKey")]
     clear_preshared_key: bool,
 }
 
@@ -572,6 +584,8 @@ struct ImportOutcome {
     /// Why the draft has no private key, when the document was an invitation
     /// and no local profile held the admitted half.
     private_key_missing: Option<String>,
+    /// What else the document leaves to fill in, if anything.
+    incomplete: Option<String>,
 }
 
 /// Seals the identity shipped with a document, if any.
@@ -650,11 +664,40 @@ async fn finish_import(
     // that says which key was admitted.
     let admitted = imported.admitted_public_key();
     let (identity_sealed, identity_error) = seal_identity(imported.identity);
-    let completed = {
+    let mut completed = {
         let config = state.config.lock().await;
         complete_profile_import(imported.profile, &config, admitted.as_deref())
             .map_err(|error| error.to_string())?
     };
+
+    // The staged key is the missing candidate.
+    //
+    // `complete_profile_import` looks for the admitted key among **saved**
+    // profiles, which is exactly where a key generated three minutes ago is
+    // not: it sits in the staging slot, waiting for a save that cannot happen
+    // until this import completes. That circle broke the normal enrolment
+    // order — generate, hand the public half over, receive an invitation,
+    // import it — and left the user with "aucun profil de ce poste ne détient
+    // la clé admise" naming the very key they had just produced.
+    if completed.profile.private_key.trim().is_empty() {
+        let mut slot = state.staged_key.lock().await;
+        let matches = slot.as_ref().is_some_and(|staged| match &admitted {
+            // The document names the admitted key: pair on it, never on the
+            // profile name. A key that was not admitted would hand the user a
+            // profile whose handshakes fail with nothing to explain them.
+            Some(admitted) => &staged.public_key == admitted,
+            // No client certificate to compare against. The staged key is the
+            // one the user just obtained for this very purpose, so adopting it
+            // is what they meant — and the notice says so.
+            None => true,
+        });
+        if matches {
+            if let Some(staged) = slot.take() {
+                completed.profile.private_key = staged.private_key.clone();
+                completed.private_key_missing = None;
+            }
+        }
+    }
 
     // The draft goes to the screen redacted; its private key stays here until
     // the user saves. Returning it whole is what put a WireGuard private key
@@ -671,6 +714,7 @@ async fn finish_import(
         identity_sealed,
         identity_error,
         private_key_missing: completed.private_key_missing,
+        incomplete: completed.incomplete,
     })
 }
 
@@ -1372,6 +1416,66 @@ mod security_tests {
             use_staged_key: false,
             clear_preshared_key: false,
         }
+    }
+
+    /// The payload the screen actually sends must deserialise.
+    ///
+    /// This is the test whose absence let `missing field peerPublicKey` reach a
+    /// user. The TypeScript suite mocks `invoke`, so it never encodes anything;
+    /// the Rust suite builds `ProfileDraft` directly, so it never decodes
+    /// anything. The names only have to agree at the boundary, and nothing was
+    /// standing there.
+    ///
+    /// The JSON below is written by hand, in the shape `api.ts` produces —
+    /// snake_case for everything the profile carries, camelCase for the two
+    /// intents. Deriving it from the struct would test serde against itself
+    /// and prove nothing.
+    #[test]
+    fn the_frontend_payload_deserialises() {
+        let payload = serde_json::json!({
+            "name": "poste-windows",
+            "endpoint": "86.229.12.86:51820",
+            "peer_public_key": "6Y8gpK+aOPbZvSnQnIbdQGTBoe5trFFWksGJVKlH3wk=",
+            "address": "100.109.177.86/32",
+            "allowed_ips": "0.0.0.0/0",
+            "persistent_keepalive": 25,
+            "heliosd_url": null,
+            "key_negotiation": null,
+            "useStagedKey": true,
+            "clearPresharedKey": false,
+        });
+
+        let draft: ProfileDraft = serde_json::from_value(payload).expect(
+            "le brouillon envoyé par l'écran doit se décoder : c'est ici que les noms \
+             doivent concorder",
+        );
+        assert_eq!(draft.name, "poste-windows");
+        assert_eq!(
+            draft.peer_public_key,
+            "6Y8gpK+aOPbZvSnQnIbdQGTBoe5trFFWksGJVKlH3wk="
+        );
+        assert_eq!(draft.address.as_deref(), Some("100.109.177.86/32"));
+        assert_eq!(draft.persistent_keepalive, 25);
+        assert!(draft.use_staged_key);
+        assert!(!draft.clear_preshared_key);
+    }
+
+    /// The two optional intents may be absent entirely.
+    #[test]
+    fn a_payload_without_intents_defaults_to_touching_no_secret() {
+        let payload = serde_json::json!({
+            "name": "poste",
+            "endpoint": "203.0.113.10:51820",
+            "peer_public_key": "cHVibGlj",
+            "address": null,
+            "allowed_ips": "0.0.0.0/0",
+            "persistent_keepalive": 25,
+            "heliosd_url": null,
+            "key_negotiation": null,
+        });
+        let draft: ProfileDraft = serde_json::from_value(payload).expect("decode");
+        assert!(!draft.use_staged_key, "aucune clé adoptée sans demande");
+        assert!(!draft.clear_preshared_key, "aucun PSK retiré sans demande");
     }
 
     /// **The** property of this lot: no secret crosses the Tauri IPC.

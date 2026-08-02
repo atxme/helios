@@ -77,6 +77,14 @@ export interface ImportOutcome {
    * shown — with this explanation — rather than refused.
    */
   private_key_missing: string | null
+  /**
+   * What else the document leaves to fill in.
+   *
+   * A document is allowed to be partial: the operator sends what they know.
+   * The import shows it and names the gap rather than refusing the file — the
+   * refusal belongs at Connect, not at the file picker.
+   */
+  incomplete: string | null
 }
 
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP

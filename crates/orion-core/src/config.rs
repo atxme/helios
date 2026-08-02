@@ -152,6 +152,16 @@ pub struct ClientProfile {
     /// Unique friendly name (selection key in the list).
     pub name: String,
     /// Gateway's UDP endpoint: `IP:port` or `FQDN:port`. **Not** an HTTP URL.
+    ///
+    /// `default` like almost every field below: a document is allowed to carry
+    /// only part of a profile. An operator hands out what they know — often an
+    /// invitation with no private key, sometimes a block without an endpoint
+    /// yet — and refusing to *parse* it would leave the user with a rejection
+    /// instead of a form they can finish. [`Self::validate`] is what decides
+    /// whether a profile may mount a tunnel; parsing only decides whether the
+    /// document is intelligible. Only `name` stays required, because it is the
+    /// key the profile is stored under.
+    #[serde(default)]
     pub endpoint: String,
     /// Client's Curve25519 private key (base64). **Secret.**
     #[serde(default)]
