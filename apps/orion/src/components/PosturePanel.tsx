@@ -193,12 +193,12 @@ export function PosturePanel({
             {vault.rotationRequired.length > 0 && (
               <Row
                 label="rotation"
-                value={vault.rotationRequired.join(', ')}
+                value={`${vault.rotationRequired.join(', ')} — conseillée`}
                 tone={AMBER}
-                note="La clé de ces profils a vécu en clair dans profiles.toml : sceller le \
-                     fichier ne rappelle pas les copies déjà parties en sauvegarde. Onglet \
-                     Profils → « Générer une nouvelle clé », faire admettre la clé publique \
-                     affichée, puis Enregistrer."
+                note="La clé de ces profils a vécu en clair dans profiles.toml. Ces profils
+                      restent connectables : Orion constate l’historique d’un fichier, il ne
+                      sait pas si la clé a fuité. Pour clore le doute — onglet Profils,
+                      « Générer une nouvelle clé », faire admettre la clé publique affichée."
               />
             )}
           </Box>

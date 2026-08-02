@@ -364,9 +364,18 @@ la même clé n'annule pas ces copies. Au premier lancement :
 2. Il crée et vérifie le coffre, y place provisoirement l'ancien profil pour ne
    pas prolonger l'exposition, crée le registre authentifié, puis remplace le TOML
    par un bootstrap sans secret de façon atomique.
-3. Le profil reste marqué « rotation obligatoire » et ne devient connectable
-   qu'après génération d'une nouvelle clé WireGuard, réadmission de sa clé
-   publique et rotation du PSK statique éventuel.
+3. Le profil est marqué comme **rotation conseillée** : la posture le montre, le
+   journal le dit, et l'écran Profils propose la manœuvre en un clic.
+
+   **Il reste connectable** (arbitrage du 2 août 2026). La décision initiale en
+   faisait un refus de connexion ; c'était une erreur de périmètre. Orion
+   constate l'historique d'un *fichier*, il ne sait rien de la clé elle-même :
+   elle peut n'avoir jamais quitté la machine, ou être une clé de développement
+   dont personne ne se soucie. Décider à la place de l'utilisateur qu'elle est
+   perdue, et lui interdire son propre tunnel sur cette présomption, dépasse ce
+   que le client a à arbitrer — c'est à l'opérateur de révoquer une admission
+   s'il juge la clé compromise, et lui seul en a les moyens. La rotation reste
+   la bonne pratique, elle n'est pas imposée par le client.
 4. Chaque étape est idempotente et journalisée sans secret. Une coupure laisse
    soit l'ancien fichier intact et non connectable, soit le nouveau coffre
    vérifiable ; jamais un profil partiellement migré présenté comme sain.
@@ -595,8 +604,9 @@ round-trip seul prouve le fonctionnement, pas la sécurité.
   symbolique, temporaire préexistant et deux sauvegardes concurrentes échouent ;
 * une injection de panne après chaque écriture, `fsync`, `rename`, réouverture et
   rotation laisse un état ancien ou nouveau cohérent, jamais un mélange ;
-* un profil historique ne redevient connectable qu'avec une nouvelle clé admise ;
-  la clé qui avait vécu en clair est rejetée après migration.
+* un profil historique est signalé comme « rotation conseillée » et le reste
+  jusqu'à ce qu'une nouvelle clé soit enregistrée ; le signalement disparaît de
+  lui-même à ce moment-là, et il n'empêche jamais la connexion.
 
 **TPM et modes d'exploitation — cible Windows réelle**
 
@@ -685,9 +695,12 @@ remplace pas.
 * **La rémanence sur SSD n'est pas traitée** par le chiffrement applicatif, et ne
   peut pas l'être. Voir §3 : le chiffrement de volume est un prérequis, pas une
   option.
-* **Les clés historiques restent compromises jusqu'à rotation.** Effacer ou
-  chiffrer l'ancien TOML ne révoque ni sauvegarde ni profil itinérant. La posture
-  reste rouge et la connexion bloquée jusqu'à nouvelle admission.
+* **Les clés historiques restent exposées jusqu'à rotation.** Effacer ou
+  chiffrer l'ancien TOML ne révoque ni sauvegarde ni profil itinérant. La
+  posture reste ambre jusqu'à ce qu'une nouvelle clé soit enregistrée. Le
+  client ne bloque pas la connexion pour autant : il constate l'historique d'un
+  fichier, pas une fuite, et la révocation d'une admission appartient à
+  l'opérateur.
 * **VBS n'est pas implémenté.** Un service sous SID distinct serait une première
   réduction contre le malware utilisateur ; VBS est la suite identifiée contre
   un adversaire noyau. Aucune propriété de la présente version n'en dépend.

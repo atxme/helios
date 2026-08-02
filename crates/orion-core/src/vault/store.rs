@@ -153,6 +153,24 @@ impl ProfileStore {
         self.provider.hardware_backed()
     }
 
+    /// Obtains the root, **then** answers whether hardware backs it.
+    ///
+    /// [`Self::hardware_backed`] reports a measurement, and an unmeasured
+    /// provider answers `false` — correctly, because a guarantee nobody has
+    /// established is not a guarantee. Asking it before anything has used the
+    /// vault therefore reads "no TPM" on a machine whose TPM is fine, which is
+    /// exactly what startup did: it printed an `ERROR` telling the user to set
+    /// `danger_allow_software_keystore`, two hundred milliseconds before
+    /// obtaining a hardware-backed root without difficulty.
+    ///
+    /// Anything that reports the posture to a human must go through here.
+    pub fn probe_hardware_root(&self) -> bool {
+        // The failure is not raised: the caller is deciding what to *say*, and
+        // the answer to "is hardware backing this" is `false` either way.
+        let _ = self.root();
+        self.provider.hardware_backed()
+    }
+
     pub fn legacy_path(&self) -> std::path::PathBuf {
         self.dir.join(LEGACY_FILE)
     }

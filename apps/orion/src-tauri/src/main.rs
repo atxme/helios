@@ -925,22 +925,29 @@ async fn connect(
     // Validates the WireGuard profile (endpoint + keys) BEFORE any side effect.
     profile.validate().map_err(|e| e.to_string())?;
 
-    // A key that once lived in plaintext is presumed compromised, and sealing
-    // the file did not recall the copies already in backups or roaming
-    // profiles. ADR-006 §3 makes such a profile unconnectable until a new key
-    // is generated and re-admitted — and the posture panel already tells the
-    // user exactly that. Until this check existed, the panel said it and
-    // nothing enforced it: the profile connected on the compromised key while
-    // the screen claimed it would not.
+    // # Signalé, jamais bloqué (arbitrage du 2 août 2026)
+    //
+    // Un profil repris de `profiles.toml` a eu sa clé en clair sur le disque,
+    // et le sceller ne rappelle pas les copies déjà parties en sauvegarde. La
+    // décision initiale en faisait un **refus de connexion**, ce qui était une
+    // erreur de périmètre : Orion constate l'historique d'un fichier, il ne
+    // sait rien de la clé elle-même — elle peut n'avoir jamais quitté la
+    // machine, ou être une clé de développement dont personne ne se soucie.
+    // Décider à la place de l'utilisateur qu'elle est perdue, et lui interdire
+    // son propre tunnel sur cette présomption, dépasse ce que le client a à
+    // arbitrer. La rotation reste la bonne pratique ; elle n'est pas à lui
+    // imposer.
+    //
+    // Ce qui reste : la posture le montre, le journal le dit, et l'écran
+    // Profils propose la manœuvre en un clic.
     let rotation_required = state.store.rotation_required().unwrap_or_default();
-    if rotation_required.contains(&profile.name) {
-        return Err(format!(
-            "« {} » vient du fichier profiles.toml, où sa clé privée était en clair : elle est \
-             donc présumée connue (sauvegardes, profil itinérant, image système). \
-             Dans l'onglet Profils : « Générer une nouvelle clé », transmettre la clé publique \
-             affichée à l'opérateur pour admission, puis Enregistrer. Le blocage tombe seul.",
-            profile.name
-        ));
+    let presumed_exposed = rotation_required.contains(&profile.name);
+    if presumed_exposed {
+        tracing::warn!(
+            profil = %profile.name,
+            "connexion avec une clé reprise de profiles.toml, où elle était en clair : \
+             une rotation reste recommandée"
+        );
     }
 
     // Sink combining relay to the frontend AND telemetry control: telemetry
@@ -982,6 +989,17 @@ async fn connect(
         }
         base(ev);
     });
+
+    // Said in the event log the user is actually looking at, not only in the
+    // file. A recommendation nobody reads is not a recommendation.
+    if presumed_exposed {
+        sink(ClientEvent::log(
+            "warn",
+            "clé reprise de profiles.toml, où elle était en clair : une rotation reste \
+             recommandée — onglet Profils, « Générer une nouvelle clé »."
+                .to_string(),
+        ));
+    }
 
     state.controller.connect(profile, sink.clone()).await;
 
@@ -1417,7 +1435,7 @@ fn main() {
              la résistance à la copie inter-machine, au rollback matériel et à un \
              administrateur de domaine détenant les clés DPAPI n'est plus assurée"
         );
-    } else if !store.hardware_backed() {
+    } else if !store.probe_hardware_root() {
         tracing::error!(
             "aucune racine matérielle sur ce poste et aucun contournement déclaré — \
              Orion refuse de conserver des secrets. Poser \
