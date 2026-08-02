@@ -21,9 +21,10 @@
 //! run would adopt. So the checks happen on the freshly finalised handle, and
 //! the material is only written once they pass.
 //!
-//! RSA-3072 with OAEP-SHA-256 is the floor. A TPM that cannot do it is refused
-//! — never silently lowered to RSA-2048, and never moved to the software
-//! provider, because both would keep the screen's promise while removing what
+//! OAEP-SHA-256 over RSA. The modulus is **preferred** at 3072 and **floored**
+//! at 2048 — see [`MIN_RSA_BITS`] for why the hardware settled that argument.
+//! Falling back is announced in the log; moving to the software provider never
+//! happens, because that would keep the screen's promise while removing what
 //! backs it.
 
 use zeroize::Zeroizing;
@@ -33,8 +34,32 @@ use crate::vault::{keys::KEY_LEN, VaultError};
 /// Name the key is persisted under, inside the provider's own store.
 pub const KEY_NAME: &str = "Helios Orion device root v1";
 
-/// Minimum modulus. Below it, refuse.
-pub const MIN_RSA_BITS: u32 = 3072;
+/// Modulus asked for first.
+///
+/// Kept as the preference, not as a requirement — see [`MIN_RSA_BITS`].
+pub const PREFERRED_RSA_BITS: u32 = 3072;
+
+/// Smallest modulus accepted. Below it, refuse.
+///
+/// # Pourquoi 2048 et non 3072 (amendement du 2 août 2026)
+///
+/// La décision initiale posait 3072 en plancher et refusait tout TPM qui ne le
+/// portait pas. Le matériel a tranché autrement : le *TPM 2.0 PC Client
+/// Profile* n'impose que **RSA-2048**, et 3072 y est facultatif — donc absent
+/// de la quasi-totalité des puces. `NCryptSetProperty(NCRYPT_LENGTH_PROPERTY)`
+/// y répond `NTE_INVALID_PARAMETER` (0x80090027), la création échoue, et Orion
+/// refuse alors de conserver le moindre secret. Un plancher que le matériel
+/// courant ne franchit pas ne protège rien : il supprime la fonctionnalité.
+///
+/// Ce que cette clé garantit est la **non-exportabilité** — un coffre copié sur
+/// une autre machine y reste illisible — et cette propriété ne dépend pas du
+/// module. Elle enveloppe 32 octets ; contre RSA-2048, un adversaire a des
+/// chemins bien moins coûteux que la factorisation.
+///
+/// [`PREFERRED_RSA_BITS`] reste demandé en premier et obtenu quand le TPM le
+/// porte. Le repli est **annoncé**, jamais silencieux : c'est la différence que
+/// l'ADR-006 exige entre dégrader et se taire.
+pub const MIN_RSA_BITS: u32 = 2048;
 
 /// Who the persisted key belongs to, as the platform reports it.
 ///
@@ -114,8 +139,8 @@ mod imp {
         NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
         MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_EXPORT_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
         NCRYPT_HANDLE, NCRYPT_IMPL_HARDWARE_FLAG, NCRYPT_IMPL_TYPE_PROPERTY,
-        NCRYPT_LENGTH_PROPERTY, NCRYPT_PAD_OAEP_FLAG, NCRYPT_SECURITY_DESCR_PROPERTY,
-        NCRYPT_SILENT_FLAG,
+        NCRYPT_LENGTH_PROPERTY, NCRYPT_OVERWRITE_KEY_FLAG, NCRYPT_PAD_OAEP_FLAG,
+        NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG,
     };
     use windows_sys::Win32::Security::{
         EqualSid, GetSecurityDescriptorOwner, GetTokenInformation, TokenUser,
@@ -325,7 +350,49 @@ mod imp {
         Ok(Some((provider, key)))
     }
 
+    /// Creates the persisted key, at the largest modulus this TPM accepts.
+    ///
+    /// Tries [`PREFERRED_RSA_BITS`] then [`MIN_RSA_BITS`]. Most TPM 2.0 chips
+    /// implement only the mandatory RSA-2048 and answer `NTE_INVALID_PARAMETER`
+    /// to anything larger — refusing outright, as the first version did, made
+    /// Orion unusable on ordinary hardware.
+    ///
+    /// The fallback is announced. A degradation nobody is told about is the one
+    /// failure mode ADR-006 refuses everywhere else.
     fn create() -> Result<(Handle, Handle), VaultError> {
+        let mut last = None;
+        for bits in [PREFERRED_RSA_BITS, MIN_RSA_BITS] {
+            match create_at(bits) {
+                Ok(handles) => {
+                    if bits < PREFERRED_RSA_BITS {
+                        tracing::warn!(
+                            bits,
+                            preferred = PREFERRED_RSA_BITS,
+                            "TPM sans RSA-{PREFERRED_RSA_BITS} : clé d'enveloppe créée en \
+                             RSA-{bits}. La liaison matérielle et la non-exportabilité sont \
+                             conservées ; c'est le module qui est plus court."
+                        );
+                    }
+                    return Ok(handles);
+                }
+                // Only a refusal of the *size* is worth retrying smaller. A
+                // provider that is absent, or a key we do not own, would fail
+                // identically at every size — retrying would just hide it
+                // behind a second, less precise error.
+                Err(error) if retryable_at_a_smaller_modulus(&error) => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| VaultError::Tpm("no RSA modulus accepted by this TPM".into())))
+    }
+
+    /// `true` when the failure plausibly comes from the requested modulus.
+    fn retryable_at_a_smaller_modulus(error: &VaultError) -> bool {
+        matches!(error, VaultError::Tpm(message) if message.contains("modulus length")
+            || message.contains("finalising"))
+    }
+
+    fn create_at(bits: u32) -> Result<(Handle, Handle), VaultError> {
         let provider = open_provider()?;
         let mut key = 0usize;
         let name = wide(KEY_NAME);
@@ -336,7 +403,7 @@ mod imp {
                 BCRYPT_RSA_ALGORITHM,
                 name.as_ptr(),
                 0,
-                0,
+                NCRYPT_OVERWRITE_KEY_FLAG,
             )
         };
         if status != 0 {
@@ -346,7 +413,6 @@ mod imp {
 
         // Length and export policy are set **before** finalisation: after it,
         // they are immutable, which is precisely the property we want.
-        let bits = MIN_RSA_BITS;
         let status = unsafe {
             NCryptSetProperty(
                 key.0 as NCRYPT_HANDLE,

@@ -239,6 +239,8 @@ export interface VaultPosture {
   /** Volume-encryption posture of the disk holding the profiles. */
   volume: string
   volumeProtected: boolean
+  /** `danger_allow_unencrypted_volume` est posé : un refus devenu un choix. */
+  unencryptedVolumeWaived: boolean
   /** Secret pages held out of swap and of the hibernation file. */
   memoryLocked: boolean
   memory: string

@@ -697,14 +697,13 @@ async fn select_profile(state: State<'_, AppState>, name: String) -> Result<Conf
 /// establish is a posture we cannot promise, and the failure mode of guessing
 /// "probably fine" is a user believing their disk is protected when it is not.
 fn require_protected_volume(state: &State<'_, AppState>) -> Result<(), String> {
-    let posture = state.store.posture();
-    if posture.volume_protected {
-        return Ok(());
-    }
-    Err(format!(
-        "{} Orion refuse d'écrire un secret tant que le volume n'est pas chiffré.",
-        posture.volume
-    ))
+    state.store.may_write_secrets().map_err(|error| {
+        format!(
+            "{error} `danger_allow_unencrypted_volume = true` dans settings.toml l'autorise \
+             explicitement, en retirant la couverture des anciens blocs disque et du fichier \
+             d'hibernation."
+        )
+    })
 }
 
 #[tauri::command]
@@ -1077,6 +1076,7 @@ fn main() {
         tracing::warn!(%complaint, "réglages locaux du coffre");
     }
     let waived = settings.danger_allow_software_keystore;
+    let bare_volume = settings.danger_allow_unencrypted_volume;
 
     let store = Arc::new(
         orion_core::vault::ProfileStore::new(
@@ -1088,7 +1088,8 @@ fn main() {
                 .allowing_software_keystore(waived),
             ),
         )
-        .allowing_software_keystore(waived),
+        .allowing_software_keystore(waived)
+        .allowing_unencrypted_volume(bare_volume),
     );
 
     // Deux situations opposées, deux messages. Les confondre créditerait
@@ -1122,12 +1123,23 @@ fn main() {
     // cela le recopie sans retirer l'ancien. Mieux vaut laisser le fichier
     // hérité en place, visible dans la posture, que produire une seconde copie
     // en croyant l'avoir protégée.
-    let volume = orion_core::vault::windows::bitlocker::protection_of(&store_dir);
-    if !volume.allows_secrets() {
+    if bare_volume {
+        // À chaque démarrage, comme pour le coffre logiciel : une dégradation
+        // qui cesse de se rappeler finit par être oubliée.
+        tracing::warn!(
+            "CHIFFREMENT DE VOLUME NON EXIGÉ par danger_allow_unencrypted_volume — \
+             les anciens blocs disque, le fichier d'échange et celui d'hibernation ne sont \
+             pas couverts"
+        );
+    }
+    if let Err(error) = store.may_write_secrets() {
         tracing::error!(
-            détail = volume.detail(),
-            "migration du fichier hérité suspendue : chiffrement de volume absent ou \
-             indéterminable"
+            %error,
+            "migration du fichier hérité suspendue. `danger_allow_unencrypted_volume = true` \
+             dans {} l'autorise explicitement",
+            store_dir
+                .join(orion_core::vault::settings::SETTINGS_FILE)
+                .display()
         );
     } else {
         match store.migrate_legacy() {

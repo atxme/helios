@@ -42,6 +42,26 @@ pub struct LocalSettings {
     /// Waives the hardware requirement. See the module documentation for what
     /// it costs.
     pub danger_allow_software_keystore: bool,
+
+    /// Waives the volume-encryption prerequisite (ADR-006 §3).
+    ///
+    /// # Pourquoi cette échappatoire existe
+    ///
+    /// Le chiffrement applicatif n'atteint ni les anciens blocs SSD ni le
+    /// fichier d'hibernation : sur un volume nu, sceller un profil **recopie**
+    /// le secret ailleurs sur le même disque sans retirer ce qui s'y trouvait.
+    /// D'où le refus.
+    ///
+    /// Mais un refus sans issue transforme un poste de développement sans
+    /// BitLocker — le cas courant d'une machine de test — en Orion qui ne peut
+    /// rien importer et ne l'explique qu'en journal. Le drapeau rend le choix
+    /// possible, explicite et visible, exactement comme
+    /// `danger_allow_software_keystore` le fait pour le TPM.
+    ///
+    /// Il ne rend pas le volume chiffré. Sous ce mode, T1 et T7 — disque volé,
+    /// sauvegarde, pagefile, hibernation — ne sont plus couverts, et la posture
+    /// continue de le dire à chaque démarrage.
+    pub danger_allow_unencrypted_volume: bool,
 }
 
 impl LocalSettings {

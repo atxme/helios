@@ -94,6 +94,11 @@ pub struct ProfileStore {
     /// reporting it as a downgrade would credit the operator with a decision
     /// they never made.
     software_keystore: bool,
+    /// The operator waived the volume-encryption prerequisite (ADR-006 §3).
+    ///
+    /// Same distinction as above, for the same reason: an unencrypted volume is
+    /// a refusal, and only this flag turns it into a stated choice.
+    unencrypted_volume: bool,
 }
 
 impl ProfileStore {
@@ -102,6 +107,7 @@ impl ProfileStore {
             dir: dir.into(),
             provider,
             software_keystore: false,
+            unencrypted_volume: false,
         }
     }
 
@@ -110,6 +116,26 @@ impl ProfileStore {
     pub fn allowing_software_keystore(mut self, allowed: bool) -> Self {
         self.software_keystore = allowed;
         self
+    }
+
+    /// Records that the volume-encryption prerequisite was waived on purpose.
+    #[must_use]
+    pub fn allowing_unencrypted_volume(mut self, allowed: bool) -> Self {
+        self.unencrypted_volume = allowed;
+        self
+    }
+
+    /// May a secret be written to this installation's directory?
+    ///
+    /// The volume posture decides, unless it was explicitly waived. `Ok` here
+    /// is what import, save and migration gate on — the panel already reports
+    /// the same fact, and a screen that states a refusal nothing enforces is
+    /// worse than one that states nothing.
+    pub fn may_write_secrets(&self) -> Result<(), VaultError> {
+        if self.unencrypted_volume {
+            return Ok(());
+        }
+        super::windows::bitlocker::require_protected(&self.dir)
     }
 
     /// Default location, beside the legacy file it replaces.
@@ -420,6 +446,7 @@ impl ProfileStore {
             software_keystore: self.software_keystore,
             volume: volume.detail(),
             volume_protected: volume.allows_secrets(),
+            unencrypted_volume_waived: self.unencrypted_volume,
             memory_locked: lock.holds(),
             memory: lock.detail(),
             dumps_excluded: exclusion.holds(),
@@ -611,6 +638,38 @@ mod tests {
         assert!(
             !posture.hardware_backed,
             "waiving the requirement must never produce a hardware claim"
+        );
+        assert!(!posture.is_clean());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Off Windows the volume posture is `Indeterminate`, which refuses. The
+    /// waiver is the only thing that lets a secret be written — and it must not
+    /// pretend the disk became encrypted.
+    #[test]
+    fn the_volume_waiver_permits_writing_without_claiming_protection() {
+        let (dir, strict) = store("volume-strict");
+        assert!(
+            strict.may_write_secrets().is_err(),
+            "une posture indéterminable doit refuser, pas passer"
+        );
+        assert!(!strict.posture().unencrypted_volume_waived);
+
+        let waived = ProfileStore::new(dir.clone(), Box::new(FixedRoot([4u8; KEY_LEN])))
+            .allowing_unencrypted_volume(true);
+        assert!(
+            waived.may_write_secrets().is_ok(),
+            "la dérogation doit lever le refus"
+        );
+
+        let posture = waived.posture();
+        assert!(
+            posture.unencrypted_volume_waived,
+            "la dérogation doit être visible"
+        );
+        assert!(
+            !posture.volume_protected,
+            "lever l'exigence ne chiffre pas le disque"
         );
         assert!(!posture.is_clean());
         let _ = std::fs::remove_dir_all(&dir);

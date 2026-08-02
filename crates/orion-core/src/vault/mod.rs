@@ -455,6 +455,13 @@ pub struct VaultPosture {
     /// Volume-encryption posture of the disk holding the profiles.
     pub volume: &'static str,
     pub volume_protected: bool,
+    /// `danger_allow_unencrypted_volume` is on.
+    ///
+    /// Distinct from `!volume_protected` for the same reason
+    /// `software_keystore` is distinct from `!hardware_backed`: an unencrypted
+    /// disk is a **refusal**, and only the flag turns it into a choice. The
+    /// panel must be able to say which of the two it is looking at.
+    pub unencrypted_volume_waived: bool,
     /// Whether secret pages are held out of swap and hibernation.
     pub memory_locked: bool,
     pub memory: &'static str,
@@ -474,6 +481,7 @@ impl VaultPosture {
         self.hardware_backed
             && !self.software_keystore
             && self.volume_protected
+            && !self.unencrypted_volume_waived
             && self.memory_locked
             && self.rotation_required.is_empty()
             && !self.legacy_present
@@ -492,6 +500,7 @@ mod posture_tests {
             software_keystore: false,
             volume: "",
             volume_protected: true,
+            unencrypted_volume_waived: false,
             memory_locked: true,
             memory: "",
             dumps_excluded: true,
@@ -508,10 +517,15 @@ mod posture_tests {
     fn any_missing_guarantee_makes_the_posture_unclean() {
         assert!(clean().is_clean());
 
-        let cases: [(&str, PostureMutation); 6] = [
+        let cases: [(&str, PostureMutation); 7] = [
             ("no hardware root", |p| p.hardware_backed = false),
             ("software keystore", |p| p.software_keystore = true),
             ("volume unprotected", |p| p.volume_protected = false),
+            // Waiving the prerequisite does not satisfy it: the disk is still
+            // unencrypted, and the panel must keep saying so.
+            ("unencrypted volume waived", |p| {
+                p.unencrypted_volume_waived = true
+            }),
             ("memory not locked", |p| p.memory_locked = false),
             ("rotation pending", |p| {
                 p.rotation_required = vec!["poste".into()]

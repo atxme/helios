@@ -159,7 +159,13 @@ export function PosturePanel({
             />
             <Row
               label="volume"
-              value={vault.volumeProtected ? 'chiffré' : 'non couvert'}
+              value={
+                vault.volumeProtected
+                  ? 'chiffré'
+                  : vault.unencryptedVolumeWaived
+                    ? 'non chiffré — exigence levée'
+                    : 'non couvert'
+              }
               tone={vault.volumeProtected ? undefined : AMBER}
               note={vault.volume}
             />

@@ -185,6 +185,7 @@ describe('Orion presentational branches', () => {
       softwareKeystore: true,
       volume: 'Volume non chiffré.',
       volumeProtected: false,
+      unencryptedVolumeWaived: false,
       memoryLocked: false,
       memory: 'Verrouillage mémoire refusé par le système.',
       dumpsExcluded: false,
@@ -203,12 +204,42 @@ describe('Orion presentational branches', () => {
     expect(html).toContain('portable')
   })
 
+  /// A refusal and a waiver must not read alike.
+  ///
+  /// Both leave the disk unencrypted, so the amber tone is the same — what
+  /// differs is whether somebody *chose* it. Reporting a machine without
+  /// BitLocker as a deliberate waiver would credit the user with a decision
+  /// they never made, and hide the one they did.
+  it('separates an unencrypted volume from one whose requirement was waived', () => {
+    const base: VaultPosture = {
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume non chiffré.',
+      volumeProtected: false,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+    }
+
+    const refused = postureHtml(profile(), base)
+    expect(refused).toContain('non couvert')
+    expect(refused).not.toContain('exigence levée')
+
+    const waived = postureHtml(profile(), { ...base, unencryptedVolumeWaived: true })
+    expect(waived).toContain('exigence levée')
+  })
+
   it('claims the hardware seal only when it holds', () => {
     const clean: VaultPosture = {
       hardwareBacked: true,
       softwareKeystore: false,
       volume: 'Volume chiffré.',
       volumeProtected: true,
+      unencryptedVolumeWaived: false,
       memoryLocked: true,
       memory: 'Pages verrouillées en RAM.',
       dumpsExcluded: true,

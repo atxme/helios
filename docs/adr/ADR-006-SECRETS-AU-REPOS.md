@@ -230,8 +230,16 @@ La hiérarchie est une conjonction, jamais une liste de voies de récupération 
 2. Une clé asymétrique non exportable est créée dans le *Microsoft Platform
    Crypto Provider*. Orion vérifie le fournisseur, la non-exportabilité, l'ACL
    utilisateur et le résultat de l'opération avant de persister quoi que ce soit.
-   Le minimum est RSA-3072 avec OAEP-SHA-256 ; un TPM qui ne le porte pas est
-   refusé plutôt que ramené silencieusement à RSA-2048 ou au fournisseur logiciel.
+   L'enveloppe est OAEP-SHA-256 ; le module est **demandé à 3072 et planché à
+   2048** (amendement du 2 août 2026). La décision initiale exigeait 3072 et
+   refusait tout TPM qui ne le portait pas : le *TPM 2.0 PC Client Profile*
+   n'impose que RSA-2048, 3072 y est facultatif, et la création échouait donc
+   sur `NTE_INVALID_PARAMETER` sur la quasi-totalité des machines — Orion
+   refusait alors de conserver le moindre secret. Un plancher que le matériel
+   courant ne franchit pas ne protège rien, il supprime la fonctionnalité. Ce
+   que cette clé garantit est la **non-exportabilité**, et elle ne dépend pas du
+   module. Le repli est journalisé à chaque création ; le fournisseur logiciel,
+   lui, reste refusé.
 3. Le blob TPM et ses métadonnées publiques sont protégés par DPAPI en portée
    utilisateur avec une entropie de domaine constante. DPAPI lie l'accès au
    compte ; il **ne contient jamais une seconde enveloppe de la clé racine**.
@@ -359,6 +367,21 @@ l'installateur et au démarrage sur le volume qui porte profils, pagefile et
 hibernation. Orion refuse import, migration et connexion automatique si cette
 posture est absente ou indéterminable. La documentation seule ne suffit pas à un
 prérequis qualifié d'absolu.
+
+Ce refus a une échappatoire, sur le modèle exact du coffre logiciel (amendement
+du 2 août 2026) :
+
+```toml
+danger_allow_unencrypted_volume = true
+```
+
+Sans elle, un poste de développement sans BitLocker — le cas courant d'une
+machine de test — obtient un Orion qui ne peut rien importer et ne l'explique
+qu'en journal ; un refus sans issue ne se traduit pas par un disque chiffré, il
+se traduit par un contournement bricolé ailleurs. Le drapeau ne chiffre rien : il
+lève l'exigence, l'annonce en `WARN` à **chaque** démarrage, et la ligne
+« volume » du panneau passe à « non chiffré — exigence levée ». Sous ce mode, T1
+et T7 ne sont plus couverts.
 
 ### 4. Helios — combler les trois manques
 
@@ -564,7 +587,10 @@ round-trip seul prouve le fonctionnement, pas la sécurité.
 * `danger_allow_software_keystore` est visible à chaque démarrage et un test de
   posture interdit d'afficher « TPM » dans ce mode ;
 * BitLocker désactivé ou état indéterminable bloque import, migration et connexion
-  automatique.
+  automatique ; `danger_allow_unencrypted_volume` lève le blocage sans jamais
+  faire passer la posture pour saine ;
+* un TPM sans RSA-3072 obtient RSA-2048 avec un `WARN` nommant le repli, et un
+  module sous 2048 reste refusé.
 
 **Gateway et mémoire — cibles réelles**
 
