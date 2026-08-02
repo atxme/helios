@@ -86,7 +86,10 @@ pub fn require_protected(path: &std::path::Path) -> Result<(), VaultError> {
 
 #[cfg(windows)]
 mod imp {
-    use super::{VolumeProtection, PROTECTION_OFF, PROTECTION_ON};
+    // Glob rather than a named list: this module only compiles on Windows,
+    // so an item added to the parent and forgotten here fails on the target
+    // and nowhere else. See the note in `tpm.rs`.
+    use super::*;
     use std::path::Path;
     use windows::core::BSTR;
     use windows::Win32::System::Com::{

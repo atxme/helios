@@ -79,7 +79,10 @@ pub fn require(region: &[u8]) -> Result<(), VaultError> {
 
 #[cfg(windows)]
 mod imp {
-    use super::Exclusion;
+    // Glob rather than a named list: this module only compiles on Windows,
+    // so an item added to the parent and forgotten here fails on the target
+    // and nowhere else. See the note in `tpm.rs`.
+    use super::*;
     use windows_sys::Win32::System::ErrorReporting::{
         WerRegisterExcludedMemoryBlock, WerUnregisterExcludedMemoryBlock,
     };

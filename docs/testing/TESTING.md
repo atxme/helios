@@ -525,6 +525,23 @@ confirmés puis corrigés avec test de non-régression :
   sessions Windows distinctes. Hors Windows, `orion_core::identity_store`
   échoue explicitement (`UnsupportedPlatform`) au lieu d’écrire ces clés en
   clair ;
+- **le code `cfg(windows)` ne se compile pas depuis WSL2**, et c’est une limite
+  d’outillage, pas de conception : `cargo check --target x86_64-pc-windows-msvc`
+  échoue en construisant `aws-lc-sys`, faute de compilateur C ciblant MSVC. Une
+  erreur de nom ou de type dans `vault/windows/` n’apparaît donc que sur le poste
+  Windows. Deux atténuations, aucune n’étant un substitut :
+  - les modules `#[cfg(windows)] mod imp` importent le parent par `use super::*`,
+    pour qu’un élément ajouté au-dessus ne manque jamais à l’appel ;
+  - les symboles `windows-sys` se vérifient hors compilation en lisant le crate
+    dans le registre Cargo, ce qui prouve l’existence et le **type** attendu :
+    ```sh
+    W=~/.cargo/registry/src/*/windows-sys-0.61*/src/Windows/Win32
+    grep -rn '\bNCryptSetProperty\b' $W --include=mod.rs   # signature exacte
+    grep -n 'pub const TOKEN_QUERY\b' $W/Security/mod.rs   # type de la constante
+    ```
+    C’est ainsi qu’ont été validés `OpenProcessToken` (dans `System::Threading`,
+    pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
+    `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
 - le job Windows valide les chemins Tauri et Win32 compilables sans matériel ;
   WireGuard-NT, le TPM physique, BitLocker réellement actif et les effets WER

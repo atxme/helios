@@ -128,10 +128,13 @@ pub use imp::{unwrap_root, wrap_root};
 
 #[cfg(windows)]
 mod imp {
-    use super::{
-        validate_key_properties, KeyOwnership, VaultError, Zeroizing, KEY_LEN, KEY_NAME,
-        MIN_RSA_BITS,
-    };
+    // Glob rather than a named list, deliberately. This module only compiles on
+    // Windows, and the workstation that builds it is not the one that edits it:
+    // an item added above and forgotten here fails on the target, minutes into a
+    // build, with an error nobody on Linux ever sees — `PREFERRED_RSA_BITS` did
+    // exactly that. The parent module is small, private and entirely dedicated
+    // to this one, so the usual argument against a glob does not apply.
+    use super::*;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey,
