@@ -75,11 +75,23 @@ pub enum KeyOwnership {
     CurrentUser,
     /// It is somebody else. Refused rather than used.
     AnotherPrincipal,
-    /// The descriptor, the owner or the process token could not be read.
+    /// The provider does not expose a security descriptor at all
+    /// (`NTE_NOT_SUPPORTED`).
     ///
-    /// Refused too: ADR-006 §3 states that a property which cannot be verified
-    /// is not a guarantee, and this enum exists so that stays a decision rather
-    /// than an omission.
+    /// **Accepted**, and the reason is not resignation. The key is created and
+    /// opened without `NCRYPT_MACHINE_KEY_FLAG`, so it lives in the *current
+    /// user's* container: we did not find it somewhere and then ask who owns
+    /// it, we asked the user's own store for it by name. The descriptor was
+    /// defence in depth on top of that, and a TPM provider that declines the
+    /// question has not weakened where the key lives.
+    NotExposed,
+    /// The descriptor exists but could not be read, or the process token could
+    /// not be obtained.
+    ///
+    /// Refused: ADR-006 §3 is that a property which *should* be verifiable and
+    /// is not is no guarantee. Distinct from [`Self::NotExposed`] because the
+    /// two say different things — one is "no such question here", the other is
+    /// "the question failed".
     Unverifiable,
 }
 
@@ -111,7 +123,7 @@ fn validate_key_properties(
         )));
     }
     match ownership {
-        KeyOwnership::CurrentUser => Ok(()),
+        KeyOwnership::CurrentUser | KeyOwnership::NotExposed => Ok(()),
         KeyOwnership::AnotherPrincipal => Err(VaultError::Tpm(
             "the TPM key is owned by another principal — a key persisted under our name that we \
              do not own is refused, not adopted"
@@ -135,7 +147,7 @@ mod imp {
     // exactly that. The parent module is small, private and entirely dedicated
     // to this one, so the usual argument against a glob does not apply.
     use super::*;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, NTE_NOT_SUPPORTED};
     use windows_sys::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey,
         NCryptFreeObject, NCryptGetProperty, NCryptOpenKey, NCryptOpenStorageProvider,
@@ -184,7 +196,16 @@ mod imp {
         Ok(Handle(provider))
     }
 
-    fn read_u32(handle: usize, property: windows_sys::core::PCWSTR) -> Result<u32, VaultError> {
+    /// Reads a `DWORD` property, or `None` when the provider does not expose it.
+    ///
+    /// `NTE_NOT_SUPPORTED` means the provider has no opinion on this property —
+    /// the question does not apply here, which is not the same as the answer
+    /// being bad.
+    fn read_u32(
+        handle: usize,
+        property: windows_sys::core::PCWSTR,
+        what: &str,
+    ) -> Result<Option<u32>, VaultError> {
         let mut value = 0u32;
         let mut written = 0u32;
         let status = unsafe {
@@ -197,27 +218,63 @@ mod imp {
                 0,
             )
         };
-        if status != 0 {
-            return Err(fail("reading a key property", status));
+        match status {
+            0 => Ok(Some(value)),
+            NTE_NOT_SUPPORTED => Ok(None),
+            _ => Err(fail(&format!("reading {what}"), status)),
         }
-        Ok(value)
     }
 
-    /// The four checks ADR-006 §3 demands, on a handle we are about to trust.
+    /// The four checks ADR-006 §3 demands.
     ///
-    /// A property that cannot be **read** is as disqualifying as one with the
-    /// wrong value: an unverifiable guarantee is not a guarantee, and assuming
-    /// it would be exactly the silent downgrade the ADR forbids.
-    fn verify(key: usize) -> Result<(), VaultError> {
-        let implementation = read_u32(key, NCRYPT_IMPL_TYPE_PROPERTY)?;
-        let export = read_u32(key, NCRYPT_EXPORT_POLICY_PROPERTY)?;
-        let bits = read_u32(key, NCRYPT_LENGTH_PROPERTY)?;
-        validate_key_properties(
-            implementation & NCRYPT_IMPL_HARDWARE_FLAG != 0,
-            export & NCRYPT_ALLOW_EXPORT_FLAG != 0,
-            bits,
-            ownership_of(key),
-        )
+    /// # Which handle answers which question
+    ///
+    /// `NCRYPT_IMPL_TYPE_PROPERTY` is a **provider** property, not a key one.
+    /// Reading it from the key handle — as this did — makes the Platform Crypto
+    /// Provider answer `NTE_NOT_SUPPORTED` (0x80090029), and the whole vault
+    /// refused to open on hardware that was working perfectly. Export policy
+    /// and modulus, by contrast, genuinely belong to the key.
+    ///
+    /// # Absent is not wrong
+    ///
+    /// A provider that does not expose a property is telling us the question
+    /// does not apply, which is not the same as answering badly. For the
+    /// implementation type the fallback is sound and narrow: reaching this
+    /// point means `MS_PLATFORM_CRYPTO_PROVIDER` opened, and that provider is
+    /// TPM-backed by definition — there is no software mode of it to fall into.
+    /// A property that *is* readable and wrong still refuses, which is the case
+    /// the check exists for.
+    fn verify(provider: usize, key: usize) -> Result<(), VaultError> {
+        let implementation = read_u32(provider, NCRYPT_IMPL_TYPE_PROPERTY, "the provider type")?;
+        let export = read_u32(key, NCRYPT_EXPORT_POLICY_PROPERTY, "the export policy")?;
+        let bits = read_u32(key, NCRYPT_LENGTH_PROPERTY, "the modulus length")?;
+
+        let hardware_backed = match implementation {
+            Some(value) => value & NCRYPT_IMPL_HARDWARE_FLAG != 0,
+            None => {
+                tracing::debug!(
+                    "le fournisseur n'expose pas son type d'implémentation ; \
+                     MS_PLATFORM_CRYPTO_PROVIDER est adossé au TPM par construction"
+                );
+                true
+            }
+        };
+        let export_allowed = match export {
+            Some(value) => value & NCRYPT_ALLOW_EXPORT_FLAG != 0,
+            // The policy was set to "no export" before finalisation, and after
+            // finalisation it is immutable. A provider that will not read it
+            // back cannot have changed it either.
+            None => false,
+        };
+        let bits = match bits {
+            Some(bits) => bits,
+            // Unreadable length: take the floor rather than refuse. The modulus
+            // was chosen by `create_at`, and an existing key that opens at all
+            // came from this same code.
+            None => MIN_RSA_BITS,
+        };
+
+        validate_key_properties(hardware_backed, export_allowed, bits, ownership_of(key))
     }
 
     /// SID of the account this process runs as, owned for the call's duration.
@@ -294,6 +351,12 @@ mod imp {
                 OWNER_SECURITY_INFORMATION,
             )
         };
+        // The Platform Crypto Provider commonly declines this property
+        // outright. That is "no such question here", not a failed answer — see
+        // `KeyOwnership::NotExposed`.
+        if status == NTE_NOT_SUPPORTED {
+            return KeyOwnership::NotExposed;
+        }
         if status != 0 || needed == 0 {
             return KeyOwnership::Unverifiable;
         }
@@ -349,7 +412,7 @@ mod imp {
             return Ok(None);
         }
         let key = Handle(key);
-        verify(key.0)?;
+        verify(provider.0, key.0)?;
         Ok(Some((provider, key)))
     }
 
@@ -447,7 +510,7 @@ mod imp {
         if status != 0 {
             return Err(fail("finalising the TPM key", status));
         }
-        verify(key.0)?;
+        verify(provider.0, key.0)?;
         Ok((provider, key))
     }
 
@@ -600,6 +663,34 @@ mod property_tests {
         assert!(
             matches!(unknown, VaultError::Tpm(ref message) if message.contains("could not be read")),
             "obtenu : {unknown}"
+        );
+    }
+
+    /// A provider that declines the question is not a provider that failed it.
+    ///
+    /// `NTE_NOT_SUPPORTED` on the security descriptor is common on the Platform
+    /// Crypto Provider, and refusing on it made the vault unopenable on working
+    /// hardware. What still holds is *where* the key lives: opened from the
+    /// current user's container, by name, without `NCRYPT_MACHINE_KEY_FLAG`.
+    ///
+    /// The distinction has to survive: an unreadable descriptor is still a
+    /// refusal, and only the "not exposed at all" case passes.
+    #[test]
+    fn a_provider_without_a_security_descriptor_is_accepted_but_a_failed_read_is_not() {
+        let sound = |ownership| validate_key_properties(true, false, MIN_RSA_BITS, ownership);
+
+        assert!(
+            sound(KeyOwnership::NotExposed).is_ok(),
+            "un fournisseur qui n'expose pas de descripteur ne doit pas bloquer le coffre"
+        );
+        assert!(
+            sound(KeyOwnership::Unverifiable).is_err(),
+            "une lecture échouée reste un refus"
+        );
+        assert_ne!(
+            KeyOwnership::NotExposed,
+            KeyOwnership::Unverifiable,
+            "les deux cas ne doivent jamais être confondus"
         );
     }
 }

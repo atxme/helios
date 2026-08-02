@@ -681,21 +681,38 @@ async fn finish_import(
     // la clé admise" naming the very key they had just produced.
     if completed.profile.private_key.trim().is_empty() {
         let mut slot = state.staged_key.lock().await;
-        let matches = slot.as_ref().is_some_and(|staged| match &admitted {
+        match (slot.as_ref(), admitted.as_deref()) {
             // The document names the admitted key: pair on it, never on the
             // profile name. A key that was not admitted would hand the user a
             // profile whose handshakes fail with nothing to explain them.
-            Some(admitted) => &staged.public_key == admitted,
-            // No client certificate to compare against. The staged key is the
-            // one the user just obtained for this very purpose, so adopting it
-            // is what they meant — and the notice says so.
-            None => true,
-        });
-        if matches {
-            if let Some(staged) = slot.take() {
-                completed.profile.private_key = staged.private_key.clone();
-                completed.private_key_missing = None;
+            (Some(staged), Some(admitted)) if staged.public_key == admitted => {
+                if let Some(staged) = slot.take() {
+                    completed.profile.private_key = staged.private_key.clone();
+                    completed.private_key_missing = None;
+                }
             }
+            // A key is waiting, and it is **not** the admitted one. Saying so
+            // beats the generic "no key of this machine matches": the user is
+            // holding a key they believe is the right one, and the useful fact
+            // is that the operator admitted a different one.
+            (Some(staged), Some(admitted)) => {
+                completed.private_key_missing = Some(format!(
+                    "la clé générée sur ce poste — « {} » — n'est pas celle que ce document \
+                     déclare admise — « {admitted} ». Faire admettre la première par \
+                     l'opérateur, ou importer la moitié privée de la seconde.",
+                    staged.public_key
+                ));
+            }
+            // No certificate to compare against. The staged key is the one the
+            // user just obtained for this very purpose, so adopting it is what
+            // they meant.
+            (Some(_), None) => {
+                if let Some(staged) = slot.take() {
+                    completed.profile.private_key = staged.private_key.clone();
+                    completed.private_key_missing = None;
+                }
+            }
+            (None, _) => {}
         }
     }
 

@@ -403,12 +403,18 @@ pub fn complete_profile_import(
     };
 
     let Some(existing) = local else {
+        // The message names the gesture, not just the gap. It used to end on
+        // "coller la clé privée correspondante" with nothing saying where —
+        // the field is « Importer une clé privée », in the identity block of
+        // this very screen.
         let missing = match admitted_public_key {
             Some(admitted) => format!(
-                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil de ce poste ne détient la clé admise « {admitted} ». Coller la clé privée correspondante, ou demander un profil complet à l'opérateur."
+                "ce document est une invitation : il ne porte pas de clé privée, et aucune clé de ce poste ne correspond à la clé admise « {admitted} ». \
+                 Utiliser « Importer une clé privée » si vous détenez la moitié privée de cette clé, ou demander un profil complet à l'opérateur."
             ),
             None => format!(
-                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil local « {} » n'en fournit une. Coller la clé privée correspondante, ou demander un profil complet à l'opérateur.",
+                "ce document est une invitation : il ne porte pas de clé privée, et aucun profil local « {} » n'en fournit une. \
+                 Utiliser « Importer une clé privée », ou demander un profil complet à l'opérateur.",
                 profile.name
             ),
         };
