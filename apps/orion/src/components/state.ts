@@ -168,89 +168,74 @@ export interface ProtectionMeta {
   detail: string
 }
 
-const PQC_DETAIL =
-  'Secret ML-KEM-1024 négocié à cette connexion et posé dans le slot PresharedKey. ' +
-  'Il est renouvelé au prochain montage : un trafic enregistré aujourd’hui reste ' +
-  'illisible pour un adversaire quantique.'
-
 /**
- * Deux PSK ML-KEM, deux propriétés de sécurité différentes.
+ * # Une ligne, pas un paragraphe
  *
- * Le même `PskKind::MlKem` est émis par les deux chemins du cœur : la
- * négociation préalable (`connect_with_key_negotiation`) et l'ancien
- * provisioning par l'API interne (`upgrade_to_post_quantum`). Le secret est
- * de même qualité, mais **le premier handshake ne l'est pas** : dans le
- * second cas il a eu lieu sans PSK, donc il est enregistrable et déchiffrable
- * plus tard. C'est précisément ce que la négociation existe pour empêcher, et
- * l'afficher identiquement effacerait la seule différence qui compte.
+ * Ces textes tenaient en quatre lignes chacun et expliquaient le « récolter
+ * maintenant, déchiffrer plus tard ». Une infobulle n'est pas l'endroit où
+ * l'on apprend la cryptographie post-quantique : elle nomme ce qui protège le
+ * tunnel à cet instant. Le raisonnement, lui, vit dans les ADR.
  *
- * Le profil suffit à trancher : porteur d'un bloc de négociation, le cœur
- * emprunte ce chemin et ne passe jamais par l'upgrade.
+ * Le seul écart conservé est celui qui change une propriété de sécurité :
+ * négocié **avant** le premier handshake ou obtenu **après** le montage. Le
+ * reste est du commentaire.
  */
-const PQC_NEGOTIATED_DETAIL =
-  'Secret ML-KEM-1024 négocié sur le port dédié AVANT le premier handshake, puis ' +
-  'posé dans le slot PresharedKey. Aucun handshake de ce tunnel n’a eu lieu sans ' +
-  'lui : rien d’enregistrable aujourd’hui ne sera déchiffrable demain.'
+const PQC_DETAIL = 'Clé renouvelée à chaque connexion.'
 
-const PQC_UPGRADED_DETAIL =
-  'Secret ML-KEM-1024 obtenu par l’API interne APRÈS le montage d’un tunnel ' +
-  'classique. Les échanges suivants sont protégés, mais le premier handshake a eu ' +
-  'lieu sans PSK : lui reste exposé au « récolter maintenant, déchiffrer plus tard ». ' +
-  'Un profil enrôlé avec négociation supprime cette fenêtre.'
+const PQC_NEGOTIATED_DETAIL = 'Clé négociée avant le premier handshake, renouvelée à chaque connexion.'
 
-const STATIC_DETAIL =
-  'PSK statique inscrit au profil, partagé hors bande. Il protège du « récolter ' +
-  'maintenant, déchiffrer plus tard », mais il ne tourne jamais et sa présence ' +
-  'désactive la négociation ML-KEM. Les deux pairs doivent porter la même valeur.'
+const PQC_UPGRADED_DETAIL = 'Clé obtenue après le montage : le premier handshake a eu lieu sans elle.'
 
-const CLASSIC_DETAIL =
-  'Aucun PSK : la confidentialité repose sur Curve25519 seul, cassable par un ' +
-  'adversaire quantique qui aurait enregistré le trafic.'
+const STATIC_DETAIL = 'Secret fixe du profil, partagé hors bande. Il ne tourne pas.'
+
+const CLASSIC_DETAIL = 'Aucun PSK : Curve25519 seul.'
 
 export function protectionMeta(
   profile: ClientProfile | null,
   observed: PskKind | null,
-  state: TunnelState,
+  // Kept in the signature though the pending label no longer varies with it:
+  // callers pass the tunnel state, and removing it would churn every call site
+  // for a parameter the next wording change is likely to want back.
+  _state?: TunnelState,
 ): ProtectionMeta {
   if (observed === 'ml_kem') {
     return profile?.key_negotiation
-      ? { tone: 'pqc', label: 'PSK PQC · négocié', detail: PQC_NEGOTIATED_DETAIL }
-      : { tone: 'pqc', label: 'PSK PQC · après tunnel', detail: PQC_UPGRADED_DETAIL }
+      ? { tone: 'pqc', label: 'ML-KEM', detail: PQC_NEGOTIATED_DETAIL }
+      : { tone: 'pqc', label: 'ML-KEM après tunnel', detail: PQC_UPGRADED_DETAIL }
   }
-  if (observed === 'static') return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
-  if (observed === 'none') return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
+  if (observed === 'static') return { tone: 'static', label: 'PSK', detail: STATIC_DETAIL }
+  if (observed === 'none') return { tone: 'classic', label: 'Classique', detail: CLASSIC_DETAIL }
 
   // Nothing observed: we announce the wait, never the acquired state. A
-  // profile that *can* obtain a PQC PSK doesn't have it yet.
-  const pending = (label: string, detail: string): ProtectionMeta => {
-    const meta = stateMeta(state)
-    return {
-      tone: 'pending',
-      label: meta.active || meta.transitioning ? `${label} — négociation…` : `${label} à la connexion`,
-      detail,
-    }
-  }
+  // profile that *can* obtain an ML-KEM key doesn't have it yet. The ellipsis
+  // carries that on its own — spelling out "à la connexion" made the chip
+  // longer than the fact it states.
+  const pending = (label: string, detail: string): ProtectionMeta => ({
+    tone: 'pending',
+    label: `${label}…`,
+    detail,
+  })
 
   // The negotiated mode is authoritative over every other clue: it is what
   // the client is about to ask for, and the gateway substitutes nothing.
   const negotiated = profile?.key_negotiation
   if (negotiated) {
-    if (negotiated.mode === 'ml_kem') return pending('PSK PQC', PQC_DETAIL)
+    if (negotiated.mode === 'ml_kem') return pending('ML-KEM', PQC_DETAIL)
     if (negotiated.mode === 'static_psk') {
-      return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
+      return { tone: 'static', label: 'PSK', detail: STATIC_DETAIL }
     }
-    return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
+    return { tone: 'classic', label: 'Classique', detail: CLASSIC_DETAIL }
   }
 
   // The presence flag, not the value: the profile no longer carries either
   // secret across the IPC (ADR-006 §5). Presence is all this ever needed.
   if (profile?.has_static_psk) {
-    return { tone: 'static', label: 'PSK statique', detail: STATIC_DETAIL }
+    return { tone: 'static', label: 'PSK', detail: STATIC_DETAIL }
   }
 
-  if (profile?.heliosd_url?.trim()) return pending('PSK PQC', PQC_DETAIL)
+  if (profile?.heliosd_url?.trim()) return pending('ML-KEM', PQC_DETAIL)
 
-  return { tone: 'classic', label: 'Sans PSK', detail: CLASSIC_DETAIL }
+  return { tone: 'classic', label: 'Classique', detail: CLASSIC_DETAIL }
 }
 
 /**
@@ -272,18 +257,15 @@ export interface ModeMeta {
 const MODE_META: Record<ProtectionMode, ModeMeta> = {
   classic: {
     label: 'Classique',
-    detail:
-      'Aucun PSK négocié : la confidentialité repose sur Curve25519 seul, cassable par un adversaire quantique qui aurait enregistré le trafic.',
+    detail: 'Aucun PSK négocié.',
   },
   static_psk: {
-    label: 'PSK statique',
-    detail:
-      'Le PSK du profil est retrouvé par comparaison d’empreinte — la valeur ne circule jamais. Il protège du « récolter maintenant, déchiffrer plus tard », mais il ne tourne pas.',
+    label: 'PSK',
+    detail: 'Le PSK du profil, retrouvé par empreinte. La valeur ne circule pas.',
   },
   ml_kem: {
-    label: 'ML-KEM-1024',
-    detail:
-      'Un PSK frais est dérivé à chaque connexion et n’est jamais écrit sur disque. Helios le pose avant de répondre, et le retire si le handshake n’aboutit pas.',
+    label: 'ML-KEM',
+    detail: 'Clé fraîche à chaque connexion, jamais écrite sur disque.',
   },
 }
 

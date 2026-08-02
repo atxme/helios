@@ -1,4 +1,4 @@
-//! Core logic of the Orion VPN client.
+//! Core logic of the Orion client.
 //!
 //! This crate depends on neither Tauri nor webkit: it compiles and is tested
 //! everywhere, including on WSL2. It carries three things:

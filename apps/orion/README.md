@@ -1,4 +1,4 @@
-# Orion VPN
+# Orion
 
 Orion est le client de bureau WireGuard de la gateway Helios. L’application
 combine une IHM React/TypeScript embarquée par Tauri et un cœur Rust portable

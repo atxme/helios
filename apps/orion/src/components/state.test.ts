@@ -78,9 +78,13 @@ describe('Orion UI state', () => {
 
     expect(negotiated.tone).toBe('pqc')
     expect(upgraded.tone).toBe('pqc')
+    // The wording is short now, but the distinction it carries is the whole
+    // point: one has protected every handshake of this tunnel, the other has
+    // not. Asserting on the *fact* rather than on a phrase that will be
+    // rewritten again.
     expect(negotiated.label).not.toBe(upgraded.label)
-    expect(negotiated.detail).toContain('AVANT')
-    expect(upgraded.detail).toContain('premier handshake a eu lieu sans PSK')
+    expect(negotiated.detail).toContain('avant le premier handshake')
+    expect(upgraded.detail).toContain('après le montage')
   })
 
   it('reads the PQC PSK from the event, never from the profile', () => {

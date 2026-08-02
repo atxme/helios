@@ -701,7 +701,7 @@ export function ProfilesView({
                 present={draft.has_private_key || rotateKey}
                 error={issues.private_key}
                 presentLabel={rotateKey ? 'nouvelle clé à l’enregistrement' : 'scellée dans le coffre'}
-                absentLabel="aucune — importer un document d’enrôlement ou en générer une"
+                absentLabel="aucune — importer un profil ou en générer une"
                 action={{
                   label: draft.has_private_key ? 'Générer une nouvelle clé' : 'Générer une clé',
                   onClick: () => {
@@ -710,12 +710,12 @@ export function ProfilesView({
                     setNotice({
                       tone: 'success',
                       message:
-                        'Une nouvelle clé sera tirée à l’enregistrement. Sa clé publique devra être réadmise par l’opérateur avant la prochaine connexion.',
+                        'Nouvelle clé à l’enregistrement. Sa clé publique devra être réadmise par l’opérateur.',
                     })
                   },
                   disabled: rotateKey,
                 }}
-                hint="Elle ne quitte jamais le poste : ni cet écran, ni un message interne ne la transportent."
+                hint="Elle ne quitte jamais le poste."
               />
               <Field
                 label="Clé publique gateway"
@@ -794,7 +794,7 @@ export function ProfilesView({
                     present={staticPsk}
                     error={issues.preshared_key}
                     presentLabel="scellé dans le coffre"
-                    absentLabel="aucun — PSK négocié en ML-KEM à chaque connexion"
+                    absentLabel="aucun — ML-KEM à chaque connexion"
                     action={
                       staticPsk
                         ? {
@@ -807,13 +807,11 @@ export function ProfilesView({
                           }
                         : undefined
                     }
-                    hint="Un PSK statique se pose à l’enrôlement, hors bande : cet écran ne peut que le retirer."
+                    hint="Se pose à l’enrôlement. Cet écran ne peut que le retirer."
                   />
                   {staticPsk && (
                     <Caution>
-                      Laisser vide pour obtenir un <strong>PSK PQC</strong> négocié en ML-KEM-1024 à
-                      chaque connexion. Une valeur ici la <strong>désactive</strong> : le secret ne
-                      tourne plus et les deux pairs doivent porter la même valeur.
+                      Un PSK statique <strong>désactive</strong> ML-KEM.
                     </Caution>
                   )}
                   <Field

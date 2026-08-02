@@ -1,7 +1,7 @@
 // Prevents opening a Windows console in release mode.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Tauri shell of the Orion VPN client.
+//! Tauri shell of the Orion client.
 //!
 //! Thin wiring layer: it contains no WireGuard logic (delegated to
 //! `orion-core`). Its role is to:
@@ -233,7 +233,7 @@ fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
 
     TrayIconBuilder::with_id("orion-notification-area")
         .icon(icon)
-        .tooltip("Orion VPN")
+        .tooltip("Orion")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {

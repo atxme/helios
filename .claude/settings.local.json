@@ -242,7 +242,11 @@
       "Bash(awk -F'[ ;]' '{s+=$4; if\\($6>0\\) f+=$6} END {print s\" tests, \"\\(f+0\\)\" échecs\"}')",
       "Bash(timeout 2400 cargo llvm-cov -p heliosd --all-features --summary-only --jobs 2)",
       "Bash(echo \"=== exit=$? ===\")",
-      "Bash(ps -o pid,etime,cmd -C heliosd)"
+      "Bash(ps -o pid,etime,cmd -C heliosd)",
+      "Bash(magick montage *)",
+      "Bash(magick small-16.png -filter point -resize 400% zoom16.png)",
+      "Bash(magick small-24.png -filter point -resize 400% zoom24.png)",
+      "Bash(magick identify *)"
     ]
   }
 }

@@ -95,7 +95,7 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
     fireEvent.change(screen.getByLabelText('Trafic capté'), { target: { value: '100.64.0.0/10' } })
     expect(screen.getByText(/ce qui en sort part/)).toBeTruthy()
-    expect(screen.getByText(/Une valeur ici la/)).toBeTruthy()
+    expect(screen.getByText(/désactive/)).toBeTruthy()
     expect(screen.queryByDisplayValue('static-secret')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
     fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
