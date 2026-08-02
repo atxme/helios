@@ -435,6 +435,18 @@ fn report(
 ///
 /// Checked up front so a missing CA is reported before the command has
 /// admitted a peer it will not be able to hand a profile to.
+/// # Le piège que ce message évite
+///
+/// Il disait « créer la CA opérateur d'abord », avec la commande toute faite.
+/// Sur un poste où la CA existe mais n'a pas été trouvée — parce que le
+/// répertoire par défaut était relatif au dossier courant — suivre ce conseil
+/// **orphelinait toute la flotte** : `heliosd init-key-negotiation` épingle la
+/// CA client dans `/var/lib/helios/key-negotiation-client-pq-ca-public.bin`, et
+/// la gateway refuse tout certificat émis par une autre. Le remède proposé
+/// cassait ce qui marchait encore.
+///
+/// Le message dit donc d'abord de **retrouver** la CA existante, et ne propose
+/// d'en créer une qu'en nommant la conséquence.
 pub fn check_client_ca(directory: &Path) -> Result<()> {
     for file in [
         CA_CERTIFICATE_FILE,
@@ -444,10 +456,20 @@ pub fn check_client_ca(directory: &Path) -> Result<()> {
         let path = directory.join(file);
         if !path.is_file() {
             bail!(
-                "{} is missing — create the operator CA first:\n  \
-                 helios-ctl key-nego init-client-ca --name <nom> --output-dir {}",
+                "CA opérateur introuvable dans {} ({} manque).\n\n\
+                 Si vous avez déjà enrôlé un client, cette CA **existe** et la gateway \
+                 n'accepte qu'elle. La retrouver :\n  \
+                 find ~ -name '{}' 2>/dev/null\n\
+                 puis la désigner par --client-ca-dir, ou la déplacer à l'emplacement \
+                 par défaut ci-dessus.\n\n\
+                 N'en créer une neuve que s'il n'en existe aucune : la gateway épingle la \
+                 CA cliente à `heliosd init-key-negotiation`, et une CA différente rend \
+                 illisible tout certificat déjà émis — tous les clients admis cessent de \
+                 négocier.\n  \
+                 helios-ctl key-nego init-client-ca --name <nom>",
+                directory.display(),
                 path.display(),
-                directory.display()
+                CA_CERTIFICATE_FILE,
             );
         }
     }

@@ -94,9 +94,13 @@ enum Cmd {
         /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
         #[arg(long)]
         endpoint: String,
-        /// Directory of the operator client CA (`key-nego init-client-ca`).
-        #[arg(long, default_value = "./orion-client-ca")]
-        client_ca_dir: PathBuf,
+        /// Répertoire de la CA opérateur (`key-nego init-client-ca`).
+        ///
+        /// Défaut : l'emplacement fixe du compte, que `HELIOS_CLIENT_CA_DIR`
+        /// déplace. Il ne dépend **pas** du répertoire courant — voir
+        /// `key_nego::default_client_ca_dir`.
+        #[arg(long)]
+        client_ca_dir: Option<PathBuf>,
         /// Client public key, when the client already holds its own pair.
         #[arg(long)]
         public_key: Option<String>,
@@ -855,6 +859,7 @@ async fn main() -> Result<()> {
         } => {
             // Checked before the gateway is contacted: a missing CA must not
             // be discovered after a peer has been admitted.
+            let client_ca_dir = client_ca_dir.unwrap_or_else(key_nego::default_client_ca_dir);
             enroll::check_client_ca(&client_ca_dir)?;
             let offline = match (gateway_certificate, gateway_pq_certificate, address) {
                 (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {

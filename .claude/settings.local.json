@@ -250,7 +250,8 @@
       "Bash(HELIOS_PUBLISHER_KEYRING_PATH=__TRACKED_VAR__/keys/publisher-keyring.json cargo build --release -p orion)",
       "Bash(dpkg -l)",
       "Bash(sed -i 's|tracing-subscriber = { version = \"0.3\", features = \\\\[\"env-filter\"\\\\] }|tracing-subscriber = { version = \"0.3\", features = [\"env-filter\", \"registry\", \"std\"] }|' Cargo.toml)",
-      "Bash(sed -i 's|^use std::io::Write;$||' apps/orion/src-tauri/src/main.rs)"
+      "Bash(sed -i 's|^use std::io::Write;$||' apps/orion/src-tauri/src/main.rs)",
+      "Bash(HELIOS_CLIENT_CA_DIR= cargo run -q -p helios-ctl -- enroll --name x --endpoint 1.2.3.4:51820 --output /tmp/x.orionprofile)"
     ]
   }
 }
