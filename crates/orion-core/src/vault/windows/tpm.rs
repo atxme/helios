@@ -290,7 +290,17 @@ mod imp {
             None => MIN_RSA_BITS,
         };
 
-        validate_key_properties(hardware_backed, export_allowed, bits, ownership_of(key))
+        let ownership = ownership_of(key);
+        // The four answers, as the provider actually gave them. Three failed
+        // starts were spent guessing which one was refusing.
+        tracing::debug!(
+            materiel = hardware_backed,
+            exportable = export_allowed,
+            module = bits,
+            ?ownership,
+            "propriétés de la clé TPM"
+        );
+        validate_key_properties(hardware_backed, export_allowed, bits, ownership)
     }
 
     /// SID of the account this process runs as, owned for the call's duration.

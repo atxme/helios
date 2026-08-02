@@ -61,6 +61,30 @@ les trois cas, et `build.rs` s’en charge.
   Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
   quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
   qui se lance, s’affiche, et ment. Prérequis : `npm ci --prefix apps/orion`.
+## Journal
+
+Orion écrit **à la fois** sur la sortie standard et dans un fichier :
+
+```
+%APPDATA%\helios\orion\config\orion.log     (Windows)
+~/.config/helios/orion/orion.log            (Linux)
+```
+
+Le fichier existe parce qu’un Orion installé n’a pas de console : en release,
+`windows_subsystem = "windows"` envoie la sortie standard nulle part, et
+demander à un utilisateur de recompiler sous `cargo run` pour obtenir un journal
+revient à lui demander de rebâtir le produit. Il est **remis à zéro à chaque
+démarrage** : ce qu’on cherche est ce lancement-ci, pas six démarrages plus tôt.
+
+Par défaut : `info` partout, `debug` pour les crates du projet — assez pour voir
+quel chemin le coffre a pris, ce que le TPM a répondu et pourquoi un profil n’a
+pas chargé, sans noyer cela sous `hyper` et `rustls`. `RUST_LOG` remplace tout :
+
+```sh
+RUST_LOG=trace cargo run -p orion --features wireguard      # tout
+RUST_LOG=orion_core::vault=trace cargo run -p orion         # le coffre seul
+```
+
 - **L’icône et le nom** viennent de `tauri.conf.json` et de `icons/icon.ico`,
   déclarés en `rerun-if-changed` : les remplacer suffit à ce que la prochaine
   compilation les embarque, exécutable, fenêtre et zone de notification

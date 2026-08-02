@@ -153,11 +153,26 @@ impl PlatformRootKeyProvider {
 
 impl RootKeyProvider for PlatformRootKeyProvider {
     fn root_key(&self) -> Result<DeviceRootKey, VaultError> {
-        if self.path.exists() {
-            self.open()
-        } else {
-            self.create()
+        // Which branch was taken, and what came of it. Without this the whole
+        // startup showed a single downstream error — "coffre illisible" — with
+        // nothing saying whether the root was created, opened, or never
+        // reached.
+        let existing = self.path.exists();
+        tracing::debug!(
+            racine = %self.path.display(),
+            existante = existing,
+            logiciel = self.software_only,
+            "obtention de la racine d'installation"
+        );
+        let outcome = if existing { self.open() } else { self.create() };
+        match &outcome {
+            Ok(_) => tracing::debug!(
+                materielle = self.hardware_backed(),
+                "racine d'installation obtenue"
+            ),
+            Err(error) => tracing::warn!(%error, "racine d'installation indisponible"),
         }
+        outcome
     }
 
     fn hardware_backed(&self) -> bool {

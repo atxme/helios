@@ -248,7 +248,9 @@
       "Bash(magick small-24.png -filter point -resize 400% zoom24.png)",
       "Bash(magick identify *)",
       "Bash(HELIOS_PUBLISHER_KEYRING_PATH=__TRACKED_VAR__/keys/publisher-keyring.json cargo build --release -p orion)",
-      "Bash(dpkg -l)"
+      "Bash(dpkg -l)",
+      "Bash(sed -i 's|tracing-subscriber = { version = \"0.3\", features = \\\\[\"env-filter\"\\\\] }|tracing-subscriber = { version = \"0.3\", features = [\"env-filter\", \"registry\", \"std\"] }|' Cargo.toml)",
+      "Bash(sed -i 's|^use std::io::Write;$||' apps/orion/src-tauri/src/main.rs)"
     ]
   }
 }

@@ -312,9 +312,26 @@ impl ProfileStore {
     pub fn load(&self) -> Result<ClientConfig, VaultError> {
         let root = self.root()?;
         let registry = self.load_registry(&root)?;
+        tracing::debug!(
+            profils = registry.entries.len(),
+            repertoire = %self.dir.display(),
+            "registre du coffre ouvert"
+        );
         let mut profiles = Vec::with_capacity(registry.entries.len());
         for entry in &registry.entries {
-            profiles.push(self.load_manifest(&root, entry)?.to_profile());
+            // Named one by one: a single failure aborts the load, and knowing
+            // *which* profile refused is the difference between a fix and a
+            // reinstall.
+            let manifest = self.load_manifest(&root, entry).inspect_err(|error| {
+                tracing::warn!(profil = %entry.name, %error, "manifeste illisible");
+            })?;
+            tracing::debug!(
+                profil = %entry.name,
+                generation = manifest.generation.0,
+                rotation_requise = entry.rotation_required,
+                "profil chargé"
+            );
+            profiles.push(manifest.to_profile());
         }
         let selected = registry
             .selected

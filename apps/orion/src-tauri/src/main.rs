@@ -935,9 +935,10 @@ async fn connect(
     let rotation_required = state.store.rotation_required().unwrap_or_default();
     if rotation_required.contains(&profile.name) {
         return Err(format!(
-            "« {} » a été repris d'un fichier en clair : sa clé privée est présumée compromise. \
-             Générer une nouvelle clé et la faire admettre par l'opérateur avant de vous \
-             connecter.",
+            "« {} » vient du fichier profiles.toml, où sa clé privée était en clair : elle est \
+             donc présumée connue (sauvegardes, profil itinérant, image système). \
+             Dans l'onglet Profils : « Générer une nouvelle clé », transmettre la clé publique \
+             affichée à l'opérateur pour admission, puis Enregistrer. Le blocage tombe seul.",
             profile.name
         ));
     }
@@ -1226,12 +1227,122 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
     })
 }
 
+/// Default log filter.
+///
+/// `info` everywhere, `debug` for the crates that are **ours**. A flat `info`
+/// left the interesting half of a startup unsaid — which vault path was taken,
+/// what the TPM answered, why a profile did not load — while a flat `debug`
+/// buries it under `hyper`, `quinn` and `rustls`. `RUST_LOG` overrides the
+/// whole thing.
+const DEFAULT_LOG_FILTER: &str = "info,orion=debug,orion_core=debug,aether=debug,\
+                                  helios_vault=debug,helios_key_negotiation=debug";
+
+/// Log file, beside the vault it describes.
+const LOG_FILE: &str = "orion.log";
+
+/// Shared handle to the log file.
+///
+/// `tracing-appender` would do this and is not in the lockfile; adding a
+/// dependency for fifteen lines is the worse trade. Locking per event is fine
+/// at the rate this application logs.
+#[derive(Clone)]
+struct FileWriter(Arc<StdMutex<std::fs::File>>);
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?
+            .flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Opens the log file, truncating what a previous run left.
+///
+/// Truncating rather than appending, and rotating nothing: what is wanted is
+/// *this* start, in full. A file that grows across weeks makes the operator
+/// scroll past six boots to reach the one that failed, and a VPN client that
+/// silently fills a disk is its own incident.
+fn open_log_file() -> Option<FileWriter> {
+    let path = orion_core::vault::ProfileStore::default_dir()
+        .ok()?
+        .join(LOG_FILE);
+    if let Some(parent) = path.parent() {
+        aether::private_file::create_private_dir(parent).ok()?;
+    }
+    let file = std::fs::File::create(&path).ok()?;
+    Some(FileWriter(Arc::new(StdMutex::new(file))))
+}
+
+/// Wires stdout **and** a file.
+///
+/// The file is what makes a release build diagnosable at all: `windows_subsystem
+/// = "windows"` means an installed Orion has no console, so everything written
+/// to stdout goes nowhere. Asking a user to reproduce under `cargo run` to see
+/// a log is asking them to rebuild the product.
+fn init_logging() -> Option<PathBuf> {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
+    };
+
+    let path = orion_core::vault::ProfileStore::default_dir()
+        .ok()
+        .map(|dir| dir.join(LOG_FILE));
+
+    match open_log_file() {
+        Some(file) => {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            use tracing_subscriber::util::SubscriberInitExt as _;
+            tracing_subscriber::registry()
+                .with(filter())
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        // No colour codes in a file somebody will paste back.
+                        .with_ansi(false)
+                        .with_writer(file),
+                )
+                .init();
+            path
+        }
+        None => {
+            tracing_subscriber::fmt().with_env_filter(filter()).init();
+            None
+        }
+    }
+}
+
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let log_path = init_logging();
+    if let Some(path) = &log_path {
+        tracing::info!(fichier = %path.display(), "journal d'Orion");
+    } else {
+        tracing::warn!("journal fichier indisponible — sortie standard uniquement");
+    }
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        backend = if cfg!(feature = "wireguard") {
+            "wireguard"
+        } else {
+            "dry-run"
+        },
+        "démarrage d'Orion"
+    );
 
     #[cfg(debug_assertions)]
     let _frontend_dev_server =

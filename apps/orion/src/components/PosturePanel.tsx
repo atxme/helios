@@ -195,10 +195,10 @@ export function PosturePanel({
                 label="rotation"
                 value={vault.rotationRequired.join(', ')}
                 tone={AMBER}
-                note="La clé de ces profils a vécu en clair : elle est présumée compromise, et \
-                     sceller le fichier ne rappelle pas les copies déjà parties en sauvegarde. \
-                     Ils ne se connecteront qu’après génération d’une nouvelle clé et sa \
-                     réadmission par l’opérateur."
+                note="La clé de ces profils a vécu en clair dans profiles.toml : sceller le \
+                     fichier ne rappelle pas les copies déjà parties en sauvegarde. Onglet \
+                     Profils → « Générer une nouvelle clé », faire admettre la clé publique \
+                     affichée, puis Enregistrer."
               />
             )}
           </Box>
