@@ -182,6 +182,17 @@ pub struct ClientProfile {
     #[serde(default)]
     pub address: Option<String>,
     /// Traffic routed into the tunnel. Defaults to [`DEFAULT_ALLOWED_IPS`].
+    ///
+    /// One or more CIDR prefixes, comma-separated — the `wg-quick` spelling of
+    /// `AllowedIPs`, which is WireGuard's cryptographic routing table. A split
+    /// tunnel usually needs several: the VPN network *and* the remote LAN have
+    /// no common supernet short of `0.0.0.0/0`, so a single prefix forced a
+    /// choice between them.
+    ///
+    /// Stored normalized (`a/n, b/m`) by
+    /// [`crate::profile_import::normalize_cidr_list`]: the screen, the sealed
+    /// profile and the peer built from it have to agree character for
+    /// character, or a reloaded profile reads as modified.
     #[serde(default = "default_allowed_ips")]
     pub allowed_ips: String,
     /// Keepalive in seconds. Defaults to [`DEFAULT_KEEPALIVE_SECS`].

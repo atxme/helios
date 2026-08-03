@@ -712,7 +712,7 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
             when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
         }),
         allowed_ips: when_filled(&profile.allowed_ips, |value| {
-            validate_cidr(value, "trafic capté")
+            validate_cidr_list(value, "trafic capté")
         }),
         // Zero is not "empty": it's a value, and it disables keepalive while
         // a client behind NAT depends on it.
@@ -738,7 +738,11 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     profile.endpoint = profile.endpoint.trim().to_string();
     profile.private_key = profile.private_key.trim().to_string();
     profile.peer_public_key = profile.peer_public_key.trim().to_string();
-    profile.allowed_ips = profile.allowed_ips.trim().to_string();
+    // Normalized rather than merely trimmed: a `wg-quick` file writes
+    // `a/n,b/m` and the screen writes `a/n, b/m`. Same list, two spellings,
+    // and a profile that came back from disk spelled differently from how it
+    // was saved would show "unsaved changes" on every load.
+    profile.allowed_ips = normalize_cidr_list(&profile.allowed_ips);
     profile.preshared_key = non_empty(profile.preshared_key);
     profile.address = non_empty(profile.address);
     profile.heliosd_url = non_empty(profile.heliosd_url);
@@ -773,7 +777,7 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     if let Some(address) = profile.address.as_deref() {
         validate_cidr(address, "adresse virtuelle")?;
     }
-    validate_cidr(&profile.allowed_ips, "AllowedIPs")?;
+    validate_cidr_list(&profile.allowed_ips, "AllowedIPs")?;
     if profile.persistent_keepalive == 0 {
         anyhow::bail!("PersistentKeepalive doit être supérieur à zéro");
     }
@@ -907,10 +911,68 @@ fn validate_endpoint_host(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_cidr(value: &str, label: &str) -> Result<()> {
-    if value.contains(',') {
-        anyhow::bail!("{label} invalide : Orion accepte un seul préfixe par profil");
+/// Splits a comma-separated prefix list into its trimmed, non-empty entries.
+///
+/// One place, because four call sites read this field — validation, import,
+/// the screen and the backend that builds the peer — and a list they parsed
+/// differently would let the UI approve a route WireGuard never installs.
+pub fn split_cidr_list(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Validates a list of prefixes: `AllowedIPs` is one, an address is not.
+///
+/// # Why several
+///
+/// `AllowedIPs` is WireGuard's cryptographic routing table, and a split
+/// tunnel usually needs more than one entry — the VPN network *and* the
+/// remote LAN, say, which have no common supernet short of `0.0.0.0/0`.
+/// Accepting a single prefix forced the choice between them, or the whole
+/// Internet. A `wg-quick` file, where a comma-separated list is the ordinary
+/// form, was refused for the same reason.
+///
+/// Each entry is validated on its own and named in the message: "the third is
+/// wrong" is what turns a rejected list into a fixed one.
+fn validate_cidr_list(value: &str, label: &str) -> Result<()> {
+    let entries = split_cidr_list(value);
+    if entries.is_empty() {
+        anyhow::bail!("{label} invalide : au moins un préfixe est requis");
     }
+    for (index, entry) in entries.iter().enumerate() {
+        validate_cidr(entry, label).with_context(|| {
+            if entries.len() > 1 {
+                format!("{label} : préfixe {} sur {}", index + 1, entries.len())
+            } else {
+                label.to_string()
+            }
+        })?;
+    }
+    // Duplicates are refused rather than silently collapsed. WireGuard would
+    // take the list as it comes, so a prefix written twice is not an ambiguity
+    // to arbitrate — it is a list the user has lost track of, and the second
+    // occurrence is usually a typo for something else.
+    for (index, entry) in entries.iter().enumerate() {
+        if entries[..index].contains(entry) {
+            anyhow::bail!("{label} invalide : le préfixe {entry} apparaît deux fois");
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites a prefix list in one canonical form: `a/n, b/m`.
+///
+/// The screen, the stored profile and the peer built from it must agree
+/// character for character — otherwise a profile saved as `a/n,b/m` and
+/// redisplayed as `a/n, b/m` reads as an unsaved change on every load.
+pub fn normalize_cidr_list(value: &str) -> String {
+    split_cidr_list(value).join(", ")
+}
+
+fn validate_cidr(value: &str, label: &str) -> Result<()> {
     let Some((address, prefix)) = value.split_once('/') else {
         anyhow::bail!("{label} invalide : notation CIDR attendue");
     };
@@ -1057,6 +1119,60 @@ mod tests {
         assert_eq!(issues.private_key, None);
         assert_eq!(issues.peer_public_key, None);
         assert_eq!(issues.address, None);
+    }
+
+    /// `AllowedIPs` is a list, and a split tunnel is why.
+    ///
+    /// One prefix used to be the limit, so reaching both the VPN network and
+    /// a remote LAN — which share no supernet short of `0.0.0.0/0` — meant
+    /// choosing one or routing the whole Internet.
+    #[test]
+    fn allowed_ips_accepts_several_prefixes_and_names_the_faulty_one() {
+        let several = ClientProfile {
+            allowed_ips: "100.64.0.0/10, 192.168.1.0/24, fd00::/8".into(),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&several).allowed_ips, None);
+        assert!(validate_imported_profile(several).is_ok());
+
+        // Spelling is normalized on the way in: the screen writes one form,
+        // a `wg-quick` file another, and a profile reloaded in a spelling it
+        // was not saved in reads as modified.
+        let unspaced = ClientProfile {
+            allowed_ips: "100.64.0.0/10,192.168.1.0/24".into(),
+            ..complete_profile()
+        };
+        assert_eq!(
+            validate_imported_profile(unspaced)
+                .expect("import")
+                .allowed_ips,
+            "100.64.0.0/10, 192.168.1.0/24"
+        );
+
+        // A faulty entry names its position: "the second is wrong" is what
+        // turns a rejected list into a fixed one.
+        let faulty = ClientProfile {
+            allowed_ips: "100.64.0.0/10, 192.168.1.0/33".into(),
+            ..complete_profile()
+        };
+        let reported = inspect_profile(&faulty)
+            .allowed_ips
+            .expect("the faulty prefix is reported");
+        assert!(reported.contains("préfixe 2 sur 2"), "{reported}");
+
+        // A prefix written twice is a list its author has lost track of.
+        let duplicated = ClientProfile {
+            allowed_ips: "10.0.0.0/8, 10.0.0.0/8".into(),
+            ..complete_profile()
+        };
+        assert!(inspect_profile(&duplicated).allowed_ips.is_some());
+
+        // And an empty list still cannot mount a tunnel that captures nothing.
+        let empty = ClientProfile {
+            allowed_ips: " , ".into(),
+            ..complete_profile()
+        };
+        assert!(validate_imported_profile(empty).is_err());
     }
 
     /// The point of inspection versus import: it doesn't stop at the first

@@ -117,6 +117,25 @@ const MAX_IMPORT_BYTES = 64 * 1024
 /** Range that captures all traffic — the one that holds up the fail-open invariant. */
 const CAPTURE_ALL = '0.0.0.0/0'
 
+/** Its IPv6 counterpart, which captures everything just as thoroughly. */
+const CAPTURE_ALL_V6 = '::/0'
+
+/**
+ * Does this prefix list still route everything through the tunnel?
+ *
+ * A string comparison against `0.0.0.0/0` no longer answers it: the field
+ * holds a **list** now, and `0.0.0.0/0, 192.168.1.0/24` captures everything
+ * while being equal to neither. Getting this wrong would show the split-tunnel
+ * warning on a full tunnel, or — worse — hide it on a narrowed one.
+ */
+function capturesEverything(value: string): boolean {
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  return entries.includes(CAPTURE_ALL) || entries.includes(CAPTURE_ALL_V6)
+}
+
 /**
  * Delay before judging a field, in milliseconds.
  *
@@ -690,7 +709,7 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
-  const narrowed = draft.allowed_ips.trim() !== CAPTURE_ALL
+  const narrowed = !capturesEverything(draft.allowed_ips)
   // A PSK entered during this edit counts as present: it is what the save is
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
@@ -1019,13 +1038,14 @@ export function ProfilesView({
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                   <Field
                     label="Trafic capté"
-                error={issues.allowed_ips}
+                    error={issues.allowed_ips}
                     value={draft.allowed_ips}
                     onChange={(value) => set('allowed_ips', value)}
+                    hint="Une ou plusieurs plages CIDR, séparées par des virgules. Ex. : 100.64.0.0/10, 192.168.1.0/24"
                   />
                   {narrowed && (
                     <Caution>
-                      Plage restreinte : ce qui en sort part <strong>en clair</strong>.{' '}
+                      Plages restreintes : ce qui en sort part <strong>en clair</strong>.{' '}
                       {CAPTURE_ALL} capte tout.
                     </Caution>
                   )}
@@ -1677,6 +1697,7 @@ function Field({
   type = 'text',
   placeholder,
   error,
+  hint,
 }: {
   label: string
   value: string
@@ -1685,6 +1706,8 @@ function Field({
   placeholder?: string
   /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
+  /** Shown while the field is acceptable. An error always wins over it. */
+  hint?: string
 }) {
   return (
     <TextField
@@ -1695,7 +1718,7 @@ function Field({
       placeholder={placeholder}
       value={value}
       error={Boolean(error)}
-      helperText={error ?? undefined}
+      helperText={error ?? hint}
       onChange={(event) => onChange(event.target.value)}
       sx={{
         '& input': { fontFamily: 'monospace', fontSize: 12 },

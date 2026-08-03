@@ -126,9 +126,22 @@ impl WireGuardBackend {
         peer.set_endpoint(&profile.endpoint)
             .map_err(|e| anyhow::anyhow!("endpoint `{}` invalide : {e}", profile.endpoint))?;
 
-        let allowed = IpAddrMask::from_str(&profile.allowed_ips)
-            .map_err(|e| anyhow::anyhow!("allowed_ips `{}` invalide : {e}", profile.allowed_ips))?;
-        peer.set_allowed_ips(vec![allowed]);
+        // Several prefixes, because `AllowedIPs` is the cryptographic routing
+        // table and a split tunnel rarely reaches everything it needs through
+        // one entry. Each is parsed on its own and named on failure: a list
+        // refused as a whole says nothing about which entry to fix.
+        let entries = crate::profile_import::split_cidr_list(&profile.allowed_ips);
+        if entries.is_empty() {
+            anyhow::bail!("allowed_ips est vide : aucun trafic ne serait capté par le tunnel");
+        }
+        let allowed = entries
+            .iter()
+            .map(|entry| {
+                IpAddrMask::from_str(entry)
+                    .map_err(|e| anyhow::anyhow!("allowed_ips : préfixe `{entry}` invalide : {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        peer.set_allowed_ips(allowed);
 
         peer.persistent_keepalive_interval = Some(profile.persistent_keepalive);
 
