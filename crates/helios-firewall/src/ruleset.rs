@@ -102,6 +102,20 @@ pub enum Match {
     DestNet(String),
     /// `ip saddr <addr>` — IP or CIDR.
     SourceNet(String),
+    /// `meta l4proto icmp`
+    ///
+    /// # Limite connue : le type ICMP n'est pas discriminé
+    ///
+    /// La règle porte sur le protocole, pas sur `icmp type echo-request` :
+    /// l'API haut niveau de `rustables` expose `Rule::icmp()` et aucun moyen
+    /// de comparer l'octet de type sans écrire l'expression `payload` à la
+    /// main — même nature de limite que le MSS clamping documenté en tête de
+    /// `netlink`. Ce que ça élargit reste borné : la règle n'est posée que
+    /// sur l'interface du tunnel, donc seuls des pairs déjà admis par
+    /// WireGuard l'atteignent, et les erreurs ICMP utiles étaient déjà
+    /// acceptées par `ct state established,related`. Ce qui la débloquerait :
+    /// une expression `payload` brute, ou un `rustables` qui expose le type.
+    Icmp,
 }
 
 impl fmt::Display for Match {
@@ -117,6 +131,7 @@ impl fmt::Display for Match {
             }
             Match::DestNet(a) => write!(f, "ip daddr {a}"),
             Match::SourceNet(a) => write!(f, "ip saddr {a}"),
+            Match::Icmp => write!(f, "meta l4proto icmp"),
         }
     }
 }
@@ -349,6 +364,46 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
+    // ── ICMP and SSH on the tunnel interface ─────────────────────────────────
+    //
+    // Both are scoped by **interface**, never by source address, and that is
+    // the whole security argument: only WireGuard puts packets on `wg_iface`,
+    // and it only does so for a peer whose key it has already authenticated.
+    // A source-address match would be satisfiable from the WAN by forging the
+    // address — which is exactly the trap of listing the CGNAT range in
+    // `allow_ssh_from`.
+    if !policy.wg_iface.is_empty() {
+        if policy.allow_tunnel_icmp {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![Match::InIface(policy.wg_iface.clone()), Match::Icmp],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "ICMP on the tunnel: `ping` is the first test anyone runs, and under a \
+                     drop policy it fails identically whether the tunnel works or not",
+                ),
+            );
+        }
+        if policy.allow_ssh_over_tunnel {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(policy.wg_iface.clone()),
+                        Match::DestPort {
+                            port: 22,
+                            proto: L4::Tcp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("administrative SSH arriving through the tunnel"),
+            );
+        }
+    }
+
     // ── Administrative SSH, regardless of tunnel state ───────────────────────
     for src in &policy.allow_ssh_from {
         rules.push(Rule::new(
@@ -482,6 +537,8 @@ mod tests {
             allow_ssh_from: vec![],
             allow_dhcp_on_wan: false,
             allow_client_internet: false,
+            allow_tunnel_icmp: false,
+            allow_ssh_over_tunnel: false,
             wg_iface: "helios0".into(),
             admin_port: None,
             admin_iface: None,
@@ -673,6 +730,79 @@ mod tests {
                     .any(|r| r.matches == vec![Match::InIface("lo".into())]
                         && r.verdict == Verdict::Accept),
                 "{kind:?} must accept loopback via its ingress interface"
+            );
+        }
+    }
+
+    /// Both tunnel openings exist only when asked, and only on the tunnel.
+    ///
+    /// The interface scope is the whole security argument. A source-address
+    /// match — listing `100.64.0.0/10` in `allow_ssh_from`, the obvious
+    /// shortcut — would be satisfiable from the WAN by a packet forging that
+    /// source, because those rules carry no interface constraint. Only
+    /// WireGuard puts packets on `wg_iface`, and only for an authenticated
+    /// peer.
+    #[test]
+    fn tunnel_icmp_and_ssh_are_opt_in_and_scoped_to_the_tunnel_interface() {
+        let closed = render(&policy(), TunnelState::Up);
+        for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+            assert!(
+                !text(&closed, ChainKind::Input)
+                    .iter()
+                    .any(|r| r.contains(forbidden)),
+                "`{forbidden}` must not appear while the flag is off"
+            );
+        }
+
+        let mut open = policy();
+        open.allow_tunnel_icmp = true;
+        open.allow_ssh_over_tunnel = true;
+        let rs = render(&open, TunnelState::Up);
+        let input = text(&rs, ChainKind::Input);
+        assert!(input
+            .iter()
+            .any(|r| r == "iifname \"helios0\" meta l4proto icmp accept"));
+        assert!(input
+            .iter()
+            .any(|r| r == "iifname \"helios0\" tcp dport 22 accept"));
+
+        // Neither may ever be rendered without its interface match, whatever
+        // the state: that rule alone is what keeps them off the WAN.
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            for rule in render(&open, state).chain(ChainKind::Input) {
+                let touches_tunnel_opening = rule.matches.contains(&Match::Icmp)
+                    || rule.matches.contains(&Match::DestPort {
+                        port: 22,
+                        proto: L4::Tcp,
+                    });
+                if touches_tunnel_opening && rule.verdict == Verdict::Accept {
+                    assert!(
+                        rule.matches.contains(&Match::InIface("helios0".into())),
+                        "{state:?}: `{rule}` opens without being scoped to the tunnel"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A gateway that cannot bring up its interface must open neither.
+    ///
+    /// Same gate as the listener ports: a rule naming an interface that does
+    /// not exist is at best dead weight, and at worst a rule that starts
+    /// matching the day something else claims that name.
+    #[test]
+    fn the_tunnel_openings_need_a_wireguard_interface() {
+        let mut p = policy();
+        p.allow_tunnel_icmp = true;
+        p.allow_ssh_over_tunnel = true;
+        p.wg_iface = String::new();
+        let rs = render(&p, TunnelState::Up);
+        for forbidden in ["meta l4proto icmp", "tcp dport 22"] {
+            assert!(
+                !text(&rs, ChainKind::Input)
+                    .iter()
+                    .any(|r| r.contains(forbidden)),
+                "`{forbidden}` must not be rendered without a tunnel interface"
             );
         }
     }

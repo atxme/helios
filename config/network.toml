@@ -120,6 +120,34 @@ admin_iface = "helios0"
 # requêtes sortent hors du tunnel et révèlent les noms consultés.
 # allow_client_internet = true
 
+# ── ICMP sur le tunnel ───────────────────────────────────────────────────────
+# Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart
+# est voulu : cette règle ne route rien et n'expose rien vers l'extérieur. Elle
+# laisse la gateway répondre pour **elle-même**, sur une interface que seuls
+# des pairs déjà admis par WireGuard atteignent.
+#
+# Ce que coûte sa fermeture est un cul-de-sac de diagnostic. `ping 100.64.0.1`
+# est le premier réflexe sur un tunnel neuf ; sous une politique `drop` il
+# expire exactement comme un tunnel qui n'est jamais monté — le test qu'on
+# tente d'abord est celui qui ne distingue pas la réussite de l'échec.
+#
+# Limite : la règle porte sur le protocole ICMP, pas sur `echo-request` seul —
+# l'API de rustables n'expose pas le type. Voir le doc-comment de
+# `helios-firewall::ruleset::Match::Icmp`.
+# allow_tunnel_icmp = true
+
+# ── SSH à travers le tunnel ──────────────────────────────────────────────────
+# Fermé par défaut : l'accès d'administration est ce qu'un attaquant cherche en
+# premier, et le modèle fail-closed ne l'ouvre que sur demande.
+#
+# À préférer à l'ajout de 100.64.0.0/10 dans `allow_ssh_from`, qui est le
+# raccourci évident et le mauvais : ces règles-là filtrent sur l'adresse source
+# **sans contrainte d'interface**, donc un paquet forgeant une source
+# 100.64.x.x depuis le WAN les satisferait. Celle-ci est bornée à l'interface
+# du tunnel, où seul WireGuard dépose des paquets, et seulement pour un pair
+# qu'il a authentifié.
+# allow_ssh_over_tunnel = true
+
 # ── Pairs autorisés ──────────────────────────────────────────────────────────
 # Ne plus éditer cette liste à la main : l'admission dérive la VIP de la clé
 # publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.

@@ -55,6 +55,8 @@ mod tests {
             allow_ssh_from: vec![],
             allow_dhcp_on_wan: false,
             allow_client_internet: true,
+            allow_tunnel_icmp: true,
+            allow_ssh_over_tunnel: true,
             wg_iface: "helios0".into(),
             admin_port: Some(8080),
             admin_iface: Some("helios0".into()),

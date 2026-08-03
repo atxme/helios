@@ -20,7 +20,7 @@ pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 /// Persisted in `/var/lib/helios/network.toml`. It is the only configuration
 /// file provided by the operator — all other parameters (TPM, API and
 /// firewall mode) are architectural constants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub wan_iface: String,
@@ -43,6 +43,19 @@ pub struct NetworkConfig {
     /// for what this covers — and what it does not cover, namely DNS.
     #[serde(default)]
     pub allow_client_internet: bool,
+    /// Answers ICMP on the tunnel interface. See
+    /// [`crate::FirewallPolicy::allow_tunnel_icmp`] for why this one defaults
+    /// to open while everything else here defaults to closed.
+    #[serde(default = "default_true")]
+    pub allow_tunnel_icmp: bool,
+    /// Accepts SSH arriving **through the tunnel**, on the tunnel interface.
+    ///
+    /// Closed by default. Prefer it to listing the CGNAT range in
+    /// [`Self::allow_ssh_from`]: that one matches on the source address with
+    /// no interface constraint, so a packet forging a `100.64.x.x` source
+    /// from the WAN would satisfy it.
+    #[serde(default)]
+    pub allow_ssh_over_tunnel: bool,
     /// Exclusive network interface for administration access.
     /// Must be the WireGuard interface (`wg_iface`): the API lives behind the tunnel.
     #[serde(default)]
@@ -93,6 +106,24 @@ pub struct NetworkConfig {
     /// case.
     #[serde(default)]
     pub escrow_public_key: Option<String>,
+}
+
+/// Serde default for the flags that are open unless the operator closes them.
+fn default_true() -> bool {
+    true
+}
+
+/// Delegated to serde so the two notions of "nothing configured" cannot drift.
+///
+/// `#[derive(Default)]` would have produced `false` for every `bool`,
+/// including [`NetworkConfig::allow_tunnel_icmp`], whose documented default is
+/// `true`. A config built in code would then have filtered differently from
+/// the identical config read from an empty file — the kind of divergence that
+/// only ever shows up on the target, in the one path nobody tested.
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        toml::from_str("").expect("every field of the network configuration has a serde default")
+    }
 }
 
 fn default_wg_iface() -> String {
@@ -375,6 +406,11 @@ impl NetworkConfig {
             allow_ssh_from: self.allow_ssh_from.clone(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
             allow_client_internet: self.allow_client_internet,
+            // Both are scoped to the tunnel interface, so they are worth
+            // nothing until that interface can exist — the same gate the
+            // listener openings above go through.
+            allow_tunnel_icmp: self.allow_tunnel_icmp && self.wireguard_ready(),
+            allow_ssh_over_tunnel: self.allow_ssh_over_tunnel && self.wireguard_ready(),
             wg_iface: self.wg_iface.clone(),
             admin_port,
             admin_iface: self.admin_iface.clone(),
@@ -510,6 +546,48 @@ mod tests {
         // client can handshake.
         assert_eq!(policy.wg_listen_port, Some(51820));
         assert!(policy.wg_peers.is_empty(), "road-warrior: no outbound peer");
+        // ICMP on the tunnel is the one opening that does not have to be
+        // asked for: it routes nothing and only lets the gateway answer for
+        // itself, to peers WireGuard has already authenticated.
+        assert!(policy.allow_tunnel_icmp, "absent means open, for this one");
+        assert!(
+            !policy.allow_ssh_over_tunnel,
+            "administrative access is never opened by omission"
+        );
+    }
+
+    /// Both tunnel openings are worth nothing until the interface can exist.
+    #[test]
+    fn the_tunnel_openings_follow_wireguard_readiness() {
+        let toml = r#"
+            wan_iface = "eth0"
+            allow_ssh_over_tunnel = true
+        "#;
+        let mut cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.wireguard_ready(),
+            "no private key: the interface cannot come up"
+        );
+        let policy = cfg.firewall_policy();
+        assert!(!policy.allow_tunnel_icmp);
+        assert!(!policy.allow_ssh_over_tunnel);
+
+        cfg.wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
+        let policy = cfg.firewall_policy();
+        assert!(policy.allow_tunnel_icmp);
+        assert!(policy.allow_ssh_over_tunnel);
+    }
+
+    /// Closing ICMP stays possible: the default is a choice, not a fixture.
+    #[test]
+    fn tunnel_icmp_can_be_closed_explicitly() {
+        let toml = r#"
+            wan_iface = "eth0"
+            allow_tunnel_icmp = false
+            wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        "#;
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.firewall_policy().allow_tunnel_icmp);
     }
 
     #[test]

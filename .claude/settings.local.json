@@ -281,7 +281,10 @@
       "Bash(bash -c 'set -euo pipefail; A=\"\"; [ -n \"$A\" ] && B=\\(x\\); echo \"atteint: ${B[*]:-vide}\"')",
       "Bash(echo \"code retour: $?\")",
       "Bash(bash --version)",
-      "Bash(bash -c 'set -euo pipefail; A=\\(\\); printf \"[%s]\\\\n\" ok \"${A[@]}\"; echo \"expansion vide OK\"')"
+      "Bash(bash -c 'set -euo pipefail; A=\\(\\); printf \"[%s]\\\\n\" ok \"${A[@]}\"; echo \"expansion vide OK\"')",
+      "Bash(ping -c 2 -W 3 192.168.1.44)",
+      "Bash(ip -4 addr show)",
+      "Bash(bash -n scripts/network-bootstrap.sh)"
     ]
   }
 }

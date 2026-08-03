@@ -93,6 +93,8 @@ BEGIN {
     order[12] = "key_negotiation_port"
     order[13] = "static_peer_addrs"
     order[14] = "escrow_public_key"
+    order[15] = "allow_tunnel_icmp"
+    order[16] = "allow_ssh_over_tunnel"
 
     managed["wan_iface"] = 1
     managed["lan_ifaces"] = 1
@@ -108,6 +110,8 @@ BEGIN {
     managed["key_negotiation_port"] = 1
     managed["static_peer_addrs"] = 1
     managed["escrow_public_key"] = 1
+    managed["allow_tunnel_icmp"] = 1
+    managed["allow_ssh_over_tunnel"] = 1
 
     desired["wan_iface"] = "\"" wan_iface "\""
     desired["lan_ifaces"] = "[]"
@@ -123,6 +127,11 @@ BEGIN {
     desired["key_negotiation_port"] = key_port
     desired["static_peer_addrs"] = "[]"
     desired["escrow_public_key"] = "\"" escrow_key "\""
+    # Écrites plutôt que laissées au défaut de serde : une valeur visible dans
+    # le fichier est une valeur qu on sait pouvoir changer. Ni l une ni l autre
+    # n est « forced » — l operateur qui les ferme les garde fermées.
+    desired["allow_tunnel_icmp"] = "true"
+    desired["allow_ssh_over_tunnel"] = "true"
 
     forced["wan_iface"] = 1
     forced["wg_listen_port"] = 1
@@ -137,7 +146,7 @@ function emit_missing(    i, key) {
     if (emitted) {
         return
     }
-    for (i = 1; i <= 14; i++) {
+    for (i = 1; i <= 16; i++) {
         key = order[i]
         if (!seen[key]) {
             print key " = " desired[key]

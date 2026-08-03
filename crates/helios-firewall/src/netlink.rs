@@ -93,6 +93,7 @@ impl NetlinkBackend {
             }
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
+            Match::Icmp => rule.icmp(),
         })
     }
 
