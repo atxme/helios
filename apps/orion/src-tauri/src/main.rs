@@ -48,7 +48,7 @@ use orion_core::{
 };
 #[cfg(target_os = "windows")]
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     WindowEvent,
 };
@@ -277,6 +277,14 @@ fn reveal_main_window(app: &AppHandle) -> tauri::Result<()> {
 #[cfg(target_os = "windows")]
 const TRAY_OPEN_MENU_ID: &str = "orion-tray-open";
 #[cfg(target_os = "windows")]
+const TRAY_CONNECT_MENU_ID: &str = "orion-tray-connect";
+#[cfg(target_os = "windows")]
+const TRAY_PROFILES_MENU_ID: &str = "orion-tray-profiles";
+#[cfg(target_os = "windows")]
+const TRAY_LOGS_MENU_ID: &str = "orion-tray-logs";
+#[cfg(target_os = "windows")]
+const TRAY_DISCONNECT_MENU_ID: &str = "orion-tray-disconnect";
+#[cfg(target_os = "windows")]
 const TRAY_QUIT_MENU_ID: &str = "orion-tray-quit";
 
 /// Installs Orion in the Windows notification area.
@@ -287,12 +295,35 @@ const TRAY_QUIT_MENU_ID: &str = "orion-tray-quit";
 #[cfg(target_os = "windows")]
 fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
     let open_item = MenuItem::with_id(app, TRAY_OPEN_MENU_ID, "Ouvrir Orion", true, None::<&str>)?;
+    let connect_item =
+        MenuItem::with_id(app, TRAY_CONNECT_MENU_ID, "Connexion", true, None::<&str>)?;
+    let profiles_item =
+        MenuItem::with_id(app, TRAY_PROFILES_MENU_ID, "Profils", true, None::<&str>)?;
+    let logs_item = MenuItem::with_id(app, TRAY_LOGS_MENU_ID, "Journal", true, None::<&str>)?;
+    let disconnect_item = MenuItem::with_id(
+        app,
+        TRAY_DISCONNECT_MENU_ID,
+        "Déconnecter",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, "Quitter Orion", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Orion's default window icon is unavailable"))?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open_item,
+            &separator,
+            &connect_item,
+            &profiles_item,
+            &logs_item,
+            &disconnect_item,
+            &separator,
+            &quit_item,
+        ],
+    )?;
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .map_err(|error| anyhow::anyhow!("Orion's tray icon is unavailable: {error}"))?;
 
     TrayIconBuilder::with_id("orion-notification-area")
         .icon(icon)
@@ -304,6 +335,29 @@ fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
                 if let Err(error) = reveal_main_window(app) {
                     tracing::warn!(%error, "unable to reveal Orion from the notification area");
                 }
+            } else if event.id() == TRAY_CONNECT_MENU_ID {
+                if let Err(error) = reveal_main_window(app) {
+                    tracing::warn!(%error, "unable to reveal Orion's connection view");
+                }
+                let _ = app.emit("helios://tray-view", "connect");
+            } else if event.id() == TRAY_PROFILES_MENU_ID {
+                if let Err(error) = reveal_main_window(app) {
+                    tracing::warn!(%error, "unable to reveal Orion's profiles view");
+                }
+                let _ = app.emit("helios://tray-view", "profiles");
+            } else if event.id() == TRAY_LOGS_MENU_ID {
+                if let Err(error) = reveal_main_window(app) {
+                    tracing::warn!(%error, "unable to reveal Orion's log view");
+                }
+                let _ = app.emit("helios://tray-view", "logs");
+            } else if event.id() == TRAY_DISCONNECT_MENU_ID {
+                let state = app.state::<AppState>();
+                state.telemetry.stop();
+                let controller = Arc::clone(&state.controller);
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    controller.disconnect(emit_sink(app_handle)).await;
+                });
             } else if event.id() == TRAY_QUIT_MENU_ID {
                 app.exit(0);
             }

@@ -72,6 +72,13 @@ export default function App() {
     if (c.pathImportedProfile) setView('profiles')
   }, [c.pathImportedProfile])
 
+  useEffect(() => {
+    const unlisten = api.onTrayView((trayView) => setView(trayView))
+    return () => {
+      unlisten.then((removeListener) => removeListener())
+    }
+  }, [])
+
   // Each view has its own space needs: connection fits in a narrow column,
   // the profile form needs two columns, the log wants width. The window
   // follows the view rather than permanently adopting the maximum of the

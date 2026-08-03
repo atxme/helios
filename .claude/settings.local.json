@@ -277,7 +277,11 @@
       "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'ls -la /var/lib/helios/ 2>/dev/null; echo \"--- hashes \\(may need sudo\\) ---\"; sha256sum /var/lib/helios/key-negotiation-client-ca.der /var/lib/helios/key-negotiation-client-pq-ca-public.bin 2>&1')",
       "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'systemctl is-active heliosd; echo \"--- journal ---\"; journalctl -u heliosd -n 60 --no-pager 2>&1 | tail -60')",
       "Bash(ssh *)",
-      "Bash(npx prettier *)"
+      "Bash(npx prettier *)",
+      "Bash(bash -c 'set -euo pipefail; A=\"\"; [ -n \"$A\" ] && B=\\(x\\); echo \"atteint: ${B[*]:-vide}\"')",
+      "Bash(echo \"code retour: $?\")",
+      "Bash(bash --version)",
+      "Bash(bash -c 'set -euo pipefail; A=\\(\\); printf \"[%s]\\\\n\" ok \"${A[@]}\"; echo \"expansion vide OK\"')"
     ]
   }
 }

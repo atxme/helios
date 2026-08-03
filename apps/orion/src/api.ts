@@ -146,6 +146,17 @@ export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
   return listen('helios://profile-path', cb)
 }
 
+/** A tray action selected while the main window was hidden. */
+export function onTrayView(
+  cb: (view: 'connect' | 'profiles' | 'logs') => void,
+): Promise<UnlistenFn> {
+  return listen<string>('helios://tray-view', (event) => {
+    if (event.payload === 'connect' || event.payload === 'profiles' || event.payload === 'logs') {
+      cb(event.payload)
+    }
+  })
+}
+
 /**
  * Reads the vault's posture.
  *

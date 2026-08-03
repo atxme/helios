@@ -45,6 +45,7 @@ REMPLACER=0
 MODE="ml-kem"
 ENDPOINT=""
 SERVER_NAME=""
+TRAFIC=""
 
 usage() {
     cat >&2 <<'EOF'
@@ -55,6 +56,12 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
   --server-name NOM    Nom authentifié par le certificat de négociation
                        (défaut : l'hôte de --endpoint)
   --mode MODE          classic | static-psk | ml-kem   (défaut : ml-kem)
+  --trafic PLAGES      Trafic capté par le tunnel : une ou plusieurs plages
+                       CIDR séparées par des virgules. Absent = tunnel
+                       complet (0.0.0.0/0). Le préciser ici plutôt que dans
+                       chaque poste évite qu'un parc finisse avec autant de
+                       tables de routage que d'utilisateurs.
+                         --trafic "100.64.0.0/10, 192.168.1.0/24"
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
@@ -72,6 +79,7 @@ while [ $# -gt 0 ]; do
         --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
         --server-name) SERVER_NAME="${2:-}"; shift 2 ;;
         --mode) MODE="${2:-}"; shift 2 ;;
+        --trafic|--allowed-ips) TRAFIC="${2:-}"; shift 2 ;;
         --remplacer) REMPLACER=1; shift ;;
         --refaire-ca) REFAIRE_CA=1; shift ;;
         --sortie) SORTIE="${2:-}"; shift 2 ;;
@@ -161,10 +169,14 @@ CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
 CA_DIR="${HELIOS_CLIENT_CA_DIR:-$CERTS_ROOT/internal-ca}"
 CTL=(cargo run --quiet -p helios-ctl --)
 
+ARG_TRAFIC=()
+[ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
+
 echo "==> Client     $CLIENT"
 echo "==> Gateway    $CIBLE   (SSH)"
 echo "==> Public     $ENDPOINT   (nom authentifié : $SERVER_NAME, mode $MODE)"
 echo "==> CA         $CA_DIR"
+echo "==> Trafic     ${TRAFIC:-0.0.0.0/0 (tunnel complet)}"
 echo
 
 TRAVAIL="$(mktemp -d)"
@@ -368,7 +380,7 @@ echo "==> Enrôlement"
     --gateway-certificate "$TRAVAIL/gw-cert.der" \
     --gateway-pq-certificate "$TRAVAIL/gw-pq-cert.json" \
     --address "$VIP" \
-    --output "$PROFIL"
+    --output "$PROFIL" "${ARG_TRAFIC[@]}"
 
 echo
 echo "==> Profil écrit : $PROFIL"

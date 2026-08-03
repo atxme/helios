@@ -130,6 +130,15 @@ enum Cmd {
         /// Revoke a peer of the same name before admitting this identity.
         #[arg(long)]
         replace: bool,
+        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
+        /// séparées par des virgules.
+        ///
+        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
+        /// finisse avec autant de tables de routage que d'utilisateurs.
+        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
+        #[arg(long)]
+        allowed_ips: Option<String>,
         /// Output file.
         #[arg(long)]
         output: PathBuf,
@@ -273,6 +282,15 @@ enum ProfileCmd {
         /// Admits the peer as a control-plane administrator.
         #[arg(long)]
         admin: bool,
+        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
+        /// séparées par des virgules.
+        ///
+        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
+        /// finisse avec autant de tables de routage que d'utilisateurs.
+        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
+        #[arg(long)]
+        allowed_ips: Option<String>,
         /// Output file. Absent: standard output.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -764,6 +782,32 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
     )
 }
 
+/// Checks and normalizes an operator-supplied `AllowedIPs` list.
+///
+/// Here rather than at render time, and that is the whole point: `render`
+/// round-trips the document through Orion's own parser, so a malformed list
+/// *would* be caught — but as "the emitted profile is not readable by Orion —
+/// this is a tooling bug", which is a lie when the operator simply mistyped a
+/// prefix. Worse, on `enroll` it would surface **after** the peer had been
+/// admitted on the gateway, leaving an admission with no profile to go with it.
+///
+/// The normalized form is what gets written, so a document and the screen that
+/// displays it never disagree on spelling.
+fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    orion_core::profile_import::validate_allowed_ips(&value)
+        .context("--allowed-ips")
+        .context(
+            "trafic capté invalide — une ou plusieurs plages CIDR séparées par des virgules, \
+             par exemple \"100.64.0.0/10, 192.168.1.0/24\"",
+        )?;
+    Ok(Some(orion_core::profile_import::normalize_cidr_list(
+        &value,
+    )))
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -822,8 +866,10 @@ async fn main() -> Result<()> {
                 public_key,
                 with_private_key,
                 admin,
+                allowed_ips,
                 output,
             } => {
+                let allowed_ips = check_allowed_ips(allowed_ips)?;
                 profile::emit(
                     &client,
                     base,
@@ -833,6 +879,7 @@ async fn main() -> Result<()> {
                         public_key,
                         with_private_key,
                         admin,
+                        allowed_ips,
                         output,
                     },
                 )
@@ -851,6 +898,7 @@ async fn main() -> Result<()> {
             identity,
             admin,
             replace,
+            allowed_ips,
             output,
             gateway_certificate,
             gateway_pq_certificate,
@@ -861,6 +909,7 @@ async fn main() -> Result<()> {
             // be discovered after a peer has been admitted.
             let client_ca_dir = client_ca_dir.unwrap_or_else(key_nego::default_client_ca_dir);
             enroll::check_client_ca(&client_ca_dir)?;
+            let allowed_ips = check_allowed_ips(allowed_ips)?;
             let offline = match (gateway_certificate, gateway_pq_certificate, address) {
                 (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
                     Some(enroll::OfflineInputs {
@@ -889,6 +938,7 @@ async fn main() -> Result<()> {
                     identity,
                     admin,
                     replace,
+                    allowed_ips,
                     output,
                     offline,
                 },

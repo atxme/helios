@@ -937,6 +937,15 @@ pub fn split_cidr_list(value: &str) -> Vec<&str> {
 ///
 /// Each entry is validated on its own and named in the message: "the third is
 /// wrong" is what turns a rejected list into a fixed one.
+/// Public entry point for tooling that emits a profile document.
+///
+/// `helios-ctl` validates the operator's `--allowed-ips` **before** admitting
+/// a peer, so a mistyped prefix is a refusal rather than an admission with no
+/// usable profile behind it.
+pub fn validate_allowed_ips(value: &str) -> Result<()> {
+    validate_cidr_list(value, "trafic capté")
+}
+
 fn validate_cidr_list(value: &str, label: &str) -> Result<()> {
     let entries = split_cidr_list(value);
     if entries.is_empty() {

@@ -4,12 +4,14 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+  onTrayView: vi.fn(),
   resizeForView: vi.fn(),
   vaultPosture: vi.fn(),
   useClient: vi.fn(),
 }))
 
 vi.mock('./api', () => ({
+  onTrayView: mocks.onTrayView,
   resizeForView: mocks.resizeForView,
   vaultPosture: mocks.vaultPosture,
 }))
@@ -65,6 +67,7 @@ function client(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.resizeForView.mockResolvedValue(undefined)
+  mocks.onTrayView.mockResolvedValue(vi.fn())
   // The shell reads the vault posture when the panel opens. A rejection is
   // the honest default here: the panel must survive it, and every test that
   // needs a real posture says so explicitly.

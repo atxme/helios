@@ -62,6 +62,12 @@ pub struct EnrollOptions {
     pub identity: Option<String>,
     /// Admit the peer as a control-plane administrator.
     pub admin: bool,
+    /// Split tunnel to ship with the profile. Absent = full tunnel.
+    ///
+    /// Stated once by the operator and carried by the document, rather than
+    /// retyped into each machine's Advanced panel — which is how a fleet ends
+    /// up with as many routing tables as it has users.
+    pub allowed_ips: Option<String>,
     /// Revoke an existing peer of the same name before admitting.
     pub replace: bool,
     pub output: PathBuf,
@@ -257,6 +263,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         private_key: private_key.as_deref(),
         peer_public_key: &material.wireguard_public_key,
         address: &address,
+        allowed_ips: options.allowed_ips.as_deref(),
         heliosd_url,
         key_negotiation: Some(profile::KeyNegotiation {
             mode: options.mode,
@@ -486,6 +493,7 @@ mod tests {
             endpoint: "vpn.example.net:51820".into(),
             client_ca_dir: PathBuf::from("./ca"),
             public_key: None,
+            allowed_ips: None,
             private_key_file: None,
             client_pki_dir: None,
             mode: ProtectionMode::MlKem,

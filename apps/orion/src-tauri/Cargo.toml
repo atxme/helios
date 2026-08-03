@@ -29,7 +29,7 @@ orion-core = { path = "../../../crates/orion-core" }
 zeroize = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 
 [features]
 default = []

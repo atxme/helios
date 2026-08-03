@@ -23,6 +23,7 @@ import {
   keyNegotiationSupport,
   onEvent,
   onProfilePath,
+  onTrayView,
   resizeForView,
   saveProfile,
   selectProfile,
@@ -112,6 +113,21 @@ describe('Orion Tauri bridge', () => {
 
     await expect(onProfilePath(callback)).resolves.toBe(unlisten)
     expect(mocks.listen).toHaveBeenCalledWith('helios://profile-path', callback)
+    expect(callback).toHaveBeenCalledOnce()
+  })
+
+  it('only accepts known tray destinations', async () => {
+    const unlisten = vi.fn()
+    const callback = vi.fn()
+    mocks.listen.mockImplementation(async (_name, handler) => {
+      handler({ payload: 'profiles' })
+      handler({ payload: 'unexpected' })
+      return unlisten
+    })
+
+    await expect(onTrayView(callback)).resolves.toBe(unlisten)
+    expect(mocks.listen).toHaveBeenCalledWith('helios://tray-view', expect.any(Function))
+    expect(callback).toHaveBeenCalledWith('profiles')
     expect(callback).toHaveBeenCalledOnce()
   })
 })

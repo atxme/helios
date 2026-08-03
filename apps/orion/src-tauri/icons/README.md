@@ -32,10 +32,14 @@ cp /tmp/orion-128.png 128x128.png
 cp /tmp/small-32.png 32x32.png
 python3 - <<'PY'
 from PIL import Image
-plan = [(16,'small'),(24,'small'),(32,'small'),(48,'small'),
-        (64,'orion'),(128,'orion'),(256,'orion')]
+plan = [(256,'orion'),(128,'orion'),(64,'orion'),
+        (48,'small'),(32,'small'),(24,'small'),(16,'small')]
 frames = [Image.open(f"/tmp/{v}-{s}.png").convert('RGBA') for s, v in plan]
-frames[-1].save('icon.ico', format='ICO',
-                sizes=[f.size for f in frames], append_images=frames[:-1])
+frames[0].save('icon.ico', format='ICO',
+               sizes=[f.size for f in frames], append_images=frames[1:])
 PY
 ```
+
+The largest frame is intentionally first. Tauri decodes the first ICO entry
+for the default window icon; starting with the 16×16 frame makes Windows scale
+that small bitmap for the title bar, taskbar and other shell surfaces.
