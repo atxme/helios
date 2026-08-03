@@ -290,6 +290,7 @@ export default function App() {
                 psk={c.psk}
                 onConnect={() => c.connect(c.selectedProfile?.name)}
                 onDisconnect={c.disconnect}
+                onOpenSsh={() => c.openSshSession(c.selectedProfile?.name)}
               />
             </Box>
           )}

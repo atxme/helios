@@ -79,6 +79,8 @@ struct JsonProfile {
     persistent_keepalive: Option<u16>,
     #[serde(default)]
     heliosd_url: Option<String>,
+    #[serde(default)]
+    ssh_target: Option<String>,
     /// Public key-negotiation material distributed with the profile.
     ///
     /// The client's own certificate and private key never travel here: they
@@ -144,6 +146,7 @@ impl From<JsonProfile> for ClientProfile {
                 .persistent_keepalive
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
+            ssh_target: profile.ssh_target,
             key_negotiation: profile.key_negotiation.map(KeyNegotiationSettings::from),
             // A document is a configuration: any PSK it carries was shared
             // out of band, never negotiated.
@@ -593,6 +596,7 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
             .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),
         persistent_keepalive: keepalive,
         heliosd_url: None,
+        ssh_target: None,
         key_negotiation: None,
         preshared_key_is_negotiated: false,
     })
@@ -654,6 +658,7 @@ pub struct ProfileIssues {
     pub allowed_ips: Option<String>,
     pub persistent_keepalive: Option<String>,
     pub heliosd_url: Option<String>,
+    pub ssh_target: Option<String>,
     /// Fault of the key-negotiation block as a whole.
     ///
     /// Deliberately a single message rather than one per sub-field: what
@@ -718,6 +723,10 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
         // a client behind NAT depends on it.
         persistent_keepalive: (profile.persistent_keepalive == 0)
             .then(|| "le keepalive doit être supérieur à zéro".to_string()),
+        ssh_target: profile
+            .ssh_target
+            .as_deref()
+            .and_then(|value| when_filled(value, validate_ssh_target)),
         heliosd_url: profile
             .heliosd_url
             .as_deref()
@@ -746,6 +755,7 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     profile.preshared_key = non_empty(profile.preshared_key);
     profile.address = non_empty(profile.address);
     profile.heliosd_url = non_empty(profile.heliosd_url);
+    profile.ssh_target = non_empty(profile.ssh_target);
 
     if profile.name.is_empty() {
         anyhow::bail!("le nom du profil est requis");
@@ -783,6 +793,9 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     }
     if let Some(url) = &profile.heliosd_url {
         validate_heliosd_url(url)?;
+    }
+    if let Some(target) = &profile.ssh_target {
+        validate_ssh_target(target)?;
     }
     // Taken out of the profile: the block is validated against the peer key
     // and the PSK of the very profile that carries it.
@@ -937,6 +950,85 @@ pub fn split_cidr_list(value: &str) -> Vec<&str> {
 ///
 /// Each entry is validated on its own and named in the message: "the third is
 /// wrong" is what turns a rejected list into a fixed one.
+/// Validates an SSH destination: `user@host`, `host`, optionally `:port`.
+///
+/// # An allow-list, and why it has to be one
+///
+/// This value ends up as an **argument of a spawned process**. Every other
+/// field of a profile is data the client interprets itself; this one crosses
+/// into the operating system. A profile document arrives from outside — an
+/// operator's file, an email attachment, a double-clicked download — so the
+/// question is not whether the string looks reasonable but whether anything
+/// it could contain can mean something to a shell.
+///
+/// Hence an allow-list of characters rather than a deny-list of dangerous
+/// ones: letters, digits, `.`, `-`, `_`, one optional `@`, one optional `:`
+/// followed by digits. No space, no quote, no `;`, `&`, `|`, `$`, backtick,
+/// newline, and no leading `-` that an argument parser would read as a flag.
+/// A deny-list is a promise to have thought of every metacharacter of every
+/// shell the launcher might one day use; this is a promise about what is
+/// allowed, which stays true when the launcher changes.
+pub fn validate_ssh_target(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("destination SSH vide");
+    }
+    if value.len() > 255 {
+        anyhow::bail!("destination SSH trop longue");
+    }
+    let (user_host, port) = match value.rsplit_once(':') {
+        Some((rest, port)) => (rest, Some(port)),
+        None => (value, None),
+    };
+    if let Some(port) = port {
+        let port: u16 = port
+            .parse()
+            .context("destination SSH invalide : port non numérique")?;
+        if port == 0 {
+            anyhow::bail!("destination SSH invalide : port nul");
+        }
+    }
+    let host = match user_host.split_once('@') {
+        Some((user, host)) => {
+            if user.is_empty() {
+                anyhow::bail!("destination SSH invalide : nom d'utilisateur vide");
+            }
+            if !user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            {
+                anyhow::bail!(
+                    "destination SSH invalide : le nom d'utilisateur n'accepte que lettres, \
+                     chiffres, point, tiret et souligné"
+                );
+            }
+            host
+        }
+        None => user_host,
+    };
+    if host.is_empty() {
+        anyhow::bail!("destination SSH invalide : hôte vide");
+    }
+    if host.contains('@') {
+        anyhow::bail!("destination SSH invalide : un seul « @ » est attendu");
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        anyhow::bail!(
+            "destination SSH invalide : l'hôte n'accepte que lettres, chiffres, point, \
+             tiret et souligné — ni espace ni caractère de shell"
+        );
+    }
+    // A leading dash would be read as an option by `ssh` itself, whatever the
+    // launcher does with quoting.
+    if value.starts_with('-') || host.starts_with('-') {
+        anyhow::bail!("destination SSH invalide : elle ne peut pas commencer par « - »");
+    }
+    Ok(())
+}
+
 /// Public entry point for tooling that emits a profile document.
 ///
 /// `helios-ctl` validates the operator's `--allowed-ips` **before** admitting
@@ -1182,6 +1274,85 @@ mod tests {
             ..complete_profile()
         };
         assert!(validate_imported_profile(empty).is_err());
+    }
+
+    /// The allow-list holds against everything a shell could read as syntax.
+    ///
+    /// This field becomes an argument of a spawned process, so the test is
+    /// written as a refusal list rather than an acceptance one: what matters
+    /// is not that `user@host` works, it is that nothing else does.
+    #[test]
+    fn an_ssh_target_refuses_everything_a_shell_could_read() {
+        for accepted in [
+            "christophe@100.64.0.1",
+            "100.64.0.1",
+            "gateway.example.net",
+            "root@gw-01.internal:2222",
+            "a_b.c-d@host_1.example",
+        ] {
+            assert!(
+                validate_ssh_target(accepted).is_ok(),
+                "`{accepted}` should be accepted"
+            );
+        }
+
+        for refused in [
+            "",
+            "   ",
+            // Command substitution and chaining, in every spelling.
+            "user@host; rm -rf /",
+            "user@host && calc.exe",
+            "user@host | more",
+            "user@$(whoami)",
+            "user@`hostname`",
+            "user@host\nsecond",
+            // Quoting and expansion.
+            "user@host'",
+            "user@\"host\"",
+            "user@${env:PATH}",
+            // Argument injection into `ssh` itself: `-o` would set options,
+            // and no amount of quoting by the launcher would stop it.
+            "-oProxyCommand=calc",
+            "-lroot",
+            // Shape faults.
+            "user@@host",
+            "@host",
+            "user@",
+            "user@host:0",
+            "user@host:notaport",
+            "user @host",
+        ] {
+            assert!(
+                validate_ssh_target(refused).is_err(),
+                "`{refused}` should be refused"
+            );
+        }
+    }
+
+    /// A document carrying a hostile destination is refused as a whole.
+    ///
+    /// The launcher is not the only gate, and must not be the first: a
+    /// profile that would never be safe to launch has no business being
+    /// stored, displayed as valid, or handed to another machine.
+    #[test]
+    fn a_document_with_a_hostile_ssh_target_does_not_import() {
+        let hostile = ClientProfile {
+            ssh_target: Some("user@host; calc.exe".into()),
+            ..complete_profile()
+        };
+        assert!(inspect_profile(&hostile).ssh_target.is_some());
+        assert!(validate_imported_profile(hostile).is_err());
+
+        let sound = ClientProfile {
+            ssh_target: Some("  christophe@100.64.0.1  ".into()),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&sound).ssh_target, None);
+        assert_eq!(
+            validate_imported_profile(sound).expect("import").ssh_target,
+            Some("christophe@100.64.0.1".into()),
+            "trimmed on the way in, so the launcher never sees padding"
+        );
     }
 
     /// The point of inspection versus import: it doesn't stop at the first

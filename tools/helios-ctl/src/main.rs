@@ -139,6 +139,12 @@ enum Cmd {
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
         #[arg(long)]
         allowed_ips: Option<String>,
+        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
+        ///
+        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
+        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
+        #[arg(long)]
+        ssh_target: Option<String>,
         /// Output file.
         #[arg(long)]
         output: PathBuf,
@@ -291,6 +297,12 @@ enum ProfileCmd {
         /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
         #[arg(long)]
         allowed_ips: Option<String>,
+        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
+        ///
+        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
+        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
+        #[arg(long)]
+        ssh_target: Option<String>,
         /// Output file. Absent: standard output.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -808,6 +820,21 @@ fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
     )))
 }
 
+/// Checks an operator-supplied SSH destination, before anything is admitted.
+///
+/// Same placement argument as [`check_allowed_ips`], with more at stake: this
+/// value ends up as an argument of a process Orion spawns. `orion-core` owns
+/// the grammar — an allow-list of characters — and checking it here means a
+/// typo is a refusal rather than a document that fails on the user's machine.
+fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_string();
+    orion_core::profile_import::validate_ssh_target(&value).context("--ssh-target")?;
+    Ok(Some(value))
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -867,9 +894,12 @@ async fn main() -> Result<()> {
                 with_private_key,
                 admin,
                 allowed_ips,
+                ssh_target,
                 output,
             } => {
                 let allowed_ips = check_allowed_ips(allowed_ips)?;
+                let ssh_target = check_ssh_target(ssh_target)?;
+                let ssh_target = check_ssh_target(ssh_target)?;
                 profile::emit(
                     &client,
                     base,
@@ -880,6 +910,7 @@ async fn main() -> Result<()> {
                         with_private_key,
                         admin,
                         allowed_ips,
+                        ssh_target,
                         output,
                     },
                 )
@@ -899,6 +930,7 @@ async fn main() -> Result<()> {
             admin,
             replace,
             allowed_ips,
+            ssh_target,
             output,
             gateway_certificate,
             gateway_pq_certificate,
@@ -939,6 +971,7 @@ async fn main() -> Result<()> {
                     admin,
                     replace,
                     allowed_ips,
+                    ssh_target,
                     output,
                     offline,
                 },

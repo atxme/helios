@@ -4,7 +4,15 @@ import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { ArrowDown, ArrowUp, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
+import {
+  ArrowDown,
+  ArrowUp,
+  Power,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldQuestion,
+  TerminalSquare,
+} from 'lucide-react'
 import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../types'
 import {
   elapsed,
@@ -42,6 +50,8 @@ interface Props {
   psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
+  /** Opens a terminal already connected to the gateway. */
+  onOpenSsh: () => void
 }
 
 const POSTURE_ICON = {
@@ -75,6 +85,7 @@ export function ConnectView({
   psk,
   onConnect,
   onDisconnect,
+  onOpenSsh,
 }: Props) {
   const meta = stateMeta(state)
   const posture = postureMeta(state, adapterUp)
@@ -247,6 +258,24 @@ export function ConnectView({
             disabled={!ready}
           >
             Connecter
+          </Button>
+        )}
+
+        {/* Only while the tunnel carries traffic: the gateway answers SSH on
+            its tunnel address alone, so offering this earlier would open a
+            window that cannot connect — or, worse, one that resolves the name
+            on the clear network. Rust enforces the same gate; this only keeps
+            the screen from proposing what it knows would be refused. */}
+        {state === 'up' && profile?.ssh_target && (
+          <Button
+            fullWidth
+            variant="text"
+            color="inherit"
+            startIcon={<TerminalSquare size={16} aria-hidden />}
+            onClick={onOpenSsh}
+            sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Terminal SSH — {profile.ssh_target}
           </Button>
         )}
 

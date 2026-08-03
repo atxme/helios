@@ -46,6 +46,8 @@ pub struct EmitOptions {
     pub admin: bool,
     /// Split tunnel to ship with the profile. Absent = full tunnel.
     pub allowed_ips: Option<String>,
+    /// SSH destination to ship with the profile. Absent = no terminal button.
+    pub ssh_target: Option<String>,
     /// Output file. Absent: standard output.
     pub output: Option<PathBuf>,
 }
@@ -78,6 +80,9 @@ pub struct Profile<'a> {
     /// the Advanced panel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_ips: Option<&'a str>,
+    /// SSH destination inside the tunnel, `user@host`. Omitted = no terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heliosd_url: Option<String>,
     /// Public negotiation settings. Absent when the gateway serves none:
@@ -221,6 +226,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         peer_public_key: &gateway_public_key,
         address: &address,
         allowed_ips: options.allowed_ips.as_deref(),
+        ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
         // `emit` never ships an identity: it is the path that keeps the
         // document free of secrets. Wiring the negotiation from here would
@@ -348,6 +354,7 @@ mod tests {
             with_private_key: false,
             admin: false,
             allowed_ips: None,
+            ssh_target: None,
             output: None,
         }
     }
@@ -436,6 +443,7 @@ mod tests {
                 peer_public_key: &gateway_key.public_key,
                 address: "100.64.1.2/32",
                 allowed_ips: None,
+                ssh_target: None,
                 heliosd_url: heliosd_url("100.64.0.1/10"),
                 key_negotiation: None,
                 key_negotiation_identity: None,
@@ -500,6 +508,7 @@ mod tests {
             peer_public_key: &gateway_key.public_key,
             address: "100.64.1.2/32",
             allowed_ips: Some("100.64.0.0/10, 192.168.1.0/24"),
+            ssh_target: Some("christophe@100.64.0.1"),
             heliosd_url: heliosd_url("100.64.0.1/10"),
             key_negotiation: Some(KeyNegotiation {
                 mode: ProtectionMode::MlKem,
@@ -561,6 +570,7 @@ mod tests {
             peer_public_key: &gateway_key.public_key,
             address: "100.64.1.2/32",
             allowed_ips: None,
+            ssh_target: None,
             heliosd_url: None,
             key_negotiation: None,
             key_negotiation_identity: None,

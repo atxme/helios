@@ -34,6 +34,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
+  ssh_target: null,
   key_negotiation: null,
   ...overrides,
 })
@@ -48,6 +49,7 @@ const noIssues: ProfileIssues = {
   allowed_ips: null,
   persistent_keepalive: null,
   heliosd_url: null,
+  ssh_target: null,
   key_negotiation: null,
 }
 

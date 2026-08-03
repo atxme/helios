@@ -131,6 +131,13 @@ export interface ClientProfile {
   persistent_keepalive: number
   heliosd_url: string | null
   /**
+   * SSH destination inside the tunnel, `user@host`.
+   *
+   * `null` = this profile offers no terminal. Reachable only once the tunnel
+   * is up, and only if the gateway sets `allow_ssh_over_tunnel`.
+   */
+  ssh_target: string | null
+  /**
    * Authenticated negotiation played before WireGuard is mounted.
    *
    * `null` = legacy path: a classic tunnel first, then a PQ PSK over the
@@ -163,6 +170,8 @@ export interface ProfileDraft {
   allowed_ips: string
   persistent_keepalive: number
   heliosd_url: string | null
+  /** SSH destination inside the tunnel, `user@host`. `null` = no terminal. */
+  ssh_target: string | null
   key_negotiation: KeyNegotiationSettings | null
   /**
    * Adopt the key staged by `generatePrivateKey` or `adoptPrivateKey`.
@@ -198,6 +207,7 @@ export interface ProfileIssues {
   allowed_ips: string | null
   persistent_keepalive: string | null
   heliosd_url: string | null
+  ssh_target: string | null
   /**
    * Fault of the key-negotiation block as a whole.
    *

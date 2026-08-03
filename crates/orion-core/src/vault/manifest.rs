@@ -29,8 +29,25 @@ use super::{codec, codec::Cursor, VaultError};
 use crate::config::{ClientProfile, KeyNegotiationSettings};
 use aether::key_negotiation::ProtectionMode;
 
-/// Manifest encoding version. Any other value is refused, never guessed.
-const MANIFEST_VERSION: u8 = 1;
+/// Version written today. Any version not listed below is refused, never
+/// guessed.
+const MANIFEST_VERSION: u8 = 2;
+
+/// Previous version, still readable: it lacks the trailing `ssh_target`.
+///
+/// # Why both, rather than a clean bump
+///
+/// The manifest is what a **sealed** profile is stored as. Refusing v1 would
+/// not have meant "migrate later", it would have meant every profile already
+/// on a user's machine becoming unreadable at the next start — with its
+/// WireGuard private key inside it, and the enrolment document long since
+/// destroyed as the import instructions require. There would be nothing to
+/// restore from.
+///
+/// So v1 decodes with `ssh_target: None` and is rewritten as v2 on the next
+/// save. The decoder stays strict about everything else: an unknown version
+/// is still refused, and trailing bytes still are.
+const MANIFEST_VERSION_WITHOUT_SSH: u8 = 1;
 
 /// Bound on a decoded manifest, checked before any allocation.
 ///
@@ -82,6 +99,7 @@ pub struct ProfileManifest {
     pub allowed_ips: String,
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
+    pub ssh_target: Option<String>,
     pub key_negotiation: Option<KeyNegotiationSettings>,
 }
 
@@ -99,6 +117,7 @@ impl ProfileManifest {
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
+            ssh_target: profile.ssh_target.clone(),
             key_negotiation: profile.key_negotiation.clone(),
         }
     }
@@ -118,6 +137,7 @@ impl ProfileManifest {
             allowed_ips: self.allowed_ips.clone(),
             persistent_keepalive: self.persistent_keepalive,
             heliosd_url: self.heliosd_url.clone(),
+            ssh_target: self.ssh_target.clone(),
             key_negotiation: self.key_negotiation.clone(),
             preshared_key_is_negotiated: false,
         }
@@ -182,6 +202,7 @@ impl ProfileManifest {
         codec::put(&mut out, self.allowed_ips.as_bytes())?;
         out.extend_from_slice(&self.persistent_keepalive.to_be_bytes());
         codec::put_option(&mut out, self.heliosd_url.as_deref().map(str::as_bytes))?;
+        codec::put_option(&mut out, self.ssh_target.as_deref().map(str::as_bytes))?;
         match &self.key_negotiation {
             None => out.push(0),
             Some(settings) => {
@@ -208,7 +229,7 @@ impl ProfileManifest {
         }
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
-        if version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION && version != MANIFEST_VERSION_WITHOUT_SSH {
             return Err(VaultError::UnsupportedManifest(version));
         }
         let generation = SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?));
@@ -221,6 +242,13 @@ impl ProfileManifest {
         let allowed_ips = cursor.text()?;
         let persistent_keepalive = u16::from_be_bytes(cursor.array::<2>()?);
         let heliosd_url = cursor.option_text()?;
+        // The one field whose presence depends on the version. Read where it
+        // was written, so v1 keeps decoding byte for byte as it always did.
+        let ssh_target = if version == MANIFEST_VERSION {
+            cursor.option_text()?
+        } else {
+            None
+        };
         let key_negotiation = match cursor.byte()? {
             0 => None,
             1 => Some(KeyNegotiationSettings {
@@ -252,6 +280,7 @@ impl ProfileManifest {
             allowed_ips,
             persistent_keepalive,
             heliosd_url,
+            ssh_target,
             key_negotiation,
         })
     }
@@ -306,6 +335,7 @@ mod tests {
             allowed_ips: "0.0.0.0/0".into(),
             persistent_keepalive: 25,
             heliosd_url: Some("http://100.64.0.1:8080".into()),
+            ssh_target: Some("christophe@100.64.0.1".into()),
             key_negotiation: Some(negotiation()),
             preshared_key_is_negotiated: false,
         }
@@ -329,10 +359,65 @@ mod tests {
         assert_eq!(rebuilt.allowed_ips, original.allowed_ips);
         assert_eq!(rebuilt.persistent_keepalive, original.persistent_keepalive);
         assert_eq!(rebuilt.heliosd_url, original.heliosd_url);
+        assert_eq!(rebuilt.ssh_target, original.ssh_target);
         let block = rebuilt.key_negotiation.expect("negotiation block");
         assert_eq!(block.mode, ProtectionMode::MlKem);
         assert_eq!(block.minimum_mode, ProtectionMode::StaticPsk);
         assert_eq!(block.identity, "orion-poste");
+    }
+
+    /// A profile sealed before `ssh_target` existed must still open.
+    ///
+    /// Built byte for byte in the v1 layout rather than derived from the v2
+    /// encoder: a test that reuses the encoder proves the encoder agrees with
+    /// itself, which is exactly what a compatibility test must not do. These
+    /// are the bytes an installed Orion actually has on disk.
+    #[test]
+    fn a_manifest_sealed_before_ssh_target_still_decodes() {
+        let source = profile();
+        let mut v1: Vec<u8> = Vec::new();
+        v1.push(MANIFEST_VERSION_WITHOUT_SSH);
+        v1.extend_from_slice(&9u64.to_be_bytes());
+        codec::put(&mut v1, source.name.as_bytes()).unwrap();
+        codec::put(&mut v1, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v1, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v1, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v1, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v1, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v1, source.allowed_ips.as_bytes()).unwrap();
+        v1.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v1, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        // No ssh_target here — that is the whole point of the version.
+        v1.push(0); // no key-negotiation block
+
+        let decoded = ProfileManifest::decode(&v1).expect("a v1 manifest must still open");
+        assert_eq!(decoded.generation, SecurityGeneration(9));
+        assert_eq!(decoded.ssh_target, None, "absent, not invented");
+        let rebuilt = decoded.to_profile();
+        assert_eq!(rebuilt.private_key, source.private_key);
+        assert_eq!(rebuilt.heliosd_url, source.heliosd_url);
+
+        // And re-sealing writes the current version, so the migration happens
+        // on the next save without anyone being asked to do anything.
+        let resealed = ProfileManifest::from_profile(&rebuilt, SecurityGeneration(9))
+            .encode()
+            .expect("encode");
+        assert_eq!(resealed[0], MANIFEST_VERSION);
+    }
+
+    /// An unknown version is still refused — compatibility is a list, not a
+    /// tolerance.
+    #[test]
+    fn an_unknown_manifest_version_is_still_refused() {
+        let encoded = ProfileManifest::from_profile(&profile(), SecurityGeneration(1))
+            .encode()
+            .expect("encode");
+        let mut future = encoded.to_vec();
+        future[0] = MANIFEST_VERSION + 1;
+        assert!(matches!(
+            ProfileManifest::decode(&future),
+            Err(VaultError::UnsupportedManifest(_))
+        ));
     }
 
     #[test]
@@ -341,6 +426,7 @@ mod tests {
         bare.preshared_key = None;
         bare.address = None;
         bare.heliosd_url = None;
+        bare.ssh_target = None;
         bare.key_negotiation = None;
         let encoded = ProfileManifest::from_profile(&bare, SecurityGeneration::default())
             .encode()

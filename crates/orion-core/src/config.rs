@@ -202,6 +202,23 @@ pub struct ClientProfile {
     /// mounted** (e.g. `http://100.64.0.1:8080`). `None` = no enriched telemetry.
     #[serde(default)]
     pub heliosd_url: Option<String>,
+    /// SSH destination inside the tunnel, as `user@host` or `host`.
+    ///
+    /// Reachable only once the tunnel is up, and only if the gateway sets
+    /// `allow_ssh_over_tunnel`. `None` = the client offers no terminal.
+    ///
+    /// # Why a whole field for what looks like a shortcut
+    ///
+    /// This value is handed to a **process launcher**. It is the one string in
+    /// a profile that becomes part of a command line, so it is the one string
+    /// an attacker would want to control — a profile document arrives from
+    /// outside, and `orion-core` is what decides whether its contents are
+    /// allowed to mean anything. Hence a named field with its own grammar
+    /// ([`crate::profile_import::validate_ssh_target`]) rather than a value
+    /// parsed out of `heliosd_url` at launch time, where no validation would
+    /// have a natural home.
+    #[serde(default)]
+    pub ssh_target: Option<String>,
     /// Authenticated public negotiation performed before WireGuard is mounted.
     #[serde(default)]
     pub key_negotiation: Option<KeyNegotiationSettings>,
@@ -242,6 +259,7 @@ impl fmt::Debug for ClientProfile {
             .field("allowed_ips", &self.allowed_ips)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
+            .field("ssh_target", &self.ssh_target)
             .field("key_negotiation", &self.key_negotiation)
             .finish()
     }
@@ -367,6 +385,7 @@ impl Default for ClientProfile {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
+            ssh_target: None,
             key_negotiation: None,
             preshared_key_is_negotiated: false,
         }

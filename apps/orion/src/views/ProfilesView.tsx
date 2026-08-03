@@ -92,6 +92,7 @@ function blankProfile(): ClientProfile {
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
     heliosd_url: null,
+    ssh_target: null,
     // No negotiation by default: its material comes from the operator, and a
     // block full of empty certificates would report itself faulty from the
     // first render. Adding one is one click away in the block below.
@@ -303,6 +304,7 @@ export function ProfilesView({
       allowed_ips: profile.allowed_ips,
       persistent_keepalive: profile.persistent_keepalive,
       heliosd_url: profile.heliosd_url,
+      ssh_target: profile.ssh_target,
       key_negotiation: profile.key_negotiation,
       useStagedKey: stagedPublicKey !== null,
       clearPresharedKey: clearPsk,
@@ -1134,10 +1136,18 @@ export function ProfilesView({
                   )}
                   <Field
                     label="URL Helios"
-                error={issues.heliosd_url}
+                    error={issues.heliosd_url}
                     placeholder="http://100.64.0.1:8080"
                     value={draft.heliosd_url ?? ''}
                     onChange={(value) => set('heliosd_url', value || null)}
+                  />
+                  <Field
+                    label="Destination SSH"
+                    error={issues.ssh_target}
+                    placeholder="utilisateur@100.64.0.1"
+                    value={draft.ssh_target ?? ''}
+                    onChange={(value) => set('ssh_target', value || null)}
+                    hint="Active le bouton « Terminal SSH » de l’écran Connexion. La gateway doit poser allow_ssh_over_tunnel."
                   />
                 </Box>
               </Collapse>

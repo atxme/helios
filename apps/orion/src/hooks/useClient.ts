@@ -135,6 +135,15 @@ export function useClient() {
     }
   }, [])
 
+  const openSshSession = useCallback(async (name?: string) => {
+    try {
+      setError(null)
+      await api.openSshSession(name)
+    } catch (cause) {
+      setError(String(cause))
+    }
+  }, [])
+
   const disconnect = useCallback(async () => {
     try {
       await api.disconnect()
@@ -204,6 +213,7 @@ export function useClient() {
     pathImportedProfile,
     connect,
     disconnect,
+    openSshSession,
     importProfile,
     saveProfile,
     removeProfile,

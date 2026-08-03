@@ -68,6 +68,8 @@ pub struct EnrollOptions {
     /// retyped into each machine's Advanced panel — which is how a fleet ends
     /// up with as many routing tables as it has users.
     pub allowed_ips: Option<String>,
+    /// SSH destination to ship with the profile. Absent = no terminal button.
+    pub ssh_target: Option<String>,
     /// Revoke an existing peer of the same name before admitting.
     pub replace: bool,
     pub output: PathBuf,
@@ -264,6 +266,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         peer_public_key: &material.wireguard_public_key,
         address: &address,
         allowed_ips: options.allowed_ips.as_deref(),
+        ssh_target: options.ssh_target.as_deref(),
         heliosd_url,
         key_negotiation: Some(profile::KeyNegotiation {
             mode: options.mode,
@@ -494,6 +497,7 @@ mod tests {
             client_ca_dir: PathBuf::from("./ca"),
             public_key: None,
             allowed_ips: None,
+            ssh_target: None,
             private_key_file: None,
             client_pki_dir: None,
             mode: ProtectionMode::MlKem,

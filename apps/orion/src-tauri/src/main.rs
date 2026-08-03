@@ -502,6 +502,7 @@ struct ProfileView {
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
+    ssh_target: Option<String>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
     /// Public half of the profile's WireGuard key. The one value of the pair
     /// that is *meant* to leave the machine — it is what the operator admits.
@@ -522,6 +523,7 @@ impl From<&ClientProfile> for ProfileView {
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
+            ssh_target: profile.ssh_target.clone(),
             key_negotiation: profile.key_negotiation.clone(),
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.trim().is_empty(),
@@ -574,6 +576,7 @@ struct ProfileDraft {
     allowed_ips: String,
     persistent_keepalive: u16,
     heliosd_url: Option<String>,
+    ssh_target: Option<String>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
     /// Adopts the key sitting in [`AppState::staged_key`].
     ///
@@ -658,6 +661,7 @@ impl ProfileDraft {
         profile.allowed_ips = self.allowed_ips;
         profile.persistent_keepalive = self.persistent_keepalive;
         profile.heliosd_url = self.heliosd_url;
+        profile.ssh_target = self.ssh_target;
         profile.key_negotiation = self.key_negotiation;
         // A stored profile never carries a negotiated PSK: that one only ever
         // exists in the ephemeral copy the backend mounts.
@@ -965,6 +969,98 @@ async fn adopt_preshared_key(
 async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
     state.staged_psk.lock().await.take();
     Ok(())
+}
+
+/// Opens a PowerShell already connected to the gateway over SSH.
+///
+/// # What this deliberately does not do
+///
+/// It does not speak SSH. Windows ships OpenSSH, and reimplementing a
+/// transport — plus a terminal emulator, plus key handling — inside a VPN
+/// client would add a large amount of security-relevant surface to duplicate
+/// something the system already does better. Orion launches the client the
+/// user would have launched, with the destination already filled in.
+///
+/// # Two gates, and why each is here
+///
+/// **The tunnel must be up.** SSH reaches the gateway's tunnel address, which
+/// exists only then. Launching earlier would open a window that fails to
+/// connect, and — worse — the name could resolve to something else entirely
+/// on the clear network.
+///
+/// **The destination is re-validated here**, even though import and save
+/// already did. This is the point where a profile field becomes an argument
+/// to a process: re-checking costs microseconds, and the alternative is
+/// trusting that every path which can write a profile got it right. A vault
+/// restored from a backup, a manifest decoded from an older version, a future
+/// caller — none of them have to be audited if the check sits at the boundary
+/// it protects.
+#[tauri::command]
+async fn open_ssh_session(state: State<'_, AppState>, name: Option<String>) -> Result<(), String> {
+    let cfg = state.config.lock().await;
+    let profile = match &name {
+        Some(name) => cfg.find(name),
+        None => cfg.selected.as_deref().and_then(|s| cfg.find(s)),
+    }
+    .ok_or("aucun profil sélectionné")?;
+    let target = profile
+        .ssh_target
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(
+            "ce profil ne déclare aucune destination SSH — la renseigner dans « Profils → \
+             Avancé → Destination SSH »",
+        )?;
+    drop(cfg);
+
+    orion_core::profile_import::validate_ssh_target(&target).map_err(|error| error.to_string())?;
+
+    if state.controller.state() != TunnelState::Up {
+        return Err(
+            "le tunnel n'est pas monté : la gateway n'est joignable en SSH qu'à travers lui".into(),
+        );
+    }
+
+    spawn_ssh_terminal(target.trim())
+}
+
+/// Launches the terminal. Windows only — that is where Orion ships.
+///
+/// The destination goes through as a **separate argument**, never
+/// concatenated into a command string: combined with the allow-list grammar of
+/// [`orion_core::profile_import::validate_ssh_target`], nothing in it can be
+/// read as syntax by the shell being started.
+#[cfg(target_os = "windows")]
+fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt as _;
+
+    // Without it the console is created inside Orion's own (absent) window
+    // station and flashes shut immediately: `windows_subsystem = "windows"`
+    // means this process has no console to inherit.
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+    std::process::Command::new("powershell.exe")
+        .args(["-NoExit", "-Command", "ssh", target])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .map_err(|error| format!("ouverture du terminal SSH impossible : {error}"))?;
+    tracing::info!(%target, "terminal SSH ouvert vers la gateway");
+    Ok(())
+}
+
+/// Refuses explicitly rather than silently doing nothing.
+///
+/// # Limite connue
+///
+/// The launcher is Windows-only because the shipped client is. A Linux or
+/// macOS build compiles and reaches this arm, which fails with a message
+/// naming the reason instead of opening a window that never appears. What
+/// would unblock it: choosing a terminal on those platforms, which is a
+/// per-desktop question (`x-terminal-emulator`, `open -a Terminal`, …) and
+/// not one this crate can answer on its own.
+#[cfg(not(target_os = "windows"))]
+fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
+    Err("l'ouverture d'un terminal SSH n'est disponible que sur Windows".into())
 }
 
 /// Merges a draft onto the stored profile and seals the result.
@@ -1683,6 +1779,7 @@ fn main() {
             discard_staged_key,
             adopt_preshared_key,
             discard_staged_psk,
+            open_ssh_session,
             delete_profile,
             select_profile,
             connect,
@@ -1733,6 +1830,7 @@ mod security_tests {
             use_staged_key: false,
             clear_preshared_key: false,
             use_staged_psk: false,
+            ssh_target: None,
         }
     }
 

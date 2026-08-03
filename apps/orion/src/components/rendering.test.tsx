@@ -26,6 +26,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
+  ssh_target: null,
   key_negotiation: null,
   ...overrides,
 })
@@ -110,6 +111,7 @@ describe('Orion presentational branches', () => {
           adapterUp={state !== 'down'}
           psk={state === 'up' ? 'ml_kem' : null}
           onConnect={callback}
+          onOpenSsh={callback}
           onDisconnect={callback}
         />,
       )

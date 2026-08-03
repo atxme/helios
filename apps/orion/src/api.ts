@@ -116,6 +116,16 @@ export const deleteProfile = (name: string) =>
 export const selectProfile = (name: string) =>
   invoke<ClientConfig>('select_profile', { name })
 
+/**
+ * Opens a PowerShell already connected to the gateway over SSH.
+ *
+ * Rust owns both gates: the tunnel must be up, and the destination is
+ * re-validated at the boundary where a profile field becomes a process
+ * argument. The screen only asks.
+ */
+export const openSshSession = (name?: string) =>
+  invoke<void>('open_ssh_session', { name: name ?? null })
+
 export const connect = (name?: string) => invoke<void>('connect', { name: name ?? null })
 export const disconnect = () => invoke<void>('disconnect')
 
