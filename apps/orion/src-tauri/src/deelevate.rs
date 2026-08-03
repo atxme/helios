@@ -20,13 +20,16 @@
 //!
 //! # Which token
 //!
-//! Windows already has the right one. When a user elevates through UAC, their
-//! elevated token keeps a **linked token**: the filtered, standard-user token
-//! of that same session. `TokenLinkedToken` returns it. That is better than
-//! anything this code could assemble — lowering the integrity level of our own
-//! token, for instance, would leave the Administrators SIDs in place and
-//! produce a medium-integrity *admin* token, which is not the same thing at
-//! all.
+//! The one `explorer.exe` already has. The desktop shell runs as the
+//! interactive user at medium integrity, so its process token *is* the
+//! standard-user token — and duplicating another process's **primary** token
+//! yields a primary token, which is what `CreateProcessWithTokenW` demands.
+//!
+//! The obvious-looking route, `TokenLinkedToken` on our own elevated token,
+//! does not survive contact: without `SeTcbPrivilege` Windows hands back an
+//! *identification*-level impersonation token, and duplicating that into a
+//! primary token fails with `ERROR_BAD_IMPERSONATION_LEVEL` (1346). That was
+//! this module's first shape, and the error is what replaced it.
 //!
 //! # The post-condition is the actual safety property
 //!
@@ -49,17 +52,16 @@ use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation,
-    TokenElevationType, TokenElevationTypeDefault, TokenElevationTypeFull,
-    TokenElevationTypeLimited, TokenLinkedToken, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY,
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation, TokenPrimary,
+    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, CREATE_NEW_CONSOLE,
-    LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, LOGON_WITH_PROFILE,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
-/// A token handle closed on drop.
+/// A handle closed on drop — a token, or the shell process it came from.
 ///
 /// Not a convenience: the refusal paths below are numerous and early, and a
 /// hand-rolled `CloseHandle` on each of them is how one of them ends up
@@ -69,9 +71,9 @@ struct Token(HANDLE);
 impl Drop for Token {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            // SAFETY: the handle was produced by OpenProcessToken,
-            // GetTokenInformation(TokenLinkedToken) or DuplicateTokenEx, and
-            // is closed exactly once — `Token` is neither `Copy` nor `Clone`.
+            // SAFETY: the handle was produced by OpenProcess,
+            // OpenProcessToken or DuplicateTokenEx, and is closed exactly
+            // once — `Token` is neither `Copy` nor `Clone`.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -138,71 +140,48 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The standard-user token of the session Orion was elevated from.
+/// The interactive user's token, borrowed from the desktop shell.
 ///
-/// Refuses rather than improvises when there is none. A gateway operator
-/// running Orion as SYSTEM, or on a machine with UAC turned off, has no
-/// filtered token to fall back to — and the tempting fallback, "spawn with
-/// our own token", is exactly the escalation this module exists to prevent.
+/// Refuses rather than improvises when there is no shell: a service session,
+/// or a machine where Explorer is not running, has no standard-user process to
+/// borrow from — and the tempting fallback, "use our own token", is exactly
+/// the escalation this module exists to prevent.
 fn standard_user_token() -> Result<Token, String> {
+    // SAFETY: returns the desktop shell window of this session, or null.
+    let shell = unsafe { GetShellWindow() };
+    if shell.is_null() {
+        return Err("aucun shell de bureau : le terminal serait élevé, il n'est pas ouvert".into());
+    }
+    let mut pid = 0u32;
+    // SAFETY: `shell` is a valid window handle; writes one u32.
+    unsafe { GetWindowThreadProcessId(shell, &mut pid) };
+    if pid == 0 {
+        return Err("processus du shell introuvable, ouverture refusée".into());
+    }
+
+    // `PROCESS_QUERY_INFORMATION`, not its `_LIMITED_` cousin: the latter is
+    // enough for most process queries and is **not** what `OpenProcessToken`
+    // documents as its requirement.
+    // SAFETY: opens the shell process; the handle is closed by `Token`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(format!(
+            "ouverture du processus du shell impossible ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let process = Token(process);
+
     let mut raw: HANDLE = std::ptr::null_mut();
-    // `TOKEN_DUPLICATE` as well as `TOKEN_QUERY`: the already-limited branch
-    // below duplicates this very handle, and `DuplicateTokenEx` refuses a
-    // source opened for querying alone.
-    // SAFETY: writes one handle into `raw`; the pseudo-handle from
-    // GetCurrentProcess needs no closing.
-    let opened =
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw) };
+    // SAFETY: writes one handle into `raw`.
+    let opened = unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut raw) };
     if opened == 0 {
         return Err(format!(
-            "lecture du jeton du processus impossible ({})",
+            "lecture du jeton du shell impossible ({})",
             std::io::Error::last_os_error()
         ));
     }
-    let own = Token(raw);
-
-    match elevation_type(&own)? {
-        // Elevated through UAC: the filtered token is right there.
-        TokenElevationTypeFull => {}
-        // Already a standard user. Orion should not reach this — its manifest
-        // requires elevation — but if it ever does, its own token is already
-        // the one we want, and duplicating it changes nothing.
-        TokenElevationTypeLimited => return duplicate_primary(&own),
-        // UAC disabled, built-in Administrator, or a service running as
-        // SYSTEM. No linked token exists, and none can be synthesised.
-        TokenElevationTypeDefault => {
-            return Err(
-                "aucun jeton d'utilisateur standard disponible sur cette machine (UAC désactivé, \
-                 compte Administrateur intégré, ou exécution en tant que service). Le terminal \
-                 serait élevé : il n'est pas ouvert. Copier la commande et l'ouvrir soi-même."
-                    .into(),
-            )
-        }
-        other => return Err(format!("type d'élévation inattendu ({other})")),
-    }
-
-    let mut linked: HANDLE = std::ptr::null_mut();
-    let mut returned = 0u32;
-    // SAFETY: `TokenLinkedToken` writes exactly one HANDLE-sized value.
-    let ok = unsafe {
-        GetTokenInformation(
-            own.0,
-            TokenLinkedToken,
-            (&mut linked as *mut HANDLE).cast(),
-            std::mem::size_of::<HANDLE>() as u32,
-            &mut returned,
-        )
-    };
-    if ok == 0 {
-        return Err(format!(
-            "jeton d'utilisateur standard illisible ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let linked = Token(linked);
-    // `TokenLinkedToken` yields an impersonation token; `CreateProcessWithTokenW`
-    // demands a primary one.
-    duplicate_primary(&linked)
+    duplicate_primary(&Token(raw))
 }
 
 /// Duplicates a token into the primary token a process creation requires.
@@ -226,28 +205,6 @@ fn duplicate_primary(token: &Token) -> Result<Token, String> {
         ));
     }
     Ok(Token(primary))
-}
-
-fn elevation_type(token: &Token) -> Result<TOKEN_ELEVATION_TYPE, String> {
-    let mut kind: TOKEN_ELEVATION_TYPE = 0;
-    let mut returned = 0u32;
-    // SAFETY: `TokenElevationType` writes exactly one i32.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenElevationType,
-            (&mut kind as *mut TOKEN_ELEVATION_TYPE).cast(),
-            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
-            &mut returned,
-        )
-    };
-    if ok == 0 {
-        return Err(format!(
-            "type d'élévation illisible ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(kind)
 }
 
 /// Asks Windows, rather than deducing, whether this token confers elevation.
