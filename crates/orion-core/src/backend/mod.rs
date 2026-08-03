@@ -517,6 +517,19 @@ async fn connect_with_key_negotiation(
             match crate::key_negotiation::prepare_for_profile(profile, identities).await {
                 Ok(negotiated) => negotiated,
                 Err(error) => {
+                    // Also to `tracing`, and not only to the UI: the event sink
+                    // feeds a window the user has usually already closed, while
+                    // the file is what gets pasted into a bug report. Without
+                    // this line `orion.log` showed three dial attempts two
+                    // seconds apart and not one word about why any of them
+                    // failed — the retry looked like the whole story.
+                    tracing::warn!(
+                        attempt,
+                        attempts = KEY_NEGOTIATION_ATTEMPTS,
+                        %endpoint,
+                        error = format!("{error:#}"),
+                        "key negotiation: attempt failed, nothing installed on the data plane"
+                    );
                     sink(ClientEvent::log(
                         "warn",
                         format!(

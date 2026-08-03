@@ -16,3 +16,4 @@ __pycache__/
 /orion-client-ca
 **/orion-client-ca-key.der
 **/orion-client-pq-ca-private.bin
+*.orionprofile

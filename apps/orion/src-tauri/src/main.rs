@@ -1250,10 +1250,17 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
 /// `info` everywhere, `debug` for the crates that are **ours**. A flat `info`
 /// left the interesting half of a startup unsaid — which vault path was taken,
 /// what the TPM answered, why a profile did not load — while a flat `debug`
-/// buries it under `hyper`, `quinn` and `rustls`. `RUST_LOG` overrides the
-/// whole thing.
+/// buries it under `hyper`.
+///
+/// `quinn` and `rustls` are in, deliberately. Key negotiation fails *inside*
+/// the QUIC handshake far more often than after it — a wrong certificate, a
+/// path that will not carry the PQ material, a port nobody forwarded — and
+/// none of that has a name until those two crates are allowed to speak. They
+/// are quiet as long as nothing connects, so the cost is paid only where the
+/// answer lives. `RUST_LOG` overrides the whole thing.
 const DEFAULT_LOG_FILTER: &str = "info,orion=debug,orion_core=debug,aether=debug,\
-                                  helios_vault=debug,helios_key_negotiation=debug";
+                                  helios_vault=debug,helios_key_negotiation=debug,\
+                                  quinn=debug,quinn_proto=debug,rustls=debug";
 
 /// Log file, beside the vault it describes.
 const LOG_FILE: &str = "orion.log";

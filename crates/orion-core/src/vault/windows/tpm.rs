@@ -142,7 +142,7 @@ fn validate_key_properties(
     // comes from the per-user container the key is opened from, not from a
     // descriptor whose owner is `SYSTEM` on perfectly ordinary machines.
     if ownership != KeyOwnership::CurrentUser {
-        tracing::debug!(
+        tracing::info!(
             ?ownership,
             "propriétaire du descripteur de la clé TPM non concluant ; la liaison au compte \
              tient au conteneur utilisateur dans lequel la clé est ouverte"
@@ -268,7 +268,7 @@ mod imp {
         let hardware_backed = match implementation {
             Some(value) => value & NCRYPT_IMPL_HARDWARE_FLAG != 0,
             None => {
-                tracing::debug!(
+                tracing::info!(
                     "le fournisseur n'expose pas son type d'implémentation ; \
                      MS_PLATFORM_CRYPTO_PROVIDER est adossé au TPM par construction"
                 );
@@ -293,7 +293,7 @@ mod imp {
         let ownership = ownership_of(key);
         // The four answers, as the provider actually gave them. Three failed
         // starts were spent guessing which one was refusing.
-        tracing::debug!(
+        tracing::info!(
             materiel = hardware_backed,
             exportable = export_allowed,
             module = bits,

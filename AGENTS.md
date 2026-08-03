@@ -108,6 +108,19 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   les handshakes. **Limite connue** : ce qui ne peut pas changer sous le plan
   de données en marche — nom d’interface, port d’écoute, adresse d’API — exige
   toujours un redémarrage.
+- L’identité de négociation, elle, n’est **pas** relue : elle est lue une fois
+  au démarrage et servie jusqu’à l’arrêt. `init-key-negotiation --rotate` sous
+  un démon en marche change donc les fichiers sans changer ce qui est présenté,
+  et les profils émis après la rotation épinglent un certificat que la gateway
+  ne sert pas encore : le client refuse le handshake QUIC sur `invalid peer
+  certificate: BadSignature`, qui nomme une signature et pas l’écart derrière
+  elle. Une rotation s’applique par `systemctl restart heliosd`. Le démarrage
+  journalise l’empreinte servie et la date d’écriture du fichier : un
+  certificat plus récent que le démon est le diagnostic complet.
+- La CA opérateur vit dans `~/.helios/certs/internal-ca`, et à **un seul**
+  endroit : la gateway n’en épingle qu’une. Un script qui la cherche ailleurs
+  ne la trouve pas, en fabrique une neuve, fait tourner l’identité de la
+  gateway pour l’y installer — et coupe tous les clients déjà admis.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.
@@ -181,6 +194,7 @@ bash scripts/regression.sh
 bash scripts/campaign.sh          # campagnes PQ, mise à jour signée et bundle
 bash scripts/lab.sh --keep        # banc complet : gateway + client admis + profil
 ./scripts/deploy.sh               # construit, signe, copie et installe sur la gateway
+./scripts/provision-client.sh nom # CA, négociation, admission et profil client
 cargo test --workspace --all-features
 cargo run -p heliosd -- run --dev
 npm run dev --prefix web
@@ -194,6 +208,15 @@ types, de champs et de variables (`render`, `assign_vip`, `verify_manifest`),
 mais aussi les commentaires, les doc-comments, les messages de journal et les
 noms de tests. Seule la documentation sous `docs/` (ADR, guides, `TESTING.md`)
 reste en **français**.
+
+`scripts/provision-client.sh` enchaîne les sept gestes d'une admission — créer
+la CA opérateur, en pousser la moitié publique, initialiser la négociation de
+la gateway, admettre le pair, rapatrier ses deux certificats, enrôler hors API,
+écrire le `.orionprofile`. Quatre copies de fichiers dans les deux sens, dont
+chacune est un endroit où coller la mauvaise valeur ; et la panne ne se voit
+qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
+sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients
+déjà admis.
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

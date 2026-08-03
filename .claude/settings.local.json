@@ -251,7 +251,32 @@
       "Bash(dpkg -l)",
       "Bash(sed -i 's|tracing-subscriber = { version = \"0.3\", features = \\\\[\"env-filter\"\\\\] }|tracing-subscriber = { version = \"0.3\", features = [\"env-filter\", \"registry\", \"std\"] }|' Cargo.toml)",
       "Bash(sed -i 's|^use std::io::Write;$||' apps/orion/src-tauri/src/main.rs)",
-      "Bash(HELIOS_CLIENT_CA_DIR= cargo run -q -p helios-ctl -- enroll --name x --endpoint 1.2.3.4:51820 --output /tmp/x.orionprofile)"
+      "Bash(HELIOS_CLIENT_CA_DIR= cargo run -q -p helios-ctl -- enroll --name x --endpoint 1.2.3.4:51820 --output /tmp/x.orionprofile)",
+      "Bash(chmod +x scripts/provision-client.sh)",
+      "Bash(bash -n scripts/provision-client.sh)",
+      "Bash(shellcheck scripts/provision-client.sh)",
+      "Bash(bash scripts/provision-client.sh --help)",
+      "Bash(HELIOS_PROVISION_STATE=/tmp/vide.conf bash scripts/provision-client.sh poste-windows)",
+      "Bash(sudo -n ls -la /root/.local/share/helios-ctl/orion-client-ca/)",
+      "Bash(export HELIOS_CLIENT_CA_DIR=/tmp/ca-diag HELIOS_PROVISION_STATE=/tmp/diag.conf)",
+      "Bash(rm -rf /tmp/ca-diag /tmp/diag.conf)",
+      "Bash(bash -x scripts/provision-client.sh essai christophe@127.0.0.1 --refaire-ca)",
+      "Bash(export HELIOS_CLIENT_CA_DIR=/tmp/ca-diag2 HELIOS_PROVISION_STATE=/tmp/diag2.conf)",
+      "Bash(rm -rf /tmp/ca-diag2 /tmp/diag2.conf)",
+      "Bash(bash -x scripts/provision-client.sh essai christophe@192.168.1.44 --refaire-ca)",
+      "Bash(sed -i 's|  --remplacer          Révoque un pair du même nom avant de l.admettre|  --remplacer          \\(sans effet : un pair du même nom est toujours remplacé\\)|' scripts/provision-client.sh)",
+      "Bash(export HELIOS_CLIENT_CA_DIR=/tmp/ca-v HELIOS_PROVISION_STATE=/tmp/v.conf)",
+      "Bash(rm -rf /tmp/ca-v /tmp/v.conf)",
+      "Bash(awk -F'\\\\t' -v n='poste-windows' '$1 == n { print $2 }' /tmp/sortie-peer.txt)",
+      "Bash(awk -F'\\\\t' -v n='poste-windows' '$1 == n { print $2 }')",
+      "Bash(rm -f /tmp/sortie-peer.txt)",
+      "Bash(awk '/^cat *)",
+      "Bash(cp scripts/provision-client.sh /tmp/piege.sh)",
+      "Bash(HELIOS_PROVISION_STATE=/tmp/p.conf bash /tmp/piege.sh essai user@host)",
+      "Bash(HELIOS_PROVISION_STATE=/tmp/e.conf bash scripts/provision-client.sh poste-windows christophe@192.168.1.44)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'ls -la /var/lib/helios/ 2>/dev/null; echo \"--- hashes \\(may need sudo\\) ---\"; sha256sum /var/lib/helios/key-negotiation-client-ca.der /var/lib/helios/key-negotiation-client-pq-ca-public.bin 2>&1')",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'systemctl is-active heliosd; echo \"--- journal ---\"; journalctl -u heliosd -n 60 --no-pager 2>&1 | tail -60')",
+      "Bash(ssh *)"
     ]
   }
 }

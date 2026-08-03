@@ -164,6 +164,23 @@ impl TlsIdentity {
         PrivateKeyDer::try_from(self.private_key.clone())
             .map_err(|_| TransportError::InvalidPrivateKey)
     }
+
+    /// Fingerprint of the leaf this end will present.
+    ///
+    /// Logged when an endpoint is built, and it is the single most useful line
+    /// in this crate. A gateway serves the certificate it read **at startup**;
+    /// rotating the identity under a running daemon leaves it presenting the
+    /// previous one, while every freshly issued profile pins the new one. The
+    /// client then refuses the handshake with `BadSignature` — a message that
+    /// names a signature and says nothing about the two certificates that no
+    /// longer match. Printing both fingerprints turns that into a comparison
+    /// anyone can make in one line.
+    fn leaf_fingerprint(&self) -> String {
+        self.certificate_chain
+            .first()
+            .map(|leaf| certificate_fingerprint_der(leaf))
+            .unwrap_or_else(|| "aucune".into())
+    }
 }
 
 impl Drop for TlsIdentity {
@@ -319,6 +336,7 @@ pub fn server_endpoint(
     identity: &TlsIdentity,
     client_ca: Vec<u8>,
 ) -> Result<Endpoint, TransportError> {
+    let client_ca_der = client_ca.clone();
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(client_ca))
@@ -340,7 +358,16 @@ pub fn server_endpoint(
     // and signature — so the size limit matters at least as much here as on
     // the client side.
     config.transport = Arc::new(transport);
-    Endpoint::server(config, bind).map_err(TransportError::Io)
+    let endpoint = Endpoint::server(config, bind).map_err(TransportError::Io)?;
+    tracing::info!(
+        %bind,
+        alpn = %String::from_utf8_lossy(KEY_NEGOTIATION_ALPN),
+        served_certificate_sha256 = %identity.leaf_fingerprint(),
+        client_ca_sha256 = %certificate_fingerprint_der(&client_ca_der),
+        datagram_bytes = SAFE_UDP_PAYLOAD,
+        "quic: key-negotiation server endpoint ready"
+    );
+    Ok(endpoint)
 }
 
 /// Builds a client endpoint with mutual TLS credentials.
@@ -381,6 +408,17 @@ fn client_config(
     identity: &TlsIdentity,
     gateway_ca: Vec<u8>,
 ) -> Result<quinn::ClientConfig, TransportError> {
+    // Both halves of the trust decision, before a single packet leaves: the
+    // certificate this client will present, and the only authority it will
+    // accept in return. A handshake refused for `BadSignature` is read against
+    // these two values and the ones the gateway prints on its side.
+    tracing::info!(
+        client_certificate_sha256 = %identity.leaf_fingerprint(),
+        pinned_gateway_ca_sha256 = %certificate_fingerprint_der(&gateway_ca),
+        alpn = %String::from_utf8_lossy(KEY_NEGOTIATION_ALPN),
+        datagram_bytes = SAFE_UDP_PAYLOAD,
+        "quic: key-negotiation client credentials loaded"
+    );
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(gateway_ca))
@@ -450,8 +488,9 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
     while let Some(incoming) = endpoint.accept().await {
         // Before any allocation or cryptography: prove the address is real.
         if !incoming.remote_address_validated() {
+            let remote = incoming.remote_address();
             if incoming.retry().is_err() {
-                tracing::debug!("key-negotiation retry refused for an already-validated peer");
+                tracing::info!(%remote, "quic: retry refused for an already-validated peer");
             }
             continue;
         }
@@ -477,8 +516,18 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
+            let remote = incoming.remote_address();
             if let Err(error) = handle_connection(incoming, handler, permit).await {
-                tracing::warn!("key-negotiation connection rejected: {error}");
+                // `aborted by peer` means the **client** hung up, and the text
+                // that follows is its own error crossing the wire. Naming the
+                // direction stops an operator reading a client-side refusal as
+                // a gateway fault.
+                tracing::warn!(
+                    %remote,
+                    error = %error,
+                    detail = ?error,
+                    "quic: key-negotiation connection rejected"
+                );
             }
         });
     }
@@ -489,8 +538,19 @@ async fn handle_connection(
     handler: Arc<dyn NegotiationHandler>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), TransportError> {
+    let started = Instant::now();
+    let remote = incoming.remote_address();
     let connection = incoming.await.map_err(TransportError::Connection)?;
     let fingerprint = peer_certificate_sha256(&connection)?;
+    // The fingerprint is what `heliosd peer add` was given: printing it here
+    // makes an admission mismatch a comparison rather than a deduction.
+    tracing::info!(
+        %remote,
+        elapsed_ms = started.elapsed().as_millis(),
+        rtt_ms = connection.rtt().as_millis(),
+        client_certificate_sha256 = %fingerprint,
+        "quic: client handshake accepted"
+    );
     let (mut send, mut recv) = connection
         .accept_bi()
         .await
@@ -668,21 +728,86 @@ pub async fn negotiate(
     // peer, say — leaves the client waiting for good. That wait has no
     // visible end: the interface is up, the UI announces «connexion…», and
     // nothing ever contradicts it.
+    let started = Instant::now();
+    tracing::info!(
+        %remote,
+        %server_name,
+        local = ?endpoint.local_addr().ok(),
+        timeout_s = CONNECT_TIMEOUT.as_secs(),
+        "quic: opening the key-negotiation connection"
+    );
     let connecting = endpoint
         .connect(remote, server_name)
         .map_err(TransportError::Connect)?;
-    let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-        .await
-        .map_err(|_| TransportError::ConnectTimeout(remote, CONNECT_TIMEOUT.as_secs()))?
-        .map_err(TransportError::Connection)?;
+    let connection = match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Err(_) => {
+            tracing::warn!(
+                %remote,
+                %server_name,
+                udp_port = remote.port(),
+                timeout_s = CONNECT_TIMEOUT.as_secs(),
+                "quic: no handshake answer — unreachable port, or this UDP port \
+                 not forwarded to the gateway"
+            );
+            return Err(TransportError::ConnectTimeout(
+                remote,
+                CONNECT_TIMEOUT.as_secs(),
+            ));
+        }
+        // The whole reason this arm is written out rather than left to `?`.
+        // Everything the exchange can be blamed on lives in this error, and it
+        // used to reach no log at all: the caller turned it into a UI event,
+        // the file recorded three dial attempts and not one cause.
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %remote,
+                %server_name,
+                elapsed_ms = started.elapsed().as_millis(),
+                error = %error,
+                detail = ?error,
+                "quic: handshake refused — on `invalid peer certificate` compare \
+                 the pinned gateway CA logged above with the certificate the \
+                 gateway logs at startup; they differ after an identity rotation \
+                 the daemon has not been restarted for"
+            );
+            return Err(TransportError::Connection(error));
+        }
+        Ok(Ok(connection)) => connection,
+    };
+    tracing::info!(
+        %remote,
+        %server_name,
+        elapsed_ms = started.elapsed().as_millis(),
+        rtt_ms = connection.rtt().as_millis(),
+        gateway_certificate_sha256 = %peer_certificate_sha256(&connection)
+            .unwrap_or_else(|_| "absente".into()),
+        "quic: handshake complete, gateway certificate accepted"
+    );
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(TransportError::Connection)?;
     write_frame(&mut send, request).await?;
-    let answer = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame::<ServerMessage>(&mut recv))
-        .await
-        .map_err(|_| TransportError::ResponseTimeout(RESPONSE_TIMEOUT.as_secs()))??;
+    let answer = match tokio::time::timeout(
+        RESPONSE_TIMEOUT,
+        read_frame::<ServerMessage>(&mut recv),
+    )
+    .await
+    {
+        Err(_) => {
+            // A gateway that answered at the transport level and then said
+            // nothing: reached, authenticated, and stuck — most often on a
+            // stale transaction still held for this peer.
+            tracing::warn!(
+                %remote,
+                timeout_s = RESPONSE_TIMEOUT.as_secs(),
+                rtt_ms = connection.rtt().as_millis(),
+                "quic: connection established but no negotiation answer"
+            );
+            return Err(TransportError::ResponseTimeout(RESPONSE_TIMEOUT.as_secs()));
+        }
+        Ok(answer) => answer?,
+    };
     match answer {
         ServerMessage::Response { response } => Ok((
             *response,
@@ -738,7 +863,21 @@ async fn write_frame<T: Serialize>(
     send.write_all(&bytes)
         .await
         .map_err(TransportError::Write)?;
+    // Frame sizes are the practical half of an MTU problem: the PQ material is
+    // what makes these messages tens of datagrams long, and a run that stops
+    // after the first frame is a path that will not carry the second.
+    tracing::info!(
+        message = short_type_name::<T>(),
+        bytes = bytes.len(),
+        "quic: frame sent"
+    );
     Ok(())
+}
+
+/// Message type without its module path, for a log line.
+fn short_type_name<T: ?Sized>() -> &'static str {
+    let full = std::any::type_name::<T>();
+    full.rsplit("::").next().unwrap_or(full)
 }
 
 async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, TransportError> {
@@ -754,6 +893,11 @@ async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, Tra
     recv.read_exact(&mut bytes)
         .await
         .map_err(TransportError::Read)?;
+    tracing::info!(
+        message = short_type_name::<T>(),
+        bytes = length,
+        "quic: frame received"
+    );
     serde_json::from_slice(&bytes).map_err(|error| TransportError::Protocol(error.to_string()))
 }
 

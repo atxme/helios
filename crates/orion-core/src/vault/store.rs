@@ -379,7 +379,7 @@ impl ProfileStore {
     pub fn load(&self) -> Result<ClientConfig, VaultError> {
         let root = self.root()?;
         let registry = self.load_registry(&root)?;
-        tracing::debug!(
+        tracing::info!(
             profils = registry.entries.len(),
             repertoire = %self.dir.display(),
             "registre du coffre ouvert"
@@ -392,7 +392,7 @@ impl ProfileStore {
             let manifest = self.load_manifest(&root, entry).inspect_err(|error| {
                 tracing::warn!(profil = %entry.name, %error, "manifeste illisible");
             })?;
-            tracing::debug!(
+            tracing::info!(
                 profil = %entry.name,
                 generation = manifest.generation.0,
                 rotation_requise = entry.rotation_required,

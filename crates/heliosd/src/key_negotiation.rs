@@ -494,6 +494,36 @@ pub async fn start(
     let identity = load_identity(boot, dry_run, &gateway_public_key)?;
     let client_ca =
         std::fs::read(CLIENT_CA_PATH).context("reading key-negotiation client CA certificate")?;
+    // The identity is read **once**, here, and served for the lifetime of the
+    // process — unlike `network.toml`, which is watched and re-read.
+    //
+    // # Limite connue
+    //
+    // `heliosd init-key-negotiation --rotate` on a running daemon therefore
+    // changes the files without changing what is served: the daemon keeps
+    // presenting the previous certificate while every profile issued after the
+    // rotation pins the new one. Clients then fail the QUIC handshake with
+    // `invalid peer certificate: BadSignature`, which names a signature and
+    // not the mismatch behind it. Restarting the daemon is what applies a
+    // rotation. Reloading it under a live data plane would mean rebuilding the
+    // QUIC endpoint while sessions hold PSK slots on it, and the closure of
+    // those sessions is what releases the slots — so the rebuild would drop
+    // every tunnel it was meant to spare.
+    //
+    // Until then this line is the diagnosis: the fingerprint served, next to
+    // the age of the file it was read from. A certificate written after the
+    // daemon started is the whole answer.
+    tracing::info!(
+        certificate_sha256 = %helios_key_negotiation::certificate_fingerprint_der(
+            &std::fs::read(CERTIFICATE_PATH).unwrap_or_default()
+        ),
+        certificate_written = ?std::fs::metadata(CERTIFICATE_PATH)
+            .and_then(|meta| meta.modified())
+            .ok(),
+        client_ca_sha256 = %helios_key_negotiation::certificate_fingerprint_der(&client_ca),
+        "key-negotiation identity read from disk — served until this daemon restarts; \
+         a rotation performed later takes effect only on restart"
+    );
     let endpoint = server_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
         &identity.tls,

@@ -158,7 +158,7 @@ impl RootKeyProvider for PlatformRootKeyProvider {
         // nothing saying whether the root was created, opened, or never
         // reached.
         let existing = self.path.exists();
-        tracing::debug!(
+        tracing::info!(
             racine = %self.path.display(),
             existante = existing,
             logiciel = self.software_only,
@@ -166,7 +166,7 @@ impl RootKeyProvider for PlatformRootKeyProvider {
         );
         let outcome = if existing { self.open() } else { self.create() };
         match &outcome {
-            Ok(_) => tracing::debug!(
+            Ok(_) => tracing::info!(
                 materielle = self.hardware_backed(),
                 "racine d'installation obtenue"
             ),
