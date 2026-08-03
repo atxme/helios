@@ -77,6 +77,51 @@ La commande affiche la clé **publique** retrouvée, pas le secret : elle doit
 pas celui de cette gateway — ne pas le déposer. Sinon, poser le fichier dans
 `/var/lib/helios/wg-key.recovery` et redémarrer : la gateway rescelle et efface.
 
+## 2 bis. Mettre à jour l'OS de la gateway
+
+`apt upgrade` ne casse rien tant que la machine tourne : les PCR ne sont
+étendus qu'au démarrage. Le risque est au **redémarrage suivant**, et seulement
+si la mise à jour a touché la chaîne de démarrage — noyau, `grub`, `shim`, une
+base Secure Boot, un firmware. Sans précaution, PCR 4 bouge, le descellement
+échoue et le démon ne démarre pas.
+
+La fenêtre de mise à jour ([ADR-007](../adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md))
+porte le secret courant à travers **un** redémarrage planifié. Le secret ne
+change pas, donc l'identité WireGuard, l'identité de négociation et la table des
+PSK statiques sont intactes de l'autre côté : aucun client à ré-enrôler.
+
+Sur la gateway, en console ou en SSH :
+
+```sh
+sudo apt update && sudo apt upgrade      # ne redémarrez pas encore
+sudo heliosd tpm prepare-update --reboot
+```
+
+`--reboot` enchaîne le redémarrage, ce qui réduit la fenêtre à quelques
+secondes — c'est le seul mode admis en exploitation. Sans lui, la fenêtre reste
+ouverte jusqu'à son échéance (trente minutes) et le redémarrage est à votre
+main ; cette variante sert aux essais contrôlés.
+
+Au retour, le journal doit contenir :
+
+```
+update window consumed: the PCRs moved (OS upgrade) and the same secret
+was resealed on the new state — vaults intact
+```
+
+Si la mise à jour n'a finalement rien déplacé, le descellement est nominal et la
+fenêtre est révoquée automatiquement — rien à faire.
+
+Pour annuler avant le redémarrage : `sudo heliosd tpm cancel-update`. Pour
+savoir où on en est : `sudo heliosd tpm update-status`.
+
+**Ce que la fenêtre ne couvre pas.** Une mise à jour de firmware ou de la base
+Secure Boot déplace PCR 0 ou 7 : la fenêtre ne s'ouvre pas, et on retombe sur
+billet de rescellement et séquestre (§2). Et pendant qu'une fenêtre est ouverte,
+quelqu'un qui a l'accès physique à la machine et démarre un autre OS signé peut
+lire le secret sans que cette lecture soit détectable — d'où `--reboot`, qui
+réduit cette exposition au redémarrage lui-même.
+
 ## 3. Premier pair administrateur
 
 Il faut un chemin local, sinon rien ne peut démarrer : aucune mutation distante

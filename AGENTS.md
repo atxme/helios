@@ -55,8 +55,22 @@ La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble
 compile plus rien. L’installateur Orion se bâtit par `cargo xtask orion-msi`,
 sur Windows uniquement — WiX n’a pas d’équivalent croisé.
 
+La mise à jour de l’OS de la gateway ne perd plus l’identité scellée
+([ADR-007](docs/adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)) : `heliosd tpm
+prepare-update --reboot` porte le **même** secret à travers un redémarrage
+planifié, dans un slot NV lisible sous PCR 0/7 par le seul `TPM2_NV_Read`, puis
+écrasé après rescellement durable. Les coffres survivent donc, et aucun client n’est
+ré-enrôlé. Le billet de rescellement reste le chemin du changement de PCR
+**subi**. Trois limites explicites : pendant qu’une fenêtre est ouverte, un
+attaquant ayant l’accès physique qui démarre un autre OS signé descelle le
+secret (`TPM2_PolicyCounterTimer` n’est pas exposé par `tss-esapi` 7.7) ; une
+mise à jour de firmware ou de base Secure Boot déplace PCR 0/7 et sort du
+périmètre ; et l’identité de négociation reste **sans séquestre**, donc un
+changement de PCR subi impose encore une rotation et le ré-enrôlement du parc.
+
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
-lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
+lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM réel — voir
+[docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 ## Invariants de sécurité
 
@@ -129,6 +143,18 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   seul côté fait échouer tous les handshakes, sans canal de rattrapage.
 - Billets TPM : Ed25519 **et** ML-DSA-65 obligatoires, `key_epoch` signé,
   trousseau compilé, v1 refusé. Compteur strictement croissant ; PCR facultatif.
+- Fenêtre de mise à jour (ADR-007) : elle **transporte** un verdict d'intégrité
+  à travers un redémarrage planifié, elle n'en fabrique pas. L'armement exige un
+  descellement nominal du démarrage courant — jamais depuis `Bypassed`,
+  `Resealed` ou `Provisioned`. Au démarrage, le descellement nominal PCR 0/4/7
+  passe **toujours en premier**, et son succès révoque une fenêtre restée armée.
+  Le marqueur non secret est synchronisé avant l'écriture NV ; une erreur
+  d'armement déclenche un écrasement compensatoire et le marqueur reste présent
+  tant que cet écrasement n'est pas confirmé.
+  À la consommation, le payload NV n'est écrasé qu'**après** que le blob
+  rescellé est sur disque et synchronisé : révoquer plus tôt laisserait un état
+  sans issue. Une erreur après ce point ne retombe jamais sur le billet. Le
+  scellement nominal, lui, n'est pas modifiable par ce chemin.
 - Identité de la gateway : elle naît **sur** la gateway (`heliosd
   init-identity`), scellée au TPM. `wg_private_key` en clair dans
   `network.toml` est un repli hérité, pas un chemin d’installation.

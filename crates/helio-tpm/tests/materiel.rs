@@ -1,20 +1,26 @@
-//! Real hardware TPM trials — target only.
+//! Real ESAPI TPM trials — hardware target or explicit software TPM.
 //!
-//! The crate's 27 unit tests run against `DryRunTpm`: they verify the
-//! decision *logic*, never the silicon. This file closes the gap, by
-//! exercising `/dev/tpmrm0` for real.
+//! The crate's unit tests run against `DryRunTpm`: they verify the decision
+//! *logic*, never the silicon. This file closes the gap, by exercising
+//! `/dev/tpmrm0` for real, or the TCTI explicitly selected by the caller.
 //!
 //! # What these trials write, and why it is reversible
 //!
-//! The real backend only uses `create_primary` (a **transient** primary key,
-//! never made persistent), `create`, `load`, `policy_pcr` and `unseal`. No NV
-//! write, no `evict_control`, no hierarchy change, no `clear`. All Helios
-//! state lives in the files designated by `TpmSettings` — here a temporary
-//! directory, never `/var/lib/helios`.
+//! The sealing path only uses `create_primary` (a **transient** primary key,
+//! never made persistent), `create`, `load`, `policy_pcr` and `unseal`. No
+//! `evict_control`, no hierarchy change, no `clear`. All Helios state lives
+//! in the files designated by `TpmSettings` — here a temporary directory,
+//! never `/var/lib/helios`.
 //!
 //! Deleting this directory therefore returns the machine to its initial
-//! state. This is what distinguishes these trials from the RAUC cycle
-//! trials, which touched boot slots and could render the target unbootable.
+//! state, with **one exception**: the update-window trial defines an NV index
+//! and writes it, because that write is the very thing it proves. It uses a
+//! disposable index — `0x01804846`, one past the production one — so a real
+//! gateway's window is never touched. The index survives the trial; remove it
+//! with `tpm2_nvundefine 0x01804846` if the machine is not disposable.
+//!
+//! This is what distinguishes these trials from the RAUC cycle trials, which
+//! touched boot slots and could render the target unbootable.
 //!
 //! No PCR is extended: an extension is irreversible until the next reboot.
 //! PCR binding is exercised by rewriting the selection *recorded in the
@@ -31,6 +37,10 @@
 //! ```sh
 //! HELIOS_TPM_MATERIEL=1 cargo test -p helio-tpm --features tpm --test materiel
 //! ```
+//!
+//! `HELIOS_TPM_TCTI` may name a complete TCTI such as
+//! `swtpm:host=127.0.0.1,port=2321`. This exercises the real ESAPI policy path
+//! against a software TPM; it does not replace the target PCR measurements.
 #![cfg(feature = "tpm")]
 
 use helio_tpm::{BootController, BootDecision, SealedKeystore, TpmSettings};
@@ -54,7 +64,7 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
         enabled: true,
         enforce: true,
         allow_provisioning,
-        device: "/dev/tpmrm0".to_string(),
+        device: std::env::var("HELIOS_TPM_TCTI").unwrap_or_else(|_| "/dev/tpmrm0".into()),
         pcr_bank: "sha256".to_string(),
         pcr_selection: vec![0, 4, 7],
         sealed_blob_path: dir.join("sealed.key").to_string_lossy().into_owned(),
@@ -63,6 +73,15 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
             .to_string_lossy()
             .into_owned(),
         state_path: dir.join("tpm-state.json").to_string_lossy().into_owned(),
+        update_window_pcr_selection: vec![0, 7],
+        update_window_marker_path: dir
+            .join("update-window.marker")
+            .to_string_lossy()
+            .into_owned(),
+        // Disposable index, distinct from the production one: a hardware
+        // trial must never undefine the index a real gateway relies on.
+        update_window_nv_index: 0x0180_4846,
+        update_window_seconds: 300,
     }
 }
 
@@ -223,6 +242,69 @@ fn the_wireguard_key_survives_a_sealed_round_trip() {
 
     vault.remove().expect("removing the vault");
     assert!(!vault.exists(), "the vault still exists after removal");
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Arming, then revoking, must be observable on a real TPM.
+///
+/// The part no hardware trial can cover here is the one that matters most:
+/// consuming a window requires PCR 4 to have actually moved, hence a kernel
+/// upgrade and a controlled reboot. That stays a manual procedure —
+/// see `docs/testing/TESTING.md`. What this proves is the half that can be
+/// proven in one process: the NV payload is policy-readable after arming and
+/// really overwritten after revocation.
+#[test]
+fn an_update_window_is_armed_then_revoked_on_the_tpm() {
+    if !hardware_requested("update window NV lifecycle") {
+        return;
+    }
+    let dir = disposable_dir("fenetre-maj");
+    let cfg = settings(&dir, true);
+
+    let provisioned = BootController::unlock(&cfg).expect("initial provisioning");
+    assert!(
+        !BootController::update_window_armed(&cfg).expect("reading the window state"),
+        "no window may be armed before one is asked for"
+    );
+
+    // Arming refuses anything but a nominal unseal, so re-unlock first.
+    let unsealed = BootController::unlock(&settings(&dir, false)).expect("nominal unseal");
+    assert!(matches!(unsealed, BootDecision::Unsealed(_)));
+    assert_eq!(
+        provisioned.secret().map(|s| s.as_bytes()),
+        unsealed.secret().map(|s| s.as_bytes())
+    );
+
+    BootController::arm_update_window(&cfg, &unsealed).expect("arming the window");
+    assert!(
+        BootController::update_window_armed(&cfg).expect("reading the window state"),
+        "the NV payload must be live after arming"
+    );
+    assert!(
+        std::path::Path::new(&cfg.update_window_marker_path).exists(),
+        "no window marker written"
+    );
+    let copied_marker = std::fs::read(&cfg.update_window_marker_path).expect("copying marker");
+
+    BootController::cancel_update_window(&cfg).expect("revoking the window");
+    assert!(
+        !BootController::update_window_armed(&cfg).expect("reading the window state"),
+        "the NV index must be written after revocation"
+    );
+    assert!(
+        !std::path::Path::new(&cfg.update_window_marker_path).exists(),
+        "the window marker outlived its revocation"
+    );
+
+    // Restoring everything the disk ever held must not restore the secret:
+    // the only payload lived in NV and was overwritten there.
+    std::fs::write(&cfg.update_window_marker_path, copied_marker).expect("restoring marker");
+    assert!(
+        !BootController::update_window_armed(&cfg).expect("reading restored marker state"),
+        "a disk marker resurrected a revoked NV payload"
+    );
+    BootController::cancel_update_window(&cfg).expect("removing restored marker");
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }

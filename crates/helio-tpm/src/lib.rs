@@ -24,8 +24,10 @@
 //!
 //! All decision logic (boot flow, hybrid ticket, blob store, anti-replay) is
 //! testable on WSL2 via [`tpm_interface::DryRunTpm`]. The real backend
-//! (`feature tpm`, `tpm_interface::TpmDevice`) can only be validated on the
-//! target — like the firewall's Netlink backend.
+//! (`feature tpm`, `tpm_interface::TpmDevice`) can run against a software TPM
+//! to verify its ESAPI command flow. Secure Boot measurements, hardware-bus
+//! protection, and persistence still require target trials — like the
+//! firewall's Netlink effects.
 
 mod blob_store;
 mod boot_controller;
@@ -38,6 +40,7 @@ mod settings;
 mod tpm_interface;
 #[cfg(feature = "tpm")]
 mod tpm_real;
+mod update_window;
 
 pub use boot_controller::{BootController, BootDecision};
 pub use escrow::EscrowError;
@@ -86,6 +89,24 @@ pub enum TpmError {
 
     #[error("reseal ticket bound to a PCR state different from the current one")]
     TicketPcrMismatch,
+
+    #[error("malformed update-window payload: {0}")]
+    UpdateWindowMalformed(&'static str),
+
+    #[error("update window expired (deadline {deadline}, now {now}) — arm a new one")]
+    UpdateWindowExpired { deadline: u64, now: u64 },
+
+    #[error("update window armed for another sealed identity — refused")]
+    UpdateWindowForeign,
+
+    #[error(
+        "no update window is armed: arming one requires a nominal unseal, \
+         which has not happened on this boot"
+    )]
+    UpdateWindowUnavailable,
+
+    #[error("update-window state is uncertain and could not be safely cleaned up: {0}")]
+    UpdateWindowCleanupFailed(String),
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),

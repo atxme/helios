@@ -93,6 +93,40 @@ enum Command {
         #[command(subcommand)]
         command: PeerCommand,
     },
+    /// TPM update window: surviving an OS upgrade that moves the PCRs.
+    Tpm {
+        #[command(subcommand)]
+        command: TpmCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TpmCommand {
+    /// Arms an update window before an OS upgrade that will reboot.
+    ///
+    /// Run it on the running gateway, **before** `apt upgrade` or before the
+    /// reboot that follows one. It carries the current TPM secret across a
+    /// single reboot, so the gateway comes back with its vaults intact even
+    /// though PCR 4 has moved — no reseal ticket, no escrow, no client to
+    /// re-enroll.
+    ///
+    /// It is deliberately local (console or SSH), not an API route: the API
+    /// lives behind the very tunnel this operation exists to preserve.
+    PrepareUpdate {
+        /// Reboots immediately after arming, which is what makes the window
+        /// last seconds instead of minutes.
+        #[arg(long)]
+        reboot: bool,
+    },
+    /// Revokes an armed window. Idempotent, and safe at any time.
+    CancelUpdate,
+    /// Revokes a window that outlived its duration. Driven by a timer.
+    ///
+    /// The non-secret marker exposes the same deadline as the protected NV
+    /// payload, so expiry can overwrite that payload without releasing it.
+    ExpireWindow,
+    /// Reports whether a window is armed on this TPM.
+    UpdateStatus,
 }
 
 #[derive(Subcommand)]
@@ -151,14 +185,14 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let network = NetworkConfig::load().context("loading the network config")?;
-
     match cli.command {
         Command::Run { dev } => {
+            let network = NetworkConfig::load().context("loading the network config")?;
             let dry_run = resolve_dry_run(dev);
             run(network, dry_run).await
         }
         Command::Status => {
+            let network = NetworkConfig::load().context("loading the network config")?;
             let dry_run = resolve_dry_run(false);
             orchestrator::status(&network, dry_run)
         }
@@ -167,15 +201,99 @@ async fn main() -> anyhow::Result<()> {
             orchestrator::check_update(dry_run).await
         }
         Command::ProvisionTpm => provision_tpm(),
-        Command::InitIdentity { rotate } => init_identity(&network, rotate),
+        Command::InitIdentity { rotate } => {
+            let network = NetworkConfig::load().context("loading the network config")?;
+            init_identity(&network, rotate)
+        }
         Command::InitKeyNegotiation {
             server_name,
             client_ca,
             client_pq_ca,
             rotate,
-        } => init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate),
-        Command::Peer { command } => peer_command(network, command),
+        } => {
+            let network = NetworkConfig::load().context("loading the network config")?;
+            init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
+        }
+        Command::Peer { command } => {
+            let network = NetworkConfig::load().context("loading the network config")?;
+            peer_command(network, command)
+        }
+        Command::Tpm { command } => tpm_command(command),
     }
+}
+
+/// Drives the update window (see `helio_tpm::update_window`).
+fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
+    let tpm = TpmSettings::default();
+    match command {
+        TpmCommand::PrepareUpdate { reboot } => prepare_update(&tpm, reboot),
+        TpmCommand::CancelUpdate => {
+            BootController::cancel_update_window(&tpm).context("revoking the update window")?;
+            info!("update window revoked");
+            Ok(())
+        }
+        TpmCommand::ExpireWindow => expire_update_window(&tpm),
+        TpmCommand::UpdateStatus => {
+            match BootController::update_window_armed(&tpm).context("reading the window state")? {
+                true => println!("armed"),
+                false => println!("none"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Revokes an armed window whose explicit marker deadline has passed.
+fn expire_update_window(tpm: &TpmSettings) -> anyhow::Result<()> {
+    if !BootController::expire_update_window(tpm).context("expiring the update window")? {
+        return Ok(());
+    }
+    warn!(
+        "update window expired without a reboot — revoked. Arm a new one when the \
+         upgrade is actually ready."
+    );
+    Ok(())
+}
+
+/// Arms the window, then optionally reboots.
+///
+/// Arming requires a **nominal** unseal here and now: the window carries an
+/// integrity verdict across a reboot, it does not create one. A gateway that
+/// is already running on a resealed or bypassed secret is refused, loudly,
+/// rather than propagating a state the boot chain never vouched for.
+fn prepare_update(tpm: &TpmSettings, reboot: bool) -> anyhow::Result<()> {
+    let boot = unlock_tpm_for_offline_command(tpm).context("unlocking the TPM vault")?;
+    if !matches!(boot, BootDecision::Unsealed(_)) {
+        anyhow::bail!(
+            "the current boot is {boot:?}, not a nominal unseal — an update window \
+             may only be armed from a boot whose integrity the TPM confirmed"
+        );
+    }
+
+    let deadline = BootController::arm_update_window(tpm, &boot)
+        .map_err(|e| anyhow::anyhow!("arming the update window: {e}"))?;
+
+    warn!(
+        deadline,
+        "update window armed — it expires on its own, and any boot that unseals \
+         nominally revokes it. Reboot now, or run `heliosd tpm cancel-update`."
+    );
+    if !reboot {
+        println!("window armed until unix {deadline} — reboot before then");
+        return Ok(());
+    }
+
+    println!("window armed until unix {deadline} — rebooting");
+    let status = std::process::Command::new("systemctl")
+        .arg("reboot")
+        .status()
+        .context("invoking systemctl reboot")?;
+    anyhow::ensure!(
+        status.success(),
+        "systemctl reboot failed ({status}) — the window stays armed; reboot by hand \
+         or run `heliosd tpm cancel-update`"
+    );
+    Ok(())
 }
 
 fn init_key_negotiation(
@@ -185,7 +303,7 @@ fn init_key_negotiation(
     client_pq_ca: &std::path::Path,
     rotate: bool,
 ) -> anyhow::Result<()> {
-    let boot = BootController::unlock(&TpmSettings::default())
+    let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
         .context("unlocking the TPM vault for key-negotiation identity creation")?;
     let resolved = gateway_key::resolve(network, &boot);
     let gateway_wg_public_key = aether::wg::public_from_private(&resolved.private_key)
@@ -213,7 +331,7 @@ fn init_key_negotiation(
 /// sealing — and no half-created identity.
 fn init_identity(network: &NetworkConfig, rotate: bool) -> anyhow::Result<()> {
     let tpm = TpmSettings::default();
-    let boot = BootController::unlock(&tpm).map_err(|e| {
+    let boot = unlock_tpm_for_offline_command(&tpm).map_err(|e| {
         anyhow::anyhow!(
             "TPM unsealing failed: {e}. Provision the vault first \
              (`heliosd provision-tpm`)."
@@ -360,7 +478,9 @@ fn provision_tpm() -> anyhow::Result<()> {
     validate_provisioning_request(&tpm)?;
 
     tpm.allow_provisioning = true;
-    match BootController::unlock(&tpm).map_err(|e| anyhow::anyhow!("sealing failed: {e}"))? {
+    match unlock_tpm_for_offline_command(&tpm)
+        .map_err(|e| anyhow::anyhow!("sealing failed: {e}"))?
+    {
         BootDecision::Provisioned(_) => {
             info!(
                 "TPM vault provisioned in {} — bound to PCR {:?} of bank {}",
@@ -455,6 +575,13 @@ fn forbid_core_dumps(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Applies process-memory protection before an offline command can create or
+/// unseal the TPM root secret.
+fn unlock_tpm_for_offline_command(tpm: &TpmSettings) -> anyhow::Result<BootDecision> {
+    forbid_core_dumps(false)?;
+    BootController::unlock(tpm).map_err(anyhow::Error::new)
+}
+
 #[cfg(not(unix))]
 fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
     Ok(())
@@ -479,6 +606,13 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         BootDecision::Unsealed(_) => info!("boot integrity confirmed (TPM)"),
         BootDecision::Provisioned(_) => warn!("first boot: TOFU provisioning performed"),
         BootDecision::Resealed(_) => warn!("post-OTA resealing performed (valid ticket)"),
+        // Not a warning, unlike the line above it: the window preserved the
+        // secret, so the vaults open and nothing has to be re-supplied. The
+        // two decisions look alike and mean opposite things.
+        BootDecision::WindowResealed(_) => info!(
+            "update window consumed: the PCRs moved (OS upgrade) and the same secret \
+             was resealed on the new state — vaults intact"
+        ),
     }
     // The WireGuard private key comes from the sealed TPM vault, not from
     // network.toml. See `gateway_key`: in the clear on disk, it would be
@@ -639,6 +773,22 @@ mod tests {
                 .unwrap()
                 .command,
             Command::ProvisionTpm
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "tpm", "prepare-update", "--reboot"])
+                .unwrap()
+                .command,
+            Command::Tpm {
+                command: TpmCommand::PrepareUpdate { reboot: true }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "tpm", "expire-window"])
+                .unwrap()
+                .command,
+            Command::Tpm {
+                command: TpmCommand::ExpireWindow
+            }
         ));
         assert!(matches!(
             Cli::try_parse_from(["heliosd", "init-identity", "--rotate"])

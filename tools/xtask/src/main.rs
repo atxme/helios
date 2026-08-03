@@ -58,6 +58,8 @@ const SYSTEMD_UNITS: &[&str] = &[
     "heliosd.service",
     "helios-update.service",
     "helios-update.path",
+    "helios-update-window.service",
+    "helios-update-window.timer",
 ];
 
 /// Shipped binaries, and their role.
@@ -718,7 +720,22 @@ mod tests {
     fn the_shipped_content_is_complete() {
         assert!(BINARIES.contains(&"heliosd"));
         assert!(BINARIES.contains(&"helios-installer"));
-        assert_eq!(SYSTEMD_UNITS.len(), 3);
+        // Named rather than counted: a count says a unit was added, never
+        // which one was dropped.
+        for unit in [
+            "heliosd.service",
+            "helios-update.service",
+            "helios-update.path",
+            // Without the timer, a window armed for an upgrade that never
+            // happened stays live until the next boot.
+            "helios-update-window.service",
+            "helios-update-window.timer",
+        ] {
+            assert!(
+                SYSTEMD_UNITS.contains(&unit),
+                "unit {unit} missing from the bundle"
+            );
+        }
         for feature in ["netlink", "wireguard", "tpm", "embed-ui"] {
             assert!(
                 GATEWAY_FEATURES.split(',').any(|f| f == feature),
@@ -813,6 +830,17 @@ mod tests {
             assert!(path.is_file(), "missing unit: {}", path.display());
         }
         assert!(root.join("config").join("network.toml").is_file());
+    }
+
+    #[test]
+    fn the_update_window_timer_executes_the_bundled_daemon() {
+        let root = workspace_root().expect("root");
+        let unit =
+            std::fs::read_to_string(root.join("deploy/systemd/helios-update-window.service"))
+                .expect("update-window service");
+
+        assert!(unit.contains("ExecStart=/opt/helios/current/heliosd tpm expire-window"));
+        assert!(!unit.contains("/opt/helios/current/bin/heliosd"));
     }
 
     #[test]

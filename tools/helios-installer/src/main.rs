@@ -106,7 +106,7 @@ fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     println!("  sudo heliosd provision-tpm     # first deployment only");
     println!("  sudo heliosd init-identity     # shows the gateway's public key");
     println!("  sudo heliosd peer add --name <name> --public-key <key> --admin");
-    println!("  sudo systemctl enable --now heliosd helios-update.path");
+    println!("  sudo systemctl enable --now heliosd helios-update.path helios-update-window.timer");
     Ok(())
 }
 
