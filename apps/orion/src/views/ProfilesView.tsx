@@ -196,6 +196,12 @@ export function ProfilesView({
   const [pasted, setPasted] = useState('')
   const [keyBusy, setKeyBusy] = useState(false)
   const [clearPsk, setClearPsk] = useState(false)
+  /** A static PSK is waiting in Rust, entered during this edit. */
+  const [stagedPsk, setStagedPsk] = useState(false)
+  /** The PSK paste field is open. It holds a secret, so it is never left mounted. */
+  const [pastingPsk, setPastingPsk] = useState(false)
+  const [pastedPsk, setPastedPsk] = useState('')
+  const [pskBusy, setPskBusy] = useState(false)
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -281,8 +287,9 @@ export function ProfilesView({
       key_negotiation: profile.key_negotiation,
       useStagedKey: stagedPublicKey !== null,
       clearPresharedKey: clearPsk,
+      useStagedPsk: stagedPsk,
     }),
-    [clearPsk, stagedPublicKey],
+    [clearPsk, stagedPsk, stagedPublicKey],
   )
 
   // A staged key wins over the stored one: it is what a save is about to
@@ -330,6 +337,10 @@ export function ProfilesView({
     setPasted('')
     void api.discardStagedKey().catch(() => {})
     setClearPsk(false)
+    setStagedPsk(false)
+    setPastingPsk(false)
+    setPastedPsk('')
+    void api.discardStagedPsk().catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -371,7 +382,47 @@ export function ProfilesView({
     // the core refuses it too, before any network access, and the screen must
     // not promise what the connection would reject.
     if (key === 'mode' && !modeAllowed(value as ProtectionMode, settings.minimum_mode)) return
+    // The mode and the static PSK are one decision, not two. `orion-core`
+    // states it as an equivalence — `static_psk` demands a PSK, every other
+    // mode forbids one — so a screen that let them be set apart could only
+    // produce profiles it would then have to mark invalid.
+    //
+    // Choosing a mode is therefore what disposes of the PSK: ML-KEM and
+    // classic drop it, and nothing else does. It used to be dropped
+    // unconditionally, which is why this screen could only ever take a PSK
+    // away.
+    if (key === 'mode') dropStagedPskFor(value as ProtectionMode)
     editNegotiation({ [key]: value } as Partial<KeyNegotiationSettings>)
+  }
+
+  /**
+   * Aligns the static PSK on the mode — both ways.
+   *
+   * `clearPsk` is the intent sent to Rust for a PSK already stored; the staged
+   * one is dropped where it lives, since it never reached this side.
+   *
+   * Coming *back* to `static_psk` withdraws the removal, because nothing has
+   * been destroyed yet: the removal is a consequence of the mode, and a
+   * consequence that outlived its cause would make the stored PSK vanish for a
+   * mode the user tried and left. Only the save is irreversible.
+   *
+   * Classic is dropped as well as ML-KEM, though only ML-KEM was asked for:
+   * `orion-core` refuses a profile PSK under *any* mode but `static_psk`, so
+   * sparing it there would only move the refusal to the save, pointing at a
+   * field the user had not touched.
+   */
+  const dropStagedPskFor = (mode: ProtectionMode) => {
+    if (mode === 'static_psk') {
+      setClearPsk(false)
+      return
+    }
+    setClearPsk(true)
+    if (stagedPsk) {
+      setStagedPsk(false)
+      void api.discardStagedPsk().catch(() => {})
+    }
+    setPastingPsk(false)
+    setPastedPsk('')
   }
 
   /**
@@ -387,10 +438,12 @@ export function ProfilesView({
     const settings = draft.key_negotiation
     if (!settings) return
     if (floorBaseline && !modeAllowed(floor, floorBaseline)) return
-    editNegotiation({
-      minimum_mode: floor,
-      ...(modeAllowed(settings.mode, floor) ? {} : { mode: floor }),
-    })
+    const mode = modeAllowed(settings.mode, floor) ? settings.mode : floor
+    // A floor that drags the mode along drags the PSK's fate with it: raising
+    // past `static_psk` is one of the ways a profile stops being allowed to
+    // hold one.
+    dropStagedPskFor(mode)
+    editNegotiation({ minimum_mode: floor, ...(mode === settings.mode ? {} : { mode }) })
   }
 
   const editNegotiation = (patch: Partial<KeyNegotiationSettings>) => {
@@ -414,7 +467,13 @@ export function ProfilesView({
   const toggleNegotiation = (enabled: boolean) => {
     if (!enabled && floorBaseline && modeLevel(floorBaseline) > 0) return
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
+    // A block created over an existing static PSK opens on `static_psk`, not
+    // on the strongest mode. Without a negotiation block that PSK was the
+    // profile's whole protection; defaulting to ML-KEM here would silently
+    // discard it the moment the user ticked a box about something else.
+    // Choosing ML-KEM afterwards still drops it — but then it is a choice.
     const settings = enabled ? blankNegotiation() : null
+    if (settings && staticPsk) settings.mode = 'static_psk'
     setDraft((profile) => ({ ...profile, key_negotiation: settings }))
     setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
@@ -524,6 +583,44 @@ export function ProfilesView({
     }
   }
 
+  /**
+   * Hands a typed PSK to Rust, and lines the negotiation mode up behind it.
+   *
+   * The mode change is the point. A PSK entered while the profile asks for
+   * ML-KEM is a contradiction the core would refuse at save time, naming a
+   * field the user had not touched. Since `static_psk` is the only mode a PSK
+   * is valid under, entering one *is* choosing that mode — so the screen makes
+   * the choice rather than reporting the conflict.
+   *
+   * The input is cleared on both outcomes, like the private-key field: it is
+   * the only other place in this screen that ever holds a secret.
+   */
+  const adoptPsk = async () => {
+    setPskBusy(true)
+    try {
+      await api.adoptPresharedKey(pastedPsk)
+      setPastedPsk('')
+      setPastingPsk(false)
+      setStagedPsk(true)
+      setClearPsk(false)
+      if (draft.key_negotiation && draft.key_negotiation.mode !== 'static_psk') {
+        editNegotiation({ mode: 'static_psk' })
+      }
+      setDirty(true)
+      setNotice({
+        tone: 'success',
+        message: draft.key_negotiation
+          ? 'PSK statique enregistré — mode de négociation passé à « PSK statique ».'
+          : 'PSK statique enregistré.',
+      })
+    } catch (cause) {
+      setPastedPsk('')
+      setNotice({ tone: 'error', message: String(cause) })
+    } finally {
+      setPskBusy(false)
+    }
+  }
+
   const remove = async () => {
     try {
       await onDelete(draft.name)
@@ -594,7 +691,18 @@ export function ProfilesView({
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
   const narrowed = draft.allowed_ips.trim() !== CAPTURE_ALL
-  const staticPsk = draft.has_static_psk && !clearPsk
+  // A PSK entered during this edit counts as present: it is what the save is
+  // about to store, and showing "aucun" next to a value the user just typed
+  // would read as the entry having been refused.
+  const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
+  /**
+   * May this profile hold a static PSK at all?
+   *
+   * Without a negotiation block, yes — a static PSK is then plain WireGuard.
+   * With one, only `static_psk` tolerates it, and the anti-downgrade floor is
+   * what can put that mode out of reach for good.
+   */
+  const pskOffered = !draft.key_negotiation || modeAllowed('static_psk', draft.key_negotiation.minimum_mode)
   const invalid = Object.values(issues).some(Boolean)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty
   // field would stay invisible until someone thinks to open it.
@@ -928,32 +1036,80 @@ export function ProfilesView({
                     value={String(draft.persistent_keepalive)}
                     onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
                   />
-                  {/* Same rule as the private key, and one more: a static PSK
-                      is an out-of-band value. It arrives through the enrolment
-                      document, so the screen can drop it but never set it. */}
+                  {/* Same inbound-only rule as the private key. What the floor
+                      forbids is not offered at all: a PSK typed under a profile
+                      pinned to ML-KEM could only be refused at save time. */}
                   <SecretState
                     label="PSK statique"
                     present={staticPsk}
                     error={issues.preshared_key}
-                    presentLabel="scellé dans le coffre"
-                    absentLabel="aucun — ML-KEM à chaque connexion"
+                    presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
+                    absentLabel={
+                      pskOffered ? 'aucun' : 'aucun — ML-KEM à chaque connexion'
+                    }
                     action={
                       staticPsk
                         ? {
                             label: 'Retirer le PSK statique',
                             onClick: () => {
                               setClearPsk(true)
+                              if (stagedPsk) {
+                                setStagedPsk(false)
+                                void api.discardStagedPsk().catch(() => {})
+                              }
                               setDirty(true)
                             },
-                            disabled: clearPsk,
+                            disabled: clearPsk && !stagedPsk,
                           }
-                        : undefined
+                        : pskOffered
+                          ? {
+                              label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
+                              onClick: () => setPastingPsk((open) => !open),
+                              disabled: pskBusy,
+                            }
+                          : undefined
                     }
-                    hint="Se pose à l’enrôlement. Cet écran ne peut que le retirer."
+                    hint={
+                      pskOffered
+                        ? 'Valeur hors bande, partagée avec l’opérateur. La saisir bascule la négociation en « PSK statique ».'
+                        : 'Le plancher anti-downgrade de ce profil exige ML-KEM : un PSK statique y serait un retour en arrière.'
+                    }
                   />
+                  {/* Mounted only while in use, and inbound only — same rule as
+                      the private-key field above (ADR-006 §5). */}
+                  {pastingPsk && !staticPsk && (
+                    <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                      <TextField
+                        fullWidth
+                        size="small"
+                        type="password"
+                        autoComplete="off"
+                        spellCheck={false}
+                        label="PSK WireGuard (base64)"
+                        value={pastedPsk}
+                        onChange={(event) => setPastedPsk(event.target.value)}
+                        helperText="Collé une fois, jamais réaffiché. Sortie de `wg genpsk`."
+                        sx={{
+                          '& input': { fontFamily: 'monospace', fontSize: 12 },
+                          '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
+                        }}
+                      />
+                      <Button
+                        size="small"
+                        variant="contained"
+                        disableElevation
+                        disabled={pskBusy || pastedPsk.trim().length === 0}
+                        onClick={adoptPsk}
+                        sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
+                      >
+                        Valider
+                      </Button>
+                    </Box>
+                  )}
                   {staticPsk && (
                     <Caution>
-                      Un PSK statique <strong>désactive</strong> ML-KEM.
+                      Un PSK statique <strong>désactive</strong> ML-KEM : le secret est le même à
+                      chaque connexion, au lieu d’être renégocié.
                     </Caution>
                   )}
                   <Field

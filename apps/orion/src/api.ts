@@ -97,6 +97,18 @@ export const adoptPrivateKey = (privateKey: string) =>
 /** Drops the staged key. Called when an edit is abandoned. */
 export const discardStagedKey = () => invoke<void>('discard_staged_key')
 
+/**
+ * Hands a static PSK to Rust, which validates it and holds it until the save.
+ *
+ * Same one-way rule as {@link adoptPrivateKey}, and nothing comes back: a PSK
+ * has no public half to show. The caller clears its input immediately.
+ */
+export const adoptPresharedKey = (presharedKey: string) =>
+  invoke<void>('adopt_preshared_key', { presharedKey })
+
+/** Drops the staged PSK. Called when an edit is abandoned. */
+export const discardStagedPsk = () => invoke<void>('discard_staged_psk')
+
 export const saveProfile = (draft: ProfileDraft) =>
   invoke<ClientConfig>('save_profile', { draft })
 export const deleteProfile = (name: string) =>

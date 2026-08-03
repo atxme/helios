@@ -13,6 +13,8 @@ const api = vi.hoisted(() => ({
   generatePrivateKey: vi.fn(),
   adoptPrivateKey: vi.fn(),
   discardStagedKey: vi.fn(),
+  adoptPresharedKey: vi.fn(),
+  discardStagedPsk: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -68,6 +70,8 @@ beforeEach(() => {
   api.generatePrivateKey.mockResolvedValue('clé-publique-générée')
   api.adoptPrivateKey.mockResolvedValue('clé-publique-importée')
   api.discardStagedKey.mockResolvedValue(undefined)
+  api.adoptPresharedKey.mockResolvedValue(undefined)
+  api.discardStagedPsk.mockResolvedValue(undefined)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
 })
 
@@ -253,6 +257,107 @@ describe('ProfilesView interactions', () => {
       'clé-publique-importée',
     )
     expect(document.body.innerHTML).not.toContain('cGFzdGVkLXByaXZhdGUta2V5')
+  })
+
+  /**
+   * The screen used to be able to take a static PSK away and nothing else,
+   * on the grounds that a PSK is an out-of-band value. That left an operator
+   * rotating one — or pointing a profile at a gateway pinned to `static_psk` —
+   * with no move but to reissue the whole profile.
+   *
+   * Entering one is also what selects the mode it is valid under: `orion-core`
+   * treats mode and PSK as a single decision, so a screen that set them apart
+   * could only build profiles it would then have to mark invalid.
+   */
+  it('takes a static PSK and moves the negotiation to the mode it belongs to', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [
+            profile({
+              key_negotiation: {
+                mode: 'ml_kem',
+                minimum_mode: 'classic',
+                endpoint: '203.0.113.10:51821',
+                server_name: '203.0.113.10',
+                gateway_ca_der: 'ca',
+                gateway_pq_certificate: 'pq',
+                identity: 'orion-portable',
+              },
+            }),
+          ],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Définir un PSK statique' }))
+    const field = screen.getByLabelText('PSK WireGuard (base64)') as HTMLInputElement
+    expect(field.type).toBe('password')
+    fireEvent.change(field, { target: { value: 'cHNrLXNlY3JldA==' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Valider' }))
+
+    await waitFor(() => expect(api.adoptPresharedKey).toHaveBeenCalledWith('cHNrLXNlY3JldA=='))
+    // The field is gone and the secret never stayed in the document.
+    await waitFor(() => expect(screen.queryByLabelText('PSK WireGuard (base64)')).toBeNull())
+    expect(document.body.innerHTML).not.toContain('cHNrLXNlY3JldA==')
+    expect(screen.getByText('nouveau PSK — à enregistrer')).toBeTruthy()
+
+    // The mode followed, and the save says so on both fields.
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    const sent = handlers.onSave.mock.calls[0][0]
+    expect(sent.useStagedPsk).toBe(true)
+    expect(sent.clearPresharedKey).toBe(false)
+    expect(sent.key_negotiation.mode).toBe('static_psk')
+  })
+
+  /** The other direction: asking for ML-KEM is what removes the PSK. */
+  it('removes the static PSK only when the requested mode stops allowing one', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [
+            profile({
+              has_static_psk: true,
+              key_negotiation: {
+                mode: 'static_psk',
+                minimum_mode: 'classic',
+                endpoint: '203.0.113.10:51821',
+                server_name: '203.0.113.10',
+                gateway_ca_der: 'ca',
+                gateway_pq_certificate: 'pq',
+                identity: 'orion-portable',
+              },
+            }),
+          ],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    // Still there, and still offered: nothing has asked for it to go.
+    expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
+
+    // Scoped to the mode group: the floor row offers the same three labels.
+    const modes = within(screen.getByLabelText('Mode'))
+    fireEvent.click(modes.getByRole('button', { name: 'ML-KEM' }))
+    await waitFor(() => expect(screen.getByText('aucun')).toBeTruthy())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    const sent = handlers.onSave.mock.calls[0][0]
+    expect(sent.clearPresharedKey).toBe(true)
+    expect(sent.key_negotiation.mode).toBe('ml_kem')
   })
 
   /** A rejected key must not stay in the field either. */

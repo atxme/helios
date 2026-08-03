@@ -147,13 +147,13 @@ export interface ClientConfig {
 /**
  * What the screen sends back on save — mirror of the shell's `ProfileDraft`.
  *
- * Everything the user can edit, and **no secret**. The two secret-touching
- * fields are intents rather than values: the interface asks Rust to draw a key
- * or to clear a PSK, it never carries either.
+ * Everything the user can edit, and **no secret**. The secret-touching fields
+ * are intents rather than values: the interface asks Rust to adopt the key or
+ * the PSK it is already holding, it never carries either back.
  *
- * There is deliberately no way to *set* a private key or a static PSK from
- * here. Both arrive through an enrolment document, which `orion-core` parses
- * and seals without the value ever reaching JavaScript (ADR-004 §6, ADR-006 §5).
+ * A secret only ever travels *towards* Rust, once, at an explicit gesture —
+ * `adoptPrivateKey`, `adoptPresharedKey` — and no path returns one (ADR-006
+ * §5). An enrolment document remains the usual way both arrive (ADR-004 §6).
  */
 export interface ProfileDraft {
   name: string
@@ -173,6 +173,13 @@ export interface ProfileDraft {
   useStagedKey?: boolean
   /** Drop the stored static PSK. */
   clearPresharedKey?: boolean
+  /**
+   * Adopt the PSK staged by `adoptPresharedKey`.
+   *
+   * Same shape as {@link useStagedKey}: the value waits in Rust, this only
+   * says "keep it".
+   */
+  useStagedPsk?: boolean
 }
 
 /**

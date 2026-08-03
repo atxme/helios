@@ -96,6 +96,13 @@ struct AppState {
     /// profile at a time, and a slot that could hold two keys would eventually
     /// attach the wrong one.
     staged_key: Arc<Mutex<Option<StagedKey>>>,
+    /// Static PSK entered on screen, held until the profile is saved.
+    ///
+    /// Same slot discipline as [`Self::staged_key`] and the same reason: the
+    /// secret crosses the IPC once, at an explicit gesture, and never comes
+    /// back out. `None` means "no new PSK this session" — whatever the profile
+    /// already held is left alone.
+    staged_psk: Arc<Mutex<Option<StagedPsk>>>,
     /// Why the vault could not be opened at startup, if it could not.
     ///
     /// Orion keeps running — the screen is more useful than a blank window —
@@ -120,6 +127,21 @@ impl Drop for StagedKey {
     fn drop(&mut self) {
         use zeroize::Zeroize as _;
         self.private_key.zeroize();
+    }
+}
+
+/// A static PSK held between the moment it is typed and the save.
+///
+/// Nothing of it is meant to leave this process — not even a public half, for
+/// there is none. The screen learns only that a value is waiting.
+struct StagedPsk {
+    value: String,
+}
+
+impl Drop for StagedPsk {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.value.zeroize();
     }
 }
 
@@ -506,11 +528,20 @@ struct ProfileDraft {
     /// never travels back: it waited in Rust the whole time.
     #[serde(default, rename = "useStagedKey")]
     use_staged_key: bool,
-    /// Clears the stored static PSK. There is deliberately no field to *set*
-    /// one from the screen: a static PSK is an out-of-band value, and the
-    /// enrolment document is what carries it.
+    /// Clears the stored static PSK.
     #[serde(default, rename = "clearPresharedKey")]
     clear_preshared_key: bool,
+    /// Adopts the PSK sitting in [`AppState::staged_psk`].
+    ///
+    /// The enrolment document remains the ordinary way a static PSK arrives.
+    /// It is not the only one: an operator who rotates a PSK out of band, or
+    /// who runs a gateway pinned to `static_psk`, otherwise had to reissue a
+    /// whole profile to change one value the screen was already displaying the
+    /// absence of. The direction is what makes it acceptable — the secret
+    /// enters once, on an explicit gesture, and no path returns it (ADR-006
+    /// §5), exactly as for [`Self::use_staged_key`].
+    #[serde(default, rename = "useStagedPsk")]
+    use_staged_psk: bool,
 }
 
 impl ProfileDraft {
@@ -524,6 +555,7 @@ impl ProfileDraft {
         self,
         stored: Option<&ClientProfile>,
         staged: Option<&StagedKey>,
+        staged_psk: Option<&StagedPsk>,
     ) -> Result<ClientProfile, String> {
         let mut profile = match stored {
             Some(profile) => profile.clone(),
@@ -552,6 +584,16 @@ impl ProfileDraft {
             }
             profile.private_key = staged.private_key.clone();
         }
+        if self.use_staged_psk {
+            let staged = staged_psk
+                .ok_or("aucun PSK en attente : saisir le PSK statique avant d'enregistrer")?;
+            profile.preshared_key = Some(staged.value.clone());
+        }
+        // After adoption, never before: clearing is what the screen sends when
+        // the requested mode no longer tolerates a static PSK, and that verdict
+        // has to apply to the value being adopted too. The other order let a
+        // PSK typed under `static_psk` survive a switch to ML-KEM made in the
+        // same edit.
         if self.clear_preshared_key {
             profile.preshared_key = None;
         }
@@ -838,6 +880,39 @@ async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Holds a static PSK the user supplies, until the profile is saved.
+///
+/// Validated here and not on screen, for the reason [`adopt_private_key`]
+/// gives: `aether` owns the shape of a WireGuard secret, and a value the
+/// interface accepted but WireGuard refuses would produce a profile whose
+/// handshakes fail with nothing naming the cause. A PSK is a 32-byte base64
+/// value — the same shape as a key, which is why the same validator answers.
+///
+/// Nothing is returned but success: unlike a key pair there is no public half
+/// to show, and echoing the secret back would put it in the DOM for the life
+/// of the screen.
+#[tauri::command]
+async fn adopt_preshared_key(
+    state: State<'_, AppState>,
+    preshared_key: String,
+) -> Result<(), String> {
+    let value = preshared_key.trim().to_string();
+    aether::wg::validate_key(&value).map_err(|_| {
+        "PSK invalide : un PSK WireGuard est 32 octets encodés en base64 \
+         (44 caractères finissant par « = »), tel que le produit `wg genpsk`"
+            .to_string()
+    })?;
+    *state.staged_psk.lock().await = Some(StagedPsk { value });
+    Ok(())
+}
+
+/// Drops the staged PSK without saving it.
+#[tauri::command]
+async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
+    state.staged_psk.lock().await.take();
+    Ok(())
+}
+
 /// Merges a draft onto the stored profile and seals the result.
 ///
 /// The volume-encryption gate is here rather than in the store because this is
@@ -861,7 +936,8 @@ async fn save_profile(
     // Taken, not peeked: the key is now the profile's, and leaving a copy in
     // the slot would let the next profile saved adopt it too.
     let staged = state.staged_key.lock().await.take();
-    let profile = draft.merge(stored.as_ref(), staged.as_ref())?;
+    let staged_psk = state.staged_psk.lock().await.take();
+    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
     let selected = profile.name.clone();
     state
         .store
@@ -1101,9 +1177,11 @@ async fn validate_profile(
         // the key the first two had.
         None => state.pending_imports.lock().await.get(&draft.name).cloned(),
     };
-    // Validation runs on every keystroke: the staged key is read, never taken.
+    // Validation runs on every keystroke: the staged secrets are read, never
+    // taken.
     let staged = state.staged_key.lock().await;
-    let profile = draft.merge(stored.as_ref(), staged.as_ref())?;
+    let staged_psk = state.staged_psk.lock().await;
+    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
     Ok(inspect_profile(&profile))
 }
 
@@ -1524,6 +1602,7 @@ fn main() {
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
+            staged_psk: Arc::new(Mutex::new(None)),
             vault_error,
         })
         .setup(|_app| {
@@ -1548,6 +1627,8 @@ fn main() {
             generate_private_key,
             adopt_private_key,
             discard_staged_key,
+            adopt_preshared_key,
+            discard_staged_psk,
             delete_profile,
             select_profile,
             connect,
@@ -1568,7 +1649,7 @@ fn main() {
 mod security_tests {
     use super::{
         associated_profile_paths, sanitize_stem, window_size_for, ClientProfile, ConfigView, Path,
-        PathBuf, ProfileDraft, ProfileView, StagedKey,
+        PathBuf, ProfileDraft, ProfileView, StagedKey, StagedPsk,
     };
 
     fn profile(name: &str) -> ClientProfile {
@@ -1597,6 +1678,7 @@ mod security_tests {
             key_negotiation: None,
             use_staged_key: false,
             clear_preshared_key: false,
+            use_staged_psk: false,
         }
     }
 
@@ -1721,7 +1803,7 @@ mod security_tests {
 
         let mut edit = draft("poste");
         edit.endpoint = "198.51.100.7:51820".into();
-        let merged = edit.merge(Some(&stored), None).expect("merge");
+        let merged = edit.merge(Some(&stored), None, None).expect("merge");
 
         assert_eq!(merged.private_key, key, "la clé stockée a été perdue");
         assert_eq!(merged.preshared_key, psk, "le PSK stocké a été perdu");
@@ -1743,7 +1825,7 @@ mod security_tests {
 
         let mut adopting = draft("nouveau");
         adopting.use_staged_key = true;
-        let created = adopting.merge(None, Some(&staged)).expect("merge");
+        let created = adopting.merge(None, Some(&staged), None).expect("merge");
         assert_eq!(created.private_key, staged.private_key);
         assert_eq!(
             created.public_key().as_deref(),
@@ -1754,22 +1836,22 @@ mod security_tests {
         // silently invented identity the operator never admitted.
         let mut orphan = draft("nouveau");
         orphan.use_staged_key = true;
-        assert!(orphan.merge(None, None).is_err());
+        assert!(orphan.merge(None, None, None).is_err());
 
         // And without the intent, a stored key is left exactly as it was.
-        let kept = draft("poste").merge(Some(&created), Some(&staged));
+        let kept = draft("poste").merge(Some(&created), Some(&staged), None);
         assert_eq!(kept.expect("merge").private_key, created.private_key);
     }
 
-    /// Clearing a static PSK is explicit, and is the only way to touch it.
+    /// Touching a static PSK is explicit in both directions.
     #[test]
-    fn a_static_psk_can_only_be_cleared_never_set_from_the_screen() {
+    fn a_static_psk_is_set_or_cleared_only_on_an_explicit_intent() {
         let stored = profile("poste");
         let mut clearing = draft("poste");
         clearing.clear_preshared_key = true;
         assert_eq!(
             clearing
-                .merge(Some(&stored), None)
+                .merge(Some(&stored), None, None)
                 .expect("merge")
                 .preshared_key,
             None
@@ -1779,9 +1861,43 @@ mod security_tests {
         // to the ephemeral profile the backend mounts, nowhere else.
         assert!(
             !draft("poste")
-                .merge(Some(&stored), None)
+                .merge(Some(&stored), None, None)
                 .expect("merge")
                 .preshared_key_is_negotiated
+        );
+
+        // Adopting one: the value waited in Rust, the draft only said "keep it".
+        let waiting = StagedPsk {
+            value: "bm91dmVhdS1wc2stc3RhdGlxdWUtaG9ycy1iYW5kZQ==".into(),
+        };
+        let mut adopting = draft("poste");
+        adopting.use_staged_psk = true;
+        assert_eq!(
+            adopting
+                .merge(Some(&stored), None, Some(&waiting))
+                .expect("merge")
+                .preshared_key
+                .as_deref(),
+            Some(waiting.value.as_str())
+        );
+
+        // Claiming a PSK that was never staged fails rather than silently
+        // leaving the previous one: the screen showed the new value as adopted.
+        let mut orphan = draft("poste");
+        orphan.use_staged_psk = true;
+        assert!(orphan.merge(Some(&stored), None, None).is_err());
+
+        // Both intents at once — a PSK typed, then a mode chosen that forbids
+        // one, in the same edit. Clearing wins, whatever the field order.
+        let mut contradicted = draft("poste");
+        contradicted.use_staged_psk = true;
+        contradicted.clear_preshared_key = true;
+        assert_eq!(
+            contradicted
+                .merge(Some(&stored), None, Some(&waiting))
+                .expect("merge")
+                .preshared_key,
+            None
         );
     }
 

@@ -276,7 +276,8 @@
       "Bash(HELIOS_PROVISION_STATE=/tmp/e.conf bash scripts/provision-client.sh poste-windows christophe@192.168.1.44)",
       "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'ls -la /var/lib/helios/ 2>/dev/null; echo \"--- hashes \\(may need sudo\\) ---\"; sha256sum /var/lib/helios/key-negotiation-client-ca.der /var/lib/helios/key-negotiation-client-pq-ca-public.bin 2>&1')",
       "Bash(ssh -o BatchMode=yes -o ConnectTimeout=8 christophe@192.168.1.44 'systemctl is-active heliosd; echo \"--- journal ---\"; journalctl -u heliosd -n 60 --no-pager 2>&1 | tail -60')",
-      "Bash(ssh *)"
+      "Bash(ssh *)",
+      "Bash(npx prettier *)"
     ]
   }
 }
