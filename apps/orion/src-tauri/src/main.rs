@@ -55,6 +55,11 @@ use tauri::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
+/// De-elevation of the SSH terminal. Windows-only: it rests on the linked
+/// token UAC produces, which has no equivalent elsewhere.
+#[cfg(target_os = "windows")]
+mod deelevate;
+
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
     controller: Arc<VpnController>,
@@ -971,32 +976,21 @@ async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens a PowerShell already connected to the gateway over SSH.
+/// Resolves the SSH destination, and checks it is safe to act on.
 ///
-/// # What this deliberately does not do
+/// Shared by the two commands below, because they must agree on every gate:
+/// one launches a terminal, the other only copies a line, and a destination
+/// good enough for the second is exactly the one good enough for the first.
 ///
-/// It does not speak SSH. Windows ships OpenSSH, and reimplementing a
-/// transport — plus a terminal emulator, plus key handling — inside a VPN
-/// client would add a large amount of security-relevant surface to duplicate
-/// something the system already does better. Orion launches the client the
-/// user would have launched, with the destination already filled in.
-///
-/// # Two gates, and why each is here
-///
-/// **The tunnel must be up.** SSH reaches the gateway's tunnel address, which
-/// exists only then. Launching earlier would open a window that fails to
-/// connect, and — worse — the name could resolve to something else entirely
-/// on the clear network.
-///
-/// **The destination is re-validated here**, even though import and save
-/// already did. This is the point where a profile field becomes an argument
-/// to a process: re-checking costs microseconds, and the alternative is
-/// trusting that every path which can write a profile got it right. A vault
-/// restored from a backup, a manifest decoded from an older version, a future
-/// caller — none of them have to be audited if the check sits at the boundary
-/// it protects.
-#[tauri::command]
-async fn open_ssh_session(state: State<'_, AppState>, name: Option<String>) -> Result<(), String> {
+/// The tunnel must be up — the gateway answers SSH on its tunnel address
+/// alone, and the host could otherwise resolve to something else entirely on
+/// the clear network. And the destination is re-validated here even though
+/// import and save already did: this is where a profile field stops being
+/// data and starts being a command line.
+async fn resolve_ssh_target(
+    state: &State<'_, AppState>,
+    name: Option<String>,
+) -> Result<String, String> {
     let cfg = state.config.lock().await;
     let profile = match &name {
         Some(name) => cfg.find(name),
@@ -1013,6 +1007,7 @@ async fn open_ssh_session(state: State<'_, AppState>, name: Option<String>) -> R
         )?;
     drop(cfg);
 
+    let target = target.trim().to_string();
     orion_core::profile_import::validate_ssh_target(&target).map_err(|error| error.to_string())?;
 
     if state.controller.state() != TunnelState::Up {
@@ -1020,44 +1015,60 @@ async fn open_ssh_session(state: State<'_, AppState>, name: Option<String>) -> R
             "le tunnel n'est pas monté : la gateway n'est joignable en SSH qu'à travers lui".into(),
         );
     }
-
-    spawn_ssh_terminal(target.trim())
+    Ok(target)
 }
 
-/// Launches the terminal. Windows only — that is where Orion ships.
+/// Opens a terminal connected to the gateway, **below** Orion's privileges.
 ///
-/// The destination goes through as a **separate argument**, never
-/// concatenated into a command string: combined with the allow-list grammar of
-/// [`orion_core::profile_import::validate_ssh_target`], nothing in it can be
-/// read as syntax by the shell being started.
-#[cfg(target_os = "windows")]
-fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt as _;
-
-    // Without it the console is created inside Orion's own (absent) window
-    // station and flashes shut immediately: `windows_subsystem = "windows"`
-    // means this process has no console to inherit.
-    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-
-    std::process::Command::new("powershell.exe")
-        .args(["-NoExit", "-Command", "ssh", target])
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|error| format!("ouverture du terminal SSH impossible : {error}"))?;
-    tracing::info!(%target, "terminal SSH ouvert vers la gateway");
-    Ok(())
+/// # The escalation this is written against
+///
+/// Orion runs elevated, always and by design: WireGuard-NT cannot be loaded
+/// otherwise, and the shipped manifest asks for `requireAdministrator`
+/// ([`windows_manifest_requires_administrator_privileges`]). A child inherits
+/// its parent's token, so the ordinary `Command::spawn` would hand out an
+/// **Administrator** shell from one click, with no UAC prompt of its own, to
+/// whoever can reach this window — or anything that can reach this command,
+/// the webview included.
+///
+/// So the child is built from the standard-user token Windows already keeps
+/// linked to the elevated one, and [`crate::deelevate`] refuses to launch
+/// anything until Windows itself confirms that token is not elevated. See
+/// that module for why a thread impersonation would not have worked.
+///
+/// Failure is a refusal, never a fallback: a machine with no linked token
+/// gets an error naming the reason, and the user still has
+/// [`ssh_command`] to copy and paste into a shell of their own.
+#[tauri::command]
+async fn open_ssh_terminal(state: State<'_, AppState>, name: Option<String>) -> Result<(), String> {
+    let target = resolve_ssh_target(&state, name).await?;
+    spawn_ssh_terminal(&target)
 }
+
+/// The same command line, for the user to paste into their own terminal.
+///
+/// Kept beside [`open_ssh_terminal`] rather than replaced by it: the launcher
+/// legitimately refuses on machines with no standard-user token — UAC off, the
+/// built-in Administrator account, a service context — and on those the copy
+/// is the whole feature rather than a consolation.
+#[tauri::command]
+async fn ssh_command(state: State<'_, AppState>, name: Option<String>) -> Result<String, String> {
+    let target = resolve_ssh_target(&state, name).await?;
+    Ok(format!("ssh {target}"))
+}
+
+#[cfg(target_os = "windows")]
+use crate::deelevate::spawn_ssh_terminal;
 
 /// Refuses explicitly rather than silently doing nothing.
 ///
 /// # Limite connue
 ///
-/// The launcher is Windows-only because the shipped client is. A Linux or
-/// macOS build compiles and reaches this arm, which fails with a message
-/// naming the reason instead of opening a window that never appears. What
-/// would unblock it: choosing a terminal on those platforms, which is a
-/// per-desktop question (`x-terminal-emulator`, `open -a Terminal`, …) and
-/// not one this crate can answer on its own.
+/// The launcher is Windows-only because the de-elevation is: it rests on the
+/// linked token UAC produces, which has no equivalent elsewhere. A Linux or
+/// macOS build reaches this arm and fails with a message naming the reason,
+/// instead of opening a window that never appears. What would unblock it:
+/// choosing a terminal on those platforms, and a way to drop privileges that
+/// is theirs rather than Windows'.
 #[cfg(not(target_os = "windows"))]
 fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
     Err("l'ouverture d'un terminal SSH n'est disponible que sur Windows".into())
@@ -1779,7 +1790,8 @@ fn main() {
             discard_staged_key,
             adopt_preshared_key,
             discard_staged_psk,
-            open_ssh_session,
+            ssh_command,
+            open_ssh_terminal,
             delete_profile,
             select_profile,
             connect,
@@ -2192,5 +2204,86 @@ mod security_tests {
         let manifest = include_str!("../windows/orion-manifest.xml");
         assert!(manifest.contains("requireAdministrator"));
         assert!(manifest.contains("Microsoft.Windows.Common-Controls"));
+    }
+
+    /// The shipped client spawns nothing with its **own** token.
+    ///
+    /// # The escalation this forbids
+    ///
+    /// Orion runs elevated — the test above is what guarantees it, because
+    /// WireGuard-NT cannot be loaded otherwise. A child process inherits its
+    /// parent's token, so any `std::process::Command` in a release build is
+    /// an Administrator process. A terminal launched that way would hand out
+    /// an admin shell for one click, with no UAC prompt of its own, to anyone
+    /// who can reach this window — or anything that can reach the command,
+    /// the webview included. It was written that way once.
+    ///
+    /// Spawning is allowed again, but only through [`crate::deelevate`],
+    /// which builds the child from the standard-user token and refuses until
+    /// Windows confirms it is not elevated. This test keeps the shortcut from
+    /// coming back: the only `Command::new` left in this file is the dev-only
+    /// Vite server, behind `debug_assertions`.
+    #[test]
+    fn the_shipped_client_spawns_nothing_with_its_own_token() {
+        let source = include_str!("main.rs");
+        // Split so this test's own scan does not match itself.
+        let needle = concat!("Command", "::new");
+        let mut spawns = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains(needle) {
+                spawns.push((index + 1, code.trim().to_string()));
+            }
+        }
+        assert_eq!(
+            spawns.len(),
+            1,
+            "a release build must spawn nothing with Orion's own token — it is an \
+             Administrator token. Use `deelevate`. Found: {spawns:?}"
+        );
+        let (line, _) = spawns[0];
+        let before = source.lines().take(line - 1).collect::<Vec<_>>().join("\n");
+        let guard = before
+            .rfind("#[cfg(debug_assertions)]")
+            .expect("the only spawn must sit behind #[cfg(debug_assertions)]");
+        assert!(
+            !before[guard..].contains("\n#[cfg("),
+            "the spawn at line {line} is no longer the one guarded by debug_assertions"
+        );
+    }
+
+    /// The de-elevating launcher keeps its post-condition, and its shape.
+    ///
+    /// Asserted on the source text, which is crude and is the only mechanism
+    /// available: the module is Windows-only, so nothing here compiles or runs
+    /// it. What it protects is the one line that makes the module safe — the
+    /// refusal when Windows still reports the token as elevated. Someone
+    /// tidying this file could drop that check and every other test would stay
+    /// green, on every platform, forever.
+    #[test]
+    fn the_deelevating_launcher_checks_before_it_launches() {
+        let source = include_str!("deelevate.rs");
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains(concat!("Command", "::new")),
+            "the launcher must not fall back to std::process — that inherits the \
+             elevated token, which is the whole thing it exists to avoid"
+        );
+
+        let refusal = code
+            .find("if is_elevated(&token)?")
+            .expect("the elevation post-condition must be present");
+        let launch = code
+            .find("CreateProcessWithTokenW(")
+            .expect("the launcher must go through CreateProcessWithTokenW");
+        assert!(
+            refusal < launch,
+            "the token must be checked **before** anything is launched"
+        );
     }
 }

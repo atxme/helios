@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from '../api'
+import { copyText } from '../clipboard'
 import type {
   ClientConfig,
   ClientProfile,
@@ -135,14 +136,32 @@ export function useClient() {
     }
   }, [])
 
-  const openSshSession = useCallback(async (name?: string) => {
+  /**
+   * Opens the terminal, and falls back to the clipboard when it cannot.
+   *
+   * The refusal is a legitimate outcome, not an incident: a machine with UAC
+   * off, the built-in Administrator account or a service context has no
+   * standard-user token, and Rust declines rather than launching an elevated
+   * shell. Copying the command is then the whole feature, so the fallback is
+   * silent about the mechanism and explicit about what to do next.
+   */
+  const openSshTerminal = useCallback(async (name?: string) => {
+    setError(null)
     try {
-      setError(null)
-      await api.openSshSession(name)
+      await api.openSshTerminal(name)
+      pushLog('info', 'Terminal SSH ouvert sous votre compte standard.')
+      return
+    } catch (cause) {
+      pushLog('warn', `Terminal non ouvert — ${String(cause)}`)
+    }
+    try {
+      const command = await api.sshCommand(name)
+      await copyText(command)
+      pushLog('info', `Commande copiée : ${command} — à coller dans un terminal.`)
     } catch (cause) {
       setError(String(cause))
     }
-  }, [])
+  }, [pushLog])
 
   const disconnect = useCallback(async () => {
     try {
@@ -213,7 +232,7 @@ export function useClient() {
     pathImportedProfile,
     connect,
     disconnect,
-    openSshSession,
+    openSshTerminal,
     importProfile,
     saveProfile,
     removeProfile,

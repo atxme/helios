@@ -50,7 +50,7 @@ interface Props {
   psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
-  /** Opens a terminal already connected to the gateway. */
+  /** Opens a terminal on the gateway, de-elevated. */
   onOpenSsh: () => void
 }
 
@@ -261,11 +261,16 @@ export function ConnectView({
           </Button>
         )}
 
-        {/* Only while the tunnel carries traffic: the gateway answers SSH on
-            its tunnel address alone, so offering this earlier would open a
-            window that cannot connect — or, worse, one that resolves the name
-            on the clear network. Rust enforces the same gate; this only keeps
-            the screen from proposing what it knows would be refused. */}
+        {/* The terminal is launched from the **standard-user** token Windows
+            keeps linked to Orion's elevated one: Orion is Administrator to
+            load the WireGuard driver, and a child built the ordinary way would
+            inherit that. Rust refuses to launch until Windows confirms the
+            token is not elevated, and the hook then falls back to copying.
+
+            Shown only while the tunnel carries traffic: the gateway answers
+            SSH on its tunnel address alone, and offering it earlier would hand
+            out a command whose host could resolve elsewhere on the clear
+            network. Rust enforces the same gate. */}
         {state === 'up' && profile?.ssh_target && (
           <Button
             fullWidth

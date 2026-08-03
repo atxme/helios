@@ -117,14 +117,28 @@ export const selectProfile = (name: string) =>
   invoke<ClientConfig>('select_profile', { name })
 
 /**
- * Opens a PowerShell already connected to the gateway over SSH.
+ * The SSH command line for the gateway, to paste into your own terminal.
  *
- * Rust owns both gates: the tunnel must be up, and the destination is
- * re-validated at the boundary where a profile field becomes a process
- * argument. The screen only asks.
+ * Orion does **not** run it, and must not: it runs elevated to load the
+ * WireGuard driver, so any terminal it spawned would be an Administrator
+ * terminal — an escalation one click away from the UI. Rust still owns the
+ * gates: the tunnel must be up, and the destination is re-validated before it
+ * reaches a clipboard.
  */
-export const openSshSession = (name?: string) =>
-  invoke<void>('open_ssh_session', { name: name ?? null })
+export const sshCommand = (name?: string) =>
+  invoke<string>('ssh_command', { name: name ?? null })
+
+/**
+ * Opens a terminal connected to the gateway, **below** Orion's privileges.
+ *
+ * Orion runs elevated to load the WireGuard driver, so the child is built from
+ * the standard-user token Windows keeps linked to the elevated one. Rust
+ * refuses to launch anything until Windows confirms that token is not
+ * elevated — on a machine with no such token the call fails, and the caller
+ * falls back to {@link sshCommand}.
+ */
+export const openSshTerminal = (name?: string) =>
+  invoke<void>('open_ssh_terminal', { name: name ?? null })
 
 export const connect = (name?: string) => invoke<void>('connect', { name: name ?? null })
 export const disconnect = () => invoke<void>('disconnect')

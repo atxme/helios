@@ -30,6 +30,14 @@ zeroize = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Désélévation du terminal SSH (`deelevate`) : jeton lié de l'utilisateur
+# standard, puis CreateProcessWithTokenW. Sans ça, un terminal lancé depuis
+# Orion hériterait de son jeton Administrateur.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+] }
 
 [features]
 default = []
