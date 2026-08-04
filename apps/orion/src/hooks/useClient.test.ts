@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
   getState: vi.fn(),
   importProfile: vi.fn(),
   importProfilePath: vi.fn(),
+  onConfigChanged: vi.fn(),
   onEvent: vi.fn(),
   onProfilePath: vi.fn(),
   saveProfile: vi.fn(),
@@ -52,13 +53,16 @@ const imported = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
 
 let emit: (event: ClientEvent) => void
 let profilePath: () => void
+let configChanged: () => void
 let unlistenEvent: ReturnType<typeof vi.fn>
 let unlistenProfilePath: ReturnType<typeof vi.fn>
+let unlistenConfig: ReturnType<typeof vi.fn>
 
 beforeEach(() => {
   vi.clearAllMocks()
   unlistenEvent = vi.fn()
   unlistenProfilePath = vi.fn()
+  unlistenConfig = vi.fn()
   api.getConfig.mockResolvedValue(config)
   api.getState.mockResolvedValue('down')
   api.backendKind.mockResolvedValue('dry-run')
@@ -71,6 +75,10 @@ beforeEach(() => {
   api.onProfilePath.mockImplementation(async (listener) => {
     profilePath = listener
     return unlistenProfilePath
+  })
+  api.onConfigChanged.mockImplementation(async (listener) => {
+    configChanged = listener
+    return unlistenConfig
   })
 })
 
@@ -118,7 +126,22 @@ describe('useClient', () => {
     await waitFor(() => {
       expect(unlistenEvent).toHaveBeenCalledOnce()
       expect(unlistenProfilePath).toHaveBeenCalledOnce()
+      expect(unlistenConfig).toHaveBeenCalledOnce()
     })
+  })
+
+  // The notification area connects a profile, which selects it. The window may
+  // be open behind that menu: without this reread it would keep displaying the
+  // profile the selection has just left.
+  it('rereads the configuration when the tray changes the selection', async () => {
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    const other: ClientProfile = { ...portable, name: 'bureau' }
+    api.getConfig.mockResolvedValue({ profiles: [portable, other], selected: 'bureau' })
+    act(() => configChanged())
+
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('bureau'))
   })
 
   it('reports every associated-profile import outcome', async () => {

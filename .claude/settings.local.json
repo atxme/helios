@@ -286,7 +286,13 @@
       "Bash(ip -4 addr show)",
       "Bash(bash -n scripts/network-bootstrap.sh)",
       "Bash(: outil *)",
-      "Bash(echo \"clippy rc=$?\")"
+      "Bash(echo \"clippy rc=$?\")",
+      "Bash(magick - -filter point -resize 500% /tmp/oi/zoom-dark.png)",
+      "Bash(touch /tmp/t.orion)",
+      "Bash(cp /tmp/t.orion ./zz-test.orion)",
+      "Bash(bash -n scripts/lab.sh)",
+      "Bash(bash -n scripts/target-bootstrap.sh)",
+      "Bash(magick /tmp/oi/final-light.png /tmp/oi/final-dark.png -append /tmp/oi/final.png)"
     ]
   }
 }

@@ -12,6 +12,7 @@ import type { VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
+import { AboutDialog } from './components/AboutDialog'
 import { EventLog } from './components/EventLog'
 import { OrionMark } from './components/OrionMark'
 import { PosturePanel } from './components/PosturePanel'
@@ -51,6 +52,15 @@ export default function App() {
   // cached value would eventually claim a protection that has since gone.
   // A failure leaves it `null` — unknown, never "fine".
   const [vault, setVault] = useState<VaultPosture | null>(null)
+  const [about, setAbout] = useState(false)
+  /**
+   * Bumped when the tray asks for an import.
+   *
+   * A counter rather than a boolean: the second «Importer…» in a row must
+   * reopen the picker, and a flag already set changes nothing. The profile
+   * screen watches the value, not its truth.
+   */
+  const [importRequest, setImportRequest] = useState(0)
   useEffect(() => {
     if (!postureAnchor) return
     let cancelled = false
@@ -72,8 +82,23 @@ export default function App() {
     if (c.pathImportedProfile) setView('profiles')
   }, [c.pathImportedProfile])
 
+  // The menu names an intent; deciding what it means to the window is this
+  // component's job. Two of the five are not views: an import opens the profile
+  // screen *and* its file picker, and «À propos» opens a dialog over whatever
+  // is displayed rather than replacing it.
   useEffect(() => {
-    const unlisten = api.onTrayView((trayView) => setView(trayView))
+    const unlisten = api.onTrayView((trayView) => {
+      if (trayView === 'about') {
+        setAbout(true)
+        return
+      }
+      if (trayView === 'import') {
+        setView('profiles')
+        setImportRequest((request) => request + 1)
+        return
+      }
+      setView(trayView)
+    })
     return () => {
       unlisten.then((removeListener) => removeListener())
     }
@@ -159,6 +184,8 @@ export default function App() {
         backend={c.backend}
         vault={vault}
       />
+
+      <AboutDialog open={about} onClose={() => setAbout(false)} />
 
       {c.error ? (
         <Alert
@@ -300,6 +327,7 @@ export default function App() {
               <ProfilesView
                 config={c.config}
                 pathImport={c.pathImportedProfile}
+                importRequest={importRequest}
                 onPathImportHandled={c.clearPathImportedProfile}
                 onImport={c.importProfile}
                 onSave={c.saveProfile}

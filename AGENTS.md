@@ -49,6 +49,15 @@ la correspondance se fait sur la clé, jamais sur le nom. À défaut, le brouill
 s’affiche quand même et le message nomme la clé attendue, celle qu’imprime
 `helios-ctl profile check`.
 
+Les profils portent l’extension **`.orion`** (`.orionprofile` jusqu’en août
+2026 : encore lue à l’import, plus écrite ni enregistrée auprès de Windows), et
+une icône de document qui leur est propre — posée par un fragment WiX, le
+gabarit de Tauri n’écrivant qu’un ProgID sans icône. Sous Windows, la zone de
+notification est une surface à part entière : état du tunnel, liste de profils
+que l’on coche pour connecter, import, journal et « À propos ». Elle vit dans
+`apps/orion/src-tauri/src/tray.rs`, dont seul le câblage est propre à Windows ;
+le modèle et les libellés se compilent et se testent partout.
+
 La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
 `helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
 `helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
@@ -242,7 +251,7 @@ reste en **français**.
 `scripts/provision-client.sh` enchaîne les sept gestes d'une admission — créer
 la CA opérateur, en pousser la moitié publique, initialiser la négociation de
 la gateway, admettre le pair, rapatrier ses deux certificats, enrôler hors API,
-écrire le `.orionprofile`. Quatre copies de fichiers dans les deux sens, dont
+écrire le `.orion`. Quatre copies de fichiers dans les deux sens, dont
 chacune est un endroit où coller la mauvaise valeur ; et la panne ne se voit
 qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
 sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients

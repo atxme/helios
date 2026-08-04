@@ -87,6 +87,23 @@ export interface ImportOutcome {
   incomplete: string | null
 }
 
+/**
+ * What the About box states.
+ *
+ * Four facts, each of which a support exchange has had to ask for: which
+ * version is installed, whether it drives a real adapter or the dry-run
+ * backend, what a profile file looks like, and where the log is.
+ */
+export interface About {
+  version: string
+  /** `wireguard` or `dry-run` — what the shipped client actually mounts. */
+  backend: string
+  /** Extension of a profile document, without the dot. */
+  profile_extension: string
+  /** Absolute path of this run's log, when one could be opened. */
+  log_path: string | null
+}
+
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP
 // endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
 // one suite.

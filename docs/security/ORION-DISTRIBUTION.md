@@ -25,6 +25,34 @@ dans `resources-windows/`. Ce répertoire et l'archive en cache restent hors Git
 La configuration Tauri Windows exécute aussi cette commande avant le build et
 place le répertoire sous `bundle.resources`.
 
+## Association `.orion` et icône de document
+
+Les profils clients portent l'extension `.orion` — `.orionprofile` jusqu'en
+août 2026. Les documents déjà écrits restent **lus** : `ORION_SUFFIXES` de
+`orion-core` accepte les deux suffixes, et le filtre du double-clic aussi.
+Seul l'enregistrement système change : l'installateur ne déclare plus que
+`.orion`, donc un double-clic sur un ancien fichier ne démarre plus Orion. Le
+glisser sur le bouton *Importer* fonctionne toujours, et le renommer suffit.
+
+Le gabarit WiX de Tauri écrit un ProgID **annoncé sans icône**, ce qui fait
+retomber Windows sur celle de l'exécutable : un profil s'affichait alors avec
+l'icône de l'application qui l'ouvre. `bundle.fileAssociations` n'a pas de champ
+d'icône, d'où le fragment `windows/orion-profile-icon.wxs`, référencé par
+`wix.fragmentPaths` et `wix.componentRefs`. Il pose deux valeurs sous
+`HKLM\Software\Classes\Orion.orion` : le nom affiché dans la colonne *Type* de
+l'Explorateur, et un `DefaultIcon` visant `orion-profile.ico`, livrée en
+ressource à côté de `orion.exe`.
+
+L'identifiant `Orion.orion` est celui que le gabarit fabrique à partir de
+`productName` et de l'extension déclarée. Le couplage est **testé**
+(`windows_bundle_gives_orion_profiles_their_own_icon`) : renommer le produit ou
+l'extension sans suivre cette clé produirait un installateur qui se construit,
+s'installe, et affiche la mauvaise icône.
+
+**Limite connue.** Cela ne vaut que pour le MSI. Le paquet NSIS
+(`cargo xtask orion-msi --with-nsis`) écrit sa propre association avec l'icône
+de l'exécutable ; le MSI est le format livré.
+
 ## Autorité interne Authenticode
 
 Créer l'autorité dans un emplacement protégé hors du dépôt :

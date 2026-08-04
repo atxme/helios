@@ -505,7 +505,7 @@ mod tests {
             identity: None,
             admin: false,
             replace: false,
-            output: PathBuf::from("portable.orionprofile"),
+            output: PathBuf::from("portable.orion"),
             offline: None,
         }
     }

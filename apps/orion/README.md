@@ -254,11 +254,49 @@ paquet Debian dépend de `libcap2-bin` et son `postinst` pose
 Authenticode sont détaillées dans
 [`../../docs/security/ORION-DISTRIBUTION.md`](../../docs/security/ORION-DISTRIBUTION.md).
 
-Les fichiers `.orionprofile` sont associés à Orion. Le premier double-clic et
-les suivants passent par la même file single-instance, la même lecture Rust
-bornée à 64 Kio, le même parseur et la même complétion des invitations depuis
-la clé privée locale de même nom. L'import reste un brouillon à vérifier puis à
-enregistrer ; il n'écrase jamais silencieusement la configuration.
+Les fichiers `.orion` sont associés à Orion, avec une icône qui leur est propre
+— la marque sur une feuille, pour qu'un profil ne se confonde pas avec le client
+qui l'ouvre. Le premier double-clic et les suivants passent par la même file
+single-instance, la même lecture Rust bornée à 64 Kio, le même parseur et la
+même complétion des invitations depuis la clé privée locale de même nom.
+L'import reste un brouillon à vérifier puis à enregistrer ; il n'écrase jamais
+silencieusement la configuration.
+
+L'extension était `.orionprofile` jusqu'en août 2026. Les documents déjà écrits
+restent **lus** — les deux suffixes sont acceptés à l'import — mais seul
+`.orion` est enregistré auprès de Windows : un double-clic sur un ancien fichier
+ne démarre plus Orion, le glisser sur le bouton *Importer* fonctionne toujours.
+
+## Zone de notification (Windows)
+
+Fermer la fenêtre ne quitte pas : le tunnel et son lien de vivacité continuent,
+et le menu de la zone de notification devient la seule surface d'Orion. Il n'est
+donc pas une liste de raccourcis vers la fenêtre, mais un petit client :
+
+```text
+● État : Connecté
+─────────────────
+✓ poste-windows
+  bureau
+─────────────────
+Ouvrir Orion
+Gestion des profils…
+Importer un profil à partir d'un fichier…
+Journal d'Orion…
+─────────────────
+À propos d'Orion…
+Quitter
+```
+
+La pastille reprend les couleurs d'état de `components/state.ts`. Cliquer un
+profil coché **déconnecte** ; cliquer un autre le sélectionne et s'y connecte —
+la sélection suit, sans quoi la fenêtre afficherait un profil pendant que le
+tunnel en porte un autre. Un refus dévoile la fenêtre et affiche l'erreur : une
+connexion lancée depuis un menu n'a aucun autre endroit où se plaindre.
+
+Le menu est **reconstruit** à chaque changement d'état ou de liste de profils,
+plutôt que modifié : tenir à jour un second modèle à côté du coffre finirait par
+diverger le jour où un profil est renommé.
 
 ## Provisioning post-quantique
 
@@ -276,7 +314,7 @@ opérationnel et reste visible dans le journal.
 
 Le frontend utilise les commandes suivantes :
 
-- `get_state`, `backend_kind`, `adapter_is_up` ;
+- `get_state`, `backend_kind`, `adapter_is_up`, `about_orion` ;
 - `get_config`, `import_profile`, `save_profile`, `delete_profile`,
   `select_profile` ;
 - `import_profile_path`, réservé aux chemins reçus de l'association système ;
@@ -285,7 +323,11 @@ Le frontend utilise les commandes suivantes :
 Les événements `state_changed`, `log`, `telemetry` et `error` sont relayés sur
 le canal `helios://event`. `helios://profile-path` signale qu'un chemin associé
 attend dans la file Rust sans donner au frontend un accès général au système de
-fichiers.
+fichiers. `helios://tray-view` porte l'intention choisie dans la zone de
+notification — dont `import`, qui n'est pas une vue mais l'ouverture du
+sélecteur de fichier de l'écran *Profils*, et `about`. `helios://config-changed`
+dit que la sélection a bougé côté Rust, ce qui arrive quand le menu connecte un
+profil pendant que la fenêtre est ouverte derrière lui.
 
 ## Régression
 

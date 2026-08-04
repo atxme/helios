@@ -47,11 +47,7 @@ use orion_core::{
     ClientProfile, ProfileIssues, ProtectedIdentityStore, VpnController,
 };
 #[cfg(target_os = "windows")]
-use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    WindowEvent,
-};
+use tauri::WindowEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
@@ -59,6 +55,10 @@ use tokio::sync::{watch, Mutex};
 /// token UAC produces, which has no equivalent elsewhere.
 #[cfg(target_os = "windows")]
 mod deelevate;
+
+/// Notification-area menu. Its model and labels are portable and tested
+/// everywhere; only the wiring inside is Windows-only.
+mod tray;
 
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
@@ -116,6 +116,12 @@ struct AppState {
     /// the admitted one, which is false: the machine's keys were never read.
     /// Carrying the cause lets those messages say so.
     vault_error: Option<String>,
+    /// Where this run writes its log, when it writes one.
+    ///
+    /// A release build has no console (`windows_subsystem = "windows"`), so the
+    /// file is the only trace left of a start that went wrong — and a path
+    /// nobody can find is a file nobody reads. The About box states it.
+    log_path: Option<PathBuf>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -263,8 +269,18 @@ impl TelemetryManager {
 }
 
 /// Builds a sink that relays each core event to the frontend.
+///
+/// It is also where the notification-area menu learns that the tunnel changed:
+/// every path that mounts or drops one — the button, the tray, the handshake
+/// poll that infers a loss — ends up here, and hooking the transition at this
+/// single point is what keeps the menu from claiming a tunnel that is gone.
+/// Only the transition, deliberately: telemetry arrives once a second, and
+/// rebuilding the menu at that rate would rebuild it under the pointer.
 fn emit_sink(app: AppHandle) -> EventSink {
     Arc::new(move |ev: ClientEvent| {
+        if matches!(ev, ClientEvent::StateChanged { .. }) {
+            tray::refresh(&app);
+        }
         let _ = app.emit("helios://event", &ev);
     })
 }
@@ -276,113 +292,6 @@ fn reveal_main_window(app: &AppHandle) -> tauri::Result<()> {
         window.unminimize()?;
         window.set_focus()?;
     }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-const TRAY_OPEN_MENU_ID: &str = "orion-tray-open";
-#[cfg(target_os = "windows")]
-const TRAY_CONNECT_MENU_ID: &str = "orion-tray-connect";
-#[cfg(target_os = "windows")]
-const TRAY_PROFILES_MENU_ID: &str = "orion-tray-profiles";
-#[cfg(target_os = "windows")]
-const TRAY_LOGS_MENU_ID: &str = "orion-tray-logs";
-#[cfg(target_os = "windows")]
-const TRAY_DISCONNECT_MENU_ID: &str = "orion-tray-disconnect";
-#[cfg(target_os = "windows")]
-const TRAY_QUIT_MENU_ID: &str = "orion-tray-quit";
-
-/// Installs Orion in the Windows notification area.
-///
-/// Hiding the window deliberately leaves the process and VPN controller
-/// untouched. The tunnel and its key-negotiation liveness link therefore keep
-/// running exactly as they did while the window was visible.
-#[cfg(target_os = "windows")]
-fn configure_windows_tray(app: &mut tauri::App) -> anyhow::Result<()> {
-    let open_item = MenuItem::with_id(app, TRAY_OPEN_MENU_ID, "Ouvrir Orion", true, None::<&str>)?;
-    let connect_item =
-        MenuItem::with_id(app, TRAY_CONNECT_MENU_ID, "Connexion", true, None::<&str>)?;
-    let profiles_item =
-        MenuItem::with_id(app, TRAY_PROFILES_MENU_ID, "Profils", true, None::<&str>)?;
-    let logs_item = MenuItem::with_id(app, TRAY_LOGS_MENU_ID, "Journal", true, None::<&str>)?;
-    let disconnect_item = MenuItem::with_id(
-        app,
-        TRAY_DISCONNECT_MENU_ID,
-        "Déconnecter",
-        true,
-        None::<&str>,
-    )?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, "Quitter Orion", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &open_item,
-            &separator,
-            &connect_item,
-            &profiles_item,
-            &logs_item,
-            &disconnect_item,
-            &separator,
-            &quit_item,
-        ],
-    )?;
-    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
-        .map_err(|error| anyhow::anyhow!("Orion's tray icon is unavailable: {error}"))?;
-
-    TrayIconBuilder::with_id("orion-notification-area")
-        .icon(icon)
-        .tooltip("Orion")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| {
-            if event.id() == TRAY_OPEN_MENU_ID {
-                if let Err(error) = reveal_main_window(app) {
-                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
-                }
-            } else if event.id() == TRAY_CONNECT_MENU_ID {
-                if let Err(error) = reveal_main_window(app) {
-                    tracing::warn!(%error, "unable to reveal Orion's connection view");
-                }
-                let _ = app.emit("helios://tray-view", "connect");
-            } else if event.id() == TRAY_PROFILES_MENU_ID {
-                if let Err(error) = reveal_main_window(app) {
-                    tracing::warn!(%error, "unable to reveal Orion's profiles view");
-                }
-                let _ = app.emit("helios://tray-view", "profiles");
-            } else if event.id() == TRAY_LOGS_MENU_ID {
-                if let Err(error) = reveal_main_window(app) {
-                    tracing::warn!(%error, "unable to reveal Orion's log view");
-                }
-                let _ = app.emit("helios://tray-view", "logs");
-            } else if event.id() == TRAY_DISCONNECT_MENU_ID {
-                let state = app.state::<AppState>();
-                state.telemetry.stop();
-                let controller = Arc::clone(&state.controller);
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    controller.disconnect(emit_sink(app_handle)).await;
-                });
-            } else if event.id() == TRAY_QUIT_MENU_ID {
-                app.exit(0);
-            }
-        })
-        .on_tray_icon_event(|tray, event| {
-            if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-            ) {
-                if let Err(error) = reveal_main_window(tray.app_handle()) {
-                    tracing::warn!(%error, "unable to reveal Orion from the notification area");
-                }
-            }
-        })
-        .build(app)?;
-
     Ok(())
 }
 
@@ -422,6 +331,36 @@ fn backend_kind(state: State<'_, AppState>) -> &'static str {
 #[tauri::command]
 fn adapter_is_up(state: State<'_, AppState>) -> bool {
     state.controller.adapter_is_up()
+}
+
+/// What the About box states.
+///
+/// Four facts, and each one is there because a support exchange asked for it:
+/// which version is installed, whether it drives a real adapter or the dry-run
+/// backend, what a profile file looks like, and where the log is.
+#[derive(serde::Serialize)]
+struct AboutView {
+    version: &'static str,
+    backend: &'static str,
+    /// Extension of an Orion profile, without the dot. Read from Rust rather
+    /// than written in the interface: it is the same string the file
+    /// association and the import filter use, and three copies of it would
+    /// eventually disagree.
+    profile_extension: &'static str,
+    log_path: Option<String>,
+}
+
+#[tauri::command]
+fn about_orion(state: State<'_, AppState>) -> AboutView {
+    AboutView {
+        version: env!("CARGO_PKG_VERSION"),
+        backend: state.controller.backend_kind(),
+        profile_extension: PROFILE_EXTENSION,
+        log_path: state
+            .log_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    }
 }
 
 /// What this machine can do with the gateway's key-negotiation port.
@@ -757,7 +696,9 @@ async fn import_profile_path(
         },
     };
     if !is_associated_profile_path(&path) {
-        return Err("seuls les fichiers .orionprofile sont acceptés par cette commande".into());
+        return Err(format!(
+            "seuls les fichiers .{PROFILE_EXTENSION} sont acceptés par cette commande"
+        ));
     }
     let imported = read_profile_import_path(&path).map_err(|error| error.to_string())?;
     finish_import(&state, imported).await.map(Some)
@@ -1082,6 +1023,7 @@ fn spawn_ssh_terminal(_target: &str) -> Result<(), String> {
 /// encryption reaches neither the old SSD blocks nor the hibernation file.
 #[tauri::command]
 async fn save_profile(
+    app: AppHandle,
     state: State<'_, AppState>,
     draft: ProfileDraft,
 ) -> Result<ConfigView, String> {
@@ -1107,26 +1049,45 @@ async fn save_profile(
     cfg.upsert(profile);
     cfg.selected = Some(selected.clone());
     state.store.select(&selected).map_err(|e| e.to_string())?;
-    Ok(ConfigView::from(&*cfg))
+    let view = ConfigView::from(&*cfg);
+    // Released before the menu is rebuilt: the rebuild reads the same lock,
+    // and holding it here would have it wait on the very command it follows.
+    drop(cfg);
+    tray::refresh(&app);
+    Ok(view)
 }
 
 #[tauri::command]
-async fn delete_profile(state: State<'_, AppState>, name: String) -> Result<ConfigView, String> {
+async fn delete_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     state
         .store
         .remove_profile(&name)
         .map_err(|e| e.to_string())?;
     cfg.remove(&name);
-    Ok(ConfigView::from(&*cfg))
+    let view = ConfigView::from(&*cfg);
+    drop(cfg);
+    tray::refresh(&app);
+    Ok(view)
 }
 
 #[tauri::command]
-async fn select_profile(state: State<'_, AppState>, name: String) -> Result<ConfigView, String> {
+async fn select_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     state.store.select(&name).map_err(|e| e.to_string())?;
     cfg.selected = Some(name);
-    Ok(ConfigView::from(&*cfg))
+    let view = ConfigView::from(&*cfg);
+    drop(cfg);
+    tray::refresh(&app);
+    Ok(view)
 }
 
 /// Refuses to write a secret onto a volume nothing encrypts (ADR-006 §3).
@@ -1145,11 +1106,44 @@ fn require_protected_volume(state: &State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn connect(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    name: Option<String>,
-) -> Result<(), String> {
+async fn connect(app: AppHandle, name: Option<String>) -> Result<(), String> {
+    start_connection(app, name).await
+}
+
+/// Selects a profile, then connects to it — the two gestures the notification
+/// area couples into one click.
+///
+/// Selecting first is not cosmetic: the connection reads the selected profile
+/// when no name is given, and every screen derives what it shows from it. A
+/// tray click that connected without selecting would leave the window
+/// displaying one profile while the tunnel carried another.
+///
+/// Only the notification-area menu calls it, so outside Windows nothing does.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+async fn select_and_connect(app: &AppHandle, name: &str) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let mut config = state.config.lock().await;
+        if config.find(name).is_none() {
+            return Err(format!("profil « {name} » introuvable"));
+        }
+        state
+            .store
+            .select(name)
+            .map_err(|error| error.to_string())?;
+        config.selected = Some(name.to_string());
+    }
+    // The window may be open behind the menu: it reads its profile list from
+    // Rust, and nothing else would tell it the selection just moved.
+    let _ = app.emit("helios://config-changed", ());
+    start_connection(app.clone(), Some(name.to_string())).await
+}
+
+/// Mounts the tunnel. Shared by the `connect` command and the tray menu, which
+/// must not differ by one step: a connection started from a hidden window has
+/// no screen to report a discrepancy on.
+async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let profile = {
         let cfg = state.config.lock().await;
         match name {
@@ -1426,10 +1420,30 @@ fn export_logs(app: AppHandle, stem: String, contents: String) -> Result<String,
     Ok(path.display().to_string())
 }
 
+/// Extension of an Orion profile, without the dot.
+///
+/// It is the extension the installer registers, the one `helios-ctl` writes,
+/// and the one the import filter offers. One constant so those three cannot
+/// drift apart.
+const PROFILE_EXTENSION: &str = "orion";
+
+/// The extension distributed until August 2026.
+///
+/// Still accepted, and only accepted — nothing produces it anymore. A profile
+/// on an operator's disk outlives the client that reads it, and refusing the
+/// document Orion itself wrote last month would send the user back to an
+/// enrolment they have no reason to redo. The installer no longer registers
+/// it, so a double-click on such a file no longer starts Orion; dragging it
+/// onto the import button still works.
+const LEGACY_PROFILE_EXTENSION: &str = "orionprofile";
+
 fn is_associated_profile_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("orionprofile"))
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case(PROFILE_EXTENSION)
+                || extension.eq_ignore_ascii_case(LEGACY_PROFILE_EXTENSION)
+        })
 }
 
 fn associated_profile_paths(args: &[String], cwd: &Path) -> Vec<PathBuf> {
@@ -1765,10 +1779,11 @@ fn main() {
             staged_key: Arc::new(Mutex::new(None)),
             staged_psk: Arc::new(Mutex::new(None)),
             vault_error,
+            log_path,
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
-            configure_windows_tray(_app)?;
+            tray::install(_app)?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1781,6 +1796,7 @@ fn main() {
             get_state,
             backend_kind,
             adapter_is_up,
+            about_orion,
             get_config,
             import_profile,
             import_profile_path,
@@ -1812,7 +1828,8 @@ fn main() {
 mod security_tests {
     use super::{
         associated_profile_paths, sanitize_stem, window_size_for, ClientProfile, ConfigView, Path,
-        PathBuf, ProfileDraft, ProfileView, StagedKey, StagedPsk,
+        PathBuf, ProfileDraft, ProfileView, StagedKey, StagedPsk, LEGACY_PROFILE_EXTENSION,
+        PROFILE_EXTENSION,
     };
 
     fn profile(name: &str) -> ClientProfile {
@@ -2142,7 +2159,11 @@ mod security_tests {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let association = &config["bundle"]["fileAssociations"][0];
-        assert_eq!(association["ext"], serde_json::json!(["orionprofile"]));
+        assert_eq!(
+            association["ext"],
+            serde_json::json!([PROFILE_EXTENSION]),
+            "the registered extension is the one the tooling writes"
+        );
         assert_eq!(
             config["bundle"]["linux"]["deb"]["postInstallScript"],
             "linux/postinst"
@@ -2174,6 +2195,62 @@ mod security_tests {
         }
     }
 
+    /// A profile must not wear the icon of the application that opens it.
+    ///
+    /// The chain is long enough to break silently: the registry key the
+    /// fragment writes is built from `productName` and the declared extension,
+    /// the icon it points at is installed by a resource entry, and the
+    /// component that carries the whole thing only reaches the package because
+    /// it is listed in `componentRefs`. Any one of the four moving alone
+    /// produces an installer that builds, installs, and shows the wrong icon.
+    #[test]
+    fn windows_bundle_gives_orion_profiles_their_own_icon() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        let fragment = include_str!("../windows/orion-profile-icon.wxs");
+
+        let product = base["productName"].as_str().expect("product name");
+        let progid = format!("{product}.{PROFILE_EXTENSION}");
+        assert!(
+            fragment.contains(&format!(r"Software\Classes\{progid}")),
+            "the fragment must write under the ProgID the WiX template creates ({progid})"
+        );
+        assert!(fragment.contains(r#"Id="OrionProfileIcon""#));
+        assert!(fragment.contains("[INSTALLDIR]orion-profile.ico"));
+
+        let wix = &windows["bundle"]["windows"]["wix"];
+        assert!(wix["fragmentPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "windows/orion-profile-icon.wxs"));
+        assert!(wix["componentRefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|component| component == "OrionProfileIcon"));
+        assert_eq!(
+            windows["bundle"]["resources"]["icons/orion-profile.ico"], "orion-profile.ico",
+            "the icon must be installed beside the executable the key points next to"
+        );
+
+        // An `.ico` is a set of images, and the small sizes are drawn
+        // separately: a single frame scaled by the shell is what the file
+        // exists to avoid.
+        let icon = include_bytes!("../icons/orion-profile.ico");
+        assert_eq!(
+            &icon[0..4],
+            &[0x00, 0x00, 0x01, 0x00],
+            "ICO header expected"
+        );
+        assert!(
+            u16::from_le_bytes([icon[4], icon[5]]) >= 5,
+            "the icon must carry the small sizes drawn for them"
+        );
+    }
+
     #[test]
     fn tauri_capabilities_stay_minimal() {
         let capabilities: serde_json::Value =
@@ -2189,13 +2266,46 @@ mod security_tests {
     fn association_only_forwards_orion_profiles() {
         let args = vec![
             "orion.exe".to_string(),
-            "invitation.orionprofile".to_string(),
+            format!("invitation.{PROFILE_EXTENSION}"),
             "--unexpected".to_string(),
             "other.json".to_string(),
         ];
         assert_eq!(
             associated_profile_paths(&args, Path::new("/profils")),
-            vec![PathBuf::from("/profils/invitation.orionprofile")]
+            vec![PathBuf::from(format!(
+                "/profils/invitation.{PROFILE_EXTENSION}"
+            ))]
+        );
+    }
+
+    /// The extension changed; the documents already written did not.
+    ///
+    /// A profile sitting on an operator's disk outlives the client that reads
+    /// it. Dropping the old suffix would turn a valid document into «format
+    /// inconnu» — and send the user back through an enrolment they have no
+    /// reason to redo.
+    #[test]
+    fn the_previous_extension_is_still_read() {
+        let args = vec![
+            "orion.exe".to_string(),
+            format!("invitation.{LEGACY_PROFILE_EXTENSION}"),
+        ];
+        assert_eq!(
+            associated_profile_paths(&args, Path::new("/profils")),
+            vec![PathBuf::from(format!(
+                "/profils/invitation.{LEGACY_PROFILE_EXTENSION}"
+            ))]
+        );
+    }
+
+    /// Windows matches an extension without regard to case, and so must the
+    /// filter: a document named `.Orion` is the same document.
+    #[test]
+    fn the_extension_is_matched_without_regard_to_case() {
+        let args = vec!["orion.exe".to_string(), "Poste.Orion".to_string()];
+        assert_eq!(
+            associated_profile_paths(&args, Path::new("/profils")),
+            vec![PathBuf::from("/profils/Poste.Orion")]
         );
     }
 

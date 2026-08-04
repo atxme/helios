@@ -517,7 +517,7 @@ VIP="$(grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$SORTIE/peer-add.log" | he
 echo "    VIP : $VIP"
 
 # ── 7. Assemblage du profil Orion ────────────────────────────────────────────
-PROFIL="$SORTIE/$NOM.orionprofile"
+PROFIL="$SORTIE/$NOM.orion"
 rm -f "$PROFIL"
 echo "==> Assemblage du profil « $NOM »"
 cargo run --quiet -p helios-ctl -- enroll \

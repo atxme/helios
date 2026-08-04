@@ -329,7 +329,7 @@ commande fait tout :
 helios-ctl enroll --name portable \
   --endpoint vpn.example.net:51820 \
   --client-ca-dir ./orion-client-ca \
-  --output portable.orionprofile
+  --output portable.orion
 ```
 
 Elle enchaîne ce que la section 5 sépare : elle lit sur la gateway sa clé

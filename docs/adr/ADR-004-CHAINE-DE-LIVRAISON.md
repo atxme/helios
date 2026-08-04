@@ -174,7 +174,7 @@ backend, car une association de fichier peut fournir un autre répertoire
 courant.
 
 Le manifeste Windows demande `requireAdministrator`. Le paquet Debian pose
-`cap_net_admin=ep` dans son `postinst`. L'association `.orionprofile` passe par
+`cap_net_admin=ep` dans son `postinst`. L'association `.orion` passe par
 le plugin single-instance et une lecture Rust bornée à 64 Kio ; l'import manuel
 et le double-clic partagent le parseur et la reprise de clé privée du profil
 local de même nom.

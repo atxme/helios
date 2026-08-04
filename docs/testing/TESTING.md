@@ -163,9 +163,21 @@ Valider avec accès console :
   éditeur dans un bundle produit après `cargo xtask orion-deps`, manifeste
   `requireAdministrator`, et horodatage RFC 3161 valide sur l'exécutable comme
   sur l'installateur ;
-- association Orion : double-clic sur `.orionprofile` au premier lancement puis
+- association Orion : double-clic sur `.orion` au premier lancement puis
   avec l'application déjà ouverte, une seule instance et reprise de la clé
   privée locale de même nom ;
+- icône des documents `.orion` : après installation du MSI, l'Explorateur montre
+  l'icône de document — feuille à coin plié — et non celle de l'application, en
+  thème clair comme en thème sombre, aux quatre tailles d'affichage. Le fragment
+  WiX est la seule pièce de la chaîne d'association que rien ne vérifie hors de
+  Windows : une `componentRefs` absente produit un installateur qui se construit
+  et s'installe sans jamais écrire la clé ;
+- zone de notification : la pastille et la ligne d'état suivent le tunnel ;
+  cocher un profil connecte, le décocher déconnecte, et un profil qui refuse de
+  monter dévoile la fenêtre avec son erreur. La liste suit un profil enregistré,
+  supprimé ou renommé. `IconMenuItem` n'est exercé que là : le module est
+  type-vérifié sous Linux en forçant la feature `tray-icon`, ce qui ne dit rien
+  du rendu Windows ;
 - identité cliente sous Windows : un document produit par `helios-ctl enroll`
   est importé, l'écran *Profils* annonce l'identité **scellée**, la connexion
   négocie en ML-KEM après suppression du fichier d'enrôlement, et la même
@@ -310,7 +322,7 @@ assisté doit être importable tel quel.
 Il ne fait **pas** partie de `regression.sh` : la régression vérifie des
 invariants, elle ne lance pas d'environnements. Le banc est un outil de
 développement et un point d'entrée pour la recette manuelle d'Orion — le profil
-`lab-poste.json` s'importe directement dans le client
+`lab-poste.orion` s'importe directement dans le client
 ([MANUAL-TESTING.md](MANUAL-TESTING.md)).
 
 Ce qu'il ne prouve pas : le plan de données. Le tunnel reste simulé, comme dans

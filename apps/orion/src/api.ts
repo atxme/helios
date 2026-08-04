@@ -5,6 +5,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  About,
   ClientConfig,
   ClientEvent,
   ImportOutcome,
@@ -20,6 +21,15 @@ export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
 export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
+
+/**
+ * What the About box states.
+ *
+ * Read from Rust rather than from `package.json`: the version that matters is
+ * the one of the binary driving the adapter, and the profile extension it
+ * reports is the same constant the file association is built from.
+ */
+export const aboutOrion = () => invoke<About>('about_orion')
 
 /**
  * Imports a document and seals any identity it carries.
@@ -170,15 +180,35 @@ export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
   return listen('helios://profile-path', cb)
 }
 
+/**
+ * What the notification-area menu asks the window to show.
+ *
+ * `import` and `about` are not views: the first opens the profile screen *and*
+ * its file picker, the second a dialog over whatever is displayed. They travel
+ * on the same channel all the same — the menu names an intent, the window
+ * decides what that means.
+ */
+export type TrayView = 'connect' | 'profiles' | 'logs' | 'import' | 'about'
+
+const TRAY_VIEWS: TrayView[] = ['connect', 'profiles', 'logs', 'import', 'about']
+
 /** A tray action selected while the main window was hidden. */
-export function onTrayView(
-  cb: (view: 'connect' | 'profiles' | 'logs') => void,
-): Promise<UnlistenFn> {
+export function onTrayView(cb: (view: TrayView) => void): Promise<UnlistenFn> {
   return listen<string>('helios://tray-view', (event) => {
-    if (event.payload === 'connect' || event.payload === 'profiles' || event.payload === 'logs') {
-      cb(event.payload)
-    }
+    const view = TRAY_VIEWS.find((known) => known === event.payload)
+    if (view) cb(view)
   })
+}
+
+/**
+ * The Rust side changed the profile list or the selection.
+ *
+ * Emitted when the tray connects to a profile: that click selects it, and the
+ * window — which may have been open behind the menu — has no other way to learn
+ * that the selection moved under it.
+ */
+export function onConfigChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen('helios://config-changed', cb)
 }
 
 /**

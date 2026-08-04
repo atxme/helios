@@ -70,6 +70,15 @@ import type {
 interface Props {
   config: ClientConfig
   pathImport: ClientProfile | null
+  /**
+   * Counter bumped each time the notification-area menu asks for an import.
+   *
+   * A counter and not a boolean: «Importer un profil…» twice in a row must
+   * open the picker twice, and a flag already set changes nothing. `0` — the
+   * value the screen mounts with — opens nothing, so reaching the profile
+   * screen by the navigation rail stays quiet.
+   */
+  importRequest?: number
   onPathImportHandled: () => void
   onImport: (contents: string, fileName: string) => Promise<ImportOutcome>
   onSave: (draft: ProfileDraft) => Promise<void>
@@ -177,6 +186,7 @@ function blankNegotiation(): KeyNegotiationSettings {
 export function ProfilesView({
   config,
   pathImport,
+  importRequest = 0,
   onPathImportHandled,
   onImport,
   onSave,
@@ -384,6 +394,13 @@ export function ProfilesView({
     })
     onPathImportHandled()
   }, [config.profiles, loadDraft, onPathImportHandled, pathImport])
+
+  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
+  // picker belongs to this screen, and opening it from the shell would mean a
+  // second one. `0` is the mounted value and opens nothing.
+  useEffect(() => {
+    if (importRequest > 0) fileInput.current?.click()
+  }, [importRequest])
 
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
@@ -815,13 +832,15 @@ export function ProfilesView({
               component="input"
               ref={fileInput}
               type="file"
-              // `.orionprofile` d'abord : c'est l'extension que produit
+              // `.orion` d'abord : c'est l'extension que produit
               // `helios-ctl enroll` et celle qu'Orion associe au double-clic.
               // Son absence ici la grisait dans le sélecteur, ce qui donnait à
               // penser que le format n'était pas supporté — alors que le
               // parseur l'accepte depuis toujours (il reconnaît le JSON à son
-              // premier caractère, pas au suffixe).
-              accept=".orionprofile,.json,.conf,application/json,text/plain"
+              // premier caractère, pas au suffixe). `.orionprofile` reste
+              // proposée : c'est le suffixe distribué jusqu'en août 2026, et
+              // les documents déjà écrits survivent au client qui les lit.
+              accept=".orion,.orionprofile,.json,.conf,application/json,text/plain"
               onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                 void importFile(event.target.files?.[0])
               }

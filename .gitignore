@@ -16,5 +16,9 @@ __pycache__/
 /orion-client-ca
 **/orion-client-ca-key.der
 **/orion-client-pq-ca-private.bin
+# Profils clients. Un profil complet porte la clé privée WireGuard du poste :
+# `.orionprofile` est le suffixe distribué jusqu'en août 2026, `.orion` celui
+# que l'outillage écrit depuis.
 *.orionprofile
+*.orion
 

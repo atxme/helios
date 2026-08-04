@@ -431,9 +431,9 @@ describe('ProfilesView interactions', () => {
     )
     const input = container.querySelector('input[type="file"]') as HTMLInputElement
 
-    fireEvent.change(input, { target: { files: [new File(['profile'], 'imported.orionprofile')] } })
+    fireEvent.change(input, { target: { files: [new File(['profile'], 'imported.orion')] } })
     await waitFor(() => expect(screen.getByText(/Identité scellée/)).toBeTruthy())
-    expect(handlers.onImport).toHaveBeenCalledWith('{"format":"orion-profile"}', 'imported.orionprofile')
+    expect(handlers.onImport).toHaveBeenCalledWith('{"format":"orion-profile"}', 'imported.orion')
 
     handlers.onImport.mockResolvedValueOnce(outcome({ private_key_missing: 'private key expected' }))
     fireEvent.change(input, { target: { files: [new File(['profile'], 'invitation.json')] } })
@@ -447,6 +447,38 @@ describe('ProfilesView interactions', () => {
     documents.readProfileDocument.mockRejectedValueOnce(new Error('invalid encoding'))
     fireEvent.change(input, { target: { files: [new File(['bad'], 'bad.json')] } })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('invalid encoding'))
+  })
+
+  // The tray's «Importer un profil…» has no picker of its own: it asks this
+  // screen for the one it already owns. A counter drives it because two
+  // requests in a row must open it twice.
+  it('opens the file picker when the notification area asks for an import', async () => {
+    const handlers = callbacks()
+    const { container, rerender } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        importRequest={0}
+        {...handlers}
+      />,
+    )
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement
+    const click = vi.spyOn(input, 'click')
+
+    // Mounted value: reaching the screen by the navigation rail opens nothing.
+    expect(click).not.toHaveBeenCalled()
+
+    for (const request of [1, 2]) {
+      rerender(
+        <ProfilesView
+          config={{ profiles: [profile()], selected: 'portable' }}
+          pathImport={null}
+          importRequest={request}
+          {...handlers}
+        />,
+      )
+    }
+    expect(click).toHaveBeenCalledTimes(2)
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {

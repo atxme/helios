@@ -217,13 +217,17 @@ pub struct CompletedImport {
 
 /// Suffixes of an Orion document.
 ///
-/// `.orionprofile` is **ours**: it is what `helios-ctl enroll` writes and what
-/// Windows associates with Orion. Leaving it out made its recognition rest
-/// entirely on the first character, so the slightest disturbance at the head
-/// of the file — a byte-order mark from a copy through PowerShell, a stray
-/// blank line — produced «format inconnu» about the very extension the tool
-/// distributes.
-const ORION_SUFFIXES: &[&str] = &[".orionprofile", ".json"];
+/// `.orion` is **ours**: it is what `helios-ctl enroll` writes and what Windows
+/// associates with Orion. Leaving it out made its recognition rest entirely on
+/// the first character, so the slightest disturbance at the head of the file —
+/// a byte-order mark from a copy through PowerShell, a stray blank line —
+/// produced «format inconnu» about the very extension the tool distributes.
+///
+/// `.orionprofile` is the suffix distributed until August 2026. Nothing writes
+/// it anymore; it stays readable because a document on an operator's disk
+/// outlives the client that reads it, and refusing what Orion itself wrote last
+/// month would send the user back through an enrolment for a rename.
+const ORION_SUFFIXES: &[&str] = &[".orion", ".orionprofile", ".json"];
 
 /// Decodes an imported profile without writing it to disk.
 ///
@@ -1111,7 +1115,7 @@ mod tests {
     /// Temporary directory of the calling test.
     ///
     /// Named after the process **and** the thread: the suite runs in
-    /// parallel, and two tests writing `portable.orionprofile` in one shared
+    /// parallel, and two tests writing `portable.orion` in one shared
     /// directory would delete each other's file.
     fn temp_directory(prefix: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -1666,7 +1670,7 @@ mod tests {
         })
         .to_string();
 
-        let imported = parse_profile_import(&document, "poste.orionprofile")
+        let imported = parse_profile_import(&document, "poste.orion")
             .expect("un document partiel doit se lire");
         assert_eq!(imported.profile.name, "poste");
         // The defaults are applied rather than left empty.
@@ -1802,8 +1806,7 @@ mod tests {
         ));
         document["profile"]["key_negotiation_identity"] = bundle;
 
-        let imported =
-            parse_profile_import(&document.to_string(), "portable.orionprofile").unwrap();
+        let imported = parse_profile_import(&document.to_string(), "portable.orion").unwrap();
         assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
 
         let mut config = ClientConfig::default();
@@ -2131,10 +2134,11 @@ mod tests {
             .contains("supérieur à zéro"));
     }
 
-    /// `.orionprofile` is the extension the tooling distributes: recognizing
-    /// it must not depend on the first character surviving the trip.
+    /// `.orion` is the extension the tooling distributes, and `.orionprofile`
+    /// the one it distributed until August 2026: recognizing either must not
+    /// depend on the first character surviving the trip.
     #[test]
-    fn the_orionprofile_suffix_selects_the_orion_parser() {
+    fn the_orion_suffixes_select_the_orion_parser() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -2151,20 +2155,21 @@ mod tests {
 
         // Leading blank lines: the head no longer decides, the suffix does.
         let padded = format!("\n\n{raw}");
-        assert_eq!(
-            parse_profile_import(&padded, "poste-windows.orionprofile")
-                .unwrap()
-                .profile
-                .name,
-            "portable"
-        );
-        assert_eq!(
-            parse_profile_import(&raw, "POSTE-WINDOWS.ORIONPROFILE")
-                .unwrap()
-                .profile
-                .name,
-            "portable"
-        );
+        for name in [
+            "poste-windows.orion",
+            // Windows matches an extension without regard to case, and a
+            // document named `.Orion` is the same document.
+            "POSTE-WINDOWS.ORION",
+            // Written before August 2026, still read.
+            "poste-windows.orionprofile",
+            "POSTE-WINDOWS.ORIONPROFILE",
+        ] {
+            assert_eq!(
+                parse_profile_import(&padded, name).unwrap().profile.name,
+                "portable",
+                "suffixe refusé : {name}"
+            );
+        }
     }
 
     /// A document is carried by hand from one machine to another, and that
@@ -2194,7 +2199,7 @@ mod tests {
             ("UTF-16BE", utf16be),
         ] {
             let directory = temp_directory("orion-import-encoding");
-            let path = directory.join("portable.orionprofile");
+            let path = directory.join("portable.orion");
             std::fs::write(&path, &bytes).unwrap();
             let imported = read_profile_import_path(&path)
                 .unwrap_or_else(|error| panic!("{label} should have been read: {error:#}"));
@@ -2239,7 +2244,7 @@ mod tests {
     #[test]
     fn reading_by_path_reuses_the_parser_and_the_limit() {
         let directory = temp_directory("orion-import-path");
-        let profile_path = directory.join("portable.orionprofile");
+        let profile_path = directory.join("portable.orion");
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -2262,7 +2267,7 @@ mod tests {
             "portable"
         );
 
-        let oversized_path = directory.join("too-big.orionprofile");
+        let oversized_path = directory.join("too-big.orion");
         std::fs::write(&oversized_path, vec![b' '; MAX_PROFILE_IMPORT_BYTES + 1]).unwrap();
         assert!(read_profile_import_path(&oversized_path)
             .unwrap_err()

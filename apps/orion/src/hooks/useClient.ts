@@ -113,12 +113,19 @@ export function useClient() {
     const unlistenProfilePath = api.onProfilePath(() => {
       void consumeProfilePath()
     })
+    // The notification-area menu connects to a profile, which selects it. The
+    // window may be open behind that menu, and nothing else would tell it the
+    // selection just moved under it.
+    const unlistenConfig = api.onConfigChanged(() => {
+      api.getConfig().then(setConfig).catch(() => {})
+    })
     // The first launch may have received its argv before React installs the
     // listener. The command then consumes the path kept on the Rust side.
     void unlistenProfilePath.then(() => consumeProfilePath())
     return () => {
       unlisten.then((f) => f())
       unlistenProfilePath.then((f) => f())
+      unlistenConfig.then((f) => f())
     }
   }, [consumeProfilePath, pushLog])
 

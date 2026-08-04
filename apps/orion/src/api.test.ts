@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 
 import {
+  aboutOrion,
   adapterIsUp,
   backendKind,
   connect,
@@ -21,6 +22,7 @@ import {
   keyNegotiationFingerprint,
   keyNegotiationIdentitySealed,
   keyNegotiationSupport,
+  onConfigChanged,
   onEvent,
   onProfilePath,
   onTrayView,
@@ -43,8 +45,9 @@ describe('Orion Tauri bridge', () => {
     await backendKind()
     await adapterIsUp()
     await getConfig()
+    await aboutOrion()
     await importProfile('{"format":"orion-profile"}', 'portable.json')
-    await importProfilePath('C:\\Profils\\portable.orionprofile')
+    await importProfilePath('C:\\Profils\\portable.orion')
     await importProfilePath()
     await keyNegotiationIdentitySealed(profile as never)
     await validateProfile(profile as never)
@@ -65,13 +68,14 @@ describe('Orion Tauri bridge', () => {
       ['backend_kind'],
       ['adapter_is_up'],
       ['get_config'],
+      ['about_orion'],
       [
         'import_profile',
         { contents: '{"format":"orion-profile"}', fileName: 'portable.json' },
       ],
       [
         'import_profile_path',
-        { path: 'C:\\Profils\\portable.orionprofile' },
+        { path: 'C:\\Profils\\portable.orion' },
       ],
       ['import_profile_path', { path: null }],
       ['key_negotiation_identity_sealed', { keyNegotiation: profile }],
@@ -121,13 +125,27 @@ describe('Orion Tauri bridge', () => {
     const callback = vi.fn()
     mocks.listen.mockImplementation(async (_name, handler) => {
       handler({ payload: 'profiles' })
+      handler({ payload: 'import' })
+      handler({ payload: 'about' })
       handler({ payload: 'unexpected' })
       return unlisten
     })
 
     await expect(onTrayView(callback)).resolves.toBe(unlisten)
     expect(mocks.listen).toHaveBeenCalledWith('helios://tray-view', expect.any(Function))
-    expect(callback).toHaveBeenCalledWith('profiles')
+    expect(callback.mock.calls).toEqual([['profiles'], ['import'], ['about']])
+  })
+
+  it('relays the configuration changes the tray causes', async () => {
+    const unlisten = vi.fn()
+    const callback = vi.fn()
+    mocks.listen.mockImplementation(async (_name, handler) => {
+      handler({ payload: null })
+      return unlisten
+    })
+
+    await expect(onConfigChanged(callback)).resolves.toBe(unlisten)
+    expect(mocks.listen).toHaveBeenCalledWith('helios://config-changed', callback)
     expect(callback).toHaveBeenCalledOnce()
   })
 })

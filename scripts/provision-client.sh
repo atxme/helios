@@ -65,7 +65,7 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
-  --sortie RÉPERTOIRE  Où écrire le .orionprofile (défaut : répertoire courant)
+  --sortie RÉPERTOIRE  Où écrire le .orion (défaut : répertoire courant)
 
 L'hôte SSH est retenu après le premier appel.
 EOF
@@ -366,7 +366,7 @@ echo "    négociation $NEGOCIATION"
 
 # ── 6. Enrôlement ────────────────────────────────────────────────────────────
 mkdir -p "$SORTIE"
-PROFIL="$SORTIE/$CLIENT.orionprofile"
+PROFIL="$SORTIE/$CLIENT.orion"
 echo "==> Enrôlement"
 "${CTL[@]}" enroll \
     --name "$CLIENT" \

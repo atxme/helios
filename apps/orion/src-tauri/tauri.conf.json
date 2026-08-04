@@ -38,10 +38,10 @@
     "fileAssociations": [
       {
         "ext": [
-          "orionprofile"
+          "orion"
         ],
-        "name": "Profil Orion",
-        "description": "Profil de connexion VPN Orion",
+        "name": "Orion.Profile",
+        "description": "Profil de connexion Orion",
         "mimeType": "application/x-orion-profile",
         "role": "Editor"
       }

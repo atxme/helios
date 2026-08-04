@@ -4,10 +4,19 @@
   },
   "bundle": {
     "resources": {
-      "../../../resources-windows/": "resources-windows/"
+      "../../../resources-windows/": "resources-windows/",
+      "icons/orion-profile.ico": "orion-profile.ico"
     },
     "windows": {
       "digestAlgorithm": "sha256",
+      "wix": {
+        "fragmentPaths": [
+          "windows/orion-profile-icon.wxs"
+        ],
+        "componentRefs": [
+          "OrionProfileIcon"
+        ]
+      },
       "signCommand": {
         "cmd": "powershell.exe",
         "args": [

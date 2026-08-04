@@ -279,7 +279,7 @@ enum ProfileCmd {
     /// est en cause ou si le problème est ailleurs — sans avoir à lancer
     /// Orion, ni à ouvrir un fichier qui contient des secrets.
     Check {
-        /// Document à relire (`.orionprofile`, `.json` ou `.conf`).
+        /// Document à relire (`.orion`, `.json` ou `.conf`).
         path: PathBuf,
     },
     /// Emits a client profile readable by Orion's import.
@@ -1120,7 +1120,7 @@ mod tests {
             vec!["helios-ctl", "watch"],
             vec!["helios-ctl", "network", "show"],
             vec!["helios-ctl", "network", "load", "network.toml"],
-            vec!["helios-ctl", "profile", "check", "client.orionprofile"],
+            vec!["helios-ctl", "profile", "check", "client.orion"],
             vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
             vec!["helios-ctl", "scenario", "flap"],
             vec!["helios-ctl", "campaign", "--generate-keys"],
@@ -1137,7 +1137,7 @@ mod tests {
                 "--endpoint",
                 "vpn.example:51820",
                 "--output",
-                "client.orionprofile",
+                "client.orion",
                 "--gateway-certificate",
                 "gateway.der"
             ])
