@@ -209,6 +209,17 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `helios-wireguard` : interface gateway et table de pairs.
 - `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.
 - `helios-api` : Axum REST/WS, provisioning et IHM embarquée.
+- `web` : console d’administration de la gateway, embarquée dans `heliosd` par
+  la feature `embed-ui`. React et **MUI seul** — pas de Tailwind, pas de moteur
+  3D : ce bundle part dans le binaire, et les polices y sont **auto-hébergées**
+  (`@fontsource-variable`, 62 Ko) parce qu’une gateway ne joint aucun CDN.
+  Direction : observatoire solaire, Material Design 3, deux schémas de couleurs
+  complets. `web/src/theme.ts` tient les pigments, `web/src/state.ts` le
+  **sens** des états du tunnel ; les deux ne se mélangent pas.
+  `web/src/theme.test.ts` vérifie qu’aucun token ne manque dans l’un des deux
+  schémas — l’oubli est invisible autrement, il rend transparent.
+  Attention aux unités `sx` : `borderRadius: 3` vaut 3 × 12 px et `width: 1`
+  vaut **100 %**, pas 1 px.
 - `helio-tpm` : scellement PCR, séquestre et billets de rescellement.
 - `helios-update` : mises à jour applicatives signées (ADR-003).
 - `heliosd` : orchestration gateway.

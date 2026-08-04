@@ -1,6 +1,6 @@
 # ADR 005 — Négociation de clé pré-WireGuard
 
-**Statut** : accepté (2026-07-25), révisé pour le protocole v3 (2026-07-28)
+**Statut** : accepté (2026-07-25), révisé pour le protocole v4 (2026-08-04)
 
 Remplace et détaille l'amendement du 24 juillet 2026 de
 [ADR-001](ADR-001-WIREGUARD.md), qui reste la référence pour le transport
@@ -60,7 +60,7 @@ flowchart LR
 
     UI --> Client
     Store --> Client
-    Client <-->|"protocole v3<br/>JSON borné"| Public
+    Client <-->|"protocole v4<br/>JSON borné"| Public
     Public --> Handler
     TPM --> Public
     TPM --> Handler
@@ -78,7 +78,8 @@ QUIC devient un lien de vivacité conservé pendant toute la durée du tunnel.
 
 | Élément | Valeur actuelle | Raison |
 |---|---:|---|
-| version applicative | `3` | rupture volontaire avec les transcripts antérieurs |
+| version applicative | `4` | horodatage signé et domaines cryptographiques propres |
+| ALPN | `helios-key-negotiation/4` | séparation nette des versions filaires |
 | transport | QUIC avec TLS 1.3 mutuel | authentification classique préalable et chiffrement du parseur |
 | flux QUIC | un flux bidirectionnel | une transaction ordonnée par connexion |
 | trame | longueur `u32` big-endian + JSON | découpage non ambigu |
@@ -163,18 +164,28 @@ JSON de transport. Chaque famille de message porte son domaine propre :
 | Message | Champs couverts par ML-DSA-65 |
 |---|---|
 | certificat PQ | version, série, rôle, sujet, émetteur, clé WireGuard, clé ML-DSA, validité |
-| requête Orion | version, transaction, mode, clé WireGuard client, nonce client, `kpub` ou empreinte du PSK statique, empreinte du certificat PQ client |
+| requête Orion | version, transaction, mode, clé WireGuard client, nonce client, horodatage, `kpub` ou empreinte du PSK statique, empreinte du certificat PQ client |
 | réponse Helios | version, transaction, mode, clé WireGuard gateway, nonce gateway, ciphertext éventuel, délai de confirmation, empreinte du certificat PQ gateway |
 | confirmation Orion | domaine de confirmation, version, transaction |
 | commit Helios | domaine de commit, version, transaction |
+
+L'empreinte d'un certificat PQ utilise cette même représentation canonique,
+complétée par la signature ML-DSA préfixée par sa longueur. La gateway accepte
+encore l'ancienne empreinte `serde_json` pour les admissions existantes, mais
+n'en émet plus.
 
 Casser ECDSA ne permet donc ni de substituer `kpub`, ni d'altérer le
 ciphertext, ni de forger une confirmation ou un commit utilisable. TLS reste
 une première barrière qui réduit l'exposition du parseur applicatif.
 
-Le protocole applicatif courant est **v3**. Toute autre version est refusée
+Le protocole applicatif courant est **v4**. Toute autre version est refusée
 avant modification du plan de données ; il n'existe pas de négociation de
 version ni de compatibilité silencieuse avec un transcript ancien.
+
+La v3 et la v4 utilisent des ALPN distincts. Leur déploiement exige donc une
+fenêtre commune pour la gateway et Orion. La compatibilité de lecture des
+anciennes empreintes PQ évite en revanche tout ré-enrôlement lié à cette seule
+migration.
 
 ### 3. Dérivation liée à toute la transaction
 
@@ -236,17 +247,18 @@ la réponse est la feature `fips` d'`aws-lc-rs`, pas un second moteur.
 
 #### Horodatage : borner le rejeu dans le temps
 
-La requête porte un horodatage Unix lié à la dérivation. Helios refuse au-delà
-de trente secondes de dérive, dans les deux sens, **avant** toute vérification
-de signature — le contrôle coûte une soustraction là où le reste coûte une
-vérification post-quantique.
+La requête porte un horodatage Unix signé et lié à la dérivation. Helios refuse
+au-delà de trente secondes de dérive, dans les deux sens, **avant** toute
+vérification de signature — le contrôle coûte une soustraction là où le reste
+coûte une vérification post-quantique.
 
-Ce contrôle ne double pas le cache anti-rejeu, il le complète là où celui-ci
-est structurellement faible. Un cache est **borné** : à 4096 entrées, un pair
-capable d'ouvrir des transactions légitimes finit par en faire oublier
-d'anciennes, et une transaction capturée jadis redevient rejouable. Une horloge
-ne s'évince pas. Le cache arrête le rejeu immédiat d'une transaction vivante ;
-l'horodatage arrête le rejeu différé d'une transaction ancienne.
+Ce contrôle ne double pas le cache anti-rejeu, il le complète. Le cache arrête
+le rejeu immédiat d'une transaction vivante. L'horodatage signé arrête le rejeu
+différé et empêche un attaquant actif de rafraîchir une capture. Une fenêtre
+résiduelle existe si le cache est évincé ou perdu lors d'un redémarrage alors
+que la requête reste dans les trente secondes admises. La supprimer exigerait
+un challenge supplémentaire ou un compteur persistant ; ce coût n'est pas
+retenu pour un risque limité à une requête déjà complètement authentifiée.
 
 Une requête venue du futur est refusée aussi : l'accepter permettrait de
 constituer d'avance une transaction à rejouer plus tard. Un poste dont
@@ -254,13 +266,9 @@ l'horloge dérive reçoit un message interne qui **nomme l'horloge** ; la
 frontière publique conserve néanmoins une erreur grossière afin de ne pas
 transformer le port en oracle d'admission.
 
-Dans le transcript v3 actuellement codé, l'horodatage n'entre pas dans la
-signature ML-DSA de la requête. Il reste protégé par TLS pendant l'échange et
-entre dans HKDF : le modifier fait dériver deux PSK différents et échoue donc
-fermé, mais un adversaire actif capable de rompre TLS peut provoquer ce déni
-de service. L'inclure dans la sérialisation signée exige une version
-applicative suivante, car changer les octets signés sans changer de version
-rendrait deux binaires v3 incompatibles.
+La v4 inclut l'horodatage après le nonce client dans la sérialisation ML-DSA.
+Une modification invalide donc la signature avant toute pose sur le plan de
+données.
 
 ### 4. Méthode complète d'une connexion
 
@@ -277,7 +285,7 @@ sequenceDiagram
     Q-->>O: Retry avec jeton d'adresse
     O->>Q: Initial + jeton, puis mTLS
     Q->>H: certificat TLS client validé
-    O->>H: requête v3 signée<br/>mode, transaction, nonce, clé WG, matériel du mode
+    O->>H: requête v4 signée<br/>mode, transaction, nonce, horodatage, clé WG, matériel du mode
     H->>H: admission, empreintes TLS/PQ,<br/>fraîcheur, signature, plancher, anti-rejeu
     H->>H: verrou exclusif du pair
     H->>H: vide / retrouve / dérive le PSK
@@ -317,9 +325,10 @@ La méthode se décompose ainsi :
    retrouve la valeur locale dont l'empreinte correspond en temps constant ;
    `ml_kem` encapsule vers `kpub`, dérive le PSK et conserve le ciphertext pour
    la réponse. Helios sauvegarde en mémoire le slot précédent pour un rollback.
-5. **Pose gateway avant annonce.** Helios demande au plan de données de poser
-   le slot candidat et attend son acquittement. Seulement après ce succès il
-   signe et renvoie la réponse. Aucune valeur négociée n'est persistée.
+5. **Pose gateway avant annonce.** Helios prépare et signe la réponse, demande
+   au plan de données de poser le slot candidat, puis attend son acquittement.
+   La réponse ne part qu'après ce succès. Aucune valeur négociée n'est
+   persistée.
 6. **Pose Orion.** Orion vérifie le certificat PQ gateway auto-signé et épinglé,
    le nom, la clé WireGuard, la signature, la transaction et le mode. Il
    décapsule si nécessaire, reconfigure le backend avec le même slot et marque
@@ -329,9 +338,10 @@ La méthode se décompose ainsi :
    calculs : il interroge le backend toutes les 250 ms et exige un handshake
    WireGuard plus récent que la pose, dans la fenêtre de 45 s.
 8. **Commit bilatéral.** Orion signe la confirmation. Helios la vérifie, élève
-   le plancher persistant si nécessaire, déplace la transaction de
-   `active` vers `committed`, signe l'ACK et l'envoie. Orion vérifie cet ACK
-   avant d'annoncer `TunnelState::Up`.
+   le plancher persistant si nécessaire, signe l'ACK tant que la transaction
+   reste restaurable, puis la déplace de `active` vers `committed` et envoie
+   l'ACK. Les données du slot précédent restent disponibles jusqu'à la
+   livraison. Orion vérifie cet ACK avant d'annoncer `TunnelState::Up`.
 9. **Vivacité.** Le flux applicatif est fini, mais la connexion QUIC reste
    détenue par le contrôleur Orion. Sa fermeture devient l'ordre de libérer le
    slot runtime de la gateway.
@@ -341,18 +351,17 @@ ferait échouer tous les handshakes, sans canal de rattrapage puisque le tunnel
 est justement ce qui manque. Si le plan de données refuse la pose, aucune
 réponse de succès ne part.
 
-Si la session QUIC se ferme, si le handshake n'arrive pas dans le délai, ou si
-la confirmation est invalide, Helios **restaure le slot précédent**. Les
-transactions sont sérialisées par pair.
+Si la session QUIC se ferme, si le handshake n'arrive pas dans le délai, si la
+confirmation est invalide, ou si la réponse ou l'ACK ne peut pas être livré,
+Helios **restaure le slot précédent**. Les transactions sont sérialisées par
+pair.
 
 #### Rattrapage d'une désynchronisation
 
 La restauration côté gateway crée un cas que le protocole seul ne referme pas.
-Si la confirmation — ou le commit qui y répond — se perd sur le réseau, les
-deux bouts divergent de la pire manière : Helios restaure l'ancien slot pendant
-qu'Orion conserve le PSK qu'il vient de poser. Tous les handshakes échouent
-ensuite, et **aucun journal ne dit pourquoi**, puisque chaque côté a fait
-exactement ce qu'il devait.
+Si la confirmation — ou le commit qui y répond — se perd sur le réseau, Helios
+restaure l'ancien slot pendant qu'Orion conserve temporairement le PSK qu'il
+vient de poser. Tous les handshakes échouent jusqu'à la tentative suivante.
 
 Si la pose Orion, le handshake avec ce PSK, la confirmation ou le commit n'aboutit
 pas, Orion renégocie entièrement — jusqu'à trois tentatives, espacées de deux
@@ -381,7 +390,9 @@ stateDiagram-v2
     Verifications --> Refus: admission / signature / plancher / rejeu
     Verifications --> Preparee: slot gateway posé
     Preparee --> Rollback: fermeture / délai / confirmation invalide
-    Preparee --> Committed: confirmation valide
+    Preparee --> CommitPrepare: confirmation valide et ACK signé
+    CommitPrepare --> Rollback: ACK non livré
+    CommitPrepare --> Committed: ACK livré
     Rollback --> NouvelleTentative: tentative restante
     Refus --> NouvelleTentative: tentative restante
     NouvelleTentative --> Filtrage: après 2 s
@@ -418,6 +429,11 @@ inattendue du lien ne déclenche pas aujourd'hui de reconnexion automatique :
 Orion avertit que la gateway a libéré le PSK et demande de se reconnecter. Ce
 choix évite une boucle de remontage implicite ; l'automatiser demanderait une
 politique explicite de reconnexion et de temporisation.
+
+Cette règle vaut aussi pour `static_psk`. Le lien QUIC représente une
+autorisation de session, pas seulement un transport de secret. Le conserver
+fermé reviendrait à maintenir un accès après disparition du canal de contrôle
+authentifié.
 
 Le lien ne transporte plus de message applicatif après le commit. Sans trafic,
 QUIC le déclarerait mort après son délai par défaut ; la gateway viderait alors
@@ -655,11 +671,17 @@ la cause.
 
 ## Limites connues
 
-- **L'horodatage v3 n'est pas couvert par ML-DSA.** Il est protégé par mTLS et
-  lié à HKDF ; une altération donne des PSK différents et échoue fermé, mais
-  elle permet un déni de service à un attaquant actif qui aurait déjà rompu
-  TLS. Le signer impose un protocole v4 afin de ne pas rendre deux
-  implémentations v3 incompatibles.
+- **Le cache anti-rejeu est borné et volatil.** L'horodatage v4 est signé, donc
+  une capture ne peut plus être rafraîchie. Une requête inchangée reste
+  toutefois rejouable pendant sa fenêtre de trente secondes si son identifiant
+  a été évincé ou si le démon a redémarré. Supprimer cette fenêtre demanderait
+  un challenge supplémentaire ou un compteur persistant, non retenu pour une
+  requête déjà complètement authentifiée.
+- **La preuve WireGuard est contrôlée par Orion.** La gateway vérifie la
+  signature de confirmation et la transaction, mais ne consulte pas elle-même
+  le compteur de handshake du backend. Un client admis et modifié peut mentir
+  sur son propre handshake ; il n'obtient aucun accès supplémentaire et
+  n'affecte aucun autre pair.
 - **La chute du lien de vivacité ne reconnecte pas automatiquement.** Orion la
   journalise et avertit que le prochain rekey échouera ; l'utilisateur doit se
   reconnecter. L'automatisation exige d'abord une politique bornée de retry et

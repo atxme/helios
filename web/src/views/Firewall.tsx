@@ -1,243 +1,266 @@
-import { AlertTriangle, Globe, Lock, LockOpen, Network, RefreshCw, Save, Server, ShieldAlert, Terminal, Wifi } from 'lucide-react'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Paper from '@mui/material/Paper'
+import Skeleton from '@mui/material/Skeleton'
+import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
+import { Globe, Lock, LockOpen, Network, RotateCcw, Send, Server, Wifi } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { applyFirewallRules, fetchFirewallRules } from '../api'
+import { DataRow } from '../components/DataRow'
+import { KnownLimit } from '../components/KnownLimit'
+import { SectionCard } from '../components/SectionCard'
+import { TUNNEL_STATE, toneColors } from '../state'
+import { CARD_RADIUS } from '../theme'
 import type { Status, TunnelState } from '../types'
-
-const KILL_SWITCH_ENGAGED: Record<TunnelState, boolean> = {
-  up: false,
-  connecting: true,
-  down: true,
-  failed: true,
-  captive_portal: true,
-}
 
 interface Props {
   status: Status | null
   state: TunnelState
 }
 
-function Row({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
+/**
+ * The kill-switch, shown as what it is: a consequence, not a setting.
+ *
+ * Its tone is the tunnel state's own tone rather than a red/green binary. The
+ * previous interface painted "engaged" red across the board, which read as a
+ * fault even when the gateway was simply stopped — and left an operator no way
+ * to tell a deliberate shutdown from a fail-closed after an error, the one
+ * distinction that decides whether anyone needs to be woken up.
+ */
+function KillSwitchCard({ state }: { state: TunnelState }) {
+  const semantics = TUNNEL_STATE[state]
+  const tone = toneColors(semantics.tone)
+  const engaged = semantics.killSwitchEngaged
+
   return (
-    <div className="flex items-center gap-3 py-2.5 border-b border-slate-200/60 dark:border-slate-800/60 last:border-0">
-      <Icon className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
-      <span className="text-slate-500 text-xs w-24 shrink-0 uppercase tracking-wider">{label}</span>
-      <span className="font-mono text-xs text-slate-700 dark:text-slate-300 truncate">{value || '—'}</span>
-    </div>
+    <Paper
+      sx={{
+        borderRadius: `${CARD_RADIUS}px`,
+        bgcolor: tone.container,
+        color: tone.onContainer,
+        px: 3,
+        py: 2.5,
+      }}
+    >
+      <Stack direction="row" spacing={2.5} sx={{ alignItems: 'center', flexWrap: 'wrap', rowGap: 2 }}>
+        <Box
+          sx={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 52,
+            height: 52,
+            borderRadius: '50%',
+            flexShrink: 0,
+            color: tone.main,
+            bgcolor: 'surfaceContainer.lowest',
+          }}
+        >
+          {engaged ? <Lock size={24} strokeWidth={1.7} /> : <LockOpen size={24} strokeWidth={1.7} />}
+        </Box>
+        <Box sx={{ minWidth: 0, flex: 1 }}>
+          <Typography variant="h4" sx={{ color: 'inherit', fontWeight: 500 }}>
+            {engaged ? 'Kill-switch engagé' : 'Kill-switch levé'}
+          </Typography>
+          <Typography variant="body2" sx={{ color: 'inherit', opacity: 0.85, mt: 0.75 }}>
+            {engaged
+              ? state === 'captive_portal'
+                ? 'Kill-switch partiel — HTTP/HTTPS limité à la passerelle du portail captif.'
+                : 'Trafic LAN bloqué — seuls WireGuard et les exceptions d’administration restent autorisés.'
+              : 'Trafic LAN autorisé à travers l’interface WireGuard.'}
+          </Typography>
+        </Box>
+      </Stack>
+    </Paper>
   )
 }
 
 function NftablesEditor({ dryRun }: { dryRun: boolean }) {
-  const [rules, setRules]       = useState('')
+  const [rules, setRules] = useState('')
   const [original, setOriginal] = useState('')
-  const [loading, setLoading]   = useState(true)
-  const [saving, setSaving]     = useState(false)
-  const [feedback, setFeedback] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [feedback, setFeedback] = useState<{ ok: boolean; message: string } | null>(null)
   const dirty = rules !== original
 
   useEffect(() => {
     fetchFirewallRules()
-      .then(r => { setRules(r.rules); setOriginal(r.rules) })
+      .then(response => {
+        setRules(response.rules)
+        setOriginal(response.rules)
+      })
       .catch(() => setRules('# Impossible de charger les règles'))
       .finally(() => setLoading(false))
   }, [])
 
   const save = async () => {
-    setSaving(true); setFeedback(null)
+    setSaving(true)
+    setFeedback(null)
     try {
       await applyFirewallRules(rules)
       setOriginal(rules)
       setFeedback({
         ok: true,
-        msg: dryRun
-          ? 'Reçu en simulation — aucune application kernel'
-          : 'Commande reçue — l’application de rulesets bruts reste à câbler dans l’orchestrateur',
+        message: dryRun
+          ? 'Reçu en simulation — aucune application noyau.'
+          : 'Commande reçue — l’application de rulesets bruts reste à câbler dans l’orchestrateur.',
       })
     } catch {
-      setFeedback({ ok: false, msg: 'Erreur lors de l\'envoi' })
+      setFeedback({ ok: false, message: 'Échec de l’envoi au démon.' })
     } finally {
-      setSaving(false) }
+      setSaving(false)
+    }
   }
 
   return (
-    <div className="card overflow-hidden">
-      <div className="flex items-center gap-2 px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60 bg-slate-50/60 dark:bg-slate-950/40">
-        <Terminal className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" strokeWidth={1.5} />
-        <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500">Ruleset nftables · expérimental</span>
-        {dirty && (
-          <span className="ml-2 text-[10px] text-amber-600 dark:text-amber-400 font-mono">● modifié</span>
-        )}
-        <div className="ml-auto flex gap-2">
-          <button
-            onClick={() => { setRules(original); setFeedback(null) }}
+    <SectionCard
+      title="Ruleset nftables"
+      subtitle={
+        dirty ? 'Modifié — non transmis.' : 'Rendu de la politique structurée appliquée par le démon.'
+      }
+      action={
+        <Stack direction="row" spacing={1}>
+          <Button
+            size="small"
+            variant="outlined"
+            color="inherit"
             disabled={!dirty || saving}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] border
-              border-slate-300 dark:border-slate-700 text-slate-500
-              hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors
-              disabled:opacity-30 disabled:cursor-not-allowed"
+            onClick={() => {
+              setRules(original)
+              setFeedback(null)
+            }}
+            startIcon={<RotateCcw size={15} />}
+            sx={{ borderColor: 'divider', color: 'text.secondary' }}
           >
-            <RefreshCw className="h-3 w-3" strokeWidth={2} />
             Réinitialiser
-          </button>
-          <button
-            onClick={save}
+          </Button>
+          <Button
+            size="small"
+            variant="contained"
             disabled={!dirty || saving}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] border
-              border-emerald-600/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400
-              hover:bg-emerald-500/20 transition-colors
-              disabled:opacity-30 disabled:cursor-not-allowed"
+            onClick={() => void save()}
+            startIcon={<Send size={15} />}
           >
-            <Save className="h-3 w-3" strokeWidth={2} />
             {saving ? 'Envoi…' : 'Transmettre'}
-          </button>
-        </div>
-      </div>
+          </Button>
+        </Stack>
+      }
+    >
+      <Stack spacing={2}>
+        <KnownLimit register="caution" title="Le texte saisi ici n’est pas appliqué au noyau">
+          Le rendu reflète fidèlement la politique structurée, mais l’application d’un ruleset
+          nftables écrit à la main n’est pas implémentée dans l’orchestrateur : la commande est reçue
+          et journalisée, puis ignorée. La politique réelle se change dans la configuration, pas ici.
+        </KnownLimit>
 
-      {dryRun && (
-        <div className="flex items-center gap-2 px-5 py-2 border-b border-amber-500/20 bg-amber-500/5 text-xs text-amber-600 dark:text-amber-400">
-          <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.5} />
-          Mode simulation — les règles seront journalisées mais non appliquées au kernel
-        </div>
-      )}
+        {loading ? (
+          <Stack spacing={1}>
+            <Skeleton variant="text" width="40%" />
+            <Skeleton variant="text" width="65%" />
+            <Skeleton variant="text" width="30%" />
+          </Stack>
+        ) : (
+          <TextField
+            value={rules}
+            onChange={event => {
+              setRules(event.target.value)
+              setFeedback(null)
+            }}
+            multiline
+            minRows={12}
+            fullWidth
+            spellCheck={false}
+            slotProps={{
+              input: { sx: { fontFamily: 'monospace', fontSize: '0.75rem', lineHeight: 1.7 } },
+            }}
+          />
+        )}
 
-      {!dryRun && (
-        <div className="flex items-center gap-2 px-5 py-2 border-b border-amber-500/20 bg-amber-500/5 text-xs text-amber-600 dark:text-amber-400">
-          <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.5} />
-          Le rendu reflète la politique structurée ; l’application de texte nftables personnalisé n’est pas encore implémentée.
-        </div>
-      )}
-
-      {loading ? (
-        <div className="p-5">
-          <div className="h-3 w-48 rounded bg-slate-200 dark:bg-slate-800 animate-pulse mb-2" />
-          <div className="h-3 w-64 rounded bg-slate-200 dark:bg-slate-800 animate-pulse mb-2" />
-          <div className="h-3 w-40 rounded bg-slate-200 dark:bg-slate-800 animate-pulse" />
-        </div>
-      ) : (
-        <textarea
-          value={rules}
-          onChange={e => { setRules(e.target.value); setFeedback(null) }}
-          className="w-full font-mono text-[11px] p-5 bg-transparent text-slate-700 dark:text-slate-300
-            focus:outline-none resize-none leading-relaxed"
-          rows={14}
-          spellCheck={false}
-        />
-      )}
-
-      {feedback && (
-        <div className={`px-5 py-2.5 border-t text-xs font-mono ${
-          feedback.ok
-            ? 'border-emerald-500/20 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400'
-            : 'border-red-500/20 bg-red-500/5 text-red-500'
-        }`}>
-          {feedback.msg}
-        </div>
-      )}
-    </div>
+        {feedback && (
+          <Typography
+            variant="body2"
+            role="status"
+            sx={{ color: feedback.ok ? 'state.up.main' : 'error.main' }}
+          >
+            {feedback.message}
+          </Typography>
+        )}
+      </Stack>
+    </SectionCard>
   )
 }
 
 export function FirewallView({ status, state }: Props) {
-  const engaged = KILL_SWITCH_ENGAGED[state]
-  const sshCidrs: string[] = status?.allow_ssh_from ?? []
+  const sshCidrs = status?.allow_ssh_from ?? []
 
   return (
-    <div className="space-y-4 max-w-4xl">
-      <div>
-        <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-200 tracking-wide">Pare-feu · Kill-switch</h1>
-        <p className="text-xs text-slate-500 mt-0.5">Architecture fail-closed — DROP par défaut, trafic LAN autorisé uniquement tant qu'un handshake WireGuard date de moins de 150 s</p>
-      </div>
+    <Stack spacing={2.5}>
+      <KillSwitchCard state={state} />
 
-      {/* Kill-switch card */}
-      <div className={`rounded-xl border p-6 backdrop-blur-md transition-all duration-700 ${
-        engaged ? 'border-red-500/30 bg-red-500/10' : 'border-emerald-500/30 bg-emerald-500/10 animate-glow-emerald'
-      }`}>
-        <div className="flex items-center gap-4">
-          <div className={`shrink-0 rounded-xl p-3 border ${engaged ? 'bg-red-500/10 border-red-500/40' : 'bg-emerald-500/10 border-emerald-500/40'}`}>
-            {engaged
-              ? <Lock     className="h-6 w-6 text-red-400"     strokeWidth={1.5} />
-              : <LockOpen className="h-6 w-6 text-emerald-400" strokeWidth={1.5} />
-            }
-          </div>
-          <div>
-            <div className={`font-bold tracking-[0.12em] text-sm mb-1 ${engaged ? 'text-red-500 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
-              {engaged ? 'KILL-SWITCH ENGAGÉ' : 'KILL-SWITCH LEVÉ'}
-            </div>
-            <p className="text-slate-500 text-xs">
-              {engaged
-                ? state === 'captive_portal'
-                  ? 'Kill-switch partiel — HTTP/HTTPS limité à la passerelle du portail captif'
-                  : 'Trafic LAN bloqué — seuls WireGuard et les exceptions d’administration restent autorisés'
-                : 'Trafic LAN autorisé à travers l’interface WireGuard'}
-            </p>
-          </div>
-          <div className="ml-auto shrink-0">
-            <span className={`text-[10px] font-mono uppercase tracking-widest px-2 py-1 rounded border ${
-              engaged ? 'border-red-500/30 text-red-400 bg-red-500/5' : 'border-emerald-500/30 text-emerald-600 dark:text-emerald-400 bg-emerald-500/5'
-            }`}>
-              {state.toUpperCase()}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* Policy + SSH grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Firewall policy */}
-        <div className="card p-5">
-          <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-3">Politique appliquée</h2>
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 2.5,
+          gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' },
+        }}
+      >
+        <SectionCard title="Politique appliquée">
           {status ? (
-            <>
-              <Row icon={Globe}   label="WAN"          value={status.wan_iface} />
-              <Row icon={Network} label="LAN protégé"  value={status.lan_ifaces.join(', ')} />
-              <Row icon={Wifi}    label="Écoute WG"     value={status.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'fermée'} />
-              <Row icon={Server}  label="Pairs admis"   value={`${status.peers.length}`} />
-            </>
+            <Box>
+              <DataRow icon={Globe} label="WAN" value={status.wan_iface} />
+              <DataRow icon={Network} label="LAN protégé" value={status.lan_ifaces.join(', ')} />
+              <DataRow
+                icon={Wifi}
+                label="Écoute WG"
+                value={status.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'fermée'}
+              />
+              <DataRow icon={Server} label="Pairs admis" value={String(status.peers.length)} />
+            </Box>
           ) : (
-            <p className="text-slate-500 dark:text-slate-400 text-xs animate-pulse">Chargement…</p>
+            <Skeleton variant="rounded" height={140} />
           )}
-        </div>
+        </SectionCard>
 
-        {/* SSH passthrough */}
-        <div className="card p-5">
-          <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 mb-3">SSH d'administration</h2>
+        <SectionCard
+          title="SSH d’administration"
+          subtitle="Exception permanente : ces règles survivent au kill-switch."
+        >
           {sshCidrs.length === 0 ? (
-            <div className="flex items-center gap-2 py-2">
-              <Lock className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
-              <span className="text-xs text-slate-500 italic">
-                Bloqué (défaut sécurisé) — configurer <span className="font-mono not-italic">allow_ssh_from</span>
-              </span>
-            </div>
+            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+              Bloqué — défaut sécurisé. Ouvrir un accès demande de renseigner{' '}
+              <code>allow_ssh_from</code> dans la configuration.
+            </Typography>
           ) : (
-            <div className="space-y-2">
+            <Box>
               {sshCidrs.map(cidr => (
-                <div key={cidr} className="flex items-center gap-2">
-                  <span className="font-mono text-xs text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800/50 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700">
-                    {cidr}
-                  </span>
-                  <span className="text-[10px] font-mono text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 px-1.5 py-0.5 rounded">tcp/22</span>
-                  <span className="text-[10px] text-amber-600 dark:text-amber-400 font-mono">toujours actif</span>
-                </div>
+                <DataRow
+                  key={cidr}
+                  icon={Lock}
+                  label="tcp/22"
+                  value={cidr}
+                  hint="Autorisé en permanence, y compris kill-switch engagé."
+                />
               ))}
-            </div>
+            </Box>
           )}
-        </div>
-      </div>
+        </SectionCard>
+      </Box>
 
-      {/* nftables editor */}
       <NftablesEditor dryRun={status?.dry_run ?? true} />
 
-      {/* Counters placeholder */}
-      <div className="rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-dashed p-5">
-        <div className="flex items-center gap-2 mb-2">
-          <ShieldAlert className="h-3.5 w-3.5 text-slate-500 dark:text-slate-500" strokeWidth={1.5} />
-          <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 dark:text-slate-500">
-            Compteurs de paquets rejetés
-          </h2>
-        </div>
-        <p className="text-xs text-slate-500 dark:text-slate-500 italic">
-          Disponible sur cible — nécessite la lecture des compteurs nftables via Netlink
-        </p>
-      </div>
-    </div>
+      <KnownLimit register="caution" title="Le DNS d’un client ne passe pas par le tunnel">
+        Même avec <code>allow_client_internet</code> actif, les requêtes DNS d’un client sortent hors
+        du tunnel et sont donc visibles de son réseau local et de son fournisseur d’accès. Le trafic
+        applicatif, lui, reste bien encapsulé. Fermer cet écart demande de rediriger le port 53 des
+        clients dans le ruleset.
+      </KnownLimit>
+
+      <KnownLimit title="Les compteurs de paquets rejetés ne sont pas relevés">
+        Ils exigent la lecture des compteurs nftables par Netlink sur la cible ; en simulation aucun
+        paquet ne traverse le noyau, il n’y aurait rien à compter.
+      </KnownLimit>
+    </Stack>
   )
 }

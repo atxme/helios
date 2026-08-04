@@ -20,18 +20,18 @@ use crate::pq::SharedSecret;
 /// Default UDP port of the key-negotiation service.
 pub const DEFAULT_KEY_NEGOTIATION_PORT: u16 = 51821;
 /// Current wire protocol version.
-pub const KEY_NEGOTIATION_VERSION: u16 = 3;
+pub const KEY_NEGOTIATION_VERSION: u16 = 4;
 /// Upper bound for one framed protocol message.
 pub const MAX_KEY_NEGOTIATION_MESSAGE_BYTES: usize = 64 * 1024;
 /// Length of transaction identifiers and nonces.
 pub const KEY_NEGOTIATION_NONCE_LEN: usize = 16;
 
-const KEY_NEGOTIATION_DOMAIN: &[u8] = b"helios-key-negotiation-psk-v3";
+const KEY_NEGOTIATION_DOMAIN: &[u8] = b"helios-key-negotiation-psk-v4";
 const PQ_CERTIFICATE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-certificate-v1";
-const PQ_REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-pq-request-v3";
-const PQ_RESPONSE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-response-v3";
-const PQ_CONFIRMATION_DOMAIN: &[u8] = b"helios-key-negotiation-pq-confirmation-v3";
-const PQ_COMMIT_DOMAIN: &[u8] = b"helios-key-negotiation-pq-commit-v3";
+const PQ_REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-pq-request-v4";
+const PQ_RESPONSE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-response-v4";
+const PQ_CONFIRMATION_DOMAIN: &[u8] = b"helios-key-negotiation-pq-confirmation-v4";
+const PQ_COMMIT_DOMAIN: &[u8] = b"helios-key-negotiation-pq-commit-v4";
 pub const PQ_CERTIFICATE_VERSION: u16 = 1;
 
 /// Protection selected by Orion for the upcoming WireGuard session.
@@ -162,6 +162,16 @@ impl PqCertificate {
     }
 
     pub fn fingerprint(&self) -> Result<String, KeyNegotiationError> {
+        let mut encoded = pq_certificate_signing_bytes(self)?;
+        let signature = decode_exact::<{ ml_dsa_65::SIG_LEN }>(
+            &self.ml_dsa_65_signature,
+            KeyNegotiationError::InvalidPqCertificate,
+        )?;
+        append_bytes(&mut encoded, &signature)?;
+        Ok(hex::encode(digest::digest(&digest::SHA256, &encoded)))
+    }
+
+    fn legacy_json_fingerprint(&self) -> Result<String, KeyNegotiationError> {
         let encoded =
             serde_json::to_vec(self).map_err(|_| KeyNegotiationError::CanonicalEncoding)?;
         Ok(hex::encode(digest::digest(&digest::SHA256, &encoded)))
@@ -196,7 +206,9 @@ impl AuthenticatedKeyNegotiationRequest {
             &self.request.client_wg_public_key,
             now_unix,
         )?;
-        if self.certificate.fingerprint()? != expected_certificate_fingerprint {
+        if self.certificate.fingerprint()? != expected_certificate_fingerprint
+            && self.certificate.legacy_json_fingerprint()? != expected_certificate_fingerprint
+        {
             return Err(KeyNegotiationError::PqCertificateFingerprintMismatch);
         }
         verify_protocol_signature(
@@ -257,11 +269,10 @@ pub struct KeyNegotiationRequest {
     pub client_nonce: [u8; KEY_NEGOTIATION_NONCE_LEN],
     /// Unix time at which the client signed this request.
     ///
-    /// Covered by the ML-DSA signature and by the PSK derivation, so it can be
-    /// neither stripped nor edited. It bounds replay in time, independently of
-    /// how big the anti-replay cache is — a cache is finite, so an attacker
-    /// able to fill it can evict an old identifier and replay the transaction
-    /// it belonged to. A clock cannot be evicted.
+    /// Covered by the ML-DSA signature and by the PSK derivation. The signature
+    /// prevents an active transport attacker from refreshing a captured
+    /// request. The freshness check limits an unchanged replay to the accepted
+    /// clock window; the transaction cache rejects duplicates in that window.
     pub timestamp_unix: u64,
     /// ML-KEM-1024 encapsulation key. Present only in `ml_kem` mode.
     pub kem_public_key: Option<Vec<u8>>,
@@ -637,6 +648,7 @@ fn pq_request_signing_bytes(
     output.push(request.mode.security_level());
     append_bytes(&mut output, request.client_wg_public_key.as_bytes())?;
     output.extend_from_slice(&request.client_nonce);
+    output.extend_from_slice(&request.timestamp_unix.to_be_bytes());
     append_optional_bytes(&mut output, request.kem_public_key.as_deref())?;
     append_optional_bytes(
         &mut output,
@@ -1144,6 +1156,62 @@ mod tests {
             issuer_private_key,
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn editing_the_timestamp_breaks_pq_authentication() {
+        let (ca_private, ca_public) = generate_ml_dsa_65_keypair().unwrap();
+        let (client_private, client_public) = generate_ml_dsa_65_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let fingerprint = certificate.fingerprint().unwrap();
+        let mut authenticated = authenticate_request(
+            request(ProtectionMode::Classic),
+            certificate,
+            client_private.as_slice(),
+        )
+        .unwrap();
+        authenticated
+            .verify(&ca_public, &fingerprint, test_now())
+            .unwrap();
+
+        authenticated.request.timestamp_unix += 1;
+        assert_eq!(
+            authenticated.verify(&ca_public, &fingerprint, test_now()),
+            Err(KeyNegotiationError::InvalidPqProtocolSignature)
+        );
+    }
+
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn legacy_json_certificate_fingerprints_remain_admitted() {
+        let (ca_private, ca_public) = generate_ml_dsa_65_keypair().unwrap();
+        let (client_private, client_public) = generate_ml_dsa_65_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let legacy_fingerprint = certificate.legacy_json_fingerprint().unwrap();
+        assert_ne!(certificate.fingerprint().unwrap(), legacy_fingerprint);
+        let authenticated = authenticate_request(
+            request(ProtectionMode::Classic),
+            certificate,
+            client_private.as_slice(),
+        )
+        .unwrap();
+
+        authenticated
+            .verify(&ca_public, &legacy_fingerprint, test_now())
+            .unwrap();
     }
 
     #[cfg(feature = "key-negotiation-signing")]

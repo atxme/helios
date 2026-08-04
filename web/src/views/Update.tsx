@@ -1,8 +1,61 @@
-import { AlertTriangle, CheckCircle2, RefreshCw, Upload } from 'lucide-react'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import LinearProgress from '@mui/material/LinearProgress'
+import Stack from '@mui/material/Stack'
+import TextField from '@mui/material/TextField'
+import Typography from '@mui/material/Typography'
+import { CheckCircle2, FileJson, HardDrive, Upload } from 'lucide-react'
 import { useEffect, useState } from 'react'
-
 import { activateUpdate, fetchUpdateStatus, stageUpdate, uploadUpdateBinary } from '../api'
+import { DataRow } from '../components/DataRow'
+import { KnownLimit } from '../components/KnownLimit'
+import { Metric } from '../components/Metric'
+import { SectionCard } from '../components/SectionCard'
 import type { FinalizedRelease, UpdateStatus } from '../types'
+
+/**
+ * Picks one file, and says which one is loaded.
+ *
+ * A bare `<input type="file">` is styled inconsistently across browsers and
+ * gives no room for a label; wrapping it in a button keeps the MD3 shape while
+ * leaving the native picker — and its keyboard behaviour — untouched.
+ */
+function FilePicker({
+  label,
+  accept,
+  file,
+  icon: Icon,
+  onPick,
+}: {
+  label: string
+  accept?: string
+  file: File | null
+  icon: typeof FileJson
+  onPick: (file: File | null) => void
+}) {
+  return (
+    <Stack spacing={1}>
+      <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+        {label}
+      </Typography>
+      <Button
+        component="label"
+        variant="outlined"
+        color="inherit"
+        startIcon={<Icon size={17} />}
+        sx={{ justifyContent: 'flex-start', borderColor: 'divider', color: 'text.primary' }}
+      >
+        {file ? file.name : 'Choisir un fichier…'}
+        <input
+          type="file"
+          accept={accept}
+          hidden
+          onChange={event => onPick(event.target.files?.[0] ?? null)}
+        />
+      </Button>
+    </Stack>
+  )
+}
 
 export function UpdateView() {
   const [status, setStatus] = useState<UpdateStatus | null>(null)
@@ -24,7 +77,9 @@ export function UpdateView() {
     }
   }
 
-  useEffect(() => { void refresh() }, [])
+  useEffect(() => {
+    void refresh()
+  }, [])
 
   const upload = async () => {
     if (!manifestFile || !binaryFile) return
@@ -68,58 +123,126 @@ export function UpdateView() {
   const expectedConfirmation = release ? `INSTALLER ${release.release_sequence}` : ''
 
   return (
-    <div className="space-y-5 max-w-4xl">
-      <div>
-        <div className="text-[10px] uppercase tracking-[0.28em] text-cyan-600 dark:text-cyan-400 font-mono">Administration WireGuard</div>
-        <h1 className="mt-1 text-2xl font-semibold text-slate-800 dark:text-slate-100">Mise à jour applicative</h1>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
-          Helios accepte uniquement un binaire dont le manifeste porte les signatures Ed25519 et ML-DSA-65 du trousseau compilé.
-        </p>
-      </div>
-
+    <Stack spacing={2.5}>
       {status && (
-        <div className="card hud p-4 grid gap-3 sm:grid-cols-3 text-xs font-mono">
-          <div><span className="text-slate-500">Canal</span><div className="mt-1 text-cyan-600 dark:text-cyan-300">{status.channel}</div></div>
-          <div><span className="text-slate-500">Target</span><div className="mt-1 break-all">{status.target}</div></div>
-          <div><span className="text-slate-500">Séquence confirmée</span><div className="mt-1">{status.highest_confirmed_sequence}</div></div>
-        </div>
+        <Box
+          sx={{
+            display: 'grid',
+            gap: 2,
+            gridTemplateColumns: { xs: 'repeat(2, 1fr)', md: 'repeat(4, 1fr)' },
+          }}
+        >
+          <Metric label="Canal" value={status.channel} />
+          <Metric label="Cible" value={status.target} />
+          <Metric
+            label="Séquence confirmée"
+            value={String(status.highest_confirmed_sequence)}
+            hint="L’anti-rollback refuse toute release dont la séquence n’est pas strictement supérieure."
+          />
+          <Metric label="Version active" value={status.active_version ?? '—'} />
+        </Box>
       )}
 
-      <div className="card hud p-5 space-y-4">
-        <div className="flex items-center gap-2 text-sm font-medium"><Upload className="h-4 w-4 text-cyan-500" /> Transférer une release signée</div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <label className="text-xs text-slate-500">Manifeste `.release.json`
-            <input className="mt-2 block w-full text-xs" type="file" accept="application/json,.json" onChange={event => setManifestFile(event.target.files?.[0] ?? null)} />
-          </label>
-          <label className="text-xs text-slate-500">Binaire `heliosd`
-            <input className="mt-2 block w-full text-xs" type="file" onChange={event => setBinaryFile(event.target.files?.[0] ?? null)} />
-          </label>
-        </div>
-        {busy && progress > 0 && <div className="text-xs font-mono text-cyan-500">Transfert {progress}%</div>}
-        <button className="px-4 py-2 rounded-lg bg-cyan-500/15 border border-cyan-500/40 text-cyan-700 dark:text-cyan-300 text-xs disabled:opacity-40" disabled={busy || !manifestFile || !binaryFile} onClick={() => void upload()}>
-          Vérifier et stager
-        </button>
-      </div>
+      <SectionCard
+        icon={Upload}
+        title="Transférer une release signée"
+        subtitle="Helios n’accepte qu’un binaire dont le manifeste porte les signatures Ed25519 et ML-DSA-65 du trousseau compilé."
+      >
+        <Stack spacing={2.5}>
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 2,
+              gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' },
+            }}
+          >
+            <FilePicker
+              label="Manifeste .release.json"
+              accept="application/json,.json"
+              file={manifestFile}
+              icon={FileJson}
+              onPick={setManifestFile}
+            />
+            <FilePicker
+              label="Binaire heliosd"
+              file={binaryFile}
+              icon={HardDrive}
+              onPick={setBinaryFile}
+            />
+          </Box>
+
+          {busy && progress > 0 && (
+            <Box>
+              <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+                Transfert {progress}%
+              </Typography>
+              <LinearProgress variant="determinate" value={progress} sx={{ mt: 0.5 }} />
+            </Box>
+          )}
+
+          <Button
+            variant="contained"
+            disabled={busy || !manifestFile || !binaryFile}
+            onClick={() => void upload()}
+            sx={{ alignSelf: 'flex-start' }}
+          >
+            Vérifier et stager
+          </Button>
+        </Stack>
+      </SectionCard>
 
       {release && (
-        <div className="card hud p-5 space-y-4 border border-amber-500/30">
-          <div className="flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-300"><AlertTriangle className="h-4 w-4" /> Activation avec rollback automatique</div>
-          <dl className="text-xs font-mono space-y-1">
-            <div>Version : {release.version}</div>
-            <div>Séquence : {release.release_sequence}</div>
-            <div className="break-all">SHA-256 : {release.sha256}</div>
-          </dl>
-          <label className="block text-xs text-slate-500">Saisir <span className="font-mono text-amber-600 dark:text-amber-300">{expectedConfirmation}</span>
-            <input className="mt-2 w-full rounded border border-[var(--panel-border)] bg-transparent px-3 py-2 font-mono text-sm" value={confirmation} onChange={event => setConfirmation(event.target.value)} />
-          </label>
-          <button className="px-4 py-2 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-700 dark:text-amber-300 text-xs disabled:opacity-40" disabled={busy || confirmation !== expectedConfirmation} onClick={() => void activate()}>
-            Activer et redémarrer heliosd
-          </button>
-        </div>
+        <SectionCard
+          title="Activation"
+          subtitle="Le démon redémarre sur la nouvelle version et revient seul à la précédente si elle ne se confirme pas."
+        >
+          <Stack spacing={2.5}>
+            <Box>
+              <DataRow label="Version" value={release.version} />
+              <DataRow label="Séquence" value={String(release.release_sequence)} />
+              <DataRow label="SHA-256" value={release.sha256} wrap />
+            </Box>
+
+            <KnownLimit register="caution" title="Cette action coupe le tunnel">
+              Tous les clients perdent leur session le temps du redémarrage, et les PSK négociés sont
+              libérés : chacun renégociera au retour du démon.
+            </KnownLimit>
+
+            <TextField
+              label={`Saisir « ${expectedConfirmation} » pour confirmer`}
+              value={confirmation}
+              onChange={event => setConfirmation(event.target.value)}
+              fullWidth
+              slotProps={{ input: { sx: { fontFamily: 'monospace' } } }}
+            />
+
+            <Button
+              variant="contained"
+              color="error"
+              disabled={busy || confirmation !== expectedConfirmation}
+              onClick={() => void activate()}
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              Activer et redémarrer heliosd
+            </Button>
+          </Stack>
+        </SectionCard>
       )}
 
-      {message && <div className="flex items-start gap-2 text-sm text-emerald-600 dark:text-emerald-300"><CheckCircle2 className="h-4 w-4 mt-0.5" />{message}</div>}
-      {error && <div className="flex items-start gap-2 text-sm text-red-500"><RefreshCw className="h-4 w-4 mt-0.5" />{error}</div>}
-    </div>
+      {message && (
+        <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center', color: 'state.up.main' }}>
+          <CheckCircle2 size={18} strokeWidth={1.8} />
+          <Typography variant="body2" sx={{ color: 'inherit' }}>
+            {message}
+          </Typography>
+        </Stack>
+      )}
+
+      {error && (
+        <KnownLimit register="danger" title="La release a été refusée">
+          {error}
+        </KnownLimit>
+      )}
+    </Stack>
   )
 }

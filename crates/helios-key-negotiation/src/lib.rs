@@ -30,7 +30,7 @@ use zeroize::Zeroize as _;
 
 /// ALPN prevents another QUIC application on the host from accepting these
 /// credentials and messages by accident.
-pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/2";
+pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/4";
 /// Confirmation is bounded independently from transport idle time.
 ///
 /// The client confirms as soon as a WireGuard handshake succeeds with the PSK
@@ -571,17 +571,22 @@ async fn handle_connection(
     let prepared = match handler.prepare(fingerprint, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            handler.rollback(transaction_id).await;
             write_frame(&mut send, &ServerMessage::Error { error }).await?;
             return Ok(());
         }
     };
-    write_frame(
+    if let Err(error) = write_frame(
         &mut send,
         &ServerMessage::Response {
             response: Box::new(prepared.response),
         },
     )
-    .await?;
+    .await
+    {
+        handler.rollback(transaction_id).await;
+        return Err(error);
+    }
 
     let confirmation = tokio::time::timeout(
         prepared.confirmation_timeout,
@@ -607,12 +612,19 @@ async fn handle_connection(
                     return Err(TransportError::Protocol(error.to_string()));
                 }
             };
-            write_frame(&mut send, &ServerMessage::Committed { commit }).await?;
-            send.finish().map_err(TransportError::ClosedStream)?;
-            tokio::time::timeout(Duration::from_secs(5), send.stopped())
-                .await
-                .map_err(|_| TransportError::CommitDeliveryTimeout)?
-                .map_err(TransportError::Stopped)?;
+            let delivery = async {
+                write_frame(&mut send, &ServerMessage::Committed { commit }).await?;
+                send.finish().map_err(TransportError::ClosedStream)?;
+                tokio::time::timeout(Duration::from_secs(5), send.stopped())
+                    .await
+                    .map_err(|_| TransportError::CommitDeliveryTimeout)?
+                    .map_err(TransportError::Stopped)
+            }
+            .await;
+            if let Err(error) = delivery {
+                handler.rollback(transaction_id).await;
+                return Err(error);
+            }
 
             // The expensive part is over: release the concurrency permit
             // before waiting, so a long-lived tunnel does not hold a slot

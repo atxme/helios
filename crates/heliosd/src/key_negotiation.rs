@@ -56,7 +56,7 @@ struct TransactionState {
     /// Kept so the slot can be released the moment the client hangs up:
     /// `active` is emptied at commit, and without this the gateway would have
     /// nothing left to tie a closing link to.
-    committed: HashMap<[u8; 16], (String, String)>,
+    committed: HashMap<[u8; 16], Transaction>,
     peers: HashSet<String>,
     replay_order: VecDeque<[u8; 16]>,
     replay_set: HashSet<[u8; 16]>,
@@ -122,6 +122,19 @@ impl GatewayHandler {
         let transaction = state.active.remove(&transaction_id)?;
         state.peers.remove(&transaction.public_key);
         Some(transaction)
+    }
+
+    async fn release_peer_reservation(&self, public_key: &str) {
+        self.transactions.lock().await.peers.remove(public_key);
+    }
+
+    async fn take_for_rollback(&self, transaction_id: [u8; 16]) -> Option<Transaction> {
+        let mut state = self.transactions.lock().await;
+        if let Some(transaction) = state.active.remove(&transaction_id) {
+            state.peers.remove(&transaction.public_key);
+            return Some(transaction);
+        }
+        state.committed.remove(&transaction_id)
     }
 
     async fn raise_security_floor(
@@ -286,7 +299,14 @@ impl NegotiationHandler for GatewayHandler {
             }
         }
 
-        let gateway_nonce = random_nonce().map_err(|_| PublicError::Protocol)?;
+        let gateway_nonce = match random_nonce() {
+            Ok(nonce) => nonce,
+            Err(_) => {
+                self.release_peer_reservation(&request.client_wg_public_key)
+                    .await;
+                return Err(PublicError::Protocol);
+            }
+        };
         let material = match prepare_key_material(
             request,
             &self.gateway_public_key,
@@ -302,9 +322,22 @@ impl NegotiationHandler for GatewayHandler {
                     ?error,
                     "key negotiation refused: preparing the key material failed"
                 );
-                let mut state = self.transactions.lock().await;
-                state.peers.remove(&request.client_wg_public_key);
+                self.release_peer_reservation(&request.client_wg_public_key)
+                    .await;
                 return Err(error);
+            }
+        };
+
+        let response = match authenticate_response(
+            material.response,
+            self.gateway_pq_certificate.clone(),
+            self.gateway_pq_private_key.as_slice(),
+        ) {
+            Ok(response) => response,
+            Err(_) => {
+                self.release_peer_reservation(&request.client_wg_public_key)
+                    .await;
+                return Err(PublicError::Protocol);
             }
         };
 
@@ -324,8 +357,8 @@ impl NegotiationHandler for GatewayHandler {
                 ?error,
                 "key negotiation refused: installing the PSK on the data plane failed"
             );
-            let mut state = self.transactions.lock().await;
-            state.peers.remove(&request.client_wg_public_key);
+            self.release_peer_reservation(&request.client_wg_public_key)
+                .await;
             return Err(error);
         }
         tracing::info!(
@@ -354,12 +387,6 @@ impl NegotiationHandler for GatewayHandler {
                 mode: request.mode,
             },
         );
-        let response = authenticate_response(
-            material.response,
-            self.gateway_pq_certificate.clone(),
-            self.gateway_pq_private_key.as_slice(),
-        )
-        .map_err(|_| PublicError::Protocol)?;
         Ok(PreparedNegotiation {
             response,
             confirmation_timeout: DEFAULT_CONFIRMATION_TIMEOUT,
@@ -389,16 +416,18 @@ impl NegotiationHandler for GatewayHandler {
             .verify(&client_pq_public_key)
             .map_err(|_| PublicError::IdentityMismatch)?;
         self.raise_security_floor(&public_key, mode).await?;
+        let commit = authenticate_commit(transaction_id, self.gateway_pq_private_key.as_slice())
+            .map_err(|_| PublicError::Protocol)?;
         let transaction = self
             .release_peer(transaction_id)
             .await
             .ok_or(PublicError::Rejected)?;
-        self.transactions.lock().await.committed.insert(
-            transaction_id,
-            (transaction.public_key.clone(), transaction.address.clone()),
-        );
-        authenticate_commit(transaction_id, self.gateway_pq_private_key.as_slice())
-            .map_err(|_| PublicError::Protocol)
+        self.transactions
+            .lock()
+            .await
+            .committed
+            .insert(transaction_id, transaction);
+        Ok(commit)
     }
 
     /// Releases the slot as soon as the client hangs up.
@@ -408,12 +437,13 @@ impl NegotiationHandler for GatewayHandler {
     /// that is gone. The link closing is a far better signal than silence, and
     /// it also covers a client that crashed rather than disconnected cleanly.
     ///
-    /// Clearing the slot is safe because it cannot strand anybody: the peer's
-    /// floor is at `ml_kem`, so its next tunnel has to negotiate a fresh PSK
-    /// anyway. A link that dropped on its own leads the client to renegotiate,
-    /// and both ends converge on a new secret.
+    /// Clearing the slot is the session policy for every mode. The client marks
+    /// the tunnel down when this authenticated link disappears; its next
+    /// connection negotiates again under the profile's current floor. Static
+    /// PSK mode deliberately does not keep access alive after its control link
+    /// has expired.
     async fn disconnected(&self, transaction_id: [u8; 16]) {
-        let Some((public_key, address)) = self
+        let Some(transaction) = self
             .transactions
             .lock()
             .await
@@ -423,21 +453,25 @@ impl NegotiationHandler for GatewayHandler {
             return;
         };
         tracing::info!(
-            peer = %public_key,
+            peer = %transaction.public_key,
             "key-negotiation link closed: releasing the PSK slot without waiting for handshakes"
         );
-        if self.install(public_key, address, None).await.is_err() {
+        if self
+            .install(transaction.public_key, transaction.address, None)
+            .await
+            .is_err()
+        {
             tracing::warn!("could not release the PSK slot after the client disconnected");
         }
     }
 
     async fn rollback(&self, transaction_id: [u8; 16]) {
-        let Some(transaction) = self.release_peer(transaction_id).await else {
+        let Some(transaction) = self.take_for_rollback(transaction_id).await else {
             return;
         };
-        // The counterpart of the client's «non confirmée»: this line says the
-        // gateway did put its slot back, so the desynchronisation the user
-        // then observes is on the client side only.
+        // The response or commit was not delivered completely. Restoring here
+        // leaves no candidate slot behind after the transport has abandoned
+        // the transaction.
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
             peer = %transaction.public_key,
@@ -840,9 +874,10 @@ mod tests {
     }
 
     use aether::key_negotiation::{
-        authenticate_request, generate_ml_dsa_65_keypair, issue_pq_certificate,
-        AuthenticatedKeyNegotiationRequest, KeyNegotiationRequest, PqCertificate,
-        PqCertificateRole, ProtectionMode, KEY_NEGOTIATION_VERSION, PQ_CERTIFICATE_VERSION,
+        authenticate_confirmation, authenticate_request, generate_ml_dsa_65_keypair,
+        issue_pq_certificate, AuthenticatedKeyNegotiationRequest, KeyNegotiationRequest,
+        PqCertificate, PqCertificateRole, ProtectionMode, KEY_NEGOTIATION_VERSION,
+        PQ_CERTIFICATE_VERSION,
     };
     const CLIENT_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const GATEWAY_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -989,6 +1024,56 @@ mod tests {
             vec![None, Some(previous_psk)],
             "classic preparation must clear the slot and rollback must restore it"
         );
+    }
+
+    #[tokio::test]
+    async fn undelivered_commit_restores_the_previous_slot() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let shared = Arc::new(RwLock::new(network(
+            &previous_psk,
+            &fixture.client_certificate.fingerprint().unwrap(),
+        )));
+        let (tx, mut rx) = mpsc::channel::<InstallPskRequest>(4);
+        let applied = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let observed = Arc::clone(&applied);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                observed
+                    .lock()
+                    .await
+                    .push(request.psk.map(|secret| secret.expose().to_string()));
+                let _ = request.reply.send(Ok(()));
+            }
+        });
+        let handler = GatewayHandler {
+            network: shared,
+            psk_tx: tx,
+            gateway_public_key: GATEWAY_KEY.into(),
+            client_pq_ca_public_key: fixture.client_ca_public_key.clone(),
+            gateway_pq_certificate: fixture.gateway_certificate.clone(),
+            gateway_pq_private_key: Zeroizing::new(fixture.gateway_private_key.clone()),
+            dry_run: true,
+            static_psks: RwLock::new(HashMap::from([(CLIENT_KEY.into(), previous_psk.clone())])),
+            transactions: Mutex::new(TransactionState::default()),
+        };
+
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([2; 16], &fixture))
+            .await
+            .unwrap();
+        handler
+            .confirm(authenticate_confirmation([2; 16], &fixture.client_private_key).unwrap())
+            .await
+            .unwrap();
+        handler.rollback([2; 16]).await;
+
+        assert_eq!(
+            *applied.lock().await,
+            vec![None, Some(previous_psk)],
+            "a commit that was not delivered must restore the previous slot"
+        );
+        assert!(handler.transactions.lock().await.committed.is_empty());
     }
 
     #[tokio::test]

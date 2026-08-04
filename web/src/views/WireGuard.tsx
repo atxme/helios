@@ -1,103 +1,216 @@
-import { KeyRound, Lock, Network, RadioTower, ShieldCheck, ShieldOff } from 'lucide-react'
-import type { ProtectionMode, Status, TunnelState } from '../types'
-
-function shortKey(key: string): string {
-  if (key.length <= 20) return key
-  return `${key.slice(0, 10)}…${key.slice(-8)}`
-}
+import Box from '@mui/material/Box'
+import Chip from '@mui/material/Chip'
+import Stack from '@mui/material/Stack'
+import Tooltip from '@mui/material/Tooltip'
+import Typography from '@mui/material/Typography'
+import { KeyRound, Lock, Network, RadioTower } from 'lucide-react'
+import { Metric } from '../components/Metric'
+import { SectionCard } from '../components/SectionCard'
+import type { PeerSummary, ProtectionMode, Status } from '../types'
 
 /**
  * How a floor reads on screen.
  *
  * The floor is not the mode currently in use — the gateway doesn't keep one —
  * it's what this peer can no longer fall back below. Saying "ML-KEM-1024"
- * alone would suggest an observed state; the label says "minimum".
+ * alone would suggest an observed state; the label says "plancher".
+ *
+ * The three tones form a ladder of *commitment*, not of quality: an outline
+ * for a peer that has committed to nothing, a caution tone for a floor that
+ * holds but never rotates, and the tertiary accent for the one floor that
+ * refuses everything below ML-KEM.
  */
-const FLOOR: Record<ProtectionMode, { label: string; hint: string; tone: string }> = {
+const FLOOR: Record<ProtectionMode, { label: string; hint: string; bg: string; fg: string }> = {
   classic: {
     label: 'plancher : aucun',
-    hint: "Ce pair peut encore négocier sans PSK. Le plancher s'élèvera de lui-même à la première négociation aboutie.",
-    tone: 'border-slate-300 dark:border-slate-700 text-slate-500',
+    hint: 'Ce pair peut encore négocier sans PSK. Le plancher s’élèvera de lui-même à la première négociation aboutie.',
+    bg: 'transparent',
+    fg: 'text.secondary',
   },
   static_psk: {
     label: 'plancher : PSK statique',
-    hint: 'Une négociation classique est refusée pour ce pair, avant toute pose sur le plan de données.',
-    tone: 'border-amber-500/40 text-amber-600 dark:text-amber-400 bg-amber-500/5',
+    hint: 'Une négociation classique est refusée pour ce pair, avant toute pose sur le plan de données. Ce PSK ne tourne jamais.',
+    bg: 'warning.container',
+    fg: 'warning.onContainer',
   },
   ml_kem: {
     label: 'plancher : ML-KEM-1024',
     hint: 'Ni classique ni PSK statique ne sont acceptés pour ce pair. Seule une édition locale de network.toml peut redescendre ce plancher.',
-    tone: 'border-violet-500/40 text-violet-600 dark:text-violet-400 bg-violet-500/5',
+    bg: 'tertiary.container',
+    fg: 'tertiary.onContainer',
   },
 }
 
-export function WireGuardView({ status, currentState }: { status: Status | null; currentState: TunnelState }) {
-  const negotiation = status?.key_negotiation_port
+function shortKey(key: string): string {
+  return key.length <= 20 ? key : `${key.slice(0, 10)}…${key.slice(-8)}`
+}
+
+function ToneChip({ label, hint, bg, fg }: { label: string; hint: string; bg: string; fg: string }) {
   return (
-    <div className="space-y-4 max-w-4xl">
-      <div>
-        <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-200 tracking-wide">WireGuard</h1>
-        <p className="text-xs text-slate-500 mt-0.5">Interface serveur, admission des clients et protection post-quantique</p>
-      </div>
+    <Tooltip title={hint}>
+      <Chip
+        size="small"
+        label={label}
+        sx={{
+          bgcolor: bg,
+          color: fg,
+          border: bg === 'transparent' ? '1px solid' : 'none',
+          borderColor: 'divider',
+          fontFamily: 'monospace',
+          fontSize: '0.6875rem',
+        }}
+      />
+    </Tooltip>
+  )
+}
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-        <Info icon={RadioTower} label="Interface" value={status?.wg_iface || '—'} />
-        <Info icon={Network} label="Écoute" value={status?.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'fermée'} />
-        <Info icon={Lock} label="Négociation" value={negotiation ? `UDP ${negotiation}` : 'inactive'} />
-        <Info icon={currentState === 'up' ? ShieldCheck : ShieldOff} label="État" value={currentState} />
-      </div>
+function PeerRow({ peer }: { peer: PeerSummary }) {
+  const floor = FLOOR[peer.minimum_key_negotiation_mode] ?? FLOOR.classic
 
-      <div className="card overflow-hidden">
-        <div className="px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60">
-          <h2 className="hud-title">Clients admis ({status?.peers.length ?? 0})</h2>
-        </div>
+  return (
+    <Stack
+      direction="row"
+      spacing={2}
+      sx={{
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        rowGap: 1.5,
+        px: 3,
+        py: 2,
+        borderBottom: '1px solid',
+        borderColor: 'divider',
+        '&:last-of-type': { borderBottom: 0 },
+      }}
+    >
+      <Box sx={{ color: 'text.disabled', display: 'flex' }}>
+        <KeyRound size={18} strokeWidth={1.6} />
+      </Box>
+
+      <Box sx={{ minWidth: 180, flex: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {peer.name}
+          </Typography>
+          {peer.admin && (
+            <Chip
+              size="small"
+              label="admin"
+              sx={{ bgcolor: 'secondary.container', color: 'secondary.onContainer', fontSize: '0.6875rem' }}
+            />
+          )}
+        </Stack>
+        <Tooltip title={peer.public_key}>
+          <Typography
+            sx={{ fontFamily: 'monospace', fontSize: '0.75rem', color: 'text.secondary', mt: 0.25 }}
+          >
+            {shortKey(peer.public_key)}
+          </Typography>
+        </Tooltip>
+      </Box>
+
+      <Typography sx={{ fontFamily: 'monospace', fontSize: '0.8125rem', flexShrink: 0 }}>
+        {peer.address}
+      </Typography>
+
+      <ToneChip {...floor} />
+
+      <ToneChip
+        label={peer.post_quantum ? 'slot PSK occupé' : 'slot PSK vide'}
+        hint={
+          peer.post_quantum
+            ? 'Un secret occupe le slot PresharedKey de ce pair. Sa valeur n’est jamais exposée par l’API.'
+            : 'Aucun PSK posé : la confidentialité repose sur Curve25519 seul.'
+        }
+        bg={peer.post_quantum ? 'tertiary.container' : 'transparent'}
+        fg={peer.post_quantum ? 'tertiary.onContainer' : 'text.secondary'}
+      />
+    </Stack>
+  )
+}
+
+function Explanation({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <Box sx={{ mb: 2, '&:last-of-type': { mb: 0 } }}>
+      <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+        <Box component="strong" sx={{ color: 'text.primary' }}>
+          {title}
+        </Box>{' '}
+        {children}
+      </Typography>
+    </Box>
+  )
+}
+
+export function WireGuardView({ status }: { status: Status | null }) {
+  const negotiation = status?.key_negotiation_port ?? null
+  const peers = status?.peers ?? []
+
+  return (
+    <Stack spacing={2.5}>
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 2,
+          gridTemplateColumns: { xs: 'repeat(2, 1fr)', md: 'repeat(3, 1fr)' },
+        }}
+      >
+        <Metric label="Interface" value={status?.wg_iface || '—'} icon={RadioTower} />
+        <Metric
+          label="Écoute"
+          value={status?.wg_listen_port ? `UDP ${status.wg_listen_port}` : 'fermée'}
+          icon={Network}
+        />
+        <Metric
+          label="Négociation"
+          value={negotiation ? `UDP ${negotiation}` : 'inactive'}
+          icon={Lock}
+          hint="Seul key_negotiation_port décide de l’ouverture du service. Absent, il reste fermé, sans erreur."
+        />
+      </Box>
+
+      <SectionCard
+        title={`Clients admis (${peers.length})`}
+        subtitle="Admis hors bande par helios-ctl peer add ; ce port n’étend jamais la liste."
+        disableContentPadding
+      >
         {!status ? (
-          <p className="p-5 text-xs text-slate-500 animate-pulse">Chargement…</p>
-        ) : status.peers.length === 0 ? (
-          <div className="p-8 text-center text-xs text-slate-500">
-            Aucun pair déclaré dans <span className="font-mono">network.toml</span>.
-          </div>
+          <Box sx={{ px: 3, py: 4 }}>
+            <Typography variant="body2" sx={{ color: 'text.disabled' }}>
+              Statut non encore reçu du démon.
+            </Typography>
+          </Box>
+        ) : peers.length === 0 ? (
+          <Box sx={{ px: 3, py: 4 }}>
+            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+              Aucun pair déclaré dans <code>network.toml</code>.
+            </Typography>
+          </Box>
         ) : (
-          <div className="divide-y divide-slate-200/60 dark:divide-slate-800/60">
-            {status.peers.map(peer => {
-              const floor = FLOOR[peer.minimum_key_negotiation_mode] ?? FLOOR.classic
-              return (
-                <div key={peer.public_key} className="p-4 flex flex-wrap items-center gap-3">
-                  <KeyRound className="h-4 w-4 text-slate-500" strokeWidth={1.5} />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-xs font-medium text-slate-800 dark:text-slate-200">{peer.name}</div>
-                    <div className="text-[10px] font-mono text-slate-500" title={peer.public_key}>{shortKey(peer.public_key)}</div>
-                  </div>
-                  <span className="text-[10px] font-mono text-slate-600 dark:text-slate-300">{peer.address}</span>
-                  <span className={`text-[10px] px-2 py-0.5 rounded border ${floor.tone}`} title={floor.hint}>
-                    {floor.label}
-                  </span>
-                  <span className={`text-[10px] px-2 py-0.5 rounded border ${peer.post_quantum
-                    ? 'border-violet-500/40 text-violet-600 dark:text-violet-400 bg-violet-500/5'
-                    : 'border-slate-300 dark:border-slate-700 text-slate-500'}`}
-                    title={peer.post_quantum
-                      ? 'Un secret occupe le slot PresharedKey de ce pair. Sa valeur n’est jamais exposée.'
-                      : 'Aucun PSK posé : la confidentialité repose sur Curve25519 seul.'}
-                  >
-                    {peer.post_quantum ? 'slot PSK occupé' : 'slot PSK vide'}
-                  </span>
-                </div>
-              )
-            })}
-          </div>
+          <Box sx={{ borderTop: '1px solid', borderColor: 'divider' }}>
+            {peers.map(peer => (
+              <PeerRow key={peer.public_key} peer={peer} />
+            ))}
+          </Box>
         )}
-      </div>
+      </SectionCard>
 
-      <div className="card overflow-hidden">
-        <div className="px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60">
-          <h2 className="hud-title">Négociation de clé</h2>
-          <p className="mt-0.5 text-[11px] text-slate-500">
-            Port public {negotiation ? <span className="font-mono">UDP {negotiation}</span> : 'non ouvert'} — il ne
-            transporte aucun trafic utilisateur, il prépare le slot PSK du <em>premier</em> handshake WireGuard.
-          </p>
-        </div>
-
-        <dl className="px-5 py-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <SectionCard
+        title="Négociation de clé"
+        subtitle={
+          <>
+            Port public {negotiation ? <code>UDP {negotiation}</code> : 'non ouvert'} — il ne transporte
+            aucun trafic utilisateur, il prépare le slot PSK du <em>premier</em> handshake WireGuard.
+          </>
+        }
+      >
+        <Box
+          sx={{
+            display: 'grid',
+            gap: 3,
+            gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' },
+            mb: 3,
+          }}
+        >
           <Field
             label="Ancre d’authentification"
             value="ML-DSA-65"
@@ -111,106 +224,121 @@ export function WireGuardView({ status, currentState }: { status: Status | null;
           <Field
             label="Ordre de pose"
             value="poser puis annoncer"
-            note="Le slot est posé sur le plan de données avant la réponse. Si aucun handshake ne réussit avec ce PSK, puis n'est confirmé par signature, Helios restaure le slot précédent."
+            note="Le slot est posé sur le plan de données avant la réponse. Si aucun handshake ne réussit avec ce PSK, puis n’est confirmé par signature, Helios restaure le slot précédent."
           />
-        </dl>
+        </Box>
 
-        <div className="border-t border-slate-200/60 dark:border-slate-800/60 px-5 py-3.5">
-          <h3 className="text-[9px] uppercase tracking-widest text-slate-500">Modes acceptés</h3>
-          <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-            <Mode name="classic" detail="Slot PSK vidé. Aucune protection contre « récolter maintenant, déchiffrer plus tard »." />
-            <Mode name="static_psk" detail="PSK déjà configuré, retrouvé par comparaison d’empreinte. Il ne tourne jamais." />
-            <Mode name="ml_kem" detail="PSK frais dérivé à chaque connexion, jamais écrit sur disque." />
-          </div>
-        </div>
+        <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+          Modes acceptés
+        </Typography>
+        <Box
+          sx={{
+            display: 'grid',
+            gap: 1.5,
+            gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' },
+            mt: 1,
+            mb: 3,
+          }}
+        >
+          <Mode name="classic" detail="Slot PSK vidé. Aucune protection contre « récolter maintenant, déchiffrer plus tard »." />
+          <Mode name="static_psk" detail="PSK déjà configuré, retrouvé par comparaison d’empreinte. Il ne tourne jamais." />
+          <Mode name="ml_kem" detail="PSK frais dérivé à chaque connexion, jamais écrit sur disque." />
+        </Box>
 
-        <div className="border-t border-slate-200/60 dark:border-slate-800/60 px-5 py-3.5 space-y-2.5 text-[11px] leading-relaxed text-slate-500">
-          <p>
-            <strong className="text-slate-600 dark:text-slate-400">La sécurité ne redescend jamais.</strong>{' '}
-            Chaque pair porte un plancher, montré ci-dessus. Une demande située en dessous est refusée
-            <em> avant</em> toute modification du plan de données, et chaque négociation aboutie élève le
-            plancher au mode utilisé — y compris après redémarrage. Aucun message réseau ni aucune
-            renégociation ne peut l’abaisser : seule une édition locale de{' '}
-            <span className="font-mono">network.toml</span> le peut.
-          </p>
-          <p>
-            <strong className="text-slate-600 dark:text-slate-400">Deux ports à rediriger.</strong>{' '}
-            <span className="font-mono">UDP {status?.wg_listen_port ?? 51820}</span> pour WireGuard et{' '}
-            <span className="font-mono">UDP {negotiation ?? 51821}</span> pour la négociation. Sans le second,
-            les clients retombent sur l’ancien chemin : tunnel classique d’abord, PSK ensuite — son
-            premier handshake n’est alors pas protégé.
-          </p>
-          <p>
-            <strong className="text-slate-600 dark:text-slate-400">Admission hors bande.</strong>{' '}
-            L’empreinte du certificat PQ du client est déclarée à l’admission
-            (<span className="font-mono">helios-ctl peer add</span>) ; le port de négociation n’étend jamais
-            la liste des pairs, il ne sert que ceux déjà admis. Sa présence choisit à elle seule un
-            plancher <span className="font-mono">ml_kem</span>.
-          </p>
-        </div>
-      </div>
+        <Explanation title="La sécurité ne redescend jamais.">
+          Chaque pair porte un plancher, montré ci-dessus. Une demande située en dessous est refusée
+          <em> avant</em> toute modification du plan de données, et chaque négociation aboutie élève le
+          plancher au mode utilisé — y compris après redémarrage. Aucun message réseau ni aucune
+          renégociation ne peut l’abaisser : seule une édition locale de <code>network.toml</code> le peut.
+        </Explanation>
+        <Explanation title="Deux ports à rediriger.">
+          <code>UDP {status?.wg_listen_port ?? 51820}</code> pour WireGuard et{' '}
+          <code>UDP {negotiation ?? 51821}</code> pour la négociation. Sans le second, les clients
+          retombent sur l’ancien chemin : tunnel classique d’abord, PSK ensuite — son premier handshake
+          n’est alors pas protégé.
+        </Explanation>
+        <Explanation title="Rotation à chaud, non.">
+          L’identité de négociation est lue une fois au démarrage et servie jusqu’à l’arrêt. Après un{' '}
+          <code>init-key-negotiation --rotate</code>, les profils émis épinglent un certificat que la
+          passerelle ne sert pas encore, et le client refuse le handshake QUIC sur{' '}
+          <code>BadSignature</code>. Une rotation s’applique par <code>systemctl restart heliosd</code>.
+        </Explanation>
+      </SectionCard>
 
-      <div className="card overflow-hidden">
-        <div className="px-5 py-3 border-b border-slate-200/60 dark:border-slate-800/60">
-          <h2 className="hud-title">Enrôlement hérité</h2>
-          <p className="mt-0.5 text-[11px] text-slate-500">
-            <span className="font-mono">POST /api/provision</span> — joignable uniquement à travers
-            le tunnel, comme le reste de cette interface.
-          </p>
-        </div>
+      <SectionCard
+        title="Enrôlement hérité"
+        subtitle={
+          <>
+            <code>POST /api/provision</code> — joignable uniquement à travers le tunnel, comme le reste
+            de cette interface.
+          </>
+        }
+      >
+        <Box
+          sx={{
+            display: 'grid',
+            gap: 3,
+            gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, 1fr)' },
+            mb: 3,
+          }}
+        >
+          <Field
+            label="Échange de clés"
+            value="ML-KEM-1024"
+            note="Le secret alimente le slot PresharedKey de WireGuard, sans toucher au handshake."
+          />
+          <Field
+            label="Plage d’adressage"
+            value="100.64.0.0/10"
+            note="VIP CGNAT dérivée de la clé publique du pair. Aucun état sur disque."
+          />
+          <Field
+            label="Durée de vie du PSK"
+            value="3600 s"
+            note="Au-delà, le client redemande un PSK par un nouvel échange."
+          />
+        </Box>
 
-        <dl className="px-5 py-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <Field label="Échange de clés" value="ML-KEM-1024" note="Le secret alimente le slot PresharedKey de WireGuard, sans toucher au handshake." />
-          <Field label="Plage d’adressage" value="100.64.0.0/10" note="VIP CGNAT dérivée de la clé publique du pair. Aucun état sur disque." />
-          <Field label="Durée de vie du PSK" value="3600 s" note="Au-delà, le client redemande un PSK par un nouvel échange." />
-        </dl>
-
-        <div className="border-t border-slate-200/60 dark:border-slate-800/60 px-5 py-3.5 space-y-2.5 text-[11px] leading-relaxed text-slate-500">
-          <p>
-            <strong className="text-slate-600 dark:text-slate-400">Chemin de compatibilité, plus le chemin nominal.</strong>{' '}
-            Ce provisioning exige un tunnel déjà monté : il ne peut donc pas protéger le premier
-            handshake, celui qu’un adversaire enregistre aujourd’hui pour le déchiffrer plus tard. Il
-            reste servi pour les profils Orion dépourvus de bloc de négociation.
-          </p>
-          <p>
-            <strong className="text-slate-600 dark:text-slate-400">Provisioning post-quantique.</strong>{' '}
-            Le PSK est dérivé par ML-KEM-1024 puis posé sur le pair <em>avant</em> d’être annoncé au
-            client : un PSK présent d’un seul côté ferait échouer tous les handshakes. En cas d’échec,
-            la demande est refusée et le tunnel reste classique.
-          </p>
-        </div>
-      </div>
-    </div>
+        <Explanation title="Chemin de compatibilité, plus le chemin nominal.">
+          Ce provisioning exige un tunnel déjà monté : il ne peut donc pas protéger le premier
+          handshake, celui qu’un adversaire enregistre aujourd’hui pour le déchiffrer plus tard. Il
+          reste servi pour les profils Orion dépourvus de bloc de négociation.
+        </Explanation>
+        <Explanation title="Provisioning post-quantique.">
+          Le PSK est dérivé par ML-KEM-1024 puis posé sur le pair <em>avant</em> d’être annoncé au
+          client : un PSK présent d’un seul côté ferait échouer tous les handshakes. En cas d’échec, la
+          demande est refusée et le tunnel reste classique.
+        </Explanation>
+      </SectionCard>
+    </Stack>
   )
 }
 
 function Mode({ name, detail }: { name: string; detail: string }) {
   return (
-    <div className="rounded border border-slate-200/60 dark:border-slate-800/60 px-3 py-2">
-      <div className="font-mono text-[10px] text-slate-700 dark:text-slate-300">{name}</div>
-      <p className="mt-1 text-[10px] leading-relaxed text-slate-500">{detail}</p>
-    </div>
+    <Box sx={{ px: 2, py: 1.5, borderRadius: '12px', bgcolor: 'surfaceContainer.high' }}>
+      <Typography sx={{ fontFamily: 'monospace', fontSize: '0.8125rem', fontWeight: 600 }}>
+        {name}
+      </Typography>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5 }}>
+        {detail}
+      </Typography>
+    </Box>
   )
 }
 
 function Field({ label, value, note }: { label: string; value: string; note: string }) {
   return (
-    <div>
-      <dt className="text-[9px] uppercase tracking-widest text-slate-500">{label}</dt>
-      <dd className="mt-1 font-mono text-xs text-slate-700 dark:text-slate-300">{value}</dd>
-      <p className="mt-1.5 text-[10px] leading-relaxed text-slate-500">{note}</p>
-    </div>
-  )
-}
-
-function Info({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
-  return (
-    <div className="card p-4 flex items-center gap-3">
-      <Icon className="h-4 w-4 text-cyan-600 dark:text-cyan-400" strokeWidth={1.5} />
-      <div>
-        <div className="text-[9px] uppercase tracking-widest text-slate-500">{label}</div>
-        <div className="text-xs font-mono text-slate-700 dark:text-slate-300">{value}</div>
-      </div>
-    </div>
+    <Box>
+      <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+        {label}
+      </Typography>
+      <Typography sx={{ fontFamily: 'monospace', fontSize: '0.875rem', fontWeight: 600, mt: 0.25 }}>
+        {value}
+      </Typography>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.75 }}>
+        {note}
+      </Typography>
+    </Box>
   )
 }

@@ -218,10 +218,10 @@ pub async fn prepare(
         mode,
         client_wg_public_key: client_wg_public_key.to_string(),
         client_nonce,
-        // Signed and bound into the derivation: the gateway refuses a request
-        // whose clock drifts too far, which bounds replay in time rather than
-        // in cache size. A machine with a wrong clock is refused with a
-        // message naming the clock.
+        // Signed and bound into the derivation. The signature prevents an
+        // active transport attacker from refreshing a captured request; the
+        // gateway clock check limits an unchanged replay to the accepted
+        // window, where the transaction cache rejects duplicates.
         timestamp_unix: unix_time_now()?,
         kem_public_key,
         static_psk_fingerprint,

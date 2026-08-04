@@ -1,6 +1,6 @@
 [package]
 name = "heliosd"
-version.workspace = true
+version = "1.11.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

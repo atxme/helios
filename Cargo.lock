@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "0.1.0"
+version = "1.6.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -2029,7 +2029,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helio-tpm"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "aether",
  "aws-lc-rs",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "helios-api"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "helios-ctl"
-version = "0.1.0"
+version = "0.10.2"
 dependencies = [
  "aether",
  "anyhow",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "helios-firewall"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "async-trait",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "helios-installer"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "helios-key-negotiation"
-version = "0.1.0"
+version = "1.7.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "helios-provisioning"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aether",
  "aws-lc-rs",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "helios-publisher"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "helios-vault"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "aws-lc-rs",
  "thiserror 2.0.18",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "helios-wireguard"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aether",
  "async-trait",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "0.1.0"
+version = "1.11.3"
 dependencies = [
  "aether",
  "anyhow",
@@ -3448,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "0.1.0"
+version = "0.25.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -3467,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "orion-core"
-version = "0.1.0"
+version = "1.31.3"
 dependencies = [
  "aether",
  "anyhow",
@@ -6834,7 +6834,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "aether",
  "anyhow",

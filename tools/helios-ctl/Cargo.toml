@@ -1,6 +1,6 @@
 [package]
 name = "helios-ctl"
-version.workspace = true
+version = "0.10.2"
 edition.workspace = true
 authors.workspace = true
 

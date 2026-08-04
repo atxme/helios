@@ -1,5 +1,9 @@
+import Stack from '@mui/material/Stack'
 import { Clock, Wifi } from 'lucide-react'
+import { DataRow } from '../components/DataRow'
+import { KnownLimit } from '../components/KnownLimit'
 import { NetworkStats } from '../components/NetworkStats'
+import { SectionCard } from '../components/SectionCard'
 import type { Status, TelemetrySample } from '../types'
 
 interface Props {
@@ -9,37 +13,29 @@ interface Props {
 
 export function TelemetryView({ samples, status }: Props) {
   return (
-    <div className="space-y-4 max-w-4xl">
+    <Stack spacing={2.5}>
+      <SectionCard
+        title="Débit"
+        subtitle="Échelle relative à la fenêtre affichée — la courbe dit la stabilité, le chiffre dit la magnitude."
+      >
+        <NetworkStats samples={samples} sparklineHeight={72} />
+      </SectionCard>
 
-      <div>
-        <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-200 tracking-wide">Télémétrie réseau</h1>
-        <p className="text-xs text-slate-500 mt-0.5">Compteurs en temps réel depuis <span className="font-mono">/proc/net/dev</span></p>
-      </div>
+      <SectionCard title="Source des mesures">
+        <DataRow icon={Wifi} label="Interface" value={status?.wan_iface ?? ''} />
+        <DataRow
+          icon={Clock}
+          label="Période"
+          value="1 s"
+          hint="Le démon échantillonne /proc/net/dev et pousse un événement de télémétrie par seconde."
+        />
+      </SectionCard>
 
-      <NetworkStats samples={samples} sparklineHeight={64} />
-
-      {/* Monitored interface */}
-      <div className="panel hud p-5 space-y-3">
-        <h2 className="hud-title">Interface surveillée</h2>
-        <div className="flex items-center gap-3">
-          <Wifi className="h-4 w-4 text-slate-500 dark:text-slate-400 shrink-0" strokeWidth={1.5} />
-          <span className="font-mono text-sm text-slate-700 dark:text-slate-300">{status?.wan_iface ?? '—'}</span>
-          <div className="flex items-center gap-1.5 ml-auto">
-            <Clock className="h-3 w-3 text-slate-500 dark:text-slate-500" strokeWidth={1.5} />
-            <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">Δ 1 s</span>
-          </div>
-        </div>
-      </div>
-
-      {/* CPU / Memory placeholder */}
-      <div className="rounded-xl border border-slate-200/50 dark:border-slate-800/50 border-dashed p-5">
-        <h2 className="text-[10px] font-medium uppercase tracking-[0.15em] text-slate-500 dark:text-slate-500 mb-3">
-          CPU · Mémoire · Température
-        </h2>
-        <p className="text-xs text-slate-500 dark:text-slate-500 italic">
-          Disponible sur cible — nécessite la lecture de <span className="font-mono not-italic">/proc/stat</span> et <span className="font-mono not-italic">/sys/class/thermal</span>
-        </p>
-      </div>
-    </div>
+      <KnownLimit title="CPU, mémoire et température ne sont pas relevés">
+        Ces compteurs exigent la lecture de <code>/proc/stat</code> et de{' '}
+        <code>/sys/class/thermal</code> sur la cible, hors du périmètre de la télémétrie réseau
+        actuelle. Les débits ci-dessus, eux, sont mesurés y compris en simulation.
+      </KnownLimit>
+    </Stack>
   )
 }

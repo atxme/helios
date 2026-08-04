@@ -292,7 +292,26 @@
       "Bash(cp /tmp/t.orion ./zz-test.orion)",
       "Bash(bash -n scripts/lab.sh)",
       "Bash(bash -n scripts/target-bootstrap.sh)",
-      "Bash(magick /tmp/oi/final-light.png /tmp/oi/final-dark.png -append /tmp/oi/final.png)"
+      "Bash(magick /tmp/oi/final-light.png /tmp/oi/final-dark.png -append /tmp/oi/final.png)",
+      "Bash(node -e \"const p=require\\('./node_modules/@mui/material/package.json'\\); console.log\\('version',p.version\\)\")",
+      "Bash(perl -0pi -e 's/ComponentType<\\\\{ size\\\\?: number \\\\| string; strokeWidth\\\\?: number \\\\}>/LucideIcon/g' '$f')",
+      "Bash(npm audit *)",
+      "Bash(npm view *)",
+      "Bash(npm ls *)",
+      "Bash(echo \"audit exit=$?\")",
+      "Bash(npm ci *)",
+      "Bash(pkill -f \"vite\")",
+      "Read(//root/.cache/**)",
+      "Bash(npx playwright *)",
+      "Bash(curl -s -m 2 -o /dev/null http://localhost:8080/api/status)",
+      "Bash(curl -s http://localhost:8080/api/status)",
+      "Bash(curl -s -m 2 -o /dev/null -w \"vite HTTP %{http_code}\\\\n\" http://localhost:5173/)",
+      "Bash(sed -i 's|localhost:5173|localhost:5180|' /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shot.mjs)",
+      "Bash(node /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shot.mjs /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shots)",
+      "Bash(NODE_PATH=/home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules node /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shot.mjs /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shots)",
+      "Bash(ln -sfn /home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules/playwright /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/node_modules/playwright)",
+      "Bash(ln -sfn /home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules/playwright-core /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/node_modules/playwright-core)",
+      "Bash(pkill -f \"5180\")"
     ]
   }
 }

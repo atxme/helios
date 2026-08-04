@@ -1,6 +1,6 @@
 [package]
 name = "orion-core"
-version.workspace = true
+version = "1.31.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
