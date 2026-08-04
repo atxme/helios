@@ -8,6 +8,16 @@
 //! next to `heliosd`, and an operator upgrading the OS is already in a session
 //! on that machine.
 //!
+//! # Why the TPM is questioned before `apt`, not after
+//!
+//! `apt upgrade` is the point of no return: once the kernel is replaced, the
+//! PCRs move at the next reboot whether or not a window was ever armed, and an
+//! unarmed reboot loses the vaults — every client re-enrolled. Arming needs a
+//! **nominal** unseal, and that condition is knowable before anything is
+//! written. So the command asks `tpm update-readiness` first and refuses the
+//! upgrade outright when the answer is not yes; finding out at
+//! `prepare-update` time, after the upgrade, would be finding out too late.
+//!
 //! The command ends by killing itself: `prepare-update --reboot` reboots, so
 //! there is nothing to report afterwards and nothing to wait for. Whether the
 //! window was consumed is written in the journal at the next boot, which is
@@ -112,6 +122,34 @@ pub enum WindowState {
     None,
 }
 
+/// Whether a window could be armed, as `heliosd tpm update-readiness` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Nominal unseal: arming will work.
+    Ready,
+    /// Nothing is sealed to the PCRs — the upgrade has no secret to lose.
+    SealingDisabled,
+    /// The TPM answers, but this boot cannot arm a window.
+    Unavailable,
+}
+
+pub fn parse_readiness(output: &str) -> Result<Readiness> {
+    let mut verdicts = output.lines().filter_map(|line| match line.trim() {
+        "ready" => Some(Readiness::Ready),
+        "disabled" => Some(Readiness::SealingDisabled),
+        "unavailable" => Some(Readiness::Unavailable),
+        _ => None,
+    });
+    match (verdicts.next(), verdicts.next()) {
+        (Some(state), None) => Ok(state),
+        _ => anyhow::bail!(
+            "unexpected `tpm update-readiness` output {:?} — does this heliosd carry \
+             the update window?",
+            output.trim()
+        ),
+    }
+}
+
 /// Reads the verdict out of `heliosd tpm update-status`.
 ///
 /// The verdict is the one line that is exactly `armed` or `none`; anything else
@@ -155,6 +193,32 @@ pub fn run(yes: bool) -> Result<()> {
         );
     }
 
+    // Everything below this line is irreversible in the way that matters: once
+    // `apt upgrade` has replaced the kernel, the PCRs move at the next reboot
+    // whether or not a window was ever armed. So the ability to arm one is
+    // established *here*, while doing nothing is still an option — an
+    // unreachable TPM or a non-nominal boot is a refusal, not a warning.
+    let arm_window = match readiness(&heliosd).context(
+        "checking whether an update window can be armed — refusing to upgrade without \
+         that answer, since the vaults are what an unarmed reboot loses",
+    )? {
+        Readiness::Ready => true,
+        Readiness::SealingDisabled => {
+            println!(
+                "TPM sealing is disabled on this gateway — the upgrade has no sealed \
+                 secret to lose, so no window will be armed and no reboot ordered."
+            );
+            false
+        }
+        Readiness::Unavailable => anyhow::bail!(
+            "this boot cannot arm an update window (see the reason logged just \
+             above) — the reboot after an upgrade would lose the vaults and force \
+             every client to be re-enrolled. Repair the TPM state first (reseal \
+             ticket, escrow), or upgrade deliberately with `sudo apt upgrade` and \
+             accept that cost."
+        ),
+    };
+
     println!("==> Refreshing package lists");
     sudo_apt(&["update"]).context("refreshing the package lists")?;
 
@@ -166,13 +230,18 @@ pub fn run(yes: bool) -> Result<()> {
         println!("\nNothing to upgrade.");
         return Ok(());
     }
-    if !yes && !confirm()? {
+    if !yes && !confirm(arm_window)? {
         println!("aborted");
         return Ok(());
     }
 
     println!("\n==> Upgrading");
     sudo_apt(&["-y", "upgrade"]).context("upgrading the packages")?;
+
+    if !arm_window {
+        println!("\nUpgrade done. Reboot when it suits you: nothing is sealed to the PCRs.");
+        return Ok(());
+    }
 
     // Say what happens next *before* ordering it: this process is about to be
     // killed by the reboot it asks for, so anything printed afterwards may
@@ -227,14 +296,18 @@ fn names_with(pending: &[(String, BootChainImpact)], wanted: BootChainImpact) ->
         .collect()
 }
 
-fn confirm() -> Result<bool> {
+fn confirm(arm_window: bool) -> Result<bool> {
     use std::io::{BufRead as _, Write as _};
 
     println!();
-    println!("About to upgrade, arm a TPM update window carrying the current secret,");
-    println!("and reboot immediately. While the window is open, someone with physical");
-    println!("access who boots another signed OS can read the secret, undetectably");
-    println!("(ADR-007). Rebooting at once is what keeps that short.");
+    if arm_window {
+        println!("About to upgrade, arm a TPM update window carrying the current secret,");
+        println!("and reboot immediately. While the window is open, someone with physical");
+        println!("access who boots another signed OS can read the secret, undetectably");
+        println!("(ADR-007). Rebooting at once is what keeps that short.");
+    } else {
+        println!("About to upgrade. No window will be armed and no reboot ordered.");
+    }
     print!("Proceed? [y/N] ");
     std::io::stdout().flush().ok();
 
@@ -274,6 +347,13 @@ fn window_state(heliosd: &str) -> Result<WindowState> {
     let output =
         heliosd_tpm_output(heliosd, &["update-status"]).context("reading the window state")?;
     parse_window_state(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Asked only once no window is armed: the readiness probe unseals, and an
+/// unseal consumes an armed window.
+fn readiness(heliosd: &str) -> Result<Readiness> {
+    let output = heliosd_tpm_output(heliosd, &["update-readiness"])?;
+    parse_readiness(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn pending_upgrades() -> Result<Vec<(String, BootChainImpact)>> {
@@ -443,6 +523,23 @@ Conf openssl (3.0.14-1 Debian:12/stable [amd64])
         assert!(parse_window_state("unknown subcommand").is_err());
         // Two verdicts are not a verdict either.
         assert!(parse_window_state("armed\nnone\n").is_err());
+    }
+
+    #[test]
+    fn the_readiness_verdict_is_read_the_same_way() {
+        assert_eq!(parse_readiness("ready\n").unwrap(), Readiness::Ready);
+        assert_eq!(
+            parse_readiness("disabled\n").unwrap(),
+            Readiness::SealingDisabled
+        );
+        assert_eq!(
+            parse_readiness("ERROR the boot is Bypassed\nunavailable\n").unwrap(),
+            Readiness::Unavailable
+        );
+        // No verdict at all is a refusal, never an implicit "go ahead": an
+        // upgrade started on a silent TPM is one that cannot arm a window.
+        assert!(parse_readiness("").is_err());
+        assert!(parse_readiness("error: unknown subcommand 'update-readiness'").is_err());
     }
 
     /// A `heliosd` that logs to stdout still answers: the probe of an absent NV

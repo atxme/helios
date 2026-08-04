@@ -120,6 +120,15 @@ l'initrd est mesuré en PCR 8/9, que Helios ne scelle pas.
 `--yes` saute la confirmation. Une fenêtre déjà armée fait refuser la commande :
 c'est le signe qu'un redémarrage précédent n'a pas eu lieu.
 
+**La capacité d'armer est vérifiée avant `apt`, jamais après.** `apt upgrade`
+est le point de non-retour : le noyau remplacé, les PCR bougeront au
+redémarrage suivant, fenêtre ou pas, et un redémarrage sans fenêtre perd les
+coffres. La commande interroge donc `heliosd tpm update-readiness` d'abord — un
+TPM injoignable ou un démarrage qui n'est pas un descellement nominal fait
+**refuser la mise à jour**, avant que quoi que ce soit ne soit écrit. Si le
+scellement est désactivé (`tpm.enabled = false`), il n'y a pas de secret à
+perdre : la mise à jour se fait, sans fenêtre ni redémarrage imposé.
+
 L'armement ne passe **pas** par l'API, et c'est délibéré (ADR-007) : l'API vit
 derrière le tunnel que la fenêtre existe précisément pour préserver, et une
 fenêtre déclenchable à distance est une exposition déclenchable à distance.

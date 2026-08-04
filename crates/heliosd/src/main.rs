@@ -127,6 +127,12 @@ enum TpmCommand {
     ExpireWindow,
     /// Reports whether a window is armed on this TPM.
     UpdateStatus,
+    /// Reports whether a window could be armed **now**, without arming one.
+    ///
+    /// Same precondition as `prepare-update`, answered before an upgrade
+    /// touches the disk. Asking afterwards is asking too late: the kernel has
+    /// already moved and the next reboot loses the vaults.
+    UpdateReadiness,
 }
 
 #[derive(Subcommand)]
@@ -250,7 +256,43 @@ fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        TpmCommand::UpdateReadiness => update_readiness(&tpm),
     }
+}
+
+/// Answers whether `prepare-update` would succeed, without arming anything.
+///
+/// Three answers on stdout, because they lead to three different operations:
+///
+/// - `ready` — the boot unsealed nominally, a window can carry that verdict;
+/// - `disabled` — nothing is sealed to the PCRs, so an OS upgrade has no
+///   secret to lose and needs no window;
+/// - `unavailable` — the TPM answers but this boot is not a nominal unseal
+///   (bypassed, provisioned, resealed). The reason is logged, on stderr.
+///
+/// An unreachable TPM is none of the three: the command fails, and the caller
+/// must treat that as a refusal rather than as an absent window. That
+/// distinction is the whole point of asking *before* upgrading — after
+/// `apt upgrade` there is no answer left that saves the vaults.
+///
+/// The probe runs the **same** unlock as arming, deliberately: a prediction
+/// made by a different path would be a different question. It inherits that
+/// path's effects — on a boot whose PCRs have already moved it can consume a
+/// reseal ticket, exactly as `prepare-update` would have.
+fn update_readiness(tpm: &TpmSettings) -> anyhow::Result<()> {
+    let boot = unlock_tpm_for_offline_command(tpm).context("unlocking the TPM vault")?;
+    match boot {
+        BootDecision::Unsealed(_) => println!("ready"),
+        BootDecision::Disabled => println!("disabled"),
+        other => {
+            warn!(
+                "the current boot is {other:?}, not a nominal unseal — no update \
+                 window can be armed from it"
+            );
+            println!("unavailable");
+        }
+    }
+    Ok(())
 }
 
 /// Revokes an armed window whose explicit marker deadline has passed.

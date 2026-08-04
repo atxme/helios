@@ -256,6 +256,10 @@ Répéter pour chaque classe de paquet : noyau, `grub-efi` / `shim-signed`,
 
 **Essais de la fenêtre**, dans cet ordre :
 
+- `heliosd tpm update-readiness` sur un démarrage nominal : `ready`. Le tester
+  aussi hors nominal — démarrer sur un billet de rescellement, puis vérifier
+  qu'il répond `unavailable` et que `helios-ctl update` refuse **sans avoir
+  touché à `apt`** ;
 - `heliosd tpm prepare-update` puis `heliosd tpm update-status` : `armed`, et
   `tpm2_nvreadpublic 0x1804845` montre un index ordinaire, écrit, sans
   `OWNERREAD` et avec `POLICYREAD` ;
