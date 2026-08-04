@@ -210,7 +210,11 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
   de release : les features y sont tenues en un seul endroit).
 - `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
   bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
-  profils clients (`profile`) et séquestre (`escrow`) ;
+  profils clients (`profile`) et séquestre (`escrow`). Il est aussi livré **sur
+  la gateway**, où `helios-ctl update` fait la mise à jour de l’OS en une
+  commande : listes, classement des paquets par PCR touché, `apt upgrade`,
+  armement de la fenêtre et redémarrage — qui la tue. Le résultat se lit au
+  journal du démarrage suivant, pas en retour de commande ;
   `helios-publisher` : outil du **poste éditeur**, hors gateway.
 
 ## Développement et validation

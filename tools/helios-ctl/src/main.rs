@@ -31,6 +31,7 @@ mod files;
 mod key_nego;
 mod peer;
 mod profile;
+mod update;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ EXAMPLES:
   cargo run -p helios-ctl -- network show
   cargo run -p helios-ctl -- network load config/network.toml
   cargo run -p helios-ctl -- scenario nominal
+  cargo run -p helios-ctl -- update                 # on the gateway
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
@@ -179,6 +181,18 @@ enum Cmd {
     KeyNego {
         #[command(subcommand)]
         command: key_nego::KeyNegoCmd,
+    },
+    /// Upgrades this gateway's OS and reboots, keeping its identity (ADR-007).
+    ///
+    /// **Runs on the gateway.** Refreshes the package lists, reports which
+    /// pending packages move which PCR, upgrades, then arms a TPM update
+    /// window and reboots — which kills this command. Whether the window was
+    /// consumed is in the journal at the next boot:
+    /// `journalctl -u heliosd -b | grep -i 'update window'`.
+    Update {
+        /// Skips the confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Runs a predefined test scenario.
     Scenario {
@@ -987,6 +1001,7 @@ async fn main() -> Result<()> {
             } => escrow::open(&escrow, &private_key, &output),
         },
         Cmd::KeyNego { command } => key_nego::run(command).await,
+        Cmd::Update { yes } => update::run(yes),
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
             "flap" => scenario_flap(&client, base).await,

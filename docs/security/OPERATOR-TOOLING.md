@@ -90,7 +90,42 @@ porte le secret courant à travers **un** redémarrage planifié. Le secret ne
 change pas, donc l'identité WireGuard, l'identité de négociation et la table des
 PSK statiques sont intactes de l'autre côté : aucun client à ré-enrôler.
 
-Sur la gateway, en console ou en SSH :
+### En une commande, sur la gateway
+
+`helios-ctl` est livré dans le bundle, à côté de `heliosd`. Dans la session SSH
+où l'on met à jour de toute façon :
+
+```sh
+helios-ctl update
+```
+
+Elle rafraîchit les listes, annonce **quels paquets en attente déplacent quel
+PCR**, met à jour, arme la fenêtre et redémarre. Le redémarrage la tue : il n'y a
+rien à attendre ni à rapporter ensuite. Ce qui s'est passé est au journal du
+démarrage suivant :
+
+```sh
+journalctl -u heliosd -b | grep -i 'update window'
+```
+
+Le classement des paquets est ce que la commande apporte de plus qu'un
+`apt upgrade` suivi d'un `prepare-update` : un `linux-image` ou un `grub-efi`
+déplacent PCR 4 et sont couverts par la fenêtre ; un `fwupd` ou un
+`secureboot-db` déplacent PCR 0/7, que la fenêtre lie elle-même — elle ne
+s'ouvrira pas, et la gateway retombera sur billet et séquestre. Mieux vaut
+l'apprendre à l'invite de confirmation que depuis une gateway qui ne redémarre
+plus. Le microcode et `linux-firmware` ne sont volontairement pas signalés :
+l'initrd est mesuré en PCR 8/9, que Helios ne scelle pas.
+
+`--yes` saute la confirmation. Une fenêtre déjà armée fait refuser la commande :
+c'est le signe qu'un redémarrage précédent n'a pas eu lieu.
+
+L'armement ne passe **pas** par l'API, et c'est délibéré (ADR-007) : l'API vit
+derrière le tunnel que la fenêtre existe précisément pour préserver, et une
+fenêtre déclenchable à distance est une exposition déclenchable à distance.
+`helios-ctl` lance donc `heliosd tpm` en sous-processus sous `sudo`.
+
+### À la main
 
 ```sh
 sudo apt update && sudo apt upgrade      # ne redémarrez pas encore
