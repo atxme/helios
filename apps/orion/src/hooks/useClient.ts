@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from '../api'
+import { copyText } from '../clipboard'
 import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  ProfileDraft,
   PskKind,
   TelemetrySample,
   TunnelState,
@@ -45,6 +47,8 @@ export function useClient() {
         // it is there on screen, and that must not stay silent.
         if (imported.private_key_missing) {
           setError(imported.private_key_missing)
+        } else if (imported.incomplete) {
+          setError(`Profil à compléter : ${imported.incomplete}`)
         } else if (imported.identity_error) {
           setError(`Identité non scellée : ${imported.identity_error}`)
         } else if (imported.identity_sealed) {
@@ -109,12 +113,19 @@ export function useClient() {
     const unlistenProfilePath = api.onProfilePath(() => {
       void consumeProfilePath()
     })
+    // The notification-area menu connects to a profile, which selects it. The
+    // window may be open behind that menu, and nothing else would tell it the
+    // selection just moved under it.
+    const unlistenConfig = api.onConfigChanged(() => {
+      api.getConfig().then(setConfig).catch(() => {})
+    })
     // The first launch may have received its argv before React installs the
     // listener. The command then consumes the path kept on the Rust side.
     void unlistenProfilePath.then(() => consumeProfilePath())
     return () => {
       unlisten.then((f) => f())
       unlistenProfilePath.then((f) => f())
+      unlistenConfig.then((f) => f())
     }
   }, [consumeProfilePath, pushLog])
 
@@ -132,6 +143,33 @@ export function useClient() {
     }
   }, [])
 
+  /**
+   * Opens the terminal, and falls back to the clipboard when it cannot.
+   *
+   * The refusal is a legitimate outcome, not an incident: a machine with UAC
+   * off, the built-in Administrator account or a service context has no
+   * standard-user token, and Rust declines rather than launching an elevated
+   * shell. Copying the command is then the whole feature, so the fallback is
+   * silent about the mechanism and explicit about what to do next.
+   */
+  const openSshTerminal = useCallback(async (name?: string) => {
+    setError(null)
+    try {
+      await api.openSshTerminal(name)
+      pushLog('info', 'Terminal SSH ouvert sous votre compte standard.')
+      return
+    } catch (cause) {
+      pushLog('warn', `Terminal non ouvert — ${String(cause)}`)
+    }
+    try {
+      const command = await api.sshCommand(name)
+      await copyText(command)
+      pushLog('info', `Commande copiée : ${command} — à coller dans un terminal.`)
+    } catch (cause) {
+      setError(String(cause))
+    }
+  }, [pushLog])
+
   const disconnect = useCallback(async () => {
     try {
       await api.disconnect()
@@ -141,10 +179,10 @@ export function useClient() {
     }
   }, [])
 
-  const saveProfile = useCallback(async (p: ClientProfile) => {
+  const saveProfile = useCallback(async (draft: ProfileDraft) => {
     try {
       setError(null)
-      setConfig(await api.saveProfile(p))
+      setConfig(await api.saveProfile(draft))
     } catch (cause) {
       setError(String(cause))
       throw cause
@@ -201,6 +239,7 @@ export function useClient() {
     pathImportedProfile,
     connect,
     disconnect,
+    openSshTerminal,
     importProfile,
     saveProfile,
     removeProfile,

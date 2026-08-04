@@ -49,14 +49,37 @@ la correspondance se fait sur la clé, jamais sur le nom. À défaut, le brouill
 s’affiche quand même et le message nomme la clé attendue, celle qu’imprime
 `helios-ctl profile check`.
 
+Les profils portent l’extension **`.orion`** (`.orionprofile` jusqu’en août
+2026 : encore lue à l’import, plus écrite ni enregistrée auprès de Windows), et
+une icône de document qui leur est propre — posée par un fragment WiX, le
+gabarit de Tauri n’écrivant qu’un ProgID sans icône. Sous Windows, la zone de
+notification est une surface à part entière : état du tunnel, liste de profils
+que l’on coche pour connecter, import, journal et « À propos ». Elle vit dans
+`apps/orion/src-tauri/src/tray.rs`, dont seul le câblage est propre à Windows ;
+le modèle et les libellés se compilent et se testent partout.
+
 La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
 `helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
 `helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
 compile plus rien. L’installateur Orion se bâtit par `cargo xtask orion-msi`,
 sur Windows uniquement — WiX n’a pas d’équivalent croisé.
 
+La mise à jour de l’OS de la gateway ne perd plus l’identité scellée
+([ADR-007](docs/adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)) : `heliosd tpm
+prepare-update --reboot` porte le **même** secret à travers un redémarrage
+planifié, dans un slot NV lisible sous PCR 0/7 par le seul `TPM2_NV_Read`, puis
+écrasé après rescellement durable. Les coffres survivent donc, et aucun client n’est
+ré-enrôlé. Le billet de rescellement reste le chemin du changement de PCR
+**subi**. Trois limites explicites : pendant qu’une fenêtre est ouverte, un
+attaquant ayant l’accès physique qui démarre un autre OS signé descelle le
+secret (`TPM2_PolicyCounterTimer` n’est pas exposé par `tss-esapi` 7.7) ; une
+mise à jour de firmware ou de base Secure Boot déplace PCR 0/7 et sort du
+périmètre ; et l’identité de négociation reste **sans séquestre**, donc un
+changement de PCR subi impose encore une rotation et le ré-enrôlement du parc.
+
 Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
-lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
+lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM réel — voir
+[docs/testing/TESTING.md](docs/testing/TESTING.md).
 
 ## Invariants de sécurité
 
@@ -108,6 +131,19 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   les handshakes. **Limite connue** : ce qui ne peut pas changer sous le plan
   de données en marche — nom d’interface, port d’écoute, adresse d’API — exige
   toujours un redémarrage.
+- L’identité de négociation, elle, n’est **pas** relue : elle est lue une fois
+  au démarrage et servie jusqu’à l’arrêt. `init-key-negotiation --rotate` sous
+  un démon en marche change donc les fichiers sans changer ce qui est présenté,
+  et les profils émis après la rotation épinglent un certificat que la gateway
+  ne sert pas encore : le client refuse le handshake QUIC sur `invalid peer
+  certificate: BadSignature`, qui nomme une signature et pas l’écart derrière
+  elle. Une rotation s’applique par `systemctl restart heliosd`. Le démarrage
+  journalise l’empreinte servie et la date d’écriture du fichier : un
+  certificat plus récent que le démon est le diagnostic complet.
+- La CA opérateur vit dans `~/.helios/certs/internal-ca`, et à **un seul**
+  endroit : la gateway n’en épingle qu’une. Un script qui la cherche ailleurs
+  ne la trouve pas, en fabrique une neuve, fait tourner l’identité de la
+  gateway pour l’y installer — et coupe tous les clients déjà admis.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.
@@ -116,6 +152,18 @@ lieu — voir [docs/testing/TESTING.md](docs/testing/TESTING.md).
   seul côté fait échouer tous les handshakes, sans canal de rattrapage.
 - Billets TPM : Ed25519 **et** ML-DSA-65 obligatoires, `key_epoch` signé,
   trousseau compilé, v1 refusé. Compteur strictement croissant ; PCR facultatif.
+- Fenêtre de mise à jour (ADR-007) : elle **transporte** un verdict d'intégrité
+  à travers un redémarrage planifié, elle n'en fabrique pas. L'armement exige un
+  descellement nominal du démarrage courant — jamais depuis `Bypassed`,
+  `Resealed` ou `Provisioned`. Au démarrage, le descellement nominal PCR 0/4/7
+  passe **toujours en premier**, et son succès révoque une fenêtre restée armée.
+  Le marqueur non secret est synchronisé avant l'écriture NV ; une erreur
+  d'armement déclenche un écrasement compensatoire et le marqueur reste présent
+  tant que cet écrasement n'est pas confirmé.
+  À la consommation, le payload NV n'est écrasé qu'**après** que le blob
+  rescellé est sur disque et synchronisé : révoquer plus tôt laisserait un état
+  sans issue. Une erreur après ce point ne retombe jamais sur le billet. Le
+  scellement nominal, lui, n'est pas modifiable par ce chemin.
 - Identité de la gateway : elle naît **sur** la gateway (`heliosd
   init-identity`), scellée au TPM. `wg_private_key` en clair dans
   `network.toml` est un repli hérité, pas un chemin d’installation.
@@ -171,7 +219,11 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
   de release : les features y sont tenues en un seul endroit).
 - `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
   bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
-  profils clients (`profile`) et séquestre (`escrow`) ;
+  profils clients (`profile`) et séquestre (`escrow`). Il est aussi livré **sur
+  la gateway**, où `helios-ctl update` fait la mise à jour de l’OS en une
+  commande : listes, classement des paquets par PCR touché, `apt upgrade`,
+  armement de la fenêtre et redémarrage — qui la tue. Le résultat se lit au
+  journal du démarrage suivant, pas en retour de commande ;
   `helios-publisher` : outil du **poste éditeur**, hors gateway.
 
 ## Développement et validation
@@ -181,6 +233,7 @@ bash scripts/regression.sh
 bash scripts/campaign.sh          # campagnes PQ, mise à jour signée et bundle
 bash scripts/lab.sh --keep        # banc complet : gateway + client admis + profil
 ./scripts/deploy.sh               # construit, signe, copie et installe sur la gateway
+./scripts/provision-client.sh nom # CA, négociation, admission et profil client
 cargo test --workspace --all-features
 cargo run -p heliosd -- run --dev
 npm run dev --prefix web
@@ -194,6 +247,15 @@ types, de champs et de variables (`render`, `assign_vip`, `verify_manifest`),
 mais aussi les commentaires, les doc-comments, les messages de journal et les
 noms de tests. Seule la documentation sous `docs/` (ADR, guides, `TESTING.md`)
 reste en **français**.
+
+`scripts/provision-client.sh` enchaîne les sept gestes d'une admission — créer
+la CA opérateur, en pousser la moitié publique, initialiser la négociation de
+la gateway, admettre le pair, rapatrier ses deux certificats, enrôler hors API,
+écrire le `.orion`. Quatre copies de fichiers dans les deux sens, dont
+chacune est un endroit où coller la mauvaise valeur ; et la panne ne se voit
+qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
+sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients
+déjà admis.
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

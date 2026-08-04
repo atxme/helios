@@ -238,14 +238,23 @@ Après installation sur une machine propre :
 
 1. vérifier `signtool verify /pa /tw` sur l'exécutable et l'installateur ;
 2. vérifier la demande UAC au lancement ;
-3. importer un profil `.orionprofile` par double-clic quand Orion est arrêté ;
+3. importer un profil `.orion` par double-clic quand Orion est arrêté ;
 4. recommencer avec Orion ouvert et confirmer qu'une seule fenêtre subsiste ;
 5. pour une invitation sans clé privée, confirmer la reprise de la clé du
    profil local qui détient la **clé admise** — quel que soit son nom — et,
    si aucun profil local ne la détient, l'affichage du brouillon accompagné
    du message nommant cette clé ;
 6. connecter réellement le tunnel et contrôler handshake, routes et retrait
-   uniquement après déconnexion explicite.
+   uniquement après déconnexion explicite ;
+7. dans l'Explorateur, vérifier que les `.orion` portent l'icône de document —
+   feuille à coin plié — et non celle de l'application, en thème clair comme en
+   thème sombre, en affichage « Grandes icônes » comme en « Détails » ;
+8. fermer la fenêtre, puis conduire le tunnel depuis la zone de notification :
+   la pastille et la ligne d'état suivent l'état, cocher un profil connecte, le
+   décocher déconnecte, « Importer un profil… » ouvre le sélecteur de fichier de
+   l'écran *Profils*, et « À propos » annonce la version, le backend et le
+   chemin du journal. Enregistrer, supprimer puis renommer un profil pendant que
+   le menu existe : la liste doit suivre sans redémarrage.
 
 ### Négociation de clé PQC, de bout en bout
 
@@ -293,7 +302,7 @@ l'admission emprunte la console (`heliosd peer add`) plutôt que `POST
 
 Sur le poste Windows :
 
-1. importer le `.orionprofile` ; l'écran *Profils* doit annoncer
+1. importer le `.orion` ; l'écran *Profils* doit annoncer
    **identité protégée · scellée** ;
 2. comparer l'empreinte PQ affichée avec celle qu'a imprimée
    `heliosd init-key-negotiation` — c'est ce qui rattache le profil à cette
@@ -370,7 +379,7 @@ la décision ADR-004 de basculer le privilège réseau vers polkit.
 ### Le chemin court : un profil venu d'une vraie gateway
 
 `bash scripts/lab.sh --keep` monte une gateway de développement, admet un client
-et émet deux profils. Importer `lab-poste.json` : il porte tout ce qu'il faut et
+et émet deux profils. Importer `lab-poste.orion` : il porte tout ce qu'il faut et
 son pair est réellement admis, ce que des clés fabriquées à la main ne
 garantissent pas.
 
@@ -379,7 +388,7 @@ Vérifier ensuite, dans l'onglet **Profils** :
 - la **clé publique du client** s'affiche en lecture seule et correspond à celle
   que `helios-ctl peer list` montre côté gateway — c'est la valeur que
   l'utilisateur transmet à l'opérateur ;
-- importer `lab.invitation.json` (sans clé privée) alors qu'un profil `lab`
+- importer `lab.invitation.orion` (sans clé privée) alors qu'un profil `lab`
   existe déjà localement : la clé privée locale doit être reprise
   silencieusement, sans que l'utilisateur ait à la ressaisir ;
 - importer ce même fichier d'invitation en ayant renommé le profil local :

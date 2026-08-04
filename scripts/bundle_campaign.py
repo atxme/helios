@@ -53,17 +53,25 @@ def exiger_refus(resultat: subprocess.CompletedProcess, quoi: str, motif: str) -
         raise Echec(f"{quoi} : refus attendu sur « {motif} », obtenu :\n{sortie}")
 
 
-def assembler(racine_depot: pathlib.Path, destination: pathlib.Path) -> None:
-    """Assemble un bundle comme `cargo xtask bundle`, depuis les binaires debug.
+def assembler(
+    racine_depot: pathlib.Path,
+    destination: pathlib.Path,
+    artefacts: pathlib.Path,
+) -> None:
+    """Assemble un bundle comme `cargo xtask bundle`, depuis `artefacts`.
 
     La campagne n'utilise pas `xtask bundle` : celui-ci reconstruit tout en
     release avec les features matérielles, ce qui n'a pas de sens en dry-run.
     Ce qui est éprouvé ici, c'est la signature, la vérification et
     l'installation — pas la compilation.
+
+    Les binaires viennent de `campaign.sh`, qui en a strippé une copie : un
+    binaire de debug non stripé dépasse `MAX_BINARY_SIZE` et ne ressemble à
+    aucun artefact réellement livré.
     """
     (destination / "systemd").mkdir(parents=True)
     for binaire in BINAIRES:
-        source = racine_depot / "target" / "debug" / binaire
+        source = artefacts / binaire
         if not source.is_file():
             raise Echec(f"binaire absent : {source}")
         cible = destination / binaire
@@ -123,10 +131,12 @@ def bootstrap(installateur: pathlib.Path, bundle: pathlib.Path,
 
 
 def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
-        version: str, commit: str, target: str) -> None:
+        version: str, commit: str, target: str, artefacts: pathlib.Path) -> None:
+    # L'installateur est exécuté, pas installé : il n'entre pas dans le bundle
+    # et sa taille ne regarde donc pas `MAX_BINARY_SIZE`.
     installateur = racine_depot / "target" / "debug" / "helios-installer"
     bundle = tmp / "bundle" / f"helios-{version}-{target}"
-    assembler(racine_depot, bundle)
+    assembler(racine_depot, bundle, artefacts)
     signer(racine_depot, bundle, epoque, version, commit, target, SEQUENCE)
     print(f"  ✓ bundle assemblé et signé, séquence {SEQUENCE}")
 
@@ -257,11 +267,25 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--git-commit", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument(
+        "--artifacts",
+        required=True,
+        type=pathlib.Path,
+        help="répertoire des binaires strippés préparés par campaign.sh",
+    )
     args = parser.parse_args()
 
     racine_depot = pathlib.Path(__file__).resolve().parent.parent
     try:
-        run(racine_depot, args.tmp, args.epoch_dir, args.version, args.git_commit, args.target)
+        run(
+            racine_depot,
+            args.tmp,
+            args.epoch_dir,
+            args.version,
+            args.git_commit,
+            args.target,
+            args.artifacts,
+        )
     except Echec as echec:
         print(f"ÉCHEC : {echec}", file=sys.stderr)
         return 1

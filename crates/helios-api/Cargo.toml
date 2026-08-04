@@ -30,3 +30,5 @@ rust-embed = { version = "8", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+futures-util.workspace = true
+tokio-tungstenite = "0.24"

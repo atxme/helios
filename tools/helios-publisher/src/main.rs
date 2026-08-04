@@ -378,8 +378,18 @@ fn sign_binary_release(
     let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
     let metadata = fs::metadata(binary)
         .with_context(|| format!("reading metadata of {}", binary.display()))?;
+    // The bound is named in the message on purpose: the ordinary cause is
+    // signing an unstripped debug build, where 80 % of the bytes are debug
+    // information no shipped artifact carries. Without the figure, the reflex
+    // is to raise the bound — which protects the update path, and is the one
+    // thing that must not move.
     if metadata.len() == 0 || metadata.len() > helios_update::MAX_BINARY_SIZE {
-        bail!("binary size out of bounds: {} bytes", metadata.len());
+        bail!(
+            "binary size out of bounds: {} bytes for a maximum of {} — is this an unstripped \
+             debug build?",
+            metadata.len(),
+            helios_update::MAX_BINARY_SIZE
+        );
     }
     helios_update::verify_elf(binary, &target)
         .with_context(|| format!("ELF validation of {}", binary.display()))?;

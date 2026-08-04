@@ -63,7 +63,12 @@ impl DryRunBackend {
 #[async_trait]
 impl VpnBackend for DryRunBackend {
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()> {
-        profile.validate()?;
+        // The data-plane form: an ML-KEM profile must carry the negotiated PSK
+        // by now, or the tunnel would come up on the static key pair alone
+        // (ADR-006, ADR-005). The simulation applies the same rule as the real
+        // backend on purpose — a check the dry run skipped would be a check
+        // nobody exercises in the regression.
+        profile.validate_for_data_plane()?;
 
         // 1. The adapter mounts BEFORE any network attempt: from this instant,
         //    AllowedIPs = 0.0.0.0/0 captures traffic and WireGuard drops it as

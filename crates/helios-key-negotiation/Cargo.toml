@@ -15,7 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
+# Keep this proc-macro dependency explicit: the crate uses `#[async_trait]` in
+# its public trait boundary, and a standalone Windows check must not lose it
+# while resolving workspace-inherited dependencies.
+async-trait = "0.1"
 aws-lc-rs.workspace = true
 tracing.workspace = true
 hex.workspace = true

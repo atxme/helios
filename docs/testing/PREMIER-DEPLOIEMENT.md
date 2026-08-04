@@ -313,7 +313,7 @@ L'installateur se retire par **Paramètres → Applications**, ou en ligne de
 commande :
 
 ```powershell
-msiexec /x "chemin\vers\Orion VPN_0.1.0_x64_en-US.msi"   # variante MSI
+msiexec /x "chemin\vers\Orion_0.1.0_x64_en-US.msi"   # variante MSI
 ```
 
 Trois résidus que la désinstallation ne retire pas :

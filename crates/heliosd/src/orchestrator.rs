@@ -1127,18 +1127,22 @@ fn mtu_transport(wan_iface: &str) -> u32 {
 
 fn parse_proc_net_dev(content: &str, iface: &str) -> Option<(u64, u64, u64, u64)> {
     for line in content.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with(iface) {
+        let Some((name, rest)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        if name.trim() != iface {
             continue;
         }
-        let rest = trimmed.trim_start_matches(iface).trim_start_matches(':');
-        let fields: Vec<u64> = rest
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if fields.len() >= 10 {
-            return Some((fields[0], fields[8], fields[1], fields[9]));
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() < 10 {
+            return None;
         }
+        return Some((
+            fields[0].parse().ok()?,
+            fields[8].parse().ok()?,
+            fields[1].parse().ok()?,
+            fields[9].parse().ok()?,
+        ));
     }
     None
 }
@@ -1429,6 +1433,118 @@ mod tests {
             Some((42, 84, 3, 4))
         );
         assert_eq!(parse_proc_net_dev(proc_net_dev, "eth1"), None);
+    }
+
+    #[test]
+    fn proc_net_dev_requires_the_exact_interface_and_complete_counters() {
+        let content = "eth01: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n\
+                       eth0: 100 invalid 7 0 0 0 0 0 200 9\n\
+                       short: 1 2 3\n\
+                       malformed without colon\n";
+
+        assert_eq!(parse_proc_net_dev(content, "eth01"), Some((1, 9, 2, 10)));
+        assert_eq!(
+            parse_proc_net_dev(content, "eth0"),
+            None,
+            "a malformed counter must not shift every following column"
+        );
+        assert_eq!(parse_proc_net_dev(content, "short"), None);
+        assert_eq!(parse_proc_net_dev(content, "eth"), None);
+    }
+
+    #[test]
+    fn handshake_freshness_covers_absent_recent_stale_and_future_timestamps() {
+        let mut peer = connected_peer("192.0.2.1:51820");
+        peer.last_handshake = None;
+        assert!(!handshake_is_fresh(&peer));
+
+        peer.last_handshake = Some(std::time::SystemTime::now());
+        assert!(handshake_is_fresh(&peer));
+
+        peer.last_handshake = Some(std::time::SystemTime::now() - HANDSHAKE_STALE_AFTER);
+        assert!(!handshake_is_fresh(&peer));
+
+        peer.last_handshake = Some(std::time::SystemTime::now() + Duration::from_secs(10));
+        assert!(!handshake_is_fresh(&peer));
+    }
+
+    #[tokio::test]
+    async fn stale_peers_are_silent_until_they_disconnect_after_being_fresh() {
+        let network = Arc::new(RwLock::new(configured_network()));
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut seen = std::collections::HashMap::new();
+        let mut peer = connected_peer("192.0.2.1:51820");
+        peer.last_handshake = Some(std::time::SystemTime::now() - Duration::from_secs(300));
+
+        log_peer_transitions(&[peer.clone()], &network, &mut seen, &event_tx).await;
+        assert!(
+            events.try_recv().is_err(),
+            "never-connected peers stay silent"
+        );
+
+        peer.last_handshake = Some(std::time::SystemTime::now());
+        log_peer_transitions(&[peer.clone()], &network, &mut seen, &event_tx).await;
+        assert!(matches!(events.try_recv(), Ok(HeliosEvent::Log { .. })));
+
+        peer.last_handshake = Some(std::time::SystemTime::now() - Duration::from_secs(300));
+        log_peer_transitions(&[peer], &network, &mut seen, &event_tx).await;
+        let message = match events.try_recv() {
+            Ok(HeliosEvent::Log { message, .. }) => message,
+            other => panic!("expected disconnection log, got {other:?}"),
+        };
+        assert!(message.contains("inactive"), "message: {message}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_mtu_probe_publishes_matching_event_and_command() {
+        let state = Arc::new(RwLock::new(TunnelState::Up));
+        let (event_tx, mut events) = broadcast::channel(4);
+        let (command_tx, mut commands) = mpsc::channel(4);
+
+        spawn_mtu_probe_if_up("missing", true, &state, &event_tx, &command_tx).await;
+
+        let event = time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            HeliosEvent::MtuDiscovered {
+                mtu: 1420,
+                mss: 1380
+            }
+        ));
+        assert!(matches!(
+            commands.recv().await,
+            Some(OrchestratorCmd::SetMssClamp(1380))
+        ));
+
+        *state.write().await = TunnelState::Down;
+        spawn_mtu_probe_if_up("missing", true, &state, &event_tx, &command_tx).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn mss_discovery_rejects_missing_interfaces_and_bounds_small_mtus() {
+        assert_eq!(discover_mss("interface-that-does-not-exist").await, None);
+        assert_eq!(
+            mtu_transport("interface-that-does-not-exist"),
+            aether::mtu::MTU_TRANSPORT_DEFAUT
+        );
+        if std::path::Path::new("/sys/class/net/lo/mtu").exists() {
+            let loopback_mtu: u32 = std::fs::read_to_string("/sys/class/net/lo/mtu")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(mtu_transport("lo"), loopback_mtu);
+            let expected = u16::try_from(loopback_mtu)
+                .ok()
+                .map(|mtu| mtu.saturating_sub(100).max(576));
+            assert_eq!(discover_mss("lo").await, expected);
+        }
     }
 
     /// Network whose peer has no PSK yet: the starting state of a client

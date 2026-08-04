@@ -5,19 +5,31 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  About,
   ClientConfig,
   ClientEvent,
-  ClientProfile,
   ImportOutcome,
+  KeyNegotiationSettings,
   KeyNegotiationSupport,
+  ProfileDraft,
   ProfileIssues,
   TunnelState,
+  VaultPosture,
 } from './types'
 
 export const getState = () => invoke<TunnelState>('get_state')
 export const backendKind = () => invoke<string>('backend_kind')
 export const adapterIsUp = () => invoke<boolean>('adapter_is_up')
 export const getConfig = () => invoke<ClientConfig>('get_config')
+
+/**
+ * What the About box states.
+ *
+ * Read from Rust rather than from `package.json`: the version that matters is
+ * the one of the binary driving the adapter, and the profile extension it
+ * reports is the same constant the file association is built from.
+ */
+export const aboutOrion = () => invoke<About>('about_orion')
 
 /**
  * Imports a document and seals any identity it carries.
@@ -31,9 +43,16 @@ export const importProfile = (contents: string, fileName: string) =>
 export const importProfilePath = (path?: string) =>
   invoke<ImportOutcome | null>('import_profile_path', { path: path ?? null })
 
-/** Is this profile's identity already sealed on this machine? */
-export const keyNegotiationIdentitySealed = (profile: ClientProfile) =>
-  invoke<boolean>('key_negotiation_identity_sealed', { profile })
+/**
+ * Is this profile's identity already sealed on this machine?
+ *
+ * Takes the negotiation block alone, not the profile: the answer depends on one
+ * field, and passing the whole profile would have meant shipping its secrets
+ * across the IPC to read it.
+ */
+export const keyNegotiationIdentitySealed = (
+  keyNegotiation: KeyNegotiationSettings | null,
+) => invoke<boolean>('key_negotiation_identity_sealed', { keyNegotiation })
 
 /**
  * Reports the faulty fields of a profile being edited.
@@ -41,12 +60,8 @@ export const keyNegotiationIdentitySealed = (profile: ClientProfile) =>
  * The rules live in `orion-core`: the UI highlights what the core refuses,
  * it doesn't reimplement them.
  */
-export const validateProfile = (profile: ClientProfile) =>
-  invoke<ProfileIssues>('validate_profile', { profile })
-
-/** Public key derived from the profile: the only half to send to the operator. */
-export const profilePublicKey = (profile: ClientProfile) =>
-  invoke<string | null>('profile_public_key', { profile })
+export const validateProfile = (draft: ProfileDraft) =>
+  invoke<ProfileIssues>('validate_profile', { draft })
 
 /**
  * What this build can do with the negotiation port.
@@ -64,15 +79,76 @@ export const keyNegotiationSupport = () =>
  * Read out loud against what the gateway printed, it is what proves the
  * imported material comes from the right gateway.
  */
-export const keyNegotiationFingerprint = (profile: ClientProfile) =>
-  invoke<string | null>('key_negotiation_fingerprint', { profile })
+export const keyNegotiationFingerprint = (
+  keyNegotiation: KeyNegotiationSettings | null,
+) => invoke<string | null>('key_negotiation_fingerprint', { keyNegotiation })
 
-export const saveProfile = (profile: ClientProfile) =>
-  invoke<ClientConfig>('save_profile', { profile })
+/**
+ * Draws a WireGuard key pair in Rust and returns its **public** half.
+ *
+ * The private half never comes back — it waits in the shell until the profile
+ * is saved. The public one is returned at once because it is what the user
+ * hands the operator: admission is out of band, and it has to happen before
+ * the profile can work at all.
+ */
+export const generatePrivateKey = () => invoke<string>('generate_private_key')
+
+/**
+ * Hands an existing private key to Rust, which validates it and answers with
+ * its public half.
+ *
+ * This is the one place a secret travels **towards** the shell, at an explicit
+ * gesture. The caller must clear its input immediately afterwards: a value
+ * left in a field stays in the DOM for as long as the screen lives.
+ */
+export const adoptPrivateKey = (privateKey: string) =>
+  invoke<string>('adopt_private_key', { privateKey })
+
+/** Drops the staged key. Called when an edit is abandoned. */
+export const discardStagedKey = () => invoke<void>('discard_staged_key')
+
+/**
+ * Hands a static PSK to Rust, which validates it and holds it until the save.
+ *
+ * Same one-way rule as {@link adoptPrivateKey}, and nothing comes back: a PSK
+ * has no public half to show. The caller clears its input immediately.
+ */
+export const adoptPresharedKey = (presharedKey: string) =>
+  invoke<void>('adopt_preshared_key', { presharedKey })
+
+/** Drops the staged PSK. Called when an edit is abandoned. */
+export const discardStagedPsk = () => invoke<void>('discard_staged_psk')
+
+export const saveProfile = (draft: ProfileDraft) =>
+  invoke<ClientConfig>('save_profile', { draft })
 export const deleteProfile = (name: string) =>
   invoke<ClientConfig>('delete_profile', { name })
 export const selectProfile = (name: string) =>
   invoke<ClientConfig>('select_profile', { name })
+
+/**
+ * The SSH command line for the gateway, to paste into your own terminal.
+ *
+ * Orion does **not** run it, and must not: it runs elevated to load the
+ * WireGuard driver, so any terminal it spawned would be an Administrator
+ * terminal — an escalation one click away from the UI. Rust still owns the
+ * gates: the tunnel must be up, and the destination is re-validated before it
+ * reaches a clipboard.
+ */
+export const sshCommand = (name?: string) =>
+  invoke<string>('ssh_command', { name: name ?? null })
+
+/**
+ * Opens a terminal connected to the gateway, **below** Orion's privileges.
+ *
+ * Orion runs elevated to load the WireGuard driver, so the child is built from
+ * the standard-user token Windows keeps linked to the elevated one. Rust
+ * refuses to launch anything until Windows confirms that token is not
+ * elevated — on a machine with no such token the call fails, and the caller
+ * falls back to {@link sshCommand}.
+ */
+export const openSshTerminal = (name?: string) =>
+  invoke<void>('open_ssh_terminal', { name: name ?? null })
 
 export const connect = (name?: string) => invoke<void>('connect', { name: name ?? null })
 export const disconnect = () => invoke<void>('disconnect')
@@ -103,3 +179,43 @@ export function onEvent(cb: (ev: ClientEvent) => void): Promise<UnlistenFn> {
 export function onProfilePath(cb: () => void): Promise<UnlistenFn> {
   return listen('helios://profile-path', cb)
 }
+
+/**
+ * What the notification-area menu asks the window to show.
+ *
+ * `import` and `about` are not views: the first opens the profile screen *and*
+ * its file picker, the second a dialog over whatever is displayed. They travel
+ * on the same channel all the same — the menu names an intent, the window
+ * decides what that means.
+ */
+export type TrayView = 'connect' | 'profiles' | 'logs' | 'import' | 'about'
+
+const TRAY_VIEWS: TrayView[] = ['connect', 'profiles', 'logs', 'import', 'about']
+
+/** A tray action selected while the main window was hidden. */
+export function onTrayView(cb: (view: TrayView) => void): Promise<UnlistenFn> {
+  return listen<string>('helios://tray-view', (event) => {
+    const view = TRAY_VIEWS.find((known) => known === event.payload)
+    if (view) cb(view)
+  })
+}
+
+/**
+ * The Rust side changed the profile list or the selection.
+ *
+ * Emitted when the tray connects to a profile: that click selects it, and the
+ * window — which may have been open behind the menu — has no other way to learn
+ * that the selection moved under it.
+ */
+export function onConfigChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen('helios://config-changed', cb)
+}
+
+/**
+ * Reads the vault's posture.
+ *
+ * Asked on every panel opening rather than cached: BitLocker can be suspended
+ * and the memory-lock privilege can change while Orion runs, so a value read
+ * once at startup would eventually claim a protection that has since gone.
+ */
+export const vaultPosture = () => invoke<VaultPosture>('vault_posture')

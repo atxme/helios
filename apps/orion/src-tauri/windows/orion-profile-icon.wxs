@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Icon of `.orion` documents.
+
+  # Why this fragment exists
+
+  Tauri does declare the association (`bundle.fileAssociations`), but its WiX
+  template writes an *advertised* ProgID with no icon: Windows then falls back
+  to the executable's own, and a profile is shown to the user with the icon of
+  the application that opens it. Nothing in Tauri's configuration distinguishes
+  the two — `FileAssociation` has no icon field. A WiX fragment is the only
+  hook that avoids vendoring the whole of `main.wxs`, whose drift against the
+  CLI version would cost far more than these twenty lines.
+
+  # What it writes
+
+  Two values under the ProgID the template creates, `Orion.orion` — hence the
+  coupling: `productName` and the declared extension form that identifier, and
+  the `windows_bundle_gives_orion_profiles_their_own_icon` test fails if either
+  changes without this key following.
+
+  The icon ships as a resource (`tauri.windows.conf.json`), and is therefore
+  installed next to `orion.exe`. Declaring it as a file of this fragment would
+  instead look for it from candle's working directory, which is the WiX build
+  directory and not the project's.
+
+  # Limite connue
+
+  MSI only. The NSIS package (`cargo xtask orion-msi --with-nsis`) writes its
+  own association, executable icon included; the MSI is the shipped format.
+-->
+
+<?if $(sys.BUILDARCH)="x86"?>
+    <?define Win64 = "no" ?>
+<?else?>
+    <?define Win64 = "yes" ?>
+<?endif?>
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <DirectoryRef Id="INSTALLDIR">
+            <Component Id="OrionProfileIcon" Guid="6175B0FC-02FE-426C-9303-085D7C76784B" Win64="$(var.Win64)">
+                <RegistryKey Root="HKLM" Key="Software\Classes\Orion.orion">
+                    <!-- Explorer's «Type» column. The advertised ProgID's
+                         description already fills it; this one wins, and stays
+                         readable while the advertisement is unresolved. -->
+                    <RegistryValue Type="string" Name="FriendlyTypeName" Value="Profil de connexion Orion" KeyPath="yes" />
+                    <RegistryKey Key="DefaultIcon">
+                        <RegistryValue Type="string" Value="&quot;[INSTALLDIR]orion-profile.ico&quot;,0" />
+                    </RegistryKey>
+                </RegistryKey>
+            </Component>
+        </DirectoryRef>
+    </Fragment>
+</Wix>

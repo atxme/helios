@@ -493,7 +493,7 @@ flowchart TD
     Keys["Résout ou génère la paire WireGuard client"]
     Certs["Émet certificats client<br/>TLS + ML-DSA-65"]
     Admit["Admet la clé avec<br/>empreintes TLS/PQ + plancher"]
-    Doc["Écrit un .orionprofile en 0600<br/>profil public + identité secrète"]
+    Doc["Écrit un .orion en 0600<br/>profil public + identité secrète"]
     Import["Orion vérifie, scelle par DPAPI,<br/>puis persiste seulement le profil"]
 
     Start --> Online

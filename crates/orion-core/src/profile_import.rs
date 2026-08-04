@@ -49,14 +49,25 @@ struct JsonHeader {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JsonProfile {
+    /// The one required field: it is the key the profile is stored under.
     name: String,
+    /// `default`, like everything below it.
+    ///
+    /// An operator hands out what they know, and a document is allowed to be
+    /// partial. Refusing to **parse** one returned the user to a file picker
+    /// with a sentence, when the useful outcome is a form with one field left
+    /// to fill. [`complete_profile_import`] names what is missing, and
+    /// [`ClientProfile::validate`] is what refuses a tunnel — parsing only
+    /// decides whether the document is intelligible.
+    #[serde(default)]
     endpoint: String,
     /// Absent in an invitation profile: the operator doesn't hold the
     /// client's private key and therefore has nothing to send back
     /// (ADR-004 §6). [`complete_profile_import`] then takes it from the local
-    /// profile holding the admitted key.
+    /// profile holding the admitted key, or from a key just generated.
     #[serde(default)]
     private_key: String,
+    #[serde(default)]
     peer_public_key: String,
     #[serde(default)]
     preshared_key: Option<String>,
@@ -68,6 +79,8 @@ struct JsonProfile {
     persistent_keepalive: Option<u16>,
     #[serde(default)]
     heliosd_url: Option<String>,
+    #[serde(default)]
+    ssh_target: Option<String>,
     /// Public key-negotiation material distributed with the profile.
     ///
     /// The client's own certificate and private key never travel here: they
@@ -133,6 +146,7 @@ impl From<JsonProfile> for ClientProfile {
                 .persistent_keepalive
                 .unwrap_or(DEFAULT_KEEPALIVE_SECS),
             heliosd_url: profile.heliosd_url,
+            ssh_target: profile.ssh_target,
             key_negotiation: profile.key_negotiation.map(KeyNegotiationSettings::from),
             // A document is a configuration: any PSK it carries was shared
             // out of band, never negotiated.
@@ -190,17 +204,30 @@ pub struct CompletedImport {
     /// The profile is then handed over with an empty `private_key`, and
     /// stays unconnectable until it is filled in.
     pub private_key_missing: Option<String>,
+    /// Why the document is not yet connectable, when something **other** than
+    /// the private key is missing.
+    ///
+    /// Same reasoning as the field above, generalised: an operator sends what
+    /// they know, and a document without an endpoint or without a pinned
+    /// gateway key is still worth showing. Refusing to import it returned the
+    /// user to a file picker with a sentence, instead of to a form with one
+    /// field left to fill.
+    pub incomplete: Option<String>,
 }
 
 /// Suffixes of an Orion document.
 ///
-/// `.orionprofile` is **ours**: it is what `helios-ctl enroll` writes and what
-/// Windows associates with Orion. Leaving it out made its recognition rest
-/// entirely on the first character, so the slightest disturbance at the head
-/// of the file — a byte-order mark from a copy through PowerShell, a stray
-/// blank line — produced «format inconnu» about the very extension the tool
-/// distributes.
-const ORION_SUFFIXES: &[&str] = &[".orionprofile", ".json"];
+/// `.orion` is **ours**: it is what `helios-ctl enroll` writes and what Windows
+/// associates with Orion. Leaving it out made its recognition rest entirely on
+/// the first character, so the slightest disturbance at the head of the file —
+/// a byte-order mark from a copy through PowerShell, a stray blank line —
+/// produced «format inconnu» about the very extension the tool distributes.
+///
+/// `.orionprofile` is the suffix distributed until August 2026. Nothing writes
+/// it anymore; it stays readable because a document on an operator's disk
+/// outlives the client that reads it, and refusing what Orion itself wrote last
+/// month would send the user back through an enrolment for a rename.
+const ORION_SUFFIXES: &[&str] = &[".orion", ".orionprofile", ".json"];
 
 /// Decodes an imported profile without writing it to disk.
 ///
@@ -361,10 +388,11 @@ pub fn complete_profile_import(
     admitted_public_key: Option<&str>,
 ) -> Result<CompletedImport> {
     if !profile.private_key.is_empty() {
-        profile.validate()?;
+        let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
             private_key_missing: None,
+            incomplete,
         });
     }
 
@@ -382,27 +410,66 @@ pub fn complete_profile_import(
     };
 
     let Some(existing) = local else {
+        // The message names the gesture, not just the gap. It used to end on
+        // "coller la clé privée correspondante" with nothing saying where —
+        // the field is « Importer une clé privée », in the identity block of
+        // this very screen.
         let missing = match admitted_public_key {
             Some(admitted) => format!(
-                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil de ce poste ne détient la clé admise « {admitted} ». Coller la clé privée correspondante, ou demander un profil complet à l'opérateur."
+                "ce document est une invitation : il ne porte pas de clé privée, et aucune clé de ce poste ne correspond à la clé admise « {admitted} ». \
+                 Utiliser « Importer une clé privée » si vous détenez la moitié privée de cette clé, ou demander un profil complet à l'opérateur."
             ),
             None => format!(
-                "ce document est une invitation : il ne contient pas de clé privée, et aucun profil local « {} » n'en fournit une. Coller la clé privée correspondante, ou demander un profil complet à l'opérateur.",
+                "ce document est une invitation : il ne porte pas de clé privée, et aucun profil local « {} » n'en fournit une. \
+                 Utiliser « Importer une clé privée », ou demander un profil complet à l'opérateur.",
                 profile.name
             ),
         };
+        let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
             private_key_missing: Some(missing),
+            incomplete,
         });
     };
 
     profile.private_key = existing.private_key.clone();
-    profile.validate()?;
+    let incomplete = advisory(&profile);
     Ok(CompletedImport {
         profile,
         private_key_missing: None,
+        incomplete,
     })
+}
+
+/// What still stands between this profile and a tunnel, if anything.
+///
+/// The rules [`ClientProfile::validate`] enforces, **reported** instead of
+/// raised. A document is imported for the user to look at and finish; the
+/// refusal belongs at the moment they press Connect, not at the moment they
+/// open a file.
+///
+/// The virtual address is checked here and not in `validate`, because the two
+/// answer different questions. `validate` asks whether the *core* may mount
+/// this profile, and the dry-run backend mounts perfectly well without a VIP;
+/// this asks whether the **document** is finished, and a real tunnel needs one.
+/// Folding it into `validate` would refuse simulations that have every right
+/// to run.
+fn advisory(profile: &ClientProfile) -> Option<String> {
+    if let Err(error) = profile.validate() {
+        return Some(format!("{error:#}"));
+    }
+    if profile
+        .address
+        .as_deref()
+        .is_none_or(|address| address.trim().is_empty())
+    {
+        return Some(
+            "l'adresse virtuelle est absente : elle est attribuée par la gateway à l'admission"
+                .into(),
+        );
+    }
+    None
 }
 
 fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBundle>)> {
@@ -533,6 +600,7 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
             .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),
         persistent_keepalive: keepalive,
         heliosd_url: None,
+        ssh_target: None,
         key_negotiation: None,
         preshared_key_is_negotiated: false,
     })
@@ -594,6 +662,7 @@ pub struct ProfileIssues {
     pub allowed_ips: Option<String>,
     pub persistent_keepalive: Option<String>,
     pub heliosd_url: Option<String>,
+    pub ssh_target: Option<String>,
     /// Fault of the key-negotiation block as a whole.
     ///
     /// Deliberately a single message rather than one per sub-field: what
@@ -652,12 +721,16 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
             when_filled(value, |value| validate_cidr(value, "adresse virtuelle"))
         }),
         allowed_ips: when_filled(&profile.allowed_ips, |value| {
-            validate_cidr(value, "trafic capté")
+            validate_cidr_list(value, "trafic capté")
         }),
         // Zero is not "empty": it's a value, and it disables keepalive while
         // a client behind NAT depends on it.
         persistent_keepalive: (profile.persistent_keepalive == 0)
             .then(|| "le keepalive doit être supérieur à zéro".to_string()),
+        ssh_target: profile
+            .ssh_target
+            .as_deref()
+            .and_then(|value| when_filled(value, validate_ssh_target)),
         heliosd_url: profile
             .heliosd_url
             .as_deref()
@@ -678,40 +751,55 @@ fn validate_imported_profile(mut profile: ClientProfile) -> Result<ClientProfile
     profile.endpoint = profile.endpoint.trim().to_string();
     profile.private_key = profile.private_key.trim().to_string();
     profile.peer_public_key = profile.peer_public_key.trim().to_string();
-    profile.allowed_ips = profile.allowed_ips.trim().to_string();
+    // Normalized rather than merely trimmed: a `wg-quick` file writes
+    // `a/n,b/m` and the screen writes `a/n, b/m`. Same list, two spellings,
+    // and a profile that came back from disk spelled differently from how it
+    // was saved would show "unsaved changes" on every load.
+    profile.allowed_ips = normalize_cidr_list(&profile.allowed_ips);
     profile.preshared_key = non_empty(profile.preshared_key);
     profile.address = non_empty(profile.address);
     profile.heliosd_url = non_empty(profile.heliosd_url);
+    profile.ssh_target = non_empty(profile.ssh_target);
 
     if profile.name.is_empty() {
         anyhow::bail!("le nom du profil est requis");
     }
-    validate_endpoint(&profile.endpoint)?;
+    // Absent fields are tolerated; **malformed** ones are not. The distinction
+    // is the whole rule here: a document that leaves a field out is a partial
+    // document the user finishes on screen, whereas a truncated key or an
+    // endpoint typed as a URL is an error that would otherwise surface much
+    // later, as a tunnel that never mounts.
+    if !profile.endpoint.is_empty() {
+        validate_endpoint(&profile.endpoint)?;
+    }
     // An invitation profile arrives without a private key: the operator
     // never held the client's, which is precisely what makes this mode safe.
-    // The document is still rejected if the key is present but malformed —
-    // a truncated key isn't an invitation, it's an error.
     if !profile.private_key.is_empty() {
         validate_wg_key(&profile.private_key, "clé privée du client")?;
     }
-    validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
+    if !profile.peer_public_key.is_empty() {
+        validate_wg_key(&profile.peer_public_key, "clé publique de la gateway")?;
+    }
     if let Some(psk) = &profile.preshared_key {
         validate_wg_key(psk, "PresharedKey")?;
     }
     if profile.allowed_ips.is_empty() {
         anyhow::bail!("AllowedIPs ne peut pas être vide");
     }
-    let address = profile
-        .address
-        .as_deref()
-        .context("l'adresse virtuelle du client est requise")?;
-    validate_cidr(address, "adresse virtuelle")?;
-    validate_cidr(&profile.allowed_ips, "AllowedIPs")?;
+    // Absent is tolerated, malformed is not — the VIP is assigned by the
+    // gateway at admission, so an invitation legitimately arrives without one.
+    if let Some(address) = profile.address.as_deref() {
+        validate_cidr(address, "adresse virtuelle")?;
+    }
+    validate_cidr_list(&profile.allowed_ips, "AllowedIPs")?;
     if profile.persistent_keepalive == 0 {
         anyhow::bail!("PersistentKeepalive doit être supérieur à zéro");
     }
     if let Some(url) = &profile.heliosd_url {
         validate_heliosd_url(url)?;
+    }
+    if let Some(target) = &profile.ssh_target {
+        validate_ssh_target(target)?;
     }
     // Taken out of the profile: the block is validated against the peer key
     // and the PSK of the very profile that carries it.
@@ -840,10 +928,156 @@ fn validate_endpoint_host(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_cidr(value: &str, label: &str) -> Result<()> {
-    if value.contains(',') {
-        anyhow::bail!("{label} invalide : Orion accepte un seul préfixe par profil");
+/// Splits a comma-separated prefix list into its trimmed, non-empty entries.
+///
+/// One place, because four call sites read this field — validation, import,
+/// the screen and the backend that builds the peer — and a list they parsed
+/// differently would let the UI approve a route WireGuard never installs.
+pub fn split_cidr_list(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Validates a list of prefixes: `AllowedIPs` is one, an address is not.
+///
+/// # Why several
+///
+/// `AllowedIPs` is WireGuard's cryptographic routing table, and a split
+/// tunnel usually needs more than one entry — the VPN network *and* the
+/// remote LAN, say, which have no common supernet short of `0.0.0.0/0`.
+/// Accepting a single prefix forced the choice between them, or the whole
+/// Internet. A `wg-quick` file, where a comma-separated list is the ordinary
+/// form, was refused for the same reason.
+///
+/// Each entry is validated on its own and named in the message: "the third is
+/// wrong" is what turns a rejected list into a fixed one.
+/// Validates an SSH destination: `user@host`, `host`, optionally `:port`.
+///
+/// # An allow-list, and why it has to be one
+///
+/// This value ends up as an **argument of a spawned process**. Every other
+/// field of a profile is data the client interprets itself; this one crosses
+/// into the operating system. A profile document arrives from outside — an
+/// operator's file, an email attachment, a double-clicked download — so the
+/// question is not whether the string looks reasonable but whether anything
+/// it could contain can mean something to a shell.
+///
+/// Hence an allow-list of characters rather than a deny-list of dangerous
+/// ones: letters, digits, `.`, `-`, `_`, one optional `@`, one optional `:`
+/// followed by digits. No space, no quote, no `;`, `&`, `|`, `$`, backtick,
+/// newline, and no leading `-` that an argument parser would read as a flag.
+/// A deny-list is a promise to have thought of every metacharacter of every
+/// shell the launcher might one day use; this is a promise about what is
+/// allowed, which stays true when the launcher changes.
+pub fn validate_ssh_target(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("destination SSH vide");
     }
+    if value.len() > 255 {
+        anyhow::bail!("destination SSH trop longue");
+    }
+    let (user_host, port) = match value.rsplit_once(':') {
+        Some((rest, port)) => (rest, Some(port)),
+        None => (value, None),
+    };
+    if let Some(port) = port {
+        let port: u16 = port
+            .parse()
+            .context("destination SSH invalide : port non numérique")?;
+        if port == 0 {
+            anyhow::bail!("destination SSH invalide : port nul");
+        }
+    }
+    let host = match user_host.split_once('@') {
+        Some((user, host)) => {
+            if user.is_empty() {
+                anyhow::bail!("destination SSH invalide : nom d'utilisateur vide");
+            }
+            if !user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            {
+                anyhow::bail!(
+                    "destination SSH invalide : le nom d'utilisateur n'accepte que lettres, \
+                     chiffres, point, tiret et souligné"
+                );
+            }
+            host
+        }
+        None => user_host,
+    };
+    if host.is_empty() {
+        anyhow::bail!("destination SSH invalide : hôte vide");
+    }
+    if host.contains('@') {
+        anyhow::bail!("destination SSH invalide : un seul « @ » est attendu");
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        anyhow::bail!(
+            "destination SSH invalide : l'hôte n'accepte que lettres, chiffres, point, \
+             tiret et souligné — ni espace ni caractère de shell"
+        );
+    }
+    // A leading dash would be read as an option by `ssh` itself, whatever the
+    // launcher does with quoting.
+    if value.starts_with('-') || host.starts_with('-') {
+        anyhow::bail!("destination SSH invalide : elle ne peut pas commencer par « - »");
+    }
+    Ok(())
+}
+
+/// Public entry point for tooling that emits a profile document.
+///
+/// `helios-ctl` validates the operator's `--allowed-ips` **before** admitting
+/// a peer, so a mistyped prefix is a refusal rather than an admission with no
+/// usable profile behind it.
+pub fn validate_allowed_ips(value: &str) -> Result<()> {
+    validate_cidr_list(value, "trafic capté")
+}
+
+fn validate_cidr_list(value: &str, label: &str) -> Result<()> {
+    let entries = split_cidr_list(value);
+    if entries.is_empty() {
+        anyhow::bail!("{label} invalide : au moins un préfixe est requis");
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        validate_cidr(entry, label).with_context(|| {
+            if entries.len() > 1 {
+                format!("{label} : préfixe {} sur {}", index + 1, entries.len())
+            } else {
+                label.to_string()
+            }
+        })?;
+    }
+    // Duplicates are refused rather than silently collapsed. WireGuard would
+    // take the list as it comes, so a prefix written twice is not an ambiguity
+    // to arbitrate — it is a list the user has lost track of, and the second
+    // occurrence is usually a typo for something else.
+    for (index, entry) in entries.iter().enumerate() {
+        if entries[..index].contains(entry) {
+            anyhow::bail!("{label} invalide : le préfixe {entry} apparaît deux fois");
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites a prefix list in one canonical form: `a/n, b/m`.
+///
+/// The screen, the stored profile and the peer built from it must agree
+/// character for character — otherwise a profile saved as `a/n,b/m` and
+/// redisplayed as `a/n, b/m` reads as an unsaved change on every load.
+pub fn normalize_cidr_list(value: &str) -> String {
+    split_cidr_list(value).join(", ")
+}
+
+fn validate_cidr(value: &str, label: &str) -> Result<()> {
     let Some((address, prefix)) = value.split_once('/') else {
         anyhow::bail!("{label} invalide : notation CIDR attendue");
     };
@@ -881,7 +1115,7 @@ mod tests {
     /// Temporary directory of the calling test.
     ///
     /// Named after the process **and** the thread: the suite runs in
-    /// parallel, and two tests writing `portable.orionprofile` in one shared
+    /// parallel, and two tests writing `portable.orion` in one shared
     /// directory would delete each other's file.
     fn temp_directory(prefix: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -990,6 +1224,139 @@ mod tests {
         assert_eq!(issues.private_key, None);
         assert_eq!(issues.peer_public_key, None);
         assert_eq!(issues.address, None);
+    }
+
+    /// `AllowedIPs` is a list, and a split tunnel is why.
+    ///
+    /// One prefix used to be the limit, so reaching both the VPN network and
+    /// a remote LAN — which share no supernet short of `0.0.0.0/0` — meant
+    /// choosing one or routing the whole Internet.
+    #[test]
+    fn allowed_ips_accepts_several_prefixes_and_names_the_faulty_one() {
+        let several = ClientProfile {
+            allowed_ips: "100.64.0.0/10, 192.168.1.0/24, fd00::/8".into(),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&several).allowed_ips, None);
+        assert!(validate_imported_profile(several).is_ok());
+
+        // Spelling is normalized on the way in: the screen writes one form,
+        // a `wg-quick` file another, and a profile reloaded in a spelling it
+        // was not saved in reads as modified.
+        let unspaced = ClientProfile {
+            allowed_ips: "100.64.0.0/10,192.168.1.0/24".into(),
+            ..complete_profile()
+        };
+        assert_eq!(
+            validate_imported_profile(unspaced)
+                .expect("import")
+                .allowed_ips,
+            "100.64.0.0/10, 192.168.1.0/24"
+        );
+
+        // A faulty entry names its position: "the second is wrong" is what
+        // turns a rejected list into a fixed one.
+        let faulty = ClientProfile {
+            allowed_ips: "100.64.0.0/10, 192.168.1.0/33".into(),
+            ..complete_profile()
+        };
+        let reported = inspect_profile(&faulty)
+            .allowed_ips
+            .expect("the faulty prefix is reported");
+        assert!(reported.contains("préfixe 2 sur 2"), "{reported}");
+
+        // A prefix written twice is a list its author has lost track of.
+        let duplicated = ClientProfile {
+            allowed_ips: "10.0.0.0/8, 10.0.0.0/8".into(),
+            ..complete_profile()
+        };
+        assert!(inspect_profile(&duplicated).allowed_ips.is_some());
+
+        // And an empty list still cannot mount a tunnel that captures nothing.
+        let empty = ClientProfile {
+            allowed_ips: " , ".into(),
+            ..complete_profile()
+        };
+        assert!(validate_imported_profile(empty).is_err());
+    }
+
+    /// The allow-list holds against everything a shell could read as syntax.
+    ///
+    /// This field becomes an argument of a spawned process, so the test is
+    /// written as a refusal list rather than an acceptance one: what matters
+    /// is not that `user@host` works, it is that nothing else does.
+    #[test]
+    fn an_ssh_target_refuses_everything_a_shell_could_read() {
+        for accepted in [
+            "christophe@100.64.0.1",
+            "100.64.0.1",
+            "gateway.example.net",
+            "root@gw-01.internal:2222",
+            "a_b.c-d@host_1.example",
+        ] {
+            assert!(
+                validate_ssh_target(accepted).is_ok(),
+                "`{accepted}` should be accepted"
+            );
+        }
+
+        for refused in [
+            "",
+            "   ",
+            // Command substitution and chaining, in every spelling.
+            "user@host; rm -rf /",
+            "user@host && calc.exe",
+            "user@host | more",
+            "user@$(whoami)",
+            "user@`hostname`",
+            "user@host\nsecond",
+            // Quoting and expansion.
+            "user@host'",
+            "user@\"host\"",
+            "user@${env:PATH}",
+            // Argument injection into `ssh` itself: `-o` would set options,
+            // and no amount of quoting by the launcher would stop it.
+            "-oProxyCommand=calc",
+            "-lroot",
+            // Shape faults.
+            "user@@host",
+            "@host",
+            "user@",
+            "user@host:0",
+            "user@host:notaport",
+            "user @host",
+        ] {
+            assert!(
+                validate_ssh_target(refused).is_err(),
+                "`{refused}` should be refused"
+            );
+        }
+    }
+
+    /// A document carrying a hostile destination is refused as a whole.
+    ///
+    /// The launcher is not the only gate, and must not be the first: a
+    /// profile that would never be safe to launch has no business being
+    /// stored, displayed as valid, or handed to another machine.
+    #[test]
+    fn a_document_with_a_hostile_ssh_target_does_not_import() {
+        let hostile = ClientProfile {
+            ssh_target: Some("user@host; calc.exe".into()),
+            ..complete_profile()
+        };
+        assert!(inspect_profile(&hostile).ssh_target.is_some());
+        assert!(validate_imported_profile(hostile).is_err());
+
+        let sound = ClientProfile {
+            ssh_target: Some("  christophe@100.64.0.1  ".into()),
+            ..complete_profile()
+        };
+        assert_eq!(inspect_profile(&sound).ssh_target, None);
+        assert_eq!(
+            validate_imported_profile(sound).expect("import").ssh_target,
+            Some("christophe@100.64.0.1".into()),
+            "trimmed on the way in, so the launcher never sees padding"
+        );
     }
 
     /// The point of inspection versus import: it doesn't stop at the first
@@ -1211,6 +1578,138 @@ mod tests {
         assert!(configured.validate().is_err());
     }
 
+    /// An ML-KEM profile must never reach the data plane without its PSK.
+    ///
+    /// `validate()` accepts that shape on purpose — it is the profile's state
+    /// at rest, before any negotiation. What must not accept it is `up()`:
+    /// mounting there would bring WireGuard up on the static key pair alone.
+    /// The handshake would succeed, the state would go `Up`, and the
+    /// post-quantum protection the profile announces would simply be absent,
+    /// with nothing on screen saying so.
+    #[test]
+    fn an_ml_kem_profile_without_its_negotiated_psk_never_reaches_the_data_plane() {
+        let at_rest = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            at_rest.validate().is_ok(),
+            "au repos, un profil ML-KEM n'a légitimement pas encore de PSK"
+        );
+
+        let refused = at_rest
+            .validate_for_data_plane()
+            .expect_err("le plan de données doit refuser un mode ML-KEM sans PSK négocié");
+        assert!(
+            refused.to_string().contains("sans PSK négocié"),
+            "message obtenu : {refused}"
+        );
+
+        // A static PSK is not a substitute: it is the operator's out-of-band
+        // value, and its presence would mean the negotiation never happened.
+        let smuggled = ClientProfile {
+            preshared_key: Some("cHNrLXN0YXRpcXVl".into()),
+            preshared_key_is_negotiated: false,
+            ..ClientProfile {
+                key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+                ..complete_profile()
+            }
+        };
+        assert!(
+            smuggled.validate_for_data_plane().is_err(),
+            "un PSK statique ne peut pas tenir lieu de PSK négocié"
+        );
+
+        // And what the negotiation actually hands to `up()` passes.
+        let negotiated = ClientProfile {
+            preshared_key: Some("cHNrLW5lZ29jaWU=".into()),
+            preshared_key_is_negotiated: true,
+            key_negotiation: Some(gateway_settings(ProtectionMode::MlKem)),
+            ..complete_profile()
+        };
+        assert!(
+            negotiated.validate_for_data_plane().is_ok(),
+            "le profil éphémère issu de la négociation doit être montable : {:?}",
+            negotiated.validate_for_data_plane().unwrap_err()
+        );
+    }
+
+    /// The other two modes keep their existing contract unchanged.
+    #[test]
+    fn the_data_plane_rule_only_constrains_ml_kem() {
+        let classic = ClientProfile {
+            key_negotiation: Some(gateway_settings(ProtectionMode::Classic)),
+            ..complete_profile()
+        };
+        assert!(classic.validate_for_data_plane().is_ok());
+
+        let static_psk = ClientProfile {
+            preshared_key: Some("cHNrLXN0YXRpcXVl".into()),
+            key_negotiation: Some(gateway_settings(ProtectionMode::StaticPsk)),
+            ..complete_profile()
+        };
+        assert!(static_psk.validate_for_data_plane().is_ok());
+
+        // A profile with no negotiation block at all is untouched by the rule.
+        assert!(complete_profile().validate_for_data_plane().is_ok());
+    }
+
+    /// A document may leave fields out; it is loaded, not refused.
+    ///
+    /// The operator sends what they know. Refusing to *parse* an invitation
+    /// with no endpoint returned the user to a file picker with a sentence,
+    /// instead of to a form with one field left to fill. `validate` is what
+    /// decides whether a tunnel may mount — parsing only decides whether the
+    /// document is intelligible.
+    #[test]
+    fn a_partial_document_is_loaded_and_its_gap_named() {
+        let document = serde_json::json!({
+            "format": "orion-profile",
+            "version": 1,
+            "profile": { "name": "poste" },
+        })
+        .to_string();
+
+        let imported = parse_profile_import(&document, "poste.orion")
+            .expect("un document partiel doit se lire");
+        assert_eq!(imported.profile.name, "poste");
+        // The defaults are applied rather than left empty.
+        assert_eq!(imported.profile.allowed_ips, DEFAULT_ALLOWED_IPS);
+        assert_eq!(
+            imported.profile.persistent_keepalive,
+            DEFAULT_KEEPALIVE_SECS
+        );
+
+        let completed = complete_profile_import(imported.profile, &ClientConfig::default(), None)
+            .expect("l'import ne refuse pas un document incomplet");
+        assert!(
+            completed.private_key_missing.is_some(),
+            "l'absence de clé privée doit être nommée"
+        );
+        assert!(
+            completed.incomplete.is_some(),
+            "ce qui reste à compléter doit être nommé, pas tu"
+        );
+    }
+
+    /// A complete document reports nothing to fill in.
+    #[test]
+    fn a_complete_document_reports_no_gap() {
+        let pair = aether::wg::generate_keypair().expect("keypair");
+        let profile = ClientProfile {
+            private_key: pair.private_key.expose().to_string(),
+            ..complete_profile()
+        };
+        let completed =
+            complete_profile_import(profile, &ClientConfig::default(), None).expect("import");
+        assert!(completed.private_key_missing.is_none());
+        assert!(
+            completed.incomplete.is_none(),
+            "obtenu : {:?}",
+            completed.incomplete
+        );
+    }
+
     fn identity_bundle(name: &str) -> serde_json::Value {
         use base64::engine::general_purpose::STANDARD;
 
@@ -1307,8 +1806,7 @@ mod tests {
         ));
         document["profile"]["key_negotiation_identity"] = bundle;
 
-        let imported =
-            parse_profile_import(&document.to_string(), "portable.orionprofile").unwrap();
+        let imported = parse_profile_import(&document.to_string(), "portable.orion").unwrap();
         assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
 
         let mut config = ClientConfig::default();
@@ -1596,16 +2094,37 @@ mod tests {
             .contains("pas une URL"));
     }
 
+    /// Absent is tolerated; **malformed** is refused.
+    ///
+    /// The document used to be rejected for a missing virtual address, which
+    /// an invitation legitimately lacks — the VIP is assigned by the gateway
+    /// at admission. What must still be refused is an address that is present
+    /// and wrong: absent, the user fills it in; wrong, it produces a tunnel
+    /// that never routes and nothing says why.
     #[test]
-    fn refuses_an_incomplete_or_unroutable_profile() {
+    fn an_absent_address_is_tolerated_but_a_malformed_one_is_not() {
         let no_address = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
         );
-        assert!(parse_profile_import(&no_address, "no-address.conf")
-            .unwrap_err()
-            .to_string()
-            .contains("adresse virtuelle"));
+        let imported = parse_profile_import(&no_address, "no-address.conf")
+            .expect("une invitation sans VIP doit se charger");
+        assert_eq!(imported.profile.address, None);
+        // …and the gap is named rather than passed over in silence.
+        let completed =
+            complete_profile_import(imported.profile, &ClientConfig::default(), None).unwrap();
+        assert!(completed
+            .incomplete
+            .expect("le manque doit être nommé")
+            .contains("adresse"));
 
+        let bad_address = format!(
+            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=pas-un-cidr\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+        );
+        assert!(parse_profile_import(&bad_address, "bad-address.conf").is_err());
+    }
+
+    #[test]
+    fn refuses_an_unroutable_profile() {
         let no_keepalive = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nPersistentKeepalive=0"
         );
@@ -1615,10 +2134,11 @@ mod tests {
             .contains("supérieur à zéro"));
     }
 
-    /// `.orionprofile` is the extension the tooling distributes: recognizing
-    /// it must not depend on the first character surviving the trip.
+    /// `.orion` is the extension the tooling distributes, and `.orionprofile`
+    /// the one it distributed until August 2026: recognizing either must not
+    /// depend on the first character surviving the trip.
     #[test]
-    fn the_orionprofile_suffix_selects_the_orion_parser() {
+    fn the_orion_suffixes_select_the_orion_parser() {
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -1635,20 +2155,21 @@ mod tests {
 
         // Leading blank lines: the head no longer decides, the suffix does.
         let padded = format!("\n\n{raw}");
-        assert_eq!(
-            parse_profile_import(&padded, "poste-windows.orionprofile")
-                .unwrap()
-                .profile
-                .name,
-            "portable"
-        );
-        assert_eq!(
-            parse_profile_import(&raw, "POSTE-WINDOWS.ORIONPROFILE")
-                .unwrap()
-                .profile
-                .name,
-            "portable"
-        );
+        for name in [
+            "poste-windows.orion",
+            // Windows matches an extension without regard to case, and a
+            // document named `.Orion` is the same document.
+            "POSTE-WINDOWS.ORION",
+            // Written before August 2026, still read.
+            "poste-windows.orionprofile",
+            "POSTE-WINDOWS.ORIONPROFILE",
+        ] {
+            assert_eq!(
+                parse_profile_import(&padded, name).unwrap().profile.name,
+                "portable",
+                "suffixe refusé : {name}"
+            );
+        }
     }
 
     /// A document is carried by hand from one machine to another, and that
@@ -1678,7 +2199,7 @@ mod tests {
             ("UTF-16BE", utf16be),
         ] {
             let directory = temp_directory("orion-import-encoding");
-            let path = directory.join("portable.orionprofile");
+            let path = directory.join("portable.orion");
             std::fs::write(&path, &bytes).unwrap();
             let imported = read_profile_import_path(&path)
                 .unwrap_or_else(|error| panic!("{label} should have been read: {error:#}"));
@@ -1723,7 +2244,7 @@ mod tests {
     #[test]
     fn reading_by_path_reuses_the_parser_and_the_limit() {
         let directory = temp_directory("orion-import-path");
-        let profile_path = directory.join("portable.orionprofile");
+        let profile_path = directory.join("portable.orion");
         let raw = format!(
             r#"{{
                 "format": "orion-profile",
@@ -1746,7 +2267,7 @@ mod tests {
             "portable"
         );
 
-        let oversized_path = directory.join("too-big.orionprofile");
+        let oversized_path = directory.join("too-big.orion");
         std::fs::write(&oversized_path, vec![b' '; MAX_PROFILE_IMPORT_BYTES + 1]).unwrap();
         assert!(read_profile_import_path(&oversized_path)
             .unwrap_err()

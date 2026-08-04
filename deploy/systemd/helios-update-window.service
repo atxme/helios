@@ -1,0 +1,26 @@
+[Unit]
+Description=Revoke a stale Helios TPM update window
+
+[Service]
+Type=oneshot
+# The window carries the TPM secret across a planned reboot. If that reboot
+# never happens, this unit overwrites the NV payload without releasing it.
+ExecStart=/opt/helios/current/heliosd tpm expire-window
+SupplementaryGroups=tss
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+ReadWritePaths=/var/lib/helios
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw

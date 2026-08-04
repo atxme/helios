@@ -49,6 +49,11 @@ function Step($Name, [scriptblock]$Body) {
 
 # 1. Ce qui se vérifie sans rien toucher : le binaire compile avec le vrai
 #    backend, et l'outillage répond.
+Step "tests de sécurité Orion sur Windows" {
+    cargo test -p orion-core --all-features
+    cargo test -p orion --all-features
+}
+
 Step "compilation du client avec le backend réel" {
     cargo build -p orion --features wireguard
 }

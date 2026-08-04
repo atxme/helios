@@ -76,6 +76,30 @@ pub struct FirewallPolicy {
     /// IP of the captive portal gateway.
     /// Set upon detection; HTTP/HTTPS towards this IP are allowed.
     pub captive_portal_gateway: Option<String>,
+    /// Answers ICMP on the tunnel interface.
+    ///
+    /// Open by default, unlike everything else this policy opens, and the
+    /// asymmetry is deliberate: this routes nothing and exposes nothing
+    /// outward. It lets the gateway answer for **itself**, on an interface
+    /// only peers already admitted by WireGuard can reach.
+    ///
+    /// What closing it costs is a diagnostic dead end. `ping 100.64.0.1` is
+    /// the first thing anyone tries on a fresh tunnel, and under a `drop`
+    /// policy it times out exactly like a tunnel that never mounted — so the
+    /// one test people reach for first is the one that cannot distinguish
+    /// success from failure.
+    pub allow_tunnel_icmp: bool,
+    /// Accepts SSH **arriving through the tunnel**.
+    ///
+    /// Closed by default: administrative access is what an attacker wants
+    /// most, and the fail-closed model opens it only on request.
+    ///
+    /// Note what this is not. [`Self::allow_ssh_from`] filters on the source
+    /// address alone, with no interface constraint — putting the CGNAT range
+    /// there would accept a packet forging that source **from the WAN**. This
+    /// rule is scoped to the tunnel interface instead, so it cannot be
+    /// reached by anything WireGuard has not already authenticated.
+    pub allow_ssh_over_tunnel: bool,
 }
 
 impl FirewallPolicy {

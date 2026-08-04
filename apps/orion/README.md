@@ -1,4 +1,4 @@
-# Orion VPN
+# Orion
 
 Orion est le client de bureau WireGuard de la gateway Helios. L’application
 combine une IHM React/TypeScript embarquée par Tauri et un cœur Rust portable
@@ -38,11 +38,57 @@ Un profil contient :
 - un keepalive persistant de 25 secondes par défaut ;
 - un éventuel PSK post-quantique et l’URL interne de l’API Helios.
 
-Les clés privées et PSK sont masqués dans les représentations `Debug`, mais ils
-sont actuellement persistés dans le fichier de profils local. La configuration
-est stockée dans le répertoire applicatif de l’OS sous `net/helios/orion`. La
-variable `ORION_CONFIG` permet de surcharger le chemin en test ou en
-développement.
+Les clés privées et PSK sont scellés dans le coffre ([ADR-006](../../docs/adr/ADR-006-SECRETS-AU-REPOS.md)) :
+ni l’IHM ni un message Tauri ne les transportent, et l’écran n’affiche que la clé
+**publique**. Le stockage vit dans le répertoire applicatif de l’OS sous
+`net/helios/orion` ; `ORION_CONFIG` surcharge le chemin du fichier hérité en test.
+
+## Construire et lancer
+
+```sh
+cargo run -p orion --features wireguard              # développement
+cargo build --release -p orion --features wireguard  # binaire seul
+cargo xtask orion-msi                                # installateur Windows
+```
+
+Les deux premières commandes suffisent au quotidien : **l’installateur n’est pas
+nécessaire pour tester**. Le nom, l’icône et l’interface sont ceux du code dans
+les trois cas, et `build.rs` s’en charge.
+
+- **En debug**, l’IHM est servie par Vite : Orion le démarre lui-même s’il ne
+  tourne pas, et toute modification de `src/` est visible au rechargement.
+- **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
+  Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
+  quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
+  qui se lance, s’affiche, et ment. Prérequis : `npm ci --prefix apps/orion`.
+## Journal
+
+Orion écrit **à la fois** sur la sortie standard et dans un fichier :
+
+```
+%APPDATA%\helios\orion\config\orion.log     (Windows)
+~/.config/helios/orion/orion.log            (Linux)
+```
+
+Le fichier existe parce qu’un Orion installé n’a pas de console : en release,
+`windows_subsystem = "windows"` envoie la sortie standard nulle part, et
+demander à un utilisateur de recompiler sous `cargo run` pour obtenir un journal
+revient à lui demander de rebâtir le produit. Il est **remis à zéro à chaque
+démarrage** : ce qu’on cherche est ce lancement-ci, pas six démarrages plus tôt.
+
+Par défaut : `info` partout, `debug` pour les crates du projet — assez pour voir
+quel chemin le coffre a pris, ce que le TPM a répondu et pourquoi un profil n’a
+pas chargé, sans noyer cela sous `hyper` et `rustls`. `RUST_LOG` remplace tout :
+
+```sh
+RUST_LOG=trace cargo run -p orion --features wireguard      # tout
+RUST_LOG=orion_core::vault=trace cargo run -p orion         # le coffre seul
+```
+
+- **L’icône et le nom** viennent de `tauri.conf.json` et de `icons/icon.ico`,
+  déclarés en `rerun-if-changed` : les remplacer suffit à ce que la prochaine
+  compilation les embarque, exécutable, fenêtre et zone de notification
+  comprises.
 
 ### Importer plutôt que ressaisir
 
@@ -208,11 +254,49 @@ paquet Debian dépend de `libcap2-bin` et son `postinst` pose
 Authenticode sont détaillées dans
 [`../../docs/security/ORION-DISTRIBUTION.md`](../../docs/security/ORION-DISTRIBUTION.md).
 
-Les fichiers `.orionprofile` sont associés à Orion. Le premier double-clic et
-les suivants passent par la même file single-instance, la même lecture Rust
-bornée à 64 Kio, le même parseur et la même complétion des invitations depuis
-la clé privée locale de même nom. L'import reste un brouillon à vérifier puis à
-enregistrer ; il n'écrase jamais silencieusement la configuration.
+Les fichiers `.orion` sont associés à Orion, avec une icône qui leur est propre
+— la marque sur une feuille, pour qu'un profil ne se confonde pas avec le client
+qui l'ouvre. Le premier double-clic et les suivants passent par la même file
+single-instance, la même lecture Rust bornée à 64 Kio, le même parseur et la
+même complétion des invitations depuis la clé privée locale de même nom.
+L'import reste un brouillon à vérifier puis à enregistrer ; il n'écrase jamais
+silencieusement la configuration.
+
+L'extension était `.orionprofile` jusqu'en août 2026. Les documents déjà écrits
+restent **lus** — les deux suffixes sont acceptés à l'import — mais seul
+`.orion` est enregistré auprès de Windows : un double-clic sur un ancien fichier
+ne démarre plus Orion, le glisser sur le bouton *Importer* fonctionne toujours.
+
+## Zone de notification (Windows)
+
+Fermer la fenêtre ne quitte pas : le tunnel et son lien de vivacité continuent,
+et le menu de la zone de notification devient la seule surface d'Orion. Il n'est
+donc pas une liste de raccourcis vers la fenêtre, mais un petit client :
+
+```text
+● État : Connecté
+─────────────────
+✓ poste-windows
+  bureau
+─────────────────
+Ouvrir Orion
+Gestion des profils…
+Importer un profil à partir d'un fichier…
+Journal d'Orion…
+─────────────────
+À propos d'Orion…
+Quitter
+```
+
+La pastille reprend les couleurs d'état de `components/state.ts`. Cliquer un
+profil coché **déconnecte** ; cliquer un autre le sélectionne et s'y connecte —
+la sélection suit, sans quoi la fenêtre afficherait un profil pendant que le
+tunnel en porte un autre. Un refus dévoile la fenêtre et affiche l'erreur : une
+connexion lancée depuis un menu n'a aucun autre endroit où se plaindre.
+
+Le menu est **reconstruit** à chaque changement d'état ou de liste de profils,
+plutôt que modifié : tenir à jour un second modèle à côté du coffre finirait par
+diverger le jour où un profil est renommé.
 
 ## Provisioning post-quantique
 
@@ -230,7 +314,7 @@ opérationnel et reste visible dans le journal.
 
 Le frontend utilise les commandes suivantes :
 
-- `get_state`, `backend_kind`, `adapter_is_up` ;
+- `get_state`, `backend_kind`, `adapter_is_up`, `about_orion` ;
 - `get_config`, `import_profile`, `save_profile`, `delete_profile`,
   `select_profile` ;
 - `import_profile_path`, réservé aux chemins reçus de l'association système ;
@@ -239,7 +323,11 @@ Le frontend utilise les commandes suivantes :
 Les événements `state_changed`, `log`, `telemetry` et `error` sont relayés sur
 le canal `helios://event`. `helios://profile-path` signale qu'un chemin associé
 attend dans la file Rust sans donner au frontend un accès général au système de
-fichiers.
+fichiers. `helios://tray-view` porte l'intention choisie dans la zone de
+notification — dont `import`, qui n'est pas une vue mais l'ouverture du
+sélecteur de fichier de l'écran *Profils*, et `about`. `helios://config-changed`
+dit que la sélection a bougé côté Rust, ce qui arrive quand le menu connecte un
+profil pendant que la fenêtre est ouverte derrière lui.
 
 ## Régression
 

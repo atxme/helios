@@ -58,6 +58,8 @@ const SYSTEMD_UNITS: &[&str] = &[
     "heliosd.service",
     "helios-update.service",
     "helios-update.path",
+    "helios-update-window.service",
+    "helios-update-window.timer",
 ];
 
 /// Shipped binaries, and their role.
@@ -718,7 +720,22 @@ mod tests {
     fn the_shipped_content_is_complete() {
         assert!(BINARIES.contains(&"heliosd"));
         assert!(BINARIES.contains(&"helios-installer"));
-        assert_eq!(SYSTEMD_UNITS.len(), 3);
+        // Named rather than counted: a count says a unit was added, never
+        // which one was dropped.
+        for unit in [
+            "heliosd.service",
+            "helios-update.service",
+            "helios-update.path",
+            // Without the timer, a window armed for an upgrade that never
+            // happened stays live until the next boot.
+            "helios-update-window.service",
+            "helios-update-window.timer",
+        ] {
+            assert!(
+                SYSTEMD_UNITS.contains(&unit),
+                "unit {unit} missing from the bundle"
+            );
+        }
         for feature in ["netlink", "wireguard", "tpm", "embed-ui"] {
             assert!(
                 GATEWAY_FEATURES.split(',').any(|f| f == feature),
@@ -780,6 +797,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_regression_workflow_executes_and_measures_orion_on_windows() {
+        let workflow = std::fs::read_to_string(
+            workspace_root()
+                .unwrap()
+                .join(".github/workflows/regression.yml"),
+        )
+        .expect("the regression workflow must exist");
+
+        for required in [
+            "orion-windows:",
+            "runs-on: windows-2025",
+            "cargo clippy -p orion-core -p orion --all-targets --all-features",
+            "cargo llvm-cov --package orion-core --package orion --all-features",
+            "coverage-orion-windows",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "Windows security regression is missing `{required}`"
+            );
+        }
+    }
+
     /// The units and the example configuration must exist in the repo: a
     /// dead reference would break the factory at the worst moment.
     #[test]
@@ -790,6 +830,17 @@ mod tests {
             assert!(path.is_file(), "missing unit: {}", path.display());
         }
         assert!(root.join("config").join("network.toml").is_file());
+    }
+
+    #[test]
+    fn the_update_window_timer_executes_the_bundled_daemon() {
+        let root = workspace_root().expect("root");
+        let unit =
+            std::fs::read_to_string(root.join("deploy/systemd/helios-update-window.service"))
+                .expect("update-window service");
+
+        assert!(unit.contains("ExecStart=/opt/helios/current/heliosd tpm expire-window"));
+        assert!(!unit.contains("/opt/helios/current/bin/heliosd"));
     }
 
     #[test]

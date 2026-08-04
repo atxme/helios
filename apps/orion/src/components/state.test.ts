@@ -14,13 +14,15 @@ import {
 const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'site-a',
   endpoint: '203.0.113.10:51820',
-  private_key: '',
   peer_public_key: '',
-  preshared_key: null,
+  public_key: null,
+  has_private_key: false,
+  has_static_psk: false,
   address: null,
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
   heliosd_url: null,
+  ssh_target: null,
   key_negotiation: null,
   ...over,
 })
@@ -54,7 +56,7 @@ describe('Orion UI state', () => {
     }
     expect(postureMeta('up', true).posture).toBe('protected')
     for (const state of ['down', 'connecting', 'failed', 'captive_portal'] as const) {
-      expect(postureMeta(state, true).posture).toBe('held')
+      expect(postureMeta(state, true).posture).toBe('blocked')
     }
   })
 
@@ -77,9 +79,13 @@ describe('Orion UI state', () => {
 
     expect(negotiated.tone).toBe('pqc')
     expect(upgraded.tone).toBe('pqc')
+    // The wording is short now, but the distinction it carries is the whole
+    // point: one has protected every handshake of this tunnel, the other has
+    // not. Asserting on the *fact* rather than on a phrase that will be
+    // rewritten again.
     expect(negotiated.label).not.toBe(upgraded.label)
-    expect(negotiated.detail).toContain('AVANT')
-    expect(upgraded.detail).toContain('premier handshake a eu lieu sans PSK')
+    expect(negotiated.detail).toContain('avant le premier handshake')
+    expect(upgraded.detail).toContain('après le montage')
   })
 
   it('reads the PQC PSK from the event, never from the profile', () => {
@@ -89,8 +95,9 @@ describe('Orion UI state', () => {
     const helios = profile({ heliosd_url: 'http://100.64.0.1:8080' })
     expect(protectionMeta(helios, 'ml_kem', 'up').tone).toBe('pqc')
 
-    // And the reverse: a filled-in `preshared_key` always denotes a static one.
-    const manual = profile({ preshared_key: 'cHNr' })
+    // And the reverse: the presence flag always denotes a static one, without
+    // carrying the value across the IPC boundary.
+    const manual = profile({ has_static_psk: true })
     expect(protectionMeta(manual, null, 'down').tone).toBe('static')
   })
 

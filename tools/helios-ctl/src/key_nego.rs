@@ -21,6 +21,48 @@ use rcgen::{
 use rustls::pki_types::CertificateDer;
 use zeroize::Zeroizing;
 
+/// Variable d'environnement qui déplace la CA opérateur.
+///
+/// Pour l'opérateur qui en gère plusieurs — une par flotte. Le reste du temps
+/// elle n'a pas à être posée : c'est l'emplacement fixe qui répond.
+pub const CLIENT_CA_DIR_ENV: &str = "HELIOS_CLIENT_CA_DIR";
+
+/// Emplacement **fixe** de la CA cliente sur le poste opérateur.
+///
+/// # Pourquoi il ne peut pas être relatif
+///
+/// Le défaut était `./orion-client-ca`, donc relatif au dossier courant. La
+/// même commande lancée d'un autre répertoire cherchait ailleurs, ne trouvait
+/// rien, et le message conseillait alors d'en créer une neuve — ce qui
+/// **orpheline la flotte entière** : `heliosd init-key-negotiation` épingle la
+/// CA cliente, et la gateway refuse tout certificat émis par une autre. Un
+/// défaut qui dépend du répertoire courant transforme un `cd` en incident.
+///
+/// L'emplacement suit donc le compte, comme le coffre Orion et comme le fait
+/// déjà la gateway avec `/var/lib/helios`. `HELIOS_CLIENT_CA_DIR` le déplace,
+/// `--client-ca-dir` le remplace pour une commande.
+///
+/// # Ce qu'il contient
+///
+/// Deux clés privées de CA — TLS et ML-DSA-65 — c'est-à-dire le pouvoir
+/// d'émettre des certificats que la gateway croira. Le répertoire naît en 0700
+/// et les fichiers en 0600.
+pub fn default_client_ca_dir() -> PathBuf {
+    // `var_os` rend `Some("")` pour une variable posée mais vide — ce qu'un
+    // `export HELIOS_CLIENT_CA_DIR=` ou un script produit sans le vouloir. La
+    // prendre pour un chemin donnait un message d'erreur qui ne nommait aucun
+    // répertoire, donc inexploitable. Vide vaut absente.
+    if let Some(directory) = std::env::var_os(CLIENT_CA_DIR_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(directory);
+    }
+    directories::ProjectDirs::from("net", "helios", "helios-ctl")
+        .map(|dirs| dirs.data_dir().join("orion-client-ca"))
+        // Dernier recours seulement : sans répertoire de données, mieux vaut un
+        // chemin utilisable qu'un échec, mais il reste relatif — d'où le
+        // message de `check_client_ca`, qui dit toujours où il a cherché.
+        .unwrap_or_else(|| PathBuf::from("orion-client-ca"))
+}
+
 const CA_CERTIFICATE_FILE: &str = "orion-client-ca.der";
 const CA_PRIVATE_KEY_FILE: &str = "orion-client-ca-key.der";
 const CLIENT_CERTIFICATE_FILE: &str = "orion-client-cert.der";
@@ -36,8 +78,10 @@ pub enum KeyNegoCmd {
     InitClientCa {
         #[arg(long)]
         name: String,
+        /// Où écrire la CA. Défaut : l'emplacement fixe du compte
+        /// (`HELIOS_CLIENT_CA_DIR` le déplace).
         #[arg(long)]
-        output_dir: PathBuf,
+        output_dir: Option<PathBuf>,
     },
     /// Issues an Orion client certificate from the operator client CA.
     IssueClient {
@@ -107,7 +151,10 @@ impl From<Mode> for ProtectionMode {
 
 pub async fn run(command: KeyNegoCmd) -> Result<()> {
     match command {
-        KeyNegoCmd::InitClientCa { name, output_dir } => init_client_ca(&name, &output_dir),
+        KeyNegoCmd::InitClientCa { name, output_dir } => {
+            let output_dir = output_dir.unwrap_or_else(default_client_ca_dir);
+            init_client_ca(&name, &output_dir)
+        }
         KeyNegoCmd::IssueClient {
             name,
             ca_certificate,
@@ -211,7 +258,9 @@ fn init_client_ca(name: &str, output_dir: &Path) -> Result<()> {
             PQ_CA_PRIVATE_KEY_FILE,
         ],
     )?;
-    std::fs::create_dir_all(output_dir)
+    // 0700 : ce répertoire porte deux clés privées de CA, c'est-à-dire le
+    // pouvoir d'émettre des certificats que la gateway croira.
+    aether::private_file::create_private_dir(output_dir)
         .with_context(|| format!("creating {}", output_dir.display()))?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())?;
@@ -502,4 +551,212 @@ fn check_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn check_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CA location must not depend on where the command was launched.
+    ///
+    /// The old default was `./orion-client-ca`. A `cd` therefore silently
+    /// pointed the tool at nothing, and the error then advised creating a new
+    /// CA — which orphans the whole fleet, since `heliosd init-key-negotiation`
+    /// pins the client CA and the gateway refuses certificates from any other.
+    /// A default that turns a `cd` into an incident is not a default.
+    #[test]
+    fn the_client_ca_location_is_absolute_and_stable() {
+        // The environment override is process-wide; this test owns it.
+        std::env::remove_var(CLIENT_CA_DIR_ENV);
+
+        let from_root = {
+            let _guard = std::env::set_current_dir("/").is_ok();
+            default_client_ca_dir()
+        };
+        let from_temp = {
+            let _guard = std::env::set_current_dir(std::env::temp_dir()).is_ok();
+            default_client_ca_dir()
+        };
+
+        assert_eq!(
+            from_root, from_temp,
+            "l'emplacement de la CA ne doit pas suivre le répertoire courant"
+        );
+        assert!(
+            from_root.is_absolute(),
+            "obtenu un chemin relatif : {}",
+            from_root.display()
+        );
+    }
+
+    /// The override exists for the operator who keeps several fleets apart.
+    ///
+    /// An **empty** value counts as absent: `export HELIOS_CLIENT_CA_DIR=` is
+    /// what a script writes by accident, and taking it for a path produced an
+    /// error message naming no directory at all — unusable.
+    #[test]
+    fn the_environment_variable_moves_the_client_ca_unless_it_is_empty() {
+        let elsewhere = std::env::temp_dir().join("helios-ctl-ca-ailleurs");
+        std::env::set_var(CLIENT_CA_DIR_ENV, &elsewhere);
+        assert_eq!(default_client_ca_dir(), elsewhere);
+
+        std::env::set_var(CLIENT_CA_DIR_ENV, "");
+        let fallback = default_client_ca_dir();
+        assert!(
+            !fallback.as_os_str().is_empty(),
+            "une variable vide ne doit pas produire un chemin vide"
+        );
+        std::env::remove_var(CLIENT_CA_DIR_ENV);
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "helios-ctl-key-nego-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
+    #[test]
+    fn cli_modes_map_one_to_one_to_protocol_modes() {
+        assert_eq!(ProtectionMode::from(Mode::Classic), ProtectionMode::Classic);
+        assert_eq!(
+            ProtectionMode::from(Mode::StaticPsk),
+            ProtectionMode::StaticPsk
+        );
+        assert_eq!(ProtectionMode::from(Mode::MlKem), ProtectionMode::MlKem);
+    }
+
+    #[test]
+    fn existing_identity_material_is_never_overwritten() {
+        let directory = test_directory("reject-existing");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("private.key"), b"keep").unwrap();
+
+        let error = reject_existing(&directory, &["absent", "private.key"])
+            .expect_err("existing material must be refused");
+        assert!(error.to_string().contains("private.key"));
+        assert_eq!(
+            std::fs::read(directory.join("private.key")).unwrap(),
+            b"keep"
+        );
+        assert!(reject_existing(&directory, &["absent"]).is_ok());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_writer_and_permission_check_enforce_private_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = test_directory("permissions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("secret");
+        write_secret(&secret, b"sensitive").unwrap();
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(check_private_permissions(&secret).is_ok());
+        assert!(write_secret(&secret, b"replacement").is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"sensitive");
+
+        let exposed = directory.join("exposed");
+        std::fs::write(&exposed, b"secret").unwrap();
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = check_private_permissions(&exposed).expect_err("world-readable secret");
+        assert!(error.to_string().contains("permissions are 644"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn client_ca_and_bound_client_identity_round_trip_through_files() {
+        let root = test_directory("issuance");
+        let ca = root.join("ca");
+        let client = root.join("client");
+        init_client_ca("  Orion test CA  ", &ca).expect("create client CA");
+
+        let keypair = aether::wg::generate_keypair().unwrap();
+        issue_client(
+            "  portable  ",
+            &keypair.public_key,
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            &client,
+        )
+        .expect("issue client identity");
+
+        let loaded = load_client_material(&client).expect("reload issued identity");
+        assert!(!loaded.certificate_der.is_empty());
+        assert!(!loaded.private_key_der.is_empty());
+        assert!(!loaded.pq_private_key.is_empty());
+        assert_eq!(
+            loaded.certificate_sha256,
+            helios_key_negotiation::certificate_fingerprint_der(&loaded.certificate_der)
+        );
+        let pq_certificate: PqCertificate =
+            serde_json::from_slice(&loaded.pq_certificate_json).unwrap();
+        assert_eq!(pq_certificate.subject, "portable");
+        assert_eq!(pq_certificate.role, PqCertificateRole::Client);
+        assert_eq!(pq_certificate.wireguard_public_key, keypair.public_key);
+        assert_eq!(
+            loaded.pq_certificate_sha256,
+            pq_certificate.fingerprint().unwrap()
+        );
+
+        assert!(
+            issue_client(
+                "portable",
+                &keypair.public_key,
+                &ca.join(CA_CERTIFICATE_FILE),
+                &ca.join(CA_PRIVATE_KEY_FILE),
+                &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+                &client,
+            )
+            .is_err(),
+            "issuing again must not replace the admitted identity"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_wireguard_identity_is_refused_before_client_files_exist() {
+        let root = test_directory("invalid-wg");
+        let ca = root.join("ca");
+        let client = root.join("client");
+        init_client_ca("Orion test CA", &ca).unwrap();
+
+        let error = issue_client(
+            "portable",
+            "not-a-wireguard-key",
+            &ca.join(CA_CERTIFICATE_FILE),
+            &ca.join(CA_PRIVATE_KEY_FILE),
+            &ca.join(PQ_CA_PRIVATE_KEY_FILE),
+            &client,
+        )
+        .expect_err("invalid peer identity");
+        assert!(error.to_string().contains("invalid WireGuard public key"));
+        assert!(!client.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn helpers_report_missing_files_and_generate_fresh_serials() {
+        let directory = test_directory("helpers");
+        let missing = directory.join("missing");
+        let error = read(&missing).expect_err("missing file");
+        assert!(error.to_string().contains(&missing.display().to_string()));
+
+        let first = random_serial().unwrap();
+        let second = random_serial().unwrap();
+        assert_ne!(first, second);
+        assert!(unix_time_now().unwrap() > 1_700_000_000);
+    }
 }

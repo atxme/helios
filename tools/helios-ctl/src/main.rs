@@ -31,6 +31,7 @@ mod files;
 mod key_nego;
 mod peer;
 mod profile;
+mod update;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ EXAMPLES:
   cargo run -p helios-ctl -- network show
   cargo run -p helios-ctl -- network load config/network.toml
   cargo run -p helios-ctl -- scenario nominal
+  cargo run -p helios-ctl -- update                 # on the gateway
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
 )]
 struct Cli {
@@ -94,9 +96,13 @@ enum Cmd {
         /// Gateway's public UDP endpoint (`IP:port` or `FQDN:port`).
         #[arg(long)]
         endpoint: String,
-        /// Directory of the operator client CA (`key-nego init-client-ca`).
-        #[arg(long, default_value = "./orion-client-ca")]
-        client_ca_dir: PathBuf,
+        /// Répertoire de la CA opérateur (`key-nego init-client-ca`).
+        ///
+        /// Défaut : l'emplacement fixe du compte, que `HELIOS_CLIENT_CA_DIR`
+        /// déplace. Il ne dépend **pas** du répertoire courant — voir
+        /// `key_nego::default_client_ca_dir`.
+        #[arg(long)]
+        client_ca_dir: Option<PathBuf>,
         /// Client public key, when the client already holds its own pair.
         #[arg(long)]
         public_key: Option<String>,
@@ -126,6 +132,21 @@ enum Cmd {
         /// Revoke a peer of the same name before admitting this identity.
         #[arg(long)]
         replace: bool,
+        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
+        /// séparées par des virgules.
+        ///
+        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
+        /// finisse avec autant de tables de routage que d'utilisateurs.
+        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
+        #[arg(long)]
+        allowed_ips: Option<String>,
+        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
+        ///
+        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
+        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
+        #[arg(long)]
+        ssh_target: Option<String>,
         /// Output file.
         #[arg(long)]
         output: PathBuf,
@@ -160,6 +181,18 @@ enum Cmd {
     KeyNego {
         #[command(subcommand)]
         command: key_nego::KeyNegoCmd,
+    },
+    /// Upgrades this gateway's OS and reboots, keeping its identity (ADR-007).
+    ///
+    /// **Runs on the gateway.** Refreshes the package lists, reports which
+    /// pending packages move which PCR, upgrades, then arms a TPM update
+    /// window and reboots — which kills this command. Whether the window was
+    /// consumed is in the journal at the next boot:
+    /// `journalctl -u heliosd -b | grep -i 'update window'`.
+    Update {
+        /// Skips the confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Runs a predefined test scenario.
     Scenario {
@@ -246,7 +279,7 @@ enum ProfileCmd {
     /// est en cause ou si le problème est ailleurs — sans avoir à lancer
     /// Orion, ni à ouvrir un fichier qui contient des secrets.
     Check {
-        /// Document à relire (`.orionprofile`, `.json` ou `.conf`).
+        /// Document à relire (`.orion`, `.json` ou `.conf`).
         path: PathBuf,
     },
     /// Emits a client profile readable by Orion's import.
@@ -269,6 +302,21 @@ enum ProfileCmd {
         /// Admits the peer as a control-plane administrator.
         #[arg(long)]
         admin: bool,
+        /// Trafic capté par le tunnel : une ou plusieurs plages CIDR,
+        /// séparées par des virgules.
+        ///
+        /// Absent = tunnel complet (`0.0.0.0/0`), qui reste le bon défaut.
+        /// Le préciser ici plutôt que dans chaque poste évite qu'un parc
+        /// finisse avec autant de tables de routage que d'utilisateurs.
+        /// Ex. : `--allowed-ips "100.64.0.0/10, 192.168.1.0/24"`
+        #[arg(long)]
+        allowed_ips: Option<String>,
+        /// Destination SSH à travers le tunnel, `utilisateur@hôte`.
+        ///
+        /// Active le bouton « Terminal SSH » d'Orion. La gateway doit poser
+        /// `allow_ssh_over_tunnel`. Absent = aucun terminal proposé.
+        #[arg(long)]
+        ssh_target: Option<String>,
         /// Output file. Absent: standard output.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -760,6 +808,47 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
     )
 }
 
+/// Checks and normalizes an operator-supplied `AllowedIPs` list.
+///
+/// Here rather than at render time, and that is the whole point: `render`
+/// round-trips the document through Orion's own parser, so a malformed list
+/// *would* be caught — but as "the emitted profile is not readable by Orion —
+/// this is a tooling bug", which is a lie when the operator simply mistyped a
+/// prefix. Worse, on `enroll` it would surface **after** the peer had been
+/// admitted on the gateway, leaving an admission with no profile to go with it.
+///
+/// The normalized form is what gets written, so a document and the screen that
+/// displays it never disagree on spelling.
+fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    orion_core::profile_import::validate_allowed_ips(&value)
+        .context("--allowed-ips")
+        .context(
+            "trafic capté invalide — une ou plusieurs plages CIDR séparées par des virgules, \
+             par exemple \"100.64.0.0/10, 192.168.1.0/24\"",
+        )?;
+    Ok(Some(orion_core::profile_import::normalize_cidr_list(
+        &value,
+    )))
+}
+
+/// Checks an operator-supplied SSH destination, before anything is admitted.
+///
+/// Same placement argument as [`check_allowed_ips`], with more at stake: this
+/// value ends up as an argument of a process Orion spawns. `orion-core` owns
+/// the grammar — an allow-list of characters — and checking it here means a
+/// typo is a refusal rather than a document that fails on the user's machine.
+fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_string();
+    orion_core::profile_import::validate_ssh_target(&value).context("--ssh-target")?;
+    Ok(Some(value))
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -818,8 +907,13 @@ async fn main() -> Result<()> {
                 public_key,
                 with_private_key,
                 admin,
+                allowed_ips,
+                ssh_target,
                 output,
             } => {
+                let allowed_ips = check_allowed_ips(allowed_ips)?;
+                let ssh_target = check_ssh_target(ssh_target)?;
+                let ssh_target = check_ssh_target(ssh_target)?;
                 profile::emit(
                     &client,
                     base,
@@ -829,6 +923,8 @@ async fn main() -> Result<()> {
                         public_key,
                         with_private_key,
                         admin,
+                        allowed_ips,
+                        ssh_target,
                         output,
                     },
                 )
@@ -847,6 +943,8 @@ async fn main() -> Result<()> {
             identity,
             admin,
             replace,
+            allowed_ips,
+            ssh_target,
             output,
             gateway_certificate,
             gateway_pq_certificate,
@@ -855,7 +953,9 @@ async fn main() -> Result<()> {
         } => {
             // Checked before the gateway is contacted: a missing CA must not
             // be discovered after a peer has been admitted.
+            let client_ca_dir = client_ca_dir.unwrap_or_else(key_nego::default_client_ca_dir);
             enroll::check_client_ca(&client_ca_dir)?;
+            let allowed_ips = check_allowed_ips(allowed_ips)?;
             let offline = match (gateway_certificate, gateway_pq_certificate, address) {
                 (Some(gateway_certificate), Some(gateway_pq_certificate), Some(address)) => {
                     Some(enroll::OfflineInputs {
@@ -884,6 +984,8 @@ async fn main() -> Result<()> {
                     identity,
                     admin,
                     replace,
+                    allowed_ips,
+                    ssh_target,
                     output,
                     offline,
                 },
@@ -899,6 +1001,7 @@ async fn main() -> Result<()> {
             } => escrow::open(&escrow, &private_key, &output),
         },
         Cmd::KeyNego { command } => key_nego::run(command).await,
+        Cmd::Update { yes } => update::run(yes),
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
             "flap" => scenario_flap(&client, base).await,
@@ -938,7 +1041,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Status;
+    use super::*;
 
     #[test]
     fn current_wireguard_status_is_deserializable() {
@@ -952,5 +1055,157 @@ mod tests {
         let status: Status = serde_json::from_str(raw).expect("valid status");
         assert_eq!(status.wg_iface, "helios0");
         assert_eq!(status.peers[0].name, "orion");
+    }
+
+    #[test]
+    fn command_line_keeps_peer_security_parameters() {
+        let cli = Cli::try_parse_from([
+            "helios-ctl",
+            "--url",
+            "https://100.64.0.1:8080/",
+            "peer",
+            "add",
+            "--name",
+            "operator",
+            "--public-key",
+            "public",
+            "--admin",
+            "--key-negotiation-certificate-sha256",
+            "tls",
+            "--key-negotiation-pq-certificate-sha256",
+            "pq",
+            "--minimum-mode",
+            "ml-kem",
+        ])
+        .unwrap();
+        assert_eq!(cli.url, "https://100.64.0.1:8080/");
+        assert!(matches!(
+            cli.command,
+            Cmd::Peer {
+                command: PeerCmd::Add {
+                    name,
+                    public_key,
+                    admin: true,
+                    key_negotiation_certificate_sha256: Some(tls),
+                    key_negotiation_pq_certificate_sha256: Some(pq),
+                    minimum_mode: Some(key_nego::Mode::MlKem),
+                }
+            } if name == "operator" && public_key == "public" && tls == "tls" && pq == "pq"
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["helios-ctl", "peer", "list"])
+                .unwrap()
+                .command,
+            Cmd::Peer {
+                command: PeerCmd::List
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["helios-ctl", "peer", "revoke", "--name", "old"])
+                .unwrap()
+                .command,
+            Cmd::Peer {
+                command: PeerCmd::Revoke { name }
+            } if name == "old"
+        ));
+    }
+
+    #[test]
+    fn command_line_covers_offline_and_diagnostic_commands() {
+        for arguments in [
+            vec!["helios-ctl", "status"],
+            vec!["helios-ctl", "connect"],
+            vec!["helios-ctl", "disconnect"],
+            vec!["helios-ctl", "watch"],
+            vec!["helios-ctl", "network", "show"],
+            vec!["helios-ctl", "network", "load", "network.toml"],
+            vec!["helios-ctl", "profile", "check", "client.orion"],
+            vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
+            vec!["helios-ctl", "scenario", "flap"],
+            vec!["helios-ctl", "campaign", "--generate-keys"],
+        ] {
+            Cli::try_parse_from(arguments).unwrap();
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "helios-ctl",
+                "enroll",
+                "--name",
+                "client",
+                "--endpoint",
+                "vpn.example:51820",
+                "--output",
+                "client.orion",
+                "--gateway-certificate",
+                "gateway.der"
+            ])
+            .is_err(),
+            "partial offline enrollment material must be refused"
+        );
+    }
+
+    #[test]
+    fn websocket_urls_preserve_transport_security() {
+        assert_eq!(ws_url("http://127.0.0.1:8080"), "ws://127.0.0.1:8080/ws");
+        assert_eq!(
+            ws_url("https://gateway.example"),
+            "wss://gateway.example/ws"
+        );
+    }
+
+    #[test]
+    fn display_helpers_cover_every_state_and_event_shape() {
+        for state in ["up", "connecting", "captive_portal", "failed", "down"] {
+            assert!(colored_state(state).contains(state));
+            assert!(state_dot(state).contains('●'));
+        }
+        assert!(ok().contains('✓'));
+        assert!(fail().contains('✗'));
+        assert!(hh_mm_ss().contains(':'));
+
+        print_ws_event(
+            "00:00:00",
+            &serde_json::json!({"type":"state_changed","state":"up"}),
+        );
+        for level in ["error", "warn", "info"] {
+            print_ws_event(
+                "00:00:00",
+                &serde_json::json!({"type":"log","level":level,"message":"event"}),
+            );
+        }
+        print_ws_event("00:00:00", &serde_json::json!({"type":"future"}));
+        print_ws_event("00:00:00", &serde_json::Value::Null);
+    }
+
+    #[test]
+    fn command_responses_preserve_refusal_details() {
+        assert!(ensure_command(
+            CmdResp {
+                ok: true,
+                error: None,
+            },
+            "connect"
+        )
+        .is_ok());
+        let explicit = ensure_command(
+            CmdResp {
+                ok: false,
+                error: Some("policy denied".into()),
+            },
+            "connect",
+        )
+        .unwrap_err();
+        assert!(explicit.to_string().contains("policy denied"));
+        let unknown = ensure_command(
+            CmdResp {
+                ok: false,
+                error: None,
+            },
+            "disconnect",
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("unknown error"));
     }
 }

@@ -8,9 +8,11 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { ChevronDown, Radio, Settings2, Terminal, X } from 'lucide-react'
 import * as api from './api'
+import type { VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
+import { AboutDialog } from './components/AboutDialog'
 import { EventLog } from './components/EventLog'
 import { OrionMark } from './components/OrionMark'
 import { PosturePanel } from './components/PosturePanel'
@@ -45,11 +47,62 @@ export default function App() {
   const [view, setView] = useState<View>('connect')
   const [navOpen, setNavOpen] = useState(false)
   const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
+  // Read on every opening rather than once at startup: BitLocker can be
+  // suspended and the memory-lock privilege can change while Orion runs, so a
+  // cached value would eventually claim a protection that has since gone.
+  // A failure leaves it `null` — unknown, never "fine".
+  const [vault, setVault] = useState<VaultPosture | null>(null)
+  const [about, setAbout] = useState(false)
+  /**
+   * Bumped when the tray asks for an import.
+   *
+   * A counter rather than a boolean: the second «Importer…» in a row must
+   * reopen the picker, and a flag already set changes nothing. The profile
+   * screen watches the value, not its truth.
+   */
+  const [importRequest, setImportRequest] = useState(0)
+  useEffect(() => {
+    if (!postureAnchor) return
+    let cancelled = false
+    api
+      .vaultPosture()
+      .then((found) => {
+        if (!cancelled) setVault(found)
+      })
+      .catch(() => {
+        if (!cancelled) setVault(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [postureAnchor])
   const posture = postureMeta(c.state, c.adapterUp)
 
   useEffect(() => {
     if (c.pathImportedProfile) setView('profiles')
   }, [c.pathImportedProfile])
+
+  // The menu names an intent; deciding what it means to the window is this
+  // component's job. Two of the five are not views: an import opens the profile
+  // screen *and* its file picker, and «À propos» opens a dialog over whatever
+  // is displayed rather than replacing it.
+  useEffect(() => {
+    const unlisten = api.onTrayView((trayView) => {
+      if (trayView === 'about') {
+        setAbout(true)
+        return
+      }
+      if (trayView === 'import') {
+        setView('profiles')
+        setImportRequest((request) => request + 1)
+        return
+      }
+      setView(trayView)
+    })
+    return () => {
+      unlisten.then((removeListener) => removeListener())
+    }
+  }, [])
 
   // Each view has its own space needs: connection fits in a narrow column,
   // the profile form needs two columns, the log wants width. The window
@@ -129,7 +182,10 @@ export default function App() {
         profile={c.selectedProfile}
         psk={c.psk}
         backend={c.backend}
+        vault={vault}
       />
+
+      <AboutDialog open={about} onClose={() => setAbout(false)} />
 
       {c.error ? (
         <Alert
@@ -261,6 +317,7 @@ export default function App() {
                 psk={c.psk}
                 onConnect={() => c.connect(c.selectedProfile?.name)}
                 onDisconnect={c.disconnect}
+                onOpenSsh={() => c.openSshTerminal(c.selectedProfile?.name)}
               />
             </Box>
           )}
@@ -270,6 +327,7 @@ export default function App() {
               <ProfilesView
                 config={c.config}
                 pathImport={c.pathImportedProfile}
+                importRequest={importRequest}
                 onPathImportHandled={c.clearPathImportedProfile}
                 onImport={c.importProfile}
                 onSave={c.saveProfile}

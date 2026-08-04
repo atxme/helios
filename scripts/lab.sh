@@ -122,7 +122,7 @@ echo "==> Émission des profils client"
 cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
     --name lab --endpoint "$ENDPOINT" \
     --public-key "$CLIENT_PUB" \
-    --output "$TMP/lab.invitation.json"
+    --output "$TMP/lab.invitation.orion"
 
 # 2. Assisté — l'opérateur génère la paire et livre un profil complet. C'est
 #    celui-là qu'on importe dans un Orion neuf pour éprouver l'IHM : il porte la
@@ -130,13 +130,13 @@ cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
 cargo run --quiet -p helios-ctl -- --url "$URL" profile emit \
     --name lab-poste --endpoint "$ENDPOINT" \
     --with-private-key \
-    --output "$TMP/lab-poste.json"
+    --output "$TMP/lab-poste.orion"
 
 echo "==> Contrôle des profils émis"
 # Sans ce contrôle, le banc afficherait deux chemins sans jamais vérifier ce
 # qu'ils contiennent — et une régression de l'émission passerait inaperçue
 # jusqu'à un import manuel dans Orion.
-python3 - "$TMP/lab.invitation.json" "$TMP/lab-poste.json" <<'PY'
+python3 - "$TMP/lab.invitation.orion" "$TMP/lab-poste.orion" <<'PY'
 import json, sys
 
 invitation, complet = (json.load(open(p)) for p in sys.argv[1:3])
@@ -180,18 +180,18 @@ echo "  Banc opérationnel."
 echo
 echo "  API gateway       $URL"
 echo "  Clé publique      $GW_PUB"
-echo "  Profil importable $TMP/lab-poste.json"
-echo "  Profil invitation $TMP/lab.invitation.json    (sans secret)"
+echo "  Profil importable $TMP/lab-poste.orion"
+echo "  Profil invitation $TMP/lab.invitation.orion    (sans secret)"
 echo
 if [ "$KEEP" = "1" ]; then
     echo "  Le daemon reste en vie (PID $DAEMON_PID)."
     echo
-    echo "  Importer lab-poste.json dans Orion, ou explorer :"
+    echo "  Importer lab-poste.orion dans Orion, ou explorer :"
     echo "    cargo run -p helios-ctl -- --url $URL status"
     echo "    cargo run -p helios-ctl -- --url $URL peer list"
     echo "    cargo run -p helios-ctl -- --url $URL watch"
     echo
-    echo "  lab-poste.json porte une clé privée : il disparaît avec le banc."
+    echo "  lab-poste.orion porte une clé privée : il disparaît avec le banc."
     echo "  Pour arrêter et tout effacer :"
     echo "    kill $DAEMON_PID && rm -rf $TMP"
 else

@@ -221,6 +221,45 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_psk_is_absent_and_an_invalid_psk_is_refused() {
+        let without_psk = KernelBackend::build_peer(&PeerConfig {
+            public_key: KEY_B.into(),
+            allowed_ips: "100.64.1.2/32".into(),
+            preshared_key: Some("   ".into()),
+        })
+        .unwrap();
+        assert!(without_psk.preshared_key.is_none());
+
+        assert!(matches!(
+            KernelBackend::build_peer(&PeerConfig {
+                public_key: KEY_B.into(),
+                allowed_ips: "100.64.1.2/32".into(),
+                preshared_key: Some("not-a-key".into()),
+            }),
+            Err(WgError::BadKey(message)) if message.contains("post-quantum PSK")
+        ));
+    }
+
+    #[test]
+    fn peer_list_translation_is_all_or_nothing() {
+        let peers = [
+            PeerConfig {
+                public_key: KEY_B.into(),
+                allowed_ips: "100.64.1.2/32".into(),
+                preshared_key: None,
+            },
+            PeerConfig {
+                public_key: "invalid".into(),
+                allowed_ips: "100.64.1.3/32".into(),
+                preshared_key: None,
+            },
+        ];
+
+        assert!(KernelBackend::build_peers(&peers).is_err());
+        assert!(KernelBackend::build_peers(&peers[..1]).is_ok());
+    }
+
+    #[test]
     fn invalid_key_or_vip_rejected() {
         assert!(KernelBackend::build_peer(&PeerConfig {
             public_key: "not-base64".into(),

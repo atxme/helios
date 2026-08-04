@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Same night sky as the application tile: a `.orion` document must read
+         as coming from Orion without being mistaken for Orion itself. -->
+    <linearGradient id="sheet" x1="18%" y1="0%" x2="82%" y2="100%">
+      <stop offset="0%" stop-color="#173C4E"/>
+      <stop offset="55%" stop-color="#0D2231"/>
+      <stop offset="100%" stop-color="#081521"/>
+    </linearGradient>
+
+    <linearGradient id="fold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2A5B72"/>
+      <stop offset="100%" stop-color="#16394A"/>
+    </linearGradient>
+
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#12B981" stop-opacity="0.5"/>
+      <stop offset="60%" stop-color="#12B981" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#12B981" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="orbit" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#12B981"/>
+      <stop offset="100%" stop-color="#48E7B4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Sheet with a folded corner. The silhouette is the whole point: it is
+       what says «file» at 16 px, where no detail survives. -->
+  <path d="M132 40 H312 L408 136 V452 A20 20 0 0 1 388 472 H132 A20 20 0 0 1 112 452
+           V60 A20 20 0 0 1 132 40 Z"
+        fill="url(#sheet)" stroke="#3C7189" stroke-width="6" stroke-opacity="0.55"/>
+  <path d="M312 40 L408 136 H332 A20 20 0 0 1 312 116 Z"
+        fill="url(#fold)" stroke="#3C7189" stroke-width="6" stroke-opacity="0.55"
+        stroke-linejoin="round"/>
+
+  <!-- The mark, on the 48-unit grid of `OrionMark.tsx` — reduced to what the
+       small sizes keep: the trajectory and the belt. -->
+  <g transform="translate(260 306) scale(5.6) translate(-24 -24)">
+    <circle cx="24" cy="24" r="15" fill="url(#halo)"/>
+    <ellipse cx="24" cy="24" rx="19.5" ry="7.6" transform="rotate(27 24 24)"
+             fill="none" stroke="url(#orbit)" stroke-width="2.9"/>
+    <g fill="#EAF7F1">
+      <circle cx="14.6" cy="31.2" r="3.1"/>
+      <circle cx="33.4" cy="16.8" r="3.1"/>
+      <circle cx="24" cy="24" r="6"/>
+    </g>
+  </g>
+</svg>

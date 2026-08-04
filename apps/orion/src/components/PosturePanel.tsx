@@ -3,7 +3,7 @@ import Divider from '@mui/material/Divider'
 import Popover from '@mui/material/Popover'
 import Typography from '@mui/material/Typography'
 import { AlertTriangle } from 'lucide-react'
-import type { ClientProfile, PskKind, TunnelState } from '../types'
+import type { ClientProfile, PskKind, TunnelState, VaultPosture } from '../types'
 import { modeMeta, postureMeta, protectionMeta, stateMeta } from './state'
 import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
@@ -38,9 +38,27 @@ interface Props {
   profile: ClientProfile | null
   psk: PskKind | null
   backend: string
+  /**
+   * What the vault can claim about itself. `null` while it is being read, or
+   * when it could not be — in which case the rows simply do not appear.
+   *
+   * Passed in rather than fetched here: this component is presentational, and
+   * the shell already owns every other fact it displays. Fetching inside would
+   * also make it untestable without a Tauri runtime.
+   */
+  vault: VaultPosture | null
 }
 
-export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, backend }: Props) {
+export function PosturePanel({
+  anchor,
+  onClose,
+  state,
+  adapterUp,
+  profile,
+  psk,
+  backend,
+  vault,
+}: Props) {
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const negotiation = profile?.key_negotiation
@@ -79,7 +97,7 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
           value={adapterUp ? 'monté' : 'démonté'}
           note={
             adapterUp
-              ? 'Tant qu’il est monté, WireGuard jette les paquets faute de handshake — rien ne sort en clair.'
+              ? 'Sans handshake valide, WireGuard bloque les paquets au lieu de les router hors tunnel.'
               : 'Le trafic ne passe plus par WireGuard.'
           }
         />
@@ -110,7 +128,7 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
           tone={narrowed ? AMBER : undefined}
           note={
             narrowed
-              ? 'Plage restreinte : ce qui en sort part en clair. 0.0.0.0/0 capte tout.'
+              ? 'Plage restreinte : les destinations hors de cette plage ne passent pas par le tunnel. 0.0.0.0/0 capte tout le trafic.'
               : undefined
           }
         />
@@ -122,6 +140,70 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
         />
         <Row label="backend" value={backend || '—'} />
       </Box>
+
+      {vault && (
+        <>
+          <Divider />
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
+            <Row
+              label="secrets"
+              value={vault.hardwareBacked ? 'scellés au TPM' : 'scellés au compte uniquement'}
+              tone={vault.hardwareBacked ? undefined : AMBER}
+              note={
+                vault.hardwareBacked
+                  ? 'Clé non exportable du TPM : copiés sur une autre machine, ils y sont \
+                     définitivement illisibles.'
+                  : 'Sécurité matérielle désactivée. La résistance à la copie inter-machine et \
+                     à un administrateur de domaine détenant les clés DPAPI n’est plus assurée.'
+              }
+            />
+            <Row
+              label="volume"
+              value={
+                vault.volumeProtected
+                  ? 'chiffré'
+                  : vault.unencryptedVolumeWaived
+                    ? 'non chiffré — exigence levée'
+                    : 'non couvert'
+              }
+              tone={vault.volumeProtected ? undefined : AMBER}
+              note={vault.volume}
+            />
+            <Row
+              label="mémoire"
+              value={vault.memoryLocked ? 'verrouillée' : 'non verrouillée'}
+              tone={vault.memoryLocked ? undefined : AMBER}
+              note={vault.memory}
+            />
+            {/* Defence in depth, so it is stated without an amber tone: the
+                exclusion covers WER reports only, never a debugger. */}
+            <Row
+              label="vidages"
+              value={vault.dumpsExcluded ? 'exclus' : 'non exclus'}
+              note={vault.dumps}
+            />
+            {vault.legacyPresent && (
+              <Row
+                label="migration"
+                value="fichier en clair présent"
+                tone={AMBER}
+                note="Un profils.toml hérité n’a pas encore été repris dans le coffre."
+              />
+            )}
+            {vault.rotationRequired.length > 0 && (
+              <Row
+                label="rotation"
+                value={`${vault.rotationRequired.join(', ')} — conseillée`}
+                tone={AMBER}
+                note="La clé de ces profils a vécu en clair dans profiles.toml. Ces profils
+                      restent connectables : Orion constate l’historique d’un fichier, il ne
+                      sait pas si la clé a fuité. Pour clore le doute — onglet Profils,
+                      « Générer une nouvelle clé », faire admettre la clé publique affichée."
+              />
+            )}
+          </Box>
+        </>
+      )}
     </Popover>
   )
 }

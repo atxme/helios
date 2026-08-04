@@ -20,8 +20,7 @@ import Typography from '@mui/material/Typography'
 import {
   AlertTriangle,
   ChevronRight,
-  Eye,
-  EyeOff,
+  KeyRound,
   FileCode2,
   Plus,
   RotateCcw,
@@ -41,6 +40,7 @@ import type {
   ImportOutcome,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
+  ProfileDraft,
   ProfileIssues,
   ProtectionMode,
 } from '../types'
@@ -70,9 +70,18 @@ import type {
 interface Props {
   config: ClientConfig
   pathImport: ClientProfile | null
+  /**
+   * Counter bumped each time the notification-area menu asks for an import.
+   *
+   * A counter and not a boolean: «Importer un profil…» twice in a row must
+   * open the picker twice, and a flag already set changes nothing. `0` — the
+   * value the screen mounts with — opens nothing, so reaching the profile
+   * screen by the navigation rail stays quiet.
+   */
+  importRequest?: number
   onPathImportHandled: () => void
   onImport: (contents: string, fileName: string) => Promise<ImportOutcome>
-  onSave: (profile: ClientProfile) => Promise<void>
+  onSave: (draft: ProfileDraft) => Promise<void>
   onDelete: (name: string) => Promise<void>
   onSelect: (name: string) => Promise<void>
 }
@@ -81,13 +90,18 @@ function blankProfile(): ClientProfile {
   return {
     name: 'nouveau',
     endpoint: '',
-    private_key: '',
     peer_public_key: '',
-    preshared_key: null,
+    // A brand-new profile has no key yet. The identity block above is where
+    // one is obtained — generated or imported — and only its public half ever
+    // reaches this object (ADR-006 §5).
+    public_key: null,
+    has_private_key: false,
+    has_static_psk: false,
     address: null,
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
     heliosd_url: null,
+    ssh_target: null,
     // No negotiation by default: its material comes from the operator, and a
     // block full of empty certificates would report itself faulty from the
     // first render. Adding one is one click away in the block below.
@@ -112,6 +126,25 @@ const MAX_IMPORT_BYTES = 64 * 1024
 
 /** Range that captures all traffic — the one that holds up the fail-open invariant. */
 const CAPTURE_ALL = '0.0.0.0/0'
+
+/** Its IPv6 counterpart, which captures everything just as thoroughly. */
+const CAPTURE_ALL_V6 = '::/0'
+
+/**
+ * Does this prefix list still route everything through the tunnel?
+ *
+ * A string comparison against `0.0.0.0/0` no longer answers it: the field
+ * holds a **list** now, and `0.0.0.0/0, 192.168.1.0/24` captures everything
+ * while being equal to neither. Getting this wrong would show the split-tunnel
+ * warning on a full tunnel, or — worse — hide it on a narrowed one.
+ */
+function capturesEverything(value: string): boolean {
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  return entries.includes(CAPTURE_ALL) || entries.includes(CAPTURE_ALL_V6)
+}
 
 /**
  * Delay before judging a field, in milliseconds.
@@ -153,6 +186,7 @@ function blankNegotiation(): KeyNegotiationSettings {
 export function ProfilesView({
   config,
   pathImport,
+  importRequest = 0,
   onPathImportHandled,
   onImport,
   onSave,
@@ -178,7 +212,26 @@ export function ProfilesView({
   const [dirty, setDirty] = useState(false)
   const [importing, setImporting] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
-  const [publicKey, setPublicKey] = useState<string | null>(null)
+  /**
+   * Public key of the pair staged in Rust, once one has been drawn or pasted.
+   *
+   * `null` means "no new key this session" — the profile keeps whatever it
+   * already had. Holding the **public** half here is what lets the screen show
+   * and copy it straight away: admission is out of band, so the user needs the
+   * value before the profile can work, not after saving it.
+   */
+  const [stagedPublicKey, setStagedPublicKey] = useState<string | null>(null)
+  /** The paste field is open. It holds a secret, so it is never left mounted. */
+  const [pasting, setPasting] = useState(false)
+  const [pasted, setPasted] = useState('')
+  const [keyBusy, setKeyBusy] = useState(false)
+  const [clearPsk, setClearPsk] = useState(false)
+  /** A static PSK is waiting in Rust, entered during this edit. */
+  const [stagedPsk, setStagedPsk] = useState(false)
+  /** The PSK paste field is open. It holds a secret, so it is never left mounted. */
+  const [pastingPsk, setPastingPsk] = useState(false)
+  const [pastedPsk, setPastedPsk] = useState('')
+  const [pskBusy, setPskBusy] = useState(false)
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -216,7 +269,7 @@ export function ProfilesView({
   useEffect(() => {
     let cancelled = false
     api
-      .keyNegotiationFingerprint(draft)
+      .keyNegotiationFingerprint(draft.key_negotiation)
       .then((found) => {
         if (!cancelled) setFingerprint(found)
       })
@@ -233,7 +286,7 @@ export function ProfilesView({
   useEffect(() => {
     let cancelled = false
     api
-      .keyNegotiationIdentitySealed(draft)
+      .keyNegotiationIdentitySealed(draft.key_negotiation)
       .then((sealed) => {
         if (!cancelled) setIdentitySealed(sealed)
       })
@@ -245,22 +298,35 @@ export function ProfilesView({
     }
   }, [draft, notice])
 
-  // Derivation lives on the Rust side: the UI doesn't handle crypto, and an
-  // incomplete private key mid-entry simply yields an absent value.
-  useEffect(() => {
-    let cancelled = false
-    api
-      .profilePublicKey(draft)
-      .then((key) => {
-        if (!cancelled) setPublicKey(key)
-      })
-      .catch(() => {
-        if (!cancelled) setPublicKey(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [draft])
+  /**
+   * The draft in the shape the shell accepts: public fields plus intents.
+   *
+   * Built here, once, so the two callers that send it — validation and save —
+   * cannot drift. Note what it does *not* contain, and cannot: neither secret
+   * is reachable from this module.
+   */
+  const toDraft = useCallback(
+    (profile: ClientProfile): ProfileDraft => ({
+      name: profile.name,
+      endpoint: profile.endpoint,
+      peer_public_key: profile.peer_public_key,
+      address: profile.address,
+      allowed_ips: profile.allowed_ips,
+      persistent_keepalive: profile.persistent_keepalive,
+      heliosd_url: profile.heliosd_url,
+      ssh_target: profile.ssh_target,
+      key_negotiation: profile.key_negotiation,
+      useStagedKey: stagedPublicKey !== null,
+      clearPresharedKey: clearPsk,
+      useStagedPsk: stagedPsk,
+    }),
+    [clearPsk, stagedPsk, stagedPublicKey],
+  )
+
+  // A staged key wins over the stored one: it is what a save is about to
+  // adopt, so it is what the user must copy and hand to the operator.
+  const publicKey = stagedPublicKey ?? draft.public_key
+  const hasKey = stagedPublicKey !== null || draft.has_private_key
 
   // The rules live in `orion-core`: we query the core rather than duplicate
   // its validation grammar in the UI. The call is deferred until typing
@@ -269,7 +335,7 @@ export function ProfilesView({
     let cancelled = false
     const timer = setTimeout(() => {
       api
-        .validateProfile(draft)
+        .validateProfile(toDraft(draft))
         .then((found) => {
           if (!cancelled) setIssues(found)
         })
@@ -281,7 +347,7 @@ export function ProfilesView({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [draft])
+  }, [draft, toDraft])
 
   /**
    * Replaces the draft wholesale.
@@ -294,6 +360,18 @@ export function ProfilesView({
     setDraft(profile)
     setHistory([])
     setFloorBaseline(profile.key_negotiation?.minimum_mode ?? null)
+    // Intents belong to the edit in progress, never to the profile: carrying a
+    // staged key onto the next profile loaded would attach it to an identity
+    // the operator never admitted.
+    setStagedPublicKey(null)
+    setPasting(false)
+    setPasted('')
+    void api.discardStagedKey().catch(() => {})
+    setClearPsk(false)
+    setStagedPsk(false)
+    setPastingPsk(false)
+    setPastedPsk('')
+    void api.discardStagedPsk().catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -317,6 +395,13 @@ export function ProfilesView({
     onPathImportHandled()
   }, [config.profiles, loadDraft, onPathImportHandled, pathImport])
 
+  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
+  // picker belongs to this screen, and opening it from the shell would mean a
+  // second one. `0` is the mounted value and opens nothing.
+  useEffect(() => {
+    if (importRequest > 0) fileInput.current?.click()
+  }, [importRequest])
+
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
     setDraft((profile) => ({ ...profile, [key]: value }))
@@ -335,7 +420,47 @@ export function ProfilesView({
     // the core refuses it too, before any network access, and the screen must
     // not promise what the connection would reject.
     if (key === 'mode' && !modeAllowed(value as ProtectionMode, settings.minimum_mode)) return
+    // The mode and the static PSK are one decision, not two. `orion-core`
+    // states it as an equivalence — `static_psk` demands a PSK, every other
+    // mode forbids one — so a screen that let them be set apart could only
+    // produce profiles it would then have to mark invalid.
+    //
+    // Choosing a mode is therefore what disposes of the PSK: ML-KEM and
+    // classic drop it, and nothing else does. It used to be dropped
+    // unconditionally, which is why this screen could only ever take a PSK
+    // away.
+    if (key === 'mode') dropStagedPskFor(value as ProtectionMode)
     editNegotiation({ [key]: value } as Partial<KeyNegotiationSettings>)
+  }
+
+  /**
+   * Aligns the static PSK on the mode — both ways.
+   *
+   * `clearPsk` is the intent sent to Rust for a PSK already stored; the staged
+   * one is dropped where it lives, since it never reached this side.
+   *
+   * Coming *back* to `static_psk` withdraws the removal, because nothing has
+   * been destroyed yet: the removal is a consequence of the mode, and a
+   * consequence that outlived its cause would make the stored PSK vanish for a
+   * mode the user tried and left. Only the save is irreversible.
+   *
+   * Classic is dropped as well as ML-KEM, though only ML-KEM was asked for:
+   * `orion-core` refuses a profile PSK under *any* mode but `static_psk`, so
+   * sparing it there would only move the refusal to the save, pointing at a
+   * field the user had not touched.
+   */
+  const dropStagedPskFor = (mode: ProtectionMode) => {
+    if (mode === 'static_psk') {
+      setClearPsk(false)
+      return
+    }
+    setClearPsk(true)
+    if (stagedPsk) {
+      setStagedPsk(false)
+      void api.discardStagedPsk().catch(() => {})
+    }
+    setPastingPsk(false)
+    setPastedPsk('')
   }
 
   /**
@@ -351,10 +476,12 @@ export function ProfilesView({
     const settings = draft.key_negotiation
     if (!settings) return
     if (floorBaseline && !modeAllowed(floor, floorBaseline)) return
-    editNegotiation({
-      minimum_mode: floor,
-      ...(modeAllowed(settings.mode, floor) ? {} : { mode: floor }),
-    })
+    const mode = modeAllowed(settings.mode, floor) ? settings.mode : floor
+    // A floor that drags the mode along drags the PSK's fate with it: raising
+    // past `static_psk` is one of the ways a profile stops being allowed to
+    // hold one.
+    dropStagedPskFor(mode)
+    editNegotiation({ minimum_mode: floor, ...(mode === settings.mode ? {} : { mode }) })
   }
 
   const editNegotiation = (patch: Partial<KeyNegotiationSettings>) => {
@@ -378,7 +505,13 @@ export function ProfilesView({
   const toggleNegotiation = (enabled: boolean) => {
     if (!enabled && floorBaseline && modeLevel(floorBaseline) > 0) return
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
+    // A block created over an existing static PSK opens on `static_psk`, not
+    // on the strongest mode. Without a negotiation block that PSK was the
+    // profile's whole protection; defaulting to ML-KEM here would silently
+    // discard it the moment the user ticked a box about something else.
+    // Choosing ML-KEM afterwards still drops it — but then it is a choice.
     const settings = enabled ? blankNegotiation() : null
+    if (settings && staticPsk) settings.mode = 'static_psk'
     setDraft((profile) => ({ ...profile, key_negotiation: settings }))
     setFloorBaseline(settings?.minimum_mode ?? null)
     setDirty(true)
@@ -424,8 +557,14 @@ export function ProfilesView({
 
   const save = async () => {
     try {
-      await onSave(draft)
+      await onSave(toDraft(draft))
       setDirty(false)
+      // The key has become the profile's: the slot is empty on the Rust side
+      // too, and keeping it here would re-send it at the next save.
+      setStagedPublicKey(null)
+      setPasting(false)
+      setPasted('')
+      setClearPsk(false)
       // Saving is the one action here with no visible consequence: the form
       // shows exactly what it showed a moment earlier. Without a word, one
       // presses the button again to be sure.
@@ -436,6 +575,87 @@ export function ProfilesView({
       })
     } catch {
       // The global error keeps the draft intact to allow a correction.
+    }
+  }
+
+  /** Draws a pair in Rust and shows the public half at once. */
+  const generateKey = async () => {
+    setKeyBusy(true)
+    try {
+      setStagedPublicKey(await api.generatePrivateKey())
+      setPasting(false)
+      setPasted('')
+      setDirty(true)
+      setNotice({
+        tone: 'success',
+        message:
+          'Clé générée. Transmettre la clé publique à l’opérateur, puis enregistrer.',
+      })
+    } catch (cause) {
+      setNotice({ tone: 'error', message: `Génération impossible : ${String(cause)}` })
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  /**
+   * Hands a pasted key to Rust, which validates it and answers its public half.
+   *
+   * The input is cleared on both outcomes. It is the only field in this screen
+   * that ever holds a secret, and it must not outlive the gesture.
+   */
+  const adoptKey = async () => {
+    setKeyBusy(true)
+    try {
+      const publicHalf = await api.adoptPrivateKey(pasted)
+      setPasted('')
+      setPasting(false)
+      setStagedPublicKey(publicHalf)
+      setDirty(true)
+      setNotice({ tone: 'success', message: 'Clé privée importée.' })
+    } catch (cause) {
+      setPasted('')
+      setNotice({ tone: 'error', message: String(cause) })
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  /**
+   * Hands a typed PSK to Rust, and lines the negotiation mode up behind it.
+   *
+   * The mode change is the point. A PSK entered while the profile asks for
+   * ML-KEM is a contradiction the core would refuse at save time, naming a
+   * field the user had not touched. Since `static_psk` is the only mode a PSK
+   * is valid under, entering one *is* choosing that mode — so the screen makes
+   * the choice rather than reporting the conflict.
+   *
+   * The input is cleared on both outcomes, like the private-key field: it is
+   * the only other place in this screen that ever holds a secret.
+   */
+  const adoptPsk = async () => {
+    setPskBusy(true)
+    try {
+      await api.adoptPresharedKey(pastedPsk)
+      setPastedPsk('')
+      setPastingPsk(false)
+      setStagedPsk(true)
+      setClearPsk(false)
+      if (draft.key_negotiation && draft.key_negotiation.mode !== 'static_psk') {
+        editNegotiation({ mode: 'static_psk' })
+      }
+      setDirty(true)
+      setNotice({
+        tone: 'success',
+        message: draft.key_negotiation
+          ? 'PSK statique enregistré — mode de négociation passé à « PSK statique ».'
+          : 'PSK statique enregistré.',
+      })
+    } catch (cause) {
+      setPastedPsk('')
+      setNotice({ tone: 'error', message: String(cause) })
+    } finally {
+      setPskBusy(false)
     }
   }
 
@@ -472,6 +692,14 @@ export function ProfilesView({
       if (imported.private_key_missing) {
         setNotice({ tone: 'error', message: imported.private_key_missing })
       }
+      // A partial document is loaded, not refused: the gap is named so the
+      // user can close it in the form they are already looking at.
+      else if (imported.incomplete) {
+        setNotice({
+          tone: 'error',
+          message: `« ${profile.name} » chargé, à compléter : ${imported.incomplete}`,
+        })
+      }
       // The identity failing to seal outranks the profile loading fine: the
       // profile is visible on screen, whereas an unsealed identity only
       // shows up much later, as a connection that fails before WireGuard.
@@ -500,8 +728,19 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
-  const narrowed = draft.allowed_ips.trim() !== CAPTURE_ALL
-  const staticPsk = Boolean(draft.preshared_key?.trim())
+  const narrowed = !capturesEverything(draft.allowed_ips)
+  // A PSK entered during this edit counts as present: it is what the save is
+  // about to store, and showing "aucun" next to a value the user just typed
+  // would read as the entry having been refused.
+  const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
+  /**
+   * May this profile hold a static PSK at all?
+   *
+   * Without a negotiation block, yes — a static PSK is then plain WireGuard.
+   * With one, only `static_psk` tolerates it, and the anti-downgrade floor is
+   * what can put that mode out of reach for good.
+   */
+  const pskOffered = !draft.key_negotiation || modeAllowed('static_psk', draft.key_negotiation.minimum_mode)
   const invalid = Object.values(issues).some(Boolean)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty
   // field would stay invisible until someone thinks to open it.
@@ -593,13 +832,15 @@ export function ProfilesView({
               component="input"
               ref={fileInput}
               type="file"
-              // `.orionprofile` d'abord : c'est l'extension que produit
+              // `.orion` d'abord : c'est l'extension que produit
               // `helios-ctl enroll` et celle qu'Orion associe au double-clic.
               // Son absence ici la grisait dans le sélecteur, ce qui donnait à
               // penser que le format n'était pas supporté — alors que le
               // parseur l'accepte depuis toujours (il reconnaît le JSON à son
-              // premier caractère, pas au suffixe).
-              accept=".orionprofile,.json,.conf,application/json,text/plain"
+              // premier caractère, pas au suffixe). `.orionprofile` reste
+              // proposée : c'est le suffixe distribué jusqu'en août 2026, et
+              // les documents déjà écrits survivent au client qui les lit.
+              accept=".orion,.orionprofile,.json,.conf,application/json,text/plain"
               onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                 void importFile(event.target.files?.[0])
               }
@@ -646,6 +887,114 @@ export function ProfilesView({
             </Alert>
           )}
 
+          {/* ── Identity ─────────────────────────────────────────────────
+              Its own block, full width, above the rest. It used to be two
+              rows lost inside the two-column grid — a state line that read
+              like a broken label, and a public key showing a dash because no
+              key existed yet. Both belong to one act: obtain an identity, then
+              hand its public half to the operator. Admission is out of band
+              (ADR-004 §6), so this is the step everything else waits on. */}
+          <Box
+            sx={{
+              mb: 1.5,
+              p: 1.5,
+              border: 1,
+              borderColor: 'divider',
+              borderRadius: 1,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1.25,
+            }}
+          >
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Typography sx={{ fontSize: 12, fontWeight: 700 }}>
+                Identité de ce poste
+              </Typography>
+              <Typography
+                sx={{
+                  fontSize: 10.5,
+                  fontFamily: 'monospace',
+                  color: hasKey ? 'success.main' : 'text.disabled',
+                }}
+              >
+                {stagedPublicKey
+                  ? 'nouvelle clé — à enregistrer'
+                  : hasKey
+                    ? 'clé scellée dans le coffre'
+                    : 'aucune clé'}
+              </Typography>
+            </Box>
+
+            <ReadOnlyField
+              label="Votre clé publique"
+              value={publicKey ?? '—'}
+              hint="À transmettre à l’opérateur : l’admission est hors bande, elle doit être déclarée sur Helios avant le premier handshake."
+            />
+
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
+              <Button
+                size="small"
+                variant="outlined"
+                color="inherit"
+                disabled={keyBusy}
+                onClick={generateKey}
+                startIcon={<KeyRound size={14} aria-hidden />}
+                sx={{ fontSize: 11.5, textTransform: 'none' }}
+              >
+                {hasKey ? 'Générer une nouvelle clé' : 'Générer une clé'}
+              </Button>
+              <Button
+                size="small"
+                variant="text"
+                color="inherit"
+                disabled={keyBusy}
+                onClick={() => setPasting((open) => !open)}
+                sx={{ fontSize: 11.5, textTransform: 'none', color: 'text.secondary' }}
+              >
+                {pasting ? 'Annuler l’import' : 'Importer une clé privée'}
+              </Button>
+              {issues.private_key && (
+                <Typography color="error" sx={{ fontSize: 10.5 }}>
+                  {issues.private_key}
+                </Typography>
+              )}
+            </Box>
+
+            {/* Mounted only while it is being used. This is the single field in
+                the screen that carries a secret, and it travels **inbound**
+                only: Rust validates it, answers with the public half, and the
+                input is cleared on both outcomes (ADR-006 §5). */}
+            {pasting && (
+              <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                <TextField
+                  fullWidth
+                  size="small"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  label="Clé privée WireGuard (base64)"
+                  value={pasted}
+                  onChange={(event) => setPasted(event.target.value)}
+                  helperText="Collée une fois, jamais réaffichée. Sortie de `wg genkey` ou d’un fichier wg-quick."
+                  sx={{
+                    '& input': { fontFamily: 'monospace', fontSize: 12 },
+                    '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
+                  }}
+                />
+                <Button
+                  size="small"
+                  variant="contained"
+                  disableElevation
+                  disabled={keyBusy || pasted.trim().length === 0}
+                  onClick={adoptKey}
+                  sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
+                >
+                  Valider
+                </Button>
+              </Box>
+            )}
+          </Box>
+
           <Box
             sx={{
               display: 'grid',
@@ -664,12 +1013,6 @@ export function ProfilesView({
                 value={draft.endpoint}
                 onChange={(value) => set('endpoint', value)}
               />
-              <Secret
-                label="Clé privée"
-                error={issues.private_key}
-                value={draft.private_key}
-                onChange={(value) => set('private_key', value)}
-              />
               <Field
                 label="Clé publique gateway"
                 error={issues.peer_public_key}
@@ -686,12 +1029,6 @@ export function ProfilesView({
                 value={draft.address ?? ''}
                 onChange={(value) => set('address', value || null)}
               />
-              <ReadOnlyField
-                label="Votre clé publique"
-                value={publicKey ?? '—'}
-                hint="À transmettre à l’opérateur : l’admission est hors bande, elle doit être déclarée sur Helios avant le premier handshake."
-              />
-
               <ButtonBase
                 onClick={() => setAdvanced((open) => !open)}
                 aria-expanded={advanced}
@@ -722,13 +1059,14 @@ export function ProfilesView({
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                   <Field
                     label="Trafic capté"
-                error={issues.allowed_ips}
+                    error={issues.allowed_ips}
                     value={draft.allowed_ips}
                     onChange={(value) => set('allowed_ips', value)}
+                    hint="Une ou plusieurs plages CIDR, séparées par des virgules. Ex. : 100.64.0.0/10, 192.168.1.0/24"
                   />
                   {narrowed && (
                     <Caution>
-                      Plage restreinte : ce qui en sort part <strong>en clair</strong>.{' '}
+                      Plages restreintes : ce qui en sort part <strong>en clair</strong>.{' '}
                       {CAPTURE_ALL} capte tout.
                     </Caution>
                   )}
@@ -739,25 +1077,96 @@ export function ProfilesView({
                     value={String(draft.persistent_keepalive)}
                     onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
                   />
-                  <Secret
+                  {/* Same inbound-only rule as the private key. What the floor
+                      forbids is not offered at all: a PSK typed under a profile
+                      pinned to ML-KEM could only be refused at save time. */}
+                  <SecretState
                     label="PSK statique"
-                error={issues.preshared_key}
-                    value={draft.preshared_key ?? ''}
-                    onChange={(value) => set('preshared_key', value || null)}
+                    present={staticPsk}
+                    error={issues.preshared_key}
+                    presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
+                    absentLabel={
+                      pskOffered ? 'aucun' : 'aucun — ML-KEM à chaque connexion'
+                    }
+                    action={
+                      staticPsk
+                        ? {
+                            label: 'Retirer le PSK statique',
+                            onClick: () => {
+                              setClearPsk(true)
+                              if (stagedPsk) {
+                                setStagedPsk(false)
+                                void api.discardStagedPsk().catch(() => {})
+                              }
+                              setDirty(true)
+                            },
+                            disabled: clearPsk && !stagedPsk,
+                          }
+                        : pskOffered
+                          ? {
+                              label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
+                              onClick: () => setPastingPsk((open) => !open),
+                              disabled: pskBusy,
+                            }
+                          : undefined
+                    }
+                    hint={
+                      pskOffered
+                        ? 'Valeur hors bande, partagée avec l’opérateur. La saisir bascule la négociation en « PSK statique ».'
+                        : 'Le plancher anti-downgrade de ce profil exige ML-KEM : un PSK statique y serait un retour en arrière.'
+                    }
                   />
+                  {/* Mounted only while in use, and inbound only — same rule as
+                      the private-key field above (ADR-006 §5). */}
+                  {pastingPsk && !staticPsk && (
+                    <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                      <TextField
+                        fullWidth
+                        size="small"
+                        type="password"
+                        autoComplete="off"
+                        spellCheck={false}
+                        label="PSK WireGuard (base64)"
+                        value={pastedPsk}
+                        onChange={(event) => setPastedPsk(event.target.value)}
+                        helperText="Collé une fois, jamais réaffiché. Sortie de `wg genpsk`."
+                        sx={{
+                          '& input': { fontFamily: 'monospace', fontSize: 12 },
+                          '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
+                        }}
+                      />
+                      <Button
+                        size="small"
+                        variant="contained"
+                        disableElevation
+                        disabled={pskBusy || pastedPsk.trim().length === 0}
+                        onClick={adoptPsk}
+                        sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
+                      >
+                        Valider
+                      </Button>
+                    </Box>
+                  )}
                   {staticPsk && (
                     <Caution>
-                      Laisser vide pour obtenir un <strong>PSK PQC</strong> négocié en ML-KEM-1024 à
-                      chaque connexion. Une valeur ici la <strong>désactive</strong> : le secret ne
-                      tourne plus et les deux pairs doivent porter la même valeur.
+                      Un PSK statique <strong>désactive</strong> ML-KEM : le secret est le même à
+                      chaque connexion, au lieu d’être renégocié.
                     </Caution>
                   )}
                   <Field
                     label="URL Helios"
-                error={issues.heliosd_url}
+                    error={issues.heliosd_url}
                     placeholder="http://100.64.0.1:8080"
                     value={draft.heliosd_url ?? ''}
                     onChange={(value) => set('heliosd_url', value || null)}
+                  />
+                  <Field
+                    label="Destination SSH"
+                    error={issues.ssh_target}
+                    placeholder="utilisateur@100.64.0.1"
+                    value={draft.ssh_target ?? ''}
+                    onChange={(value) => set('ssh_target', value || null)}
+                    hint="Active le bouton « Terminal SSH » de l’écran Connexion. La gateway doit poser allow_ssh_over_tunnel."
                   />
                 </Box>
               </Collapse>
@@ -1317,6 +1726,7 @@ function Field({
   type = 'text',
   placeholder,
   error,
+  hint,
 }: {
   label: string
   value: string
@@ -1325,6 +1735,8 @@ function Field({
   placeholder?: string
   /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
+  /** Shown while the field is acceptable. An error always wins over it. */
+  hint?: string
 }) {
   return (
     <TextField
@@ -1335,7 +1747,7 @@ function Field({
       placeholder={placeholder}
       value={value}
       error={Boolean(error)}
-      helperText={error ?? undefined}
+      helperText={error ?? hint}
       onChange={(event) => onChange(event.target.value)}
       sx={{
         '& input': { fontFamily: 'monospace', fontSize: 12 },
@@ -1375,51 +1787,90 @@ function ReadOnlyField({ label, value, hint }: { label: string; value: string; h
 }
 
 /** Secret field: masked by default, revealable without forcing blind entry. */
-function Secret({
+/**
+ * States that a secret exists, without being able to carry it.
+ *
+ * # What this replaces, and why
+ *
+ * A `TextField` holding the WireGuard private key, with a button to reveal it.
+ * That single component was the widest hole in ADR-006: the value had to be
+ * serialised across the Tauri IPC to be displayed, parsed into a JavaScript
+ * string nothing can wipe, and kept in a DOM node's `value` for the life of
+ * the screen — where a screenshot, an accessibility client, or anything with
+ * access to the WebView could read it. Sealing a key on disk and then showing
+ * it in a browser engine protects the quiet half of its life.
+ *
+ * There is deliberately **no `value` prop**. The component cannot display a
+ * secret because it is never given one, which is a stronger guarantee than a
+ * component that merely chooses not to. What the user acts on is an *intent* —
+ * generate, clear — carried out in Rust.
+ */
+function SecretState({
   label,
-  value,
-  onChange,
+  present,
+  presentLabel,
+  absentLabel,
+  action,
   error,
+  hint,
 }: {
   label: string
-  value: string
-  onChange: (value: string) => void
+  present: boolean
+  /** What to say when the secret is there. Never the secret. */
+  presentLabel: string
+  absentLabel: string
+  action?: { label: string; onClick: () => void; disabled?: boolean }
   /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
+  hint?: string
 }) {
-  const [visible, setVisible] = useState(false)
   return (
-    <TextField
-      fullWidth
-      size="small"
-      label={label}
-      type={visible ? 'text' : 'password'}
-      value={value}
-      error={Boolean(error)}
-      helperText={error ?? undefined}
-      onChange={(event) => onChange(event.target.value)}
-      slotProps={{
-        input: {
-          endAdornment: (
-            <InputAdornment position="end">
-              <Tooltip title={visible ? 'Masquer la valeur' : 'Afficher la valeur'}>
-                <IconButton
-                  edge="end"
-                  size="small"
-                  onClick={() => setVisible((shown) => !shown)}
-                  aria-label={visible ? 'Masquer la valeur' : 'Afficher la valeur'}
-                >
-                  {visible ? <EyeOff size={15} aria-hidden /> : <Eye size={15} aria-hidden />}
-                </IconButton>
-              </Tooltip>
-            </InputAdornment>
-          ),
-        },
-      }}
-      sx={{
-        '& input': { fontFamily: 'monospace', fontSize: 12 },
-        '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
-      }}
-    />
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+        <Typography
+          color="text.disabled"
+          sx={{
+            width: 110,
+            flexShrink: 0,
+            fontFamily: 'monospace',
+            fontSize: 9.5,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          {label}
+        </Typography>
+        <Typography
+          sx={{
+            minWidth: 0,
+            color: error ? 'error.main' : present ? 'text.primary' : 'text.secondary',
+            fontFamily: 'monospace',
+            fontSize: 11.5,
+            overflowWrap: 'anywhere',
+          }}
+        >
+          {present ? presentLabel : absentLabel}
+        </Typography>
+      </Box>
+      {action && (
+        <Button
+          size="small"
+          variant="text"
+          onClick={action.onClick}
+          disabled={action.disabled}
+          sx={{ ml: '118px', mt: 0.25, fontSize: 11, textTransform: 'none' }}
+        >
+          {action.label}
+        </Button>
+      )}
+      {(error || hint) && (
+        <Typography
+          color={error ? 'error' : 'text.secondary'}
+          sx={{ mt: 0.25, ml: '118px', fontSize: 10.5, lineHeight: 1.4 }}
+        >
+          {error ?? hint}
+        </Typography>
+      )}
+    </Box>
   )
 }

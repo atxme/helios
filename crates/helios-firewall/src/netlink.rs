@@ -93,6 +93,7 @@ impl NetlinkBackend {
             }
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
+            Match::Icmp => rule.icmp(),
         })
     }
 
@@ -345,5 +346,108 @@ mod tests {
         assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
         assert!(IpAddr::from_str("203.0.113.10").is_ok());
         assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
+    }
+
+    /// Translation is the largest deterministic part of the real backend.
+    /// It is exercised without sending the resulting batch to the kernel.
+    #[test]
+    fn a_complete_ruleset_translates_before_any_netlink_side_effect() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![
+                crate::ruleset::Rule {
+                    chain: ChainKind::Input,
+                    matches: vec![
+                        Match::Established,
+                        Match::InIface("helios0".into()),
+                        Match::DestPort {
+                            port: 8080,
+                            proto: L4::Tcp,
+                        },
+                        Match::DestNet("100.64.0.1".into()),
+                        Match::SourceNet("100.64.0.0/10".into()),
+                    ],
+                    verdict: Verdict::Accept,
+                    note: None,
+                },
+                crate::ruleset::Rule {
+                    chain: ChainKind::Forward,
+                    matches: vec![
+                        Match::OutIface("eth0".into()),
+                        Match::DestPortSet {
+                            ports: vec![53, 51820],
+                            proto: L4::Udp,
+                        },
+                        Match::DestNet("2001:db8::/32".into()),
+                        Match::SourceNet("2001:db8::1".into()),
+                    ],
+                    verdict: Verdict::Drop,
+                    note: None,
+                },
+            ],
+            mss_clamp: Some(1280),
+            masquerade_out: Some("eth0".into()),
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
+
+        let mut accept_by_default = ruleset;
+        accept_by_default.default_verdict = Verdict::Accept;
+        accept_by_default.masquerade_out = None;
+        assert!(NetlinkBackend::new()
+            .build_batch(&accept_by_default)
+            .is_ok());
+    }
+
+    #[test]
+    fn malformed_addresses_abort_the_batch_before_it_can_be_sent() {
+        for malformed in [
+            Match::DestNet("not-an-address".into()),
+            Match::DestNet("10.0.0.0/99".into()),
+            Match::SourceNet("still-not-an-address".into()),
+            Match::SourceNet("2001:db8::/999".into()),
+        ] {
+            let ruleset = Ruleset {
+                default_verdict: Verdict::Drop,
+                rules: vec![crate::ruleset::Rule {
+                    chain: ChainKind::Output,
+                    matches: vec![malformed],
+                    verdict: Verdict::Accept,
+                    note: None,
+                }],
+                mss_clamp: None,
+                masquerade_out: None,
+            };
+            assert!(
+                NetlinkBackend::new().build_batch(&ruleset).is_err(),
+                "an invalid address must cancel translation"
+            );
+        }
+    }
+
+    #[test]
+    fn two_port_sets_are_refused_instead_of_becoming_a_partial_rule() {
+        let ruleset = Ruleset {
+            default_verdict: Verdict::Drop,
+            rules: vec![crate::ruleset::Rule {
+                chain: ChainKind::Input,
+                matches: vec![
+                    Match::DestPortSet {
+                        ports: vec![80, 443],
+                        proto: L4::Tcp,
+                    },
+                    Match::DestPortSet {
+                        ports: vec![53],
+                        proto: L4::Udp,
+                    },
+                ],
+                verdict: Verdict::Accept,
+                note: None,
+            }],
+            mss_clamp: None,
+            masquerade_out: None,
+        };
+
+        assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());
     }
 }

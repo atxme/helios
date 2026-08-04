@@ -1,4 +1,4 @@
-//! Core logic of the Orion VPN client.
+//! Core logic of the Orion client.
 //!
 //! This crate depends on neither Tauri nor webkit: it compiles and is tested
 //! everywhere, including on WSL2. It carries three things:
@@ -31,6 +31,7 @@ pub mod net_pin;
 pub mod profile_import;
 pub mod provisioning;
 pub mod telemetry;
+pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
 pub use config::{

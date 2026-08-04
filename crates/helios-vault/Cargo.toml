@@ -1,0 +1,15 @@
+[package]
+name = "helios-vault"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Conteneur AEAD unique des secrets au repos (ADR-006) — AES-256-GCM, séparation de domaine, parseur borné."
+
+[dependencies]
+thiserror.workspace = true
+# AES-256-GCM, HKDF et PBKDF2 : moteur cryptographique unique du dépôt, et
+# seule voie vers une validation FIPS ultérieure (ADR-002, ADR-006 §1).
+aws-lc-rs.workspace = true
+# Le texte clair rendu par `open` ne doit pas survivre à sa portée.
+zeroize.workspace = true

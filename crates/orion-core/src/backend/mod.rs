@@ -25,6 +25,7 @@
 //! real WireGuard backend (BoringTun + Wintun via `defguard_wireguard_rs`) is
 //! target-only, just like the `netlink` feature on the heliosd side.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -184,8 +185,8 @@ async fn upgrade_to_post_quantum(
         sink(ClientEvent::protection(PskKind::None));
         sink(ClientEvent::log(
             "info",
-            "Pas d'URL Helios interne au profil : le tunnel reste classique \
-             (Curve25519 seul, vulnérable au « récolter maintenant, déchiffrer plus tard »)"
+            "Pas d'URL Helios interne au profil : le tunnel reste classique, \
+             Curve25519 seul, sans PSK ML-KEM"
                 .to_string(),
         ));
         return;
@@ -195,7 +196,7 @@ async fn upgrade_to_post_quantum(
         sink(ClientEvent::protection(PskKind::None));
         sink(ClientEvent::log(
             "warn",
-            "Aucun handshake dans le délai imparti : PSK PQC reporté à la \
+            "Aucun handshake WireGuard dans le délai imparti : PSK ML-KEM reporté à la \
              prochaine connexion — le tunnel reste classique"
                 .to_string(),
         ));
@@ -208,7 +209,7 @@ async fn upgrade_to_post_quantum(
             sink(ClientEvent::protection(PskKind::None));
             sink(ClientEvent::log(
                 "warn",
-                format!("Négociation du PSK PQC impossible : {e} — le tunnel reste classique"),
+                format!("Négociation du PSK ML-KEM impossible : {e} — le tunnel reste classique"),
             ));
             return;
         }
@@ -244,8 +245,8 @@ async fn upgrade_to_post_quantum(
             sink(ClientEvent::log(
                 "info",
                 format!(
-                    "PSK PQC installé (ML-KEM-1024, valable {} s) — \
-                     le prochain handshake sera protégé",
+                    "PSK ML-KEM-1024 installé (valable {} s) — \
+                     le prochain handshake WireGuard sera protégé",
                     outcome.lifetime.as_secs()
                 ),
             ));
@@ -260,8 +261,9 @@ async fn upgrade_to_post_quantum(
             sink(ClientEvent::log(
                 "error",
                 format!(
-                    "PSK PQC obtenu mais non installé localement : {e}. La gateway \
-                     l'a posé de son côté — se reconnecter pour resynchroniser."
+                    "PSK ML-KEM négocié mais non installé sur cette machine : {e}. La gateway \
+                     l'a déjà installé de son côté — se reconnecter pour resynchroniser \
+                     les deux slots."
                 ),
             ));
         }
@@ -280,8 +282,37 @@ pub struct VpnController {
     /// it: the task ends once the tunnel is up, while the link must stay open
     /// for as long as the tunnel does. Closing it on `disconnect` is what
     /// spares the gateway from waiting for stale handshakes.
-    link_slot: Arc<Mutex<Option<helios_key_negotiation::SessionLink>>>,
+    link_slot: Arc<Mutex<Option<LinkWatch>>>,
+    /// Has the liveness link of the current tunnel died on its own?
+    ///
+    /// The handshake age cannot express this. When the link closes, the
+    /// gateway drops the negotiated PSK, but the WireGuard session already
+    /// established keeps carrying traffic until its next rekey — so the last
+    /// handshake stays fresh for up to two more minutes while the tunnel is
+    /// already condemned. Inferring the state from freshness alone left the
+    /// UI showing a healthy connection the client knew was over.
+    link_lost: Arc<AtomicBool>,
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
+}
+
+/// A liveness link and the task watching it, kept together.
+///
+/// They must also *die* together. A watcher outliving its link reports the
+/// death of a session a renegotiation has already replaced — and would
+/// condemn the healthy tunnel that succeeded it.
+struct LinkWatch {
+    link: helios_key_negotiation::SessionLink,
+    watcher: JoinHandle<()>,
+}
+
+impl LinkWatch {
+    /// Stops watching, then hangs up. In this order: the closure is
+    /// deliberate here, and the watcher exists to report the ones that
+    /// aren't.
+    fn close(self) {
+        self.watcher.abort();
+        self.link.close();
+    }
 }
 
 impl VpnController {
@@ -291,6 +322,7 @@ impl VpnController {
             state: Arc::new(RwLock::new(TunnelState::Down)),
             task: Mutex::new(None),
             link_slot: Arc::new(Mutex::new(None)),
+            link_lost: Arc::new(AtomicBool::new(false)),
             key_negotiation_identities: None,
         }
     }
@@ -352,10 +384,34 @@ impl VpnController {
     /// clear-text leak.
     pub async fn connect(&self, profile: ClientProfile, user_sink: EventSink) {
         self.abort_task().await;
+        // The previous session ends here, whatever the new profile does: its
+        // link is hung up so the gateway releases that PSK now, and its
+        // watcher stops before it can report a closure this connection
+        // caused. A verdict left standing would condemn the tunnel about to
+        // be built.
+        if let Some(previous) = self.link_slot.lock().await.take() {
+            previous.close();
+        }
+        self.link_lost.store(false, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
+        // Says a connection has begun, before anything long happens.
+        //
+        // A negotiated connection reaches its backend only *after* the ML-KEM
+        // exchange — several seconds during which nothing was emitted at all.
+        // The state therefore stayed on `Down` while a connection was under
+        // way, and every consumer reading it concluded there was none: the
+        // screen showed «Déconnecté», and the shell's inference loop, whose
+        // stop condition is precisely that state, ended on its first tick and
+        // never downgraded anything afterwards.
+        //
+        // Emitting it here rather than in the spawned task is deliberate: the
+        // caller must be able to observe the transition as soon as `connect`
+        // returns, without racing the task it just started.
+        sink(ClientEvent::state(TunnelState::Connecting));
         let backend = Arc::clone(&self.backend);
         let identities = self.key_negotiation_identities.clone();
         let link_slot = Arc::clone(&self.link_slot);
+        let link_lost = Arc::clone(&self.link_lost);
         let handle = tokio::spawn(async move {
             if profile.key_negotiation.is_some() {
                 if let Err(error) = connect_with_key_negotiation(
@@ -364,6 +420,7 @@ impl VpnController {
                     &sink,
                     identities.as_deref(),
                     &link_slot,
+                    &link_lost,
                 )
                 .await
                 {
@@ -401,6 +458,7 @@ impl VpnController {
         if let Some(link) = self.link_slot.lock().await.take() {
             link.close();
         }
+        self.link_lost.store(false, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
         if let Err(e) = self.backend.down(&sink).await {
             sink(ClientEvent::Error {
@@ -418,11 +476,34 @@ impl VpnController {
     ///
     /// **Never** touches the adapter: this inference drives the UI and
     /// telemetry, not the anti-leak protection (ADR-001 §3).
+    ///
+    /// # Why freshness is not the only input
+    ///
+    /// A closed session link is invisible to the handshake age: the gateway has
+    /// already released the negotiated PSK, but the WireGuard session in place
+    /// keeps its last handshake recent until the rekey that will fail, up to
+    /// two minutes later. Freshness alone therefore kept answering `Up` for a
+    /// tunnel whose end was already decided — the screen said connected while
+    /// the log said the session was over. A closed link outranks freshness, and
+    /// it also has to: without it, this poll would hoist the tunnel back to
+    /// `Up` three seconds after the closure was announced.
+    ///
+    /// # Two outcomes, because the two situations differ
+    ///
+    /// A stale handshake is recoverable: WireGuard renegotiates on its own once
+    /// the endpoint answers again, so the state falls back to `Connecting` and
+    /// this poll keeps watching. A closed session link is not: the gateway
+    /// released the PSK and only a new negotiation installs another one, so the
+    /// state goes to `Down` — there is no tunnel left, and saying anything else
+    /// would promise a recovery that cannot happen. Neither outcome unmounts the
+    /// adapter; that stays the privilege of an explicit disconnection.
     pub async fn poll_handshake(&self, user_sink: EventSink) {
-        let fresh = matches!(
-            self.backend.last_handshake_age().await,
-            Some(age) if age < HANDSHAKE_STALE_AFTER
-        );
+        let link_lost = self.link_lost.load(Ordering::SeqCst);
+        let fresh = !link_lost
+            && matches!(
+                self.backend.last_handshake_age().await,
+                Some(age) if age < HANDSHAKE_STALE_AFTER
+            );
         let current = self.state();
         let sink = self.wrap_sink(user_sink);
 
@@ -430,12 +511,20 @@ impl VpnController {
             (TunnelState::Connecting, true) => {
                 sink(ClientEvent::state(TunnelState::Up));
             }
+            // The closure has just been announced by the link watcher, with the
+            // detail this transition cannot carry. Repeating it would only push
+            // that explanation further up the log.
+            (TunnelState::Up, false) if link_lost => {
+                sink(ClientEvent::state(TunnelState::Down));
+            }
             (TunnelState::Up, false) => {
                 sink(ClientEvent::log(
                     "warn",
-                    "handshake WireGuard périmé — tunnel non opérationnel \
-                     (adaptateur maintenu, aucun trafic en clair)"
-                        .to_string(),
+                    format!(
+                        "aucun handshake WireGuard depuis {} s : le tunnel ne transporte plus \
+                         de trafic. L'adaptateur reste monté et bloque les paquets.",
+                        HANDSHAKE_STALE_AFTER.as_secs()
+                    ),
                 ));
                 sink(ClientEvent::state(TunnelState::Connecting));
             }
@@ -491,7 +580,8 @@ async fn connect_with_key_negotiation(
     profile: &ClientProfile,
     sink: &EventSink,
     identities: Option<&dyn crate::key_negotiation::IdentityProvider>,
-    link_slot: &Mutex<Option<helios_key_negotiation::SessionLink>>,
+    link_slot: &Mutex<Option<LinkWatch>>,
+    link_lost: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let identities = identities
         .context("the Orion shell did not provide a protected key-negotiation identity store")?;
@@ -517,12 +607,25 @@ async fn connect_with_key_negotiation(
             match crate::key_negotiation::prepare_for_profile(profile, identities).await {
                 Ok(negotiated) => negotiated,
                 Err(error) => {
+                    // Also to `tracing`, and not only to the UI: the event sink
+                    // feeds a window the user has usually already closed, while
+                    // the file is what gets pasted into a bug report. Without
+                    // this line `orion.log` showed three dial attempts two
+                    // seconds apart and not one word about why any of them
+                    // failed — the retry looked like the whole story.
+                    tracing::warn!(
+                        attempt,
+                        attempts = KEY_NEGOTIATION_ATTEMPTS,
+                        %endpoint,
+                        error = format!("{error:#}"),
+                        "key negotiation: attempt failed, nothing installed on the data plane"
+                    );
                     sink(ClientEvent::log(
                         "warn",
                         format!(
-                        "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : accord non conclu — \
-                         {error:#}. Rien n'a été posé sur le plan de données."
-                    ),
+                            "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : échec — \
+                         {error:#}. Aucun PSK installé sur le plan de données."
+                        ),
                     ));
                     last_error = Some(error);
                     if attempt < KEY_NEGOTIATION_ATTEMPTS {
@@ -535,8 +638,8 @@ async fn connect_with_key_negotiation(
         sink(ClientEvent::log(
             "info",
             format!(
-                "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : accord obtenu ({mode:?}) — \
-                 pose du PSK puis attente d'un handshake WireGuard réussi avec ce PSK \
+                "négociation {attempt}/{KEY_NEGOTIATION_ATTEMPTS} : PSK négocié ({mode:?}) — \
+                 installation puis attente d'un handshake WireGuard réussi avec ce PSK \
                  ({} s au plus)",
                 negotiated.confirmation_timeout.as_secs()
             ),
@@ -573,10 +676,18 @@ async fn connect_with_key_negotiation(
                 // without either end having said anything. Saying it here is
                 // what turns an unexplained drop two minutes later into a
                 // diagnosable event.
-                spawn_link_watch(link.clone(), Arc::clone(sink));
-                // Replaces any previous link: a renegotiation supersedes the
-                // tunnel the old one described.
-                *link_slot.lock().await = Some(link);
+                let watcher =
+                    spawn_link_watch(link.clone(), Arc::clone(sink), Arc::clone(link_lost));
+                // Replaces any previous link — and stops its watcher, which
+                // would otherwise announce the death of the session this
+                // renegotiation has just superseded, condemning the tunnel it
+                // was replaced by.
+                if let Some(previous) = link_slot.lock().await.replace(LinkWatch { link, watcher })
+                {
+                    previous.close();
+                }
+                // A fresh link outranks any verdict the previous one left.
+                link_lost.store(false, Ordering::SeqCst);
                 let protection = match mode {
                     aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
                     aether::key_negotiation::ProtectionMode::StaticPsk => PskKind::Static,
@@ -640,17 +751,28 @@ async fn connect_with_key_negotiation(
 /// The gateway releases the PSK slot as soon as this link closes. The tunnel
 /// survives on the current WireGuard session and dies at the next rekey, two
 /// to three minutes later — long enough that nobody connects the two events.
-fn spawn_link_watch(link: helios_key_negotiation::SessionLink, sink: EventSink) {
+///
+/// The verdict is raised **before** it is logged, because it is what the state
+/// inference reads: a poll landing between the two would find a still-fresh
+/// handshake and leave the screen claiming a healthy connection, right under
+/// the line saying the session is over. Only an aborted watcher stays silent,
+/// and that is reserved for closures Orion itself ordered.
+fn spawn_link_watch(
+    link: helios_key_negotiation::SessionLink,
+    sink: EventSink,
+    link_lost: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         link.closed().await;
+        link_lost.store(true, Ordering::SeqCst);
         sink(ClientEvent::log(
             "warn",
-            "le lien de session avec la gateway est tombé : elle a libéré le PSK négocié. \
-             Le tunnel tient jusqu'au prochain renouvellement de clé WireGuard (≤ 2 min), \
-             puis cessera. Se reconnecter renégocie."
+            "session QUIC de négociation fermée : la gateway a retiré le PSK ML-KEM de son \
+             plan de données. Le prochain rekey WireGuard (≤ 2 min) échouera. Se reconnecter \
+             pour négocier un nouveau PSK."
                 .to_string(),
         ));
-    });
+    })
 }
 
 /// Installs the negotiated slot and commits it, or reports why it could not.
@@ -729,6 +851,44 @@ mod tests {
         }
     }
 
+    /// A connection announces itself before it does anything long.
+    ///
+    /// The bug this guards against was silent on this side and fatal on the
+    /// other: a negotiated connection reaches its backend only after the ML-KEM
+    /// exchange, so the state stayed `Down` for seconds while the tunnel was
+    /// being built. The shell's inference loop stops on that state — it ended
+    /// on its first tick, and nothing downgraded the tunnel for the rest of the
+    /// session. A lost session link then left the screen on «Connecté».
+    #[tokio::test]
+    async fn connecting_is_announced_before_the_backend_is_reached() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        let seen: Arc<std::sync::Mutex<Vec<TunnelState>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+
+        ctrl.connect(
+            profile(),
+            Arc::new(move |ev: ClientEvent| {
+                if let ClientEvent::StateChanged { state } = ev {
+                    recorder.lock().unwrap().push(state);
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            seen.lock().unwrap().first().copied(),
+            Some(TunnelState::Connecting),
+            "the transition must be visible as soon as `connect` returns, without \
+             waiting for the task it started"
+        );
+        assert_ne!(
+            ctrl.state(),
+            TunnelState::Down,
+            "a connection under way may not read as no connection at all"
+        );
+    }
+
     /// Orion's security invariant (ADR-001 §3 bis). If this test breaks, the
     /// clear-text leak becomes exploitable by simply blocking UDP 51820.
     #[tokio::test]
@@ -786,6 +946,70 @@ mod tests {
         ctrl.poll_handshake(sink()).await;
         assert_eq!(ctrl.state(), TunnelState::Connecting);
         assert!(ctrl.adapter_is_up(), "polling must never unmount");
+    }
+
+    /// The bug this guards against: the session link closed, the log said so,
+    /// and the screen kept showing a healthy connection.
+    ///
+    /// Nothing in the handshake age can express it. The gateway has released
+    /// the negotiated PSK, but the WireGuard session already established keeps
+    /// its last handshake recent until the rekey that will fail — so freshness
+    /// answered `Up` for a tunnel whose end was already decided.
+    ///
+    /// `Down` rather than `Connecting`, and the difference is not cosmetic:
+    /// nothing is being connected. Only a new negotiation installs a PSK the
+    /// gateway also holds, so the screen states a tunnel that is over and offers
+    /// to build another one.
+    #[tokio::test]
+    async fn a_lost_session_link_ends_the_up_state_despite_a_fresh_handshake() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+
+        ctrl.connect(profile(), sink()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        backend.set_handshake_age(Some(Duration::from_secs(10)));
+        ctrl.poll_handshake(sink()).await;
+        assert_eq!(ctrl.state(), TunnelState::Up);
+
+        // The gateway hung up. The handshake stays recent — that is the whole
+        // difficulty.
+        ctrl.link_lost.store(true, Ordering::SeqCst);
+        ctrl.poll_handshake(sink()).await;
+        assert_eq!(
+            ctrl.state(),
+            TunnelState::Down,
+            "a closed link must leave the `Up` state: the session is over and the \
+             screen may not keep claiming otherwise"
+        );
+
+        // And it must stay there. Freshness alone would hoist the tunnel back
+        // up on the very next poll, three seconds later — the screen would
+        // flicker between the two answers instead of settling on the true one.
+        ctrl.poll_handshake(sink()).await;
+        assert_eq!(ctrl.state(), TunnelState::Down);
+        assert!(
+            ctrl.adapter_is_up(),
+            "the inference must never unmount: only an explicit disconnection may"
+        );
+    }
+
+    /// The verdict belongs to one session. A reconnection must be able to
+    /// reach `Up` again, otherwise the first lost link would pin the client
+    /// to `Connecting` for as long as the process lives.
+    #[tokio::test]
+    async fn reconnecting_clears_the_lost_link_verdict() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+
+        ctrl.connect(profile(), sink()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ctrl.link_lost.store(true, Ordering::SeqCst);
+
+        ctrl.connect(profile(), sink()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        backend.set_handshake_age(Some(Duration::from_secs(10)));
+        ctrl.poll_handshake(sink()).await;
+        assert_eq!(ctrl.state(), TunnelState::Up);
     }
 
     /// A profile already carrying a static PSK must not be renegotiated:

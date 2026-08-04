@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { decodeProfileDocument } from './profileDocument'
+import { decodeProfileDocument, readProfileDocument } from './profileDocument'
 
 const DOCUMENT = '{"format":"orion-profile","version":1}'
 
@@ -41,5 +41,12 @@ describe('decodeProfileDocument', () => {
     const accented = '{"name":"poste-éà"}'
     const bytes = new TextEncoder().encode(accented)
     expect(decodeProfileDocument(bytes.buffer as ArrayBuffer)).toBe(accented)
+  })
+
+  it('reads the bytes from a selected file before decoding them', async () => {
+    const buffer = encoded('utf-16le')
+    const file = { arrayBuffer: async () => buffer } as File
+
+    await expect(readProfileDocument(file)).resolves.toBe(DOCUMENT)
   })
 })

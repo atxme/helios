@@ -77,6 +77,103 @@ La commande affiche la clé **publique** retrouvée, pas le secret : elle doit
 pas celui de cette gateway — ne pas le déposer. Sinon, poser le fichier dans
 `/var/lib/helios/wg-key.recovery` et redémarrer : la gateway rescelle et efface.
 
+## 2 bis. Mettre à jour l'OS de la gateway
+
+`apt upgrade` ne casse rien tant que la machine tourne : les PCR ne sont
+étendus qu'au démarrage. Le risque est au **redémarrage suivant**, et seulement
+si la mise à jour a touché la chaîne de démarrage — noyau, `grub`, `shim`, une
+base Secure Boot, un firmware. Sans précaution, PCR 4 bouge, le descellement
+échoue et le démon ne démarre pas.
+
+La fenêtre de mise à jour ([ADR-007](../adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md))
+porte le secret courant à travers **un** redémarrage planifié. Le secret ne
+change pas, donc l'identité WireGuard, l'identité de négociation et la table des
+PSK statiques sont intactes de l'autre côté : aucun client à ré-enrôler.
+
+### En une commande, sur la gateway
+
+`helios-ctl` est livré dans le bundle, à côté de `heliosd`. Dans la session SSH
+où l'on met à jour de toute façon :
+
+```sh
+helios-ctl update
+```
+
+Elle rafraîchit les listes, annonce **quels paquets en attente déplacent quel
+PCR**, met à jour, arme la fenêtre et redémarre. Le redémarrage la tue : il n'y a
+rien à attendre ni à rapporter ensuite. Ce qui s'est passé est au journal du
+démarrage suivant :
+
+```sh
+journalctl -u heliosd -b | grep -i 'update window'
+```
+
+Le classement des paquets est ce que la commande apporte de plus qu'un
+`apt upgrade` suivi d'un `prepare-update` : un `linux-image` ou un `grub-efi`
+déplacent PCR 4 et sont couverts par la fenêtre ; un `fwupd` ou un
+`secureboot-db` déplacent PCR 0/7, que la fenêtre lie elle-même — elle ne
+s'ouvrira pas, et la gateway retombera sur billet et séquestre. Mieux vaut
+l'apprendre à l'invite de confirmation que depuis une gateway qui ne redémarre
+plus. Le microcode et `linux-firmware` ne sont volontairement pas signalés :
+l'initrd est mesuré en PCR 8/9, que Helios ne scelle pas.
+
+`--yes` saute la confirmation. Une fenêtre déjà armée fait refuser la commande :
+c'est le signe qu'un redémarrage précédent n'a pas eu lieu.
+
+**La capacité d'armer est vérifiée avant `apt`, jamais après.** `apt upgrade`
+est le point de non-retour : le noyau remplacé, les PCR bougeront au
+redémarrage suivant, fenêtre ou pas, et un redémarrage sans fenêtre perd les
+coffres. La commande interroge donc `heliosd tpm update-readiness` d'abord — un
+TPM injoignable ou un démarrage qui n'est pas un descellement nominal fait
+**refuser la mise à jour**, avant que quoi que ce soit ne soit écrit. Si le
+scellement est désactivé (`tpm.enabled = false`), il n'y a pas de secret à
+perdre : la mise à jour se fait, sans fenêtre ni redémarrage imposé.
+
+L'armement ne passe **pas** par l'API, et c'est délibéré (ADR-007) : l'API vit
+derrière le tunnel que la fenêtre existe précisément pour préserver, et une
+fenêtre déclenchable à distance est une exposition déclenchable à distance.
+`helios-ctl` lance donc `heliosd tpm` en sous-processus sous `sudo`.
+
+### À la main
+
+```sh
+sudo apt update && sudo apt upgrade      # ne redémarrez pas encore
+sudo heliosd tpm prepare-update --reboot
+```
+
+`--reboot` enchaîne le redémarrage, ce qui réduit la fenêtre à quelques
+secondes — c'est le seul mode admis en exploitation. Sans lui, la fenêtre reste
+ouverte jusqu'à son échéance (trente minutes) et le redémarrage est à votre
+main ; cette variante sert aux essais contrôlés.
+
+Au retour, le journal doit contenir :
+
+```
+update window consumed: the PCRs moved (OS upgrade) and the same secret
+was resealed on the new state — vaults intact
+```
+
+Si la mise à jour n'a finalement rien déplacé, le descellement est nominal et la
+fenêtre est révoquée automatiquement — rien à faire.
+
+Pour annuler avant le redémarrage : `sudo heliosd tpm cancel-update`. Pour
+savoir où on en est : `sudo heliosd tpm update-status`.
+
+L'absence d'index NV — l'état ordinaire d'une gateway sans fenêtre armée — est
+demandée par `TPM2_GetCapability`, qui répond « aucun » sans échouer. Une
+version antérieure la déduisait de l'échec d'un `TPM2_NV_ReadPublic`, ce qui
+faisait afficher `WARNING:esys:` / `ERROR:esys:` (`0x18b`) à chaque
+interrogation : des lignes lues comme un diagnostic de panne alors qu'elles
+disaient que tout allait bien. Si vous en revoyez, elles portent sur autre
+chose.
+
+**Ce que la fenêtre ne couvre pas.** Une mise à jour de firmware ou de la base
+Secure Boot déplace PCR 0 ou 7 : la fenêtre ne s'ouvre pas, et on retombe sur
+billet de rescellement et séquestre (§2). Et pendant qu'une fenêtre est ouverte,
+quelqu'un qui a l'accès physique à la machine et démarre un autre OS signé peut
+lire le secret sans que cette lecture soit détectable — d'où `--reboot`, qui
+réduit cette exposition au redémarrage lui-même.
+
 ## 3. Premier pair administrateur
 
 Il faut un chemin local, sinon rien ne peut démarrer : aucune mutation distante
@@ -232,7 +329,7 @@ commande fait tout :
 helios-ctl enroll --name portable \
   --endpoint vpn.example.net:51820 \
   --client-ca-dir ./orion-client-ca \
-  --output portable.orionprofile
+  --output portable.orion
 ```
 
 Elle enchaîne ce que la section 5 sépare : elle lit sur la gateway sa clé

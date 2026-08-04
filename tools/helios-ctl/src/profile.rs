@@ -44,6 +44,10 @@ pub struct EmitOptions {
     pub with_private_key: bool,
     /// Admit the peer as a control-plane administrator.
     pub admin: bool,
+    /// Split tunnel to ship with the profile. Absent = full tunnel.
+    pub allowed_ips: Option<String>,
+    /// SSH destination to ship with the profile. Absent = no terminal button.
+    pub ssh_target: Option<String>,
     /// Output file. Absent: standard output.
     pub output: Option<PathBuf>,
 }
@@ -65,6 +69,20 @@ pub struct Profile<'a> {
     pub private_key: Option<&'a str>,
     pub peer_public_key: &'a str,
     pub address: &'a str,
+    /// Traffic the client routes into the tunnel — one or more CIDR prefixes,
+    /// comma-separated.
+    ///
+    /// Omitted rather than defaulted, because the two are not the same thing:
+    /// an absent field lets `orion-core` apply `0.0.0.0/0`, the full tunnel,
+    /// which stays the right answer when the operator has said nothing. Only
+    /// a split tunnel needs stating, and it is stated **here** so a fleet gets
+    /// it from the document rather than from each user retyping prefixes into
+    /// the Advanced panel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_ips: Option<&'a str>,
+    /// SSH destination inside the tunnel, `user@host`. Omitted = no terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_target: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heliosd_url: Option<String>,
     /// Public negotiation settings. Absent when the gateway serves none:
@@ -129,6 +147,18 @@ pub fn check(path: &Path) -> Result<()> {
     println!(
         "  adresse         : {}",
         profile.address.as_deref().unwrap_or("—")
+    );
+    // Said whether or not the document stated it: what matters to the reader
+    // is what the client will route, and an absent field means the full
+    // tunnel — a fact no one should have to know the defaulting rule to learn.
+    println!(
+        "  trafic capté    : {}{}",
+        profile.allowed_ips,
+        if profile.allowed_ips == orion_core::DEFAULT_ALLOWED_IPS {
+            "  (tunnel complet)"
+        } else {
+            "  (tunnel fractionné — le reste sort en clair)"
+        }
     );
     // Ce que l'import fera de la clé privée absente est la question qu'on
     // pose le plus souvent à cette commande : la clé admise est ce qui
@@ -195,6 +225,8 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         private_key: private_key.as_deref(),
         peer_public_key: &gateway_public_key,
         address: &address,
+        allowed_ips: options.allowed_ips.as_deref(),
+        ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
         // `emit` never ships an identity: it is the path that keeps the
         // document free of secrets. Wiring the negotiation from here would
@@ -321,6 +353,8 @@ mod tests {
             public_key: None,
             with_private_key: false,
             admin: false,
+            allowed_ips: None,
+            ssh_target: None,
             output: None,
         }
     }
@@ -408,6 +442,8 @@ mod tests {
                 private_key,
                 peer_public_key: &gateway_key.public_key,
                 address: "100.64.1.2/32",
+                allowed_ips: None,
+                ssh_target: None,
                 heliosd_url: heliosd_url("100.64.0.1/10"),
                 key_negotiation: None,
                 key_negotiation_identity: None,
@@ -471,6 +507,8 @@ mod tests {
             private_key: Some(client_key.private_key.expose()),
             peer_public_key: &gateway_key.public_key,
             address: "100.64.1.2/32",
+            allowed_ips: Some("100.64.0.0/10, 192.168.1.0/24"),
+            ssh_target: Some("christophe@100.64.0.1"),
             heliosd_url: heliosd_url("100.64.0.1/10"),
             key_negotiation: Some(KeyNegotiation {
                 mode: ProtectionMode::MlKem,
@@ -503,6 +541,47 @@ mod tests {
         assert_eq!(
             imported.identity.expect("identity shipped").identity,
             "orion-portable"
+        );
+        // A split tunnel stated by the operator reaches the client through the
+        // document. Without this field it did not: every user had to retype
+        // the prefixes into the Advanced panel, and a fleet ended up with as
+        // many routing tables as it had people.
+        assert_eq!(
+            imported.profile.allowed_ips,
+            "100.64.0.0/10, 192.168.1.0/24"
+        );
+    }
+
+    /// Saying nothing is not saying `0.0.0.0/0` — but it must behave that way.
+    ///
+    /// The field is omitted rather than written out, so an operator reading a
+    /// document sees only what was decided. `orion-core` supplies the full
+    /// tunnel, which is the safe default: it is that prefix, with the adapter
+    /// lifecycle, that makes WireGuard drop packets rather than leak them.
+    #[test]
+    fn an_omitted_split_tunnel_becomes_the_full_tunnel_on_the_client() {
+        let client_key = aether::wg::generate_keypair().unwrap();
+        let gateway_key = aether::wg::generate_keypair().unwrap();
+
+        let json = render(Profile {
+            name: "portable",
+            endpoint: "vpn.example.net:51820",
+            private_key: Some(client_key.private_key.expose()),
+            peer_public_key: &gateway_key.public_key,
+            address: "100.64.1.2/32",
+            allowed_ips: None,
+            ssh_target: None,
+            heliosd_url: None,
+            key_negotiation: None,
+            key_negotiation_identity: None,
+        })
+        .expect("document read back by Orion");
+
+        assert!(!json.contains("allowed_ips"), "{json}");
+        let imported = orion_core::parse_profile_import(&json, "portable.json").unwrap();
+        assert_eq!(
+            imported.profile.allowed_ips,
+            orion_core::DEFAULT_ALLOWED_IPS
         );
     }
 }

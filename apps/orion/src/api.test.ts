@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 
 import {
+  aboutOrion,
   adapterIsUp,
   backendKind,
   connect,
@@ -18,11 +19,19 @@ import {
   getState,
   importProfile,
   importProfilePath,
+  keyNegotiationFingerprint,
+  keyNegotiationIdentitySealed,
+  keyNegotiationSupport,
+  onConfigChanged,
   onEvent,
   onProfilePath,
-  profilePublicKey,
+  onTrayView,
+  resizeForView,
   saveProfile,
   selectProfile,
+  validateProfile,
+  vaultPosture,
+  exportLogs,
 } from './api'
 
 describe('Orion Tauri bridge', () => {
@@ -36,36 +45,52 @@ describe('Orion Tauri bridge', () => {
     await backendKind()
     await adapterIsUp()
     await getConfig()
+    await aboutOrion()
     await importProfile('{"format":"orion-profile"}', 'portable.json')
-    await importProfilePath('C:\\Profils\\portable.orionprofile')
-    await profilePublicKey(profile as never)
+    await importProfilePath('C:\\Profils\\portable.orion')
+    await importProfilePath()
+    await keyNegotiationIdentitySealed(profile as never)
+    await validateProfile(profile as never)
+    await vaultPosture()
+    await keyNegotiationSupport()
+    await keyNegotiationFingerprint(profile as never)
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
     await connect('portable')
     await connect()
     await disconnect()
+    await resizeForView('profiles')
+    await exportLogs('orion-log', 'contents')
 
     expect(mocks.invoke.mock.calls).toEqual([
       ['get_state'],
       ['backend_kind'],
       ['adapter_is_up'],
       ['get_config'],
+      ['about_orion'],
       [
         'import_profile',
         { contents: '{"format":"orion-profile"}', fileName: 'portable.json' },
       ],
       [
         'import_profile_path',
-        { path: 'C:\\Profils\\portable.orionprofile' },
+        { path: 'C:\\Profils\\portable.orion' },
       ],
-      ['profile_public_key', { profile }],
-      ['save_profile', { profile }],
+      ['import_profile_path', { path: null }],
+      ['key_negotiation_identity_sealed', { keyNegotiation: profile }],
+      ['validate_profile', { draft: profile }],
+      ['vault_posture'],
+      ['key_negotiation_support'],
+      ['key_negotiation_fingerprint', { keyNegotiation: profile }],
+      ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],
       ['connect', { name: 'portable' }],
       ['connect', { name: null }],
       ['disconnect'],
+      ['resize_for_view', { view: 'profiles' }],
+      ['export_logs', { stem: 'orion-log', contents: 'contents' }],
     ])
   })
 
@@ -92,6 +117,35 @@ describe('Orion Tauri bridge', () => {
 
     await expect(onProfilePath(callback)).resolves.toBe(unlisten)
     expect(mocks.listen).toHaveBeenCalledWith('helios://profile-path', callback)
+    expect(callback).toHaveBeenCalledOnce()
+  })
+
+  it('only accepts known tray destinations', async () => {
+    const unlisten = vi.fn()
+    const callback = vi.fn()
+    mocks.listen.mockImplementation(async (_name, handler) => {
+      handler({ payload: 'profiles' })
+      handler({ payload: 'import' })
+      handler({ payload: 'about' })
+      handler({ payload: 'unexpected' })
+      return unlisten
+    })
+
+    await expect(onTrayView(callback)).resolves.toBe(unlisten)
+    expect(mocks.listen).toHaveBeenCalledWith('helios://tray-view', expect.any(Function))
+    expect(callback.mock.calls).toEqual([['profiles'], ['import'], ['about']])
+  })
+
+  it('relays the configuration changes the tray causes', async () => {
+    const unlisten = vi.fn()
+    const callback = vi.fn()
+    mocks.listen.mockImplementation(async (_name, handler) => {
+      handler({ payload: null })
+      return unlisten
+    })
+
+    await expect(onConfigChanged(callback)).resolves.toBe(unlisten)
+    expect(mocks.listen).toHaveBeenCalledWith('helios://config-changed', callback)
     expect(callback).toHaveBeenCalledOnce()
   })
 })

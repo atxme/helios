@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check Helios TPM update windows
+
+[Timer]
+# Five minutes: the default window lasts thirty minutes, while a window armed
+# with --reboot lives for only a few seconds. A shorter interval would open the
+# TPM more often without materially reducing the operational exposure.
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

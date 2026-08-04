@@ -1,9 +1,10 @@
 //! **Real** TPM2 backend — hardened sealing/unsealing (target only).
 //!
-//! Warning: **security-critical module, validatable only on real TPM hardware.**
+//! Warning: **security-critical module, fully validatable only on real TPM hardware.**
 //! Like `helios-firewall/src/netlink.rs`, this code only compiles with
-//! `--features tpm` (libtss2-esys present) and cannot be exercised on WSL2
-//! nor by CI. The invariants below must be re-checked during hardware bring-up.
+//! `--features tpm` (libtss2-esys present). A software TPM exercises the ESAPI
+//! command flow, but PCR measurement, Secure Boot, bus protection, and NV
+//! persistence must still be re-checked during hardware bring-up.
 //!
 //! ## Hardening measures applied
 //!
@@ -30,29 +31,32 @@ use std::str::FromStr;
 
 use sha2::{Digest as _, Sha256};
 use tss_esapi::{
-    attributes::{ObjectAttributesBuilder, SessionAttributesBuilder},
-    constants::SessionType,
-    handles::{KeyHandle, ObjectHandle, SessionHandle},
+    attributes::{NvIndexAttributesBuilder, ObjectAttributesBuilder, SessionAttributesBuilder},
+    constants::{
+        nv_index_type::NvIndexType, CapabilityType, CommandCode, SessionType, Tss2ResponseCodeKind,
+    },
+    handles::{KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, SessionHandle},
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
         key_bits::AesKeyBits,
-        resource_handles::Hierarchy,
+        resource_handles::{Hierarchy, NvAuth, Provision},
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme, Private, Public,
-        PublicBuilder, PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData,
-        SymmetricDefinition, SymmetricDefinitionObject,
+        CapabilityData, Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme,
+        MaxNvBuffer, NvPublicBuilder, Private, Public, PublicBuilder, PublicEccParametersBuilder,
+        PublicKeyedHashParameters, SensitiveData, SymmetricDefinition, SymmetricDefinitionObject,
     },
     traits::{Marshall, UnMarshall},
-    Context, TctiNameConf,
+    Context, Error as TssError, TctiNameConf,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     secret::SecretKey,
     tpm_interface::{SealedBlob, TpmSealer},
+    update_window::{is_armed_payload, is_armed_prefix, PAYLOAD_LEN},
     Result, TpmError,
 };
 
@@ -66,16 +70,43 @@ pub(crate) struct TpmDevice {
     device_path: String,
     bank: String,
     indices: Vec<u8>,
+    window_indices: Vec<u8>,
+    window_nv_index: u32,
 }
 
 impl TpmDevice {
     pub(crate) fn new(cfg: &crate::settings::TpmSettings) -> Result<Self> {
         // Immediate refusal of weak banks (SHA-1) — defense in depth.
         hash_alg_from_bank(&cfg.pcr_bank)?;
+        // The window must never be able to open more than the nominal policy:
+        // a selection that drifted out of subset would silently widen what a
+        // planned upgrade unlocks.
+        if cfg.update_window_pcr_selection != [0, 7] {
+            return Err(TpmError::Connection(
+                "update-window PCR selection must be exactly [0, 7]".into(),
+            ));
+        }
+        if !cfg
+            .update_window_pcr_selection
+            .iter()
+            .all(|index| cfg.pcr_selection.contains(index))
+            || cfg.update_window_pcr_selection.len() >= cfg.pcr_selection.len()
+        {
+            return Err(TpmError::Connection(
+                "update-window PCR selection must be a strict subset of nominal sealing".into(),
+            ));
+        }
+        if cfg.update_window_seconds == 0 {
+            return Err(TpmError::Connection(
+                "update-window duration must be greater than zero".into(),
+            ));
+        }
         Ok(Self {
             device_path: cfg.device.clone(),
             bank: cfg.pcr_bank.clone(),
             indices: cfg.pcr_selection.clone(),
+            window_indices: cfg.update_window_pcr_selection.clone(),
+            window_nv_index: cfg.update_window_nv_index,
         })
     }
 }
@@ -196,12 +227,128 @@ impl TpmSealer for TpmDevice {
         let _ = ctx.flush_context(primary.key_handle.into());
         outcome
     }
+
+    // ── Update window ────────────────────────────────────────────────────────
+
+    fn arm_update_window(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() != PAYLOAD_LEN {
+            return Err(TpmError::Connection(format!(
+                "update-window payload has {} bytes; {PAYLOAD_LEN} expected",
+                payload.len(),
+            )));
+        }
+        let mut ctx = open_context(&self.device_path)?;
+        let alg = hash_alg_from_bank(&self.bank)?;
+        let selection = pcr_selection(alg, &self.window_indices)?;
+
+        let primary = create_primary(&mut ctx)?;
+        let outcome = (|| {
+            let auth_policy = compute_window_policy_digest(&mut ctx, &selection)?;
+            let handle =
+                redefine_window_index(&mut ctx, self.window_nv_index, auth_policy, payload.len())?;
+            let session = start_salted_session(&mut ctx, primary.key_handle, SessionType::Hmac)?;
+            let data = MaxNvBuffer::try_from(payload.to_vec())
+                .map_err(|e| TpmError::Connection(format!("NV payload: {e}")))?;
+            let written = ctx
+                .execute_with_session(Some(session), |ctx| {
+                    ctx.nv_write(NvAuth::Owner, handle, data, 0)
+                })
+                .map_err(|e| TpmError::Connection(format!("NV write (arm window): {e}")));
+
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            let mut object = ObjectHandle::from(handle);
+            let _ = ctx.tr_close(&mut object);
+            written
+        })();
+
+        let _ = ctx.flush_context(primary.key_handle.into());
+        outcome
+    }
+
+    fn unseal_update_window(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        self.read_update_window_payload()?
+            .ok_or(TpmError::UpdateWindowUnavailable)
+    }
+
+    fn revoke_update_window(&mut self) -> Result<()> {
+        let mut ctx = open_context(&self.device_path)?;
+        let Some(handle) = open_nv_index(&mut ctx, self.window_nv_index)? else {
+            return Ok(());
+        };
+        let data = MaxNvBuffer::try_from(vec![0u8; PAYLOAD_LEN])
+            .map_err(|e| TpmError::Connection(format!("NV buffer: {e}")))?;
+        let written = ctx
+            .execute_with_nullauth_session(|ctx| ctx.nv_write(NvAuth::Owner, handle, data, 0))
+            .map_err(|e| TpmError::Connection(format!("NV write (revoke window): {e}")));
+        let mut object = ObjectHandle::from(handle);
+        let _ = ctx.tr_close(&mut object);
+        written
+    }
+
+    fn update_window_armed(&mut self) -> Result<bool> {
+        Ok(self
+            .read_update_window_bytes(4)?
+            .is_some_and(|prefix| is_armed_prefix(&prefix)))
+    }
+}
+
+impl TpmDevice {
+    /// Reads the policy-protected NV slot. The secret never exists in a disk
+    /// blob; revocation overwrites this data area inside the TPM.
+    fn read_update_window_payload(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let data = self.read_update_window_bytes(PAYLOAD_LEN as u16)?;
+        Ok(data.filter(|bytes| is_armed_payload(bytes)))
+    }
+
+    /// Reads part of the policy-protected NV slot through an encrypted
+    /// session. Callers that only need status read four magic bytes so the
+    /// secret does not leave the TPM.
+    fn read_update_window_bytes(&self, size: u16) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let mut ctx = open_context(&self.device_path)?;
+        let Some(handle) = open_nv_index(&mut ctx, self.window_nv_index)? else {
+            return Ok(None);
+        };
+        let alg = hash_alg_from_bank(&self.bank)?;
+        let selection = pcr_selection(alg, &self.window_indices)?;
+        let primary = create_primary(&mut ctx)?;
+
+        let outcome = (|| {
+            let session = start_salted_session(&mut ctx, primary.key_handle, SessionType::Policy)?;
+            let policy_session = PolicySession::try_from(session)
+                .map_err(|e| TpmError::Connection(format!("policy session (window): {e}")))?;
+            let policy_step = window_policy_steps(&mut ctx, policy_session, selection);
+            let read = policy_step.and_then(|()| {
+                ctx.execute_with_session(Some(session), |ctx| {
+                    ctx.nv_read(NvAuth::NvIndex(handle), handle, size, 0)
+                })
+                .map_err(|error| {
+                    if is_policy_fail(&error) {
+                        TpmError::UnsealPolicyFail
+                    } else {
+                        TpmError::Connection(format!("NV read (window): {error}"))
+                    }
+                })
+            });
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            read
+        })();
+
+        let _ = ctx.flush_context(primary.key_handle.into());
+        let mut object = ObjectHandle::from(handle);
+        let _ = ctx.tr_close(&mut object);
+        Ok(Some(Zeroizing::new(outcome?.value().to_vec())))
+    }
 }
 
 // ─────────────────────────────── Helpers TPM2 ───────────────────────────────
 
 fn open_context(device: &str) -> Result<Context> {
-    let tcti = TctiNameConf::from_str(&format!("device:{device}"))
+    let tcti_name = if device.contains(':') {
+        device.to_string()
+    } else {
+        format!("device:{device}")
+    };
+    let tcti = TctiNameConf::from_str(&tcti_name)
         .map_err(|e| TpmError::Connection(format!("TCTI {device}: {e}")))?;
     Context::new(tcti).map_err(|e| TpmError::Connection(e.to_string()))
 }
@@ -390,6 +537,147 @@ fn compute_pcr_policy_digest(
     result
 }
 
+// ───────────────────────────── Update window ─────────────────────────────
+
+/// The window's policy, in the order both sessions must replay.
+///
+/// A policy digest is a chain: the same three assertions in another order
+/// produce another digest, and the object would never open. Sealing and
+/// unsealing therefore go through this one function.
+fn window_policy_steps(
+    ctx: &mut Context,
+    policy_session: PolicySession,
+    selection: tss_esapi::structures::PcrSelectionList,
+) -> Result<()> {
+    // 1. PCR 0/7 — firmware and Secure Boot, not PCR 4.
+    ctx.policy_pcr(policy_session, empty_digest()?, selection)
+        .map_err(|e| TpmError::Connection(format!("policy_pcr (window): {e}")))?;
+    // 2. The NV slot must have been initialized. This assertion is valid here
+    // because the policy authorizes NV_Read on the index itself, rather than
+    // trying to make one NV index gate an unrelated keyed-hash object.
+    ctx.policy_nv_written(policy_session, true)
+        .map_err(|e| TpmError::Connection(format!("policy_nv_written: {e}")))?;
+    // 3. The policy can only release the NV payload through NV_Read.
+    ctx.policy_command_code(policy_session, CommandCode::NvRead)
+        .map_err(|e| TpmError::Connection(format!("policy_command_code: {e}")))?;
+    Ok(())
+}
+
+/// Computes the window's policy digest through a trial session.
+fn compute_window_policy_digest(
+    ctx: &mut Context,
+    selection: &tss_esapi::structures::PcrSelectionList,
+) -> Result<Digest> {
+    let session = ctx
+        .start_auth_session(
+            None,
+            None,
+            None,
+            SessionType::Trial,
+            SymmetricDefinition::AES_128_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .map_err(|e| TpmError::Connection(format!("trial session (window): {e}")))?
+        .ok_or_else(|| TpmError::Connection("empty trial session (window)".into()))?;
+
+    let result = (|| {
+        let policy_session = PolicySession::try_from(session)
+            .map_err(|e| TpmError::Connection(format!("policy session (window): {e}")))?;
+        window_policy_steps(ctx, policy_session, selection.clone())?;
+        ctx.policy_get_digest(policy_session)
+            .map_err(|e| TpmError::Connection(format!("policy_get_digest (window): {e}")))
+    })();
+
+    let _ = ctx.flush_context(SessionHandle::from(session).into());
+    result
+}
+
+/// Opens the revocation index, or `None` if it is not defined.
+fn open_nv_index(ctx: &mut Context, index: u32) -> Result<Option<NvIndexHandle>> {
+    let tpm_handle = NvIndexTpmHandle::new(index)
+        .map_err(|e| TpmError::Connection(format!("NV index {index:#x}: {e}")))?;
+    // Asked before opening, and not deduced from a failed open: see
+    // `nv_index_is_defined`.
+    if !nv_index_is_defined(ctx, index)? {
+        return Ok(None);
+    }
+    match ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(tpm_handle.into())) {
+        Ok(object) => Ok(Some(NvIndexHandle::from(object))),
+        // An undefined index is the ordinary state of a gateway that has
+        // never armed a window, not an error. Still handled here: the index
+        // can be undefined between the two commands above.
+        Err(error) if is_missing_handle(&error) => Ok(None),
+        Err(error) => Err(TpmError::Connection(format!(
+            "open NV index {index:#x}: {error}"
+        ))),
+    }
+}
+
+/// Is this NV index defined? Asked without provoking a failure.
+///
+/// `TPM2_GetCapability` returns the defined handles at or after `index`, and
+/// **succeeds** when there are none — where `Esys_TR_FromTPMPublic` fails with
+/// `TPM_RC_HANDLE` (`0x18b`). Both answer the same question, but the failing
+/// one makes the TSS stack print three `WARNING`/`ERROR` lines on stderr, plus
+/// one from `tss_esapi`, for the ordinary state of a gateway with no update
+/// window armed. An operator running `helios-ctl update` read those as the
+/// diagnosis of a TPM problem; the diagnosis was that nothing was wrong.
+///
+/// Cost: one extra TPM command on a path that only runs on operator commands
+/// and at boot. Cheaper than an alarm that has to be explained every time.
+fn nv_index_is_defined(ctx: &mut Context, index: u32) -> Result<bool> {
+    let (capability, _more) = ctx
+        .execute_without_session(|ctx| ctx.get_capability(CapabilityType::Handles, index, 1))
+        .map_err(|e| TpmError::Connection(format!("listing NV index {index:#x}: {e}")))?;
+    let CapabilityData::Handles(handles) = capability else {
+        return Err(TpmError::Connection(format!(
+            "listing NV index {index:#x}: the TPM answered with another capability"
+        )));
+    };
+    // The TPM answers with the first handle **at or after** `index`, so a
+    // non-empty answer proves nothing on its own — a window index that does
+    // not exist yields the next defined one. Only equality is an answer.
+    Ok(handles
+        .into_inner()
+        .first()
+        .is_some_and(|handle| u32::from(*handle) == index))
+}
+
+/// Undefines then defines the policy-protected NV window slot.
+fn redefine_window_index(
+    ctx: &mut Context,
+    index: u32,
+    auth_policy: Digest,
+    data_size: usize,
+) -> Result<NvIndexHandle> {
+    let tpm_handle = NvIndexTpmHandle::new(index)
+        .map_err(|e| TpmError::Connection(format!("NV index {index:#x}: {e}")))?;
+
+    if let Some(existing) = open_nv_index(ctx, index)? {
+        ctx.execute_with_nullauth_session(|ctx| ctx.nv_undefine_space(Provision::Owner, existing))
+            .map_err(|e| TpmError::Connection(format!("NV undefine: {e}")))?;
+    }
+
+    let attributes = NvIndexAttributesBuilder::new()
+        .with_owner_write(true)
+        .with_policy_read(true)
+        .with_nv_index_type(NvIndexType::Ordinary)
+        .with_no_da(true)
+        .build()
+        .map_err(|e| TpmError::Connection(format!("NV attributes: {e}")))?;
+    let public = NvPublicBuilder::new()
+        .with_nv_index(tpm_handle)
+        .with_index_name_algorithm(HashingAlgorithm::Sha256)
+        .with_index_attributes(attributes)
+        .with_index_auth_policy(auth_policy)
+        .with_data_area_size(data_size)
+        .build()
+        .map_err(|e| TpmError::Connection(format!("NV public: {e}")))?;
+
+    ctx.execute_with_nullauth_session(|ctx| ctx.nv_define_space(Provision::Owner, None, public))
+        .map_err(|e| TpmError::Connection(format!("NV define: {e}")))
+}
+
 fn to_secret_key(sensitive: SensitiveData) -> Result<SecretKey> {
     let bytes = sensitive.value();
     if bytes.len() != 32 {
@@ -469,10 +757,21 @@ fn unmarshal_blob(bytes: &[u8]) -> Result<(Vec<u8>, Public, Private)> {
 
 /// Detects TPM2_RC_POLICY_FAIL (PCRs no longer matching the authPolicy).
 ///
-/// Detection via the error's `Debug` to avoid depending on the exact enum
-/// path of `tss-esapi` (to confirm at bring-up). Only this case triggers the
-/// resealing path; any other error remains a hard error.
-fn is_policy_fail(e: &tss_esapi::Error) -> bool {
-    let s = format!("{e:?}");
-    s.contains("PolicyFail") || s.contains("policy_fail")
+/// Only this exact TPM response triggers the policy-refusal path; transport,
+/// resource-manager, and wrapper errors remain hard failures.
+fn is_policy_fail(error: &TssError) -> bool {
+    matches!(
+        error,
+        TssError::Tss2Error(code) if code.kind() == Some(Tss2ResponseCodeKind::PolicyFail)
+    )
+}
+
+/// `TR_FromTPMPublic` returns TPM2_RC_HANDLE for an undefined NV index.
+/// No transport, resource-manager, or wrapper error may be mistaken for this
+/// ordinary absent state, especially on the revocation path.
+fn is_missing_handle(error: &TssError) -> bool {
+    matches!(
+        error,
+        TssError::Tss2Error(code) if code.kind() == Some(Tss2ResponseCodeKind::Handle)
+    )
 }

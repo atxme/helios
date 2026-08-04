@@ -62,6 +62,14 @@ pub struct EnrollOptions {
     pub identity: Option<String>,
     /// Admit the peer as a control-plane administrator.
     pub admin: bool,
+    /// Split tunnel to ship with the profile. Absent = full tunnel.
+    ///
+    /// Stated once by the operator and carried by the document, rather than
+    /// retyped into each machine's Advanced panel — which is how a fleet ends
+    /// up with as many routing tables as it has users.
+    pub allowed_ips: Option<String>,
+    /// SSH destination to ship with the profile. Absent = no terminal button.
+    pub ssh_target: Option<String>,
     /// Revoke an existing peer of the same name before admitting.
     pub replace: bool,
     pub output: PathBuf,
@@ -257,6 +265,8 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         private_key: private_key.as_deref(),
         peer_public_key: &material.wireguard_public_key,
         address: &address,
+        allowed_ips: options.allowed_ips.as_deref(),
+        ssh_target: options.ssh_target.as_deref(),
         heliosd_url,
         key_negotiation: Some(profile::KeyNegotiation {
             mode: options.mode,
@@ -435,6 +445,18 @@ fn report(
 ///
 /// Checked up front so a missing CA is reported before the command has
 /// admitted a peer it will not be able to hand a profile to.
+/// # Le piège que ce message évite
+///
+/// Il disait « créer la CA opérateur d'abord », avec la commande toute faite.
+/// Sur un poste où la CA existe mais n'a pas été trouvée — parce que le
+/// répertoire par défaut était relatif au dossier courant — suivre ce conseil
+/// **orphelinait toute la flotte** : `heliosd init-key-negotiation` épingle la
+/// CA client dans `/var/lib/helios/key-negotiation-client-pq-ca-public.bin`, et
+/// la gateway refuse tout certificat émis par une autre. Le remède proposé
+/// cassait ce qui marchait encore.
+///
+/// Le message dit donc d'abord de **retrouver** la CA existante, et ne propose
+/// d'en créer une qu'en nommant la conséquence.
 pub fn check_client_ca(directory: &Path) -> Result<()> {
     for file in [
         CA_CERTIFICATE_FILE,
@@ -444,10 +466,20 @@ pub fn check_client_ca(directory: &Path) -> Result<()> {
         let path = directory.join(file);
         if !path.is_file() {
             bail!(
-                "{} is missing — create the operator CA first:\n  \
-                 helios-ctl key-nego init-client-ca --name <nom> --output-dir {}",
+                "CA opérateur introuvable dans {} ({} manque).\n\n\
+                 Si vous avez déjà enrôlé un client, cette CA **existe** et la gateway \
+                 n'accepte qu'elle. La retrouver :\n  \
+                 find ~ -name '{}' 2>/dev/null\n\
+                 puis la désigner par --client-ca-dir, ou la déplacer à l'emplacement \
+                 par défaut ci-dessus.\n\n\
+                 N'en créer une neuve que s'il n'en existe aucune : la gateway épingle la \
+                 CA cliente à `heliosd init-key-negotiation`, et une CA différente rend \
+                 illisible tout certificat déjà émis — tous les clients admis cessent de \
+                 négocier.\n  \
+                 helios-ctl key-nego init-client-ca --name <nom>",
+                directory.display(),
                 path.display(),
-                directory.display()
+                CA_CERTIFICATE_FILE,
             );
         }
     }
@@ -464,6 +496,8 @@ mod tests {
             endpoint: "vpn.example.net:51820".into(),
             client_ca_dir: PathBuf::from("./ca"),
             public_key: None,
+            allowed_ips: None,
+            ssh_target: None,
             private_key_file: None,
             client_pki_dir: None,
             mode: ProtectionMode::MlKem,
@@ -471,7 +505,7 @@ mod tests {
             identity: None,
             admin: false,
             replace: false,
-            output: PathBuf::from("portable.orionprofile"),
+            output: PathBuf::from("portable.orion"),
             offline: None,
         }
     }

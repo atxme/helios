@@ -491,9 +491,39 @@ pub async fn start(
     };
     let gateway_public_key = aether::wg::public_from_private(&gateway_private_key)
         .context("gateway WireGuard identity is unavailable for key negotiation")?;
-    let identity = load_identity(boot, dry_run)?;
+    let identity = load_identity(boot, dry_run, &gateway_public_key)?;
     let client_ca =
         std::fs::read(CLIENT_CA_PATH).context("reading key-negotiation client CA certificate")?;
+    // The identity is read **once**, here, and served for the lifetime of the
+    // process — unlike `network.toml`, which is watched and re-read.
+    //
+    // # Limite connue
+    //
+    // `heliosd init-key-negotiation --rotate` on a running daemon therefore
+    // changes the files without changing what is served: the daemon keeps
+    // presenting the previous certificate while every profile issued after the
+    // rotation pins the new one. Clients then fail the QUIC handshake with
+    // `invalid peer certificate: BadSignature`, which names a signature and
+    // not the mismatch behind it. Restarting the daemon is what applies a
+    // rotation. Reloading it under a live data plane would mean rebuilding the
+    // QUIC endpoint while sessions hold PSK slots on it, and the closure of
+    // those sessions is what releases the slots — so the rebuild would drop
+    // every tunnel it was meant to spare.
+    //
+    // Until then this line is the diagnosis: the fingerprint served, next to
+    // the age of the file it was read from. A certificate written after the
+    // daemon started is the whole answer.
+    tracing::info!(
+        certificate_sha256 = %helios_key_negotiation::certificate_fingerprint_der(
+            &std::fs::read(CERTIFICATE_PATH).unwrap_or_default()
+        ),
+        certificate_written = ?std::fs::metadata(CERTIFICATE_PATH)
+            .and_then(|meta| meta.modified())
+            .ok(),
+        client_ca_sha256 = %helios_key_negotiation::certificate_fingerprint_der(&client_ca),
+        "key-negotiation identity read from disk — served until this daemon restarts; \
+         a rotation performed later takes effect only on restart"
+    );
     let endpoint = server_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
         &identity.tls,
@@ -550,14 +580,32 @@ struct LoadedIdentity {
     pq_private_key: Zeroizing<Vec<u8>>,
 }
 
-fn load_identity(boot: &BootDecision, dry_run: bool) -> Result<LoadedIdentity> {
+/// Object context of the negotiation identity: the gateway WireGuard public
+/// key it serves.
+///
+/// **Limite connue** : ADR-006 §2 demande d'y joindre l'époque du certificat.
+/// Aucune époque n'est modelée aujourd'hui — l'ajouter suppose de versionner le
+/// certificat de négociation, ce qui relève du lot gateway. La liaison au pair
+/// est en place ; la fraîcheur du certificat ne l'est pas encore.
+fn negotiation_identity_context(gateway_wg_public_key: &str) -> helio_tpm::Context {
+    helio_tpm::Context::new().field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
+}
+
+fn load_identity(
+    boot: &BootDecision,
+    dry_run: bool,
+    gateway_wg_public_key: &str,
+) -> Result<LoadedIdentity> {
     let certificate =
         std::fs::read(CERTIFICATE_PATH).context("reading key-negotiation certificate")?;
     let private_identity = match boot.secret() {
-        Some(secret) => SealedKeystore::new(PRIVATE_KEYSTORE_PATH)
-            .load(secret)
-            .context("unsealing key-negotiation private key")?
-            .to_vec(),
+        Some(secret) => SealedKeystore::new(
+            PRIVATE_KEYSTORE_PATH,
+            helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        )
+        .load(secret, &negotiation_identity_context(gateway_wg_public_key))
+        .context("unsealing key-negotiation private key")?
+        .to_vec(),
         None if dry_run => {
             let path = std::env::var("HELIOS_KEY_NEGO_DEV_KEY_DER")
                 .context("HELIOS_KEY_NEGO_DEV_KEY_DER is required in dev mode")?;
@@ -659,7 +707,10 @@ pub fn initialize(
     let client_ca_destination = std::path::PathBuf::from(CLIENT_CA_PATH);
     let pq_certificate_path = std::path::PathBuf::from(PQ_CERTIFICATE_PATH);
     let client_pq_ca_destination = std::path::PathBuf::from(CLIENT_PQ_CA_PATH);
-    let keystore = SealedKeystore::new(PRIVATE_KEYSTORE_PATH);
+    let keystore = SealedKeystore::new(
+        PRIVATE_KEYSTORE_PATH,
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    );
     let already_initialized = keystore.exists()
         || certificate_path.exists()
         || client_ca_destination.exists()
@@ -728,7 +779,11 @@ pub fn initialize(
         .context("encoding the private key-negotiation identity")?,
     );
     keystore
-        .store(secret, private_identity.as_slice())
+        .store(
+            secret,
+            &negotiation_identity_context(gateway_wg_public_key),
+            private_identity.as_slice(),
+        )
         .context("sealing the gateway TLS and PQ keys")?;
 
     write_public_atomic(&certificate_path, certificate.der().as_ref())

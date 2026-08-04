@@ -77,27 +77,69 @@ export interface ImportOutcome {
    * shown — with this explanation — rather than refused.
    */
   private_key_missing: string | null
+  /**
+   * What else the document leaves to fill in.
+   *
+   * A document is allowed to be partial: the operator sends what they know.
+   * The import shows it and names the gap rather than refusing the file — the
+   * refusal belongs at Connect, not at the file picker.
+   */
+  incomplete: string | null
+}
+
+/**
+ * What the About box states.
+ *
+ * Four facts, each of which a support exchange has had to ask for: which
+ * version is installed, whether it drives a real adapter or the dry-run
+ * backend, what a profile file looks like, and where the log is.
+ */
+export interface About {
+  version: string
+  /** `wireguard` or `dry-run` — what the shipped client actually mounts. */
+  backend: string
+  /** Extension of a profile document, without the dot. */
+  profile_extension: string
+  /** Absolute path of this run's log, when one could be opened. */
+  log_path: string | null
 }
 
 // A WireGuard peer: identity = Curve25519 public key, reached via a UDP
 // endpoint. No CA, no EAP, no cryptographic proposal — WireGuard has only
 // one suite.
+//
+// **No secret in this type, by construction** (ADR-006 §5). The shell's
+// `ProfileView` is the mirror of it, and it carries neither the private key nor
+// the static PSK: both stay in Rust, sealed in the vault. Anything that reached
+// this interface would have been serialised into a Tauri message, parsed into a
+// JavaScript `String` nothing can wipe, and held in a DOM node for as long as
+// the screen lives.
+//
+// What the screen actually needs is the **public** half — the one value meant
+// to leave the machine — plus a boolean saying whether each secret is present.
 export interface ClientProfile {
   name: string
   /** Gateway's UDP endpoint: `IP:port` or `FQDN:port`. */
   endpoint: string
-  /** Client's Curve25519 private key (base64). Secret. */
-  private_key: string
   /** Gateway's Curve25519 public key (base64). */
   peer_public_key: string
   /**
-   * **Static** PSK shared out of band (base64). Secret.
+   * Public half of the profile's WireGuard key.
+   *
+   * `null` while the profile has no key yet. This is what the user hands to
+   * the operator to be admitted (ADR-004 §6).
+   */
+  public_key: string | null
+  /** A private key is stored. The screen shows the state, never the value. */
+  has_private_key: boolean
+  /**
+   * A **static** PSK is stored.
    *
    * The PQC PSK from ML-KEM never lands here: it isn't persisted and gets
-   * renegotiated on every connection. `null` is therefore the normal case
+   * renegotiated on every connection. `false` is therefore the normal case
    * for a Helios profile — see `PskKind`.
    */
-  preshared_key: string | null
+  has_static_psk: boolean
   /** CGNAT VIP assigned by the gateway at enrollment (e.g. `100.64.1.2/32`). */
   address: string | null
   /** Traffic routed into the tunnel. Defaults to `0.0.0.0/0`. */
@@ -105,6 +147,13 @@ export interface ClientProfile {
   /** Keepalive in seconds. Defaults to 25. */
   persistent_keepalive: number
   heliosd_url: string | null
+  /**
+   * SSH destination inside the tunnel, `user@host`.
+   *
+   * `null` = this profile offers no terminal. Reachable only once the tunnel
+   * is up, and only if the gateway sets `allow_ssh_over_tunnel`.
+   */
+  ssh_target: string | null
   /**
    * Authenticated negotiation played before WireGuard is mounted.
    *
@@ -117,6 +166,46 @@ export interface ClientProfile {
 export interface ClientConfig {
   profiles: ClientProfile[]
   selected: string | null
+}
+
+/**
+ * What the screen sends back on save — mirror of the shell's `ProfileDraft`.
+ *
+ * Everything the user can edit, and **no secret**. The secret-touching fields
+ * are intents rather than values: the interface asks Rust to adopt the key or
+ * the PSK it is already holding, it never carries either back.
+ *
+ * A secret only ever travels *towards* Rust, once, at an explicit gesture —
+ * `adoptPrivateKey`, `adoptPresharedKey` — and no path returns one (ADR-006
+ * §5). An enrolment document remains the usual way both arrive (ADR-004 §6).
+ */
+export interface ProfileDraft {
+  name: string
+  endpoint: string
+  peer_public_key: string
+  address: string | null
+  allowed_ips: string
+  persistent_keepalive: number
+  heliosd_url: string | null
+  /** SSH destination inside the tunnel, `user@host`. `null` = no terminal. */
+  ssh_target: string | null
+  key_negotiation: KeyNegotiationSettings | null
+  /**
+   * Adopt the key staged by `generatePrivateKey` or `adoptPrivateKey`.
+   *
+   * The pair already exists in Rust and its public half is on screen; this
+   * only says "keep it". Without it, a save leaves the stored key untouched.
+   */
+  useStagedKey?: boolean
+  /** Drop the stored static PSK. */
+  clearPresharedKey?: boolean
+  /**
+   * Adopt the PSK staged by `adoptPresharedKey`.
+   *
+   * Same shape as {@link useStagedKey}: the value waits in Rust, this only
+   * says "keep it".
+   */
+  useStagedPsk?: boolean
 }
 
 /**
@@ -135,6 +224,7 @@ export interface ProfileIssues {
   allowed_ips: string | null
   persistent_keepalive: string | null
   heliosd_url: string | null
+  ssh_target: string | null
   /**
    * Fault of the key-negotiation block as a whole.
    *
@@ -174,4 +264,42 @@ export interface LogLine {
 export interface TelemetrySample {
   rx_bps: number
   tx_bps: number
+}
+
+/**
+ * What the vault can honestly claim about itself (ADR-006 §3).
+ *
+ * Every field is **measured**, never assumed. A guarantee that could not be
+ * established is reported as absent rather than defaulted to the reassuring
+ * answer — a panel that promised what nothing backs is the failure the ADR
+ * names, not a cosmetic one.
+ */
+export interface VaultPosture {
+  /** Installation root bound to a TPM key whose properties were verified. */
+  hardwareBacked: boolean
+  /**
+   * `danger_allow_software_keystore` is on. A **downgrade**, not a recovery:
+   * resistance to inter-machine copying and to a domain administrator holding
+   * DPAPI backup keys is withdrawn with it.
+   */
+  softwareKeystore: boolean
+  /** Volume-encryption posture of the disk holding the profiles. */
+  volume: string
+  volumeProtected: boolean
+  /** `danger_allow_unencrypted_volume` est posé : un refus devenu un choix. */
+  unencryptedVolumeWaived: boolean
+  /** Secret pages held out of swap and of the hibernation file. */
+  memoryLocked: boolean
+  memory: string
+  /** Secret pages excluded from Windows Error Reporting dumps. */
+  dumpsExcluded: boolean
+  dumps: string
+  /**
+   * Profiles whose key once lived in plaintext. Presumed compromised — sealing
+   * the file does not recall the copies already in backups — and unconnectable
+   * until a new key is admitted.
+   */
+  rotationRequired: string[]
+  /** A plaintext `profiles.toml` is still present and not yet migrated. */
+  legacyPresent: boolean
 }

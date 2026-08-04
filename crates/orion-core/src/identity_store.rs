@@ -212,12 +212,9 @@ impl ProtectedIdentityStore {
         );
         let sealed = seal(&plaintext)?;
 
-        std::fs::create_dir_all(&self.directory)
+        aether::private_file::create_private_dir(&self.directory)
             .with_context(|| format!("création de {}", self.directory.display()))?;
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, &sealed)
-            .with_context(|| format!("écriture de {}", temporary.display()))?;
-        std::fs::rename(&temporary, &path)
+        aether::private_file::write_private_atomic(&path, &sealed)
             .with_context(|| format!("remplacement atomique de {}", path.display()))?;
         Ok(path)
     }
@@ -241,7 +238,7 @@ impl ProtectedIdentityStore {
     /// user's session being able to unseal.
     pub fn contains(&self, identity: &str) -> bool {
         self.path_of(identity)
-            .is_ok_and(|path| std::fs::metadata(path).is_ok())
+            .is_ok_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
     }
 }
 
@@ -420,6 +417,16 @@ mod dpapi {
 mod tests {
     use super::*;
 
+    fn test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "orion-identity-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
     fn bundle() -> ClientIdentityBundle {
         let encoder = base64::engine::general_purpose::STANDARD;
         ClientIdentityBundle {
@@ -445,11 +452,31 @@ mod tests {
                 ..bundle()
             },
             ClientIdentityBundle {
+                certificate_chain: vec![String::new()],
+                ..bundle()
+            },
+            ClientIdentityBundle {
+                certificate_chain: vec!["not base64".into()],
+                ..bundle()
+            },
+            ClientIdentityBundle {
                 private_key: "pas du base64 !".into(),
                 ..bundle()
             },
             ClientIdentityBundle {
+                private_key: String::new(),
+                ..bundle()
+            },
+            ClientIdentityBundle {
+                pq_certificate: String::new(),
+                ..bundle()
+            },
+            ClientIdentityBundle {
                 pq_private_key: String::new(),
+                ..bundle()
+            },
+            ClientIdentityBundle {
+                pq_private_key: "not base64".into(),
                 ..bundle()
             },
             // Decodable base64, but not the JSON document a PQ certificate is.
@@ -461,6 +488,29 @@ mod tests {
             assert!(broken.validate().is_err(), "{broken:?} should be refused");
         }
         assert!(bundle().validate().is_ok());
+    }
+
+    #[test]
+    fn debug_never_prints_private_material() {
+        let bundle = bundle();
+        let rendered = format!("{bundle:?}");
+
+        assert!(rendered.contains("orion-portable"));
+        assert!(rendered.contains("private_key: \"***\""));
+        assert!(rendered.contains("pq_private_key: \"***\""));
+        assert!(!rendered.contains(&bundle.private_key));
+        assert!(!rendered.contains(&bundle.pq_private_key));
+    }
+
+    #[test]
+    fn serialized_bundles_reject_unknown_fields() {
+        let mut value = serde_json::to_value(bundle()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Bool(true));
+
+        assert!(serde_json::from_value::<ClientIdentityBundle>(value).is_err());
     }
 
     /// The identity name comes from an operator-written document: it must not
@@ -486,6 +536,146 @@ mod tests {
             store.path_of("orion-portable").unwrap(),
             Path::new("/var/lib/orion/orion-portable.identity")
         );
+        assert!(store.path_of("...").is_err());
+
+        let long = "a".repeat(128);
+        let path = store.path_of(&long).unwrap();
+        assert_eq!(
+            path.file_stem().unwrap().to_string_lossy().len(),
+            96,
+            "identity filenames are bounded"
+        );
+    }
+
+    #[test]
+    fn contains_only_accepts_a_regular_identity_file() {
+        let directory = test_directory("contains");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = ProtectedIdentityStore::at(directory.clone());
+        let path = store.path_of("portable").unwrap();
+
+        assert!(!store.contains("portable"));
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            !store.contains("portable"),
+            "a directory is not a sealed identity"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"sealed").unwrap();
+        assert!(store.contains("portable"));
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn bounded_reads_distinguish_the_limit_from_an_oversized_blob() {
+        let directory = test_directory("bounded");
+        std::fs::create_dir_all(&directory).unwrap();
+        let exact = directory.join("exact.identity");
+        let oversized = directory.join("oversized.identity");
+        std::fs::write(&exact, vec![0x5a; MAX_SEALED_BYTES]).unwrap();
+        std::fs::write(&oversized, vec![0x5a; MAX_SEALED_BYTES + 1]).unwrap();
+
+        assert_eq!(read_bounded(&exact).unwrap().len(), MAX_SEALED_BYTES);
+        let error = read_bounded(&oversized).expect_err("oversized identity must be refused");
+        assert!(error.to_string().contains("anormalement volumineuse"));
+        assert!(read_bounded(&directory.join("missing.identity")).is_err());
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn loading_an_absent_identity_reports_its_name() {
+        let store = ProtectedIdentityStore::at(test_directory("missing"));
+        let error = store.load("workstation").expect_err("identity is absent");
+        assert!(
+            error.downcast_ref::<IdentityStoreError>().is_some_and(
+                |error| matches!(error, IdentityStoreError::NotFound(name) if name == "workstation")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Exercises the actual Windows account boundary rather than the
+    /// non-Windows refusal compiled on the Linux runner.
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_sealing_round_trips_and_hides_the_plaintext() {
+        let plaintext = b"orion identity private material";
+        let sealed = seal(plaintext).expect("DPAPI must seal for the current test account");
+
+        assert_ne!(sealed, plaintext);
+        assert!(
+            !sealed
+                .windows(plaintext.len())
+                .any(|window| window == plaintext),
+            "the DPAPI envelope must not contain the plaintext"
+        );
+        assert_eq!(unseal(&sealed).unwrap().as_slice(), plaintext);
+    }
+
+    /// Covers validation, DPAPI, the atomic replacement and decoding as one
+    /// operation on the platform Orion actually ships for.
+    #[cfg(windows)]
+    #[test]
+    fn protected_store_round_trips_and_replaces_an_identity() {
+        let directory = test_directory("windows-round-trip");
+        let store = ProtectedIdentityStore::at(directory.clone());
+        let first = bundle();
+
+        let path = store.store(&first).unwrap();
+        let ciphertext = std::fs::read(&path).unwrap();
+        assert!(!ciphertext
+            .windows(first.private_key.len())
+            .any(|window| { window == first.private_key.as_bytes() }));
+        assert!(store.contains(&first.identity));
+        let loaded = store.load(&first.identity).unwrap();
+        assert_eq!(loaded.private_key, first.private_key);
+        assert_eq!(loaded.pq_private_key, first.pq_private_key);
+
+        let mut replacement = first;
+        replacement.pq_private_key = base64::engine::general_purpose::STANDARD.encode([9u8; 64]);
+        store.store(&replacement).unwrap();
+        assert_eq!(
+            store.load(&replacement.identity).unwrap().pq_private_key,
+            replacement.pq_private_key
+        );
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// DPAPI authentication must turn a modified blob into an explicit
+    /// decryption failure, never partially decoded identity material.
+    #[cfg(windows)]
+    #[test]
+    fn a_tampered_identity_blob_is_refused() {
+        let directory = test_directory("windows-tamper");
+        let store = ProtectedIdentityStore::at(directory.clone());
+        let identity = bundle();
+        let path = store.store(&identity).unwrap();
+        let mut sealed = std::fs::read(&path).unwrap();
+        let last = sealed.last_mut().expect("DPAPI produced a non-empty blob");
+        *last ^= 0x80;
+        std::fs::write(&path, sealed).unwrap();
+
+        let error = store
+            .load(&identity.identity)
+            .expect_err("modified DPAPI material must not open");
+        assert!(
+            error
+                .downcast_ref::<IdentityStoreError>()
+                .is_some_and(|error| matches!(error, IdentityStoreError::Unseal(_))),
+            "unexpected error: {error}"
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// The refusal must be explicit rather than a silent plaintext fallback:
@@ -509,7 +699,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn a_refused_seal_leaves_no_file_behind() {
-        let directory = std::env::temp_dir().join(format!("orion-identity-{}", std::process::id()));
+        let directory = test_directory("refused-seal");
         let store = ProtectedIdentityStore::at(directory.clone());
 
         assert!(store.store(&bundle()).is_err());

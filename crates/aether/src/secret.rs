@@ -1,18 +1,43 @@
-//! Secret carried between internal components, whose display does not leak.
+//! Secret carried between internal components, whose display does not leak
+//! and whose memory does not survive it ([ADR-006](../../../docs/adr/ADR-006-SECRETS-AU-REPOS.md) §5).
 //!
 //! A bare `String` carrying a PSK ends up sooner or later in a derived
 //! `Debug`, hence in a log. [`SecretString`] makes this leak impossible by
 //! construction: its `Debug` never prints the value, and one must call
 //! [`SecretString::expose`] — named to stand out in review — to obtain it.
 //!
-//! This type does not replace [`zeroize`]: it protects against accidental
-//! display, not memory remanence. For a secret whose in-memory lifetime must
-//! be bounded, prefer `Zeroizing` (see [`crate::enroll::Psk`]).
+//! # The rule is on the type before it is on `Drop`
+//!
+//! Zeroizing repairs nothing about a copy already made. ADR-006 §5 therefore
+//! starts with what the type *allows*: no `Clone`, no `Serialize`, no
+//! `Display`, no revealing `Debug`. A duplication that is genuinely needed goes
+//! through [`SecretString::duplicate`], whose name makes it a point to justify
+//! in review — exactly like `expose`.
+//!
+//! `Drop` comes second, and it does come: the buffer is wiped with the
+//! `zeroize` crate, whose volatile writes and fences the compiler may not
+//! elide. An ordinary `String` drop leaves the bytes in the freed allocation.
+//!
+//! # Comparison is constant-time
+//!
+//! `PartialEq` on a secret is a timing oracle: the default byte comparison
+//! returns as soon as two bytes differ, which leaks how long a common prefix
+//! is. Since these values are compared against attacker-supplied ones — a PSK
+//! fingerprint, a pasted key — the implementation here compares every byte.
+//!
+//! # What this does not do
+//!
+//! It does not lock the page in RAM. A `String` grows by reallocating, and the
+//! old allocation is copied then freed **unwiped** by the allocator. For a
+//! secret whose residency must be controlled, see [`crate::locked`].
 
 use std::fmt;
 
+use zeroize::Zeroize as _;
+
 /// A secret string (base64 PSK, private key…) that never prints itself.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Deliberately **not** `Clone`: see the module documentation.
 pub struct SecretString(String);
 
 impl SecretString {
@@ -26,9 +51,25 @@ impl SecretString {
         &self.0
     }
 
+    /// Makes a second copy of the secret.
+    ///
+    /// Named rather than derived, so that a duplication appears in a diff. Each
+    /// copy is one more buffer to wipe and one more chance for one to be
+    /// forgotten; the ones that remain should be the ones someone chose.
+    #[must_use]
+    pub fn duplicate(&self) -> Self {
+        Self(self.0.clone())
+    }
+
     /// Is the secret empty? Useful for validating without exposing.
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -39,6 +80,27 @@ impl fmt::Debug for SecretString {
         f.write_str("SecretString(***)")
     }
 }
+
+/// Constant-time equality.
+///
+/// The lengths are compared first and in the clear, which is not a leak worth
+/// avoiding: the length of a base64 PSK is a public property of the protocol.
+/// What must not leak is *where* two values start to differ.
+impl PartialEq for SecretString {
+    fn eq(&self, other: &Self) -> bool {
+        let ours = self.0.as_bytes();
+        let theirs = other.0.as_bytes();
+        if ours.len() != theirs.len() {
+            return false;
+        }
+        ours.iter()
+            .zip(theirs)
+            .fold(0u8, |differences, (a, b)| differences | (a ^ b))
+            == 0
+    }
+}
+
+impl Eq for SecretString {}
 
 /// `Display` is deliberately **not implemented**: a secret must not be able
 /// to end up in a `format!` by accident. Use [`SecretString::expose`].
@@ -103,5 +165,48 @@ mod tests {
     fn empty_is_detected_without_exposing() {
         assert!(SecretString::new("   ").is_empty());
         assert!(!SecretString::new("x").is_empty());
+    }
+
+    #[test]
+    fn duplicate_yields_an_equal_but_independent_secret() {
+        let original = SecretString::new("valeur");
+        let copy = original.duplicate();
+        assert_eq!(original, copy);
+        assert_eq!(copy.expose(), "valeur");
+    }
+
+    /// Comparison must not answer "how far did I get before differing".
+    #[test]
+    fn equality_holds_on_every_shape() {
+        let reference = SecretString::new("abcdefgh");
+        assert_eq!(reference, SecretString::new("abcdefgh"));
+        // Same length, differs at the last byte: the case a short-circuiting
+        // comparison would answer fastest.
+        assert_ne!(reference, SecretString::new("abcdefgX"));
+        // Same length, differs at the first byte.
+        assert_ne!(reference, SecretString::new("Xbcdefgh"));
+        assert_ne!(reference, SecretString::new("abcdefg"));
+        assert_ne!(reference, SecretString::new("abcdefghi"));
+        assert_eq!(SecretString::new(""), SecretString::new(""));
+    }
+
+    /// The buffer must be wiped, not merely dropped.
+    ///
+    /// Reading freed memory is undefined behaviour, so the check is made on a
+    /// buffer we still own: `Drop` calls exactly this, and asserting the
+    /// primitive is what makes the guarantee testable at all.
+    #[test]
+    fn the_buffer_is_wiped_rather_than_merely_freed() {
+        let mut value = String::from("psk-ultra-confidentiel");
+        let address = value.as_ptr();
+        let length = value.len();
+        value.zeroize();
+        // SAFETY: the allocation is still owned by `value`; `zeroize` empties
+        // the string but does not release its buffer.
+        let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "the buffer still holds the secret after zeroize"
+        );
     }
 }

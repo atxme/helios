@@ -48,6 +48,27 @@ cargo run --quiet -p helios-publisher -- keygen \
 export HELIOS_PUBLISHER_KEYRING_PATH="$TMP/publisher/publisher-keyring.json"
 cargo build --quiet -p heliosd -p helios-ctl -p helios-publisher -p helios-installer
 
+# Artefacts de campagne : des copies **strippées** des binaires de debug.
+#
+# Ce n'est pas une optimisation, c'est ce qui rend la campagne représentative.
+# Un `heliosd` de debug pèse ~131 Mio dont 83 % d'informations de débogage, et
+# dépasse donc `helios_update::MAX_BINARY_SIZE` (128 Mio) — une borne qui existe
+# pour le chemin de mise à jour et qu'il serait absurde de relever pour
+# accommoder un script. Aucun artefact réellement livré ne contient ces
+# symboles : la campagne signait quelque chose six fois plus gros que ce
+# qu'elle est censée éprouver.
+if ! command -v strip > /dev/null; then
+    echo "Refus : « strip » est introuvable (paquet binutils)." >&2
+    echo "  La campagne ne peut pas produire d'artefact représentatif sans lui." >&2
+    exit 1
+fi
+ARTIFACTS="$TMP/artifacts"
+mkdir -p "$ARTIFACTS"
+for binaire in heliosd helios-ctl helios-installer; do
+    cp "target/debug/$binaire" "$ARTIFACTS/$binaire"
+    strip "$ARTIFACTS/$binaire"
+done
+
 # Clés de campagne, jetables : elles ne servent qu'à cette exécution et
 # disparaissent avec le répertoire temporaire. `--generate-keys` n'écrit que des
 # lignes CLÉ=valeur sur stdout ; l'aide part sur stderr, d'où le 2>/dev/null.
@@ -118,7 +139,7 @@ cargo run --quiet -p helios-publisher -- binary-release \
     --version "$HELIOS_VERSION" \
     --git-commit "$GIT_COMMIT" \
     --target "$TARGET_TRIPLE" \
-    --binary target/debug/heliosd \
+    --binary "$ARTIFACTS/heliosd" \
     --ed25519-private-key "$TMP/publisher/ed25519-private.pk8" \
     --ml-dsa-65-private-key "$TMP/publisher/ml-dsa-65-private.bin" \
     --keyring "$TMP/publisher/publisher-keyring.json" \
@@ -126,7 +147,7 @@ cargo run --quiet -p helios-publisher -- binary-release \
 python3 scripts/update_campaign.py \
     --url http://127.0.0.1:8080 \
     --manifest "$TMP/heliosd.release.json" \
-    --binary target/debug/heliosd \
+    --binary "$ARTIFACTS/heliosd" \
     --activate
 
 echo "==> Campagne d'installation par bundle signé"
@@ -138,7 +159,8 @@ python3 scripts/bundle_campaign.py \
     --epoch-dir "$TMP/publisher" \
     --version "$HELIOS_VERSION" \
     --git-commit "$GIT_COMMIT" \
-    --target "$TARGET_TRIPLE"
+    --target "$TARGET_TRIPLE" \
+    --artifacts "$ARTIFACTS"
 
 echo "==> Vérification : aucun secret dans le journal du daemon"
 if grep -qF "$CLIENT_PRIV" "$TMP/daemon.log"; then

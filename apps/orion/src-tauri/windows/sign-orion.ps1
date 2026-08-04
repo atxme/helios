@@ -48,7 +48,7 @@ if (-not (Test-Path -LiteralPath $Artifact -PathType Leaf)) {
     throw "Artefact à signer introuvable : $Artifact"
 }
 
-& $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 /d "Orion VPN" $Artifact
+& $signTool sign /sha1 $thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 /d "Orion" $Artifact
 if ($LASTEXITCODE -ne 0) {
     throw "La signature ou l'horodatage Authenticode a échoué pour $Artifact (code $LASTEXITCODE)."
 }

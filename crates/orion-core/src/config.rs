@@ -152,6 +152,16 @@ pub struct ClientProfile {
     /// Unique friendly name (selection key in the list).
     pub name: String,
     /// Gateway's UDP endpoint: `IP:port` or `FQDN:port`. **Not** an HTTP URL.
+    ///
+    /// `default` like almost every field below: a document is allowed to carry
+    /// only part of a profile. An operator hands out what they know — often an
+    /// invitation with no private key, sometimes a block without an endpoint
+    /// yet — and refusing to *parse* it would leave the user with a rejection
+    /// instead of a form they can finish. [`Self::validate`] is what decides
+    /// whether a profile may mount a tunnel; parsing only decides whether the
+    /// document is intelligible. Only `name` stays required, because it is the
+    /// key the profile is stored under.
+    #[serde(default)]
     pub endpoint: String,
     /// Client's Curve25519 private key (base64). **Secret.**
     #[serde(default)]
@@ -172,6 +182,17 @@ pub struct ClientProfile {
     #[serde(default)]
     pub address: Option<String>,
     /// Traffic routed into the tunnel. Defaults to [`DEFAULT_ALLOWED_IPS`].
+    ///
+    /// One or more CIDR prefixes, comma-separated — the `wg-quick` spelling of
+    /// `AllowedIPs`, which is WireGuard's cryptographic routing table. A split
+    /// tunnel usually needs several: the VPN network *and* the remote LAN have
+    /// no common supernet short of `0.0.0.0/0`, so a single prefix forced a
+    /// choice between them.
+    ///
+    /// Stored normalized (`a/n, b/m`) by
+    /// [`crate::profile_import::normalize_cidr_list`]: the screen, the sealed
+    /// profile and the peer built from it have to agree character for
+    /// character, or a reloaded profile reads as modified.
     #[serde(default = "default_allowed_ips")]
     pub allowed_ips: String,
     /// Keepalive in seconds. Defaults to [`DEFAULT_KEEPALIVE_SECS`].
@@ -181,6 +202,23 @@ pub struct ClientProfile {
     /// mounted** (e.g. `http://100.64.0.1:8080`). `None` = no enriched telemetry.
     #[serde(default)]
     pub heliosd_url: Option<String>,
+    /// SSH destination inside the tunnel, as `user@host` or `host`.
+    ///
+    /// Reachable only once the tunnel is up, and only if the gateway sets
+    /// `allow_ssh_over_tunnel`. `None` = the client offers no terminal.
+    ///
+    /// # Why a whole field for what looks like a shortcut
+    ///
+    /// This value is handed to a **process launcher**. It is the one string in
+    /// a profile that becomes part of a command line, so it is the one string
+    /// an attacker would want to control — a profile document arrives from
+    /// outside, and `orion-core` is what decides whether its contents are
+    /// allowed to mean anything. Hence a named field with its own grammar
+    /// ([`crate::profile_import::validate_ssh_target`]) rather than a value
+    /// parsed out of `heliosd_url` at launch time, where no validation would
+    /// have a natural home.
+    #[serde(default)]
+    pub ssh_target: Option<String>,
     /// Authenticated public negotiation performed before WireGuard is mounted.
     #[serde(default)]
     pub key_negotiation: Option<KeyNegotiationSettings>,
@@ -221,6 +259,7 @@ impl fmt::Debug for ClientProfile {
             .field("allowed_ips", &self.allowed_ips)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
+            .field("ssh_target", &self.ssh_target)
             .field("key_negotiation", &self.key_negotiation)
             .finish()
     }
@@ -247,6 +286,55 @@ impl ClientProfile {
             // ML-KEM just produced is the expected outcome of that very mode,
             // and judging it by the same rule refused every commit.
             validate_key_negotiation(settings, &self.peer_public_key, self.has_static_psk())?;
+        }
+        Ok(())
+    }
+
+    /// Validates a profile **about to be installed on the data plane**.
+    ///
+    /// # The gap this closes
+    ///
+    /// [`Self::validate`] runs on the profile as the user edits and stores it,
+    /// where an ML-KEM profile legitimately holds **no** PSK: the PSK does not
+    /// exist yet, it is what the negotiation produces. That leniency is right
+    /// there and wrong here — applied unchanged at mount time it accepts a
+    /// profile whose mode announces ML-KEM while the `PresharedKey` slot is
+    /// empty. WireGuard would then come up on the static key pair alone, a
+    /// perfectly functional tunnel with none of the post-quantum protection
+    /// the screen claims and the floor promised. Nothing downstream would say
+    /// so: the handshake succeeds, the state goes `Up`, and the only trace is
+    /// a `PskKind` nobody cross-checks.
+    ///
+    /// So the data plane asks a stricter question: *is the secret that mode
+    /// requires actually here*. In ML-KEM mode the answer must be a PSK
+    /// carrying [`Self::preshared_key_is_negotiated`] — a static one is not
+    /// interchangeable, it is the operator's out-of-band value and would mean
+    /// the negotiation never happened.
+    ///
+    /// The client's WireGuard private key is required either way and is not
+    /// what this arbitrates: WireGuard's handshake needs it in every mode. The
+    /// negotiated PSK is mixed **in addition** to it, and this is what refuses
+    /// to mount when that addition is missing.
+    pub fn validate_for_data_plane(&self) -> Result<()> {
+        self.validate()?;
+        let Some(settings) = &self.key_negotiation else {
+            return Ok(());
+        };
+        if settings.mode != ProtectionMode::MlKem {
+            return Ok(());
+        }
+        if !self.has_preshared_key() {
+            anyhow::bail!(
+                "mode ML-KEM sans PSK négocié : monter le tunnel maintenant l'établirait sur la \
+                 seule paire de clés statique, sans la protection post-quantique annoncée. \
+                 La négociation doit aboutir avant la pose."
+            );
+        }
+        if !self.preshared_key_is_negotiated {
+            anyhow::bail!(
+                "mode ML-KEM avec un PSK statique : un PSK partagé hors bande n'est pas le \
+                 secret que la négociation produit, et ne peut pas en tenir lieu"
+            );
         }
         Ok(())
     }
@@ -297,6 +385,7 @@ impl Default for ClientProfile {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
+            ssh_target: None,
             key_negotiation: None,
             preshared_key_is_negotiated: false,
         }
@@ -338,19 +427,32 @@ impl ClientConfig {
         }
     }
 
-    /// Persists the config atomically (temporary write + rename), same
-    /// scheme as [`aether::NetworkConfig::save`].
+    /// Writes `profiles.toml` — **test-only, and deliberately so**.
+    ///
+    /// # Why this is not a production path any more
+    ///
+    /// This wrote the private key and the static PSK in the clear, and that is
+    /// exactly the file ADR-006 §3 retires: `profiles.toml` is now an *import*
+    /// format the migration consumes and deletes, never something Orion
+    /// produces. [`crate::vault::ProfileStore::save_profile`] is the writer.
+    ///
+    /// It is `cfg(test)` rather than deleted because the migration tests need
+    /// to *create* a legacy file to migrate. Keeping it callable from the
+    /// shipped binary is what let a floor raise silently recreate that file
+    /// after every negotiated connection — the compiler now refuses that,
+    /// which is a stronger guarantee than a comment asking nobody to call it.
+    #[cfg(test)]
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            aether::private_file::create_private_dir(parent)
                 .with_context(|| format!("création de {}", parent.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("sérialisation TOML")?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw.as_bytes())
-            .with_context(|| format!("écriture de {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).context("rename atomique")?;
+        // 0600 from creation on Unix — see `aether::private_file`, including
+        // why Windows gets nothing here and what actually protects it (ADR-006).
+        aether::private_file::write_private_atomic(&path, raw.as_bytes())
+            .with_context(|| format!("écriture privée de {}", path.display()))?;
         Ok(())
     }
 
@@ -581,6 +683,20 @@ mod tests {
         assert_eq!(p.persistent_keepalive, DEFAULT_KEEPALIVE_SECS);
         assert!(p.has_preshared_key());
         assert_eq!(loaded.selected.as_deref(), Some("site-a"));
+
+        // The file carries a private key and a PSK: it must never be readable
+        // by anyone else. Asserted on the SECOND write too, because that is the
+        // one that used to hand the mode back to the umask (ADR-006).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&path), 0o600, "mode after the first save");
+            cfg.save().unwrap();
+            assert_eq!(mode(&path), 0o600, "mode after a rewrite");
+        }
 
         std::env::remove_var("ORION_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);

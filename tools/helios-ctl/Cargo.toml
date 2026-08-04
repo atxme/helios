@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 aether.workspace = true
+# Emplacement fixe de la CA opérateur, indépendant du répertoire courant.
+directories = "5"
 # Séquestre de l'identité de la gateway : la moitié opérateur (génération de la
 # paire, ouverture du blob) vit ici, jamais sur la gateway. Sans la feature
 # `tpm` : le module `escrow` est de la crypto pure, aucun accès matériel.

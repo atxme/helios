@@ -21,6 +21,7 @@ embed-ui = ["helios-api/embed-ui"]
 tpm = ["helio-tpm/tpm"]
 
 [dependencies]
+
 # `key-negotiation-signing` sans condition : un heliosd qui compile en
 # ignorant `key_negotiation_port` laisse la gateway annoncer un service
 # qu'elle ne rend pas, et les clients échouent avant WireGuard.
@@ -40,6 +41,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # Non optionnelle : voir la note sur `aether` plus bas.
 helios-key-negotiation = { workspace = true }
+# Conteneur AEAD de la table des PSK statiques (ADR-006 §4).
+helios-vault = { workspace = true }
+thiserror.workspace = true
 aws-lc-rs.workspace = true
 zeroize.workspace = true
 rcgen = { workspace = true }
@@ -55,3 +59,9 @@ serde_json.workspace = true
 # both ends derive the same PSK, which no unit test on either side can show.
 orion-core = { workspace = true }
 rcgen = { workspace = true }
+
+# `prctl(PR_SET_DUMPABLE, 0)` avant le chargement de la première clé
+# (ADR-006 §6). Déjà présente transitivement via tokio : aucun coût
+# supplémentaire de chaîne d'approvisionnement.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

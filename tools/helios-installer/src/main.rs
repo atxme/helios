@@ -106,7 +106,7 @@ fn bootstrap(archive: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     println!("  sudo heliosd provision-tpm     # first deployment only");
     println!("  sudo heliosd init-identity     # shows the gateway's public key");
     println!("  sudo heliosd peer add --name <name> --public-key <key> --admin");
-    println!("  sudo systemctl enable --now heliosd helios-update.path");
+    println!("  sudo systemctl enable --now heliosd helios-update.path helios-update-window.timer");
     Ok(())
 }
 
@@ -280,6 +280,14 @@ fn wait_activation_delay(requested_at: u64, delay: u64) {
 mod tests {
     use super::*;
 
+    fn test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "helios-installer-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
     #[test]
     fn readiness_requires_version_and_real_mode() {
         assert!(readiness_matches(
@@ -297,5 +305,103 @@ mod tests {
             Some("1.2.0"),
             true
         ));
+        assert!(readiness_matches("anything", None, false));
+        assert!(readiness_matches(
+            "version=1.2.0\nmode_reel=false\n",
+            Some("1.2.0"),
+            false
+        ));
+        assert!(readiness_matches("mode_reel=true\n", None, true));
+        assert!(!readiness_matches(
+            "version=1.2.0-extra\nmode_reel=true",
+            Some("1.2.0"),
+            true
+        ));
+    }
+
+    #[test]
+    fn command_line_requires_one_bootstrap_source() {
+        assert!(matches!(
+            Cli::try_parse_from(["helios-installer", "install-pending"])
+                .unwrap()
+                .command,
+            CommandKind::InstallPending
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "helios-installer",
+                "bootstrap",
+                "--archive",
+                "release.tar.gz"
+            ])
+            .unwrap()
+            .command,
+            CommandKind::Bootstrap {
+                archive: Some(_),
+                dir: None
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "helios-installer",
+            "bootstrap",
+            "--archive",
+            "release.tar.gz",
+            "--dir",
+            "release"
+        ])
+        .is_err());
+        assert!(bootstrap(None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("provide"));
+    }
+
+    #[test]
+    fn readiness_wait_returns_immediately_or_times_out() {
+        let directory = test_directory("readiness");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("ready");
+        fs::write(&marker, "version=2.0.0\nmode_reel=true\n").unwrap();
+
+        wait_ready(&marker, Duration::from_millis(50), Some("2.0.0"), true).unwrap();
+        assert!(wait_ready(&marker, Duration::ZERO, Some("different"), true)
+            .unwrap_err()
+            .to_string()
+            .contains("did not publish"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn extraction_requires_an_archive_with_one_directory_root() {
+        let directory = test_directory("archive");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("payload/bundle")).unwrap();
+        fs::write(directory.join("payload/bundle/manifest.json"), b"{}").unwrap();
+        let valid = directory.join("valid.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&valid)
+            .arg("-C")
+            .arg(directory.join("payload"))
+            .arg("bundle")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let root = extract(&valid).unwrap();
+        assert!(root.join("manifest.json").is_file());
+        fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        assert!(extract(&directory.join("absent.tar.gz")).is_err());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn past_activation_times_never_sleep() {
+        let started = std::time::Instant::now();
+        wait_activation_delay(0, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

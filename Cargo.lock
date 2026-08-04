@@ -27,11 +27,13 @@ dependencies = [
  "curve25519-dalek 4.1.3",
  "fips204",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.2",
+ "windows-sys 0.61.2",
  "x25519-dalek 2.0.1",
  "zeroize",
 ]
@@ -616,6 +618,12 @@ name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
+name = "byteorder-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
@@ -2026,6 +2034,7 @@ dependencies = [
  "aether",
  "aws-lc-rs",
  "getrandom 0.2.17",
+ "helios-vault",
  "hex",
  "serde",
  "serde_json",
@@ -2046,6 +2055,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "futures-util",
  "helios-firewall",
  "helios-provisioning",
  "helios-update",
@@ -2055,6 +2065,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tracing",
  "x25519-dalek 2.0.1",
@@ -2069,6 +2080,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "clap",
+ "directories",
  "futures-util",
  "helio-tpm",
  "helios-key-negotiation",
@@ -2094,6 +2106,7 @@ dependencies = [
  "async-trait",
  "ipnetwork",
  "rustables",
+ "tokio",
  "toml 0.8.2",
  "tracing",
 ]
@@ -2170,6 +2183,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-vault"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "helios-wireguard"
 version = "0.1.0"
 dependencies = [
@@ -2199,12 +2221,15 @@ dependencies = [
  "helios-key-negotiation",
  "helios-provisioning",
  "helios-update",
+ "helios-vault",
  "helios-wireguard",
+ "libc",
  "orion-core",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tracing",
@@ -2495,6 +2520,19 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "image"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+dependencies = [
+ "bytemuck",
+ "byteorder-lite",
+ "moxcms",
+ "num-traits",
+ "png 0.18.1",
 ]
 
 [[package]]
@@ -2922,6 +2960,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+dependencies = [
+ "num-traits",
+ "pxfm",
 ]
 
 [[package]]
@@ -3413,6 +3461,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3427,6 +3477,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "directories",
  "helios-key-negotiation",
+ "helios-vault",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3434,6 +3485,8 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tracing",
+ "unicode-normalization",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
  "x25519-dalek 2.0.1",
  "zeroize",
@@ -3810,6 +3863,12 @@ dependencies = [
  "version_check",
  "yansi",
 ]
+
+[[package]]
+name = "pxfm"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
 name = "quick-xml"
@@ -4909,6 +4968,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image",
  "jni",
  "libc",
  "log",
@@ -5692,6 +5752,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

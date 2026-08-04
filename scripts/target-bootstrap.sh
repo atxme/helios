@@ -230,7 +230,7 @@ if [ ! -f "$ENROLLMENT_STATE" ]; then
     {
         printf 'name=%s\n' "$CLIENT_NAME"
         printf 'public_key=%s\n' "$CLIENT_PUBLIC_KEY"
-        printf 'profile=%s/%s.orionprofile\n' "$TARGET_DIR" "$CLIENT_NAME"
+        printf 'profile=%s/%s.orion\n' "$TARGET_DIR" "$CLIENT_NAME"
     } > "$ENROLLMENT_STATE"
     chmod 600 "$ENROLLMENT_STATE"
 else

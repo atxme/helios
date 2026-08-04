@@ -9,6 +9,7 @@ members = [
     "crates/helios-provisioning",
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
+    "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -33,6 +34,7 @@ default-members = [
     "crates/helios-provisioning",
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
+    "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
     "tools/helios-ctl",
@@ -67,7 +69,7 @@ toml = "0.8"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
@@ -107,6 +109,7 @@ aether = { path = "crates/aether" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }
+helios-vault = { path = "crates/helios-vault" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }

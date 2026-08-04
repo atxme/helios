@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Lighter than the full sheet, deliberately: at 32 px and below the icon
+         is judged on its silhouette, and the deep navy of the large size sinks
+         into the dark background of Explorer's dark theme. -->
+    <linearGradient id="sheet" x1="18%" y1="0%" x2="82%" y2="100%">
+      <stop offset="0%" stop-color="#265D77"/>
+      <stop offset="55%" stop-color="#154257"/>
+      <stop offset="100%" stop-color="#0E3044"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#59A2BE"/>
+      <stop offset="100%" stop-color="#2E6D89"/>
+    </linearGradient>
+    <linearGradient id="orbit" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#12B981"/>
+      <stop offset="100%" stop-color="#54F0BE"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Below 48 px the margins of the full sheet cost more than they carry: the
+       page fills the tile, the fold is bigger than a real one, and the halo is
+       dropped. Same figure, fewer strokes — the rule the application icon
+       already follows. -->
+  <path d="M96 24 H328 L440 136 V464 A16 16 0 0 1 424 480 H96 A16 16 0 0 1 80 464
+           V40 A16 16 0 0 1 96 24 Z"
+        fill="url(#sheet)"/>
+  <path d="M328 24 L440 136 H344 A16 16 0 0 1 328 120 Z" fill="url(#fold)"/>
+
+  <g transform="translate(260 312) scale(7.1) translate(-24 -24)">
+    <ellipse cx="24" cy="24" rx="19.5" ry="7.6" transform="rotate(27 24 24)"
+             fill="none" stroke="url(#orbit)" stroke-width="3.6"/>
+    <g fill="#FFFFFF">
+      <circle cx="14.6" cy="31.2" r="3.6"/>
+      <circle cx="33.4" cy="16.8" r="3.6"/>
+      <circle cx="24" cy="24" r="6.8"/>
+    </g>
+  </g>
+</svg>

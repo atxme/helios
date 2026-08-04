@@ -4,7 +4,15 @@ import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { ArrowDown, ArrowUp, Power, ShieldAlert, ShieldCheck, ShieldQuestion } from 'lucide-react'
+import {
+  ArrowDown,
+  ArrowUp,
+  Power,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldQuestion,
+  TerminalSquare,
+} from 'lucide-react'
 import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../types'
 import {
   elapsed,
@@ -42,11 +50,13 @@ interface Props {
   psk: PskKind | null
   onConnect: () => void
   onDisconnect: () => void
+  /** Opens a terminal on the gateway, de-elevated. */
+  onOpenSsh: () => void
 }
 
 const POSTURE_ICON = {
   protected: ShieldCheck,
-  held: ShieldQuestion,
+  blocked: ShieldQuestion,
   exposed: ShieldAlert,
 } as const
 
@@ -75,6 +85,7 @@ export function ConnectView({
   psk,
   onConnect,
   onDisconnect,
+  onOpenSsh,
 }: Props) {
   const meta = stateMeta(state)
   const posture = postureMeta(state, adapterUp)
@@ -88,13 +99,16 @@ export function ConnectView({
 
   const duration = elapsed(upSince, now)
   const protection = protectionMeta(profile, psk, state)
-  const ready = Boolean(profile?.endpoint && profile.private_key && profile.peer_public_key)
+  // `has_private_key` rather than the key itself: the screen needs to know a
+  // key exists, and never needed to hold one (ADR-006 §5).
+  const ready = Boolean(profile?.endpoint && profile.has_private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
-  // Only "held" deserves a sentence: it's the one counter-intuitive case,
-  // where the user believes they're leaking while WireGuard drops their
-  // packets. "Protected" and "in clear" are already said by the header
-  // chip, word for word — repeating them here would just be filler.
-  const explain = posture.posture === 'held'
+  // Only "blocked" deserves a sentence: it's the one counter-intuitive case,
+  // where the machine reaches nothing at all and the reason is an adapter the
+  // screen would otherwise never mention. "Protected" and "in clear" are
+  // already said by the header chip, word for word — repeating them here would
+  // just be filler.
+  const explain = posture.posture === 'blocked'
   // Throughput is only shown if it truly exists. As long as telemetry
   // emits nothing, an empty card would be an unfulfilled promise.
   const hasThroughput = meta.active && history.length >= 2
@@ -142,10 +156,10 @@ export function ConnectView({
         </Box>
       </Stack>
 
-      {/* Posture: only "held". The other two states are already stated
+      {/* Posture: only "blocked". The other two states are already stated
           identically by the header chip; only this one says something the
-          chip doesn't — that WireGuard drops the packets and that the
-          adapter must absolutely not be unmounted. */}
+          chip doesn't — that an adapter is still mounted, that it is what
+          blocks the packets, and how to get out of it. */}
       {explain && (
         <Box
           sx={{
@@ -245,6 +259,46 @@ export function ConnectView({
             disabled={!ready}
           >
             Connecter
+          </Button>
+        )}
+
+        {/* The only way out of a mounted adapter with no tunnel, and it has to
+            be on screen: the session is over, the primary button offers to
+            build another one, and without this the user would have no gesture
+            left to take the adapter down — while nothing on the machine
+            reaches the network. */}
+        {!meta.active && !meta.transitioning && adapterUp && (
+          <Button
+            fullWidth
+            variant="text"
+            color="inherit"
+            onClick={onDisconnect}
+            sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Démonter l’adaptateur WireGuard
+          </Button>
+        )}
+
+        {/* The terminal is launched from the **standard-user** token Windows
+            keeps linked to Orion's elevated one: Orion is Administrator to
+            load the WireGuard driver, and a child built the ordinary way would
+            inherit that. Rust refuses to launch until Windows confirms the
+            token is not elevated, and the hook then falls back to copying.
+
+            Shown only while the tunnel carries traffic: the gateway answers
+            SSH on its tunnel address alone, and offering it earlier would hand
+            out a command whose host could resolve elsewhere on the clear
+            network. Rust enforces the same gate. */}
+        {state === 'up' && profile?.ssh_target && (
+          <Button
+            fullWidth
+            variant="text"
+            color="inherit"
+            startIcon={<TerminalSquare size={16} aria-hidden />}
+            onClick={onOpenSsh}
+            sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Terminal SSH — {profile.ssh_target}
           </Button>
         )}
 

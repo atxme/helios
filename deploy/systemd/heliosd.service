@@ -32,5 +32,33 @@ ProtectHome=true
 ReadWritePaths=/var/lib/helios
 RuntimeDirectory=helios
 
+# Tout fichier créé par le démon naît en 0600 / 0700 (ADR-006). `save()` pose
+# déjà le mode explicitement ; ceci couvre à la source tout ce qui écrirait sans
+# y penser — fichiers temporaires, journaux, artefacts de mise à jour.
+UMask=0077
+
+# Rémanence mémoire : un vidage de core d'un processus qui tient une clé privée
+# WireGuard en clair, c'est le secret déposé sur le disque. `LimitCORE` supprime
+# le fichier ; `CoredumpFilter` vide l'ensemble des types de pages retenus, pour
+# le cas où un collecteur tiers relèverait la limite.
+# `CoredumpFilter=` vide conserverait la valeur héritée et ne filtrerait rien :
+# la valeur explicite `0` est exigée (ADR-006 §6).
+LimitCORE=0
+CoredumpFilter=0
+# Le trousseau noyau du service n'est partagé avec personne.
+KeyringMode=private
+
+# Durcissement (ADR-006 §6). Aucune de ces options n'est requise par heliosd :
+# il manipule nftables et WireGuard par netlink, écrit dans /var/lib/helios, et
+# ne charge aucun module ni ne touche aux cgroups.
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
 [Install]
 WantedBy=multi-user.target
