@@ -409,12 +409,7 @@ mod windows {
                 model.is_engaged(&name)
             };
             if engaged {
-                let state = app.state::<AppState>();
-                state.telemetry.stop();
-                state
-                    .controller
-                    .disconnect(crate::emit_sink(app.clone()))
-                    .await;
+                crate::stop_connection(&app).await;
             } else if let Err(error) = crate::select_and_connect(&app, &name).await {
                 // The window is probably hidden — this is the one path where a
                 // refusal has no screen to land on. It is shown as an error the

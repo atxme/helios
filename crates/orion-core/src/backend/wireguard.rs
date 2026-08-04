@@ -236,7 +236,7 @@ impl VpnBackend for WireGuardBackend {
             sink(ClientEvent::log(
                 "info",
                 format!(
-                    "interface {} montée ({}) — le trafic hors tunnel est jeté",
+                    "interface {} montée ({}) — les paquets hors tunnel sont bloqués",
                     self.ifname, profile.allowed_ips
                 ),
             ));

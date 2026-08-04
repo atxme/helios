@@ -97,7 +97,7 @@ export function PosturePanel({
           value={adapterUp ? 'monté' : 'démonté'}
           note={
             adapterUp
-              ? 'Tant qu’il est monté, WireGuard jette les paquets faute de handshake — rien ne sort en clair.'
+              ? 'Sans handshake valide, WireGuard bloque les paquets au lieu de les router hors tunnel.'
               : 'Le trafic ne passe plus par WireGuard.'
           }
         />
@@ -128,7 +128,7 @@ export function PosturePanel({
           tone={narrowed ? AMBER : undefined}
           note={
             narrowed
-              ? 'Plage restreinte : ce qui en sort part en clair. 0.0.0.0/0 capte tout.'
+              ? 'Plage restreinte : les destinations hors de cette plage ne passent pas par le tunnel. 0.0.0.0/0 capte tout le trafic.'
               : undefined
           }
         />

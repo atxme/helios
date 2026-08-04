@@ -98,9 +98,14 @@ describe('Orion presentational branches', () => {
     )
   })
 
-  it('renders connection decisions for missing, incomplete, held and active profiles', () => {
+  it('renders connection decisions for missing, incomplete, blocked and active profiles', () => {
     const callback = vi.fn()
-    const render = (state: TunnelState, selected: ClientProfile | null, history = [] as { rx_bps: number; tx_bps: number }[]) =>
+    const render = (
+      state: TunnelState,
+      selected: ClientProfile | null,
+      history = [] as { rx_bps: number; tx_bps: number }[],
+      adapterUp = state !== 'down',
+    ) =>
       renderToStaticMarkup(
         <ConnectView
           state={state}
@@ -108,7 +113,7 @@ describe('Orion presentational branches', () => {
           upSince={state === 'up' ? 0 : null}
           telemetry={history[history.length - 1] ?? null}
           history={history}
-          adapterUp={state !== 'down'}
+          adapterUp={adapterUp}
           psk={state === 'up' ? 'ml_kem' : null}
           onConnect={callback}
           onOpenSsh={callback}
@@ -118,8 +123,18 @@ describe('Orion presentational branches', () => {
 
     expect(render('down', null)).toContain('aucun profil sélectionné')
     expect(render('down', profile({ has_private_key: false }))).toContain('Profil incomplet')
-    expect(render('failed', profile())).toContain('Rien ne fuit')
+    expect(render('failed', profile())).toContain('Trafic bloqué')
     expect(render('connecting', profile())).toContain('Annuler et démonter')
+
+    // A lost session ends on `down` with the adapter still mounted: the screen
+    // states a disconnection, and must keep the one gesture that removes the
+    // adapter — nothing on the machine reaches the network until it goes.
+    const lost = render('down', profile(), [], true)
+    expect(lost).toContain('Déconnecté')
+    expect(lost).toContain('Démonter l’adaptateur WireGuard')
+    // Nothing mounted, nothing to unmount: the button would name a gesture
+    // with no object.
+    expect(render('down', profile())).not.toContain('Démonter l’adaptateur')
     const active = render('up', profile(), [
       { rx_bps: 1000, tx_bps: 500 },
       { rx_bps: 2000, tx_bps: 750 },

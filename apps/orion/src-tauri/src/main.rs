@@ -116,6 +116,13 @@ struct AppState {
     /// the admitted one, which is false: the machine's keys were never read.
     /// Carrying the cause lets those messages say so.
     vault_error: Option<String>,
+    /// The handshake-inference loop of the current connection, if one runs.
+    ///
+    /// One at a time, like telemetry, and for the same reason: each connection
+    /// starts one, and a connection that failed leaves a loop with nothing left
+    /// to infer. Without this slot every attempt piled up another task polling
+    /// the adapter every three seconds for the life of the process.
+    handshake_poll: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Where this run writes its log, when it writes one.
     ///
     /// A release build has no console (`windows_subsystem = "windows"`), so the
@@ -165,8 +172,9 @@ impl Drop for StagedPsk {
 /// Three seconds rather than ten: this loop is what turns a tunnel that has
 /// stopped answering into a visible state change, and ten seconds of a
 /// screen claiming a dead tunnel is alive is ten seconds too many. A
-/// negotiated connection no longer waits on it at all — the negotiation
-/// announces `Up` itself, having just observed the handshake.
+/// negotiated connection no longer waits on it to *reach* `Up` — the
+/// negotiation announces it itself, having just observed the handshake — but it
+/// is still what makes it leave that state, a lost session link included.
 const HANDSHAKE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(debug_assertions)]
@@ -1236,17 +1244,32 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
 
     // State inference loop: WireGuard notifies nothing, we poll the age of
     // the last handshake. Never touches the adapter (ADR-001 §3 bis).
+    //
+    // `Down` ends it — but only once the connection has left that state. The
+    // first tick of a `tokio` interval fires immediately, and reading `Down`
+    // there is what a starting connection looks like, not a finished one: the
+    // loop used to end on that very tick and infer nothing for the rest of the
+    // session. A lost session link then kept the screen on «Connecté» while the
+    // log announced the tunnel was over.
     let controller = Arc::clone(&state.controller);
-    tokio::spawn(async move {
+    let poll = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HANDSHAKE_POLL_INTERVAL);
+        let mut started = false;
         loop {
             ticker.tick().await;
-            if controller.state() == TunnelState::Down {
-                break; // explicit disconnection: nothing left to infer
+            match controller.state() {
+                // Explicit disconnection: nothing left to infer.
+                TunnelState::Down if started => break,
+                TunnelState::Down => continue,
+                _ => started = true,
             }
             controller.poll_handshake(sink.clone()).await;
         }
     });
+    let previous = state.handshake_poll.lock().unwrap().replace(poll);
+    if let Some(previous) = previous {
+        previous.abort();
+    }
 
     Ok(())
 }
@@ -1304,10 +1327,25 @@ fn raise_key_negotiation_floor(
 }
 
 #[tauri::command]
-async fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.telemetry.stop();
-    state.controller.disconnect(emit_sink(app)).await;
+async fn disconnect(app: AppHandle) -> Result<(), String> {
+    stop_connection(&app).await;
     Ok(())
+}
+
+/// Unmounts the tunnel. Shared by the `disconnect` command and the tray menu,
+/// for the same reason as [`start_connection`]: two paths that differ by one
+/// step end up differing by more.
+async fn stop_connection(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.telemetry.stop();
+    // The inference stops before the state moves, not after: a poll that read
+    // `Up` and lands once the tunnel is down would re-announce `Connecting`
+    // behind the disconnection the user just asked for.
+    let poll = state.handshake_poll.lock().unwrap().take();
+    if let Some(poll) = poll {
+        poll.abort();
+    }
+    state.controller.disconnect(emit_sink(app.clone())).await;
 }
 
 /// Reports the faulty fields of a profile being edited.
@@ -1778,6 +1816,7 @@ fn main() {
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
             staged_psk: Arc::new(Mutex::new(None)),
+            handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
         })

@@ -82,16 +82,17 @@ export function stateMeta(state: TunnelState): StateMeta {
  * explicit disconnection. As long as it's mounted, WireGuard **drops**
  * packets for lack of a handshake; there is no leak.
  *
- * This is counter-intuitive and the UI must say so: "Failed" with the
- * adapter mounted is not an exposed situation. Without this distinction, a
- * user sees a red error and unmounts the adapter "to retry cleanly" — a
- * gesture that precisely makes it leak in clear.
+ * This is counter-intuitive and the UI must say so: a tunnel that is gone with
+ * the adapter still mounted is not an exposed situation — it is a machine whose
+ * traffic goes nowhere at all. Saying only "disconnected" would leave the user
+ * hunting for a network failure that isn't one, so the posture names the
+ * adapter and the two ways out.
  *
- * This is why `detail` is only shown on `held` and `exposed`: where the
+ * This is why `detail` is only shown on `blocked` and `exposed`: where the
  * spontaneous reading is wrong. On `protected`, the state speaks for
  * itself — the header chip is enough, one more banner would say nothing new.
  */
-export type Posture = 'protected' | 'held' | 'exposed'
+export type Posture = 'protected' | 'blocked' | 'exposed'
 
 export interface PostureMeta {
   posture: Posture
@@ -101,8 +102,8 @@ export interface PostureMeta {
   accent: string
 }
 
-const HELD = '#2F5D8A'
-const HELD_VIVID = '#3B82F6'
+const BLOCKED = '#2F5D8A'
+const BLOCKED_VIVID = '#3B82F6'
 const EXPOSED = '#A8501B'
 const EXPOSED_VIVID = '#F97316'
 
@@ -111,7 +112,7 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
     return {
       posture: 'exposed',
       label: 'Exposé',
-      detail: 'Adaptateur démonté : le trafic sort hors tunnel.',
+      detail: 'Aucun adaptateur WireGuard : le trafic sort hors tunnel.',
       color: EXPOSED,
       accent: EXPOSED_VIVID,
     }
@@ -122,17 +123,17 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
       label: 'Protégé',
       // "Tout" would be a word too many: DNS queries leave outside the
       // tunnel, a documented limit the posture panel states in full.
-      detail: 'Handshake réussi il y a moins de 150 s : le trafic IP passe par la gateway.',
+      detail: 'Dernier handshake WireGuard il y a moins de 150 s : le trafic IP passe par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }
   }
   return {
-    posture: 'held',
-    label: 'Retenu',
-    detail: 'WireGuard retient les paquets. Rien ne fuit — ne pas démonter.',
-    color: HELD,
-    accent: HELD_VIVID,
+    posture: 'blocked',
+    label: 'Trafic bloqué',
+    detail: 'Adaptateur WireGuard monté sans tunnel actif. Se reconnecter, ou déconnecter pour le démonter.',
+    color: BLOCKED,
+    accent: BLOCKED_VIVID,
   }
 }
 
@@ -180,13 +181,13 @@ export interface ProtectionMeta {
  * négocié **avant** le premier handshake ou obtenu **après** le montage. Le
  * reste est du commentaire.
  */
-const PQC_DETAIL = 'Clé renouvelée à chaque connexion.'
+const PQC_DETAIL = 'PSK renouvelé à chaque connexion.'
 
-const PQC_NEGOTIATED_DETAIL = 'Clé négociée avant le premier handshake, renouvelée à chaque connexion.'
+const PQC_NEGOTIATED_DETAIL = 'PSK négocié avant le premier handshake, renouvelé à chaque connexion.'
 
-const PQC_UPGRADED_DETAIL = 'Clé obtenue après le montage : le premier handshake a eu lieu sans elle.'
+const PQC_UPGRADED_DETAIL = 'PSK obtenu après le montage : le premier handshake a eu lieu sans lui.'
 
-const STATIC_DETAIL = 'Secret fixe du profil, partagé hors bande. Il ne tourne pas.'
+const STATIC_DETAIL = 'PSK fixe du profil, transmis hors bande. Il n’est jamais renouvelé.'
 
 const CLASSIC_DETAIL = 'Aucun PSK : Curve25519 seul.'
 
@@ -265,7 +266,7 @@ const MODE_META: Record<ProtectionMode, ModeMeta> = {
   },
   ml_kem: {
     label: 'ML-KEM',
-    detail: 'Clé fraîche à chaque connexion, jamais écrite sur disque.',
+    detail: 'Nouveau PSK à chaque connexion, jamais écrit sur disque.',
   },
 }
 

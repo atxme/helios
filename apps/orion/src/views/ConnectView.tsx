@@ -56,7 +56,7 @@ interface Props {
 
 const POSTURE_ICON = {
   protected: ShieldCheck,
-  held: ShieldQuestion,
+  blocked: ShieldQuestion,
   exposed: ShieldAlert,
 } as const
 
@@ -103,11 +103,12 @@ export function ConnectView({
   // key exists, and never needed to hold one (ADR-006 §5).
   const ready = Boolean(profile?.endpoint && profile.has_private_key && profile.peer_public_key)
   const PostureIcon = POSTURE_ICON[posture.posture]
-  // Only "held" deserves a sentence: it's the one counter-intuitive case,
-  // where the user believes they're leaking while WireGuard drops their
-  // packets. "Protected" and "in clear" are already said by the header
-  // chip, word for word — repeating them here would just be filler.
-  const explain = posture.posture === 'held'
+  // Only "blocked" deserves a sentence: it's the one counter-intuitive case,
+  // where the machine reaches nothing at all and the reason is an adapter the
+  // screen would otherwise never mention. "Protected" and "in clear" are
+  // already said by the header chip, word for word — repeating them here would
+  // just be filler.
+  const explain = posture.posture === 'blocked'
   // Throughput is only shown if it truly exists. As long as telemetry
   // emits nothing, an empty card would be an unfulfilled promise.
   const hasThroughput = meta.active && history.length >= 2
@@ -155,10 +156,10 @@ export function ConnectView({
         </Box>
       </Stack>
 
-      {/* Posture: only "held". The other two states are already stated
+      {/* Posture: only "blocked". The other two states are already stated
           identically by the header chip; only this one says something the
-          chip doesn't — that WireGuard drops the packets and that the
-          adapter must absolutely not be unmounted. */}
+          chip doesn't — that an adapter is still mounted, that it is what
+          blocks the packets, and how to get out of it. */}
       {explain && (
         <Box
           sx={{
@@ -258,6 +259,23 @@ export function ConnectView({
             disabled={!ready}
           >
             Connecter
+          </Button>
+        )}
+
+        {/* The only way out of a mounted adapter with no tunnel, and it has to
+            be on screen: the session is over, the primary button offers to
+            build another one, and without this the user would have no gesture
+            left to take the adapter down — while nothing on the machine
+            reaches the network. */}
+        {!meta.active && !meta.transitioning && adapterUp && (
+          <Button
+            fullWidth
+            variant="text"
+            color="inherit"
+            onClick={onDisconnect}
+            sx={{ fontSize: 12, textTransform: 'none', color: 'text.secondary' }}
+          >
+            Démonter l’adaptateur WireGuard
           </Button>
         )}
 

@@ -56,7 +56,7 @@ describe('Orion UI state', () => {
     }
     expect(postureMeta('up', true).posture).toBe('protected')
     for (const state of ['down', 'connecting', 'failed', 'captive_portal'] as const) {
-      expect(postureMeta(state, true).posture).toBe('held')
+      expect(postureMeta(state, true).posture).toBe('blocked')
     }
   })
 
