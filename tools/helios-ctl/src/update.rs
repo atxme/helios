@@ -112,13 +112,31 @@ pub enum WindowState {
     None,
 }
 
+/// Reads the verdict out of `heliosd tpm update-status`.
+///
+/// The verdict is the one line that is exactly `armed` or `none`; anything else
+/// is dropped. A `heliosd` older than this tool logs to stdout, and a status
+/// probe on a gateway that never armed a window logs an ESAPI error for the
+/// absent NV index — the verdict then arrives after several lines of journal.
+/// A log line can never be mistaken for a verdict: the format always prefixes a
+/// timestamp and a level.
+///
+/// Requiring **exactly one** verdict is what keeps this from guessing: no line
+/// at all means another binary answered, and two would mean the output is not
+/// what this tool thinks it is. Guessing `none` there would arm a second
+/// window over an unfinished one.
 pub fn parse_window_state(output: &str) -> Result<WindowState> {
-    match output.trim() {
-        "armed" => Ok(WindowState::Armed),
-        "none" => Ok(WindowState::None),
-        other => anyhow::bail!(
-            "unexpected `tpm update-status` output {other:?} — does this heliosd carry \
-             the update window?"
+    let mut verdicts = output.lines().filter_map(|line| match line.trim() {
+        "armed" => Some(WindowState::Armed),
+        "none" => Some(WindowState::None),
+        _ => None,
+    });
+    match (verdicts.next(), verdicts.next()) {
+        (Some(state), None) => Ok(state),
+        _ => anyhow::bail!(
+            "unexpected `tpm update-status` output {:?} — does this heliosd carry \
+             the update window?",
+            output.trim()
         ),
     }
 }
@@ -423,5 +441,21 @@ Conf openssl (3.0.14-1 Debian:12/stable [amd64])
         // guess, since guessing "none" would arm a second window.
         assert!(parse_window_state("").is_err());
         assert!(parse_window_state("unknown subcommand").is_err());
+        // Two verdicts are not a verdict either.
+        assert!(parse_window_state("armed\nnone\n").is_err());
+    }
+
+    /// A `heliosd` that logs to stdout still answers: the probe of an absent NV
+    /// index — a gateway with no window armed — puts an ESAPI error in front of
+    /// the verdict, and reading it as "unknown binary" blocked every upgrade.
+    #[test]
+    fn the_verdict_survives_log_lines_on_stdout() {
+        let output = "\
+2026-08-04T07:29:11.618510Z ERROR tss_esapi::context::general_esys_tr: Error when getting ESYS handle from TPM handle: the handle is not correct for the use (associated with handle number 1)
+2026-08-04T07:29:11.618520Z  INFO tss_esapi::context: Closing context.
+2026-08-04T07:29:11.618523Z  INFO tss_esapi::context: Context closed.
+none
+";
+        assert_eq!(parse_window_state(output).unwrap(), WindowState::None);
     }
 }

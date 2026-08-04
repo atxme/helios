@@ -182,8 +182,18 @@ impl From<NegotiationMode> for aether::key_negotiation::ProtectionMode {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Logs go to **stderr**, never stdout: several subcommands answer on stdout
+    // and are read by a machine — `tpm update-status` returns `armed`/`none` to
+    // `helios-ctl update`, `peer add` returns the assigned VIP. A log line
+    // interleaved there is not noise, it is a wrong answer: `tss_esapi` alone
+    // logs an ERROR every time an absent NV index is probed, which is the
+    // ordinary state of a gateway with no update window armed. systemd captures
+    // both streams, so the journal is unchanged.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match cli.command {
         Command::Run { dev } => {

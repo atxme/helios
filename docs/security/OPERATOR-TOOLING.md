@@ -150,6 +150,11 @@ fenêtre est révoquée automatiquement — rien à faire.
 Pour annuler avant le redémarrage : `sudo heliosd tpm cancel-update`. Pour
 savoir où on en est : `sudo heliosd tpm update-status`.
 
+Sur une gateway sans fenêtre armée, cette interrogation affiche des lignes
+`WARNING:esys:` / `ERROR:esys:` autour de `NV_ReadPublic` (`0x18b`) : c'est la
+bibliothèque TSS qui commente l'absence de l'index NV, c'est-à-dire l'état
+ordinaire. Le verdict est la dernière ligne — `armed` ou `none`.
+
 **Ce que la fenêtre ne couvre pas.** Une mise à jour de firmware ou de la base
 Secure Boot déplace PCR 0 ou 7 : la fenêtre ne s'ouvre pas, et on retombe sur
 billet de rescellement et séquestre (§2). Et pendant qu'une fenêtre est ouverte,
