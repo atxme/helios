@@ -32,7 +32,9 @@ use std::str::FromStr;
 use sha2::{Digest as _, Sha256};
 use tss_esapi::{
     attributes::{NvIndexAttributesBuilder, ObjectAttributesBuilder, SessionAttributesBuilder},
-    constants::{nv_index_type::NvIndexType, CommandCode, SessionType, Tss2ResponseCodeKind},
+    constants::{
+        nv_index_type::NvIndexType, CapabilityType, CommandCode, SessionType, Tss2ResponseCodeKind,
+    },
     handles::{KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, SessionHandle},
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
@@ -42,8 +44,8 @@ use tss_esapi::{
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme, MaxNvBuffer,
-        NvPublicBuilder, Private, Public, PublicBuilder, PublicEccParametersBuilder,
+        CapabilityData, Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme,
+        MaxNvBuffer, NvPublicBuilder, Private, Public, PublicBuilder, PublicEccParametersBuilder,
         PublicKeyedHashParameters, SensitiveData, SymmetricDefinition, SymmetricDefinitionObject,
     },
     traits::{Marshall, UnMarshall},
@@ -594,15 +596,51 @@ fn compute_window_policy_digest(
 fn open_nv_index(ctx: &mut Context, index: u32) -> Result<Option<NvIndexHandle>> {
     let tpm_handle = NvIndexTpmHandle::new(index)
         .map_err(|e| TpmError::Connection(format!("NV index {index:#x}: {e}")))?;
+    // Asked before opening, and not deduced from a failed open: see
+    // `nv_index_is_defined`.
+    if !nv_index_is_defined(ctx, index)? {
+        return Ok(None);
+    }
     match ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(tpm_handle.into())) {
         Ok(object) => Ok(Some(NvIndexHandle::from(object))),
         // An undefined index is the ordinary state of a gateway that has
-        // never armed a window, not an error.
+        // never armed a window, not an error. Still handled here: the index
+        // can be undefined between the two commands above.
         Err(error) if is_missing_handle(&error) => Ok(None),
         Err(error) => Err(TpmError::Connection(format!(
             "open NV index {index:#x}: {error}"
         ))),
     }
+}
+
+/// Is this NV index defined? Asked without provoking a failure.
+///
+/// `TPM2_GetCapability` returns the defined handles at or after `index`, and
+/// **succeeds** when there are none — where `Esys_TR_FromTPMPublic` fails with
+/// `TPM_RC_HANDLE` (`0x18b`). Both answer the same question, but the failing
+/// one makes the TSS stack print three `WARNING`/`ERROR` lines on stderr, plus
+/// one from `tss_esapi`, for the ordinary state of a gateway with no update
+/// window armed. An operator running `helios-ctl update` read those as the
+/// diagnosis of a TPM problem; the diagnosis was that nothing was wrong.
+///
+/// Cost: one extra TPM command on a path that only runs on operator commands
+/// and at boot. Cheaper than an alarm that has to be explained every time.
+fn nv_index_is_defined(ctx: &mut Context, index: u32) -> Result<bool> {
+    let (capability, _more) = ctx
+        .execute_without_session(|ctx| ctx.get_capability(CapabilityType::Handles, index, 1))
+        .map_err(|e| TpmError::Connection(format!("listing NV index {index:#x}: {e}")))?;
+    let CapabilityData::Handles(handles) = capability else {
+        return Err(TpmError::Connection(format!(
+            "listing NV index {index:#x}: the TPM answered with another capability"
+        )));
+    };
+    // The TPM answers with the first handle **at or after** `index`, so a
+    // non-empty answer proves nothing on its own — a window index that does
+    // not exist yields the next defined one. Only equality is an answer.
+    Ok(handles
+        .into_inner()
+        .first()
+        .is_some_and(|handle| u32::from(*handle) == index))
 }
 
 /// Undefines then defines the policy-protected NV window slot.

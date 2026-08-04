@@ -191,11 +191,16 @@ async fn main() -> anyhow::Result<()> {
     // Logs go to **stderr**, never stdout: several subcommands answer on stdout
     // and are read by a machine — `tpm update-status` returns `armed`/`none` to
     // `helios-ctl update`, `peer add` returns the assigned VIP. A log line
-    // interleaved there is not noise, it is a wrong answer: `tss_esapi` alone
-    // logs an ERROR every time an absent NV index is probed, which is the
-    // ordinary state of a gateway with no update window armed. systemd captures
+    // interleaved there is not noise, it is a wrong answer. systemd captures
     // both streams, so the journal is unchanged.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    //
+    // `tss_esapi` is held at `warn` by default: at `info` it narrates opening
+    // and closing a TPM context, three lines for every command, which buried
+    // what the command itself had to say. Its warnings and errors still come
+    // through, and `RUST_LOG` overrides the whole thing when a TPM problem is
+    // what one is actually chasing.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tss_esapi=warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

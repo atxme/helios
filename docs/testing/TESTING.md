@@ -260,6 +260,10 @@ Répéter pour chaque classe de paquet : noyau, `grub-efi` / `shim-signed`,
   aussi hors nominal — démarrer sur un billet de rescellement, puis vérifier
   qu'il répond `unavailable` et que `helios-ctl update` refuse **sans avoir
   touché à `apt`** ;
+- sans fenêtre armée, `heliosd tpm update-status` ne doit imprimer **aucune**
+  ligne `esys` : l'index NV absent se demande par `TPM2_GetCapability`, qui
+  répond sans échouer. Non vérifiable en WSL2 — ce chemin ne s'exerce que sur
+  un TPM réel ;
 - `heliosd tpm prepare-update` puis `heliosd tpm update-status` : `armed`, et
   `tpm2_nvreadpublic 0x1804845` montre un index ordinaire, écrit, sans
   `OWNERREAD` et avec `POLICYREAD` ;
