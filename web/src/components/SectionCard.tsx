@@ -10,28 +10,26 @@ import { CARD_RADIUS } from '../theme'
 /**
  * The console's single content surface.
  *
- * MD3 expresses elevation with tone rather than shadow, so a card is simply
- * one rung up the `surfaceContainer` ladder from the page behind it, plus a
- * hairline. Views never build their own panel: every card in Helios has the
- * same radius, the same padding and the same header rhythm, which is what
- * keeps seven very different views reading as one instrument.
+ * Every card in Helios has the same radius, the same padding and the same
+ * header rhythm, which is what keeps four very different views reading as one
+ * product. Views never build their own panel.
  *
- * Typographic contract, applied here and relied on everywhere else:
- * the card title is `h6` — plain, readable prose — while the mono capitals of
- * `overline` are reserved for **labelling data** (`DataRow`, `Metric`). The
- * previous interface used those capitals for both, which left no way to tell a
- * section from a field at a glance.
+ * `accent` colors the header icon only. It marks what a card is *about* —
+ * a client, a key, a firewall rule — and it is the one place the interface
+ * spends color on categories rather than on state.
  */
 
 interface Props {
   title?: ReactNode
-  /** One sentence under the title: what this card is for, or what it implies. */
+  /** One short line. If it needs a paragraph, it belongs in a tooltip. */
   subtitle?: ReactNode
   icon?: LucideIcon
+  /** An `sx` color path for the header icon. */
+  accent?: string
   /** Controls pinned to the right of the header. */
   action?: ReactNode
   children?: ReactNode
-  /** For content that manages its own padding — lists, editors, tables. */
+  /** For content managing its own padding — lists, tables, editors. */
   disableContentPadding?: boolean
   sx?: SxProps<Theme>
 }
@@ -40,6 +38,7 @@ export function SectionCard({
   title,
   subtitle,
   icon: Icon,
+  accent = 'primary.main',
   action,
   children,
   disableContentPadding = false,
@@ -54,6 +53,7 @@ export function SectionCard({
         bgcolor: 'surfaceContainer.low',
         border: '1px solid',
         borderColor: 'divider',
+        boxShadow: 'var(--mui-palette-cardShadow)',
         overflow: 'hidden',
         ...sx,
       }}
@@ -61,23 +61,18 @@ export function SectionCard({
       {hasHeader && (
         <Stack
           direction="row"
-          spacing={2}
-          sx={{
-            alignItems: 'flex-start',
-            px: 3,
-            pt: 2.5,
-            pb: children ? 2 : 2.5,
-          }}
+          spacing={1.5}
+          sx={{ alignItems: 'center', px: 2.5, pt: 2.25, pb: children ? 1.75 : 2.25 }}
         >
           {Icon && (
-            <Box sx={{ color: 'primary.main', mt: 0.25, display: 'flex' }}>
-              <Icon size={20} strokeWidth={1.6} />
+            <Box sx={{ color: accent, display: 'flex', flexShrink: 0 }}>
+              <Icon size={18} strokeWidth={2} />
             </Box>
           )}
           <Box sx={{ minWidth: 0, flex: 1 }}>
             {title && <Typography variant="h6">{title}</Typography>}
             {subtitle && (
-              <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5 }}>
+              <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.25 }}>
                 {subtitle}
               </Typography>
             )}
@@ -87,7 +82,7 @@ export function SectionCard({
       )}
 
       {children && (
-        <Box sx={disableContentPadding ? undefined : { px: 3, pb: 2.5, pt: hasHeader ? 0 : 2.5 }}>
+        <Box sx={disableContentPadding ? undefined : { px: 2.5, pb: 2.25, pt: hasHeader ? 0 : 2.25 }}>
           {children}
         </Box>
       )}

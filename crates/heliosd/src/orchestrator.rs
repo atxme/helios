@@ -26,7 +26,7 @@ use aether::{
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_wireguard::{InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT};
+use helios_wireguard::{InterfaceConfig, PeerConfig, PeerStatus, WireguardBackend, WG_LISTEN_PORT};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -38,7 +38,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WG_PORT: u16 = WG_LISTEN_PORT;
 
 /// Beyond this age, a peer's handshake is considered stale (ADR-001 §3).
-const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(150);
+///
+/// Derived from the shared constant rather than restated: the console reports
+/// who is connected using the same threshold, and the two drifting apart would
+/// show a client as online after the kill-switch had already cut it.
+const HANDSHAKE_STALE_AFTER: Duration =
+    Duration::from_secs(helios_wireguard::HANDSHAKE_STALE_AFTER_SECS);
 
 /// Selects the WireGuard data plane. Like for the firewall: dry-run by
 /// default, real kernel backend behind the `wireguard` feature.
@@ -147,6 +152,10 @@ pub async fn run(
     // carry a secret and await an acknowledgment).
     mut psk_rx: mpsc::Receiver<InstallPskRequest>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
+    // Snapshot of the data plane, published for the API: it holds no
+    // WireGuard backend and must not, so the runtime reaches it the same way
+    // the tunnel state does.
+    shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
     boot: helio_tpm::BootDecision,
@@ -196,6 +205,7 @@ pub async fn run(
         Arc::clone(&wg),
         Arc::clone(&shared_state),
         Arc::clone(&shared_network),
+        Arc::clone(&shared_peers),
         event_tx.clone(),
         internal_tx.clone(),
     );
@@ -963,6 +973,7 @@ fn spawn_handshake_poller(
     wg: Arc<dyn WireguardBackend>,
     shared: Arc<RwLock<TunnelState>>,
     shared_network: Arc<RwLock<NetworkConfig>>,
+    shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     internal_tx: mpsc::Sender<OrchestratorCmd>,
 ) {
@@ -977,6 +988,10 @@ fn spawn_handshake_poller(
         loop {
             ticker.tick().await;
             if !wg.is_up() {
+                // Emptied rather than left as it was: a console still listing
+                // yesterday's peers as connected, while the interface is down,
+                // is worse than one listing none.
+                shared_peers.write().await.clear();
                 continue;
             }
             let peers = match wg.peers().await {
@@ -986,6 +1001,10 @@ fn spawn_handshake_poller(
                     continue;
                 }
             };
+
+            // Published before the state is inferred: the snapshot is what the
+            // console reads, and it must never lag behind the state it explains.
+            *shared_peers.write().await = peers.clone();
 
             log_peer_transitions(&peers, &shared_network, &mut seen, &event_tx).await;
 
@@ -1276,6 +1295,7 @@ mod tests {
             wireguard,
             Arc::clone(&state),
             Arc::clone(&network),
+            Arc::new(RwLock::new(Vec::new())),
             event_tx,
             internal_tx,
         );

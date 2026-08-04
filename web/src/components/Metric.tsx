@@ -31,15 +31,16 @@ export function Metric({ label, value, icon: Icon, accent, hint }: Props) {
   const tile = (
     <Paper
       sx={{
-        px: 2.25,
+        px: 2,
         py: 1.75,
-        borderRadius: '14px',
+        borderRadius: '12px',
         bgcolor: 'surfaceContainer.low',
         border: '1px solid',
         borderColor: 'divider',
+        boxShadow: 'var(--mui-palette-cardShadow)',
         display: 'flex',
         alignItems: 'center',
-        gap: 1.75,
+        gap: 1.5,
         minWidth: 0,
         height: '100%',
       }}
@@ -50,15 +51,17 @@ export function Metric({ label, value, icon: Icon, accent, hint }: Props) {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            width: 34,
-            height: 34,
-            borderRadius: '10px',
+            width: 32,
+            height: 32,
+            borderRadius: '9px',
             flexShrink: 0,
-            bgcolor: 'primary.container',
-            color: 'primary.onContainer',
+            bgcolor: accent ? 'transparent' : 'primary.container',
+            border: accent ? '1px solid' : 'none',
+            borderColor: 'divider',
+            color: accent ?? 'primary.main',
           }}
         >
-          <Icon size={17} strokeWidth={1.8} />
+          <Icon size={16} strokeWidth={2} />
         </Box>
       )}
       <Box sx={{ minWidth: 0 }}>

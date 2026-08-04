@@ -19,8 +19,9 @@
 
 pub mod auth;
 pub mod embed;
+pub mod health;
 pub mod provision;
-pub mod routes;
+mod routes;
 pub mod update;
 pub mod ws;
 
@@ -40,6 +41,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use helios_wireguard::PeerStatus;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// State shared across all Axum handlers.
@@ -72,6 +74,19 @@ pub struct AppState {
     /// a complete Orion profile from the gateway itself, instead of copying
     /// certificate files off `/var/lib/helios` by hand.
     pub key_negotiation: Option<Arc<KeyNegotiationMaterial>>,
+    /// Non-secret summary of the boot-time sealing decision, `None` when the
+    /// daemon runs without TPM validation. A projection: `BootDecision` itself
+    /// carries the unlock secret and must not reach this crate.
+    pub tpm: Option<health::TpmSummary>,
+    /// Last observation of the data plane, written by the orchestrator's
+    /// handshake poller.
+    ///
+    /// The API holds no WireGuard backend — it must not, it would then be able
+    /// to change the data plane from an HTTP handler. So the runtime arrives
+    /// the same way the tunnel state and the firewall policy do: a snapshot
+    /// the orchestrator publishes. It is emptied when the interface goes down,
+    /// because a stale list of "connected" peers is worse than no list.
+    pub peer_runtime: Arc<RwLock<Vec<PeerStatus>>>,
 }
 
 /// Public key-negotiation material, exactly as an Orion profile pins it.
@@ -110,7 +125,22 @@ impl AppState {
             )),
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
+            tpm: None,
+            peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Publishes the gateway's sealing posture, without its secret.
+    ///
+    /// A builder rather than a `new` parameter: a daemon built without the
+    /// `tpm` feature, or started with validation disabled, is the ordinary
+    /// case in development and must not have to name an absent value.
+    pub fn with_tpm(mut self, kind: &'static str, preserved_vaults: bool) -> Self {
+        self.tpm = Some(health::TpmSummary {
+            kind,
+            preserved_vaults,
+        });
+        self
     }
 
     /// Publishes the key-negotiation certificates read from disk at startup.
@@ -164,6 +194,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(routes::status))
         // Publisher trust anchor compiled into the binary (ADR-002).
         .route("/api/trust", get(routes::trust))
+        .route("/api/health", get(health::health))
         .route("/api/network", get(routes::network_get))
         .route("/api/key-negotiation", get(routes::key_negotiation_get))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))

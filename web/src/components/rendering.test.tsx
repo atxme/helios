@@ -32,6 +32,7 @@ const STATUS: Status = {
   split_tunnel_cidrs: [],
   mss_clamp: null,
   captive_portal_gateway: null,
+  handshake_stale_after_seconds: 150,
 }
 
 describe('custom design tokens', () => {
@@ -49,7 +50,7 @@ describe('custom design tokens', () => {
         sx={{
           bgcolor: 'state.up.container',
           color: 'surfaceContainer.low',
-          borderColor: 'primary.container',
+          borderColor: 'tertiary.container',
         }}
       />,
     )
@@ -63,7 +64,7 @@ describe('custom design tokens', () => {
 
     expect(rule).toContain('state-up-container')
     expect(rule).toContain('surfaceContainer-low')
-    expect(rule).toContain('primary-container')
+    expect(rule).toContain('tertiary-container')
   })
 })
 
@@ -71,7 +72,7 @@ describe('AppShell', () => {
   it('titles the view from the navigation model rather than from the view', () => {
     mount(
       <AppShell
-        nav="firewall"
+        nav="security"
         onNav={vi.fn()}
         status={STATUS}
         currentState="up"
@@ -82,7 +83,7 @@ describe('AppShell', () => {
       </AppShell>,
     )
 
-    const item = navItem('firewall')
+    const item = navItem('security')
     expect(screen.getByRole('heading', { name: item.title })).toBeTruthy()
     expect(screen.getByText(item.description)).toBeTruthy()
   })
@@ -91,7 +92,7 @@ describe('AppShell', () => {
     const onNav = vi.fn()
     mount(
       <AppShell
-        nav="dashboard"
+        nav="overview"
         onNav={onNav}
         status={STATUS}
         currentState="up"
@@ -109,14 +110,14 @@ describe('AppShell', () => {
       expect(rail.getByText(item.label), item.id).toBeTruthy()
     }
 
-    fireEvent.click(rail.getByText(navItem('trust').label))
-    expect(onNav).toHaveBeenCalledWith('trust')
+    fireEvent.click(rail.getByText(navItem('clients').label))
+    expect(onNav).toHaveBeenCalledWith('clients')
   })
 
   it('keeps the tunnel state visible from every view', () => {
     mount(
       <AppShell
-        nav="settings"
+        nav="system"
         onNav={vi.fn()}
         status={STATUS}
         currentState="failed"
@@ -139,7 +140,7 @@ describe('AppShell', () => {
     render(
       <ThemeProvider theme={heliosTheme} defaultMode="system">
         <AppShell
-          nav="dashboard"
+          nav="overview"
           onNav={vi.fn()}
           status={STATUS}
           currentState="up"
@@ -161,7 +162,7 @@ describe('AppShell', () => {
   it('announces a simulating daemon and a dead event stream', () => {
     mount(
       <AppShell
-        nav="dashboard"
+        nav="overview"
         onNav={vi.fn()}
         status={{ ...STATUS, dry_run: true }}
         currentState="down"
@@ -173,7 +174,9 @@ describe('AppShell', () => {
     )
 
     expect(screen.getByText('Simulation')).toBeTruthy()
+    // Distinct from the tunnel's own "Hors ligne", which sits beside it.
     expect(screen.getByText('Flux coupé')).toBeTruthy()
+    expect(screen.getByText('Hors ligne')).toBeTruthy()
     expect(screen.getByRole('alert').textContent).toContain('orchestrateur injoignable')
   })
 })

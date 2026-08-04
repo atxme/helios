@@ -213,9 +213,12 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
   la feature `embed-ui`. React et **MUI seul** — pas de Tailwind, pas de moteur
   3D : ce bundle part dans le binaire, et les polices y sont **auto-hébergées**
   (`@fontsource-variable`, 62 Ko) parce qu’une gateway ne joint aucun CDN.
-  Direction : observatoire solaire, Material Design 3, deux schémas de couleurs
-  complets. `web/src/theme.ts` tient les pigments, `web/src/state.ts` le
-  **sens** des états du tunnel ; les deux ne se mélangent pas.
+  Quatre destinations : Aperçu, Clients, Sécurité, Système
+  (`web/src/navigation.ts`) — la console montre un **état et des actions**, les
+  explications d’architecture restent en infobulle et dans les ADR.
+  `web/src/theme.ts` tient les pigments et `web/src/state.ts` le **sens** des
+  états du tunnel ; les deux ne se mélangent pas, et trois familles de couleur
+  ne s’empruntent rien : action (indigo), post-quantique (violet), état.
   `web/src/theme.test.ts` vérifie qu’aucun token ne manque dans l’un des deux
   schémas — l’oubli est invisible autrement, il rend transparent.
   Attention aux unités `sx` : `borderRadius: 3` vaut 3 × 12 px et `width: 1`

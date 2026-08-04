@@ -84,6 +84,17 @@ pub struct PeerConfig {
     pub preshared_key: Option<String>,
 }
 
+/// Beyond this age, a handshake no longer proves anything.
+///
+/// WireGuard is connectionless: nothing announces a disconnection, and the
+/// only evidence a peer is still there is a recent handshake. The value lives
+/// here, next to [`PeerStatus`], because two very different consumers must
+/// agree on it — the orchestrator, which infers the tunnel state from it and
+/// therefore decides whether the kill-switch lifts, and the API, which reports
+/// to the console who is connected. A console applying its own threshold would
+/// eventually show a client as online while the firewall had already cut it.
+pub const HANDSHAKE_STALE_AFTER_SECS: u64 = 150;
+
 /// Observed state of a peer, read from the data plane.
 #[derive(Debug, Clone)]
 pub struct PeerStatus {

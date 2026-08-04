@@ -10,42 +10,44 @@ import type { ReactNode } from 'react'
 import type { WsStatus } from '../hooks/useHelios'
 import { NAV_ITEMS, navItem } from '../navigation'
 import type { NavId } from '../navigation'
-import { EMPHASIZED, GUTTER, RAIL_WIDTH } from '../theme'
+import { EMPHASIZED, GUTTER, RAIL_WIDTH, SUN } from '../theme'
 import type { Status, TunnelState } from '../types'
-import { HeliosLockup } from './HeliosMark'
+import { HeliosMark } from './HeliosMark'
 import { StateChip } from './StateBadge'
 
 /**
- * The frame every view is seen through: MD3 navigation rail, app bar, content.
+ * The frame every view is seen through: navigation rail, header, content.
  *
- * The rail is permanent rather than collapsible. A supervision console is
- * navigated dozens of times per session and the destination set never changes,
- * so a drawer would trade a permanent 96 px for a permanent extra click. Below
- * `sm` the rail turns into a horizontal bar — the same seven destinations,
- * scrolled — because a phone-width viewport happens when an operator opens the
- * console from a laptop on a cramped screen, not because Helios is mobile-first.
+ * The rail is permanent rather than collapsible. Four destinations never
+ * change, and a drawer would trade a permanent 92 px for a permanent extra
+ * click. Below `sm` it becomes a horizontal bar — that width happens when an
+ * operator opens the console on a cramped laptop screen, not because Helios is
+ * mobile-first.
  *
- * The app bar carries what is true regardless of the view: the tunnel state,
+ * The header carries what stays true whichever view is open: the tunnel state,
  * whether the daemon is simulating, and whether the event stream is live. An
- * operator who navigates away from the dashboard does not stop needing to know
- * that the tunnel just dropped.
+ * operator who navigated to Système does not stop needing to know the tunnel
+ * just dropped.
  */
 
 const WS_INDICATOR: Record<WsStatus, { color: string; label: string; hint: string }> = {
   connected: {
     color: 'state.up.main',
-    label: 'Temps réel',
-    hint: 'Le flux d’événements est ouvert : l’état affiché suit le démon.',
+    label: 'En direct',
+    hint: 'Le flux d’événements est ouvert : l’affichage suit le démon.',
   },
   connecting: {
     color: 'state.connecting.main',
-    label: 'Connexion…',
+    label: 'Connexion',
     hint: 'Ouverture du flux d’événements.',
   },
   disconnected: {
+    // Never "hors ligne": that is what a *tunnel* is, and the state chip sits
+    // right next to this one. Two different facts cannot share a word in the
+    // same header.
     color: 'state.failed.main',
     label: 'Flux coupé',
-    hint: 'Le flux est fermé : l’état affiché peut être périmé. Une reconnexion est tentée automatiquement.',
+    hint: 'Flux fermé : l’affichage peut être périmé. Une reconnexion est tentée automatiquement.',
   },
 }
 
@@ -67,39 +69,25 @@ function RailItem({
         width: '100%',
         flexDirection: 'column',
         gap: 0.5,
-        py: 0.75,
-        borderRadius: 3,
-        color: active ? 'rail.textActive' : 'rail.text',
-        transition: `color 260ms ${EMPHASIZED}`,
-        '&:hover': { color: 'rail.textActive' },
-        '&:hover .rail-indicator': { bgcolor: 'rail.indicator' },
+        py: 1,
+        borderRadius: '10px',
+        color: active ? 'primary.main' : 'text.secondary',
+        bgcolor: active ? 'primary.container' : 'transparent',
+        transition: `background-color 200ms ${EMPHASIZED}, color 200ms ${EMPHASIZED}`,
+        '&:hover': {
+          bgcolor: active ? 'primary.container' : 'surfaceContainer.high',
+          color: active ? 'primary.main' : 'text.primary',
+        },
         '&.Mui-focusVisible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 2 },
       }}
     >
-      {/* MD3 active indicator: a pill behind the icon, never a side bar. */}
-      <Box
-        className="rail-indicator"
-        sx={{
-          width: 54,
-          height: 32,
-          borderRadius: 999,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          bgcolor: active ? 'rail.indicator' : 'transparent',
-          transition: `background-color 260ms ${EMPHASIZED}`,
-        }}
-      >
-        <Icon size={20} strokeWidth={active ? 2.1 : 1.7} />
-      </Box>
+      <Icon size={20} strokeWidth={active ? 2.2 : 1.8} />
       <Typography
         sx={{
           fontSize: '0.6875rem',
-          fontWeight: active ? 700 : 500,
-          letterSpacing: '0.02em',
+          fontWeight: active ? 650 : 500,
           lineHeight: 1.2,
           color: 'inherit',
-          textAlign: 'center',
         }}
       >
         {item.label}
@@ -112,9 +100,9 @@ function RailItem({
 function ColorSchemeToggle() {
   const { mode, setMode } = useColorScheme()
 
-  // Before mount, MUI has not yet resolved the stored preference; rendering a
-  // guessed icon here would flip on hydration.
-  if (!mode) return <Box sx={{ height: 36 }} />
+  // Before mount MUI has not resolved the stored preference; guessing an icon
+  // here would flip it on hydration.
+  if (!mode) return <Box sx={{ height: 34 }} />
 
   const next = mode === 'system' ? 'light' : mode === 'light' ? 'dark' : 'system'
   const LABEL = {
@@ -130,15 +118,15 @@ function ColorSchemeToggle() {
         onClick={() => setMode(next)}
         aria-label={text}
         sx={{
-          width: 36,
-          height: 36,
-          borderRadius: '50%',
-          color: 'rail.text',
-          '&:hover': { color: 'rail.textActive', bgcolor: 'rail.indicator' },
+          width: 34,
+          height: 34,
+          borderRadius: '8px',
+          color: 'text.secondary',
+          '&:hover': { bgcolor: 'surfaceContainer.high', color: 'text.primary' },
           '&.Mui-focusVisible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: 2 },
         }}
       >
-        <Icon size={18} strokeWidth={1.7} />
+        <Icon size={17} strokeWidth={1.8} />
       </ButtonBase>
     </Tooltip>
   )
@@ -152,9 +140,20 @@ interface Props {
   currentState: TunnelState
   error: string | null
   wsStatus: WsStatus
+  /** Controls belonging to the open view, shown next to its heading. */
+  actions?: ReactNode
 }
 
-export function AppShell({ children, nav, onNav, status, currentState, error, wsStatus }: Props) {
+export function AppShell({
+  children,
+  nav,
+  onNav,
+  status,
+  currentState,
+  error,
+  wsStatus,
+  actions,
+}: Props) {
   const current = navItem(nav)
   const ws = WS_INDICATOR[wsStatus]
 
@@ -171,66 +170,57 @@ export function AppShell({ children, nav, onNav, status, currentState, error, ws
         component="nav"
         aria-label="Sections de la console"
         sx={{
-          position: 'relative',
           display: 'flex',
           flexShrink: 0,
-          // The rail keeps its night in both schemes: it is the one fixed
-          // instrument, it carries the mark, and holding it constant gives the
-          // light scheme a spine instead of a pale field of panels.
-          bgcolor: 'rail.bg',
-          borderColor: 'rail.border',
+          bgcolor: 'surfaceContainer.lowest',
+          borderColor: 'divider',
           flexDirection: { xs: 'row', sm: 'column' },
           width: { xs: '100%', sm: RAIL_WIDTH },
           borderRight: { xs: 0, sm: '1px solid' },
           borderBottom: { xs: '1px solid', sm: 0 },
           alignItems: 'center',
-          gap: 0.5,
-          px: { xs: 1, sm: 1.25 },
+          gap: 0.75,
+          px: 1.25,
           py: { xs: 1, sm: 2 },
           overflowX: { xs: 'auto', sm: 'visible' },
-          // A sliver of corona along the inner edge — the sun, seen from the side.
-          '&::after': {
-            content: '""',
-            position: 'absolute',
-            display: { xs: 'none', sm: 'block' },
-            pointerEvents: 'none',
-            top: 0,
-            bottom: 0,
-            right: 0,
-            // '1px', not 1: in MUI's system a unitless width of 1 means 100%,
-            // which turns this hairline into a sheet covering the whole rail
-            // and swallowing every click on it.
-            width: '1px',
-            background:
-              'linear-gradient(180deg, transparent 0%, var(--mui-palette-primary-main) 18%, transparent 62%)',
-            opacity: 0.5,
-          },
         }}
       >
-        <Box sx={{ display: { xs: 'none', sm: 'block' }, mb: 2 }}>
-          <HeliosLockup />
+        <Box
+          sx={{
+            display: { xs: 'none', sm: 'flex' },
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 0.75,
+            mb: 2,
+          }}
+        >
+          {/* The sun is spent here, and nowhere else in the interface. */}
+          <Box sx={{ color: SUN, display: 'flex' }}>
+            <HeliosMark size={30} title="Helios" />
+          </Box>
+          <Typography
+            variant="overline"
+            sx={{ color: 'text.secondary', fontSize: '0.625rem', lineHeight: 1 }}
+          >
+            Helios
+          </Typography>
         </Box>
 
         {NAV_ITEMS.map(item => (
-          <Box key={item.id} sx={{ width: { xs: 72, sm: '100%' }, flexShrink: 0 }}>
+          <Box key={item.id} sx={{ width: { xs: 76, sm: '100%' }, flexShrink: 0 }}>
             <RailItem item={item} active={item.id === nav} onSelect={() => onNav(item.id)} />
           </Box>
         ))}
 
         <Stack
           spacing={1}
-          sx={{
-            display: { xs: 'none', sm: 'flex' },
-            mt: 'auto',
-            pt: 2,
-            alignItems: 'center',
-          }}
+          sx={{ display: { xs: 'none', sm: 'flex' }, mt: 'auto', pt: 2, alignItems: 'center' }}
         >
           <ColorSchemeToggle />
           {status && (
             <Typography
               variant="caption"
-              sx={{ color: 'rail.text', fontFamily: 'monospace', opacity: 0.7 }}
+              sx={{ color: 'text.disabled', fontFamily: 'monospace', fontSize: '0.6875rem' }}
             >
               v{status.version}
             </Typography>
@@ -244,26 +234,25 @@ export function AppShell({ children, nav, onNav, status, currentState, error, ws
           direction="row"
           spacing={2}
           sx={{
-            alignItems: 'flex-start',
+            alignItems: 'center',
             px: GUTTER,
             pt: GUTTER,
-            pb: 2,
+            pb: 2.5,
             flexWrap: 'wrap',
             rowGap: 1.5,
           }}
         >
           <Box sx={{ minWidth: 0, flex: 1 }}>
-            <Typography variant="h3" sx={{ fontWeight: 500 }}>
-              {current.title}
-            </Typography>
-            <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.75, maxWidth: '68ch' }}>
+            <Typography variant="h3">{current.title}</Typography>
+            <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5 }}>
               {current.description}
             </Typography>
           </Box>
 
-          <Stack direction="row" spacing={1} sx={{ alignItems: 'center', flexShrink: 0 }}>
+          <Stack direction="row" spacing={1.25} sx={{ alignItems: 'center', flexShrink: 0 }}>
+            {actions}
             {status?.dry_run && (
-              <Tooltip title="Les backends noyau WireGuard et nftables ne sont pas utilisés : les commandes sont journalisées, pas appliquées.">
+              <Tooltip title="Les backends noyau ne sont pas utilisés : les commandes sont journalisées, pas appliquées.">
                 <Chip
                   size="small"
                   label="Simulation"
@@ -291,31 +280,23 @@ export function AppShell({ children, nav, onNav, status, currentState, error, ws
             sx={{
               mx: GUTTER,
               mb: 2,
-              px: 2.5,
-              py: 1.75,
-              borderRadius: '14px',
+              px: 2,
+              py: 1.5,
+              borderRadius: '10px',
               alignItems: 'center',
               bgcolor: 'error.container',
               color: 'error.onContainer',
             }}
           >
-            <AlertCircle size={18} strokeWidth={1.8} />
-            <Typography variant="body2" sx={{ color: 'inherit' }}>
+            <AlertCircle size={17} strokeWidth={2} />
+            <Typography variant="body2" sx={{ color: 'inherit', fontWeight: 500 }}>
               {error}
             </Typography>
           </Stack>
         )}
 
-        <Box
-          component="main"
-          sx={{
-            flex: 1,
-            overflowY: 'auto',
-            px: GUTTER,
-            pb: 6,
-          }}
-        >
-          <Box sx={{ maxWidth: 1080 }}>{children}</Box>
+        <Box component="main" sx={{ flex: 1, overflowY: 'auto', px: GUTTER, pb: 6 }}>
+          <Box sx={{ maxWidth: 1180 }}>{children}</Box>
         </Box>
       </Box>
     </Box>

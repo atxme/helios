@@ -60,12 +60,15 @@ describe('Helios color schemes', () => {
     }
   })
 
-  it('holds the navigation rail at the same night in both schemes', () => {
-    // The rail is the console's fixed instrument. If it ever followed the
-    // color scheme it would dissolve into the light one, taking the mark and
-    // the product's identity with it — and the light scheme would be a pale
-    // field of panels again, which is what this palette exists to fix.
-    expect(paletteOf('light').rail).toEqual(paletteOf('dark').rail)
+  it('separates the page from the surfaces it carries', () => {
+    // The first palette failed here: page, card and tile all landed within
+    // three percent of one another, so nothing had an edge and the whole
+    // console read as one beige field.
+    for (const scheme of SCHEMES) {
+      const palette = paletteOf(scheme)
+      expect(palette.background.default, scheme).not.toBe(palette.surfaceContainer.low)
+      expect(palette.divider, scheme).not.toBe(palette.background.default)
+    }
   })
 
   it('keeps the state family out of the brand family', () => {

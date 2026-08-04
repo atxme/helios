@@ -756,6 +756,10 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         psk_tx,
         Arc::clone(&shared_policy),
     );
+    // The sealing posture, as two non-secret facts. `boot` itself is moved
+    // into the orchestrator below — it holds the unlock secret, and only the
+    // orchestrator may seal.
+    state = state.with_tpm(boot.kind(), boot.preserved_vaults());
     // Published for the operator tooling: `helios-ctl` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
@@ -763,6 +767,9 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         state = state.with_key_negotiation(material);
     }
     let api_ready = Arc::clone(&state.api_ready);
+    // The console reads the data plane through this snapshot; only the
+    // orchestrator's poller writes it.
+    let peer_runtime = Arc::clone(&state.peer_runtime);
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —
         // which the orchestrator, started right after, has not yet assigned
@@ -797,6 +804,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         cmd_rx,
         psk_rx,
         shared_policy,
+        peer_runtime,
         boot,
         api_ready,
     )

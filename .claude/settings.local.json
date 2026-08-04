@@ -311,7 +311,9 @@
       "Bash(NODE_PATH=/home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules node /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shot.mjs /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/shots)",
       "Bash(ln -sfn /home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules/playwright /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/node_modules/playwright)",
       "Bash(ln -sfn /home/christophe/.npm/_npx/e41f203b7505f1fb/node_modules/playwright-core /tmp/claude-1000/-home-christophe-helios/af32faa5-602b-49df-92fa-99046bf2b4cb/scratchpad/node_modules/playwright-core)",
-      "Bash(pkill -f \"5180\")"
+      "Bash(pkill -f \"5180\")",
+      "Bash(echo \"fmt exit=$?\")",
+      "Bash(fuser -k 5180/tcp)"
     ]
   }
 }

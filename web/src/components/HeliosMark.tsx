@@ -1,6 +1,3 @@
-import Box from '@mui/material/Box'
-import Typography from '@mui/material/Typography'
-
 /**
  * Helios mark — the gateway.
  *
@@ -91,30 +88,3 @@ export function HeliosMark({ size = 32, compact = false, title }: Props) {
   )
 }
 
-/**
- * Mark and wordmark, stacked — the head of the navigation rail.
- *
- * Colored from the `rail` tokens rather than the page's, because the rail
- * holds its night in both schemes: `text.secondary` would vanish into it as
- * soon as the light scheme is selected.
- */
-export function HeliosLockup() {
-  return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0.75 }}>
-      <Box
-        sx={{
-          color: 'primary.main',
-          filter: 'drop-shadow(0 0 10px color-mix(in srgb, var(--mui-palette-primary-main) 45%, transparent))',
-        }}
-      >
-        <HeliosMark size={32} title="Helios" />
-      </Box>
-      <Typography
-        variant="overline"
-        sx={{ color: 'rail.text', letterSpacing: '0.2em', lineHeight: 1, fontSize: '0.625rem' }}
-      >
-        Helios
-      </Typography>
-    </Box>
-  )
-}

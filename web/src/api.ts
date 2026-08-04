@@ -1,6 +1,16 @@
 // In dev, Vite proxies /api and /ws to heliosd. In production, the embedded
 // interface and the API are served by the same Axum process.
-import type { CommandResponse, FinalizedRelease, FirewallRules, Status, Trust, UpdateStatus } from './types'
+import type {
+  CommandResponse,
+  FinalizedRelease,
+  FirewallRules,
+  Health,
+  PeerAdmission,
+  PeerSummary,
+  Status,
+  Trust,
+  UpdateStatus,
+} from './types'
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
@@ -22,10 +32,38 @@ async function command(url: string, body?: unknown): Promise<void> {
 
 export const fetchStatus = () => json<Status>('/api/status')
 export const fetchTrust = () => json<Trust>('/api/trust')
+export const fetchHealth = () => json<Health>('/api/health')
 export const tunnelStart = () => command('/api/tunnel/start')
 export const tunnelStop = () => command('/api/tunnel/stop')
 export const releaseCaptivePortal = () => command('/api/captive-portal/release')
 export const setSplitTunnel = (cidrs: string[]) => command('/api/split-tunnel', { cidrs })
+
+/**
+ * Admits a client, and returns it as the gateway recorded it.
+ *
+ * Unlike the tunnel commands this does not go through `command()`: admission
+ * answers with the peer itself — most importantly the VIP the gateway derived
+ * — and an operator who admitted a client needs that address to hand it over.
+ */
+export const admitPeer = (peer: PeerAdmission) =>
+  json<PeerSummary>('/api/peers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(peer),
+  })
+
+/**
+ * Removes a client from admission.
+ *
+ * Not a cryptographic revocation: the peer drops at its next handshake
+ * attempt, there is no revocation list (ADR-004).
+ */
+export const revokePeer = (name: string) =>
+  json<PeerSummary>('/api/peers/revoke', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
 
 export const fetchFirewallRules = () => json<FirewallRules>('/api/firewall/rules')
 export const applyFirewallRules = (rules: string) => command('/api/firewall/rules', { rules })

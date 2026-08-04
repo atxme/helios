@@ -1,6 +1,9 @@
-use aether::{key_negotiation::ProtectionMode, NetworkConfig, OrchestratorCmd};
+use std::time::SystemTime;
+
+use aether::{key_negotiation::ProtectionMode, NetworkConfig, OrchestratorCmd, WgPeer};
 use axum::{extract::State, http::StatusCode, Json};
 use helios_firewall::ruleset;
+use helios_wireguard::PeerStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -25,11 +28,27 @@ pub struct StatusResponse {
     pub split_tunnel_cidrs: Vec<String>,
     pub mss_clamp: Option<u16>,
     pub captive_portal_gateway: Option<String>,
+    /// Age beyond which a handshake no longer proves a peer is there.
+    ///
+    /// Published rather than left for the console to hardcode: this is the
+    /// same threshold the orchestrator uses to decide whether the kill-switch
+    /// lifts, and an interface applying its own would eventually report a
+    /// client as connected after the firewall had already cut it.
+    pub handshake_stale_after_seconds: u64,
 }
 
 /// An authorized WireGuard peer, as exposed to the UI.
-/// The public key is public by nature; the PSK is never exposed,
-/// only its presence is published.
+///
+/// The public key is public by nature; the PSK is never exposed, only its
+/// presence is published.
+///
+/// The last four fields are the **runtime**, and they answer the question the
+/// console is actually opened for: is this client connected right now. They
+/// come from the data plane, not from the configuration, so they are absent
+/// whenever the interface is down or the peer has never been seen — which is
+/// why they are optional rather than zeroed. A peer showing `rx_bytes: 0`
+/// because nothing was observed, and a peer showing `rx_bytes: 0` because it
+/// really transferred nothing, are not the same fact.
 #[derive(Serialize, Clone)]
 pub struct PeerSummary {
     pub name: String,
@@ -38,6 +57,50 @@ pub struct PeerSummary {
     pub post_quantum: bool,
     pub admin: bool,
     pub minimum_key_negotiation_mode: ProtectionMode,
+    /// Seconds since the last successful handshake. `None` = never handshaked,
+    /// or the data plane has not been observed since the interface came up.
+    pub last_handshake_age_seconds: Option<u64>,
+    /// The peer's current endpoint. It roams, so this value changes.
+    pub endpoint: Option<String>,
+    /// Bytes counted by the data plane, `None` when it was not observed.
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+}
+
+impl PeerSummary {
+    /// The configured half, with no runtime attached.
+    ///
+    /// Used as-is by admission and revocation: a peer that was just admitted
+    /// has, by construction, never handshaked, and one that was just revoked
+    /// no longer has a runtime worth reporting.
+    fn from_config(peer: &WgPeer) -> Self {
+        Self {
+            name: peer.name.clone(),
+            public_key: peer.public_key.clone(),
+            address: peer.address.clone(),
+            post_quantum: peer.preshared_key.is_some(),
+            admin: peer.admin,
+            minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,
+            last_handshake_age_seconds: None,
+            endpoint: None,
+            rx_bytes: None,
+            tx_bytes: None,
+        }
+    }
+
+    /// Attaches what the data plane last reported for this peer.
+    fn with_runtime(mut self, observed: &PeerStatus, now: SystemTime) -> Self {
+        self.last_handshake_age_seconds = observed.last_handshake.and_then(|at| {
+            // A handshake dated in the future means the clocks disagree, not
+            // that the peer is fresh: reporting a negative age as a huge
+            // unsigned number would show the peer as long dead.
+            now.duration_since(at).ok().map(|age| age.as_secs())
+        });
+        self.endpoint = observed.endpoint.clone();
+        self.rx_bytes = Some(observed.rx_bytes);
+        self.tx_bytes = Some(observed.tx_bytes);
+        self
+    }
 }
 
 /// Public view of the network configuration.
@@ -220,18 +283,24 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     let policy = s.policy.read().await;
     let network = s.network.read().await;
 
+    // The runtime is matched to the configuration by public key, never by
+    // name: a peer can be renamed in `network.toml` while the data plane keeps
+    // serving the same key, and matching on the name would silently attach one
+    // client's traffic figures to another's row.
+    let observed = s.peer_runtime.read().await;
+    let now = SystemTime::now();
     let peers: Vec<PeerSummary> = network
         .peers
         .iter()
-        .map(|p| PeerSummary {
-            name: p.name.clone(),
-            public_key: p.public_key.clone(),
-            address: p.address.clone(),
-            post_quantum: p.preshared_key.is_some(),
-            admin: p.admin,
-            minimum_key_negotiation_mode: p.minimum_key_negotiation_mode,
+        .map(|p| {
+            let summary = PeerSummary::from_config(p);
+            match observed.iter().find(|o| o.public_key_b64() == p.public_key) {
+                Some(status) => summary.with_runtime(status, now),
+                None => summary,
+            }
         })
         .collect();
+    drop(observed);
 
     Json(StatusResponse {
         state: state.as_str().to_string(),
@@ -248,6 +317,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         split_tunnel_cidrs: policy.split_tunnel_cidrs.clone(),
         mss_clamp: policy.mss_clamp,
         captive_portal_gateway: policy.captive_portal_gateway.clone(),
+        handshake_stale_after_seconds: helios_wireguard::HANDSHAKE_STALE_AFTER_SECS,
     })
 }
 
@@ -401,14 +471,7 @@ pub async fn peer_admit(
     apply_network(&s, updated).await?;
 
     tracing::info!(peer = %peer.name, vip = %peer.address, admin = peer.admin, "peer admitted");
-    Ok(Json(PeerSummary {
-        name: peer.name,
-        public_key: peer.public_key,
-        address: peer.address,
-        post_quantum: peer.preshared_key.is_some(),
-        admin: peer.admin,
-        minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,
-    }))
+    Ok(Json(PeerSummary::from_config(&peer)))
 }
 
 /// Removes a peer from admission.
@@ -424,14 +487,7 @@ pub async fn peer_revoke(
     apply_network(&s, updated).await?;
 
     tracing::warn!(peer = %peer.name, "peer removed from admission");
-    Ok(Json(PeerSummary {
-        name: peer.name,
-        public_key: peer.public_key,
-        address: peer.address,
-        post_quantum: peer.preshared_key.is_some(),
-        admin: peer.admin,
-        minimum_key_negotiation_mode: peer.minimum_key_negotiation_mode,
-    }))
+    Ok(Json(PeerSummary::from_config(&peer)))
 }
 
 /// Persists a mutated configuration then forwards it to the orchestrator.
@@ -658,7 +714,7 @@ pub async fn trust() -> Json<TrustResponse> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use aether::{NetworkConfig, OrchestratorCmd, TunnelState, WgPeer};
     use axum::extract::State;
@@ -711,6 +767,93 @@ mod tests {
             ),
             cmd_rx,
         )
+    }
+
+    /// A data-plane observation, keyed like the peer the fixture configures.
+    fn observed(public_key_b64: &str, age: Duration) -> PeerStatus {
+        use base64::Engine as _;
+        PeerStatus {
+            public_key: base64::engine::general_purpose::STANDARD
+                .decode(public_key_b64)
+                .unwrap(),
+            allowed_ips: vec!["100.64.1.2/32".into()],
+            last_handshake: Some(SystemTime::now() - age),
+            endpoint: Some("203.0.113.9:51820".into()),
+            rx_bytes: 4_096,
+            tx_bytes: 8_192,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_attaches_the_runtime_observed_on_the_data_plane() {
+        let (app, _cmd_rx) = app_state(TunnelState::Up);
+        *app.peer_runtime.write().await = vec![observed(PEER_KEY, Duration::from_secs(30))];
+
+        let response = status(State(app)).await.0;
+
+        let peer = &response.peers[0];
+        assert_eq!(peer.endpoint.as_deref(), Some("203.0.113.9:51820"));
+        assert_eq!(peer.rx_bytes, Some(4_096));
+        assert_eq!(peer.tx_bytes, Some(8_192));
+        let age = peer.last_handshake_age_seconds.expect("handshake observed");
+        assert!((30..=31).contains(&age), "unexpected age: {age}");
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_runtime_when_the_data_plane_was_not_observed() {
+        let (app, _cmd_rx) = app_state(TunnelState::Down);
+
+        let response = status(State(app)).await.0;
+
+        // Absent, not zeroed: "never observed" and "transferred nothing" are
+        // different facts, and the console renders them differently.
+        let peer = &response.peers[0];
+        assert_eq!(peer.rx_bytes, None);
+        assert_eq!(peer.tx_bytes, None);
+        assert_eq!(peer.last_handshake_age_seconds, None);
+        assert_eq!(peer.endpoint, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_is_matched_by_public_key_and_never_by_name() {
+        let (app, _cmd_rx) = app_state(TunnelState::Up);
+        // Same peer name, a different key: this is what a stale observation
+        // looks like after a client rotated its identity. Attaching it would
+        // credit one client's traffic to another's row.
+        let mut stale = observed(PEER_KEY, Duration::from_secs(10));
+        stale.public_key = vec![0x42; 32];
+        *app.peer_runtime.write().await = vec![stale];
+
+        let response = status(State(app)).await.0;
+
+        assert_eq!(response.peers[0].endpoint, None);
+        assert_eq!(response.peers[0].rx_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_dated_in_the_future_is_reported_as_unknown() {
+        let (app, _cmd_rx) = app_state(TunnelState::Up);
+        let mut skewed = observed(PEER_KEY, Duration::from_secs(0));
+        skewed.last_handshake = Some(SystemTime::now() + Duration::from_secs(3_600));
+        *app.peer_runtime.write().await = vec![skewed];
+
+        let response = status(State(app)).await.0;
+
+        // Clocks disagree. Reporting the negative age as an unsigned number
+        // would show the peer as dead for 584 942 years.
+        assert_eq!(response.peers[0].last_handshake_age_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn status_publishes_the_freshness_threshold_it_is_judged_by() {
+        let (app, _cmd_rx) = app_state(TunnelState::Up);
+
+        let response = status(State(app)).await.0;
+
+        assert_eq!(
+            response.handshake_stale_after_seconds,
+            helios_wireguard::HANDSHAKE_STALE_AFTER_SECS
+        );
     }
 
     #[tokio::test]

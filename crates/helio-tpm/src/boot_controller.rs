@@ -39,6 +39,22 @@ impl BootDecision {
         }
     }
 
+    /// Non-secret name of this decision, safe to publish.
+    ///
+    /// Exists so the console can report the gateway's sealing posture without
+    /// the API ever holding a [`BootDecision`] — which carries the unlock
+    /// secret, and must not transit through the API crate.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BootDecision::Disabled => "disabled",
+            BootDecision::Bypassed => "bypassed",
+            BootDecision::Unsealed(_) => "unsealed",
+            BootDecision::Provisioned(_) => "provisioned",
+            BootDecision::Resealed(_) => "resealed",
+            BootDecision::WindowResealed(_) => "window_resealed",
+        }
+    }
+
     /// Did this boot preserve the secret the vaults were encrypted under?
     ///
     /// The two decisions that answer `false` are the ones after which

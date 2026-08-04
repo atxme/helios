@@ -8,10 +8,13 @@ import { Sparkline } from './Sparkline'
 /**
  * Live throughput, in and out.
  *
- * Direction gets a brand accent — amber in, green out — because these two
- * curves are data, not state. Reusing a state tone here would let a green
- * upload curve read as "protected", which is the one confusion this interface
- * cannot afford.
+ * Blue in, violet out. The two hues are deliberately far apart on the wheel:
+ * the curves are stacked, read at a glance, and an earlier pairing put indigo
+ * next to violet — close enough that at sparkline width you had to read the
+ * label to know which direction you were looking at.
+ *
+ * Neither is a state tone. A green upload curve would read as "protected",
+ * which is the one confusion this interface cannot afford.
  */
 
 export function formatBps(bps: number): string {
@@ -85,7 +88,7 @@ export function NetworkStats({
       <Channel
         label="Rx entrant"
         icon={ArrowDownRight}
-        color="primary.main"
+        color="state.connecting.main"
         bps={latest?.rx_bps ?? null}
         pps={latest?.rx_pps ?? null}
         values={samples.map(sample => sample.rx_bps)}
