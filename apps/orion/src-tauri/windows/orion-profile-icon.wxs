@@ -27,8 +27,13 @@
 
   # Limite connue
 
-  MSI only. The NSIS package (`cargo xtask orion-msi --with-nsis`) writes its
-  own association, executable icon included; the MSI is the shipped format.
+  MSI only. The NSIS package (`cargo xtask orion-msi`, NSIS bundle asked for)
+  writes its own association, executable icon included; the MSI is the shipped
+  format.
+
+  Note the flag is not spelled out here: two hyphens in a row close nothing in
+  XML, they make the comment ill-formed, and candle then rejects the file
+  before reading a single element.
 -->
 
 <?if $(sys.BUILDARCH)="x86"?>

@@ -2290,6 +2290,28 @@ mod security_tests {
         );
     }
 
+    /// The WiX fragment must stay well-formed XML, comments included.
+    ///
+    /// `--` inside a comment body is illegal XML, and a command line quoted in
+    /// prose is the natural way to write one by accident. candle refuses the
+    /// file before reading an element, but the bundler logs its output at debug
+    /// level: the build then fails with `failed to run candle.exe` and no line
+    /// number, minutes into a release job that only runs on Windows.
+    #[test]
+    fn windows_wix_fragment_comments_are_well_formed() {
+        let mut rest = include_str!("../windows/orion-profile-icon.wxs");
+        while let Some(start) = rest.find("<!--") {
+            let body = &rest[start + "<!--".len()..];
+            let end = body.find("-->").expect("unterminated XML comment");
+            assert!(
+                !body[..end].contains("--"),
+                "an XML comment must not contain `--`: {}",
+                &body[..end]
+            );
+            rest = &body[end + "-->".len()..];
+        }
+    }
+
     #[test]
     fn tauri_capabilities_stay_minimal() {
         let capabilities: serde_json::Value =
