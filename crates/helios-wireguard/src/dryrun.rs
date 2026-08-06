@@ -165,6 +165,7 @@ mod tests {
             public_key: key.into(),
             allowed_ips: vip.into(),
             preshared_key: None,
+            persistent_keepalive_secs: 25,
         }
     }
 

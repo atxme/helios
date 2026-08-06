@@ -881,7 +881,7 @@ porte une signature ML-DSA-87 sur une forme JCS et le hash de la demande locale.
 ### 5. Corrections de la revue amont avant implémentation
 
 La spécification a été relue une troisième fois avant que le module v5 existe.
-Six décisions supplémentaires deviennent architecturales.
+Sept décisions supplémentaires deviennent architecturales.
 
 **La preuve WireGuard devient bilatérale.** Orion n'envoie la confirmation
 qu'après une progression observée par son backend, et Helios ne commit qu'après
@@ -926,6 +926,19 @@ post-quantique du premier handshake. Les deux chemins sont représentés par des
 variantes de profil distinctes afin que la suppression du bloc de négociation
 d'un profil Helios soit un downgrade refusé, jamais une conversion implicite en
 `classic`.
+
+**Le cycle de vie des certificats est prévu avant la première implémentation.**
+Le certificat PQ gateway v5 n'est plus auto-signé : la gateway génère et scelle
+sa clé, puis `CA-PQ` émet la leaf depuis le poste opérateur. La clé WireGuard et
+le `server_name` restent les ancres stables. Profils et admissions portent une
+identité active et une suivante au plus, liées par une transition signée,
+datée et de génération strictement consécutive. Une rotation de `CA-PQ` exige
+les signatures de l'ancienne et de la nouvelle CA ; la CA TLS cliente porte
+également un slot actif/suivant, dont la transition est autorisée par `CA-PQ`.
+Les formats, l'import manuel et l'anti-rollback appartiennent au socle v5 ;
+seuls le planificateur, les alertes et les campagnes sont reportables en v5.x.
+La spécification complète est
+[ROTATION-CERTIFICATS-V5](../ROTATION-CERTIFICATS-V5.md).
 
 ### 6. Ce que l'amendement ne change pas
 
@@ -987,3 +1000,9 @@ une donnée WireGuard ordinaire et ne devient pas le mode `static_psk` v5.
 - **Les refus ne sont pas strictement constants en temps.** Une identité ne
   peut sonder que son propre pair et les budgets bornent les mesures, mais le
   coût syntaxique et celui de ML-DSA restent différents.
+- **La révocation de certificat n'est pas instantanée sans canal de fraîcheur
+  indépendant.** Une transition ou révocation signée peut être distribuée par
+  un canal non fiable, mais une gateway ou un réseau compromis peut la retenir.
+  La v5 prévoit l'import hors ligne et les échéances ; garantir une information
+  fraîche à un client isolé exigerait un service de statut ou une distribution
+  d'entreprise distincte.

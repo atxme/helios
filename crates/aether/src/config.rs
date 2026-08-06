@@ -161,7 +161,7 @@ pub struct WgPeer {
     /// remains on Orion.
     #[serde(default)]
     pub key_negotiation_certificate_sha256: Option<String>,
-    /// Fingerprint of the ML-DSA-65 application certificate admitted for
+    /// Fingerprint of the ML-DSA-87 application certificate admitted for
     /// this WireGuard identity.
     #[serde(default)]
     pub key_negotiation_pq_certificate_sha256: Option<String>,
@@ -169,6 +169,36 @@ pub struct WgPeer {
     /// can raise the mode but can never lower it below this policy.
     #[serde(default)]
     pub minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode,
+    /// Seconds between WireGuard keep-alives sent **by the gateway** to this
+    /// peer. `0` disables them.
+    ///
+    /// Since v5 the whole liveness story reads the data plane: Orion
+    /// renegotiates when its last handshake ages past
+    /// `HANDSHAKE_STALE_AFTER_SECS`, and the gateway reclaims a PSK slot past
+    /// [`PSK_RECLAIM_AFTER_STALE_SECS`](crate::key_negotiation::PSK_RECLAIM_AFTER_STALE_SECS).
+    /// Both assume a live tunnel keeps producing handshakes, which an idle one
+    /// does not unless something sends.
+    ///
+    /// The gateway therefore sends its own keep-alives rather than trusting
+    /// the client's configuration, which it cannot inspect. That turns the
+    /// assumption into a consequence of its own settings: every 25 seconds it
+    /// emits, so as long as the peer answers, a rekey lands roughly every two
+    /// minutes and the handshake age stays well under either threshold. When
+    /// the peer stops answering, those failures **are** the disappearance
+    /// signal.
+    #[serde(default = "default_persistent_keepalive_secs")]
+    pub persistent_keepalive_secs: u16,
+}
+
+/// Gateway-side keep-alive interval, in seconds.
+///
+/// Matches the client default. Short enough that a rekey happens well inside
+/// the reclamation window, long enough to be one 32-byte packet per peer per
+/// 25 seconds.
+pub const DEFAULT_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
+
+const fn default_persistent_keepalive_secs() -> u16 {
+    DEFAULT_PERSISTENT_KEEPALIVE_SECS
 }
 
 impl NetworkConfig {
@@ -330,6 +360,19 @@ impl NetworkConfig {
                     peer.name
                 )));
             }
+            // A negotiated peer without keep-alives silently loses both
+            // liveness mechanisms of v5: the gateway would never reclaim its
+            // slot, and the client would never notice a gateway restart. The
+            // failure only shows the day something falls over, so it is
+            // refused here — at load and at every hot reload — rather than
+            // documented as an operator responsibility.
+            if pq_identity.is_some() && peer.persistent_keepalive_secs == 0 {
+                return Err(HeliosError::Config(format!(
+                    "peer {} negotiates its PSK but has persistent_keepalive_secs = 0; \
+                     liveness is read from the data plane and needs handshakes to read",
+                    peer.name
+                )));
+            }
         }
         Ok(())
     }
@@ -446,6 +489,7 @@ mod tests {
                 key_negotiation_certificate_sha256: Some("empreinte-tls".into()),
                 key_negotiation_pq_certificate_sha256: Some("empreinte-pq".into()),
                 minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+                persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };
@@ -461,6 +505,7 @@ mod tests {
                     // A file that asks for less than what was reached: the
                     // floor must not follow it down.
                     minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+                    persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
                     ..running.peers[0].clone()
                 },
                 WgPeer {
@@ -472,6 +517,7 @@ mod tests {
                     key_negotiation_certificate_sha256: None,
                     key_negotiation_pq_certificate_sha256: None,
                     minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::MlKem,
+                    persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
                 },
             ],
             ..NetworkConfig::default()
@@ -601,6 +647,7 @@ mod tests {
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
             minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+            persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         };
         let mut cfg = NetworkConfig {
             peers: vec![
@@ -717,6 +764,7 @@ mod tests {
             key_negotiation_certificate_sha256: None,
             key_negotiation_pq_certificate_sha256: None,
             minimum_key_negotiation_mode: crate::key_negotiation::ProtectionMode::Classic,
+            persistent_keepalive_secs: DEFAULT_PERSISTENT_KEEPALIVE_SECS,
         });
 
         // What the daemon actually does before persisting (ADR-006 §4).

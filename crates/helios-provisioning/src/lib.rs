@@ -78,9 +78,7 @@ pub mod ipam;
 pub mod rotation;
 pub mod session;
 
-pub use admission::{
-    admit, admit_with_certificate, admit_with_key_negotiation, revoke, AdmissionError,
-};
+pub use admission::{admit_with_key_negotiation, revoke, AdmissionError};
 pub use ipam::{assign_vip, derive_cgnat_ip, IpamError, PeerTable, MAX_VIP_PROBES, POOL_SIZE};
 pub use rotation::{RotationAction, RotationState, REVERT_AFTER};
 pub use session::{

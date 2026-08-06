@@ -1,15 +1,16 @@
 # Note technique — négociation de clé pré-WireGuard v4
 
-**Statut** : protocole **actuellement servi** par le code. Révisé par la
-[v5](NEGOCIATION-DE-CLE-V5.md), spécifiée le 2026-08-06 et pas encore
-implémentée.
+**Statut** : **plus servi par le code**. Remplacé par la
+[v5](NEGOCIATION-DE-CLE-V5.md), implémentée le 2026-08-06. Conservé comme trace
+de ce qui tournait avant la bascule, et comme référence pour lire les
+justifications de l'amendement de l'ADR-005.
 
 **Version** : 4
 
 **Date de la note** : 2026-08-04
 
-> Cette note reste la description exacte de ce que `heliosd` et Orion servent
-> aujourd'hui. Une revue de sécurité a identifié vingt défauts, dont le
+> Cette note décrivait exactement ce que `heliosd` et Orion servaient jusqu'au
+> 6 août 2026. Une revue de sécurité a identifié vingt défauts, dont le
 > rejeu d'une requête authentifiée après éviction du cache, l'absence de
 > liaison à la gateway visée, la corrélation des sessions `static_psk` et la
 > coexistence d'un rollback et d'un commit signé. Leur traitement est spécifié
@@ -17,8 +18,8 @@ implémentée.
 > renversent un choix antérieur est dans l'amendement du 6 août 2026 de
 > l'[ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md).
 >
-> Ne pas lire ce document comme la cible, ni la v5 comme une description du
-> système.
+> Ne pas lire ce document comme une description du système : les deux versions
+> ne négocient pas ensemble, et le code ne sert plus que la v5.
 
 Cette note décrit le protocole réellement servi par Helios et Orion. Elle
 complète [ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md). Elle reprend la forme

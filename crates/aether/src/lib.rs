@@ -26,7 +26,7 @@ pub mod wg;
 
 pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
 pub use error::{HeliosError, Result};
-pub use events::{HeliosEvent, InstallPskRequest, OrchestratorCmd};
+pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
 pub use pq::{Kem, MlKem1024Kem, PqError, SharedSecret};
 pub use secret::SecretString;

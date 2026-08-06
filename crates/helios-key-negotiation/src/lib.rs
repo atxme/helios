@@ -12,10 +12,12 @@ use std::{
 };
 
 use aether::key_negotiation::{
-    derive_negotiated_psk, static_psk_fingerprint, AuthenticatedKeyNegotiationCommit,
-    AuthenticatedKeyNegotiationConfirmation, AuthenticatedKeyNegotiationRequest,
-    AuthenticatedKeyNegotiationResponse, KeyNegotiationRequest, KeyNegotiationResponse,
-    ProtectionMode, KEY_NEGOTIATION_VERSION, MAX_KEY_NEGOTIATION_MESSAGE_BYTES,
+    commitments_match, derive_negotiated_psk, static_psk_commitment,
+    AuthenticatedKeyNegotiationCommit, AuthenticatedKeyNegotiationConfirmation,
+    AuthenticatedKeyNegotiationRequest, AuthenticatedKeyNegotiationResponse,
+    AuthenticatedPskRelease, AuthenticatedPskReleased, KeyNegotiationChallenge,
+    KeyNegotiationRequest, KeyNegotiationResponse, ProtectionMode, KEY_NEGOTIATION_VERSION,
+    MAX_KEY_NEGOTIATION_MESSAGE_BYTES, SERVER_CHALLENGE_LEN,
 };
 use aether::pq::{Kem, MlKem1024Kem};
 use aether::SecretString;
@@ -30,7 +32,7 @@ use zeroize::Zeroize as _;
 
 /// ALPN prevents another QUIC application on the host from accepting these
 /// credentials and messages by accident.
-pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/4";
+pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/5";
 /// Confirmation is bounded independently from transport idle time.
 ///
 /// The client confirms as soon as a WireGuard handshake succeeds with the PSK
@@ -42,8 +44,23 @@ pub const KEY_NEGOTIATION_ALPN: &[u8] = b"helios-key-negotiation/4";
 /// session that had already died; forty-five seconds still leaves twenty
 /// times the room a handshake needs.
 pub const DEFAULT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(45);
-/// Bounds authenticated connection tasks exposed on the public WAN port.
+
+/// Bounds concurrent **negotiations** on the public WAN port.
+///
+/// Not a tunnel ceiling. Since v5 the connection is closed right after the
+/// commit, so it lives for one transaction — a few hundred milliseconds in
+/// the nominal case. In v4 the same number bounded the tunnels themselves,
+/// because every connected client held its connection open for the life of
+/// its tunnel.
 pub const MAX_ACTIVE_NEGOTIATIONS: usize = 128;
+
+/// How long a gateway-issued challenge stays usable.
+///
+/// It lives in the connection's own state, so this bound only matters for a
+/// client that asks for one and then dawdles. Long enough to cover an
+/// ML-KEM keygen and an ML-DSA-87 signature on a slow laptop, short enough
+/// that a connection cannot sit on a valid authorization.
+pub const CHALLENGE_VALIDITY: Duration = Duration::from_secs(45);
 
 /// Handshakes accepted per source address and per window, once its address is
 /// validated.
@@ -54,6 +71,26 @@ pub const MAX_ACTIVE_NEGOTIATIONS: usize = 128;
 /// linear in the number of addresses an attacker actually holds.
 pub const MAX_HANDSHAKES_PER_SOURCE: u32 = 8;
 
+/// Negotiations one admitted identity may open per [`SOURCE_RATE_WINDOW`].
+///
+/// Charged after mTLS, when the peer has a name. The address budget below
+/// bounds anonymous traffic; this one bounds an authenticated peer that
+/// roams, whose every attempt still costs an ML-DSA-87 verification and an
+/// ML-KEM encapsulation.
+pub const MAX_NEGOTIATIONS_PER_IDENTITY: u32 = 8;
+
+/// Longest a negotiation connection may live, from address validation.
+///
+/// Not renewable, and unrelated to the idle timeout: a peer that keeps
+/// sending well-formed frames is never idle, so an idle timeout alone lets a
+/// connection — and the concurrency permit it holds — live for ever. With
+/// only 128 permits, a handful of such connections is the whole service.
+///
+/// Sized above the sum of the phases it must contain: a challenge round trip,
+/// a preparation, and up to a 45-second wait for the confirming WireGuard
+/// handshake.
+pub const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(90);
+
 /// Window over which [`MAX_HANDSHAKES_PER_SOURCE`] is counted.
 ///
 /// A legitimate client negotiates once per connection, so eight attempts a
@@ -62,7 +99,10 @@ pub const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Secret configuration prepared for the WireGuard peer.
 ///
-/// `None` is meaningful only for classic mode and removes the peer's PSK.
+/// Since `classic` stopped being a negotiable mode, every negotiation that
+/// gets this far produces a key: `psk` is always `Some` here. The `Option`
+/// remains because the data-plane call it feeds also uses `None` to *clear* a
+/// slot, which is a different operation reached by a different path.
 #[derive(Debug)]
 pub struct PreparedKeyMaterial {
     pub response: KeyNegotiationResponse,
@@ -93,25 +133,51 @@ pub fn prepare_key_material(
     let mut response = KeyNegotiationResponse {
         protocol_version: KEY_NEGOTIATION_VERSION,
         transaction_id: request.transaction_id,
+        server_challenge: request.server_challenge,
         selected_mode: request.mode,
         gateway_wg_public_key: gateway_wg_public_key.to_string(),
+        client_wg_public_key: request.client_wg_public_key.clone(),
         gateway_nonce,
         kem_ciphertext: None,
         confirmation_timeout_secs: timeout_secs,
+        // `static_psk` never expires: the value belongs to both peers'
+        // configuration, not to this transaction.
+        psk_lifetime_secs: match request.mode {
+            ProtectionMode::StaticPsk => 0,
+            _ => aether::key_negotiation::NEGOTIATED_PSK_LIFETIME_SECS,
+        },
     };
 
     let psk = match request.mode {
-        ProtectionMode::Classic => None,
+        // Unreachable through the public port, where `validate()` refuses it
+        // before anything is prepared. Kept as an explicit refusal rather than
+        // an `unreachable!()`: this function is also reachable from tests and
+        // tooling, and a mode that yields no PSK must never silently produce a
+        // prepared slot.
+        ProtectionMode::Classic => return Err(PublicError::Rejected),
         ProtectionMode::StaticPsk => {
-            let configured = static_psk.ok_or(PublicError::ModeUnavailable)?;
-            let expected = request
-                .static_psk_fingerprint
+            // `Rejected`, not a mode-specific code: whether the peer has no
+            // static PSK configured, or has one that does not match, is
+            // exactly the sort of state the public boundary must not reveal.
+            let configured = static_psk.ok_or(PublicError::Rejected)?;
+            let presented = request
+                .static_psk_commitment
                 .as_deref()
                 .ok_or(PublicError::Protocol)?;
-            let actual =
-                static_psk_fingerprint(configured).map_err(|_| PublicError::ModeUnavailable)?;
-            if !constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
-                return Err(PublicError::ModeUnavailable);
+            // Recomputed for this transaction, so the comparison proves
+            // possession *now* rather than matching a stable identifier an
+            // observer could have harvested from an earlier negotiation.
+            let expected = static_psk_commitment(
+                configured,
+                &request.transaction_id,
+                &request.client_nonce,
+                &request.server_challenge,
+                &request.client_wg_public_key,
+                gateway_wg_public_key,
+            )
+            .map_err(|_| PublicError::Rejected)?;
+            if !commitments_match(&expected, presented) {
+                return Err(PublicError::Rejected);
             }
             Some(SecretString::new(configured.to_string()))
         }
@@ -132,17 +198,6 @@ pub fn prepare_key_material(
     };
 
     Ok(PreparedKeyMaterial { response, psk })
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
 }
 
 /// DER material loaded from a protected local store.
@@ -195,8 +250,23 @@ pub struct PreparedNegotiation {
     pub confirmation_timeout: Duration,
 }
 
+/// What the gateway announces in a challenge, before anyone is authenticated.
+///
+/// Public by construction: both values are already in every client profile.
+/// Announcing them lets a client detect a wrong or substituted endpoint
+/// before spending an ML-DSA-87 signature on it.
+#[derive(Debug, Clone)]
+pub struct GatewayIdentity {
+    pub wg_public_key: String,
+    pub server_name: String,
+}
+
 #[async_trait]
 pub trait NegotiationHandler: Send + Sync + 'static {
+    /// Identity to put in a challenge. Must be what the gateway actually
+    /// serves, not what its configuration file says it should serve.
+    fn announced_identity(&self) -> GatewayIdentity;
+
     async fn prepare(
         &self,
         certificate_sha256: String,
@@ -208,24 +278,59 @@ pub trait NegotiationHandler: Send + Sync + 'static {
         confirmation: AuthenticatedKeyNegotiationConfirmation,
     ) -> Result<AuthenticatedKeyNegotiationCommit, PublicError>;
 
+    /// Undoes a transaction that never reached its commit.
+    ///
+    /// Only callable **before** the commit is signed. After that point there
+    /// is no rollback: see the ordering in `heliosd::key_negotiation`.
     async fn rollback(&self, transaction_id: [u8; 16]);
 
-    /// The client hung up after a committed transaction.
+    /// Explicit teardown, authenticated exactly like a request.
     ///
-    /// Distinct from [`Self::rollback`], which undoes a transaction that never
-    /// completed: here the tunnel existed and is now over. The gateway can
-    /// release the slot immediately instead of waiting for handshakes to stop.
-    async fn disconnected(&self, transaction_id: [u8; 16]);
+    /// Replaces v4's `disconnected`, which inferred teardown from a closed
+    /// connection. Inference is gone: a closed connection now means nothing
+    /// at all, and only this signed message — or the data plane going quiet —
+    /// removes a PSK.
+    async fn release(
+        &self,
+        certificate_sha256: String,
+        release: AuthenticatedPskRelease,
+    ) -> Result<AuthenticatedPskReleased, PublicError>;
+}
+
+/// What a client sends. Tagged, because v5 has two entry points on the same
+/// port — negotiating a PSK, and releasing one — plus the challenge phase
+/// that precedes both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ClientMessage {
+    ChallengeRequest {
+        protocol_version: u16,
+    },
+    Request {
+        request: Box<AuthenticatedKeyNegotiationRequest>,
+    },
+    Confirmation {
+        confirmation: AuthenticatedKeyNegotiationConfirmation,
+    },
+    Release {
+        release: Box<AuthenticatedPskRelease>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServerMessage {
+    Challenge {
+        challenge: KeyNegotiationChallenge,
+    },
     Response {
         response: Box<AuthenticatedKeyNegotiationResponse>,
     },
     Committed {
         commit: AuthenticatedKeyNegotiationCommit,
+    },
+    Released {
+        released: Box<AuthenticatedPskReleased>,
     },
     Error {
         error: PublicError,
@@ -233,23 +338,36 @@ enum ServerMessage {
 }
 
 /// Deliberately coarse error sent to an unauthenticated network boundary.
+///
+/// # Why there are only three
+///
+/// v4 exposed seven. Three of them — `identity_mismatch`, `downgrade`,
+/// `busy` — answered questions an attacker had no right to ask: they let
+/// anyone enumerate admitted peers and read their security floor from a
+/// public port, by sending requests and reading which refusal came back.
+///
+/// v5 keeps the causes and stops publishing them. Every pre-installation
+/// refusal is [`Self::Rejected`], whatever produced it: unknown peer, wrong
+/// TLS fingerprint, invalid or unadmitted PQ certificate, bad signature,
+/// missing or spent challenge, clock outside the window, mode below the
+/// floor, concurrent transaction, wrong gateway. The real reason is named in
+/// the gateway's protected journal, where an operator reads it and an
+/// attacker does not.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
 pub enum PublicError {
-    #[error("request was rejected")]
-    Rejected,
-    #[error("peer certificate is not bound to this WireGuard identity")]
-    IdentityMismatch,
-    #[error("protection mode is unavailable for this peer")]
-    ModeUnavailable,
-    #[error("selected protection mode is below the peer security floor")]
-    Downgrade,
-    #[error("another key negotiation is already active for this peer")]
-    Busy,
-    #[error("data-plane configuration failed")]
-    DataPlane,
+    /// Malformed frame, encoding or version — decided before authentication.
     #[error("protocol message is invalid")]
     Protocol,
+    /// Any refusal **before** the slot is installed.
+    #[error("request was rejected")]
+    Rejected,
+    /// Failure at or after slot installation.
+    ///
+    /// Only ever observable by a peer that is already authenticated and
+    /// admitted, so it tells an outsider nothing.
+    #[error("the gateway could not complete an authenticated request")]
+    Internal,
 }
 
 /// Builds a QUIC server requiring a client certificate rooted in `client_ca`.
@@ -288,9 +406,8 @@ fn pinned_transport() -> quinn::TransportConfig {
     // on working until the next WireGuard rekey — then died, two to three
     // minutes in, for no reason either end announced. Keep-alives are what
     // make silence mean "still here".
-    transport.keep_alive_interval(Some(LINK_KEEP_ALIVE));
     transport.max_idle_timeout(Some(
-        LINK_IDLE_TIMEOUT
+        TRANSACTION_IDLE_TIMEOUT
             .try_into()
             .expect("the idle timeout fits QUIC's varint"),
     ));
@@ -300,20 +417,24 @@ fn pinned_transport() -> quinn::TransportConfig {
 /// Datagram size every QUIC path must carry (RFC 9000 §14).
 const SAFE_UDP_PAYLOAD: u16 = 1200;
 
-/// Beat that keeps the liveness link alive.
+/// Silence after which a **transaction** connection is abandoned.
 ///
-/// Comfortably under [`LINK_IDLE_TIMEOUT`] so that losing one or two beats
-/// does not kill a tunnel. Two small datagrams per ten seconds and per client
-/// is a negligible price for the property they buy: the gateway holds the PSK
-/// for exactly as long as the client is there, and not one second less.
-const LINK_KEEP_ALIVE: Duration = Duration::from_secs(10);
-
-/// Silence after which the link is considered dead.
+/// This is not a liveness mechanism, and nothing about the tunnel depends on
+/// it: since v5 the connection is closed as soon as the commit is delivered,
+/// and a PSK is never released because a connection went away.
 ///
-/// Three missed beats. Short enough that the gateway frees the slot of a
-/// client that truly vanished — a crash, a laptop lid — rather than waiting
-/// for handshakes to go stale 150 s later.
-const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
+/// It exists for one reason. Between the response and the confirmation the
+/// client is waiting on a WireGuard handshake and neither end sends anything
+/// — up to [`DEFAULT_CONFIRMATION_TIMEOUT`]. QUIC's own default of thirty
+/// seconds would tear the connection down in the middle of that wait, which
+/// would look exactly like a gateway that stopped answering. Sixty seconds
+/// clears the confirmation window with room to spare.
+///
+/// The v4 keep-alive is gone with the link it kept alive. Nothing here should
+/// ever be reintroduced as a way of inferring that a peer is still there:
+/// that question is now answered by the data plane
+/// (`helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS`).
+const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Time allowed for the QUIC handshake with the negotiation service.
 ///
@@ -322,6 +443,15 @@ const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(35);
 /// the very first thing a client does, and the port is not the WireGuard one
 /// — forgetting to forward it is the ordinary mistake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for a peer to take the last frame before the connection goes.
+const COMMIT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Time allowed for the gateway's challenge.
+///
+/// It costs the gateway one RNG read and no signature, so anything slower
+/// than this is a path problem rather than a load problem.
+const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Time allowed for the gateway's negotiation answer.
 ///
@@ -354,6 +484,18 @@ pub fn server_endpoint(
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = pinned_transport();
     transport.max_concurrent_bidi_streams(1u32.into());
+    // Nothing in this protocol ever opens a unidirectional stream. Leaving
+    // quinn's default in place would let a peer open a hundred of them and
+    // hold receive buffers the exchange has no use for.
+    transport.max_concurrent_uni_streams(0u32.into());
+    // The receive windows bound what one connection can make the gateway
+    // buffer before the frame length is even parsed. A negotiation moves tens
+    // of kilobytes in a couple of round-trips, so twice the maximum message
+    // is generous for the protocol and far below quinn's default.
+    let window = u32::try_from(2 * MAX_KEY_NEGOTIATION_MESSAGE_BYTES)
+        .expect("the message bound fits a QUIC flow-control window");
+    transport.stream_receive_window(window.into());
+    transport.receive_window(window.into());
     // The gateway answers with the bulkiest half of the exchange — ciphertext
     // and signature — so the size limit matters at least as much here as on
     // the client side.
@@ -436,28 +578,56 @@ fn client_config(
 }
 
 /// Serves connections until the endpoint is closed.
-/// Counts recent handshakes per source address.
+/// The bucket a source address is counted in.
 ///
-/// Deliberately a plain map behind a mutex rather than a background sweeper:
-/// entries are pruned on insertion, so an address that stops talking costs
-/// nothing, and the map never outgrows the number of addresses seen within one
-/// window.
-#[derive(Default)]
-struct SourceLimiter {
-    seen: std::collections::HashMap<std::net::IpAddr, (Instant, u32)>,
+/// IPv4 is counted per address. IPv6 is counted per **`/64`**, because that is
+/// the smallest block an ordinary subscriber is handed: counting per exact
+/// address would let one host walk through 2^64 of them and never reach the
+/// limit, which makes the whole per-source budget decorative on IPv6.
+///
+/// The trade-off is deliberate and stated: several legitimate clients behind
+/// one `/64` share one budget, exactly as several clients behind one IPv4 NAT
+/// already do.
+fn rate_bucket(source: std::net::IpAddr) -> std::net::IpAddr {
+    match source {
+        std::net::IpAddr::V4(v4) => std::net::IpAddr::V4(v4),
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    }
 }
 
-impl SourceLimiter {
-    /// `true` if this address may open one more handshake.
-    fn admit(&mut self, source: std::net::IpAddr, now: Instant) -> bool {
+/// Counts recent events per key, over a sliding window.
+///
+/// Deliberately a plain map behind a mutex rather than a background sweeper:
+/// entries are pruned on insertion, so a key that stops appearing costs
+/// nothing, and the map never outgrows the number of keys seen within one
+/// window.
+struct RateLimiter<K> {
+    seen: std::collections::HashMap<K, (Instant, u32)>,
+    budget: u32,
+}
+
+impl<K: std::hash::Hash + Eq> RateLimiter<K> {
+    fn new(budget: u32) -> Self {
+        Self {
+            seen: std::collections::HashMap::new(),
+            budget,
+        }
+    }
+
+    /// `true` if this key may consume one more unit of budget.
+    fn admit(&mut self, key: K, now: Instant) -> bool {
         self.seen
             .retain(|_, (started, _)| now.duration_since(*started) < SOURCE_RATE_WINDOW);
-        let entry = self.seen.entry(source).or_insert((now, 0));
+        let entry = self.seen.entry(key).or_insert((now, 0));
         if now.duration_since(entry.0) >= SOURCE_RATE_WINDOW {
             *entry = (now, 0);
         }
         entry.1 += 1;
-        entry.1 <= MAX_HANDSHAKES_PER_SOURCE
+        entry.1 <= self.budget
     }
 }
 
@@ -483,7 +653,17 @@ impl SourceLimiter {
 /// [`MAX_ACTIVE_NEGOTIATIONS`] then bounds concurrency for what gets through.
 pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
     let capacity = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_NEGOTIATIONS));
-    let limiter = Arc::new(std::sync::Mutex::new(SourceLimiter::default()));
+    let limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(
+        MAX_HANDSHAKES_PER_SOURCE,
+    )));
+    // Counted once mTLS has named a peer, which is a different question from
+    // the address budget above. A holder of one admitted certificate roaming
+    // across addresses — or simply behind a large provider — would otherwise
+    // face no limit at all, and every negotiation it opens costs the gateway
+    // an ML-DSA-87 verification and an ML-KEM encapsulation.
+    let per_identity = Arc::new(std::sync::Mutex::new(RateLimiter::new(
+        MAX_NEGOTIATIONS_PER_IDENTITY,
+    )));
 
     while let Some(incoming) = endpoint.accept().await {
         // Before any allocation or cryptography: prove the address is real.
@@ -498,7 +678,7 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
         let source = incoming.remote_address().ip();
         let admitted = limiter
             .lock()
-            .map(|mut limiter| limiter.admit(source, Instant::now()))
+            .map(|mut limiter| limiter.admit(rate_bucket(source), Instant::now()))
             // A poisoned lock must not open the port wide: refuse instead.
             .unwrap_or(false);
         if !admitted {
@@ -515,9 +695,24 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
             }
         };
         let handler = Arc::clone(&handler);
+        let per_identity = Arc::clone(&per_identity);
         tokio::spawn(async move {
             let remote = incoming.remote_address();
-            if let Err(error) = handle_connection(incoming, handler, permit).await {
+            // The absolute ceiling. `handle_connection` bounds each phase it
+            // waits on, but the sum of well-behaved phases is not itself
+            // bounded — this is what makes it so.
+            let served = tokio::time::timeout(
+                MAX_CONNECTION_LIFETIME,
+                handle_connection(incoming, handler, permit, per_identity),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(TransportError::Protocol(format!(
+                    "connection exceeded its {} s absolute lifetime",
+                    MAX_CONNECTION_LIFETIME.as_secs()
+                )))
+            });
+            if let Err(error) = served {
                 // `aborted by peer` means the **client** hung up, and the text
                 // that follows is its own error crossing the wire. Naming the
                 // direction stops an operator reading a client-side refusal as
@@ -537,11 +732,30 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     handler: Arc<dyn NegotiationHandler>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    per_identity: Arc<std::sync::Mutex<RateLimiter<String>>>,
 ) -> Result<(), TransportError> {
     let started = Instant::now();
     let remote = incoming.remote_address();
     let connection = incoming.await.map_err(TransportError::Connection)?;
     let fingerprint = peer_certificate_sha256(&connection)?;
+    // Now that mTLS has named the peer, charge it. A per-address budget does
+    // not bound a single admitted identity that roams.
+    let within_budget = per_identity
+        .lock()
+        .map(|mut limiter| limiter.admit(fingerprint.clone(), Instant::now()))
+        // A poisoned lock must not open the port wide: refuse instead.
+        .unwrap_or(false);
+    if !within_budget {
+        tracing::warn!(
+            %remote,
+            client_certificate_sha256 = %fingerprint,
+            "key-negotiation rate exceeded for this admitted identity"
+        );
+        connection.close(0u32.into(), b"rate");
+        return Err(TransportError::Protocol(
+            "negotiation rate exceeded for this identity".into(),
+        ));
+    }
     // The fingerprint is what `heliosd peer add` was given: printing it here
     // makes an admission mismatch a comparison rather than a deduction.
     tracing::info!(
@@ -555,7 +769,121 @@ async fn handle_connection(
         .accept_bi()
         .await
         .map_err(TransportError::Connection)?;
-    let request: AuthenticatedKeyNegotiationRequest = read_frame(&mut recv).await?;
+
+    // The challenge lives here — in this task's stack, for this connection —
+    // and nowhere else. That is the whole anti-replay design of v5, and it is
+    // why it needed no global table, no persistence and no counter: an
+    // `Option` owned by a single task is consumed exactly once by
+    // construction, so two requests bearing the same challenge cannot both be
+    // accepted even in principle. The 128-connection ceiling already bounds
+    // how many can exist.
+    let mut issued_challenge: Option<[u8; SERVER_CHALLENGE_LEN]> = None;
+    let mut challenge_requests = 0u32;
+    let challenge_deadline = Instant::now() + CHALLENGE_VALIDITY;
+
+    let request = loop {
+        match read_frame::<ClientMessage>(&mut recv).await? {
+            ClientMessage::ChallengeRequest { protocol_version } => {
+                // Exactly one per connection. Each costs a CSPRNG read and a
+                // frame, and answering an unbounded stream of them is free
+                // work for an attacker who never intends to negotiate. The
+                // previous code merely replaced the live challenge, which
+                // bounded how many were *valid* at once but not how many the
+                // gateway would produce.
+                if challenge_requests > 0 {
+                    write_frame(
+                        &mut send,
+                        &ServerMessage::Error {
+                            error: PublicError::Protocol,
+                        },
+                    )
+                    .await?;
+                    return Err(TransportError::Protocol(
+                        "a connection may request only one challenge".into(),
+                    ));
+                }
+                challenge_requests += 1;
+                if protocol_version != KEY_NEGOTIATION_VERSION {
+                    write_frame(
+                        &mut send,
+                        &ServerMessage::Error {
+                            error: PublicError::Protocol,
+                        },
+                    )
+                    .await?;
+                    return Err(TransportError::Protocol(format!(
+                        "unsupported protocol version {protocol_version}"
+                    )));
+                }
+                let challenge = random_challenge()?;
+                issued_challenge = Some(challenge);
+                let identity = handler.announced_identity();
+                write_frame(
+                    &mut send,
+                    &ServerMessage::Challenge {
+                        challenge: KeyNegotiationChallenge {
+                            protocol_version: KEY_NEGOTIATION_VERSION,
+                            server_challenge: challenge,
+                            gateway_wg_public_key: identity.wg_public_key,
+                            server_name: identity.server_name,
+                            expires_in_secs: CHALLENGE_VALIDITY.as_secs() as u32,
+                        },
+                    },
+                )
+                .await?;
+            }
+            // A release is the other thing this port does. It reuses the
+            // challenge phase, the mTLS identity and the same coarse errors.
+            ClientMessage::Release { release } => {
+                let outcome = match consume_challenge(
+                    &mut issued_challenge,
+                    challenge_deadline,
+                    release.release.server_challenge,
+                ) {
+                    Ok(()) => handler.release(fingerprint, *release).await,
+                    Err(error) => Err(error),
+                };
+                match outcome {
+                    Ok(released) => {
+                        write_frame(
+                            &mut send,
+                            &ServerMessage::Released {
+                                released: Box::new(released),
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => write_frame(&mut send, &ServerMessage::Error { error }).await?,
+                }
+                drain_then_close(&connection, &mut send, "psk released").await;
+                return Ok(());
+            }
+            ClientMessage::Request { request } => {
+                if let Err(error) = consume_challenge(
+                    &mut issued_challenge,
+                    challenge_deadline,
+                    request.request.server_challenge,
+                ) {
+                    write_frame(&mut send, &ServerMessage::Error { error }).await?;
+                    return Ok(());
+                }
+                break *request;
+            }
+            ClientMessage::Confirmation { .. } => {
+                write_frame(
+                    &mut send,
+                    &ServerMessage::Error {
+                        error: PublicError::Protocol,
+                    },
+                )
+                .await?;
+                return Err(TransportError::Protocol(
+                    "confirmation received before any negotiation".into(),
+                ));
+            }
+        }
+    };
+
     if let Err(error) = request.request.validate() {
         write_frame(
             &mut send,
@@ -568,6 +896,7 @@ async fn handle_connection(
     }
 
     let transaction_id = request.request.transaction_id;
+    let server_challenge = request.request.server_challenge;
     let prepared = match handler.prepare(fingerprint, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -590,87 +919,129 @@ async fn handle_connection(
 
     let confirmation = tokio::time::timeout(
         prepared.confirmation_timeout,
-        read_frame::<AuthenticatedKeyNegotiationConfirmation>(&mut recv),
+        read_frame::<ClientMessage>(&mut recv),
     )
     .await;
-    match confirmation {
-        Ok(Ok(message))
-            if message.confirmation.protocol_version == KEY_NEGOTIATION_VERSION
-                && message.confirmation.transaction_id == transaction_id =>
+    let message = match confirmation {
+        Ok(Ok(ClientMessage::Confirmation { confirmation }))
+            if confirmation.confirmation.protocol_version == KEY_NEGOTIATION_VERSION
+                && confirmation.confirmation.transaction_id == transaction_id
+                && confirmation.confirmation.server_challenge == server_challenge =>
         {
-            let commit = match handler.confirm(message).await {
-                Ok(commit) => commit,
-                Err(error) => {
-                    handler.rollback(transaction_id).await;
-                    write_frame(
-                        &mut send,
-                        &ServerMessage::Error {
-                            error: error.clone(),
-                        },
-                    )
-                    .await?;
-                    return Err(TransportError::Protocol(error.to_string()));
-                }
-            };
-            let delivery = async {
-                write_frame(&mut send, &ServerMessage::Committed { commit }).await?;
-                send.finish().map_err(TransportError::ClosedStream)?;
-                tokio::time::timeout(Duration::from_secs(5), send.stopped())
-                    .await
-                    .map_err(|_| TransportError::CommitDeliveryTimeout)?
-                    .map_err(TransportError::Stopped)
-            }
-            .await;
-            if let Err(error) = delivery {
-                handler.rollback(transaction_id).await;
-                return Err(error);
-            }
-
-            // The expensive part is over: release the concurrency permit
-            // before waiting, so a long-lived tunnel does not hold a slot
-            // that only exists to bound handshake cost.
-            drop(permit);
-
-            // From here the connection is a liveness link. Its closure — an
-            // explicit disconnect, a crash, or a dead network — is what tells
-            // the gateway to release the slot without waiting 150 s for
-            // handshakes to go stale.
-            connection.closed().await;
-            handler.disconnected(transaction_id).await;
+            confirmation
         }
-        _ => handler.rollback(transaction_id).await,
+        // Timed out, unreadable, or not the transaction we are holding.
+        _ => {
+            handler.rollback(transaction_id).await;
+            return Ok(());
+        }
+    };
+
+    // Point of no return. `confirm` persists the floor and signs the commit,
+    // in that order; once it returns Ok there is no rollback, and none of the
+    // failures below may reach for one. A commit that cannot be delivered
+    // leaves the slot armed on this side and the client renegotiates — which
+    // converges — whereas restoring the slot behind a signed commit would put
+    // a valid, verifiable commit in a client's hands against a gateway that
+    // had undone everything. That was the v4 behaviour, and it is the double
+    // semantics v5 exists to remove.
+    let commit = match handler.confirm(message).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            handler.rollback(transaction_id).await;
+            write_frame(
+                &mut send,
+                &ServerMessage::Error {
+                    error: error.clone(),
+                },
+            )
+            .await?;
+            return Err(TransportError::Protocol(error.to_string()));
+        }
+    };
+
+    if let Err(error) = write_frame(&mut send, &ServerMessage::Committed { commit }).await {
+        tracing::warn!(
+            %remote,
+            transaction = %hex::encode(transaction_id),
+            error = %error,
+            "commit could not be sent; the slot stays armed and the client will \
+             renegotiate — this is not a rollback"
+        );
+        return Err(error);
+    }
+
+    // Closed, not kept. The connection carried a transaction and that
+    // transaction is over; nothing about the tunnel depends on it any more.
+    // Liveness is read from the data plane by both ends.
+    //
+    // The drain is not politeness: closing a QUIC connection discards data
+    // the peer has not read, so hanging up straight after the write loses the
+    // commit on a fast local path. A lost commit is survivable — the client
+    // renegotiates — but losing it *every* time would make the nominal case
+    // the degraded one.
+    drain_then_close(&connection, &mut send, "negotiation committed").await;
+    drop(permit);
+    Ok(())
+}
+
+/// Finishes a stream, waits for the peer to have taken it, then hangs up.
+///
+/// Failures are logged and swallowed: this runs after the point of no return,
+/// where there is nothing left to undo and nothing useful to return.
+async fn drain_then_close(connection: &Connection, send: &mut SendStream, reason: &'static str) {
+    if let Err(error) = send.finish() {
+        tracing::debug!(%error, "stream already closed by the peer");
+    }
+    match tokio::time::timeout(COMMIT_DELIVERY_TIMEOUT, send.stopped()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::debug!(%error, "peer reset the stream before acknowledging it"),
+        Err(_) => tracing::warn!(
+            timeout_s = COMMIT_DELIVERY_TIMEOUT.as_secs(),
+            "peer never acknowledged the final frame"
+        ),
+    }
+    connection.close(0u32.into(), reason.as_bytes());
+}
+
+/// Checks a presented challenge against the one this connection issued, and
+/// spends it.
+///
+/// `Option::take` is the atomic consumption the specification asks for: the
+/// value is owned by one task, so a second request carrying the same
+/// challenge finds `None`. No lock is involved because there is nothing to
+/// share.
+///
+/// Every failure is [`PublicError::Rejected`] — absent, expired, mismatched
+/// and already-spent are indistinguishable on the wire, and the caller
+/// journals which one it was.
+fn consume_challenge(
+    issued: &mut Option<[u8; SERVER_CHALLENGE_LEN]>,
+    deadline: Instant,
+    presented: [u8; SERVER_CHALLENGE_LEN],
+) -> Result<(), PublicError> {
+    let Some(expected) = issued.take() else {
+        tracing::warn!("key negotiation: request without a live challenge on this connection");
+        return Err(PublicError::Rejected);
+    };
+    if Instant::now() > deadline {
+        tracing::warn!("key negotiation: challenge expired before it was used");
+        return Err(PublicError::Rejected);
+    }
+    if expected != presented {
+        tracing::warn!("key negotiation: request carries a challenge this connection never issued");
+        return Err(PublicError::Rejected);
     }
     Ok(())
 }
 
-/// Live link kept open for as long as the tunnel is meant to exist.
-///
-/// # Why the session outlives the negotiation
-///
-/// WireGuard is connectionless: when one end goes away, the other only finds
-/// out when handshakes stop being answered — up to 150 s later. For that whole
-/// window Orion shows a tunnel that is already dead, and Helios keeps a PSK
-/// slot for a peer that is gone.
-///
-/// The QUIC connection that carried the negotiation solves this for free. It
-/// is authenticated, it is already there, and **its closure is a signal**:
-/// whoever hangs up — deliberately, or by crashing — is noticed by the other
-/// end within a round-trip rather than within two and a half minutes.
-#[derive(Clone)]
-pub struct SessionLink {
-    connection: Connection,
-}
-
-impl SessionLink {
-    /// Resolves as soon as the peer closes the link, whatever the reason.
-    pub async fn closed(&self) {
-        self.connection.closed().await;
-    }
-
-    /// Hangs up, telling the peer the tunnel is going down now.
-    pub fn close(&self) {
-        self.connection.close(0u32.into(), b"tunnel closed by peer");
-    }
+fn random_challenge() -> Result<[u8; SERVER_CHALLENGE_LEN], TransportError> {
+    use aws_lc_rs::rand::SecureRandom as _;
+    let mut challenge = [0u8; SERVER_CHALLENGE_LEN];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut challenge)
+        .map_err(|_| TransportError::Protocol("system RNG failed to produce a challenge".into()))?;
+    Ok(challenge)
 }
 
 /// Active client session. Confirmation consumes it to prevent duplicate commit.
@@ -680,21 +1051,34 @@ pub struct ClientSession {
     send: SendStream,
     recv: RecvStream,
     transaction_id: [u8; 16],
+    server_challenge: [u8; SERVER_CHALLENGE_LEN],
 }
 
 impl ClientSession {
+    /// Sends the confirmation and reads the commit, then **hangs up**.
+    ///
+    /// v4 handed the connection back as a liveness link. v5 does not: the
+    /// transaction is the whole purpose of the connection, and keeping it
+    /// open tied the life of a tunnel to the life of a control connection on
+    /// a WAN path. Any network blip longer than 35 seconds killed a healthy
+    /// tunnel.
     pub async fn confirm(
         mut self,
         confirmation: AuthenticatedKeyNegotiationConfirmation,
-    ) -> Result<(AuthenticatedKeyNegotiationCommit, SessionLink), TransportError> {
+    ) -> Result<AuthenticatedKeyNegotiationCommit, TransportError> {
         if confirmation.confirmation.protocol_version != KEY_NEGOTIATION_VERSION
             || confirmation.confirmation.transaction_id != self.transaction_id
+            || confirmation.confirmation.server_challenge != self.server_challenge
         {
             return Err(TransportError::Protocol(
                 "client confirmation does not match the active transaction".into(),
             ));
         }
-        write_frame(&mut self.send, &confirmation).await?;
+        write_frame(
+            &mut self.send,
+            &ClientMessage::Confirmation { confirmation },
+        )
+        .await?;
         self.send.finish().map_err(TransportError::ClosedStream)?;
         let committed = tokio::time::timeout(
             Duration::from_secs(5),
@@ -703,7 +1087,10 @@ impl ClientSession {
         .await
         .map_err(|_| TransportError::CommitTimeout)??;
         let commit = match committed {
-            ServerMessage::Committed { commit } if commit.transaction_id == self.transaction_id => {
+            ServerMessage::Committed { commit }
+                if commit.transaction_id == self.transaction_id
+                    && commit.server_challenge == self.server_challenge =>
+            {
                 commit
             }
             ServerMessage::Error { error } => return Err(TransportError::Rejected(error)),
@@ -713,33 +1100,20 @@ impl ClientSession {
                 ))
             }
         };
-        // The connection is handed back rather than dropped: from here on it
-        // is the link whose closure tells the gateway this tunnel is over.
-        Ok((
-            commit,
-            SessionLink {
-                connection: self.connection,
-            },
-        ))
+        self.connection.close(0u32.into(), b"negotiation committed");
+        Ok(commit)
     }
 }
 
-pub async fn negotiate(
+/// Opens a connection, takes a challenge, and returns it with the streams.
+///
+/// Shared by both entry points, because a release authenticates exactly like
+/// a request: same mTLS, same challenge phase, same refusals.
+async fn open_with_challenge(
     endpoint: &Endpoint,
     remote: SocketAddr,
     server_name: &str,
-    request: &AuthenticatedKeyNegotiationRequest,
-) -> Result<(AuthenticatedKeyNegotiationResponse, ClientSession), TransportError> {
-    request
-        .request
-        .validate()
-        .map_err(|error| TransportError::Protocol(error.to_string()))?;
-    // Bounded, both of them. QUIC only gives up on its own when *nothing*
-    // arrives; a gateway whose service answers at the transport level and
-    // then says nothing — because it is holding a stale transaction for this
-    // peer, say — leaves the client waiting for good. That wait has no
-    // visible end: the interface is up, the UI announces «connexion…», and
-    // nothing ever contradicts it.
+) -> Result<(Connection, SendStream, RecvStream, KeyNegotiationChallenge), TransportError> {
     let started = Instant::now();
     tracing::info!(
         %remote,
@@ -795,11 +1169,122 @@ pub async fn negotiate(
             .unwrap_or_else(|_| "absente".into()),
         "quic: handshake complete, gateway certificate accepted"
     );
+
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(TransportError::Connection)?;
-    write_frame(&mut send, request).await?;
+    write_frame(
+        &mut send,
+        &ClientMessage::ChallengeRequest {
+            protocol_version: KEY_NEGOTIATION_VERSION,
+        },
+    )
+    .await?;
+    let challenge =
+        match tokio::time::timeout(CHALLENGE_TIMEOUT, read_frame::<ServerMessage>(&mut recv))
+            .await
+            .map_err(|_| TransportError::ResponseTimeout(CHALLENGE_TIMEOUT.as_secs()))??
+        {
+            ServerMessage::Challenge { challenge } => challenge,
+            ServerMessage::Error { error } => return Err(TransportError::Rejected(error)),
+            _ => {
+                return Err(TransportError::Protocol(
+                    "gateway answered a challenge request with something else".into(),
+                ))
+            }
+        };
+    Ok((connection, send, recv, challenge))
+}
+
+/// Asks the gateway for a challenge and checks the identity it announces.
+///
+/// The check happens here, before any signature is produced: reaching the
+/// wrong gateway and reaching a substituted one look identical from the
+/// client, and both are cheaper to detect now than after an ML-DSA-87
+/// operation.
+pub async fn request_challenge(
+    endpoint: &Endpoint,
+    remote: SocketAddr,
+    server_name: &str,
+    expected_gateway_wg_public_key: &str,
+) -> Result<PendingChallenge, TransportError> {
+    let (connection, send, recv, challenge) =
+        open_with_challenge(endpoint, remote, server_name).await?;
+    challenge
+        .validate_against(expected_gateway_wg_public_key, server_name)
+        .map_err(|error| {
+            tracing::warn!(
+                %remote,
+                announced_wg_public_key = %challenge.gateway_wg_public_key,
+                announced_server_name = %challenge.server_name,
+                expected_wg_public_key = %expected_gateway_wg_public_key,
+                expected_server_name = %server_name,
+                "quic: the gateway announces an identity the profile does not pin"
+            );
+            TransportError::Protocol(error.to_string())
+        })?;
+    Ok(PendingChallenge {
+        connection,
+        send,
+        recv,
+        challenge,
+    })
+}
+
+/// A challenge in hand, on a connection ready to carry one transaction.
+pub struct PendingChallenge {
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    challenge: KeyNegotiationChallenge,
+}
+
+impl PendingChallenge {
+    pub fn server_challenge(&self) -> [u8; SERVER_CHALLENGE_LEN] {
+        self.challenge.server_challenge
+    }
+}
+
+/// Sends the signed request on the connection that issued its challenge.
+///
+/// The challenge and the connection are inseparable: a request is only valid
+/// on the connection whose challenge it carries, so this consumes the
+/// [`PendingChallenge`] rather than taking an endpoint.
+pub async fn negotiate(
+    endpoint: &Endpoint,
+    pending: PendingChallenge,
+    request: &AuthenticatedKeyNegotiationRequest,
+) -> Result<(AuthenticatedKeyNegotiationResponse, ClientSession), TransportError> {
+    request
+        .request
+        .validate()
+        .map_err(|error| TransportError::Protocol(error.to_string()))?;
+    if request.request.server_challenge != pending.challenge.server_challenge {
+        return Err(TransportError::Protocol(
+            "request does not carry the challenge issued on this connection".into(),
+        ));
+    }
+    let PendingChallenge {
+        connection,
+        mut send,
+        mut recv,
+        challenge,
+    } = pending;
+
+    write_frame(
+        &mut send,
+        &ClientMessage::Request {
+            request: Box::new(request.clone()),
+        },
+    )
+    .await?;
+    // Bounded. QUIC only gives up on its own when *nothing* arrives; a gateway
+    // whose service answers at the transport level and then says nothing —
+    // because it is holding a stale transaction for this peer, say — leaves
+    // the client waiting for good. That wait has no visible end: the
+    // interface is up, the UI announces «connexion…», and nothing ever
+    // contradicts it.
     let answer = match tokio::time::timeout(
         RESPONSE_TIMEOUT,
         read_frame::<ServerMessage>(&mut recv),
@@ -807,11 +1292,7 @@ pub async fn negotiate(
     .await
     {
         Err(_) => {
-            // A gateway that answered at the transport level and then said
-            // nothing: reached, authenticated, and stuck — most often on a
-            // stale transaction still held for this peer.
             tracing::warn!(
-                %remote,
                 timeout_s = RESPONSE_TIMEOUT.as_secs(),
                 rtt_ms = connection.rtt().as_millis(),
                 "quic: connection established but no negotiation answer"
@@ -829,11 +1310,80 @@ pub async fn negotiate(
                 send,
                 recv,
                 transaction_id: request.request.transaction_id,
+                server_challenge: challenge.server_challenge,
             },
         )),
         ServerMessage::Error { error } => Err(TransportError::Rejected(error)),
-        ServerMessage::Committed { .. } => Err(TransportError::Protocol(
-            "server committed before sending negotiation material".into(),
+        _ => Err(TransportError::Protocol(
+            "server answered a negotiation request out of order".into(),
+        )),
+    }
+}
+
+/// Tells the gateway to drop the PSK a given transaction installed.
+///
+/// Best-effort by design: a host that is powered off, a network that is down
+/// or a process that is killed send nothing, and the slot then falls back on
+/// data-plane reclamation. Callers should log a failure and carry on tearing
+/// down rather than treat it as fatal — the client is disconnecting either
+/// way.
+pub async fn release_psk(
+    endpoint: &Endpoint,
+    remote: SocketAddr,
+    server_name: &str,
+    expected_gateway_wg_public_key: &str,
+    // The gateway PQ certificate pinned by the profile. The acknowledgment is
+    // verified against it before this returns: an unverified "released" is
+    // worth nothing, since anyone able to answer on this port could send one
+    // and have the client zeroise a PSK the gateway still holds — leaving a
+    // slot filled on one side only, which fails every handshake with no
+    // channel left to repair it.
+    pinned_gateway_pq_certificate: &aether::key_negotiation::PqCertificate,
+    build: impl FnOnce([u8; SERVER_CHALLENGE_LEN]) -> Result<AuthenticatedPskRelease, TransportError>,
+) -> Result<AuthenticatedPskReleased, TransportError> {
+    let pending = request_challenge(
+        endpoint,
+        remote,
+        server_name,
+        expected_gateway_wg_public_key,
+    )
+    .await?;
+    let release = build(pending.challenge.server_challenge)?;
+    let sent = release.release.clone();
+    let PendingChallenge {
+        connection,
+        mut send,
+        mut recv,
+        ..
+    } = pending;
+
+    write_frame(
+        &mut send,
+        &ClientMessage::Release {
+            release: Box::new(release),
+        },
+    )
+    .await?;
+    send.finish().map_err(TransportError::ClosedStream)?;
+    let answer = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame::<ServerMessage>(&mut recv))
+        .await
+        .map_err(|_| TransportError::ResponseTimeout(RESPONSE_TIMEOUT.as_secs()))??;
+    connection.close(0u32.into(), b"psk released");
+    match answer {
+        ServerMessage::Released { released } => {
+            released
+                .verify(&sent, pinned_gateway_pq_certificate)
+                .map_err(|error| {
+                    TransportError::Protocol(format!(
+                        "the release acknowledgment is not signed by the pinned gateway \
+                         certificate: {error}"
+                    ))
+                })?;
+            Ok(*released)
+        }
+        ServerMessage::Error { error } => Err(TransportError::Rejected(error)),
+        _ => Err(TransportError::Protocol(
+            "gateway answered a release with something else".into(),
         )),
     }
 }
@@ -974,7 +1524,7 @@ mod tests {
 
     use aether::key_negotiation::{
         authenticate_commit, authenticate_confirmation, authenticate_request,
-        authenticate_response, generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate,
+        authenticate_response, generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate,
         PqCertificateRole, ProtectionMode, KEY_NEGOTIATION_NONCE_LEN, PQ_CERTIFICATE_VERSION,
     };
     use base64::Engine as _;
@@ -986,13 +1536,41 @@ mod tests {
 
     const CLIENT_WG_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const GATEWAY_WG_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const TEST_SERVER_NAME: &str = "gateway.test";
+    const TEST_CHALLENGE: [u8; SERVER_CHALLENGE_LEN] = [5; SERVER_CHALLENGE_LEN];
+    const GATEWAY_CERT_FINGERPRINT: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// The cheapest request a v5 decoder accepts.
+    ///
+    /// Was a `classic` request until that mode stopped being negotiable.
+    /// `static_psk` costs one HMAC to build, where `ml_kem` costs a keypair.
+    fn simple_request(transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN]) -> KeyNegotiationRequest {
+        let mut request = KeyNegotiationRequest {
+            protocol_version: KEY_NEGOTIATION_VERSION,
+            server_challenge: TEST_CHALLENGE,
+            transaction_id,
+            mode: ProtectionMode::StaticPsk,
+            client_wg_public_key: CLIENT_WG_KEY.into(),
+            gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+            server_name: TEST_SERVER_NAME.into(),
+            gateway_certificate_fingerprint: GATEWAY_CERT_FINGERPRINT.into(),
+            client_nonce: [2; KEY_NEGOTIATION_NONCE_LEN],
+            timestamp_unix: test_now(),
+            kem_public_key: None,
+            static_psk_commitment: None,
+        };
+        let psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        request.static_psk_commitment = Some(commitment(&psk, &request));
+        request
+    }
 
     /// Address validation proves an address is real, not that it is
     /// friendly. This bound is what keeps a validated attacker's CPU cost
     /// linear in the number of addresses it actually holds.
     #[test]
     fn a_single_source_cannot_buy_unlimited_handshakes() {
-        let mut limiter = SourceLimiter::default();
+        let mut limiter = RateLimiter::new(MAX_HANDSHAKES_PER_SOURCE);
         let attacker: std::net::IpAddr = "203.0.113.9".parse().unwrap();
         let bystander: std::net::IpAddr = "203.0.113.10".parse().unwrap();
         let start = Instant::now();
@@ -1019,33 +1597,92 @@ mod tests {
         );
     }
 
+    /// Counting IPv6 per exact address is the same as not counting it.
+    ///
+    /// A subscriber is routinely handed a `/64`, which is 2^64 addresses: an
+    /// attacker with one of those can spend a fresh source for every single
+    /// handshake and never meet the budget. Bucketing by prefix is what makes
+    /// the IPv6 limit mean anything at all.
+    #[test]
+    fn an_ipv6_attacker_cannot_walk_out_of_its_own_budget() {
+        let mut limiter = RateLimiter::new(MAX_HANDSHAKES_PER_SOURCE);
+        let start = Instant::now();
+
+        // Every attempt from a different address inside one /64.
+        for attempt in 0..=MAX_HANDSHAKES_PER_SOURCE {
+            let source: std::net::IpAddr =
+                format!("2001:db8:1:1::{:x}", attempt + 1).parse().unwrap();
+            let admitted = limiter.admit(rate_bucket(source), start);
+            if attempt == MAX_HANDSHAKES_PER_SOURCE {
+                assert!(!admitted, "the whole /64 shares one budget");
+            } else {
+                assert!(admitted, "attempt {attempt} is within the budget");
+            }
+        }
+
+        // A neighbouring /64 is a different subscriber and keeps its own.
+        let neighbour: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        assert!(limiter.admit(rate_bucket(neighbour), start));
+    }
+
+    /// The concurrency permit is held for the whole connection, so a
+    /// connection that never ends is a permit that never returns.
+    #[test]
+    fn the_absolute_lifetime_covers_every_phase_it_must_contain() {
+        // A challenge round trip, then a preparation, then the longest
+        // confirmation wait a client may be told to observe.
+        let phases = CHALLENGE_TIMEOUT
+            + RESPONSE_TIMEOUT
+            + Duration::from_secs(aether::key_negotiation::MAX_CONFIRMATION_TIMEOUT_SECS as u64);
+        assert!(
+            MAX_CONNECTION_LIFETIME >= phases,
+            "an honest negotiation must never be cut short by the ceiling meant for hostile ones"
+        );
+        assert!(
+            MAX_CONNECTION_LIFETIME > TRANSACTION_IDLE_TIMEOUT,
+            "the ceiling exists because the idle timeout cannot bound a busy connection"
+        );
+    }
+
     #[test]
     fn all_modes_prepare_exactly_one_wireguard_slot_state() {
         let static_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
 
-        let classic = KeyNegotiationRequest {
+        let base = KeyNegotiationRequest {
             protocol_version: KEY_NEGOTIATION_VERSION,
+            server_challenge: TEST_CHALLENGE,
             transaction_id: [1; 16],
             mode: ProtectionMode::Classic,
             client_wg_public_key: CLIENT_WG_KEY.into(),
+            gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+            server_name: TEST_SERVER_NAME.into(),
+            gateway_certificate_fingerprint: GATEWAY_CERT_FINGERPRINT.into(),
             client_nonce: [2; 16],
             timestamp_unix: test_now(),
             kem_public_key: None,
-            static_psk_fingerprint: None,
+            static_psk_commitment: None,
         };
-        let prepared = prepare_key_material(
-            &classic,
-            GATEWAY_WG_KEY,
-            [3; 16],
-            Some(&static_psk),
-            DEFAULT_CONFIRMATION_TIMEOUT,
-        )
-        .unwrap();
-        assert!(prepared.psk.is_none());
+        // Every other mode prepares a slot. `classic` prepares nothing,
+        // because it no longer exists as a negotiation outcome: a tunnel with
+        // no preshared key is a plain WireGuard profile.
+        //
+        // `Protocol`, not `Rejected`: this is a decoding refusal, and it says
+        // nothing about the peer. That the mode is retired is public
+        // knowledge, unlike a peer's floor or its admission status.
+        assert!(matches!(
+            prepare_key_material(
+                &base,
+                GATEWAY_WG_KEY,
+                [3; 16],
+                Some(&static_psk),
+                DEFAULT_CONFIRMATION_TIMEOUT,
+            ),
+            Err(PublicError::Protocol)
+        ));
 
-        let mut static_request = classic.clone();
+        let mut static_request = base.clone();
         static_request.mode = ProtectionMode::StaticPsk;
-        static_request.static_psk_fingerprint = Some(static_psk_fingerprint(&static_psk).unwrap());
+        static_request.static_psk_commitment = Some(commitment(&static_psk, &static_request));
         let prepared = prepare_key_material(
             &static_request,
             GATEWAY_WG_KEY,
@@ -1057,7 +1694,7 @@ mod tests {
         assert_eq!(prepared.psk.unwrap().expose(), static_psk);
 
         let (_secret_key, public_key) = MlKem1024Kem::generate().unwrap();
-        let mut kem_request = classic;
+        let mut kem_request = base;
         kem_request.mode = ProtectionMode::MlKem;
         kem_request.kem_public_key = Some(public_key);
         let prepared = prepare_key_material(
@@ -1072,20 +1709,29 @@ mod tests {
         assert!(prepared.response.kem_ciphertext.is_some());
     }
 
+    /// Recomputes an engagement exactly as the gateway will.
+    fn commitment(psk: &str, request: &KeyNegotiationRequest) -> String {
+        static_psk_commitment(
+            psk,
+            &request.transaction_id,
+            &request.client_nonce,
+            &request.server_challenge,
+            &request.client_wg_public_key,
+            GATEWAY_WG_KEY,
+        )
+        .unwrap()
+    }
+
+    /// L'engagement prouve la possession **pour cette transaction** : celui
+    /// d'un autre PSK ne passe pas, et rien dans le refus ne dit lequel des
+    /// deux cas — pas de PSK configuré, ou mauvais PSK — s'est produit.
     #[test]
-    fn static_mode_rejects_another_psk_fingerprint() {
+    fn static_mode_rejects_another_psk_commitment() {
         let configured = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let other = base64::engine::general_purpose::STANDARD.encode([8u8; 32]);
-        let request = KeyNegotiationRequest {
-            protocol_version: KEY_NEGOTIATION_VERSION,
-            transaction_id: [1; 16],
-            mode: ProtectionMode::StaticPsk,
-            client_wg_public_key: CLIENT_WG_KEY.into(),
-            client_nonce: [2; 16],
-            timestamp_unix: test_now(),
-            kem_public_key: None,
-            static_psk_fingerprint: Some(static_psk_fingerprint(&other).unwrap()),
-        };
+        let mut request = simple_request([1; 16]);
+        request.mode = ProtectionMode::StaticPsk;
+        request.static_psk_commitment = Some(commitment(&other, &request));
         assert!(matches!(
             prepare_key_material(
                 &request,
@@ -1094,8 +1740,31 @@ mod tests {
                 Some(&configured),
                 DEFAULT_CONFIRMATION_TIMEOUT
             ),
-            Err(PublicError::ModeUnavailable)
+            Err(PublicError::Rejected)
         ));
+
+        // Le bon PSK, lui, passe — sinon le test ci-dessus ne prouverait rien.
+        request.static_psk_commitment = Some(commitment(&configured, &request));
+        assert!(prepare_key_material(
+            &request,
+            GATEWAY_WG_KEY,
+            [3; 16],
+            Some(&configured),
+            DEFAULT_CONFIRMATION_TIMEOUT
+        )
+        .is_ok());
+    }
+
+    /// Deux transactions, le **même** PSK : deux engagements différents. C'est
+    /// ce qui remplace l'empreinte stable de la v4, corrélable d'une session à
+    /// l'autre par un simple observateur du port public.
+    #[test]
+    fn the_same_static_psk_commits_differently_each_transaction() {
+        let psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let first = simple_request([1; 16]);
+        let mut second = simple_request([2; 16]);
+        second.server_challenge = [6; SERVER_CHALLENGE_LEN];
+        assert_ne!(commitment(&psk, &first), commitment(&psk, &second));
     }
 
     struct TestPki {
@@ -1114,7 +1783,7 @@ mod tests {
         role: PqCertificateRole,
         wireguard_public_key: &str,
     ) -> (PqCertificate, Vec<u8>) {
-        let (private_key, public_key) = generate_ml_dsa_65_keypair().unwrap();
+        let (private_key, public_key) = generate_ml_dsa_87_keypair().unwrap();
         let certificate = issue_pq_certificate(
             PqCertificate {
                 version: PQ_CERTIFICATE_VERSION,
@@ -1123,10 +1792,10 @@ mod tests {
                 issuer: subject.into(),
                 role,
                 wireguard_public_key: wireguard_public_key.into(),
-                ml_dsa_65_public_key: base64::engine::general_purpose::STANDARD.encode(public_key),
+                ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(public_key),
                 not_before_unix: 1,
                 not_after_unix: u64::MAX,
-                ml_dsa_65_signature: String::new(),
+                ml_dsa_87_signature: String::new(),
             },
             private_key.as_slice(),
         )
@@ -1194,31 +1863,60 @@ mod tests {
         expected_fingerprint: String,
         confirmed: AtomicBool,
         rolled_back: AtomicBool,
-        disconnected: AtomicBool,
+        released: AtomicBool,
         gateway_pq_certificate: PqCertificate,
         gateway_pq_private_key: Vec<u8>,
     }
 
+    impl Handler {
+        fn new(pki: &TestPki) -> Self {
+            Self {
+                expected_fingerprint: pki.client_fingerprint.clone(),
+                confirmed: AtomicBool::new(false),
+                rolled_back: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
+                gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
+            }
+        }
+    }
+
     #[async_trait]
     impl NegotiationHandler for Handler {
+        fn announced_identity(&self) -> GatewayIdentity {
+            GatewayIdentity {
+                wg_public_key: GATEWAY_WG_KEY.into(),
+                server_name: "localhost".into(),
+            }
+        }
+
         async fn prepare(
             &self,
             certificate_sha256: String,
             request: AuthenticatedKeyNegotiationRequest,
         ) -> Result<PreparedNegotiation, PublicError> {
+            // A wrong TLS fingerprint is `Rejected` like every other
+            // pre-installation refusal: the public boundary must not let a
+            // caller tell an unknown peer from a mismatched certificate.
             if certificate_sha256 != self.expected_fingerprint {
-                return Err(PublicError::IdentityMismatch);
+                return Err(PublicError::Rejected);
             }
             Ok(PreparedNegotiation {
                 response: authenticate_response(
                     KeyNegotiationResponse {
                         protocol_version: KEY_NEGOTIATION_VERSION,
                         transaction_id: request.request.transaction_id,
+                        server_challenge: request.request.server_challenge,
                         selected_mode: request.request.mode,
                         gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+                        client_wg_public_key: request.request.client_wg_public_key.clone(),
                         gateway_nonce: [3; KEY_NEGOTIATION_NONCE_LEN],
                         kem_ciphertext: None,
                         confirmation_timeout_secs: 2,
+                        psk_lifetime_secs: match request.request.mode {
+                            ProtectionMode::StaticPsk => 0,
+                            _ => aether::key_negotiation::NEGOTIATED_PSK_LIFETIME_SECS,
+                        },
                     },
                     self.gateway_pq_certificate.clone(),
                     &self.gateway_pq_private_key,
@@ -1234,24 +1932,49 @@ mod tests {
         ) -> Result<AuthenticatedKeyNegotiationCommit, PublicError> {
             self.confirmed.store(true, Ordering::SeqCst);
             authenticate_commit(
+                confirmation.confirmation.server_challenge,
                 confirmation.confirmation.transaction_id,
                 &self.gateway_pq_private_key,
             )
-            .map_err(|_| PublicError::Protocol)
-        }
-
-        async fn disconnected(&self, _transaction_id: [u8; 16]) {
-            self.disconnected.store(true, Ordering::SeqCst);
+            .map_err(|_| PublicError::Internal)
         }
 
         async fn rollback(&self, _transaction_id: [u8; 16]) {
             self.rolled_back.store(true, Ordering::SeqCst);
         }
+
+        async fn release(
+            &self,
+            certificate_sha256: String,
+            release: AuthenticatedPskRelease,
+        ) -> Result<AuthenticatedPskReleased, PublicError> {
+            if certificate_sha256 != self.expected_fingerprint {
+                return Err(PublicError::Rejected);
+            }
+            self.released.store(true, Ordering::SeqCst);
+            aether::key_negotiation::authenticate_released(
+                aether::key_negotiation::PskReleased {
+                    protocol_version: KEY_NEGOTIATION_VERSION,
+                    server_challenge: release.release.server_challenge,
+                    installed_transaction_id: release.release.installed_transaction_id,
+                },
+                self.gateway_pq_certificate.clone(),
+                &self.gateway_pq_private_key,
+            )
+            .map_err(|_| PublicError::Internal)
+        }
     }
 
-    #[tokio::test]
-    async fn mutual_tls_negotiation_is_confirmed_on_the_same_stream() {
-        let pki = test_pki();
+    /// Monte le service et rend l'endpoint client, pour ne pas répéter huit
+    /// lignes de PKI dans chaque test.
+    fn bench(
+        pki: &TestPki,
+    ) -> (
+        Arc<Handler>,
+        tokio::task::JoinHandle<()>,
+        Endpoint,
+        SocketAddr,
+    ) {
         let server = server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             &pki.server,
@@ -1259,49 +1982,65 @@ mod tests {
         )
         .unwrap();
         let server_addr = server.local_addr().unwrap();
-        let handler = Arc::new(Handler {
-            expected_fingerprint: pki.client_fingerprint,
-            confirmed: AtomicBool::new(false),
-            rolled_back: AtomicBool::new(false),
-            disconnected: AtomicBool::new(false),
-            gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
-            gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
-        });
-        let served = Arc::clone(&handler);
-        let task = tokio::spawn(serve(server, served));
+        let handler = Arc::new(Handler::new(pki));
+        let task = tokio::spawn(serve(
+            server,
+            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+        ));
+        let client = client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &pki.client,
+            pki.ca_der.clone(),
+        )
+        .unwrap();
+        (handler, task, client, server_addr)
+    }
 
-        let client =
-            client_endpoint("127.0.0.1:0".parse().unwrap(), &pki.client, pki.ca_der).unwrap();
-        let request = KeyNegotiationRequest {
-            protocol_version: KEY_NEGOTIATION_VERSION,
-            transaction_id: [1; KEY_NEGOTIATION_NONCE_LEN],
-            mode: ProtectionMode::Classic,
-            client_wg_public_key: CLIENT_WG_KEY.into(),
-            client_nonce: [2; KEY_NEGOTIATION_NONCE_LEN],
-            timestamp_unix: test_now(),
-            kem_public_key: None,
-            static_psk_fingerprint: None,
-        };
+    /// Le déroulé nominal v5 : challenge, requête, réponse, confirmation,
+    /// commit, **fermeture**. La connexion ne survit pas à la transaction, et
+    /// sa fermeture ne retire aucun PSK.
+    #[tokio::test]
+    async fn a_negotiation_ends_with_a_commit_and_a_closed_connection() {
+        let pki = test_pki();
+        let (handler, task, client, server_addr) = bench(&pki);
+
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let challenge = pending.server_challenge();
+        assert_ne!(
+            challenge, [0u8; SERVER_CHALLENGE_LEN],
+            "un challenge nul ne prouverait rien"
+        );
+
+        let mut request = simple_request([1; KEY_NEGOTIATION_NONCE_LEN]);
+        request.server_challenge = challenge;
+        request.server_name = "localhost".into();
         let authenticated_request = authenticate_request(
             request.clone(),
-            pki.client_pq_certificate,
+            pki.client_pq_certificate.clone(),
             &pki.client_pq_private_key,
         )
         .unwrap();
-        let (response, session) =
-            negotiate(&client, server_addr, "localhost", &authenticated_request)
-                .await
-                .unwrap();
+        let (response, session) = negotiate(&client, pending, &authenticated_request)
+            .await
+            .unwrap();
         response
             .response
             .validate_for(&request, GATEWAY_WG_KEY)
             .unwrap();
-        let confirmation =
-            authenticate_confirmation(request.transaction_id, &pki.client_pq_private_key).unwrap();
-        let (commit, link) = session.confirm(confirmation).await.unwrap();
+
+        let confirmation = authenticate_confirmation(
+            challenge,
+            request.transaction_id,
+            &pki.client_pq_private_key,
+        )
+        .unwrap();
+        let commit = session.confirm(confirmation).await.unwrap();
         commit
-            .verify(&pki.gateway_pq_certificate.ml_dsa_65_public_key)
+            .verify(&pki.gateway_pq_certificate.ml_dsa_87_public_key)
             .unwrap();
+        assert_eq!(commit.server_challenge, challenge);
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while !handler.confirmed.load(Ordering::SeqCst) {
@@ -1310,78 +2049,147 @@ mod tests {
         })
         .await
         .unwrap();
+
+        // Le point le plus important de la v5 : la connexion est finie, et
+        // cela ne dit rien du tunnel. En v4 la même fermeture libérait le
+        // slot ; ici elle ne doit produire aucun retrait ni aucun rollback.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handler.released.load(Ordering::SeqCst),
+            "fermer la connexion ne doit plus retirer de PSK"
+        );
         assert!(!handler.rolled_back.load(Ordering::SeqCst));
 
-        // The link is what tells the gateway the tunnel is over. Closing it
-        // must be noticed within a round-trip — the whole point is not waiting
-        // 150 s for WireGuard handshakes to go stale.
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// Le challenge est à usage unique : le rejouer sur une seconde connexion
+    /// échoue, ce qui est exactement la propriété que la v4 n'avait pas.
+    #[tokio::test]
+    async fn a_challenge_cannot_be_replayed_on_another_connection() {
+        let pki = test_pki();
+        let (handler, task, client, server_addr) = bench(&pki);
+
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let stolen = pending.server_challenge();
+        drop(pending);
+
+        // Nouvelle connexion, donc nouveau challenge — mais on présente
+        // l'ancien, entièrement signé.
+        let second = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let mut request = simple_request([7; KEY_NEGOTIATION_NONCE_LEN]);
+        request.server_challenge = stolen;
+        request.server_name = "localhost".into();
+        let replayed = authenticate_request(
+            request,
+            pki.client_pq_certificate.clone(),
+            &pki.client_pq_private_key,
+        )
+        .unwrap();
+        let outcome = negotiate(&client, second, &replayed).await.err();
         assert!(
-            !handler.disconnected.load(Ordering::SeqCst),
-            "a live link must not look like a departure"
+            matches!(outcome, Some(TransportError::Protocol(_))),
+            "une requête portant le challenge d'une autre connexion doit être refusée : {outcome:?}"
         );
-        link.close();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !handler.disconnected.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("closing the link must be seen at once");
+        assert!(!handler.confirmed.load(Ordering::SeqCst));
+
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// Le client refuse une gateway qui annonce une autre identité, avant
+    /// d'avoir produit la moindre signature.
+    #[tokio::test]
+    async fn a_gateway_announcing_another_identity_is_refused_before_signing() {
+        let pki = test_pki();
+        let (_handler, task, client, server_addr) = bench(&pki);
+
+        let outcome = request_challenge(&client, server_addr, "localhost", CLIENT_WG_KEY)
+            .await
+            .err();
         assert!(
-            !handler.rolled_back.load(Ordering::SeqCst),
-            "a committed tunnel ending is not a rollback"
+            matches!(outcome, Some(TransportError::Protocol(_))),
+            "l'identité annoncée doit être comparée au profil : {outcome:?}"
         );
 
         client.close(0u32.into(), b"test complete");
         task.abort();
     }
 
+    /// Un `release` signé retire le slot ; c'est le seul message qui le fasse.
+    #[tokio::test]
+    async fn a_signed_release_is_acknowledged_with_a_signed_answer() {
+        let pki = test_pki();
+        let (handler, task, client, server_addr) = bench(&pki);
+
+        let installed = [4; KEY_NEGOTIATION_NONCE_LEN];
+        let certificate = pki.client_pq_certificate.clone();
+        let private_key = pki.client_pq_private_key.clone();
+        let released = release_psk(
+            &client,
+            server_addr,
+            "localhost",
+            GATEWAY_WG_KEY,
+            &pki.gateway_pq_certificate,
+            move |challenge| {
+                aether::key_negotiation::authenticate_release(
+                    aether::key_negotiation::PskRelease {
+                        protocol_version: KEY_NEGOTIATION_VERSION,
+                        server_challenge: challenge,
+                        installed_transaction_id: installed,
+                        client_wg_public_key: CLIENT_WG_KEY.into(),
+                        gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+                        timestamp_unix: test_now(),
+                    },
+                    certificate,
+                    &private_key,
+                )
+                .map_err(|error| TransportError::Protocol(error.to_string()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handler.released.load(Ordering::SeqCst));
+        assert_eq!(released.released.installed_transaction_id, installed);
+        // L'accusé est signé : la gateway ne fait aucune affirmation non
+        // signée sur l'état d'un slot.
+        assert!(!released.ml_dsa_87_signature.is_empty());
+
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// Une session abandonnée avant confirmation doit être défaite : c'est le
+    /// rollback, qui n'existe que **avant** la signature du commit.
     #[tokio::test]
     async fn closing_an_unconfirmed_session_requests_rollback() {
         let pki = test_pki();
-        let server = server_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            &pki.server,
-            pki.ca_der.clone(),
-        )
-        .unwrap();
-        let server_addr = server.local_addr().unwrap();
-        let handler = Arc::new(Handler {
-            expected_fingerprint: pki.client_fingerprint,
-            confirmed: AtomicBool::new(false),
-            rolled_back: AtomicBool::new(false),
-            disconnected: AtomicBool::new(false),
-            gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
-            gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
-        });
-        let task = tokio::spawn(serve(
-            server,
-            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
-        ));
-        let client =
-            client_endpoint("127.0.0.1:0".parse().unwrap(), &pki.client, pki.ca_der).unwrap();
-        let request = KeyNegotiationRequest {
-            protocol_version: KEY_NEGOTIATION_VERSION,
-            transaction_id: [4; KEY_NEGOTIATION_NONCE_LEN],
-            mode: ProtectionMode::Classic,
-            client_wg_public_key: CLIENT_WG_KEY.into(),
-            client_nonce: [5; KEY_NEGOTIATION_NONCE_LEN],
-            timestamp_unix: test_now(),
-            kem_public_key: None,
-            static_psk_fingerprint: None,
-        };
+        let (handler, task, client, server_addr) = bench(&pki);
+
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let mut request = simple_request([4; KEY_NEGOTIATION_NONCE_LEN]);
+        request.server_challenge = pending.server_challenge();
+        request.server_name = "localhost".into();
         let authenticated_request = authenticate_request(
             request,
-            pki.client_pq_certificate,
+            pki.client_pq_certificate.clone(),
             &pki.client_pq_private_key,
         )
         .unwrap();
-        let (_, session) = negotiate(&client, server_addr, "localhost", &authenticated_request)
+        let (_, session) = negotiate(&client, pending, &authenticated_request)
             .await
             .unwrap();
         drop(session);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !handler.rolled_back.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }

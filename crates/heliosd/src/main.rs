@@ -8,7 +8,8 @@ mod static_psk;
 use std::sync::Arc;
 
 use aether::{
-    HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK,
+    HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest, OrchestratorCmd,
+    TunnelState, API_BIND_LOOPBACK,
 };
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -727,11 +728,12 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // Dedicated provisioning channel: it carries a secret and awaits an
     // acknowledgment, unlike the UI order flow.
     let (psk_tx, psk_rx) = mpsc::channel::<InstallPskRequest>(8);
+    // Read-only counterpart, for the one decision that cannot use the
+    // ten-second peer snapshot: proving a WireGuard handshake at the commit.
+    let (handshake_tx, handshake_rx) = mpsc::channel::<ObserveHandshakeRequest>(8);
     let tunnel_state = Arc::new(RwLock::new(TunnelState::Down));
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy = Arc::new(RwLock::new(shared_network.read().await.firewall_policy()));
-
-    key_negotiation::start(Arc::clone(&shared_network), psk_tx.clone(), &boot, dry_run).await?;
 
     // The API listens on the tunnel's address: this is how Orion clients
     // reach provisioning and telemetry. Filtering is still enforced by the
@@ -753,13 +755,28 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         Arc::clone(&tunnel_state),
         event_tx.clone(),
         cmd_tx,
-        psk_tx,
+        psk_tx.clone(),
         Arc::clone(&shared_policy),
     );
     // The sealing posture, as two non-secret facts. `boot` itself is moved
     // into the orchestrator below — it holds the unlock secret, and only the
     // orchestrator may seal.
     state = state.with_tpm(boot.kind(), boot.preserved_vaults());
+    // Started here rather than earlier because the reclamation loop reads the
+    // same data-plane snapshot the console does, and that snapshot is owned
+    // by `AppState`. Polling the backend a second time would risk the two
+    // readers disagreeing on whether a peer is still there — and the whole
+    // point of v5's liveness is that there is one answer, read where the
+    // traffic is.
+    key_negotiation::start(
+        Arc::clone(&shared_network),
+        psk_tx.clone(),
+        handshake_tx,
+        Arc::clone(&state.peer_runtime),
+        &boot,
+        dry_run,
+    )
+    .await?;
     // Published for the operator tooling: `helios-ctl` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
@@ -803,6 +820,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         event_tx,
         cmd_rx,
         psk_rx,
+        handshake_rx,
         shared_policy,
         peer_runtime,
         boot,
@@ -1025,6 +1043,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };

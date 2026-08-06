@@ -36,7 +36,8 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 ## Négociation de clé — notes techniques
 
 Les deux notes coexistent volontairement : l'une décrit ce qui tourne, l'autre
-ce qu'il faut construire.
+ce qui tournait. La bascule est coupante — ALPN, domaines de signature et
+format de certificat distincts — donc rien ne négocie entre les deux.
 
 - [NEGOCIATION-DE-CLE-V4.md](NEGOCIATION-DE-CLE-V4.md) — protocole
   **actuellement servi** par `heliosd` et Orion.
@@ -45,6 +46,10 @@ ce qu'il faut construire.
   la v4 puis de la spécification elle-même. Son §0 les indexe un par un. Le mode
   Orion `classic` y reste disponible pour les hôtes WireGuard génériques, mais
   demeure strictement hors du protocole de négociation Helios v5.
+- [ROTATION-CERTIFICATS-V5.md](ROTATION-CERTIFICATS-V5.md) — cycle de vie cible
+  des certificats TLS/PQ : chevauchement borné, générations anti-rollback,
+  rotation de `CA-PQ`, révocation urgente et frontière entre socle v5 et
+  automatisation v5.x.
 
 ## Sécurité
 

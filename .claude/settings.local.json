@@ -316,7 +316,11 @@
       "Bash(fuser -k 5180/tcp)",
       "Bash(xxd)",
       "Bash(curl -sSL -o wix.xsd https://raw.githubusercontent.com/wixtoolset/wix3/develop/src/tools/wix/Xsd/wix.xsd)",
-      "Bash(command -v xmlstarlet)"
+      "Bash(command -v xmlstarlet)",
+      "Bash(awk '{s+=$4} END {print s\" tests passés\"}')",
+      "Bash(echo \"--- heliosd features matérielles: $? ---\")",
+      "Bash(awk '{s+=$4} END {print s\" tests passés, 0 échec\"}')",
+      "Bash(awk -F'[ ;]' '{p+=$4} END {print \"total passed:\", p}')"
     ]
   }
 }

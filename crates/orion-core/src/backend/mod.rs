@@ -276,13 +276,12 @@ pub struct VpnController {
     backend: Arc<dyn VpnBackend>,
     state: Arc<RwLock<TunnelState>>,
     task: Mutex<Option<JoinHandle<()>>>,
-    /// Live negotiation link of the current tunnel.
+    /// Receipt for the PSK currently posed, if any.
     ///
     /// Held here rather than in the connection task because it must outlive
-    /// it: the task ends once the tunnel is up, while the link must stay open
-    /// for as long as the tunnel does. Closing it on `disconnect` is what
-    /// spares the gateway from waiting for stale handshakes.
-    link_slot: Arc<Mutex<Option<LinkWatch>>>,
+    /// it: the task ends once the tunnel is up, while the receipt is needed
+    /// at disconnection, arbitrarily later.
+    installed: Arc<Mutex<Option<InstalledNegotiation>>>,
     /// Has the liveness link of the current tunnel died on its own?
     ///
     /// The handshake age cannot express this. When the link closes, the
@@ -295,24 +294,19 @@ pub struct VpnController {
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
-/// A liveness link and the task watching it, kept together.
+/// The PSK currently posed for this tunnel, and which transaction posed it.
 ///
-/// They must also *die* together. A watcher outliving its link reports the
-/// death of a session a renegotiation has already replaced — and would
-/// condemn the healthy tunnel that succeeded it.
-struct LinkWatch {
-    link: helios_key_negotiation::SessionLink,
-    watcher: JoinHandle<()>,
-}
-
-impl LinkWatch {
-    /// Stops watching, then hangs up. In this order: the closure is
-    /// deliberate here, and the watcher exists to report the ones that
-    /// aren't.
-    fn close(self) {
-        self.watcher.abort();
-        self.link.close();
-    }
+/// v4 kept a live QUIC link here and treated its closure as the end of the
+/// tunnel. v5 keeps a receipt instead: the transaction identifier the gateway
+/// recorded as the slot's owner, which is what a signed release must name to
+/// be accepted. Nothing about the tunnel depends on a connection any more.
+#[derive(Clone)]
+struct InstalledNegotiation {
+    transaction_id: [u8; 16],
+    /// The profile that negotiated it — the release has to be signed with the
+    /// same identity and aimed at the same gateway, and the profile in use
+    /// may have changed by the time the user disconnects.
+    profile: ClientProfile,
 }
 
 impl VpnController {
@@ -321,7 +315,7 @@ impl VpnController {
             backend,
             state: Arc::new(RwLock::new(TunnelState::Down)),
             task: Mutex::new(None),
-            link_slot: Arc::new(Mutex::new(None)),
+            installed: Arc::new(Mutex::new(None)),
             link_lost: Arc::new(AtomicBool::new(false)),
             key_negotiation_identities: None,
         }
@@ -384,14 +378,11 @@ impl VpnController {
     /// clear-text leak.
     pub async fn connect(&self, profile: ClientProfile, user_sink: EventSink) {
         self.abort_task().await;
-        // The previous session ends here, whatever the new profile does: its
-        // link is hung up so the gateway releases that PSK now, and its
-        // watcher stops before it can report a closure this connection
-        // caused. A verdict left standing would condemn the tunnel about to
-        // be built.
-        if let Some(previous) = self.link_slot.lock().await.take() {
-            previous.close();
-        }
+        // No link to hang up any more. A previous PSK is not released here:
+        // the negotiation about to run replaces it atomically on both ends,
+        // and releasing first would open a window in which the gateway holds
+        // nothing for a peer that is about to reconnect.
+        self.installed.lock().await.take();
         self.link_lost.store(false, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
         // Says a connection has begun, before anything long happens.
@@ -410,7 +401,7 @@ impl VpnController {
         sink(ClientEvent::state(TunnelState::Connecting));
         let backend = Arc::clone(&self.backend);
         let identities = self.key_negotiation_identities.clone();
-        let link_slot = Arc::clone(&self.link_slot);
+        let installed = Arc::clone(&self.installed);
         let link_lost = Arc::clone(&self.link_lost);
         let handle = tokio::spawn(async move {
             if profile.key_negotiation.is_some() {
@@ -419,7 +410,7 @@ impl VpnController {
                     &profile,
                     &sink,
                     identities.as_deref(),
-                    &link_slot,
+                    &installed,
                     &link_lost,
                 )
                 .await
@@ -449,17 +440,55 @@ impl VpnController {
         *self.task.lock().await = Some(handle);
     }
 
+    /// Sends the signed release for a PSK this controller had installed.
+    ///
+    /// Failures are reported and swallowed. The gateway's own reclamation —
+    /// five minutes of handshake silence — is the backstop, and it exists
+    /// precisely because this message cannot be guaranteed.
+    async fn release_installed_psk(&self, installed: InstalledNegotiation, sink: &EventSink) {
+        let Some(identities) = self.key_negotiation_identities.clone() else {
+            return;
+        };
+        if installed.profile.key_negotiation.is_none() {
+            return;
+        }
+        match crate::key_negotiation::release_for_profile(
+            &installed.profile,
+            identities.as_ref(),
+            installed.transaction_id,
+        )
+        .await
+        {
+            Ok(()) => sink(ClientEvent::log(
+                "info",
+                "PSK négocié libéré auprès de la gateway".to_string(),
+            )),
+            Err(error) => sink(ClientEvent::log(
+                "warn",
+                format!(
+                    "libération du PSK non confirmée ({error:#}) — la gateway le retirera \
+                     d'elle-même quand les handshakes cesseront"
+                ),
+            )),
+        }
+    }
+
     /// Unmounts the tunnel — **the only path allowed to remove the adapter**.
     pub async fn disconnect(&self, user_sink: EventSink) {
         self.abort_task().await;
-        // Hang up before unmounting: the gateway releases its PSK slot on the
-        // spot instead of inferring the departure from handshakes that stop
-        // coming, up to 150 s later.
-        if let Some(link) = self.link_slot.lock().await.take() {
-            link.close();
-        }
+        let installed = self.installed.lock().await.take();
         self.link_lost.store(false, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
+        // Say it explicitly, before unmounting. This is the message that
+        // replaces v4's closing link, and it is best-effort by construction:
+        // a host being powered off sends nothing, and the gateway then falls
+        // back on reclaiming the slot once handshakes go quiet. A failure
+        // here must never stop a disconnection — refusing to disconnect
+        // because a courtesy message did not land would be worse than the
+        // courtesy.
+        if let Some(installed) = installed {
+            self.release_installed_psk(installed, &sink).await;
+        }
         if let Err(e) = self.backend.down(&sink).await {
             sink(ClientEvent::Error {
                 message: format!("échec de déconnexion: {e}"),
@@ -580,7 +609,7 @@ async fn connect_with_key_negotiation(
     profile: &ClientProfile,
     sink: &EventSink,
     identities: Option<&dyn crate::key_negotiation::IdentityProvider>,
-    link_slot: &Mutex<Option<LinkWatch>>,
+    installed: &Mutex<Option<InstalledNegotiation>>,
     link_lost: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let identities = identities
@@ -669,24 +698,24 @@ async fn connect_with_key_negotiation(
         )
         .await
         {
-            Ok(link) => {
-                // Watches the liveness link. Its closure means the gateway has
-                // released the PSK slot: the tunnel still carries traffic, and
-                // will keep doing so until the next WireGuard rekey — then die
-                // without either end having said anything. Saying it here is
-                // what turns an unexplained drop two minutes later into a
-                // diagnosable event.
-                let watcher =
-                    spawn_link_watch(link.clone(), Arc::clone(sink), Arc::clone(link_lost));
-                // Replaces any previous link — and stops its watcher, which
-                // would otherwise announce the death of the session this
-                // renegotiation has just superseded, condemning the tunnel it
-                // was replaced by.
-                if let Some(previous) = link_slot.lock().await.replace(LinkWatch { link, watcher })
-                {
-                    previous.close();
-                }
-                // A fresh link outranks any verdict the previous one left.
+            Ok(transaction_id) => {
+                // The receipt the gateway will require to accept a release.
+                // It replaces any previous one: the slot has a single owner,
+                // and a renegotiation is precisely a change of owner.
+                //
+                // Only `ml_kem` produces one. A `static_psk` negotiation
+                // proves possession of a value both peers were configured
+                // with; it leaves the gateway's slot in `configured_static`,
+                // owned by nobody. Sending a release for it would ask the
+                // gateway to delete an operator's configuration — which it
+                // refuses — so recording a receipt here would only schedule a
+                // round trip that announces the disconnection and changes
+                // nothing (spec §12.2).
+                *installed.lock().await = (mode == aether::key_negotiation::ProtectionMode::MlKem)
+                    .then(|| InstalledNegotiation {
+                        transaction_id,
+                        profile: profile.clone(),
+                    });
                 link_lost.store(false, Ordering::SeqCst);
                 let protection = match mode {
                     aether::key_negotiation::ProtectionMode::Classic => PskKind::None,
@@ -746,35 +775,6 @@ async fn connect_with_key_negotiation(
     Err(error)
 }
 
-/// Reports the death of the liveness link, which nothing else would announce.
-///
-/// The gateway releases the PSK slot as soon as this link closes. The tunnel
-/// survives on the current WireGuard session and dies at the next rekey, two
-/// to three minutes later — long enough that nobody connects the two events.
-///
-/// The verdict is raised **before** it is logged, because it is what the state
-/// inference reads: a poll landing between the two would find a still-fresh
-/// handshake and leave the screen claiming a healthy connection, right under
-/// the line saying the session is over. Only an aborted watcher stays silent,
-/// and that is reserved for closures Orion itself ordered.
-fn spawn_link_watch(
-    link: helios_key_negotiation::SessionLink,
-    sink: EventSink,
-    link_lost: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        link.closed().await;
-        link_lost.store(true, Ordering::SeqCst);
-        sink(ClientEvent::log(
-            "warn",
-            "session QUIC de négociation fermée : la gateway a retiré le PSK ML-KEM de son \
-             plan de données. Le prochain rekey WireGuard (≤ 2 min) échouera. Se reconnecter \
-             pour négocier un nouveau PSK."
-                .to_string(),
-        ));
-    })
-}
-
 /// Installs the negotiated slot and commits it, or reports why it could not.
 ///
 /// Split out so the caller can tell a failure that left the slot
@@ -786,7 +786,7 @@ async fn commit_negotiated_slot(
     negotiated: crate::key_negotiation::NegotiatedKey,
     prepared_at: tokio::time::Instant,
     confirmation_timeout: Duration,
-) -> anyhow::Result<helios_key_negotiation::SessionLink> {
+) -> anyhow::Result<[u8; 16]> {
     backend
         .up(negotiated_profile, sink)
         .await
@@ -811,7 +811,9 @@ async fn commit_negotiated_slot(
             prepared_at.elapsed().as_secs()
         ),
     ));
-    negotiated.confirm().await
+    let transaction_id = negotiated.transaction_id();
+    negotiated.confirm().await?;
+    Ok(transaction_id)
 }
 
 async fn wait_for_new_handshake(

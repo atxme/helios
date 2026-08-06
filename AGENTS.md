@@ -29,13 +29,44 @@ et `helios-ctl peer` admettent les clients par le **même** code
 document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
 expose enfin le séquestre.
 
-La négociation de clé pré-WireGuard (ADR-001, amendement du 24 juillet 2026)
-existe de bout en bout : port UDP dédié, authentification ML-DSA-65, trois modes
-et plancher anti-downgrade qui monte seul et ne redescend pas. Les deux IHM
-l’exposent — plancher par pair côté gateway ; côté Orion l’écran *Profils*
-édite tout le bloc, certificats compris, avec empreinte PQ dérivée en Rust et
-état de l’identité. Seul le plancher n’y est pas librement modifiable : il ne
-descend jamais sous la valeur avec laquelle le profil a été chargé.
+La négociation de clé pré-WireGuard existe de bout en bout, en **protocole v5**
+([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendement du 6 août 2026 ;
+spécification [NEGOCIATION-DE-CLE-V5.md](docs/NEGOCIATION-DE-CLE-V5.md)) : port
+UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, trois
+modes et plancher anti-downgrade qui monte seul et ne redescend pas. La v4 est
+décrite par [NEGOCIATION-DE-CLE-V4.md](docs/NEGOCIATION-DE-CLE-V4.md), conservée
+comme trace de ce qui tournait avant la bascule — le code ne la sert plus, et
+les deux versions ne négocient pas ensemble (ALPN, domaines de signature et
+format de certificat distincts). Les deux IHM exposent la négociation —
+plancher par pair côté gateway ; côté Orion l’écran *Profils* édite tout le
+bloc, certificats compris, avec empreinte PQ dérivée en Rust et état de
+l’identité. Seul le plancher n’y est pas librement modifiable : il ne descend
+jamais sous la valeur avec laquelle le profil a été chargé.
+
+**La v5 est partiellement implémentée**, et la spécification nomme ce qui
+manque. Ne pas la présenter comme terminée : la mention « implémentée à trois
+exceptions » portée ici jusqu’au 6 août 2026 était fausse, et une revue a dû
+l’établir. Restent ouverts :
+
+- le **discriminant de type de profil Orion** (§19, §22). `classic` est refusé
+  au décodage v5 et à la préparation — aucun message v5 ne peut le
+  sélectionner — mais la variante subsiste dans `ProtectionMode` et un profil
+  Orion reste un bloc `key_negotiation` facultatif, dont l’absence signifie
+  encore implicitement « classique ». La retirer est une migration de format :
+  `network.toml`, document `.orion`, manifeste de coffre (`mode_id = 0`) et les
+  deux IHM ;
+- le **renouvellement de PSK en place** (§12.3), suspendu à l’essai bloquant du
+  §20.0 qui doit d’abord établir sur un vrai plan de données qu’une session
+  WireGuard réinitialisée handshake dans les délais ;
+- la **renégociation d’Orion sur vieillissement de handshake** (§12.5) : la
+  gateway récupère bien son slot, mais un client dont le PSK a été retiré ne
+  s’en aperçoit qu’à la déconnexion ;
+- l’**enrôlement sans clé privée avec signature opérateur** (§15), qui reste au
+  modèle v4 décrit plus bas ;
+- tout le **cycle de vie des certificats**
+  ([ROTATION-CERTIFICATS-V5](docs/ROTATION-CERTIFICATS-V5.md)) : leaf PQ
+  gateway encore auto-signée, ni slot actif/suivant, ni génération
+  anti-rollback.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par
@@ -99,12 +130,93 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
   vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
   en affichant un profil et un mode négocié.
-- La session QUIC de négociation **survit à l’échange** : c’est le lien de
-  vivacité dont la fermeture dit à la gateway de libérer le PSK. Elle ne porte
-  alors plus rien, d’où des keep-alives obligatoires (`LINK_KEEP_ALIVE`) :
-  sans eux QUIC déclare la connexion morte au bout de 30 s, la gateway retire
-  le PSK, et le tunnel meurt au renouvellement de clé WireGuard suivant — deux
-  à trois minutes plus tard, sans que rien ne relie les deux événements.
+- La session QUIC de négociation **est fermée après le commit** : elle porte
+  une transaction, puis disparaît. Sa fermeture ne dit **rien** du tunnel et ne
+  retire aucun PSK. C’est l’inverse de la v4, où elle était un lien de
+  vivacité — et où toute coupure réseau de plus de 35 s tuait un tunnel sain.
+  Ne réintroduire ni keep-alive QUIC, ni délai d’inactivité qui servirait à
+  déduire qu’un pair est encore là. Le seul délai restant
+  (`TRANSACTION_IDLE_TIMEOUT`, 60 s) borne la transaction et couvre l’attente
+  de confirmation, rien d’autre.
+- La vivacité se lit sur le **plan de données**, jamais sur un canal de
+  contrôle. Trois seuils, trois questions distinctes :
+  `HANDSHAKE_STALE_AFTER_SECS` (150 s) décide de l’état du tunnel et donc du
+  kill-switch ; `PSK_RECLAIM_AFTER_STALE_SECS` (300 s) décide que la gateway
+  détruit le secret d’un pair disparu ; `MAX_PSK_LIFETIME` (24 h) borne l’âge
+  d’un PSK même sur un tunnel sain. Les deux premiers encadrent les 180 s au
+  bout desquelles WireGuard abandonne lui-même une session : à 300 s la
+  gateway ne détruit jamais quelque chose qui marchait encore.
+- Tout cela suppose un keep-alive persistant, et la gateway le **pose
+  elle-même** (`WgPeer::persistent_keepalive_secs`, 25 s) plutôt que de faire
+  confiance à celui du client, qu’elle ne peut pas inspecter. L’admission
+  refuse un `0` explicite et le chargement de `network.toml` échoue en nommant
+  le pair : sans keep-alive, un tunnel inactif ne produit aucun handshake et
+  les deux seuils ci-dessus liraient un horodatage ancien sur un pair
+  parfaitement sain.
+- Un PSK négocié n’est retiré que par un `release` signé, un remplacement
+  atomique, une révocation d’admission, le vieillissement du handshake ou
+  l’échéance. Jamais par un silence réseau sur un canal de contrôle.
+- Le commit signé est le **point de non-retour**. `take_for_rollback` ne
+  cherche que dans les transactions `active` : après la signature il ne trouve
+  rien, et c’est structurel. La v4 restaurait le slot quand le commit
+  n’arrivait pas à destination, ce qui laissait un client détenir un commit
+  valide et vérifiable face à une gateway ayant tout défait.
+- Le commit exige une **preuve de handshake WireGuard** lue sur le plan de
+  données : une observation strictement postérieure à celle mémorisée juste
+  avant la pose du candidat. C’est la seule preuve de l’échange qui engage la
+  clé privée **WireGuard** du pair — TLS et ML-DSA-87 en attestent deux autres.
+  Sans elle, une identité de négociation volée fait committer la gateway sur un
+  PSK arbitraire et coupe le vrai client. La lecture passe par
+  `ObserveHandshakeRequest`, pas par l’instantané `peer_runtime` : celui-ci
+  retarde de 10 s et refuserait des confirmations légitimes.
+- Chaque slot porte une **génération par pair**, et tout acteur tardif doit
+  présenter celle qu’il a observée — rollback, `release` retardé, récupération
+  décidée sur un instantané. Une génération périmée est un no-op, jamais une
+  écriture. Sans cela, chacun des trois efface le PSK d’une transaction plus
+  récente et coupe un tunnel qui marchait.
+- Ordre d’un retrait : **vider le plan de données d’abord**, n’oublier l’état
+  qu’après succès, le verrou tenu à travers l’écriture. L’inverse laisse un PSK
+  orphelin quand l’écriture échoue — plus rien ne le désigne, un `release`
+  rejoué répond « released » sans rien retirer, et la récupération ignore que
+  le slot existe.
+- Un PSK **statique** n’entre pas dans le cycle transactionnel. Il n’a pas de
+  propriétaire, n’expire pas, n’est pas retiré par `release` ni par la
+  récupération : c’est la configuration de l’opérateur, présente avant la
+  transaction et après elle. Le commit le laisse en `configured_static`, et
+  Orion n’enregistre pas de reçu pour lui. L’effacer serait détruire une valeur
+  qu’aucune renégociation ne restaure.
+- `classic` n’est **pas** un mode négociable v5 : refusé au décodage
+  (`ClassicNotNegotiable`) et à la préparation. Un tunnel sans PSK est un profil
+  WireGuard générique, pas un résultat de négociation — sinon le plancher du
+  protocole se satisfait de l’absence de protection. La variante survit dans le
+  type pour qu’un `network.toml` existant se relise encore ; voir la limite
+  ci-dessus.
+- Anti-rejeu : un `server_challenge` de 32 octets par connexion, à usage
+  unique, et **une seule** demande de challenge par connexion. Il vit dans la
+  pile de la tâche de connexion — `Option::take` **est** la consommation
+  atomique — et n’est délibérément **pas signé** par la gateway : le signer
+  offrirait une opération ML-DSA-87 gratuite à un client non authentifié. Le
+  cache de 4096 identifiants subsiste en défense en profondeur ; ne plus le
+  présenter comme la défense anti-rejeu.
+- Bornes DoS du port public, toutes nécessaires ensemble : Retry avant tout
+  état, budget par IPv4 ou par **préfixe IPv6 `/64`** (compter par adresse
+  exacte rend la limite décorative sur IPv6), budget par identité admise une
+  fois mTLS passé, durée de vie absolue de 90 s par connexion (l’idle timeout
+  ne borne pas une connexion occupée, et le permis de concurrence ne revient
+  jamais), zéro flux unidirectionnel et fenêtres de réception bornées.
+- Deux longueurs ML-DSA, deux modules : `aether::key_negotiation::ML_DSA_87_*`
+  pour la PKI de négociation, `aether::sig::ML_DSA_65_*` pour les artefacts
+  éditeur. Valider du matériel de négociation avec la constante de `sig`
+  compile, se lit bien, et refuse toute vraie clé ML-DSA-87.
+- Trois codes d’erreur publics seulement : `protocol`, `rejected`, `internal`.
+  Tout refus avant installation du slot est `rejected`, quelle qu’en soit la
+  cause. Les sept codes de la v4 laissaient énumérer les pairs admis et lire
+  leur plancher depuis un port public. Le motif réel va au journal protégé.
+- Deux jeux de paramètres ML-DSA coexistent et **ne se remplacent pas** :
+  `ml-dsa-65` porte les signatures d’artefacts éditeur (ADR-002,
+  `aether::sig`, `REQUIRED_ALGS`), `ml-dsa-87` porte la PKI de négociation
+  (ADR-005 v5). Remplacer le premier par le second invaliderait la
+  vérification de toutes les releases déjà signées.
 - Négociation de clé : datagrammes QUIC **épinglés à 1200 octets**, découverte
   de MTU désactivée des deux côtés. Le matériel PQ pèse plusieurs kilooctets et
   quinn sonde jusqu’à 1452 par défaut — une taille qui passe en labo puis

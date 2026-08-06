@@ -283,6 +283,7 @@ mod security_tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };
@@ -439,6 +440,17 @@ mod security_tests {
 
     /// Test public key, distinct from the already-admitted peer's.
     const NEW_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    /// Ce que la v5 exige de toute admission : les deux empreintes.
+    ///
+    /// Un pair sans identité PQ est refusé, et le plancher `ml_kem` est
+    /// imposé — le défaut v4, qui retombait sur `classic` en l'absence de
+    /// certificat, produisait des pairs au premier handshake nu.
+    const ADMIT_IDENTITY: &str = concat!(
+        r#""key_negotiation_certificate_sha256":"#,
+        r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+        r#""key_negotiation_pq_certificate_sha256":"#,
+        r#""bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb""#
+    );
 
     #[tokio::test]
     async fn admission_allocates_a_vip_and_notifies_the_orchestrator() {
@@ -448,7 +460,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -494,7 +506,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -528,7 +540,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -552,16 +564,23 @@ mod security_tests {
 
         for (body, expected) in [
             (
-                format!(r#"{{"name":"workstation","public_key":"{NEW_KEY}"}}"#),
+                format!(r#"{{"name":"workstation","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"other","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#
-                    .to_string(),
+                format!(
+                    r#"{{"name":"other","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",{ADMIT_IDENTITY}}}"#
+                ),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"other","public_key":"not-a-key"}"#.to_string(),
+                format!(r#"{{"name":"other","public_key":"not-a-key",{ADMIT_IDENTITY}}}"#),
+                StatusCode::BAD_REQUEST,
+            ),
+            // Nouveau en v5 : une admission sans identité PQ est refusée, et
+            // c'est une erreur d'entrée, pas un conflit d'état.
+            (
+                format!(r#"{{"name":"nu","public_key":"{NEW_KEY}"}}"#),
                 StatusCode::BAD_REQUEST,
             ),
         ] {
@@ -616,7 +635,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();

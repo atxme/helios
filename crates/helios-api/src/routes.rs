@@ -451,13 +451,13 @@ pub async fn peer_admit(
     Json(body): Json<PeerAdmitRequest>,
 ) -> Result<Json<PeerSummary>, (StatusCode, String)> {
     let mut updated = s.network.read().await.clone();
-    let minimum_mode = body.minimum_key_negotiation_mode.unwrap_or_else(|| {
-        if body.key_negotiation_pq_certificate_sha256.is_some() {
-            ProtectionMode::MlKem
-        } else {
-            ProtectionMode::Classic
-        }
-    });
+    // `ml_kem` unconditionally. The v4 default fell back to `classic` when no
+    // PQ certificate was supplied, which quietly produced peers whose first
+    // handshake was unprotected; the admission layer now refuses such a peer
+    // outright, and naming the floor here makes the refusal say why.
+    let minimum_mode = body
+        .minimum_key_negotiation_mode
+        .unwrap_or(ProtectionMode::MlKem);
     let peer = helios_provisioning::admit_with_key_negotiation(
         &mut updated,
         &body.name,
@@ -540,7 +540,13 @@ async fn apply_network(
 fn admission_status(error: helios_provisioning::AdmissionError) -> (StatusCode, String) {
     use helios_provisioning::AdmissionError as E;
     let code = match &error {
-        E::EmptyName | E::Key(_) | E::CertificateFingerprint => StatusCode::BAD_REQUEST,
+        E::EmptyName
+        | E::Key(_)
+        | E::CertificateFingerprint
+        // Both are refusals of an admission the caller can fix by supplying
+        // what v5 requires — a PQ identity, and the `ml_kem` floor.
+        | E::MissingNegotiationIdentity
+        | E::FloorBelowMlKem(_) => StatusCode::BAD_REQUEST,
         E::NameTaken(_) | E::KeyTaken(_) => StatusCode::CONFLICT,
         E::Unknown(_) => StatusCode::NOT_FOUND,
         E::Ipam(_) => StatusCode::INSUFFICIENT_STORAGE,
@@ -743,6 +749,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: Some("aa".repeat(32)),
                 minimum_key_negotiation_mode: ProtectionMode::MlKem,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         }

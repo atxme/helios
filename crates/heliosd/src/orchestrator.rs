@@ -21,8 +21,8 @@ use std::{
 };
 
 use aether::{
-    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelEvent,
-    TunnelState,
+    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest,
+    OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
@@ -80,6 +80,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
             public_key: p.public_key.clone(),
             allowed_ips: p.address.clone(),
             preshared_key: p.preshared_key.clone(),
+            persistent_keepalive_secs: p.persistent_keepalive_secs,
         })
         .collect();
     (iface, peers)
@@ -151,6 +152,10 @@ pub async fn run(
     // PSK installation requests from provisioning (dedicated channel: they
     // carry a secret and await an acknowledgment).
     mut psk_rx: mpsc::Receiver<InstallPskRequest>,
+    // Fresh reads of one peer's last handshake. Separate from `shared_peers`
+    // below, which is a ten-second-old republication: the key-negotiation
+    // commit needs the value *now* — see `ObserveHandshakeRequest`.
+    mut handshake_rx: mpsc::Receiver<ObserveHandshakeRequest>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
     // Snapshot of the data plane, published for the API: it holds no
     // WireGuard backend and must not, so the runtime reaches it the same way
@@ -255,6 +260,15 @@ pub async fn run(
             psk_request = psk_rx.recv() => {
                 if let Some(request) = psk_request {
                     install_peer_psk(request, &shared_network, wg.as_ref(), &event_tx).await;
+                }
+            }
+
+            // Key negotiation, at the commit: has this peer handshaken since
+            // its candidate PSK was posed? Only the backend knows, and only
+            // this task holds it.
+            handshake_request = handshake_rx.recv() => {
+                if let Some(request) = handshake_request {
+                    observe_peer_handshake(request, wg.as_ref()).await;
                 }
             }
 
@@ -588,6 +602,25 @@ async fn handle_external_cmd(
 /// session keys are already derived, the new PSK will only be used on the
 /// next handshake (≤ 2 min). This is what makes hot application safe — see
 /// `helios_provisioning::rotation`.
+/// Answers one [`ObserveHandshakeRequest`] from the live data plane.
+///
+/// A peer absent from the backend answers `Ok(None)`, not an error: it has
+/// simply never handshaken, which is a fact the caller can act on. Only a
+/// backend that cannot be read at all is an `Err`, and the caller must treat
+/// that as "cannot tell" rather than as "no handshake" — a commit that
+/// accepted a failed read as proof would prove nothing.
+async fn observe_peer_handshake(request: ObserveHandshakeRequest, wg: &dyn WireguardBackend) {
+    let ObserveHandshakeRequest { public_key, reply } = request;
+    let answer = match wg.peers().await {
+        Ok(peers) => Ok(peers
+            .iter()
+            .find(|peer| peer.public_key_b64() == public_key)
+            .and_then(|peer| peer.last_handshake)),
+        Err(error) => Err(error.to_string()),
+    };
+    let _ = reply.send(answer);
+}
+
 async fn install_peer_psk(
     request: InstallPskRequest,
     shared_network: &Arc<RwLock<NetworkConfig>>,
@@ -1267,6 +1300,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         }

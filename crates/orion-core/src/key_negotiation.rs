@@ -9,8 +9,8 @@ use std::{net::SocketAddr, time::Duration};
 use aether::{
     key_negotiation::{
         authenticate_confirmation, authenticate_request, derive_negotiated_psk,
-        static_psk_fingerprint, KeyNegotiationRequest, PqCertificate, ProtectionMode,
-        KEY_NEGOTIATION_NONCE_LEN, KEY_NEGOTIATION_VERSION,
+        static_psk_commitment, KeyNegotiationRequest, PqCertificate, ProtectionMode,
+        KEY_NEGOTIATION_NONCE_LEN, KEY_NEGOTIATION_VERSION, SERVER_CHALLENGE_LEN,
     },
     pq::{Kem, MlKem1024Kem},
     SecretString,
@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use helios_key_negotiation::{
-    client_endpoint_on_socket, negotiate, ClientSession, SessionLink, TlsIdentity,
+    client_endpoint_on_socket, negotiate, request_challenge, ClientSession, TlsIdentity,
 };
 use zeroize::Zeroizing;
 
@@ -29,9 +29,9 @@ use crate::ClientProfile;
 pub struct ClientIdentity {
     pub certificate_chain: Vec<Vec<u8>>,
     pub private_key: Vec<u8>,
-    /// JSON application certificate signed with ML-DSA-65.
+    /// JSON application certificate signed with ML-DSA-87.
     pub pq_certificate: Vec<u8>,
-    /// Raw ML-DSA-65 key loaded from the protected store.
+    /// Raw ML-DSA-87 key loaded from the protected store.
     pub pq_private_key: Vec<u8>,
 }
 
@@ -85,13 +85,13 @@ pub struct KeyNegotiationClient {
     pub client_certificate_chain: Vec<Vec<u8>>,
     /// Client PKCS#8 key loaded from an OS-protected store.
     pub client_private_key: Vec<u8>,
-    /// JSON ML-DSA-65 client certificate.
+    /// JSON ML-DSA-87 client certificate.
     pub client_pq_certificate: Vec<u8>,
-    /// Raw ML-DSA-65 client private key.
+    /// Raw ML-DSA-87 client private key.
     pub client_pq_private_key: Vec<u8>,
     /// CA certificate that authenticates the gateway certificate.
     pub gateway_ca: Vec<u8>,
-    /// Pinned self-signed ML-DSA-65 gateway certificate.
+    /// Pinned self-signed ML-DSA-87 gateway certificate.
     pub gateway_pq_certificate: PqCertificate,
     /// Orion refuses any locally selected mode below this floor.
     pub minimum_mode: ProtectionMode,
@@ -127,29 +127,44 @@ pub struct NegotiatedKey {
     pub confirmation_timeout: Duration,
     session: ClientSession,
     transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
+    server_challenge: [u8; SERVER_CHALLENGE_LEN],
     client_pq_private_key: Zeroizing<Vec<u8>>,
     gateway_pq_public_key: String,
 }
 
 impl NegotiatedKey {
+    /// Identifier the gateway records as this slot's owner.
+    ///
+    /// Needed later to release it: the gateway only accepts a release naming
+    /// the transaction that currently owns the slot, so a delayed one cannot
+    /// dismantle a tunnel a newer negotiation just built.
+    pub fn transaction_id(&self) -> [u8; KEY_NEGOTIATION_NONCE_LEN] {
+        self.transaction_id
+    }
+
     /// Commits only after the caller has seen a WireGuard handshake succeed
     /// with the PSK this negotiation just installed.
     ///
-    /// Returns the live link: as long as it is held, the gateway considers
-    /// this tunnel alive. Closing it — or dropping it, or crashing — tells the
-    /// gateway to release the slot at once instead of waiting for handshakes
-    /// to go stale.
-    pub async fn confirm(self) -> Result<SessionLink> {
+    /// The connection is closed on the way out. v4 handed back a liveness
+    /// link whose closure released the PSK; that tied a tunnel's life to a
+    /// control connection on a WAN path, so any blip over 35 seconds killed a
+    /// healthy tunnel. Liveness is now read from the data plane, and the PSK
+    /// is removed only by an explicit release, a replacement, a revocation or
+    /// a deadline.
+    pub async fn confirm(self) -> Result<()> {
         let transaction = hex_prefix(&self.transaction_id);
-        let confirmation =
-            authenticate_confirmation(self.transaction_id, self.client_pq_private_key.as_slice())
-                .context("signing the key-negotiation confirmation with ML-DSA-65")?;
+        let confirmation = authenticate_confirmation(
+            self.server_challenge,
+            self.transaction_id,
+            self.client_pq_private_key.as_slice(),
+        )
+        .context("signing the key-negotiation confirmation with ML-DSA-87")?;
         tracing::info!(
             %transaction,
             "key negotiation: sending the confirmation over the QUIC session"
         );
         let started = std::time::Instant::now();
-        let (commit, link) = self.session.confirm(confirmation).await.with_context(|| {
+        let commit = self.session.confirm(confirmation).await.with_context(|| {
             // This is where a session that was fine at negotiation time dies:
             // the WireGuard interface has come up in between, and the route to
             // the gateway is no longer the one this connection was opened on.
@@ -169,7 +184,7 @@ impl NegotiatedKey {
             elapsed_ms = started.elapsed().as_millis(),
             "key negotiation: gateway committed the slot"
         );
-        Ok(link)
+        Ok(())
     }
 }
 
@@ -196,46 +211,6 @@ pub async fn prepare(
     aether::wg::validate_key(expected_gateway_wg_public_key)
         .context("invalid gateway WireGuard public key")?;
 
-    let transaction_id = random_identifier()?;
-    let client_nonce = random_identifier()?;
-    let mut kem_secret = None;
-    let (kem_public_key, static_psk_fingerprint) = match mode {
-        ProtectionMode::Classic => (None, None),
-        ProtectionMode::StaticPsk => {
-            let psk = static_psk.context("static mode requires a profile PSK")?;
-            (None, Some(static_psk_fingerprint(psk)?))
-        }
-        ProtectionMode::MlKem => {
-            let (secret, public) =
-                MlKem1024Kem::generate().context("generating an ML-KEM-1024 keypair")?;
-            kem_secret = Some(secret);
-            (Some(public), None)
-        }
-    };
-    let request = KeyNegotiationRequest {
-        protocol_version: KEY_NEGOTIATION_VERSION,
-        transaction_id,
-        mode,
-        client_wg_public_key: client_wg_public_key.to_string(),
-        client_nonce,
-        // Signed and bound into the derivation. The signature prevents an
-        // active transport attacker from refreshing a captured request; the
-        // gateway clock check limits an unchanged replay to the accepted
-        // window, where the transaction cache rejects duplicates.
-        timestamp_unix: unix_time_now()?,
-        kem_public_key,
-        static_psk_fingerprint,
-    };
-    let client_pq_certificate: PqCertificate =
-        serde_json::from_slice(&client.client_pq_certificate)
-            .context("decoding the client PQ certificate")?;
-    let authenticated_request = authenticate_request(
-        request,
-        client_pq_certificate,
-        &client.client_pq_private_key,
-    )
-    .context("signing the key-negotiation request with ML-DSA-65")?;
-
     let remote = resolve_remote(&client.remote).await?;
     // Pinned off the tunnel before anything is sent. This session opens
     // before the WireGuard interface exists and has to outlive it coming up;
@@ -246,6 +221,88 @@ pub async fn prepare(
         .context("opening the key-negotiation socket")?;
     let endpoint = client_endpoint_on_socket(socket, &identity, client.gateway_ca)
         .context("building the authenticated key-negotiation client")?;
+
+    // The challenge comes first, and the request cannot exist without it: it
+    // is signed into the transcript and mixed into the HKDF salt. Asking for
+    // it also checks, for free and before any ML-DSA-87 work, that the
+    // gateway answering is the one this profile pins.
+    let pending = request_challenge(
+        &endpoint,
+        remote,
+        &client.server_name,
+        expected_gateway_wg_public_key,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "obtaining a key-negotiation challenge from {remote} \
+             (server name {})",
+            client.server_name
+        )
+    })?;
+    let server_challenge = pending.server_challenge();
+
+    let transaction_id = random_identifier()?;
+    let client_nonce = random_identifier()?;
+    let mut kem_secret = None;
+    let (kem_public_key, commitment) = match mode {
+        ProtectionMode::Classic => (None, None),
+        ProtectionMode::StaticPsk => {
+            let psk = static_psk.context("static mode requires a profile PSK")?;
+            // Bound to this transaction, so two sessions with the same PSK
+            // present two different values and an observer of the public port
+            // has nothing to correlate.
+            (
+                None,
+                Some(static_psk_commitment(
+                    psk,
+                    &transaction_id,
+                    &client_nonce,
+                    &server_challenge,
+                    client_wg_public_key,
+                    expected_gateway_wg_public_key,
+                )?),
+            )
+        }
+        ProtectionMode::MlKem => {
+            let (secret, public) =
+                MlKem1024Kem::generate().context("generating an ML-KEM-1024 keypair")?;
+            kem_secret = Some(secret);
+            (Some(public), None)
+        }
+    };
+    let request = KeyNegotiationRequest {
+        protocol_version: KEY_NEGOTIATION_VERSION,
+        server_challenge,
+        transaction_id,
+        mode,
+        client_wg_public_key: client_wg_public_key.to_string(),
+        // Names the gateway this request is for. Signed, and checked there
+        // before any slot moves: without it an authentic request could be
+        // replayed against another gateway sharing the operator CA.
+        gateway_wg_public_key: expected_gateway_wg_public_key.to_string(),
+        server_name: client.server_name.clone(),
+        gateway_certificate_fingerprint: client
+            .gateway_pq_certificate
+            .fingerprint()
+            .context("computing the pinned gateway certificate fingerprint")?,
+        client_nonce,
+        // A secondary control since v5: it discards a delayed request before
+        // any cryptography and names a drifting clock. The challenge above is
+        // what makes replay impossible.
+        timestamp_unix: unix_time_now()?,
+        kem_public_key,
+        static_psk_commitment: commitment,
+    };
+    let client_pq_certificate: PqCertificate =
+        serde_json::from_slice(&client.client_pq_certificate)
+            .context("decoding the client PQ certificate")?;
+    let authenticated_request = authenticate_request(
+        request,
+        client_pq_certificate,
+        &client.client_pq_private_key,
+    )
+    .context("signing the key-negotiation request with ML-DSA-87")?;
     // Everything needed to tell a routing problem from a refusal: where we
     // dial, under which name the certificate is checked, and what the request
     // weighs — the PQ material is what makes these datagrams large.
@@ -262,20 +319,15 @@ pub async fn prepare(
         "key negotiation: dialing the gateway"
     );
     let started = std::time::Instant::now();
-    let (authenticated_response, session) = negotiate(
-        &endpoint,
-        remote,
-        &client.server_name,
-        &authenticated_request,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "performing key negotiation with {remote} (server name {}, after {} ms)",
-            client.server_name,
-            started.elapsed().as_millis()
-        )
-    })?;
+    let (authenticated_response, session) = negotiate(&endpoint, pending, &authenticated_request)
+        .await
+        .with_context(|| {
+            format!(
+                "performing key negotiation with {remote} (server name {}, after {} ms)",
+                client.server_name,
+                started.elapsed().as_millis()
+            )
+        })?;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         selected_mode = ?authenticated_response.response.selected_mode,
@@ -318,13 +370,14 @@ pub async fn prepare(
     };
 
     Ok(NegotiatedKey {
+        server_challenge,
         mode,
         psk,
         confirmation_timeout: Duration::from_secs(response.confirmation_timeout_secs.into()),
         session,
         transaction_id,
         client_pq_private_key: Zeroizing::new(client.client_pq_private_key),
-        gateway_pq_public_key: client.gateway_pq_certificate.ml_dsa_65_public_key.clone(),
+        gateway_pq_public_key: client.gateway_pq_certificate.ml_dsa_87_public_key.clone(),
     })
 }
 
@@ -423,4 +476,90 @@ fn random_identifier() -> Result<[u8; KEY_NEGOTIATION_NONCE_LEN]> {
         ));
     }
     Ok(value)
+}
+
+/// Tells the gateway to drop the PSK a committed negotiation installed.
+///
+/// This is what replaces v4's closing QUIC link. It is **best-effort** and
+/// deliberately so: a host that is powered off or a network that is down
+/// sends nothing, and the slot then falls back on the gateway's own
+/// data-plane reclamation. Callers log a failure and carry on tearing the
+/// tunnel down — the client is disconnecting either way, and refusing to
+/// disconnect because a courtesy message failed would be worse than the
+/// courtesy.
+pub async fn release_for_profile(
+    profile: &ClientProfile,
+    identities: &dyn IdentityProvider,
+    installed_transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
+) -> Result<()> {
+    let settings = profile
+        .key_negotiation
+        .as_ref()
+        .context("profile has no key-negotiation settings")?;
+    let gateway_ca = base64::engine::general_purpose::STANDARD
+        .decode(settings.gateway_ca_der.trim())
+        .context("decoding the gateway CA certificate")?;
+    // The anchor the acknowledgment is checked against. Without it the client
+    // would zeroise its PSK on anyone's say-so.
+    let pinned_gateway_pq_certificate: PqCertificate = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(settings.gateway_pq_certificate.trim())
+            .context("decoding the pinned gateway PQ certificate")?,
+    )
+    .context("parsing the pinned gateway PQ certificate")?;
+    let client_wg_public_key = profile
+        .public_key()
+        .context("deriving the client WireGuard public key")?;
+    let identity = identities.load(&settings.identity).await.with_context(|| {
+        format!(
+            "loading key-negotiation identity {} to release the PSK",
+            settings.identity
+        )
+    })?;
+    let client_pq_certificate: PqCertificate = serde_json::from_slice(&identity.pq_certificate)
+        .context("decoding the client PQ certificate")?;
+    let client_pq_private_key = identity.pq_private_key.clone();
+    let tls = TlsIdentity {
+        certificate_chain: identity.certificate_chain,
+        private_key: identity.private_key,
+    };
+
+    let remote = resolve_remote(&settings.endpoint).await?;
+    let socket = crate::net_pin::negotiation_socket(remote, crate::net_pin::TUNNEL_IFNAME)
+        .context("opening the release socket")?;
+    let endpoint = client_endpoint_on_socket(socket, &tls, gateway_ca)
+        .context("building the authenticated release client")?;
+
+    let peer_public_key = profile.peer_public_key.clone();
+    let timestamp_unix = unix_time_now()?;
+    let released = helios_key_negotiation::release_psk(
+        &endpoint,
+        remote,
+        &settings.server_name,
+        &profile.peer_public_key,
+        &pinned_gateway_pq_certificate,
+        move |server_challenge| {
+            aether::key_negotiation::authenticate_release(
+                aether::key_negotiation::PskRelease {
+                    protocol_version: KEY_NEGOTIATION_VERSION,
+                    server_challenge,
+                    installed_transaction_id,
+                    client_wg_public_key,
+                    gateway_wg_public_key: peer_public_key,
+                    timestamp_unix,
+                },
+                client_pq_certificate,
+                &client_pq_private_key,
+            )
+            .map_err(|error| helios_key_negotiation::TransportError::Protocol(error.to_string()))
+        },
+    )
+    .await
+    .context("sending the signed PSK release")?;
+
+    tracing::info!(
+        transaction = %hex_prefix(&released.released.installed_transaction_id),
+        "key negotiation: the gateway acknowledged the PSK release"
+    );
+    Ok(())
 }

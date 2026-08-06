@@ -1408,12 +1408,12 @@ mod tests {
     /// client's own private key.
     fn gateway_settings(mode: ProtectionMode) -> KeyNegotiationSettings {
         use aether::key_negotiation::{
-            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
             PQ_CERTIFICATE_VERSION,
         };
         use base64::engine::general_purpose::STANDARD;
 
-        let (private_key, public_key) = generate_ml_dsa_65_keypair().unwrap();
+        let (private_key, public_key) = generate_ml_dsa_87_keypair().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1426,10 +1426,10 @@ mod tests {
                 issuer: "vpn.example.net".into(),
                 role: PqCertificateRole::Gateway,
                 wireguard_public_key: GATEWAY_PUBLIC.into(),
-                ml_dsa_65_public_key: STANDARD.encode(&public_key),
+                ml_dsa_87_public_key: STANDARD.encode(&public_key),
                 not_before_unix: now - 60,
                 not_after_unix: now + 3600,
-                ml_dsa_65_signature: String::new(),
+                ml_dsa_87_signature: String::new(),
             },
             &private_key,
         )
