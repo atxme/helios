@@ -22,13 +22,29 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
   cycle de vie des secrets, admission, profils clients et livraison
   d'artefacts.
 - [adr/ADR-005-NEGOCIATION-DE-CLE.md](adr/ADR-005-NEGOCIATION-DE-CLE.md) —
-  spécification et modèle de menace de la négociation de clé pré-WireGuard :
-  port public, PKI ML-DSA-65, PSK ML-KEM du **premier** handshake, plancher
-  anti-downgrade et identité cliente scellée.
+  décision et modèle de menace de la négociation de clé pré-WireGuard : port
+  public, PKI applicative post-quantique, PSK ML-KEM du **premier** handshake,
+  plancher anti-downgrade et identité cliente scellée. Amendé le 2026-08-06
+  pour la v5 : fermeture de QUIC après le commit, challenge anti-rejeu,
+  ML-DSA-87, preuve WireGuard bilatérale, états générationnels et enrôlement
+  autorisé sans clé privée transportée.
 - [adr/ADR-006-SECRETS-AU-REPOS.md](adr/ADR-006-SECRETS-AU-REPOS.md) —
   chiffrement AES-256-GCM des secrets sur disque, hiérarchie de clés Orion liée
   au TPM, hygiène mémoire et modèle de menace du stockage local. Le chiffrement
   de volume (BitLocker / dm-crypt) y devient un **prérequis d'installation**.
+
+## Négociation de clé — notes techniques
+
+Les deux notes coexistent volontairement : l'une décrit ce qui tourne, l'autre
+ce qu'il faut construire.
+
+- [NEGOCIATION-DE-CLE-V4.md](NEGOCIATION-DE-CLE-V4.md) — protocole
+  **actuellement servi** par `heliosd` et Orion.
+- [NEGOCIATION-DE-CLE-V5.md](NEGOCIATION-DE-CLE-V5.md) — protocole **cible**,
+  non implémenté : traitement des constats successifs des revues de sécurité de
+  la v4 puis de la spécification elle-même. Son §0 les indexe un par un. Le mode
+  Orion `classic` y reste disponible pour les hôtes WireGuard génériques, mais
+  demeure strictement hors du protocole de négociation Helios v5.
 
 ## Sécurité
 

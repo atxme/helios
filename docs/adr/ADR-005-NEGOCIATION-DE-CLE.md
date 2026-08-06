@@ -1,6 +1,14 @@
 # ADR 005 — Négociation de clé pré-WireGuard
 
-**Statut** : accepté (2026-07-25), révisé pour le protocole v4 (2026-08-04)
+**Statut** : accepté (2026-07-25), révisé pour le protocole v4 (2026-08-04),
+**amendé le 2026-08-06** pour le protocole v5 — voir
+[Amendement du 6 août 2026](#amendement-du-6-août-2026--protocole-v5).
+
+> Le corps de cet ADR décrit le protocole **v4**, celui que le code sert
+> aujourd'hui. L'amendement en fin de document renverse trois de ses décisions
+> et en précise plusieurs autres. Là où les deux se contredisent, l'amendement
+> fait foi pour la cible, le corps pour l'existant. La spécification détaillée
+> de la cible est [NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md).
 
 Remplace et détaille l'amendement du 24 juillet 2026 de
 [ADR-001](ADR-001-WIREGUARD.md), qui reste la référence pour le transport
@@ -730,3 +738,252 @@ rythme, pour un gain nul — le PSK couvre déjà toutes les sessions dérivées
 **Une PKI post-quantique complète en remplacement de X.509.** Aucune pile QUIC
 ne l'accepte aujourd'hui. La superposition retenue donne la même propriété
 d'authentification PQ sans réécrire une pile TLS.
+
+## Amendement du 6 août 2026 — protocole v5
+
+**Statut** : accepté. Spécification :
+[NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md). Non implémenté au jour
+de cet amendement.
+
+Une revue de sécurité de la v4 a produit vingt constats. La plupart se
+traitent par ajout et n'engagent pas cet ADR : ils sont dans la spécification.
+Quatre décisions initiales, puis les corrections de la revue amont avant
+implémentation, **renversent** ou **restreignent** des choix acceptés ici. C'est
+ce que cet amendement acte.
+
+### 1. La session QUIC ne survit plus au commit
+
+Le §5 de cet ADR fait de la connexion QUIC un lien de vivacité conservé aussi
+longtemps que le tunnel. **Ce choix est abandonné.** Après vérification du
+commit, Orion ferme explicitement la connexion. Les keep-alives de 10 s, le
+délai de 35 s et toute libération de PSK déclenchée par une fermeture
+disparaissent.
+
+Le raisonnement du §5 partait d'un vrai problème — WireGuard est sans
+connexion, un pair disparu n'est constaté que 150 s plus tard — mais la solution
+retenue liait la survie d'un tunnel à la survie d'une session TCP-like sur un
+chemin WAN. La conséquence pratique est celle que le §5 décrivait lui-même sans
+en tirer la conclusion : **toute coupure réseau de plus de 35 secondes tue un
+tunnel sain**, et le fait mourir au rekey WireGuard suivant, deux à trois
+minutes après l'événement qui l'a causé, sans que rien ne relie les deux. Une
+liaison mobile qui bascule d'un relais à l'autre produit exactement cela.
+
+La vivacité revient donc à WireGuard, qui est conçu pour survivre à un chemin
+intermittent, et le retrait d'un PSK `ml_kem` devient explicite : message
+`release` signé, remplacement atomique, révocation d'admission, ou échéance de
+24 heures. Le PSK statique reste gouverné par la configuration.
+
+**La vivacité change de support, elle ne disparaît pas.** C'est la précision
+qu'une seconde revue a imposée. Supprimer le lien QUIC supprimait aussi le seul
+canal qui apprenait à un client que la gateway avait perdu son PSK — après un
+redémarrage de `heliosd`, par exemple, qui vide tous les slots négociés puisque
+aucun n'est persisté. Le tunnel serait alors mort silencieusement au rekey
+suivant, deux minutes plus tard, sans rien pour relier les deux : exactement le
+mode de panne que le §5 voulait éviter, réintroduit par l'autre bout.
+
+Le signal est donc reconstruit sur le **plan de données**, où il aurait dû être
+depuis le début : l'âge du dernier handshake WireGuard, que la gateway observe
+déjà toutes les dix secondes pour établir l'état du tunnel. Orion renégocie à
+150 secondes d'âge, la gateway récupère le slot à 300 secondes ; les deux seuils
+encadrent les 180 secondes au bout desquelles WireGuard abandonne lui-même une
+session. Cela suppose un keep-alive persistant configuré, qui devient une
+exigence et non une option.
+
+Ce que l'on perd reste réel et écrit en toutes lettres dans la spécification
+(§12.4) : la détection passe de 35 secondes à cinq minutes, et disparaît
+entièrement pour un pair sans keep-alive. Le slot reste inutilisable sans la clé
+privée WireGuard du pair, et le remède d'un poste perdu n'a jamais été
+l'échéance du PSK — c'est `helios-ctl peer remove`.
+
+Conséquence de dimensionnement : la limite de 128 connexions simultanées cesse
+d'être un plafond de tunnels et redevient ce qu'elle prétendait être, un plafond
+de négociations.
+
+### 2. L'anti-rejeu n'est plus probabiliste
+
+Les « Limites connues » de cet ADR acceptaient une fenêtre résiduelle : une
+requête entièrement authentifiée restait rejouable pendant trente secondes si
+son identifiant avait été évincé du cache de 4096 entrées ou si le démon avait
+redémarré. Le coût d'y remédier — « un challenge supplémentaire ou un compteur
+persistant » — avait été jugé non retenu.
+
+**Ce refus est levé.** Une phase `challenge` précède désormais la requête : la
+gateway émet 32 octets attachés à l'état de la connexion, à usage unique,
+consommés atomiquement à l'acceptation, et couverts par toutes les signatures
+ainsi que par le sel HKDF.
+
+Le coût s'est révélé bien plus bas que l'estimation initiale, parce que le
+challenge n'a pas besoin d'une table globale : il vit dans la connexion QUIC,
+dont le nombre est déjà plafonné à 128. Il n'y a ni structure à dimensionner, ni
+état à persister, ni compteur à synchroniser. Un aller-retour de plus, aucune
+signature supplémentaire — le challenge n'est délibérément **pas** signé, pour
+ne pas offrir une opération ML-DSA gratuite à un client non authentifié.
+
+Le cache de 4096 identifiants est conservé comme défense en profondeur. Il n'est
+plus une propriété de sécurité, et l'horodatage signé devient un contrôle
+secondaire : il écarte les requêtes retardées avant toute cryptographie et
+nomme une horloge dérivée. Ni l'un ni l'autre ne doit plus être présenté comme
+le mécanisme anti-rejeu.
+
+### 3. ML-DSA-87 : les catégories deviennent homogènes
+
+Les « Limites connues » constataient que l'authentification en catégorie 3
+était devenue le maillon le plus bas sous un KEM de catégorie 5, et concluaient
+que passer en ML-DSA-87 « est une décision d'exploitation autant que de
+cryptographie, et elle n'est pas prise ici ».
+
+**Elle est prise ici : ML-DSA-87 sur toute la PKI de négociation.**
+
+Ce qui a changé n'est pas l'analyse cryptographique — elle reste juste, casser
+ML-DSA-65 permettrait de substituer `kpub` sur une négociation en cours, pas de
+déchiffrer un enregistrement passé — mais le prix. Le blocage était le
+ré-enrôlement du parc. Or la v5 le rend obligatoire par ailleurs : le document
+d'enrôlement change de forme (point 4 ci-dessous) et l'empreinte PQ héritée
+disparaît. Le parc est ré-enrôlé de toute façon. Rester en catégorie 3 aurait
+signifié payer la migration sans en prendre le bénéfice.
+
+Le périmètre est strict : **la PKI de négociation seulement**. Les signatures
+d'artefacts éditeur restent régies par
+[ADR-002](ADR-002-SIGNATURES-PQ.md) — Ed25519 **et** ML-DSA-65, trousseau
+compilé, `REQUIRED_ALGS` inchangé. Toucher `aether::sig` invaliderait la
+vérification de toutes les releases déjà signées.
+
+Corollaires : certificat PQ en version `2`, domaine de certificat en `-v2`, clé
+privée gateway de 4896 octets à sceller au TPM, signatures de 4627 octets, et
+une migration coupante décrite au §18 de la spécification.
+
+### 4. L'enrôlement ne transporte plus de clé privée
+
+Le §7 de cet ADR fait naître l'identité cliente sur le poste opérateur et la
+fait voyager « une fois », scellée à l'arrivée par DPAPI. Le §8 en tire un
+document `.orion` qui est un secret, à transférer par canal maîtrisé et à
+détruire des deux côtés.
+
+**Ce modèle est abandonné.** Les trois clés privées du client — WireGuard, TLS
+et ML-DSA-87 — naissent dans le stockage protégé du poste client et n'en sortent
+jamais. L'opérateur émet d'abord une invitation signée, ciblée, expirante et à
+usage unique. La demande qui lui répond ne porte que du public et trois preuves
+de possession ; l'opérateur consomme l'invitation avant d'émettre les
+certificats, d'admettre le pair et de renvoyer un document qui n'est plus un
+secret.
+
+Le raisonnement du §7 tenait à une seule contrainte pratique : éviter un
+aller-retour. Le prix était qu'un secret existait en clair sur au moins deux
+machines et un canal de transfert, protégé par une discipline de destruction
+manuelle. Un aller-retour est moins cher qu'une discipline.
+
+La possession WireGuard est prouvée par un challenge X25519 éphémère propre à
+l'invitation — jamais par la clé WireGuard gateway. L'empreinte de `CA-PQ` est
+confirmée hors bande et épinglée **avant** la création de la demande ; le
+document final ne peut donc plus apporter à la fois son ancre et sa preuve. Il
+porte une signature ML-DSA-87 sur une forme JCS et le hash de la demande locale.
+
+### 5. Corrections de la revue amont avant implémentation
+
+La spécification a été relue une troisième fois avant que le module v5 existe.
+Six décisions supplémentaires deviennent architecturales.
+
+**La preuve WireGuard devient bilatérale.** Orion n'envoie la confirmation
+qu'après une progression observée par son backend, et Helios ne commit qu'après
+avoir observé la même progression sur le sien. La signature de confirmation
+autorise ; elle ne prouve pas la possession de la clé privée WireGuard. Une
+identité TLS/ML-DSA volée peut provoquer une pose candidate, jamais la
+committer ni relever le plancher.
+
+**Toutes les mutations d'un pair partagent une machine d'état générationnelle.**
+Négociation, confirmation, rollback, `release`, échéance, récupération,
+hot-reload et révocation passent par le même sérialiseur. `peer remove` domine ;
+un callback portant une génération obsolète est un no-op. Il n'existe donc plus
+de course capable de retirer le candidat d'une autre transaction ou de restaurer
+un secret après révocation.
+
+**Les ressources QUIC ont une durée absolue.** Une connexion porte un challenge,
+une requête et, pour une négociation, une confirmation ; elle utilise un flux
+bidirectionnel et aucun flux unidirectionnel. Le 0-RTT et la reprise TLS sont
+désactivés. Les limites portent sur l'IPv4 ou le préfixe IPv6 `/64`, puis sur
+l'identité admise ; les 128 permis expirent après 90 s sans pouvoir être
+rafraîchis par du trafic improductif.
+
+**Les représentations et contrôles cryptographiques sont canoniques.** Clés
+WireGuard et empreintes entrent sous leur forme binaire de 32 octets dans les
+signatures et le HKDF. Base64, hexadécimal, DNS et UTF-8 n'ont qu'une forme
+acceptée. ML-KEM applique tous les contrôles d'entrée FIPS 203, pas seulement la
+longueur, et les calculs temporels ne peuvent pas déborder sur une valeur `u64`.
+
+**La durée maximale ML-KEM vaut réellement 24 heures.** Le renouvellement part
+à 21 h 36 et le retrait est ferme à 24 h, sans heure de grâce supplémentaire.
+Une source de temps écoulé incluant la suspension empêche un recul d'horloge ou
+une veille de prolonger le slot. Le PSK statique reste une donnée de
+configuration : ni `release`, ni échéance de 24 h, ni prétention de fraîcheur.
+
+**`classic` n'existe pas dans le protocole de négociation v5, mais reste une
+capacité d'Orion.** La migration Helios est déjà coupante ; garder un mode vide
+dans le parseur v5 augmenterait seulement la surface d'attaque. La v5 accepte
+`static_psk` et `ml_kem` et réserve `0x00`. En revanche, un profil Orion
+explicitement `classic` continue de joindre un hôte WireGuard générique sans
+ouvrir QUIC, sans identité de négociation et sans revendiquer la protection
+post-quantique du premier handshake. Les deux chemins sont représentés par des
+variantes de profil distinctes afin que la suppression du bloc de négociation
+d'un profil Helios soit un downgrade refusé, jamais une conversion implicite en
+`classic`.
+
+### 6. Ce que l'amendement ne change pas
+
+Restent en vigueur, tels que décrits dans le corps de l'ADR : le second port
+UDP et son rôle, les deux modes v5 choisis par le client et jamais substitués,
+l'ancre d'authentification applicative superposée à TLS, ML-KEM-1024 et
+HKDF-SHA-512 avec leur justification de paramètres, le rejet de KMAC, la pose
+gateway **avant** annonce, le plancher anti-downgrade monotone des deux côtés,
+le sérialiseur par pair, la validation d'adresse QUIC et les limites de source,
+les 1200 octets de datagramme et la découverte de MTU désactivée.
+
+Le maintien du chemin Orion `classic` ne crée pas de troisième mode v5 : il est
+hors de l'ALPN, du port de négociation, de l'admission Helios et de son plancher
+anti-downgrade. Un PSK WireGuard provisionné directement dans ce profil reste
+une donnée WireGuard ordinaire et ne devient pas le mode `static_psk` v5.
+
+### 7. Nouvelles limites connues
+
+- **La disparition brutale d'un client est détectée en cinq minutes, contre
+  trente-cinq secondes.** C'est le prix direct du point 1, quantifié au §12.4 de
+  la spécification. La détection dépend entièrement du keep-alive persistant ;
+  pour que cette dépendance ne soit pas silencieuse, la gateway pose désormais
+  le keep-alive elle-même sur chaque pair négocié plutôt que de compter sur
+  celui du client, qu'elle ne peut pas inspecter. `WgPeer` et `PeerConfig`
+  gagnent le champ correspondant, l'admission refuse un pair négocié sans, et le
+  chargement de configuration le valide.
+- **Le renouvellement de PSK repose sur un raisonnement non mesuré.** La preuve
+  par handshake exigée par le protocole n'est pas satisfaisable sans
+  réinitialiser la session WireGuard, ce que la spécification impose désormais.
+  Que cette réinitialisation tienne les délais sur un vrai plan de données reste
+  **à établir** : c'est le seul essai bloquant de la v5 (§20.0), il précède
+  l'écriture du chemin de renouvellement, et son échec choisit la reconnexion
+  complète pré-arbitrée au §12.3, jamais la suppression de la preuve.
+- **Le `release` est best-effort.** Il suppose un arrêt propre d'Orion. L'accusé
+  `released` est signé, mais aucune reprise n'est tentée si la connexion
+  échoue : le PSK retombe sur la récupération par vieillissement.
+- **Un renouvellement de PSK interrompt brièvement le trafic.** La preuve exigée
+  par le protocole impose de forcer un handshake, donc de réinitialiser la
+  session WireGuard du pair. La supprimer demanderait deux slots PSK simultanés,
+  que WireGuard n'offre pas.
+- **Un redémarrage de `heliosd` coupe tous les tunnels.** Les PSK négociés ne
+  sont pas persistés — c'est voulu — et les clients se réparent seuls en moins
+  de trois minutes, sans que rien ne les prévienne à l'avance.
+- **Les deux bouts peuvent diverger sur le verdict d'une transaction.** La perte
+  du commit est tolérée, pas empêchée. Un accusé applicatif ne la supprimerait
+  pas : il déplacerait l'ambiguïté d'un cran, le problème des deux généraux
+  n'ayant pas de solution par échange de messages. La v5 choisit donc quel côté
+  la porte — le client, qui peut la résoudre seul en renégociant.
+- **La migration est coupante.** Il n'y a pas de double pile v4/v5 : maintenir
+  un listener v4 garderait vivante la fenêtre de rejeu que la v5 ferme. Les
+  clients sont coupés entre le redémarrage de la gateway et l'import de leur
+  nouveau profil.
+- **La confiance initiale dépend encore d'un humain.** L'empreinte `CA-PQ` est
+  confirmée lors de l'invitation, avant toute demande ou document final, mais
+  elle dépend d'un opérateur qui la lit réellement.
+- **L'enrôlement gagne un aller-retour et un registre opérateur.** Perdre le
+  registre invalide les invitations en attente sans compromettre les clés
+  clientes ; il faut en émettre de nouvelles.
+- **Les refus ne sont pas strictement constants en temps.** Une identité ne
+  peut sonder que son propre pair et les budgets bornent les mesures, mais le
+  coût syntaxique et celui de ML-DSA restent différents.
