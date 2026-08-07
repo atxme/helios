@@ -267,6 +267,16 @@ pub trait NegotiationHandler: Send + Sync + 'static {
     /// serves, not what its configuration file says it should serve.
     fn announced_identity(&self) -> GatewayIdentity;
 
+    /// The one admitted peer this TLS certificate belongs to, if any.
+    ///
+    /// Called as soon as mTLS names the peer and **before** a challenge is
+    /// issued (spec §4.4, §7.3): an unknown fingerprint must not cost the
+    /// gateway a CSPRNG read and a frame, and an admitted identity must not
+    /// get to choose which peer it probes. The WireGuard key in the request
+    /// is then checked against this answer — it is never itself a lookup key
+    /// into the peer table.
+    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String>;
+
     async fn prepare(
         &self,
         certificate_sha256: String,
@@ -282,7 +292,13 @@ pub trait NegotiationHandler: Send + Sync + 'static {
     ///
     /// Only callable **before** the commit is signed. After that point there
     /// is no rollback: see the ordering in `heliosd::key_negotiation`.
-    async fn rollback(&self, transaction_id: [u8; 16]);
+    ///
+    /// The peer's WireGuard key is passed alongside the identifier because
+    /// this must also undo a `prepare` that was **destroyed part-way
+    /// through** and therefore never recorded its transaction. The
+    /// implementation matches on the identifier the slot itself carries, so
+    /// a call naming a transaction that no longer owns the slot is a no-op.
+    async fn rollback(&self, transaction_id: [u8; 16], client_wg_public_key: &str);
 
     /// Explicit teardown, authenticated exactly like a request.
     ///
@@ -396,23 +412,42 @@ fn pinned_transport() -> quinn::TransportConfig {
     transport.mtu_discovery_config(None);
     transport.initial_mtu(SAFE_UDP_PAYLOAD);
     transport.min_mtu(SAFE_UDP_PAYLOAD);
-    // The connection outlives the exchange: once committed, it becomes the
-    // liveness link whose closure tells the gateway to release the PSK slot
-    // ([`SessionLink`]). It then carries **nothing** — which QUIC, left to its
-    // defaults, reads as death after 30 seconds of silence.
+    // Between the response and the confirmation the client is waiting on a
+    // WireGuard handshake, and neither end sends anything for as long as that
+    // takes. QUIC's default reads 30 seconds of that silence as death and
+    // tears down a connection that is doing exactly what the protocol asks.
     //
-    // That is exactly what happened: the gateway released the slot half a
-    // minute into every tunnel, the client kept its own, and the session went
-    // on working until the next WireGuard rekey — then died, two to three
-    // minutes in, for no reason either end announced. Keep-alives are what
-    // make silence mean "still here".
+    // This is *not* a liveness signal, and nothing about the tunnel depends
+    // on it. In v4 the connection was the liveness link and its closure
+    // released the PSK slot — which released it half a minute into every
+    // tunnel, and the session then worked until the next WireGuard rekey and
+    // died two to three minutes in for no reason either end announced. v5
+    // closes the connection after the commit and reads liveness from the data
+    // plane; this timeout only bounds a transaction.
     transport.max_idle_timeout(Some(
         TRANSACTION_IDLE_TIMEOUT
             .try_into()
             .expect("the idle timeout fits QUIC's varint"),
     ));
+    // Nothing in this protocol ever opens a unidirectional stream. Leaving
+    // quinn's default in place would let a peer open a hundred of them and
+    // hold receive buffers the exchange has no use for. Set on **both** sides:
+    // a limit only the gateway announces bounds only the gateway.
+    transport.max_concurrent_uni_streams(0u32.into());
+    // The receive windows bound what one connection can make its peer buffer
+    // before a frame length is even parsed.
+    transport.stream_receive_window(RECEIVE_WINDOW.into());
+    transport.receive_window(RECEIVE_WINDOW.into());
     transport
 }
+
+/// Flow-control window, per stream and per connection (spec §4.1).
+///
+/// Three maximum frames — `3 × (4 + 65 536)` — which is the most either end
+/// legitimately has in flight, and neither ever keeps more than one complete
+/// unprocessed frame per direction. Far below quinn's default, which is sized
+/// for bulk transfer rather than for a two-round-trip exchange.
+const RECEIVE_WINDOW: u32 = 3 * (4 + MAX_KEY_NEGOTIATION_MESSAGE_BYTES as u32);
 
 /// Datagram size every QUIC path must carry (RFC 9000 §14).
 const SAFE_UDP_PAYLOAD: u16 = 1200;
@@ -434,7 +469,11 @@ const SAFE_UDP_PAYLOAD: u16 = 1200;
 /// ever be reintroduced as a way of inferring that a peer is still there:
 /// that question is now answered by the data plane
 /// (`helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS`).
-const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Fifty seconds is the value §4.5 fixes. It sits above the 45-second
+/// confirmation window it has to clear and below the 90-second ceiling, which
+/// is the whole of what it must satisfy.
+const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Time allowed for the QUIC handshake with the negotiation service.
 ///
@@ -479,26 +518,19 @@ pub fn server_endpoint(
         .with_single_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     tls.alpn_protocols = vec![KEY_NEGOTIATION_ALPN.to_vec()];
+    // Session resumption and 0-RTT are forbidden (spec §4.1). Every
+    // connection redoes the full mutual TLS and presents the current client
+    // certificate, so no identity inherited from a ticket can bypass current
+    // validity or current admission. rustls issues tickets by default, which
+    // is precisely the behaviour being refused here.
+    tls.send_tls13_tickets = 0;
+    tls.max_early_data_size = 0;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport = pinned_transport();
+    // Exactly one, opened by Orion. A second is a protocol error.
     transport.max_concurrent_bidi_streams(1u32.into());
-    // Nothing in this protocol ever opens a unidirectional stream. Leaving
-    // quinn's default in place would let a peer open a hundred of them and
-    // hold receive buffers the exchange has no use for.
-    transport.max_concurrent_uni_streams(0u32.into());
-    // The receive windows bound what one connection can make the gateway
-    // buffer before the frame length is even parsed. A negotiation moves tens
-    // of kilobytes in a couple of round-trips, so twice the maximum message
-    // is generous for the protocol and far below quinn's default.
-    let window = u32::try_from(2 * MAX_KEY_NEGOTIATION_MESSAGE_BYTES)
-        .expect("the message bound fits a QUIC flow-control window");
-    transport.stream_receive_window(window.into());
-    transport.receive_window(window.into());
-    // The gateway answers with the bulkiest half of the exchange — ciphertext
-    // and signature — so the size limit matters at least as much here as on
-    // the client side.
     config.transport = Arc::new(transport);
     let endpoint = Endpoint::server(config, bind).map_err(TransportError::Io)?;
     tracing::info!(
@@ -570,10 +602,19 @@ fn client_config(
         .with_client_auth_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     tls.alpn_protocols = vec![KEY_NEGOTIATION_ALPN.to_vec()];
+    // The client half of the same refusal: no ticket is kept, so none can be
+    // offered. `Arc::new(NoClientSessionStorage)` is what rustls calls "do not
+    // resume"; leaving the default in place would have the client volunteer a
+    // resumption the gateway is configured never to grant.
+    tls.resumption = rustls::client::Resumption::disabled();
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-    client_config.transport_config(Arc::new(pinned_transport()));
+    let mut transport = pinned_transport();
+    // The gateway never opens a stream to the client, so the client accepts
+    // none: the single bidirectional stream is Orion's, in Orion's direction.
+    transport.max_concurrent_bidi_streams(0u32.into());
+    client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
 
@@ -706,12 +747,7 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
                 handle_connection(incoming, handler, permit, per_identity),
             )
             .await
-            .unwrap_or_else(|_| {
-                Err(TransportError::Protocol(format!(
-                    "connection exceeded its {} s absolute lifetime",
-                    MAX_CONNECTION_LIFETIME.as_secs()
-                )))
-            });
+            .unwrap_or_else(|_| Err(TransportError::Protocol(absolute_lifetime_reached())));
             if let Err(error) = served {
                 // `aborted by peer` means the **client** hung up, and the text
                 // that follows is its own error crossing the wire. Naming the
@@ -728,6 +764,131 @@ pub async fn serve(endpoint: Endpoint, handler: Arc<dyn NegotiationHandler>) {
     }
 }
 
+fn absolute_lifetime_reached() -> String {
+    format!(
+        "connection exceeded its {} s absolute lifetime",
+        MAX_CONNECTION_LIFETIME.as_secs()
+    )
+}
+
+/// The absolute lifetime of one connection, as a point in time.
+///
+/// Each phase clamps its own timeout against what is left of it, so the
+/// ceiling is normally reached on an ordinary code path — one that rolls
+/// back, answers, and releases its permit. The `timeout` wrapping the whole
+/// connection stays as a backstop, but it must not be the mechanism that
+/// usually fires: destroying a future runs no code.
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    fn starting_now() -> Self {
+        Self(Instant::now() + MAX_CONNECTION_LIFETIME)
+    }
+
+    /// `phase`, or whatever is left of the connection's life, whichever is
+    /// shorter. Zero once the ceiling has passed, which every `timeout`
+    /// treats as an immediate expiry.
+    fn clamp(self, phase: Duration) -> Duration {
+        phase.min(self.remaining())
+    }
+
+    fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
+/// Undoes an unresolved transaction even when the task carrying it is
+/// destroyed rather than returned from.
+///
+/// # Why the ordinary exit paths are not enough
+///
+/// Every exit from [`handle_connection`] already rolls back. None of them
+/// runs when the future is **dropped**, and one is dropped on purpose: the
+/// `timeout` enforcing the 90-second ceiling. The interval that matters is
+/// the wait for the confirmation — up to 45 seconds in which nothing happens
+/// but the client thinking. A connection destroyed there used to leave the
+/// candidate PSK posed, the peer reserved and the transaction in the active
+/// table with nothing left to resolve it: that peer could not negotiate again
+/// until the daemon restarted, and reaching the state cost an admitted client
+/// one connection it simply never finished.
+///
+/// # Why it spawns
+///
+/// `Drop` cannot await. The rollback is guarded by the transaction identifier
+/// the slot itself carries, so running it a moment late is a no-op rather
+/// than a write — which is what makes detaching it safe.
+struct RollbackGuard {
+    handler: Arc<dyn NegotiationHandler>,
+    transaction_id: [u8; 16],
+    public_key: String,
+    armed: bool,
+}
+
+impl RollbackGuard {
+    fn arm(
+        handler: Arc<dyn NegotiationHandler>,
+        transaction_id: [u8; 16],
+        public_key: String,
+    ) -> Self {
+        Self {
+            handler,
+            transaction_id,
+            public_key,
+            armed: true,
+        }
+    }
+
+    /// Rolls back now, waiting for it, and disarms **once it has returned**.
+    ///
+    /// The order is the whole point. Disarming first — the obvious way to
+    /// write this — reopens the hole the guard exists to close: the rollback
+    /// is an `await`, the absolute ceiling can destroy the task inside it, and
+    /// `Drop` would then find a guard that has already declared itself done.
+    /// The candidate would stay posed with no record of it.
+    ///
+    /// This makes a double rollback possible, and that is fine: undoing is
+    /// keyed on the identifier the slot itself carries, so the second call
+    /// finds a slot that is no longer its own and writes nothing.
+    async fn roll_back(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.handler
+            .rollback(self.transaction_id, &self.public_key)
+            .await;
+        self.armed = false;
+    }
+
+    /// The commit is signed. There is nothing left that may be undone.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::warn!(
+            transaction = %hex::encode(self.transaction_id),
+            peer = %self.public_key,
+            "connection destroyed with a candidate PSK posed; rolling back out of band"
+        );
+        let handler = Arc::clone(&self.handler);
+        let transaction_id = self.transaction_id;
+        let public_key = std::mem::take(&mut self.public_key);
+        // `Handle::try_current` rather than `tokio::spawn`, which panics with
+        // no runtime. There is one here in every case that matters; during
+        // shutdown there may not be, and a panic inside `Drop` would be a
+        // worse outcome than a slot the next start clears anyway.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { handler.rollback(transaction_id, &public_key).await });
+        }
+    }
+}
+
 async fn handle_connection(
     incoming: quinn::Incoming,
     handler: Arc<dyn NegotiationHandler>,
@@ -735,11 +896,29 @@ async fn handle_connection(
     per_identity: Arc<std::sync::Mutex<RateLimiter<String>>>,
 ) -> Result<(), TransportError> {
     let started = Instant::now();
+    let deadline = Deadline::starting_now();
     let remote = incoming.remote_address();
     let connection = incoming.await.map_err(TransportError::Connection)?;
     let fingerprint = peer_certificate_sha256(&connection)?;
-    // Now that mTLS has named the peer, charge it. A per-address budget does
-    // not bound a single admitted identity that roams.
+    // Resolved before anything is spent on this connection (spec §4.4, §7.3).
+    // Two properties come out of doing it here rather than at `prepare`: an
+    // unknown fingerprint never costs a challenge, and an admitted identity
+    // is bound to **its** peer from this point on — the WireGuard key in the
+    // request is checked against this answer instead of being a lookup key of
+    // its own, so one admitted client cannot aim a negotiation at another.
+    let Some(admitted_peer) = handler.resolve_admitted_peer(&fingerprint).await else {
+        tracing::warn!(
+            %remote,
+            client_certificate_sha256 = %fingerprint,
+            "quic: certificate signed by the client CA but not admitted for any peer"
+        );
+        connection.close(0u32.into(), b"rejected");
+        return Err(TransportError::Protocol(
+            "client certificate is not admitted for any peer".into(),
+        ));
+    };
+    // Now that mTLS has named an *admitted* peer, charge it. A per-address
+    // budget does not bound a single admitted identity that roams.
     let within_budget = per_identity
         .lock()
         .map(|mut limiter| limiter.admit(fingerprint.clone(), Instant::now()))
@@ -782,7 +961,16 @@ async fn handle_connection(
     let challenge_deadline = Instant::now() + CHALLENGE_VALIDITY;
 
     let request = loop {
-        match read_frame::<ClientMessage>(&mut recv).await? {
+        // Nothing before the request has a phase timeout of its own: the
+        // challenge round-trip is short and the client sets the pace. What it
+        // must not do is outlast the connection, so the read is bounded by
+        // what is left of the absolute lifetime and expires as an error
+        // rather than as a destroyed task.
+        let frame =
+            tokio::time::timeout(deadline.remaining(), read_frame::<ClientMessage>(&mut recv))
+                .await
+                .map_err(|_| TransportError::Protocol(absolute_lifetime_reached()))??;
+        match frame {
             ClientMessage::ChallengeRequest { protocol_version } => {
                 // Exactly one per connection. Each costs a CSPRNG read and a
                 // frame, and answering an unbounded stream of them is free
@@ -894,13 +1082,36 @@ async fn handle_connection(
         .await?;
         return Err(TransportError::Protocol(error.to_string()));
     }
+    // The request may only speak for the peer mTLS already bound it to.
+    if request.request.client_wg_public_key != admitted_peer {
+        write_frame(
+            &mut send,
+            &ServerMessage::Error {
+                error: PublicError::Rejected,
+            },
+        )
+        .await?;
+        return Err(TransportError::Protocol(
+            "request names a WireGuard key other than the one this certificate is admitted for"
+                .into(),
+        ));
+    }
 
     let transaction_id = request.request.transaction_id;
     let server_challenge = request.request.server_challenge;
+    // Armed before `prepare`, not after it. `prepare` reserves the peer's
+    // slot and poses the candidate on the data plane before it returns, so
+    // the interval it occupies is one where an abandoned connection has
+    // something to undo.
+    let mut guard = RollbackGuard::arm(
+        Arc::clone(&handler),
+        transaction_id,
+        request.request.client_wg_public_key.clone(),
+    );
     let prepared = match handler.prepare(fingerprint, request).await {
         Ok(prepared) => prepared,
         Err(error) => {
-            handler.rollback(transaction_id).await;
+            guard.roll_back().await;
             write_frame(&mut send, &ServerMessage::Error { error }).await?;
             return Ok(());
         }
@@ -913,12 +1124,17 @@ async fn handle_connection(
     )
     .await
     {
-        handler.rollback(transaction_id).await;
+        guard.roll_back().await;
         return Err(error);
     }
 
+    // Clamped to whatever is left of the absolute lifetime. The confirmation
+    // wait is the long one — up to 45 s — so it is the phase that would
+    // otherwise run past the 90 s ceiling and have the connection destroyed
+    // under it. Bounding it here means the deadline is reached on an ordinary
+    // code path, with the rollback the ceiling itself cannot perform.
     let confirmation = tokio::time::timeout(
-        prepared.confirmation_timeout,
+        deadline.clamp(prepared.confirmation_timeout),
         read_frame::<ClientMessage>(&mut recv),
     )
     .await;
@@ -932,7 +1148,7 @@ async fn handle_connection(
         }
         // Timed out, unreadable, or not the transaction we are holding.
         _ => {
-            handler.rollback(transaction_id).await;
+            guard.roll_back().await;
             return Ok(());
         }
     };
@@ -945,10 +1161,14 @@ async fn handle_connection(
     // a valid, verifiable commit in a client's hands against a gateway that
     // had undone everything. That was the v4 behaviour, and it is the double
     // semantics v5 exists to remove.
+    //
+    // Disarmed only *after* `confirm` returns `Ok`: if the task is destroyed
+    // during `confirm` itself the candidate must still come back, and if
+    // `confirm` succeeded there is nothing left that may be undone.
     let commit = match handler.confirm(message).await {
         Ok(commit) => commit,
         Err(error) => {
-            handler.rollback(transaction_id).await;
+            guard.roll_back().await;
             write_frame(
                 &mut send,
                 &ServerMessage::Error {
@@ -959,6 +1179,7 @@ async fn handle_connection(
             return Err(TransportError::Protocol(error.to_string()));
         }
     };
+    guard.disarm();
 
     if let Err(error) = write_frame(&mut send, &ServerMessage::Committed { commit }).await {
         tracing::warn!(
@@ -1864,17 +2085,33 @@ mod tests {
         confirmed: AtomicBool,
         rolled_back: AtomicBool,
         released: AtomicBool,
+        /// How many rollbacks actually ran to completion.
+        rollbacks: std::sync::atomic::AtomicUsize,
+        /// Held open by default; a test can close it to park a rollback on an
+        /// `await` and then destroy the task sitting there.
+        rollback_gate: tokio::sync::Semaphore,
         gateway_pq_certificate: PqCertificate,
         gateway_pq_private_key: Vec<u8>,
     }
 
     impl Handler {
         fn new(pki: &TestPki) -> Self {
+            Self::with_rollback_permits(pki, tokio::sync::Semaphore::MAX_PERMITS)
+        }
+
+        /// A handler whose `rollback` blocks until the test lets it through.
+        fn with_blocked_rollback(pki: &TestPki) -> Self {
+            Self::with_rollback_permits(pki, 0)
+        }
+
+        fn with_rollback_permits(pki: &TestPki, permits: usize) -> Self {
             Self {
                 expected_fingerprint: pki.client_fingerprint.clone(),
                 confirmed: AtomicBool::new(false),
                 rolled_back: AtomicBool::new(false),
                 released: AtomicBool::new(false),
+                rollbacks: std::sync::atomic::AtomicUsize::new(0),
+                rollback_gate: tokio::sync::Semaphore::new(permits),
                 gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
                 gateway_pq_private_key: pki.gateway_pq_private_key.clone(),
             }
@@ -1939,8 +2176,17 @@ mod tests {
             .map_err(|_| PublicError::Internal)
         }
 
-        async fn rollback(&self, _transaction_id: [u8; 16]) {
+        async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
+            (certificate_sha256 == self.expected_fingerprint).then(|| CLIENT_WG_KEY.to_string())
+        }
+
+        async fn rollback(&self, _transaction_id: [u8; 16], _public_key: &str) {
+            // The suspension point a real rollback has — it writes to the
+            // data plane — and the one a cancelled task can be destroyed in.
+            let _permit = self.rollback_gate.acquire().await;
             self.rolled_back.store(true, Ordering::SeqCst);
+            self.rollbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn release(
@@ -1963,6 +2209,119 @@ mod tests {
             )
             .map_err(|_| PublicError::Internal)
         }
+    }
+
+    /// The rollback survives the destruction of the task that owned it.
+    ///
+    /// This is what the absolute-lifetime timeout does to a connection still
+    /// waiting for its confirmation: it drops the future, and dropping a
+    /// future runs none of the exit paths. Before the guard existed that left
+    /// the candidate PSK posed and the peer reserved, with nothing left able
+    /// to resolve either — one unfinished connection locked an admitted peer
+    /// out until the daemon restarted.
+    #[tokio::test]
+    async fn a_destroyed_connection_still_rolls_its_candidate_back() {
+        let pki = test_pki();
+        let handler = Arc::new(Handler::new(&pki));
+        drop(RollbackGuard::arm(
+            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+            [3; 16],
+            CLIENT_WG_KEY.into(),
+        ));
+
+        // `Drop` cannot await, so it spawns; yielding is what lets that run.
+        tokio::task::yield_now().await;
+
+        assert!(
+            handler.rolled_back.load(Ordering::SeqCst),
+            "a candidate must be undone even when nothing returns from the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_guard_never_undoes_a_signed_commit() {
+        let pki = test_pki();
+        let handler = Arc::new(Handler::new(&pki));
+        let mut guard = RollbackGuard::arm(
+            Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+            [3; 16],
+            CLIENT_WG_KEY.into(),
+        );
+        guard.disarm();
+        drop(guard);
+
+        tokio::task::yield_now().await;
+
+        assert!(
+            !handler.rolled_back.load(Ordering::SeqCst),
+            "past the point of no return there is nothing to undo, and undoing it would hand a \
+             client a valid commit against a gateway that had restored the previous state"
+        );
+    }
+
+    /// A rollback destroyed **inside its own await** must be run again.
+    ///
+    /// The guard used to clear `armed` before awaiting the rollback, which
+    /// reintroduced the hole it exists to close: the ceiling fires while the
+    /// rollback is writing to the data plane, the task is destroyed, and
+    /// `Drop` finds a guard that has already declared itself finished. The
+    /// candidate stays posed and the peer stays reserved — and on the gateway
+    /// side that window is real, because undoing removes the transaction
+    /// record *before* it awaits the restore.
+    #[tokio::test]
+    async fn a_rollback_destroyed_inside_its_own_await_is_run_again() {
+        let pki = test_pki();
+        let handler = Arc::new(Handler::with_blocked_rollback(&pki));
+
+        let task = tokio::spawn({
+            let handler = Arc::clone(&handler) as Arc<dyn NegotiationHandler>;
+            async move {
+                let mut guard = RollbackGuard::arm(handler, [4; 16], CLIENT_WG_KEY.into());
+                guard.roll_back().await;
+            }
+        });
+        // Let it reach the suspension point inside `rollback`, then destroy
+        // it there — which is exactly what the absolute ceiling does.
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            handler.rollbacks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the first attempt must not have completed, or this proves nothing"
+        );
+
+        handler.rollback_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handler.rollbacks.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a rollback destroyed part-way through must be retried by the guard");
+    }
+
+    /// No phase may outlive the connection that carries it.
+    ///
+    /// The 45-second confirmation wait is the one that would: a client that
+    /// dawdles before requesting leaves less than 45 seconds of budget, and
+    /// the ceiling would then fire during the wait — destroying the task
+    /// instead of timing the phase out. Clamping keeps the exit on an
+    /// ordinary code path.
+    #[test]
+    fn a_phase_is_clamped_to_what_is_left_of_the_connection() {
+        let nearly_over = Deadline(Instant::now() + Duration::from_secs(2));
+        assert!(
+            nearly_over.clamp(Duration::from_secs(45)) <= Duration::from_secs(2),
+            "the confirmation wait must not outlast the connection's ceiling"
+        );
+
+        let over = Deadline(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            over.clamp(Duration::from_secs(45)),
+            Duration::ZERO,
+            "past the ceiling every phase expires at once, rather than saturating backwards"
+        );
     }
 
     /// Monte le service et rend l'endpoint client, pour ne pas répéter huit

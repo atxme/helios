@@ -56,11 +56,10 @@ pub struct InitializedIdentity {
 struct Transaction {
     public_key: String,
     address: String,
-    previous_psk: Option<String>,
     client_pq_public_key: String,
     mode: ProtectionMode,
     server_challenge: [u8; SERVER_CHALLENGE_LEN],
-    /// Slot generation observed when this transaction reserved the peer.
+    /// Slot generation this transaction **reserved**, not merely observed.
     ///
     /// Anything that acts on the slot later must present it. A rollback whose
     /// generation no longer matches is a no-op, because something newer has
@@ -99,6 +98,39 @@ enum SlotState {
     ConfiguredStatic,
     /// A fresh `ml_kem` PSK, owned by the transaction that derived it.
     Committed(InstalledPsk),
+    /// A candidate is posed and its transaction has not resolved yet.
+    ///
+    /// From the moment the candidate reaches the data plane it is the slot's
+    /// logical owner (spec §11.1), which is the whole point of naming this
+    /// state: without it the table still described the *displaced* PSK while
+    /// the wire already carried the new one, so a `release` naming the old
+    /// transaction — or a reclamation decided on an old, stale handshake —
+    /// matched, cleared the data plane, and wiped a candidate that was about
+    /// to commit. The gateway would then have signed a commit for a PSK no
+    /// longer posed.
+    ///
+    /// Everything after `transaction_id` is rollback data. Nothing may act on
+    /// it, and it lives **here** rather than only in the transaction record
+    /// so that undoing a candidate needs no transaction record at all: a
+    /// `prepare` destroyed between installing the candidate and recording it
+    /// is still fully undoable, because the slot itself says what to put
+    /// back.
+    Preparing {
+        transaction_id: [u8; 16],
+        previous: Box<SlotState>,
+        address: String,
+        previous_psk: Option<String>,
+        /// Whether the candidate's installation has been **begun**.
+        ///
+        /// Set before the call, not after it, so that it is true even when
+        /// the call is cancelled or fails: at that point the gateway does not
+        /// know what the data plane holds, and §11.3's rest period is owed
+        /// either way. Deriving this from the transaction record instead
+        /// would lose it, because an interrupted preparation can have no
+        /// transaction record yet and the slot is the only state guaranteed
+        /// to survive the task that began the write.
+        install_attempted: bool,
+    },
 }
 
 /// A PSK the gateway holds for a peer, and when it started holding it.
@@ -123,6 +155,14 @@ pub struct InstalledPsk {
 struct PeerSlot {
     generation: u64,
     state: SlotState,
+    /// End of the rest period a post-installation rollback arms (spec §4.5).
+    ///
+    /// Ten seconds during which this peer poses nothing new. A negotiation
+    /// identity that has been stolen but is not backed by the peer's
+    /// WireGuard key can never commit — the handshake proof stops it — but
+    /// without this it can pose and roll back a candidate as fast as the
+    /// round-trip allows, keeping a working slot in permanent oscillation.
+    resting_until: Option<std::time::Instant>,
 }
 
 impl Default for PeerSlot {
@@ -130,8 +170,24 @@ impl Default for PeerSlot {
         Self {
             generation: 0,
             state: SlotState::Empty,
+            resting_until: None,
         }
     }
+}
+
+/// Rest imposed on a peer by a rollback that had already posed a candidate.
+const POST_INSTALL_REST: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a signed `release` actually names in the peer's slot.
+///
+/// Two very different things can carry the same transaction identifier, and
+/// the answer on the wire is identical for both — telling them apart would be
+/// an oracle on the peer's state.
+enum ReleaseTarget {
+    /// A committed `ml_kem` PSK. Cleared by the release.
+    Committed,
+    /// The candidate of a transaction that has not confirmed yet. Cancelled.
+    Candidate,
 }
 
 #[derive(Default)]
@@ -237,15 +293,211 @@ impl GatewayHandler {
             .map_err(|_| PublicError::Internal)
     }
 
-    async fn release_peer(&self, transaction_id: [u8; 16]) -> Option<Transaction> {
+    /// Undoes everything a transaction that did not commit left behind.
+    ///
+    /// # Why it is keyed by transaction identifier
+    ///
+    /// Because it has to work in the one case where no generation was ever
+    /// handed back to a caller: a `prepare` destroyed part-way through, after
+    /// it reserved the slot — possibly after it posed the candidate — and
+    /// before it recorded anything. The slot names its own owner, so
+    /// ownership is checked against that and nothing else. A transaction that
+    /// no longer owns the slot undoes nothing, which is the whole point of
+    /// the state.
+    ///
+    /// # Ordering
+    ///
+    /// The data plane is restored first and the table follows, under one
+    /// lock, exactly as in [`Self::clear_slot`] and for the same reason. If
+    /// the restore fails the slot stays `preparing` **and** the peer stays
+    /// reserved: the gateway could not put back what it displaced, so it
+    /// refuses to let anything else pose on top of a data plane it no longer
+    /// describes. That peer is fail-closed until an operator acts, which is
+    /// the honest outcome — the alternative is a slot nothing points at.
+    async fn abandon(&self, transaction_id: [u8; 16], public_key: &str) {
         let mut state = self.transactions.lock().await;
-        let transaction = state.active.remove(&transaction_id)?;
-        state.peers.remove(&transaction.public_key);
-        Some(transaction)
+        let (previous, address, previous_psk, install_attempted) =
+            match &state.slot(public_key).state {
+                SlotState::Preparing {
+                    transaction_id: owner,
+                    previous,
+                    address,
+                    previous_psk,
+                    install_attempted,
+                } if *owner == transaction_id => (
+                    (**previous).clone(),
+                    address.clone(),
+                    previous_psk.clone(),
+                    *install_attempted,
+                ),
+                // Someone else owns the slot, or this transaction already
+                // resolved. Either way there is nothing of ours to undo. Drop
+                // only this stale record: the peer reservation may already
+                // belong to the newer transaction and must not be removed by
+                // an actor that cannot prove it owns the slot.
+                _ => {
+                    state.active.remove(&transaction_id);
+                    return;
+                }
+            };
+        if let Err(error) = self
+            .install(
+                public_key.to_string(),
+                address,
+                previous_psk.map(SecretString::new),
+            )
+            .await
+        {
+            tracing::error!(
+                peer = %public_key,
+                ?error,
+                "key-negotiation rollback failed; peer remains fail-closed until operator action"
+            );
+            return;
+        }
+        state.active.remove(&transaction_id);
+        state.peers.remove(public_key);
+        let slot = state.slot(public_key);
+        slot.state = previous;
+        slot.generation += 1;
+        // Read from the slot, never from the presence of a transaction
+        // record. A destroyed rollback may be retried, and the slot is the
+        // ownership record that outlives every attempt to undo it.
+        if install_attempted {
+            slot.resting_until = Some(std::time::Instant::now() + POST_INSTALL_REST);
+        }
     }
 
-    async fn release_peer_reservation(&self, public_key: &str) {
-        self.transactions.lock().await.peers.remove(public_key);
+    /// Installs a prepared candidate only while the reservation still owns it.
+    ///
+    /// The ownership check, the backend write and the `active` insertion are
+    /// one serialized operation. A release can cancel a transaction while it
+    /// is deriving its material; without this final check that cancelled task
+    /// would resume, pose its candidate after the release, and record a
+    /// transaction for a slot it no longer owned.
+    async fn install_candidate(
+        &self,
+        transaction_id: [u8; 16],
+        public_key: &str,
+        generation: u64,
+        address: String,
+        psk: Option<SecretString>,
+        transaction: Transaction,
+    ) -> Result<(), PublicError> {
+        let mut state = self.transactions.lock().await;
+        let slot = state.slot(public_key);
+        let still_ours = slot.generation == generation
+            && matches!(
+                &slot.state,
+                SlotState::Preparing {
+                    transaction_id: owner,
+                    ..
+                } if *owner == transaction_id
+            );
+        if !still_ours {
+            tracing::warn!(
+                transaction = %hex_prefix(&transaction_id),
+                peer = %public_key,
+                reserved = generation,
+                current = slot.generation,
+                "key negotiation cancelled before the candidate reached the data plane"
+            );
+            return Err(PublicError::Rejected);
+        }
+        let SlotState::Preparing {
+            install_attempted, ..
+        } = &mut slot.state
+        else {
+            return Err(PublicError::Internal);
+        };
+        *install_attempted = true;
+
+        // Keep the state lock across the backend write. `release`, rollback,
+        // reclamation and another preparation all use the same lock, so none
+        // can observe ownership and then act on a different physical slot.
+        self.install(public_key.to_string(), address, psk).await?;
+        state.active.insert(transaction_id, transaction);
+        Ok(())
+    }
+
+    /// Applies a signed release as one linearizable slot transition.
+    ///
+    /// If confirmation commits before this lock is acquired, the release
+    /// clears that committed PSK. If the release acquires it first, it restores
+    /// the state displaced by the candidate and confirmation can no longer
+    /// pass its compare-and-swap. Splitting classification from the action
+    /// allowed both sides to believe they had won.
+    async fn release_owned_slot(
+        &self,
+        transaction_id: [u8; 16],
+        public_key: &str,
+    ) -> Result<Option<ReleaseTarget>, PublicError> {
+        enum Action {
+            Committed {
+                address: String,
+            },
+            Candidate {
+                previous: SlotState,
+                address: String,
+                previous_psk: Option<String>,
+                install_attempted: bool,
+            },
+        }
+
+        let mut state = self.transactions.lock().await;
+        let action = match &state.slot(public_key).state {
+            SlotState::Committed(installed) if installed.transaction_id == transaction_id => {
+                Some(Action::Committed {
+                    address: installed.address.clone(),
+                })
+            }
+            SlotState::Preparing {
+                transaction_id: owner,
+                previous,
+                address,
+                previous_psk,
+                install_attempted,
+            } if *owner == transaction_id => Some(Action::Candidate {
+                previous: (**previous).clone(),
+                address: address.clone(),
+                previous_psk: previous_psk.clone(),
+                install_attempted: *install_attempted,
+            }),
+            _ => None,
+        };
+
+        match action {
+            Some(Action::Committed { address }) => {
+                self.install(public_key.to_string(), address, None).await?;
+                let slot = state.slot(public_key);
+                slot.state = SlotState::Empty;
+                slot.generation += 1;
+                Ok(Some(ReleaseTarget::Committed))
+            }
+            Some(Action::Candidate {
+                previous,
+                address,
+                previous_psk,
+                install_attempted,
+            }) => {
+                self.install(
+                    public_key.to_string(),
+                    address,
+                    previous_psk.map(SecretString::new),
+                )
+                .await?;
+                state.active.remove(&transaction_id);
+                state.peers.remove(public_key);
+                let slot = state.slot(public_key);
+                slot.state = previous;
+                slot.generation += 1;
+                if install_attempted {
+                    slot.resting_until = Some(std::time::Instant::now() + POST_INSTALL_REST);
+                }
+                Ok(Some(ReleaseTarget::Candidate))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Clears a peer's slot on the data plane, then in the table.
@@ -285,47 +537,19 @@ impl GatewayHandler {
             // Configuration data, not a transactional secret: §12.2 of the
             // spec puts it outside this lifecycle entirely.
             SlotState::ConfiguredStatic | SlotState::Empty => return Ok(()),
+            // A candidate belongs to its transaction, and clearing it here
+            // would be exactly the erase the generation exists to prevent: a
+            // reclamation or a delayed release matching a slot that has moved
+            // on. Cancelling a candidate has one entry point — the release
+            // that names it, which goes through [`Self::release_owned_slot`]
+            // and puts back what the candidate displaced.
+            SlotState::Preparing { .. } => return Ok(()),
         };
         self.install(public_key.to_string(), address, None).await?;
         let slot = state.slot(public_key);
         slot.state = SlotState::Empty;
         slot.generation += 1;
         Ok(())
-    }
-
-    /// Restores the PSK a rolled-back transaction had displaced.
-    ///
-    /// Same ordering and same generation guard as [`Self::clear_slot`].
-    async fn restore_slot(&self, transaction: &Transaction) -> Result<(), PublicError> {
-        let mut state = self.transactions.lock().await;
-        let slot = state.slot(&transaction.public_key);
-        if slot.generation != transaction.generation {
-            return Ok(());
-        }
-        self.install(
-            transaction.public_key.clone(),
-            transaction.address.clone(),
-            transaction.previous_psk.clone().map(SecretString::new),
-        )
-        .await?;
-        let slot = state.slot(&transaction.public_key);
-        slot.generation += 1;
-        Ok(())
-    }
-
-    /// Rollback data, if the transaction has not passed its point of no return.
-    ///
-    /// Only ever finds an `active` transaction. v4 also looked in the
-    /// committed set, so a delivery failure after a signed commit undid the
-    /// slot — leaving a client holding a valid, verifiable commit against a
-    /// gateway that had restored the previous state. That double semantics is
-    /// what v5 removes: once `confirm` has signed, this returns `None` and
-    /// there is nothing to undo.
-    async fn take_for_rollback(&self, transaction_id: [u8; 16]) -> Option<Transaction> {
-        let mut state = self.transactions.lock().await;
-        let transaction = state.active.remove(&transaction_id)?;
-        state.peers.remove(&transaction.public_key);
-        Some(transaction)
     }
 
     /// PSKs that should be dropped, with the generation and reason.
@@ -435,6 +659,18 @@ impl NegotiationHandler for GatewayHandler {
         }
     }
 
+    async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
+        self.network
+            .read()
+            .await
+            .peers
+            .iter()
+            .find(|peer| {
+                peer.key_negotiation_certificate_sha256.as_deref() == Some(certificate_sha256)
+            })
+            .map(|peer| peer.public_key.clone())
+    }
+
     async fn prepare(
         &self,
         certificate_sha256: String,
@@ -475,27 +711,36 @@ impl NegotiationHandler for GatewayHandler {
             })?;
         let (address, previous_psk, pq_fingerprint, minimum_mode) = {
             let network = self.network.read().await;
+            // Found by the **TLS fingerprint**, never by the key the request
+            // carries (spec §7.3). Searching on the request's field and then
+            // comparing the fingerprint refuses the same messages, but it
+            // makes a client-chosen value the index into the peer table; a
+            // single missing comparison anywhere downstream would then let an
+            // admitted identity aim a negotiation at another peer.
             let peer = network
                 .peers
                 .iter()
-                .find(|peer| peer.public_key == request.client_wg_public_key)
+                .find(|peer| {
+                    peer.key_negotiation_certificate_sha256.as_deref()
+                        == Some(certificate_sha256.as_str())
+                })
                 .ok_or_else(|| {
                     tracing::warn!(
                         %transaction,
                         peer = %peer_key,
-                        "key negotiation refused: this WireGuard key is not admitted"
+                        presented = %certificate_sha256,
+                        "key negotiation refused: this client certificate is not admitted"
                     );
                     PublicError::Rejected
                 })?;
-            if peer.key_negotiation_certificate_sha256.as_deref()
-                != Some(certificate_sha256.as_str())
-            {
+            if peer.public_key != request.client_wg_public_key {
                 tracing::warn!(
                     %transaction,
                     peer = %peer.name,
-                    presented = %certificate_sha256,
-                    admitted = peer.key_negotiation_certificate_sha256.as_deref().unwrap_or("aucune"),
-                    "key negotiation refused: client certificate does not match the admitted one"
+                    named = %request.client_wg_public_key,
+                    admitted = %peer.public_key,
+                    "key negotiation refused: the request names a WireGuard key other than the \
+                     one this certificate is admitted for"
                 );
                 return Err(PublicError::Rejected);
             }
@@ -591,6 +836,18 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 return Err(PublicError::Rejected);
             }
+            if let Some(until) = state.slot(&request.client_wg_public_key).resting_until {
+                if std::time::Instant::now() < until {
+                    state.peers.remove(&request.client_wg_public_key);
+                    tracing::warn!(
+                        %transaction,
+                        peer = %peer_key,
+                        "key negotiation refused: this peer is in the rest period a rolled-back \
+                         candidate armed"
+                    );
+                    return Err(PublicError::Rejected);
+                }
+            }
             state.replay_set.insert(request.transaction_id);
             state.replay_order.push_back(request.transaction_id);
             while state.replay_order.len() > MAX_REPLAY_IDENTIFIERS {
@@ -598,10 +855,28 @@ impl NegotiationHandler for GatewayHandler {
                     state.replay_set.remove(&expired);
                 }
             }
-            // Captured under the same lock that reserved the peer, so it
-            // describes the slot this transaction is about to displace and
-            // nothing later.
-            state.slot(&request.client_wg_public_key).generation
+            // Reserved, not merely observed. Incrementing the generation and
+            // claiming the slot happen under the **same** lock that reserved
+            // the peer, so from here on every other actor — a delayed
+            // `release`, the reclaimer, a rollback from an earlier
+            // transaction — sees a generation it does not hold and a slot it
+            // does not own, and is a no-op instead of a write.
+            //
+            // Reading the generation without taking it, as this did before,
+            // left a window in which those actors still matched: they cleared
+            // the data plane under a candidate that then committed.
+            let slot = state.slot(&request.client_wg_public_key);
+            slot.generation += 1;
+            slot.resting_until = None;
+            let previous_state = std::mem::replace(&mut slot.state, SlotState::Empty);
+            slot.state = SlotState::Preparing {
+                transaction_id: request.transaction_id,
+                previous: Box::new(previous_state),
+                address: address.clone(),
+                previous_psk: previous_psk.clone(),
+                install_attempted: false,
+            };
+            slot.generation
         };
 
         // Read **before** the candidate is posed, because the commit compares
@@ -617,7 +892,7 @@ impl NegotiationHandler for GatewayHandler {
                         "key negotiation refused: the data plane could not be read before posing \
                          the candidate PSK, so no commit could be proven afterwards"
                     );
-                    self.release_peer_reservation(&request.client_wg_public_key)
+                    self.abandon(request.transaction_id, &request.client_wg_public_key)
                         .await;
                     return Err(error);
                 }
@@ -626,7 +901,7 @@ impl NegotiationHandler for GatewayHandler {
         let gateway_nonce = match random_nonce() {
             Ok(nonce) => nonce,
             Err(_) => {
-                self.release_peer_reservation(&request.client_wg_public_key)
+                self.abandon(request.transaction_id, &request.client_wg_public_key)
                     .await;
                 return Err(PublicError::Protocol);
             }
@@ -646,7 +921,7 @@ impl NegotiationHandler for GatewayHandler {
                     ?error,
                     "key negotiation refused: preparing the key material failed"
                 );
-                self.release_peer_reservation(&request.client_wg_public_key)
+                self.abandon(request.transaction_id, &request.client_wg_public_key)
                     .await;
                 return Err(error);
             }
@@ -659,17 +934,29 @@ impl NegotiationHandler for GatewayHandler {
         ) {
             Ok(response) => response,
             Err(_) => {
-                self.release_peer_reservation(&request.client_wg_public_key)
+                self.abandon(request.transaction_id, &request.client_wg_public_key)
                     .await;
                 return Err(PublicError::Protocol);
             }
         };
 
+        let transaction_record = Transaction {
+            public_key: request.client_wg_public_key.clone(),
+            address: address.clone(),
+            client_pq_public_key: authenticated.certificate.ml_dsa_87_public_key.clone(),
+            mode: request.mode,
+            server_challenge: request.server_challenge,
+            generation,
+            handshake_before_install,
+        };
         if let Err(error) = self
-            .install(
-                request.client_wg_public_key.clone(),
+            .install_candidate(
+                request.transaction_id,
+                &request.client_wg_public_key,
+                generation,
                 address.clone(),
                 material.psk,
+                transaction_record,
             )
             .await
         {
@@ -681,7 +968,7 @@ impl NegotiationHandler for GatewayHandler {
                 ?error,
                 "key negotiation refused: installing the PSK on the data plane failed"
             );
-            self.release_peer_reservation(&request.client_wg_public_key)
+            self.abandon(request.transaction_id, &request.client_wg_public_key)
                 .await;
             return Err(error);
         }
@@ -701,19 +988,6 @@ impl NegotiationHandler for GatewayHandler {
             }
         }
 
-        self.transactions.lock().await.active.insert(
-            request.transaction_id,
-            Transaction {
-                public_key: request.client_wg_public_key.clone(),
-                address,
-                previous_psk,
-                client_pq_public_key: authenticated.certificate.ml_dsa_87_public_key.clone(),
-                mode: request.mode,
-                server_challenge: request.server_challenge,
-                generation,
-                handshake_before_install,
-            },
-        );
         Ok(PreparedNegotiation {
             response,
             confirmation_timeout: DEFAULT_CONFIRMATION_TIMEOUT,
@@ -801,6 +1075,32 @@ impl NegotiationHandler for GatewayHandler {
             return Err(PublicError::Rejected);
         }
 
+        // Compare-and-swap before anything durable happens. The candidate
+        // this confirmation speaks for must still be the one the slot holds:
+        // if the generation has moved, or the slot is no longer `preparing`
+        // for this transaction, then the PSK about to be committed is not the
+        // PSK on the data plane, and signing a commit for it would hand the
+        // client a receipt for a secret the gateway does not have.
+        {
+            let mut state = self.transactions.lock().await;
+            let slot = state.slot(&public_key);
+            let still_ours = slot.generation == generation
+                && matches!(
+                    &slot.state,
+                    SlotState::Preparing { transaction_id: owner, .. } if *owner == transaction_id
+                );
+            if !still_ours {
+                tracing::warn!(
+                    transaction = %hex_prefix(&transaction_id),
+                    peer = %public_key,
+                    reserved = generation,
+                    current = slot.generation,
+                    "confirmation refused: this peer's slot moved on since the candidate was posed"
+                );
+                return Err(PublicError::Rejected);
+            }
+        }
+
         self.raise_security_floor(&public_key, mode).await?;
         let commit = authenticate_commit(
             server_challenge,
@@ -811,13 +1111,24 @@ impl NegotiationHandler for GatewayHandler {
 
         // Past this line the transaction is irreversible: its rollback data
         // is dropped rather than moved to a second map.
-        let transaction = self
-            .release_peer(transaction_id)
-            .await
-            .ok_or(PublicError::Internal)?;
-        {
+        //
+        // Dropping the reservation and recording what the slot now holds are
+        // one locked step. Two steps left a window between them in which the
+        // next request could reserve the freed peer and pose its own
+        // candidate, only for this transaction's tail to overwrite the slot
+        // record with its own — describing a PSK the data plane no longer
+        // carried.
+        let transaction = {
             let mut state = self.transactions.lock().await;
+            let transaction = state
+                .active
+                .remove(&transaction_id)
+                .ok_or(PublicError::Internal)?;
+            state.peers.remove(&transaction.public_key);
             let slot = state.slot(&transaction.public_key);
+            if slot.generation != generation {
+                return Err(PublicError::Internal);
+            }
             // Two committed states, because the two modes leave two different
             // things in the slot. `ml_kem` leaves a fresh secret this
             // transaction owns, expires and may release. `static_psk` leaves
@@ -834,7 +1145,8 @@ impl NegotiationHandler for GatewayHandler {
                 }),
             };
             slot.generation += 1;
-        }
+            transaction
+        };
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
             peer = %transaction.public_key,
@@ -850,6 +1162,9 @@ impl NegotiationHandler for GatewayHandler {
     /// Idempotent, and deliberately uninformative: cleared, already empty and
     /// owned by another transaction all produce the same signed answer.
     /// Telling them apart would be an oracle on a peer's state.
+    ///
+    /// A release also reaches a candidate still being prepared — see
+    /// [`ReleaseTarget`] — and that too answers the same way.
     async fn release(
         &self,
         certificate_sha256: String,
@@ -863,14 +1178,18 @@ impl NegotiationHandler for GatewayHandler {
         }
         let pq_fingerprint = {
             let network = self.network.read().await;
+            // Indexed by the TLS fingerprint, like `prepare`: the key the
+            // message carries is checked against the answer, never used to
+            // find it.
             let peer = network
                 .peers
                 .iter()
-                .find(|peer| peer.public_key == release.client_wg_public_key)
+                .find(|peer| {
+                    peer.key_negotiation_certificate_sha256.as_deref()
+                        == Some(certificate_sha256.as_str())
+                })
                 .ok_or(PublicError::Rejected)?;
-            if peer.key_negotiation_certificate_sha256.as_deref()
-                != Some(certificate_sha256.as_str())
-            {
+            if peer.public_key != release.client_wg_public_key {
                 return Err(PublicError::Rejected);
             }
             peer.key_negotiation_pq_certificate_sha256
@@ -888,53 +1207,47 @@ impl NegotiationHandler for GatewayHandler {
                 PublicError::Rejected
             })?;
 
-        // Only the current owner may tear the slot down. Without this a
-        // release delayed on the network could dismantle a tunnel a **later**
-        // negotiation had just established.
-        //
-        // A `configured_static` slot is never torn down here, whatever the
-        // release names: that value is the operator's configuration, present
-        // before the transaction and after it. Honouring a release against it
-        // would let a client permanently delete a secret only the operator
-        // can restore.
-        let owner = {
-            let mut state = self.transactions.lock().await;
-            let slot = state.slot(&release.client_wg_public_key);
-            match &slot.state {
-                SlotState::Committed(installed)
-                    if installed.transaction_id == release.installed_transaction_id =>
-                {
-                    Some(slot.generation)
-                }
-                _ => None,
-            }
-        };
-        match owner {
-            Some(generation) => {
+        // Classification and action share one lock inside
+        // `release_owned_slot`. If confirmation wins that lock first this is a
+        // committed release; if release wins it first the candidate is rolled
+        // back and confirmation becomes stale. There is no intermediate
+        // observation that can turn into a no-op after the slot changes.
+        match self
+            .release_owned_slot(
+                release.installed_transaction_id,
+                &release.client_wg_public_key,
+            )
+            .await
+        {
+            Ok(Some(ReleaseTarget::Committed)) => {
                 tracing::info!(
                     peer = %peer_key,
                     transaction = %hex_prefix(&release.installed_transaction_id),
                     "signed release accepted: clearing the PSK slot"
                 );
-                // Clears the data plane first and only then forgets the
-                // record, so a failed write leaves the slot still owned and
-                // still reclaimable rather than orphaned.
-                if self
-                    .clear_slot(&release.client_wg_public_key, generation)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(peer = %peer_key, "could not clear the PSK slot after a release");
-                    return Err(PublicError::Internal);
-                }
             }
-            None => {
+            Ok(Some(ReleaseTarget::Candidate)) => {
+                tracing::info!(
+                    peer = %peer_key,
+                    transaction = %hex_prefix(&release.installed_transaction_id),
+                    "signed release accepted: cancelling the candidate this peer is preparing"
+                );
+            }
+            Ok(None) => {
                 tracing::info!(
                     peer = %peer_key,
                     "release does not name the transaction that owns this peer's slot, or the \
                      slot holds a configured static PSK; answering as released without touching \
                      anything"
                 );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    peer = %peer_key,
+                    ?error,
+                    "could not apply the signed release to the PSK slot"
+                );
+                return Err(error);
             }
         }
 
@@ -950,27 +1263,16 @@ impl NegotiationHandler for GatewayHandler {
         .map_err(|_| PublicError::Internal)
     }
 
-    async fn rollback(&self, transaction_id: [u8; 16]) {
-        let Some(transaction) = self.take_for_rollback(transaction_id).await else {
-            return;
-        };
-        // The response or commit was not delivered completely. Restoring here
-        // leaves no candidate slot behind after the transport has abandoned
-        // the transaction.
+    async fn rollback(&self, transaction_id: [u8; 16], client_wg_public_key: &str) {
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
-            peer = %transaction.public_key,
-            restored = transaction.previous_psk.is_some(),
+            peer = %client_wg_public_key,
             "key negotiation rolled back: the peer's previous PSK slot is restored"
         );
-        // Generation-guarded: if anything has touched this peer's slot since
+        // Ownership-guarded: if anything has touched this peer's slot since
         // the transaction reserved it, the restore is a no-op rather than a
         // write that would undo a newer negotiation.
-        if self.restore_slot(&transaction).await.is_err() {
-            tracing::error!(
-                "key-negotiation rollback failed; peer remains fail-closed until operator action"
-            );
-        }
+        self.abandon(transaction_id, client_wg_public_key).await;
     }
 }
 
@@ -1660,7 +1962,7 @@ mod tests {
             .prepare(CERTIFICATE_FINGERPRINT.into(), request([1; 16], &fixture))
             .await
             .unwrap();
-        handler.rollback([1; 16]).await;
+        handler.rollback([1; 16], CLIENT_KEY).await;
 
         let writes = plane.writes().await;
         assert_eq!(writes.len(), 2, "one candidate posed, one restore");
@@ -1701,7 +2003,7 @@ mod tests {
         // holding a valid, verifiable commit against a gateway that had undone
         // everything. Choosing one semantics is the whole point of v5's point
         // of no return.
-        handler.rollback([2; 16]).await;
+        handler.rollback([2; 16], CLIENT_KEY).await;
 
         assert_eq!(
             plane.writes().await.len(),
@@ -1712,8 +2014,10 @@ mod tests {
         assert!(state.active.is_empty());
         let slot = state.slot(CLIENT_KEY);
         assert_eq!(
-            slot.generation, 1,
-            "the commit is one transition, and the generation records it"
+            slot.generation, 2,
+            "two transitions are recorded: reserving the slot for the candidate, then committing \
+             it. The reservation counts — it is what makes every actor holding the previous \
+             generation a no-op from the moment the candidate is posed."
         );
         let SlotState::Committed(installed) = &slot.state else {
             panic!("a committed ml_kem negotiation must leave an owned slot");
@@ -2005,6 +2309,374 @@ mod tests {
         assert!(
             matches!(slot.state, SlotState::Committed(_)),
             "the slot must stay owned so the next attempt can still clear it"
+        );
+    }
+
+    /// The interleaving the generation was introduced for, but which reading
+    /// it without taking it never stopped.
+    ///
+    /// A peer whose handshake has aged past the reclamation threshold
+    /// renegotiates. The reclaimer's ten-second snapshot still shows the old,
+    /// stale handshake, and the slot record still described the *displaced*
+    /// PSK — so the reclamation matched the current generation, cleared the
+    /// data plane, and wiped a candidate that was about to commit. Naming the
+    /// slot `preparing` from the moment it is reserved is what removes the
+    /// match.
+    #[tokio::test]
+    async fn a_candidate_being_prepared_is_not_reclaimable() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([20; 16], &fixture))
+            .await
+            .unwrap();
+
+        let ancient = helios_wireguard::PeerStatus {
+            public_key: base64::engine::general_purpose::STANDARD
+                .decode(CLIENT_KEY)
+                .unwrap(),
+            endpoint: None,
+            last_handshake: Some(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(
+                        helios_wireguard::PSK_RECLAIM_AFTER_STALE_SECS * 10,
+                    ),
+            ),
+            allowed_ips: Vec::new(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+        assert!(
+            handler.reclaimable(&[ancient]).await.is_empty(),
+            "a slot a transaction is preparing has an owner and a deadline of its own; the \
+             reclaimer must leave it to them"
+        );
+
+        // And the candidate is still the only thing the data plane was told.
+        assert_eq!(plane.writes().await.len(), 1);
+    }
+
+    /// The other stale actor: a `release` naming the PSK the candidate
+    /// displaced.
+    ///
+    /// It authenticates, it names a transaction the gateway really did commit,
+    /// and it arrives while the next negotiation is in flight. Honouring it
+    /// clears the data plane under a candidate whose handshake proof may
+    /// already be in — leaving the gateway free to sign a commit for a PSK it
+    /// no longer holds.
+    #[tokio::test]
+    async fn a_release_naming_the_displaced_psk_cannot_wipe_the_candidate() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+        // First negotiation, committed: it owns the slot.
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([21; 16], &fixture))
+            .await
+            .unwrap();
+        plane.handshake_happens().await;
+        handler
+            .confirm(
+                authenticate_confirmation(TEST_CHALLENGE, [21; 16], &fixture.client_private_key)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Second negotiation, in flight: its candidate is on the data plane.
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([22; 16], &fixture))
+            .await
+            .unwrap();
+        let candidate = plane.writes().await.last().cloned().flatten();
+        let generation = handler
+            .transactions
+            .lock()
+            .await
+            .slot(CLIENT_KEY)
+            .generation;
+
+        // The delayed release for the first transaction lands now.
+        handler.clear_slot(CLIENT_KEY, generation).await.unwrap();
+
+        assert_eq!(
+            plane.writes().await.last().cloned().flatten(),
+            candidate,
+            "the candidate must still be the last thing the data plane was told"
+        );
+        let mut state = handler.transactions.lock().await;
+        assert!(
+            matches!(
+                state.slot(CLIENT_KEY).state,
+                SlotState::Preparing { transaction_id, .. } if transaction_id == [22; 16]
+            ),
+            "the slot belongs to the transaction preparing it, not to the one it displaced"
+        );
+    }
+
+    /// A `prepare` destroyed after it posed its candidate and before it
+    /// recorded anything.
+    ///
+    /// This is what the absolute connection deadline used to do — it dropped
+    /// the future, and dropping a future runs nothing. The undo therefore
+    /// cannot depend on the transaction record: it is driven off the slot,
+    /// which names its own owner.
+    #[tokio::test]
+    async fn a_transaction_that_was_never_recorded_is_still_undone() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([23; 16], &fixture))
+            .await
+            .unwrap();
+        // Exactly what a cancellation between `install` and the insert leaves
+        // behind: a posed candidate and no record of it.
+        handler.transactions.lock().await.active.remove(&[23; 16]);
+
+        handler.rollback([23; 16], CLIENT_KEY).await;
+
+        assert_eq!(
+            plane.writes().await.last().cloned().flatten(),
+            Some(previous_psk),
+            "the displaced PSK must come back even with no transaction to read it from"
+        );
+        let mut state = handler.transactions.lock().await;
+        assert!(
+            !state.peers.contains(CLIENT_KEY),
+            "the reservation must go too, or that peer never negotiates again"
+        );
+        let slot = state.slot(CLIENT_KEY);
+        assert!(matches!(
+            slot.state,
+            SlotState::ConfiguredStatic | SlotState::Empty
+        ));
+        // The rest period is owed by the *slot*, not by the transaction
+        // record. A destroyed preparation may not have inserted that record
+        // yet, so the slot is the only reliable witness that a backend write
+        // was attempted and that §11.3 therefore requires a rest.
+        assert!(
+            slot.resting_until.is_some(),
+            "a candidate that reached the data plane rests the peer, whatever is left of its \
+             transaction record"
+        );
+    }
+
+    /// §11.1, priority 2: a `release` naming the candidate cancels it.
+    ///
+    /// No per-peer actor is needed to make this safe. The transaction record
+    /// and the slot both go under this lock, so the connection that posed the
+    /// candidate discovers the cancellation at its own confirmation — where
+    /// the compare-and-swap finds a slot that is no longer its own.
+    #[tokio::test]
+    async fn a_release_naming_the_candidate_cancels_the_transaction() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([26; 16], &fixture))
+            .await
+            .unwrap();
+
+        let release = aether::key_negotiation::authenticate_release(
+            aether::key_negotiation::PskRelease {
+                protocol_version: KEY_NEGOTIATION_VERSION,
+                server_challenge: TEST_CHALLENGE,
+                installed_transaction_id: [26; 16],
+                client_wg_public_key: CLIENT_KEY.into(),
+                gateway_wg_public_key: GATEWAY_KEY.into(),
+                timestamp_unix: test_now(),
+            },
+            fixture.client_certificate.clone(),
+            &fixture.client_private_key,
+        )
+        .unwrap();
+        handler
+            .release(CERTIFICATE_FINGERPRINT.into(), release)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plane.writes().await.last().cloned().flatten(),
+            Some(previous_psk),
+            "cancelling a candidate restores what it displaced; emptying the slot would destroy \
+             a PSK the release never named"
+        );
+
+        // The confirmation the original connection is still holding must now
+        // be refused, without any message having reached its task.
+        plane.handshake_happens().await;
+        let refusal = handler
+            .confirm(
+                authenticate_confirmation(TEST_CHALLENGE, [26; 16], &fixture.client_private_key)
+                    .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(refusal, Err(PublicError::Rejected)),
+            "a cancelled transaction must not be able to sign a commit"
+        );
+    }
+
+    /// A release may arrive while `prepare` is still deriving material, before
+    /// the candidate reaches the backend.
+    ///
+    /// Cancelling the slot is not enough by itself: the suspended preparation
+    /// must re-check ownership immediately before its write, otherwise it
+    /// resumes after the release and poses a candidate for a transaction that
+    /// no longer exists.
+    #[tokio::test]
+    async fn a_cancelled_preparation_cannot_install_its_candidate_late() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let candidate = base64::engine::general_purpose::STANDARD.encode([8u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+        let transaction_id = [27; 16];
+        let generation = {
+            let mut state = handler.transactions.lock().await;
+            state.peers.insert(CLIENT_KEY.into());
+            let slot = state.slot(CLIENT_KEY);
+            slot.generation += 1;
+            slot.state = SlotState::Preparing {
+                transaction_id,
+                previous: Box::new(SlotState::Empty),
+                address: "100.64.1.2/32".into(),
+                previous_psk: Some(previous_psk.clone()),
+                install_attempted: false,
+            };
+            slot.generation
+        };
+
+        // The release wins while the original preparation is suspended.
+        handler.abandon(transaction_id, CLIENT_KEY).await;
+        let writes_after_release = plane.writes().await.len();
+
+        let result = handler
+            .install_candidate(
+                transaction_id,
+                CLIENT_KEY,
+                generation,
+                "100.64.1.2/32".into(),
+                Some(SecretString::new(candidate)),
+                Transaction {
+                    public_key: CLIENT_KEY.into(),
+                    address: "100.64.1.2/32".into(),
+                    client_pq_public_key: fixture.client_certificate.ml_dsa_87_public_key.clone(),
+                    mode: ProtectionMode::MlKem,
+                    server_challenge: TEST_CHALLENGE,
+                    generation,
+                    handshake_before_install: None,
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(PublicError::Rejected)));
+        assert_eq!(
+            plane.writes().await.len(),
+            writes_after_release,
+            "a preparation that lost its slot must never reach the backend"
+        );
+        assert!(
+            !handler
+                .transactions
+                .lock()
+                .await
+                .active
+                .contains_key(&transaction_id),
+            "a cancelled preparation must not recreate its transaction record"
+        );
+    }
+
+    /// If confirmation wins before the release is serialized, the release
+    /// must act on the now-committed owner rather than on an obsolete snapshot
+    /// that still called it a candidate.
+    #[tokio::test]
+    async fn a_release_after_commit_clears_the_same_transaction() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+        let transaction_id = [28; 16];
+
+        handler
+            .prepare(
+                CERTIFICATE_FINGERPRINT.into(),
+                request(transaction_id, &fixture),
+            )
+            .await
+            .unwrap();
+        plane.handshake_happens().await;
+        handler
+            .confirm(
+                authenticate_confirmation(
+                    TEST_CHALLENGE,
+                    transaction_id,
+                    &fixture.client_private_key,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let release = aether::key_negotiation::authenticate_release(
+            aether::key_negotiation::PskRelease {
+                protocol_version: KEY_NEGOTIATION_VERSION,
+                server_challenge: TEST_CHALLENGE,
+                installed_transaction_id: transaction_id,
+                client_wg_public_key: CLIENT_KEY.into(),
+                gateway_wg_public_key: GATEWAY_KEY.into(),
+                timestamp_unix: test_now(),
+            },
+            fixture.client_certificate.clone(),
+            &fixture.client_private_key,
+        )
+        .unwrap();
+        handler
+            .release(CERTIFICATE_FINGERPRINT.into(), release)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plane.writes().await.last().cloned().flatten(),
+            None,
+            "a release serialized after commit must clear that committed PSK"
+        );
+        let mut state = handler.transactions.lock().await;
+        assert!(matches!(state.slot(CLIENT_KEY).state, SlotState::Empty));
+    }
+
+    /// §4.5: a rollback that had already posed a candidate rests the peer.
+    ///
+    /// A stolen negotiation identity without the peer's WireGuard key can
+    /// never commit, but nothing stopped it posing and rolling back a
+    /// candidate as fast as the round-trip allowed — which keeps a working
+    /// slot in permanent oscillation.
+    #[tokio::test]
+    async fn a_rolled_back_candidate_rests_the_peer() {
+        let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let fixture = pq_fixture();
+        let (handler, _plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
+
+        handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([24; 16], &fixture))
+            .await
+            .unwrap();
+        handler.rollback([24; 16], CLIENT_KEY).await;
+
+        let refusal = handler
+            .prepare(CERTIFICATE_FINGERPRINT.into(), request([25; 16], &fixture))
+            .await;
+        assert!(
+            matches!(refusal, Err(PublicError::Rejected)),
+            "the next attempt waits out the rest period"
+        );
+        assert!(
+            !handler.transactions.lock().await.peers.contains(CLIENT_KEY),
+            "a refusal during the rest period must not leave the peer reserved"
         );
     }
 

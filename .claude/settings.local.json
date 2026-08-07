@@ -320,7 +320,13 @@
       "Bash(awk '{s+=$4} END {print s\" tests passés\"}')",
       "Bash(echo \"--- heliosd features matérielles: $? ---\")",
       "Bash(awk '{s+=$4} END {print s\" tests passés, 0 échec\"}')",
-      "Bash(awk -F'[ ;]' '{p+=$4} END {print \"total passed:\", p}')"
+      "Bash(awk -F'[ ;]' '{p+=$4} END {print \"total passed:\", p}')",
+      "Bash(perl -0pi -e 's/self\\\\.release_peer_reservation\\\\\\(&request\\\\.client_wg_public_key\\\\\\)\\\\n\\(\\\\s+\\)\\\\.await;/self.abandon_reservation\\(&request.client_wg_public_key, generation\\)\\\\n$1.await;/g' crates/heliosd/src/key_negotiation.rs)",
+      "Bash(perl -0pi -e 's/self\\\\.abandon_reservation\\\\\\(&request\\\\.client_wg_public_key, generation\\\\\\)\\\\n\\(\\\\s+\\)\\\\.await;/self.abandon\\(request.transaction_id, &request.client_wg_public_key\\)\\\\n$1.await;/g' crates/heliosd/src/key_negotiation.rs)",
+      "Bash(perl -pi -e 's/async fn rollback\\\\\\(&self, _transaction_id: \\\\[u8; 16\\\\]\\\\\\) \\\\{/async fn rollback\\(&self, _transaction_id: [u8; 16], _public_key: &str\\) {/' crates/helios-key-negotiation/src/lib.rs)",
+      "Bash(perl -pi -e 's/handler\\\\.rollback\\\\\\(\\\\[\\(\\\\d\\); 16\\\\]\\\\\\)\\\\.await;/handler.rollback\\([$1; 16], CLIENT_KEY\\).await;/' crates/heliosd/src/key_negotiation.rs)",
+      "Bash(awk 'NR<=682 && /^#{2,4} /{h=$0; n=NR} END{}' docs/NEGOCIATION-DE-CLE-V5.md)",
+      "Bash(awk -F: '$1<682')"
     ]
   }
 }

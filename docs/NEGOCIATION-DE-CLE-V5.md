@@ -6,15 +6,70 @@ un **contrat à finir d'implémenter**, pas une description du système.
 
 > Une revue du 6 août 2026 a établi que la mention « implémenté à trois
 > exceptions » portée ici auparavant était fausse : sept défauts bloquants et
-> plusieurs écarts subsistaient. Six des sept sont corrigés ; ce qui suit est la
-> liste exacte de ce qui ne l'est pas.
+> plusieurs écarts subsistaient. Six des sept ont été corrigés.
 >
-> **Ce qui n'est pas implémenté**, au 2026-08-06 :
+> Deux revues du 7 août 2026 ont montré que la correction du cinquième — la
+> machine d'état générationnelle — était incomplète, et que deux défauts
+> bloquants restaient dans le cycle transactionnel du PSK. Ils sont corrigés à
+> leur tour :
+>
+> - la **génération n'était pas réservée** avant la pose du candidat. `prepare`
+>   la lisait sans l'incrémenter et le slot continuait de décrire le PSK
+>   *déplacé*, si bien qu'un `release` visant l'ancienne transaction ou une
+>   récupération décidée sur un instantané vieux de dix secondes correspondait
+>   encore, vidait le plan de données sous le candidat, et laissait la gateway
+>   signer un commit pour un PSK qu'elle ne détenait plus. L'état `preparing`
+>   du [§11.1](#111-états-gateway) existe désormais, la génération est prise
+>   sous le **même** verrou que la réservation du pair, et la confirmation
+>   revérifie l'appartenance du slot avant de persister le plancher et de
+>   signer ;
+> - l'**échéance absolue annulait sans rollback**. Les 90 s du
+>   [§4.5](#45-délais-et-limites) étaient un `timeout` autour de toute la
+>   connexion : à l'échéance la tâche était détruite, et détruire une future
+>   n'exécute aucun chemin de sortie. Le candidat restait posé, le pair réservé
+>   et la transaction active — un pair admis pouvait s'enfermer dehors avec une
+>   seule connexion inachevée. Chaque phase est maintenant bornée par ce qui
+>   reste de l'échéance, et une garde de destruction rattrape le cas résiduel.
+>   La garde ne se désarme qu'**après** le retour du rollback : le désarmer
+>   d'abord rouvrait exactement le trou qu'elle bouche, puisque le rollback est
+>   lui-même un `await` que l'échéance peut détruire. Le repos du §11.3 se lit
+>   donc sur le slot, pas sur la présence d'un enregistrement de transaction —
+>   une préparation interrompue peut ne jamais avoir inséré cet enregistrement,
+>   alors que le slot sait déjà qu'une écriture backend a été tentée.
+>
+> Une revue supplémentaire du 7 août a fermé les deux dernières courses de cette
+> correction. Un `release` pouvait annuler `preparing` pendant la dérivation,
+> puis la tâche initiale reprenait, posait quand même son candidat et recréait
+> une transaction sans propriétaire. Et un `release` pouvait observer le
+> candidat, perdre la course contre `confirm`, puis répondre `released` sans
+> retirer le PSK désormais committé. La vérification d'appartenance, l'écriture
+> backend et l'insertion de la transaction forment maintenant une seule
+> section sérialisée ; la classification et l'application du `release` aussi.
+> Si le commit gagne, le `release` retire le PSK committé. Si le `release`
+> gagne, il restaure l'état précédent et le compare-and-swap du commit échoue.
+>
+> Sont posés au passage : la période de repos de dix secondes après rollback
+> post-installation ([§4.5](#45-délais-et-limites), [§11.3](#113-rollback)) ;
+> les paramètres de transport normatifs — idle timeout de 50 s, fenêtres de
+> `196620` octets, reprise TLS et 0-RTT explicitement désactivés des deux
+> côtés, limites de flux annoncées des deux côtés ; la **priorité 2 du
+> [§11.1](#111-états-gateway)**, un `release` visant le candidat annulant
+> désormais la transaction — la même transition tient le slot et
+> l'enregistrement sous un seul verrou, et la connexion qui avait posé le
+> candidat l'apprend à sa confirmation, dont le compare-and-swap échoue ; et la
+> **résolution de l'identité avant le challenge** du [§5.3](#53-erreurs-publiques),
+> une empreinte TLS non admise étant refusée sans qu'un challenge lui soit
+> émis, le budget par identité n'étant débité que d'un pair admis, et la clé
+> WireGuard de la requête étant vérifiée contre le pair résolu au lieu de
+> servir elle-même de clé de recherche.
+>
+> **Ce qui n'est pas implémenté**, au 2026-08-07 :
 >
 > - le **discriminant de type de profil Orion**
 >   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
->   `classic` est bien refusé au décodage v5 et à la préparation — un message v5
->   ne peut plus le sélectionner. Mais la variante subsiste dans
+>   `classic` est bien refusé à la validation d'une requête v5 et à la
+>   préparation — serde le décode, `validate()` le rejette, et aucun message v5
+>   ne peut donc le sélectionner. Mais la variante subsiste dans
 >   `ProtectionMode`, et un profil Orion reste un bloc `key_negotiation`
 >   **facultatif** au lieu de l'union explicite `ClassicWireGuard` /
 >   `HeliosKeyNegotiation`. L'absence du bloc peut donc encore signifier
@@ -40,22 +95,39 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
->   anti-rollback, ni import manuel de transition.
+>   anti-rollback, ni import manuel de transition ;
+> - l'état **`revoked`** du [§11.1](#111-états-gateway) : une révocation est
+>   exprimée par l'absence du pair dans `network.peers`, lue à chaque décision,
+>   et non par un marqueur terminal dans le slot. Hors concurrence, un pair
+>   retiré ne négocie plus rien ; en concurrence, l'absence de transition
+>   atomique entre admission, génération et plan de données ne fournit pas
+>   encore la priorité normative de `revoked`. Un marqueur mis en cache se
+>   périmerait en outre au hot-reload. Ce qui débloquerait : faire porter la
+>   révocation et le retrait du plan de données par le même sérialiseur que le
+>   slot, génération incrémentée comprise.
 >
 > **Ce qui est en place et couvert par la régression** : challenge à usage
 > unique, liaison à la gateway visée, ML-DSA-87, engagement HMAC du PSK
 > statique, trois codes d'erreur, point de non-retour, `release` signé et son
 > accusé **vérifié**, preuve de handshake WireGuard au commit, machine d'état
-> générationnelle par pair, PSK statique hors du cycle transactionnel,
-> `psk_lifetime_secs` signé et contrôlé, récupération par vieillissement,
-> keep-alive posé par la gateway, plancher `ml_kem` à l'admission, et les
-> bornes DoS du [§4.5](#45-délais-et-limites) — challenge unique par connexion,
-> durée absolue de 90 s, budget par préfixe IPv6 `/64`, budget par identité
-> admise, flux et fenêtres bornés.
+> générationnelle par pair avec état `preparing`, réservation de la génération
+> sous le verrou de la réservation du pair et compare-and-swap avant chaque
+> écriture backend, installation et enregistrement du candidat atomiques
+> vis-à-vis d'un `release`, classification et application du `release` dans la
+> même transition, rollback garanti même quand la tâche est détruite, période
+> de repos après rollback post-installation, PSK statique hors du cycle
+> transactionnel, `psk_lifetime_secs` signé et contrôlé, récupération par
+> vieillissement, keep-alive posé par la gateway, plancher `ml_kem` à
+> l'admission, résolution de l'empreinte TLS vers son unique pair admis avant
+> toute émission de challenge, et les bornes DoS du
+> [§4.5](#45-délais-et-limites) — challenge unique par connexion, durée absolue
+> de 90 s bornant chaque phase, budget par préfixe IPv6 `/64`, budget par
+> identité admise, reprise TLS et 0-RTT désactivés, flux et fenêtres bornés des
+> deux côtés.
 
 **Version** : 5
 
-**Date de la note** : 2026-08-06
+**Date de la note** : 2026-08-07
 
 Cette note décrit le protocole **cible**, révisé après la revue de sécurité de
 la v4. Elle complète [ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md), dont
@@ -1230,9 +1302,11 @@ Les priorités sont normatives :
    et précédent, puis retire le pair. Aucun rollback antérieur ne peut le
    recréer.
 2. Un `release` visant le candidat `ml_kem` pendant `preparing` annule la
-   transaction et vide le slot dans la même transition. Un identifiant visant
-   l'état précédent, tout autre identifiant et tout `release` en
-   `configured_static` sont un no-op signé.
+   transaction et restaure l'état précédent dans la même transition. Il ne
+   vide pas aveuglément le slot : le candidat peut avoir déplacé un PSK
+   statique, qui n'appartient pas au cycle transactionnel et qu'aucun `release`
+   ne doit retirer. Un identifiant visant l'état précédent, tout autre
+   identifiant et tout `release` en `configured_static` sont un no-op signé.
 3. Échéance et récupération constatées pendant `preparing` sont mémorisées.
    Après commit, elles sont annulées par la preuve et le nouvel instant de pose ;
    après rollback, elles s'appliquent immédiatement à l'état restauré.
@@ -2497,8 +2571,9 @@ déclarer la v5 implémentée.
   échouent en nommant le pair ;
 - `release` en `ml_kem` : retrait effectif, idempotence, no-op pour un
   `target_transaction_id` périmé, refus sans challenge, et **vérification de la
-  signature de l'accusé `released`** par le client, plus les deux courses
-  pendant `preparing` ;
+  signature de l'accusé `released`** par le client, plus les courses pendant
+  `preparing`, l'installation tardive d'un candidat déjà annulé et les deux
+  ordres de sérialisation entre `release` et commit ;
 - durée de vie du PSK : renouvellement déclenché à 90 %, retrait ferme à 24 h,
   sans extension après recul d'horloge ou suspension simulée ;
 - enrôlement : invitation expirée, rejouée, révoquée, ciblant une autre gateway

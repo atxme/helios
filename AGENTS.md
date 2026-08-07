@@ -32,9 +32,10 @@ expose enfin le séquestre.
 La négociation de clé pré-WireGuard existe de bout en bout, en **protocole v5**
 ([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendement du 6 août 2026 ;
 spécification [NEGOCIATION-DE-CLE-V5.md](docs/NEGOCIATION-DE-CLE-V5.md)) : port
-UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, trois
-modes et plancher anti-downgrade qui monte seul et ne redescend pas. La v4 est
-décrite par [NEGOCIATION-DE-CLE-V4.md](docs/NEGOCIATION-DE-CLE-V4.md), conservée
+UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, deux
+modes négociables — `static_psk` et `ml_kem` — et plancher anti-downgrade qui
+monte seul et ne redescend pas. La v4 est décrite par
+[NEGOCIATION-DE-CLE-V4.md](docs/NEGOCIATION-DE-CLE-V4.md), conservée
 comme trace de ce qui tournait avant la bascule — le code ne la sert plus, et
 les deux versions ne négocient pas ensemble (ALPN, domaines de signature et
 format de certificat distincts). Les deux IHM exposent la négociation —
@@ -46,15 +47,24 @@ jamais sous la valeur avec laquelle le profil a été chargé.
 **La v5 est partiellement implémentée**, et la spécification nomme ce qui
 manque. Ne pas la présenter comme terminée : la mention « implémentée à trois
 exceptions » portée ici jusqu’au 6 août 2026 était fausse, et une revue a dû
-l’établir. Restent ouverts :
+l’établir. Une seconde revue, le 7 août 2026, a montré que la machine d’état
+générationnelle posée en réponse à la première était elle-même incomplète — la
+génération n’était pas réservée avant la pose du candidat, et l’échéance
+absolue de connexion détruisait la tâche sans rollback. Les deux sont corrigés.
+Restent ouverts :
 
 - le **discriminant de type de profil Orion** (§19, §22). `classic` est refusé
-  au décodage v5 et à la préparation — aucun message v5 ne peut le
-  sélectionner — mais la variante subsiste dans `ProtectionMode` et un profil
-  Orion reste un bloc `key_negotiation` facultatif, dont l’absence signifie
-  encore implicitement « classique ». La retirer est une migration de format :
-  `network.toml`, document `.orion`, manifeste de coffre (`mode_id = 0`) et les
-  deux IHM ;
+  à la validation d’une requête v5 et à la préparation — serde le décode, puis
+  `validate()` le rejette, donc aucun message v5 ne peut le sélectionner — mais
+  la variante subsiste dans `ProtectionMode` et un profil Orion reste un bloc
+  `key_negotiation` facultatif, dont l’absence signifie encore implicitement
+  « classique ». La retirer est une migration de format : `network.toml`,
+  document `.orion`, manifeste de coffre (`mode_id = 0`) et les deux IHM ;
+- l’état **`revoked`** du §11.1 : une révocation se lit à l’absence du pair
+  dans `network.peers`, pas à un marqueur terminal dans le slot. Hors
+  concurrence le pair ne négocie plus, mais l’absence de transition atomique
+  entre admission, génération et plan de données ne fournit pas encore la
+  priorité normative de `revoked` ;
 - le **renouvellement de PSK en place** (§12.3), suspendu à l’essai bloquant du
   §20.0 qui doit d’abord établir sur un vrai plan de données qu’une session
   WireGuard réinitialisée handshake dans les délais ;
@@ -153,6 +163,14 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   le pair : sans keep-alive, un tunnel inactif ne produit aucun handshake et
   les deux seuils ci-dessus liraient un horodatage ancien sur un pair
   parfaitement sain.
+- L’empreinte TLS est résolue vers **son** unique pair admis dès la fin du
+  mTLS, avant qu’un challenge soit émis. La clé WireGuard d’une requête est
+  ensuite comparée à ce pair ; elle n’est jamais la clé de recherche dans la
+  table. Chercher par le champ du client puis comparer l’empreinte refuse les
+  mêmes messages, mais fait d’une valeur choisie par le client l’index de la
+  table — une comparaison manquante en aval laisserait alors une identité
+  admise viser un autre pair. Le budget par identité ne se débite qu’après
+  cette résolution.
 - Un PSK négocié n’est retiré que par un `release` signé, un remplacement
   atomique, une révocation d’admission, le vieillissement du handshake ou
   l’échéance. Jamais par un silence réseau sur un canal de contrôle.
@@ -174,6 +192,39 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   décidée sur un instantané. Une génération périmée est un no-op, jamais une
   écriture. Sans cela, chacun des trois efface le PSK d’une transaction plus
   récente et coupe un tunnel qui marchait.
+- La génération se **réserve**, elle ne s’observe pas. `prepare` l’incrémente
+  et pose l’état `preparing` sous le **même** verrou qui réserve le pair, avant
+  de lire le plan de données et avant d’installer le candidat. La lire sans la
+  prendre laissait le slot décrire le PSK *déplacé* pendant que le fil portait
+  déjà le nouveau : un `release` visant l’ancienne transaction correspondait
+  encore, et la récupération aussi. La confirmation revérifie l’appartenance du
+  slot — même génération, `preparing` à son nom — **avant** de persister le
+  plancher et de signer, sinon la gateway signe un commit pour un PSK qu’elle
+  ne détient plus.
+- La vérification de propriété, la pose backend du candidat et l’insertion de
+  la transaction active forment une **seule section sérialisée**. De même, un
+  `release` classe et applique son action sous ce sérialiseur : si le commit a
+  gagné il retire le PSK committé ; s’il gagne avant le commit, il restaure
+  l’état précédent et le compare-and-swap de confirmation échoue. Découpler
+  l’observation de l’écriture permet à une préparation annulée de poser son
+  candidat en retard, ou à un `release` d’accuser un retrait sans effet.
+- Un rollback doit survivre à la **destruction de la tâche**. Détruire une
+  future n’exécute aucun chemin de sortie : l’échéance absolue de 90 s le
+  faisait, et laissait candidat posé, pair réservé et transaction active — un
+  pair admis s’enfermait dehors avec une seule connexion inachevée. Chaque
+  phase est bornée par ce qui reste de l’échéance, et une garde de destruction
+  couvre le reste. Le défaire s’appuie sur l’identifiant que le slot porte
+  lui-même, jamais sur l’enregistrement de transaction : un `prepare`
+  interrompu peut ne pas encore en avoir écrit. La garde ne se désarme donc
+  qu’après le **retour** du rollback : le désarmer avant l’`await` rouvre le
+  trou qu’elle bouche, et
+  tout ce qui se déduisait de la présence de l’enregistrement — le repos
+  compris — doit se lire sur le slot.
+- Un rollback survenu **après** la pose d’un candidat met le pair au repos dix
+  secondes. Une identité de négociation volée sans la clé WireGuard du pair ne
+  peut jamais committer — la preuve de handshake l’arrête — mais rien ne
+  l’empêchait de faire osciller un slot qui marchait, aussi vite que le
+  round-trip le permet.
 - Ordre d’un retrait : **vider le plan de données d’abord**, n’oublier l’état
   qu’après succès, le verrou tenu à travers l’écriture. L’inverse laisse un PSK
   orphelin quand l’écriture échoue — plus rien ne le désigne, un `release`
@@ -185,8 +236,10 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   transaction et après elle. Le commit le laisse en `configured_static`, et
   Orion n’enregistre pas de reçu pour lui. L’effacer serait détruire une valeur
   qu’aucune renégociation ne restaure.
-- `classic` n’est **pas** un mode négociable v5 : refusé au décodage
-  (`ClassicNotNegotiable`) et à la préparation. Un tunnel sans PSK est un profil
+- `classic` n’est **pas** un mode négociable v5 : refusé par `validate()`
+  (`ClassicNotNegotiable`) et à la préparation. Le décodeur serde l’accepte
+  encore, puisque la variante doit survivre pour relire un `network.toml` ;
+  c’est la validation qui refuse, et il faut le dire ainsi. Un tunnel sans PSK est un profil
   WireGuard générique, pas un résultat de négociation — sinon le plancher du
   protocole se satisfait de l’absence de protection. La variante survit dans le
   type pour qu’un `network.toml` existant se relise encore ; voir la limite
@@ -203,7 +256,12 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   exacte rend la limite décorative sur IPv6), budget par identité admise une
   fois mTLS passé, durée de vie absolue de 90 s par connexion (l’idle timeout
   ne borne pas une connexion occupée, et le permis de concurrence ne revient
-  jamais), zéro flux unidirectionnel et fenêtres de réception bornées.
+  jamais), reprise TLS et 0-RTT désactivés des deux côtés, zéro flux
+  unidirectionnel et fenêtres de réception bornées. Les limites de flux et de
+  fenêtre s’annoncent des **deux** côtés : une borne que seule la gateway
+  déclare ne borne que la gateway. L’échéance absolue borne chaque phase, elle
+  n’enveloppe pas la connexion : détruire la tâche à l’échéance n’exécute
+  aucun rollback.
 - Deux longueurs ML-DSA, deux modules : `aether::key_negotiation::ML_DSA_87_*`
   pour la PKI de négociation, `aether::sig::ML_DSA_65_*` pour les artefacts
   éditeur. Valider du matériel de négociation avec la constante de `sig`
