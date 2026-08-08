@@ -120,6 +120,35 @@ admin_iface = "helios0"
 # requêtes sortent hors du tunnel et révèlent les noms consultés.
 # allow_client_internet = true
 
+# ── Sortie propre de la gateway ──────────────────────────────────────────────
+# Fermé par défaut, comme tout le reste — mais c'est celui dont l'absence se
+# diagnostique le plus mal, parce que la chaîne `output` est celle qu'on ne
+# regarde pas. Sous la politique fail-closed elle accepte le loopback, les flux
+# `established`, le renouvellement DHCP et le transport site-à-site, puis jette
+# le reste. Une gateway dans cet état ne résout aucun nom, ne joint aucun
+# serveur NTP et ne télécharge aucun paquet.
+#
+# Ça ne ressemble pas à un pare-feu, ça ressemble à une panne de DNS : le stub
+# 127.0.0.53 est joignable (loopback accepté), mais quand systemd-resolved
+# relaie la requête vers la box c'est un flux `new` sur le WAN, et la policy le
+# jette. `apt` affiche alors `Ign :` sur chaque source et se fige à 0 %.
+#
+# Deux conséquences à connaître :
+#   - `helios-ctl update` lance `apt-get update` SUR la gateway. Sans cette
+#     ligne, le chemin de mise à jour de l'OS du produit ne peut pas marcher.
+#   - sans NTP, l'horloge dérive — sur la machine dont le métier est justement
+#     de vérifier des dates de validité de certificats.
+#
+# Ce que ça ouvre, et rien d'autre : en sortie, sur la seule interface WAN,
+# UDP 53, TCP 53/80/443 et UDP 123. Rien en entrée, rien en traversée. C'est le
+# trafic que la gateway émet POUR ELLE-MÊME, qui n'a jamais eu vocation à
+# passer dans un tunnel ; le kill-switch protège ce qu'elle RELAIE, et ça reste
+# dans la chaîne `forward`, que cette ligne ne touche pas.
+#
+# Contrairement à `allow_client_internet`, l'ouverture ne suit pas l'état du
+# tunnel : on met une gateway à jour précisément quand son tunnel est baissé.
+# allow_gateway_egress = true
+
 # ── ICMP sur le tunnel ───────────────────────────────────────────────────────
 # Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart
 # est voulu : cette règle ne route rien et n'expose rien vers l'extérieur. Elle

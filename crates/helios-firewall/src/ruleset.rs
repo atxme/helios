@@ -27,6 +27,21 @@
 //! is allowed: NAT is applied and removed together with the tunnel, otherwise
 //! the kill-switch would let out in the clear what it just cut off.
 //!
+//! # The gateway's own egress
+//!
+//! Neither of the two forms above covers the gateway's *own* traffic, and the
+//! `output` chain is the one nobody reads: under the fail-closed policy it
+//! accepts loopback, `established` flows, DHCP renewal and the site-to-site
+//! WireGuard transport, then drops the rest. So a gateway resolves no name,
+//! reaches no NTP server and fetches no package — including through
+//! `helios-ctl update`, which runs `apt-get` on that very machine.
+//!
+//! `allow_gateway_egress` opens it, on the WAN interface and on those ports
+//! only. It is separate from `allow_client_internet` because it answers a
+//! different question — what the gateway emits, not what it relays — and it
+//! does not follow the tunnel state, because an upgrade happens when the
+//! tunnel is down.
+//!
 //! # Known limitation: DNS is not tunneled
 //!
 //! Even with `allow_client_internet` active, the client keeps its own
@@ -364,6 +379,69 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
+    // ── The gateway's own egress ─────────────────────────────────────────────
+    // Name resolution, time and package fetching, for the gateway itself.
+    // Scoped to the WAN interface and to those ports, in `output` only: this
+    // forwards nothing and opens nothing inbound.
+    //
+    // Not gated on the tunnel state. The kill-switch exists to stop relayed
+    // traffic from leaving in the clear, and relaying lives in `forward`. The
+    // moment an operator most needs this opening is an upgrade, which is
+    // exactly a moment when the tunnel may be down.
+    if policy.allow_gateway_egress && !wan.is_empty() {
+        rules.push(
+            Rule::new(
+                Output,
+                vec![
+                    Match::OutIface(wan.clone()),
+                    Match::DestPort {
+                        port: 53,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note(
+                "the gateway's own DNS: without it the resolver's query to the LAN is a \
+                 new flow, dropped by the policy — which reads as a name-resolution \
+                 failure and is not one",
+            ),
+        );
+        rules.push(
+            Rule::new(
+                Output,
+                vec![
+                    Match::OutIface(wan.clone()),
+                    Match::DestPortSet {
+                        // 53 over TCP is not optional: a truncated answer
+                        // falls back to it, and so does anything DNSSEC-sized.
+                        ports: vec![53, 80, 443],
+                        proto: L4::Tcp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note("package fetching — `helios-ctl update` runs `apt-get` on the gateway"),
+        );
+        rules.push(
+            Rule::new(
+                Output,
+                vec![
+                    Match::OutIface(wan.clone()),
+                    Match::DestPort {
+                        port: 123,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note(
+                "NTP: the machine that checks certificate validity dates is the one whose \
+                 clock must not drift",
+            ),
+        );
+    }
+
     // ── ICMP and SSH on the tunnel interface ─────────────────────────────────
     //
     // Both are scoped by **interface**, never by source address, and that is
@@ -538,6 +616,7 @@ mod tests {
             allow_dhcp_on_wan: false,
             allow_client_internet: false,
             allow_tunnel_icmp: false,
+            allow_gateway_egress: false,
             allow_ssh_over_tunnel: false,
             wg_iface: "helios0".into(),
             admin_port: None,
@@ -622,6 +701,71 @@ mod tests {
                     .iter()
                     .any(|r| r.contains("dport 67") || r.contains("dport 68")),
                 "state {st:?}: DHCP must not traverse the gateway"
+            );
+        }
+    }
+
+    /// Closed by default like everything else — but the failure it produces
+    /// is a name-resolution timeout, which points nowhere near the firewall.
+    #[test]
+    fn gateway_egress_is_closed_by_default() {
+        let rs = render(&policy(), TunnelState::Up);
+        for port in ["dport 53", "dport 123", "dport 443"] {
+            assert!(
+                !text(&rs, ChainKind::Output)
+                    .iter()
+                    .any(|r| r.contains(port)),
+                "{port} open without the configuration requesting it"
+            );
+        }
+    }
+
+    /// The three openings the gateway needs for itself, and only in `output`:
+    /// this is what it emits, never what it relays.
+    #[test]
+    fn gateway_egress_opens_resolution_time_and_packages_on_the_wan() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+        let rs = render(&p, TunnelState::Up);
+        let out = text(&rs, ChainKind::Output);
+
+        for expected in [
+            "oifname \"eth0\" udp dport 53 accept",
+            "oifname \"eth0\" tcp dport { 53, 80, 443 } accept",
+            "oifname \"eth0\" udp dport 123 accept",
+        ] {
+            assert!(
+                out.iter().any(|r| r == expected),
+                "missing rule: {expected}"
+            );
+        }
+
+        for kind in [ChainKind::Input, ChainKind::Forward] {
+            assert!(
+                !text(&rs, kind)
+                    .iter()
+                    .any(|r| r.contains("dport 53") || r.contains("dport 123")),
+                "the gateway's own egress must open nothing in {}",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The moment an operator needs this opening is an upgrade, and that is
+    /// exactly a moment when the tunnel may be down. A flag that followed the
+    /// tunnel state would be closed precisely when it is needed —
+    /// `helios-ctl update` runs `apt-get` on the gateway itself.
+    #[test]
+    fn gateway_egress_does_not_follow_the_tunnel_state() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+
+        for st in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            assert!(
+                text(&render(&p, st), ChainKind::Output)
+                    .iter()
+                    .any(|r| r == "oifname \"eth0\" udp dport 53 accept"),
+                "state {st:?}: the gateway must still be able to resolve"
             );
         }
     }

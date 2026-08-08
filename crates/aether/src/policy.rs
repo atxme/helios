@@ -89,6 +89,37 @@ pub struct FirewallPolicy {
     /// one test people reach for first is the one that cannot distinguish
     /// success from failure.
     pub allow_tunnel_icmp: bool,
+    /// Lets the gateway open outbound connections **for itself**: name
+    /// resolution, time synchronization and package fetching, on the WAN
+    /// interface only.
+    ///
+    /// Closed by default, like everything else here. But what closing it
+    /// costs is not obvious, because the `output` chain is the one nobody
+    /// looks at: under the fail-closed policy it accepts loopback,
+    /// `established` traffic, DHCP renewal and the site-to-site WireGuard
+    /// transport — and nothing else. A gateway in that state cannot resolve a
+    /// name, cannot reach an NTP server and cannot fetch a package. It is not
+    /// a DNS failure, though that is exactly what it looks like: `apt` prints
+    /// `Ign` for every source and hangs at 0 %, because the resolver's query
+    /// to the LAN leaves as a **new** flow and the policy drops it.
+    ///
+    /// Two consequences that are worth naming, since neither announces
+    /// itself. `helios-ctl update` runs `apt-get update` **on the gateway**,
+    /// so the product's own OS-upgrade path cannot work while its own
+    /// kill-switch is applied. And without NTP the clock drifts, on the
+    /// machine whose job is to check certificate validity dates.
+    ///
+    /// Note what this does **not** do: it opens nothing inbound, forwards
+    /// nothing, and gives no client anything. It is the gateway's own
+    /// traffic, which was never meant to go through a tunnel — the
+    /// kill-switch protects what the gateway *relays*, and that stays in the
+    /// `forward` chain, untouched by this flag.
+    ///
+    /// Deliberately **not** gated on the tunnel state, unlike
+    /// [`Self::allow_client_internet`]: an operator upgrades a gateway
+    /// precisely when its tunnel is down, and a flag that closed itself in
+    /// that moment would be closed exactly when it is needed.
+    pub allow_gateway_egress: bool,
     /// Accepts SSH **arriving through the tunnel**.
     ///
     /// Closed by default: administrative access is what an attacker wants

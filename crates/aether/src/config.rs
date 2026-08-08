@@ -48,6 +48,14 @@ pub struct NetworkConfig {
     /// to open while everything else here defaults to closed.
     #[serde(default = "default_true")]
     pub allow_tunnel_icmp: bool,
+    /// Lets the gateway resolve, synchronize its clock and fetch packages for
+    /// itself, on the WAN interface.
+    ///
+    /// Closed by default. See [`crate::FirewallPolicy::allow_gateway_egress`]
+    /// for what a gateway without it cannot do — starting with the OS upgrade
+    /// `helios-ctl update` is supposed to run on that very machine.
+    #[serde(default)]
+    pub allow_gateway_egress: bool,
     /// Accepts SSH arriving **through the tunnel**, on the tunnel interface.
     ///
     /// Closed by default. Prefer it to listing the CGNAT range in
@@ -449,6 +457,10 @@ impl NetworkConfig {
             allow_ssh_from: self.allow_ssh_from.clone(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
             allow_client_internet: self.allow_client_internet,
+            // No `wireguard_ready()` gate: this one is scoped to the WAN, not
+            // to the tunnel interface, and it is most needed on a gateway
+            // whose tunnel is precisely not up.
+            allow_gateway_egress: self.allow_gateway_egress,
             // Both are scoped to the tunnel interface, so they are worth
             // nothing until that interface can exist — the same gate the
             // listener openings above go through.
@@ -622,6 +634,26 @@ mod tests {
         let policy = cfg.firewall_policy();
         assert!(policy.allow_tunnel_icmp);
         assert!(policy.allow_ssh_over_tunnel);
+    }
+
+    /// Unlike the two tunnel openings, this one is scoped to the WAN and must
+    /// survive a gateway whose interface cannot come up: an operator upgrades
+    /// a gateway precisely when its tunnel is down.
+    #[test]
+    fn gateway_egress_is_opt_in_and_ignores_wireguard_readiness() {
+        let cfg = NetworkConfig::default();
+        assert!(
+            !cfg.firewall_policy().allow_gateway_egress,
+            "the gateway's own egress is never opened by omission"
+        );
+
+        let toml = r#"
+            wan_iface = "eth0"
+            allow_gateway_egress = true
+        "#;
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.wireguard_ready());
+        assert!(cfg.firewall_policy().allow_gateway_egress);
     }
 
     /// Closing ICMP stays possible: the default is a choice, not a fixture.

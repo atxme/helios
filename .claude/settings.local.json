@@ -326,7 +326,10 @@
       "Bash(perl -pi -e 's/async fn rollback\\\\\\(&self, _transaction_id: \\\\[u8; 16\\\\]\\\\\\) \\\\{/async fn rollback\\(&self, _transaction_id: [u8; 16], _public_key: &str\\) {/' crates/helios-key-negotiation/src/lib.rs)",
       "Bash(perl -pi -e 's/handler\\\\.rollback\\\\\\(\\\\[\\(\\\\d\\); 16\\\\]\\\\\\)\\\\.await;/handler.rollback\\([$1; 16], CLIENT_KEY\\).await;/' crates/heliosd/src/key_negotiation.rs)",
       "Bash(awk 'NR<=682 && /^#{2,4} /{h=$0; n=NR} END{}' docs/NEGOCIATION-DE-CLE-V5.md)",
-      "Bash(awk -F: '$1<682')"
+      "Bash(awk -F: '$1<682')",
+      "Bash(timeout 10 curl -s https://ifconfig.me)",
+      "Bash(ip -brief addr)",
+      "Read(//mnt/wsl/**)"
     ]
   }
 }
