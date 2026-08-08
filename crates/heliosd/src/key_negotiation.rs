@@ -9,17 +9,18 @@ use std::{
 
 use aether::{
     key_negotiation::{
-        authenticate_commit, authenticate_released, authenticate_response,
-        generate_ml_dsa_87_keypair, issue_pq_certificate, AuthenticatedKeyNegotiationCommit,
+        authenticate_commit, authenticate_response, generate_ml_dsa_87_keypair,
+        issue_pq_certificate, AuthenticatedKeyNegotiationCommit,
         AuthenticatedKeyNegotiationConfirmation, AuthenticatedKeyNegotiationRequest,
-        AuthenticatedPskRelease, AuthenticatedPskReleased, PqCertificate, PqCertificateRole,
-        ProtectionMode, PskReleased, PQ_CERTIFICATE_VERSION, SERVER_CHALLENGE_LEN,
+        AuthenticatedPskRelease, PqCertificate, PqCertificateRole, ProtectionMode,
+        KEY_NEGOTIATION_VERSION, PQ_CERTIFICATE_VERSION, SERVER_CHALLENGE_LEN,
     },
     InstallPskRequest, NetworkConfig, SecretString,
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use helio_tpm::{BootDecision, SealedKeystore};
+use helios_api::key_negotiation::PskReleaseRefusal;
 use helios_key_negotiation::{
     prepare_key_material, server_endpoint, GatewayIdentity, NegotiationHandler,
     PreparedNegotiation, PublicError, TlsIdentity, DEFAULT_CONFIRMATION_TIMEOUT,
@@ -178,18 +179,6 @@ impl Default for PeerSlot {
 /// Rest imposed on a peer by a rollback that had already posed a candidate.
 const POST_INSTALL_REST: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// What a signed `release` actually names in the peer's slot.
-///
-/// Two very different things can carry the same transaction identifier, and
-/// the answer on the wire is identical for both — telling them apart would be
-/// an oracle on the peer's state.
-enum ReleaseTarget {
-    /// A committed `ml_kem` PSK. Cleared by the release.
-    Committed,
-    /// The candidate of a transaction that has not confirmed yet. Cancelled.
-    Candidate,
-}
-
 #[derive(Default)]
 struct TransactionState {
     active: HashMap<[u8; 16], Transaction>,
@@ -206,7 +195,7 @@ impl TransactionState {
     }
 }
 
-struct GatewayHandler {
+pub struct GatewayHandler {
     network: Arc<RwLock<NetworkConfig>>,
     psk_tx: mpsc::Sender<InstallPskRequest>,
     /// Fresh reads of the data plane, for the handshake proof at the commit.
@@ -422,82 +411,43 @@ impl GatewayHandler {
 
     /// Applies a signed release as one linearizable slot transition.
     ///
-    /// If confirmation commits before this lock is acquired, the release
-    /// clears that committed PSK. If the release acquires it first, it restores
-    /// the state displaced by the candidate and confirmation can no longer
-    /// pass its compare-and-swap. Splitting classification from the action
-    /// allowed both sides to believe they had won.
+    /// Classification and action share the lock. If confirmation commits
+    /// before it is acquired, this clears that committed PSK; if the release
+    /// acquires it first, the slot is not yet `Committed` and this is a no-op.
+    /// Splitting observation from the write let both sides believe they had
+    /// won.
+    ///
+    /// # Why `preparing` is untouched
+    ///
+    /// §11.1 priority 2: a release only withdraws a `committed` state whose
+    /// owner it names exactly. A candidate belongs to the connection
+    /// preparing it, and that connection already has an exit path for every
+    /// way it can end — its rollback guard, which survives even the
+    /// destruction of its task. Letting a second message cancel a candidate
+    /// gave the same slot two writers with no ordering between them, and the
+    /// v5 client sends no release before its commit anyway: the only callers
+    /// left would be a stale command or a forged one.
+    ///
+    /// Returns whether the slot was actually cleared. The caller logs it; it
+    /// never reaches the wire, where a cleared slot and a no-op are the same
+    /// `204`.
     async fn release_owned_slot(
         &self,
         transaction_id: [u8; 16],
         public_key: &str,
-    ) -> Result<Option<ReleaseTarget>, PublicError> {
-        enum Action {
-            Committed {
-                address: String,
-            },
-            Candidate {
-                previous: SlotState,
-                address: String,
-                previous_psk: Option<String>,
-                install_attempted: bool,
-            },
-        }
-
+    ) -> Result<bool, PublicError> {
         let mut state = self.transactions.lock().await;
-        let action = match &state.slot(public_key).state {
+        let address = match &state.slot(public_key).state {
             SlotState::Committed(installed) if installed.transaction_id == transaction_id => {
-                Some(Action::Committed {
-                    address: installed.address.clone(),
-                })
+                installed.address.clone()
             }
-            SlotState::Preparing {
-                transaction_id: owner,
-                previous,
-                address,
-                previous_psk,
-                install_attempted,
-            } if *owner == transaction_id => Some(Action::Candidate {
-                previous: (**previous).clone(),
-                address: address.clone(),
-                previous_psk: previous_psk.clone(),
-                install_attempted: *install_attempted,
-            }),
-            _ => None,
+            _ => return Ok(false),
         };
-
-        match action {
-            Some(Action::Committed { address }) => {
-                self.install(public_key.to_string(), address, None).await?;
-                let slot = state.slot(public_key);
-                slot.state = SlotState::Empty;
-                slot.generation += 1;
-                Ok(Some(ReleaseTarget::Committed))
-            }
-            Some(Action::Candidate {
-                previous,
-                address,
-                previous_psk,
-                install_attempted,
-            }) => {
-                self.install(
-                    public_key.to_string(),
-                    address,
-                    previous_psk.map(SecretString::new),
-                )
-                .await?;
-                state.active.remove(&transaction_id);
-                state.peers.remove(public_key);
-                let slot = state.slot(public_key);
-                slot.state = previous;
-                slot.generation += 1;
-                if install_attempted {
-                    slot.resting_until = Some(std::time::Instant::now() + POST_INSTALL_REST);
-                }
-                Ok(Some(ReleaseTarget::Candidate))
-            }
-            None => Ok(None),
-        }
+        self.install(public_key.to_string(), address, None).await?;
+        let slot = state.slot(public_key);
+        slot.state = SlotState::Empty;
+        slot.generation += 1;
+        Ok(true)
     }
 
     /// Clears a peer's slot on the data plane, then in the table.
@@ -540,9 +490,9 @@ impl GatewayHandler {
             // A candidate belongs to its transaction, and clearing it here
             // would be exactly the erase the generation exists to prevent: a
             // reclamation or a delayed release matching a slot that has moved
-            // on. Cancelling a candidate has one entry point — the release
-            // that names it, which goes through [`Self::release_owned_slot`]
-            // and puts back what the candidate displaced.
+            // on. Undoing a candidate has one entry point — the rollback guard
+            // of the connection preparing it, which puts back what the
+            // candidate displaced.
             SlotState::Preparing { .. } => return Ok(()),
         };
         self.install(public_key.to_string(), address, None).await?;
@@ -1157,112 +1107,6 @@ impl NegotiationHandler for GatewayHandler {
         Ok(commit)
     }
 
-    /// Explicit teardown, authenticated exactly like a request.
-    ///
-    /// Idempotent, and deliberately uninformative: cleared, already empty and
-    /// owned by another transaction all produce the same signed answer.
-    /// Telling them apart would be an oracle on a peer's state.
-    ///
-    /// A release also reaches a candidate still being prepared — see
-    /// [`ReleaseTarget`] — and that too answers the same way.
-    async fn release(
-        &self,
-        certificate_sha256: String,
-        authenticated: AuthenticatedPskRelease,
-    ) -> Result<AuthenticatedPskReleased, PublicError> {
-        let release = &authenticated.release;
-        let peer_key = release.client_wg_public_key.clone();
-        if release.gateway_wg_public_key != self.gateway_public_key {
-            tracing::warn!(peer = %peer_key, "release refused: it names another gateway");
-            return Err(PublicError::Rejected);
-        }
-        let pq_fingerprint = {
-            let network = self.network.read().await;
-            // Indexed by the TLS fingerprint, like `prepare`: the key the
-            // message carries is checked against the answer, never used to
-            // find it.
-            let peer = network
-                .peers
-                .iter()
-                .find(|peer| {
-                    peer.key_negotiation_certificate_sha256.as_deref()
-                        == Some(certificate_sha256.as_str())
-                })
-                .ok_or(PublicError::Rejected)?;
-            if peer.public_key != release.client_wg_public_key {
-                return Err(PublicError::Rejected);
-            }
-            peer.key_negotiation_pq_certificate_sha256
-                .clone()
-                .ok_or(PublicError::Rejected)?
-        };
-        authenticated
-            .verify(
-                &self.client_pq_ca_public_key,
-                &pq_fingerprint,
-                unix_time_now().map_err(|_| PublicError::Protocol)?,
-            )
-            .map_err(|error| {
-                tracing::warn!(peer = %peer_key, %error, "release refused: authentication failed");
-                PublicError::Rejected
-            })?;
-
-        // Classification and action share one lock inside
-        // `release_owned_slot`. If confirmation wins that lock first this is a
-        // committed release; if release wins it first the candidate is rolled
-        // back and confirmation becomes stale. There is no intermediate
-        // observation that can turn into a no-op after the slot changes.
-        match self
-            .release_owned_slot(
-                release.installed_transaction_id,
-                &release.client_wg_public_key,
-            )
-            .await
-        {
-            Ok(Some(ReleaseTarget::Committed)) => {
-                tracing::info!(
-                    peer = %peer_key,
-                    transaction = %hex_prefix(&release.installed_transaction_id),
-                    "signed release accepted: clearing the PSK slot"
-                );
-            }
-            Ok(Some(ReleaseTarget::Candidate)) => {
-                tracing::info!(
-                    peer = %peer_key,
-                    transaction = %hex_prefix(&release.installed_transaction_id),
-                    "signed release accepted: cancelling the candidate this peer is preparing"
-                );
-            }
-            Ok(None) => {
-                tracing::info!(
-                    peer = %peer_key,
-                    "release does not name the transaction that owns this peer's slot, or the \
-                     slot holds a configured static PSK; answering as released without touching \
-                     anything"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    peer = %peer_key,
-                    ?error,
-                    "could not apply the signed release to the PSK slot"
-                );
-                return Err(error);
-            }
-        }
-
-        authenticate_released(
-            PskReleased {
-                protocol_version: aether::key_negotiation::KEY_NEGOTIATION_VERSION,
-                server_challenge: release.server_challenge,
-                installed_transaction_id: release.installed_transaction_id,
-            },
-            self.gateway_pq_certificate.clone(),
-            self.gateway_pq_private_key.as_slice(),
-        )
-        .map_err(|_| PublicError::Internal)
-    }
-
     async fn rollback(&self, transaction_id: [u8; 16], client_wg_public_key: &str) {
         tracing::info!(
             transaction = %hex_prefix(&transaction_id),
@@ -1276,6 +1120,115 @@ impl NegotiationHandler for GatewayHandler {
     }
 }
 
+/// Explicit teardown, arriving **inside the WireGuard tunnel**.
+///
+/// The gateway learns the caller's identity from the source VIP, which
+/// `helios_api::auth::require_peer` has already resolved against the peer
+/// table; this only ever *compares* the keys the body carries. So a release
+/// engages the peer's WireGuard key — proved by the packet having crossed the
+/// tunnel at all — on top of its ML-DSA-87 identity.
+///
+/// Idempotent and deliberately uninformative: cleared, already empty, owned by
+/// another transaction, still `preparing` and holding a configured static PSK
+/// are one and the same answer. Telling them apart would be an oracle on a
+/// peer's state.
+#[async_trait::async_trait]
+impl helios_api::key_negotiation::PskReleaseHandler for GatewayHandler {
+    async fn release(
+        &self,
+        caller_wg_public_key: &str,
+        authenticated: AuthenticatedPskRelease,
+    ) -> Result<(), PskReleaseRefusal> {
+        let release = &authenticated.release;
+        if release.protocol_version != KEY_NEGOTIATION_VERSION {
+            return Err(PskReleaseRefusal::Protocol);
+        }
+        // The body's own copy of the client key is checked against the one the
+        // transport proved, never used to find a peer. A negotiation identity
+        // stolen from one client therefore cannot aim a release at another.
+        if release.client_wg_public_key != caller_wg_public_key {
+            tracing::warn!(
+                peer = %caller_wg_public_key,
+                "release refused: the body names another peer than the source VIP"
+            );
+            return Err(PskReleaseRefusal::Rejected);
+        }
+        if release.gateway_wg_public_key != self.gateway_public_key {
+            tracing::warn!(
+                peer = %caller_wg_public_key,
+                "release refused: it names another gateway"
+            );
+            return Err(PskReleaseRefusal::Rejected);
+        }
+        let pq_fingerprint = {
+            let network = self.network.read().await;
+            let peer = network
+                .peers
+                .iter()
+                .find(|peer| peer.public_key == caller_wg_public_key)
+                .ok_or(PskReleaseRefusal::Rejected)?;
+            peer.key_negotiation_pq_certificate_sha256
+                .clone()
+                .ok_or(PskReleaseRefusal::Rejected)?
+        };
+        authenticated
+            .verify(
+                &self.client_pq_ca_public_key,
+                &pq_fingerprint,
+                unix_time_now().map_err(|_| PskReleaseRefusal::Internal)?,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    peer = %caller_wg_public_key,
+                    %error,
+                    "release refused: authentication failed"
+                );
+                PskReleaseRefusal::Rejected
+            })?;
+
+        // Classification and action share one lock inside
+        // `release_owned_slot`. If confirmation wins that lock first this
+        // clears the PSK it just committed; if the release wins, the slot is
+        // not committed yet and nothing is touched.
+        match self
+            .release_owned_slot(release.installed_transaction_id, caller_wg_public_key)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    peer = %caller_wg_public_key,
+                    transaction = %hex_prefix(&release.installed_transaction_id),
+                    "signed release accepted: clearing the PSK slot"
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                tracing::info!(
+                    peer = %caller_wg_public_key,
+                    "release does not name the committed transaction that owns this peer's \
+                     slot; answering without touching anything"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    peer = %caller_wg_public_key,
+                    ?error,
+                    "could not apply the signed release to the PSK slot"
+                );
+                Err(PskReleaseRefusal::Internal)
+            }
+        }
+    }
+}
+
+/// Starts the negotiation service, and hands back what the internal API needs.
+///
+/// The returned handler is the **same** object the QUIC listener serves, not a
+/// copy: the in-tunnel `release` and the negotiation itself must contend for
+/// one per-peer serializer, or two writers would race on the same slot.
+/// `None` means no `key_negotiation_port`, so no service and nothing to
+/// release.
 pub async fn start(
     network: Arc<RwLock<NetworkConfig>>,
     psk_tx: mpsc::Sender<InstallPskRequest>,
@@ -1283,7 +1236,7 @@ pub async fn start(
     peer_runtime: Arc<RwLock<Vec<helios_wireguard::PeerStatus>>>,
     boot: &BootDecision,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<Option<Arc<GatewayHandler>>> {
     let (port, gateway_private_key, static_psks) = {
         let network = network.read().await;
         // No port declared, no service. This used to be an error, back when
@@ -1297,7 +1250,7 @@ pub async fn start(
             tracing::info!(
                 "key_negotiation_port absent: the pre-WireGuard negotiation stays closed"
             );
-            return Ok(());
+            return Ok(None);
         };
         let static_psks = network
             .peers
@@ -1370,8 +1323,11 @@ pub async fn start(
     });
     tracing::info!("key-negotiation listening on UDP {port}");
     spawn_psk_reclaimer(Arc::clone(&handler), peer_runtime);
-    tokio::spawn(helios_key_negotiation::serve(endpoint, handler));
-    Ok(())
+    tokio::spawn(helios_key_negotiation::serve(
+        endpoint,
+        Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
+    ));
+    Ok(Some(handler))
 }
 
 /// How often the reclaimer looks at the data plane.
@@ -1803,6 +1759,32 @@ mod tests {
         // these tests are about. `classic` used to serve here and no longer
         // decodes at all.
         request_in_mode(transaction_id, fixture, ProtectionMode::MlKem, None)
+    }
+
+    /// Sends a signed `release` the way Orion does: through the internal API.
+    ///
+    /// The caller key is passed separately, exactly as `require_peer` supplies
+    /// it after resolving the source VIP — the body's copy is only ever
+    /// compared against it.
+    async fn release_in_tunnel(
+        handler: &GatewayHandler,
+        fixture: &PqFixture,
+        installed_transaction_id: [u8; 16],
+    ) -> Result<(), PskReleaseRefusal> {
+        use helios_api::key_negotiation::PskReleaseHandler as _;
+
+        let release = aether::key_negotiation::authenticate_release(
+            aether::key_negotiation::PskRelease {
+                protocol_version: KEY_NEGOTIATION_VERSION,
+                installed_transaction_id,
+                client_wg_public_key: CLIENT_KEY.into(),
+                gateway_wg_public_key: GATEWAY_KEY.into(),
+            },
+            fixture.client_certificate.clone(),
+            &fixture.client_private_key,
+        )
+        .unwrap();
+        handler.release(CLIENT_KEY, release).await
     }
 
     /// The same request in a chosen mode, with the static commitment when one
@@ -2466,14 +2448,17 @@ mod tests {
         );
     }
 
-    /// §11.1, priority 2: a `release` naming the candidate cancels it.
+    /// §11.1, priority 2: a `release` arriving during `preparing` is a no-op.
     ///
-    /// No per-peer actor is needed to make this safe. The transaction record
-    /// and the slot both go under this lock, so the connection that posed the
-    /// candidate discovers the cancellation at its own confirmation — where
-    /// the compare-and-swap finds a slot that is no longer its own.
+    /// Only a `committed` state whose owner the release names exactly is
+    /// withdrawn. A candidate belongs to the connection preparing it, and that
+    /// connection already has an exit path for every way it can end — its
+    /// rollback guard, which survives even the destruction of its task.
+    /// Letting a second message cancel a candidate gave one slot two writers
+    /// with no ordering between them; the client sends no release before its
+    /// own commit, so the only callers left would be stale or forged.
     #[tokio::test]
-    async fn a_release_naming_the_candidate_cancels_the_transaction() {
+    async fn a_release_arriving_during_preparation_touches_nothing() {
         let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let fixture = pq_fixture();
         let (handler, plane) = gateway_with(&fixture, &previous_psk, ProtectionMode::MlKem);
@@ -2482,45 +2467,28 @@ mod tests {
             .prepare(CERTIFICATE_FINGERPRINT.into(), request([26; 16], &fixture))
             .await
             .unwrap();
+        let candidate = plane.writes().await.last().cloned().flatten();
 
-        let release = aether::key_negotiation::authenticate_release(
-            aether::key_negotiation::PskRelease {
-                protocol_version: KEY_NEGOTIATION_VERSION,
-                server_challenge: TEST_CHALLENGE,
-                installed_transaction_id: [26; 16],
-                client_wg_public_key: CLIENT_KEY.into(),
-                gateway_wg_public_key: GATEWAY_KEY.into(),
-                timestamp_unix: test_now(),
-            },
-            fixture.client_certificate.clone(),
-            &fixture.client_private_key,
-        )
-        .unwrap();
-        handler
-            .release(CERTIFICATE_FINGERPRINT.into(), release)
+        release_in_tunnel(&handler, &fixture, [26; 16])
             .await
             .unwrap();
 
         assert_eq!(
             plane.writes().await.last().cloned().flatten(),
-            Some(previous_psk),
-            "cancelling a candidate restores what it displaced; emptying the slot would destroy \
-             a PSK the release never named"
+            candidate,
+            "the candidate must still be the last thing the data plane was told"
         );
 
-        // The confirmation the original connection is still holding must now
-        // be refused, without any message having reached its task.
+        // And the connection that posed it can still confirm: nothing took
+        // its slot away.
         plane.handshake_happens().await;
-        let refusal = handler
+        handler
             .confirm(
                 authenticate_confirmation(TEST_CHALLENGE, [26; 16], &fixture.client_private_key)
                     .unwrap(),
             )
-            .await;
-        assert!(
-            matches!(refusal, Err(PublicError::Rejected)),
-            "a cancelled transaction must not be able to sign a commit"
-        );
+            .await
+            .expect("a no-op release must not cost the transaction its commit");
     }
 
     /// A release may arrive while `prepare` is still deriving material, before
@@ -2622,21 +2590,7 @@ mod tests {
             .await
             .unwrap();
 
-        let release = aether::key_negotiation::authenticate_release(
-            aether::key_negotiation::PskRelease {
-                protocol_version: KEY_NEGOTIATION_VERSION,
-                server_challenge: TEST_CHALLENGE,
-                installed_transaction_id: transaction_id,
-                client_wg_public_key: CLIENT_KEY.into(),
-                gateway_wg_public_key: GATEWAY_KEY.into(),
-                timestamp_unix: test_now(),
-            },
-            fixture.client_certificate.clone(),
-            &fixture.client_private_key,
-        )
-        .unwrap();
-        handler
-            .release(CERTIFICATE_FINGERPRINT.into(), release)
+        release_in_tunnel(&handler, &fixture, transaction_id)
             .await
             .unwrap();
 

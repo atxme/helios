@@ -73,12 +73,11 @@ Restent ouverts :
   s’en aperçoit qu’à la déconnexion ;
 - l’**enrôlement sans clé privée avec signature opérateur** (§15), qui reste au
   modèle v4 décrit plus bas ;
-- la **libération dans le tunnel WireGuard** (§7.5, amendement ADR-005 du
-  8 août 2026) : à la déconnexion, le code ouvre encore une seconde connexion
-  QUIC publique avec challenge et accusé signé. La cible envoie le `release`
-  signé sur `POST /api/key-negotiation/release` via l’API interne, authentifie
-  d’abord la VIP source comme son pair WireGuard, puis retire seulement le
-  propriétaire `committed` correspondant ; aucun repli QUIC public ;
+- la **libération à la désinstallation d’un profil** (§12.2) : le `release` du
+  §7.5 part bien à la déconnexion, mais retirer un profil dont le tunnel est
+  monté n’en envoie aucun — le slot tient jusqu’à la récupération à 300 s. Seul
+  le contrôleur détient le reçu de commit, et le chemin de suppression ne l’a
+  pas ;
 - tout le **cycle de vie des certificats**
   ([ROTATION-CERTIFICATS-V5](docs/ROTATION-CERTIFICATS-V5.md)) : leaf PQ
   gateway encore auto-signée, ni slot actif/suivant, ni génération
@@ -180,6 +179,24 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
 - Un PSK négocié n’est retiré que par un `release` signé, un remplacement
   atomique, une révocation d’admission, le vieillissement du handshake ou
   l’échéance. Jamais par un silence réseau sur un canal de contrôle.
+- Le `release` vit **dans le tunnel WireGuard**, sur `POST
+  /api/key-negotiation/release`, et nulle part ailleurs : le port QUIC public
+  ne porte plus que challenge, requête, confirmation et commit, et le tag
+  hérité `release` n’y décode plus. Négocier doit précéder WireGuard, se
+  déconnecter le suit — rouvrir le port public pour annoncer un arrêt
+  réauthentifiait par mTLS, challenge et ML-DSA une machine qui tenait déjà un
+  canal chiffré et authentifié vers la gateway. `require_peer` résout la VIP
+  source vers l’unique pair admis ; la clé du corps n’est que **comparée** à
+  celle-là, jamais la clé de recherche. Pas de challenge, pas d’horodatage,
+  pas de repli QUIC : l’identifiant de transaction suffit à rendre une
+  commande ancienne inoffensive, et WireGuard refuse déjà les paquets rejoués.
+  L’opération est best-effort, bornée à deux secondes côté Orion, et son échec
+  ne retarde pas la déconnexion — la récupération à 300 s est le filet.
+- Un `release` ne retire qu’un état `committed` dont il nomme exactement le
+  propriétaire. Pendant `preparing` c’est un **no-op** : le candidat appartient
+  à la connexion qui le prépare, et sa garde de rollback est la seule sortie,
+  y compris quand la tâche est détruite. Lui laisser annuler un candidat
+  donnait deux écrivains sans ordre à un même slot.
 - Le commit signé est le **point de non-retour**. `take_for_rollback` ne
   cherche que dans les transactions `active` : après la signature il ne trouve
   rien, et c’est structurel. La v4 restaurait le slot quand le commit
@@ -210,10 +227,10 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
 - La vérification de propriété, la pose backend du candidat et l’insertion de
   la transaction active forment une **seule section sérialisée**. De même, un
   `release` classe et applique son action sous ce sérialiseur : si le commit a
-  gagné il retire le PSK committé ; s’il gagne avant le commit, il restaure
-  l’état précédent et le compare-and-swap de confirmation échoue. Découpler
-  l’observation de l’écriture permet à une préparation annulée de poser son
-  candidat en retard, ou à un `release` d’accuser un retrait sans effet.
+  gagné il retire le PSK committé ; s’il arrive avant, le slot n’est pas encore
+  `committed` et rien n’est touché. Découpler l’observation de l’écriture
+  permet à une préparation annulée de poser son candidat en retard, ou à un
+  `release` d’accuser un retrait sans effet.
 - Un rollback doit survivre à la **destruction de la tâche**. Détruire une
   future n’exécute aucun chemin de sortie : l’échéance absolue de 90 s le
   faisait, et laissait candidat posé, pair réservé et transaction active — un

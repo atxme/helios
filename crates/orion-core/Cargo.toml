@@ -16,6 +16,10 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# Le type `Host` de l'URL analysée. `reqwest` réexporte `Url` mais pas lui, et
+# distinguer une adresse littérale d'un nom doit se lire sur **la** structure
+# que le client HTTP utilisera, jamais sur une seconde analyse de la chaîne.
+url = "2"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

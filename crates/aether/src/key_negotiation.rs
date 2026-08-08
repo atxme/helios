@@ -65,8 +65,9 @@ const PQ_REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-pq-request-v5";
 const PQ_RESPONSE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-response-v5";
 const PQ_CONFIRMATION_DOMAIN: &[u8] = b"helios-key-negotiation-pq-confirmation-v5";
 const PQ_COMMIT_DOMAIN: &[u8] = b"helios-key-negotiation-pq-commit-v5";
-const PQ_RELEASE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-release-v5";
-const PQ_RELEASED_DOMAIN: &[u8] = b"helios-key-negotiation-pq-released-v5";
+/// Distinct from the domain of the withdrawn public QUIC message, so that no
+/// signature produced by the old path is valid on the internal API.
+const PQ_IN_TUNNEL_RELEASE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-in-tunnel-release-v5";
 const STATIC_PSK_COMMITMENT_LABEL: &[u8] = b"helios-static-psk-commitment-v5";
 
 /// Certificate format version. `2` carries ML-DSA-87; `1` carried ML-DSA-65
@@ -728,13 +729,23 @@ impl AuthenticatedKeyNegotiationCommit {
 
 /// Explicit teardown, carrying what the closed QUIC link no longer signals.
 ///
-/// Travels on a **new** connection with its own challenge phase, and follows
-/// exactly the same authentication path as a request.
+/// Travels **inside the WireGuard tunnel**, on `POST
+/// /api/key-negotiation/release` of the internal API — not on the public
+/// negotiation port. The negotiation itself has to cross the Internet before
+/// WireGuard exists, which is what the public port is for; an explicit
+/// disconnection happens after a successful handshake, when an encrypted and
+/// mutually authenticated channel to the gateway is already there. Reopening
+/// the public port to announce a teardown re-authenticated by mTLS, challenge
+/// and ML-DSA a machine that had nothing left to prove.
+///
+/// Hence no `server_challenge` and no timestamp: WireGuard rejects replayed
+/// network packets, and at the application layer `installed_transaction_id`
+/// makes a stale command harmless — the gateway only clears the slot whose
+/// current `committed` owner it names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PskRelease {
     pub protocol_version: u16,
-    pub server_challenge: [u8; SERVER_CHALLENGE_LEN],
     /// Transaction that installed the PSK being released.
     ///
     /// The gateway only clears the slot if this names its current owner, so a
@@ -743,7 +754,6 @@ pub struct PskRelease {
     pub installed_transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
     pub client_wg_public_key: String,
     pub gateway_wg_public_key: String,
-    pub timestamp_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +765,9 @@ pub struct AuthenticatedPskRelease {
 }
 
 impl AuthenticatedPskRelease {
+    /// `now_unix` is only the clock the **certificate** validity is read
+    /// against. The release itself carries no timestamp: there is no clock
+    /// window to widen or narrow, and therefore none to get wrong.
     pub fn verify(
         &self,
         issuer_public_key: &[u8],
@@ -766,9 +779,6 @@ impl AuthenticatedPskRelease {
                 received: self.release.protocol_version,
                 supported: KEY_NEGOTIATION_VERSION,
             });
-        }
-        if self.release.server_challenge.iter().all(|byte| *byte == 0) {
-            return Err(KeyNegotiationError::ZeroChallenge);
         }
         if self
             .release
@@ -782,13 +792,6 @@ impl AuthenticatedPskRelease {
             .map_err(|_| KeyNegotiationError::InvalidWireGuardKey)?;
         crate::wg::validate_key(&self.release.gateway_wg_public_key)
             .map_err(|_| KeyNegotiationError::InvalidWireGuardKey)?;
-        let drift = now_unix.abs_diff(self.release.timestamp_unix);
-        if drift > MAX_REQUEST_CLOCK_SKEW_SECS {
-            return Err(KeyNegotiationError::StaleRequest {
-                drift_secs: drift,
-                tolerance_secs: MAX_REQUEST_CLOCK_SKEW_SECS,
-            });
-        }
         self.certificate.verify(
             issuer_public_key,
             PqCertificateRole::Client,
@@ -802,62 +805,6 @@ impl AuthenticatedPskRelease {
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
             &pq_release_signing_bytes(&self.release, &self.certificate)?,
-            &self.ml_dsa_87_signature,
-        )
-    }
-}
-
-/// Idempotent, **signed** acknowledgment of a release.
-///
-/// Signed by the same rule that covers the commit: every gateway statement
-/// about the state of a slot is signed. The impact of a forged one is small —
-/// Orion is disconnecting anyway — but the rule is easier to hold than the
-/// exception, and the signature costs one operation on a connection that is
-/// already authenticated, so it amplifies nothing.
-///
-/// The same value is returned whether the slot was cleared, was already empty,
-/// or belongs to another transaction: distinguishing them would be an oracle
-/// on a peer's state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PskReleased {
-    pub protocol_version: u16,
-    pub server_challenge: [u8; SERVER_CHALLENGE_LEN],
-    pub installed_transaction_id: [u8; KEY_NEGOTIATION_NONCE_LEN],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthenticatedPskReleased {
-    pub released: PskReleased,
-    pub certificate: PqCertificate,
-    pub ml_dsa_87_signature: String,
-}
-
-impl AuthenticatedPskReleased {
-    pub fn verify(
-        &self,
-        release: &PskRelease,
-        pinned_certificate: &PqCertificate,
-    ) -> Result<(), KeyNegotiationError> {
-        if self.released.protocol_version != KEY_NEGOTIATION_VERSION {
-            return Err(KeyNegotiationError::VersionMismatch {
-                received: self.released.protocol_version,
-                supported: KEY_NEGOTIATION_VERSION,
-            });
-        }
-        if self.released.server_challenge != release.server_challenge {
-            return Err(KeyNegotiationError::ChallengeMismatch);
-        }
-        if self.released.installed_transaction_id != release.installed_transaction_id {
-            return Err(KeyNegotiationError::TransactionMismatch);
-        }
-        if self.certificate.fingerprint()? != pinned_certificate.fingerprint()? {
-            return Err(KeyNegotiationError::PqCertificateFingerprintMismatch);
-        }
-        verify_protocol_signature(
-            &self.certificate.ml_dsa_87_public_key,
-            &pq_released_signing_bytes(&self.released, &self.certificate)?,
             &self.ml_dsa_87_signature,
         )
     }
@@ -1123,33 +1070,47 @@ fn pq_response_signing_bytes(
     Ok(output)
 }
 
+/// Spec §8.4, and the one message in this module that follows §8 to the
+/// letter: keys and fingerprints are **decoded** to their 32 bytes, with no
+/// length prefix and no base64 or hexadecimal text in the signed transcript.
+///
+/// The four older messages still sign the canonical text with a `u32` length.
+/// That divergence is uniform, already served, and correcting it would
+/// invalidate every deployed pair at once. This message has no deployed
+/// signature to preserve — its domain is new — so it is written to the
+/// contract rather than to the neighbours. Two encodings under two distinct
+/// domains cannot be confused for one another; a standing divergence from the
+/// spec is the thing worth avoiding.
 fn pq_release_signing_bytes(
     release: &PskRelease,
     certificate: &PqCertificate,
 ) -> Result<Vec<u8>, KeyNegotiationError> {
-    let mut output = Vec::with_capacity(512);
-    output.extend_from_slice(PQ_RELEASE_DOMAIN);
+    let client_wg_public_key = decode_exact::<{ crate::wg::KEY_LEN }>(
+        &release.client_wg_public_key,
+        KeyNegotiationError::InvalidWireGuardKey,
+    )?;
+    let gateway_wg_public_key = decode_exact::<{ crate::wg::KEY_LEN }>(
+        &release.gateway_wg_public_key,
+        KeyNegotiationError::InvalidWireGuardKey,
+    )?;
+    let fingerprint = decode_hex_sha256(&certificate.fingerprint()?)?;
+
+    let mut output = Vec::with_capacity(PQ_IN_TUNNEL_RELEASE_DOMAIN.len() + 2 + 16 + 32 * 3);
+    output.extend_from_slice(PQ_IN_TUNNEL_RELEASE_DOMAIN);
     output.extend_from_slice(&release.protocol_version.to_be_bytes());
-    output.extend_from_slice(&release.server_challenge);
     output.extend_from_slice(&release.installed_transaction_id);
-    append_bytes(&mut output, release.client_wg_public_key.as_bytes())?;
-    append_bytes(&mut output, release.gateway_wg_public_key.as_bytes())?;
-    output.extend_from_slice(&release.timestamp_unix.to_be_bytes());
-    append_bytes(&mut output, certificate.fingerprint()?.as_bytes())?;
+    output.extend_from_slice(&client_wg_public_key);
+    output.extend_from_slice(&gateway_wg_public_key);
+    output.extend_from_slice(&fingerprint);
     Ok(output)
 }
 
-fn pq_released_signing_bytes(
-    released: &PskReleased,
-    certificate: &PqCertificate,
-) -> Result<Vec<u8>, KeyNegotiationError> {
-    let mut output = Vec::with_capacity(256);
-    output.extend_from_slice(PQ_RELEASED_DOMAIN);
-    output.extend_from_slice(&released.protocol_version.to_be_bytes());
-    output.extend_from_slice(&released.server_challenge);
-    output.extend_from_slice(&released.installed_transaction_id);
-    append_bytes(&mut output, certificate.fingerprint()?.as_bytes())?;
-    Ok(output)
+fn decode_hex_sha256(value: &str) -> Result<[u8; 32], KeyNegotiationError> {
+    validate_hex_sha256(value)?;
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(value, &mut bytes)
+        .map_err(|_| KeyNegotiationError::InvalidCertificateFingerprint)?;
+    Ok(bytes)
 }
 
 fn pq_transaction_signing_bytes(
@@ -1331,23 +1292,6 @@ pub fn authenticate_release(
     )?;
     Ok(AuthenticatedPskRelease {
         release,
-        certificate,
-        ml_dsa_87_signature: signature,
-    })
-}
-
-#[cfg(feature = "key-negotiation-signing")]
-pub fn authenticate_released(
-    released: PskReleased,
-    certificate: PqCertificate,
-    gateway_private_key: &[u8],
-) -> Result<AuthenticatedPskReleased, KeyNegotiationError> {
-    let signature = sign_ml_dsa_87(
-        gateway_private_key,
-        &pq_released_signing_bytes(&released, &certificate)?,
-    )?;
-    Ok(AuthenticatedPskReleased {
-        released,
         certificate,
         ml_dsa_87_signature: signature,
     })
@@ -2089,15 +2033,14 @@ mod tests {
         );
     }
 
-    /// Le `release` suit le même chemin d'authentification qu'une requête, et
-    /// son accusé est signé : la gateway ne fait aucune affirmation non signée
-    /// sur l'état d'un slot.
+    /// Le `release` du tunnel s'authentifie comme une requête, et son domaine
+    /// de signature est distinct de celui du message QUIC retiré : la même
+    /// commande ne peut pas être rejouée d'un transport vers l'autre.
     #[cfg(feature = "key-negotiation-signing")]
     #[test]
-    fn a_release_and_its_acknowledgment_are_both_authenticated() {
+    fn an_in_tunnel_release_is_authenticated_and_bound_to_its_transaction() {
         let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
         let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
-        let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().unwrap();
         let client_certificate = pq_certificate(
             PqCertificateRole::Client,
             "orion",
@@ -2105,26 +2048,17 @@ mod tests {
             &client_public,
             ca_private.as_slice(),
         );
-        let gateway_certificate = pq_certificate(
-            PqCertificateRole::Gateway,
-            SERVER_NAME,
-            GATEWAY_WG_KEY,
-            &gateway_public,
-            gateway_private.as_slice(),
-        );
         let fingerprint = client_certificate.fingerprint().unwrap();
 
         let release = PskRelease {
             protocol_version: KEY_NEGOTIATION_VERSION,
-            server_challenge: challenge(),
             installed_transaction_id: [4; KEY_NEGOTIATION_NONCE_LEN],
             client_wg_public_key: CLIENT_WG_KEY.into(),
             gateway_wg_public_key: GATEWAY_WG_KEY.into(),
-            timestamp_unix: test_now(),
         };
         let mut authenticated = authenticate_release(
             release.clone(),
-            client_certificate,
+            client_certificate.clone(),
             client_private.as_slice(),
         )
         .unwrap();
@@ -2132,30 +2066,95 @@ mod tests {
             .verify(&ca_public, &fingerprint, test_now())
             .unwrap();
 
+        // Le domaine porte le transport : une signature produite sur les
+        // octets de l'ancien message QUIC public ne vaut rien ici.
+        let mut public_domain_bytes = pq_release_signing_bytes(&release, &client_certificate)
+            .unwrap()
+            .split_off(PQ_IN_TUNNEL_RELEASE_DOMAIN.len());
+        let mut rebuilt = b"helios-key-negotiation-pq-release-v5".to_vec();
+        rebuilt.append(&mut public_domain_bytes);
+        let mut replayed = authenticated.clone();
+        replayed.ml_dsa_87_signature = sign_ml_dsa_87(client_private.as_slice(), &rebuilt).unwrap();
+        assert_eq!(
+            replayed.verify(&ca_public, &fingerprint, test_now()),
+            Err(KeyNegotiationError::InvalidPqProtocolSignature)
+        );
+
         // Rediriger un release vers une autre transaction casse sa signature.
         authenticated.release.installed_transaction_id[0] ^= 1;
         assert_eq!(
             authenticated.verify(&ca_public, &fingerprint, test_now()),
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
         );
+    }
 
-        let acknowledged = authenticate_released(
-            PskReleased {
-                protocol_version: KEY_NEGOTIATION_VERSION,
-                server_challenge: release.server_challenge,
-                installed_transaction_id: release.installed_transaction_id,
-            },
-            gateway_certificate.clone(),
-            gateway_private.as_slice(),
-        )
-        .unwrap();
-        acknowledged.verify(&release, &gateway_certificate).unwrap();
+    /// §8.4 octet par octet : trois valeurs binaires de 32, sans préfixe de
+    /// longueur ni texte base64 ou hexadécimal.
+    ///
+    /// Ce contrôle vaut d'être écrit : les quatre messages voisins signent la
+    /// forme textuelle avec un `u32` de longueur, et rien dans le code
+    /// n'empêche d'aligner celui-ci sur eux par mimétisme. L'assertion est ce
+    /// qui rend l'écart visible plutôt que plausible.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn the_in_tunnel_release_signs_decoded_thirty_two_byte_values() {
+        let (ca_private, _) = generate_ml_dsa_87_keypair().unwrap();
+        let (_, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let release = PskRelease {
+            protocol_version: KEY_NEGOTIATION_VERSION,
+            installed_transaction_id: [4; KEY_NEGOTIATION_NONCE_LEN],
+            client_wg_public_key: CLIENT_WG_KEY.into(),
+            gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+        };
 
-        let mut forged = acknowledged;
-        forged.released.installed_transaction_id[0] ^= 1;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(PQ_IN_TUNNEL_RELEASE_DOMAIN);
+        expected.extend_from_slice(&KEY_NEGOTIATION_VERSION.to_be_bytes());
+        expected.extend_from_slice(&[4; KEY_NEGOTIATION_NONCE_LEN]);
+        expected.extend_from_slice(&STANDARD.decode(CLIENT_WG_KEY).unwrap());
+        expected.extend_from_slice(&STANDARD.decode(GATEWAY_WG_KEY).unwrap());
+        expected.extend_from_slice(&hex::decode(certificate.fingerprint().unwrap()).unwrap());
+
         assert_eq!(
-            forged.verify(&release, &gateway_certificate),
-            Err(KeyNegotiationError::TransactionMismatch)
+            pq_release_signing_bytes(&release, &certificate).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected.len(),
+            PQ_IN_TUNNEL_RELEASE_DOMAIN.len() + 2 + KEY_NEGOTIATION_NONCE_LEN + 3 * 32
+        );
+    }
+
+    /// Une clé de longueur invalide est refusée à la signature, pas encodée
+    /// telle quelle : c'est la contrepartie du décodage.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_release_naming_an_undecodable_key_cannot_be_signed() {
+        let (ca_private, _) = generate_ml_dsa_87_keypair().unwrap();
+        let (_, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let release = PskRelease {
+            protocol_version: KEY_NEGOTIATION_VERSION,
+            installed_transaction_id: [4; KEY_NEGOTIATION_NONCE_LEN],
+            client_wg_public_key: "AAAA".into(),
+            gateway_wg_public_key: GATEWAY_WG_KEY.into(),
+        };
+        assert_eq!(
+            pq_release_signing_bytes(&release, &certificate),
+            Err(KeyNegotiationError::InvalidWireGuardKey)
         );
     }
 

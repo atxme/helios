@@ -768,7 +768,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // readers disagreeing on whether a peer is still there — and the whole
     // point of v5's liveness is that there is one answer, read where the
     // traffic is.
-    key_negotiation::start(
+    if let Some(handler) = key_negotiation::start(
         Arc::clone(&shared_network),
         psk_tx.clone(),
         handshake_tx,
@@ -776,7 +776,13 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         &boot,
         dry_run,
     )
-    .await?;
+    .await?
+    {
+        // The in-tunnel `release` (spec §7.5) reaches the same state machine
+        // as the public negotiation, through the same per-peer serializer.
+        // A second instance here would give one slot two writers.
+        state = state.with_psk_release(handler);
+    }
     // Published for the operator tooling: `helios-ctl` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.

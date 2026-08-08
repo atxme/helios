@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod embed;
 pub mod health;
+pub mod key_negotiation;
 pub mod provision;
 mod routes;
 pub mod update;
@@ -35,6 +36,7 @@ use aether::{
 };
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -74,6 +76,15 @@ pub struct AppState {
     /// a complete Orion profile from the gateway itself, instead of copying
     /// certificate files off `/var/lib/helios` by hand.
     pub key_negotiation: Option<Arc<KeyNegotiationMaterial>>,
+    /// Gateway side of the in-tunnel PSK release, `None` when the gateway
+    /// runs no key-negotiation service.
+    ///
+    /// A trait object, and deliberately so: the API must not own a WireGuard
+    /// backend — it would then be able to change the data plane from an HTTP
+    /// handler. It hands an authenticated command to the state machine that
+    /// owns the per-peer serializer, and learns nothing back beyond a refusal
+    /// class.
+    pub psk_release: Option<Arc<dyn key_negotiation::PskReleaseHandler>>,
     /// Non-secret summary of the boot-time sealing decision, `None` when the
     /// daemon runs without TPM validation. A projection: `BootDecision` itself
     /// carries the unlock secret and must not reach this crate.
@@ -125,6 +136,7 @@ impl AppState {
             )),
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
+            psk_release: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
@@ -150,6 +162,18 @@ impl AppState {
     /// have to name an absent value.
     pub fn with_key_negotiation(mut self, material: KeyNegotiationMaterial) -> Self {
         self.key_negotiation = Some(Arc::new(material));
+        self
+    }
+
+    /// Wires the in-tunnel PSK release to the running key-negotiation service.
+    ///
+    /// A builder, like the two above: a gateway with no `key_negotiation_port`
+    /// runs no such service, and must not have to name an absent value.
+    pub fn with_psk_release(
+        mut self,
+        handler: Arc<dyn key_negotiation::PskReleaseHandler>,
+    ) -> Self {
+        self.psk_release = Some(handler);
         self
     }
 }
@@ -184,6 +208,19 @@ pub fn router(state: AppState) -> Router {
 
     let authenticated_peer = Router::new()
         .route("/api/provision", post(provision::provision))
+        // Explicit teardown of a negotiated PSK, sent through the tunnel
+        // before the client unmounts its adapter (spec §7.5). Behind
+        // `require_peer` like provisioning: the source VIP is what ties the
+        // command to a peer, and the body's key is only ever compared to it.
+        .route(
+            "/api/key-negotiation/release",
+            // The 32 KiB bound is applied by the transport, so an oversized
+            // body is refused before it is buffered — the handler's own check
+            // is what keeps that guarantee true when it is called directly.
+            post(key_negotiation::release).layer(DefaultBodyLimit::max(
+                key_negotiation::MAX_RELEASE_BODY_BYTES,
+            )),
+        )
         .route("/ws", get(ws::handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

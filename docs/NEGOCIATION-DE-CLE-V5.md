@@ -45,18 +45,23 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > retirer le PSK désormais committé. La vérification d'appartenance, l'écriture
 > backend et l'insertion de la transaction forment maintenant une seule
 > section sérialisée ; la classification et l'application du `release` aussi.
-> Si le commit gagne, le `release` retire le PSK committé. Si le `release`
-> gagne, il restaure l'état précédent et le compare-and-swap du commit échoue.
+> Si le commit gagne, le `release` retire le PSK committé.
+>
+> La seconde de ces deux courses a été **fermée autrement** par la revue du
+> 8 août : un `release` arrivé pendant `preparing` ne restaure plus rien, c'est
+> un no-op. La garde de rollback de la connexion qui prépare est la seule
+> sortie du candidat, et elle survit à la destruction de sa tâche — d'où la
+> priorité 2 du [§11.1](#111-états-gateway) telle qu'elle est écrite
+> aujourd'hui.
 >
 > Sont posés au passage : la période de repos de dix secondes après rollback
 > post-installation ([§4.5](#45-délais-et-limites), [§11.3](#113-rollback)) ;
 > les paramètres de transport normatifs — idle timeout de 50 s, fenêtres de
 > `196620` octets, reprise TLS et 0-RTT explicitement désactivés des deux
 > côtés, limites de flux annoncées des deux côtés ; la **priorité 2 du
-> [§11.1](#111-états-gateway)**, un `release` visant le candidat annulant
-> désormais la transaction — la même transition tient le slot et
-> l'enregistrement sous un seul verrou, et la connexion qui avait posé le
-> candidat l'apprend à sa confirmation, dont le compare-and-swap échoue ; et la
+> [§11.1](#111-états-gateway)**, dont la rédaction du 7 août faisait annuler la
+> transaction par un `release` visant le candidat — **remplacée le 8 août** par
+> le no-op, seule la garde de rollback défaisant un candidat ; et la
 > **résolution de l'identité avant le challenge** du [§5.3](#53-erreurs-publiques),
 > une empreinte TLS non admise étant refusée sans qu'un challenge lui soit
 > émis, le budget par identité n'étant débité que d'un pair admis, et la clé
@@ -92,13 +97,13 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios-ctl enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
-> - la **libération dans le tunnel WireGuard** ([§7.5](#75-libération-signée-dans-le-tunnel)).
->   Le code ouvre encore une seconde connexion QUIC publique à la déconnexion,
->   avec mTLS, challenge et accusé ML-DSA-87. Cette voie est remplacée dans la
->   cible par un `POST` signé sur l'API interne, authentifié d'abord par le pair
->   WireGuard qui le transporte. Ce qui débloquerait : relier l'API au même
->   sérialiseur de slot, migrer Orion, puis retirer `Release` et `Released` de
->   l'enveloppe QUIC ;
+> - la **libération à la désinstallation d'un profil**
+>   ([§12.2](#122-cycle-de-vie-du-psk)). Le `release` du
+>   [§7.5](#75-libération-signée-dans-le-tunnel) est bien envoyé dans le tunnel
+>   à la déconnexion, mais retirer un profil pendant que son tunnel est monté
+>   ne l'envoie pas : le slot reste posé jusqu'à la récupération à 300 s. Ce
+>   qui débloquerait : donner au chemin de suppression de profil l'accès au
+>   contrôleur, qui seul détient le reçu de commit ;
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
@@ -2792,4 +2797,4 @@ courant détaillé en tête de note.
 | [`helios-ctl::enroll`](../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
-encore ouverts, dont le déplacement du `release` hors du port QUIC public.
+encore ouverts, dont la libération manquante à la désinstallation d'un profil.

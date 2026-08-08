@@ -442,9 +442,11 @@ impl VpnController {
 
     /// Sends the signed release for a PSK this controller had installed.
     ///
-    /// Failures are reported and swallowed. The gateway's own reclamation —
-    /// five minutes of handshake silence — is the backstop, and it exists
-    /// precisely because this message cannot be guaranteed.
+    /// Goes out on the internal API **through the tunnel that is still up**,
+    /// which is why this runs before `down()` and not after. Bounded to two
+    /// seconds, and failures are reported and swallowed: the gateway's own
+    /// reclamation — five minutes of handshake silence — is the backstop, and
+    /// it exists precisely because this message cannot be guaranteed.
     async fn release_installed_psk(&self, installed: InstalledNegotiation, sink: &EventSink) {
         let Some(identities) = self.key_negotiation_identities.clone() else {
             return;
@@ -459,15 +461,21 @@ impl VpnController {
         )
         .await
         {
+            // « Reçue », pas « libérée ». Le `204` dit que la gateway a lu la
+            // commande, pas qu'un slot a changé : elle répond la même chose
+            // quand la transaction nommée n'est plus propriétaire, et c'est
+            // délibéré — distinguer les cas renseignerait le client sur l'état
+            // d'un pair. Seul le journal de la gateway sait ce qui a été
+            // retiré, et l'IHM ne doit pas affirmer davantage qu'elle ne sait.
             Ok(()) => sink(ClientEvent::log(
                 "info",
-                "PSK négocié libéré auprès de la gateway".to_string(),
+                "demande de libération du PSK reçue par la gateway".to_string(),
             )),
             Err(error) => sink(ClientEvent::log(
                 "warn",
                 format!(
-                    "libération du PSK non confirmée ({error:#}) — la gateway le retirera \
-                     d'elle-même quand les handshakes cesseront"
+                    "libération du PSK demandée sans confirmation ({error:#}) — la gateway le \
+                     retirera d'elle-même quand les handshakes cesseront"
                 ),
             )),
         }

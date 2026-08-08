@@ -15,9 +15,8 @@ use aether::key_negotiation::{
     commitments_match, derive_negotiated_psk, static_psk_commitment,
     AuthenticatedKeyNegotiationCommit, AuthenticatedKeyNegotiationConfirmation,
     AuthenticatedKeyNegotiationRequest, AuthenticatedKeyNegotiationResponse,
-    AuthenticatedPskRelease, AuthenticatedPskReleased, KeyNegotiationChallenge,
-    KeyNegotiationRequest, KeyNegotiationResponse, ProtectionMode, KEY_NEGOTIATION_VERSION,
-    MAX_KEY_NEGOTIATION_MESSAGE_BYTES, SERVER_CHALLENGE_LEN,
+    KeyNegotiationChallenge, KeyNegotiationRequest, KeyNegotiationResponse, ProtectionMode,
+    KEY_NEGOTIATION_VERSION, MAX_KEY_NEGOTIATION_MESSAGE_BYTES, SERVER_CHALLENGE_LEN,
 };
 use aether::pq::{Kem, MlKem1024Kem};
 use aether::SecretString;
@@ -299,23 +298,16 @@ pub trait NegotiationHandler: Send + Sync + 'static {
     /// implementation matches on the identifier the slot itself carries, so
     /// a call naming a transaction that no longer owns the slot is a no-op.
     async fn rollback(&self, transaction_id: [u8; 16], client_wg_public_key: &str);
-
-    /// Explicit teardown, authenticated exactly like a request.
-    ///
-    /// Replaces v4's `disconnected`, which inferred teardown from a closed
-    /// connection. Inference is gone: a closed connection now means nothing
-    /// at all, and only this signed message — or the data plane going quiet —
-    /// removes a PSK.
-    async fn release(
-        &self,
-        certificate_sha256: String,
-        release: AuthenticatedPskRelease,
-    ) -> Result<AuthenticatedPskReleased, PublicError>;
 }
 
-/// What a client sends. Tagged, because v5 has two entry points on the same
-/// port — negotiating a PSK, and releasing one — plus the challenge phase
-/// that precedes both.
+/// What a client sends.
+///
+/// Tagged, and the tag set is now exactly one transaction: challenge,
+/// request, confirmation. The v5 `release` used to be the port's second entry
+/// point; it moved into the WireGuard tunnel (spec §7.5), so the historic tag
+/// no longer decodes and the frame is refused as a protocol error before any
+/// handler runs — which is what a withdrawn message should look like on the
+/// wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessage {
@@ -327,9 +319,6 @@ enum ClientMessage {
     },
     Confirmation {
         confirmation: AuthenticatedKeyNegotiationConfirmation,
-    },
-    Release {
-        release: Box<AuthenticatedPskRelease>,
     },
 }
 
@@ -344,9 +333,6 @@ enum ServerMessage {
     },
     Committed {
         commit: AuthenticatedKeyNegotiationCommit,
-    },
-    Released {
-        released: Box<AuthenticatedPskReleased>,
     },
     Error {
         error: PublicError,
@@ -1020,32 +1006,6 @@ async fn handle_connection(
                 )
                 .await?;
             }
-            // A release is the other thing this port does. It reuses the
-            // challenge phase, the mTLS identity and the same coarse errors.
-            ClientMessage::Release { release } => {
-                let outcome = match consume_challenge(
-                    &mut issued_challenge,
-                    challenge_deadline,
-                    release.release.server_challenge,
-                ) {
-                    Ok(()) => handler.release(fingerprint, *release).await,
-                    Err(error) => Err(error),
-                };
-                match outcome {
-                    Ok(released) => {
-                        write_frame(
-                            &mut send,
-                            &ServerMessage::Released {
-                                released: Box::new(released),
-                            },
-                        )
-                        .await?
-                    }
-                    Err(error) => write_frame(&mut send, &ServerMessage::Error { error }).await?,
-                }
-                drain_then_close(&connection, &mut send, "psk released").await;
-                return Ok(());
-            }
             ClientMessage::Request { request } => {
                 if let Err(error) = consume_challenge(
                     &mut issued_challenge,
@@ -1328,8 +1288,9 @@ impl ClientSession {
 
 /// Opens a connection, takes a challenge, and returns it with the streams.
 ///
-/// Shared by both entry points, because a release authenticates exactly like
-/// a request: same mTLS, same challenge phase, same refusals.
+/// One entry point now: the port carries a negotiation and nothing else. It
+/// used to be shared with the `release`, which authenticated the same way
+/// before that command moved into the WireGuard tunnel (spec §7.5).
 async fn open_with_challenge(
     endpoint: &Endpoint,
     remote: SocketAddr,
@@ -1537,74 +1498,6 @@ pub async fn negotiate(
         ServerMessage::Error { error } => Err(TransportError::Rejected(error)),
         _ => Err(TransportError::Protocol(
             "server answered a negotiation request out of order".into(),
-        )),
-    }
-}
-
-/// Tells the gateway to drop the PSK a given transaction installed.
-///
-/// Best-effort by design: a host that is powered off, a network that is down
-/// or a process that is killed send nothing, and the slot then falls back on
-/// data-plane reclamation. Callers should log a failure and carry on tearing
-/// down rather than treat it as fatal — the client is disconnecting either
-/// way.
-pub async fn release_psk(
-    endpoint: &Endpoint,
-    remote: SocketAddr,
-    server_name: &str,
-    expected_gateway_wg_public_key: &str,
-    // The gateway PQ certificate pinned by the profile. The acknowledgment is
-    // verified against it before this returns: an unverified "released" is
-    // worth nothing, since anyone able to answer on this port could send one
-    // and have the client zeroise a PSK the gateway still holds — leaving a
-    // slot filled on one side only, which fails every handshake with no
-    // channel left to repair it.
-    pinned_gateway_pq_certificate: &aether::key_negotiation::PqCertificate,
-    build: impl FnOnce([u8; SERVER_CHALLENGE_LEN]) -> Result<AuthenticatedPskRelease, TransportError>,
-) -> Result<AuthenticatedPskReleased, TransportError> {
-    let pending = request_challenge(
-        endpoint,
-        remote,
-        server_name,
-        expected_gateway_wg_public_key,
-    )
-    .await?;
-    let release = build(pending.challenge.server_challenge)?;
-    let sent = release.release.clone();
-    let PendingChallenge {
-        connection,
-        mut send,
-        mut recv,
-        ..
-    } = pending;
-
-    write_frame(
-        &mut send,
-        &ClientMessage::Release {
-            release: Box::new(release),
-        },
-    )
-    .await?;
-    send.finish().map_err(TransportError::ClosedStream)?;
-    let answer = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame::<ServerMessage>(&mut recv))
-        .await
-        .map_err(|_| TransportError::ResponseTimeout(RESPONSE_TIMEOUT.as_secs()))??;
-    connection.close(0u32.into(), b"psk released");
-    match answer {
-        ServerMessage::Released { released } => {
-            released
-                .verify(&sent, pinned_gateway_pq_certificate)
-                .map_err(|error| {
-                    TransportError::Protocol(format!(
-                        "the release acknowledgment is not signed by the pinned gateway \
-                         certificate: {error}"
-                    ))
-                })?;
-            Ok(*released)
-        }
-        ServerMessage::Error { error } => Err(TransportError::Rejected(error)),
-        _ => Err(TransportError::Protocol(
-            "gateway answered a release with something else".into(),
         )),
     }
 }
@@ -2084,7 +1977,6 @@ mod tests {
         expected_fingerprint: String,
         confirmed: AtomicBool,
         rolled_back: AtomicBool,
-        released: AtomicBool,
         /// How many rollbacks actually ran to completion.
         rollbacks: std::sync::atomic::AtomicUsize,
         /// Held open by default; a test can close it to park a rollback on an
@@ -2109,7 +2001,6 @@ mod tests {
                 expected_fingerprint: pki.client_fingerprint.clone(),
                 confirmed: AtomicBool::new(false),
                 rolled_back: AtomicBool::new(false),
-                released: AtomicBool::new(false),
                 rollbacks: std::sync::atomic::AtomicUsize::new(0),
                 rollback_gate: tokio::sync::Semaphore::new(permits),
                 gateway_pq_certificate: pki.gateway_pq_certificate.clone(),
@@ -2187,27 +2078,6 @@ mod tests {
             self.rolled_back.store(true, Ordering::SeqCst);
             self.rollbacks
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        async fn release(
-            &self,
-            certificate_sha256: String,
-            release: AuthenticatedPskRelease,
-        ) -> Result<AuthenticatedPskReleased, PublicError> {
-            if certificate_sha256 != self.expected_fingerprint {
-                return Err(PublicError::Rejected);
-            }
-            self.released.store(true, Ordering::SeqCst);
-            aether::key_negotiation::authenticate_released(
-                aether::key_negotiation::PskReleased {
-                    protocol_version: KEY_NEGOTIATION_VERSION,
-                    server_challenge: release.release.server_challenge,
-                    installed_transaction_id: release.release.installed_transaction_id,
-                },
-                self.gateway_pq_certificate.clone(),
-                &self.gateway_pq_private_key,
-            )
-            .map_err(|_| PublicError::Internal)
         }
     }
 
@@ -2411,13 +2281,13 @@ mod tests {
 
         // Le point le plus important de la v5 : la connexion est finie, et
         // cela ne dit rien du tunnel. En v4 la même fermeture libérait le
-        // slot ; ici elle ne doit produire aucun retrait ni aucun rollback.
+        // slot ; ici elle ne doit produire aucun rollback — et ce port n'a
+        // plus du tout de quoi retirer un PSK.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            !handler.released.load(Ordering::SeqCst),
-            "fermer la connexion ne doit plus retirer de PSK"
+            !handler.rolled_back.load(Ordering::SeqCst),
+            "fermer la connexion après le commit ne doit rien défaire"
         );
-        assert!(!handler.rolled_back.load(Ordering::SeqCst));
 
         client.close(0u32.into(), b"test complete");
         task.abort();
@@ -2480,46 +2350,60 @@ mod tests {
         task.abort();
     }
 
-    /// Un `release` signé retire le slot ; c'est le seul message qui le fasse.
+    /// Le `release` a quitté ce port : le tag hérité ne décode plus.
+    ///
+    /// Il ne suffit pas de ne plus l'envoyer. Un Orion resté en arrière et une
+    /// gateway migrée doivent diverger franchement, pas silencieusement — et
+    /// le refus arrive au parseur, avant tout handler, donc sans révéler quoi
+    /// que ce soit de l'état d'un slot.
     #[tokio::test]
-    async fn a_signed_release_is_acknowledged_with_a_signed_answer() {
+    async fn the_legacy_quic_release_message_is_refused_as_a_protocol_error() {
         let pki = test_pki();
         let (handler, task, client, server_addr) = bench(&pki);
 
-        let installed = [4; KEY_NEGOTIATION_NONCE_LEN];
-        let certificate = pki.client_pq_certificate.clone();
-        let private_key = pki.client_pq_private_key.clone();
-        let released = release_psk(
-            &client,
-            server_addr,
-            "localhost",
-            GATEWAY_WG_KEY,
-            &pki.gateway_pq_certificate,
-            move |challenge| {
-                aether::key_negotiation::authenticate_release(
-                    aether::key_negotiation::PskRelease {
-                        protocol_version: KEY_NEGOTIATION_VERSION,
-                        server_challenge: challenge,
-                        installed_transaction_id: installed,
-                        client_wg_public_key: CLIENT_WG_KEY.into(),
-                        gateway_wg_public_key: GATEWAY_WG_KEY.into(),
-                        timestamp_unix: test_now(),
-                    },
-                    certificate,
-                    &private_key,
-                )
-                .map_err(|error| TransportError::Protocol(error.to_string()))
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let PendingChallenge {
+            connection,
+            mut send,
+            mut recv,
+            challenge,
+        } = pending;
+
+        // Le message tel que la v5 le transportait avant le 8 août 2026.
+        let legacy = serde_json::json!({
+            "type": "release",
+            "release": {
+                "release": {
+                    "protocol_version": KEY_NEGOTIATION_VERSION,
+                    "server_challenge": challenge.server_challenge,
+                    "installed_transaction_id": vec![4u8; KEY_NEGOTIATION_NONCE_LEN],
+                    "client_wg_public_key": CLIENT_WG_KEY,
+                    "gateway_wg_public_key": GATEWAY_WG_KEY,
+                    "timestamp_unix": test_now(),
+                },
+                "certificate": pki.client_pq_certificate,
+                "ml_dsa_87_signature": "",
             },
+        });
+        write_frame(&mut send, &legacy).await.unwrap();
+        let _ = send.finish();
+
+        // La gateway ferme sans rien accuser : plus aucun `released` n'existe.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frame::<ServerMessage>(&mut recv),
         )
         .await
         .unwrap();
+        assert!(
+            answer.is_err(),
+            "un tag retiré ne doit produire aucune réponse applicative : {answer:?}"
+        );
+        assert!(!handler.rolled_back.load(Ordering::SeqCst));
 
-        assert!(handler.released.load(Ordering::SeqCst));
-        assert_eq!(released.released.installed_transaction_id, installed);
-        // L'accusé est signé : la gateway ne fait aucune affirmation non
-        // signée sur l'état d'un slot.
-        assert!(!released.ml_dsa_87_signature.is_empty());
-
+        connection.close(0u32.into(), b"test complete");
         client.close(0u32.into(), b"test complete");
         task.abort();
     }
