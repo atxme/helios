@@ -41,8 +41,9 @@ use std::str::FromStr;
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    expr::Masquerade, Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol,
-    ProtocolFamily, Rule as NfRule, Table,
+    expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Masquerade},
+    Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily,
+    Rule as NfRule, Table,
 };
 use tracing::{info, warn};
 
@@ -50,6 +51,14 @@ use crate::ruleset::{render, ChainKind, Match, Ruleset, Verdict, L4};
 use crate::FirewallBackend;
 
 const TABLE_NAME: &str = "helios";
+
+/// Conntrack states [`Match::Established`] accepts, as the kernel reads them.
+///
+/// Pinned as a constant so a refactor back to [`NfRule::established`] — which
+/// sets `ESTABLISHED` alone, i.e. `0b010` — fails a test instead of quietly
+/// halving what the rule matches.
+const ESTABLISHED_OR_RELATED: u32 =
+    ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
 
 pub struct NetlinkBackend {
     table_name: String,
@@ -82,7 +91,7 @@ impl NetlinkBackend {
         };
 
         Ok(match m {
-            Match::Established => rule.established().map_err(Self::err)?,
+            Match::Established => Self::established_or_related(rule)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
@@ -95,6 +104,35 @@ impl NetlinkBackend {
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp => rule.icmp(),
         })
+    }
+
+    /// `ct state established,related`, built by hand.
+    ///
+    /// [`NfRule::established`] would be the obvious call, and it is wrong
+    /// here: it masks `ESTABLISHED` alone, so what got applied was `ct state
+    /// established` while [`Match`] displayed — and the API served, and the
+    /// console showed — `ct state established,related`. Exactly the
+    /// display/applied divergence the `ruleset` module doc rules out, and the
+    /// kind that survives review because both sides read correct on their
+    /// own.
+    ///
+    /// What `related` covers is not decorative. It is how conntrack labels an
+    /// ICMP error attached to a tracked flow, `destination unreachable —
+    /// fragmentation needed` first among them. Dropping those under a
+    /// fail-closed policy black-holes path-MTU discovery: connections open,
+    /// then hang on the first full-size packet, and the tunnel gets blamed.
+    ///
+    /// The three expressions reproduce what `rustables` emits, with the mask
+    /// widened by one bit — same layout, same little-endian mask convention.
+    fn established_or_related(rule: NfRule) -> Result<NfRule> {
+        Ok(rule
+            .with_expr(Conntrack::new(ConntrackKey::State))
+            .with_expr(
+                Bitwise::new(ESTABLISHED_OR_RELATED.to_le_bytes(), 0u32.to_be_bytes())
+                    .map_err(Self::err)?,
+            )
+            // Non-zero after masking: the packet is in one of the two states.
+            .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
     /// Applies an address match, accepting either a plain IP or a CIDR.
@@ -339,6 +377,26 @@ mod tests {
     fn a_set_without_expansion_stays_intact() {
         let matches = vec![Match::InIface("lo".into())];
         assert_eq!(NetlinkBackend::expand_port_sets(&matches), vec![matches]);
+    }
+
+    /// `related` is how conntrack labels an ICMP error attached to a tracked
+    /// flow — `fragmentation needed` above all. Matching `established` alone
+    /// black-holes path-MTU discovery under a drop policy: connections open,
+    /// then hang on the first full-size packet.
+    ///
+    /// Only the mask is checked here; that the kernel prints `ct state
+    /// established,related` is target-only, see `docs/testing/TESTING.md`.
+    #[test]
+    fn the_conntrack_mask_carries_related_and_not_established_alone() {
+        assert_eq!(
+            ESTABLISHED_OR_RELATED, 0b110,
+            "the mask the kernel reads must carry both states"
+        );
+        assert_ne!(
+            ESTABLISHED_OR_RELATED,
+            ConnTrackState::ESTABLISHED.bits(),
+            "`NfRule::established` is precisely what this constant exists to avoid"
+        );
     }
 
     #[test]
