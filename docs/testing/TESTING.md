@@ -596,6 +596,28 @@ confirmés puis corrigés avec test de non-régression :
 | `iif "lo"` sur la chaîne `output` | ne matche jamais ; tout le trafic loopback sortant tombait sous `drop` |
 | API liée avant la création de la VIP | `bind` en échec, erreur avalée : gateway opérationnelle mais définitivement sans API |
 
+### Défauts trouvés sur gateway en service (8 août 2026)
+
+Deux autres, relevés en cherchant pourquoi `helios-ctl update` échouait sur la
+gateway de production. Le second est à vérifier sur cible : il n'est pas
+observable ailleurs.
+
+| Défaut | Effet |
+| --- | --- |
+| chaîne `output` sans sortie propre à la gateway | ni DNS, ni NTP, ni paquets : `apt` affiche `Ign :` sur chaque source puis se fige à 0 %, et le symptôme désigne le résolveur au lieu du pare-feu. Corrigé par `allow_gateway_egress` |
+| `ct state established` appliqué là où `established,related` était affiché | `rustables::Rule::established()` ne masque que le bit `ESTABLISHED`. Le dry-run, l'API et la console affichaient la forme complète : la divergence n'était visible que dans `nft list`. Les erreurs ICMP `fragmentation needed` tombaient sous `drop`, donc trou noir de PMTU |
+
+Vérification cible du second, après déploiement :
+
+```sh
+sudo nft list chain inet helios input | grep 'ct state'
+# attendu : ct state established,related accept
+```
+
+Une sortie qui affiche `ct state established` seul signifie que le binaire
+installé est antérieur au correctif — la traduction Netlink est le seul endroit
+où l'écart se voit.
+
 ## Limites connues
 
 - le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;

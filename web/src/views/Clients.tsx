@@ -40,7 +40,7 @@ import type { PeerSummary, ProtectionMode, Status } from '../types'
 const FLOOR: Record<ProtectionMode, { label: string; hint: string; bg: string; fg: string }> = {
   classic: {
     label: 'aucun',
-    hint: 'Ce pair peut encore négocier sans PSK. Le plancher s’élèvera de lui-même à la première négociation aboutie.',
+    hint: 'Hérité d’un network.toml antérieur : « classique » n’est pas un mode négociable, ce pair ne peut donc pas négocier de PSK. Le ré-admettre le place sur le plancher ML-KEM.',
     bg: 'transparent',
     fg: 'text.secondary',
   },
@@ -201,7 +201,8 @@ function AdmitDialog({
 }) {
   const [name, setName] = useState('')
   const [publicKey, setPublicKey] = useState('')
-  const [fingerprint, setFingerprint] = useState('')
+  const [tlsFingerprint, setTlsFingerprint] = useState('')
+  const [pqFingerprint, setPqFingerprint] = useState('')
   const [admin, setAdmin] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -209,7 +210,8 @@ function AdmitDialog({
   const reset = () => {
     setName('')
     setPublicKey('')
-    setFingerprint('')
+    setTlsFingerprint('')
+    setPqFingerprint('')
     setAdmin(false)
     setError(null)
   }
@@ -222,7 +224,8 @@ function AdmitDialog({
         name: name.trim(),
         public_key: publicKey.trim(),
         admin,
-        key_negotiation_pq_certificate_sha256: fingerprint.trim() || null,
+        key_negotiation_certificate_sha256: tlsFingerprint.trim(),
+        key_negotiation_pq_certificate_sha256: pqFingerprint.trim(),
       })
       onAdmitted(peer)
       reset()
@@ -234,7 +237,11 @@ function AdmitDialog({
     }
   }
 
-  const complete = name.trim().length > 0 && publicKey.trim().length > 0
+  const complete =
+    name.trim().length > 0 &&
+    publicKey.trim().length > 0 &&
+    tlsFingerprint.trim().length > 0 &&
+    pqFingerprint.trim().length > 0
 
   return (
     <Dialog open={open} onClose={busy ? undefined : onClose} fullWidth maxWidth="sm">
@@ -265,13 +272,25 @@ function AdmitDialog({
             slotProps={{ input: { sx: { fontFamily: 'monospace', fontSize: '0.8125rem' } } }}
           />
 
+          {/* Both fingerprints, both required: the admission layer refuses a
+              peer that carries only one of the two identities, and the floor
+              it lands on is `ml_kem` unconditionally. A dialog that sent the
+              PQ one alone could only ever be refused. */}
+          <TextField
+            label="Empreinte du certificat TLS du client"
+            value={tlsFingerprint}
+            onChange={event => setTlsFingerprint(event.target.value)}
+            fullWidth
+            placeholder="SHA-256, 64 caractères hexadécimaux"
+            slotProps={{ input: { sx: { fontFamily: 'monospace', fontSize: '0.8125rem' } } }}
+          />
+
           <TextField
             label="Empreinte du certificat PQ du client"
-            value={fingerprint}
-            onChange={event => setFingerprint(event.target.value)}
+            value={pqFingerprint}
+            onChange={event => setPqFingerprint(event.target.value)}
             fullWidth
-            placeholder="SHA-256, facultatif"
-            helperText="Sa présence choisit à elle seule un plancher ML-KEM. Sans elle, le client négociera d’abord en classique."
+            placeholder="SHA-256, 64 caractères hexadécimaux"
             slotProps={{ input: { sx: { fontFamily: 'monospace', fontSize: '0.8125rem' } } }}
           />
 
@@ -443,14 +462,6 @@ export function ClientsView({ status, refresh, admitOpen, onAdmitOpenChange }: P
           ))
         )}
       </SectionCard>
-
-      {status && status.peers.length > 0 && !status.dry_run && peers.every(p => p.rx_bytes === null) && (
-        <KnownLimit title="Aucune observation du plan de données">
-          L’interface est arrêtée, ou aucun relevé n’a encore eu lieu — le sondeur interroge
-          WireGuard toutes les dix secondes. Les colonnes de trafic et de handshake restent vides
-          jusque-là plutôt que d’afficher des zéros qui ressembleraient à des mesures.
-        </KnownLimit>
-      )}
 
       <AdmitDialog
         open={admitOpen}

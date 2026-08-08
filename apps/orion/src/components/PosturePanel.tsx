@@ -9,19 +9,17 @@ import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
 
 /**
- * Security posture, in full — what the header chip states in one word.
+ * Security posture, in short — what the header chip states in one word.
  *
- * The chip answers "am I protected"; this panel answers "on what grounds",
- * and it is the only place in Orion that does. Everything technical the
- * Connect view used to carry permanently lives here instead: that view has
- * one job, and a line reading `backend wireguard-nt` was never part of it.
+ * The chip answers "am I protected"; this panel answers "on what grounds".
+ * It carries values, not prose: a row states a fact and nothing else, and a
+ * fact that needs a paragraph to be worth reading does not belong on a screen
+ * whose whole job is to be scanned in two seconds.
  *
- * **The DNS row is permanent, and that is the point.** A client's DNS queries
- * leave outside the tunnel even with the tunnel up — a documented limit of
- * `helios-firewall::ruleset`, not an incident, hence a stated property rather
- * than an alert. It is also the one gap between what "Protégé" suggests and
- * what actually happens, so the panel that justifies the chip is exactly
- * where it belongs.
+ * **The vault block is alerts only.** Rows that describe a healthy vault —
+ * secrets sealed to the TPM, volume encrypted, memory locked — told the user
+ * nothing they could act on, and pushed the rows that *do* matter below the
+ * fold. What is nominal is silent; what is degraded appears.
  */
 
 /** Range that captures all traffic — the one that holds up the fail-open invariant. */
@@ -37,7 +35,6 @@ interface Props {
   adapterUp: boolean
   profile: ClientProfile | null
   psk: PskKind | null
-  backend: string
   /**
    * What the vault can claim about itself. `null` while it is being read, or
    * when it could not be — in which case the rows simply do not appear.
@@ -49,20 +46,20 @@ interface Props {
   vault: VaultPosture | null
 }
 
-export function PosturePanel({
-  anchor,
-  onClose,
-  state,
-  adapterUp,
-  profile,
-  psk,
-  backend,
-  vault,
-}: Props) {
+export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, vault }: Props) {
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const negotiation = profile?.key_negotiation
   const narrowed = profile ? profile.allowed_ips.trim() !== CAPTURE_ALL : false
+  // Nominal is silent: the block only exists when it has something to report.
+  const degraded =
+    vault !== null &&
+    (!vault.hardwareBacked ||
+      !vault.volumeProtected ||
+      !vault.memoryLocked ||
+      !vault.dumpsExcluded ||
+      vault.legacyPresent ||
+      vault.rotationRequired.length > 0)
 
   return (
     <Popover
@@ -83,39 +80,28 @@ export function PosturePanel({
             {posture.label}
           </Typography>
         </Box>
-        <Typography color="text.secondary" sx={{ mt: 0.4, fontSize: 11.5, lineHeight: 1.5 }}>
-          {posture.detail}
-        </Typography>
       </Box>
 
       <Divider />
 
       <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
         <Row label="tunnel" value={stateMeta(state).label} />
-        <Row
-          label="adaptateur"
-          value={adapterUp ? 'monté' : 'démonté'}
-          note={
-            adapterUp
-              ? 'Sans handshake valide, WireGuard bloque les paquets au lieu de les router hors tunnel.'
-              : 'Le trafic ne passe plus par WireGuard.'
-          }
-        />
-        <Row label="protection" value={protection.label} note={protection.detail} />
+        <Row label="protection" value={protection.label} />
         {negotiation && (
           <Row
             label="négociation"
-            value={modeMeta(negotiation.mode).label}
+            // The endpoint sits in the value rather than behind the copy
+            // button alone: a button that carries a string the panel never
+            // shows copies something the user cannot check.
+            value={
+              negotiation.endpoint
+                ? `${modeMeta(negotiation.mode).label} · ${negotiation.endpoint}`
+                : modeMeta(negotiation.mode).label
+            }
             copy={negotiation.endpoint || undefined}
             copyLabel="l’endpoint de négociation"
-            note={`Échange authentifié en ML-DSA-65 sur ${negotiation.endpoint || '—'}, avant le montage de WireGuard.`}
           />
         )}
-      </Box>
-
-      <Divider />
-
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
         <Row
           label="adresse"
           value={profile?.address ?? '—'}
@@ -126,79 +112,35 @@ export function PosturePanel({
           label="trafic capté"
           value={profile?.allowed_ips ?? '—'}
           tone={narrowed ? AMBER : undefined}
-          note={
-            narrowed
-              ? 'Plage restreinte : les destinations hors de cette plage ne passent pas par le tunnel. 0.0.0.0/0 capte tout le trafic.'
-              : undefined
-          }
         />
-        {/* Permanent, tunnel up or down: it is a property of the product. */}
-        <Row
-          label="DNS"
-          value="hors tunnel"
-          note="Les requêtes DNS de ce poste ne passent pas par Helios, même tunnel monté : le résolveur du réseau local voit les noms consultés. Le contenu des échanges, lui, reste chiffré."
-        />
-        <Row label="backend" value={backend || '—'} />
       </Box>
 
-      {vault && (
+      {degraded && vault && (
         <>
           <Divider />
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
-            <Row
-              label="secrets"
-              value={vault.hardwareBacked ? 'scellés au TPM' : 'scellés au compte uniquement'}
-              tone={vault.hardwareBacked ? undefined : AMBER}
-              note={
-                vault.hardwareBacked
-                  ? 'Clé non exportable du TPM : copiés sur une autre machine, ils y sont \
-                     définitivement illisibles.'
-                  : 'Sécurité matérielle désactivée. La résistance à la copie inter-machine et \
-                     à un administrateur de domaine détenant les clés DPAPI n’est plus assurée.'
-              }
-            />
-            <Row
-              label="volume"
-              value={
-                vault.volumeProtected
-                  ? 'chiffré'
-                  : vault.unencryptedVolumeWaived
-                    ? 'non chiffré — exigence levée'
-                    : 'non couvert'
-              }
-              tone={vault.volumeProtected ? undefined : AMBER}
-              note={vault.volume}
-            />
-            <Row
-              label="mémoire"
-              value={vault.memoryLocked ? 'verrouillée' : 'non verrouillée'}
-              tone={vault.memoryLocked ? undefined : AMBER}
-              note={vault.memory}
-            />
+            {!vault.hardwareBacked && (
+              <Row label="secrets" value="scellés au compte uniquement" tone={AMBER} />
+            )}
+            {!vault.volumeProtected && (
+              <Row
+                label="volume"
+                value={vault.unencryptedVolumeWaived ? 'non chiffré — exigence levée' : 'non couvert'}
+                tone={AMBER}
+              />
+            )}
+            {!vault.memoryLocked && <Row label="mémoire" value="non verrouillée" tone={AMBER} />}
             {/* Defence in depth, so it is stated without an amber tone: the
                 exclusion covers WER reports only, never a debugger. */}
-            <Row
-              label="vidages"
-              value={vault.dumpsExcluded ? 'exclus' : 'non exclus'}
-              note={vault.dumps}
-            />
+            {!vault.dumpsExcluded && <Row label="vidages" value="non exclus" />}
             {vault.legacyPresent && (
-              <Row
-                label="migration"
-                value="fichier en clair présent"
-                tone={AMBER}
-                note="Un profils.toml hérité n’a pas encore été repris dans le coffre."
-              />
+              <Row label="migration" value="fichier en clair présent" tone={AMBER} />
             )}
             {vault.rotationRequired.length > 0 && (
               <Row
                 label="rotation"
                 value={`${vault.rotationRequired.join(', ')} — conseillée`}
                 tone={AMBER}
-                note="La clé de ces profils a vécu en clair dans profiles.toml. Ces profils
-                      restent connectables : Orion constate l’historique d’un fichier, il ne
-                      sait pas si la clé a fuité. Pour clore le doute — onglet Profils,
-                      « Générer une nouvelle clé », faire admettre la clé publique affichée."
               />
             )}
           </Box>
@@ -208,24 +150,16 @@ export function PosturePanel({
   )
 }
 
-/**
- * One fact: its instrument label, its value, and why it matters.
- *
- * `note` is not optional prose — it carries what the value alone gets wrong.
- * A row that needs no explanation simply omits it rather than filling the
- * space with a paraphrase.
- */
+/** One fact: its instrument label and its value. */
 function Row({
   label,
   value,
-  note,
   tone,
   copy,
   copyLabel,
 }: {
   label: string
   value: string
-  note?: string
   /** Overrides the value's color when the fact itself is a caution. */
   tone?: string
   /** Value handed to the clipboard, when it is one worth carrying out. */
@@ -233,46 +167,36 @@ function Row({
   copyLabel?: string
 }) {
   return (
-    <Box sx={{ minWidth: 0 }}>
-      <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, minWidth: 0 }}>
-        <Typography
-          color="text.disabled"
-          sx={{
-            width: 76,
-            flexShrink: 0,
-            fontFamily: 'monospace',
-            fontSize: 9.5,
-            letterSpacing: '0.08em',
-            textTransform: 'uppercase',
-          }}
-        >
-          {label}
-        </Typography>
-        <Typography
-          sx={{
-            minWidth: 0,
-            color: tone ?? 'text.primary',
-            fontFamily: 'monospace',
-            fontSize: 11,
-            overflowWrap: 'anywhere',
-          }}
-        >
-          {value}
-        </Typography>
-        {tone && <AlertTriangle size={12} aria-hidden style={{ color: tone, flexShrink: 0 }} />}
-        {copy && (
-          <Box sx={{ ml: 'auto' }}>
-            <CopyButton value={copy} label={copyLabel ?? label} />
-          </Box>
-        )}
-      </Box>
-      {note && (
-        <Typography
-          color="text.secondary"
-          sx={{ mt: 0.25, ml: '84px', fontSize: 10.5, lineHeight: 1.5 }}
-        >
-          {note}
-        </Typography>
+    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, minWidth: 0 }}>
+      <Typography
+        color="text.disabled"
+        sx={{
+          width: 76,
+          flexShrink: 0,
+          fontFamily: 'monospace',
+          fontSize: 9.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+        }}
+      >
+        {label}
+      </Typography>
+      <Typography
+        sx={{
+          minWidth: 0,
+          color: tone ?? 'text.primary',
+          fontFamily: 'monospace',
+          fontSize: 11,
+          overflowWrap: 'anywhere',
+        }}
+      >
+        {value}
+      </Typography>
+      {tone && <AlertTriangle size={12} aria-hidden style={{ color: tone, flexShrink: 0 }} />}
+      {copy && (
+        <Box sx={{ ml: 'auto' }}>
+          <CopyButton value={copy} label={copyLabel ?? label} />
+        </Box>
       )}
     </Box>
   )

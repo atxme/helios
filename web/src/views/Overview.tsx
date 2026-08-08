@@ -90,7 +90,7 @@ export function OverviewView({
           label="Négociation"
           value={status?.key_negotiation_port ? `UDP ${status.key_negotiation_port}` : 'inactive'}
           icon={KeyRound}
-          hint="Sans ce second port, les clients retombent sur l’ancien chemin et leur premier handshake n’est pas protégé."
+          hint="Sans ce second port, aucun PSK post-quantique n’est négocié et un client qui épingle cette gateway échoue avant WireGuard."
         />
       </Box>
 
@@ -120,7 +120,6 @@ export function OverviewView({
       <SectionCard
         title="Événements"
         icon={ScrollText}
-        subtitle={events.length === 0 ? 'Diffusés par le démon en temps réel.' : undefined}
         action={
           events.length > 0 ? (
             <Typography variant="overline" sx={{ color: 'text.disabled' }}>

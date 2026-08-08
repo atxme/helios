@@ -1421,7 +1421,7 @@ function KeyNegotiation({
         label="empreinte PQ"
         value={fingerprint ?? 'illisible'}
         copyable={Boolean(fingerprint)}
-        hint="Empreinte SHA-256 du certificat ML-DSA-65 épinglé. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
+        hint="Empreinte SHA-256 du certificat ML-DSA-87 épinglé. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
       />
       <EncodedData
         caDer={settings.gateway_ca_der}

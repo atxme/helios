@@ -181,7 +181,6 @@ export default function App() {
         adapterUp={c.adapterUp}
         profile={c.selectedProfile}
         psk={c.psk}
-        backend={c.backend}
         vault={vault}
       />
 

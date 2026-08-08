@@ -1,45 +1,89 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
-**Statut** : spécifié — **non implémenté**.
+**Statut** : cible spécifiée — **cycle de vie non implémenté**. Le protocole de
+négociation servi est déjà la v5 ; cette note décrit le lot certificat restant.
 
 **Version du format** : `1`
 
-**Date de la note** : 2026-08-06
+**Date de la note** : 2026-08-08
 
 Cette note complète la
 [spécification de négociation de clé v5](NEGOCIATION-DE-CLE-V5.md) et
-[ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md). Elle définit maintenant les
-formats et transitions indispensables pour ne pas figer la v5 autour d'un
-certificat unique. L'ordonnancement automatique, les alertes et les campagnes
-de parc pourront être livrés dans une extension opérationnelle v5.x sans
-changer les objets signés ni le modèle de confiance.
+[ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md). La v5 filaire, ML-DSA-87 et le
+certificat `PqCertificate` v2 sont déjà servis. Le code reste toutefois figé
+autour d'une seule identité gateway auto-signée et d'une seule génération
+cliente. Cette note définit les formats et transitions qui ferment ce manque.
+L'ordonnancement automatique, les alertes et les campagnes de parc pourront
+être livrés ensuite sans changer les objets signés ni le modèle de confiance.
 
-Les exigences de cette note s'appliquent seulement aux profils Orion de type
-`helios_key_negotiation`. Un profil `classic` reste un profil WireGuard
-générique, sans certificat de négociation, sans CA-PQ et sans mise à jour de
-confiance Helios.
+Les exigences de cette note s'appliquent seulement à la branche cible
+`helios_key_negotiation` des profils Orion. Le discriminant explicite de cette
+branche n'est pas encore implémenté : aujourd'hui, un profil porte encore un
+bloc `key_negotiation` facultatif. La migration de format décrite par la
+spécification v5 doit donc être livrée avant, ou atomiquement avec, le présent
+lot. L'absence d'un bloc ne doit jamais permettre de reclasser comme `classic`
+un profil déjà connu comme Helios. Un vrai profil `classic` reste un profil
+WireGuard générique, sans certificat de négociation, sans `CA-PQ` et sans mise
+à jour de confiance Helios.
 
-## 0. Décisions
+## 0. État de départ et décisions
+
+### 0.1 État effectivement servi au 8 août 2026
+
+Le point de départ de l'implémentation est précisément le suivant :
+
+- l'ALPN `helios-key-negotiation/5`, les messages de négociation v5 et
+  `PqCertificate.version = 2` sont en service ;
+- la leaf PQ gateway est encore **auto-signée** et directement épinglée dans
+  chaque profil Orion ; Orion n'épingle pas encore la clé publique `CA-PQ` ni
+  de `trust_domain_id` ;
+- la leaf TLS gateway est auto-signée et son DER unique est épinglé dans le
+  profil ;
+- les leafs TLS et PQ clientes sont émises par les CA opérateur, mais
+  l'admission ne conserve qu'un couple d'empreintes sans génération
+  active/suivante ;
+- le profil Orion conserve un seul certificat TLS gateway, un seul certificat
+  PQ gateway et un seul nom d'identité cliente ; le format `.orion` courant
+  peut encore transporter les clés privées de cette identité ;
+- `heliosd` charge une identité unique au démarrage. La commande
+  `init-key-negotiation --rotate` remplace les fichiers ; elle ne prépare ni
+  transition, ni slot suivant, et tous les profils qui épinglent l'ancienne
+  identité cessent alors de se connecter après le redémarrage ;
+- aucun compteur de certificat, objet de transition, route interne de mise à
+  jour de confiance, import `orion-trust-update` ou registre de révocation
+  décrit ici n'existe encore.
+
+Cette note ne doit donc pas être lue comme une capacité cachée de la v5
+actuelle. En particulier, `init-key-negotiation --rotate` n'est pas le chemin
+de rotation de parc défini ci-dessous.
+
+### 0.2 Décisions normatives
 
 | Sujet | Décision normative |
 | --- | --- |
 | identité stable de la gateway | clé publique WireGuard et `server_name`, tous deux inchangés pendant une rotation |
-| certificat PQ gateway | émis par `CA-PQ`, jamais auto-signé en v5 |
+| certificat PQ gateway | émis par `CA-PQ` dans l'état cible ; l'auto-signature actuelle n'est admise que jusqu'à la bascule de §13 |
 | certificat TLS gateway | épinglage actif/suivant ; une transition peut remplacer TLS, PQ ou les deux atomiquement |
 | état d'un profil | certificat actif et certificat suivant, jamais davantage |
 | état d'un client admis | génération active et suivante, chacune associant exactement une empreinte TLS et une empreinte PQ |
 | fenêtre | `not_before < activation_at < not_after`, chevauchement limité à 30 jours |
 | anti-rollback | génération `u64` strictement séquentielle et persistée avant activation |
 | autorité d'une transition leaf | signature ML-DSA-87 par la `CA-PQ` déjà épinglée |
+| garde des CA | clés privées `CA-PQ` et `CA-TLS` confinées dans l'autorité opérateur, jamais sur une gateway ni dans Orion |
 | rotation de `CA-PQ` | transition signée par l'ancienne **et** la nouvelle CA, générations consécutives |
 | rotation de `CA-TLS` cliente | deux ancres au plus, transition autorisée par `CA-PQ` avant toute nouvelle leaf mTLS |
 | compromission | révocation sans grâce ; si `CA-PQ` est compromise, réinitialisation hors bande |
-| automatisation | reportable en v5.x ; formats, parseurs, états doubles et import manuel appartiennent à la v5 initiale |
+| automatisation | reportable après le socle ; formats, parseurs, états doubles et import manuel appartiennent au lot certificat v5 |
 
 Le choix de faire émettre le certificat PQ gateway par `CA-PQ` est retenu à la
 place d'une simple cosignature par l'ancienne leaf. Une leaf compromise ne peut
-ainsi autoriser seule sa remplaçante. La clé privée `CA-PQ` reste exclusivement
-sur le poste opérateur ; elle n'entre ni sur la gateway, ni dans Orion.
+ainsi autoriser seule sa remplaçante. Les clés privées `CA-PQ` et `CA-TLS`
+restent exclusivement dans une **autorité de signature opérateur isolée** ;
+elles n'entrent ni sur une gateway, ni dans Orion. Cette note fixe cette
+frontière de confiance, pas la topologie de l'autorité : poste hors ligne, HSM
+ou service dédié relèvent d'une décision d'architecture séparée. Un simple
+canal chiffré ne modifie ni cette frontière ni les exigences d'autorisation,
+d'audit et d'anti-rejeu.
 
 ## 1. Périmètre
 
@@ -107,16 +151,19 @@ rendues en hexadécimal minuscule dans JSON.
 
 ### 3.1 Certificat PQ gateway
 
-Le `PqCertificate` v2 de rôle `gateway` est désormais signé par `CA-PQ`. Son
-champ `issuer` désigne cette CA. La vérification contrôle la signature de CA,
-le rôle, la clé WireGuard stable, `server_name`, la période de validité et la
-forme ML-DSA-87. La vérification auto-signée d'une leaf gateway est absente du
-chemin v5.
+Dans l'état cible, le `PqCertificate` v2 de rôle `gateway` est signé par
+`CA-PQ`. Son champ `issuer` désigne cette CA. La vérification contrôle la
+signature de CA, le rôle, la clé WireGuard stable, `server_name`, la période de
+validité et la forme ML-DSA-87. Après la bascule de §13, la vérification
+auto-signée d'une leaf gateway est absente du chemin
+`helios_key_negotiation`. Le lecteur de migration peut encore reconnaître
+l'ancien pin pour préparer la bascule, mais il ne l'installe jamais dans un
+slot actif ou suivant du nouveau format.
 
 La gateway génère chaque nouvelle clé privée ML-DSA-87 sur la gateway, la
-scelle au TPM et exporte une demande publique signée par la nouvelle clé. Le
-poste opérateur vérifie cette preuve de possession avant d'émettre la leaf. La
-clé privée ne quitte jamais la gateway.
+scelle au TPM et exporte une demande publique signée par la nouvelle clé.
+L'autorité opérateur vérifie cette preuve de possession avant d'émettre la
+leaf. La clé privée ne quitte jamais la gateway.
 
 ### 3.2 État gateway dans Orion
 
@@ -243,8 +290,8 @@ dominent le temps mural.
 
 ## 5. Demande de certificat gateway
 
-`GatewayCertificateRequest` permet au poste opérateur d'émettre une leaf sans
-recevoir de clé privée :
+`GatewayCertificateRequest` permet à l'autorité opérateur d'émettre une leaf
+sans recevoir de clé privée :
 
 | Champ | Contrainte |
 | --- | --- |
@@ -409,7 +456,7 @@ correspondance.
 
 ### 7.2 Émission et grant
 
-Le poste opérateur vérifie la demande, émet les deux certificats et construit
+L'autorité opérateur vérifie la demande, émet les deux certificats et construit
 un `ClientCertificateRotationGrant` signé par `CA-PQ`. Le grant lie :
 
 - les identités gateway et cliente ;
@@ -470,33 +517,47 @@ soupçonnée compromise n'autorise jamais une rotation d'urgence.
 
 ## 8. Distribution des mises à jour
 
-### 8.1 Échange v5 réservé dès l'origine
+### 8.1 Mise à jour de confiance dans le tunnel
 
-La v5 initiale réserve et parse les messages suivants sur son ALPN existant :
-
-```json
-{"type":"trust_update_request","request":{}}
-```
-
-```json
-{"type":"trust_update","update":{}}
-```
-
-L'échange utilise une connexion distincte de la négociation PSK : mTLS,
-challenge gateway, requête signée par l'identité cliente active, réponse, puis
-fermeture QUIC. Il ne pose aucun slot WireGuard et ne modifie aucun plancher de
-mode.
-
-`AuthenticatedTrustUpdateRequest` contient la requête, le certificat PQ client
-de la génération reconnue par mTLS et une signature ML-DSA-87. La requête
-contient `request_id` aléatoire, le challenge, les identités WireGuard, les
-générations connues, les empreintes actives et un horodatage soumis à la même
-dérive de ±30 secondes que la négociation. La signature couvre :
+Le port QUIC public de la v5 est réservé à l'établissement pré-WireGuard d'un
+PSK. Une fois le tunnel monté, Orion récupère les transitions ordinaires par :
 
 ```text
-"helios-trust-update-request-v5"
+POST http://<adresse-WireGuard-gateway>:8080/api/key-negotiation/trust-update
+Content-Type: application/json
+```
+
+L'adresse vient de `heliosd_url` dans le profil et doit être routée dans le
+tunnel. Orion n'essaie jamais cette route sur l'adresse publique de la gateway
+et ne retombe pas sur QUIC. La requête est limitée à 32 Kio avant
+désérialisation ; la réponse JSON est limitée à 64 Kio.
+
+La route n'est **pas** reconnue par le code v5 actuel. Elle n'est appelée
+qu'après mise à niveau des deux bouts. Une gateway ancienne répond `404` ;
+Orion conserve alors sa confiance actuelle et propose le document hors ligne
+de §8.2. Il n'accepte jamais pour autant un certificat expiré, une génération
+ancienne ou un repli vers un pin unique. Les messages de négociation PSK et
+leurs transcriptions signées ne changent pas.
+
+Avant toute vérification ML-DSA, l'API résout l'adresse source réelle vers son
+unique pair admis, selon la même règle que les autres routes authentifiées de
+`helios-api`. Aucun en-tête de proxy n'est accepté. La clé WireGuard cliente du
+corps est ensuite comparée à ce pair ; elle ne sert jamais d'index dans la
+table. Cette résolution prouve que l'appel traverse un tunnel établi par la
+clé WireGuard admise.
+
+`AuthenticatedTrustUpdateRequest` contient la requête, le certificat PQ client
+de la génération courante et une signature ML-DSA-87. La requête contient un
+`request_id` aléatoire de 16 octets non nuls, les identités WireGuard, les
+générations connues et les empreintes actives. Elle ne contient ni challenge
+public, ni horodatage : l'anti-rejeu du transport WireGuard protège le paquet,
+et les générations ainsi que les empreintes signées empêchent tout rollback de
+l'état applicatif. La signature couvre :
+
+```text
+"helios-in-tunnel-trust-update-request-v5"
 || protocol_version:u16
-|| server_challenge:32 || request_id:16
+|| request_id:16
 || trust_domain_id:16
 || gateway_wg_public_key:32 || client_wg_public_key:32
 || ca_epoch:u64 || ca_tls_epoch:u64
@@ -506,27 +567,31 @@ dérive de ±30 secondes que la négociation. La signature couvre :
 || active_gateway_certificate_fingerprint:32
 || active_client_tls_certificate_fingerprint:32
 || active_client_pq_certificate_fingerprint:32
-|| timestamp_unix:u64
 || client_pq_certificate_fingerprint:32
 ```
 
-La gateway exige que la génération mTLS, le certificat PQ présenté et les deux
-empreintes clientes de la requête désignent le même couple actif ou suivant.
-Le challenge est consommé atomiquement à l'acceptation. Une répétition de
-`request_id` est un no-op de défense en profondeur ; les générations signées
-rendent les objets de réponse rejouables sans rollback.
+La gateway exige que le pair WireGuard résolu, le certificat PQ présenté et
+les deux empreintes clientes de la requête désignent le même couple autorisé à
+l'instant courant : actif, ou suivant seulement à partir de son
+`activation_at`. Une répétition de `request_id` peut être servie de manière
+idempotente ; sa mémorisation est une borne opérationnelle et non la défense
+anti-rejeu principale. Les objets de réponse restent rejouables sans rollback
+grâce à leurs générations et signatures.
 
-La requête contient les quatre générations connues et les empreintes actives.
-La réponse contient au plus une transition `CA-PQ`, une transition `CA-TLS`,
-une transition gateway et un grant client. Tous sont pré-signés ; la gateway
-n'appelle jamais `CA-PQ` et ne réalise aucune signature de CA à la demande. Une
-réponse vide est valide.
+La réponse `200 OK` contient au plus une transition `CA-PQ`, une transition
+`CA-TLS`, une transition gateway et un grant client. Tous sont pré-signés ; la
+gateway n'appelle jamais `CA-PQ` et ne réalise aucune signature de CA à la
+demande. Une réponse vide est valide. Les erreurs HTTP sont volontairement
+grossières : `400` pour le JSON ou la version, `401` si la source n'est pas un
+pair admis, `403` pour une identité, un certificat ou une signature refusés,
+`413` au-delà de 32 Kio, `415` hors JSON et `500` après une erreur interne.
+Le motif détaillé reste dans le journal protégé de la gateway.
 
 Le client vérifie chaque objet indépendamment, puis applique l'ensemble dans
 l'ordre `CA-PQ -> CA-TLS -> gateway -> client` sous une transaction locale
 atomique. Si un objet échoue, aucun des quatre états n'est modifié. Une réponse
-qui dépasserait la trame v5 de 64 Kio est refusée par l'émetteur et doit être
-scindée en connexions successives.
+qui dépasserait 64 Kio est refusée par l'émetteur et doit être scindée entre
+plusieurs requêtes successives.
 
 ### 8.2 Document hors ligne
 
@@ -538,17 +603,18 @@ signature doit se vérifier sous la CA active au **début** de l'import ; cette 
 vient du profil local, jamais du document seul. Chaque objet embarqué conserve
 en plus sa propre signature normative.
 
-Un client dont le certificat mTLS a expiré ou qui est resté hors ligne au-delà
-du chevauchement utilise ce document. Une leaf expirée n'est jamais réacceptée
-pour télécharger sa propre mise à jour.
+Un client dont le certificat PQ applicatif a expiré, dont le tunnel ne peut
+plus être établi ou qui est resté hors ligne au-delà du chevauchement utilise
+ce document. Une leaf expirée n'est jamais réacceptée pour télécharger sa
+propre mise à jour.
 
-Un document réseau ou hors ligne contient une seule transition de CA. Une
-opération d'import hors ligne peut accepter au plus trois documents strictement
-consécutifs, chacun signé sous la CA devenue active à l'étape précédente et
-persisté avant le suivant. À aucun instant le magasin de confiance ne contient
-plus de deux CA. Au-delà de trois générations manquées, une réinitialisation
-opérateur explicite est exigée afin de borner taille, temps de vérification et
-complexité de récupération.
+Une réponse réseau ou un document hors ligne contient une seule transition de
+CA. Une opération d'import hors ligne peut accepter au plus trois documents
+strictement consécutifs, chacun signé sous la CA devenue active à l'étape
+précédente et persisté avant le suivant. À aucun instant le magasin de confiance
+ne contient plus de deux CA. Au-delà de trois générations manquées, une
+réinitialisation opérateur explicite est exigée afin de borner taille, temps de
+vérification et complexité de récupération.
 
 ## 9. Rotation de `CA-PQ`
 
@@ -598,8 +664,9 @@ l'unique ancre et l'ancienne est supprimée.
 Chaque transition est conservée par l'outillage opérateur sous son numéro de
 génération afin qu'un client hors ligne puisse reconstruire une chaîne
 séquentielle. Les fichiers sont publics mais signés ; les clés privées des deux
-CA restent hors ligne. L'ancienne clé privée peut être détruite seulement après
-la fin de la fenêtre et la publication durable de la transition.
+CA restent confinées dans l'autorité de signature. L'ancienne clé privée peut
+être détruite seulement après la fin de la fenêtre et la publication durable
+de la transition.
 
 ### 9.3 CA compromise
 
@@ -704,7 +771,7 @@ jamais retarder le retrait de l'admission.
 1. Générer et sceller la nouvelle clé sur la gateway.
 2. Exporter et vérifier `GatewayCertificateRequest`.
 3. Émettre la leaf PQ sous `CA-PQ` et, si nécessaire, la nouvelle leaf TLS.
-4. Produire et signer `GatewayIdentityTransition` sur le poste opérateur.
+4. Produire et signer `GatewayIdentityTransition` dans l'autorité opérateur.
 5. Installer et synchroniser clé, certificats et transition sur la gateway sans
    modifier l'identité servie.
 6. Distribuer la transition aux clients et mesurer ceux qui l'ont persistée.
@@ -721,7 +788,7 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
 
 1. Générer les nouvelles clés dans le stockage protégé Orion.
 2. Produire la demande et les trois preuves de possession/continuité.
-3. Émettre les deux certificats sur le poste opérateur.
+3. Émettre les deux certificats dans l'autorité opérateur.
 4. Installer et synchroniser la génération suivante dans l'admission gateway.
 5. Signer puis distribuer le grant.
 6. Orion persiste le grant et bascule à `activation_at`.
@@ -730,7 +797,8 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
 
 ### 11.3 Rotation de CA normale
 
-1. Créer la nouvelle CA hors ligne et son `trust_domain_id` identique.
+1. Créer la nouvelle CA dans l'autorité isolée en conservant le même
+   `trust_domain_id`.
 2. Produire la transition `N -> N+1`, signée par les deux CA.
 3. Publier durablement la transition numérotée.
 4. La distribuer aux gateways et clients avant toute leaf sous la nouvelle CA.
@@ -739,34 +807,43 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
 
 ### 11.4 Rotation de la CA TLS cliente
 
-1. Produire la nouvelle CA TLS et `ClientTlsCaTransition` sur le poste
+1. Produire la nouvelle CA TLS et `ClientTlsCaTransition` dans l'autorité
    opérateur.
 2. Installer et synchroniser la CA suivante sur la gateway.
 3. Émettre les grants clients dont la leaf TLS chaîne vers cette CA.
 4. Activer la CA et les générations clientes à leurs dates liées.
 5. Retirer l'ancienne CA seulement après la fin du chevauchement.
 
-## 12. Ce qui appartient à v5 et ce qui peut attendre v5.x
+## 12. Socle certificat v5 et automatisation ultérieure
 
-### 12.1 Obligatoire dans la première implémentation v5
+### 12.1 Obligatoire pour déclarer le cycle de vie implémenté
 
 - émission du certificat PQ gateway par `CA-PQ` ;
 - `trust_domain_id` et les cinq compteurs monotones ;
+- migration explicite du profil Orion vers le discriminant
+  `helios_key_negotiation`, sans reclassement par absence de champ ;
+- enrôlement v5 sans clé privée dans le document et signature opérateur, afin
+  que la confiance initiale en `CA-PQ` ne soit pas apportée par l'objet qu'elle
+  signe elle-même ;
 - deux ancres `CA-TLS` clientes au plus ;
 - états `active + next` bornés pour gateway, client et CA ;
 - association atomique des empreintes TLS/PQ clientes ;
 - formats signés des §§5 à 10 et parseurs stricts ;
-- messages `trust_update_request` et `trust_update` ;
+- route interne authentifiée `POST /api/key-negotiation/trust-update` ;
 - import manuel d'un document `orion-trust-update` ;
 - persistance atomique, promotion et suppression définitive ;
+- sérialisation de la révocation d'admission, de la génération cliente et du
+  retrait du plan de données, afin que l'état terminal `revoked` domine aussi
+  en concurrence ;
 - affichage clair de l'état `active`, `staged`, `overlap`, `expired` ou
   `revoked` ;
 - tests du §14.
 
-Une première release peut n'émettre aucune transition après l'enrôlement. Elle
-doit néanmoins savoir les représenter, les vérifier et les appliquer. C'est ce
-qui permet à une version v5.x ultérieure d'automatiser le cycle sans changer le
-protocole ou ré-enrôler le parc.
+La première release du lot certificat peut n'émettre automatiquement aucune
+transition après l'enrôlement. Elle doit néanmoins savoir les représenter, les
+vérifier et les appliquer manuellement. C'est ce qui permet à une extension
+ultérieure d'automatiser le cycle sans changer le protocole ou ré-enrôler le
+parc.
 
 ### 12.2 Reportable dans une extension opérationnelle v5.x
 
@@ -784,10 +861,12 @@ Ces fonctions orchestrent les objets normatifs. Elles ne peuvent augmenter le
 nombre de slots, ignorer une génération, prolonger le chevauchement ou accepter
 une CA apportée seulement par la mise à jour.
 
-## 13. Migration vers la v5 initiale
+## 13. Migration depuis la v5 actuellement servie
 
-La v5 n'étant pas encore implémentée, elle ne doit émettre aucun profil neuf
-avec une leaf PQ gateway auto-signée. L'enrôlement initial crée directement :
+### 13.1 Installation neuve après implémentation du lot
+
+Une installation neuve ne doit plus émettre de profil avec une leaf PQ gateway
+auto-signée. L'enrôlement initial crée directement :
 
 - `trust_domain_id` aléatoire ;
 - `ca_epoch = 1` avec `current_ca_public_key` ;
@@ -796,6 +875,57 @@ avec une leaf PQ gateway auto-signée. L'enrôlement initial crée directement :
 - les leafs gateway actives et aucun slot suivant ;
 - `client_identity_generation = 1` pour chaque admission ;
 - `revocation_epoch = 0` pour chaque identité.
+
+### 13.2 Parc v5 existant
+
+Le parc actuel ne possède pas l'ancre nécessaire pour vérifier une transition
+ordinaire : Orion épingle la leaf PQ gateway auto-signée, pas `CA-PQ`. Un
+`CaTransition` ne peut pas réparer cette absence, puisqu'il doit être vérifié
+par une CA déjà fiable. La première installation de `CA-PQ` constitue donc un
+**bootstrap de confiance**, pas la génération `N -> N+1` d'une rotation.
+
+Ce bootstrap exige une confirmation hors bande de l'empreinte `CA-PQ`, comme
+un enrôlement neuf. Ni la leaf gateway actuellement épinglée, ni un document
+signé seulement par la CA qu'il transporte ne suffisent à étendre la confiance
+à tout le domaine opérateur. Cette règle évite qu'une compromission de la leaf
+d'une seule gateway puisse créer une nouvelle CA valable pour tout le parc.
+
+La migration suit cet ordre :
+
+1. Déployer les lecteurs du nouveau profil, les états bornés et les compteurs,
+   sans modifier l'identité encore servie.
+2. Créer `trust_domain_id` et fixer `ca_epoch = 1`. La clé opérateur qui signe
+   déjà les leafs PQ clientes peut devenir cette première `CA-PQ` si elle est
+   ML-DSA-87, disponible dans l'autorité de signature et confirmée hors bande ;
+   son emplacement historique ne vaut jamais preuve d'identité.
+3. Générer dans un chemin de staging une nouvelle identité gateway, obtenir sa
+   leaf PQ signée par `CA-PQ`, puis préparer l'état gateway de génération `1`.
+   L'ancienne leaf auto-signée n'entre pas dans cet état cible.
+4. Convertir chaque couple TLS/PQ client admis en génération cliente `1`, après
+   vérification de sa chaîne, de ses clés et de l'unicité globale des deux
+   empreintes. Une identité dont l'émetteur ou la clé privée locale ne peut pas
+   être prouvé est ré-enrôlée ; elle n'est pas réparée par supposition.
+5. Préparer pour chaque Orion un profil `helios_key_negotiation` épinglant
+   `CA-PQ`, `trust_domain_id` et la nouvelle identité gateway. Le document ne
+   transporte aucune clé privée et Orion ne l'active qu'après la confirmation
+   hors bande. Il peut réutiliser une identité locale dont les clés publiques
+   correspondent exactement à la génération cliente convertie.
+6. Une fois tous les profils préparés, promouvoir atomiquement l'identité de
+   staging et redémarrer `heliosd`, puis activer les profils préparés. Après ce
+   point, le chemin cible refuse toute leaf gateway auto-signée.
+
+Les étapes 6 côté gateway et Orion forment une bascule coordonnée, avec une
+indisponibilité possible. Les slots actif/suivant ne la suppriment pas : ils ne
+peuvent fonctionner qu'après établissement d'une ancre commune. Inventer une
+transition automatique depuis la leaf auto-signée actuelle contredirait la
+frontière de confiance de §2.2.
+
+`init-key-negotiation --rotate` ne réalise aucune de ces étapes. Tant que le
+staging, le bootstrap de profil et la promotion atomique ne sont pas
+implémentés, cette commande reste un remplacement coupant qui exige la remise
+à jour manuelle de tous les profils.
+
+### 13.3 Champ filaire conservé
 
 Le champ signé de la requête v5 reste
 `gateway_certificate_fingerprint` au singulier : il désigne **la leaf PQ
@@ -806,17 +936,18 @@ chevauchement. Le profil, lui, porte les champs
 l'empreinte demandée est autorisée à l'instant courant et correspond à la leaf
 qu'il sert.
 
-La migration v4 -> v5 décrite par la spécification principale réémet donc la
-gateway sous `CA-PQ` dès l'origine. Aucun chemin de compatibilité v5 n'accepte
-la leaf gateway auto-signée de la v4.
-
 ## 14. Plan de validation
 
 ### 14.1 Tests déterministes et propriétés
 
-- rejet d'une leaf gateway PQ auto-signée dans le chemin v5 ;
+- rejet d'une leaf gateway PQ auto-signée dans le chemin cible après bascule,
+  sans empêcher le lecteur de migration d'identifier l'ancien pin ;
 - acceptation d'une leaf gateway PQ signée par la CA épinglée et refus sous une
   CA seulement apportée par le document ;
+- bootstrap du parc actuel refusé sans confirmation hors bande de `CA-PQ`, y
+  compris si l'objet est signé par l'ancienne leaf gateway ;
+- conversion d'un couple client existant en génération `1` seulement si la
+  chaîne, les empreintes et les clés locales correspondent exactement ;
 - liaison obligatoire de chaque transition à la clé WireGuard, au
   `server_name` et au `trust_domain_id` du profil ;
 - refus des générations égales avec contenu différent, inférieures, sautées et
@@ -848,6 +979,10 @@ la leaf gateway auto-signée de la v4.
 - mélange d'un document destiné à une autre gateway ou à un autre domaine de
   confiance refusé ;
 - taille de trame, nombre d'objets et coûts ML-DSA bornés ;
+- réponse `404` d'une ancienne gateway à la route de mise à jour, sans repli
+  vers QUIC, une leaf expirée, un pin unique ou un mode plus faible ;
+- refus de la route depuis une source hors tunnel, une VIP inconnue, un pair
+  différent de la clé signée ou une identité PQ d'une autre génération ;
 - fuzzing de tous les objets signés, de leurs certificats embarqués et de la
   machine d'état temporelle.
 
@@ -855,7 +990,10 @@ la leaf gateway auto-signée de la v4.
 
 - client resté hors ligne avant activation, pendant le chevauchement et après
   son terme ;
-- import hors ligne après expiration du certificat mTLS ;
+- import hors ligne après expiration du certificat PQ applicatif ou perte du
+  tunnel ;
+- bascule coordonnée d'un parc v5 actuel : profil préparé, identité gateway de
+  staging promue, ancien certificat auto-signé définitivement refusé ;
 - redémarrage de `heliosd` sur la nouvelle identité, puis rollback pendant la
   fenêtre ;
 - crash avant et après chaque synchronisation de l'ordre §11 ;
@@ -900,20 +1038,30 @@ protège la continuité, pas la compromission de la clé courante. Passer à un
 seuil multi-signatures pour `CA-PQ` serait une nouvelle décision
 d'architecture et un nouveau format.
 
+**La forme d'exploitation de l'autorité opérateur n'est pas décidée ici.** Le
+code actuel utilise un poste opérateur et `~/.helios/certs/internal-ca`. Un
+service dédié isolé pourrait supprimer cette dépendance au poste, mais il
+changerait la disponibilité et la surface d'attaque de la CA. Le choisir exige
+un ADR qui fixe au minimum la garde des clés, l'authentification mutuelle,
+l'autorisation humaine ou automatique, l'anti-rejeu, le journal d'audit, la
+sauvegarde et la reprise après compromission. Cette note n'assimile jamais le
+seul chiffrement du lien à ces propriétés.
+
 ## 16. Correspondance cible avec le code
 
 | Composant | Responsabilité |
 | --- | --- |
-| `aether::key_negotiation` | certificats gateway émis par CA, quatre objets signés, encodage canonique et empreintes |
+| `aether::key_negotiation` | certificats gateway émis par CA, objets signés, encodage canonique et empreintes |
 | `aether::config` | états bornés, générations, invariants temporels et union active/suivante |
-| `helios-key-negotiation` | échange `trust_update`, limites de trame et fermeture après réponse |
+| `helios-api` | route interne de mise à jour, authentification de la source WireGuard et limites HTTP |
 | `heliosd::key_negotiation` | chargement de l'identité active, publication de transition et preuve de leaf servie |
 | `helios-provisioning::admission` | générations clientes TLS/PQ atomiques, unicité et révocation dominante |
 | configuration TLS de `heliosd` | deux CA clientes au plus, promotion par `ca_tls_epoch` et vérification mTLS avant résolution de génération |
 | `orion-core::config` | ancres, pins actifs/suivants, compteurs persistants et anti-rollback |
 | `orion-core::key_negotiation` | récupération, validation et application transactionnelle des mises à jour |
 | `orion-core::identity_store` | clés et certificats clients actifs/suivants protégés, promotion atomique |
-| `helios-ctl` | émission hors ligne, registre des transitions et documents de récupération |
+| autorité opérateur | garde des clés privées CA, politique d'émission, signatures, anti-rejeu et journal d'audit |
+| `helios-ctl` | export des demandes, contrôle des réponses, registre des transitions et documents de récupération ; client de l'autorité si celle-ci devient un service |
 
 ## 17. Références de conception
 

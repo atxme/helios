@@ -1,14 +1,15 @@
 # ADR 005 — Négociation de clé pré-WireGuard
 
 **Statut** : accepté (2026-07-25), révisé pour le protocole v4 (2026-08-04),
-**amendé le 2026-08-06** pour le protocole v5 — voir
-[Amendement du 6 août 2026](#amendement-du-6-août-2026--protocole-v5).
+**amendé les 6 et 8 août 2026** pour le protocole v5 — voir
+[l'amendement v5](#amendement-du-6-août-2026--protocole-v5) et
+[la libération dans le tunnel](#amendement-du-8-août-2026--libération-dans-le-tunnel).
 
-> Le corps de cet ADR décrit le protocole **v4**, celui que le code sert
-> aujourd'hui. L'amendement en fin de document renverse trois de ses décisions
-> et en précise plusieurs autres. Là où les deux se contredisent, l'amendement
-> fait foi pour la cible, le corps pour l'existant. La spécification détaillée
-> de la cible est [NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md).
+> Le corps de cet ADR décrit le protocole **v4**, conservé comme historique.
+> Le code sert aujourd'hui une v5 partielle. Les amendements en fin de document
+> renversent plusieurs décisions du corps ; le plus récent fait foi en cas de
+> contradiction. La spécification détaillée de la cible est
+> [NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md).
 
 Remplace et détaille l'amendement du 24 juillet 2026 de
 [ADR-001](ADR-001-WIREGUARD.md), qui reste la référence pour le transport
@@ -972,9 +973,10 @@ une donnée WireGuard ordinaire et ne devient pas le mode `static_psk` v5.
   **à établir** : c'est le seul essai bloquant de la v5 (§20.0), il précède
   l'écriture du chemin de renouvellement, et son échec choisit la reconnexion
   complète pré-arbitrée au §12.3, jamais la suppression de la preuve.
-- **Le `release` est best-effort.** Il suppose un arrêt propre d'Orion. L'accusé
-  `released` est signé, mais aucune reprise n'est tentée si la connexion
-  échoue : le PSK retombe sur la récupération par vieillissement.
+- **Le `release` est best-effort.** Il suppose un arrêt propre d'Orion et
+  retombe sur la récupération par vieillissement en cas d'échec. Le transport
+  QUIC et l'accusé signé retenus le 6 août sont remplacés par l'amendement du
+  8 août ; seule cette propriété best-effort subsiste.
 - **Un renouvellement de PSK interrompt brièvement le trafic.** La preuve exigée
   par le protocole impose de forcer un handshake, donc de réinitialiser la
   session WireGuard du pair. La supprimer demanderait deux slots PSK simultanés,
@@ -1006,3 +1008,72 @@ une donnée WireGuard ordinaire et ne devient pas le mode `static_psk` v5.
   La v5 prévoit l'import hors ligne et les échéances ; garantir une information
   fraîche à un client isolé exigerait un service de statut ou une distribution
   d'entreprise distincte.
+
+## Amendement du 8 août 2026 — libération dans le tunnel
+
+**Statut** : accepté. Cet amendement remplace le transport QUIC du `release` et
+son accusé `released` décrits par l'amendement du 6 août. Il ne change ni la
+machine d'état générationnelle, ni les autres causes de retrait.
+
+### Constat
+
+Le port QUIC public répond à une contrainte précise : préparer le PSK
+**avant** que WireGuard puisse transporter le premier paquet. Cette contrainte
+n'existe plus lors d'une déconnexion explicite. Orion possède alors un tunnel
+dont le commit a exigé un handshake réussi ; rouvrir le port public pour refaire
+mTLS, challenge et ML-DSA dupliquait l'authentification disponible et donnait au
+plan de contrôle pré-tunnel une responsabilité post-tunnel inutile.
+
+Le `release` public apportait une preuve de l'identité TLS/PQ, mais pas la preuve
+directe que son émetteur détenait encore la clé privée WireGuard du pair. Le
+faire circuler dans WireGuard ajoute précisément cette propriété et réduit la
+surface du parseur public. Supprimer toute notification aurait également été
+possible : le remplacement atomique permet déjà une reconnexion et la gateway
+récupère le slot à 300 secondes. Le `release` est néanmoins conservé pour
+zéroïser immédiatement le secret lors d'un arrêt propre.
+
+### Décision
+
+- `Release` et `Released` sortent de l'enveloppe `helios-key-negotiation/5`.
+  Après le commit, ce port n'est plus rouvert pour déconnecter.
+- Orion envoie, avant `VpnBackend::down()`, un
+  `POST /api/key-negotiation/release` JSON sur l'adresse WireGuard interne de la
+  gateway. Aucun DNS ni repli par le WAN n'est autorisé.
+- L'API résout d'abord la VIP source réelle vers son unique pair `/32` admis,
+  sans header proxy. La clé cliente du corps est comparée à ce pair, jamais
+  utilisée comme index. La signature ML-DSA-87 lie ensuite le certificat
+  client, l'identifiant propriétaire et les deux clés WireGuard.
+- Il n'y a ni challenge, ni horodatage de libération : WireGuard porte
+  l'anti-rejeu réseau et l'identifiant de transaction rend tout rejeu
+  applicatif ancien inoffensif. Un nouveau domaine de signature interdit de
+  réutiliser une signature de l'ancien message QUIC.
+- Seul un propriétaire `committed` correspondant est retiré. Une commande en
+  `preparing`, un identifiant périmé, un slot vide ou statique sont des no-op.
+  L'abandon de `preparing` reste couvert par la garde de rollback.
+- Le retrait conserve l'ordre plan de données, puis état, sous le sérialiseur
+  du pair. Le `204 No Content` est uniforme mais non probant : la modification
+  du PSK peut couper la réponse qui devait reprendre le même tunnel. Orion borne
+  l'essai à deux secondes, puis zéroïse et démonte dans tous les cas.
+- Une déconnexion brutale, un tunnel déjà mort ou une version mixte qui ne
+  comprend pas la route retombent sur la récupération à 300 secondes. Aucun de
+  ces cas ne bloque la déconnexion ni ne réactive le `release` public.
+
+### Conséquences
+
+Le port public redevient exclusivement pré-WireGuard : challenge, préparation,
+confirmation, commit, puis fermeture. Le chemin de déconnexion réutilise
+l'authentification `require_peer` déjà portée par l'API interne et doit être
+relié au même sérialiseur que la négociation. Pendant une mise à niveau
+progressive, un ancien Orion face à une nouvelle gateway ou l'inverse peut ne
+pas libérer immédiatement le slot ; cette perte est sûre et bornée par la
+récupération existante. L'ALPN reste `/5` : aucun octet de la négociation, de
+la dérivation ou du commit ne change, et l'échec du geste post-commit
+best-effort avait déjà exactement ce comportement de récupération. Une gateway
+mise à jour refuse le message QUIC historique ; elle ne le réinterprète jamais.
+
+La même frontière s'applique à la distribution normale des transitions de
+certificat : lorsqu'un tunnel existe, la route interne de mise à jour de
+confiance définie par
+[ROTATION-CERTIFICATS-V5](../ROTATION-CERTIFICATS-V5.md) remplace l'extension
+QUIC initialement envisagée. Le document signé hors ligne reste le secours si
+le tunnel ou l'identité applicative ne permet plus cet échange.

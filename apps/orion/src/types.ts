@@ -38,7 +38,7 @@ export interface KeyNegotiationSettings {
   server_name: string
   /** Gateway CA certificate, DER encoded in base64. */
   gateway_ca_der: string
-  /** Pinned ML-DSA-65 gateway certificate: base64-encoded JSON. */
+  /** Pinned ML-DSA-87 gateway certificate: base64-encoded JSON. */
   gateway_pq_certificate: string
   /** Opaque lookup name in the protected identity store. */
   identity: string

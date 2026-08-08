@@ -24,10 +24,11 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
 - [adr/ADR-005-NEGOCIATION-DE-CLE.md](adr/ADR-005-NEGOCIATION-DE-CLE.md) —
   décision et modèle de menace de la négociation de clé pré-WireGuard : port
   public, PKI applicative post-quantique, PSK ML-KEM du **premier** handshake,
-  plancher anti-downgrade et identité cliente scellée. Amendé le 2026-08-06
-  pour la v5 : fermeture de QUIC après le commit, challenge anti-rejeu,
-  ML-DSA-87, preuve WireGuard bilatérale, états générationnels et enrôlement
-  autorisé sans clé privée transportée.
+  plancher anti-downgrade et identité cliente scellée. Amendé les 6 et 8 août
+  2026 pour la v5 : fermeture de QUIC après le commit, challenge anti-rejeu,
+  ML-DSA-87, preuve WireGuard bilatérale, états générationnels, enrôlement
+  autorisé sans clé privée transportée et opérations post-commit dans le
+  tunnel.
 - [adr/ADR-006-SECRETS-AU-REPOS.md](adr/ADR-006-SECRETS-AU-REPOS.md) —
   chiffrement AES-256-GCM des secrets sur disque, hiérarchie de clés Orion liée
   au TPM, hygiène mémoire et modèle de menace du stockage local. Le chiffrement
@@ -39,13 +40,14 @@ Les deux notes coexistent volontairement : l'une décrit ce qui tourne, l'autre
 ce qui tournait. La bascule est coupante — ALPN, domaines de signature et
 format de certificat distincts — donc rien ne négocie entre les deux.
 
-- [NEGOCIATION-DE-CLE-V4.md](NEGOCIATION-DE-CLE-V4.md) — protocole
-  **actuellement servi** par `heliosd` et Orion.
-- [NEGOCIATION-DE-CLE-V5.md](NEGOCIATION-DE-CLE-V5.md) — protocole **cible**,
-  non implémenté : traitement des constats successifs des revues de sécurité de
-  la v4 puis de la spécification elle-même. Son §0 les indexe un par un. Le mode
-  Orion `classic` y reste disponible pour les hôtes WireGuard génériques, mais
-  demeure strictement hors du protocole de négociation Helios v5.
+- [NEGOCIATION-DE-CLE-V4.md](NEGOCIATION-DE-CLE-V4.md) — protocole historique,
+  conservé comme trace de ce qui tournait avant la bascule.
+- [NEGOCIATION-DE-CLE-V5.md](NEGOCIATION-DE-CLE-V5.md) — protocole
+  **actuellement servi, mais partiellement implémenté** : son état de tête nomme
+  les lots encore ouverts. Son §0 indexe les constats successifs des revues de
+  sécurité. Le mode Orion `classic` reste disponible pour les hôtes WireGuard
+  génériques, mais demeure strictement hors du protocole de négociation Helios
+  v5.
 - [ROTATION-CERTIFICATS-V5.md](ROTATION-CERTIFICATS-V5.md) — cycle de vie cible
   des certificats TLS/PQ : chevauchement borné, générations anti-rollback,
   rotation de `CA-PQ`, révocation urgente et frontière entre socle v5 et

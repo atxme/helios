@@ -124,7 +124,6 @@ function UpdatePanel() {
       title="Mise à jour"
       icon={Upload}
       accent="secondary.main"
-      subtitle="Seul un binaire dont le manifeste porte les signatures Ed25519 et ML-DSA-65 du trousseau compilé est accepté."
     >
       <Stack spacing={2.5}>
         {status && (
@@ -268,7 +267,6 @@ export function SystemView({ status, events, onSplitTunnelChange }: Props) {
           title="Split-tunneling"
           icon={Route}
           accent="state.connecting.main"
-          subtitle="Un CIDR par ligne. Une liste vide désactive les routes de contournement."
         >
           <Stack spacing={2}>
             <TextField
@@ -310,12 +308,6 @@ export function SystemView({ status, events, onSplitTunnelChange }: Props) {
         <EventLog events={events} maxHeight={420} />
       </SectionCard>
 
-      <KnownLimit title="Ce qui ne se change pas ici">
-        Les secrets WireGuard et la liste d’admission vivent dans{' '}
-        <code>/var/lib/helios/network.toml</code> et ne sont jamais sérialisés par l’API. Le fichier
-        est relu à chaud, mais le nom de l’interface, le port d’écoute et l’adresse d’administration
-        exigent un <code>systemctl restart heliosd</code>.
-      </KnownLimit>
     </Stack>
   )
 }

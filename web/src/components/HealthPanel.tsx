@@ -217,11 +217,6 @@ export function HealthPanel() {
         </SectionCard>
       )}
 
-      <KnownLimit title="L’occupation disque n’est pas relevée">
-        Elle exige <code>statvfs</code>, que la bibliothèque standard de Rust n’expose pas. Tirer{' '}
-        <code>libc</code> et un appel <code>unsafe</code> dans le crate d’API pour un seul chiffre
-        méritait son propre arbitrage.
-      </KnownLimit>
     </Stack>
   )
 }

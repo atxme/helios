@@ -63,7 +63,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > WireGuard de la requête étant vérifiée contre le pair résolu au lieu de
 > servir elle-même de clé de recherche.
 >
-> **Ce qui n'est pas implémenté**, au 2026-08-07 :
+> **Ce qui n'est pas implémenté**, au 2026-08-08 :
 >
 > - le **discriminant de type de profil Orion**
 >   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
@@ -92,6 +92,13 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios-ctl enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
+> - la **libération dans le tunnel WireGuard** ([§7.5](#75-libération-signée-dans-le-tunnel)).
+>   Le code ouvre encore une seconde connexion QUIC publique à la déconnexion,
+>   avec mTLS, challenge et accusé ML-DSA-87. Cette voie est remplacée dans la
+>   cible par un `POST` signé sur l'API interne, authentifié d'abord par le pair
+>   WireGuard qui le transporte. Ce qui débloquerait : relier l'API au même
+>   sérialiseur de slot, migrer Orion, puis retirer `Release` et `Released` de
+>   l'enveloppe QUIC ;
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
@@ -108,8 +115,8 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >
 > **Ce qui est en place et couvert par la régression** : challenge à usage
 > unique, liaison à la gateway visée, ML-DSA-87, engagement HMAC du PSK
-> statique, trois codes d'erreur, point de non-retour, `release` signé et son
-> accusé **vérifié**, preuve de handshake WireGuard au commit, machine d'état
+> statique, trois codes d'erreur, point de non-retour, preuve de handshake
+> WireGuard au commit, machine d'état
 > générationnelle par pair avec état `preparing`, réservation de la génération
 > sous le verrou de la réservation du pair et compare-and-swap avant chaque
 > écriture backend, installation et enregistrement du candidat atomiques
@@ -127,7 +134,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 
 **Version** : 5
 
-**Date de la note** : 2026-08-07
+**Date de la note** : 2026-08-08
 
 Cette note décrit le protocole **cible**, révisé après la revue de sécurité de
 la v4. Elle complète [ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md), dont
@@ -136,9 +143,9 @@ antérieurs. Le cycle de vie des certificats, ses formats de transition et la
 frontière entre le socle v5 et l'automatisation v5.x sont normés dans la note
 [rotation des certificats v5](ROTATION-CERTIFICATS-V5.md).
 
-Tant que le code n'a pas basculé, cette note n'est pas une description du
-système : c'est un contrat à implémenter. La v4 reste la référence de ce qui
-tourne.
+Le code sert déjà une partie de cette cible en v5. Cette note reste un contrat
+à finir d'implémenter : le bloc d'état en tête distingue les mécanismes en
+place de ceux qui manquent. La v4 n'est conservée que comme historique.
 
 Les noms de structures et de fonctions cités sont ceux qu'attend le code Rust
 après bascule.
@@ -152,7 +159,7 @@ normative.
 | # | Défaut v4 | Traitement v5 | § |
 | --- | --- | --- | --- |
 | 1 | La session QUIC survit au commit et sert de lien de vivacité | QUIC est **fermé** après le commit ; la vivacité revient à WireGuard | [§12](#12-fin-de-session-et-vivacité) |
-| 2 | Cycle de vie du PSK défini par un timeout QUIC | Cycle de vie explicite : `release` signé, remplacement atomique, révocation, vieillissement du handshake, durée maximale | [§12.2](#122-cycle-de-vie-du-psk) |
+| 2 | Cycle de vie du PSK défini par un timeout QUIC | Cycle de vie explicite : `release` signé dans WireGuard, remplacement atomique, révocation, vieillissement du handshake, durée maximale | [§12.2](#122-cycle-de-vie-du-psk) |
 | 3 | Anti-rejeu fondé sur un cache volatil de 4096 identifiants | Phase `challenge` gateway, challenge de 32 octets à usage unique, consommé atomiquement | [§6.1](#61-challenge-gateway) |
 | 4 | Horodatage présenté comme défense anti-rejeu principale | Horodatage rétrogradé en contrôle secondaire ; le cache devient de la défense en profondeur | [§6.1](#61-challenge-gateway), [§17.2](#172-rôle-résiduel-de-lhorodatage) |
 | 5 | Aucune contrainte de taille ni de forme sur le PSK statique | 32 octets exactement, exigés après décodage, refus sinon | [§9.1](#91-mode-psk-statique) |
@@ -189,7 +196,7 @@ rendu le renouvellement de PSK inopérant à tous les coups.
 | C | L'échéance de 24 h n'est pas persistée, un redémarrage prolongerait les slots | **prémisse fausse, gap réel** | Un redémarrage **vide** les slots ; le vrai défaut était la mort silencieuse des tunnels, sans canal pour la dire | [§12.5](#125-redémarrage-de-la-gateway) |
 | D | Le ré-enrôlement complet manque aux limites | **fondé** | Section de limites connues consolidée | [§21](#21-limites-connues) |
 | E | La gateway ne contrôle pas la réutilisation du `client_nonce` | **non fondé** | La fraîcheur vient de deux valeurs produites par la gateway ; l'argument est désormais écrit plutôt que sous-entendu | [§7.1](#71-requête-client) |
-| F | L'accusé `released` n'est pas signé | **fondé** | Signé, par uniformité : toute affirmation de la gateway sur l'état d'un slot est signée | [§7.5](#75-libération-signée) |
+| F | L'accusé `released` n'est pas signé | **fondé dans le transport alors retenu, puis rendu sans objet** | La revue du 8 août supprime l'accusé applicatif et la seconde connexion QUIC ; le retrait devient une commande best-effort dans WireGuard | [§7.5](#75-libération-signée-dans-le-tunnel) |
 
 Le constat C mérite d'être lu en entier : la remarque était fausse sur le
 mécanisme mais désignait le bon endroit. En supprimant le lien QUIC, la v5 avait
@@ -198,6 +205,23 @@ avait perdu son PSK. Le protocole reconstruit donc cette vivacité **sur le plan
 de données** — âge du dernier handshake WireGuard, lu des deux côtés — ce qui la
 rend cohérente avec la décision de fond de la v5 : la vivacité se lit là où
 passe le trafic.
+
+### Revue du canal de libération
+
+Une revue du 8 août 2026 a distingué deux opérations jusque-là confondues.
+La négociation initiale doit traverser Internet **avant** WireGuard et justifie
+donc le port QUIC public. La déconnexion explicite arrive, elle, après un
+handshake WireGuard réussi : rouvrir ce même port public pour annoncer l'arrêt
+réauthentifiait par mTLS, challenge et ML-DSA une machine qui disposait déjà
+d'un canal chiffré et authentifié vers la gateway.
+
+Le `release` reste utile pour zéroïser immédiatement un secret lors d'un arrêt
+propre, mais il quitte l'ALPN public. Orion l'envoie sur l'API interne à travers
+le tunnel encore monté. La gateway résout d'abord la VIP source vers son unique
+pair admis, compare la clé du message à ce pair, puis vérifie la signature PQ
+et l'identifiant propriétaire. Il n'existe plus de message QUIC `Release`, de
+réponse `Released`, ni de challenge de libération. Une déconnexion brutale ou
+un tunnel déjà mort retombe sans reprise sur la récupération à 300 secondes.
 
 ### Revue amont avant implémentation
 
@@ -278,9 +302,9 @@ Le protocole suit cette règle d'ordre :
 La différence de forme la plus visible avec la v4 est la dernière ligne. La
 connexion QUIC n'est plus un lien de vivacité : elle porte une transaction, puis
 disparaît. Ce qui maintient le tunnel est WireGuard et son keep-alive ; ce qui
-retire un PSK `ml_kem` est un message `release` signé, un remplacement, une
-révocation, une échéance, ou le constat que le pair ne handshake plus. Le PSK
-statique reste gouverné par la configuration.
+retire un PSK `ml_kem` est un message `release` signé transporté **dans le
+tunnel**, un remplacement, une révocation, une échéance, ou le constat que le
+pair ne handshake plus. Le PSK statique reste gouverné par la configuration.
 
 Le déplacement de fond est là : la vivacité se lit **sur le plan de données**,
 là où passe le trafic, et non sur un canal de contrôle parallèle dont la chute
@@ -475,11 +499,14 @@ Le passage à ML-DSA-87 augmente la taille des trames. Le pire cas reste borné 
 | `challenge` | < 1 Kio |
 | requête `ml_kem` | ≈ 23 Kio |
 | réponse `ml_kem` | ≈ 23 Kio |
-| confirmation, commit, `release` | ≈ 7 Kio |
+| confirmation, commit | ≈ 7 Kio |
 
 La borne de 64 Kio est conservée ; elle laisse un facteur deux et demi sur le
 message le plus lourd. Elle doit être vérifiée par un test, pas déduite de ce
 tableau.
+
+Le `release` ne passe pas dans cette trame QUIC. Son corps JSON signé traverse
+l'API HTTP interne et est borné séparément à 32 Kio avant désérialisation.
 
 ### 4.2 Cryptographie
 
@@ -615,6 +642,14 @@ L'ALPN est versionné avec le format filaire. Une modification incompatible des
 octets signés, des messages ou de la dérivation incrémente la version
 applicative, les domaines cryptographiques et l'ALPN.
 
+Le retrait du `release` public ne déclenche exceptionnellement pas une v6 : il
+n'entre ni dans la négociation, ni dans la dérivation, ni dans le verdict du
+commit, et son échec a toujours eu pour sémantique normative de poursuivre la
+déconnexion puis de récupérer le slot à 300 secondes. Deux versions mixtes
+continuent donc d'établir exactement le même tunnel ; elles perdent seulement
+l'effacement anticipé best-effort. Une gateway mise à jour refuse le message
+QUIC historique avec `protocol` et ne lui donne aucun autre sens.
+
 ## 5. Format de transport
 
 ### 5.1 Trame
@@ -649,12 +684,12 @@ Le serveur envoie une enveloppe taguée :
 ```
 
 ```json
-{"type":"released","release":{}}
-```
-
-```json
 {"type":"error","error":{"code":"rejected"}}
 ```
+
+L'enveloppe publique ne contient ni `release`, ni accusé de retrait. Une fois
+le commit émis, toute libération explicite passe par le tunnel WireGuard selon
+le §7.5. Le type QUIC historique `release` est une erreur `protocol`.
 
 ### 5.3 Erreurs publiques
 
@@ -733,7 +768,8 @@ Règles normatives :
    opération, sous le même verrou. Deux requêtes concurrentes portant le même
    challenge ne peuvent pas être acceptées toutes les deux.
 6. Il entre dans le message signé de la requête, dans celui de la réponse, de
-   la confirmation, du commit et du `release`, et dans le sel HKDF.
+   la confirmation et du commit, ainsi que dans le sel HKDF. Le `release`
+   circule plus tard dans WireGuard et ne consomme aucun challenge QUIC.
 7. La première requête applicative portant ce challenge termine sa phase : un
    succès le consomme, un refus ferme la connexion et détruit le challenge.
 
@@ -877,84 +913,87 @@ AuthenticatedKeyNegotiationCommit {
 Le client vérifie la signature du commit avant de déclarer la négociation
 terminée, puis **ferme la connexion QUIC**.
 
-### 7.5 Libération signée
+### 7.5 Libération signée dans le tunnel
 
-Nouveau message v5. Il porte la déconnexion explicite, que la fermeture de QUIC
-ne signale plus. Il n'existe que pour un slot `ml_kem`. Un PSK statique relève
-de la configuration persistante : une déconnexion cesse de l'utiliser côté
-client mais ne demande pas à la gateway d'effacer sa configuration.
+Le `release` porte la déconnexion explicite, que la fermeture de QUIC ne
+signale plus. Il n'existe que pour un slot `ml_kem` **déjà committé**. Un PSK
+statique relève de la configuration persistante : une déconnexion cesse de
+l'utiliser côté client mais ne demande pas à la gateway d'effacer sa
+configuration.
+
+Le `release` n'est pas un message de l'ALPN public. Orion l'envoie avant
+`VpnBackend::down()` par :
+
+```text
+POST http://<adresse-WireGuard-gateway>:8080/api/key-negotiation/release
+Content-Type: application/json
+```
+
+L'adresse vient de `heliosd_url`, doit être une adresse de la gateway routée
+par le tunnel déjà monté et ne déclenche aucune résolution DNS. Si elle est
+absente, hors des `AllowedIPs`, ou si le tunnel ne transporte déjà plus de
+trafic, Orion n'essaie jamais le port QUIC public en repli : il démonte
+l'adaptateur et laisse la récupération de §12.4 agir.
+
+Le corps, borné à 32 Kio avant désérialisation, est :
 
 ```text
 AuthenticatedPskRelease {
     release: {
         protocol_version,
-        server_challenge,
-        target_transaction_id,
+        installed_transaction_id,
         client_wg_public_key,
-        gateway_wg_public_key,
-        timestamp_unix
+        gateway_wg_public_key
     },
     certificate,
     ml_dsa_87_signature
 }
 ```
 
-Il circule sur une **nouvelle** connexion QUIC, ouverte au moment de la
-déconnexion, avec sa propre phase de challenge. Il suit exactement le même
-chemin d'authentification qu'une requête : mTLS, empreintes, certificat PQ,
-signature, challenge consommé, horodatage.
+Le tunnel fournit déjà chiffrement, anti-rejeu réseau et authentification de la
+clé WireGuard. L'API applique `require_peer` avant la vérification ML-DSA : elle
+résout l'adresse source réelle vers l'unique VIP `/32` admise, sans consulter
+aucun header proxy, puis obtient **sa** clé WireGuard. La clé
+`client_wg_public_key` du corps est comparée à ce pair ; elle ne sert jamais de
+clé de recherche. La clé gateway est comparée à l'identité locale. Enfin, le
+certificat PQ, son empreinte admise et la signature sont vérifiés. Le retrait
+engage donc les clés WireGuard **et** ML-DSA du client au lieu de seulement
+prouver l'identité de négociation sur un second canal public.
 
-`target_transaction_id` est l'identifiant de la négociation dont Orion veut
-rendre le slot absent. Après commit, c'est l'identifiant propriétaire courant.
-Pendant `preparing`, c'est l'identifiant candidat que le client a lui-même créé
-avant d'envoyer sa requête, qu'il ait ou non reçu la réponse. La gateway ne
-retire le slot que si cet identifiant est le propriétaire courant ou le candidat
-courant. Un `release` retardé visant l'état précédent est un no-op et ne peut
-donc pas démonter une négociation **postérieure**.
+Il n'y a ni `server_challenge`, ni horodatage. WireGuard rejette les paquets
+réseau rejoués ; au niveau applicatif, `installed_transaction_id` rend une
+ancienne commande inoffensive. La gateway ne retire le slot que si cet
+identifiant est le propriétaire `committed` courant. Un identifiant ancien, un
+slot vide ou `configured_static`, et une commande arrivée pendant `preparing`
+sont le même no-op idempotent. L'abandon d'une transaction `preparing` relève
+de sa garde de rollback et de la fermeture de sa connexion QUIC, pas d'un
+second message.
 
-Le traitement prend le sérialiseur générationnel du pair défini au §11.1. Si
-le pair est `preparing` et que l'identifiant vise le candidat, la déconnexion
-explicite domine : la transaction est annulée, candidat et précédent sont
-détruits et le slot est vidé en une transition. S'il vise seulement l'état
-précédent, il est obsolète et ne fait rien. Tout callback ultérieur de la
-transaction annulée porte une génération obsolète et devient un no-op. Un
-`release` concurrent ne peut donc ni vider un candidat non visé, ni provoquer
-la restauration ultérieure du secret qu'il vient de retirer.
+Le traitement prend le sérialiseur générationnel du pair défini au §11.1 et
+respecte l'ordre « plan de données d'abord, état ensuite ». La réponse HTTP est
+un `204 No Content` uniforme, émis seulement après le traitement, mais Orion ne
+fonde aucune décision dessus : changer le PSK peut rendre la réponse
+intransportable sur la session WireGuard qui vient de porter la requête. Il
+attend au plus deux secondes, journalise « demandé » si la réponse se perd, puis
+zéroïse sa copie et démonte l'adaptateur dans tous les cas. La gateway
+journalise seule le retrait effectivement appliqué.
 
-La réponse est **signée** et idempotente :
+Les statuts HTTP sont bornés et ne révèlent jamais l'état du slot :
 
-```text
-AuthenticatedPskReleased {
-    released: {
-        protocol_version,
-        server_challenge,
-        target_transaction_id
-    },
-    ml_dsa_87_signature
-}
-```
+| Statut | Cas |
+| --- | --- |
+| `204` | commande authentifiée, qu'elle ait retiré le propriétaire courant ou produit un no-op |
+| `400` | JSON ou version de protocole invalide |
+| `401` | source non résolue vers un pair admis |
+| `403` | identité du corps, certificat ou signature refusés |
+| `413` | corps supérieur à 32 Kio |
+| `415` | mutation sans `Content-Type: application/json` |
+| `500` | écriture du plan de données ou transition interne échouée |
 
-Elle vaut aussi bien pour un slot effectivement retiré que pour un slot déjà
-vide ou détenu par une autre transaction. La gateway ne dit pas laquelle des
-trois situations s'est produite — le distinguer serait un oracle sur l'état d'un
-pair.
-
-La signature de cet accusé n'est pas une précaution symbolique, mais la
-conséquence d'une règle uniforme : **toute affirmation de la gateway sur l'état
-d'un slot est signée**. Sans elle, un adversaire actif capable de casser TLS
-pourrait avaler un `release` et répondre à sa place ; Orion effacerait son PSK
-en croyant la gateway d'accord, alors qu'elle a gardé le sien. L'écart est
-mineur — Orion se déconnecte de toute façon — mais la signature coûte une
-opération ML-DSA sur une connexion **déjà authentifiée**, donc sans
-amplification possible, et elle permet à Orion de journaliser une preuve plutôt
-qu'une supposition. C'est le même raisonnement qui justifie, à l'inverse, de ne
-**pas** signer le challenge de [§6.1](#61-challenge-gateway), émis avant toute
-authentification.
-
-Le `release` est **best-effort**. Un poste qui s'éteint brutalement, un réseau
-qui tombe ou un processus tué n'en envoient aucun ; le PSK reste alors posé
-jusqu'à sa récupération par vieillissement du handshake, son remplacement, sa
-révocation ou son échéance. Voir
+Le `release` reste donc **best-effort**. Un poste qui s'éteint brutalement, un
+réseau qui tombe ou un processus tué n'en envoient aucun ; le PSK reste alors
+posé jusqu'à sa récupération par vieillissement du handshake, son remplacement,
+sa révocation ou son échéance. Voir
 [§12.4](#124-récupération-dun-slot-sans-client).
 
 ## 8. Authentification des messages
@@ -967,8 +1006,8 @@ révocation ou son échéance. Voir
 | signature réponse | authentifier le ciphertext et le résultat gateway |
 | signature confirmation | autoriser le commit de la transaction `preparing` |
 | signature commit | authentifier l'accusé final |
-| signature release | autoriser le retrait du slot |
-| signature released | attester que la gateway a traité le retrait |
+| transport WireGuard du `release` | prouver que la commande vient du pair dont la VIP est admise |
+| signature du `release` | lier le retrait à l'identité PQ cliente, au propriétaire du slot et à la gateway visée |
 
 Les signatures ML-DSA utilisent une sérialisation binaire dédiée. Le JSON ne
 sert jamais de message signé.
@@ -1058,7 +1097,7 @@ PQ_RESPONSE_DOMAIN
 
 Le domaine vaut `helios-key-negotiation-pq-response-v5`.
 
-### 8.4 Confirmation, commit et release
+### 8.4 Confirmation, commit et libération dans le tunnel
 
 La confirmation est signée sur :
 
@@ -1074,32 +1113,21 @@ Le domaine vaut `helios-key-negotiation-pq-confirmation-v5`.
 Le commit est signé sur la même forme, avec le domaine
 `helios-key-negotiation-pq-commit-v5`.
 
-Le `release` est signé sur :
+Le `release` dans le tunnel est signé sur :
 
 ```text
-PQ_RELEASE_DOMAIN
+PQ_IN_TUNNEL_RELEASE_DOMAIN
 || protocol_version:u16
-|| server_challenge:32
-|| target_transaction_id:16
+|| installed_transaction_id:16
 || client_wg_public_key:32
 || gateway_wg_public_key:32
-|| timestamp_unix:u64
 || certificate_fingerprint:32
 ```
 
-Le domaine vaut `helios-key-negotiation-pq-release-v5`.
-
-L'accusé de la gateway est signé sur :
-
-```text
-PQ_RELEASED_DOMAIN
-|| protocol_version:u16
-|| server_challenge:32
-|| target_transaction_id:16
-|| certificate_fingerprint:32
-```
-
-Le domaine vaut `helios-key-negotiation-pq-released-v5`.
+Le domaine vaut `helios-key-negotiation-pq-in-tunnel-release-v5`. Il diffère du
+domaine du message QUIC retiré afin qu'aucune signature produite par l'ancien
+chemin ne soit valide sur l'API interne. La réponse HTTP ne constitue pas un
+objet cryptographique et ne porte aucune signature.
 
 ## 9. Algorithmes de clé
 
@@ -1291,7 +1319,7 @@ la donnée de rollback. Une seule transaction peut être `preparing` par pair.
 
 Toutes les opérations qui peuvent modifier le pair passent par **le même
 sérialiseur par clé WireGuard** : nouvelle négociation, confirmation, timeout,
-fermeture QUIC, `release`, échéance, récupération par vieillissement,
+fermeture QUIC, `release` reçu dans le tunnel, échéance, récupération par vieillissement,
 hot-reload et révocation. Une implémentation peut employer un acteur ou un
 verrou, mais toute écriture backend est validée par un compare-and-swap sur la
 génération réservée. Une opération devenue obsolète ne touche plus le backend.
@@ -1301,12 +1329,11 @@ Les priorités sont normatives :
 1. `peer remove` incrémente la génération, passe en `revoked`, détruit candidat
    et précédent, puis retire le pair. Aucun rollback antérieur ne peut le
    recréer.
-2. Un `release` visant le candidat `ml_kem` pendant `preparing` annule la
-   transaction et restaure l'état précédent dans la même transition. Il ne
-   vide pas aveuglément le slot : le candidat peut avoir déplacé un PSK
-   statique, qui n'appartient pas au cycle transactionnel et qu'aucun `release`
-   ne doit retirer. Un identifiant visant l'état précédent, tout autre
-   identifiant et tout `release` en `configured_static` sont un no-op signé.
+2. Un `release` reçu dans WireGuard retire seulement un état `committed` dont
+   il nomme exactement le propriétaire. Pendant `preparing`, la commande est
+   un no-op : seule la garde de rollback de la transaction peut restaurer
+   l'état précédent. Un identifiant périmé, tout autre identifiant et tout
+   `release` en `configured_static` sont également des no-op idempotents.
 3. Échéance et récupération constatées pendant `preparing` sont mémorisées.
    Après commit, elles sont annulées par la preuve et le nouvel instant de pose ;
    après rollback, elles s'appliquent immédiatement à l'état restauré.
@@ -1560,25 +1587,28 @@ les cas suivants, et seulement ceux-là :
 
 | Cause | Effet gateway | Effet Orion |
 | --- | --- | --- |
-| `release` signé et vérifié ([§7.5](#75-libération-signée)) | slot vidé | PSK zéroïsé |
+| `release` signé reçu dans WireGuard ([§7.5](#75-libération-signée-dans-le-tunnel)) | slot vidé | PSK zéroïsé |
 | remplacement atomique par une nouvelle négociation commitée | slot écrasé | PSK remplacé |
 | révocation d'admission (`helios-ctl peer remove`) | pair retiré | — |
 | vieillissement du handshake ([§12.4](#124-récupération-dun-slot-sans-client)) | slot vidé après 300 s | — |
 | échéance de durée de vie ([§12.3](#123-politique-de-renouvellement)) | slot vidé | PSK zéroïsé |
 | redémarrage de `heliosd` ([§12.5](#125-redémarrage-de-la-gateway)) | tous les slots vidés | PSK conservé jusqu'à renégociation |
 
-Une déconnexion VPN explicite en mode `ml_kem` déclenche un `release` **avant**
-le démontage de l'adaptateur, puis la zéroïsation locale. La désinstallation
-d'un profil fait de même si une identité utilisable est encore disponible. En
+Une déconnexion VPN explicite en mode `ml_kem` déclenche un `release` sur l'API
+interne **avant** le démontage de l'adaptateur, puis la zéroïsation locale. La
+tentative est bornée à deux secondes et son échec ne retarde jamais davantage
+la déconnexion. La désinstallation d'un profil fait de même si le tunnel, le
+reçu de commit et une identité utilisable sont encore disponibles. En
 `static_psk`, Orion démonte seulement son adaptateur et libère sa copie mémoire ;
 la source configurée reste protégée dans son stockage.
 
-Si une déconnexion `ml_kem` arrive pendant `preparing`, Orion ferme d'abord la
-connexion de transaction puis ouvre la connexion de `release` avec l'identifiant
-du candidat, qu'il connaît depuis la création de sa requête. La règle
-générationnelle de §11.1 garantit que l'ordre d'arrivée ne change pas le
-résultat final : slot vide, candidat et précédent détruits. En `static_psk`, la
-fermeture rollbacke vers `configured_static` et aucun `release` n'est envoyé.
+Si une déconnexion `ml_kem` arrive pendant `preparing`, Orion annule la tâche
+et ferme la connexion de transaction. La garde gateway rollbacke le candidat ;
+aucun `release` n'est envoyé sans commit vérifié et sans tunnel établi. Si le
+commit gagne la course mais que son reçu n'atteint pas l'état d'Orion, le slot
+reste committé jusqu'à son remplacement ou à la récupération de §12.4. En
+`static_psk`, la fermeture rollbacke vers `configured_static` et aucun
+`release` n'est envoyé.
 
 Une seule forme de silence est interprétée : celle du **plan de données**. Le
 vieillissement du handshake WireGuard dit qu'un pair ne communique plus, parce
@@ -2324,7 +2354,8 @@ Trois règles complètent le tableau :
 | **vieillissement d'un PSK** | **durée de vie de 24 h et renouvellement complet** |
 | **slot conservé pour un pair disparu** | **récupération à 300 s d'âge de handshake** |
 | **tunnel mort après redémarrage gateway** | **renégociation Orion à 150 s d'âge de handshake** |
-| **accusé de retrait forgé** | **`released` signé ML-DSA-87** |
+| **retrait demandé par un autre pair** | **VIP source résolue vers la clé WireGuard admise, puis certificat et signature ML-DSA-87 du même pair** |
+| **ancien retrait rejoué contre un nouveau tunnel** | **`installed_transaction_id` propriétaire et génération courante obligatoires** |
 | fuite après échec Orion | adaptateur conservé, paquets rejetés |
 | downgrade réseau | planchers persistants des deux côtés |
 | vol du fichier d'identité Windows | DPAPI lié au compte |
@@ -2337,8 +2368,9 @@ Les lignes en gras sont celles que la v4 n'avait pas, ou n'avait qu'en partie.
 
 ### 17.2 Rôle résiduel de l'horodatage
 
-`timestamp_unix` reste signé, reste vérifié dans une fenêtre de ±30 secondes, et
-reste lié à la dérivation. Mais il n'est **plus** présenté comme le mécanisme
+Le `timestamp_unix` de la requête de négociation reste signé, vérifié dans une
+fenêtre de ±30 secondes et lié à la dérivation. Le `release` interne de §7.5
+n'en porte pas. L'horodatage n'est **plus** présenté comme le mécanisme
 anti-rejeu principal.
 
 Son rôle en v5 est double :
@@ -2498,8 +2530,8 @@ déclarer la v5 implémentée.
 - rejet d'un challenge absent, expiré, inconnu, ou déjà consommé ;
 - **duplication de challenge** : deux requêtes concurrentes portant le même
   challenge, une seule acceptée ;
-- second `challenge_request`, seconde requête de négociation ou de `release`,
-  message hors ordre ou second flux : fermeture sans renouveler challenge ni
+- second `challenge_request`, seconde requête de négociation, message hors
+  ordre ou second flux : fermeture sans renouveler challenge ni
   échéance ;
 - rétention des permis : 128 connexions lentes sont toutes libérées à leur
   échéance absolue ; un flux de paquets ne la repousse pas ; 0-RTT et reprise
@@ -2538,7 +2570,7 @@ déclarer la v5 implémentée.
   l'observation gateway échoue, et réciproquement le client n'envoie pas de
   confirmation sans sa propre progression ;
 - **matrice de courses générationnelles** : `preparing` en concurrence avec
-  `release` de l'ancien et du candidat, timeout, échéance, récupération,
+  un `release` dans le tunnel, timeout, échéance, récupération,
   hot-reload et `peer remove`. Le résultat respecte les priorités de §11.1 ; un
   callback obsolète ne touche jamais le backend et une révocation n'est jamais
   annulée par rollback ;
@@ -2569,11 +2601,13 @@ déclarer la v5 implémentée.
   intervalle non nul, un `0` explicite est refusé, et le chargement comme la
   relecture à chaud d'un `network.toml` portant un pair négocié sans keep-alive
   échouent en nommant le pair ;
-- `release` en `ml_kem` : retrait effectif, idempotence, no-op pour un
-  `target_transaction_id` périmé, refus sans challenge, et **vérification de la
-  signature de l'accusé `released`** par le client, plus les courses pendant
-  `preparing`, l'installation tardive d'un candidat déjà annulé et les deux
-  ordres de sérialisation entre `release` et commit ;
+- `release` en `ml_kem` sur l'API interne : corps refusé au-delà de 32 Kio,
+  source inconnue refusée avant ML-DSA, VIP liée à un autre pair refusée, clé
+  gateway différente refusée, signature invalide refusée, retrait effectif du
+  propriétaire `committed`, idempotence et no-op pour un identifiant périmé,
+  un slot statique ou un état `preparing` ;
+- déconnexion Orion : aucun socket QUIC nouveau, tentative HTTP bornée à deux
+  secondes avant `down()`, puis démontage et zéroïsation même sans réponse ;
 - durée de vie du PSK : renouvellement déclenché à 90 %, retrait ferme à 24 h,
   sans extension après recul d'horloge ou suspension simulée ;
 - enrôlement : invitation expirée, rejouée, révoquée, ciblant une autre gateway
@@ -2623,6 +2657,10 @@ une compilation WSL2.
 - **récupération d'un slot après arrêt brutal d'un client** : poste éteint sans
   `release`, slot retiré à 300 s, vérifié sur le plan de données réel et non sur
   l'état interne de la gateway ;
+- **libération dans un tunnel réel** : la requête atteint l'API avant
+  `down()`, le slot est retiré même si la réponse HTTP ne revient pas après la
+  modification du PSK, et aucune route physique ni socket QUIC public n'est
+  utilisé en repli ;
 - **scellement TPM réel** de l'identité ML-DSA-87 gateway, dont la taille de clé
   privée passe de 4032 à 4896 octets ;
 - **DPAPI réel** : génération des trois clés privées clientes dans le stockage
@@ -2662,9 +2700,12 @@ puisque les handshakes que la gateway observe viennent de ses propres
 keep-alives — mais il perdrait la traversée de NAT, ce qui est son problème et
 se voit immédiatement.
 
-**Le `release` est best-effort.** Il suppose un arrêt propre d'Orion et une
-connexion qui aboutit. Aucune reprise n'est tentée : le PSK retombe sur la
-récupération par vieillissement.
+**Le `release` est best-effort.** Il suppose un arrêt propre d'Orion et un
+tunnel encore capable de joindre l'API interne. Aucune reprise n'est tentée,
+et surtout aucun second QUIC public n'est ouvert en repli : le PSK retombe sur
+la récupération par vieillissement. La réponse HTTP peut disparaître quand la
+gateway vide le slot qui transportait cette réponse ; Orion ne la traite donc
+jamais comme une condition de déconnexion.
 
 **Les deux bouts peuvent diverger sur le verdict d'une transaction.** La perte
 du commit est tolérée et non empêchée
@@ -2730,8 +2771,8 @@ aucune de ses lignes ne se coche par une compilation.
 
 ## 22. Correspondance avec le code
 
-Modules concernés par la bascule. Cette table décrit la cible, pas l'état
-courant.
+Modules concernés par l'achèvement. Cette table décrit la cible, pas l'état
+courant détaillé en tête de note.
 
 | Composant | Responsabilité v5 |
 | --- | --- |
@@ -2739,22 +2780,16 @@ courant.
 | [`aether::pq`](../crates/aether/src/pq.rs) | abstraction ML-KEM-1024, zéroïsation de la clé éphémère |
 | [`aether::sig`](../crates/aether/src/sig.rs) | **inchangé** — ADR-002, artefacts éditeur, Ed25519 + ML-DSA-65 |
 | [`helios-key-negotiation`](../crates/helios-key-negotiation/src/lib.rs) | QUIC sans reprise/0-RTT, trames, flux et délais bornés, phase unique de challenge, fermeture après commit |
-| [`heliosd::key_negotiation`](../crates/heliosd/src/key_negotiation.rs) | machine d'état générationnelle, pose, preuve WireGuard gateway, rollback, point de non-retour, `release`, échéance de PSK, staging et promotion de l'identité v5 |
-| [`orion-core::key_negotiation`](../crates/orion-core/src/key_negotiation.rs) | challenge, requête, décapsulation, dérivation, confirmation, `release` |
+| [`heliosd::key_negotiation`](../crates/heliosd/src/key_negotiation.rs) | machine d'état générationnelle, pose, preuve WireGuard gateway, rollback, point de non-retour, traitement sérialisé du `release`, échéance de PSK, staging et promotion de l'identité v5 |
+| [`helios-api`](../crates/helios-api/src/lib.rs) | `POST /api/key-negotiation/release`, résolution de la VIP source par `require_peer`, borne JSON et transfert au sérialiseur du slot |
+| [`orion-core::key_negotiation`](../crates/orion-core/src/key_negotiation.rs) | challenge, requête, décapsulation, dérivation et confirmation ; construction/signature du `release` sans transport QUIC |
 | cycle de vie des certificats | objets signés, deux slots bornés, générations et import manuel de [ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md) |
 | configuration Orion | union explicite `ClassicWireGuard` / `HeliosKeyNegotiation`, migration des profils génériques hérités et refus des changements de variante implicites |
-| [`orion-core::backend`](../crates/orion-core/src/backend/mod.rs) | chemin WireGuard direct pour `classic` sans ouvrir QUIC ; pose client, preuve WireGuard, renouvellement à chaud et cycle de vie pour Helios |
+| [`orion-core::backend`](../crates/orion-core/src/backend/mod.rs) | chemin WireGuard direct pour `classic` sans ouvrir QUIC ; pose client, preuve WireGuard, renouvellement à chaud et `release` HTTP borné avant `down()` pour Helios |
 | [`aether::config`](../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers, longueur des PSK statiques, **keep-alive de `WgPeer`** |
 | [`helios-wireguard`](../crates/helios-wireguard/src/lib.rs) | **keep-alive de `PeerConfig`**, séquence monotone d'observation du handshake, `HANDSHAKE_STALE_AFTER_SECS` et récupération à 300 s |
 | [`helios-provisioning::admission`](../crates/helios-provisioning/src/admission.rs) | unicité des empreintes TLS/PQ, refus d'un pair négocié sans keep-alive, plancher `ml_kem` par défaut |
 | [`helios-ctl::enroll`](../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
-Deux invariants du dépôt changent avec cette bascule et devront être réécrits
-dans `AGENTS.md` **au moment où le code bascule**, pas avant :
-
-- « La session QUIC de négociation survit à l'échange » devient l'inverse ;
-- les keep-alives QUIC obligatoires et le délai de 30 s disparaissent.
-
-
-Tant que le code sert la v4, ces invariants restent vrais et doivent rester
-écrits tels quels.
+`AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
+encore ouverts, dont le déplacement du `release` hors du port QUIC public.

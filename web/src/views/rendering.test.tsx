@@ -198,6 +198,17 @@ describe('Clients', () => {
     fireEvent.change(screen.getByLabelText('Clé publique WireGuard'), {
       target: { value: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=' },
     })
+
+    // Both identities, or the admission layer refuses the peer outright: the
+    // button stays disabled until each one is there.
+    expect(screen.getByRole('button', { name: 'Admettre' }).hasAttribute('disabled')).toBe(true)
+    fireEvent.change(screen.getByLabelText('Empreinte du certificat TLS du client'), {
+      target: { value: 'aa'.repeat(32) },
+    })
+    fireEvent.change(screen.getByLabelText('Empreinte du certificat PQ du client'), {
+      target: { value: 'bb'.repeat(32) },
+    })
+
     fireEvent.click(screen.getByRole('button', { name: 'Admettre' }))
 
     await waitFor(() => expect(refresh).toHaveBeenCalled())
@@ -207,6 +218,8 @@ describe('Clients', () => {
       name: 'poste-atelier',
       public_key: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=',
       admin: false,
+      key_negotiation_certificate_sha256: 'aa'.repeat(32),
+      key_negotiation_pq_certificate_sha256: 'bb'.repeat(32),
     })
   })
 
@@ -251,10 +264,9 @@ describe('Security', () => {
     expect(screen.getByText('Kill-switch engagé')).toBeTruthy()
   })
 
-  it('states the limits it is required to state', async () => {
+  it('warns that a development keyring is compiled into this binary', async () => {
     mount(<SecurityView status={STATUS} state="up" />)
 
-    expect(screen.getByText(/DNS d’un client ne passe pas par le tunnel/)).toBeTruthy()
     await waitFor(() =>
       expect(screen.getByText(/Trousseau de développement compilé/)).toBeTruthy(),
     )

@@ -30,7 +30,7 @@ document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
 expose enfin le séquestre.
 
 La négociation de clé pré-WireGuard existe de bout en bout, en **protocole v5**
-([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendement du 6 août 2026 ;
+([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendements des 6 et 8 août 2026 ;
 spécification [NEGOCIATION-DE-CLE-V5.md](docs/NEGOCIATION-DE-CLE-V5.md)) : port
 UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, deux
 modes négociables — `static_psk` et `ml_kem` — et plancher anti-downgrade qui
@@ -73,6 +73,12 @@ Restent ouverts :
   s’en aperçoit qu’à la déconnexion ;
 - l’**enrôlement sans clé privée avec signature opérateur** (§15), qui reste au
   modèle v4 décrit plus bas ;
+- la **libération dans le tunnel WireGuard** (§7.5, amendement ADR-005 du
+  8 août 2026) : à la déconnexion, le code ouvre encore une seconde connexion
+  QUIC publique avec challenge et accusé signé. La cible envoie le `release`
+  signé sur `POST /api/key-negotiation/release` via l’API interne, authentifie
+  d’abord la VIP source comme son pair WireGuard, puis retire seulement le
+  propriétaire `committed` correspondant ; aucun repli QUIC public ;
 - tout le **cycle de vie des certificats**
   ([ROTATION-CERTIFICATS-V5](docs/ROTATION-CERTIFICATS-V5.md)) : leaf PQ
   gateway encore auto-signée, ni slot actif/suivant, ni génération
@@ -228,8 +234,8 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
 - Ordre d’un retrait : **vider le plan de données d’abord**, n’oublier l’état
   qu’après succès, le verrou tenu à travers l’écriture. L’inverse laisse un PSK
   orphelin quand l’écriture échoue — plus rien ne le désigne, un `release`
-  rejoué répond « released » sans rien retirer, et la récupération ignore que
-  le slot existe.
+  rejoué devient un no-op sans rien retirer, et la récupération ignore que le
+  slot existe.
 - Un PSK **statique** n’entre pas dans le cycle transactionnel. Il n’a pas de
   propriétaire, n’expire pas, n’est pas retiré par `release` ni par la
   récupération : c’est la configuration de l’opérateur, présente avant la
@@ -266,7 +272,8 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   pour la PKI de négociation, `aether::sig::ML_DSA_65_*` pour les artefacts
   éditeur. Valider du matériel de négociation avec la constante de `sig`
   compile, se lit bien, et refuse toute vraie clé ML-DSA-87.
-- Trois codes d’erreur publics seulement : `protocol`, `rejected`, `internal`.
+- Sur le port QUIC public, trois codes d’erreur seulement : `protocol`,
+  `rejected`, `internal`.
   Tout refus avant installation du slot est `rejected`, quelle qu’en soit la
   cause. Les sept codes de la v4 laissaient énumérer les pairs admis et lire
   leur plancher depuis un port public. Le motif réel va au journal protégé.

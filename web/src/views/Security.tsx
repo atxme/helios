@@ -126,7 +126,6 @@ function TrustPanel() {
         title="Ancre de confiance"
         icon={Fingerprint}
         accent="tertiary.main"
-        subtitle="Compilée dans le binaire. Toutes les signatures doivent être valides, jamais « au moins une »."
       >
         <Stack spacing={2}>
           <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', rowGap: 1 }}>
@@ -198,18 +197,17 @@ export function SecurityView({ status, state }: { status: Status | null; state: 
           title="Négociation post-quantique"
           icon={Fingerprint}
           accent="tertiary.main"
-          subtitle="Prépare le slot PSK du premier handshake, avant WireGuard."
         >
           <Box>
             <DataRow
               icon={Wifi}
               label="Port"
               value={negotiation ? `UDP ${negotiation}` : 'inactif'}
-              hint="Absent, le service reste fermé sans erreur. Les clients retombent alors sur l’ancien chemin."
+              hint="Absent, le service reste fermé sans erreur : aucun PSK post-quantique n’est négocié, et un client qui épingle cette gateway échoue avant WireGuard."
             />
             <DataRow
               label="Authentification"
-              value="ML-DSA-65"
+              value="ML-DSA-87"
               hint="Requête, réponse, confirmation et commit sont signés. TLS 1.3 mutuel reste le transport, il n’est plus l’ancre."
             />
             <DataRow
@@ -230,7 +228,6 @@ export function SecurityView({ status, state }: { status: Status | null; state: 
         title="SSH d’administration"
         icon={Terminal}
         accent="warning.main"
-        subtitle="Exception permanente : ces règles survivent au kill-switch."
       >
         {sshCidrs.length === 0 ? (
           <Typography variant="body2" sx={{ color: 'text.secondary' }}>
@@ -257,12 +254,6 @@ export function SecurityView({ status, state }: { status: Status | null; state: 
       </SectionCard>
 
       <TrustPanel />
-
-      <KnownLimit register="caution" title="Le DNS d’un client ne passe pas par le tunnel">
-        Même avec <code>allow_client_internet</code> actif, ses requêtes DNS sortent hors du tunnel
-        et restent visibles de son réseau local et de son fournisseur d’accès. Le trafic applicatif,
-        lui, reste encapsulé.
-      </KnownLimit>
     </Stack>
   )
 }
