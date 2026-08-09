@@ -9,6 +9,7 @@
 //! present. This only requires a C compiler, no CMake/Go toolchain (see
 //! ADR-001 §2 and the vigilance notes).
 
+pub mod certificates;
 pub mod config;
 pub mod enroll;
 pub mod error;
