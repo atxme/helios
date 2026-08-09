@@ -80,20 +80,21 @@ Restent ouverts :
   pas ;
 - l'**exploitation** du cycle de vie des certificats
   ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) §12.3,
-  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)). Le **socle** est
-  livré depuis le 9 août 2026 : `aether::certificates` porte tous les objets
-  signés des §§3 à 10, les états bornés actif/suivant et les générations
-  anti-rollback ; `helios-provisioning::certificates` porte le staging à lease,
-  le reçu signé et le commit ; `helios-api` sert `trust-update`, `stage` et
-  `stage-commit` dans le tunnel ; le binaire **`astra`** porte le registre,
-  l'audit chaîné, l'émetteur délégué borné et le statut signé ;
-  `orion-core::certificates` porte l'ancre, les slots, le planificateur
-  dispersé et l'application atomique. Restent ouverts : le coffre HVLT, le
-  compagnon `astra-signer` et toute approbation par YubiKey (les routes
-  concernées répondent `501` par une erreur nommée), le veth privé
-  Astra–Helios, le discriminant de profil Orion et la bascule du §13, les deux
-  surfaces IHM, et la tâche de fond qui déclenche le renouvellement. La leaf PQ
-  gateway servie reste auto-signée tant que cette bascule n'a pas eu lieu.
+  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)). Le chemin
+  « demande → autorisation → persistance gateway → reçu → grant → commit » est
+  livré et branché : `aether::certificates` porte les objets signés, les états
+  bornés et les contrôles X.509 ; `helios-provisioning::certificates` exige le
+  grant au commit ; `heliosd::certificates` est le propriétaire unique du
+  registre et signe les reçus par la leaf servie ; le binaire **`astra`** porte
+  registre, audit chaîné et émetteur délégué borné ;
+  `orion-core::certificates` vérifie une transaction chunkée entière avant de
+  l'appliquer par une seule écriture. Restent ouverts : le coffre HVLT, le
+  compagnon `astra-signer` et toute approbation par YubiKey (routes en `501`),
+  le veth privé Astra–Helios — donc la gateway ne détient encore **aucun objet
+  pré-signé à distribuer** et répond `503` à un client qu'elle sait en retard —,
+  la récupération d'une identité expirée, le discriminant de profil Orion et la
+  bascule du §13, et les deux surfaces IHM. La leaf PQ gateway servie reste
+  auto-signée tant que cette bascule n'a pas eu lieu.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par

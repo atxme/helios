@@ -1,47 +1,15 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
 **Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
-(2026-08-09). Le protocole de négociation servi est déjà la v5. Le socle du lot
-certificat existe désormais dans le code ; ce qui manque est nommé au §12.4.
+(revu le 2026-08-09). Le protocole de négociation servi est déjà la v5. Le §12.3
+nomme précisément ce qui est livré et ce qui ne l'est pas ; ne pas lire le reste
+de la note comme une capacité disponible.
 
-Ce qui est livré : `aether::certificates` (tous les objets signés des §§3 à 10,
-encodage canonique, empreintes, générations, fenêtres, calcul 80 %, états
-bornés actif/suivant) ; `helios-provisioning::certificates` (staging à lease,
-reçu signé après persistance, commit à deux signatures, purge, révocation
-dominante, unicité globale des empreintes) ; `helios-api` (routes in-tunnel
-`trust-update`, `stage`, `stage-commit`) ; le binaire `astra` (registre, audit
-chaîné, émetteur délégué borné, planificateur, statut signé, endpoint public
-borné) ; `orion-core::certificates` (ancre, slots, planificateur dispersé
-stable, application atomique d'une transaction).
-
-Ne pas lire cette note comme une capacité complète : sans le compagnon
-`astra-signer`, sans le coffre HVLT et sans le veth privé, la récupération
-d'une identité expirée et les campagnes manuelles ne sont pas atteignables.
-
-**Version du format** : `1`
-
-**Date de la note** : 2026-08-09
-
-Cette note complète la
-[spécification de négociation de clé v5](NEGOCIATION-DE-CLE-V5.md) et
-[ADR-005](../adr/ADR-005-NEGOCIATION-DE-CLE.md), puis fixe avec
-[ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) l'exploitation de
-l'autorité. La v5 filaire, ML-DSA-87 et le
-certificat `PqCertificate` v2 sont déjà servis. Le code reste toutefois figé
-autour d'une seule identité gateway auto-signée et d'une seule génération
-cliente. Cette note définit les formats et transitions qui ferment ce manque.
-Elle définit également Astra, l'ordonnancement automatique, la récupération
-d'une identité expirée, les approbations YubiKey et les campagnes manuelles.
-
-Les exigences de cette note s'appliquent seulement à la branche cible
-`helios_key_negotiation` des profils Orion. Le discriminant explicite de cette
-branche n'est pas encore implémenté : aujourd'hui, un profil porte encore un
-bloc `key_negotiation` facultatif. La migration de format décrite par la
-spécification v5 doit donc être livrée avant, ou atomiquement avec, le présent
-lot. L'absence d'un bloc ne doit jamais permettre de reclasser comme `classic`
-un profil déjà connu comme Helios. Un vrai profil `classic` reste un profil
-WireGuard générique, sans certificat de négociation, sans `CA-PQ` et sans mise
-à jour de confiance Helios.
+Le lot livré ferme le chemin « demande → autorisation → persistance gateway →
+reçu → grant → commit » et le branche au démon. Ce qui manque est
+l'exploitation : le coffre maître, le compagnon de signature, le canal privé
+Astra–Helios, la distribution effective des objets de transition, la bascule de
+profil du §13 et les deux IHM.
 
 ## 0. État de départ et décisions
 
@@ -1731,31 +1699,53 @@ autorité. Le libellé montre avant approbation le nombre de cibles, les
 générations et si une CA sera tournée. Aucune action globale n'est placée
 derrière un bouton au libellé ambigu « Renouveler ».
 
-### 12.3 Ce qui reste à livrer au 9 août 2026
+### 12.3 État de l'implémentation au 9 août 2026
 
-Le socle des §§3 à 10 est implémenté et testé ; l'exploitation ne l'est pas.
-Restent ouverts, dans l'ordre où ils débloquent le reste :
+**Livré et testé.**
+
+- `aether::certificates` : tous les objets signés des §§3 à 10, l'encodage
+  canonique, les empreintes, les générations, les fenêtres, le calcul 80 % et
+  les états bornés actif/suivant. L'idempotence porte sur l'empreinte du
+  **document** signé, pas sur son contenu.
+- `aether::certificates::x509` : CA réelle et auto-signée, `basicConstraints`,
+  `keyCertSign`, `clientAuth`, validité, chaîne `leaf → intermédiaire → CA-TLS`
+  vers une ancre déjà détenue, et liaison CSR ↔ clé certifiée.
+- `helios-provisioning::certificates` : staging à lease, reçu signé après
+  écriture et `fsync`, commit qui **exige le grant**, purge, révocation
+  dominante, unicité globale des empreintes.
+- `helios-api` : `trust-update`, `stage` et `stage-commit` dans le tunnel,
+  derrière la résolution de source.
+- `heliosd::certificates` : propriétaire unique du registre, signature des
+  reçus par la leaf servie, boucle de balayage des leases et des
+  chevauchements.
+- `astra` : registre, audit chaîné dont la tête distingue une restauration d'un
+  fork, émetteur délégué borné qui fixe lui-même la validité des leafs,
+  planificateur, statut signé, budgets plafonnés par source et par identité.
+- `orion-core::certificates` : ancre, slots, planificateur dispersé stable,
+  vérification complète d'une transaction chunkée et application par une seule
+  écriture, révocations différées appliquées à leur instant.
+
+**Non livré.** Ces points sont refusés explicitement à l'exécution, jamais
+contournés :
 
 - le **coffre maître HVLT** et ses key-slots FIDO2 `hmac-secret`, donc toute
   garde de `CA-PQ` et de `CA-TLS` ailleurs que sur le poste opérateur ;
-- le **compagnon `astra-signer`**, donc toute approbation par YubiKey : les
-  routes `/v1/campaigns`, `/v1/client-rotation/recovery` et
-  `/v1/signer-results/<id>` répondent `501` par une variante d'erreur nommée
-  plutôt que par un chemin dégradé ;
-- le **canal veth privé** entre Astra et Helios (`/internal/v1/certificates/*`,
-  TLS 1.3 `(EC)DHE` sans reprise ni 0-RTT) : le renouvellement ordinaire n'en a
-  pas besoin — il passe dans le tunnel du client — mais la récupération d'une
-  identité expirée si ;
+- le **compagnon `astra-signer`** et toute approbation par YubiKey : les routes
+  `/v1/campaigns`, `/v1/client-rotation/recovery` et `/v1/signer-results/<id>`
+  répondent `501` par une variante d'erreur nommée ;
+- le **canal veth privé** Astra–Helios (`/internal/v1/certificates/*`, TLS 1.3
+  `(EC)DHE` sans reprise ni 0-RTT). Conséquence directe : la gateway ne détient
+  aucun objet pré-signé à distribuer, donc `trust-update` répond `503` à un
+  client qu'elle sait en retard, au lieu de lui annoncer qu'il est à jour ;
+- la **récupération d'une identité expirée** de bout en bout, qui dépend des
+  deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
-  coordonnée du §13, qui restent la frontière de bootstrap ;
+  coordonnée du §13 ;
 - les **surfaces IHM** du §12.2, côté Orion comme côté console Helios ;
-- l'ordonnancement automatique **exécuté** : le calcul de la fenêtre et la
-  dispersion existent, la tâche de fond qui les déclenche n'est pas branchée ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données.
 
-Tant que ces points ne sont pas livrés, une livraison peut être déployée
-derrière un refus explicite, mais **ne doit pas** être présentée comme « cycle
-de vie implémenté » (§12.1).
+Tant que ces points ne sont pas livrés, cette livraison **ne doit pas** être
+présentée comme « cycle de vie implémenté » (§12.1).
 
 ### 12.4 Fonctions reportables après le cycle complet
 
