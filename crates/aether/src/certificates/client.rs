@@ -420,12 +420,30 @@ impl ClientCertificateStageAuthorization {
             return Err(CertificateError::StageExpired);
         }
 
+        // Resolve the issuer **before** touching the leaf: a leaf signed by the
+        // delegated issuer chains to that issuer, not to `CA-PQ`, and reading
+        // it under the wrong key would refuse every ordinary renewal — or, the
+        // other way round, accept a leaf nobody authorized.
+        let issuer_key = self.resolve_issuer(
+            ca_pq,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            &self.next_pq_certificate,
+            self.active_generation,
+            self.next_generation,
+            self.reason,
+            now_unix,
+        )?;
+
         // The incoming PQ leaf is read at `activation_at`, for the same reason
         // a gateway leaf is: a candidate prepared ahead of time is not valid
         // today, and it must still be valid at the end of the overlap.
         self.next_pq_certificate
             .verify(
-                ca_pq.as_bytes(),
+                issuer_key.as_bytes(),
                 PqCertificateRole::Client,
                 None,
                 &client_wg_public_key.to_base64(),
@@ -436,7 +454,31 @@ impl ClientCertificateStageAuthorization {
             return Err(CertificateError::OutsideValidityPeriod);
         }
 
-        let transcript = self.signing_bytes()?;
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// The key that signed both this object and the leaf it carries.
+    ///
+    /// Under [`IssuerKind::Master`] that is `CA-PQ` itself, and the delegation
+    /// fields must be absent — naming two authorities at once is one authority
+    /// too many. Under [`IssuerKind::Astra`] the delegation is verified
+    /// against the anchor first, then its scope, and only then is its key
+    /// allowed to stand for the authority.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_issuer<'a>(
+        &'a self,
+        ca_pq: &'a MlDsa87PublicKey,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        leaf: &PqCertificate,
+        active_generation: u64,
+        next_generation: u64,
+        reason: RotationReason,
+        now_unix: u64,
+    ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         match self.issuer_kind {
             IssuerKind::Master => {
                 if self.issuer_authorization.is_some()
@@ -444,16 +486,13 @@ impl ClientCertificateStageAuthorization {
                 {
                     return Err(CertificateError::UnauthorizedIssuer);
                 }
-                verify_ml_dsa_87(ca_pq, &transcript, &self.signature)
+                Ok(ca_pq)
             }
             IssuerKind::Astra => {
                 let delegation = self
                     .issuer_authorization
                     .as_ref()
                     .ok_or(CertificateError::UnauthorizedIssuer)?;
-                // Anchor first, then scope, then the operational signature.
-                // Checking the scope of a delegation nobody authorized is
-                // checking nothing.
                 delegation.verify(
                     ca_pq,
                     trust_domain_id,
@@ -470,22 +509,17 @@ impl ClientCertificateStageAuthorization {
                 {
                     return Err(CertificateError::UnauthorizedIssuer);
                 }
-                let lifetime = self
-                    .next_pq_certificate
+                let lifetime = leaf
                     .not_after_unix
-                    .checked_sub(self.next_pq_certificate.not_before_unix)
+                    .checked_sub(leaf.not_before_unix)
                     .ok_or(CertificateError::InvalidValidityPeriod)?;
                 delegation.authorize_renewal(
-                    self.active_generation,
-                    self.next_generation,
+                    active_generation,
+                    next_generation,
                     lifetime,
-                    self.reason,
+                    reason,
                 )?;
-                verify_ml_dsa_87(
-                    &delegation.pq_issuer_public_key,
-                    &transcript,
-                    &self.signature,
-                )
+                Ok(&delegation.pq_issuer_public_key)
             }
         }
     }
@@ -813,9 +847,19 @@ impl ClientCertificateRotationGrant {
         if now_unix >= self.stage_expires_at {
             return Err(CertificateError::StageExpired);
         }
+
+        let issuer_key = self.resolve_issuer(
+            ca_pq,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            now_unix,
+        )?;
         self.next_pq_certificate
             .verify(
-                ca_pq.as_bytes(),
+                issuer_key.as_bytes(),
                 PqCertificateRole::Client,
                 None,
                 &client_wg_public_key.to_base64(),
@@ -830,7 +874,23 @@ impl ClientCertificateRotationGrant {
             return Err(CertificateError::MissingProof("new client"));
         }
 
-        let transcript = self.signing_bytes()?;
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// Same rule as [`ClientCertificateStageAuthorization::resolve_issuer`]:
+    /// the delegated issuer stands for the authority only after `CA-PQ` has
+    /// authorized it and its scope has been checked.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_issuer<'a>(
+        &'a self,
+        ca_pq: &'a MlDsa87PublicKey,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        now_unix: u64,
+    ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         match self.issuer_kind {
             IssuerKind::Master => {
                 if self.issuer_authorization.is_some()
@@ -838,7 +898,7 @@ impl ClientCertificateRotationGrant {
                 {
                     return Err(CertificateError::UnauthorizedIssuer);
                 }
-                verify_ml_dsa_87(ca_pq, &transcript, &self.signature)
+                Ok(ca_pq)
             }
             IssuerKind::Astra => {
                 let delegation = self
@@ -872,11 +932,7 @@ impl ClientCertificateRotationGrant {
                     lifetime,
                     self.reason,
                 )?;
-                verify_ml_dsa_87(
-                    &delegation.pq_issuer_public_key,
-                    &transcript,
-                    &self.signature,
-                )
+                Ok(&delegation.pq_issuer_public_key)
             }
         }
     }
@@ -1554,6 +1610,86 @@ mod tests {
         authorization.signature = sign_ml_dsa_87(&ca.private, &transcript).unwrap();
         assert!(matches!(
             authorization.verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                None,
+                1_100,
+            ),
+            Err(CertificateError::UnauthorizedIssuer)
+        ));
+    }
+
+    /// A leaf issued by the delegated issuer chains to **that issuer**, and
+    /// the delegation is what makes the issuer stand for the authority. Both
+    /// halves matter: reading the leaf under `CA-PQ` would refuse every
+    /// ordinary renewal, and skipping the delegation check would accept a leaf
+    /// nobody authorized.
+    #[test]
+    fn an_astra_issued_leaf_chains_to_the_delegation_not_to_ca_pq() {
+        use crate::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+
+        let ca = keys();
+        let issuer = keys();
+        let subject = keys();
+
+        let delegation = AstraIssuerAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            issuer_epoch: 3,
+            pq_issuer_public_key: issuer.public.clone(),
+            tls_intermediate_certificate: DerCertificate::new(vec![5; 256]).expect("der"),
+            allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 200_000,
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            not_before: 0,
+            not_after: 500_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca.private)
+        .expect("sign delegation");
+
+        let delegated_leaf = client_leaf(&issuer, &subject, 4);
+        let mut authorization =
+            authorization(&ca, &ca, delegated_leaf, Fingerprint::of(b"request"));
+        authorization.issuer_kind = IssuerKind::Astra;
+        authorization.issuer_epoch = 3;
+        authorization.issuer_authorization_fingerprint = delegation.fingerprint();
+        authorization.issuer_authorization = Some(delegation.clone());
+        let authorization = authorization.sign(&issuer.private).expect("sign");
+
+        authorization
+            .verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                None,
+                1_100,
+            )
+            .expect("a delegated leaf verifies under its delegation");
+
+        // The same object carrying a leaf issued by `CA-PQ` instead does not:
+        // the delegation names the issuer, and the leaf must match it.
+        let master_leaf = client_leaf(&ca, &subject, 5);
+        let mut mismatched = authorization.clone();
+        mismatched.next_pq_certificate = master_leaf;
+        let mismatched = mismatched.sign(&issuer.private).expect("sign");
+        assert!(matches!(
+            mismatched.verify(
                 &ca.public,
                 &domain(),
                 1,

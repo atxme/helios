@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aether",
+    "crates/astra",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
@@ -27,6 +28,7 @@ members = [
 # et il n'y a aucune dépendance GTK.
 default-members = [
     "crates/aether",
+    "crates/astra",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
