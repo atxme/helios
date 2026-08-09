@@ -1,7 +1,22 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
-**Statut** : cible spécifiée — **cycle de vie non implémenté**. Le protocole de
-négociation servi est déjà la v5 ; cette note décrit le lot certificat restant.
+**Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
+(2026-08-09). Le protocole de négociation servi est déjà la v5. Le socle du lot
+certificat existe désormais dans le code ; ce qui manque est nommé au §12.4.
+
+Ce qui est livré : `aether::certificates` (tous les objets signés des §§3 à 10,
+encodage canonique, empreintes, générations, fenêtres, calcul 80 %, états
+bornés actif/suivant) ; `helios-provisioning::certificates` (staging à lease,
+reçu signé après persistance, commit à deux signatures, purge, révocation
+dominante, unicité globale des empreintes) ; `helios-api` (routes in-tunnel
+`trust-update`, `stage`, `stage-commit`) ; le binaire `astra` (registre, audit
+chaîné, émetteur délégué borné, planificateur, statut signé, endpoint public
+borné) ; `orion-core::certificates` (ancre, slots, planificateur dispersé
+stable, application atomique d'une transaction).
+
+Ne pas lire cette note comme une capacité complète : sans le compagnon
+`astra-signer`, sans le coffre HVLT et sans le veth privé, la récupération
+d'une identité expirée et les campagnes manuelles ne sont pas atteignables.
 
 **Version du format** : `1`
 
@@ -1716,7 +1731,33 @@ autorité. Le libellé montre avant approbation le nombre de cibles, les
 générations et si une CA sera tournée. Aucune action globale n'est placée
 derrière un bouton au libellé ambigu « Renouveler ».
 
-### 12.3 Fonctions reportables après le cycle complet
+### 12.3 Ce qui reste à livrer au 9 août 2026
+
+Le socle des §§3 à 10 est implémenté et testé ; l'exploitation ne l'est pas.
+Restent ouverts, dans l'ordre où ils débloquent le reste :
+
+- le **coffre maître HVLT** et ses key-slots FIDO2 `hmac-secret`, donc toute
+  garde de `CA-PQ` et de `CA-TLS` ailleurs que sur le poste opérateur ;
+- le **compagnon `astra-signer`**, donc toute approbation par YubiKey : les
+  routes `/v1/campaigns`, `/v1/client-rotation/recovery` et
+  `/v1/signer-results/<id>` répondent `501` par une variante d'erreur nommée
+  plutôt que par un chemin dégradé ;
+- le **canal veth privé** entre Astra et Helios (`/internal/v1/certificates/*`,
+  TLS 1.3 `(EC)DHE` sans reprise ni 0-RTT) : le renouvellement ordinaire n'en a
+  pas besoin — il passe dans le tunnel du client — mais la récupération d'une
+  identité expirée si ;
+- le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
+  coordonnée du §13, qui restent la frontière de bootstrap ;
+- les **surfaces IHM** du §12.2, côté Orion comme côté console Helios ;
+- l'ordonnancement automatique **exécuté** : le calcul de la fenêtre et la
+  dispersion existent, la tâche de fond qui les déclenche n'est pas branchée ;
+- les **essais d'intégration** du §14.2, qui supposent un vrai plan de données.
+
+Tant que ces points ne sont pas livrés, une livraison peut être déployée
+derrière un refus explicite, mais **ne doit pas** être présentée comme « cycle
+de vie implémenté » (§12.1).
+
+### 12.4 Fonctions reportables après le cycle complet
 
 - notifications par courrier ou messagerie externe ;
 - coffre cryptographique M-sur-N et approbation par plusieurs identités

@@ -648,6 +648,18 @@ où l'écart se voit.
     pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
     `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
+- **le cycle de vie des certificats est vérifié en logique, pas en
+  exploitation.** `aether::certificates`, le registre gateway, le magasin Orion
+  et le binaire `astra` sont couverts par des tests déterministes qui prennent
+  l’horloge en argument : fenêtres, générations, avortement antidaté, commit
+  tardif, couples TLS/PQ mixtes, transaction chunkée invisible avant son
+  dernier fragment. Ce qui **n’est pas** exercé, et ne peut pas l’être en
+  WSL2 : l’extension CTAP2 `hmac-secret` d’une YubiKey réelle, l’ouverture du
+  coffre HVLT par le compagnon `astra-signer`, le veth privé Astra–Helios et
+  ses garanties TLS 1.3, le redémarrage de `heliosd` sur une nouvelle identité
+  gateway, et la bascule coordonnée d’un parc existant. Les routes qui
+  dépendent d’un credential matériel répondent `501` par une variante d’erreur
+  nommée — c’est un refus franc, pas une couverture ;
 - le job Windows valide les chemins Tauri et Win32 compilables sans matériel ;
   WireGuard-NT, le TPM physique, BitLocker réellement actif et les effets WER
   dans un vidage exigent toujours la campagne sur cible ;

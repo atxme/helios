@@ -78,13 +78,22 @@ Restent ouverts :
   monté n’en envoie aucun — le slot tient jusqu’à la récupération à 300 s. Seul
   le contrôleur détient le reçu de commit, et le chemin de suppression ne l’a
   pas ;
-- tout le **cycle de vie des certificats**
-  ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md),
-  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)) : leaf PQ
-  gateway encore auto-signée, ni slot actif/suivant, ni génération
-  anti-rollback ; le service Astra, le planificateur à 80 %, la récupération
-  après expiration et les campagnes protégées par YubiKey ne sont pas encore
-  implémentés.
+- l'**exploitation** du cycle de vie des certificats
+  ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) §12.3,
+  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)). Le **socle** est
+  livré depuis le 9 août 2026 : `aether::certificates` porte tous les objets
+  signés des §§3 à 10, les états bornés actif/suivant et les générations
+  anti-rollback ; `helios-provisioning::certificates` porte le staging à lease,
+  le reçu signé et le commit ; `helios-api` sert `trust-update`, `stage` et
+  `stage-commit` dans le tunnel ; le binaire **`astra`** porte le registre,
+  l'audit chaîné, l'émetteur délégué borné et le statut signé ;
+  `orion-core::certificates` porte l'ancre, les slots, le planificateur
+  dispersé et l'application atomique. Restent ouverts : le coffre HVLT, le
+  compagnon `astra-signer` et toute approbation par YubiKey (les routes
+  concernées répondent `501` par une erreur nommée), le veth privé
+  Astra–Helios, le discriminant de profil Orion et la bascule du §13, les deux
+  surfaces IHM, et la tâche de fond qui déclenche le renouvellement. La leaf PQ
+  gateway servie reste auto-signée tant que cette bascule n'a pas eu lieu.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par
@@ -407,6 +416,12 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 ## Workspace
 
 - `aether` : états, config, politique, ML-KEM, protocole et signatures hybrides.
+  `aether::certificates` y ajoute le cycle de vie des certificats : objets
+  signés, encodage canonique, générations et états bornés à deux slots.
+- `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
+  conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
+  distingue une restauration d'un fork, émetteur délégué borné et endpoint
+  public. Il ne détient **jamais** `CA-PQ` en clair.
 - `helios-firewall` : ruleset structuré, dry-run, backend Netlink.
 - `helios-wireguard` : interface gateway et table de pairs.
 - `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.
