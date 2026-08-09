@@ -91,6 +91,10 @@ pub mod test_x509 {
         let mut authority_name = DistinguishedName::new();
         authority_name.push(DnType::CommonName, "CA-TLS");
         authority_params.distinguished_name = authority_name;
+        // Every link of a chain is checked against the clock, anchors included,
+        // so the test anchor has to cover the same synthetic era as its leaf.
+        authority_params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        authority_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
         let authority_key = KeyPair::generate().expect("key");
         let authority = authority_params
             .self_signed(&authority_key)
@@ -131,6 +135,8 @@ pub mod test_x509 {
         let mut name = DistinguishedName::new();
         name.push(DnType::CommonName, common_name);
         params.distinguished_name = name;
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        params.not_after = rcgen::date_time_ymd(4096, 1, 1);
         let key = KeyPair::generate().expect("key");
         let certificate = params.self_signed(&key).expect("authority");
         DerCertificate::new(certificate.der().to_vec()).expect("der")

@@ -31,3 +31,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Les tests d'intégration du binaire lancent `astra` comme le fait un
+# opérateur, et fabriquent le matériel d'entrée (clé publique `CA-PQ`) avec les
+# mêmes types que la production.
+aether = { workspace = true, features = ["key-negotiation-signing"] }

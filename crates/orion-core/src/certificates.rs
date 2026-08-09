@@ -32,12 +32,13 @@ use std::path::{Path, PathBuf};
 use aether::certificates::{
     client::ClientCertificateGeneration,
     encoding::{Fingerprint, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
-    gateway::GatewayIdentityTransition,
+    gateway::{pq_certificate_fingerprint, GatewayIdentityTransition},
+    revocation::RevocationScope,
     state::{
         base_state_fingerprint, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome,
+        GatewayCertificateState, InstallOutcome, TrustLedger, TrustSnapshot,
     },
-    status::AstraCertificateStatus,
+    status::{AstraCertificateStatus, CertificateKind},
     transport::{
         OrionTrustUpdateDocument, PendingTrustTransaction, TrustUpdateChunk, TrustUpdateObject,
         TrustUpdateTransactionManifest,
@@ -68,51 +69,13 @@ pub struct TrustState {
     /// unverifiable, and a client that cannot apply an abort refuses the next
     /// epoch for good — the sequential counter would never advance again.
     pub staged_gateway_transition: Option<GatewayIdentityTransition>,
-    /// Revocations accepted but not yet effective (spec §10.1).
+    /// Revocations in flight, gateway counter, and status ordering per target.
     ///
-    /// A revocation may name a future instant. Verifying it and then dropping
-    /// it — which is what an implementation that only looks at "is it effective
-    /// now" does — silently discards a decision the authority already made, and
-    /// its epoch has been consumed, so it can never be delivered again.
+    /// Held together because they are the cross-cutting part of the state:
+    /// a revocation may name either identity, and the status counters are per
+    /// certificate rather than global.
     #[serde(default)]
-    pub scheduled_revocations: Vec<ScheduledRevocation>,
-    /// Last `(astra_service_key_epoch, status_epoch)` accepted, so a replayed
-    /// older status cannot move the local view backwards.
-    pub last_status: Option<(u64, u64)>,
-}
-
-/// Largest number of revocations held before their effective instant.
-///
-/// A ceiling rather than an unbounded list: a peer can only ever be revoked
-/// once, so more than a handful in flight means something is wrong, and
-/// growing the store on a remote party's say-so is how a bounded state stops
-/// being bounded.
-pub const MAX_SCHEDULED_REVOCATIONS: usize = 8;
-
-/// A verified revocation waiting for its own instant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScheduledRevocation {
-    pub revocation_epoch: u64,
-    pub effective_at: u64,
-    pub revoked_tls_fingerprint: Option<Fingerprint>,
-    pub revoked_pq_fingerprint: Option<Fingerprint>,
-}
-
-impl ScheduledRevocation {
-    /// Whether this revocation withdraws any fingerprint the peer holds.
-    ///
-    /// Both families are checked. A revocation naming only the TLS half is a
-    /// revocation: the generation is indivisible, and letting the PQ half
-    /// survive would leave an identity that mTLS refuses and the negotiation
-    /// still accepts.
-    fn hits(&self, certificates: &ClientCertificateState) -> bool {
-        let occupied = certificates.occupied_fingerprints();
-        [self.revoked_tls_fingerprint, self.revoked_pq_fingerprint]
-            .into_iter()
-            .flatten()
-            .any(|revoked| occupied.iter().any(|held| held.matches(&revoked)))
-    }
+    pub ledger: TrustLedger,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,13 +155,14 @@ impl TrustStore {
 
     /// SHA-256 of the complete live state, as a manifest binds it (spec §8.1).
     pub fn base_state_fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        base_state_fingerprint(
-            &self.state.gateway,
-            &self.state.client_tls_ca,
-            &self.state.astra,
-            self.state.issuer_epoch,
-            &self.state.certificates,
-        )
+        base_state_fingerprint(&TrustSnapshot {
+            gateway: &self.state.gateway,
+            client_tls_ca: &self.state.client_tls_ca,
+            astra: &self.state.astra,
+            issuer: self.state.issuer.as_ref(),
+            client: &self.state.certificates,
+            ledger: &self.state.ledger,
+        })
     }
 
     /// The gateway PQ leaf this client may accept right now.
@@ -321,12 +285,14 @@ impl TrustStore {
                     }
                 }
                 TrustUpdateObject::AstraServiceKeyEmergencyReplacement(replacement) => {
+                    // The counter is the profile's own: this is a domain-wide
+                    // decision, and reading it against a per-peer axis would
+                    // make two clients of one fleet answer differently.
                     if candidate.astra.apply_emergency_replacement(
                         replacement,
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
-                        candidate.certificates.revocation_epoch,
                         now_unix,
                     )? == InstallOutcome::Installed
                     {
@@ -389,28 +355,45 @@ impl TrustStore {
                     }
                 }
                 TrustUpdateObject::CertificateRevocation(revocation) => {
+                    // Which identity this object names decides everything that
+                    // follows: which counter it advances, and which state it
+                    // will eventually remove something from. Reading a gateway
+                    // revocation against the client counter consumes a number
+                    // the client then needs, and revokes nothing.
+                    let current_epoch = match revocation.scope {
+                        RevocationScope::Gateway => {
+                            if revocation.identity_key != candidate.gateway.gateway_wg_public_key
+                                || revocation.server_name.as_deref()
+                                    != Some(candidate.gateway.server_name.as_str())
+                            {
+                                return Err(TrustError::Certificate(
+                                    CertificateError::GatewayIdentityMismatch,
+                                ));
+                            }
+                            candidate.ledger.gateway_revocation_epoch
+                        }
+                        RevocationScope::Client => {
+                            if revocation.identity_key != candidate.client_wg_public_key {
+                                return Err(TrustError::Certificate(
+                                    CertificateError::ClientIdentityMismatch,
+                                ));
+                            }
+                            candidate.certificates.revocation_epoch
+                        }
+                    };
                     revocation.verify(
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
-                        candidate.certificates.revocation_epoch,
+                        current_epoch,
                     )?;
                     // The epoch is consumed the moment the object verifies —
                     // it will never be delivered again — so a revocation dated
                     // in the future is **kept**, not dropped.
-                    candidate.certificates.revocation_epoch = revocation.revocation_epoch;
-                    let scheduled = ScheduledRevocation {
-                        revocation_epoch: revocation.revocation_epoch,
-                        effective_at: revocation.effective_at,
-                        revoked_tls_fingerprint: revocation.revoked_tls_fingerprint,
-                        revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
-                    };
-                    if candidate.scheduled_revocations.len() >= MAX_SCHEDULED_REVOCATIONS {
-                        return Err(TrustError::Certificate(
-                            CertificateError::InvalidTransaction("too many pending revocations"),
-                        ));
+                    if revocation.scope == RevocationScope::Client {
+                        candidate.certificates.revocation_epoch = revocation.revocation_epoch;
                     }
-                    candidate.scheduled_revocations.push(scheduled);
+                    candidate.ledger.schedule(revocation)?;
                     applied += 1;
                 }
                 TrustUpdateObject::ClientCertificateStageAuthorization(_)
@@ -420,7 +403,7 @@ impl TrustStore {
                     // bypass the commit that makes it activable.
                 }
                 TrustUpdateObject::CertificateStatus(status) => {
-                    self.absorb_status(&mut candidate, status, now_unix)?;
+                    absorb_status(&mut candidate, status, now_unix)?;
                     applied += 1;
                 }
             }
@@ -429,38 +412,16 @@ impl TrustStore {
         // Every revocation that is already due takes effect inside the same
         // transaction, so a client never adopts a trust update and only then
         // notices it was revoked by it.
-        apply_due_revocations(&mut candidate, now_unix);
+        candidate.ledger.apply_due(
+            &mut candidate.gateway,
+            &mut candidate.certificates,
+            now_unix,
+        )?;
 
         // Written first, adopted second.
         self.write(&candidate)?;
         self.state = candidate;
         Ok(applied)
-    }
-
-    /// Verifies a signed status and records its ordering key.
-    ///
-    /// The status never widens validity: it moves `last_status` and nothing
-    /// else. What it is checked for is monotonicity — a replayed older one
-    /// must not become the current view.
-    fn absorb_status(
-        &self,
-        candidate: &mut TrustState,
-        status: &AstraCertificateStatus,
-        now_unix: u64,
-    ) -> Result<(), TrustError> {
-        let service_key = candidate
-            .astra
-            .service_key_for(status.astra_service_key_epoch, now_unix)
-            .ok_or(CertificateError::UnauthorizedIssuer)?;
-        status.verify(
-            service_key,
-            status.astra_service_key_epoch,
-            &candidate.trust_domain_id,
-            &status.certificate_fingerprint,
-            candidate.last_status,
-        )?;
-        candidate.last_status = Some(status.ordering_key());
-        Ok(())
     }
 
     /// Applies an offline `orion-trust-update` document (spec §8.4).
@@ -497,7 +458,20 @@ impl TrustStore {
         moved |= candidate.client_tls_ca.promote_if_due(now_unix);
         moved |= candidate.astra.promote_service_key_if_due(now_unix);
         moved |= candidate.certificates.promote_if_due(now_unix);
-        moved |= apply_due_revocations(&mut candidate, now_unix);
+        moved |= candidate.ledger.apply_due(
+            &mut candidate.gateway,
+            &mut candidate.certificates,
+            now_unix,
+        )?;
+        // A promoted generation is gone from the state, so its status counter
+        // is only occupying room in a bounded map.
+        let held: Vec<Fingerprint> = status_targets(&candidate)
+            .into_iter()
+            .map(|target| target.fingerprint)
+            .collect();
+        let before = candidate.ledger.last_statuses.len();
+        candidate.ledger.prune_statuses(&held);
+        moved |= candidate.ledger.last_statuses.len() != before;
         if moved {
             self.write(&candidate)?;
             self.state = candidate;
@@ -506,27 +480,169 @@ impl TrustStore {
     }
 }
 
-/// Applies every scheduled revocation that has reached its instant.
+/// One certified object this store currently holds, as a status names it.
+struct StatusTarget {
+    kind: CertificateKind,
+    generation: u64,
+    fingerprint: Fingerprint,
+}
+
+/// Every target a signed status may legitimately be about.
 ///
-/// Returns whether anything changed. A revocation that hits any fingerprint
-/// the peer holds — active, next or pending, TLS **or** PQ — makes the whole
-/// identity terminal: the generation is indivisible, so half of it cannot
-/// survive.
-fn apply_due_revocations(state: &mut TrustState, now_unix: u64) -> bool {
-    let mut moved = false;
-    let mut remaining = Vec::with_capacity(state.scheduled_revocations.len());
-    for revocation in std::mem::take(&mut state.scheduled_revocations) {
-        if now_unix < revocation.effective_at {
-            remaining.push(revocation);
-            continue;
-        }
-        if revocation.hits(&state.certificates) {
-            state.certificates.revoke(revocation.revocation_epoch);
-        }
-        moved = true;
+/// A status is not indexed by the fingerprint it carries: it has to name a
+/// slot this store actually holds, of the right family, at the right
+/// generation. Passing the status's own fingerprint in as the expected one —
+/// which is what an implementation reaches for first — makes the binding check
+/// tautological, and a correctly signed status about another identity is then
+/// absorbed as if it described this one.
+fn status_targets(state: &TrustState) -> Vec<StatusTarget> {
+    let mut targets = Vec::new();
+    let mut push = |kind, generation, fingerprint| {
+        targets.push(StatusTarget {
+            kind,
+            generation,
+            fingerprint,
+        });
+    };
+
+    for generation in [
+        Some(&state.certificates.active),
+        state.certificates.next.as_ref(),
+        state.certificates.pending.as_ref().map(|p| &p.candidate),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push(
+            CertificateKind::ClientTls,
+            generation.generation,
+            generation.tls_certificate_fingerprint,
+        );
+        push(
+            CertificateKind::ClientPq,
+            generation.generation,
+            generation.pq_certificate_fingerprint,
+        );
     }
-    state.scheduled_revocations = remaining;
-    moved
+
+    let gateway = &state.gateway;
+    push(
+        CertificateKind::GatewayTls,
+        gateway.active_gateway_identity_epoch,
+        gateway.active_tls_fingerprint(),
+    );
+    if let Ok(fingerprint) = gateway.active_pq_fingerprint() {
+        push(
+            CertificateKind::GatewayPq,
+            gateway.active_gateway_identity_epoch,
+            fingerprint,
+        );
+    }
+    if let Some(epoch) = gateway.next_gateway_identity_epoch {
+        if let Some(certificate) = &gateway.next_gateway_tls_certificate {
+            push(
+                CertificateKind::GatewayTls,
+                epoch,
+                certificate.fingerprint(),
+            );
+        }
+        if let Some(Ok(fingerprint)) = gateway
+            .next_gateway_certificate
+            .as_ref()
+            .map(pq_certificate_fingerprint)
+        {
+            push(CertificateKind::GatewayPq, epoch, fingerprint);
+        }
+    }
+
+    push(
+        CertificateKind::CaPq,
+        gateway.ca_epoch,
+        gateway.current_ca_public_key.authority_fingerprint(),
+    );
+    if let Some(next) = &gateway.next_ca_public_key {
+        push(
+            CertificateKind::CaPq,
+            gateway.ca_epoch + 1,
+            next.authority_fingerprint(),
+        );
+    }
+    push(
+        CertificateKind::CaTls,
+        state.client_tls_ca.ca_tls_epoch,
+        state
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint(),
+    );
+    if let Some(next) = &state.client_tls_ca.next_client_tls_ca_certificate {
+        push(
+            CertificateKind::CaTls,
+            state.client_tls_ca.ca_tls_epoch + 1,
+            next.fingerprint(),
+        );
+    }
+    push(
+        CertificateKind::AstraServiceKey,
+        state.astra.astra_service_key_epoch,
+        state
+            .astra
+            .active_astra_service_public_key
+            .authority_fingerprint(),
+    );
+    if let Some(next) = &state.astra.next_astra_service_public_key {
+        push(
+            CertificateKind::AstraServiceKey,
+            state.astra.astra_service_key_epoch + 1,
+            next.authority_fingerprint(),
+        );
+    }
+    if let Some(issuer) = &state.issuer {
+        push(
+            CertificateKind::AstraIssuer,
+            issuer.issuer_epoch,
+            issuer.authorization.fingerprint(),
+        );
+    }
+    targets
+}
+
+/// Verifies a signed status against the slot it claims to describe.
+///
+/// The status never widens validity: it moves an ordering counter and nothing
+/// else. What it is checked for is that it names something this store holds,
+/// and that it is not older than the last one accepted **for that same
+/// target** — Astra counts per certificate, so a global counter would leave a
+/// freshly rotated leaf refused for good behind the epoch of the leaf it
+/// replaced.
+fn absorb_status(
+    candidate: &mut TrustState,
+    status: &AstraCertificateStatus,
+    now_unix: u64,
+) -> Result<(), TrustError> {
+    let target = status_targets(candidate)
+        .into_iter()
+        .find(|target| {
+            target.kind == status.certificate_kind
+                && target.generation == status.generation
+                && target.fingerprint.matches(&status.certificate_fingerprint)
+        })
+        .ok_or(CertificateError::FingerprintMismatch("status target"))?;
+    let service_key = candidate
+        .astra
+        .service_key_for(status.astra_service_key_epoch, now_unix)
+        .ok_or(CertificateError::UnauthorizedIssuer)?;
+    status.verify(
+        service_key,
+        status.astra_service_key_epoch,
+        &candidate.trust_domain_id,
+        &target.fingerprint,
+        candidate.ledger.last_status_for(&target.fingerprint),
+    )?;
+    candidate
+        .ledger
+        .record_status(&target.fingerprint, status)?;
+    Ok(())
 }
 
 /// The instant this client opens its renewal window (spec §4.3).
@@ -655,20 +771,32 @@ mod tests {
         assert!(renewal_is_due(&generation, &key(1), instant).expect("due"));
     }
 
+    /// A signed gateway leaf: a PQ certificate's fingerprint covers its own
+    /// signature, so an unsigned placeholder has no fingerprint at all.
     #[cfg(feature = "certificate-signing")]
     fn gateway_leaf() -> PqCertificate {
-        PqCertificate {
-            version: PQ_CERTIFICATE_VERSION,
-            serial: [1; 16],
-            subject: "gateway.example".into(),
-            issuer: "CA-PQ".into(),
-            role: PqCertificateRole::Gateway,
-            wireguard_public_key: key(9).to_base64(),
-            ml_dsa_87_public_key: String::new(),
-            not_before_unix: 0,
-            not_after_unix: 1_000_000,
-            ml_dsa_87_signature: String::new(),
-        }
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+        use aether::key_negotiation::issue_pq_certificate;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, subject_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [1; 16],
+                subject: "gateway.example".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: key(9).to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 0,
+                not_after_unix: 1_000_000,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_private,
+        )
+        .expect("issue")
     }
 
     #[cfg(feature = "certificate-signing")]
@@ -704,6 +832,8 @@ mod tests {
                     activation_at: None,
                     retire_active_at: None,
                     published: false,
+                    revoked: false,
+                    revocation_epoch: 0,
                 },
                 client_tls_ca: ClientTlsCaState {
                     ca_tls_epoch: 1,
@@ -723,13 +853,14 @@ mod tests {
                     astra_service_key_epoch: 1,
                     service_key_activation_at: None,
                     service_key_retire_active_at: None,
+                    service_key_revocation_epoch: 0,
+                    last_emergency_replacement_fingerprint: None,
                 },
                 issuer_epoch: 1,
                 issuer: None,
                 certificates: ClientCertificateState::new(generation(4)),
                 staged_gateway_transition: None,
-                scheduled_revocations: Vec::new(),
-                last_status: None,
+                ledger: TrustLedger::default(),
             },
         )
     }
@@ -788,7 +919,7 @@ mod tests {
             "a revocation dated for later is not in force yet"
         );
         assert_eq!(
-            store.state().scheduled_revocations.len(),
+            store.state().ledger.scheduled_revocations.len(),
             1,
             "and it is kept: its epoch has already been consumed"
         );
@@ -805,7 +936,265 @@ mod tests {
             store.state().certificates.revoked,
             "at its instant it takes effect, even though only the TLS half was named"
         );
-        assert!(store.state().scheduled_revocations.is_empty());
+        assert!(store.state().ledger.scheduled_revocations.is_empty());
+    }
+
+    /// A gateway revocation must remove the **gateway**, and it must spend the
+    /// gateway's counter. Reading it against the client's consumes a number
+    /// the client then needs, and revokes nothing at all.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_gateway_revocation_retires_the_gateway_and_not_the_client() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let served = store
+            .state()
+            .gateway
+            .active_pq_fingerprint()
+            .expect("fingerprint");
+
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Gateway,
+            identity_key: key(9),
+            server_name: Some("gateway.example".into()),
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: None,
+            revoked_pq_fingerprint: Some(served),
+            effective_at: 2_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(
+                    revocation.clone(),
+                ))],
+                1_000,
+            )
+            .expect("revocation accepted");
+
+        assert_eq!(store.state().ledger.gateway_revocation_epoch, 1);
+        assert_eq!(
+            store.state().certificates.revocation_epoch,
+            0,
+            "a gateway decision must not spend the client's counter"
+        );
+
+        store.refresh(2_000).expect("refresh");
+        assert!(
+            store.state().gateway.revoked,
+            "the compromised gateway is retired at its instant"
+        );
+        assert!(
+            store
+                .acceptable_gateway_fingerprints(2_000)
+                .expect("fingerprints")
+                .is_empty(),
+            "and no leaf of it is acceptable any more"
+        );
+        assert!(
+            !store.state().certificates.revoked,
+            "the client identity is untouched: it was not the one revoked"
+        );
+
+        // The client's own counter is still at zero, so its first revocation
+        // is still deliverable — which is exactly what a shared counter would
+        // have destroyed.
+        let client_revocation = EmergencyCertificateRevocation {
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revoked_pq_fingerprint: Some(generation(4).pq_certificate_fingerprint),
+            effective_at: 2_500,
+            ca_signature: MlDsa87Signature::placeholder(),
+            ..revocation
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(
+                    client_revocation,
+                ))],
+                2_100,
+            )
+            .expect("the client's own first revocation still verifies");
+        store.refresh(2_500).expect("refresh");
+        assert!(store.state().certificates.revoked);
+    }
+
+    /// A revocation naming another machine is refused before its counter is
+    /// spent: the object is signed, but it is not about this store.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_revocation_naming_another_identity_is_refused() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+
+        let stranger = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(77),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: Some(generation(4).tls_certificate_fingerprint),
+            revoked_pq_fingerprint: None,
+            effective_at: 1_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        assert!(store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(stranger))],
+                1_000
+            )
+            .is_err());
+        assert_eq!(store.state().certificates.revocation_epoch, 0);
+        assert!(!store.state().certificates.revoked);
+    }
+
+    /// A status must name a slot this store actually holds, of the right
+    /// family and generation. Taking the expected fingerprint from the status
+    /// itself makes the binding tautological, and a correctly signed status
+    /// about another identity is then absorbed as if it were about this one.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_status_about_something_this_store_does_not_hold_is_refused() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::status::{
+            AstraCertificateStatus, CertificateKind, CertificateStatus,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+
+        let status = |fingerprint, kind, generation, status_epoch| {
+            AstraCertificateStatus {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                certificate_fingerprint: fingerprint,
+                certificate_kind: kind,
+                generation,
+                status: CertificateStatus::Active,
+                suggested_window_start: 800_000,
+                suggested_window_end: 1_000_000,
+                produced_at: 1_000,
+                next_update: 4_600,
+                status_epoch,
+                astra_service_key_epoch: 1,
+                astra_signature: MlDsa87Signature::placeholder(),
+            }
+            .sign(&service_private)
+            .expect("sign")
+        };
+
+        // Perfectly signed, and about a certificate this store never held.
+        let stranger = status(
+            Fingerprint::of(b"someone else's leaf"),
+            CertificateKind::ClientPq,
+            4,
+            1,
+        );
+        assert!(store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(stranger))],
+                1_000
+            )
+            .is_err());
+
+        // The right fingerprint under the wrong family is refused too: the
+        // three fields together name a slot, and any one of them alone does
+        // not.
+        let mislabelled = status(
+            active.pq_certificate_fingerprint,
+            CertificateKind::GatewayPq,
+            4,
+            1,
+        );
+        assert!(store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(mislabelled))],
+                1_000
+            )
+            .is_err());
+
+        // The genuine one lands, and moves the counter of that target only.
+        let genuine = status(
+            active.pq_certificate_fingerprint,
+            CertificateKind::ClientPq,
+            4,
+            7,
+        );
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(genuine))],
+                1_000,
+            )
+            .expect("a status about a slot this store holds");
+        assert_eq!(
+            store
+                .state()
+                .ledger
+                .last_status_for(&active.pq_certificate_fingerprint),
+            Some((1, 7))
+        );
+        // …and the TLS half of the same generation is a different target, so
+        // it still starts at its own epoch instead of being held back behind
+        // the counter of a certificate it has nothing to do with.
+        let tls = status(
+            active.tls_certificate_fingerprint,
+            CertificateKind::ClientTls,
+            4,
+            1,
+        );
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(tls))],
+                1_000,
+            )
+            .expect("counters are per target");
     }
 
     /// A transaction that fails anywhere leaves the live state untouched —

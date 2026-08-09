@@ -8,15 +8,27 @@
 //!
 //! # What is checked, and where
 //!
-//! - a **CA** must parse, be self-signed, carry `basicConstraints:CA=true` and
-//!   `keyUsage:keyCertSign`. Self-signature is possession: without it, an
-//!   authorization could name any public key as the next anchor;
+//! - a **CA** must parse, name itself as its own issuer, be self-signed, carry
+//!   `basicConstraints:CA=true` and `keyUsage:keyCertSign`. Self-signature is
+//!   possession: without it, an authorization could name any public key as the
+//!   next anchor. The issuer/subject comparison is not redundant with it — a
+//!   certificate can verify under its own key while naming another authority,
+//!   and a chain builder that matched on name would then follow it;
 //! - a **client leaf** must parse, not be a CA, carry the `clientAuth`
-//!   extended usage, be inside its validity at the instant it will be used,
-//!   and chain to an anchor the verifier already holds;
+//!   extended usage, carry `digitalSignature` when it declares a `keyUsage` at
+//!   all, be inside its validity at the instant it will be used, and chain to
+//!   an anchor the verifier already holds;
 //! - a **CSR** must carry the same public key as the leaf issued from it.
 //!   Without that check a grant can be perfectly signed and still install a
 //!   certificate for a private key the client never generated.
+//!
+//! # Every link of a chain is checked, not only the leaf
+//!
+//! [`assert_chains_to`] takes the instant the chain will be used and refuses a
+//! path whose intermediate or anchor is outside its own validity, or whose
+//! intermediate is not a CA. Verifying only the leaf's dates is the classic
+//! hole: an expired anchor keeps issuing perfectly-dated leaves forever, and
+//! the lifecycle would treat the retired authority as current.
 //!
 //! # What is deliberately not checked
 //!
@@ -35,6 +47,16 @@ pub struct X509Facts {
     pub is_certificate_authority: bool,
     pub can_sign_certificates: bool,
     pub is_client_authentication_leaf: bool,
+    /// Whether the certificate declares a `keyUsage` extension at all.
+    ///
+    /// The distinction matters: an absent extension asserts nothing, while a
+    /// present one that omits `digitalSignature` says the key may **not** sign
+    /// a handshake. Collapsing the two would either refuse legacy leaves or
+    /// accept a key its own issuer restricted.
+    pub declares_key_usage: bool,
+    pub can_digitally_sign: bool,
+    /// Issuer and subject names are equal — a necessary condition of a root.
+    pub is_self_issued: bool,
     pub not_before: u64,
     pub not_after: u64,
 }
@@ -59,11 +81,13 @@ pub fn inspect(certificate: &DerCertificate) -> Result<X509Facts, CertificateErr
         .ok()
         .flatten()
         .is_some_and(|extension| extension.value.ca);
-    let can_sign_certificates = parsed
-        .key_usage()
-        .ok()
-        .flatten()
+    let key_usage = parsed.key_usage().ok().flatten();
+    let can_sign_certificates = key_usage
+        .as_ref()
         .is_some_and(|extension| extension.value.key_cert_sign());
+    let can_digitally_sign = key_usage
+        .as_ref()
+        .is_some_and(|extension| extension.value.digital_signature());
     let is_client_authentication_leaf = parsed
         .extended_key_usage()
         .ok()
@@ -75,12 +99,35 @@ pub fn inspect(certificate: &DerCertificate) -> Result<X509Facts, CertificateErr
         is_certificate_authority,
         can_sign_certificates,
         is_client_authentication_leaf,
+        declares_key_usage: key_usage.is_some(),
+        can_digitally_sign,
+        is_self_issued: parsed.issuer() == parsed.subject(),
         not_before,
         not_after,
     })
 }
 
-/// A certificate authority: self-signed, `CA=true`, able to sign certificates.
+/// The certificate is inside its own validity at `now_unix`.
+///
+/// Used on every link of a chain, not only on the leaf: an expired anchor goes
+/// on issuing perfectly-dated leaves, and nothing else notices.
+pub fn assert_valid_at(
+    certificate: &DerCertificate,
+    now_unix: u64,
+) -> Result<(), CertificateError> {
+    let facts = inspect(certificate)?;
+    if now_unix < facts.not_before || now_unix >= facts.not_after {
+        return Err(CertificateError::InvalidX509("outside validity"));
+    }
+    Ok(())
+}
+
+/// A certificate authority: self-issued, self-signed, `CA=true`, able to sign.
+///
+/// Deliberately says nothing about dates. An anchor staged for a future
+/// activation is legitimately not valid today, and this is the structural
+/// check; [`assert_valid_at`] is the temporal one, applied where a chain is
+/// actually used.
 pub fn assert_certificate_authority(certificate: &DerCertificate) -> Result<(), CertificateError> {
     let facts = inspect(certificate)?;
     if !facts.is_certificate_authority {
@@ -88,6 +135,12 @@ pub fn assert_certificate_authority(certificate: &DerCertificate) -> Result<(), 
     }
     if !facts.can_sign_certificates {
         return Err(CertificateError::InvalidX509("cannot sign certificates"));
+    }
+    if !facts.is_self_issued {
+        // A certificate can verify under its own key and still name another
+        // authority as its issuer. Accepting it as a root would let a name
+        // that belongs to someone else be treated as this anchor's own.
+        return Err(CertificateError::InvalidX509("root is not self-issued"));
     }
     let parsed = parse(certificate.as_bytes())?;
     parsed
@@ -122,39 +175,84 @@ pub fn assert_client_leaf(
     if !facts.is_client_authentication_leaf {
         return Err(CertificateError::InvalidX509("no clientAuth usage"));
     }
+    // An absent `keyUsage` asserts nothing; a present one that omits
+    // `digitalSignature` says this key may not sign a handshake, which is the
+    // only thing a client leaf is ever used for.
+    if facts.declares_key_usage && !facts.can_digitally_sign {
+        return Err(CertificateError::InvalidX509("no digitalSignature usage"));
+    }
     if now_unix < facts.not_before || now_unix >= facts.not_after {
         return Err(CertificateError::InvalidX509("outside validity"));
     }
     Ok(())
 }
 
-/// Chains `leaf` to one of the anchors the verifier already holds.
+/// Chains `leaf` to one of the anchors the verifier already holds, at
+/// `now_unix`.
 ///
 /// `intermediates` are tried between the two — the delegated issuer's
 /// client-auth intermediate is the only one this PKI has. A leaf that chains
 /// to nothing is refused; a leaf that chains to an anchor the caller did not
 /// supply is refused for the same reason.
+///
+/// Every link above the leaf must be a CA **and** be inside its own validity
+/// at `now_unix`. Checking only the leaf leaves an expired anchor issuing
+/// perfectly-dated certificates, which is the failure a lifecycle notices last.
 pub fn assert_chains_to(
     leaf: &DerCertificate,
     intermediates: &[&DerCertificate],
     anchors: &[&DerCertificate],
+    now_unix: u64,
 ) -> Result<(), CertificateError> {
     if anchors.is_empty() {
         return Err(CertificateError::InvalidX509("no trust anchor"));
     }
+    let usable = |certificate: &DerCertificate| -> bool {
+        inspect(certificate).is_ok_and(|facts| {
+            facts.is_certificate_authority
+                && facts.can_sign_certificates
+                && now_unix >= facts.not_before
+                && now_unix < facts.not_after
+        })
+    };
+    let mut saw_expired_link = false;
     for anchor in anchors {
         if assert_issued_by(leaf, anchor).is_ok() {
-            return Ok(());
+            if usable(anchor) {
+                return Ok(());
+            }
+            saw_expired_link = true;
+            continue;
         }
         for intermediate in intermediates {
             if assert_issued_by(leaf, intermediate).is_ok()
                 && assert_issued_by(intermediate, anchor).is_ok()
             {
-                return Ok(());
+                if usable(intermediate) && usable(anchor) {
+                    return Ok(());
+                }
+                saw_expired_link = true;
             }
         }
     }
+    if saw_expired_link {
+        // The signatures line up and the path exists; what fails is that a
+        // link is outside its validity or is not an authority. Saying "no
+        // path" there sends an operator looking for the wrong problem.
+        return Err(CertificateError::InvalidX509("unusable chain link"));
+    }
     Err(CertificateError::InvalidX509("no path to a trust anchor"))
+}
+
+/// The certificate's `SubjectPublicKeyInfo`, DER-encoded.
+///
+/// What a holder of the matching private key can compare against to prove the
+/// two belong together. A daemon that only checks its key files *exist* starts
+/// up announcing an issuer it cannot actually issue with, and the mismatch
+/// surfaces at the first renewal — at 80 % of a leaf's life, on a client that
+/// has no fallback.
+pub fn subject_public_key_info(certificate: &DerCertificate) -> Result<Vec<u8>, CertificateError> {
+    Ok(parse(certificate.as_bytes())?.public_key().raw.to_vec())
 }
 
 /// The leaf certifies the key the CSR proved possession of.
@@ -273,20 +371,88 @@ mod tests {
         ));
     }
 
+    /// An instant at which the whole freshly-generated material is valid.
+    fn inside(certificate: &DerCertificate) -> u64 {
+        inspect(certificate).expect("facts").not_before + 1
+    }
+
     #[test]
     fn a_client_leaf_chains_to_its_anchor_and_not_to_another() {
         let (ca_der, ca, ca_key) = authority("CA-TLS");
         let (other_der, _, _) = authority("another-CA");
         let (leaf, _, _) = client_leaf(&ca, &ca_key);
+        let now = inside(&ca_der);
 
-        assert_chains_to(&leaf, &[], &[&ca_der]).expect("chains to its own CA");
+        assert_chains_to(&leaf, &[], &[&ca_der], now).expect("chains to its own CA");
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[&other_der]),
+            assert_chains_to(&leaf, &[], &[&other_der], now),
             Err(CertificateError::InvalidX509("no path to a trust anchor"))
         ));
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[]),
+            assert_chains_to(&leaf, &[], &[], now),
             Err(CertificateError::InvalidX509("no trust anchor"))
+        ));
+    }
+
+    /// An expired anchor keeps issuing perfectly-dated leaves. The chain is
+    /// where that has to be caught, because nothing downstream looks.
+    #[test]
+    fn a_chain_through_an_expired_anchor_is_refused() {
+        let (ca_der, ca, ca_key) = authority("CA-TLS");
+        let (leaf, _, _) = client_leaf(&ca, &ca_key);
+        let anchor = inspect(&ca_der).expect("facts");
+
+        assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_before + 1).expect("inside validity");
+        assert!(matches!(
+            assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_after),
+            Err(CertificateError::InvalidX509("unusable chain link"))
+        ));
+        assert!(matches!(
+            assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_before - 1),
+            Err(CertificateError::InvalidX509("unusable chain link"))
+        ));
+    }
+
+    /// A certificate that verifies under its own key while naming another
+    /// issuer is not a root: a name-matching path builder would follow it.
+    #[test]
+    fn a_self_signed_certificate_naming_another_issuer_is_not_a_root() {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.distinguished_name = name("impostor");
+        // rcgen signs with the given key while writing the *issuer* name of the
+        // certificate it is signed by, so this is self-signed and not
+        // self-issued.
+        let key = KeyPair::generate().expect("key");
+        let (_, issuer, _) = authority("CA-TLS");
+        let certificate = params
+            .signed_by(&key, &issuer, &key)
+            .expect("self-signed under another name");
+        let der = DerCertificate::new(certificate.der().to_vec()).expect("der");
+        assert!(matches!(
+            assert_certificate_authority(&der),
+            Err(CertificateError::InvalidX509("root is not self-issued"))
+        ));
+    }
+
+    /// A `keyUsage` that omits `digitalSignature` forbids the one thing a
+    /// client leaf does.
+    #[test]
+    fn a_client_leaf_without_digital_signature_usage_is_refused() {
+        let (_, ca, ca_key) = authority("CA-TLS");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::KeyEncipherment];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.distinguished_name = name("workstation");
+        let key = KeyPair::generate().expect("key");
+        let leaf = params.signed_by(&key, &ca, &ca_key).expect("leaf");
+        let leaf = DerCertificate::new(leaf.der().to_vec()).expect("der");
+        let now = inside(&leaf);
+        assert!(matches!(
+            assert_client_leaf(&leaf, now),
+            Err(CertificateError::InvalidX509("no digitalSignature usage"))
         ));
     }
 
@@ -306,9 +472,10 @@ mod tests {
         let intermediate_der = DerCertificate::new(intermediate.der().to_vec()).expect("der");
 
         let (leaf, _, _) = client_leaf(&intermediate, &intermediate_key);
-        assert_chains_to(&leaf, &[&intermediate_der], &[&ca_der]).expect("three-link path");
+        let now = inside(&ca_der);
+        assert_chains_to(&leaf, &[&intermediate_der], &[&ca_der], now).expect("three-link path");
         // Without the intermediate the path does not exist.
-        assert!(assert_chains_to(&leaf, &[], &[&ca_der]).is_err());
+        assert!(assert_chains_to(&leaf, &[], &[&ca_der], now).is_err());
     }
 
     #[test]

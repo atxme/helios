@@ -1707,12 +1707,24 @@ derrière un bouton au libellé ambigu « Renouveler ».
   canonique, les empreintes, les générations, les fenêtres, le calcul 80 % et
   les états bornés actif/suivant. L'idempotence porte sur l'empreinte du
   **document** signé, pas sur son contenu.
-- `aether::certificates::x509` : CA réelle et auto-signée, `basicConstraints`,
-  `keyCertSign`, `clientAuth`, validité, chaîne `leaf → intermédiaire → CA-TLS`
-  vers une ancre déjà détenue, et liaison CSR ↔ clé certifiée.
+- `aether::certificates::x509` : CA réelle, auto-émise et auto-signée,
+  `basicConstraints`, `keyCertSign`, `clientAuth`, `digitalSignature` dès qu'un
+  `keyUsage` est déclaré, chaîne `leaf → intermédiaire → CA-TLS` vers une ancre
+  déjà détenue — **chaque maillon** étant lu contre l'horloge de l'instant où
+  la chaîne servira — et liaison CSR ↔ clé certifiée.
+- Deux axes de révocation distincts, l'un pour la gateway et l'autre par
+  client, plus un troisième pour la clé de service Astra. Une révocation porte
+  sa portée et l'identité qu'elle nomme ; elle est refusée si elle en désigne
+  une autre, et appliquée à l'état que cette portée nomme.
+- Les compteurs de statut sont tenus **par cible**, comme Astra les émet : une
+  génération fraîche repart à son propre compteur au lieu d'être bloquée
+  derrière celui de la leaf qu'elle remplace. Un statut doit nommer une famille,
+  une génération et une empreinte que le porteur détient réellement.
 - `helios-provisioning::certificates` : staging à lease, reçu signé après
   écriture et `fsync`, commit qui **exige le grant**, purge, révocation
-  dominante, unicité globale des empreintes.
+  dominante, unicité globale des empreintes. Toute mutation est calculée sur
+  une copie, écrite, puis adoptée : un échec d'écriture laisse le registre
+  décrivant ce que le disque contient.
 - `helios-api` : `trust-update`, `stage` et `stage-commit` dans le tunnel,
   derrière la résolution de source.
 - `heliosd::certificates` : propriétaire unique du registre, signature des
@@ -1721,6 +1733,12 @@ derrière un bouton au libellé ambigu « Renouveler ».
 - `astra` : registre, audit chaîné dont la tête distingue une restauration d'un
   fork, émetteur délégué borné qui fixe lui-même la validité des leafs,
   planificateur, statut signé, budgets plafonnés par source et par identité.
+  Au démarrage, les deux clés privées de l'émetteur sont prouvées appartenir à
+  la délégation que le registre porte — signature ML-DSA-87 vérifiée sous
+  `pq_issuer_public_key`, `SubjectPublicKeyInfo` comparé à celui de
+  l'intermédiaire — plutôt que constatées présentes. Le binaire a ses propres
+  essais : `bootstrap`, refus d'une seconde histoire, refus d'une ancre
+  illisible, `status`.
 - `orion-core::certificates` : ancre, slots, planificateur dispersé stable,
   vérification complète d'une transaction chunkée et application par une seule
   écriture, révocations différées appliquées à leur instant.
@@ -1734,9 +1752,15 @@ contournés :
   `/v1/campaigns`, `/v1/client-rotation/recovery` et `/v1/signer-results/<id>`
   répondent `501` par une variante d'erreur nommée ;
 - le **canal veth privé** Astra–Helios (`/internal/v1/certificates/*`, TLS 1.3
-  `(EC)DHE` sans reprise ni 0-RTT). Conséquence directe : la gateway ne détient
-  aucun objet pré-signé à distribuer, donc `trust-update` répond `503` à un
-  client qu'elle sait en retard, au lieu de lui annoncer qu'il est à jour ;
+  `(EC)DHE` sans reprise ni 0-RTT). Deux conséquences directes : la gateway ne
+  détient aucun objet pré-signé à distribuer, donc `trust-update` répond `503`
+  à un client qu'elle sait en retard au lieu de lui annoncer qu'il est à jour ;
+  et sa réponse ne porte **jamais** de statut signé, parce qu'un statut est
+  signé par la clé de service Astra, que `heliosd` ne détient pas et ne doit
+  pas détenir. La comparaison qui décide « à jour » couvre en revanche tous les
+  compteurs et toutes les empreintes actives, gateway comme client : une
+  omission y répondrait « rien à récupérer » à un client en retard, et c'est le
+  seul refus dont il ne se relève pas ;
 - la **récupération d'une identité expirée** de bout en bout, qui dépend des
   deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule

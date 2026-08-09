@@ -24,6 +24,16 @@
 //! deadline therefore loses the race against the purge deterministically,
 //! instead of depending on which task read the clock first.
 //!
+//! # Written first, adopted second
+//!
+//! Every mutation is computed on a **copy** of the state, written to disk, and
+//! only then swapped in. Mutating memory and saving afterwards leaves the two
+//! disagreeing whenever the write fails: the in-memory registry would report a
+//! commit as already present — and answer the retry with success — while the
+//! disk still holds the candidate as pending. A restart would then undo a
+//! commit the client was told had landed, and the client has no way to ask
+//! again: from its side the transaction is closed.
+//!
 //! # Limite connue
 //!
 //! The registry stores the PQ leaf of each generation but not the TLS one: the
@@ -164,15 +174,17 @@ impl CertificateRegistry {
         &self.state
     }
 
-    /// Writes the registry atomically and `fsync`s file and directory.
+    /// Writes a candidate state atomically, `fsync`s, then adopts it.
     ///
-    /// Called before any answer that would let another party believe the write
-    /// happened. A receipt signed over an unsynced state is a signature over a
-    /// fact that a power cut can still undo.
-    pub fn save(&self) -> Result<(), RegistryError> {
-        let encoded = serde_json::to_vec_pretty(&self.state)
+    /// The order is the invariant: on a failed write the live state is the one
+    /// that is still on disk, so a retry sees exactly what a restart would.
+    /// Adopting first and reporting the error afterwards would leave the
+    /// running registry describing a transaction the disk never received.
+    fn persist(&mut self, candidate: RegistryState) -> Result<(), RegistryError> {
+        let encoded = serde_json::to_vec_pretty(&candidate)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
         aether::private_file::write_private_atomic(&self.path, &encoded)?;
+        self.state = candidate;
         Ok(())
     }
 
@@ -216,14 +228,16 @@ impl CertificateRegistry {
         active: ClientCertificateGeneration,
         active_pq_certificate: PqCertificate,
     ) -> Result<(), RegistryError> {
-        self.assert_fingerprints_free(
+        assert_fingerprints_free(
+            &self.state,
             wg_public_key,
             &[
                 active.tls_certificate_fingerprint,
                 active.pq_certificate_fingerprint,
             ],
         )?;
-        self.state.peers.insert(
+        let mut candidate = self.state.clone();
+        candidate.peers.insert(
             wg_public_key.to_base64(),
             PeerCertificates {
                 name: name.to_string(),
@@ -232,7 +246,7 @@ impl CertificateRegistry {
                 staged_pq_certificate: None,
             },
         );
-        self.save()
+        self.persist(candidate)
     }
 
     /// Persists a candidate generation and returns the receipt to be signed.
@@ -255,12 +269,13 @@ impl CertificateRegistry {
         if authorization.client_wg_public_key != *caller_wg_public_key {
             return Err(RegistryError::PeerMismatch);
         }
+        let mut state = self.state.clone();
         // An expired stage must not block a fresh one, and the purge belongs
-        // to the same serialized section as the staging it competes with.
-        self.purge_expired(now_unix)?;
+        // to the same serialized section — and the same write — as the staging
+        // it competes with.
+        purge_expired_in(&mut state, now_unix);
 
-        let peer = self
-            .state
+        let peer = state
             .peers
             .get(&caller_wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
@@ -269,21 +284,22 @@ impl CertificateRegistry {
         }
 
         authorization.verify(
-            &self.state.gateway.current_ca_public_key,
-            &self.state.trust_domain_id,
-            self.state.gateway.ca_epoch,
-            self.state.client_tls_ca.ca_tls_epoch,
-            &self.state.gateway.gateway_wg_public_key,
-            &self.state.gateway.server_name,
+            &state.gateway.current_ca_public_key,
+            &state.trust_domain_id,
+            state.gateway.ca_epoch,
+            state.client_tls_ca.ca_tls_epoch,
+            &state.gateway.gateway_wg_public_key,
+            &state.gateway.server_name,
             caller_wg_public_key,
             &peer.state.active,
-            &self.state.client_tls_ca.acceptable_anchors(now_unix),
+            &state.client_tls_ca.acceptable_anchors(now_unix),
             None,
             now_unix,
         )?;
 
         let candidate = authorization.candidate()?;
-        self.assert_fingerprints_free(
+        assert_fingerprints_free(
+            &state,
             caller_wg_public_key,
             &[
                 candidate.tls_certificate_fingerprint,
@@ -291,8 +307,7 @@ impl CertificateRegistry {
             ],
         )?;
 
-        let peer = self
-            .state
+        let peer = state
             .peers
             .get_mut(&caller_wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
@@ -302,8 +317,9 @@ impl CertificateRegistry {
         }
         let active_generation = peer.state.active.generation;
 
-        // Persisted and synced **before** the receipt exists.
-        self.save()?;
+        // Persisted, synced and adopted **before** the receipt exists: the
+        // signature that follows is a statement about a durable fact.
+        self.persist(state)?;
 
         Ok(GatewayCertificateStageReceipt {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -365,13 +381,24 @@ impl CertificateRegistry {
         if peer.state.revoked {
             return Err(RegistryError::Certificate(CertificateError::Revoked));
         }
-        // A replayed commit for the stage that already produced `next` is a
-        // no-op, and must be recognised before the absent `pending` turns it
-        // into a refusal.
-        if peer.state.last_committed_stage.as_ref() == Some(&commit.stage_id)
-            && peer.state.next.is_some()
-        {
-            return Ok(InstallOutcome::AlreadyPresent);
+        // A replayed commit is recognised by the **signed document**, not by
+        // the stage identifier: a second, differently-signed commit naming the
+        // same stage is a conflict, and answering it with success would report
+        // someone else's decision as landed. The candidate is gone by now, so
+        // this is also the only comparison still available — which is why it
+        // has to be the exact bytes that were verified the first time.
+        let commit_fingerprint = commit.fingerprint();
+        if let Some(committed) = &peer.state.last_committed_stage {
+            if committed.stage_id == commit.stage_id && peer.state.next.is_some() {
+                if committed.commit_fingerprint.matches(&commit_fingerprint) {
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                return Err(RegistryError::Certificate(
+                    CertificateError::GenerationConflict {
+                        generation: peer.state.next.as_ref().map_or(0, |next| next.generation),
+                    },
+                ));
+            }
         }
         let pending = peer
             .state
@@ -435,43 +462,38 @@ impl CertificateRegistry {
         )?;
 
         let stage_id = pending.stage_id;
-        let peer = self
-            .state
+        let mut state = self.state.clone();
+        let peer = state
             .peers
             .get_mut(&caller_wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
         // Helios commits a candidate that is still `pending_grant`: the grant
         // travels to the client, not through here (spec §7.3).
-        let outcome = peer
-            .state
-            .commit(&stage_id, PendingStageState::PendingGrant, now_unix)?;
-        self.save()?;
+        let outcome = peer.state.commit(
+            &stage_id,
+            &commit_fingerprint,
+            PendingStageState::PendingGrant,
+            now_unix,
+        )?;
+        self.persist(state)?;
         Ok(outcome)
     }
 
     /// Drops every candidate whose lease has run out, and returns their peers.
     pub fn purge_expired(&mut self, now_unix: u64) -> Result<Vec<String>, RegistryError> {
-        let mut purged = Vec::new();
-        for (key, peer) in self.state.peers.iter_mut() {
-            if peer.state.purge_expired(now_unix) {
-                // The staged leaf goes with the candidate: keeping it would
-                // leave a certificate the registry can no longer name.
-                if peer.state.next.is_none() {
-                    peer.staged_pq_certificate = None;
-                }
-                purged.push(key.clone());
-            }
-        }
+        let mut state = self.state.clone();
+        let purged = purge_expired_in(&mut state, now_unix);
         if !purged.is_empty() {
-            self.save()?;
+            self.persist(state)?;
         }
         Ok(purged)
     }
 
     /// Promotes every generation whose overlap has ended.
     pub fn promote_due(&mut self, now_unix: u64) -> Result<Vec<String>, RegistryError> {
+        let mut state = self.state.clone();
         let mut promoted = Vec::new();
-        for (key, peer) in self.state.peers.iter_mut() {
+        for (key, peer) in state.peers.iter_mut() {
             if peer.state.promote_if_due(now_unix) {
                 if let Some(certificate) = peer.staged_pq_certificate.take() {
                     peer.active_pq_certificate = certificate;
@@ -480,7 +502,7 @@ impl CertificateRegistry {
             }
         }
         if !promoted.is_empty() {
-            self.save()?;
+            self.persist(state)?;
         }
         Ok(promoted)
     }
@@ -495,42 +517,58 @@ impl CertificateRegistry {
         wg_public_key: &WireGuardKey,
         revocation_epoch: u64,
     ) -> Result<(), RegistryError> {
-        let peer = self
-            .state
+        let mut state = self.state.clone();
+        let peer = state
             .peers
             .get_mut(&wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
         peer.state.revoke(revocation_epoch);
         peer.staged_pq_certificate = None;
-        self.save()
+        self.persist(state)
     }
+}
 
-    /// Refuses a fingerprint already bound to another peer (spec §3.3).
-    ///
-    /// Global across active, next **and** pending: a candidate that duplicated
-    /// another peer's fingerprint would make a future connection resolvable to
-    /// two identities.
-    fn assert_fingerprints_free(
-        &self,
-        owner: &WireGuardKey,
-        fingerprints: &[Fingerprint],
-    ) -> Result<(), RegistryError> {
-        let owner = owner.to_base64();
-        for (key, peer) in &self.state.peers {
-            if *key == owner {
-                continue;
+/// Drops every candidate whose lease has run out, in place.
+fn purge_expired_in(state: &mut RegistryState, now_unix: u64) -> Vec<String> {
+    let mut purged = Vec::new();
+    for (key, peer) in state.peers.iter_mut() {
+        if peer.state.purge_expired(now_unix) {
+            // The staged leaf goes with the candidate: keeping it would leave
+            // a certificate the registry can no longer name.
+            if peer.state.next.is_none() {
+                peer.staged_pq_certificate = None;
             }
-            for occupied in peer.state.occupied_fingerprints() {
-                if fingerprints
-                    .iter()
-                    .any(|candidate| candidate.matches(&occupied))
-                {
-                    return Err(RegistryError::FingerprintTaken(peer.name.clone()));
-                }
+            purged.push(key.clone());
+        }
+    }
+    purged
+}
+
+/// Refuses a fingerprint already bound to another peer (spec §3.3).
+///
+/// Global across active, next **and** pending: a candidate that duplicated
+/// another peer's fingerprint would make a future connection resolvable to two
+/// identities.
+fn assert_fingerprints_free(
+    state: &RegistryState,
+    owner: &WireGuardKey,
+    fingerprints: &[Fingerprint],
+) -> Result<(), RegistryError> {
+    let owner = owner.to_base64();
+    for (key, peer) in &state.peers {
+        if *key == owner {
+            continue;
+        }
+        for occupied in peer.state.occupied_fingerprints() {
+            if fingerprints
+                .iter()
+                .any(|candidate| candidate.matches(&occupied))
+            {
+                return Err(RegistryError::FingerprintTaken(peer.name.clone()));
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "certificate-signing"))]
@@ -668,6 +706,8 @@ mod tests {
                 activation_at: None,
                 retire_active_at: None,
                 published: false,
+                revoked: false,
+                revocation_epoch: 0,
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 1,
@@ -686,6 +726,8 @@ mod tests {
                 astra_service_key_epoch: 1,
                 service_key_activation_at: None,
                 service_key_retire_active_at: None,
+                service_key_revocation_epoch: 0,
+                last_emergency_replacement_fingerprint: None,
             },
             issuer: None,
             peers: BTreeMap::new(),
@@ -945,6 +987,121 @@ mod tests {
                 .expect("replay"),
             InstallOutcome::AlreadyPresent
         );
+    }
+
+    /// A failed write must leave the registry describing what is on disk.
+    ///
+    /// Mutating memory and saving afterwards produces the worst outcome
+    /// available here: the running gateway answers the client's retry with
+    /// success, and a restart then reloads a candidate that is still pending.
+    /// The transaction is closed on the client's side, so nothing asks again.
+    #[test]
+    fn a_commit_whose_write_fails_leaves_the_registry_on_what_is_on_disk() {
+        let mut fixture = fixture();
+        let candidate = keys();
+        let candidate_leaf = leaf(
+            &fixture.ca,
+            &candidate,
+            PqCertificateRole::Client,
+            &client_key(2),
+            3,
+        );
+        let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+        let receipt = fixture
+            .registry
+            .stage(&client_key(2), &authorization, 1_100)
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+        let grant = grant_for(&fixture, &authorization, receipt);
+        let commit = commit_for(
+            &authorization,
+            &grant,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_200,
+        );
+
+        // Repoint the registry at a path no write can reach.
+        let unwritable = fixture
+            ._directory
+            .path()
+            .join("missing")
+            .join("certificates.json");
+        fixture.registry = CertificateRegistry::new(unwritable, fixture.registry.state().clone());
+
+        assert!(matches!(
+            fixture
+                .registry
+                .commit(&client_key(2), &commit, &grant, 1_300),
+            Err(RegistryError::Io(_))
+        ));
+        let peer = fixture.registry.peer(&client_key(2)).expect("peer");
+        assert!(
+            peer.state.pending.is_some() && peer.state.next.is_none(),
+            "the live state must still describe the candidate the disk holds"
+        );
+
+        // And the retry is the same refusal, not a success invented in memory.
+        assert!(matches!(
+            fixture
+                .registry
+                .commit(&client_key(2), &commit, &grant, 1_400),
+            Err(RegistryError::Io(_))
+        ));
+    }
+
+    /// Idempotency is the same signed document. A second, differently-signed
+    /// commit naming the same stage is a conflict — answering it with success
+    /// would report someone else's decision as landed.
+    #[test]
+    fn a_second_differently_signed_commit_for_the_same_stage_is_a_conflict() {
+        let mut fixture = fixture();
+        let candidate = keys();
+        let candidate_leaf = leaf(
+            &fixture.ca,
+            &candidate,
+            PqCertificateRole::Client,
+            &client_key(2),
+            3,
+        );
+        let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+        let receipt = fixture
+            .registry
+            .stage(&client_key(2), &authorization, 1_100)
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+        let grant = grant_for(&fixture, &authorization, receipt);
+        let commit = commit_for(
+            &authorization,
+            &grant,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_200,
+        );
+        fixture
+            .registry
+            .commit(&client_key(2), &commit, &grant, 1_300)
+            .expect("commit");
+
+        // Same stage, same candidate, a different signed document: only
+        // `committed_at` moved.
+        let other = commit_for(
+            &authorization,
+            &grant,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_250,
+        );
+        assert!(matches!(
+            fixture
+                .registry
+                .commit(&client_key(2), &other, &grant, 1_400),
+            Err(RegistryError::Certificate(
+                CertificateError::GenerationConflict { .. }
+            ))
+        ));
     }
 
     /// A commit that arrives at the deadline loses the race against the purge,

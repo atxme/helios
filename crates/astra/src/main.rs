@@ -268,16 +268,21 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
         Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
     let tls_private_key =
         Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
+    // Present is not the same as correct: the keys and the delegation come
+    // from two different places, and a mismatch would only show up at the
+    // first renewal.
+    let issuer = DelegatedIssuer::load(
+        installed.authorization.clone(),
+        pq_private_key,
+        tls_private_key,
+    )
+    .context("checking the delegated issuer's private material against the registry")?;
     tracing::info!(
         issuer_epoch = installed.issuer_epoch,
         not_after = installed.authorization.not_after,
         "delegated issuer loaded"
     );
-    Ok(Some(DelegatedIssuer::new(
-        installed.authorization.clone(),
-        pq_private_key,
-        tls_private_key,
-    )))
+    Ok(Some(issuer))
 }
 
 fn status(state_dir: &Path) -> Result<()> {

@@ -510,10 +510,14 @@ impl ClientCertificateStageAuthorization {
             .as_ref()
             .map(|delegation| vec![&delegation.tls_intermediate_certificate])
             .unwrap_or_default();
+        // The chain is read at `activation_at`, like the leaf itself: an anchor
+        // that expires before the candidate goes into service could not have
+        // vouched for it there.
         crate::certificates::x509::assert_chains_to(
             &self.next_tls_certificate,
             &intermediates,
             tls_anchors,
+            self.window.activation_at,
         )?;
         // The anchor the object *names* must be the one it actually chains to.
         if !tls_anchors.iter().any(|anchor| {
@@ -1065,6 +1069,7 @@ impl ClientCertificateRotationGrant {
             &self.next_tls_certificate,
             &intermediates,
             tls_anchors,
+            self.window.activation_at,
         )?;
         if !tls_anchors.iter().any(|anchor| {
             anchor
@@ -1186,6 +1191,19 @@ impl ClientCertificateStageCommit {
             .u64(self.stage_expires_at)
             .u64(self.committed_at);
         bytes.finish()
+    }
+
+    /// SHA-256 of the signed transcript followed by both client signatures.
+    ///
+    /// This is the identity a replay is recognised by: once the candidate has
+    /// become `next`, nothing else about the commit is still comparable, and
+    /// "the same stage identifier" is not the same document.
+    pub fn fingerprint(&self) -> Fingerprint {
+        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        bytes
+            .length_prefixed(self.active_pq_signature.as_bytes())
+            .length_prefixed(self.staged_pq_signature.as_bytes());
+        Fingerprint::of(&bytes.finish())
     }
 
     /// Verifies the commit against the candidate the gateway is holding.

@@ -333,7 +333,7 @@
       "Bash(awk '/^enum Command/,/^}/' tools/helios-ctl/src/main.rs)",
       "Bash(sed -i 's|    #\\\\[serde\\(flatten\\)\\\\]\\\\n||' crates/aether/src/certificates/authority.rs)",
       "Bash(perl -0pi -e 's/    #\\\\[serde\\\\\\(flatten\\\\\\)\\\\]\\\\n\\(    pub window: TransitionWindow,\\)/$1/g' crates/aether/src/certificates/authority.rs)",
-      "Bash(echo \"status=$?\")"
+      "Bash(echo \"EXIT_BASE=$?\")"
     ]
   }
 }

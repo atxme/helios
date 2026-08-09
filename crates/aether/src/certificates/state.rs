@@ -20,6 +20,18 @@
 //! A revoked identity refuses staging, commit, promotion and rollback, and no
 //! operator credential lifts it. Only a fresh admission creates a new
 //! identity. This is the one state that wins every race in this module.
+//!
+//! # Two scopes, two counters, two effects
+//!
+//! A revocation names either the gateway or a client, and the two axes never
+//! meet. [`TrustLedger`] holds the gateway counter, [`ClientCertificateState`]
+//! its own, and [`TrustLedger::apply_due`] routes each decision to the state it
+//! actually removes something from. Sharing one counter would let a gateway
+//! revocation consume a client's, and then the client's own revocation would
+//! be refused as a rollback — the decision would exist, be signed, be
+//! verified, and change nothing.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +51,8 @@ use super::{
         pq_certificate_fingerprint, GatewayIdentityTransition, GatewayTransitionAbort,
         GatewayTransitionAbortTombstone,
     },
+    revocation::{EmergencyCertificateRevocation, RevocationScope},
+    status::AstraCertificateStatus,
     window::TransitionWindow,
     CertificateError,
 };
@@ -103,6 +117,15 @@ pub struct GatewayCertificateState {
     /// Set while a staged transition has not yet been distributed. Once
     /// `true`, an abort is refused for good (spec §6.3).
     pub published: bool,
+    /// Terminal: the served gateway identity has been revoked (spec §10.1).
+    ///
+    /// Nothing local repairs it. A revoked gateway offers no acceptable leaf,
+    /// so the client refuses the handshake instead of negotiating with an
+    /// identity the authority has withdrawn.
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default)]
+    pub revocation_epoch: u64,
 }
 
 impl GatewayCertificateState {
@@ -123,6 +146,9 @@ impl GatewayCertificateState {
         &self,
         now_unix: u64,
     ) -> Result<Vec<Fingerprint>, CertificateError> {
+        if self.revoked {
+            return Ok(Vec::new());
+        }
         let mut fingerprints = vec![self.active_pq_fingerprint()?];
         if let (Some(certificate), Some(activation_at)) =
             (&self.next_gateway_certificate, self.activation_at)
@@ -144,6 +170,9 @@ impl GatewayCertificateState {
         transition: &GatewayIdentityTransition,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
+        if self.revoked {
+            return Err(CertificateError::Revoked);
+        }
         // An identical decision already held is a no-op, and it must be
         // recognised before the generation rule refuses `current` as a repeat.
         // "Identical" is the whole signed document: the same leaves under a
@@ -271,6 +300,75 @@ impl GatewayCertificateState {
         Ok(true)
     }
 
+    /// Withdraws the named gateway leaves (spec §10.1).
+    ///
+    /// Two outcomes, and the difference is which slot the fingerprints hit:
+    ///
+    /// - a leaf that is **served** makes the state terminal. There is no
+    ///   partial gateway identity: the generation is indivisible, so naming
+    ///   only its TLS half still removes the whole of it, and `acceptable_pq_
+    ///   fingerprints` then returns nothing at all;
+    /// - a leaf that is merely **staged** cancels the transition and leaves
+    ///   the active identity alone. That is not leniency — the staged leaf was
+    ///   never served, and retiring a working gateway because its successor
+    ///   was compromised would take the fleet down for nothing.
+    ///
+    /// Returns whether anything moved.
+    pub fn apply_revocation(
+        &mut self,
+        revoked_tls_fingerprint: Option<&Fingerprint>,
+        revoked_pq_fingerprint: Option<&Fingerprint>,
+        revocation_epoch: u64,
+    ) -> Result<bool, CertificateError> {
+        let named = |candidate: &Fingerprint| {
+            [revoked_tls_fingerprint, revoked_pq_fingerprint]
+                .into_iter()
+                .flatten()
+                .any(|revoked| revoked.matches(candidate))
+        };
+
+        if named(&self.active_tls_fingerprint()) || named(&self.active_pq_fingerprint()?) {
+            self.revoked = true;
+            self.revocation_epoch = revocation_epoch;
+            self.next_gateway_identity_epoch = None;
+            self.next_transition_fingerprint = None;
+            self.next_gateway_tls_certificate = None;
+            self.next_gateway_certificate = None;
+            self.activation_at = None;
+            self.retire_active_at = None;
+            self.published = false;
+            return Ok(true);
+        }
+
+        let staged_hit = self
+            .next_gateway_tls_certificate
+            .as_ref()
+            .map(DerCertificate::fingerprint)
+            .is_some_and(|fingerprint| named(&fingerprint))
+            || self
+                .next_gateway_certificate
+                .as_ref()
+                .map(pq_certificate_fingerprint)
+                .transpose()?
+                .is_some_and(|fingerprint| named(&fingerprint));
+        if staged_hit {
+            self.revocation_epoch = revocation_epoch;
+            self.next_gateway_identity_epoch = None;
+            self.next_transition_fingerprint = None;
+            self.next_gateway_tls_certificate = None;
+            self.next_gateway_certificate = None;
+            self.activation_at = None;
+            self.retire_active_at = None;
+            self.published = false;
+            return Ok(true);
+        }
+        // A revocation naming a leaf this state never held is not an error —
+        // an offline document may carry the fleet's decisions — but its epoch
+        // is still consumed by the caller, so it can never be replayed.
+        self.revocation_epoch = revocation_epoch;
+        Ok(false)
+    }
+
     /// Installs a CA rotation, keeping at most two anchors (spec §9.2).
     pub fn apply_ca_transition(
         &mut self,
@@ -377,7 +475,9 @@ impl GatewayCertificateState {
             .u64(self.retire_active_at.unwrap_or(0))
             .u64(self.ca_activation_at.unwrap_or(0))
             .u64(self.ca_retire_active_at.unwrap_or(0))
-            .u8(u8::from(self.published));
+            .u8(u8::from(self.published))
+            .u8(u8::from(self.revoked))
+            .u64(self.revocation_epoch);
         Ok(())
     }
 }
@@ -455,6 +555,21 @@ impl ClientTlsCaState {
         true
     }
 
+    pub(crate) fn snapshot(&self, bytes: &mut CanonicalBytes) {
+        bytes
+            .u64(self.ca_tls_epoch)
+            .fingerprint(&self.active_client_tls_ca_certificate.fingerprint())
+            .optional_fingerprint(
+                self.next_client_tls_ca_certificate
+                    .as_ref()
+                    .map(DerCertificate::fingerprint)
+                    .as_ref(),
+            )
+            .optional_fingerprint(self.next_transition_fingerprint.as_ref())
+            .u64(self.activation_at.unwrap_or(0))
+            .u64(self.retire_active_at.unwrap_or(0));
+    }
+
     /// The chains an mTLS verifier accepts at `now_unix` — two at most.
     pub fn acceptable_anchors(&self, now_unix: u64) -> Vec<&DerCertificate> {
         let mut anchors = vec![&self.active_client_tls_ca_certificate];
@@ -484,12 +599,34 @@ pub enum PendingStageState {
 #[serde(deny_unknown_fields)]
 pub struct ClientCertificatePendingStage {
     pub stage_id: Id16,
+    /// Fingerprint of the **signed** staging authorization that created it.
+    ///
+    /// The idempotency rule of spec §4.2 is "the same signed bytes", and this
+    /// is what makes that literally true here. Comparing the candidate, the
+    /// lease and the request fingerprint compares consequences: two
+    /// authorizations differing only in their window, their reason or their
+    /// signature would look identical, and the second sender would be told its
+    /// decision landed when the first one is what the state still holds.
+    pub authorization_fingerprint: Fingerprint,
     pub request_fingerprint: Fingerprint,
     pub candidate: ClientCertificateGeneration,
     pub state: PendingStageState,
     pub stage_expires_at: u64,
     /// Window the candidate will follow once committed.
     pub window: TransitionWindow,
+}
+
+/// The commit that produced the current `next` generation.
+///
+/// Both halves are needed: the identifier says *which* stage, the fingerprint
+/// says *which document* closed it. A retry over a lossy link replays the same
+/// signed commit and must be a no-op; a different commit naming the same stage
+/// is a conflict, not a second success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedStage {
+    pub stage_id: Id16,
+    pub commit_fingerprint: Fingerprint,
 }
 
 /// Active generation, candidate and next — never more (spec §3.3).
@@ -501,13 +638,13 @@ pub struct ClientCertificateState {
     pub next: Option<ClientCertificateGeneration>,
     pub activation_at: Option<u64>,
     pub retire_active_at: Option<u64>,
-    /// Stage that produced the committed `next`, so a replayed commit is
+    /// Commit that produced the current `next`, so a replayed one is
     /// recognised as the same one instead of finding an empty `pending`.
     ///
     /// Without it, the second delivery of a successful commit looks exactly
     /// like a commit for a stage that never existed, and a retry over a lossy
     /// link would be reported as a refusal.
-    pub last_committed_stage: Option<Id16>,
+    pub last_committed_stage: Option<CommittedStage>,
     /// Terminal. No credential, campaign or grant lifts it.
     pub revoked: bool,
     pub revocation_epoch: u64,
@@ -541,15 +678,15 @@ impl ClientCertificateState {
             return Err(CertificateError::Revoked);
         }
         let candidate = authorization.candidate()?;
+        let authorization_fingerprint = authorization.fingerprint()?;
         if let Some(pending) = &self.pending {
             if pending.stage_id == authorization.stage_id {
-                // Identical replay is idempotent; the same identifier over
-                // different bytes is a conflict, not a second attempt.
-                if pending.candidate == candidate
-                    && pending.stage_expires_at == authorization.stage_expires_at
-                    && pending
-                        .request_fingerprint
-                        .matches(&authorization.request_fingerprint)
+                // Idempotency is the **same signed document**, not the same
+                // consequences: two authorizations with identical candidates
+                // and leases can still differ in window, reason or signature.
+                if pending
+                    .authorization_fingerprint
+                    .matches(&authorization_fingerprint)
                 {
                     return Ok(InstallOutcome::AlreadyPresent);
                 }
@@ -568,6 +705,7 @@ impl ClientCertificateState {
 
         self.pending = Some(ClientCertificatePendingStage {
             stage_id: authorization.stage_id,
+            authorization_fingerprint,
             request_fingerprint: authorization.request_fingerprint,
             candidate,
             state: PendingStageState::PendingGrant,
@@ -611,17 +749,28 @@ impl ClientCertificateState {
     pub fn commit(
         &mut self,
         stage_id: &Id16,
+        commit_fingerprint: &Fingerprint,
         required_state: PendingStageState,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
         if self.revoked {
             return Err(CertificateError::Revoked);
         }
-        // A replay is recognised by the stage that produced the committed
-        // slot, not by "there is a `next` roughly where one would be": a
-        // different stage landing on the same generation is a conflict.
-        if self.last_committed_stage.as_ref() == Some(stage_id) && self.next.is_some() {
-            return Ok(InstallOutcome::AlreadyPresent);
+        // A replay is recognised by the signed commit that produced the slot,
+        // not by "there is a `next` roughly where one would be". Two things
+        // follow: a different stage landing on the same generation is a
+        // conflict, and a *different document* closing the same stage is a
+        // conflict too — otherwise the second sender would be told its commit
+        // landed while the first one is what the state holds.
+        if let Some(committed) = &self.last_committed_stage {
+            if committed.stage_id == *stage_id && self.next.is_some() {
+                if committed.commit_fingerprint.matches(commit_fingerprint) {
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                return Err(CertificateError::GenerationConflict {
+                    generation: self.next.as_ref().map_or(0, |next| next.generation),
+                });
+            }
         }
         let pending = self
             .pending
@@ -642,7 +791,10 @@ impl ClientCertificateState {
         let candidate = pending.candidate.clone();
         self.pending = None;
         self.next = Some(candidate);
-        self.last_committed_stage = Some(*stage_id);
+        self.last_committed_stage = Some(CommittedStage {
+            stage_id: *stage_id,
+            commit_fingerprint: *commit_fingerprint,
+        });
         self.activation_at = Some(window.activation_at);
         self.retire_active_at = Some(window.not_after);
         Ok(InstallOutcome::Installed)
@@ -747,24 +899,11 @@ impl ClientCertificateState {
     /// the transaction would then apply to a world it was not computed for —
     /// which is the exact failure `base_state_fingerprint` exists to catch.
     pub(crate) fn snapshot(&self, bytes: &mut CanonicalBytes) {
-        bytes
-            .u64(self.active.generation)
-            .u64(self.active.ca_tls_epoch)
-            .fingerprint(&self.active.tls_ca_certificate_fingerprint)
-            .fingerprint(&self.active.tls_certificate_fingerprint)
-            .fingerprint(&self.active.pq_certificate_fingerprint)
-            .u64(self.active.not_before)
-            .u64(self.active.not_after);
-
+        generation_snapshot(bytes, &self.active);
         match &self.next {
             Some(next) => {
-                bytes
-                    .u8(1)
-                    .u64(next.generation)
-                    .fingerprint(&next.tls_certificate_fingerprint)
-                    .fingerprint(&next.pq_certificate_fingerprint)
-                    .u64(next.not_before)
-                    .u64(next.not_after);
+                bytes.u8(1);
+                generation_snapshot(bytes, next);
             }
             None => {
                 bytes.u8(0);
@@ -775,15 +914,29 @@ impl ClientCertificateState {
                 bytes
                     .u8(1)
                     .id(&pending.stage_id)
-                    .fingerprint(&pending.request_fingerprint)
-                    .u64(pending.candidate.generation)
-                    .fingerprint(&pending.candidate.tls_certificate_fingerprint)
-                    .fingerprint(&pending.candidate.pq_certificate_fingerprint)
+                    .fingerprint(&pending.authorization_fingerprint)
+                    .fingerprint(&pending.request_fingerprint);
+                generation_snapshot(bytes, &pending.candidate);
+                bytes
                     .u8(match pending.state {
                         PendingStageState::PendingGrant => 0,
                         PendingStageState::PendingCommit => 1,
                     })
-                    .u64(pending.stage_expires_at);
+                    .u64(pending.stage_expires_at)
+                    .u64(pending.window.not_before)
+                    .u64(pending.window.activation_at)
+                    .u64(pending.window.not_after);
+            }
+            None => {
+                bytes.u8(0);
+            }
+        }
+        match &self.last_committed_stage {
+            Some(committed) => {
+                bytes
+                    .u8(1)
+                    .id(&committed.stage_id)
+                    .fingerprint(&committed.commit_fingerprint);
             }
             None => {
                 bytes.u8(0);
@@ -795,6 +948,22 @@ impl ClientCertificateState {
             .u64(self.revocation_epoch)
             .u8(u8::from(self.revoked));
     }
+}
+
+/// Every field of one generation, for the state fingerprint.
+///
+/// Written once and reused for all three slots: a snapshot that summarised
+/// `next` and `pending` more coarsely than `active` would let a manifest be
+/// built against a state whose candidate had already moved.
+fn generation_snapshot(bytes: &mut CanonicalBytes, generation: &ClientCertificateGeneration) {
+    bytes
+        .u64(generation.generation)
+        .u64(generation.ca_tls_epoch)
+        .fingerprint(&generation.tls_ca_certificate_fingerprint)
+        .fingerprint(&generation.tls_certificate_fingerprint)
+        .fingerprint(&generation.pq_certificate_fingerprint)
+        .u64(generation.not_before)
+        .u64(generation.not_after);
 }
 
 /// Astra's identity as a client pins it (spec §2.4).
@@ -810,6 +979,17 @@ pub struct AstraProfile {
     pub astra_service_key_epoch: u64,
     pub service_key_activation_at: Option<u64>,
     pub service_key_retire_active_at: Option<u64>,
+    /// Revocation counter of the **Astra service key**, on its own axis.
+    ///
+    /// It used to borrow the client's, which is a domain-wide decision read
+    /// against a per-peer counter: two clients at different counters would
+    /// accept or refuse the same global replacement differently, and whichever
+    /// accepted it would burn a number its own revocations then need.
+    #[serde(default)]
+    pub service_key_revocation_epoch: u64,
+    /// The emergency replacement already applied, by signed document.
+    #[serde(default)]
+    pub last_emergency_replacement_fingerprint: Option<Fingerprint>,
 }
 
 impl AstraProfile {
@@ -871,17 +1051,27 @@ impl AstraProfile {
     }
 
     /// Immediate replacement of a compromised key: no overlap at all.
+    ///
+    /// The counter compared here is this profile's own
+    /// `service_key_revocation_epoch`, never a client's: the decision is
+    /// domain-wide, and reading it against a per-peer axis makes the same
+    /// signed object land differently on two clients of one fleet.
     pub fn apply_emergency_replacement(
         &mut self,
         replacement: &EmergencyAstraServiceKeyReplacement,
         ca_pq: &MlDsa87PublicKey,
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
-        current_revocation_epoch: u64,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.astra_service_key_epoch == replacement.next_service_key_epoch
-            && self.active_astra_service_public_key == replacement.next_service_public_key
+        // Idempotency on the signed document. Comparing "same epoch, same next
+        // key" would swallow a *different* replacement that happens to install
+        // the same key — a different revocation epoch, a different effective
+        // instant — and report it as already applied.
+        let fingerprint = replacement.fingerprint();
+        if self
+            .last_emergency_replacement_fingerprint
+            .is_some_and(|applied| applied.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
@@ -890,7 +1080,7 @@ impl AstraProfile {
             trust_domain_id,
             ca_epoch,
             self.astra_service_key_epoch,
-            current_revocation_epoch,
+            self.service_key_revocation_epoch,
         )?;
         // The object must retire the key this profile is actually serving. One
         // naming another fingerprint is a valid signature over someone else's
@@ -910,11 +1100,30 @@ impl AstraProfile {
         }
         self.active_astra_service_public_key = replacement.next_service_public_key.clone();
         self.astra_service_key_epoch = replacement.next_service_key_epoch;
+        self.service_key_revocation_epoch = replacement.revocation_epoch;
+        self.last_emergency_replacement_fingerprint = Some(fingerprint);
         self.next_astra_service_public_key = None;
         self.next_service_key_transition_fingerprint = None;
         self.service_key_activation_at = None;
         self.service_key_retire_active_at = None;
         Ok(InstallOutcome::Installed)
+    }
+
+    pub(crate) fn snapshot(&self, bytes: &mut CanonicalBytes) {
+        bytes
+            .u64(self.astra_service_key_epoch)
+            .fingerprint(&self.active_astra_service_public_key.authority_fingerprint())
+            .optional_fingerprint(
+                self.next_astra_service_public_key
+                    .as_ref()
+                    .map(MlDsa87PublicKey::authority_fingerprint)
+                    .as_ref(),
+            )
+            .optional_fingerprint(self.next_service_key_transition_fingerprint.as_ref())
+            .u64(self.service_key_activation_at.unwrap_or(0))
+            .u64(self.service_key_retire_active_at.unwrap_or(0))
+            .u64(self.service_key_revocation_epoch)
+            .optional_fingerprint(self.last_emergency_replacement_fingerprint.as_ref());
     }
 
     pub fn promote_service_key_if_due(&mut self, now_unix: u64) -> bool {
@@ -963,49 +1172,259 @@ impl AstraIssuerState {
     }
 }
 
+/// Largest number of revocations held before their effective instant.
+///
+/// A ceiling rather than an unbounded list: an identity can only ever be
+/// revoked once, so more than a handful in flight means something is wrong,
+/// and growing a bounded state on a remote party's say-so is how it stops
+/// being bounded.
+pub const MAX_SCHEDULED_REVOCATIONS: usize = 8;
+
+/// Largest number of status-ordering entries kept.
+///
+/// The targets are drawn from the slots the holder already has — two anchors,
+/// two gateway leaves per family, three client generations — so the map is
+/// naturally bounded. The ceiling is what makes that a checked property
+/// instead of an argument.
+pub const MAX_TRACKED_STATUS_TARGETS: usize = 24;
+
+/// A verified revocation waiting for its own instant (spec §10.1).
+///
+/// Its scope is kept, and it is the whole point: the object named either the
+/// gateway or a client, and applying it to the other one would remove an
+/// identity nobody revoked while leaving the compromised one in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledRevocation {
+    pub scope: RevocationScope,
+    pub revocation_epoch: u64,
+    pub effective_at: u64,
+    pub revoked_tls_fingerprint: Option<Fingerprint>,
+    pub revoked_pq_fingerprint: Option<Fingerprint>,
+}
+
+impl ScheduledRevocation {
+    /// Whether this revocation withdraws any fingerprint a client holds.
+    ///
+    /// Both families are checked. A revocation naming only the TLS half is a
+    /// revocation: the generation is indivisible, and letting the PQ half
+    /// survive would leave an identity that mTLS refuses and the negotiation
+    /// still accepts.
+    fn hits_client(&self, certificates: &ClientCertificateState) -> bool {
+        let occupied = certificates.occupied_fingerprints();
+        [self.revoked_tls_fingerprint, self.revoked_pq_fingerprint]
+            .into_iter()
+            .flatten()
+            .any(|revoked| occupied.iter().any(|held| held.matches(&revoked)))
+    }
+}
+
+/// Ordering key of the last status accepted for one target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusOrdering {
+    pub astra_service_key_epoch: u64,
+    pub status_epoch: u64,
+}
+
+impl StatusOrdering {
+    fn key(self) -> (u64, u64) {
+        (self.astra_service_key_epoch, self.status_epoch)
+    }
+}
+
+/// What a trust holder knows that belongs to no single authority family.
+///
+/// Two things live here because they are cross-cutting: the revocations that
+/// have been verified but not yet reached their instant, and the last status
+/// ordering **per target**. The second is deliberately not one global pair —
+/// Astra counts statuses per certificate, so a freshly rotated leaf starts at
+/// epoch 1 and would be refused for good behind the high epoch of the leaf it
+/// replaced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustLedger {
+    /// Revocation counter of the **gateway** identity, on its own axis.
+    #[serde(default)]
+    pub gateway_revocation_epoch: u64,
+    #[serde(default)]
+    pub scheduled_revocations: Vec<ScheduledRevocation>,
+    /// Keyed by the target's fingerprint in lowercase hex.
+    #[serde(default)]
+    pub last_statuses: BTreeMap<String, StatusOrdering>,
+}
+
+impl TrustLedger {
+    /// Records a revocation whose object has already been verified.
+    ///
+    /// A revocation dated in the future is **kept**: its epoch is consumed the
+    /// moment it verifies, so dropping it would discard a decision the
+    /// authority already made and that can never be delivered again.
+    pub fn schedule(
+        &mut self,
+        revocation: &EmergencyCertificateRevocation,
+    ) -> Result<(), CertificateError> {
+        if self.scheduled_revocations.len() >= MAX_SCHEDULED_REVOCATIONS {
+            return Err(CertificateError::InvalidTransaction(
+                "too many pending revocations",
+            ));
+        }
+        if revocation.scope == RevocationScope::Gateway {
+            self.gateway_revocation_epoch = revocation.revocation_epoch;
+        }
+        self.scheduled_revocations.push(ScheduledRevocation {
+            scope: revocation.scope,
+            revocation_epoch: revocation.revocation_epoch,
+            effective_at: revocation.effective_at,
+            revoked_tls_fingerprint: revocation.revoked_tls_fingerprint,
+            revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
+        });
+        Ok(())
+    }
+
+    /// Applies every revocation that has reached its instant, to the state its
+    /// scope names. Returns whether anything moved.
+    pub fn apply_due(
+        &mut self,
+        gateway: &mut GatewayCertificateState,
+        client: &mut ClientCertificateState,
+        now_unix: u64,
+    ) -> Result<bool, CertificateError> {
+        let mut moved = false;
+        let mut remaining = Vec::with_capacity(self.scheduled_revocations.len());
+        for revocation in std::mem::take(&mut self.scheduled_revocations) {
+            if now_unix < revocation.effective_at {
+                remaining.push(revocation);
+                continue;
+            }
+            match revocation.scope {
+                RevocationScope::Client => {
+                    if revocation.hits_client(client) {
+                        client.revoke(revocation.revocation_epoch);
+                    }
+                }
+                RevocationScope::Gateway => {
+                    gateway.apply_revocation(
+                        revocation.revoked_tls_fingerprint.as_ref(),
+                        revocation.revoked_pq_fingerprint.as_ref(),
+                        revocation.revocation_epoch,
+                    )?;
+                }
+            }
+            moved = true;
+        }
+        self.scheduled_revocations = remaining;
+        Ok(moved)
+    }
+
+    pub fn last_status_for(&self, target: &Fingerprint) -> Option<(u64, u64)> {
+        self.last_statuses
+            .get(&target.to_hex())
+            .map(|ordering| ordering.key())
+    }
+
+    /// Records the ordering of an accepted status for one target.
+    pub fn record_status(
+        &mut self,
+        target: &Fingerprint,
+        status: &AstraCertificateStatus,
+    ) -> Result<(), CertificateError> {
+        let key = target.to_hex();
+        if !self.last_statuses.contains_key(&key)
+            && self.last_statuses.len() >= MAX_TRACKED_STATUS_TARGETS
+        {
+            return Err(CertificateError::InvalidTransaction(
+                "too many status targets",
+            ));
+        }
+        self.last_statuses.insert(
+            key,
+            StatusOrdering {
+                astra_service_key_epoch: status.astra_service_key_epoch,
+                status_epoch: status.status_epoch,
+            },
+        );
+        Ok(())
+    }
+
+    /// Forgets the ordering of targets the holder no longer has a slot for.
+    ///
+    /// A promoted generation is gone from the state, so keeping its counter
+    /// would only ever consume room in a bounded map.
+    pub fn prune_statuses(&mut self, held: &[Fingerprint]) {
+        self.last_statuses
+            .retain(|key, _| held.iter().any(|fingerprint| fingerprint.to_hex() == *key));
+    }
+
+    fn snapshot(&self, bytes: &mut CanonicalBytes) {
+        bytes
+            .u64(self.gateway_revocation_epoch)
+            .u16(self.scheduled_revocations.len() as u16);
+        for revocation in &self.scheduled_revocations {
+            bytes
+                .u8(match revocation.scope {
+                    RevocationScope::Gateway => 0,
+                    RevocationScope::Client => 1,
+                })
+                .u64(revocation.revocation_epoch)
+                .u64(revocation.effective_at)
+                .optional_fingerprint(revocation.revoked_tls_fingerprint.as_ref())
+                .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref());
+        }
+        bytes.u16(self.last_statuses.len() as u16);
+        for (target, ordering) in &self.last_statuses {
+            bytes
+                .text(target)
+                .u64(ordering.astra_service_key_epoch)
+                .u64(ordering.status_epoch);
+        }
+    }
+}
+
+/// The complete state a transaction is computed against (spec §8.1).
+///
+/// Passed as one value rather than five arguments because the point is
+/// exhaustiveness: adding a slot to the trust store and forgetting to bind it
+/// here is what lets a manifest be built against a world that has since moved.
+pub struct TrustSnapshot<'a> {
+    pub gateway: &'a GatewayCertificateState,
+    pub client_tls_ca: &'a ClientTlsCaState,
+    pub astra: &'a AstraProfile,
+    pub issuer: Option<&'a AstraIssuerState>,
+    pub client: &'a ClientCertificateState,
+    pub ledger: &'a TrustLedger,
+}
+
 /// SHA-256 of the receiver's complete trust state (spec §8.1).
 ///
 /// A manifest is bound to this value, so a transaction built against a state
 /// that has since moved is refused instead of being applied to a world it was
 /// never computed for.
-pub fn base_state_fingerprint(
-    gateway: &GatewayCertificateState,
-    tls_ca: &ClientTlsCaState,
-    astra: &AstraProfile,
-    issuer_epoch: u64,
-    client: &ClientCertificateState,
-) -> Result<Fingerprint, CertificateError> {
+pub fn base_state_fingerprint(snapshot: &TrustSnapshot) -> Result<Fingerprint, CertificateError> {
     let mut bytes = CanonicalBytes::new(BASE_STATE_DOMAIN);
-    gateway.snapshot(&mut bytes)?;
-    bytes
-        .u64(tls_ca.ca_tls_epoch)
-        .fingerprint(&tls_ca.active_client_tls_ca_certificate.fingerprint())
-        .optional_fingerprint(
-            tls_ca
-                .next_client_tls_ca_certificate
-                .as_ref()
-                .map(DerCertificate::fingerprint)
-                .as_ref(),
-        )
-        .u64(tls_ca.activation_at.unwrap_or(0))
-        .u64(tls_ca.retire_active_at.unwrap_or(0))
-        .u64(astra.astra_service_key_epoch)
-        .fingerprint(
-            &astra
-                .active_astra_service_public_key
-                .authority_fingerprint(),
-        )
-        .optional_fingerprint(
-            astra
-                .next_astra_service_public_key
-                .as_ref()
-                .map(MlDsa87PublicKey::authority_fingerprint)
-                .as_ref(),
-        )
-        .u64(astra.service_key_activation_at.unwrap_or(0))
-        .u64(astra.service_key_retire_active_at.unwrap_or(0))
-        .u64(issuer_epoch);
-    client.snapshot(&mut bytes);
+    snapshot.gateway.snapshot(&mut bytes)?;
+    snapshot.client_tls_ca.snapshot(&mut bytes);
+    snapshot.astra.snapshot(&mut bytes);
+    match snapshot.issuer {
+        // The whole delegation, not just its number: an issuer swapped at the
+        // same epoch changes which key may certify the next client leaf.
+        Some(issuer) => {
+            bytes
+                .u8(1)
+                .u64(issuer.issuer_epoch)
+                .fingerprint(&issuer.authorization.fingerprint())
+                .u8(match issuer.state {
+                    IssuerLifecycle::Active => 0,
+                    IssuerLifecycle::Expiring => 1,
+                    IssuerLifecycle::Revoked => 2,
+                });
+        }
+        None => {
+            bytes.u8(0);
+        }
+    }
+    snapshot.client.snapshot(&mut bytes);
+    snapshot.ledger.snapshot(&mut bytes);
     Ok(Fingerprint::of(&bytes.finish()))
 }
 
@@ -1026,10 +1445,16 @@ mod tests {
         }
     }
 
+    /// A distinct signed-commit identity per seed.
+    fn commit_fingerprint(seed: u8) -> Fingerprint {
+        Fingerprint::of(&[seed, 0xC0])
+    }
+
     fn staged_state() -> ClientCertificateState {
         let mut state = ClientCertificateState::new(generation(4, 1));
         state.pending = Some(ClientCertificatePendingStage {
             stage_id: Id16::new([3; 16]).expect("stage"),
+            authorization_fingerprint: Fingerprint::of(b"authorization"),
             request_fingerprint: Fingerprint::of(b"request"),
             candidate: generation(5, 2),
             state: PendingStageState::PendingGrant,
@@ -1053,6 +1478,7 @@ mod tests {
         state
             .commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000,
             )
@@ -1079,6 +1505,7 @@ mod tests {
         state
             .commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000,
             )
@@ -1114,6 +1541,7 @@ mod tests {
         assert!(matches!(
             state.commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 5_001
             ),
@@ -1127,6 +1555,7 @@ mod tests {
         assert!(matches!(
             state.commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 5_000
             ),
@@ -1142,6 +1571,7 @@ mod tests {
         assert!(matches!(
             orion.commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingCommit,
                 2_000
             ),
@@ -1154,6 +1584,7 @@ mod tests {
         orion
             .commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingCommit,
                 2_000,
             )
@@ -1161,27 +1592,50 @@ mod tests {
         assert!(orion.next.is_some());
     }
 
-    /// A retry over a lossy link is a no-op, and it is recognised by the stage
-    /// that produced the slot — not by "there is a `next` roughly here".
+    /// A retry over a lossy link is a no-op, and it is recognised by the exact
+    /// signed commit — not by "there is a `next` roughly here", and not by the
+    /// stage identifier alone.
     #[test]
-    fn a_replayed_commit_is_idempotent_for_its_own_stage_only() {
+    fn a_replayed_commit_is_idempotent_only_for_its_own_signed_document() {
         let mut state = staged_state();
         let stage = Id16::new([3; 16]).unwrap();
         state
-            .commit(&stage, PendingStageState::PendingGrant, 2_000)
+            .commit(
+                &stage,
+                &commit_fingerprint(1),
+                PendingStageState::PendingGrant,
+                2_000,
+            )
             .expect("commit");
 
         assert_eq!(
             state
-                .commit(&stage, PendingStageState::PendingGrant, 2_100)
+                .commit(
+                    &stage,
+                    &commit_fingerprint(1),
+                    PendingStageState::PendingGrant,
+                    2_100
+                )
                 .expect("replay"),
             InstallOutcome::AlreadyPresent
         );
-        // Another stage landing on the same generation is a conflict, not a
-        // second success.
+        // A *different* document closing the same stage is a conflict: telling
+        // its sender the commit landed would report someone else's decision as
+        // theirs.
+        assert!(matches!(
+            state.commit(
+                &stage,
+                &commit_fingerprint(2),
+                PendingStageState::PendingGrant,
+                2_100
+            ),
+            Err(CertificateError::GenerationConflict { .. })
+        ));
+        // And another stage landing on the same generation is refused.
         assert!(matches!(
             state.commit(
                 &Id16::new([4; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_100
             ),
@@ -1195,6 +1649,7 @@ mod tests {
         assert!(matches!(
             state.commit(
                 &Id16::new([9; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000
             ),
@@ -1213,6 +1668,7 @@ mod tests {
         assert!(matches!(
             state.commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000
             ),
@@ -1236,6 +1692,7 @@ mod tests {
         state
             .commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000,
             )
@@ -1260,6 +1717,7 @@ mod tests {
         state
             .commit(
                 &Id16::new([3; 16]).unwrap(),
+                &commit_fingerprint(1),
                 PendingStageState::PendingGrant,
                 2_000,
             )
@@ -1338,6 +1796,8 @@ mod tests {
                 activation_at: None,
                 retire_active_at: None,
                 published: false,
+                revoked: false,
+                revocation_epoch: 0,
             }
         }
 
@@ -1526,6 +1986,8 @@ mod tests {
             astra_service_key_epoch: 3,
             service_key_activation_at: Some(1_000),
             service_key_retire_active_at: Some(2_000),
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
         };
         assert!(profile.service_key_for(3, 999).is_some());
         assert!(profile.service_key_for(4, 999).is_none());

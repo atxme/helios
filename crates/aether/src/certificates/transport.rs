@@ -570,8 +570,16 @@ impl PendingTrustTransaction {
         Ok(())
     }
 
+    /// Every object slot filled **and** every announced fragment received.
+    ///
+    /// Both, not either. A manifest declaring two chunks can have all its
+    /// object slots filled by chunk 0 alone — nothing forbids a fragment from
+    /// covering the whole range — and a transaction committed on that basis is
+    /// one the sender never emitted. The chunk count is part of the signed
+    /// manifest, so it is a statement about how the decision was split, not a
+    /// transport detail.
     pub fn is_complete(&self) -> bool {
-        self.slots.iter().all(Option::is_some)
+        self.slots.iter().all(Option::is_some) && self.chunks.iter().all(Option::is_some)
     }
 
     /// The full ordered object list, or nothing at all.
@@ -861,6 +869,41 @@ mod tests {
             pending.accept(&forged),
             Err(CertificateError::FingerprintMismatch("transaction object"))
         ));
+    }
+
+    /// A fragment may cover more of the range than the split announced. The
+    /// transaction is still not complete until every announced fragment has
+    /// arrived — the count is signed, and it says how the decision was split.
+    #[test]
+    fn one_fragment_filling_every_slot_does_not_complete_a_two_chunk_transaction() {
+        let authority = keys();
+        let objects = vec![ca_object(1), ca_object(2)];
+        let manifest = manifest(&authority, &objects, 2);
+        let mut pending = PendingTrustTransaction::new(manifest.clone());
+
+        let whole = TrustUpdateChunk {
+            manifest_fingerprint: manifest.fingerprint(),
+            chunk_index: 0,
+            chunk_count: 2,
+            first_object_index: 0,
+            objects: objects.clone(),
+        };
+        pending.accept(&whole).expect("oversized first fragment");
+        assert!(
+            !pending.is_complete(),
+            "every object is present, but the announced second fragment is not"
+        );
+        assert!(pending.complete().is_none());
+
+        let second = TrustUpdateChunk {
+            manifest_fingerprint: manifest.fingerprint(),
+            chunk_index: 1,
+            chunk_count: 2,
+            first_object_index: 1,
+            objects: vec![objects[1].clone()],
+        };
+        pending.accept(&second).expect("second fragment");
+        assert_eq!(pending.complete().expect("complete").len(), 2);
     }
 
     #[test]

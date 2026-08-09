@@ -64,6 +64,11 @@ pub enum IssuerError {
     MasterAuthorityRequired,
     #[error("the gateway receipt does not answer this staging authorization")]
     ReceiptMismatch,
+    #[error(
+        "the {0} private key on disk does not belong to the delegation the registry holds: Astra \
+         would announce an issuer it cannot issue with"
+    )]
+    IssuerKeyMismatch(&'static str),
 }
 
 /// The issuer's private material, as Astra holds it.
@@ -76,6 +81,12 @@ pub struct DelegatedIssuer {
     tls_intermediate_key_der: Zeroizing<Vec<u8>>,
 }
 
+/// Transcript the startup check signs to prove key ownership.
+///
+/// Domain-separated like every other signature here, and over a constant: it
+/// proves possession, and it must never be confusable with an object.
+const ISSUER_KEY_PROBE: &[u8] = b"helios-astra-delegated-issuer-key-probe-v5";
+
 impl DelegatedIssuer {
     pub fn new(
         authorization: AstraIssuerAuthorization,
@@ -87,6 +98,50 @@ impl DelegatedIssuer {
             pq_private_key,
             tls_intermediate_key_der,
         }
+    }
+
+    /// Builds the issuer only if both private keys match the delegation.
+    ///
+    /// The three parts arrive from two different places — the authorization is
+    /// public and travels in the registry, the keys are sealed locally — so
+    /// nothing else guarantees they belong together. Checking that the files
+    /// merely *exist* lets Astra start up announcing a delegation it cannot
+    /// use, and the mismatch then surfaces at the first renewal: at 80 % of a
+    /// leaf's life, on a client with no fallback, as an unexplained refusal.
+    ///
+    /// Both checks are possession proofs against the **public** halves the
+    /// delegation names: an ML-DSA-87 signature verified under
+    /// `pq_issuer_public_key`, and the TLS key's `SubjectPublicKeyInfo`
+    /// compared with the intermediate's.
+    pub fn load(
+        authorization: AstraIssuerAuthorization,
+        pq_private_key: Zeroizing<Vec<u8>>,
+        tls_intermediate_key_der: Zeroizing<Vec<u8>>,
+    ) -> Result<Self, IssuerError> {
+        let proof =
+            aether::certificates::encoding::sign_ml_dsa_87(&pq_private_key, ISSUER_KEY_PROBE)
+                .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+        aether::certificates::encoding::verify_ml_dsa_87(
+            &authorization.pq_issuer_public_key,
+            ISSUER_KEY_PROBE,
+            &proof,
+        )
+        .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+
+        let tls_key = KeyPair::try_from(tls_intermediate_key_der.as_slice())
+            .map_err(|_| IssuerError::IssuerKeyMismatch("TLS"))?;
+        let certified = aether::certificates::x509::subject_public_key_info(
+            &authorization.tls_intermediate_certificate,
+        )?;
+        if tls_key.public_key_der() != certified {
+            return Err(IssuerError::IssuerKeyMismatch("TLS"));
+        }
+
+        Ok(Self::new(
+            authorization,
+            pq_private_key,
+            tls_intermediate_key_der,
+        ))
     }
 
     /// Issues the two leaves of a candidate generation.
@@ -324,6 +379,10 @@ mod tests {
         let mut name = DistinguishedName::new();
         name.push(DnType::CommonName, "astra-issuer");
         params.distinguished_name = name;
+        // Every link of a chain is read against the clock, this one included,
+        // and these tests drive a synthetic clock near the Unix epoch.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        params.not_after = rcgen::date_time_ymd(4096, 1, 1);
         let key = KeyPair::generate().expect("key");
         let certificate = params.self_signed(&key).expect("intermediate");
         (
@@ -474,6 +533,47 @@ mod tests {
                 1_100,
             )
             .expect("the gateway accepts a delegated staging");
+    }
+
+    /// Present is not correct. The delegation and the two private keys arrive
+    /// from different places, and a mismatch that startup lets through only
+    /// surfaces at the first renewal — on a client with no fallback.
+    #[test]
+    fn loading_refuses_private_material_that_does_not_match_the_delegation() {
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (intermediate_der, intermediate_key) = intermediate();
+        let authorization = AstraIssuerAuthorization {
+            pq_issuer_public_key: issuer_public,
+            tls_intermediate_certificate: intermediate_der,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+            ..fixture().issuer.authorization.clone()
+        }
+        .sign(&ca_private)
+        .expect("sign delegation");
+
+        // The genuine triple loads.
+        DelegatedIssuer::load(
+            authorization.clone(),
+            issuer_private.clone(),
+            intermediate_key.clone(),
+        )
+        .expect("the genuine material loads");
+
+        // A stranger's PQ key signs perfectly and verifies under nothing this
+        // delegation names.
+        let (stranger_pq, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        assert!(matches!(
+            DelegatedIssuer::load(authorization.clone(), stranger_pq, intermediate_key),
+            Err(IssuerError::IssuerKeyMismatch("ML-DSA-87"))
+        ));
+
+        // And a TLS key that is not the intermediate's.
+        let (_, other_tls_key) = intermediate();
+        assert!(matches!(
+            DelegatedIssuer::load(authorization, issuer_private, other_tls_key),
+            Err(IssuerError::IssuerKeyMismatch("TLS"))
+        ));
     }
 
     /// The four things the delegation withholds, checked before any signature

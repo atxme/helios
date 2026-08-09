@@ -23,6 +23,13 @@
 //! [`TrustUpdateRefusal::Unavailable`] — a `503` — rather than an empty update,
 //! because an empty update tells a client the opposite of the truth and it
 //! would stop asking.
+//!
+//! For the same reason the response never carries a signed status. A status is
+//! signed by the **Astra service key**, which this process does not hold and
+//! must not hold; the gateway can only forward one it was given, and nothing
+//! gives it one yet. Answering with an unsigned status, or with one signed by
+//! the gateway leaf, would be inventing an authority — so the field stays
+//! `None` until the private channel exists.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,6 +140,47 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
+/// Whether the caller already holds everything this gateway would send it.
+///
+/// Every value the request declares is compared, and that exhaustiveness is
+/// the property: a comparison that skipped a counter would answer "you are up
+/// to date" to a client that is behind on exactly that counter, and the client
+/// would stop asking. Since the only other answer this route can give today is
+/// a `503`, a false "current" is the one outcome with no recovery — the client
+/// has been told there is nothing to fetch.
+///
+/// Written as a free function over the persisted state so it can be exercised
+/// without a runtime, a lock or a signer.
+fn caller_is_current(
+    state: &helios_provisioning::certificates::RegistryState,
+    peer: &helios_provisioning::certificates::PeerCertificates,
+    request: &aether::certificates::transport::TrustUpdateRequest,
+) -> Result<bool, CertificateError> {
+    let issuer_epoch = state
+        .issuer
+        .as_ref()
+        .map_or(0, |issuer| issuer.issuer_epoch);
+    Ok(request.ca_epoch == state.gateway.ca_epoch
+        && request.ca_tls_epoch == state.client_tls_ca.ca_tls_epoch
+        && request.astra_service_key_epoch == state.astra.astra_service_key_epoch
+        && request.issuer_epoch == issuer_epoch
+        && request.active_gateway_identity_epoch == state.gateway.active_gateway_identity_epoch
+        && request.gateway_decision_epoch == state.gateway.gateway_decision_epoch
+        && request
+            .active_gateway_tls_certificate_fingerprint
+            .matches(&state.gateway.active_tls_fingerprint())
+        && request
+            .active_gateway_certificate_fingerprint
+            .matches(&state.gateway.active_pq_fingerprint()?)
+        && request.client_identity_generation == peer.state.active.generation
+        && request
+            .active_client_tls_certificate_fingerprint
+            .matches(&peer.state.active.tls_certificate_fingerprint)
+        && request
+            .active_client_pq_certificate_fingerprint
+            .matches(&peer.state.active.pq_certificate_fingerprint))
+}
+
 /// Maps a registry refusal to the bounded class the API may report.
 ///
 /// The detail goes to the protected log. A peer learns only the class, exactly
@@ -187,24 +235,8 @@ impl TrustUpdateHandler for CertificateService {
             })?;
 
         let peer = registry.peer(&caller).ok_or(TrustUpdateRefusal::Rejected)?;
-        let gateway_pq = state
-            .gateway
-            .active_pq_fingerprint()
+        let current = caller_is_current(state, peer, &request.request)
             .map_err(|_| TrustUpdateRefusal::Internal)?;
-
-        // What the caller declared it holds, against what this gateway serves.
-        let current = request
-            .request
-            .active_gateway_certificate_fingerprint
-            .matches(&gateway_pq)
-            && request
-                .request
-                .active_gateway_tls_certificate_fingerprint
-                .matches(&state.gateway.active_tls_fingerprint())
-            && request.request.ca_epoch == state.gateway.ca_epoch
-            && request.request.ca_tls_epoch == state.client_tls_ca.ca_tls_epoch
-            && request.request.gateway_decision_epoch == state.gateway.gateway_decision_epoch
-            && request.request.client_identity_generation == peer.state.active.generation;
 
         if current {
             return Ok(TrustUpdateResponse {
@@ -265,5 +297,254 @@ impl TrustUpdateHandler for CertificateService {
                 classify(error)
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::client::ClientCertificateGeneration;
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, TrustDomainId,
+    };
+    use aether::certificates::state::{
+        AstraProfile, ClientCertificateState, ClientTlsCaState, GatewayCertificateState,
+    };
+    use aether::certificates::transport::TrustUpdateRequest;
+    use aether::certificates::CERTIFICATE_PROTOCOL_VERSION;
+    use aether::key_negotiation::{
+        issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
+    };
+    use helios_provisioning::certificates::{PeerCertificates, RegistryState};
+
+    fn key(seed: u8) -> WireGuardKey {
+        WireGuardKey::from_bytes([seed; 32])
+    }
+
+    fn generation() -> ClientCertificateGeneration {
+        ClientCertificateGeneration {
+            generation: 4,
+            ca_tls_epoch: 1,
+            tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
+            tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+            pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+            not_before: 0,
+            not_after: 1_000_000,
+        }
+    }
+
+    /// A signed leaf: the fingerprint of a PQ certificate covers its
+    /// signature, so an unsigned placeholder has no fingerprint at all.
+    fn signed_leaf(role: PqCertificateRole, subject: &str, serial: u8) -> PqCertificate {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, subject_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [serial; 16],
+                subject: subject.into(),
+                issuer: "CA-PQ".into(),
+                role,
+                wireguard_public_key: key(9).to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 0,
+                not_after_unix: 1_000_000,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_private,
+        )
+        .expect("issue")
+    }
+
+    fn gateway_leaf() -> PqCertificate {
+        signed_leaf(PqCertificateRole::Gateway, "gateway.example", 1)
+    }
+
+    fn state() -> RegistryState {
+        let (_, anchor) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+        RegistryState {
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway: GatewayCertificateState {
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: key(9),
+                server_name: "gateway.example".into(),
+                ca_epoch: 1,
+                current_ca_public_key: anchor,
+                next_ca_public_key: None,
+                next_ca_transition_fingerprint: None,
+                ca_activation_at: None,
+                ca_retire_active_at: None,
+                active_gateway_identity_epoch: 3,
+                gateway_decision_epoch: 3,
+                next_gateway_identity_epoch: None,
+                next_transition_fingerprint: None,
+                last_aborted_transition: None,
+                active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
+                next_gateway_tls_certificate: None,
+                active_gateway_certificate: gateway_leaf(),
+                next_gateway_certificate: None,
+                activation_at: None,
+                retire_active_at: None,
+                published: false,
+                revoked: false,
+                revocation_epoch: 0,
+            },
+            client_tls_ca: ClientTlsCaState {
+                ca_tls_epoch: 2,
+                active_client_tls_ca_certificate: DerCertificate::new(vec![2; 64]).expect("der"),
+                next_client_tls_ca_certificate: None,
+                next_transition_fingerprint: None,
+                activation_at: None,
+                retire_active_at: None,
+            },
+            astra: AstraProfile {
+                authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                active_astra_service_public_key: service,
+                next_astra_service_public_key: None,
+                next_service_key_transition_fingerprint: None,
+                astra_service_key_epoch: 5,
+                service_key_activation_at: None,
+                service_key_retire_active_at: None,
+                service_key_revocation_epoch: 0,
+                last_emergency_replacement_fingerprint: None,
+            },
+            issuer: None,
+            peers: Default::default(),
+        }
+    }
+
+    fn peer() -> PeerCertificates {
+        PeerCertificates {
+            name: "workstation".into(),
+            state: ClientCertificateState::new(generation()),
+            active_pq_certificate: signed_leaf(PqCertificateRole::Client, "workstation", 2),
+            staged_pq_certificate: None,
+        }
+    }
+
+    /// A request that declares exactly what the gateway serves.
+    fn request(state: &RegistryState, peer: &PeerCertificates) -> TrustUpdateRequest {
+        TrustUpdateRequest {
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            request_id: Id16::new([7; 16]).expect("id"),
+            trust_domain_id: state.trust_domain_id,
+            gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+            client_wg_public_key: key(2),
+            ca_epoch: state.gateway.ca_epoch,
+            ca_tls_epoch: state.client_tls_ca.ca_tls_epoch,
+            astra_service_key_epoch: state.astra.astra_service_key_epoch,
+            issuer_epoch: 0,
+            active_gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
+            gateway_decision_epoch: state.gateway.gateway_decision_epoch,
+            client_identity_generation: peer.state.active.generation,
+            active_gateway_tls_certificate_fingerprint: state.gateway.active_tls_fingerprint(),
+            active_gateway_certificate_fingerprint: state
+                .gateway
+                .active_pq_fingerprint()
+                .expect("fingerprint"),
+            active_client_tls_certificate_fingerprint: peer
+                .state
+                .active
+                .tls_certificate_fingerprint,
+            active_client_pq_certificate_fingerprint: peer.state.active.pq_certificate_fingerprint,
+            client_pq_certificate_fingerprint: Fingerprint::of(b"presented"),
+        }
+    }
+
+    #[test]
+    fn a_caller_declaring_exactly_what_the_gateway_serves_is_current() {
+        let state = state();
+        let peer = peer();
+        assert!(caller_is_current(&state, &peer, &request(&state, &peer)).expect("comparison"));
+    }
+
+    /// Every counter and every active fingerprint is compared. A gap in this
+    /// list answers "you are up to date" to a client that is not, and the
+    /// client stops asking — the one refusal with no recovery.
+    #[test]
+    fn a_caller_behind_on_any_single_value_is_not_current() {
+        let state = state();
+        let peer = peer();
+        let stale = Fingerprint::of(b"an older certificate");
+
+        /// One way of being behind, and the name it is reported under.
+        type Mutation = (&'static str, fn(&mut TrustUpdateRequest, Fingerprint));
+
+        let mutations: Vec<Mutation> = vec![
+            ("ca_epoch", |request, _| request.ca_epoch -= 1),
+            ("ca_tls_epoch", |request, _| request.ca_tls_epoch -= 1),
+            ("astra_service_key_epoch", |request, _| {
+                request.astra_service_key_epoch -= 1
+            }),
+            ("issuer_epoch", |request, _| request.issuer_epoch += 1),
+            ("active_gateway_identity_epoch", |request, _| {
+                request.active_gateway_identity_epoch -= 1
+            }),
+            ("gateway_decision_epoch", |request, _| {
+                request.gateway_decision_epoch -= 1
+            }),
+            ("client_identity_generation", |request, _| {
+                request.client_identity_generation -= 1
+            }),
+            ("gateway TLS leaf", |request, stale| {
+                request.active_gateway_tls_certificate_fingerprint = stale
+            }),
+            ("gateway PQ leaf", |request, stale| {
+                request.active_gateway_certificate_fingerprint = stale
+            }),
+            ("client TLS leaf", |request, stale| {
+                request.active_client_tls_certificate_fingerprint = stale
+            }),
+            ("client PQ leaf", |request, stale| {
+                request.active_client_pq_certificate_fingerprint = stale
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let mut behind = request(&state, &peer);
+            mutate(&mut behind, stale);
+            assert!(
+                !caller_is_current(&state, &peer, &behind).expect("comparison"),
+                "a caller behind on {name} was reported as up to date"
+            );
+        }
+    }
+
+    /// The delegation counts too: a client that has never seen the installed
+    /// issuer cannot verify a leaf renewed under it.
+    #[test]
+    fn a_caller_that_has_not_seen_the_installed_issuer_is_not_current() {
+        let mut state = state();
+        let peer = peer();
+        let current = request(&state, &peer);
+
+        let (_, issuer_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        state.issuer = Some(aether::certificates::state::AstraIssuerState {
+            issuer_epoch: 4,
+            authorization: aether::certificates::authority::AstraIssuerAuthorization {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: 1,
+                ca_tls_epoch: 2,
+                gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+                server_name: state.gateway.server_name.clone(),
+                issuer_epoch: 4,
+                pq_issuer_public_key: issuer_key,
+                tls_intermediate_certificate: DerCertificate::new(vec![3; 64]).expect("der"),
+                allowed_usage:
+                    aether::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: 1_000_000,
+                ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            },
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+
+        assert!(!caller_is_current(&state, &peer, &current).expect("comparison"));
     }
 }
