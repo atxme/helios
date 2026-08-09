@@ -461,21 +461,20 @@ impl VpnController {
         )
         .await
         {
-            // « Reçue », pas « libérée ». Le `204` dit que la gateway a lu la
-            // commande, pas qu'un slot a changé : elle répond la même chose
-            // quand la transaction nommée n'est plus propriétaire, et c'est
-            // délibéré — distinguer les cas renseignerait le client sur l'état
-            // d'un pair. Seul le journal de la gateway sait ce qui a été
-            // retiré, et l'IHM ne doit pas affirmer davantage qu'elle ne sait.
+            // "Received", not "released". A 204 only says that the gateway
+            // read the command, not that a slot changed: it deliberately sends
+            // the same response when the named transaction no longer owns the
+            // slot. Only the gateway log knows whether anything was removed,
+            // and the UI must not claim more than it knows.
             Ok(()) => sink(ClientEvent::log(
                 "info",
-                "demande de libération du PSK reçue par la gateway".to_string(),
+                "PSK release request received by the gateway".to_string(),
             )),
             Err(error) => sink(ClientEvent::log(
                 "warn",
                 format!(
-                    "libération du PSK demandée sans confirmation ({error:#}) — la gateway le \
-                     retirera d'elle-même quand les handshakes cesseront"
+                    "PSK release requested without confirmation ({error:#}) — the gateway will \
+                     remove it after handshakes stop"
                 ),
             )),
         }

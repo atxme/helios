@@ -2225,9 +2225,9 @@ mod tests {
         (handler, task, client, server_addr)
     }
 
-    /// Le déroulé nominal v5 : challenge, requête, réponse, confirmation,
-    /// commit, **fermeture**. La connexion ne survit pas à la transaction, et
-    /// sa fermeture ne retire aucun PSK.
+    /// The nominal v5 sequence is challenge, request, response, confirmation,
+    /// commit, then **closure**. The connection does not outlive the
+    /// transaction, and closing it does not remove any PSK.
     #[tokio::test]
     async fn a_negotiation_ends_with_a_commit_and_a_closed_connection() {
         let pki = test_pki();
@@ -2279,14 +2279,13 @@ mod tests {
         .await
         .unwrap();
 
-        // Le point le plus important de la v5 : la connexion est finie, et
-        // cela ne dit rien du tunnel. En v4 la même fermeture libérait le
-        // slot ; ici elle ne doit produire aucun rollback — et ce port n'a
-        // plus du tout de quoi retirer un PSK.
+        // The key v5 property: the connection is over, and that says nothing
+        // about the tunnel. In v4 the same closure released the slot; here it
+        // must not trigger rollback, and this port can no longer remove a PSK.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !handler.rolled_back.load(Ordering::SeqCst),
-            "fermer la connexion après le commit ne doit rien défaire"
+            "closing the connection after commit must not undo anything"
         );
 
         client.close(0u32.into(), b"test complete");
@@ -2350,12 +2349,11 @@ mod tests {
         task.abort();
     }
 
-    /// Le `release` a quitté ce port : le tag hérité ne décode plus.
+    /// `release` has left this port: the legacy tag no longer decodes.
     ///
-    /// Il ne suffit pas de ne plus l'envoyer. Un Orion resté en arrière et une
-    /// gateway migrée doivent diverger franchement, pas silencieusement — et
-    /// le refus arrive au parseur, avant tout handler, donc sans révéler quoi
-    /// que ce soit de l'état d'un slot.
+    /// Merely not sending it is insufficient. An outdated Orion and a migrated
+    /// gateway must fail explicitly rather than silently. Rejection happens in
+    /// the parser, before any handler, without revealing slot state.
     #[tokio::test]
     async fn the_legacy_quic_release_message_is_refused_as_a_protocol_error() {
         let pki = test_pki();
@@ -2371,7 +2369,7 @@ mod tests {
             challenge,
         } = pending;
 
-        // Le message tel que la v5 le transportait avant le 8 août 2026.
+        // The message exactly as v5 carried it before August 8, 2026.
         let legacy = serde_json::json!({
             "type": "release",
             "release": {
@@ -2390,7 +2388,8 @@ mod tests {
         write_frame(&mut send, &legacy).await.unwrap();
         let _ = send.finish();
 
-        // La gateway ferme sans rien accuser : plus aucun `released` n'existe.
+        // The gateway closes without acknowledging anything: `released` no
+        // longer exists.
         let answer = tokio::time::timeout(
             Duration::from_secs(2),
             read_frame::<ServerMessage>(&mut recv),
@@ -2399,7 +2398,7 @@ mod tests {
         .unwrap();
         assert!(
             answer.is_err(),
-            "un tag retiré ne doit produire aucune réponse applicative : {answer:?}"
+            "a removed tag must not produce an application response: {answer:?}"
         );
         assert!(!handler.rolled_back.load(Ordering::SeqCst));
 

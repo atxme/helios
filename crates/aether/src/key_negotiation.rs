@@ -2033,9 +2033,9 @@ mod tests {
         );
     }
 
-    /// Le `release` du tunnel s'authentifie comme une requête, et son domaine
-    /// de signature est distinct de celui du message QUIC retiré : la même
-    /// commande ne peut pas être rejouée d'un transport vers l'autre.
+    /// The in-tunnel `release` is authenticated like a request, and its
+    /// signature domain differs from the removed QUIC message: the same
+    /// command cannot be replayed from one transport to the other.
     #[cfg(feature = "key-negotiation-signing")]
     #[test]
     fn an_in_tunnel_release_is_authenticated_and_bound_to_its_transaction() {
@@ -2066,8 +2066,8 @@ mod tests {
             .verify(&ca_public, &fingerprint, test_now())
             .unwrap();
 
-        // Le domaine porte le transport : une signature produite sur les
-        // octets de l'ancien message QUIC public ne vaut rien ici.
+        // The domain binds the transport: a signature produced over the old
+        // public QUIC message bytes is invalid here.
         let mut public_domain_bytes = pq_release_signing_bytes(&release, &client_certificate)
             .unwrap()
             .split_off(PQ_IN_TUNNEL_RELEASE_DOMAIN.len());
@@ -2080,7 +2080,7 @@ mod tests {
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
         );
 
-        // Rediriger un release vers une autre transaction casse sa signature.
+        // Redirecting a release to another transaction breaks its signature.
         authenticated.release.installed_transaction_id[0] ^= 1;
         assert_eq!(
             authenticated.verify(&ca_public, &fingerprint, test_now()),
@@ -2088,13 +2088,13 @@ mod tests {
         );
     }
 
-    /// §8.4 octet par octet : trois valeurs binaires de 32, sans préfixe de
-    /// longueur ni texte base64 ou hexadécimal.
+    /// §8.4 byte for byte: three 32-byte binary values, without a length prefix
+    /// or base64/hexadecimal text.
     ///
-    /// Ce contrôle vaut d'être écrit : les quatre messages voisins signent la
-    /// forme textuelle avec un `u32` de longueur, et rien dans le code
-    /// n'empêche d'aligner celui-ci sur eux par mimétisme. L'assertion est ce
-    /// qui rend l'écart visible plutôt que plausible.
+    /// This check is deliberately explicit: the four neighboring messages sign
+    /// the textual form with a `u32` length, and nothing else prevents this one
+    /// from being aligned with them by imitation. The assertion makes the
+    /// difference visible rather than merely plausible.
     #[cfg(feature = "key-negotiation-signing")]
     #[test]
     fn the_in_tunnel_release_signs_decoded_thirty_two_byte_values() {
@@ -2132,8 +2132,8 @@ mod tests {
         );
     }
 
-    /// Une clé de longueur invalide est refusée à la signature, pas encodée
-    /// telle quelle : c'est la contrepartie du décodage.
+    /// A key with an invalid length is rejected before signing rather than
+    /// encoded as-is; this is the counterpart of decoding.
     #[cfg(feature = "key-negotiation-signing")]
     #[test]
     fn a_release_naming_an_undecodable_key_cannot_be_signed() {

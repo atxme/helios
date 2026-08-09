@@ -360,10 +360,10 @@ impl GatewayHandler {
     /// Installs a prepared candidate only while the reservation still owns it.
     ///
     /// The ownership check, the backend write and the `active` insertion are
-    /// one serialized operation. A release can cancel a transaction while it
-    /// is deriving its material; without this final check that cancelled task
-    /// would resume, pose its candidate after the release, and record a
-    /// transaction for a slot it no longer owned.
+    /// one serialized operation. Connection cancellation can roll the
+    /// reservation back while material is being derived; without this final
+    /// check that cancelled task would resume, install its candidate, and
+    /// record a transaction for a slot it no longer owned.
     async fn install_candidate(
         &self,
         transaction_id: [u8; 16],
@@ -2491,15 +2491,15 @@ mod tests {
             .expect("a no-op release must not cost the transaction its commit");
     }
 
-    /// A release may arrive while `prepare` is still deriving material, before
-    /// the candidate reaches the backend.
+    /// A connection may be cancelled while `prepare` is still deriving
+    /// material, before the candidate reaches the backend.
     ///
     /// Cancelling the slot is not enough by itself: the suspended preparation
     /// must re-check ownership immediately before its write, otherwise it
-    /// resumes after the release and poses a candidate for a transaction that
+    /// resumes after rollback and installs a candidate for a transaction that
     /// no longer exists.
     #[tokio::test]
-    async fn a_cancelled_preparation_cannot_install_its_candidate_late() {
+    async fn a_rolled_back_preparation_cannot_install_its_candidate_late() {
         let previous_psk = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
         let candidate = base64::engine::general_purpose::STANDARD.encode([8u8; 32]);
         let fixture = pq_fixture();
@@ -2520,9 +2520,9 @@ mod tests {
             slot.generation
         };
 
-        // The release wins while the original preparation is suspended.
+        // The rollback wins while the original preparation is suspended.
         handler.abandon(transaction_id, CLIENT_KEY).await;
-        let writes_after_release = plane.writes().await.len();
+        let writes_after_rollback = plane.writes().await.len();
 
         let result = handler
             .install_candidate(
@@ -2546,7 +2546,7 @@ mod tests {
         assert!(matches!(result, Err(PublicError::Rejected)));
         assert_eq!(
             plane.writes().await.len(),
-            writes_after_release,
+            writes_after_rollback,
             "a preparation that lost its slot must never reach the backend"
         );
         assert!(

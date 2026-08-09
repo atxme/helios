@@ -622,7 +622,7 @@ fn tunnel_routed_address(heliosd_url: &str, allowed_ips: &str) -> Result<reqwest
     if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!(
             "internal Helios URL must not carry userinfo — the host it names is not \
-                       the host that would be contacted"
+             the host that would be contacted"
         );
     }
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
