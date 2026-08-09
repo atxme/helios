@@ -33,6 +33,12 @@ cas de doute (voir [AGENTS.md](../AGENTS.md)).
   chiffrement AES-256-GCM des secrets sur disque, hiérarchie de clés Orion liée
   au TPM, hygiène mémoire et modèle de menace du stockage local. Le chiffrement
   de volume (BitLocker / dm-crypt) y devient un **prérequis d'installation**.
+- [adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)
+  — transport du secret scellé à travers un redémarrage planifié qui déplace
+  les PCR.
+- [adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md](adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)
+  — coordinateur PKI Astra co-implanté, émetteur délégué, YubiKeys,
+  renouvellement autonome et récupération distante.
 
 ## Négociation de clé — notes techniques
 
@@ -40,18 +46,18 @@ Les deux notes coexistent volontairement : l'une décrit ce qui tourne, l'autre
 ce qui tournait. La bascule est coupante — ALPN, domaines de signature et
 format de certificat distincts — donc rien ne négocie entre les deux.
 
-- [NEGOCIATION-DE-CLE-V4.md](NEGOCIATION-DE-CLE-V4.md) — protocole historique,
+- [specification/NEGOCIATION-DE-CLE-V4.md](specification/NEGOCIATION-DE-CLE-V4.md) — protocole historique,
   conservé comme trace de ce qui tournait avant la bascule.
-- [NEGOCIATION-DE-CLE-V5.md](NEGOCIATION-DE-CLE-V5.md) — protocole
+- [specification/NEGOCIATION-DE-CLE-V5.md](specification/NEGOCIATION-DE-CLE-V5.md) — protocole
   **actuellement servi, mais partiellement implémenté** : son état de tête nomme
   les lots encore ouverts. Son §0 indexe les constats successifs des revues de
   sécurité. Le mode Orion `classic` reste disponible pour les hôtes WireGuard
   génériques, mais demeure strictement hors du protocole de négociation Helios
   v5.
-- [ROTATION-CERTIFICATS-V5.md](ROTATION-CERTIFICATS-V5.md) — cycle de vie cible
-  des certificats TLS/PQ : chevauchement borné, générations anti-rollback,
-  rotation de `CA-PQ`, révocation urgente et frontière entre socle v5 et
-  automatisation v5.x.
+- [specification/ROTATION-CERTIFICATS.md](specification/ROTATION-CERTIFICATS.md)
+  — cycle de vie cible des certificats TLS/PQ : chevauchement borné,
+  générations anti-rollback, Astra, rotation de `CA-PQ`, récupération expirée
+  et campagnes manuelles YubiKey.
 
 ## Sécurité
 

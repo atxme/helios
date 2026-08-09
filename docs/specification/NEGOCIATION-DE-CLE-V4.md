@@ -16,13 +16,13 @@ justifications de l'amendement de l'ADR-005.
 > coexistence d'un rollback et d'un commit signé. Leur traitement est spécifié
 > dans la [v5](NEGOCIATION-DE-CLE-V5.md) §0 ; le raisonnement des décisions qui
 > renversent un choix antérieur est dans l'amendement du 6 août 2026 de
-> l'[ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md).
+> l'[ADR-005](../adr/ADR-005-NEGOCIATION-DE-CLE.md).
 >
 > Ne pas lire ce document comme une description du système : les deux versions
 > ne négocient pas ensemble, et le code ne sert plus que la v5.
 
 Cette note décrit le protocole réellement servi par Helios et Orion. Elle
-complète [ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md). Elle reprend la forme
+complète [ADR-005](../adr/ADR-005-NEGOCIATION-DE-CLE.md). Elle reprend la forme
 générale d’une spécification comme [X3DH](https://signal.org/docs/specifications/x3dh/),
 mais le protocole est propre à Helios.
 
@@ -1012,20 +1012,20 @@ Ils ne prouvent pas :
 - le comportement réseau d’une installation publique.
 
 Ces points exigent les machines cibles décrites dans
-[TESTING.md](testing/TESTING.md).
+[TESTING.md](../testing/TESTING.md).
 
 ## 18. Correspondance avec le code
 
 | Composant | Responsabilité |
 | --- | --- |
-| [`aether::key_negotiation`](../crates/aether/src/key_negotiation.rs) | types, validation, certificats, signatures, HKDF |
-| [`aether::pq`](../crates/aether/src/pq.rs) | abstraction ML-KEM-1024 |
-| [`helios-key-negotiation`](../crates/helios-key-negotiation/src/lib.rs) | QUIC, TLS, trames, limites, session de vivacité |
-| [`heliosd::key_negotiation`](../crates/heliosd/src/key_negotiation.rs) | admission, pose, rollback, commit, TPM |
-| [`orion-core::key_negotiation`](../crates/orion-core/src/key_negotiation.rs) | requête client, décapsulation, dérivation, confirmation |
-| [`orion-core::backend`](../crates/orion-core/src/backend/mod.rs) | pose client, preuve WireGuard, retries, cycle de vie |
-| [`aether::config`](../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers |
-| [`helios-ctl::enroll`](../tools/helios-ctl/src/enroll.rs) | enrôlement et document Orion |
+| [`aether::key_negotiation`](../../crates/aether/src/key_negotiation.rs) | types, validation, certificats, signatures, HKDF |
+| [`aether::pq`](../../crates/aether/src/pq.rs) | abstraction ML-KEM-1024 |
+| [`helios-key-negotiation`](../../crates/helios-key-negotiation/src/lib.rs) | QUIC, TLS, trames, limites, session de vivacité |
+| [`heliosd::key_negotiation`](../../crates/heliosd/src/key_negotiation.rs) | admission, pose, rollback, commit, TPM |
+| [`orion-core::key_negotiation`](../../crates/orion-core/src/key_negotiation.rs) | requête client, décapsulation, dérivation, confirmation |
+| [`orion-core::backend`](../../crates/orion-core/src/backend/mod.rs) | pose client, preuve WireGuard, retries, cycle de vie |
+| [`aether::config`](../../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers |
+| [`helios-ctl::enroll`](../../tools/helios-ctl/src/enroll.rs) | enrôlement et document Orion |
 
 Les tests les plus importants sont :
 

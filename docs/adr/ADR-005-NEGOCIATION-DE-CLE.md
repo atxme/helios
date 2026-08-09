@@ -9,7 +9,7 @@
 > Le code sert aujourd'hui une v5 partielle. Les amendements en fin de document
 > renversent plusieurs décisions du corps ; le plus récent fait foi en cas de
 > contradiction. La spécification détaillée de la cible est
-> [NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md).
+> [NEGOCIATION-DE-CLE-V5.md](../specification/NEGOCIATION-DE-CLE-V5.md).
 
 Remplace et détaille l'amendement du 24 juillet 2026 de
 [ADR-001](ADR-001-WIREGUARD.md), qui reste la référence pour le transport
@@ -704,8 +704,11 @@ la cause.
   couverte par les tests ; la pose réelle du slot sur WireGuard-NT et sur le
   backend noyau exige deux machines et les deux redirections
   ([TESTING](../testing/TESTING.md)).
-- **Aucune rotation automatique des certificats.** Ils valent 825 jours ; leur
-  expiration se traite en réémettant. Rien n'avertit à l'approche de l'échéance.
+- **Le cycle Astra n'est pas encore implémenté.** Le code servi conserve les
+  certificats à 825 jours et ne prévient pas encore leur expiration. La cible
+  acceptée — planification à 80 %, récupération après expiration et campagnes
+  YubiKey — est fixée par l'[ADR-008](ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) et
+  la spécification de rotation.
 - **Les catégories NIST ne sont pas homogènes.** Le KEM est en catégorie 5
   (ML-KEM-1024) et le KDF au-dessus, mais l'authentification reste en
   catégorie 3 (ML-DSA-65) : c'est désormais elle le maillon le plus bas du
@@ -743,7 +746,7 @@ d'authentification PQ sans réécrire une pile TLS.
 ## Amendement du 6 août 2026 — protocole v5
 
 **Statut** : accepté. Spécification :
-[NEGOCIATION-DE-CLE-V5.md](../NEGOCIATION-DE-CLE-V5.md). Non implémenté au jour
+[NEGOCIATION-DE-CLE-V5.md](../specification/NEGOCIATION-DE-CLE-V5.md). Non implémenté au jour
 de cet amendement.
 
 Une revue de sécurité de la v4 a produit vingt constats. La plupart se
@@ -936,10 +939,12 @@ identité active et une suivante au plus, liées par une transition signée,
 datée et de génération strictement consécutive. Une rotation de `CA-PQ` exige
 les signatures de l'ancienne et de la nouvelle CA ; la CA TLS cliente porte
 également un slot actif/suivant, dont la transition est autorisée par `CA-PQ`.
-Les formats, l'import manuel et l'anti-rollback appartiennent au socle v5 ;
-seuls le planificateur, les alertes et les campagnes sont reportables en v5.x.
-La spécification complète est
-[ROTATION-CERTIFICATS-V5](../ROTATION-CERTIFICATS-V5.md).
+L'[ADR-008](ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) complète ce choix : les
+formats, l'anti-rollback, le service Astra, le planificateur à 80 %, la
+récupération après expiration et les campagnes YubiKey forment désormais un
+seul cycle cible. Aucun de ces éléments ne doit être présenté comme déjà
+implémenté. La spécification complète est
+[ROTATION-CERTIFICATS](../specification/ROTATION-CERTIFICATS.md).
 
 ### 6. Ce que l'amendement ne change pas
 
@@ -1074,6 +1079,6 @@ mise à jour refuse le message QUIC historique ; elle ne le réinterprète jamai
 La même frontière s'applique à la distribution normale des transitions de
 certificat : lorsqu'un tunnel existe, la route interne de mise à jour de
 confiance définie par
-[ROTATION-CERTIFICATS-V5](../ROTATION-CERTIFICATS-V5.md) remplace l'extension
+[ROTATION-CERTIFICATS](../specification/ROTATION-CERTIFICATS.md) remplace l'extension
 QUIC initialement envisagée. Le document signé hors ligne reste le secours si
 le tunnel ou l'identité applicative ne permet plus cet échange.

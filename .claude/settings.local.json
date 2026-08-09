@@ -329,7 +329,8 @@
       "Bash(awk -F: '$1<682')",
       "Bash(timeout 10 curl -s https://ifconfig.me)",
       "Bash(ip -brief addr)",
-      "Read(//mnt/wsl/**)"
+      "Read(//mnt/wsl/**)",
+      "Bash(awk '/^enum Command/,/^}/' tools/helios-ctl/src/main.rs)"
     ]
   }
 }

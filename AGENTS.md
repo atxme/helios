@@ -31,11 +31,11 @@ expose enfin le séquestre.
 
 La négociation de clé pré-WireGuard existe de bout en bout, en **protocole v5**
 ([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendements des 6 et 8 août 2026 ;
-spécification [NEGOCIATION-DE-CLE-V5.md](docs/NEGOCIATION-DE-CLE-V5.md)) : port
+spécification [NEGOCIATION-DE-CLE-V5.md](docs/specification/NEGOCIATION-DE-CLE-V5.md)) : port
 UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, deux
 modes négociables — `static_psk` et `ml_kem` — et plancher anti-downgrade qui
 monte seul et ne redescend pas. La v4 est décrite par
-[NEGOCIATION-DE-CLE-V4.md](docs/NEGOCIATION-DE-CLE-V4.md), conservée
+[NEGOCIATION-DE-CLE-V4.md](docs/specification/NEGOCIATION-DE-CLE-V4.md), conservée
 comme trace de ce qui tournait avant la bascule — le code ne la sert plus, et
 les deux versions ne négocient pas ensemble (ALPN, domaines de signature et
 format de certificat distincts). Les deux IHM exposent la négociation —
@@ -79,9 +79,12 @@ Restent ouverts :
   le contrôleur détient le reçu de commit, et le chemin de suppression ne l’a
   pas ;
 - tout le **cycle de vie des certificats**
-  ([ROTATION-CERTIFICATS-V5](docs/ROTATION-CERTIFICATS-V5.md)) : leaf PQ
+  ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md),
+  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)) : leaf PQ
   gateway encore auto-signée, ni slot actif/suivant, ni génération
-  anti-rollback.
+  anti-rollback ; le service Astra, le planificateur à 80 %, la récupération
+  après expiration et les campagnes protégées par YubiKey ne sont pas encore
+  implémentés.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par
@@ -334,10 +337,15 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   elle. Une rotation s’applique par `systemctl restart heliosd`. Le démarrage
   journalise l’empreinte servie et la date d’écriture du fichier : un
   certificat plus récent que le démon est le diagnostic complet.
-- La CA opérateur vit dans `~/.helios/certs/internal-ca`, et à **un seul**
-  endroit : la gateway n’en épingle qu’une. Un script qui la cherche ailleurs
-  ne la trouve pas, en fabrique une neuve, fait tourner l’identité de la
-  gateway pour l’y installer — et coupe tous les clients déjà admis.
+- Dans le code actuel, la CA opérateur vit dans
+  `~/.helios/certs/internal-ca`, et à **un seul** endroit : la gateway n'en
+  épingle qu'une. Un script qui la cherche ailleurs ne la trouve pas, en
+  fabrique une neuve, fait tourner l'identité de la gateway pour l'y installer
+  — et coupe tous les clients déjà admis. La cible ADR-008 migre ce registre
+  vers Astra : coffre maître chiffré co-implanté mais déverrouillé et signé
+  côté opérateur par YubiKey, plus émetteur Astra délégué et borné sur la
+  gateway. Tant que cette migration atomique n'est pas livrée, aucun chemin ne
+  mélange les deux emplacements et aucune seconde CA n'est créée.
 - L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
   initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
   lectures ne doivent jamais sérialiser clé privée ou PSK.

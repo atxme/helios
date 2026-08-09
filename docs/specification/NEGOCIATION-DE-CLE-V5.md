@@ -105,7 +105,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   qui débloquerait : donner au chemin de suppression de profil l'accès au
 >   contrôleur, qui seul détient le reçu de commit ;
 > - tout le **cycle de vie des certificats**
->   ([ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md)) : la leaf PQ gateway
+>   ([ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
 >   anti-rollback, ni import manuel de transition ;
 > - l'état **`revoked`** du [§11.1](#111-états-gateway) : une révocation est
@@ -139,14 +139,15 @@ un **contrat à finir d'implémenter**, pas une description du système.
 
 **Version** : 5
 
-**Date de la note** : 2026-08-08
+**Date de la note** : 2026-08-09
 
 Cette note décrit le protocole **cible**, révisé après la revue de sécurité de
-la v4. Elle complète [ADR-005](adr/ADR-005-NEGOCIATION-DE-CLE.md), dont
+la v4. Elle complète [ADR-005](../adr/ADR-005-NEGOCIATION-DE-CLE.md), dont
 l'amendement du 6 août 2026 porte les décisions qui renversent des choix
-antérieurs. Le cycle de vie des certificats, ses formats de transition et la
-frontière entre le socle v5 et l'automatisation v5.x sont normés dans la note
-[rotation des certificats v5](ROTATION-CERTIFICATS-V5.md).
+antérieurs. Le cycle de vie des certificats, Astra, ses formats de transition,
+le renouvellement automatique et la récupération expirée sont normés dans la
+note [rotation des certificats v5](ROTATION-CERTIFICATS.md) et
+[ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md).
 
 Le code sert déjà une partie de cette cible en v5. Cette note reste un contrat
 à finir d'implémenter : le bloc d'état en tête distingue les mécanismes en
@@ -385,7 +386,7 @@ La gateway présente un certificat X.509 auto-signé. Orion le vérifie avec le
 certificat public épinglé dans le profil et avec `server_name`.
 
 Orion présente un certificat X.509 signé par la `CA-TLS` active ou suivante
-autorisée par la [spécification de rotation](ROTATION-CERTIFICATS-V5.md). Helios
+autorisée par la [spécification de rotation](ROTATION-CERTIFICATS.md). Helios
 calcule son empreinte SHA-256 DER et la compare à la génération TLS/PQ admise
 pour la clé WireGuard. Une empreinte TLS et une empreinte PQ clientes ne peuvent
 chacune appartenir qu'à un seul pair, génération active et suivante comprises.
@@ -423,7 +424,7 @@ gateway auto-signée.
 
 Le profil épingle la CA déjà confirmée hors bande et conserve au plus une leaf
 gateway active et une suivante, conformément à la
-[spécification de rotation](ROTATION-CERTIFICATS-V5.md). L'empreinte singulière
+[spécification de rotation](ROTATION-CERTIFICATS.md). L'empreinte singulière
 d'une requête reste celle de la leaf exactement utilisée par cette transaction.
 
 La vérification du certificat contrôle :
@@ -574,7 +575,7 @@ réémis. Le parc est donc ré-enrôlé pendant la migration v4 → v5. Voir
 
 Ce changement ne concerne **que** la PKI de négociation de clé. Les signatures
 d'artefacts éditeur restent régies par
-[ADR-002](adr/ADR-002-SIGNATURES-PQ.md) : Ed25519 **et** ML-DSA-65, trousseau
+[ADR-002](../adr/ADR-002-SIGNATURES-PQ.md) : Ed25519 **et** ML-DSA-65, trousseau
 compilé, `REQUIRED_ALGS` inchangé. Confondre les deux domaines casserait la
 vérification de toutes les releases déjà signées.
 
@@ -2276,7 +2277,7 @@ signature.
    publiques ;
 4. refuse tout changement silencieux de la clé publique WireGuard gateway ou
    tout certificat PQ non autorisé par une transition valide de
-   [rotation](ROTATION-CERTIFICATS-V5.md). Une transition signée par la CA déjà
+   [rotation](ROTATION-CERTIFICATS.md). Une transition signée par la CA déjà
    épinglée et de génération consécutive est appliquée sans nouvelle
    confirmation ; tout autre changement exige une confirmation hors bande et
    un nouveau profil.
@@ -2299,7 +2300,7 @@ L'identité est chargée une fois au démarrage. Une rotation exige
 `systemctl restart heliosd` ; le démarrage journalise l'empreinte servie et la
 date d'écriture du fichier. La transition est distribuée et synchronisée avant
 ce redémarrage ; l'ordre complet est défini par la
-[spécification de rotation](ROTATION-CERTIFICATS-V5.md).
+[spécification de rotation](ROTATION-CERTIFICATS.md).
 
 ## 16. Hygiène mémoire
 
@@ -2622,7 +2623,7 @@ déclarer la v5 implémentée.
 - document `.orion` substitué, signé par une CA apportée seulement par lui-même,
   lié à une autre demande ou modifié après JCS refusé ;
 - matrice complète de rotation gateway, client, `CA-PQ`, `CA-TLS` et révocation
-  urgente définie au [§14 de la spécification dédiée](ROTATION-CERTIFICATS-V5.md#14-plan-de-validation) ;
+  urgente définie au [§14 de la spécification dédiée](ROTATION-CERTIFICATS.md#14-plan-de-validation) ;
 - **réutilisation du `client_nonce`** : deux transactions du même client portant
   le même nonce produisent deux PSK différents, ce qui vaut vérification de
   l'argument de [§7.1](#71-requête-client) ;
@@ -2638,7 +2639,7 @@ déclarer la v5 implémentée.
 ### 20.2 Ce qui exige les machines cibles
 
 Ces essais sont target-only et suivent
-[docs/testing/TESTING.md](testing/TESTING.md). Aucun ne peut être remplacé par
+[docs/testing/TESTING.md](../testing/TESTING.md). Aucun ne peut être remplacé par
 une compilation WSL2.
 
 - pose réelle du slot sur le **noyau WireGuard** de la gateway, et lecture du
@@ -2763,12 +2764,12 @@ borné, mais une différence de coût entre validation syntaxique et ML-DSA rest
 observable. La supprimer complètement demanderait d'exécuter les opérations
 les plus coûteuses sur toute entrée hostile, ce qui contredirait la défense DoS.
 
-**L'automatisation de la rotation des certificats peut suivre en v5.x.** La v5
-initiale doit néanmoins porter les formats signés, deux slots bornés, les
-générations anti-rollback et l'import manuel définis par la
-[spécification de rotation](ROTATION-CERTIFICATS-V5.md). Le planificateur, les
-alertes et les campagnes de parc peuvent être livrés ensuite sans changer le
-protocole.
+**Le cycle complet des certificats reste non implémenté.** La cible comprend
+désormais les formats signés, deux slots bornés, les générations anti-rollback,
+Astra, le planificateur à 80 %, la récupération expirée et les campagnes
+YubiKey définis par la [spécification de rotation](ROTATION-CERTIFICATS.md).
+Une livraison qui ne porte que les formats ou l'import manuel ne doit pas être
+présentée comme cycle de vie achevé.
 
 **Les effets matériels ne sont pas prouvés en WSL2.** La liste de ce qui exige
 les machines cibles est au [§20.2](#202-ce-qui-exige-les-machines-cibles), et
@@ -2781,20 +2782,20 @@ courant détaillé en tête de note.
 
 | Composant | Responsabilité v5 |
 | --- | --- |
-| [`aether::key_negotiation`](../crates/aether/src/key_negotiation.rs) | types v5, challenge, engagement HMAC, certificats v2, signatures ML-DSA-87, HKDF |
-| [`aether::pq`](../crates/aether/src/pq.rs) | abstraction ML-KEM-1024, zéroïsation de la clé éphémère |
-| [`aether::sig`](../crates/aether/src/sig.rs) | **inchangé** — ADR-002, artefacts éditeur, Ed25519 + ML-DSA-65 |
-| [`helios-key-negotiation`](../crates/helios-key-negotiation/src/lib.rs) | QUIC sans reprise/0-RTT, trames, flux et délais bornés, phase unique de challenge, fermeture après commit |
-| [`heliosd::key_negotiation`](../crates/heliosd/src/key_negotiation.rs) | machine d'état générationnelle, pose, preuve WireGuard gateway, rollback, point de non-retour, traitement sérialisé du `release`, échéance de PSK, staging et promotion de l'identité v5 |
-| [`helios-api`](../crates/helios-api/src/lib.rs) | `POST /api/key-negotiation/release`, résolution de la VIP source par `require_peer`, borne JSON et transfert au sérialiseur du slot |
-| [`orion-core::key_negotiation`](../crates/orion-core/src/key_negotiation.rs) | challenge, requête, décapsulation, dérivation et confirmation ; construction/signature du `release` sans transport QUIC |
-| cycle de vie des certificats | objets signés, deux slots bornés, générations et import manuel de [ROTATION-CERTIFICATS-V5](ROTATION-CERTIFICATS-V5.md) |
+| [`aether::key_negotiation`](../../crates/aether/src/key_negotiation.rs) | types v5, challenge, engagement HMAC, certificats v2, signatures ML-DSA-87, HKDF |
+| [`aether::pq`](../../crates/aether/src/pq.rs) | abstraction ML-KEM-1024, zéroïsation de la clé éphémère |
+| [`aether::sig`](../../crates/aether/src/sig.rs) | **inchangé** — ADR-002, artefacts éditeur, Ed25519 + ML-DSA-65 |
+| [`helios-key-negotiation`](../../crates/helios-key-negotiation/src/lib.rs) | QUIC sans reprise/0-RTT, trames, flux et délais bornés, phase unique de challenge, fermeture après commit |
+| [`heliosd::key_negotiation`](../../crates/heliosd/src/key_negotiation.rs) | machine d'état générationnelle, pose, preuve WireGuard gateway, rollback, point de non-retour, traitement sérialisé du `release`, échéance de PSK, staging et promotion de l'identité v5 |
+| [`helios-api`](../../crates/helios-api/src/lib.rs) | `POST /api/key-negotiation/release`, résolution de la VIP source par `require_peer`, borne JSON et transfert au sérialiseur du slot |
+| [`orion-core::key_negotiation`](../../crates/orion-core/src/key_negotiation.rs) | challenge, requête, décapsulation, dérivation et confirmation ; construction/signature du `release` sans transport QUIC |
+| cycle de vie des certificats | objets signés, deux slots bornés, générations, Astra et récupération de [ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md) |
 | configuration Orion | union explicite `ClassicWireGuard` / `HeliosKeyNegotiation`, migration des profils génériques hérités et refus des changements de variante implicites |
-| [`orion-core::backend`](../crates/orion-core/src/backend/mod.rs) | chemin WireGuard direct pour `classic` sans ouvrir QUIC ; pose client, preuve WireGuard, renouvellement à chaud et `release` HTTP borné avant `down()` pour Helios |
-| [`aether::config`](../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers, longueur des PSK statiques, **keep-alive de `WgPeer`** |
-| [`helios-wireguard`](../crates/helios-wireguard/src/lib.rs) | **keep-alive de `PeerConfig`**, séquence monotone d'observation du handshake, `HANDSHAKE_STALE_AFTER_SECS` et récupération à 300 s |
-| [`helios-provisioning::admission`](../crates/helios-provisioning/src/admission.rs) | unicité des empreintes TLS/PQ, refus d'un pair négocié sans keep-alive, plancher `ml_kem` par défaut |
-| [`helios-ctl::enroll`](../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
+| [`orion-core::backend`](../../crates/orion-core/src/backend/mod.rs) | chemin WireGuard direct pour `classic` sans ouvrir QUIC ; pose client, preuve WireGuard, renouvellement à chaud et `release` HTTP borné avant `down()` pour Helios |
+| [`aether::config`](../../crates/aether/src/config.rs) | ports, pairs, secrets runtime, planchers, longueur des PSK statiques, **keep-alive de `WgPeer`** |
+| [`helios-wireguard`](../../crates/helios-wireguard/src/lib.rs) | **keep-alive de `PeerConfig`**, séquence monotone d'observation du handshake, `HANDSHAKE_STALE_AFTER_SECS` et récupération à 300 s |
+| [`helios-provisioning::admission`](../../crates/helios-provisioning/src/admission.rs) | unicité des empreintes TLS/PQ, refus d'un pair négocié sans keep-alive, plancher `ml_kem` par défaut |
+| [`helios-ctl::enroll`](../../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
 encore ouverts, dont la libération manquante à la désinstallation d'un profil.
