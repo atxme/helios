@@ -22,6 +22,7 @@
 //! [`aether::TunnelState::Up`].
 
 pub mod backend;
+pub mod certificates;
 pub mod config;
 pub mod events;
 pub mod identity_store;
