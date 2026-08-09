@@ -44,6 +44,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rcgen::{CertificateParams, CertificateSigningRequestParams, KeyPair};
 use zeroize::Zeroizing;
 
+/// Unix seconds as the X.509 encoder wants them.
+fn to_offset_date_time(seconds: u64) -> Result<time::OffsetDateTime, IssuerError> {
+    let seconds = i64::try_from(seconds).map_err(|_| CertificateError::ArithmeticOverflow)?;
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .map_err(|_| IssuerError::Certificate(CertificateError::InvalidValidityPeriod))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IssuerError {
     #[error("certificate object refused: {0}")]
@@ -110,7 +117,14 @@ impl DelegatedIssuer {
         )?;
         let _ = window;
 
-        let csr = CertificateSigningRequestParams::from_der(&request.tls_csr.as_bytes().into())?;
+        let mut csr =
+            CertificateSigningRequestParams::from_der(&request.tls_csr.as_bytes().into())?;
+        // A PKCS#10 request carries no validity — and must not: the period is
+        // the **issuer's** decision, bounded by the delegation's ceiling. Left
+        // alone, the leaf would silently inherit the library's default window
+        // and stop matching the generation it belongs to.
+        csr.params.not_before = to_offset_date_time(validity.0)?;
+        csr.params.not_after = to_offset_date_time(validity.1)?;
         let issuer_key = KeyPair::try_from(self.tls_intermediate_key_der.as_slice())?;
         let issuer_params = CertificateParams::from_ca_cert_der(
             &self
@@ -281,6 +295,9 @@ mod tests {
 
     struct Fixture {
         issuer: DelegatedIssuer,
+        /// The delegated intermediate, self-signed here so it is both the
+        /// intermediate and the anchor a test verifier holds.
+        tls_anchor: DerCertificate,
         ca_public: MlDsa87PublicKey,
         client_active: Zeroizing<Vec<u8>>,
     }
@@ -342,6 +359,7 @@ mod tests {
         .expect("sign delegation");
 
         Fixture {
+            tls_anchor: authorization.tls_intermediate_certificate.clone(),
             issuer: DelegatedIssuer::new(authorization, issuer_private, intermediate_key),
             ca_public,
             client_active,
@@ -356,6 +374,10 @@ mod tests {
         let mut name = DistinguishedName::new();
         name.push(DnType::CommonName, "workstation");
         params.distinguished_name = name;
+        // The tests drive synthetic clocks near the Unix epoch, so the leaf
+        // issued from this request has to be valid there.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        params.not_after = rcgen::date_time_ymd(4096, 1, 1);
         let key = KeyPair::generate().expect("key");
         let request = params.serialize_request(&key).expect("csr");
         (
@@ -427,7 +449,7 @@ mod tests {
                 &request,
                 &active(),
                 Id16::new([4; 16]).expect("stage"),
-                Fingerprint::of(b"tls ca"),
+                fixture.tls_anchor.fingerprint(),
                 tls_leaf,
                 pq_leaf,
                 window,
@@ -447,6 +469,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active(),
+                &[&fixture.tls_anchor],
                 None,
                 1_100,
             )
@@ -492,7 +515,7 @@ mod tests {
                     &request,
                     &active(),
                     Id16::new([4; 16]).expect("stage"),
-                    Fingerprint::of(b"tls ca"),
+                    fixture.tls_anchor.fingerprint(),
                     tls_leaf.clone(),
                     pq_leaf.clone(),
                     window,
@@ -547,7 +570,7 @@ mod tests {
                 &request,
                 &active(),
                 Id16::new([4; 16]).expect("stage"),
-                Fingerprint::of(b"tls ca"),
+                fixture.tls_anchor.fingerprint(),
                 tls_leaf,
                 pq_leaf,
                 window,

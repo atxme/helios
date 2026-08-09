@@ -65,6 +65,42 @@ const RECOVERY_APPROVAL_DOMAIN: &[u8] = b"helios-astra-expired-recovery-approval
 /// Longest credential identifier accepted from a FIDO2 authenticator.
 pub const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
 
+/// Verifies a client PQ leaf under whichever authority may have issued it.
+///
+/// After an ordinary renewal a client leaf chains to the **delegated Astra
+/// issuer**, not to `CA-PQ`. A consumer that only ever tried the anchor would
+/// refuse every renewed identity — which is exactly what happened to the
+/// in-tunnel trust-update route before this existed.
+///
+/// The candidates are supplied by the caller, in the order it trusts them, and
+/// they come from its own state: the anchor it pins and the delegation it has
+/// installed. The certificate never names the key that verifies it.
+pub fn verify_client_leaf_under_any(
+    certificate: &PqCertificate,
+    issuers: &[&MlDsa87PublicKey],
+    client_wg_public_key: &WireGuardKey,
+    now_unix: u64,
+) -> Result<(), CertificateError> {
+    if issuers.is_empty() {
+        return Err(CertificateError::UnauthorizedIssuer);
+    }
+    for issuer in issuers {
+        if certificate
+            .verify(
+                issuer.as_bytes(),
+                PqCertificateRole::Client,
+                None,
+                &client_wg_public_key.to_base64(),
+                now_unix,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(CertificateError::UnauthorizedIssuer)
+}
+
 /// One client generation: TLS and PQ bound together (spec §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,6 +397,7 @@ impl ClientCertificateStageAuthorization {
         server_name: &str,
         client_wg_public_key: &WireGuardKey,
         active: &ClientCertificateGeneration,
+        tls_anchors: &[&DerCertificate],
         request_expires_at: Option<u64>,
         now_unix: u64,
     ) -> Result<(), CertificateError> {
@@ -453,8 +490,40 @@ impl ClientCertificateStageAuthorization {
         if self.next_pq_certificate.not_after_unix < self.window.not_after {
             return Err(CertificateError::OutsideValidityPeriod);
         }
+        self.verify_tls_leaf(tls_anchors)?;
 
         verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// The TLS half of the candidate: a real client leaf, on a real path.
+    ///
+    /// The PQ half has always been verified; the TLS one used to be a byte
+    /// string nobody parsed. A generation is indivisible, so half of it being
+    /// unchecked made the whole of it unchecked.
+    fn verify_tls_leaf(&self, tls_anchors: &[&DerCertificate]) -> Result<(), CertificateError> {
+        crate::certificates::x509::assert_client_leaf(
+            &self.next_tls_certificate,
+            self.window.activation_at,
+        )?;
+        let intermediates: Vec<&DerCertificate> = self
+            .issuer_authorization
+            .as_ref()
+            .map(|delegation| vec![&delegation.tls_intermediate_certificate])
+            .unwrap_or_default();
+        crate::certificates::x509::assert_chains_to(
+            &self.next_tls_certificate,
+            &intermediates,
+            tls_anchors,
+        )?;
+        // The anchor the object *names* must be the one it actually chains to.
+        if !tls_anchors.iter().any(|anchor| {
+            anchor
+                .fingerprint()
+                .matches(&self.next_tls_ca_certificate_fingerprint)
+        }) {
+            return Err(CertificateError::FingerprintMismatch("client TLS CA"));
+        }
+        Ok(())
     }
 
     /// The key that signed both this object and the leaf it carries.
@@ -750,6 +819,12 @@ impl ClientCertificateRotationGrant {
     /// The embedded receipt is verified under the gateway leaf **this client
     /// pins**: a grant is only worth what the gateway admitted, and a receipt
     /// signed by another gateway describes another fleet.
+    ///
+    /// On top of what [`Self::verify_for_gateway`] checks, this binds the
+    /// grant to the **local** request: its fingerprint, its generations and
+    /// the public key it proved possession of. Without that, a valid grant
+    /// issued for another machine would be installed against private keys
+    /// nobody on this one holds.
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
@@ -763,8 +838,132 @@ impl ClientCertificateRotationGrant {
         server_name: &str,
         client_wg_public_key: &WireGuardKey,
         request: &ClientCertificateRotationRequest,
+        tls_anchors: &[&DerCertificate],
         now_unix: u64,
     ) -> Result<(), CertificateError> {
+        let issuer_key = self.verify_common(
+            ca_pq,
+            gateway_pq_public_key,
+            gateway_certificate_fingerprint,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            client_wg_public_key,
+            tls_anchors,
+            now_unix,
+        )?;
+
+        // The TLS leaf must certify the key **this** client generated. A grant
+        // can be perfectly signed and still install a certificate whose private
+        // key nobody holds; the failure would then surface at the next mTLS
+        // handshake, after the old generation was retired.
+        crate::certificates::x509::assert_csr_matches(
+            &request.tls_csr,
+            &self.next_tls_certificate,
+        )?;
+
+        if !self.request_fingerprint.matches(&request.fingerprint()) {
+            return Err(CertificateError::FingerprintMismatch("rotation request"));
+        }
+        if self.active_generation != request.active_generation
+            || self.next_generation != request.requested_generation
+        {
+            return Err(CertificateError::GenerationConflict {
+                generation: self.next_generation,
+            });
+        }
+        // The leaf must certify the key the client actually generated, or the
+        // candidate would be a certificate without a usable private key.
+        if self.next_pq_certificate.ml_dsa_87_public_key
+            != request.new_ml_dsa_87_public_key.to_base64()
+        {
+            return Err(CertificateError::MissingProof("new client"));
+        }
+
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// Verifies the grant as **Helios** does, on a commit arriving in the
+    /// tunnel (spec §7.3).
+    ///
+    /// The gateway never sees the rotation request — it only ever held the
+    /// staging authorization — so it binds the grant to what it *does* know:
+    /// the receipt it signed itself, the candidate it persisted, and the
+    /// generation that candidate follows. Requiring the grant here is what
+    /// closes the protocol: without it a client holding both private keys
+    /// could commit a candidate the authority never released.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_for_gateway(
+        &self,
+        ca_pq: &MlDsa87PublicKey,
+        gateway_pq_public_key: &MlDsa87PublicKey,
+        gateway_certificate_fingerprint: &Fingerprint,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        client_wg_public_key: &WireGuardKey,
+        active_generation: u64,
+        candidate: &ClientCertificateGeneration,
+        stage_id: &Id16,
+        tls_anchors: &[&DerCertificate],
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        let issuer_key = self.verify_common(
+            ca_pq,
+            gateway_pq_public_key,
+            gateway_certificate_fingerprint,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            client_wg_public_key,
+            tls_anchors,
+            now_unix,
+        )?;
+
+        if self.stage_receipt.stage_id != *stage_id {
+            return Err(CertificateError::UnknownStage);
+        }
+        if self.active_generation != active_generation {
+            return Err(CertificateError::GenerationConflict {
+                generation: self.active_generation,
+            });
+        }
+        // Every field of the candidate, not just its fingerprints: a grant
+        // that released another window or another TLS anchor for the same two
+        // leaves would be describing a different decision.
+        if self.candidate()? != *candidate {
+            return Err(CertificateError::FingerprintMismatch("staged client"));
+        }
+
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// Everything both verifiers share: identities, the embedded receipt, the
+    /// window, and the resolution of the issuer that signed the leaf.
+    ///
+    /// Returns the issuer key, so neither caller can verify the grant's own
+    /// signature under a key the grant chose for itself.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_common<'a>(
+        &'a self,
+        ca_pq: &'a MlDsa87PublicKey,
+        gateway_pq_public_key: &MlDsa87PublicKey,
+        gateway_certificate_fingerprint: &Fingerprint,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        client_wg_public_key: &WireGuardKey,
+        tls_anchors: &[&DerCertificate],
+        now_unix: u64,
+    ) -> Result<&'a MlDsa87PublicKey, CertificateError> {
         if self.format_version != CERTIFICATE_FORMAT_VERSION {
             return Err(CertificateError::UnsupportedFormatVersion {
                 received: self.format_version,
@@ -788,19 +987,6 @@ impl ClientCertificateRotationGrant {
         }
         if self.client_wg_public_key != *client_wg_public_key {
             return Err(CertificateError::ClientIdentityMismatch);
-        }
-        // The grant must answer *this* request: the local one, whose private
-        // keys the client holds. Otherwise a valid grant for another machine
-        // would be installed against keys nobody has.
-        if !self.request_fingerprint.matches(&request.fingerprint()) {
-            return Err(CertificateError::FingerprintMismatch("rotation request"));
-        }
-        if self.active_generation != request.active_generation
-            || self.next_generation != request.requested_generation
-        {
-            return Err(CertificateError::GenerationConflict {
-                generation: self.next_generation,
-            });
         }
         if !self
             .stage_receipt_fingerprint
@@ -866,15 +1052,28 @@ impl ClientCertificateRotationGrant {
                 self.window.activation_at,
             )
             .map_err(|_| CertificateError::UnauthorizedIssuer)?;
-        // The leaf must certify the key the client actually generated, or the
-        // candidate would be a certificate without a usable private key.
-        if self.next_pq_certificate.ml_dsa_87_public_key
-            != request.new_ml_dsa_87_public_key.to_base64()
-        {
-            return Err(CertificateError::MissingProof("new client"));
+        crate::certificates::x509::assert_client_leaf(
+            &self.next_tls_certificate,
+            self.window.activation_at,
+        )?;
+        let intermediates: Vec<&DerCertificate> = self
+            .issuer_authorization
+            .as_ref()
+            .map(|delegation| vec![&delegation.tls_intermediate_certificate])
+            .unwrap_or_default();
+        crate::certificates::x509::assert_chains_to(
+            &self.next_tls_certificate,
+            &intermediates,
+            tls_anchors,
+        )?;
+        if !tls_anchors.iter().any(|anchor| {
+            anchor
+                .fingerprint()
+                .matches(&self.next_tls_ca_certificate_fingerprint)
+        }) {
+            return Err(CertificateError::FingerprintMismatch("client TLS CA"));
         }
-
-        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+        Ok(issuer_key)
     }
 
     /// Same rule as [`ClientCertificateStageAuthorization::resolve_issuer`]:
@@ -1142,7 +1341,7 @@ impl ExpiredCertificateRecoveryRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn verify_historical(
         &self,
-        ca_pq: &MlDsa87PublicKey,
+        issuers: &[&MlDsa87PublicKey],
         trust_domain_id: &TrustDomainId,
         gateway_wg_public_key: &WireGuardKey,
         server_name: &str,
@@ -1211,16 +1410,16 @@ impl ExpiredCertificateRecoveryRequest {
         }
         // The chain is verified at an instant **inside** the expired leaf's own
         // validity: this validator waives the period, it does not waive the
-        // issuer signature, the role or the WireGuard binding.
-        self.expired_pq_certificate
-            .verify(
-                ca_pq.as_bytes(),
-                PqCertificateRole::Client,
-                None,
-                &client_wg_public_key.to_base64(),
-                self.expired_pq_certificate.not_before_unix,
-            )
-            .map_err(|_| CertificateError::UnauthorizedIssuer)?;
+        // issuer signature, the role or the WireGuard binding. The leaf may
+        // have been issued by a delegated issuer of an earlier epoch, so the
+        // caller supplies every authority that could legitimately have signed
+        // it.
+        verify_client_leaf_under_any(
+            &self.expired_pq_certificate,
+            issuers,
+            client_wg_public_key,
+            self.expired_pq_certificate.not_before_unix,
+        )?;
 
         let expired_key =
             MlDsa87PublicKey::parse(&self.expired_pq_certificate.ml_dsa_87_public_key)?;
@@ -1383,6 +1582,10 @@ mod tests {
         issue_pq_certificate(certificate, &ca.private).expect("issue")
     }
 
+    fn tls_material() -> crate::certificates::test_x509::TlsMaterial {
+        crate::certificates::test_x509::client_material("workstation")
+    }
+
     fn active_generation() -> ClientCertificateGeneration {
         ClientCertificateGeneration {
             generation: 4,
@@ -1539,6 +1742,7 @@ mod tests {
         ca: &Keys,
         candidate_leaf: PqCertificate,
         request_fingerprint: Fingerprint,
+        tls: &crate::certificates::test_x509::TlsMaterial,
     ) -> ClientCertificateStageAuthorization {
         let mut authorization = ClientCertificateStageAuthorization {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -1559,8 +1763,8 @@ mod tests {
             next_generation: 5,
             active_tls_certificate_fingerprint: Fingerprint::of(b"active tls"),
             active_pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
-            next_tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
-            next_tls_certificate: DerCertificate::new(vec![4; 512]).expect("der"),
+            next_tls_ca_certificate_fingerprint: tls.authority.fingerprint(),
+            next_tls_certificate: tls.leaf.clone(),
             next_pq_certificate: candidate_leaf,
             issued_at: 1_000,
             stage_expires_at: 1_000 + 3_600,
@@ -1579,7 +1783,8 @@ mod tests {
         let ca = keys();
         let subject = keys();
         let leaf = client_leaf(&ca, &subject, 2);
-        let authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"));
+        let tls = tls_material();
+        let authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"), &tls);
 
         assert!(authorization
             .verify(
@@ -1591,6 +1796,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             )
@@ -1604,7 +1810,8 @@ mod tests {
         let ca = keys();
         let subject = keys();
         let leaf = client_leaf(&ca, &subject, 2);
-        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"));
+        let tls = tls_material();
+        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"), &tls);
         authorization.issuer_authorization_fingerprint = Fingerprint::of(b"delegation");
         let transcript = authorization.signing_bytes().unwrap();
         authorization.signature = sign_ml_dsa_87(&ca.private, &transcript).unwrap();
@@ -1618,6 +1825,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             ),
@@ -1637,6 +1845,7 @@ mod tests {
         let ca = keys();
         let issuer = keys();
         let subject = keys();
+        let tls = tls_material();
 
         let delegation = AstraIssuerAuthorization {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -1647,7 +1856,9 @@ mod tests {
             server_name: SERVER_NAME.into(),
             issuer_epoch: 3,
             pq_issuer_public_key: issuer.public.clone(),
-            tls_intermediate_certificate: DerCertificate::new(vec![5; 256]).expect("der"),
+            tls_intermediate_certificate: crate::certificates::test_x509::certificate_authority(
+                "astra-issuer",
+            ),
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 200_000,
             policy_fingerprint: Fingerprint::of(b"policy"),
@@ -1660,7 +1871,7 @@ mod tests {
 
         let delegated_leaf = client_leaf(&issuer, &subject, 4);
         let mut authorization =
-            authorization(&ca, &ca, delegated_leaf, Fingerprint::of(b"request"));
+            authorization(&ca, &ca, delegated_leaf, Fingerprint::of(b"request"), &tls);
         authorization.issuer_kind = IssuerKind::Astra;
         authorization.issuer_epoch = 3;
         authorization.issuer_authorization_fingerprint = delegation.fingerprint();
@@ -1677,6 +1888,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             )
@@ -1698,6 +1910,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             ),
@@ -1710,7 +1923,8 @@ mod tests {
         let ca = keys();
         let subject = keys();
         let leaf = client_leaf(&ca, &subject, 2);
-        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"));
+        let tls = tls_material();
+        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"), &tls);
 
         authorization.stage_expires_at = authorization.window.activation_at + 1;
         let transcript = authorization.signing_bytes().unwrap();
@@ -1725,6 +1939,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             ),
@@ -1746,6 +1961,7 @@ mod tests {
                 SERVER_NAME,
                 &client_key(),
                 &active_generation(),
+                &[&tls.authority],
                 None,
                 1_100,
             ),

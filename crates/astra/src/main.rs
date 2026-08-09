@@ -29,7 +29,7 @@ use aether::certificates::encoding::{
 use anyhow::{Context, Result};
 use astra::registry::{AstraRegistry, AstraState, ChallengeStore};
 use astra::service::{AstraService, SourceBudget, MAX_LIVE_CHALLENGES};
-use astra::AuditEvent;
+use astra::{AuditEvent, DelegatedIssuer};
 use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
@@ -37,6 +37,8 @@ use zeroize::Zeroizing;
 const DEFAULT_STATE_DIR: &str = "/var/lib/astra";
 const REGISTRY_FILE: &str = "registry.json";
 const SERVICE_KEY_FILE: &str = "service-key.bin";
+const ISSUER_PQ_KEY_FILE: &str = "issuer-pq-key.bin";
+const ISSUER_TLS_KEY_FILE: &str = "issuer-tls-key.der";
 
 #[derive(Parser)]
 #[command(
@@ -205,18 +207,11 @@ fn run(state_dir: &Path, bind: SocketAddr, expected_audit_head: Option<&str>) ->
         peers = registry.state().peers.len(),
         "Astra ready"
     );
-    if registry.state().issuer.is_none() {
-        // A domain with no delegation cannot renew anything without a human.
-        // Saying so at startup beats discovering it at 80 % of a leaf's life.
-        tracing::warn!(
-            "no delegated issuer installed: ordinary renewals will be refused until \
-             `AstraIssuerAuthorization` is signed by the operator companion"
-        );
-    }
 
+    let issuer = load_issuer(state_dir, &registry)?;
     let service = Arc::new(AstraService {
         registry: Mutex::new(registry),
-        issuer: None,
+        issuer,
         challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
         budgets: Mutex::new(SourceBudget::default()),
         service_private_key,
@@ -238,6 +233,51 @@ fn run(state_dir: &Path, bind: SocketAddr, expected_audit_head: Option<&str>) ->
         .await
         .context("serving the Astra public endpoint")
     })
+}
+
+/// Builds the delegated issuer, when the domain has one **and** its private
+/// material is on disk.
+///
+/// The three parts are independent on purpose: the authorization is public and
+/// travels in the registry, while the two private keys are generated and
+/// sealed locally. A registry that names a delegation whose keys are missing is
+/// an incomplete install, and it is reported as such — an issuer silently
+/// forced to `None` would refuse every ordinary renewal with no explanation,
+/// at 80 % of a leaf's life.
+fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<DelegatedIssuer>> {
+    let Some(installed) = registry.state().issuer.as_ref() else {
+        tracing::warn!(
+            "no delegated issuer in the registry: ordinary renewals stay refused until \
+             `AstraIssuerAuthorization` is signed by the operator companion"
+        );
+        return Ok(None);
+    };
+    let pq_key = state_dir.join(ISSUER_PQ_KEY_FILE);
+    let tls_key = state_dir.join(ISSUER_TLS_KEY_FILE);
+    if !pq_key.exists() || !tls_key.exists() {
+        tracing::error!(
+            issuer_epoch = installed.issuer_epoch,
+            pq_key = %pq_key.display(),
+            tls_key = %tls_key.display(),
+            "the registry names a delegated issuer but its private material is missing: \
+             ordinary renewals will be refused"
+        );
+        return Ok(None);
+    }
+    let pq_private_key =
+        Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
+    let tls_private_key =
+        Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
+    tracing::info!(
+        issuer_epoch = installed.issuer_epoch,
+        not_after = installed.authorization.not_after,
+        "delegated issuer loaded"
+    );
+    Ok(Some(DelegatedIssuer::new(
+        installed.authorization.clone(),
+        pq_private_key,
+        tls_private_key,
+    )))
 }
 
 fn status(state_dir: &Path) -> Result<()> {

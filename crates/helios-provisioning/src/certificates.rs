@@ -37,15 +37,14 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::{
     client::{
-        ClientCertificateGeneration, ClientCertificateStageAuthorization,
-        ClientCertificateStageCommit, GatewayCertificateStageReceipt,
+        ClientCertificateGeneration, ClientCertificateRotationGrant,
+        ClientCertificateStageAuthorization, ClientCertificateStageCommit,
+        GatewayCertificateStageReceipt,
     },
-    encoding::{
-        Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
-    },
+    encoding::{Fingerprint, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome,
+        GatewayCertificateState, InstallOutcome, PendingStageState,
     },
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
 };
@@ -278,6 +277,7 @@ impl CertificateRegistry {
             &self.state.gateway.server_name,
             caller_wg_public_key,
             &peer.state.active,
+            &self.state.client_tls_ca.acceptable_anchors(now_unix),
             None,
             now_unix,
         )?;
@@ -327,31 +327,31 @@ impl CertificateRegistry {
         })
     }
 
-    /// Marks a staged candidate as released to the client.
-    pub fn mark_pending_commit(
-        &mut self,
-        caller_wg_public_key: &WireGuardKey,
-        stage_id: &Id16,
-    ) -> Result<(), RegistryError> {
-        let peer = self
-            .state
-            .peers
-            .get_mut(&caller_wg_public_key.to_base64())
-            .ok_or(RegistryError::UnknownPeer)?;
-        peer.state.mark_pending_commit(stage_id)?;
-        self.save()
-    }
-
     /// Turns the candidate into the committed `next` generation.
     ///
-    /// Both signatures are verified here, under the keys the registry holds —
-    /// the active leaf it admitted and the candidate leaf it staged. Neither
-    /// comes from the commit message, so a commit cannot bring its own
-    /// verifier.
+    /// # Why the grant is mandatory here
+    ///
+    /// The two client signatures prove who is asking, not that the authority
+    /// released anything. A client holding both private keys — the ordinary
+    /// case, it generated them — could otherwise commit the moment the staging
+    /// authorization reached the gateway, before Astra ever saw the receipt and
+    /// before any grant existed. That collapses the whole ordering the receipt
+    /// exists to create.
+    ///
+    /// So the grant travels with the commit and is verified against what the
+    /// gateway itself knows: the receipt it signed, the candidate it persisted
+    /// and the generation that candidate follows. The commit's own
+    /// `grant_fingerprint` and `stage_receipt_fingerprint` must then name
+    /// exactly those objects.
+    ///
+    /// Every key used to verify comes from the registry — the active leaf it
+    /// admitted, the candidate leaf it staged, its own gateway leaf — so
+    /// nothing in the message chooses its own verifier.
     pub fn commit(
         &mut self,
         caller_wg_public_key: &WireGuardKey,
         commit: &ClientCertificateStageCommit,
+        grant: &ClientCertificateRotationGrant,
         now_unix: u64,
     ) -> Result<InstallOutcome, RegistryError> {
         if commit.client_wg_public_key != *caller_wg_public_key {
@@ -365,11 +365,60 @@ impl CertificateRegistry {
         if peer.state.revoked {
             return Err(RegistryError::Certificate(CertificateError::Revoked));
         }
+        // A replayed commit for the stage that already produced `next` is a
+        // no-op, and must be recognised before the absent `pending` turns it
+        // into a refusal.
+        if peer.state.last_committed_stage.as_ref() == Some(&commit.stage_id)
+            && peer.state.next.is_some()
+        {
+            return Ok(InstallOutcome::AlreadyPresent);
+        }
         let pending = peer
             .state
             .pending
             .as_ref()
             .ok_or(RegistryError::Certificate(CertificateError::UnknownStage))?;
+
+        let gateway_pq_public_key = MlDsa87PublicKey::parse(
+            &self
+                .state
+                .gateway
+                .active_gateway_certificate
+                .ml_dsa_87_public_key,
+        )?;
+        grant.verify_for_gateway(
+            &self.state.gateway.current_ca_public_key,
+            &gateway_pq_public_key,
+            &self.state.gateway.active_pq_fingerprint()?,
+            &self.state.trust_domain_id,
+            self.state.gateway.ca_epoch,
+            self.state.client_tls_ca.ca_tls_epoch,
+            &self.state.gateway.gateway_wg_public_key,
+            &self.state.gateway.server_name,
+            caller_wg_public_key,
+            peer.state.active.generation,
+            &pending.candidate,
+            &pending.stage_id,
+            &self.state.client_tls_ca.acceptable_anchors(now_unix),
+            now_unix,
+        )?;
+        // The commit must name *this* grant and *this* receipt. One that
+        // verified against one grant while naming another would let a stale
+        // pair be replayed against a fresh candidate.
+        if !commit.grant_fingerprint.matches(&grant.fingerprint()?) {
+            return Err(RegistryError::Certificate(
+                CertificateError::FingerprintMismatch("rotation grant"),
+            ));
+        }
+        if !commit
+            .stage_receipt_fingerprint
+            .matches(&grant.stage_receipt_fingerprint)
+        {
+            return Err(RegistryError::Certificate(
+                CertificateError::FingerprintMismatch("stage receipt"),
+            ));
+        }
+
         // Reading the clock once, here, is what makes the race with the purge
         // deterministic: a commit at the deadline is late, not lucky.
         commit.verify(
@@ -391,7 +440,11 @@ impl CertificateRegistry {
             .peers
             .get_mut(&caller_wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
-        let outcome = peer.state.commit(&stage_id, now_unix)?;
+        // Helios commits a candidate that is still `pending_grant`: the grant
+        // travels to the client, not through here (spec §7.3).
+        let outcome = peer
+            .state
+            .commit(&stage_id, PendingStageState::PendingGrant, now_unix)?;
         self.save()?;
         Ok(outcome)
     }
@@ -485,6 +538,7 @@ mod tests {
     use super::*;
     use aether::certificates::authority::RotationReason;
     use aether::certificates::client::IssuerKind;
+    use aether::certificates::encoding::Id16;
     use aether::certificates::encoding::{generate_ml_dsa_87_keypair, DerCertificate};
     use aether::certificates::window::TransitionWindow;
     use aether::key_negotiation::{
@@ -559,6 +613,7 @@ mod tests {
     }
 
     struct Fixture {
+        tls: aether::certificates::test_x509::TlsMaterial,
         registry: CertificateRegistry,
         ca: Keys,
         gateway_leaf_key: Keys,
@@ -568,6 +623,7 @@ mod tests {
 
     fn fixture() -> Fixture {
         let directory = tempfile::tempdir().expect("temp dir");
+        let tls = aether::certificates::test_x509::client_material("workstation");
         let ca = keys();
         let gateway_leaf_key = keys();
         let astra_key = keys();
@@ -597,11 +653,13 @@ mod tests {
                 ca_epoch: 1,
                 current_ca_public_key: ca.public.clone(),
                 next_ca_public_key: None,
+                next_ca_transition_fingerprint: None,
                 ca_activation_at: None,
                 ca_retire_active_at: None,
                 active_gateway_identity_epoch: 1,
                 gateway_decision_epoch: 1,
                 next_gateway_identity_epoch: None,
+                next_transition_fingerprint: None,
                 last_aborted_transition: None,
                 active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
                 next_gateway_tls_certificate: None,
@@ -613,8 +671,9 @@ mod tests {
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 1,
-                active_client_tls_ca_certificate: DerCertificate::new(vec![2; 64]).expect("der"),
+                active_client_tls_ca_certificate: tls.authority.clone(),
                 next_client_tls_ca_certificate: None,
+                next_transition_fingerprint: None,
                 activation_at: None,
                 retire_active_at: None,
             },
@@ -623,6 +682,7 @@ mod tests {
                 webauthn_rp_id: "astra.example".into(),
                 active_astra_service_public_key: astra_key.public.clone(),
                 next_astra_service_public_key: None,
+                next_service_key_transition_fingerprint: None,
                 astra_service_key_epoch: 1,
                 service_key_activation_at: None,
                 service_key_retire_active_at: None,
@@ -643,6 +703,7 @@ mod tests {
             .expect("admission");
 
         Fixture {
+            tls,
             registry,
             ca,
             gateway_leaf_key,
@@ -682,8 +743,8 @@ mod tests {
                 .state
                 .active
                 .pq_certificate_fingerprint,
-            next_tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
-            next_tls_certificate: DerCertificate::new(vec![7; 128]).expect("der"),
+            next_tls_ca_certificate_fingerprint: fixture.tls.authority.fingerprint(),
+            next_tls_certificate: fixture.tls.leaf.clone(),
             next_pq_certificate: candidate_leaf.clone(),
             issued_at: 1_000,
             stage_expires_at,
@@ -692,6 +753,76 @@ mod tests {
             signature: MlDsa87Signature::placeholder(),
         };
         authorization.sign(&fixture.ca.private).expect("sign")
+    }
+
+    /// The grant the authority releases against a receipt, signed by `CA-PQ`
+    /// acting as the master issuer.
+    fn grant_for(
+        fixture: &Fixture,
+        authorization: &ClientCertificateStageAuthorization,
+        receipt: GatewayCertificateStageReceipt,
+    ) -> ClientCertificateRotationGrant {
+        ClientCertificateRotationGrant {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: authorization.trust_domain_id,
+            ca_epoch: authorization.ca_epoch,
+            ca_tls_epoch: authorization.ca_tls_epoch,
+            issuer_kind: authorization.issuer_kind,
+            issuer_epoch: authorization.issuer_epoch,
+            issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
+            issuer_authorization: authorization.issuer_authorization.clone(),
+            request_fingerprint: authorization.request_fingerprint,
+            stage_receipt_fingerprint: receipt.fingerprint(),
+            stage_receipt: receipt,
+            gateway_wg_public_key: authorization.gateway_wg_public_key,
+            server_name: authorization.server_name.clone(),
+            client_wg_public_key: authorization.client_wg_public_key,
+            active_generation: authorization.active_generation,
+            next_generation: authorization.next_generation,
+            active_tls_certificate_fingerprint: authorization.active_tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: authorization.active_pq_certificate_fingerprint,
+            next_tls_ca_certificate_fingerprint: authorization.next_tls_ca_certificate_fingerprint,
+            next_tls_certificate: authorization.next_tls_certificate.clone(),
+            next_pq_certificate: authorization.next_pq_certificate.clone(),
+            stage_expires_at: authorization.stage_expires_at,
+            window: authorization.window,
+            reason: authorization.reason,
+            signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&fixture.ca.private)
+        .expect("sign grant")
+    }
+
+    /// The commit a client sends once it holds the grant.
+    fn commit_for(
+        authorization: &ClientCertificateStageAuthorization,
+        grant: &ClientCertificateRotationGrant,
+        active_private: &[u8],
+        candidate_private: &[u8],
+        committed_at: u64,
+    ) -> ClientCertificateStageCommit {
+        let candidate = authorization.candidate().expect("candidate");
+        ClientCertificateStageCommit {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: authorization.trust_domain_id,
+            stage_id: authorization.stage_id,
+            grant_fingerprint: grant.fingerprint().expect("fingerprint"),
+            stage_receipt_fingerprint: grant.stage_receipt_fingerprint,
+            gateway_wg_public_key: authorization.gateway_wg_public_key,
+            client_wg_public_key: authorization.client_wg_public_key,
+            active_generation: authorization.active_generation,
+            staged_generation: candidate.generation,
+            staged_tls_certificate_fingerprint: candidate.tls_certificate_fingerprint,
+            staged_pq_certificate_fingerprint: candidate.pq_certificate_fingerprint,
+            stage_expires_at: authorization.stage_expires_at,
+            committed_at,
+            active_pq_signature: MlDsa87Signature::placeholder(),
+            staged_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(active_private, candidate_private)
+        .expect("sign commit")
     }
 
     /// The receipt is produced only after the candidate is on disk: that
@@ -769,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_signed_by_both_keys_promotes_the_candidate_to_next() {
+    fn a_commit_carrying_the_grant_promotes_the_candidate_to_next() {
         let mut fixture = fixture();
         let candidate = keys();
         let candidate_leaf = leaf(
@@ -783,34 +914,22 @@ mod tests {
         let receipt = fixture
             .registry
             .stage(&client_key(2), &authorization, 1_100)
-            .expect("staging");
-        let generation = authorization.candidate().expect("candidate");
-
-        let commit = ClientCertificateStageCommit {
-            format_version: CERTIFICATE_FORMAT_VERSION,
-            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
-            trust_domain_id: domain(),
-            stage_id: authorization.stage_id,
-            grant_fingerprint: Fingerprint::of(b"grant"),
-            stage_receipt_fingerprint: receipt.fingerprint(),
-            gateway_wg_public_key: gateway_key(),
-            client_wg_public_key: client_key(2),
-            active_generation: 4,
-            staged_generation: 5,
-            staged_tls_certificate_fingerprint: generation.tls_certificate_fingerprint,
-            staged_pq_certificate_fingerprint: generation.pq_certificate_fingerprint,
-            stage_expires_at: 5_000,
-            committed_at: 1_200,
-            active_pq_signature: MlDsa87Signature::placeholder(),
-            staged_pq_signature: MlDsa87Signature::placeholder(),
-        }
-        .sign(&fixture.active_client.private, &candidate.private)
-        .expect("sign");
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+        let grant = grant_for(&fixture, &authorization, receipt);
+        let commit = commit_for(
+            &authorization,
+            &grant,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_200,
+        );
 
         assert_eq!(
             fixture
                 .registry
-                .commit(&client_key(2), &commit, 1_300)
+                .commit(&client_key(2), &commit, &grant, 1_300)
                 .expect("commit"),
             InstallOutcome::Installed
         );
@@ -818,12 +937,133 @@ mod tests {
         assert!(peer.state.pending.is_none());
         assert_eq!(peer.state.next.as_ref().expect("next").generation, 5);
 
-        // Late is late: past the lease the same commit is refused.
-        let mut late = fixture;
-        assert!(late
+        // A retry over a lossy link must be a no-op, not a refusal.
+        assert_eq!(
+            fixture
+                .registry
+                .commit(&client_key(2), &commit, &grant, 1_400)
+                .expect("replay"),
+            InstallOutcome::AlreadyPresent
+        );
+    }
+
+    /// A commit that arrives at the deadline loses the race against the purge,
+    /// deterministically — the clock is read once, by the caller.
+    #[test]
+    fn a_commit_arriving_at_the_lease_deadline_is_refused() {
+        let mut fixture = fixture();
+        let candidate = keys();
+        let candidate_leaf = leaf(
+            &fixture.ca,
+            &candidate,
+            PqCertificateRole::Client,
+            &client_key(2),
+            3,
+        );
+        let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+        let receipt = fixture
             .registry
-            .commit(&client_key(2), &commit, 5_000)
+            .stage(&client_key(2), &authorization, 1_100)
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+        let grant = grant_for(&fixture, &authorization, receipt);
+        let commit = commit_for(
+            &authorization,
+            &grant,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_200,
+        );
+
+        assert!(fixture
+            .registry
+            .commit(&client_key(2), &commit, &grant, 5_000)
             .is_err());
+        assert!(fixture
+            .registry
+            .peer(&client_key(2))
+            .expect("peer")
+            .state
+            .next
+            .is_none());
+    }
+
+    /// The point of the whole staging protocol: holding both private keys is
+    /// not enough. Without a grant the authority released, the candidate the
+    /// gateway persisted stays where it is.
+    #[test]
+    fn a_client_holding_both_keys_cannot_commit_without_a_grant() {
+        let mut fixture = fixture();
+        let candidate = keys();
+        let candidate_leaf = leaf(
+            &fixture.ca,
+            &candidate,
+            PqCertificateRole::Client,
+            &client_key(2),
+            3,
+        );
+        let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+        let receipt = fixture
+            .registry
+            .stage(&client_key(2), &authorization, 1_100)
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+
+        // A grant the client forged for itself: everything matches except the
+        // authority that signed it.
+        let impostor = keys();
+        let forged = ClientCertificateRotationGrant {
+            signature: MlDsa87Signature::placeholder(),
+            ..grant_for(&fixture, &authorization, receipt.clone())
+        }
+        .sign(&impostor.private)
+        .expect("sign");
+        let commit = commit_for(
+            &authorization,
+            &forged,
+            &fixture.active_client.private,
+            &candidate.private,
+            1_200,
+        );
+        assert!(matches!(
+            fixture
+                .registry
+                .commit(&client_key(2), &commit, &forged, 1_300),
+            Err(RegistryError::Certificate(
+                CertificateError::InvalidSignature
+            ))
+        ));
+
+        // And a commit naming a grant other than the one it carries is refused
+        // before any state moves.
+        let genuine = grant_for(&fixture, &authorization, receipt);
+        let mismatched = ClientCertificateStageCommit {
+            grant_fingerprint: Fingerprint::of(b"another grant"),
+            ..commit_for(
+                &authorization,
+                &genuine,
+                &fixture.active_client.private,
+                &candidate.private,
+                1_200,
+            )
+        };
+        assert!(fixture
+            .registry
+            .commit(&client_key(2), &mismatched, &genuine, 1_300)
+            .is_err());
+
+        assert!(
+            fixture
+                .registry
+                .peer(&client_key(2))
+                .expect("peer")
+                .state
+                .next
+                .is_none(),
+            "no refusal may leave a committed slot behind"
+        );
     }
 
     /// A commit that only proves the candidate key would let a leaked grant
@@ -844,32 +1084,24 @@ mod tests {
         let receipt = fixture
             .registry
             .stage(&client_key(2), &authorization, 1_100)
-            .expect("staging");
-        let generation = authorization.candidate().expect("candidate");
-
-        let commit = ClientCertificateStageCommit {
-            format_version: CERTIFICATE_FORMAT_VERSION,
-            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
-            trust_domain_id: domain(),
-            stage_id: authorization.stage_id,
-            grant_fingerprint: Fingerprint::of(b"grant"),
-            stage_receipt_fingerprint: receipt.fingerprint(),
-            gateway_wg_public_key: gateway_key(),
-            client_wg_public_key: client_key(2),
-            active_generation: 4,
-            staged_generation: 5,
-            staged_tls_certificate_fingerprint: generation.tls_certificate_fingerprint,
-            staged_pq_certificate_fingerprint: generation.pq_certificate_fingerprint,
-            stage_expires_at: 5_000,
-            committed_at: 1_200,
-            active_pq_signature: MlDsa87Signature::placeholder(),
-            staged_pq_signature: MlDsa87Signature::placeholder(),
-        }
-        .sign(&stranger.private, &candidate.private)
-        .expect("sign");
+            .expect("staging")
+            .sign(&fixture.gateway_leaf_key.private)
+            .expect("sign receipt");
+        let grant = grant_for(&fixture, &authorization, receipt);
+        // Signed by a key that is not the peer's active one: continuity is
+        // exactly what this signature is there to prove.
+        let commit = commit_for(
+            &authorization,
+            &grant,
+            &stranger.private,
+            &candidate.private,
+            1_200,
+        );
 
         assert!(matches!(
-            fixture.registry.commit(&client_key(2), &commit, 1_300),
+            fixture
+                .registry
+                .commit(&client_key(2), &commit, &grant, 1_300),
             Err(RegistryError::Certificate(CertificateError::MissingProof(
                 "active client"
             )))

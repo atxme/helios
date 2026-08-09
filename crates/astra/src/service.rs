@@ -102,29 +102,85 @@ struct ErrorBody {
     error: String,
 }
 
-/// Budget keyed by IPv4 address or IPv6 `/64` prefix.
+/// Budget keyed by IPv4 address or IPv6 `/64` prefix, and by admitted peer.
 ///
-/// Counting IPv6 by exact address makes a limit decorative: a single ordinary
-/// allocation holds 2^64 of them.
+/// Two properties, and both are load-bearing:
+///
+/// - counting IPv6 by exact address makes a limit decorative: a single
+///   ordinary allocation holds 2^64 of them, so the key is the `/64`;
+/// - the map itself is **bounded**. An unbounded one turns a rate limit into a
+///   memory-exhaustion primitive: every fresh source costs an entry, and an
+///   attacker with a `/64` — or a botnet — has as many as they like. Past the
+///   ceiling, stale windows are dropped and a source that still has no entry
+///   is refused rather than admitted for free.
 #[derive(Debug, Default)]
 pub struct SourceBudget {
-    windows: HashMap<[u8; 16], (u64, u32)>,
+    sources: HashMap<[u8; 16], (u64, u32)>,
+    peers: HashMap<[u8; 32], (u64, u32)>,
+}
+
+/// Largest number of sources tracked at once.
+///
+/// Sixty-five thousand entries is a few megabytes; beyond that the map is the
+/// attack rather than the defence.
+pub const MAX_TRACKED_SOURCES: usize = 65_536;
+/// Largest number of admitted peers tracked at once.
+pub const MAX_TRACKED_PEERS: usize = 4_096;
+/// Requests one admitted identity may make per window (spec §8.2).
+pub const PEER_BUDGET: u32 = 12;
+
+/// Charges one request against a bounded per-key window.
+fn charge_bounded<K: Copy + Eq + std::hash::Hash>(
+    windows: &mut HashMap<K, (u64, u32)>,
+    key: K,
+    now_unix: u64,
+    budget: u32,
+    capacity: usize,
+) -> bool {
+    let window = now_unix / BUDGET_WINDOW_SECS;
+    if !windows.contains_key(&key) && windows.len() >= capacity {
+        // Drop what is already spent before refusing anything.
+        windows.retain(|_, (seen, _)| *seen == window);
+        if windows.len() >= capacity {
+            return false;
+        }
+    }
+    let entry = windows.entry(key).or_insert((window, 0));
+    if entry.0 != window {
+        *entry = (window, 0);
+    }
+    if entry.1 >= budget {
+        return false;
+    }
+    entry.1 += 1;
+    true
 }
 
 impl SourceBudget {
     /// Charges one request. `false` means the source is over budget.
     pub fn charge(&mut self, source: IpAddr, now_unix: u64) -> bool {
-        let key = Self::key(source);
-        let window = now_unix / BUDGET_WINDOW_SECS;
-        let entry = self.windows.entry(key).or_insert((window, 0));
-        if entry.0 != window {
-            *entry = (window, 0);
-        }
-        if entry.1 >= SOURCE_BUDGET {
-            return false;
-        }
-        entry.1 += 1;
-        true
+        charge_bounded(
+            &mut self.sources,
+            Self::key(source),
+            now_unix,
+            SOURCE_BUDGET,
+            MAX_TRACKED_SOURCES,
+        )
+    }
+
+    /// Charges one request against an admitted identity (spec §8.2).
+    ///
+    /// A network budget alone bounds an anonymous flood; it does nothing about
+    /// one admitted peer spending the authority's signature budget from a
+    /// thousand addresses.
+    pub fn charge_peer(&mut self, peer: &WireGuardKey, now_unix: u64) -> bool {
+        charge_bounded(
+            &mut self.peers,
+            *peer.as_bytes(),
+            now_unix,
+            PEER_BUDGET,
+            MAX_TRACKED_PEERS,
+        )
     }
 
     fn key(source: IpAddr) -> [u8; 16] {
@@ -260,6 +316,17 @@ async fn status_query(
         .peer(&query.client_wg_public_key)
         .ok_or(ServiceError::Refused)?
         .clone();
+    // Charged after the challenge and the lookup, before any ML-DSA work: the
+    // per-identity budget is what stops one admitted peer from spending the
+    // authority's signature budget from a thousand addresses.
+    if !service
+        .budgets
+        .lock()
+        .await
+        .charge_peer(&query.client_wg_public_key, now)
+    {
+        return Err(ServiceError::Throttled);
+    }
 
     // The proof is by the PQ key of the identity being asked about, verified
     // through the certificate the query carries — which must itself be the one
@@ -351,6 +418,45 @@ mod tests {
         // A different /64 has its own.
         let elsewhere: IpAddr = "2001:db9::1".parse().unwrap();
         assert!(budget.charge(elsewhere, 1_000));
+    }
+
+    /// An unbounded map turns a rate limit into a memory-exhaustion
+    /// primitive: every fresh source would cost an entry, and an attacker has
+    /// as many as they like.
+    #[test]
+    fn the_source_map_is_bounded_and_refuses_rather_than_growing() {
+        let mut budget = SourceBudget::default();
+        let mut accepted = 0usize;
+        for index in 0..(MAX_TRACKED_SOURCES + 64) {
+            let source: IpAddr = format!("2001:db8:{:x}:{:x}::1", index / 65_536, index % 65_536)
+                .parse()
+                .unwrap();
+            if budget.charge(source, 1_000) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, MAX_TRACKED_SOURCES,
+            "past the ceiling a new source is refused, not admitted for free"
+        );
+
+        // The next window frees the whole table again.
+        let fresh: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(budget.charge(fresh, 1_000 + BUDGET_WINDOW_SECS));
+    }
+
+    /// One admitted peer must not be able to spend the authority's signature
+    /// budget from a thousand addresses.
+    #[test]
+    fn an_admitted_peer_has_its_own_budget() {
+        let mut budget = SourceBudget::default();
+        let peer = WireGuardKey::from_bytes([4; 32]);
+        for _ in 0..PEER_BUDGET {
+            assert!(budget.charge_peer(&peer, 1_000));
+        }
+        assert!(!budget.charge_peer(&peer, 1_000));
+        assert!(budget.charge_peer(&WireGuardKey::from_bytes([5; 32]), 1_000));
+        assert!(budget.charge_peer(&peer, 1_000 + BUDGET_WINDOW_SECS));
     }
 
     #[test]

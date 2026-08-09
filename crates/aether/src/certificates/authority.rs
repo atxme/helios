@@ -225,6 +225,13 @@ impl ClientTlsCaTransition {
             ));
         }
         self.window.validate()?;
+        // The incoming anchor must be a real one, and prove it holds its own
+        // key. A signature from `CA-PQ` says the operator meant to install
+        // *this document*; it says nothing about whether the bytes inside are
+        // a certificate authority at all.
+        crate::certificates::x509::assert_certificate_authority(
+            &self.next_client_tls_ca_certificate,
+        )?;
         verify_ml_dsa_87(ca_pq, &self.signing_bytes(), &self.ca_pq_signature)
     }
 }
@@ -336,6 +343,12 @@ impl AstraIssuerAuthorization {
         validate_server_name(&self.server_name)?;
         if self.maximum_leaf_lifetime_secs == 0 {
             return Err(CertificateError::IssuerScopeViolation("leaf lifetime"));
+        }
+        // The delegated intermediate must itself be able to certify, or every
+        // leaf it signs would chain to nothing.
+        let intermediate = crate::certificates::x509::inspect(&self.tls_intermediate_certificate)?;
+        if !intermediate.is_certificate_authority || !intermediate.can_sign_certificates {
+            return Err(CertificateError::IssuerScopeViolation("TLS intermediate"));
         }
         if self.not_after <= self.not_before {
             return Err(CertificateError::InvalidValidityPeriod);
@@ -821,7 +834,9 @@ mod tests {
             server_name: "gateway.example".into(),
             issuer_epoch: 1,
             pq_issuer_public_key: issuer.clone(),
-            tls_intermediate_certificate: DerCertificate::new(vec![3; 128]).expect("der"),
+            tls_intermediate_certificate: crate::certificates::test_x509::certificate_authority(
+                "astra-issuer",
+            ),
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 90 * 86_400,
             policy_fingerprint: Fingerprint::of(b"policy"),

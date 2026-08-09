@@ -73,6 +73,8 @@ pub struct GatewayCertificateState {
     pub ca_epoch: u64,
     pub current_ca_public_key: MlDsa87PublicKey,
     pub next_ca_public_key: Option<MlDsa87PublicKey>,
+    /// Fingerprint of the `CaTransition` document that staged `next_ca`.
+    pub next_ca_transition_fingerprint: Option<Fingerprint>,
     pub ca_activation_at: Option<u64>,
     pub ca_retire_active_at: Option<u64>,
 
@@ -82,6 +84,13 @@ pub struct GatewayCertificateState {
     /// epoch outside an abort that has not yet been followed by a promotion.
     pub gateway_decision_epoch: u64,
     pub next_gateway_identity_epoch: Option<u64>,
+    /// Fingerprint of the staged transition **document**.
+    ///
+    /// Idempotency is "the same signed bytes", not "the same leaves": two
+    /// transitions can install identical certificates under different windows,
+    /// reasons or epochs, and treating the second as a replay would silently
+    /// keep the first decision while the sender believed the second landed.
+    pub next_transition_fingerprint: Option<Fingerprint>,
     pub last_aborted_transition: Option<GatewayTransitionAbortTombstone>,
 
     pub active_gateway_tls_certificate: DerCertificate,
@@ -137,9 +146,12 @@ impl GatewayCertificateState {
     ) -> Result<InstallOutcome, CertificateError> {
         // An identical decision already held is a no-op, and it must be
         // recognised before the generation rule refuses `current` as a repeat.
-        if self.next_gateway_identity_epoch == Some(transition.gateway_identity_epoch)
-            && self.next_gateway_tls_certificate == transition.next_gateway_tls_certificate
-            && self.next_gateway_certificate == transition.next_gateway_certificate
+        // "Identical" is the whole signed document: the same leaves under a
+        // different window are a different decision.
+        let fingerprint = transition.fingerprint()?;
+        if self
+            .next_transition_fingerprint
+            .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
@@ -166,6 +178,7 @@ impl GatewayCertificateState {
 
         self.gateway_decision_epoch = transition.gateway_identity_epoch;
         self.next_gateway_identity_epoch = Some(transition.gateway_identity_epoch);
+        self.next_transition_fingerprint = Some(fingerprint);
         if transition.next_gateway_tls_certificate.is_some() {
             self.next_gateway_tls_certificate = transition.next_gateway_tls_certificate.clone();
         }
@@ -219,6 +232,7 @@ impl GatewayCertificateState {
         )?;
 
         self.next_gateway_identity_epoch = None;
+        self.next_transition_fingerprint = None;
         self.next_gateway_tls_certificate = None;
         self.next_gateway_certificate = None;
         self.activation_at = None;
@@ -250,6 +264,7 @@ impl GatewayCertificateState {
         }
         self.active_gateway_identity_epoch = epoch;
         self.next_gateway_identity_epoch = None;
+        self.next_transition_fingerprint = None;
         self.activation_at = None;
         self.retire_active_at = None;
         self.published = false;
@@ -262,8 +277,10 @@ impl GatewayCertificateState {
         transition: &CaTransition,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.next_ca_public_key.as_ref() == Some(&transition.next_ca_public_key)
-            && self.ca_epoch + 1 == transition.next_ca_epoch
+        let fingerprint = transition.fingerprint();
+        if self
+            .next_ca_transition_fingerprint
+            .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
@@ -283,6 +300,7 @@ impl GatewayCertificateState {
             ));
         }
         self.next_ca_public_key = Some(transition.next_ca_public_key.clone());
+        self.next_ca_transition_fingerprint = Some(fingerprint);
         self.ca_activation_at = Some(transition.window.activation_at);
         self.ca_retire_active_at = Some(transition.window.not_after);
         Ok(InstallOutcome::Installed)
@@ -301,6 +319,7 @@ impl GatewayCertificateState {
         };
         self.current_ca_public_key = next;
         self.ca_epoch += 1;
+        self.next_ca_transition_fingerprint = None;
         self.ca_activation_at = None;
         self.ca_retire_active_at = None;
         true
@@ -351,7 +370,14 @@ impl GatewayCertificateState {
                     .as_ref()
                     .map(|tombstone| tombstone.abort_fingerprint)
                     .as_ref(),
-            );
+            )
+            .optional_fingerprint(self.next_transition_fingerprint.as_ref())
+            .optional_fingerprint(self.next_ca_transition_fingerprint.as_ref())
+            .u64(self.activation_at.unwrap_or(0))
+            .u64(self.retire_active_at.unwrap_or(0))
+            .u64(self.ca_activation_at.unwrap_or(0))
+            .u64(self.ca_retire_active_at.unwrap_or(0))
+            .u8(u8::from(self.published));
         Ok(())
     }
 }
@@ -363,6 +389,8 @@ pub struct ClientTlsCaState {
     pub ca_tls_epoch: u64,
     pub active_client_tls_ca_certificate: DerCertificate,
     pub next_client_tls_ca_certificate: Option<DerCertificate>,
+    /// Fingerprint of the `ClientTlsCaTransition` document that staged it.
+    pub next_transition_fingerprint: Option<Fingerprint>,
     pub activation_at: Option<u64>,
     pub retire_active_at: Option<u64>,
 }
@@ -377,8 +405,10 @@ impl ClientTlsCaState {
         ca_epoch: u64,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.next_client_tls_ca_certificate.as_ref()
-            == Some(&transition.next_client_tls_ca_certificate)
+        let fingerprint = transition.fingerprint();
+        if self
+            .next_transition_fingerprint
+            .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
@@ -401,6 +431,7 @@ impl ClientTlsCaState {
         }
         self.next_client_tls_ca_certificate =
             Some(transition.next_client_tls_ca_certificate.clone());
+        self.next_transition_fingerprint = Some(fingerprint);
         self.activation_at = Some(transition.window.activation_at);
         self.retire_active_at = Some(transition.window.not_after);
         Ok(InstallOutcome::Installed)
@@ -418,6 +449,7 @@ impl ClientTlsCaState {
         };
         self.active_client_tls_ca_certificate = next;
         self.ca_tls_epoch += 1;
+        self.next_transition_fingerprint = None;
         self.activation_at = None;
         self.retire_active_at = None;
         true
@@ -469,6 +501,13 @@ pub struct ClientCertificateState {
     pub next: Option<ClientCertificateGeneration>,
     pub activation_at: Option<u64>,
     pub retire_active_at: Option<u64>,
+    /// Stage that produced the committed `next`, so a replayed commit is
+    /// recognised as the same one instead of finding an empty `pending`.
+    ///
+    /// Without it, the second delivery of a successful commit looks exactly
+    /// like a commit for a stage that never existed, and a retry over a lossy
+    /// link would be reported as a refusal.
+    pub last_committed_stage: Option<Id16>,
     /// Terminal. No credential, campaign or grant lifts it.
     pub revoked: bool,
     pub revocation_epoch: u64,
@@ -482,6 +521,7 @@ impl ClientCertificateState {
             next: None,
             activation_at: None,
             retire_active_at: None,
+            last_committed_stage: None,
             revoked: false,
             revocation_epoch: 0,
         }
@@ -538,6 +578,11 @@ impl ClientCertificateState {
     }
 
     /// Marks the candidate as released to the client, still not activable.
+    ///
+    /// **Orion's** step, and only Orion's: the gateway never sees the grant
+    /// travel, so its candidate stays `pending_grant` until the commit arrives
+    /// (spec §7.3). A gateway that moved its own candidate here would then
+    /// commit from a state it is not supposed to commit from.
     pub fn mark_pending_commit(&mut self, stage_id: &Id16) -> Result<(), CertificateError> {
         let pending = self
             .pending
@@ -552,24 +597,31 @@ impl ClientCertificateState {
 
     /// Turns the candidate into the `next` generation, atomically.
     ///
+    /// `required_state` is what the candidate must already be in, and the two
+    /// ends require different things: Helios commits a candidate that is still
+    /// `pending_grant` — it never sees the grant travel to the client — while
+    /// Orion commits its own only once it holds the grant and has marked it
+    /// `pending_commit` (spec §7.3). Passing the state in, rather than
+    /// accepting whichever one is there, is what keeps one end from silently
+    /// adopting the other's rule.
+    ///
     /// The clock is read once by the caller, under the same serializer as
     /// revocation and purge: a commit that arrives at the deadline loses the
     /// race rather than winning it by a rounding.
     pub fn commit(
         &mut self,
         stage_id: &Id16,
+        required_state: PendingStageState,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
         if self.revoked {
             return Err(CertificateError::Revoked);
         }
-        if let Some(next) = &self.next {
-            if let Some(pending) = &self.pending {
-                let _ = pending;
-            } else if next.generation == self.active.generation + 1 {
-                // Already committed: a replayed commit changes nothing.
-                return Ok(InstallOutcome::AlreadyPresent);
-            }
+        // A replay is recognised by the stage that produced the committed
+        // slot, not by "there is a `next` roughly where one would be": a
+        // different stage landing on the same generation is a conflict.
+        if self.last_committed_stage.as_ref() == Some(stage_id) && self.next.is_some() {
+            return Ok(InstallOutcome::AlreadyPresent);
         }
         let pending = self
             .pending
@@ -578,6 +630,11 @@ impl ClientCertificateState {
         if pending.stage_id != *stage_id {
             return Err(CertificateError::UnknownStage);
         }
+        if pending.state != required_state {
+            return Err(CertificateError::IllegalStateTransition(
+                "candidate is not in the state this end commits from",
+            ));
+        }
         if now_unix >= pending.stage_expires_at {
             return Err(CertificateError::StageExpired);
         }
@@ -585,6 +642,7 @@ impl ClientCertificateState {
         let candidate = pending.candidate.clone();
         self.pending = None;
         self.next = Some(candidate);
+        self.last_committed_stage = Some(*stage_id);
         self.activation_at = Some(window.activation_at);
         self.retire_active_at = Some(window.not_after);
         Ok(InstallOutcome::Installed)
@@ -681,23 +739,59 @@ impl ClientCertificateState {
         fingerprints
     }
 
+    /// Every value a decision about this peer could depend on (spec §8.1).
+    ///
+    /// Both families of both slots, the instants, the counters and the
+    /// terminal flag. A snapshot that summarised only the PQ side would let a
+    /// manifest be built against a state whose TLS half had already moved, and
+    /// the transaction would then apply to a world it was not computed for —
+    /// which is the exact failure `base_state_fingerprint` exists to catch.
     pub(crate) fn snapshot(&self, bytes: &mut CanonicalBytes) {
         bytes
             .u64(self.active.generation)
+            .u64(self.active.ca_tls_epoch)
+            .fingerprint(&self.active.tls_ca_certificate_fingerprint)
             .fingerprint(&self.active.tls_certificate_fingerprint)
             .fingerprint(&self.active.pq_certificate_fingerprint)
-            .optional_fingerprint(
-                self.next
-                    .as_ref()
-                    .map(|next| next.pq_certificate_fingerprint)
-                    .as_ref(),
-            )
-            .optional_fingerprint(
-                self.pending
-                    .as_ref()
-                    .map(|pending| pending.candidate.pq_certificate_fingerprint)
-                    .as_ref(),
-            )
+            .u64(self.active.not_before)
+            .u64(self.active.not_after);
+
+        match &self.next {
+            Some(next) => {
+                bytes
+                    .u8(1)
+                    .u64(next.generation)
+                    .fingerprint(&next.tls_certificate_fingerprint)
+                    .fingerprint(&next.pq_certificate_fingerprint)
+                    .u64(next.not_before)
+                    .u64(next.not_after);
+            }
+            None => {
+                bytes.u8(0);
+            }
+        }
+        match &self.pending {
+            Some(pending) => {
+                bytes
+                    .u8(1)
+                    .id(&pending.stage_id)
+                    .fingerprint(&pending.request_fingerprint)
+                    .u64(pending.candidate.generation)
+                    .fingerprint(&pending.candidate.tls_certificate_fingerprint)
+                    .fingerprint(&pending.candidate.pq_certificate_fingerprint)
+                    .u8(match pending.state {
+                        PendingStageState::PendingGrant => 0,
+                        PendingStageState::PendingCommit => 1,
+                    })
+                    .u64(pending.stage_expires_at);
+            }
+            None => {
+                bytes.u8(0);
+            }
+        }
+        bytes
+            .u64(self.activation_at.unwrap_or(0))
+            .u64(self.retire_active_at.unwrap_or(0))
             .u64(self.revocation_epoch)
             .u8(u8::from(self.revoked));
     }
@@ -711,6 +805,8 @@ pub struct AstraProfile {
     pub webauthn_rp_id: String,
     pub active_astra_service_public_key: MlDsa87PublicKey,
     pub next_astra_service_public_key: Option<MlDsa87PublicKey>,
+    /// Fingerprint of the `AstraServiceKeyTransition` document that staged it.
+    pub next_service_key_transition_fingerprint: Option<Fingerprint>,
     pub astra_service_key_epoch: u64,
     pub service_key_activation_at: Option<u64>,
     pub service_key_retire_active_at: Option<u64>,
@@ -748,7 +844,10 @@ impl AstraProfile {
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.next_astra_service_public_key.as_ref() == Some(&transition.next_service_public_key)
+        let fingerprint = transition.fingerprint();
+        if self
+            .next_service_key_transition_fingerprint
+            .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
@@ -765,6 +864,7 @@ impl AstraProfile {
             self.astra_service_key_epoch,
         )?;
         self.next_astra_service_public_key = Some(transition.next_service_public_key.clone());
+        self.next_service_key_transition_fingerprint = Some(fingerprint);
         self.service_key_activation_at = Some(transition.window.activation_at);
         self.service_key_retire_active_at = Some(transition.window.not_after);
         Ok(InstallOutcome::Installed)
@@ -778,6 +878,7 @@ impl AstraProfile {
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
         current_revocation_epoch: u64,
+        now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
         if self.astra_service_key_epoch == replacement.next_service_key_epoch
             && self.active_astra_service_public_key == replacement.next_service_public_key
@@ -791,9 +892,26 @@ impl AstraProfile {
             self.astra_service_key_epoch,
             current_revocation_epoch,
         )?;
+        // The object must retire the key this profile is actually serving. One
+        // naming another fingerprint is a valid signature over someone else's
+        // decision, and applying it would evict a key nobody revoked.
+        if !replacement
+            .revoked_service_key_fingerprint
+            .matches(&self.active_astra_service_public_key.authority_fingerprint())
+        {
+            return Err(CertificateError::FingerprintMismatch("revoked service key"));
+        }
+        // `effective_at` is a date, not a formality: a replacement announced
+        // for tomorrow must not retire today's key today.
+        if now_unix < replacement.effective_at {
+            return Err(CertificateError::IllegalStateTransition(
+                "emergency replacement is not effective yet",
+            ));
+        }
         self.active_astra_service_public_key = replacement.next_service_public_key.clone();
         self.astra_service_key_epoch = replacement.next_service_key_epoch;
         self.next_astra_service_public_key = None;
+        self.next_service_key_transition_fingerprint = None;
         self.service_key_activation_at = None;
         self.service_key_retire_active_at = None;
         Ok(InstallOutcome::Installed)
@@ -811,6 +929,7 @@ impl AstraProfile {
         };
         self.active_astra_service_public_key = next;
         self.astra_service_key_epoch += 1;
+        self.next_service_key_transition_fingerprint = None;
         self.service_key_activation_at = None;
         self.service_key_retire_active_at = None;
         true
@@ -868,6 +987,8 @@ pub fn base_state_fingerprint(
                 .map(DerCertificate::fingerprint)
                 .as_ref(),
         )
+        .u64(tls_ca.activation_at.unwrap_or(0))
+        .u64(tls_ca.retire_active_at.unwrap_or(0))
         .u64(astra.astra_service_key_epoch)
         .fingerprint(
             &astra
@@ -881,6 +1002,8 @@ pub fn base_state_fingerprint(
                 .map(MlDsa87PublicKey::authority_fingerprint)
                 .as_ref(),
         )
+        .u64(astra.service_key_activation_at.unwrap_or(0))
+        .u64(astra.service_key_retire_active_at.unwrap_or(0))
         .u64(issuer_epoch);
     client.snapshot(&mut bytes);
     Ok(Fingerprint::of(&bytes.finish()))
@@ -928,7 +1051,11 @@ mod tests {
         ));
 
         state
-            .commit(&Id16::new([3; 16]).unwrap(), 2_000)
+            .commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000,
+            )
             .expect("commit");
         assert!(state.pending.is_none());
         assert!(state.next.is_some());
@@ -949,7 +1076,13 @@ mod tests {
     #[test]
     fn a_state_in_overlap_refuses_a_pair_split_across_generations() {
         let mut state = staged_state();
-        state.commit(&Id16::new([3; 16]).unwrap(), 2_000).unwrap();
+        state
+            .commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000,
+            )
+            .unwrap();
         let active = generation(4, 1);
         let next = generation(5, 2);
 
@@ -979,7 +1112,11 @@ mod tests {
 
         // And a commit arriving afterwards has nothing to commit.
         assert!(matches!(
-            state.commit(&Id16::new([3; 16]).unwrap(), 5_001),
+            state.commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                5_001
+            ),
             Err(CertificateError::UnknownStage)
         ));
     }
@@ -988,8 +1125,67 @@ mod tests {
     fn a_commit_at_the_deadline_loses_the_race_against_the_purge() {
         let mut state = staged_state();
         assert!(matches!(
-            state.commit(&Id16::new([3; 16]).unwrap(), 5_000),
+            state.commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                5_000
+            ),
             Err(CertificateError::StageExpired)
+        ));
+    }
+
+    /// The two ends commit from different states, and neither may adopt the
+    /// other's rule: Orion must hold the grant first.
+    #[test]
+    fn each_end_commits_only_from_the_state_it_owns() {
+        let mut orion = staged_state();
+        assert!(matches!(
+            orion.commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingCommit,
+                2_000
+            ),
+            Err(CertificateError::IllegalStateTransition(_))
+        ));
+
+        orion
+            .mark_pending_commit(&Id16::new([3; 16]).unwrap())
+            .expect("grant persisted");
+        orion
+            .commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingCommit,
+                2_000,
+            )
+            .expect("commit");
+        assert!(orion.next.is_some());
+    }
+
+    /// A retry over a lossy link is a no-op, and it is recognised by the stage
+    /// that produced the slot — not by "there is a `next` roughly here".
+    #[test]
+    fn a_replayed_commit_is_idempotent_for_its_own_stage_only() {
+        let mut state = staged_state();
+        let stage = Id16::new([3; 16]).unwrap();
+        state
+            .commit(&stage, PendingStageState::PendingGrant, 2_000)
+            .expect("commit");
+
+        assert_eq!(
+            state
+                .commit(&stage, PendingStageState::PendingGrant, 2_100)
+                .expect("replay"),
+            InstallOutcome::AlreadyPresent
+        );
+        // Another stage landing on the same generation is a conflict, not a
+        // second success.
+        assert!(matches!(
+            state.commit(
+                &Id16::new([4; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_100
+            ),
+            Err(CertificateError::UnknownStage)
         ));
     }
 
@@ -997,7 +1193,11 @@ mod tests {
     fn a_commit_naming_another_stage_is_refused() {
         let mut state = staged_state();
         assert!(matches!(
-            state.commit(&Id16::new([9; 16]).unwrap(), 2_000),
+            state.commit(
+                &Id16::new([9; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000
+            ),
             Err(CertificateError::UnknownStage)
         ));
         assert!(state.pending.is_some());
@@ -1011,7 +1211,11 @@ mod tests {
         assert!(state.pending.is_none());
         assert!(state.next.is_none());
         assert!(matches!(
-            state.commit(&Id16::new([3; 16]).unwrap(), 2_000),
+            state.commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000
+            ),
             Err(CertificateError::Revoked)
         ));
         assert!(!state.promote_if_due(u64::MAX));
@@ -1029,7 +1233,13 @@ mod tests {
     #[test]
     fn a_promoted_generation_never_comes_back_when_the_clock_moves_backwards() {
         let mut state = staged_state();
-        state.commit(&Id16::new([3; 16]).unwrap(), 2_000).unwrap();
+        state
+            .commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000,
+            )
+            .unwrap();
         assert!(state.promote_if_due(20_000));
         assert_eq!(state.active.generation, 5);
         assert!(state.next.is_none());
@@ -1047,7 +1257,13 @@ mod tests {
     fn a_peer_never_holds_three_generations_at_once() {
         let mut state = staged_state();
         assert_eq!(state.occupied_fingerprints().len(), 4);
-        state.commit(&Id16::new([3; 16]).unwrap(), 2_000).unwrap();
+        state
+            .commit(
+                &Id16::new([3; 16]).unwrap(),
+                PendingStageState::PendingGrant,
+                2_000,
+            )
+            .unwrap();
         assert_eq!(state.occupied_fingerprints().len(), 4);
         assert!(state.pending.is_none() || state.next.is_none());
     }
@@ -1107,11 +1323,13 @@ mod tests {
                 ca_epoch: 1,
                 current_ca_public_key: ca.public.clone(),
                 next_ca_public_key: None,
+                next_ca_transition_fingerprint: None,
                 ca_activation_at: None,
                 ca_retire_active_at: None,
                 active_gateway_identity_epoch: 1,
                 gateway_decision_epoch: 1,
                 next_gateway_identity_epoch: None,
+                next_transition_fingerprint: None,
                 last_aborted_transition: None,
                 active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
                 next_gateway_tls_certificate: None,
@@ -1304,6 +1522,7 @@ mod tests {
             webauthn_rp_id: "astra.example".into(),
             active_astra_service_public_key: active,
             next_astra_service_public_key: Some(next),
+            next_service_key_transition_fingerprint: None,
             astra_service_key_epoch: 3,
             service_key_activation_at: Some(1_000),
             service_key_retire_active_at: Some(2_000),

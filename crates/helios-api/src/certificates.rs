@@ -27,7 +27,10 @@
 //! oracle on other peers' generations.
 
 use aether::certificates::{
-    client::{ClientCertificateStageAuthorization, ClientCertificateStageCommit},
+    client::{
+        ClientCertificateRotationGrant, ClientCertificateStageAuthorization,
+        ClientCertificateStageCommit,
+    },
     status::AstraCertificateStatus,
     transport::{
         AuthenticatedTrustUpdateRequest, TrustUpdateChunk, TrustUpdateTransactionManifest,
@@ -62,6 +65,20 @@ pub struct TrustUpdateResponse {
     pub chunk: Option<TrustUpdateChunk>,
 }
 
+/// A commit and the grant that authorizes it (spec §7.3).
+///
+/// The two travel together because the gateway needs both: the signatures
+/// prove who is committing, the grant proves the authority released anything
+/// at all. A commit alone would let a client that holds its own two private
+/// keys — which it always does, it generated them — activate a candidate the
+/// authority never granted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageCommitRequest {
+    pub commit: ClientCertificateStageCommit,
+    pub grant: ClientCertificateRotationGrant,
+}
+
 /// Why a trust update was refused, in the only shapes the API may report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustUpdateRefusal {
@@ -70,6 +87,11 @@ pub enum TrustUpdateRefusal {
     /// Authenticated transport, refused identity: another peer, another
     /// gateway, a certificate or signature that does not verify.
     Rejected,
+    /// The caller is behind, and the gateway holds no signed object to bring
+    /// it forward. Distinct from "you are current" on purpose: answering an
+    /// empty update to a client that is provably out of date would tell it the
+    /// opposite of the truth, and it would stop asking.
+    Unavailable,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -90,11 +112,12 @@ pub trait TrustUpdateHandler: Send + Sync {
         request: AuthenticatedTrustUpdateRequest,
     ) -> Result<TrustUpdateResponse, TrustUpdateRefusal>;
 
-    /// Client's commit of a staged generation, arriving in the tunnel.
+    /// Client's commit of a staged generation, arriving in the tunnel with
+    /// the grant that authorizes it.
     async fn stage_commit(
         &self,
         caller_wg_public_key: &str,
-        commit: ClientCertificateStageCommit,
+        request: Box<StageCommitRequest>,
     ) -> Result<(), TrustUpdateRefusal>;
 
     /// Staging authorization handed over by an Orion that still has a tunnel.
@@ -110,6 +133,7 @@ impl TrustUpdateRefusal {
         match self {
             Self::Protocol => StatusCode::BAD_REQUEST,
             Self::Rejected => StatusCode::FORBIDDEN,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -200,7 +224,7 @@ pub async fn stage_commit(
     if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    let commit: ClientCertificateStageCommit = match serde_json::from_slice(&body) {
+    let request: StageCommitRequest = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(peer = %caller_key, %error, "commit refused: unreadable body");
@@ -210,7 +234,7 @@ pub async fn stage_commit(
     let Some(handler) = s.trust_update.as_ref() else {
         return StatusCode::NOT_FOUND;
     };
-    match handler.stage_commit(caller_key, commit).await {
+    match handler.stage_commit(caller_key, Box::new(request)).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(refusal) => refusal.status(),
     }
@@ -252,7 +276,7 @@ mod tests {
         async fn stage_commit(
             &self,
             _caller_wg_public_key: &str,
-            _commit: ClientCertificateStageCommit,
+            _request: Box<StageCommitRequest>,
         ) -> Result<(), TrustUpdateRefusal> {
             Ok(())
         }
@@ -407,6 +431,10 @@ mod tests {
         for (refusal, expected) in [
             (TrustUpdateRefusal::Protocol, StatusCode::BAD_REQUEST),
             (TrustUpdateRefusal::Rejected, StatusCode::FORBIDDEN),
+            (
+                TrustUpdateRefusal::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 TrustUpdateRefusal::Internal,
                 StatusCode::INTERNAL_SERVER_ERROR,

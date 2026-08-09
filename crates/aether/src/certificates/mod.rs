@@ -52,6 +52,90 @@ pub mod state;
 pub mod status;
 pub mod transport;
 pub mod window;
+pub mod x509;
+
+/// Real X.509 material, for the tests of every crate that verifies a chain.
+///
+/// The verifiers parse what they are handed, so a placeholder byte string is
+/// refused — which is the point. Building genuine certificates here keeps every
+/// test honest about what it exercises, and keeps four crates from each
+/// growing their own slightly different fixture.
+///
+/// Behind the signing feature: a gateway that only verifies does not link an
+/// issuance library.
+#[cfg(feature = "key-negotiation-signing")]
+pub mod test_x509 {
+    use super::encoding::DerCertificate;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    /// A client TLS anchor, the leaf it issued and the CSR that leaf answers.
+    pub struct TlsMaterial {
+        pub authority: DerCertificate,
+        pub leaf: DerCertificate,
+        pub csr: DerCertificate,
+    }
+
+    /// A complete, genuine client TLS chain.
+    pub fn client_material(common_name: &str) -> TlsMaterial {
+        use rcgen::ExtendedKeyUsagePurpose;
+
+        let mut authority_params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        authority_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        authority_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let mut authority_name = DistinguishedName::new();
+        authority_name.push(DnType::CommonName, "CA-TLS");
+        authority_params.distinguished_name = authority_name;
+        let authority_key = KeyPair::generate().expect("key");
+        let authority = authority_params
+            .self_signed(&authority_key)
+            .expect("authority");
+
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let mut leaf_name = DistinguishedName::new();
+        leaf_name.push(DnType::CommonName, common_name);
+        leaf_params.distinguished_name = leaf_name;
+        // The tests drive synthetic clocks starting near the Unix epoch, so
+        // the leaf has to be valid there. Real material never looks like this.
+        leaf_params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(4096, 1, 1);
+        let leaf_key = KeyPair::generate().expect("key");
+        let csr = leaf_params.serialize_request(&leaf_key).expect("csr");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &authority, &authority_key)
+            .expect("leaf");
+
+        TlsMaterial {
+            authority: DerCertificate::new(authority.der().to_vec()).expect("der"),
+            leaf: DerCertificate::new(leaf.der().to_vec()).expect("der"),
+            csr: DerCertificate::new(csr.der().to_vec()).expect("der"),
+        }
+    }
+
+    /// A certification authority able to sign certificates.
+    pub fn certificate_authority(common_name: &str) -> DerCertificate {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, common_name);
+        params.distinguished_name = name;
+        let key = KeyPair::generate().expect("key");
+        let certificate = params.self_signed(&key).expect("authority");
+        DerCertificate::new(certificate.der().to_vec()).expect("der")
+    }
+}
 
 pub use encoding::{
     verify_ml_dsa_87, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature,
@@ -98,6 +182,8 @@ pub enum CertificateError {
     InvalidSignature,
     #[error("DER certificate is empty or larger than the bound")]
     InvalidDerCertificate,
+    #[error("X.509 certificate refused: {0}")]
+    InvalidX509(&'static str),
     #[error("server name is not in the canonical DNS form of the v5 negotiation")]
     InvalidServerName,
     #[error("signing operation failed")]

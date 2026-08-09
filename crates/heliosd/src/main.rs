@@ -1,5 +1,6 @@
 //! `heliosd` — control plane orchestrator daemon.
 
+mod certificates;
 mod gateway_key;
 mod key_negotiation;
 mod orchestrator;
@@ -778,6 +779,28 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     )
     .await?
     {
+        // The certificate lifecycle, when this gateway has a trust domain. It
+        // signs its receipts through the negotiation handler — the same leaf
+        // the client already pins, unsealed once — and it is the single owner
+        // of the registry: a second one would give one slot two writers.
+        match certificates::CertificateService::load(
+            helios_provisioning::certificates::CertificateRegistry::path(),
+            Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
+        ) {
+            Ok(Some(service)) => {
+                info!("certificate lifecycle ready");
+                certificates::spawn_maintenance(Arc::clone(&service));
+                state = state.with_trust_update(service);
+            }
+            Ok(None) => info!(
+                "no certificate registry: the trust domain is not bootstrapped, and the \
+                 in-tunnel lifecycle routes stay closed"
+            ),
+            Err(error) => error!(
+                %error,
+                "certificate registry unusable — the in-tunnel lifecycle routes stay closed"
+            ),
+        }
         // The in-tunnel `release` (spec §7.5) reaches the same state machine
         // as the public negotiation, through the same per-peer serializer.
         // A second instance here would give one slot two writers.

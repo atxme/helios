@@ -31,13 +31,17 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::{
     client::ClientCertificateGeneration,
-    encoding::{Fingerprint, TrustDomainId, WireGuardKey},
+    encoding::{Fingerprint, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
     gateway::GatewayIdentityTransition,
     state::{
         base_state_fingerprint, AstraProfile, ClientCertificateState, ClientTlsCaState,
         GatewayCertificateState, InstallOutcome,
     },
-    transport::{OrionTrustUpdateDocument, TrustUpdateObject},
+    status::AstraCertificateStatus,
+    transport::{
+        OrionTrustUpdateDocument, PendingTrustTransaction, TrustUpdateChunk, TrustUpdateObject,
+        TrustUpdateTransactionManifest,
+    },
     CertificateError,
 };
 use serde::{Deserialize, Serialize};
@@ -52,6 +56,10 @@ pub struct TrustState {
     pub client_tls_ca: ClientTlsCaState,
     pub astra: AstraProfile,
     pub issuer_epoch: u64,
+    /// The delegated issuer this client accepts leaves from, when one has been
+    /// installed. Absent, only `CA-PQ` may have issued a client leaf.
+    #[serde(default)]
+    pub issuer: Option<aether::certificates::state::AstraIssuerState>,
     pub certificates: ClientCertificateState,
     /// The staged gateway transition itself, not just its slots.
     ///
@@ -60,9 +68,51 @@ pub struct TrustState {
     /// unverifiable, and a client that cannot apply an abort refuses the next
     /// epoch for good — the sequential counter would never advance again.
     pub staged_gateway_transition: Option<GatewayIdentityTransition>,
+    /// Revocations accepted but not yet effective (spec §10.1).
+    ///
+    /// A revocation may name a future instant. Verifying it and then dropping
+    /// it — which is what an implementation that only looks at "is it effective
+    /// now" does — silently discards a decision the authority already made, and
+    /// its epoch has been consumed, so it can never be delivered again.
+    #[serde(default)]
+    pub scheduled_revocations: Vec<ScheduledRevocation>,
     /// Last `(astra_service_key_epoch, status_epoch)` accepted, so a replayed
     /// older status cannot move the local view backwards.
     pub last_status: Option<(u64, u64)>,
+}
+
+/// Largest number of revocations held before their effective instant.
+///
+/// A ceiling rather than an unbounded list: a peer can only ever be revoked
+/// once, so more than a handful in flight means something is wrong, and
+/// growing the store on a remote party's say-so is how a bounded state stops
+/// being bounded.
+pub const MAX_SCHEDULED_REVOCATIONS: usize = 8;
+
+/// A verified revocation waiting for its own instant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledRevocation {
+    pub revocation_epoch: u64,
+    pub effective_at: u64,
+    pub revoked_tls_fingerprint: Option<Fingerprint>,
+    pub revoked_pq_fingerprint: Option<Fingerprint>,
+}
+
+impl ScheduledRevocation {
+    /// Whether this revocation withdraws any fingerprint the peer holds.
+    ///
+    /// Both families are checked. A revocation naming only the TLS half is a
+    /// revocation: the generation is indivisible, and letting the PQ half
+    /// survive would leave an identity that mTLS refuses and the negotiation
+    /// still accepts.
+    fn hits(&self, certificates: &ClientCertificateState) -> bool {
+        let occupied = certificates.occupied_fingerprints();
+        [self.revoked_tls_fingerprint, self.revoked_pq_fingerprint]
+            .into_iter()
+            .flatten()
+            .any(|revoked| occupied.iter().any(|held| held.matches(&revoked)))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,10 +157,37 @@ impl TrustStore {
     }
 
     pub fn save(&self) -> Result<(), TrustError> {
-        let encoded = serde_json::to_vec_pretty(&self.state)
+        self.write(&self.state)
+    }
+
+    /// Writes a state without adopting it.
+    ///
+    /// The order matters: a transaction is written to disk **first**, and the
+    /// in-memory state is replaced only once that write succeeded. Swapping
+    /// first and returning the write error afterwards would leave a running
+    /// client trusting objects that no restart would ever reload — the live
+    /// state and the persisted one would disagree for as long as the process
+    /// lived.
+    fn write(&self, state: &TrustState) -> Result<(), TrustError> {
+        let encoded = serde_json::to_vec_pretty(state)
             .map_err(|error| TrustError::Corrupt(error.to_string()))?;
         aether::private_file::write_private_atomic(&self.path, &encoded)?;
         Ok(())
+    }
+
+    /// Authorities that may have issued a client leaf of this domain.
+    ///
+    /// `CA-PQ` first, then the delegated Astra issuer if one is installed: an
+    /// ordinary renewal produces a leaf chaining to the second.
+    pub fn client_leaf_issuers(&self) -> Vec<&MlDsa87PublicKey> {
+        let mut issuers = vec![&self.state.gateway.current_ca_public_key];
+        if let Some(next) = &self.state.gateway.next_ca_public_key {
+            issuers.push(next);
+        }
+        if let Some(issuer) = &self.state.issuer {
+            issuers.push(&issuer.authorization.pq_issuer_public_key);
+        }
+        issuers
     }
 
     /// SHA-256 of the complete live state, as a manifest binds it (spec §8.1).
@@ -140,12 +217,66 @@ impl TrustStore {
         )
     }
 
-    /// Applies a verified, complete set of trust objects in one write.
+    /// Verifies a whole chunked transaction, then applies it (spec §8.1).
     ///
-    /// The objects arrive in the apply order the manifest declared; each is
-    /// verified against the anchors the store **already** holds, in a
-    /// temporary copy. Only if every one of them lands does the copy replace
-    /// the live state. A partial success is not exposed, because there is no
+    /// This is the entry point production code uses. It is what makes the
+    /// transaction a *decision* rather than a delivery: the manifest is
+    /// verified under an authority this store already trusts, its snapshot is
+    /// compared against the live state, every fragment is attributed to it,
+    /// and only a complete set is applied — by a single write.
+    ///
+    /// [`Self::apply`] stays public for the offline document and for tests,
+    /// but it takes an already-attributed object list; it is not a shortcut
+    /// around this.
+    pub fn verify_and_apply_transaction(
+        &mut self,
+        manifest: &TrustUpdateTransactionManifest,
+        chunks: &[TrustUpdateChunk],
+        now_unix: u64,
+    ) -> Result<usize, TrustError> {
+        // The authority is resolved from the local state, never from the
+        // manifest: a transaction that named the key which verifies it would
+        // authorize itself.
+        let (authority_key, authority_epoch) = match manifest.manifest_authority_kind {
+            aether::certificates::transport::ManifestAuthority::CaPq => (
+                &self.state.gateway.current_ca_public_key,
+                self.state.gateway.ca_epoch,
+            ),
+            aether::certificates::transport::ManifestAuthority::AstraServiceKey => (
+                &self.state.astra.active_astra_service_public_key,
+                self.state.astra.astra_service_key_epoch,
+            ),
+        };
+        manifest.verify(
+            authority_key,
+            authority_epoch,
+            &self.state.trust_domain_id,
+            &self.state.gateway.gateway_wg_public_key,
+            &self.state.client_wg_public_key,
+            &self.base_state_fingerprint()?,
+            now_unix,
+        )?;
+
+        let mut pending = PendingTrustTransaction::new(manifest.clone());
+        for chunk in chunks {
+            pending.accept(chunk)?;
+        }
+        let objects = pending.complete().ok_or(TrustError::Certificate(
+            CertificateError::InvalidTransaction("incomplete transaction"),
+        ))?;
+        if !pending.is_usable_at(now_unix) {
+            return Err(TrustError::Certificate(
+                CertificateError::InvalidTransaction("transaction expired before commit"),
+            ));
+        }
+        self.apply(&objects, now_unix)
+    }
+
+    /// Applies an attributed, complete set of trust objects in one write.
+    ///
+    /// Each object is verified against the anchors the store **already** holds,
+    /// in a temporary copy. Only if every one of them lands is the copy written
+    /// and adopted. A partial success is not exposed, because there is no
     /// instant at which it exists.
     pub fn apply(
         &mut self,
@@ -196,8 +327,40 @@ impl TrustStore {
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
                         candidate.certificates.revocation_epoch,
+                        now_unix,
                     )? == InstallOutcome::Installed
                     {
+                        applied += 1;
+                    }
+                }
+                TrustUpdateObject::AstraIssuerAuthorization(delegation) => {
+                    // A delegation is not an anchor, but it decides which key
+                    // may have issued the client's own next leaf. Ignoring it
+                    // would make every renewed identity unverifiable here.
+                    delegation.verify(
+                        &candidate.gateway.current_ca_public_key,
+                        &candidate.trust_domain_id,
+                        candidate.gateway.ca_epoch,
+                        candidate.client_tls_ca.ca_tls_epoch,
+                        &candidate.gateway.gateway_wg_public_key,
+                        &candidate.gateway.server_name,
+                        now_unix,
+                    )?;
+                    if delegation.issuer_epoch < candidate.issuer_epoch {
+                        return Err(TrustError::Certificate(
+                            CertificateError::GenerationRollback {
+                                current: candidate.issuer_epoch,
+                                proposed: delegation.issuer_epoch,
+                            },
+                        ));
+                    }
+                    if delegation.issuer_epoch > candidate.issuer_epoch {
+                        candidate.issuer_epoch = delegation.issuer_epoch;
+                        candidate.issuer = Some(aether::certificates::state::AstraIssuerState {
+                            issuer_epoch: delegation.issuer_epoch,
+                            authorization: (**delegation).clone(),
+                            state: aether::certificates::state::IssuerLifecycle::Active,
+                        });
                         applied += 1;
                     }
                 }
@@ -232,30 +395,72 @@ impl TrustStore {
                         candidate.gateway.ca_epoch,
                         candidate.certificates.revocation_epoch,
                     )?;
-                    // A revocation naming this client's own identity is
-                    // terminal, and it dominates whatever else the transaction
-                    // carried for it.
-                    let active = candidate.certificates.active.pq_certificate_fingerprint;
-                    if revocation.revokes(&active, now_unix) {
-                        candidate.certificates.revoke(revocation.revocation_epoch);
+                    // The epoch is consumed the moment the object verifies —
+                    // it will never be delivered again — so a revocation dated
+                    // in the future is **kept**, not dropped.
+                    candidate.certificates.revocation_epoch = revocation.revocation_epoch;
+                    let scheduled = ScheduledRevocation {
+                        revocation_epoch: revocation.revocation_epoch,
+                        effective_at: revocation.effective_at,
+                        revoked_tls_fingerprint: revocation.revoked_tls_fingerprint,
+                        revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
+                    };
+                    if candidate.scheduled_revocations.len() >= MAX_SCHEDULED_REVOCATIONS {
+                        return Err(TrustError::Certificate(
+                            CertificateError::InvalidTransaction("too many pending revocations"),
+                        ));
                     }
+                    candidate.scheduled_revocations.push(scheduled);
                     applied += 1;
                 }
-                // The delegation, the staging and the grant are not trust
-                // anchors: they are checked and installed by the rotation
-                // flow, which holds the private keys they refer to.
-                TrustUpdateObject::AstraIssuerAuthorization(_)
-                | TrustUpdateObject::ClientCertificateStageAuthorization(_)
-                | TrustUpdateObject::ClientCertificateRotationGrant(_)
-                | TrustUpdateObject::CertificateStatus(_) => {}
+                TrustUpdateObject::ClientCertificateStageAuthorization(_)
+                | TrustUpdateObject::ClientCertificateRotationGrant(_) => {
+                    // The rotation flow owns these: it holds the private keys
+                    // they refer to, and installing a candidate here would
+                    // bypass the commit that makes it activable.
+                }
+                TrustUpdateObject::CertificateStatus(status) => {
+                    self.absorb_status(&mut candidate, status, now_unix)?;
+                    applied += 1;
+                }
             }
         }
 
-        // One write, after everything verified. A failure above returned
-        // already, and the live state was never touched.
+        // Every revocation that is already due takes effect inside the same
+        // transaction, so a client never adopts a trust update and only then
+        // notices it was revoked by it.
+        apply_due_revocations(&mut candidate, now_unix);
+
+        // Written first, adopted second.
+        self.write(&candidate)?;
         self.state = candidate;
-        self.save()?;
         Ok(applied)
+    }
+
+    /// Verifies a signed status and records its ordering key.
+    ///
+    /// The status never widens validity: it moves `last_status` and nothing
+    /// else. What it is checked for is monotonicity — a replayed older one
+    /// must not become the current view.
+    fn absorb_status(
+        &self,
+        candidate: &mut TrustState,
+        status: &AstraCertificateStatus,
+        now_unix: u64,
+    ) -> Result<(), TrustError> {
+        let service_key = candidate
+            .astra
+            .service_key_for(status.astra_service_key_epoch, now_unix)
+            .ok_or(CertificateError::UnauthorizedIssuer)?;
+        status.verify(
+            service_key,
+            status.astra_service_key_epoch,
+            &candidate.trust_domain_id,
+            &status.certificate_fingerprint,
+            candidate.last_status,
+        )?;
+        candidate.last_status = Some(status.ordering_key());
+        Ok(())
     }
 
     /// Applies an offline `orion-trust-update` document (spec §8.4).
@@ -274,23 +479,54 @@ impl TrustStore {
         self.apply(&document.objects, now_unix)
     }
 
-    /// Promotes every slot whose overlap has ended.
-    pub fn promote_due(&mut self, now_unix: u64) -> Result<bool, TrustError> {
-        let mut moved = self.state.gateway.promote_if_due(now_unix)?;
+    /// Brings the store up to date with the clock.
+    ///
+    /// Promotes every slot whose overlap has ended, and applies every
+    /// revocation that has reached its instant. Callers run it before reading
+    /// the store, so a revocation dated for this morning is in force this
+    /// morning rather than at the next trust update.
+    pub fn refresh(&mut self, now_unix: u64) -> Result<bool, TrustError> {
+        let mut candidate = self.state.clone();
+        let mut moved = candidate.gateway.promote_if_due(now_unix)?;
         if moved {
             // The staged document has done its job: keeping it would let a
             // late abort name a transition that is already the active one.
-            self.state.staged_gateway_transition = None;
+            candidate.staged_gateway_transition = None;
         }
-        moved |= self.state.gateway.promote_ca_if_due(now_unix);
-        moved |= self.state.client_tls_ca.promote_if_due(now_unix);
-        moved |= self.state.astra.promote_service_key_if_due(now_unix);
-        moved |= self.state.certificates.promote_if_due(now_unix);
+        moved |= candidate.gateway.promote_ca_if_due(now_unix);
+        moved |= candidate.client_tls_ca.promote_if_due(now_unix);
+        moved |= candidate.astra.promote_service_key_if_due(now_unix);
+        moved |= candidate.certificates.promote_if_due(now_unix);
+        moved |= apply_due_revocations(&mut candidate, now_unix);
         if moved {
-            self.save()?;
+            self.write(&candidate)?;
+            self.state = candidate;
         }
         Ok(moved)
     }
+}
+
+/// Applies every scheduled revocation that has reached its instant.
+///
+/// Returns whether anything changed. A revocation that hits any fingerprint
+/// the peer holds — active, next or pending, TLS **or** PQ — makes the whole
+/// identity terminal: the generation is indivisible, so half of it cannot
+/// survive.
+fn apply_due_revocations(state: &mut TrustState, now_unix: u64) -> bool {
+    let mut moved = false;
+    let mut remaining = Vec::with_capacity(state.scheduled_revocations.len());
+    for revocation in std::mem::take(&mut state.scheduled_revocations) {
+        if now_unix < revocation.effective_at {
+            remaining.push(revocation);
+            continue;
+        }
+        if revocation.hits(&state.certificates) {
+            state.certificates.revoke(revocation.revocation_epoch);
+        }
+        moved = true;
+    }
+    state.scheduled_revocations = remaining;
+    moved
 }
 
 /// The instant this client opens its renewal window (spec §4.3).
@@ -453,11 +689,13 @@ mod tests {
                     ca_epoch: 1,
                     current_ca_public_key: anchor,
                     next_ca_public_key: None,
+                    next_ca_transition_fingerprint: None,
                     ca_activation_at: None,
                     ca_retire_active_at: None,
                     active_gateway_identity_epoch: 1,
                     gateway_decision_epoch: 1,
                     next_gateway_identity_epoch: None,
+                    next_transition_fingerprint: None,
                     last_aborted_transition: None,
                     active_gateway_tls_certificate: DerCertificate::new(vec![1; 64]).expect("der"),
                     next_gateway_tls_certificate: None,
@@ -472,6 +710,7 @@ mod tests {
                     active_client_tls_ca_certificate: DerCertificate::new(vec![2; 64])
                         .expect("der"),
                     next_client_tls_ca_certificate: None,
+                    next_transition_fingerprint: None,
                     activation_at: None,
                     retire_active_at: None,
                 },
@@ -480,16 +719,93 @@ mod tests {
                     webauthn_rp_id: "astra.example".into(),
                     active_astra_service_public_key: service,
                     next_astra_service_public_key: None,
+                    next_service_key_transition_fingerprint: None,
                     astra_service_key_epoch: 1,
                     service_key_activation_at: None,
                     service_key_retire_active_at: None,
                 },
                 issuer_epoch: 1,
+                issuer: None,
                 certificates: ClientCertificateState::new(generation(4)),
                 staged_gateway_transition: None,
+                scheduled_revocations: Vec::new(),
                 last_status: None,
             },
         )
+    }
+
+    /// A revocation dated for later is kept, not dropped: its epoch is already
+    /// consumed, so it would never be delivered again.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_future_revocation_is_held_and_applied_at_its_own_instant() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revocation_epoch: 1,
+            // Only the TLS half is named, and that is still a revocation: the
+            // generation is indivisible.
+            revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+            revoked_pq_fingerprint: None,
+            effective_at: 9_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(
+                    revocation,
+                ))],
+                1_000,
+            )
+            .expect("revocation accepted");
+
+        assert!(
+            !store.state().certificates.revoked,
+            "a revocation dated for later is not in force yet"
+        );
+        assert_eq!(
+            store.state().scheduled_revocations.len(),
+            1,
+            "and it is kept: its epoch has already been consumed"
+        );
+        assert_eq!(store.state().certificates.revocation_epoch, 1);
+
+        store.refresh(8_999).expect("refresh");
+        assert!(
+            !store.state().certificates.revoked,
+            "one second before its instant it is still not in force"
+        );
+
+        store.refresh(9_000).expect("refresh");
+        assert!(
+            store.state().certificates.revoked,
+            "at its instant it takes effect, even though only the TLS half was named"
+        );
+        assert!(store.state().scheduled_revocations.is_empty());
     }
 
     /// A transaction that fails anywhere leaves the live state untouched —

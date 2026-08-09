@@ -132,7 +132,7 @@ impl AuthenticatedTrustUpdateRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
-        ca_pq: &MlDsa87PublicKey,
+        issuers: &[&MlDsa87PublicKey],
         trust_domain_id: &TrustDomainId,
         gateway_wg_public_key: &WireGuardKey,
         resolved_client_wg_public_key: &WireGuardKey,
@@ -154,15 +154,15 @@ impl AuthenticatedTrustUpdateRequest {
         if self.request.client_wg_public_key != *resolved_client_wg_public_key {
             return Err(CertificateError::ClientIdentityMismatch);
         }
-        self.certificate
-            .verify(
-                ca_pq.as_bytes(),
-                crate::key_negotiation::PqCertificateRole::Client,
-                None,
-                &resolved_client_wg_public_key.to_base64(),
-                now_unix,
-            )
-            .map_err(|_| CertificateError::UnauthorizedIssuer)?;
+        // The leaf may chain to `CA-PQ` **or** to the delegated Astra issuer:
+        // an ordinary renewal produces the second, and a route that only tried
+        // the anchor would refuse every client that had ever renewed.
+        crate::certificates::client::verify_client_leaf_under_any(
+            &self.certificate,
+            issuers,
+            resolved_client_wg_public_key,
+            now_unix,
+        )?;
         let presented = pq_certificate_fingerprint(&self.certificate)?;
         if !self
             .request
@@ -506,16 +506,25 @@ pub struct PendingTrustTransaction {
     manifest: TrustUpdateTransactionManifest,
     manifest_fingerprint: Fingerprint,
     slots: Vec<Option<TrustUpdateObject>>,
+    /// Fingerprint of the fragment accepted at each index.
+    ///
+    /// Object slots alone are not enough: two fragments claiming the same
+    /// `chunk_index` over different ranges would both be accepted, and between
+    /// them they could fill the transaction without the sender ever having
+    /// emitted that split. A chunk index names one fragment, for good.
+    chunks: Vec<Option<Fingerprint>>,
 }
 
 impl PendingTrustTransaction {
     pub fn new(manifest: TrustUpdateTransactionManifest) -> Self {
         let slots = vec![None; manifest.objects.len()];
+        let chunks = vec![None; usize::from(manifest.chunk_count)];
         let manifest_fingerprint = manifest.fingerprint();
         Self {
             manifest,
             manifest_fingerprint,
             slots,
+            chunks,
         }
     }
 
@@ -531,6 +540,22 @@ impl PendingTrustTransaction {
     /// carrying different bytes is a conflict.
     pub fn accept(&mut self, chunk: &TrustUpdateChunk) -> Result<(), CertificateError> {
         chunk.verify_against(&self.manifest)?;
+
+        // One fragment per index. A second one carrying different bytes at the
+        // same index is a conflict, not a second delivery — otherwise two
+        // partial splits could be combined into a transaction the sender never
+        // produced.
+        let index = usize::from(chunk.chunk_index);
+        let fingerprint = chunk.fingerprint()?;
+        match self.chunks.get_mut(index) {
+            Some(Some(seen)) if !seen.matches(&fingerprint) => {
+                return Err(CertificateError::InvalidTransaction("chunk conflict"))
+            }
+            Some(slot @ None) => *slot = Some(fingerprint),
+            Some(Some(_)) => {}
+            None => return Err(CertificateError::InvalidTransaction("chunk index")),
+        }
+
         let first = usize::from(chunk.first_object_index);
         for (offset, object) in chunk.objects.iter().enumerate() {
             let slot = &mut self.slots[first + offset];

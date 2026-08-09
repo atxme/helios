@@ -1417,6 +1417,23 @@ struct LoadedIdentity {
     pq_private_key: Zeroizing<Vec<u8>>,
 }
 
+/// The gateway signs staging receipts with the leaf it already serves.
+///
+/// Not a second copy of the sealed key: the certificate lifecycle asks the
+/// negotiation handler, which unsealed it once at startup and is the only
+/// holder for the life of the process.
+impl crate::certificates::StageReceiptSigner for GatewayHandler {
+    fn sign_stage_receipt(
+        &self,
+        receipt: aether::certificates::client::GatewayCertificateStageReceipt,
+    ) -> Result<
+        aether::certificates::client::GatewayCertificateStageReceipt,
+        aether::certificates::CertificateError,
+    > {
+        receipt.sign(&self.gateway_pq_private_key)
+    }
+}
+
 /// Object context of the negotiation identity: the gateway WireGuard public
 /// key it serves.
 ///
