@@ -2,6 +2,11 @@
 
 **Statut** : accepté (2026-08-09).
 
+**Révision de sécurité du 2026-08-09** : ajout de l'avortement pré-publication,
+des leases de staging, de la rotation de clé de service, des statuts
+authentifiés, du transport atomique chunké et clarification du modèle YubiKey
+1-sur-2.
+
 **Portée** : exploitation de la PKI de négociation v5, renouvellement distant,
 récupération d'une identité expirée et commandes manuelles de rotation. Les
 formats détaillés et les machines d'état sont fixés par la
@@ -71,9 +76,10 @@ lecture seule, UID propre, répertoire d'état propre et limites de ressources.
 Le canal public Astra est un endpoint HTTPS distinct, avec un nom DNS stable
 qui sert aussi de RP ID WebAuthn. Un déploiement peut exposer directement un
 `astra_port` ou placer le conteneur derrière un reverse proxy sur TCP 443. Ce
-canal porte les demandes publiques, les statuts, les cérémonies d'approbation
-et les objets signés ; il ne porte jamais de clé privée cliente, de PSK ou de
-clé CA en clair.
+canal porte les demandes publiques, les cérémonies d'approbation et les objets
+signés ; il ne porte jamais de clé privée cliente, de PSK ou de clé CA en
+clair. Un statut client n'y est jamais lisible par empreinte seule : il exige
+un challenge frais signé par la clé PQ de l'identité ou une campagne YubiKey.
 
 Le canal Astra–Helios utilise une paire veth dans un réseau sans route par
 défaut et sans forwarding. Le pare-feu n'y autorise que l'API privée de cycle
@@ -81,6 +87,11 @@ de vie. Le transport est mutuellement authentifié et chaque mutation conserve
 en plus son autorisation ML-DSA-87 propre. Le chiffrement du lien protège la
 séparation des processus ; il n'est jamais présenté comme une défense contre
 `root`, qui contrôle les deux extrémités et le noyau.
+
+Ce transport impose TLS 1.3 avec échange `(EC)DHE` éphémère, sans TLS 1.2,
+0-RTT, tickets de reprise ni mode PSK sans Diffie-Hellman. Une compromission
+ultérieure des clés mTLS ne doit pas déchiffrer une capture ancienne ; les
+signatures applicatives restent l'autorisation normative.
 
 Le canal WireGuard reste prioritaire dès qu'il existe. Une opération ordinaire
 initiée par Orion passe par l'API interne du tunnel. Le canal public Astra ne
@@ -113,6 +124,13 @@ compromission de l'hôte peut donc abuser de cette délégation jusqu'à son
 échéance, mais ne donne pas le pouvoir non borné de `CA-PQ`. Orion et Helios
 vérifient la délégation, son époque, sa fenêtre et ses usages avant toute leaf
 ou grant signé par l'émetteur Astra.
+
+La clé applicative qui signe statuts, challenges et opérations possède son
+propre slot actif/suivant. Sa rotation planifiée exige continuité ancienne,
+preuve de la nouvelle clé et signature `CA-PQ`. Si elle est compromise,
+`CA-PQ` autorise un remplacement immédiat sans sa signature. Orion n'apprend
+jamais une nouvelle clé de service depuis une réponse autorisée uniquement par
+la clé remplacée.
 
 ### 4. Deux YubiKeys obligatoires pour l'autorité
 
@@ -159,6 +177,15 @@ Règles de gestion :
   distincts ;
 - les credentials synchronisés dans un cloud ne satisfont pas une politique
   qui exige un authentificateur matériel.
+
+Le coffre v1 reste 1-sur-2 : chacune des deux clés peut ouvrir seule un
+key-slot, puisque la secondaire doit réellement secourir la perte de la
+principale. Exiger deux confirmations pour une rotation d'autorité est une
+barrière opératoire contre l'erreur et l'usage d'une seule clé volée avec un
+compagnon honnête ; ce n'est ni un partage de secret ni une séparation entre
+deux personnes. Un poste compromis après un déverrouillage peut extraire la CA.
+Un vrai M-sur-N demanderait au moins un coffre à seuil et des identités
+d'opérateurs distinctes ; Astra v1 ne revendique pas cette propriété.
 
 Les deux credentials sont des credentials opérateur liés au
 `trust_domain_id` et à la clé WireGuard de la gateway. Orion peut demander une
@@ -219,6 +246,13 @@ Astra fait persister la nouvelle génération par Helios et exige un
 alors négocier avec la nouvelle leaf et seulement ensuite établir WireGuard.
 Une identité révoquée ne suit jamais ce chemin.
 
+Une YubiKey suffit à cette récupération parce que l'ancienne clé PQ privée est
+une seconde preuve indépendante et que la clé WireGuard, le domaine et la
+dernière génération restent inchangés. Une réadmission privée de cette preuve
+peut créer une nouvelle continuité et demande deux confirmations YubiKey. Le
+vol simultané de l'ancienne clé et l'approbation d'une YubiKey compromet ce
+chemin ; une politique plus stricte peut en exiger deux, jamais zéro.
+
 ### 7. Commandes manuelles et rollback borné
 
 Orion et la console Helios exposent une surface « Certificats ». Les deux IHM
@@ -241,6 +275,7 @@ La console Helios expose :
 - « Renouveler toute la chaîne », qui ordonne émetteur, CA TLS, identité
   gateway et identités clientes ;
 - « Tourner les autorités », action distincte qui tourne `CA-PQ` et `CA-TLS` ;
+- l'annulation signée d'une transition gateway préparée mais non publiée ;
 - le rollback temporaire de l'identité gateway pendant le chevauchement.
 
 Toute commande manuelle ci-dessus exige au moins une YubiKey opérateur. Une
@@ -255,11 +290,37 @@ slot encore actif dans un chevauchement existant, conserve le slot suivant et
 expire au plus tard à `not_after`. Après promotion, révocation ou suppression
 de l'ancien slot, il est refusé.
 
+### 8. Avortement, leases et atomicité logique
+
+Une transition gateway peut être avortée sans révocation seulement tant
+qu'elle est `staged`, avant `activation_at` **et avant toute publication**.
+Astra persiste `published` avant d'émettre le premier octet ou document ; après
+ce point, un client hors ligne pourrait conserver la décision initiale puis la
+promouvoir à `not_after`. L'avortement signé retire le slot suivant, laisse
+l'identité courante active, consomme définitivement l'époque et publie un
+tombstone séquentiel sans les leafs annulées. Après publication, le rollback
+temporaire ou une nouvelle transition en avant sont les seules sorties
+ordinaires.
+
+Un staging client n'occupe pas indéfiniment `next`. Il porte une lease de
+24 heures au plus et reste `pending_grant` jusqu'à ce qu'Orion ait persisté le
+grant puis envoyé un commit signé par les clés active et candidate. Sans commit
+avant l'échéance, Helios purge atomiquement le candidat et refuse tout callback
+tardif. La récupération expirée relaie ce commit par Astra et le veth ; le
+renouvellement ordinaire l'envoie dans WireGuard.
+
+La limite de 64 Kio fractionne seulement le transport d'une mise à jour de
+confiance. Tous les chunks appartiennent à un manifeste signé unique et restent
+dans un espace pending invisible. Orion publie `CA-PQ`, `CA-TLS`, clé de
+service Astra, gateway et client par une seule écriture locale après réception
+et validation de l'ensemble. Une transaction incomplète expire sans état de
+confiance mixte.
+
 ## Conséquences
 
 Astra rend le renouvellement ordinaire indépendant de la présence de
 l'opérateur et ferme le cas du client revenu après expiration, tant que celui-ci
-possède encore son ancienne clé et une YubiKey préalablement liée. La gateway
+possède encore son ancienne clé et une YubiKey opérateur. La gateway
 reste l'autorité sur l'admission et doit persister la génération avant que le
 client ne la reçoive.
 
@@ -278,6 +339,20 @@ maître. Protéger également l'émetteur opérationnel contre le noyau hôte
 demanderait un HSM ou un environnement d'exécution attesté portant ML-DSA-87.
 Aucun simple conteneur, veth, mTLS ou vTPM contrôlé par cet hôte ne fournit
 cette propriété.
+
+La leaf TLS gateway reste auto-signée et épinglée, tandis que la leaf PQ chaîne
+vers `CA-PQ`. Cette asymétrie est volontaire : TLS protège le transport par un
+pin dont le remplacement est autorisé par `CA-PQ`; ML-DSA-87 porte l'autorité
+applicative post-quantique. `CA-TLS` reste exclusivement l'autorité des leafs
+mTLS clientes.
+
+La migration depuis le pin auto-signé actuel reste une bascule coordonnée du
+discriminant de profil et de l'identité gateway. C'est le point de
+disponibilité le plus risqué du lot et une coupure y est acceptée : Astra ne
+peut pas faire naître rétroactivement la confiance en `CA-PQ`. De même, Astra
+co-implantée ne supprime pas l'attaque de gel sur les révocations ; un hôte qui
+retient statut et objets signés reste borné seulement par les échéances et les
+canaux hors ligne.
 
 ## Alternatives écartées
 
