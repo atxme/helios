@@ -18,6 +18,7 @@
 //! (RwLock shared with the orchestrator).
 
 pub mod auth;
+pub mod certificates;
 pub mod embed;
 pub mod health;
 pub mod key_negotiation;
@@ -85,6 +86,11 @@ pub struct AppState {
     /// owns the per-peer serializer, and learns nothing back beyond a refusal
     /// class.
     pub psk_release: Option<Arc<dyn key_negotiation::PskReleaseHandler>>,
+    /// Gateway side of the certificate lifecycle, `None` when the trust
+    /// domain is not bootstrapped. Absent, the in-tunnel trust-update route
+    /// answers `404` — the same answer an older gateway gives, so Orion has a
+    /// single behaviour to implement.
+    pub trust_update: Option<Arc<dyn certificates::TrustUpdateHandler>>,
     /// Non-secret summary of the boot-time sealing decision, `None` when the
     /// daemon runs without TPM validation. A projection: `BootDecision` itself
     /// carries the unlock secret and must not reach this crate.
@@ -137,6 +143,7 @@ impl AppState {
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
             psk_release: None,
+            trust_update: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
@@ -174,6 +181,12 @@ impl AppState {
         handler: Arc<dyn key_negotiation::PskReleaseHandler>,
     ) -> Self {
         self.psk_release = Some(handler);
+        self
+    }
+
+    /// Wires the certificate lifecycle, once the trust domain exists.
+    pub fn with_trust_update(mut self, handler: Arc<dyn certificates::TrustUpdateHandler>) -> Self {
+        self.trust_update = Some(handler);
         self
     }
 }
@@ -219,6 +232,27 @@ pub fn router(state: AppState) -> Router {
             // is what keeps that guarantee true when it is called directly.
             post(key_negotiation::release).layer(DefaultBodyLimit::max(
                 key_negotiation::MAX_RELEASE_BODY_BYTES,
+            )),
+        )
+        // Certificate lifecycle inside the tunnel (spec §7 and §8.1). Same
+        // `require_peer` resolution as the release: the source VIP names the
+        // peer, the body only ever confirms it.
+        .route(
+            "/api/key-negotiation/trust-update",
+            post(certificates::trust_update).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/stage",
+            post(certificates::stage).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/stage-commit",
+            post(certificates::stage_commit).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
             )),
         )
         .route("/ws", get(ws::handler))

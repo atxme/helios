@@ -336,6 +336,16 @@ impl MlDsa87Signature {
         Self::new(decoded)
     }
 
+    /// An all-zero placeholder, for building an object before signing it.
+    ///
+    /// It is **not** a signature and never verifies: ML-DSA-87 rejects it
+    /// under any key. An object still carrying one is refused by every
+    /// verifier here, which is what makes "forgot to sign" a refusal rather
+    /// than a silent acceptance.
+    pub fn placeholder() -> Self {
+        Self(vec![0; ml_dsa_87::SIG_LEN])
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

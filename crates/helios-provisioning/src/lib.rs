@@ -74,6 +74,7 @@
 //! `network.toml`, for which the above limitation still holds.
 
 pub mod admission;
+pub mod certificates;
 pub mod ipam;
 pub mod rotation;
 pub mod session;
