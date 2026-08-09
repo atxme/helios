@@ -1,133 +1,238 @@
-# Architecture actuelle
+# Current architecture
 
-Ce document décrit le code après la rupture IKEv2 → WireGuard (ADR-001) et
-l’introduction des signatures hybrides d’artefacts (ADR-002) et des mises à
-jour applicatives (ADR-003). Les ADR conservent
-le raisonnement historique ; ce document est la vue opérationnelle courante.
+This document is the operational view of the code as it stands. The ADRs keep
+the historical reasoning; when the two disagree, the code and the accepted ADRs
+win.
 
-## Frontières du système
+## System boundaries
 
-Helios est la gateway Linux. Orion est le client road-warrior. `aether` contient
-les contrats purs partagés, sans ressource système au runtime.
+Helios is the Linux gateway. Orion is the road-warrior client. `aether` holds
+the shared pure contracts and owns no runtime system resource.
 
 ```text
-Orion (Tauri)                         Helios (appliance Linux)
-┌─────────────────────┐              ┌───────────────────────────────┐
-│ React ↔ commandes   │              │ heliosd                       │
-│ Tauri               │              │  ├─ orchestrateur             │
-│        │             │              │  ├─ API Axum / WebSocket      │
-│ orion-core          │              │  ├─ provisioning ML-KEM       │
-│  └─ backend WG      │◄─ WireGuard ─►│  ├─ backend WireGuard         │
-└─────────────────────┘              │  ├─ pare-feu nftables         │
-                                     │  ├─ TPM / séquestre           │
-                                     │  └─ update signé + rollback   │
-                                     └───────────────────────────────┘
+Orion (Tauri)                          Helios (Linux appliance)
+┌──────────────────────┐              ┌────────────────────────────────┐
+│ React ↔ Tauri cmds   │              │ heliosd                        │
+│                      │─ QUIC/mTLS ─►│  ├─ key negotiation (v5)       │
+│ orion-core           │  (pre-tunnel)│  ├─ orchestrator               │
+│  ├─ key negotiation  │              │  ├─ Axum API / WebSocket       │
+│  ├─ identity store   │◄─ WireGuard ►│  ├─ WireGuard backend          │
+│  └─ WireGuard backend│              │  ├─ nftables firewall          │
+└──────────────────────┘              │  ├─ TPM, vault, escrow         │
+                                      │  └─ signed update + rollback   │
+                                      └────────────────────────────────┘
 ```
 
-Le noyau transporte et chiffre les paquets via WireGuard. `heliosd` ne
-réimplémente pas WireGuard : il monte l’interface, configure les pairs, observe
-les handshakes et applique la politique nftables.
+The kernel carries and encrypts packets. `heliosd` does not reimplement
+WireGuard: it brings the interface up, configures peers, observes handshakes and
+applies the nftables policy.
 
-## Démarrage de la gateway
+## Gateway startup
 
-L’ordre est une propriété de sécurité :
+The order is a security property:
 
-1. charger la configuration et les secrets autorisés par le TPM ;
-2. engager le kill-switch avant tout contact réseau ;
-3. monter/configurer `helios0` et ses pairs ;
-4. passer à `connecting` ;
-5. interroger les handshakes toutes les 10 secondes ;
-6. passer à `up` lorsqu’un handshake a moins de 150 secondes ;
-7. revenir à `connecting` lorsque le handshake expire.
+1. load the configuration and the secrets the TPM authorises;
+2. engage the kill-switch before any network contact;
+3. bring up `helios0` and configure its peers;
+4. move to `connecting`;
+5. poll handshakes every 10 seconds;
+6. move to `up` once a handshake is younger than 150 seconds;
+7. fall back to `connecting` when that handshake goes stale.
 
-Seul `TunnelState::Up` autorise le trafic LAN. `down`, `connecting`, `failed` et
-`captive_portal` restent fail-closed, à l’exception des ouvertures étroitement
-déclarées pour le handshake, l’administration et le portail captif.
+Only `TunnelState::Up` allows LAN traffic. `down`, `connecting`, `failed` and
+`captive_portal` stay fail-closed, save for the narrowly declared openings for
+the handshake, administration and the captive portal.
 
-Le backend Netlink traduit d’abord la totalité du ruleset. Une erreur de
-traduction n’envoie rien. Le lot est ensuite appliqué par une transaction
-atomique : aucune application règle par règle n’est autorisée.
+The Netlink backend translates the **whole** ruleset first. A translation error
+sends nothing. The batch is then applied as one atomic transaction; rule-by-rule
+application is never allowed. NAT belongs to that same transaction: a masquerade
+outliving the kill-switch would leak in clear what the switch just cut.
 
-## Cycle de vie d’Orion
+`network.toml` is watched and re-read live, so the peer table changes without a
+restart. Every reload goes through `NetworkConfig::adopt_runtime_secrets_from`:
+the file holds neither the sealed private key nor the negotiated PSKs, and
+applying it verbatim would strip the gateway of its identity. What cannot change
+under a running data plane — interface name, listen port, API address — still
+requires a restart.
 
-Orion monte son adaptateur directement depuis le profil : endpoint UDP, clé
-privée client, clé publique gateway, VIP, `AllowedIPs`, keepalive et PSK
-éventuel. L’API Helios n’intervient jamais dans la montée initiale puisqu’elle
-vit derrière le tunnel.
+## Key negotiation (v5)
 
-Orion ne possède pas de kill-switch local. Avec `AllowedIPs = 0.0.0.0/0`, son
-adaptateur doit rester monté après un échec pour que WireGuard capture et jette
-les paquets. `down()` n’est appelé que lors d’une déconnexion explicite. Un
-binaire compilé avec `orion/wireguard` refuse de démarrer si le backend réel ne
-peut pas s’initialiser ; il ne retombe pas sur une simulation.
+Before any WireGuard packet, Orion negotiates on a dedicated UDP port and leaves
+with the PSK the **first** handshake will use. TLS carries; the ML-DSA-87
+application certificate and the signed transcript authenticate.
 
-## API d’administration
+- One 32-byte `server_challenge` per connection, single-use, deliberately
+  unsigned by the gateway — signing it would hand an unauthenticated peer a free
+  ML-DSA-87 operation.
+- The TLS fingerprint resolves to **its** one admitted peer as soon as mTLS
+  completes. A request's WireGuard key is then compared against that peer; it is
+  never the lookup key into the table.
+- Two negotiable modes, `static_psk` and `ml_kem`, plus a per-peer floor that
+  only ever rises. `classic` is not a v5 mode: `validate()` rejects it.
+- The gateway installs the PSK on the data plane **before** announcing it, and
+  refuses the request if the install fails. A negotiated PSK never reaches disk.
+- Commit requires a **WireGuard handshake proof** read from the data plane,
+  strictly newer than the observation taken before the candidate was installed.
+  It is the only evidence that engages the peer's WireGuard private key.
+- The signed commit is the point of no return. Rollback only searches active
+  transactions, so after signing it finds nothing — by construction.
+- Each slot carries a per-peer generation, reserved under the same lock that
+  reserves the peer. Any late actor must present the generation it observed; a
+  stale one is a no-op, never a write.
+- The QUIC session is closed after commit. It carried a transaction, not a
+  liveness signal — the opposite of v4, where a 35-second network blip killed a
+  healthy tunnel.
 
-L’API écoute sur l’adresse hôte de `wg_address` lorsque la gateway est prête,
-sinon sur `127.0.0.1:8080`. nftables limite l’accès distant à `admin_iface`.
+Liveness is read on the data plane only, at three distinct thresholds:
+`HANDSHAKE_STALE_AFTER_SECS` (150 s) decides tunnel state and therefore the
+kill-switch; `PSK_RECLAIM_AFTER_STALE_SECS` (300 s) decides when the gateway
+destroys a vanished peer's secret; `MAX_PSK_LIFETIME` (24 h) bounds a PSK's age
+on a healthy tunnel. All of it assumes a persistent keep-alive, so the gateway
+sets its own (25 s) rather than trusting one it cannot inspect.
 
-- les lectures d’état et de règles ne contiennent aucun secret ;
-- `GET /api/network` renvoie une vue dédiée qui expose seulement si une clé
-  privée ou un PSK est configuré ;
-- `GET /api/trust` expose les algorithmes obligatoires et les empreintes du
-  trousseau éditeur compilé, jamais les clés complètes ;
-- toutes les mutations exigent `application/json` et aucun CORS permissif n’est
-  activé ;
-- l’adresse source est rattachée à l’unique VIP `/32` d’un pair WireGuard et
-  les mutations exigent `admin = true` ;
-- le WebSocket diffuse les transitions et la télémétrie post-connexion.
+The public QUIC port answers with three error codes only — `protocol`,
+`rejected`, `internal` — so that it cannot be used to enumerate admitted peers
+or read their floor. Its DoS bounds are Retry before any state, a budget per
+IPv4 address or per IPv6 `/64` prefix, a budget per admitted identity after
+mTLS, a 90-second absolute connection lifetime, TLS resumption and 0-RTT
+disabled on both ends, no unidirectional streams, and datagrams pinned to 1200
+bytes with MTU discovery off on both sides.
 
-Cette barrière HTTP protège des formulaires cross-origin. L’identité
-applicative est celle du pair WireGuard ; aucun login web distinct n’est ajouté.
+Releasing a PSK lives **inside** the tunnel, on
+`POST /api/key-negotiation/release`, and nowhere else. It is best-effort and its
+failure does not delay disconnection; the 300-second reclaim is the net.
 
-## Mise à jour applicative
+The negotiation is not a compile-time feature — every binary carries it, and
+only `key_negotiation_port` decides whether the service opens.
 
-L’IHM transfère un manifeste `helios-binary-release-v1` et le binaire par
-fragments JSON. `heliosd` vérifie les signatures Ed25519 et ML-DSA-65, la
-target, le canal, la taille et le SHA-256, puis stage sous
-`/var/lib/helios/updates`. `helios-installer`, lancé par systemd et privé de
-réseau, revérifie l’artefact, bascule `/opt/helios/current`, redémarre le daemon
-et restaure le lien précédent si le daemon et son API ne deviennent pas prêts.
+## Certificate lifecycle
 
-Ce flux ne remplace ni kernel ni rootfs, ne redémarre pas la machine et ne
-modifie donc pas les PCR TPM 0/4/7.
+Not implemented. The gateway's PQ leaf is still self-signed and pinned as such
+in every profile; there is no active/next slot and no anti-rollback generation.
+The target is fixed by
+[specification/ROTATION-CERTIFICATS.md](specification/ROTATION-CERTIFICATS.md)
+and [ADR-008](adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md), which names **Astra**
+the PKI coordinator: a dedicated container co-located with `heliosd`, a separate
+public HTTPS channel, a private veth channel to the gateway, a master anchor in
+an HVLT vault and a bounded delegated issuing key.
 
-## Provisioning et post-quantique
+`init-key-negotiation --rotate` is not that path. It replaces files; it prepares
+no transition and no next slot, and every profile pinning the old identity stops
+connecting after the restart.
 
-L’admission initiale lie hors bande la clé publique WireGuard et les empreintes
-des certificats Orion TLS et ML-DSA-65. Avant WireGuard, un port QUIC/mTLS de
-key-negotiation prépare le mode choisi par Orion. TLS transporte ; le certificat
-PQ et les signatures ML-DSA authentifient `kpub`, le ciphertext, la confirmation
-et l’ACK. Un plancher persistant interdit toute renégociation sous le niveau
-admis. Helios pose son slot avant de répondre ; une fermeture ou expiration
-restaure le slot précédent.
+## Orion lifecycle
 
-L’ancien `/api/provision` derrière un tunnel classique reste un chemin de
-compatibilité pour les profils non migrés. L’IPAM CGNAT déterministe demeure
-indépendant de la key-negotiation.
+Orion brings its adapter up straight from the profile: UDP endpoint, client
+private key, gateway public key, VIP, `AllowedIPs`, keep-alive and the PSK the
+negotiation just produced. The Helios API never takes part in that initial
+bring-up, since it lives behind the tunnel.
 
-## Démarrage vérifié et signature éditeur
+Orion has no local kill-switch. With `AllowedIPs = 0.0.0.0/0`, the adapter must
+stay up after a failure so WireGuard keeps capturing and dropping packets;
+`down()` is called on explicit disconnection only. A binary built with
+`orion/wireguard` refuses to start when the real backend cannot initialise, and
+never falls back to a simulation. Conversely, an Orion **for Windows** built
+without that feature does not compile: the fallback would ship a client that
+opens no tunnel while displaying a profile and a negotiated mode.
 
-`helio-tpm` scelle le secret qui protège l’identité WireGuard de la gateway sur
-les PCR 0/4/7. Après une OTA, un billet de rescellement v2 doit porter deux
-signatures valides sur les mêmes octets : Ed25519 et ML-DSA-65. L’époque de clé
-est signée et sélectionne un trousseau public compilé.
+The client identity is sealed by DPAPI to the Windows account. Known limitation:
+DPAPI neither compiles nor runs under WSL2 — off Windows the seal fails loudly
+rather than writing those keys in clear.
 
-Le compteur du billet est obligatoire et doit strictement augmenter. Sa
-liaison PCR est facultative ; si elle est présente, elle doit correspondre. Le
-format v1 Ed25519 seul est refusé sans fallback. La signature est produite hors
-gateway par `helios-publisher`.
+## Administration API
 
-La récupération de l’identité WireGuard est volontairement inachevée : le
-choix entre `TpmState.version` sur fichier et un compteur NV TPM doit être
-tranché avant le lot 3 de l’ADR-002.
+The API listens on the host address of `wg_address` once the gateway is ready,
+otherwise on `127.0.0.1:8080`. nftables limits remote access to `admin_iface`.
+It never brings the initial tunnel up.
 
-## Backends et validation
+- state and rule reads carry no secret;
+- `GET /api/network` returns a dedicated view that only says **whether** a
+  private key or a PSK is configured;
+- `GET /api/trust` exposes the required algorithms and the compiled publisher
+  keyring fingerprints, never whole keys;
+- `GET /api/key-negotiation` serves the public negotiation material that
+  `helios-ctl enroll` reads;
+- every mutation requires `application/json`, and no permissive CORS is enabled;
+- the source address resolves to a WireGuard peer's single `/32` VIP, with no
+  proxy header accepted, and mutations require `admin = true`;
+- the WebSocket streams state transitions and post-connection telemetry.
 
-Les backends par défaut sont simulés. Les features matérielles sont `netlink`,
-`wireguard`, `tpm` et `embed-ui`. Leur compilation sous WSL2 valide les types et
-les contrats ; elle ne valide pas les effets noyau ou TPM. La recette matérielle
-de [TESTING.md](testing/TESTING.md) reste obligatoire avant livraison.
+The HTTP barrier guards against cross-origin forms. The application identity is
+the WireGuard peer's; no separate web login exists.
 
-Lorsque le mode réel est demandé, une feature ou un backend indisponible arrête
-le daemon. Une gateway ne retombe jamais silencieusement sur une simulation.
+## Admission and provisioning
+
+Admission binds, out of band, a client's WireGuard public key and the
+fingerprints of its TLS and ML-DSA-87 certificates. `heliosd peer` and
+`helios-ctl peer` share one implementation in
+`helios_provisioning::admission`. Admission never does a read-modify-write of
+`network.toml` from the API's redacted view — that would erase other peers'
+PSKs — and it persists neither private key nor PSK. It also refuses an explicit
+keep-alive of `0`: without one, an idle tunnel produces no handshake and the
+liveness thresholds would read a stale timestamp on a perfectly healthy peer.
+
+`POST /api/provision` remains the in-tunnel ML-KEM exchange for an already
+admitted peer, deliberately without TLS: the tunnel already provides
+confidentiality and mutual authentication, and the PSK's post-quantum
+confidentiality does not depend on the channel. The deterministic CGNAT IPAM is
+independent of key negotiation.
+
+## Secrets at rest
+
+[ADR-006](adr/ADR-006-SECRETS-AU-REPOS.md) mandates a single container,
+`helios-vault`: AES-256-GCM, domain and object-context separation, bounded
+parser. A `domain` separates uses; an `object_context` separates instances of
+one use, so two blobs of the same kind never stay interchangeable.
+
+The gateway's identity is born **on** the gateway (`heliosd init-identity`) and
+sealed to the TPM. A cleartext `wg_private_key` in `network.toml` is a legacy
+fallback, not an installation path. The escrow private key belongs on the
+operator workstation, never on the gateway it rescues.
+
+## Verified boot and update window
+
+`helio-tpm` seals the secret protecting the gateway's WireGuard identity against
+PCR 0/4/7. A v2 resealing ticket must carry two valid signatures over the same
+canonical bytes — Ed25519 **and** ML-DSA-65. The signed key epoch selects a
+compiled public keyring; its counter is mandatory and must strictly increase;
+its PCR binding is optional but must match when present. The v1 Ed25519-only
+format is refused with no fallback.
+
+[ADR-007](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md) adds an update window that
+**carries** an integrity verdict across a planned reboot rather than
+manufacturing one. Arming requires a nominal unseal of the current boot. At
+startup the nominal PCR 0/4/7 unseal always runs first, and its success revokes
+a window left armed. On consumption, the NV payload is overwritten only **after**
+the resealed blob is on disk and synced.
+
+WireGuard identity recovery is deliberately unfinished: the choice between a
+file-based `TpmState.version` and a TPM NV counter must be settled before ADR-002
+lot 3.
+
+## Application update
+
+The UI transfers a `helios-binary-release-v1` manifest and the binary in JSON
+chunks. `heliosd` verifies the Ed25519 and ML-DSA-65 signatures, the target, the
+channel, the size and the SHA-256, then stages under `/var/lib/helios/updates`.
+`helios-installer`, launched by systemd and denied network access, re-verifies
+the artefact, switches `/opt/helios/current`, restarts the daemon and restores
+the previous link if the daemon and its API do not become ready.
+
+This flow replaces neither kernel nor rootfs, does not reboot the machine, and
+therefore does not move TPM PCR 0/4/7. Upgrading the OS is a different path:
+`helios-ctl update`, which arms the ADR-007 window and reboots.
+
+Two ML-DSA parameter sets coexist and do not substitute for one another:
+`ml-dsa-65` signs publisher artefacts (`aether::sig`), `ml-dsa-87` carries the
+negotiation PKI (`aether::key_negotiation`). Swapping them would invalidate the
+verification of every release already signed.
+
+## Backends and validation
+
+Default backends are simulated. The hardware features are `netlink`,
+`wireguard`, `tpm` and `embed-ui`. Compiling them under WSL2 validates types and
+contracts; it validates no kernel or TPM effect. The hardware recipe in
+[TESTING.md](testing/TESTING.md) stays mandatory before delivery.
+
+When real mode is requested, an unavailable feature or backend stops the daemon.
+A gateway never silently falls back to a simulation.
