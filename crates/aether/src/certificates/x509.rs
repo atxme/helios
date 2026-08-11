@@ -257,6 +257,18 @@ pub fn assert_chains_to(
     Err(CertificateError::InvalidX509("no path to a trust anchor"))
 }
 
+/// The distinguished names an interface displays: subject, then issuer.
+///
+/// Reading them here rather than in each consumer keeps `x509-parser` behind
+/// this module: it is the one place in the workspace that decides what a
+/// certificate says, and a second parser would eventually disagree with it.
+pub fn subject_and_issuer(
+    certificate: &DerCertificate,
+) -> Result<(String, String), CertificateError> {
+    let parsed = parse(certificate.as_bytes())?;
+    Ok((parsed.subject().to_string(), parsed.issuer().to_string()))
+}
+
 /// The certificate's `SubjectPublicKeyInfo`, DER-encoded.
 ///
 /// What a holder of the matching private key can compare against to prove the

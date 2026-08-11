@@ -31,6 +31,7 @@ import {
 } from 'lucide-react'
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
+import { CertificatePanel } from '../components/CertificatePanel'
 import { CopyButton } from '../components/CopyButton'
 import {
   modeAllowed,
@@ -41,6 +42,7 @@ import {
 } from '../components/state'
 import { GUTTER } from '../theme'
 import type {
+  CertificateInventory,
   ClientConfig,
   ClientProfile,
   ImportOutcome,
@@ -239,8 +241,14 @@ export function ProfilesView({
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
-  const [fingerprint, setFingerprint] = useState<string | null>(null)
-  const [identitySealed, setIdentitySealed] = useState(false)
+  /**
+   * The four certificates this profile depends on, as the shell reports them.
+   *
+   * Replaces a fingerprint fetched on its own: the shell already has to open
+   * the pinned material and the protected store to answer, and answering one
+   * question at a time meant three round trips for three halves of one fact.
+   */
+  const [inventory, setInventory] = useState<CertificateInventory | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -265,40 +273,35 @@ export function ProfilesView({
     }
   }, [])
 
-  // Same rule as the public key: the fingerprint is derived on the Rust side.
-  // The UI handles no crypto, and an unreadable certificate simply yields no
-  // value — the fault is reported by the core, not disguised as a hash.
-  useEffect(() => {
-    let cancelled = false
-    api
-      .keyNegotiationFingerprint(draft.key_negotiation)
-      .then((found) => {
-        if (!cancelled) setFingerprint(found)
-      })
-      .catch(() => {
-        if (!cancelled) setFingerprint(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [draft])
-
-  // Re-asked on every import notice: sealing happens during import, so the
+  // Read on the Rust side, like the public key: the UI handles no crypto, and
+  // two of these certificates live in a protected store it must not reach. An
+  // unreadable one yields a named fault rather than a dash.
+  //
+  // Keyed on the negotiation block **by value**, and deferred like the
+  // validation: answering unseals the protected identity, and doing that on
+  // every keystroke of the profile name would be a DPAPI call per character
+  // for an answer that cannot have changed.
+  //
+  // The notice is a dependency too: sealing happens during an import, so the
   // answer changes at exactly that moment.
+  const negotiationKey = JSON.stringify(draft.key_negotiation)
   useEffect(() => {
     let cancelled = false
-    api
-      .keyNegotiationIdentitySealed(draft.key_negotiation)
-      .then((sealed) => {
-        if (!cancelled) setIdentitySealed(sealed)
-      })
-      .catch(() => {
-        if (!cancelled) setIdentitySealed(false)
-      })
+    const timer = setTimeout(() => {
+      api
+        .certificateInventory(JSON.parse(negotiationKey) as KeyNegotiationSettings | null)
+        .then((found) => {
+          if (!cancelled) setInventory(found)
+        })
+        .catch(() => {
+          if (!cancelled) setInventory(null)
+        })
+    }, VALIDATION_DELAY_MS)
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
-  }, [draft, notice])
+  }, [negotiationKey, notice])
 
   /**
    * The draft in the shape the shell accepts: public fields plus intents.
@@ -1164,8 +1167,7 @@ export function ProfilesView({
             floorBaseline={floorBaseline}
             issue={issues.key_negotiation}
             support={support}
-            fingerprint={fingerprint}
-            identitySealed={identitySealed}
+            inventory={inventory}
             pskField={pskField}
             onChange={setNegotiation}
             onRaiseFloor={raiseFloor}
@@ -1266,8 +1268,7 @@ function KeyNegotiation({
   floorBaseline,
   issue,
   support,
-  fingerprint,
-  identitySealed,
+  inventory,
   pskField,
   onChange,
   onRaiseFloor,
@@ -1278,9 +1279,8 @@ function KeyNegotiation({
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
-  /** The identity this profile names is sealed on this machine. */
-  identitySealed: boolean
-  fingerprint: string | null
+  /** The four certificates this profile depends on. */
+  inventory: CertificateInventory | null
   /** The static PSK row, shown here when `static_psk` is the chosen mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
@@ -1418,44 +1418,18 @@ function KeyNegotiation({
           value={settings.identity}
           onChange={(value) => onChange('identity', value)}
         />
-        <Box sx={{ display: 'flex', alignItems: 'center' }}>
-          <Detail
-            label="identité"
-            value={identitySealed ? 'scellée' : 'absente de ce poste'}
-            hint={
-              identitySealed
-                ? 'Certificat client scellé au compte Windows par DPAPI. Le fichier d’enrôlement n’est plus nécessaire.'
-                : 'Aucune identité de ce nom sur ce poste : importer le fichier d’enrôlement produit par « helios-ctl enroll ».'
-            }
-          />
-        </Box>
       </Box>
 
-      {/* The fingerprint is what one reads; the base64 behind it is what one
-          pastes, once, on the rare day a certificate is reissued. Only the
-          first belongs in the flow. */}
-      <Detail
-        label="empreinte PQ"
-        value={fingerprint ?? 'illisible'}
-        copyable={Boolean(fingerprint)}
-        hint="Empreinte SHA-256 du certificat ML-DSA-87 épinglé. Comparer avec ce qu’a affiché « heliosd init-key-negotiation » : c’est ce qui rattache le profil à la bonne gateway."
-      />
+      {/* Certificates, with their dates. This is what replaced a fingerprint
+          and two «présent / absent» words: an expired gateway leaf and a wrong
+          endpoint used to produce the same screen, and the same failure right
+          before WireGuard with nothing to look at. */}
+      <CertificatePanel inventory={inventory} identityName={settings.identity} />
       <EncodedData
         caDer={settings.gateway_ca_der}
         pqCertificate={settings.gateway_pq_certificate}
         onChange={onChange}
       />
-
-      {/* The missing identity outranks everything else this block says: the
-          mode, the floor and the fingerprint are all moot if the client has
-          no certificate to present. */}
-      {!identitySealed && settings.identity.trim() !== '' && (
-        <Caution>
-          Aucune identité protégée nommée <strong>{settings.identity}</strong> sur ce poste : la
-          connexion échouera <strong>avant</strong> WireGuard. Importer le fichier d’enrôlement
-          fourni par l’opérateur — il scelle le certificat client et peut être détruit ensuite.
-        </Caution>
-      )}
 
       {issue && (
         <Alert severity="error" variant="outlined" sx={{ py: 0, fontSize: 11 }}>
@@ -1678,53 +1652,6 @@ function Blob({
       )}
     </Box>
   )
-}
-
-/**
- * Received value, read-only: it is meant to be compared, not edited.
- *
- * Compared *elsewhere*, which is why `copyable` exists. A fingerprint one
- * must hold against what `heliosd init-key-negotiation` printed, shown
- * truncated and selectable only by dragging across monospace text, is a
- * verification nobody performs.
- */
-function Detail({
-  label,
-  value,
-  hint,
-  copyable,
-}: {
-  label: string
-  value: string
-  hint?: string
-  /** The value carries out of Orion — offer the clipboard. */
-  copyable?: boolean
-}) {
-  const row = (
-    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.75, minWidth: 0 }}>
-      <Typography
-        color="text.disabled"
-        sx={{
-          flexShrink: 0,
-          fontFamily: 'monospace',
-          fontSize: 9.5,
-          letterSpacing: '0.08em',
-          textTransform: 'uppercase',
-        }}
-      >
-        {label}
-      </Typography>
-      <Typography
-        noWrap
-        color="text.secondary"
-        sx={{ fontFamily: 'monospace', fontSize: 10.5, minWidth: 0 }}
-      >
-        {value}
-      </Typography>
-      {copyable && <CopyButton value={value} label={label} />}
-    </Box>
-  )
-  return hint ? <Tooltip title={hint}>{row}</Tooltip> : row
 }
 
 /**

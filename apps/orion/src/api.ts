@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   About,
+  CertificateInventory,
   ClientConfig,
   ClientEvent,
   ImportOutcome,
@@ -44,17 +45,6 @@ export const importProfilePath = (path?: string) =>
   invoke<ImportOutcome | null>('import_profile_path', { path: path ?? null })
 
 /**
- * Is this profile's identity already sealed on this machine?
- *
- * Takes the negotiation block alone, not the profile: the answer depends on one
- * field, and passing the whole profile would have meant shipping its secrets
- * across the IPC to read it.
- */
-export const keyNegotiationIdentitySealed = (
-  keyNegotiation: KeyNegotiationSettings | null,
-) => invoke<boolean>('key_negotiation_identity_sealed', { keyNegotiation })
-
-/**
  * Reports the faulty fields of a profile being edited.
  *
  * The rules live in `orion-core`: the UI highlights what the core refuses,
@@ -74,14 +64,20 @@ export const keyNegotiationSupport = () =>
   invoke<KeyNegotiationSupport>('key_negotiation_support')
 
 /**
- * Fingerprint of the gateway PQ certificate pinned by the profile.
+ * The four certificates a connection depends on, with their dates.
  *
- * Read out loud against what the gateway printed, it is what proves the
- * imported material comes from the right gateway.
+ * Read in Rust, through the same validator the negotiation uses: the two
+ * client certificates live in the protected identity store, which this side
+ * has no business reaching, and re-deriving the 80 / 90 / 95 % ladder here
+ * would be a second implementation of the planner's arithmetic.
+ *
+ * It supersedes the two calls it replaced — one for the pinned fingerprint,
+ * one for "is the identity sealed". Both answered a third of this question,
+ * and three round trips for three halves of one fact is how a screen ends up
+ * showing a fingerprint that belongs to a certificate it has not checked.
  */
-export const keyNegotiationFingerprint = (
-  keyNegotiation: KeyNegotiationSettings | null,
-) => invoke<string | null>('key_negotiation_fingerprint', { keyNegotiation })
+export const certificateInventory = (keyNegotiation: KeyNegotiationSettings | null) =>
+  invoke<CertificateInventory>('certificate_inventory', { keyNegotiation })
 
 /**
  * Draws a WireGuard key pair in Rust and returns its **public** half.

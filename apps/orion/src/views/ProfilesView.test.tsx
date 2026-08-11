@@ -3,11 +3,15 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ClientProfile, ImportOutcome, ProfileIssues } from '../types'
+import type {
+  CertificateInventory,
+  ClientProfile,
+  ImportOutcome,
+  ProfileIssues,
+} from '../types'
 
 const api = vi.hoisted(() => ({
-  keyNegotiationFingerprint: vi.fn(),
-  keyNegotiationIdentitySealed: vi.fn(),
+  certificateInventory: vi.fn(),
   keyNegotiationSupport: vi.fn(),
   validateProfile: vi.fn(),
   generatePrivateKey: vi.fn(),
@@ -39,6 +43,21 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   ...overrides,
 })
 
+/**
+ * What the shell reports for a profile whose identity is not on this machine.
+ *
+ * The default in these tests, because it is the default of a fresh machine:
+ * the material is pinned, the protected store holds nothing yet.
+ */
+const emptyInventory: CertificateInventory = {
+  gateway_pq: null,
+  gateway_ca_tls: null,
+  client_tls: null,
+  client_pq: null,
+  faults: [],
+  identity_sealed: false,
+}
+
 const noIssues: ProfileIssues = {
   name: null,
   endpoint: null,
@@ -65,8 +84,7 @@ function callbacks() {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.keyNegotiationFingerprint.mockResolvedValue('sha256:fingerprint')
-  api.keyNegotiationIdentitySealed.mockResolvedValue(false)
+  api.certificateInventory.mockResolvedValue(emptyInventory)
   api.keyNegotiationSupport.mockResolvedValue({ identity_store: false })
   api.validateProfile.mockResolvedValue(noIssues)
   api.generatePrivateKey.mockResolvedValue('clé-publique-générée')
@@ -118,7 +136,10 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ajouter' }))
     expect(screen.getByText(/CA TLS absente/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Identité protégée'), { target: { value: 'workstation' } })
-    expect(screen.getByText(/Aucune identité protégée nommée/)).toBeTruthy()
+    // The certificate panel is deferred like the validation: reading it
+    // unseals the protected identity, and a DPAPI call per keystroke would buy
+    // nothing.
+    await waitFor(() => expect(screen.getByText(/Aucune identité protégée nommée/)).toBeTruthy())
     expect(screen.getByText(/Aucun stockage protégé d’identité/)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Afficher les données encodées' }))

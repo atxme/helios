@@ -57,6 +57,49 @@ export interface KeyNegotiationSupport {
 }
 
 /**
+ * Where a certificate stands on the renewal ladder of the spec's §4.3.
+ *
+ * Computed in Rust from the lifecycle's own `ValidityPeriod` — 80 %, 90 %,
+ * 95 % of the lifetime. The screen renders it; it does not derive it.
+ */
+export type CertificatePhase =
+  | 'not_yet_valid'
+  | 'valid'
+  | 'renewal_due'
+  | 'warning'
+  | 'critical'
+  | 'expired'
+
+/** One certificate, as the shell reports it. */
+export interface CertificateFacts {
+  subject: string
+  issuer: string
+  /** SHA-256, lowercase hex — the value read out to compare. */
+  fingerprint: string
+  not_before: number
+  not_after: number
+  /** Instant the renewal window opens: 80 % of the lifetime. */
+  renewal_at: number
+  phase: CertificatePhase
+}
+
+/**
+ * The four certificates a connection depends on.
+ *
+ * Two are pinned by the profile, two live in the protected identity store.
+ * An absent slot is an absence — no negotiation block, no protected store —
+ * while a slot that exists and could not be read appears in `faults`, named.
+ */
+export interface CertificateInventory {
+  gateway_pq: CertificateFacts | null
+  gateway_ca_tls: CertificateFacts | null
+  client_tls: CertificateFacts | null
+  client_pq: CertificateFacts | null
+  faults: string[]
+  identity_sealed: boolean
+}
+
+/**
  * Result of importing a document — mirror of the shell's `ImportOutcome`.
  *
  * The identity's fate is reported next to the profile rather than replacing

@@ -392,35 +392,38 @@ fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport 
     }
 }
 
-/// Is this profile's identity already sealed on this machine?
+/// The four certificates a connection depends on, with their dates.
 ///
-/// Answered without unsealing: the screen needs to know whether the import
-/// still has to happen, and that question must not depend on the session
-/// being able to decrypt. `false` also covers "no negotiation block" — a
-/// profile that needs no identity needs no import either.
+/// # Why the shell reads them rather than the screen
+///
+/// Two of them live in the protected identity store, which the WebView has no
+/// business reaching, and all four are parsed by the same validator the
+/// negotiation uses — `aether::certificates::x509` and the v5 PQ format. A
+/// screen that decoded base64 and read dates itself would be a second
+/// implementation of the lifecycle's arithmetic, and the day the two disagreed
+/// the interface would be the one lying.
+///
+/// Nothing secret crosses back. The bundle is unsealed inside `orion-core`,
+/// which keeps the two private halves and returns subjects, fingerprints and
+/// instants (ADR-006 §5).
 #[tauri::command]
-fn key_negotiation_identity_sealed(
+fn certificate_inventory(
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> bool {
-    // Takes the block alone rather than a whole profile: this answers a
-    // question about the negotiation identity, and passing the profile would
-    // have meant shipping its secrets across the IPC to read one field.
-    let Some(settings) = key_negotiation else {
-        return false;
-    };
-    ProtectedIdentityStore::for_current_user().is_ok_and(|store| store.contains(&settings.identity))
+) -> orion_core::CertificateInventory {
+    orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix())
 }
 
-/// Fingerprint of the gateway PQ certificate pinned by a profile.
+/// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
 ///
-/// Same reasoning as [`profile_public_key`]: the value is derived on the Rust
-/// side and displayed so the user can compare it, out loud or by phone, with
-/// what `heliosd init-key-negotiation` printed on the gateway.
-#[tauri::command]
-fn key_negotiation_fingerprint(
-    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> Option<String> {
-    key_negotiation.and_then(|settings| settings.gateway_pq_fingerprint())
+/// A clock behind the certificate's `not_before` reads as "not yet valid" and
+/// one far ahead reads as expired, which is exactly what the connection would
+/// conclude: the panel is wrong in the same direction as the failure, rather
+/// than reassuring while the handshake refuses.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// A profile **as the interface is allowed to see it** (ADR-006 §5).
@@ -1855,8 +1858,7 @@ fn main() {
             resize_for_view,
             validate_profile,
             key_negotiation_support,
-            key_negotiation_fingerprint,
-            key_negotiation_identity_sealed,
+            certificate_inventory,
             vault_posture,
         ])
         .run(tauri::generate_context!())

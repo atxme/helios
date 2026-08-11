@@ -12,6 +12,7 @@ import {
   aboutOrion,
   adapterIsUp,
   backendKind,
+  certificateInventory,
   connect,
   deleteProfile,
   disconnect,
@@ -19,8 +20,6 @@ import {
   getState,
   importProfile,
   importProfilePath,
-  keyNegotiationFingerprint,
-  keyNegotiationIdentitySealed,
   keyNegotiationSupport,
   onConfigChanged,
   onEvent,
@@ -49,11 +48,10 @@ describe('Orion Tauri bridge', () => {
     await importProfile('{"format":"orion-profile"}', 'portable.json')
     await importProfilePath('C:\\Profils\\portable.orion')
     await importProfilePath()
-    await keyNegotiationIdentitySealed(profile as never)
     await validateProfile(profile as never)
     await vaultPosture()
     await keyNegotiationSupport()
-    await keyNegotiationFingerprint(profile as never)
+    await certificateInventory(profile as never)
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -78,11 +76,10 @@ describe('Orion Tauri bridge', () => {
         { path: 'C:\\Profils\\portable.orion' },
       ],
       ['import_profile_path', { path: null }],
-      ['key_negotiation_identity_sealed', { keyNegotiation: profile }],
       ['validate_profile', { draft: profile }],
       ['vault_posture'],
       ['key_negotiation_support'],
-      ['key_negotiation_fingerprint', { keyNegotiation: profile }],
+      ['certificate_inventory', { keyNegotiation: profile }],
       ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],
