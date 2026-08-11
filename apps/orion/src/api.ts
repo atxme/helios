@@ -17,6 +17,7 @@ import type {
   ProfileCertificates,
   ProfileDraft,
   ProfileIssues,
+  SpeedTestResult,
   TunnelState,
   VaultPosture,
 } from './types'
@@ -110,6 +111,9 @@ export const runCertificateAction = (name: string, action: CertificateAction) =>
 /** The last certificate action that failed on this profile, if any. */
 export const lastCertificateError = (name: string) =>
   invoke<string | null>('last_certificate_error', { name })
+
+/** Measures the authenticated WireGuard path to the active profile's gateway. */
+export const runSpeedTest = () => invoke<SpeedTestResult>('run_speed_test')
 
 /**
  * Draws a WireGuard key pair in Rust and returns its **public** half.

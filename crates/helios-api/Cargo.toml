@@ -26,10 +26,10 @@ serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
+futures-util.workspace = true
 mime_guess.workspace = true
 rust-embed = { version = "8", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-futures-util.workspace = true
 tokio-tungstenite = "0.24"

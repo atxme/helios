@@ -232,6 +232,34 @@ Valider avec accès console :
   campagne automatisée couvre la vérification et les refus, pas l'interaction
   avec systemd ni la persistance à travers un redémarrage.
 
+- coffre d'autorité Astra ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) §4),
+  sur le poste où la clé de sécurité est branchée — Windows en administrateur,
+  ou un Linux avec accès au périphérique HID :
+  `astra-signer init` crée le coffre et enregistre la première clé, puis
+  `astra-signer verify` la rouvre après avoir débranché et rebranché ;
+  `astra-signer enrol` enregistre la seconde en la branchant à la place de la
+  première, et **chacune** des deux rouvre ensuite les ancres seule. Vérifier
+  aussi qu'une troisième clé s'enrôle exactement de la même façon, qu'une clé
+  jamais enrôlée est refusée sans ambiguïté, que rebrancher une clé déjà
+  enregistrée pour un second slot est refusé par la clé elle-même — c'est
+  l'`excludeList` CTAP2 qui répond, pas le coffre —, et que `remove` ne laisse
+  jamais moins de deux slots. Un mauvais PIN doit refuser, pas ouvrir.
+
+  Ce qui **n'est pas** exerçable ailleurs : rien d'autre. La séquence complète
+  est éprouvée en dur par `tools/astra-signer/tests/enrolment.rs` contre des
+  clés simulées ; ce que seule la cible établit, c'est que la clé produit bien
+  une sortie `hmac-secret` stable pour un couple (credential, sel) à travers
+  débranchements et redémarrages. Si elle ne l'était pas, le coffre ne se
+  rouvrirait plus et aucun test hors matériel ne l'aurait dit.
+
+  WSL2 n'a aucun passthrough USB, et sous Windows l'accès HID direct aux
+  périphériques FIDO est réservé aux processus élevés depuis Windows 10 1903 :
+  le compagnon s'y lance en administrateur. CTAP n'est **pas** une feature de
+  compilation — tout binaire `astra-signer` porte la pile, et il n'existe aucun
+  chemin qui ouvre le coffre sans clé. Le prix est une dépendance de
+  compilation : `libudev` sous Linux, posée par `scripts/setup-dev.sh`, sans
+  laquelle le workspace entier ne se bâtit plus.
+
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
 

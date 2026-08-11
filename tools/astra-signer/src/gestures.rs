@@ -1,0 +1,207 @@
+//! The authority gestures, with no terminal in them.
+//!
+//! Each one is the exact sequence the corresponding command performs, minus
+//! the prompts and the printing. They live here rather than in `main.rs`
+//! because the order of the steps is the interesting part — and because a
+//! sequence that only exists inside an interactive program is a sequence
+//! nothing exercises.
+//!
+//! # Why enrolling takes two objects
+//!
+//! [`open_with_authorized_key`] and [`add_key`] are separate on purpose: they
+//! run against two different authenticators, plugged one at a time. The vault
+//! enforces the rule — wrapping the master key for a new credential requires
+//! the master key — and this split is what lets a caller obtain the two
+//! secrets in the only order that is physically possible.
+//!
+//! Nothing here distinguishes the second key from the fifth. Registering
+//! another one later is the same gesture with the same arguments, which is the
+//! whole point: an operator who buys a third key runs `enrol` again.
+
+use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId};
+use astra::vault::{
+    draw_salt, AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, VaultError,
+};
+use base64::Engine as _;
+
+use crate::authenticator::{Authenticator, AuthenticatorError, CredentialSubject, Opened};
+
+#[derive(Debug, thiserror::Error)]
+pub enum GestureError {
+    #[error(transparent)]
+    Vault(#[from] VaultError),
+    #[error(transparent)]
+    Authenticator(#[from] AuthenticatorError),
+    #[error("génération des ancres d'autorité : {0}")]
+    Anchors(String),
+}
+
+pub type Result<T> = std::result::Result<T, GestureError>;
+
+/// What `init` is asked for.
+pub struct NewAuthority {
+    pub rp_id: String,
+    pub trust_domain_id: TrustDomainId,
+    pub label: String,
+    pub role: SlotRole,
+}
+
+/// What `enrol` is asked for. Identical whether it is the second key or the
+/// eighth.
+pub struct NewKey {
+    pub label: String,
+    pub role: SlotRole,
+}
+
+pub struct Created {
+    pub vault: AuthorityVault,
+    /// The half of the anchor that leaves this program: what `astra bootstrap`
+    /// is given, and the only `CA-PQ` value anything else ever sees.
+    pub ca_pq_public_key: MlDsa87PublicKey,
+}
+
+/// Creates the vault around fresh anchors and registers the first key.
+///
+/// The anchors are generated **before** the token is asked for anything: an
+/// operator who has to unplug and retry should not be doing it around a
+/// half-made authority.
+pub fn create_authority(
+    key: &dyn Authenticator,
+    request: &NewAuthority,
+    pin: &str,
+    now_unix: u64,
+) -> Result<Created> {
+    let (ca_pq_private_key, ca_pq_public_key) =
+        generate_ml_dsa_87_keypair().map_err(|error| GestureError::Anchors(error.to_string()))?;
+    let ca_tls_key =
+        rcgen::KeyPair::generate().map_err(|error| GestureError::Anchors(error.to_string()))?;
+    let secrets = AuthoritySecrets {
+        ca_pq_private_key: encode(&ca_pq_private_key),
+        ca_tls_private_key: encode(&ca_tls_key.serialize_der()),
+    };
+
+    let credential_id =
+        key.register(&request.rp_id, &subject(&request.trust_domain_id), &[], pin)?;
+    // The salt has to exist before the vault does: the first slot's secret is
+    // this token's `hmac-secret` output *for this salt*.
+    let salt = draw_salt()?;
+    let opened = key.derive(
+        &request.rp_id,
+        std::slice::from_ref(&credential_id),
+        &salt,
+        pin,
+    )?;
+
+    let vault = AuthorityVault::create(
+        request.trust_domain_id,
+        &request.rp_id,
+        salt,
+        &secrets,
+        SlotEnrolment {
+            role: request.role,
+            label: request.label.clone(),
+            credential_id,
+            enrolled_at: now_unix,
+        },
+        &opened.secret,
+        now_unix,
+    )?;
+    Ok(Created {
+        vault,
+        ca_pq_public_key,
+    })
+}
+
+/// Resolves the connected token against the vault's slots, and derives its
+/// secret.
+///
+/// One assertion answers both questions: the allow-list carries every
+/// registered credential, and the token names the one it holds.
+pub fn open_with_authorized_key(
+    key: &dyn Authenticator,
+    vault: &AuthorityVault,
+    pin: &str,
+) -> Result<Opened> {
+    let opened = key.derive(&vault.rp_id, &vault.credential_ids()?, &vault.salt()?, pin)?;
+    // Resolves the slot here so a caller cannot proceed with a credential the
+    // vault does not know — the error would otherwise surface two steps later,
+    // after the operator has swapped tokens.
+    vault.slot_for_credential(&opened.credential_id)?;
+    Ok(opened)
+}
+
+/// Registers another security key, using a secret an authorized one released.
+///
+/// `new` is a **different** device from the one that produced `opening`. The
+/// exclusion list is every credential already registered, so a token that
+/// already holds a slot of this vault refuses rather than taking a second: two
+/// slots on one object is not a recovery, though it reads as one.
+pub fn add_key(
+    new: &dyn Authenticator,
+    vault: &mut AuthorityVault,
+    opening: &Opened,
+    request: &NewKey,
+    pin: &str,
+    now_unix: u64,
+) -> Result<[u8; 16]> {
+    let known = vault.credential_ids()?;
+    let salt = vault.salt()?;
+    let credential_id =
+        new.register(&vault.rp_id, &subject(&vault.trust_domain_id), &known, pin)?;
+    let new_secret = new.derive(
+        &vault.rp_id,
+        std::slice::from_ref(&credential_id),
+        &salt,
+        pin,
+    )?;
+    let slot_id = vault.add_slot(
+        &opening.credential_id,
+        &opening.secret,
+        SlotEnrolment {
+            role: request.role,
+            label: request.label.clone(),
+            credential_id,
+            enrolled_at: now_unix,
+        },
+        &new_secret.secret,
+    )?;
+    Ok(slot_id)
+}
+
+/// Withdraws a key, re-sealing the body under the table it leaves behind.
+pub fn remove_key(vault: &mut AuthorityVault, opening: &Opened, slot_id: &[u8; 16]) -> Result<()> {
+    vault.remove_slot(&opening.credential_id, &opening.secret, slot_id)?;
+    Ok(())
+}
+
+/// Proves a token opens the anchors, not merely a slot.
+///
+/// ADR-008 §4 finalises the bootstrap only «après enregistrement et essai des
+/// deux clés», and a slot that unwraps a master key which no longer opens the
+/// body is exactly what that trial has to catch. Only reading the payload
+/// finds it, so this reads it — and drops it immediately.
+pub fn prove_anchors_open(vault: &AuthorityVault, opening: &Opened) -> Result<()> {
+    let secrets = vault.open(&opening.credential_id, &opening.secret)?;
+    let readable = !secrets.ca_pq_private_key.is_empty() && !secrets.ca_tls_private_key.is_empty();
+    drop(secrets);
+    if !readable {
+        return Err(GestureError::Anchors(
+            "le corps du coffre s'est ouvert sur des ancres vides".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Ties a credential to one trust domain, so a key registered for two
+/// authorities shows two entries rather than one ambiguous one.
+fn subject(trust_domain_id: &TrustDomainId) -> CredentialSubject {
+    CredentialSubject {
+        user_id: trust_domain_id.as_bytes().to_vec(),
+        user_name: format!("astra-{trust_domain_id}"),
+        display_name: "Autorité Helios".to_string(),
+    }
+}
+
+fn encode(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}

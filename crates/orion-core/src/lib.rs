@@ -33,6 +33,7 @@ pub mod mtu;
 pub mod net_pin;
 pub mod profile_import;
 pub mod provisioning;
+pub mod speedtest;
 pub mod telemetry;
 pub mod vault;
 
@@ -50,3 +51,4 @@ pub use profile_import::{
     CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,
 };
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};
+pub use speedtest::{run as run_speedtest, SpeedTestError, SpeedTestResult};

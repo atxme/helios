@@ -18,12 +18,31 @@
 //!
 //! # A campaign is approved as a whole
 //!
-//! The operator credential signs the SHA-256 of the complete canonical
-//! campaign: every target, its key, its epoch, its generation and its exact
-//! current fingerprints. Astra refuses a target added, removed or modified
-//! after that approval. Approving a campaign therefore never signs a list that
-//! can still change downstream — which is the difference between "renew these
-//! eleven leaves" and "renew whatever this list holds when I get to it".
+//! [`AstraRotationCampaign::fingerprint`] covers the SHA-256 of the complete
+//! canonical campaign: every target, its key, its epoch, its generation and
+//! its exact current fingerprints. Astra refuses a target added, removed or
+//! modified afterwards — the difference between "renew these eleven leaves"
+//! and "renew whatever this list holds when I get to it".
+//!
+//! # What a hardware credential does here, and what it never does
+//!
+//! It **never signs anything this module verifies.** No field in the whole
+//! certificate lifecycle holds anything but an `MlDsa87Signature`, and a
+//! YubiKey signs no ML-DSA — it has RSA, P-256/P-384 and Ed25519, nothing
+//! post-quantum.
+//!
+//! Its job is authentication and key derivation: presence plus user
+//! verification release a CTAP2 `hmac-secret` output, that output unwraps a
+//! key-slot of the authority vault, and the anchors inside it produce the
+//! ML-DSA-87 signature. The campaign fingerprint is what `astra-signer`
+//! **displays** before asking for the touch, and what the resulting `CA-PQ`
+//! signature is bound to.
+//!
+//! `required_credentials` follows from that: two is not a threshold anyone
+//! verifies, it is two key-slots the companion must see opened before it will
+//! sign — an operational barrier against a mistake and against one stolen key
+//! used with an honest companion (ADR-008 §4, which says so in as many
+//! words).
 
 use serde::{Deserialize, Serialize};
 
@@ -313,7 +332,7 @@ pub struct AstraRotationCampaign {
 }
 
 impl AstraRotationCampaign {
-    /// The canonical form an operator credential approves.
+    /// The canonical form the companion displays before asking for a touch.
     fn approval_bytes(&self) -> Vec<u8> {
         let mut bytes = CanonicalBytes::new(CAMPAIGN_APPROVAL_DOMAIN);
         bytes
@@ -343,7 +362,8 @@ impl AstraRotationCampaign {
         bytes.finish()
     }
 
-    /// SHA-256 of the canonical campaign — the value a credential signs.
+    /// SHA-256 of the canonical campaign — the value the `CA-PQ` signature is
+    /// bound to, and the one an operator reads on the companion's screen.
     ///
     /// Order is part of it: reordering the targets changes the fingerprint, so
     /// an approval cannot be reused for the same set applied differently.
@@ -351,7 +371,7 @@ impl AstraRotationCampaign {
         Fingerprint::of(&self.approval_bytes())
     }
 
-    /// Structural checks, before any credential is asked to approve.
+    /// Structural checks, before an operator is asked for anything.
     pub fn validate(&self, now_unix: u64) -> Result<(), CertificateError> {
         if self.format_version != CERTIFICATE_FORMAT_VERSION {
             return Err(CertificateError::UnsupportedFormatVersion {

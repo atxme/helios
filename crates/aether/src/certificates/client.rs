@@ -1456,7 +1456,12 @@ impl ExpiredCertificateRecoveryRequest {
         .map_err(|_| CertificateError::MissingProof("new client"))
     }
 
-    /// The exact challenge a hardware credential signs for this request.
+    /// The exact operation an operator confirms for this request.
+    ///
+    /// Not something the token signs: a YubiKey signs no ML-DSA, and nothing
+    /// here verifies a WebAuthn assertion. This is the value `astra-signer`
+    /// displays before the touch that unwraps the vault, and the value the
+    /// resulting `CA-PQ` signature is bound to.
     pub fn approval_challenge(&self) -> Fingerprint {
         expired_recovery_approval_challenge(
             &self.fingerprint(),
@@ -1466,10 +1471,11 @@ impl ExpiredCertificateRecoveryRequest {
     }
 }
 
-/// WebAuthn challenge bound to one recovery request (spec §7.5).
+/// The operation hash bound to one recovery request (spec §7.5).
 ///
-/// The credential approves this hash, so an approval cannot be moved to
-/// another peer, another generation or a later deadline.
+/// It is what makes an approval unmovable: displayed before the unlock and
+/// bound into the signature that follows, it cannot be carried to another
+/// peer, another generation or a later deadline.
 pub fn expired_recovery_approval_challenge(
     request_fingerprint: &Fingerprint,
     astra_challenge: &[u8; 32],
@@ -2108,8 +2114,8 @@ mod tests {
         ));
     }
 
-    /// The approval a credential signs is bound to the exact request, its
-    /// challenge and its deadline: none of the three can be moved afterwards.
+    /// The approved operation is bound to the exact request, its challenge and
+    /// its deadline: none of the three can be moved afterwards.
     #[test]
     fn the_recovery_approval_challenge_binds_request_challenge_and_deadline() {
         let request = Fingerprint::of(b"request");

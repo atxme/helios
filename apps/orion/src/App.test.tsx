@@ -28,6 +28,9 @@ vi.mock('./views/ConnectView', () => ({
 vi.mock('./views/ProfilesView', () => ({
   ProfilesView: () => <div>profiles-view</div>,
 }))
+vi.mock('./views/SpeedTestView', () => ({
+  SpeedTestView: () => <div>speedtest-view</div>,
+}))
 vi.mock('./components/EventLog', () => ({
   EventLog: () => <div>logs-view</div>,
 }))
@@ -103,6 +106,10 @@ describe('App interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Journal' }))
     expect(screen.getByText('logs-view')).toBeTruthy()
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('logs'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Speedtest' }))
+    expect(screen.getByText('speedtest-view')).toBeTruthy()
+    await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('speedtest'))
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

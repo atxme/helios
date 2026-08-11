@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 aether = { workspace = true, features = ["key-negotiation-signing"] }
+# Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
+# trois — un par key-slot, plus le corps — au lieu d'inventer un format.
+helios-vault.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 aws-lc-rs.workspace = true
@@ -35,3 +38,6 @@ tempfile = "3"
 # opérateur, et fabriquent le matériel d'entrée (clé publique `CA-PQ`) avec les
 # mêmes types que la production.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
+# Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
+# trois — un par key-slot, plus le corps — au lieu d'inventer un format.
+helios-vault.workspace = true

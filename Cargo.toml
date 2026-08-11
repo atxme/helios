@@ -13,6 +13,7 @@ members = [
     "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
+    "tools/astra-signer",
     "tools/helios-ctl",
     "tools/helios-publisher",
     "tools/helios-installer",
@@ -39,6 +40,7 @@ default-members = [
     "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
+    "tools/astra-signer",
     "tools/helios-ctl",
     "tools/helios-installer",
     "tools/xtask",
@@ -76,12 +78,13 @@ clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 futures-util = "0.3"
+bytes = "1"
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # Backend crypto : AWS-LC (aws-lc-sys), non-FIPS → statique, builder `cc`, aucune
 # toolchain CMake/Go/Ninja ni bindgen (bindings pré-générés). ML-KEM-768 (FIPS 203)
@@ -106,6 +109,9 @@ blake3 = "1"
 zeroize = "1"
 base64 = "0.22"
 hex = "0.4"
+# Saisie du PIN FIDO2 sans écho. Un PIN d'authentificateur affiché dans un
+# terminal se retrouve dans un scrollback, une capture d'écran ou un partage.
+rpassword = "7"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -115,6 +121,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 defguard_wireguard_rs = "0.11"
 
 aether = { path = "crates/aether" }
+astra = { path = "crates/astra" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }

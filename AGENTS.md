@@ -88,13 +88,34 @@ Restent ouverts :
   registre et signe les reçus par la leaf servie ; le binaire **`astra`** porte
   registre, audit chaîné et émetteur délégué borné ;
   `orion-core::certificates` vérifie une transaction chunkée entière avant de
-  l'appliquer par une seule écriture. Restent ouverts : le coffre HVLT, le
-  compagnon `astra-signer` et toute approbation par YubiKey (routes en `501`),
-  le veth privé Astra–Helios — donc la gateway ne détient encore **aucun objet
-  pré-signé à distribuer** et répond `503` à un client qu'elle sait en retard —,
-  la récupération d'une identité expirée, le discriminant de profil Orion et la
+  l'appliquer par une seule écriture. Le **coffre d'autorité** existe aussi :
+  `astra::vault` enveloppe `CA-PQ` et `CA-TLS` sous un key-slot par credential
+  FIDO2, et le compagnon **`astra-signer`** crée le coffre, y enrôle des clés,
+  les éprouve et en retire — `init`, `enrol`, `verify`, `list`, `remove`,
+  `rename`. Restent ouverts : les **commandes de signature** du compagnon
+  (certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes) et
+  donc toute approbation opérateur (routes en `501`), le veth privé
+  Astra–Helios — donc la gateway ne détient encore **aucun objet pré-signé à
+  distribuer** et répond `503` à un client qu'elle sait en retard —, la
+  récupération d'une identité expirée, le discriminant de profil Orion et la
   bascule du §13, et les deux surfaces IHM. La leaf PQ gateway servie reste
   auto-signée tant que cette bascule n'a pas eu lieu.
+  **Aucune clé de sécurité ne signe quoi que ce soit** : une YubiKey 5 ne
+  produit pas d'ML-DSA, et tout champ de signature du cycle de vie est un
+  `MlDsa87Signature`. Le jeton authentifie et dérive — `hmac-secret` ouvre un
+  key-slot, rien d'autre. Le coffre exige deux credentials (`REQUIRED_SLOTS`)
+  et en accepte huit ; enrôler la troisième est le **même** geste que la
+  seconde. Le corps est scellé sous une empreinte de la table de slots, donc un
+  slot retiré puis recollé depuis une sauvegarde n'ouvre plus le fichier
+  courant — une sauvegarde antérieure, elle, reste ouvrable par la clé retirée.
+  CTAP n'est **pas** une feature de compilation, pas plus que la négociation de
+  clé : tout binaire `astra-signer` porte la pile, et aucun chemin n'ouvre le
+  coffre sans clé. Le prix est `libudev` en dépendance de compilation, posée par
+  `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus.
+  **Limite connue** : le matériel ne s'exerce ni en WSL2 (aucun passthrough USB)
+  ni sans clé branchée, et sous Windows le compagnon demande un processus élevé.
+  La séquence au-dessus du matériel, elle, est éprouvée par
+  `tools/astra-signer/tests/enrolment.rs`.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par
@@ -422,7 +443,16 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
   conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
   distingue une restauration d'un fork, émetteur délégué borné et endpoint
-  public. Il ne détient **jamais** `CA-PQ` en clair.
+  public. Il ne détient **jamais** `CA-PQ` en clair. `astra::vault` y ajoute le
+  format du coffre d'autorité — key-slots FIDO2, corps scellé lié à la table de
+  slots. Astra le transporte et le sauvegarde ; il ne l'ouvre pas, et rien dans
+  le conteneur ne le peut.
+- `astra-signer` : compagnon du **poste opérateur** (ADR-008 §4), le seul
+  programme du dépôt qui détienne `CA-PQ` en clair, et seulement le temps d'une
+  opération. Il parle à CTAP2 directement — jamais un navigateur, jamais Orion,
+  jamais la console. Trois modules : `authenticator` (la seule frontière avec
+  le matériel), `gestures` (les séquences, éprouvées hors terminal), `store`
+  (le fichier).
 - `helios-firewall` : ruleset structuré, dry-run, backend Netlink.
 - `helios-wireguard` : interface gateway et table de pairs.
 - `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.

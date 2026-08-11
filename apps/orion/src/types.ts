@@ -364,6 +364,22 @@ export interface TelemetrySample {
   tx_bps: number
 }
 
+/** One bounded Orion-to-Helios data-path measurement. */
+export interface SpeedTestResult {
+  latency_ms: number
+  jitter_ms: number
+  latency_p95_ms: number
+  download_mbps: number
+  upload_mbps: number
+  download_variation_pct: number
+  upload_variation_pct: number
+  duration_ms: number
+  download_bytes: number
+  upload_bytes: number
+  parallel_streams: number
+  measurement_rounds: number
+}
+
 /**
  * What the vault can honestly claim about itself (ADR-006 §3).
  *

@@ -30,6 +30,7 @@ import {
   onTrayView,
   resizeForView,
   runCertificateAction,
+  runSpeedTest,
   saveProfile,
   selectProfile,
   validateProfile,
@@ -60,6 +61,7 @@ describe('Orion Tauri bridge', () => {
     await certificateOverview()
     await runCertificateAction('portable', 'renew_now')
     await lastCertificateError('portable')
+    await runSpeedTest()
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -92,6 +94,7 @@ describe('Orion Tauri bridge', () => {
       ['certificate_overview'],
       ['run_certificate_action', { name: 'portable', action: 'renew_now' }],
       ['last_certificate_error', { name: 'portable' }],
+      ['run_speed_test'],
       ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],

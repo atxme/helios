@@ -24,6 +24,7 @@ pub mod health;
 pub mod key_negotiation;
 pub mod provision;
 mod routes;
+pub mod speedtest;
 pub mod update;
 pub mod ws;
 
@@ -221,6 +222,12 @@ pub fn router(state: AppState) -> Router {
 
     let authenticated_peer = Router::new()
         .route("/api/provision", post(provision::provision))
+        .route("/api/speedtest/ping", get(speedtest::ping))
+        .route("/api/speedtest/download", get(speedtest::download))
+        .route(
+            "/api/speedtest/upload",
+            post(speedtest::upload).layer(DefaultBodyLimit::max(speedtest::MAX_TRANSFER_BYTES)),
+        )
         // Explicit teardown of a negotiated PSK, sent through the tunnel
         // before the client unmounts its adapter (spec §7.5). Behind
         // `require_peer` like provisioning: the source VIP is what ties the
@@ -284,16 +291,17 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
     if matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH
-    ) && !request
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-        })
+    ) && request.uri().path() != "/api/speedtest/upload"
+        && !request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            })
     {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
@@ -472,6 +480,63 @@ mod security_tests {
             assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
             assert!(cmd_rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn speedtest_upload_accepts_a_bounded_binary_body_only_for_a_peer() {
+        let (app_state, _cmd_rx) = state();
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/speedtest/upload?bytes=4")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, "4")
+            .body(Body::from("test"))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let (app_state, _cmd_rx) = state_real();
+        let response = router(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/speedtest/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn speedtest_download_is_bounded_and_returns_the_requested_size() {
+        let (app_state, _cmd_rx) = state();
+        let mut request = Request::builder()
+            .uri("/api/speedtest/download?bytes=32")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64).await.unwrap();
+        assert_eq!(body.len(), 32);
+
+        let (app_state, _cmd_rx) = state();
+        let uri = format!(
+            "/api/speedtest/download?bytes={}",
+            speedtest::MAX_TRANSFER_BYTES + 1
+        );
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

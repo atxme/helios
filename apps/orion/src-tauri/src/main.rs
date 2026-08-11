@@ -69,6 +69,10 @@ struct AppState {
     store: Arc<orion_core::vault::ProfileStore>,
     config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
+    /// Serializes the expensive benchmark. The UI disables its button, but
+    /// the Rust boundary still refuses a second IPC invocation so two tests
+    /// cannot divide the same path and both report half of its capacity.
+    speedtest: Mutex<()>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
     /// Imported profiles the user has not saved yet, keyed by display name.
     ///
@@ -554,6 +558,40 @@ async fn last_certificate_error(
         .await
         .get(&name)
         .cloned())
+}
+
+/// Measures the data path to the gateway named by the active profile.
+///
+/// This command is intentionally available only while WireGuard is `Up`: the
+/// gateway's API lives behind that tunnel, and running it against a profile's
+/// public endpoint would measure a different path than the one Orion
+/// protects. The transfer implementation itself lives in `orion-core`, so it
+/// remains testable without Tauri or WebView.
+#[tauri::command]
+async fn run_speed_test(state: State<'_, AppState>) -> Result<orion_core::SpeedTestResult, String> {
+    let _exclusive = state
+        .speedtest
+        .try_lock()
+        .map_err(|_| "un speedtest est déjà en cours".to_string())?;
+    if state.controller.state() != TunnelState::Up || !state.controller.adapter_is_up() {
+        return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
+    }
+    let gateway_url = {
+        let config = state.config.lock().await;
+        config
+            .selected
+            .as_deref()
+            .and_then(|name| config.find(name))
+            .or_else(|| config.profiles.first())
+            .and_then(|profile| profile.heliosd_url.clone())
+            .ok_or_else(|| {
+                "le profil connecté ne fournit pas d’URL interne Helios pour le speedtest"
+                    .to_string()
+            })?
+    };
+    orion_core::run_speedtest(&gateway_url)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
@@ -1554,6 +1592,7 @@ fn window_size_for(view: &str) -> (f64, f64) {
         // Certificates lists every Helios profile of the device with four
         // rows and four actions each: it needs the height, not the width.
         "certificates" => (800.0, 760.0),
+        "speedtest" => (720.0, 600.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the
         // height of the other views only produced a hole in the middle.
@@ -1975,6 +2014,7 @@ fn main() {
             store,
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
+            speedtest: Mutex::new(()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
@@ -2024,6 +2064,7 @@ fn main() {
             certificate_overview,
             run_certificate_action,
             last_certificate_error,
+            run_speed_test,
             vault_posture,
         ])
         .run(tauri::generate_context!())
@@ -2308,7 +2349,7 @@ mod security_tests {
             window["minWidth"].as_f64().expect("minWidth"),
             window["minHeight"].as_f64().expect("minHeight"),
         );
-        for view in ["connect", "profiles", "logs"] {
+        for view in ["connect", "profiles", "certificates", "speedtest", "logs"] {
             let (w, h) = window_size_for(view);
             assert!(w >= min_w, "{view} : {w} < {min_w}");
             assert!(h >= min_h, "{view} : {h} < {min_h}");

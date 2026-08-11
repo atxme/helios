@@ -193,6 +193,34 @@ récupération avec l'un d'eux depuis la machine cliente, mais la campagne reste
 bornée au pair, à ses empreintes et à sa génération avant que le compagnon ne
 l'affiche et ne la signe.
 
+#### Amendement du 11 août 2026 — deux est un plancher, pas un plafond
+
+« Au moins deux » se lit à la lettre : `astra::vault` exige deux credentials
+avant de tenir l'autorité pour amorcée et en accepte huit. Enrôler une
+troisième clé est le **même** geste que la seconde, avec les mêmes arguments —
+une clé autorisée ouvre, la nouvelle reçoit un slot. Aucune n'est distinguée
+cryptographiquement ; « principale » et « récupération » restent des libellés
+d'exploitation, et un libellé n'entre dans aucune dérivation.
+
+Le corps du coffre est scellé sous une empreinte de la table de slots. Retirer
+une clé rescelle donc le corps, ce qui n'exige **qu'une seule** clé restante :
+les enveloppes des autres slots ne bougent pas. Sans cette liaison, retirer un
+slot ne ferait qu'effacer une ligne, et la ligne recollée depuis une sauvegarde
+rouvrirait le fichier courant — la clé maîtresse, elle, n'aurait pas changé.
+
+**Limite connue** : cette liaison protège le fichier *courant*, pas les copies
+déjà faites. Une sauvegarde antérieure au retrait reste ouvrable par la clé
+retirée, définitivement, comme toute sauvegarde LUKS l'est par une phrase
+supprimée depuis. La réponse à un credential réellement compromis est une
+rotation de `CA-PQ`, pas un retrait de slot.
+
+Un sel unique par coffre, et non par slot : `hmac-secret` rend
+`HMAC(CredRandom, sel)` et `CredRandom` est tiré par l'authentificateur pour
+chaque credential, donc deux slots d'un même coffre dérivent déjà deux secrets
+distincts. Un sel par slot n'ajouterait rien et coûterait la résolution en une
+seule assertion — le jeton nomme le credential qu'il détient parmi ceux
+proposés, et rend son secret, d'un seul contact.
+
 ### 5. Renouvellement ordinaire automatique à 80 %
 
 Pour une leaf active :

@@ -72,8 +72,13 @@ sudo apt-get update -qq
 sudo apt-get install -y \
     build-essential pkg-config curl git \
     libssl-dev \
+    libudev-dev \
     ca-certificates
 success "Outils de base OK"
+# libudev-dev : en-têtes exigées par `hidapi`, donc par astra-signer, qui porte
+# la pile CTAP2 sans condition (ADR-008 §4). Sans ce paquet le workspace ne se
+# bâtit plus. Le paquet s'installe partout ; brancher une clé de sécurité, non
+# — WSL2 n'a aucun passthrough USB. Voir docs/testing/TESTING.md.
 
 # ── 3. Dépendances apps/orion (app Tauri = webkit2gtk) ──────────────
 info "Dépendances client Tauri (webkit2gtk-4.1 + GTK3)..."

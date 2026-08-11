@@ -35,12 +35,18 @@
 //! # Limite connue
 //!
 //! The operator credential layer of ADR-008 §4 — FIDO2 `hmac-secret` key
-//! slots, the `astra-signer` companion and the two-credential approval policy
-//! — is not exercised by this crate: it needs a physical authenticator, which
-//! no WSL2 build can provide. The objects here carry the campaign fingerprint
-//! that a credential approves ([`status::AstraRotationCampaign`]), and refuse
-//! an operation whose campaign does not match, but the assertion itself is
-//! verified by the Astra coordinator. See
+//! slots and the `astra-signer` companion — is not exercised by this crate: it
+//! needs a physical authenticator, which no WSL2 build can provide.
+//!
+//! It is worth being exact about what that layer does, because the obvious
+//! guess is wrong. The authenticator **never signs anything verified here**,
+//! and it could not: a YubiKey holds RSA, P-256/P-384 and Ed25519, and every
+//! signature field in this module is an `MlDsa87Signature`. What presence and
+//! user verification release is a `hmac-secret` output, which unwraps a
+//! key-slot of the authority vault; the anchors inside it are what sign. The
+//! objects here carry the campaign fingerprint the companion **displays**
+//! ([`status::AstraRotationCampaign`]) and refuse an operation whose campaign
+//! does not match. See
 //! [`docs/testing/TESTING.md`](../../../../docs/testing/TESTING.md).
 
 pub mod authority;

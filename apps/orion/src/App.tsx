@@ -6,13 +6,14 @@ import ButtonBase from '@mui/material/ButtonBase'
 import IconButton from '@mui/material/IconButton'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { ChevronDown, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
+import { ChevronDown, Gauge, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
 import * as api from './api'
 import type { VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { CertificatesView } from './views/CertificatesView'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
+import { SpeedTestView } from './views/SpeedTestView'
 import { AboutDialog } from './components/AboutDialog'
 import { EventLog } from './components/EventLog'
 import { OrionMark } from './components/OrionMark'
@@ -30,7 +31,7 @@ import { GUTTER, PINE } from './theme'
  * same length — that's exactly the defect being fixed here.
  */
 
-type View = 'connect' | 'profiles' | 'certificates' | 'logs'
+type View = 'connect' | 'profiles' | 'certificates' | 'speedtest' | 'logs'
 
 /** Width of the collapsed rail. The icon slot is exactly this width. */
 const RAIL = 56
@@ -45,6 +46,7 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
   // §12.2's «tous les profils Helios de cet appareil» cannot live on a screen
   // that shows one profile at a time.
   { value: 'certificates', label: 'Certificats', icon: ShieldCheck },
+  { value: 'speedtest', label: 'Speedtest', icon: Gauge },
   { value: 'logs', label: 'Journal', icon: Terminal },
 ]
 
@@ -345,6 +347,12 @@ export default function App() {
           {view === 'certificates' && (
             <Box role="region" aria-label="Certificats" sx={{ height: '100%' }}>
               <CertificatesView />
+            </Box>
+          )}
+
+          {view === 'speedtest' && (
+            <Box role="region" aria-label="Speedtest" sx={{ height: '100%' }}>
+              <SpeedTestView state={c.state} profile={c.selectedProfile} />
             </Box>
           )}
 

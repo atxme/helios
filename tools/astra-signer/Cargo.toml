@@ -1,0 +1,39 @@
+[package]
+name = "astra-signer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Compagnon opérateur d'Astra (ADR-008 §4) : ouvre le coffre d'autorité par une clé de sécurité FIDO2, sur le poste où elle est branchée. Ni Astra, ni la gateway, ni un navigateur ne voient jamais CA-PQ."
+
+[lib]
+name = "astra_signer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astra-signer"
+path = "src/main.rs"
+
+[dependencies]
+aether.workspace = true
+astra.workspace = true
+anyhow.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+rcgen.workspace = true
+rpassword.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+# Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
+# compagnon qui ne parle à aucune clé n'ouvre aucun coffre, et la spécification
+# refuse tout autre déverrouillage — le bâtir sans serait indiscernable d'une
+# panne. Elle tire `hidapi`, donc `libudev` sous Linux (scripts/setup-dev.sh).
+# `aws-lc-rs` plutôt que `ring` : c'est le backend cryptographique du dépôt, et
+# deux piles dans un même binaire sont deux surfaces à suivre.
+ctap-hid-fido2 = { version = "3.5", default-features = false, features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+tempfile = "3"

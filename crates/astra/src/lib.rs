@@ -48,6 +48,7 @@ pub mod issuer;
 pub mod planner;
 pub mod registry;
 pub mod service;
+pub mod vault;
 
 pub use audit::{AuditChain, AuditEvent};
 pub use issuer::DelegatedIssuer;

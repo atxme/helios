@@ -16,6 +16,8 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+futures-util.workspace = true
+bytes.workspace = true
 # The parsed URL's `Host` type. `reqwest` re-exports `Url` but not this type,
 # and distinguishing an IP literal from a name must use the exact structure
 # consumed by the HTTP client, never a second parse of the source string.
