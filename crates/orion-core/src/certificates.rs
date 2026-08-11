@@ -90,7 +90,6 @@ pub struct TrustState {
     /// Held together because they are the cross-cutting part of the state:
     /// a revocation may name either identity, and the status counters are per
     /// certificate rather than global.
-    #[serde(default)]
     pub ledger: TrustLedger,
 }
 
@@ -417,7 +416,11 @@ impl TrustStore {
                     if revocation.scope == RevocationScope::Client {
                         candidate.certificates.revocation_epoch = revocation.revocation_epoch;
                     }
-                    candidate.ledger.schedule(revocation)?;
+                    candidate.ledger.schedule(
+                        revocation,
+                        &candidate.gateway,
+                        &candidate.certificates,
+                    )?;
                     applied += 1;
                 }
                 TrustUpdateObject::ClientCertificateStageAuthorization(_)
@@ -893,23 +896,33 @@ mod tests {
         )
     }
 
-    /// A document from before the ledger existed is refused, not silently
-    /// accepted with the revocations it carried dropped on the floor.
+    /// The immediately preceding complete shape is refused, not silently
+    /// accepted with an empty tombstone list.
     ///
     /// Nothing that ships has ever written this file, so no such document can
     /// exist today — but the failure mode is what matters if one ever does:
     /// loud, and on the side of refusing to run.
+    #[cfg(feature = "certificate-signing")]
     #[test]
     fn a_trust_store_from_an_earlier_shape_is_refused_rather_than_half_read() {
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("trust.json");
-        // The pre-ledger shape: two flat fields where `ledger` now is.
+        let (_, anchor) = generate_ml_dsa_87_keypair().expect("anchor");
+        let (_, service) = generate_ml_dsa_87_keypair().expect("service");
+        let current = store(path.clone(), anchor, service);
+        let mut previous = serde_json::to_value(current.state()).expect("serialize state");
+        previous
+            .get_mut("ledger")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("ledger object")
+            .remove("revoked");
         std::fs::write(
             &path,
-            br#"{"trust_domain_id":"01010101010101010101010101010101",
-                 "scheduled_revocations":[],"last_status":null}"#,
+            serde_json::to_vec_pretty(&previous).expect("encode previous shape"),
         )
-        .expect("write");
+        .expect("write previous shape");
         assert!(matches!(
             TrustStore::load(&path),
             Err(TrustError::Corrupt(_))
@@ -977,7 +990,9 @@ mod tests {
             // Only the TLS half is named, and that is still a revocation: the
             // generation is indivisible.
             revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+            revoked_tls_not_after: Some(active.not_after),
             revoked_pq_fingerprint: None,
+            revoked_pq_not_after: None,
             effective_at: 9_000,
             reason: RevocationReason::KeyCompromise,
             replacement_transition_fingerprint: None,
@@ -1054,7 +1069,9 @@ mod tests {
             server_name: Some("gateway.example".into()),
             revocation_epoch: 1,
             revoked_tls_fingerprint: None,
+            revoked_tls_not_after: None,
             revoked_pq_fingerprint: Some(served),
+            revoked_pq_not_after: Some(1_000_000),
             effective_at: 2_000,
             reason: RevocationReason::KeyCompromise,
             replacement_transition_fingerprint: None,
@@ -1154,7 +1171,9 @@ mod tests {
                 server_name: None,
                 revocation_epoch: epoch,
                 revoked_tls_fingerprint: None,
+                revoked_tls_not_after: None,
                 revoked_pq_fingerprint: Some(fingerprint),
+                revoked_pq_not_after: Some(1_000_000),
                 effective_at,
                 reason: RevocationReason::KeyCompromise,
                 replacement_transition_fingerprint: None,
@@ -1222,7 +1241,9 @@ mod tests {
             server_name: None,
             revocation_epoch: 1,
             revoked_tls_fingerprint: None,
+            revoked_tls_not_after: None,
             revoked_pq_fingerprint: Some(unseen),
+            revoked_pq_not_after: Some(1_000_000),
             effective_at: 1_000,
             reason: RevocationReason::KeyCompromise,
             replacement_transition_fingerprint: None,
@@ -1256,9 +1277,9 @@ mod tests {
             .find(|tombstone| tombstone.fingerprint.matches(&unseen))
             .expect("tombstone");
         assert_eq!(tombstone.revocation_epoch, 1);
-        assert!(
-            tombstone.expires_at.is_none(),
-            "the client never held it, so its cryptographic expiry is unknown"
+        assert_eq!(
+            tombstone.expires_at, 1_000_000,
+            "the signed revocation supplies the expiry even for an unseen leaf"
         );
         assert!(tombstone.revocation_fingerprint.is_some());
     }
@@ -1291,7 +1312,9 @@ mod tests {
             server_name: None,
             revocation_epoch: 1,
             revoked_tls_fingerprint: Some(generation(4).tls_certificate_fingerprint),
+            revoked_tls_not_after: Some(generation(4).not_after),
             revoked_pq_fingerprint: None,
+            revoked_pq_not_after: None,
             effective_at: 1_000,
             reason: RevocationReason::KeyCompromise,
             replacement_transition_fingerprint: None,
@@ -1308,6 +1331,58 @@ mod tests {
             .is_err());
         assert_eq!(store.state().certificates.revocation_epoch, 0);
         assert!(!store.state().certificates.revoked);
+    }
+
+    /// A future revocation is checked against a leaf already held before its
+    /// epoch is consumed. Deferring this check to `effective_at` would persist
+    /// an impossible decision and make every later refresh fail.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_revocation_with_a_false_cryptographic_expiry_is_never_scheduled() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+            revoked_tls_not_after: Some(active.not_after + 1),
+            revoked_pq_fingerprint: None,
+            revoked_pq_not_after: None,
+            effective_at: 9_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        assert!(store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(
+                    revocation
+                ))],
+                1_000,
+            )
+            .is_err());
+        assert_eq!(store.state().certificates.revocation_epoch, 0);
+        assert!(store.state().ledger.scheduled_revocations.is_empty());
     }
 
     /// A status must name a slot this store actually holds, of the right

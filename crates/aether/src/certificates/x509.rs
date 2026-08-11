@@ -18,6 +18,10 @@
 //!   extended usage, carry `digitalSignature` when it declares a `keyUsage` at
 //!   all, stay valid over its **whole** window, and chain to an anchor the
 //!   verifier already holds;
+//! - a pinned **gateway TLS leaf** must parse, not be a CA, carry `serverAuth`,
+//!   name the expected DNS endpoint, verify its self-signature and cover its
+//!   whole transition window. The pin authorizes the key, but it does not turn
+//!   arbitrary DER into a usable TLS identity;
 //! - a **CSR** must carry the same public key as the leaf issued from it.
 //!   Without that check a grant can be perfectly signed and still install a
 //!   certificate for a private key the client never generated.
@@ -49,6 +53,7 @@ pub struct X509Facts {
     pub is_certificate_authority: bool,
     pub can_sign_certificates: bool,
     pub is_client_authentication_leaf: bool,
+    pub is_server_authentication_leaf: bool,
     /// Whether the certificate declares a `keyUsage` extension at all.
     ///
     /// The distinction matters: an absent extension asserts nothing, while a
@@ -95,18 +100,76 @@ pub fn inspect(certificate: &DerCertificate) -> Result<X509Facts, CertificateErr
         .ok()
         .flatten()
         .is_some_and(|extension| extension.value.client_auth);
+    let is_server_authentication_leaf = parsed
+        .extended_key_usage()
+        .ok()
+        .flatten()
+        .is_some_and(|extension| extension.value.server_auth);
     let not_before = parsed.validity().not_before.timestamp().max(0) as u64;
     let not_after = parsed.validity().not_after.timestamp().max(0) as u64;
     Ok(X509Facts {
         is_certificate_authority,
         can_sign_certificates,
         is_client_authentication_leaf,
+        is_server_authentication_leaf,
         declares_key_usage: key_usage.is_some(),
         can_digitally_sign,
         is_self_issued: parsed.issuer() == parsed.subject(),
         not_before,
         not_after,
     })
+}
+
+/// A self-signed gateway TLS leaf protected by an out-of-band pin.
+///
+/// The CA-PQ signature authorizes installing the DER fingerprint; this check
+/// proves the bytes are also a TLS server identity for the gateway being
+/// rotated. Requiring the self-signature is possession of the embedded public
+/// key. Requiring a DNS SAN follows TLS name validation instead of falling
+/// back to the legacy common name.
+pub fn assert_pinned_gateway_leaf(
+    certificate: &DerCertificate,
+    server_name: &str,
+    from_unix: u64,
+    until_unix: u64,
+) -> Result<(), CertificateError> {
+    let facts = inspect(certificate)?;
+    if facts.is_certificate_authority {
+        return Err(CertificateError::InvalidX509("gateway leaf is a CA"));
+    }
+    if !facts.is_server_authentication_leaf {
+        return Err(CertificateError::InvalidX509("no serverAuth usage"));
+    }
+    if facts.declares_key_usage && !facts.can_digitally_sign {
+        return Err(CertificateError::InvalidX509("no digitalSignature usage"));
+    }
+    if !facts.is_self_issued {
+        return Err(CertificateError::InvalidX509(
+            "pinned gateway leaf is not self-issued",
+        ));
+    }
+
+    let parsed = parse(certificate.as_bytes())?;
+    let names_expected_gateway = parsed
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|extension| {
+            extension
+                .value
+                .general_names
+                .iter()
+                .any(|name| matches!(name, GeneralName::DNSName(dns) if *dns == server_name))
+        });
+    if !names_expected_gateway {
+        return Err(CertificateError::InvalidX509(
+            "gateway DNS name is not in subjectAltName",
+        ));
+    }
+    parsed
+        .verify_signature(None)
+        .map_err(|_| CertificateError::InvalidX509("self-signature does not verify"))?;
+    assert_covers(certificate, from_unix, until_unix)
 }
 
 /// The certificate covers the whole span it will be in service for.

@@ -332,6 +332,15 @@ impl GatewayIdentityTransition {
         }
         self.window.validate()?;
 
+        if let Some(certificate) = &self.next_gateway_tls_certificate {
+            crate::certificates::x509::assert_pinned_gateway_leaf(
+                certificate,
+                server_name,
+                self.window.activation_at,
+                self.window.not_after,
+            )?;
+        }
+
         if let Some(certificate) = &self.next_gateway_certificate {
             // The incoming leaf is verified **at `activation_at`**, not at the
             // current instant: a transition prepared weeks ahead carries a
@@ -348,7 +357,7 @@ impl GatewayIdentityTransition {
                 .map_err(|_| CertificateError::UnauthorizedIssuer)?;
             // And it must outlive the overlap: a leaf expiring inside the
             // window would promote the fleet onto an already-dead identity.
-            if certificate.not_after_unix < self.window.not_after {
+            if certificate.not_after_unix <= self.window.not_after {
                 return Err(CertificateError::OutsideValidityPeriod);
             }
         }
@@ -544,6 +553,7 @@ mod tests {
     use crate::certificates::encoding::{generate_ml_dsa_87_keypair, sign_ml_dsa_87};
     use crate::key_negotiation::{issue_pq_certificate, PQ_CERTIFICATE_VERSION};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
     use zeroize::Zeroizing;
 
     const SERVER_NAME: &str = "gateway.example";
@@ -585,6 +595,18 @@ mod tests {
             ml_dsa_87_signature: String::new(),
         };
         issue_pq_certificate(certificate, &ca.private).expect("issue")
+    }
+
+    fn gateway_tls_leaf(server_name: &str, not_after_year: i32) -> DerCertificate {
+        let mut params = CertificateParams::new(vec![server_name.to_string()]).expect("params");
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        params.not_after = rcgen::date_time_ymd(not_after_year, 1, 1);
+        let key = KeyPair::generate().expect("TLS key");
+        let certificate = params.self_signed(&key).expect("TLS certificate");
+        DerCertificate::new(certificate.der().to_vec()).expect("DER")
     }
 
     fn transition(ca: &Keys, next_leaf: Option<PqCertificate>) -> GatewayIdentityTransition {
@@ -635,17 +657,43 @@ mod tests {
         let pq_only = transition(&ca, Some(leaf.clone()));
         assert!(verify(&pq_only, &ca, 1).is_ok());
 
+        let tls_leaf = gateway_tls_leaf(SERVER_NAME, 4096);
         let mut tls_only = transition(&ca, None);
-        tls_only.next_gateway_tls_certificate = Some(DerCertificate::new(vec![7; 64]).unwrap());
+        tls_only.next_gateway_tls_certificate = Some(tls_leaf.clone());
         let transcript = tls_only.signing_bytes().unwrap();
         tls_only.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).unwrap();
         assert!(verify(&tls_only, &ca, 1).is_ok());
 
         let mut both = transition(&ca, Some(leaf));
-        both.next_gateway_tls_certificate = Some(DerCertificate::new(vec![7; 64]).unwrap());
+        both.next_gateway_tls_certificate = Some(tls_leaf);
         let transcript = both.signing_bytes().unwrap();
         both.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).unwrap();
         assert!(verify(&both, &ca, 1).is_ok());
+    }
+
+    #[test]
+    fn a_gateway_tls_leaf_must_be_a_valid_self_signed_server_identity() {
+        let ca = keys();
+        let mut malformed = transition(&ca, None);
+        malformed.next_gateway_tls_certificate =
+            Some(DerCertificate::new(vec![7; 64]).expect("bounded DER"));
+        let transcript = malformed.signing_bytes().expect("transcript");
+        malformed.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
+        assert!(matches!(
+            verify(&malformed, &ca, 1),
+            Err(CertificateError::InvalidX509("unparsable"))
+        ));
+
+        let mut wrong_name = transition(&ca, None);
+        wrong_name.next_gateway_tls_certificate = Some(gateway_tls_leaf("other.example", 4096));
+        let transcript = wrong_name.signing_bytes().expect("transcript");
+        wrong_name.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
+        assert!(matches!(
+            verify(&wrong_name, &ca, 1),
+            Err(CertificateError::InvalidX509(
+                "gateway DNS name is not in subjectAltName"
+            ))
+        ));
     }
 
     /// A transition that installs nothing is not a decision.
@@ -684,9 +732,17 @@ mod tests {
         let mut leaf = gateway_leaf(&ca, &subject);
         leaf.not_after_unix = 2_500;
         let leaf = issue_pq_certificate(leaf, &ca.private).expect("reissue");
-        let transition = transition(&ca, Some(leaf));
+        let short_lived_transition = transition(&ca, Some(leaf));
         assert!(matches!(
-            verify(&transition, &ca, 1),
+            verify(&short_lived_transition, &ca, 1),
+            Err(CertificateError::OutsideValidityPeriod)
+        ));
+
+        let mut equal = gateway_leaf(&ca, &subject);
+        equal.not_after_unix = window().not_after;
+        let equal = issue_pq_certificate(equal, &ca.private).expect("reissue");
+        assert!(matches!(
+            verify(&transition(&ca, Some(equal)), &ca, 1),
             Err(CertificateError::OutsideValidityPeriod)
         ));
     }

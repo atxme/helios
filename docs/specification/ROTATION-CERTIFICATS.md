@@ -1469,7 +1469,9 @@ transport suit sa PKI Web et ne peut modifier la clé applicative épinglée.
 | `server_name` | obligatoire pour la gateway |
 | `revocation_epoch` | compteur de révocation local + 1 dans la portée visée |
 | `revoked_tls_fingerprint` | facultative si TLS n'est pas concerné |
+| `revoked_tls_not_after` | présente si et seulement si l'empreinte TLS l'est ; expiration cryptographique signée |
 | `revoked_pq_fingerprint` | facultative si PQ n'est pas concerné |
+| `revoked_pq_not_after` | présente si et seulement si l'empreinte PQ l'est ; expiration cryptographique signée |
 | `effective_at` | effet immédiat ou futur explicite |
 | `reason` | `key_compromise`, `suspected_compromise`, `cessation` ou `superseded` |
 | `replacement_transition_fingerprint` | facultative |
@@ -1478,6 +1480,13 @@ transport suit sa PKI Web et ne peut modifier la clé applicative épinglée.
 Au moins une empreinte est présente. L'objet est signé sous le domaine
 `helios-certificate-emergency-revocation-v5` avec tous les champs ci-dessus,
 dans l'ordre et l'encodage binaire canonique de la v5.
+
+Les couples `empreinte/not_after` sont indivisibles. L'expiration est portée
+par la décision signée même lorsque le destinataire n'a jamais détenu la leaf :
+elle ne peut être devinée localement, mais elle est nécessaire pour libérer de
+façon sûre un registre de tombstones borné. Quand le destinataire détient la
+leaf, son expiration DER/PQ doit être identique à la valeur signée ; un écart
+fait refuser toute la transaction.
 
 ### 10.2 Effet
 
@@ -1490,8 +1499,10 @@ identité de remplacement déjà vérifiée ne reste disponible, la connexion
 Le compteur de révocation est persisté avec les empreintes retirées et avance
 indépendamment des générations de certificat. Une rotation ultérieure ne peut
 donc ni réintroduire une leaf révoquée, ni faire disparaître la décision par un
-numéro de génération concurrent. Une empreinte révoquée reste mémorisée au
-moins jusqu'à la fin de sa validité cryptographique.
+numéro de génération concurrent. Une empreinte révoquée reste mémorisée
+jusqu'à la fin de sa validité cryptographique signée. À capacité maximale, les
+tombstones expirés sont retirés avant toute décision ; si toutes les entrées
+sont encore vivantes, la nouvelle révocation est refusée sans éviction.
 
 Pour une gateway compromise, la révocation doit atteindre Orion par un canal
 que l'attaquant ne peut pas falsifier : import du document signé, distribution
@@ -1708,14 +1719,17 @@ derrière un bouton au libellé ambigu « Renouveler ».
   les états bornés actif/suivant. L'idempotence porte sur l'empreinte du
   **document** signé, pas sur son contenu.
 - `aether::certificates::x509` : CA réelle, auto-émise et auto-signée,
-  `basicConstraints`, `keyCertSign`, `clientAuth`, `digitalSignature` dès qu'un
-  `keyUsage` est déclaré, chaîne `leaf → intermédiaire → CA-TLS` vers une ancre
-  déjà détenue et liaison CSR ↔ clé certifiée. La validité est lue sur
+  `basicConstraints`, `keyCertSign`, `clientAuth`, `serverAuth`,
+  `digitalSignature` dès qu'un `keyUsage` est déclaré, SAN DNS et
+  auto-signature de la leaf TLS gateway épinglée, chaîne
+  `leaf → intermédiaire → CA-TLS` vers une ancre déjà détenue et liaison CSR ↔
+  clé certifiée. La validité est lue sur
   **chaque maillon** et sur **toute la fenêtre**, `not_before <= activation_at`
   et `not_after > window.not_after` (§4.1) : un seul instant laisserait une
   leaf ou une ancre expirer au milieu du chevauchement qu'elle porte, une fois
   la génération sortante déjà programmée pour le retrait. La CA-TLS entrante et
-  l'intermédiaire délégué sont soumis à la même règle sur leur propre fenêtre.
+  l'intermédiaire délégué et les deux leafs gateway sont soumis à la même règle
+  sur leur propre fenêtre.
 - Deux axes de révocation distincts, l'un pour la gateway et l'autre par
   client, plus un troisième pour la clé de service Astra. Une révocation porte
   sa portée et l'identité qu'elle nomme ; elle est refusée si elle en désigne
@@ -1723,16 +1737,18 @@ derrière un bouton au libellé ambigu « Renouveler ».
   ne redescend jamais : deux décisions datées différemment prennent effet dans
   l'ordre de l'horloge, pas dans celui des numéros.
 - Les empreintes retirées sont **mémorisées** après leur instant (§10.2), avec
-  portée, famille, compteur, expiration cryptographique quand le porteur la
-  connaissait et empreinte du document signé. Tous les chemins d'installation
+  portée, famille, compteur, expiration cryptographique portée par la décision
+  signée et empreinte du document signé. Tous les chemins d'installation
   les consultent — transition gateway, rotation de `CA-PQ` et de `CA-TLS`,
   transition et remplacement d'urgence de la clé de service, staging d'un
   candidat client — et le registre en pose aussi à `peer remove`. Sans cela, une
   révocation visant une empreinte que le porteur ne détient pas *encore* est
   consommée puis oubliée : son époque est dépensée, l'objet n'est plus jamais
   distribuable, et la transition suivante réinstalle la leaf. La liste est
-  plafonnée et **refuse** plutôt que d'évincer : oublier une révocation est
-  irrattrapable, refuser une mise à jour ne l'est pas.
+  plafonnée, purge les entrées arrivées à leur expiration signée, puis
+  **refuse** plutôt que d'évincer une entrée encore vivante. Une seconde
+  révocation de la même leaf remplace compteur, expiration et provenance comme
+  une seule décision cohérente.
 - Les compteurs de statut sont tenus **par cible**, comme Astra les émet : une
   génération fraîche repart à son propre compteur au lieu d'être bloquée
   derrière celui de la leaf qu'elle remplace. Un statut doit nommer une famille,
@@ -2090,7 +2106,10 @@ remplacement, alors que la leaf PQ chaîne directement vers `CA-PQ`. Cette
 asymétrie est volontaire : TLS fournit le transport épinglé et ML-DSA-87 porte
 l'autorité applicative post-quantique. Un implémenteur ne doit ni tenter de
 chaîner la leaf TLS vers `CA-TLS` cliente, ni laisser son ancien pin
-s'auto-autoriser.
+s'auto-autoriser. L'épinglage ne dispense pas de valider le DER : la leaf doit
+être auto-émise et auto-signée, non-CA, porter `serverAuth`, `digitalSignature`
+si `keyUsage` est présent, nommer exactement le `server_name` dans son SAN DNS
+et couvrir toute la fenêtre de transition.
 
 **La migration initiale reste une bascule coordonnée.** Avant que le profil
 porte son discriminant et `CA-PQ`, aucun objet signé par la nouvelle CA ne peut

@@ -1232,7 +1232,9 @@ pub struct ScheduledRevocation {
     pub revocation_epoch: u64,
     pub effective_at: u64,
     pub revoked_tls_fingerprint: Option<Fingerprint>,
+    pub revoked_tls_not_after: Option<u64>,
     pub revoked_pq_fingerprint: Option<Fingerprint>,
+    pub revoked_pq_not_after: Option<u64>,
     /// Fingerprint of the signed revocation, carried through to the tombstone.
     pub revocation_fingerprint: Option<Fingerprint>,
 }
@@ -1278,14 +1280,11 @@ pub struct RevocationTombstone {
     pub family: RevokedFamily,
     pub fingerprint: Fingerprint,
     pub revocation_epoch: u64,
-    /// Instant past which the revoked certificate could not have been valid
-    /// anyway, when the holder knew it.
-    ///
-    /// `None` precisely when the revocation named something this holder never
-    /// had — the case the tombstone exists for. The spec asks for "at least
-    /// until the end of its cryptographic validity", so an unknown expiry is
-    /// kept until the ceiling forces a decision, never guessed.
-    pub expires_at: Option<u64>,
+    /// Instant past which the revoked certificate could not have been valid.
+    /// Signed into a remote revocation and read from the generation for a
+    /// local `peer remove`, so it is available even if this holder never saw
+    /// the certificate itself.
+    pub expires_at: u64,
     /// The signed revocation this came from.
     ///
     /// `None` for a local operator decision — `peer remove` on the gateway has
@@ -1325,7 +1324,6 @@ pub struct TrustLedger {
     #[serde(default)]
     pub scheduled_revocations: Vec<ScheduledRevocation>,
     /// Fingerprints already withdrawn, kept so no later object reinstalls one.
-    #[serde(default)]
     pub revoked: Vec<RevocationTombstone>,
     /// Keyed by the target's fingerprint in lowercase hex.
     #[serde(default)]
@@ -1341,11 +1339,33 @@ impl TrustLedger {
     pub fn schedule(
         &mut self,
         revocation: &EmergencyCertificateRevocation,
+        gateway: &GatewayCertificateState,
+        client: &ClientCertificateState,
     ) -> Result<(), CertificateError> {
         if self.scheduled_revocations.len() >= MAX_SCHEDULED_REVOCATIONS {
             return Err(CertificateError::InvalidTransaction(
                 "too many pending revocations",
             ));
+        }
+        for (fingerprint, signed_expiry) in [
+            (
+                revocation.revoked_tls_fingerprint,
+                revocation.revoked_tls_not_after,
+            ),
+            (
+                revocation.revoked_pq_fingerprint,
+                revocation.revoked_pq_not_after,
+            ),
+        ] {
+            if let (Some(fingerprint), Some(signed_expiry)) = (fingerprint, signed_expiry) {
+                if known_expiry(gateway, client, &fingerprint)
+                    .is_some_and(|held_expiry| held_expiry != signed_expiry)
+                {
+                    return Err(CertificateError::InvalidTransaction(
+                        "revocation expiry does not match the held certificate",
+                    ));
+                }
+            }
         }
         if revocation.scope == RevocationScope::Gateway {
             self.gateway_revocation_epoch = revocation.revocation_epoch;
@@ -1355,7 +1375,9 @@ impl TrustLedger {
             revocation_epoch: revocation.revocation_epoch,
             effective_at: revocation.effective_at,
             revoked_tls_fingerprint: revocation.revoked_tls_fingerprint,
+            revoked_tls_not_after: revocation.revoked_tls_not_after,
             revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
+            revoked_pq_not_after: revocation.revoked_pq_not_after,
             revocation_fingerprint: Some(revocation.fingerprint()),
         });
         Ok(())
@@ -1366,8 +1388,8 @@ impl TrustLedger {
     ///
     /// The tombstone is written **before** the decision is applied: applying
     /// it clears the very slot the cryptographic expiry would have been read
-    /// from, and a tombstone with an unknown expiry outlives one that could
-    /// have been pruned.
+    /// from. The signed expiry remains available when this holder never had
+    /// the certificate at all.
     pub fn apply_due(
         &mut self,
         gateway: &mut GatewayCertificateState,
@@ -1381,22 +1403,39 @@ impl TrustLedger {
                 remaining.push(revocation);
                 continue;
             }
-            for (family, fingerprint) in [
-                (RevokedFamily::Tls, revocation.revoked_tls_fingerprint),
-                (RevokedFamily::Pq, revocation.revoked_pq_fingerprint),
+            for (family, fingerprint, signed_expiry) in [
+                (
+                    RevokedFamily::Tls,
+                    revocation.revoked_tls_fingerprint,
+                    revocation.revoked_tls_not_after,
+                ),
+                (
+                    RevokedFamily::Pq,
+                    revocation.revoked_pq_fingerprint,
+                    revocation.revoked_pq_not_after,
+                ),
             ] {
-                let Some(fingerprint) = fingerprint else {
+                let (Some(fingerprint), Some(expires_at)) = (fingerprint, signed_expiry) else {
                     continue;
                 };
-                let expires_at = known_expiry(gateway, client, &fingerprint);
-                self.remember(RevocationTombstone {
-                    scope: revocation.scope,
-                    family,
-                    fingerprint,
-                    revocation_epoch: revocation.revocation_epoch,
-                    expires_at,
-                    revocation_fingerprint: revocation.revocation_fingerprint,
-                })?;
+                if known_expiry(gateway, client, &fingerprint)
+                    .is_some_and(|held_expiry| held_expiry != expires_at)
+                {
+                    return Err(CertificateError::InvalidTransaction(
+                        "revocation expiry does not match the held certificate",
+                    ));
+                }
+                self.remember(
+                    RevocationTombstone {
+                        scope: revocation.scope,
+                        family,
+                        fingerprint,
+                        revocation_epoch: revocation.revocation_epoch,
+                        expires_at,
+                        revocation_fingerprint: revocation.revocation_fingerprint,
+                    },
+                    now_unix,
+                )?;
             }
             match revocation.scope {
                 RevocationScope::Client => {
@@ -1425,17 +1464,24 @@ impl TrustLedger {
     /// frees nothing, the operation is **refused**. Evicting a live tombstone
     /// to make room would silently restore the ability to reinstall a revoked
     /// leaf, and a refused trust update is recoverable in a way that is not.
-    pub fn remember(&mut self, tombstone: RevocationTombstone) -> Result<(), CertificateError> {
-        if let Some(existing) = self
-            .revoked
-            .iter_mut()
-            .find(|held| held.fingerprint.matches(&tombstone.fingerprint))
-        {
-            // The same fingerprint withdrawn twice is one decision, kept at
-            // the highest counter that named it.
-            existing.revocation_epoch = existing.revocation_epoch.max(tombstone.revocation_epoch);
-            if existing.expires_at.is_none() {
-                existing.expires_at = tombstone.expires_at;
+    pub fn remember(
+        &mut self,
+        tombstone: RevocationTombstone,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        self.forget_expired(now_unix);
+        if now_unix >= tombstone.expires_at {
+            return Ok(());
+        }
+        if let Some(existing) = self.revoked.iter_mut().find(|held| {
+            held.scope == tombstone.scope
+                && held.family == tombstone.family
+                && held.fingerprint.matches(&tombstone.fingerprint)
+        }) {
+            // Keep the whole newest decision together. Updating only the
+            // counter would leave it pointing at the older signed document.
+            if tombstone.revocation_epoch > existing.revocation_epoch {
+                *existing = tombstone;
             }
             return Ok(());
         }
@@ -1450,13 +1496,12 @@ impl TrustLedger {
 
     /// Drops tombstones whose target could no longer be valid anyway.
     ///
-    /// Only those with a **known** expiry: an unknown one is exactly the case
-    /// where the holder never saw the certificate, and guessing a date there
-    /// would be inventing the fact the tombstone exists to record.
+    /// Remote expiry is part of the signed revocation, so a certificate the
+    /// holder never saw is just as reclaimable as one it once installed.
     pub fn forget_expired(&mut self, now_unix: u64) -> bool {
         let before = self.revoked.len();
         self.revoked
-            .retain(|tombstone| tombstone.expires_at.is_none_or(|expiry| now_unix < expiry));
+            .retain(|tombstone| now_unix < tombstone.expires_at);
         self.revoked.len() != before
     }
 
@@ -1531,7 +1576,9 @@ impl TrustLedger {
                 .u64(revocation.revocation_epoch)
                 .u64(revocation.effective_at)
                 .optional_fingerprint(revocation.revoked_tls_fingerprint.as_ref())
+                .optional_u64(revocation.revoked_tls_not_after)
                 .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref())
+                .optional_u64(revocation.revoked_pq_not_after)
                 .optional_fingerprint(revocation.revocation_fingerprint.as_ref());
         }
         bytes.u16(self.revoked.len() as u16);
@@ -1544,7 +1591,7 @@ impl TrustLedger {
                 })
                 .fingerprint(&tombstone.fingerprint)
                 .u64(tombstone.revocation_epoch)
-                .u64(tombstone.expires_at.unwrap_or(0))
+                .u64(tombstone.expires_at)
                 .optional_fingerprint(tombstone.revocation_fingerprint.as_ref());
         }
         bytes.u16(self.last_statuses.len() as u16);
@@ -2233,16 +2280,19 @@ mod tests {
 
             let mut ledger = TrustLedger::default();
             ledger
-                .remember(RevocationTombstone {
-                    scope: RevocationScope::Gateway,
-                    family: RevokedFamily::Pq,
-                    fingerprint: pq_certificate_fingerprint(&next).expect("fingerprint"),
-                    revocation_epoch: 1,
-                    // Never held, so no expiry is known — the case the
-                    // tombstone exists for.
-                    expires_at: None,
-                    revocation_fingerprint: Some(Fingerprint::of(b"the signed revocation")),
-                })
+                .remember(
+                    RevocationTombstone {
+                        scope: RevocationScope::Gateway,
+                        family: RevokedFamily::Pq,
+                        fingerprint: pq_certificate_fingerprint(&next).expect("fingerprint"),
+                        revocation_epoch: 1,
+                        // Never held, but the signed revocation still carries the
+                        // cryptographic expiry.
+                        expires_at: next.not_after_unix,
+                        revocation_fingerprint: Some(Fingerprint::of(b"the signed revocation")),
+                    },
+                    500,
+                )
                 .expect("tombstone");
 
             assert!(matches!(
@@ -2262,7 +2312,7 @@ mod tests {
         }
     }
 
-    /// A tombstone is never traded away to make room for another.
+    /// A live tombstone is never traded away to make room for another.
     #[test]
     fn a_full_tombstone_list_refuses_rather_than_forgetting_a_revocation() {
         let tombstone = |seed: u8, expires_at| RevocationTombstone {
@@ -2276,10 +2326,12 @@ mod tests {
 
         let mut ledger = TrustLedger::default();
         for seed in 0..MAX_REVOCATION_TOMBSTONES as u8 {
-            ledger.remember(tombstone(seed, None)).expect("room");
+            ledger
+                .remember(tombstone(seed, 10_000), 1_000)
+                .expect("room");
         }
         assert!(matches!(
-            ledger.remember(tombstone(200, None)),
+            ledger.remember(tombstone(200, 10_000), 1_000),
             Err(CertificateError::InvalidTransaction(_))
         ));
         assert!(
@@ -2289,44 +2341,88 @@ mod tests {
 
         // Recording the same fingerprint twice is one decision, not two slots.
         assert_eq!(ledger.revoked.len(), MAX_REVOCATION_TOMBSTONES);
-        ledger.remember(tombstone(0, Some(9_000))).expect("merge");
+        ledger.remember(tombstone(0, 9_000), 1_000).expect("merge");
         assert_eq!(ledger.revoked.len(), MAX_REVOCATION_TOMBSTONES);
     }
 
-    /// Only a **known** cryptographic expiry lets a tombstone be dropped.
-    /// An unknown one is precisely the case where forgetting is unsafe.
+    /// Expired entries are reclaimed before the ceiling can refuse a new one.
     #[test]
-    fn only_a_tombstone_with_a_known_expiry_is_ever_forgotten() {
+    fn an_expired_tombstone_makes_room_for_a_new_revocation() {
         let mut ledger = TrustLedger::default();
+        for seed in 0..MAX_REVOCATION_TOMBSTONES as u8 {
+            ledger
+                .remember(
+                    RevocationTombstone {
+                        scope: RevocationScope::Client,
+                        family: RevokedFamily::Tls,
+                        fingerprint: Fingerprint::of(&[seed]),
+                        revocation_epoch: u64::from(seed),
+                        expires_at: if seed == 0 { 5_000 } else { 10_000 },
+                        revocation_fingerprint: None,
+                    },
+                    1_000,
+                )
+                .expect("tombstone");
+        }
+
         ledger
-            .remember(RevocationTombstone {
-                scope: RevocationScope::Client,
-                family: RevokedFamily::Tls,
-                fingerprint: Fingerprint::of(b"held once"),
-                revocation_epoch: 1,
-                expires_at: Some(5_000),
-                revocation_fingerprint: None,
-            })
-            .expect("tombstone");
-        ledger
-            .remember(RevocationTombstone {
-                scope: RevocationScope::Client,
-                family: RevokedFamily::Pq,
-                fingerprint: Fingerprint::of(b"never held"),
-                revocation_epoch: 2,
-                expires_at: None,
-                revocation_fingerprint: None,
-            })
+            .remember(
+                RevocationTombstone {
+                    scope: RevocationScope::Client,
+                    family: RevokedFamily::Pq,
+                    fingerprint: Fingerprint::of(b"new decision"),
+                    revocation_epoch: 33,
+                    expires_at: 12_000,
+                    revocation_fingerprint: None,
+                },
+                5_000,
+            )
             .expect("tombstone");
 
-        assert!(!ledger.forget_expired(4_999));
-        assert!(ledger.forget_expired(5_000));
-        assert!(!ledger.is_revoked(&Fingerprint::of(b"held once")));
-        assert!(
-            ledger.is_revoked(&Fingerprint::of(b"never held")),
-            "an unknown expiry is kept: guessing one would drop the record"
+        assert_eq!(ledger.revoked.len(), MAX_REVOCATION_TOMBSTONES);
+        assert!(!ledger.is_revoked(&Fingerprint::of(&[0])));
+        assert!(ledger.is_revoked(&Fingerprint::of(b"new decision")));
+    }
+
+    /// Updating a decision updates its counter and signed provenance together.
+    #[test]
+    fn a_newer_revocation_of_the_same_leaf_replaces_the_whole_tombstone() {
+        let mut ledger = TrustLedger::default();
+        let first_document = Fingerprint::of(b"first revocation");
+        let second_document = Fingerprint::of(b"second revocation");
+        ledger
+            .remember(
+                RevocationTombstone {
+                    scope: RevocationScope::Client,
+                    family: RevokedFamily::Pq,
+                    fingerprint: Fingerprint::of(b"same leaf"),
+                    revocation_epoch: 1,
+                    expires_at: 9_000,
+                    revocation_fingerprint: Some(first_document),
+                },
+                1_000,
+            )
+            .expect("tombstone");
+        ledger
+            .remember(
+                RevocationTombstone {
+                    scope: RevocationScope::Client,
+                    family: RevokedFamily::Pq,
+                    fingerprint: Fingerprint::of(b"same leaf"),
+                    revocation_epoch: 2,
+                    expires_at: 9_000,
+                    revocation_fingerprint: Some(second_document),
+                },
+                1_000,
+            )
+            .expect("replace");
+
+        assert_eq!(ledger.revoked.len(), 1);
+        assert_eq!(ledger.revoked[0].revocation_epoch, 2);
+        assert_eq!(
+            ledger.revoked[0].revocation_fingerprint,
+            Some(second_document)
         );
-        assert!(!ledger.forget_expired(u64::MAX));
     }
 
     /// After the outgoing key is retired, no `status_epoch` revives it.

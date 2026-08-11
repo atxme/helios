@@ -136,7 +136,6 @@ pub struct RegistryState {
     /// nothing about a fingerprint arriving later inside a staging
     /// authorization. A readmission under a fresh identity is legitimate; the
     /// **same** leaf coming back is what §10.2 forbids.
-    #[serde(default)]
     pub ledger: TrustLedger,
 }
 
@@ -529,6 +528,7 @@ impl CertificateRegistry {
         &mut self,
         wg_public_key: &WireGuardKey,
         revocation_epoch: u64,
+        now_unix: u64,
     ) -> Result<(), RegistryError> {
         let mut state = self.state.clone();
         let peer = state
@@ -562,7 +562,7 @@ impl CertificateRegistry {
                     family,
                     fingerprint,
                     revocation_epoch,
-                    expires_at: Some(generation.not_after),
+                    expires_at: generation.not_after,
                     // A local `peer remove` is not a signed object, and
                     // inventing a fingerprint for it would misdescribe where
                     // the decision came from.
@@ -571,7 +571,7 @@ impl CertificateRegistry {
             }
         }
         for tombstone in tombstones {
-            state.ledger.remember(tombstone)?;
+            state.ledger.remember(tombstone, now_unix)?;
         }
 
         let peer = state
@@ -979,6 +979,30 @@ mod tests {
                 &authorization,
             )
             .expect("receipt verifies");
+    }
+
+    /// The last complete registry shape had no ledger. Accepting it with an
+    /// empty default would forget every local peer-removal tombstone.
+    #[test]
+    fn a_registry_from_the_previous_shape_is_refused() {
+        let fixture = fixture();
+        let path = fixture.registry.path.clone();
+        let mut previous =
+            serde_json::to_value(fixture.registry.state()).expect("serialize registry");
+        previous
+            .as_object_mut()
+            .expect("registry object")
+            .remove("ledger");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&previous).expect("encode previous shape"),
+        )
+        .expect("write previous shape");
+
+        assert!(matches!(
+            CertificateRegistry::load(&path),
+            Err(RegistryError::Corrupt(_))
+        ));
     }
 
     /// The caller is resolved from the transport; the body is only compared.
@@ -1429,7 +1453,10 @@ mod tests {
             .stage(&client_key(2), &authorization, 1_100)
             .expect("staging");
 
-        fixture.registry.revoke(&client_key(2), 1).expect("revoke");
+        fixture
+            .registry
+            .revoke(&client_key(2), 1, 1_000)
+            .expect("revoke");
         let peer = fixture.registry.peer(&client_key(2)).expect("peer");
         assert!(peer.state.revoked);
         assert!(peer.state.pending.is_none());

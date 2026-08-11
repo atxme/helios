@@ -507,6 +507,20 @@ impl CanonicalBytes {
         }
     }
 
+    /// An optional integer: a presence byte, then the value if present.
+    ///
+    /// Using zero as an absence sentinel would make `None` and `Some(0)` share
+    /// one signed transcript even though they have different semantics.
+    pub(crate) fn optional_u64(&mut self, value: Option<u64>) -> &mut Self {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.u64(value)
+            }
+            None => self.u8(0),
+        }
+    }
+
     /// Variable-length field, prefixed by its `u32` length.
     pub(crate) fn length_prefixed(&mut self, bytes: &[u8]) -> &mut Self {
         // A field longer than 4 GiB cannot exist here: every variable-length
@@ -633,6 +647,15 @@ mod tests {
         absent.optional_fingerprint(None);
         let mut zero = CanonicalBytes::new(b"domain");
         zero.optional_fingerprint(Some(&Fingerprint::from_bytes([0; FINGERPRINT_LEN])));
+        assert_ne!(absent.finish(), zero.finish());
+    }
+
+    #[test]
+    fn an_absent_optional_integer_does_not_encode_like_zero() {
+        let mut absent = CanonicalBytes::new(b"domain");
+        absent.optional_u64(None);
+        let mut zero = CanonicalBytes::new(b"domain");
+        zero.optional_u64(Some(0));
         assert_ne!(absent.finish(), zero.finish());
     }
 

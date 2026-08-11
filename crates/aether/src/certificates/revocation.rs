@@ -88,7 +88,14 @@ pub struct EmergencyCertificateRevocation {
     pub server_name: Option<String>,
     pub revocation_epoch: u64,
     pub revoked_tls_fingerprint: Option<Fingerprint>,
+    /// Cryptographic expiry of the named TLS leaf.
+    ///
+    /// It is signed even when the recipient never held the leaf, so the
+    /// recipient can eventually forget the tombstone without guessing.
+    pub revoked_tls_not_after: Option<u64>,
     pub revoked_pq_fingerprint: Option<Fingerprint>,
+    /// Cryptographic expiry of the named PQ leaf.
+    pub revoked_pq_not_after: Option<u64>,
     pub effective_at: u64,
     pub reason: RevocationReason,
     pub replacement_transition_fingerprint: Option<Fingerprint>,
@@ -107,7 +114,9 @@ impl EmergencyCertificateRevocation {
             .text(self.server_name.as_deref().unwrap_or(""))
             .u64(self.revocation_epoch)
             .optional_fingerprint(self.revoked_tls_fingerprint.as_ref())
+            .optional_u64(self.revoked_tls_not_after)
             .optional_fingerprint(self.revoked_pq_fingerprint.as_ref())
+            .optional_u64(self.revoked_pq_not_after)
             .u64(self.effective_at)
             .u8(self.reason.domain_byte())
             .optional_fingerprint(self.replacement_transition_fingerprint.as_ref());
@@ -165,6 +174,11 @@ impl EmergencyCertificateRevocation {
         if self.revoked_tls_fingerprint.is_none() && self.revoked_pq_fingerprint.is_none() {
             return Err(CertificateError::EmptyTransition);
         }
+        if self.revoked_tls_fingerprint.is_some() != self.revoked_tls_not_after.is_some()
+            || self.revoked_pq_fingerprint.is_some() != self.revoked_pq_not_after.is_some()
+        {
+            return Err(CertificateError::InvalidValidityPeriod);
+        }
         require_next_generation(current_revocation_epoch, self.revocation_epoch)?;
         verify_ml_dsa_87(ca_pq, &self.signing_bytes(), &self.ca_signature)
     }
@@ -221,7 +235,9 @@ mod tests {
             server_name: server_name.map(str::to_string),
             revocation_epoch: 1,
             revoked_tls_fingerprint: None,
+            revoked_tls_not_after: None,
             revoked_pq_fingerprint: Some(Fingerprint::of(b"compromised")),
+            revoked_pq_not_after: Some(10_000),
             effective_at: 5_000,
             reason: RevocationReason::KeyCompromise,
             replacement_transition_fingerprint: None,
@@ -289,6 +305,27 @@ mod tests {
         assert!(matches!(
             empty.verify(&public, &domain(), 1, 0),
             Err(CertificateError::EmptyTransition)
+        ));
+    }
+
+    #[test]
+    fn every_revoked_fingerprint_carries_its_signed_cryptographic_expiry() {
+        let (private, public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut missing = revocation(&private, RevocationScope::Client, None);
+        missing.revoked_pq_not_after = None;
+        missing.ca_signature = sign_ml_dsa_87(&private, &missing.signing_bytes()).expect("sign");
+        assert!(matches!(
+            missing.verify(&public, &domain(), 1, 0),
+            Err(CertificateError::InvalidValidityPeriod)
+        ));
+
+        let mut expiry_without_leaf = revocation(&private, RevocationScope::Client, None);
+        expiry_without_leaf.revoked_tls_not_after = Some(10_000);
+        expiry_without_leaf.ca_signature =
+            sign_ml_dsa_87(&private, &expiry_without_leaf.signing_bytes()).expect("sign");
+        assert!(matches!(
+            expiry_without_leaf.verify(&public, &domain(), 1, 0),
+            Err(CertificateError::InvalidValidityPeriod)
         ));
     }
 
