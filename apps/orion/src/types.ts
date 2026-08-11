@@ -90,6 +90,39 @@ export interface CertificateFacts {
  * An absent slot is an absence — no negotiation block, no protected store —
  * while a slot that exists and could not be read appears in `faults`, named.
  */
+/** The four actions spec §12.2 requires the Profiles surface to offer. */
+export type CertificateAction =
+  | 'renew_now'
+  | 'renew_every_profile'
+  | 'recover_expired'
+  | 'rollback_to_previous'
+
+/**
+ * Why an action cannot run.
+ *
+ * Each variant is a **different** thing for the user to do — import an
+ * enrolment file, run on a machine with a protected store, wait for a format
+ * migration — which is why they are not one flag.
+ */
+export type CertificateActionBlockKind =
+  | 'no_negotiation'
+  | 'no_identity_store'
+  | 'identity_missing'
+  | 'nothing_expired'
+  | 'no_previous_identity'
+  | 'trust_material_missing'
+  | 'operator_credential_required'
+
+/** One action and whether it may run, as the shell decides. */
+export interface CertificateActionState {
+  action: CertificateAction
+  /** Fixed in Rust: §12.2 forbids an ambiguous « Renouveler ». */
+  label: string
+  blocked_by: { kind: CertificateActionBlockKind } | null
+  /** The sentence to show, as-is. `null` when the action may run. */
+  message: string | null
+}
+
 export interface CertificateInventory {
   gateway_pq: CertificateFacts | null
   gateway_ca_tls: CertificateFacts | null

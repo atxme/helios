@@ -129,6 +129,13 @@ struct AppState {
     /// file is the only trace left of a start that went wrong — and a path
     /// nobody can find is a file nobody reads. The About box states it.
     log_path: Option<PathBuf>,
+    /// Last certificate action that failed, per profile — the «dernière
+    /// erreur» spec §12.2 asks the Certificates surface to display.
+    ///
+    /// In memory rather than persisted: it describes an attempt made in this
+    /// session, and a message surviving a restart would outlive the situation
+    /// it described — an identity imported since, a store now available.
+    last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -411,6 +418,86 @@ fn certificate_inventory(
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
 ) -> orion_core::CertificateInventory {
     orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix())
+}
+
+/// State of the four certificate actions of spec §12.2, for one profile.
+///
+/// Decided in `orion-core`, beside the state it reads. The screen renders the
+/// reason it is given; a button greyed out with no sentence leaves the user
+/// with the question they opened the screen to answer.
+#[tauri::command]
+fn certificate_actions(
+    state: State<'_, AppState>,
+    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+) -> Vec<orion_core::CertificateActionState> {
+    let inventory =
+        orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix());
+    orion_core::certificate_actions::action_states(
+        key_negotiation.as_ref(),
+        &inventory,
+        state.controller.key_negotiation_ready(),
+    )
+}
+
+/// Runs one of the four actions, or reports why it cannot run.
+///
+/// The refusal happens **before** a key pair is generated or an authority is
+/// asked to certify anything: a press that produced a key and then discovered
+/// it could not finish would leave a half-rotation behind every time.
+///
+/// The reason is recorded as this profile's last error, which is what §12.2
+/// asks the surface to display.
+#[tauri::command]
+async fn run_certificate_action(
+    state: State<'_, AppState>,
+    name: String,
+    action: orion_core::CertificateAction,
+) -> Result<(), String> {
+    let settings = {
+        let cfg = state.config.lock().await;
+        cfg.find(&name)
+            .and_then(|profile| profile.key_negotiation.clone())
+    };
+    let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now_unix());
+    let outcome = orion_core::certificate_actions::run(
+        action,
+        settings.as_ref(),
+        &inventory,
+        state.controller.key_negotiation_ready(),
+    );
+    match outcome {
+        Ok(()) => {
+            state.last_certificate_error.lock().await.remove(&name);
+            Ok(())
+        }
+        Err(block) => {
+            let message = block.message();
+            state
+                .last_certificate_error
+                .lock()
+                .await
+                .insert(name, message.clone());
+            Err(message)
+        }
+    }
+}
+
+/// The last certificate action that failed on this profile, if any.
+///
+/// Kept in memory rather than persisted: it describes an attempt made in this
+/// session, and a message surviving a restart would outlive the situation it
+/// described — a missing identity imported since, a store now available.
+#[tauri::command]
+async fn last_certificate_error(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Option<String>, String> {
+    Ok(state
+        .last_certificate_error
+        .lock()
+        .await
+        .get(&name)
+        .cloned())
 }
 
 /// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
@@ -1822,6 +1909,7 @@ fn main() {
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
+            last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
@@ -1859,6 +1947,9 @@ fn main() {
             validate_profile,
             key_negotiation_support,
             certificate_inventory,
+            certificate_actions,
+            run_certificate_action,
+            last_certificate_error,
             vault_posture,
         ])
         .run(tauri::generate_context!())

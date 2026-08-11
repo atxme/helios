@@ -12,6 +12,7 @@ import {
   aboutOrion,
   adapterIsUp,
   backendKind,
+  certificateActions,
   certificateInventory,
   connect,
   deleteProfile,
@@ -21,11 +22,13 @@ import {
   importProfile,
   importProfilePath,
   keyNegotiationSupport,
+  lastCertificateError,
   onConfigChanged,
   onEvent,
   onProfilePath,
   onTrayView,
   resizeForView,
+  runCertificateAction,
   saveProfile,
   selectProfile,
   validateProfile,
@@ -52,6 +55,9 @@ describe('Orion Tauri bridge', () => {
     await vaultPosture()
     await keyNegotiationSupport()
     await certificateInventory(profile as never)
+    await certificateActions(profile as never)
+    await runCertificateAction('portable', 'renew_now')
+    await lastCertificateError('portable')
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -80,6 +86,9 @@ describe('Orion Tauri bridge', () => {
       ['vault_posture'],
       ['key_negotiation_support'],
       ['certificate_inventory', { keyNegotiation: profile }],
+      ['certificate_actions', { keyNegotiation: profile }],
+      ['run_certificate_action', { name: 'portable', action: 'renew_now' }],
+      ['last_certificate_error', { name: 'portable' }],
       ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],

@@ -4,7 +4,12 @@ import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { CertificatePanel } from './CertificatePanel'
-import type { CertificateFacts, CertificateInventory, CertificatePhase } from '../types'
+import type {
+  CertificateActionState,
+  CertificateFacts,
+  CertificateInventory,
+  CertificatePhase,
+} from '../types'
 
 afterEach(cleanup)
 
@@ -96,6 +101,90 @@ describe('CertificatePanel', () => {
       />,
     )
     expect(screen.getByText(/base64 illisible/)).toBeTruthy()
+  })
+
+  /**
+   * §12.2 names four actions. They are shown disabled with their reason, never
+   * hidden: an action that disappears when unavailable teaches the user it
+   * does not exist, and the day it becomes available nobody looks for it.
+   */
+  it('offers the four actions of the specification, disabled with their reason', () => {
+    const actions: CertificateActionState[] = [
+      {
+        action: 'renew_now',
+        label: 'Renouveler maintenant',
+        blocked_by: { kind: 'trust_material_missing' },
+        message: 'Ce profil ne porte pas le matériel de confiance…',
+      },
+      {
+        action: 'renew_every_profile',
+        label: 'Renouveler tous les profils Helios de cet appareil',
+        blocked_by: { kind: 'trust_material_missing' },
+        message: 'Ce profil ne porte pas le matériel de confiance…',
+      },
+      {
+        action: 'recover_expired',
+        label: 'Récupérer le certificat expiré',
+        blocked_by: { kind: 'nothing_expired' },
+        message: 'Aucun certificat de ce profil n’est expiré…',
+      },
+      {
+        action: 'rollback_to_previous',
+        label: 'Revenir temporairement à l’ancienne identité',
+        blocked_by: { kind: 'no_previous_identity' },
+        message: 'Ce poste ne détient aucune identité précédente…',
+      },
+    ]
+    render(
+      <CertificatePanel
+        inventory={inventory({ gateway_pq: facts('valid') })}
+        identityName="orion-poste"
+        actions={actions}
+        onRun={() => {}}
+      />,
+    )
+    for (const action of actions) {
+      const button = screen.getByRole('button', { name: action.label })
+      expect(button).toBeTruthy()
+      expect((button as HTMLButtonElement).disabled).toBe(true)
+    }
+  })
+
+  /** An action that may run is pressable, and presses. */
+  it('runs an action that the state machine allows', () => {
+    const run: string[] = []
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('renewal_due') })}
+        identityName="orion-poste"
+        actions={[
+          {
+            action: 'renew_now',
+            label: 'Renouveler maintenant',
+            blocked_by: null,
+            message: null,
+          },
+        ]}
+        onRun={(action) => run.push(action)}
+      />,
+    )
+    const button = screen.getByRole('button', { name: 'Renouveler maintenant' })
+    expect((button as HTMLButtonElement).disabled).toBe(false)
+    button.click()
+    expect(run).toEqual(['renew_now'])
+  })
+
+  /** The two other things §12.2 asks the surface to show. */
+  it('states the chosen renewal date and the last error', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('valid', { renewal_at: 80_000 }) })}
+        identityName="orion-poste"
+        lastError="Ce profil ne porte pas le matériel de confiance."
+      />,
+    )
+    expect(screen.getByText('renouvellement')).toBeTruthy()
+    expect(screen.getByText(/matériel de confiance/)).toBeTruthy()
   })
 
   /**

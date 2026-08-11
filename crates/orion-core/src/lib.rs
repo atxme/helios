@@ -22,6 +22,7 @@
 //! [`aether::TunnelState::Up`].
 
 pub mod backend;
+pub mod certificate_actions;
 pub mod certificate_inventory;
 pub mod certificates;
 pub mod config;
@@ -36,6 +37,7 @@ pub mod telemetry;
 pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
+pub use certificate_actions::{CertificateAction, CertificateActionBlock, CertificateActionState};
 pub use certificate_inventory::{CertificateFacts, CertificateInventory, CertificatePhase};
 pub use config::{
     ClientConfig, ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS,

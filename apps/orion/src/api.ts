@@ -6,6 +6,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   About,
+  CertificateAction,
+  CertificateActionState,
   CertificateInventory,
   ClientConfig,
   ClientEvent,
@@ -78,6 +80,25 @@ export const keyNegotiationSupport = () =>
  */
 export const certificateInventory = (keyNegotiation: KeyNegotiationSettings | null) =>
   invoke<CertificateInventory>('certificate_inventory', { keyNegotiation })
+
+/**
+ * State of the four certificate actions of spec §12.2, for one profile.
+ *
+ * The decision is the shell's, beside the state it reads. This side renders
+ * the reason it is given and never composes one: a screen that guessed why an
+ * action is unavailable would eventually guess wrong, and it would guess in
+ * the reassuring direction.
+ */
+export const certificateActions = (keyNegotiation: KeyNegotiationSettings | null) =>
+  invoke<CertificateActionState[]>('certificate_actions', { keyNegotiation })
+
+/** Runs one of them, or rejects with the reason it cannot run. */
+export const runCertificateAction = (name: string, action: CertificateAction) =>
+  invoke<void>('run_certificate_action', { name, action })
+
+/** The last certificate action that failed on this profile, if any. */
+export const lastCertificateError = (name: string) =>
+  invoke<string | null>('last_certificate_error', { name })
 
 /**
  * Draws a WireGuard key pair in Rust and returns its **public** half.
