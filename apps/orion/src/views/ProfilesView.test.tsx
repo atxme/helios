@@ -569,6 +569,39 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledWith('portable'))
   })
 
+  /**
+   * A wg-quick file carries `DNS`, `MTU`, `Table`. The profile imports, and
+   * what will not be honoured is said — dropping it silently would hand back a
+   * tunnel that differs from the one the file describes.
+   */
+  it('reports what an imported WireGuard file said and Orion does not apply', async () => {
+    const handlers = callbacks()
+    handlers.onImport.mockResolvedValue({
+      profile: profile({ name: 'fournisseur' }),
+      identity_sealed: false,
+      identity_error: null,
+      private_key_missing: null,
+      incomplete: null,
+      notices: ['DNS = 100.64.0.1 : Orion n’applique pas de serveur DNS.'],
+    })
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(input, 'files', {
+      value: [new File(['[Interface]'], 'fournisseur.conf')],
+    })
+    fireEvent.change(input)
+
+    await waitFor(() => expect(screen.getByText(/n’applique pas de serveur DNS/)).toBeTruthy())
+    // Appended, not substituted: the profile still loaded.
+    expect(screen.getByText(/« fournisseur » chargé/)).toBeTruthy()
+  })
+
   it('imports normal, incomplete, oversized and unreadable documents', async () => {
     const handlers = callbacks()
     const outcome = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
@@ -577,6 +610,7 @@ describe('ProfilesView interactions', () => {
       identity_error: null,
       private_key_missing: null,
       incomplete: null,
+      notices: [],
       ...overrides,
     })
     handlers.onImport.mockResolvedValueOnce(outcome())

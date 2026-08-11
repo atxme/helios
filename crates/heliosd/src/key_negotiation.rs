@@ -2826,6 +2826,7 @@ mod tests {
                 gateway_pq_certificate: base64::engine::general_purpose::STANDARD
                     .encode(serde_json::to_vec(&gateway_pq_certificate).unwrap()),
                 identity: "orion".into(),
+                trust: None,
             }),
             ..orion_core::ClientProfile::default()
         };

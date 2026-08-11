@@ -20,23 +20,27 @@
 //! and the `astra-signer` companion, which Astra itself refuses with `501`
 //! (spec §12.3). That is a known, documented gap.
 //!
-//! The other two are blocked by something narrower and worth naming exactly:
-//! **an Orion profile does not carry the trust material a renewal needs.** The
-//! ordinary §7 renewal has the client sign a rotation request, hand it to
-//! Astra's delegated issuer, relay the resulting staging to the gateway, and
-//! commit the grant it gets back. To do that a client must hold, at minimum,
-//! the trust domain identifier, the Astra authority it is allowed to talk to
-//! with its pinned service key, and the client `CA-TLS` anchor its own new
-//! leaf will chain to. A profile holds none of the three: it pins the
-//! *gateway's* material and the name of a protected identity, and nothing
-//! else.
+//! The other two are blocked by one of two things, and which one matters: the
+//! first is the operator's to fix, the second is ours.
 //!
-//! That is the `helios_key_negotiation` profile discriminant of §19 — a format
-//! migration touching `network.toml`, the `.orion` document, the vault
-//! manifest and both interfaces. Until it lands, a renewal button would either
-//! lie or fail at the last step, after having generated a key pair and asked
-//! an authority to certify it. [`CertificateActionBlock::TrustMaterialMissing`]
-//! says so, by name, before anything is generated.
+//! The ordinary §7 renewal has the client sign a rotation request, hand it to
+//! Astra's delegated issuer, relay the resulting staging to the gateway, and
+//! commit the grant it gets back. To do that a client must hold the trust
+//! domain identifier, the Astra authority it is allowed to talk to with its
+//! pinned service key, and the client `CA-TLS` anchor its own new leaf will
+//! chain to. **A profile enrolled before §19 carries none of the three** — it
+//! pins the *gateway's* material and the name of a protected identity, and
+//! nothing else.
+//!
+//! That material now has a home — `KeyNegotiationSettings::trust`, carried by
+//! the `.orion` document and the vault manifest — so a profile enrolled since
+//! §19 holds it. What remains is the client half of the §7 exchange itself,
+//! and [`CertificateActionBlock::RenewalPathNotWired`] names that instead.
+//!
+//! Either way the refusal happens **before** a key pair is generated or an
+//! authority is asked to certify anything: a button that produced a key and
+//! then discovered it could not finish would leave a half-rotation behind on
+//! every press.
 
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +107,8 @@ pub enum CertificateActionBlock {
     /// The profile carries no trust domain, no Astra authority and no client
     /// `CA-TLS`: §19's discriminant.
     TrustMaterialMissing,
+    /// The trust material is there; the client half of §7 is not wired yet.
+    RenewalPathNotWired,
     /// Needs a hardware credential and the `astra-signer` companion.
     OperatorCredentialRequired,
 }
@@ -138,9 +144,15 @@ impl CertificateActionBlock {
             }
             Self::TrustMaterialMissing => {
                 "Ce profil ne porte pas le matériel de confiance qu'un renouvellement exige — \
-                 domaine de confiance, autorité Astra épinglée et CA TLS cliente. Le format de \
-                 profil ne les transporte pas encore ; le renouvellement reste celui de \
-                 l'opérateur, qui réémet, et de l'import du nouveau fichier."
+                 domaine de confiance, autorité Astra épinglée et CA TLS cliente. Il a été \
+                 enrôlé avant que le format ne les transporte : demander à l'opérateur un \
+                 document réémis, qui les portera."
+                    .into()
+            }
+            Self::RenewalPathNotWired => {
+                "Ce profil porte bien son matériel de confiance, mais le chemin de \
+                 renouvellement du §7 — requête au délégué Astra, staging relayé à la gateway, \
+                 commit du grant — n'est pas encore branché côté client."
                     .into()
             }
             Self::OperatorCredentialRequired => {
@@ -193,7 +205,13 @@ fn renewal_block(
             identity: settings.identity.clone(),
         });
     }
-    Some(CertificateActionBlock::TrustMaterialMissing)
+    // The §19 material, if the document carried it. A profile written before
+    // the discriminant has none, and that is the honest reason to give — it is
+    // the one the operator can fix, by re-issuing a document that carries it.
+    if settings.trust.is_none() {
+        return Some(CertificateActionBlock::TrustMaterialMissing);
+    }
+    Some(CertificateActionBlock::RenewalPathNotWired)
 }
 
 /// Whether anything this profile depends on has already expired.
@@ -302,6 +320,7 @@ mod tests {
             gateway_ca_der: String::new(),
             gateway_pq_certificate: String::new(),
             identity: "orion-poste".into(),
+            trust: None,
         }
     }
 
@@ -373,7 +392,8 @@ mod tests {
     }
 
     /// With everything present locally, what remains is the format gap — and
-    /// it is named, because it is the one thing the user cannot fix.
+    /// it is named, because it is the operator who fixes it, by re-issuing a
+    /// document that carries the material.
     #[test]
     fn a_ready_machine_is_blocked_only_on_the_missing_trust_material() {
         let settings = settings();
@@ -396,6 +416,38 @@ mod tests {
             .message
             .as_ref()
             .is_some_and(|message| message.contains("domaine de confiance")));
+    }
+
+    /// A profile enrolled since §19 carries the material, so the reason moves
+    /// to the one thing left: the client half of the exchange. Naming the
+    /// format gap there would send the operator re-issuing a document that is
+    /// already correct.
+    #[test]
+    fn a_profile_carrying_its_trust_material_is_blocked_on_the_path_instead() {
+        let mut settings = settings();
+        settings.trust = Some(crate::config::TrustMaterial {
+            trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
+            ca_epoch: 1,
+            ca_pq_public_key: String::new(),
+            ca_tls_epoch: 1,
+            client_tls_ca_der: String::new(),
+            client_generation: 4,
+            astra_authority_url: "https://astra.example".into(),
+            astra_service_key_epoch: 1,
+            astra_service_public_key: String::new(),
+        });
+        let inventory = CertificateInventory {
+            identity_sealed: true,
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &inventory, true),
+                CertificateAction::RenewNow
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::RenewalPathNotWired)
+        );
     }
 
     /// Recovery answers about expiry first. Telling a user with healthy

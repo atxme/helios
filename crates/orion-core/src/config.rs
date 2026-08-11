@@ -53,6 +53,124 @@ pub struct KeyNegotiationSettings {
     pub gateway_pq_certificate: String,
     /// Opaque lookup name in the shell's protected identity store.
     pub identity: String,
+    /// What this client needs to renew its own identity (spec §19).
+    ///
+    /// Optional, and that is the migration in progress: a document written
+    /// before §19 carries none, and such a profile connects exactly as before
+    /// while being unable to rotate. `certificate_actions` names that gap
+    /// rather than offering a button that would fail at the last step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<TrustMaterial>,
+}
+
+/// The trust material a §7 renewal needs, and that a profile used not to hold.
+///
+/// # Why each field is here
+///
+/// A renewal has the client sign a rotation request, hand it to Astra's
+/// delegated issuer, relay the resulting staging to the gateway and commit the
+/// grant it gets back. Each step needs something the profile did not carry:
+///
+/// - the **request** is bound to a trust domain and to the generation it
+///   follows, so `trust_domain_id` and `client_generation`;
+/// - reaching the authority needs `astra_authority_url`, and believing what
+///   comes back needs the pinned `astra_service_public_key` with its epoch;
+/// - verifying the **grant** needs the anchor `ca_pq_public_key` at
+///   `ca_epoch`, and the client `CA-TLS` at `ca_tls_epoch` — the new TLS leaf
+///   chains to that one, not to the gateway CA the profile already pinned.
+///
+/// The two fingerprints of the current generation are deliberately **not**
+/// here: they are derived from the certificates in the protected store, and a
+/// second copy in a file an operator edits is a second thing that can be
+/// wrong.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustMaterial {
+    /// 32 lowercase hex characters — 16 bytes.
+    pub trust_domain_id: String,
+    pub ca_epoch: u64,
+    /// `CA-PQ`, base64 ML-DSA-87. The anchor, **not** the pinned gateway leaf.
+    pub ca_pq_public_key: String,
+    pub ca_tls_epoch: u64,
+    /// Client TLS anchor, base64 DER.
+    pub client_tls_ca_der: String,
+    /// Generation this client's current identity is at.
+    pub client_generation: u64,
+    pub astra_authority_url: String,
+    pub astra_service_key_epoch: u64,
+    /// Astra's service key, base64 ML-DSA-87.
+    pub astra_service_public_key: String,
+}
+
+impl TrustMaterial {
+    /// Decodes and checks every field, or names the one that is wrong.
+    ///
+    /// Called at import and by [`validate_key_negotiation`], so a document
+    /// whose trust block is unusable is refused when it arrives rather than at
+    /// the first renewal — 80 % into a leaf's life, which is the worst moment
+    /// to discover a typo an operator made months earlier.
+    ///
+    /// The messages are user-facing: they are displayed as-is in Orion.
+    pub fn validate(&self) -> Result<()> {
+        aether::certificates::encoding::TrustDomainId::parse_hex(self.trust_domain_id.trim())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "identifiant de domaine de confiance invalide : 32 caractères hexadécimaux \
+                     attendus"
+                )
+            })?;
+        aether::certificates::encoding::MlDsa87PublicKey::parse(self.ca_pq_public_key.trim())
+            .map_err(|_| anyhow::anyhow!("clé publique CA-PQ illisible"))?;
+        aether::certificates::encoding::MlDsa87PublicKey::parse(
+            self.astra_service_public_key.trim(),
+        )
+        .map_err(|_| anyhow::anyhow!("clé de service Astra illisible"))?;
+
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(self.client_tls_ca_der.trim())
+            .map_err(|_| anyhow::anyhow!("CA TLS cliente : base64 illisible"))?;
+        let certificate = aether::certificates::encoding::DerCertificate::new(der)
+            .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))?;
+        // A real authority, checked by the same validator the lifecycle uses.
+        // A byte string that merely decodes would fail at the first chain
+        // verification, on the machine that can least afford it.
+        aether::certificates::x509::assert_certificate_authority(&certificate)
+            .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))?;
+
+        if self.astra_authority_url.trim().is_empty() {
+            anyhow::bail!("l'URL de l'autorité Astra est vide");
+        }
+        // Astra authenticates itself by its pinned ML-DSA-87 service key, not
+        // by its transport (spec §9.6). `https` is still required: without it
+        // an observer reads which client renews, and when.
+        if !self.astra_authority_url.trim().starts_with("https://") {
+            anyhow::bail!("l'URL de l'autorité Astra doit être en https://");
+        }
+        if self.ca_epoch == 0 || self.ca_tls_epoch == 0 || self.astra_service_key_epoch == 0 {
+            anyhow::bail!("les compteurs d'autorité commencent à 1");
+        }
+        Ok(())
+    }
+
+    /// The trust domain identifier, decoded.
+    pub fn trust_domain(&self) -> Result<aether::certificates::encoding::TrustDomainId> {
+        aether::certificates::encoding::TrustDomainId::parse_hex(self.trust_domain_id.trim())
+            .map_err(|_| anyhow::anyhow!("identifiant de domaine de confiance invalide"))
+    }
+
+    /// `CA-PQ`, decoded.
+    pub fn ca_pq(&self) -> Result<aether::certificates::encoding::MlDsa87PublicKey> {
+        aether::certificates::encoding::MlDsa87PublicKey::parse(self.ca_pq_public_key.trim())
+            .map_err(|_| anyhow::anyhow!("clé publique CA-PQ illisible"))
+    }
+
+    /// The client TLS anchor, decoded.
+    pub fn client_tls_ca(&self) -> Result<aether::certificates::encoding::DerCertificate> {
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(self.client_tls_ca_der.trim())
+            .map_err(|_| anyhow::anyhow!("CA TLS cliente : base64 illisible"))?;
+        aether::certificates::encoding::DerCertificate::new(der)
+            .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))
+    }
 }
 
 impl KeyNegotiationSettings {
@@ -556,6 +674,7 @@ mod tests {
                 gateway_ca_der: "MIIB".into(),
                 gateway_pq_certificate: "e30=".into(),
                 identity: "orion-poste".into(),
+                trust: None,
             }),
             ..ClientProfile::default()
         }

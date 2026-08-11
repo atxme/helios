@@ -346,6 +346,7 @@ mod tests {
             gateway_ca_der: "pas du base64 !".into(),
             gateway_pq_certificate: "pas du base64 !".into(),
             identity: String::new(),
+            trust: None,
         };
         let found = inventory(Some(&settings), 1_000);
         assert!(found.gateway_pq.is_none());

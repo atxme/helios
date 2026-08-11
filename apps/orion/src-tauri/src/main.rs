@@ -736,6 +736,14 @@ struct ImportOutcome {
     private_key_missing: Option<String>,
     /// What else the document leaves to fill in, if anything.
     incomplete: Option<String>,
+    /// What the document said that Orion read and does **not** apply.
+    ///
+    /// A wg-quick file routinely carries `DNS`, `MTU` or `Table`. Refusing the
+    /// file over them made Orion unable to open an ordinary WireGuard
+    /// configuration; dropping them without a word would hand back a tunnel
+    /// that differs from the one the file describes. They are imported, and
+    /// reported.
+    notices: Vec<String>,
 }
 
 /// Seals the identity shipped with a document, if any.
@@ -818,8 +826,13 @@ async fn finish_import(
     let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let mut completed = {
         let config = state.config.lock().await;
-        complete_profile_import(imported.profile, &config, admitted.as_deref())
-            .map_err(|error| error.to_string())?
+        complete_profile_import(
+            imported.profile,
+            &config,
+            admitted.as_deref(),
+            imported.notices,
+        )
+        .map_err(|error| error.to_string())?
     };
 
     // The staged key is the missing candidate.
@@ -897,6 +910,7 @@ async fn finish_import(
         identity_error,
         private_key_missing: completed.private_key_missing,
         incomplete: completed.incomplete,
+        notices: completed.notices,
     })
 }
 

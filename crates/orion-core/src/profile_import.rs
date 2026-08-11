@@ -51,6 +51,13 @@ struct JsonHeader {
 struct JsonProfile {
     /// The one required field: it is the key the profile is stored under.
     name: String,
+    /// What this document claims to be (spec §19).
+    ///
+    /// Absent in a document written before the field existed; the kind is
+    /// then inferred from the negotiation block, which is the behaviour this
+    /// field exists to stop relying on.
+    #[serde(default)]
+    profile_type: Option<ProfileKind>,
     /// `default`, like everything below it.
     ///
     /// An operator hands out what they know, and a document is allowed to be
@@ -108,6 +115,35 @@ struct JsonKeyNegotiation {
     gateway_ca_der: String,
     gateway_pq_certificate: String,
     identity: String,
+    /// Trust material of spec §19. Absent in a document written before it.
+    #[serde(default)]
+    trust: Option<crate::config::TrustMaterial>,
+}
+
+/// What kind of profile a document declares (spec §19, §22).
+///
+/// # Why an explicit discriminant, when the block already says it
+///
+/// It used to be inferred: a `key_negotiation` block meant a Helios profile,
+/// its absence meant classic. Inference reads a **presence** as an
+/// **intention**, and the two come apart in the direction that matters — a
+/// document whose negotiation block was dropped by an editor, a conversion, a
+/// hand-written file missing a brace, all arrive looking exactly like a
+/// deliberate classic profile. Orion would then mount a tunnel with no
+/// pre-WireGuard authentication and report nothing, because from its side
+/// nothing was wrong.
+///
+/// So the document says which it is, and a document that claims
+/// `helios_key_negotiation` without a block is refused instead of silently
+/// downgraded. Inference survives only for documents written before the field
+/// existed, where there is nothing else to go on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    /// A plain WireGuard peer. No negotiation block, and none expected.
+    Classic,
+    /// A Helios profile: the negotiation block is mandatory.
+    HeliosKeyNegotiation,
 }
 
 impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
@@ -126,6 +162,7 @@ impl From<JsonKeyNegotiation> for KeyNegotiationSettings {
             gateway_ca_der: value.gateway_ca_der,
             gateway_pq_certificate: value.gateway_pq_certificate,
             identity: value.identity,
+            trust: value.trust,
         }
     }
 }
@@ -166,6 +203,13 @@ pub struct ProfileImport {
     pub profile: ClientProfile,
     /// Present only when the operator shipped the identity in the document.
     pub identity: Option<ClientIdentityBundle>,
+    /// What the document said that Orion read but does **not** apply.
+    ///
+    /// Distinct from [`CompletedImport::incomplete`], which is about a field
+    /// left to fill. These are fields that were *understood and dropped* — a
+    /// `DNS` line, an `MTU` — and dropping one silently changes the tunnel's
+    /// behaviour without changing anything the user can see.
+    pub notices: Vec<String>,
 }
 
 impl ProfileImport {
@@ -200,6 +244,12 @@ impl ProfileImport {
 #[derive(Debug)]
 pub struct CompletedImport {
     pub profile: ClientProfile,
+    /// What the document said that Orion read but does not apply.
+    ///
+    /// Carried through from [`ProfileImport::notices`]: the completion step
+    /// changes nothing about them, and dropping them here would undo the
+    /// point of reading them at all.
+    pub notices: Vec<String>,
     /// User-facing explanation when no local profile holds the private half.
     /// The profile is then handed over with an empty `private_key`, and
     /// stays unconnectable until it is filled in.
@@ -248,10 +298,12 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
         .any(|suffix| lower_name.ends_with(suffix));
     // wg-quick has no notion of a client identity: only the Orion document
     // can carry one.
-    let (profile, identity) = if named_orion || trimmed.starts_with('{') {
-        parse_json(trimmed)?
+    let (profile, identity, notices) = if named_orion || trimmed.starts_with('{') {
+        let (profile, identity) = parse_json(trimmed)?;
+        (profile, identity, Vec::new())
     } else if lower_name.ends_with(".conf") || trimmed.starts_with('[') {
-        (parse_wg_quick(trimmed, file_name)?, None)
+        let parsed = parse_wg_quick(trimmed, file_name)?;
+        (parsed.profile, None, parsed.notices)
     } else {
         anyhow::bail!(
             "format inconnu : « {file_name} » ne commence ni par « {{ » (document Orion) ni par « [ » (profil WireGuard) — {}",
@@ -275,7 +327,11 @@ pub fn parse_profile_import(contents: &str, file_name: &str) -> Result<ProfileIm
             );
         }
     }
-    Ok(ProfileImport { profile, identity })
+    Ok(ProfileImport {
+        profile,
+        identity,
+        notices,
+    })
 }
 
 /// Reads a profile from a path without ever allocating more than the import
@@ -386,11 +442,13 @@ pub fn complete_profile_import(
     mut profile: ClientProfile,
     config: &ClientConfig,
     admitted_public_key: Option<&str>,
+    notices: Vec<String>,
 ) -> Result<CompletedImport> {
     if !profile.private_key.is_empty() {
         let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
+            notices,
             private_key_missing: None,
             incomplete,
         });
@@ -428,6 +486,7 @@ pub fn complete_profile_import(
         let incomplete = advisory(&profile);
         return Ok(CompletedImport {
             profile,
+            notices,
             private_key_missing: Some(missing),
             incomplete,
         });
@@ -437,6 +496,7 @@ pub fn complete_profile_import(
     let incomplete = advisory(&profile);
     Ok(CompletedImport {
         profile,
+        notices,
         private_key_missing: None,
         incomplete,
     })
@@ -496,6 +556,39 @@ fn parse_json(contents: &str) -> Result<(ClientProfile, Option<ClientIdentityBun
     // and that is the property worth keeping — the secret cannot reach
     // `profiles.toml` by way of a struct update.
     let identity = profile.key_negotiation_identity.take();
+
+    // The discriminant of spec §19, checked against what the document
+    // actually carries. A claim and a content that disagree is the case the
+    // field exists for: inferring from the block would have accepted both
+    // silently, and one of the two is a profile that mounts a tunnel with no
+    // pre-WireGuard authentication.
+    let declared = profile.profile_type;
+    let has_block = profile.key_negotiation.is_some();
+    match (declared, has_block) {
+        (Some(ProfileKind::HeliosKeyNegotiation), false) => anyhow::bail!(
+            "ce document se déclare « helios_key_negotiation » mais ne porte pas de bloc de \
+             négociation : un profil Helios sans négociation monterait un tunnel sans \
+             authentification avant WireGuard"
+        ),
+        (Some(ProfileKind::Classic), true) => anyhow::bail!(
+            "ce document se déclare « classic » mais porte un bloc de négociation : l'un des \
+             deux est faux, et deviner lequel reviendrait à choisir un niveau de protection à \
+             la place de l'opérateur"
+        ),
+        // No claim: inferred, as documents written before §19 have always
+        // been read. This is the arm the discriminant exists to retire.
+        _ => {}
+    }
+
+    if let Some(trust) = profile
+        .key_negotiation
+        .as_ref()
+        .and_then(|block| block.trust.as_ref())
+    {
+        trust
+            .validate()
+            .context("matériel de confiance du document")?;
+    }
     Ok((profile.into(), identity))
 }
 
@@ -505,7 +598,71 @@ enum WgSection {
     Peer,
 }
 
-fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
+/// A wg-quick file, read into a profile plus what was dropped along the way.
+struct WgQuickImport {
+    profile: ClientProfile,
+    notices: Vec<String>,
+}
+
+/// wg-quick properties Orion reads and applies.
+const WG_APPLIED_INTERFACE: &[&str] = &["privatekey", "address"];
+const WG_APPLIED_PEER: &[&str] = &[
+    "publickey",
+    "presharedkey",
+    "allowedips",
+    "endpoint",
+    "persistentkeepalive",
+];
+
+/// Properties Orion understands, does not apply, and **says so**.
+///
+/// Refusing the file over these was the wrong trade: they appear in almost
+/// every configuration a provider hands out, and a client that cannot open a
+/// normal WireGuard file is not a WireGuard client. Dropping them silently is
+/// the other wrong trade — a `DNS` line that vanishes takes name resolution
+/// with it, and the user sees a tunnel that works and a browser that does not.
+///
+/// So each one is imported as a notice naming the consequence.
+fn wg_unapplied_notice(field: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    Some(match field {
+        // Orion does not tunnel DNS at all — the same documented limit the
+        // gateway's ruleset carries. Naming it here is the only chance the
+        // user has to learn it before the queries leave in the clear.
+        "dns" => format!(
+            "DNS = {value} : Orion n'applique pas de serveur DNS et ne tunnelise pas les \
+             requêtes de résolution ; elles sortiront hors du tunnel."
+        ),
+        "mtu" => format!(
+            "MTU = {value} : Orion laisse l'adaptateur choisir son MTU. Un chemin qui exigeait \
+             cette valeur peut fragmenter."
+        ),
+        "table" => {
+            format!("Table = {value} : Orion pose ses routes lui-même, à partir du trafic capté.")
+        }
+        "listenport" => {
+            format!("ListenPort = {value} : Orion laisse le système attribuer le port source.")
+        }
+        "fwmark" => format!("FwMark = {value} : Orion ne marque pas ses paquets."),
+        _ => return None,
+    })
+}
+
+/// Properties Orion refuses, because they run something.
+///
+/// A `PostUp` is a shell command the configuration depends on — a firewall
+/// rule, a route, a resolver swap. Orion will not execute it, and importing
+/// the file **without** it would produce a tunnel the author never described.
+/// This is the one class where refusing is right: the alternative is a profile
+/// that looks identical and behaves differently.
+fn wg_executable_field(field: &str) -> bool {
+    matches!(
+        field,
+        "preup" | "postup" | "predown" | "postdown" | "saveconfig"
+    )
+}
+
+fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickImport> {
     let mut section = None;
     let mut interface = HashMap::new();
     let mut peer = HashMap::new();
@@ -567,18 +724,14 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
     if interface_count == 0 {
         anyhow::bail!("section [Interface] absente du fichier WireGuard");
     }
-    reject_unsupported_fields(&interface, &["privatekey", "address"], "[Interface]")?;
-    reject_unsupported_fields(
-        &peer,
-        &[
-            "publickey",
-            "presharedkey",
-            "allowedips",
-            "endpoint",
-            "persistentkeepalive",
-        ],
-        "[Peer]",
+    let mut notices = Vec::new();
+    classify_wg_fields(
+        &interface,
+        WG_APPLIED_INTERFACE,
+        "[Interface]",
+        &mut notices,
     )?;
+    classify_wg_fields(&peer, WG_APPLIED_PEER, "[Peer]", &mut notices)?;
 
     let keepalive = match peer.get("persistentkeepalive") {
         Some(raw) => raw
@@ -587,7 +740,7 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
         None => DEFAULT_KEEPALIVE_SECS,
     };
 
-    Ok(ClientProfile {
+    let profile = ClientProfile {
         name: profile_name_from_file(file_name),
         endpoint: required_field(&peer, "endpoint", "Endpoint")?,
         private_key: required_field(&interface, "privatekey", "PrivateKey")?,
@@ -603,21 +756,46 @@ fn parse_wg_quick(contents: &str, file_name: &str) -> Result<ClientProfile> {
         ssh_target: None,
         key_negotiation: None,
         preshared_key_is_negotiated: false,
-    })
+    };
+    Ok(WgQuickImport { profile, notices })
 }
 
-fn reject_unsupported_fields(
+/// Sorts a section's properties into applied, reported and refused.
+///
+/// The three classes are the whole point. An allowlist alone refused ordinary
+/// files; no list at all would drop, without a word, lines the tunnel's
+/// behaviour depends on.
+fn classify_wg_fields(
     fields: &HashMap<String, String>,
-    supported: &[&str],
+    applied: &[&str],
     section: &str,
+    notices: &mut Vec<String>,
 ) -> Result<()> {
-    if let Some(field) = fields
-        .keys()
-        .find(|field| !supported.contains(&field.as_str()))
-    {
-        anyhow::bail!(
-            "propriété {field} de {section} non prise en charge par Orion ; la retirer modifierait le comportement du profil"
-        );
+    // Sorted, so two imports of one file report the same thing in the same
+    // order: a notice list that shuffled between runs reads as new problems.
+    let mut names: Vec<&String> = fields.keys().collect();
+    names.sort();
+    for field in names {
+        if applied.contains(&field.as_str()) {
+            continue;
+        }
+        if wg_executable_field(field) {
+            anyhow::bail!(
+                "propriété {field} de {section} : Orion n'exécute aucune commande d'un fichier \
+                 importé, et l'importer sans elle produirait un tunnel différent de celui que ce \
+                 fichier décrit. La retirer du fichier, en connaissance de cause, permet l'import."
+            );
+        }
+        match wg_unapplied_notice(field, &fields[field]) {
+            Some(notice) => notices.push(notice),
+            // A property nobody here knows about could mean anything, and
+            // guessing which half of the trade it falls on is how a silent
+            // behaviour change gets shipped.
+            None => anyhow::bail!(
+                "propriété {field} de {section} inconnue d'Orion ; la retirer modifierait \
+                 peut-être le comportement du profil"
+            ),
+        }
     }
     Ok(())
 }
@@ -1443,6 +1621,7 @@ mod tests {
             gateway_ca_der: STANDARD.encode([0x30, 0x82, 0x01, 0x00]),
             gateway_pq_certificate: STANDARD.encode(serde_json::to_vec(&certificate).unwrap()),
             identity: "orion-portable".into(),
+            trust: None,
         }
     }
 
@@ -1460,6 +1639,143 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// A document declaring its kind, with or without a negotiation block.
+    fn document_of_kind(kind: &str, settings: Option<serde_json::Value>) -> String {
+        let mut profile = serde_json::json!({
+            "name": "portable",
+            "endpoint": "vpn.example.net:51820",
+            "private_key": CLIENT_PRIVATE,
+            "peer_public_key": GATEWAY_PUBLIC,
+            "address": "100.64.1.2/32",
+            "profile_type": kind,
+        });
+        if let Some(settings) = settings {
+            profile
+                .as_object_mut()
+                .unwrap()
+                .insert("key_negotiation".into(), settings);
+        }
+        serde_json::json!({
+            "format": PROFILE_IMPORT_FORMAT,
+            "version": PROFILE_IMPORT_VERSION,
+            "profile": profile,
+        })
+        .to_string()
+    }
+
+    /// The discriminant of spec §19: a claim and a content that disagree are
+    /// refused, in both directions.
+    ///
+    /// Inference reads a **presence** as an **intention**, and the two come
+    /// apart in the direction that matters: a negotiation block dropped by an
+    /// editor arrives looking exactly like a deliberate classic profile, and
+    /// Orion would mount a tunnel with no pre-WireGuard authentication and
+    /// report nothing.
+    #[test]
+    fn a_declared_kind_that_contradicts_the_document_is_refused() {
+        let settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+
+        let error = parse_profile_import(
+            &document_of_kind("helios_key_negotiation", None),
+            "portable.orion",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ne porte pas de bloc de négociation"));
+
+        let error = parse_profile_import(
+            &document_of_kind("classic", Some(settings.clone())),
+            "portable.orion",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("se déclare « classic »"));
+
+        // And the two consistent documents import.
+        parse_profile_import(&document_of_kind("classic", None), "portable.orion")
+            .expect("a declared classic profile without a block");
+        parse_profile_import(
+            &document_of_kind("helios_key_negotiation", Some(settings)),
+            "portable.orion",
+        )
+        .expect("a declared Helios profile with its block");
+    }
+
+    /// A document written before §19 declares nothing, and is still inferred.
+    /// That arm is what the discriminant exists to retire, not to break.
+    #[test]
+    fn a_document_without_a_declared_kind_is_still_inferred() {
+        let settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+        let imported = parse_profile_import(&document_with(settings), "portable.orion")
+            .expect("a document written before the discriminant");
+        assert!(imported.profile.key_negotiation.is_some());
+    }
+
+    /// The trust material is checked when it arrives, not at the first
+    /// renewal — 80 % into a leaf's life is the worst moment to discover a
+    /// typo an operator made months earlier.
+    #[test]
+    fn an_unusable_trust_block_is_refused_at_import() {
+        let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+        settings.as_object_mut().unwrap().insert(
+            "trust".into(),
+            serde_json::json!({
+                "trust_domain_id": "pas de l'hexadécimal",
+                "ca_epoch": 1,
+                "ca_pq_public_key": "",
+                "ca_tls_epoch": 1,
+                "client_tls_ca_der": "",
+                "client_generation": 4,
+                "astra_authority_url": "https://astra.example",
+                "astra_service_key_epoch": 1,
+                "astra_service_public_key": "",
+            }),
+        );
+        let error = parse_profile_import(&document_with(settings), "portable.orion")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("matériel de confiance"));
+    }
+
+    /// A genuine trust block imports, and reaches the profile intact.
+    #[test]
+    fn a_genuine_trust_block_reaches_the_profile() {
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+        use base64::engine::general_purpose::STANDARD;
+
+        let (_, ca_pq) = generate_ml_dsa_87_keypair().unwrap();
+        let (_, astra) = generate_ml_dsa_87_keypair().unwrap();
+        let ca_tls = aether::certificates::test_x509::certificate_authority("CA-TLS");
+
+        let mut settings = serde_json::to_value(gateway_settings(ProtectionMode::MlKem)).unwrap();
+        settings.as_object_mut().unwrap().insert(
+            "trust".into(),
+            serde_json::json!({
+                "trust_domain_id": "0102030405060708090a0b0c0d0e0f10",
+                "ca_epoch": 2,
+                "ca_pq_public_key": ca_pq.to_base64(),
+                "ca_tls_epoch": 1,
+                "client_tls_ca_der": STANDARD.encode(ca_tls.as_bytes()),
+                "client_generation": 4,
+                "astra_authority_url": "https://astra.example",
+                "astra_service_key_epoch": 1,
+                "astra_service_public_key": astra.to_base64(),
+            }),
+        );
+        let imported = parse_profile_import(&document_with(settings), "portable.orion")
+            .expect("a genuine trust block");
+        let trust = imported
+            .profile
+            .key_negotiation
+            .and_then(|block| block.trust)
+            .expect("the trust material reaches the profile");
+        assert_eq!(trust.ca_epoch, 2);
+        assert_eq!(trust.client_generation, 4);
+        assert!(trust.trust_domain().is_ok());
+        assert!(trust.ca_pq().is_ok());
+        assert!(trust.client_tls_ca().is_ok());
     }
 
     /// The operator document is the vehicle for the negotiation settings:
@@ -1680,8 +1996,9 @@ mod tests {
             DEFAULT_KEEPALIVE_SECS
         );
 
-        let completed = complete_profile_import(imported.profile, &ClientConfig::default(), None)
-            .expect("l'import ne refuse pas un document incomplet");
+        let completed =
+            complete_profile_import(imported.profile, &ClientConfig::default(), None, Vec::new())
+                .expect("l'import ne refuse pas un document incomplet");
         assert!(
             completed.private_key_missing.is_some(),
             "l'absence de clé privée doit être nommée"
@@ -1701,7 +2018,8 @@ mod tests {
             ..complete_profile()
         };
         let completed =
-            complete_profile_import(profile, &ClientConfig::default(), None).expect("import");
+            complete_profile_import(profile, &ClientConfig::default(), None, Vec::new())
+                .expect("import");
         assert!(completed.private_key_missing.is_none());
         assert!(
             completed.incomplete.is_none(),
@@ -1771,7 +2089,7 @@ mod tests {
             ..complete_profile()
         });
 
-        let completed = complete_profile_import(imported.profile, &config, None)
+        let completed = complete_profile_import(imported.profile, &config, None, Vec::new())
             .unwrap()
             .profile;
         assert_eq!(completed.private_key, CLIENT_PRIVATE);
@@ -1818,8 +2136,13 @@ mod tests {
         });
 
         let admitted_key = imported.admitted_public_key();
-        let completed =
-            complete_profile_import(imported.profile, &config, admitted_key.as_deref()).unwrap();
+        let completed = complete_profile_import(
+            imported.profile,
+            &config,
+            admitted_key.as_deref(),
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(completed.private_key_missing, None);
         assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
         assert_eq!(completed.profile.name, "portable");
@@ -1840,8 +2163,13 @@ mod tests {
             ..complete_profile()
         });
 
-        let completed =
-            complete_profile_import(invitation, &config, Some("une-autre-clé-publique")).unwrap();
+        let completed = complete_profile_import(
+            invitation,
+            &config,
+            Some("une-autre-clé-publique"),
+            Vec::new(),
+        )
+        .unwrap();
         let message = completed
             .private_key_missing
             .expect("an unadmitted local key must not complete the document");
@@ -1938,7 +2266,7 @@ mod tests {
             selected: None,
         };
 
-        let completed = complete_profile_import(invitation, &config, None).unwrap();
+        let completed = complete_profile_import(invitation, &config, None, Vec::new()).unwrap();
         assert_eq!(completed.private_key_missing, None);
         assert_eq!(completed.profile.private_key, CLIENT_PRIVATE);
     }
@@ -1957,7 +2285,8 @@ mod tests {
         // which endpoint and which address were issued, and can paste the
         // key rather than being told to start over.
         let completed =
-            complete_profile_import(invitation, &ClientConfig::default(), None).unwrap();
+            complete_profile_import(invitation, &ClientConfig::default(), None, Vec::new())
+                .unwrap();
         let message = completed
             .private_key_missing
             .expect("the absence of a key must be reported");
@@ -2060,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_multiple_peers_and_unapplied_options() {
+    fn refuses_multiple_peers() {
         let multiple = format!(
             "[Interface]\nPrivateKey={CLIENT_PRIVATE}\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\n[Peer]\nPublicKey={GATEWAY_PUBLIC}"
         );
@@ -2068,14 +2397,64 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("un seul pair"));
+    }
 
-        let dns = format!(
-            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nDNS=100.64.0.1\n[Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    /// An ordinary provider file carries `DNS`, `MTU`, `Table`. Refusing it
+    /// over them made Orion unable to open a normal WireGuard configuration;
+    /// dropping them without a word would hand back a different tunnel.
+    #[test]
+    fn an_ordinary_wireguard_file_imports_and_reports_what_is_not_applied() {
+        let contents = format!(
+            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\nDNS=100.64.0.1\nMTU=1380\nTable=off\nListenPort=51820\n\
+             [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820\nAllowedIPs=0.0.0.0/0\nPersistentKeepalive=25"
         );
-        assert!(parse_profile_import(&dns, "dns.conf")
+        let imported = parse_profile_import(&contents, "fournisseur.conf").expect("import");
+        assert_eq!(imported.profile.endpoint, "host:51820");
+        assert_eq!(imported.profile.address.as_deref(), Some("100.64.1.2/32"));
+        assert_eq!(imported.notices.len(), 4);
+        // Sorted, so two imports of one file report the same thing in the same
+        // order.
+        assert!(imported.notices[0].starts_with("DNS = 100.64.0.1"));
+        assert!(imported
+            .notices
+            .iter()
+            .any(|notice| notice.contains("MTU = 1380")));
+        assert!(imported
+            .notices
+            .iter()
+            .any(|notice| notice.contains("Table = off")));
+        // The DNS notice names the consequence, which is the documented limit
+        // the user has no other way to learn.
+        assert!(imported.notices[0].contains("hors du tunnel"));
+    }
+
+    /// The one class where refusing is right: a command the configuration
+    /// depends on, which Orion will not run.
+    #[test]
+    fn a_wireguard_file_that_runs_a_command_is_refused_by_name() {
+        let contents = format!(
+            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nPostUp=iptables -A FORWARD -i %i -j ACCEPT\n\
+             [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+        );
+        let error = parse_profile_import(&contents, "scripted.conf")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("postup"));
+        assert!(error.contains("n'exécute aucune commande"));
+    }
+
+    /// A property nobody here knows about could mean anything, and guessing is
+    /// how a silent behaviour change gets shipped.
+    #[test]
+    fn an_unknown_wireguard_property_is_still_refused() {
+        let contents = format!(
+            "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nQuantumTunnel=on\n\
+             [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+        );
+        assert!(parse_profile_import(&contents, "odd.conf")
             .unwrap_err()
             .to_string()
-            .contains("dns"));
+            .contains("quantumtunnel"));
     }
 
     #[test]
@@ -2111,7 +2490,8 @@ mod tests {
         assert_eq!(imported.profile.address, None);
         // …and the gap is named rather than passed over in silence.
         let completed =
-            complete_profile_import(imported.profile, &ClientConfig::default(), None).unwrap();
+            complete_profile_import(imported.profile, &ClientConfig::default(), None, Vec::new())
+                .unwrap();
         assert!(completed
             .incomplete
             .expect("le manque doit être nommé")

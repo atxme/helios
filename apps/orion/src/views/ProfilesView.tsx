@@ -740,6 +740,11 @@ export function ProfilesView({
     try {
       const imported = await onImport(await readProfileDocument(file), file.name)
       const profile = imported.profile
+      // What the file said and Orion does not apply. Appended to whatever the
+      // import concluded rather than replacing it: a `DNS` line that will not
+      // be honoured does not stop a profile from being imported, and it must
+      // not hide a missing private key either.
+      const dropped = imported.notices.length > 0 ? ` ${imported.notices.join(' ')}` : ''
       const existing = config.profiles.find((candidate) => candidate.name === profile.name)
 
       loadDraft(profile)
@@ -748,14 +753,14 @@ export function ProfilesView({
       // WireGuard has nothing to sign with, and the message says which key is
       // expected — that is what lets the user act.
       if (imported.private_key_missing) {
-        setNotice({ tone: 'error', message: imported.private_key_missing })
+        setNotice({ tone: 'error', message: `${imported.private_key_missing}${dropped}` })
       }
       // A partial document is loaded, not refused: the gap is named so the
       // user can close it in the form they are already looking at.
       else if (imported.incomplete) {
         setNotice({
           tone: 'error',
-          message: `« ${profile.name} » chargé, à compléter : ${imported.incomplete}`,
+          message: `« ${profile.name} » chargé, à compléter : ${imported.incomplete}${dropped}`,
         })
       }
       // The identity failing to seal outranks the profile loading fine: the
@@ -764,7 +769,7 @@ export function ProfilesView({
       else if (imported.identity_error) {
         setNotice({
           tone: 'error',
-          message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}`,
+          message: `« ${profile.name} » chargé, mais l’identité n’a pas pu être scellée : ${imported.identity_error}${dropped}`,
         })
       } else {
         const sealed = imported.identity_sealed
@@ -773,8 +778,8 @@ export function ProfilesView({
         setNotice({
           tone: 'success',
           message: existing
-            ? `« ${profile.name} » chargé. Enregistrer remplacera le profil existant.${sealed}`
-            : `« ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.${sealed}`,
+            ? `« ${profile.name} » chargé. Enregistrer remplacera le profil existant.${sealed}${dropped}`
+            : `« ${profile.name} » chargé. Vérifiez-le puis enregistrez-le.${sealed}${dropped}`,
         })
       }
     } catch (cause) {

@@ -161,6 +161,15 @@ export interface ImportOutcome {
    * refusal belongs at Connect, not at the file picker.
    */
   incomplete: string | null
+  /**
+   * What the document said that Orion read and does **not** apply.
+   *
+   * A wg-quick file routinely carries `DNS`, `MTU` or `Table`. Refusing the
+   * file over them made Orion unable to open an ordinary WireGuard
+   * configuration; dropping them without a word would hand back a tunnel that
+   * differs from the one the file describes.
+   */
+  notices: string[]
 }
 
 /**
