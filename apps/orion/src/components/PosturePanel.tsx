@@ -22,9 +22,6 @@ import { GUTTER } from '../theme'
  * fold. What is nominal is silent; what is degraded appears.
  */
 
-/** Range that captures all traffic — the one that holds up the fail-open invariant. */
-const CAPTURE_ALL = '0.0.0.0/0'
-
 const AMBER = '#A16207'
 
 interface Props {
@@ -50,7 +47,6 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const negotiation = profile?.key_negotiation
-  const narrowed = profile ? profile.allowed_ips.trim() !== CAPTURE_ALL : false
   // Nominal is silent: the block only exists when it has something to report.
   const degraded =
     vault !== null &&
@@ -108,11 +104,11 @@ export function PosturePanel({ anchor, onClose, state, adapterUp, profile, psk, 
           copy={profile?.address ?? undefined}
           copyLabel="l’adresse virtuelle"
         />
-        <Row
-          label="trafic capté"
-          value={profile?.allowed_ips ?? '—'}
-          tone={narrowed ? AMBER : undefined}
-        />
+        {/* No amber for a narrowed range. Split tunnelling is a decision the
+            operator made — routing a subnet and leaving the rest alone is the
+            normal shape of a corporate profile, not a degradation. The amber
+            rows below are for facts the machine reports about itself. */}
+        <Row label="trafic capté" value={profile?.allowed_ips ?? '—'} />
       </Box>
 
       {degraded && vault && (

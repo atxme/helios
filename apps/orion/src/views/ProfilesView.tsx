@@ -32,7 +32,13 @@ import {
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
-import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
+import {
+  modeAllowed,
+  modeLevel,
+  modeMeta,
+  NEGOTIABLE_MODES,
+  PROTECTION_MODES,
+} from '../components/state'
 import { GUTTER } from '../theme'
 import type {
   ClientConfig,
@@ -60,11 +66,29 @@ import type {
  * this screen still cannot do is lower the anti-downgrade floor — that is an
  * invariant, not an ergonomic choice.
  *
- * Warnings are **conditional** rather than permanent: a paragraph shown at
- * all times becomes invisible from being there. The one about `AllowedIPs`
- * only appears if the range has been restricted, the one about the PSK only
- * if a static value has been set — that is, at the precise moment the risk
- * exists.
+ * # Two blocks, and the line between them is the protocol's
+ *
+ * «Tunnel WireGuard» holds what a plain WireGuard peer needs and nothing
+ * else: a profile with that block filled in and no negotiation connects to
+ * any WireGuard gateway. Everything the v5 negotiation adds — the mode, the
+ * floor, the negotiation endpoint, the pinned gateway material, the protected
+ * identity — lives in the second block, and so does the static PSK **as soon
+ * as a negotiation block exists**, because there it stops being a WireGuard
+ * setting and becomes the material of one mode.
+ *
+ * That line is not a presentation choice. `classic` is refused as a
+ * negotiable mode by `aether::key_negotiation` (`ClassicNotNegotiable`): a
+ * negotiated `classic` is a tunnel with no preshared key, which is exactly
+ * what the first block already expresses. So classic is not a mode offered
+ * inside the negotiation block — it is the absence of the block.
+ *
+ * # No captions
+ *
+ * Fields state values. What a mode does, what a range captures, why a floor
+ * refuses something — none of that is printed under the field: it belongs to
+ * a tooltip when it is worth a hover, and to the ADR otherwise. A screen that
+ * explains itself in permanent paragraphs stops being read, and the paragraph
+ * that matters goes down with the rest.
  */
 
 interface Props {
@@ -123,28 +147,6 @@ type Notice = { tone: 'success' | 'error'; message: string; transient?: boolean 
 const NOTICE_MS = 3000
 
 const MAX_IMPORT_BYTES = 64 * 1024
-
-/** Range that captures all traffic — the one that holds up the fail-open invariant. */
-const CAPTURE_ALL = '0.0.0.0/0'
-
-/** Its IPv6 counterpart, which captures everything just as thoroughly. */
-const CAPTURE_ALL_V6 = '::/0'
-
-/**
- * Does this prefix list still route everything through the tunnel?
- *
- * A string comparison against `0.0.0.0/0` no longer answers it: the field
- * holds a **list** now, and `0.0.0.0/0, 192.168.1.0/24` captures everything
- * while being equal to neither. Getting this wrong would show the split-tunnel
- * warning on a full tunnel, or — worse — hide it on a narrowed one.
- */
-function capturesEverything(value: string): boolean {
-  const entries = value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-  return entries.includes(CAPTURE_ALL) || entries.includes(CAPTURE_ALL_V6)
-}
 
 /**
  * Delay before judging a field, in milliseconds.
@@ -622,13 +624,14 @@ export function ProfilesView({
   }
 
   /**
-   * Hands a typed PSK to Rust, and lines the negotiation mode up behind it.
+   * Hands a typed PSK to Rust.
    *
-   * The mode change is the point. A PSK entered while the profile asks for
-   * ML-KEM is a contradiction the core would refuse at save time, naming a
-   * field the user had not touched. Since `static_psk` is the only mode a PSK
-   * is valid under, entering one *is* choosing that mode — so the screen makes
-   * the choice rather than reporting the conflict.
+   * No mode juggling here any more, and that is the point of the split: the
+   * field only exists where a PSK is legal — under `static_psk`, or on a
+   * profile with no negotiation block at all. It used to sit among the
+   * WireGuard settings whatever the mode said, so entering one had to *move*
+   * the mode to avoid a contradiction the core would refuse at save time,
+   * naming a field the user had not touched.
    *
    * The input is cleared on both outcomes, like the private-key field: it is
    * the only other place in this screen that ever holds a secret.
@@ -641,16 +644,8 @@ export function ProfilesView({
       setPastingPsk(false)
       setStagedPsk(true)
       setClearPsk(false)
-      if (draft.key_negotiation && draft.key_negotiation.mode !== 'static_psk') {
-        editNegotiation({ mode: 'static_psk' })
-      }
       setDirty(true)
-      setNotice({
-        tone: 'success',
-        message: draft.key_negotiation
-          ? 'PSK statique enregistré — mode de négociation passé à « PSK statique ».'
-          : 'PSK statique enregistré.',
-      })
+      setNotice({ tone: 'success', message: 'PSK statique enregistré.' })
     } catch (cause) {
       setPastedPsk('')
       setNotice({ tone: 'error', message: String(cause) })
@@ -728,28 +723,88 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
-  const narrowed = !capturesEverything(draft.allowed_ips)
   // A PSK entered during this edit counts as present: it is what the save is
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
-  /**
-   * May this profile hold a static PSK at all?
-   *
-   * Without a negotiation block, yes — a static PSK is then plain WireGuard.
-   * With one, only `static_psk` tolerates it, and the anti-downgrade floor is
-   * what can put that mode out of reach for good.
-   */
-  const pskOffered = !draft.key_negotiation || modeAllowed('static_psk', draft.key_negotiation.minimum_mode)
   const invalid = Object.values(issues).some(Boolean)
-  // The "Advanced" collapse must flag what it hides: otherwise a faulty
-  // field would stay invisible until someone thinks to open it.
-  const advancedFlagged =
-    narrowed ||
-    staticPsk ||
-    Boolean(
-      issues.allowed_ips || issues.persistent_keepalive || issues.preshared_key || issues.heliosd_url,
-    )
+  // The "Advanced" collapse must flag what it hides: otherwise a faulty field
+  // would stay invisible until someone thinks to open it. A narrowed range is
+  // *not* one of those: split tunnelling is a decision, not a defect.
+  const advancedFlagged = Boolean(
+    issues.allowed_ips ||
+      issues.persistent_keepalive ||
+      issues.ssh_target ||
+      (!draft.key_negotiation && issues.preshared_key) ||
+      issues.heliosd_url,
+  )
+
+  /**
+   * The static PSK, wherever it belongs on this profile.
+   *
+   * One component, two homes. Without a negotiation block the PSK is a plain
+   * WireGuard setting and sits under «Avancé»; with one it is the material of
+   * the `static_psk` mode and sits under that mode. Rendering it twice, or
+   * keeping it in the WireGuard block while a mode governs it, is what made
+   * the two halves of this screen impossible to tell apart.
+   */
+  const pskField = (
+    <>
+      {/* Same inbound-only rule as the private key (ADR-006 §5). */}
+      <SecretState
+        label="PSK statique"
+        present={staticPsk}
+        error={issues.preshared_key}
+        presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
+        absentLabel="aucun"
+        action={
+          staticPsk
+            ? {
+                label: 'Retirer le PSK statique',
+                onClick: () => {
+                  setClearPsk(true)
+                  if (stagedPsk) {
+                    setStagedPsk(false)
+                    void api.discardStagedPsk().catch(() => {})
+                  }
+                  setDirty(true)
+                },
+                disabled: clearPsk && !stagedPsk,
+              }
+            : {
+                label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
+                onClick: () => setPastingPsk((open) => !open),
+                disabled: pskBusy,
+              }
+        }
+      />
+      {pastingPsk && !staticPsk && (
+        <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+          <TextField
+            fullWidth
+            size="small"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            label="PSK WireGuard (base64)"
+            value={pastedPsk}
+            onChange={(event) => setPastedPsk(event.target.value)}
+            sx={{ '& input': { fontFamily: 'monospace', fontSize: 12 } }}
+          />
+          <Button
+            size="small"
+            variant="contained"
+            disableElevation
+            disabled={pskBusy || pastedPsk.trim().length === 0}
+            onClick={adoptPsk}
+            sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
+          >
+            Valider
+          </Button>
+        </Box>
+      )}
+    </>
+  )
 
   return (
     <Box sx={{ display: 'flex', height: '100%', flexDirection: 'column' }}>
@@ -975,11 +1030,7 @@ export function ProfilesView({
                   label="Clé privée WireGuard (base64)"
                   value={pasted}
                   onChange={(event) => setPasted(event.target.value)}
-                  helperText="Collée une fois, jamais réaffichée. Sortie de `wg genkey` ou d’un fichier wg-quick."
-                  sx={{
-                    '& input': { fontFamily: 'monospace', fontSize: 12 },
-                    '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
-                  }}
+                  sx={{ '& input': { fontFamily: 'monospace', fontSize: 12 } }}
                 />
                 <Button
                   size="small"
@@ -995,6 +1046,13 @@ export function ProfilesView({
             )}
           </Box>
 
+          {/* ── Tunnel WireGuard ─────────────────────────────────────────
+              The strict minimum, and nothing about negotiation. A profile
+              with this block filled in and no negotiation connects to any
+              WireGuard gateway — which is what «classique» means here. */}
+          <Typography component="h3" sx={{ mb: 1, fontSize: 12.5, fontWeight: 650 }}>
+            Tunnel WireGuard
+          </Typography>
           <Box
             sx={{
               display: 'grid',
@@ -1057,116 +1115,42 @@ export function ProfilesView({
 
               <Collapse in={advanced} unmountOnExit>
                 <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+                  {/* The example lives in the placeholder, not under the
+                      field: it is a value, and a value belongs where the value
+                      goes. No caution for a narrowed range either — routing one
+                      subnet and leaving the rest alone is what most corporate
+                      profiles do on purpose. */}
                   <Field
                     label="Trafic capté"
                     error={issues.allowed_ips}
+                    placeholder="0.0.0.0/0  ·  100.64.0.0/10, 192.168.1.0/24"
                     value={draft.allowed_ips}
                     onChange={(value) => set('allowed_ips', value)}
-                    hint="Une ou plusieurs plages CIDR, séparées par des virgules. Ex. : 100.64.0.0/10, 192.168.1.0/24"
                   />
-                  {narrowed && (
-                    <Caution>
-                      Plages restreintes : ce qui en sort part <strong>en clair</strong>.{' '}
-                      {CAPTURE_ALL} capte tout.
-                    </Caution>
-                  )}
                   <Field
                     label="Keepalive (s)"
-                error={issues.persistent_keepalive}
+                    error={issues.persistent_keepalive}
                     type="number"
                     value={String(draft.persistent_keepalive)}
                     onChange={(value) => set('persistent_keepalive', Number(value) || 0)}
                   />
-                  {/* Same inbound-only rule as the private key. What the floor
-                      forbids is not offered at all: a PSK typed under a profile
-                      pinned to ML-KEM could only be refused at save time. */}
-                  <SecretState
-                    label="PSK statique"
-                    present={staticPsk}
-                    error={issues.preshared_key}
-                    presentLabel={stagedPsk ? 'nouveau PSK — à enregistrer' : 'scellé dans le coffre'}
-                    absentLabel={
-                      pskOffered ? 'aucun' : 'aucun — ML-KEM à chaque connexion'
-                    }
-                    action={
-                      staticPsk
-                        ? {
-                            label: 'Retirer le PSK statique',
-                            onClick: () => {
-                              setClearPsk(true)
-                              if (stagedPsk) {
-                                setStagedPsk(false)
-                                void api.discardStagedPsk().catch(() => {})
-                              }
-                              setDirty(true)
-                            },
-                            disabled: clearPsk && !stagedPsk,
-                          }
-                        : pskOffered
-                          ? {
-                              label: pastingPsk ? 'Annuler' : 'Définir un PSK statique',
-                              onClick: () => setPastingPsk((open) => !open),
-                              disabled: pskBusy,
-                            }
-                          : undefined
-                    }
-                    hint={
-                      pskOffered
-                        ? 'Valeur hors bande, partagée avec l’opérateur. La saisir bascule la négociation en « PSK statique ».'
-                        : 'Le plancher anti-downgrade de ce profil exige ML-KEM : un PSK statique y serait un retour en arrière.'
-                    }
-                  />
-                  {/* Mounted only while in use, and inbound only — same rule as
-                      the private-key field above (ADR-006 §5). */}
-                  {pastingPsk && !staticPsk && (
-                    <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
-                      <TextField
-                        fullWidth
-                        size="small"
-                        type="password"
-                        autoComplete="off"
-                        spellCheck={false}
-                        label="PSK WireGuard (base64)"
-                        value={pastedPsk}
-                        onChange={(event) => setPastedPsk(event.target.value)}
-                        helperText="Collé une fois, jamais réaffiché. Sortie de `wg genpsk`."
-                        sx={{
-                          '& input': { fontFamily: 'monospace', fontSize: 12 },
-                          '& .MuiFormHelperText-root': { fontSize: 10.5, lineHeight: 1.4 },
-                        }}
-                      />
-                      <Button
-                        size="small"
-                        variant="contained"
-                        disableElevation
-                        disabled={pskBusy || pastedPsk.trim().length === 0}
-                        onClick={adoptPsk}
-                        sx={{ mt: 0.5, fontSize: 11.5, textTransform: 'none', flexShrink: 0 }}
-                      >
-                        Valider
-                      </Button>
-                    </Box>
-                  )}
-                  {staticPsk && (
-                    <Caution>
-                      Un PSK statique <strong>désactive</strong> ML-KEM : le secret est le même à
-                      chaque connexion, au lieu d’être renégocié.
-                    </Caution>
-                  )}
-                  <Field
-                    label="URL Helios"
-                    error={issues.heliosd_url}
-                    placeholder="http://100.64.0.1:8080"
-                    value={draft.heliosd_url ?? ''}
-                    onChange={(value) => set('heliosd_url', value || null)}
-                  />
+                  {/* Only without a negotiation block. With one, the PSK is
+                      the material of the `static_psk` mode and belongs under
+                      that mode, not among the WireGuard settings. */}
+                  {!draft.key_negotiation && pskField}
                   <Field
                     label="Destination SSH"
                     error={issues.ssh_target}
                     placeholder="utilisateur@100.64.0.1"
                     value={draft.ssh_target ?? ''}
                     onChange={(value) => set('ssh_target', value || null)}
-                    hint="Active le bouton « Terminal SSH » de l’écran Connexion. La gateway doit poser allow_ssh_over_tunnel."
+                  />
+                  <Field
+                    label="URL Helios"
+                    error={issues.heliosd_url}
+                    placeholder="http://100.64.0.1:8080"
+                    value={draft.heliosd_url ?? ''}
+                    onChange={(value) => set('heliosd_url', value || null)}
                   />
                 </Box>
               </Collapse>
@@ -1182,6 +1166,7 @@ export function ProfilesView({
             support={support}
             fingerprint={fingerprint}
             identitySealed={identitySealed}
+            pskField={pskField}
             onChange={setNegotiation}
             onRaiseFloor={raiseFloor}
             onToggle={toggleNegotiation}
@@ -1283,6 +1268,7 @@ function KeyNegotiation({
   support,
   fingerprint,
   identitySealed,
+  pskField,
   onChange,
   onRaiseFloor,
   onToggle,
@@ -1295,6 +1281,8 @@ function KeyNegotiation({
   /** The identity this profile names is sealed on this machine. */
   identitySealed: boolean
   fingerprint: string | null
+  /** The static PSK row, shown here when `static_psk` is the chosen mode. */
+  pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
     key: Key,
     value: KeyNegotiationSettings[Key],
@@ -1312,29 +1300,42 @@ function KeyNegotiation({
     return (
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
         {title}
-        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.5 }}>
-          Aucune : le tunnel monte d’abord, le PSK post-quantique n’arrive
-          qu’ensuite par l’API. Le <strong>premier handshake</strong> n’est donc pas protégé.
+        <Typography color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: 11 }}>
+          aucune
         </Typography>
-        <Button
-          size="small"
-          variant="outlined"
-          startIcon={<ShieldPlus size={14} aria-hidden />}
-          onClick={() => onToggle(true)}
-          sx={{ ml: 'auto', flexShrink: 0 }}
+        {/* `describeChild`: the sentence describes the button, it does not
+            rename it. Without it MUI turns the tooltip into the accessible
+            name, and a screen reader announces a paragraph where a verb
+            belongs. */}
+        <Tooltip
+          describeChild
+          title="Sans négociation, le tunnel monte avant toute authentification post-quantique : le premier handshake n’est pas protégé."
         >
-          Ajouter
-        </Button>
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<ShieldPlus size={14} aria-hidden />}
+            onClick={() => onToggle(true)}
+            sx={{ ml: 'auto', flexShrink: 0 }}
+          >
+            Ajouter
+          </Button>
+        </Tooltip>
       </Box>
     )
   }
 
-  const selected = modeMeta(settings.mode)
   const unusable = support && !support.identity_store
   // Removing the block is a downgrade. It stays possible while nothing has
   // been negotiated — a block just added by hand, typically — and the floor
   // is what closes the door as soon as something has.
   const removable = !floorBaseline || modeLevel(floorBaseline) === 0
+  // A block loaded with `classic` cannot negotiate at all: the gateway
+  // refuses that mode by name. It is not offered above, so it can only come
+  // from a document written before the rule — and it has to be said, because
+  // the failure would otherwise land at connection time with no field to look
+  // at.
+  const notNegotiable = settings.mode === 'classic'
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -1343,7 +1344,10 @@ function KeyNegotiation({
             saying it twice is how a screen ends up unreadable. */}
         {title}
         {removable && (
-          <Tooltip title="Retirer la négociation : le tunnel remonterait sans protection avant le premier handshake.">
+          <Tooltip
+            describeChild
+            title="Retirer la négociation : le profil redevient un pair WireGuard ordinaire, et le tunnel monte sans protection avant le premier handshake."
+          >
             <Button
               size="small"
               variant="text"
@@ -1357,18 +1361,31 @@ function KeyNegotiation({
         )}
       </Box>
 
+      {/* Two modes, not three. `classic` is the absence of this block, and
+          the gateway refuses it as a negotiated mode by name. */}
       <ModeChoice
         label="Mode"
+        modes={NEGOTIABLE_MODES}
         value={settings.mode}
         floor={settings.minimum_mode}
         onChange={(mode) => onChange('mode', mode)}
       />
-      <Typography color="text.secondary" sx={{ fontSize: 11, lineHeight: 1.55 }}>
-        {selected.detail}
-      </Typography>
+
+      {notNegotiable && (
+        <Caution>
+          Ce profil demande le mode <strong>classique</strong>, que la gateway refuse de négocier.
+          Choisir « PSK » ou « ML-KEM », ou retirer la négociation.
+        </Caution>
+      )}
+
+      {/* The PSK belongs to the mode that uses it, and appears with it. Under
+          ML-KEM there is no PSK row at all — nothing to grey out, nothing to
+          explain. */}
+      {settings.mode === 'static_psk' && pskField}
 
       <ModeChoice
         label="Plancher"
+        modes={PROTECTION_MODES}
         value={settings.minimum_mode}
         floor={floorBaseline ?? 'classic'}
         hint="Mode sous lequel ce profil refuse de négocier, avant tout accès réseau. Il ne redescend pas : le relever engage les connexions suivantes."
@@ -1465,12 +1482,15 @@ function KeyNegotiation({
  */
 function ModeChoice({
   label,
+  modes,
   value,
   floor,
   hint,
   onChange,
 }: {
   label: string
+  /** Which modes this row offers. The mode row omits `classic`. */
+  modes: ProtectionMode[]
   value: ProtectionMode
   /** Nothing below this is selectable. */
   floor: ProtectionMode
@@ -1502,7 +1522,7 @@ function ModeChoice({
         aria-label={label}
         sx={{ '& .MuiToggleButton-root': { px: 1.25, py: 0.4, fontSize: 11.5, textTransform: 'none' } }}
       >
-        {PROTECTION_MODES.map((mode) => {
+        {modes.map((mode) => {
           const meta = modeMeta(mode)
           const allowed = modeAllowed(mode, floor)
           return (
@@ -1511,7 +1531,9 @@ function ModeChoice({
               value={mode}
               disabled={!allowed}
               aria-label={meta.label}
-              title={allowed ? meta.detail : `Sous le plancher : ${modeMeta(floor).label}.`}
+              // Only the refusal is worth a tooltip: it is the one thing the
+              // button cannot say by being greyed out.
+              title={allowed ? undefined : `Sous le plancher : ${modeMeta(floor).label}.`}
             >
               {meta.label}
             </ToggleButton>
@@ -1562,16 +1584,26 @@ function EncodedData({
         >
           {summary}
         </Typography>
-        <Button
-          size="small"
-          variant="text"
-          color="inherit"
-          startIcon={<FileCode2 size={14} aria-hidden />}
-          onClick={() => setOpen(true)}
-          sx={{ ml: 'auto', flexShrink: 0, color: 'text.secondary', fontSize: 11 }}
+        {/* The pin is static on this side. The certificate lifecycle rotates
+            the gateway's leaves on Helios and Astra, but Orion holds no trust
+            store yet: a reissued certificate is re-pasted here. Saying so on
+            hover is what keeps the day it happens from looking like a
+            breakage. */}
+        <Tooltip
+          describeChild
+          title="Matériel public d’épinglage. Le renouvellement automatique n’est pas branché côté Orion : après une réémission, la nouvelle valeur se colle ici."
         >
-          Afficher les données encodées
-        </Button>
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            startIcon={<FileCode2 size={14} aria-hidden />}
+            onClick={() => setOpen(true)}
+            sx={{ ml: 'auto', flexShrink: 0, color: 'text.secondary', fontSize: 11 }}
+          >
+            Afficher les données encodées
+          </Button>
+        </Tooltip>
       </Box>
 
       <Dialog
@@ -1585,11 +1617,6 @@ function EncodedData({
           Données encodées de la gateway
         </DialogTitle>
         <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
-          <DialogContentText sx={{ fontSize: 11.5, lineHeight: 1.55 }}>
-            Rien ici n’est secret : ce matériel est public et sert à épingler la gateway. Le
-            remplacer n’a de sens qu’après une réémission de certificat — le cœur revérifie
-            l’épinglage et signale le bloc comme fautif si la valeur ne correspond plus.
-          </DialogContentText>
           <Blob
             label="CA TLS de la gateway (DER base64)"
             value={caDer}
@@ -1726,17 +1753,21 @@ function Field({
   type = 'text',
   placeholder,
   error,
-  hint,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   type?: 'text' | 'number'
   placeholder?: string
-  /** Message from the core, `null` if the field is acceptable. */
+  /**
+   * Message from the core, `null` if the field is acceptable.
+   *
+   * The only text a field ever prints under itself. There is deliberately no
+   * `hint`: an explanation shown at all times is read once and then becomes
+   * part of the furniture, and it pushes the error — the one line that has to
+   * be seen — further down the form.
+   */
   error?: string | null
-  /** Shown while the field is acceptable. An error always wins over it. */
-  hint?: string
 }) {
   return (
     <TextField
@@ -1747,7 +1778,7 @@ function Field({
       placeholder={placeholder}
       value={value}
       error={Boolean(error)}
-      helperText={error ?? hint}
+      helperText={error}
       onChange={(event) => onChange(event.target.value)}
       sx={{
         '& input': { fontFamily: 'monospace', fontSize: 12 },
@@ -1812,7 +1843,6 @@ function SecretState({
   absentLabel,
   action,
   error,
-  hint,
 }: {
   label: string
   present: boolean
@@ -1822,7 +1852,6 @@ function SecretState({
   action?: { label: string; onClick: () => void; disabled?: boolean }
   /** Message from the core, `null` if the field is acceptable. */
   error?: string | null
-  hint?: string
 }) {
   return (
     <Box>
@@ -1863,12 +1892,12 @@ function SecretState({
           {action.label}
         </Button>
       )}
-      {(error || hint) && (
+      {error && (
         <Typography
-          color={error ? 'error' : 'text.secondary'}
+          color="error"
           sx={{ mt: 0.25, ml: '118px', fontSize: 10.5, lineHeight: 1.4 }}
         >
-          {error ?? hint}
+          {error}
         </Typography>
       )}
     </Box>
