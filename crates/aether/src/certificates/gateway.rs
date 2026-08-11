@@ -268,6 +268,12 @@ impl GatewayIdentityTransition {
         ))
     }
 
+    /// The same fingerprints, flattened — what a revocation check needs.
+    pub fn installed_fingerprints(&self) -> Result<Vec<Fingerprint>, CertificateError> {
+        let (tls, pq) = self.next_fingerprints()?;
+        Ok([tls, pq].into_iter().flatten().collect())
+    }
+
     /// Verifies the whole decision against the locally trusted anchor.
     ///
     /// Order matters, and it is the order of spec §6.2: the parser recomputes

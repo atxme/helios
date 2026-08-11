@@ -16,19 +16,21 @@
 //!   and a chain builder that matched on name would then follow it;
 //! - a **client leaf** must parse, not be a CA, carry the `clientAuth`
 //!   extended usage, carry `digitalSignature` when it declares a `keyUsage` at
-//!   all, be inside its validity at the instant it will be used, and chain to
-//!   an anchor the verifier already holds;
+//!   all, stay valid over its **whole** window, and chain to an anchor the
+//!   verifier already holds;
 //! - a **CSR** must carry the same public key as the leaf issued from it.
 //!   Without that check a grant can be perfectly signed and still install a
 //!   certificate for a private key the client never generated.
 //!
-//! # Every link of a chain is checked, not only the leaf
+//! # Every link, over the whole window — not one link at one instant
 //!
-//! [`assert_chains_to`] takes the instant the chain will be used and refuses a
-//! path whose intermediate or anchor is outside its own validity, or whose
-//! intermediate is not a CA. Verifying only the leaf's dates is the classic
-//! hole: an expired anchor keeps issuing perfectly-dated leaves forever, and
-//! the lifecycle would treat the retired authority as current.
+//! [`assert_chains_to`] takes the **span** the chain will be in service for
+//! and refuses a path whose intermediate or anchor does not cover all of it,
+//! or whose intermediate is not a CA. Two classic holes meet here: verifying
+//! only the leaf's dates lets an expired anchor go on issuing perfectly-dated
+//! leaves, and verifying a single instant lets a link retire in the middle of
+//! the overlap it exists to carry — after the outgoing generation has already
+//! been scheduled for retirement, so there is nothing to fall back to.
 //!
 //! # What is deliberately not checked
 //!
@@ -107,17 +109,25 @@ pub fn inspect(certificate: &DerCertificate) -> Result<X509Facts, CertificateErr
     })
 }
 
-/// The certificate is inside its own validity at `now_unix`.
+/// The certificate covers the whole span it will be in service for.
 ///
-/// Used on every link of a chain, not only on the leaf: an expired anchor goes
-/// on issuing perfectly-dated leaves, and nothing else notices.
-pub fn assert_valid_at(
+/// `not_before <= from_unix` **and** `not_after > until_unix`, per spec §4.1.
+/// Checking a single instant is the subtler half of the same hole as checking
+/// only the leaf: a certificate valid at `activation_at` can expire in the
+/// middle of the overlap, and the generation it belongs to is then half-dead
+/// while the state machine still considers it current — with the outgoing
+/// generation already retired and nothing left to fall back to.
+pub fn assert_covers(
     certificate: &DerCertificate,
-    now_unix: u64,
+    from_unix: u64,
+    until_unix: u64,
 ) -> Result<(), CertificateError> {
     let facts = inspect(certificate)?;
-    if now_unix < facts.not_before || now_unix >= facts.not_after {
-        return Err(CertificateError::InvalidX509("outside validity"));
+    if facts.not_before > from_unix {
+        return Err(CertificateError::InvalidX509("not valid yet at activation"));
+    }
+    if facts.not_after <= until_unix {
+        return Err(CertificateError::InvalidX509("expires inside its window"));
     }
     Ok(())
 }
@@ -126,8 +136,8 @@ pub fn assert_valid_at(
 ///
 /// Deliberately says nothing about dates. An anchor staged for a future
 /// activation is legitimately not valid today, and this is the structural
-/// check; [`assert_valid_at`] is the temporal one, applied where a chain is
-/// actually used.
+/// check; [`assert_covers`] is the temporal one, applied against the window
+/// the anchor is being installed for.
 pub fn assert_certificate_authority(certificate: &DerCertificate) -> Result<(), CertificateError> {
     let facts = inspect(certificate)?;
     if !facts.is_certificate_authority {
@@ -163,10 +173,14 @@ pub fn assert_issued_by(
         .map_err(|_| CertificateError::InvalidX509("issuer signature does not verify"))
 }
 
-/// A client mTLS leaf: not a CA, `clientAuth`, and inside its validity.
+/// A client mTLS leaf: not a CA, `clientAuth`, and valid for its whole window.
+///
+/// The span is `[from_unix, until_unix]` — in practice `activation_at` to the
+/// end of the overlap, not a single instant.
 pub fn assert_client_leaf(
     certificate: &DerCertificate,
-    now_unix: u64,
+    from_unix: u64,
+    until_unix: u64,
 ) -> Result<(), CertificateError> {
     let facts = inspect(certificate)?;
     if facts.is_certificate_authority {
@@ -181,28 +195,27 @@ pub fn assert_client_leaf(
     if facts.declares_key_usage && !facts.can_digitally_sign {
         return Err(CertificateError::InvalidX509("no digitalSignature usage"));
     }
-    if now_unix < facts.not_before || now_unix >= facts.not_after {
-        return Err(CertificateError::InvalidX509("outside validity"));
-    }
-    Ok(())
+    assert_covers(certificate, from_unix, until_unix)
 }
 
-/// Chains `leaf` to one of the anchors the verifier already holds, at
-/// `now_unix`.
+/// Chains `leaf` to one of the anchors the verifier already holds, over the
+/// whole span `[from_unix, until_unix]`.
 ///
 /// `intermediates` are tried between the two — the delegated issuer's
 /// client-auth intermediate is the only one this PKI has. A leaf that chains
 /// to nothing is refused; a leaf that chains to an anchor the caller did not
 /// supply is refused for the same reason.
 ///
-/// Every link above the leaf must be a CA **and** be inside its own validity
-/// at `now_unix`. Checking only the leaf leaves an expired anchor issuing
-/// perfectly-dated certificates, which is the failure a lifecycle notices last.
+/// Every link above the leaf must be a CA **and** cover the whole span.
+/// Checking only the leaf leaves an expired anchor issuing perfectly-dated
+/// certificates; checking a single instant lets an anchor retire in the middle
+/// of the overlap it was supposed to carry.
 pub fn assert_chains_to(
     leaf: &DerCertificate,
     intermediates: &[&DerCertificate],
     anchors: &[&DerCertificate],
-    now_unix: u64,
+    from_unix: u64,
+    until_unix: u64,
 ) -> Result<(), CertificateError> {
     if anchors.is_empty() {
         return Err(CertificateError::InvalidX509("no trust anchor"));
@@ -211,8 +224,8 @@ pub fn assert_chains_to(
         inspect(certificate).is_ok_and(|facts| {
             facts.is_certificate_authority
                 && facts.can_sign_certificates
-                && now_unix >= facts.not_before
-                && now_unix < facts.not_after
+                && facts.not_before <= from_unix
+                && facts.not_after > until_unix
         })
     };
     let mut saw_expired_link = false;
@@ -383,13 +396,13 @@ mod tests {
         let (leaf, _, _) = client_leaf(&ca, &ca_key);
         let now = inside(&ca_der);
 
-        assert_chains_to(&leaf, &[], &[&ca_der], now).expect("chains to its own CA");
+        assert_chains_to(&leaf, &[], &[&ca_der], now, now).expect("chains to its own CA");
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[&other_der], now),
+            assert_chains_to(&leaf, &[], &[&other_der], now, now),
             Err(CertificateError::InvalidX509("no path to a trust anchor"))
         ));
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[], now),
+            assert_chains_to(&leaf, &[], &[], now, now),
             Err(CertificateError::InvalidX509("no trust anchor"))
         ));
     }
@@ -402,13 +415,26 @@ mod tests {
         let (leaf, _, _) = client_leaf(&ca, &ca_key);
         let anchor = inspect(&ca_der).expect("facts");
 
-        assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_before + 1).expect("inside validity");
+        assert_chains_to(
+            &leaf,
+            &[],
+            &[&ca_der],
+            anchor.not_before + 1,
+            anchor.not_before + 1,
+        )
+        .expect("inside validity");
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_after),
+            assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_after, anchor.not_after),
             Err(CertificateError::InvalidX509("unusable chain link"))
         ));
         assert!(matches!(
-            assert_chains_to(&leaf, &[], &[&ca_der], anchor.not_before - 1),
+            assert_chains_to(
+                &leaf,
+                &[],
+                &[&ca_der],
+                anchor.not_before - 1,
+                anchor.not_before - 1
+            ),
             Err(CertificateError::InvalidX509("unusable chain link"))
         ));
     }
@@ -451,7 +477,7 @@ mod tests {
         let leaf = DerCertificate::new(leaf.der().to_vec()).expect("der");
         let now = inside(&leaf);
         assert!(matches!(
-            assert_client_leaf(&leaf, now),
+            assert_client_leaf(&leaf, now, now),
             Err(CertificateError::InvalidX509("no digitalSignature usage"))
         ));
     }
@@ -473,25 +499,48 @@ mod tests {
 
         let (leaf, _, _) = client_leaf(&intermediate, &intermediate_key);
         let now = inside(&ca_der);
-        assert_chains_to(&leaf, &[&intermediate_der], &[&ca_der], now).expect("three-link path");
+        assert_chains_to(&leaf, &[&intermediate_der], &[&ca_der], now, now)
+            .expect("three-link path");
         // Without the intermediate the path does not exist.
-        assert!(assert_chains_to(&leaf, &[], &[&ca_der], now).is_err());
+        assert!(assert_chains_to(&leaf, &[], &[&ca_der], now, now).is_err());
     }
 
+    /// A leaf must cover the whole window it is installed for, not merely be
+    /// alive on the day it activates.
     #[test]
-    fn a_client_leaf_must_carry_client_auth_and_be_inside_its_validity() {
+    fn a_client_leaf_must_carry_client_auth_and_cover_its_whole_window() {
         let (_, ca, ca_key) = authority("CA-TLS");
         let (leaf, _, _) = client_leaf(&ca, &ca_key);
         let facts = inspect(&leaf).expect("facts");
+        let activation = facts.not_before + 1;
 
-        assert_client_leaf(&leaf, facts.not_before + 1).expect("valid leaf");
+        assert_client_leaf(&leaf, activation, facts.not_after - 1).expect("covers its window");
         assert!(matches!(
-            assert_client_leaf(&leaf, facts.not_before - 1),
-            Err(CertificateError::InvalidX509("outside validity"))
+            assert_client_leaf(&leaf, facts.not_before - 1, facts.not_after - 1),
+            Err(CertificateError::InvalidX509("not valid yet at activation"))
         ));
+        // Valid at activation, gone before the end of the overlap: the exact
+        // half-dead generation §4.1 forbids.
         assert!(matches!(
-            assert_client_leaf(&leaf, facts.not_after),
-            Err(CertificateError::InvalidX509("outside validity"))
+            assert_client_leaf(&leaf, activation, facts.not_after),
+            Err(CertificateError::InvalidX509("expires inside its window"))
+        ));
+    }
+
+    /// The same rule on a chain: an anchor that retires mid-overlap takes
+    /// every leaf under it with it, after the outgoing one was retired.
+    #[test]
+    fn a_chain_whose_anchor_retires_mid_window_is_refused() {
+        let (ca_der, ca, ca_key) = authority("CA-TLS");
+        let (leaf, _, _) = client_leaf(&ca, &ca_key);
+        let anchor = inspect(&ca_der).expect("facts");
+        let activation = anchor.not_before + 1;
+
+        assert_chains_to(&leaf, &[], &[&ca_der], activation, anchor.not_after - 1)
+            .expect("the anchor outlasts the window");
+        assert!(matches!(
+            assert_chains_to(&leaf, &[], &[&ca_der], activation, anchor.not_after),
+            Err(CertificateError::InvalidX509("unusable chain link"))
         ));
     }
 

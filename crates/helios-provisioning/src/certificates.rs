@@ -54,7 +54,8 @@ use aether::certificates::{
     encoding::{Fingerprint, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome, PendingStageState,
+        GatewayCertificateState, InstallOutcome, PendingStageState, RevocationTombstone,
+        RevokedFamily, TrustLedger,
     },
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
 };
@@ -128,6 +129,15 @@ pub struct RegistryState {
     /// Keyed by the peer's WireGuard public key in base64 — its identity, and
     /// the only value the gateway ever resolves a caller to.
     pub peers: BTreeMap<String, PeerCertificates>,
+    /// Fingerprints already withdrawn, and the counters that withdrew them.
+    ///
+    /// The gateway keeps them for the same reason Orion does: `revoked` on a
+    /// peer only covers a peer that is still in the registry, and it says
+    /// nothing about a fingerprint arriving later inside a staging
+    /// authorization. A readmission under a fresh identity is legitimate; the
+    /// **same** leaf coming back is what §10.2 forbids.
+    #[serde(default)]
+    pub ledger: TrustLedger,
 }
 
 /// The registry, with its file.
@@ -307,11 +317,14 @@ impl CertificateRegistry {
             ],
         )?;
 
-        let peer = state
-            .peers
+        let RegistryState { peers, ledger, .. } = &mut state;
+        let peer = peers
             .get_mut(&caller_wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
-        let outcome = peer.state.stage(authorization, now_unix)?;
+        // The tombstones outlive the peer record, so a candidate carrying a
+        // leaf this gateway already withdrew is refused even after a
+        // readmission under a fresh identity.
+        let outcome = peer.state.stage(authorization, ledger, now_unix)?;
         if outcome == InstallOutcome::Installed {
             peer.staged_pq_certificate = Some(authorization.next_pq_certificate.clone());
         }
@@ -520,6 +533,49 @@ impl CertificateRegistry {
         let mut state = self.state.clone();
         let peer = state
             .peers
+            .get(&wg_public_key.to_base64())
+            .ok_or(RegistryError::UnknownPeer)?;
+
+        // Remember what is being withdrawn *before* withdrawing it: `revoke`
+        // clears the slots these fingerprints and their expiries are read
+        // from. Without the tombstones, `peer remove` followed by a fresh
+        // admission would let the very same leaf be staged again — the peer
+        // record that carried `revoked` is gone by then.
+        let mut tombstones = Vec::new();
+        for generation in [
+            Some(&peer.state.active),
+            peer.state.next.as_ref(),
+            peer.state
+                .pending
+                .as_ref()
+                .map(|pending| &pending.candidate),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (family, fingerprint) in [
+                (RevokedFamily::Tls, generation.tls_certificate_fingerprint),
+                (RevokedFamily::Pq, generation.pq_certificate_fingerprint),
+            ] {
+                tombstones.push(RevocationTombstone {
+                    scope: aether::certificates::revocation::RevocationScope::Client,
+                    family,
+                    fingerprint,
+                    revocation_epoch,
+                    expires_at: Some(generation.not_after),
+                    // A local `peer remove` is not a signed object, and
+                    // inventing a fingerprint for it would misdescribe where
+                    // the decision came from.
+                    revocation_fingerprint: None,
+                });
+            }
+        }
+        for tombstone in tombstones {
+            state.ledger.remember(tombstone)?;
+        }
+
+        let peer = state
+            .peers
             .get_mut(&wg_public_key.to_base64())
             .ok_or(RegistryError::UnknownPeer)?;
         peer.state.revoke(revocation_epoch);
@@ -529,7 +585,12 @@ impl CertificateRegistry {
 }
 
 /// Drops every candidate whose lease has run out, in place.
+///
+/// The same sweep forgets tombstones whose target could no longer be valid
+/// anyway: the list is bounded, and a spent tombstone protects nothing while
+/// occupying a slot a live revocation may need.
 fn purge_expired_in(state: &mut RegistryState, now_unix: u64) -> Vec<String> {
+    state.ledger.forget_expired(now_unix);
     let mut purged = Vec::new();
     for (key, peer) in state.peers.iter_mut() {
         if peer.state.purge_expired(now_unix) {
@@ -731,6 +792,7 @@ mod tests {
             },
             issuer: None,
             peers: BTreeMap::new(),
+            ledger: TrustLedger::default(),
         };
 
         let mut registry =

@@ -1710,12 +1710,29 @@ derrière un bouton au libellé ambigu « Renouveler ».
 - `aether::certificates::x509` : CA réelle, auto-émise et auto-signée,
   `basicConstraints`, `keyCertSign`, `clientAuth`, `digitalSignature` dès qu'un
   `keyUsage` est déclaré, chaîne `leaf → intermédiaire → CA-TLS` vers une ancre
-  déjà détenue — **chaque maillon** étant lu contre l'horloge de l'instant où
-  la chaîne servira — et liaison CSR ↔ clé certifiée.
+  déjà détenue et liaison CSR ↔ clé certifiée. La validité est lue sur
+  **chaque maillon** et sur **toute la fenêtre**, `not_before <= activation_at`
+  et `not_after > window.not_after` (§4.1) : un seul instant laisserait une
+  leaf ou une ancre expirer au milieu du chevauchement qu'elle porte, une fois
+  la génération sortante déjà programmée pour le retrait. La CA-TLS entrante et
+  l'intermédiaire délégué sont soumis à la même règle sur leur propre fenêtre.
 - Deux axes de révocation distincts, l'un pour la gateway et l'autre par
   client, plus un troisième pour la clé de service Astra. Une révocation porte
   sa portée et l'identité qu'elle nomme ; elle est refusée si elle en désigne
-  une autre, et appliquée à l'état que cette portée nomme.
+  une autre, et appliquée à l'état que cette portée nomme. Un compteur consommé
+  ne redescend jamais : deux décisions datées différemment prennent effet dans
+  l'ordre de l'horloge, pas dans celui des numéros.
+- Les empreintes retirées sont **mémorisées** après leur instant (§10.2), avec
+  portée, famille, compteur, expiration cryptographique quand le porteur la
+  connaissait et empreinte du document signé. Tous les chemins d'installation
+  les consultent — transition gateway, rotation de `CA-PQ` et de `CA-TLS`,
+  transition et remplacement d'urgence de la clé de service, staging d'un
+  candidat client — et le registre en pose aussi à `peer remove`. Sans cela, une
+  révocation visant une empreinte que le porteur ne détient pas *encore* est
+  consommée puis oubliée : son époque est dépensée, l'objet n'est plus jamais
+  distribuable, et la transition suivante réinstalle la leaf. La liste est
+  plafonnée et **refuse** plutôt que d'évincer : oublier une révocation est
+  irrattrapable, refuser une mise à jour ne l'est pas.
 - Les compteurs de statut sont tenus **par cible**, comme Astra les émet : une
   génération fraîche repart à son propre compteur au lieu d'être bloquée
   derrière celui de la leaf qu'elle remplace. Un statut doit nommer une famille,
@@ -1766,7 +1783,17 @@ contournés :
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
   coordonnée du §13 ;
 - les **surfaces IHM** du §12.2, côté Orion comme côté console Helios ;
-- les **essais d'intégration** du §14.2, qui supposent un vrai plan de données.
+- les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
+- toute **migration de format** des états persistés. `TrustState` et
+  `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné
+  a changé pendant ce lot. Il n'y a pas de chemin de migration parce qu'il n'y a
+  rien à migrer : hors tests, rien n'écrit ces deux fichiers, donc aucune
+  instance d'une forme antérieure n'existe sur aucun disque. C'est un constat
+  daté, pas une décision à conserver — dès qu'un Orion publié écrit un magasin
+  de confiance, le format est figé et tout changement ultérieur exige une
+  migration explicite avec des fixtures de la version précédente. En attendant,
+  un document illisible échoue franchement plutôt que de se désérialiser en un
+  état qui aurait silencieusement perdu les révocations qu'il portait.
 
 Tant que ces points ne sont pas livrés, cette livraison **ne doit pas** être
 présentée comme « cycle de vie implémenté » (§12.1).

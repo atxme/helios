@@ -413,6 +413,7 @@ mod tests {
             },
             issuer: None,
             peers: Default::default(),
+            ledger: Default::default(),
         }
     }
 

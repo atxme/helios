@@ -168,11 +168,15 @@ impl GatewayCertificateState {
     pub fn install_transition(
         &mut self,
         transition: &GatewayIdentityTransition,
+        ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
         if self.revoked {
             return Err(CertificateError::Revoked);
         }
+        // A revoked leaf never comes back, whatever signs the document that
+        // carries it (spec §10.2).
+        ledger.assert_not_revoked(&transition.installed_fingerprints()?)?;
         // An identical decision already held is a no-op, and it must be
         // recognised before the generation rule refuses `current` as a repeat.
         // "Identical" is the whole signed document: the same leaves under a
@@ -329,7 +333,7 @@ impl GatewayCertificateState {
 
         if named(&self.active_tls_fingerprint()) || named(&self.active_pq_fingerprint()?) {
             self.revoked = true;
-            self.revocation_epoch = revocation_epoch;
+            self.revocation_epoch = self.revocation_epoch.max(revocation_epoch);
             self.next_gateway_identity_epoch = None;
             self.next_transition_fingerprint = None;
             self.next_gateway_tls_certificate = None;
@@ -352,7 +356,7 @@ impl GatewayCertificateState {
                 .transpose()?
                 .is_some_and(|fingerprint| named(&fingerprint));
         if staged_hit {
-            self.revocation_epoch = revocation_epoch;
+            self.revocation_epoch = self.revocation_epoch.max(revocation_epoch);
             self.next_gateway_identity_epoch = None;
             self.next_transition_fingerprint = None;
             self.next_gateway_tls_certificate = None;
@@ -364,8 +368,10 @@ impl GatewayCertificateState {
         }
         // A revocation naming a leaf this state never held is not an error —
         // an offline document may carry the fleet's decisions — but its epoch
-        // is still consumed by the caller, so it can never be replayed.
-        self.revocation_epoch = revocation_epoch;
+        // is still consumed by the caller, so it can never be replayed. The
+        // tombstone written beside it is what stops that leaf from arriving
+        // later through a transition.
+        self.revocation_epoch = self.revocation_epoch.max(revocation_epoch);
         Ok(false)
     }
 
@@ -373,8 +379,10 @@ impl GatewayCertificateState {
     pub fn apply_ca_transition(
         &mut self,
         transition: &CaTransition,
+        ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
+        ledger.assert_not_revoked(&[transition.next_ca_fingerprint])?;
         let fingerprint = transition.fingerprint();
         if self
             .next_ca_transition_fingerprint
@@ -503,8 +511,10 @@ impl ClientTlsCaState {
         ca_pq: &MlDsa87PublicKey,
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
+        ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
+        ledger.assert_not_revoked(&[transition.next_client_tls_ca_certificate.fingerprint()])?;
         let fingerprint = transition.fingerprint();
         if self
             .next_transition_fingerprint
@@ -672,12 +682,17 @@ impl ClientCertificateState {
     pub fn stage(
         &mut self,
         authorization: &ClientCertificateStageAuthorization,
+        ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
         if self.revoked {
             return Err(CertificateError::Revoked);
         }
         let candidate = authorization.candidate()?;
+        ledger.assert_not_revoked(&[
+            candidate.tls_certificate_fingerprint,
+            candidate.pq_certificate_fingerprint,
+        ])?;
         let authorization_fingerprint = authorization.fingerprint()?;
         if let Some(pending) = &self.pending {
             if pending.stage_id == authorization.stage_id {
@@ -830,9 +845,14 @@ impl ClientCertificateState {
     }
 
     /// Terminal revocation: dominates staging, commit, promotion and rollback.
+    /// The counter never moves backwards. Two revocations dated for different
+    /// instants are applied in clock order, not in counter order, so the later
+    /// decision can reach `effective_at` first — and writing its predecessor's
+    /// number afterwards would make an already-consumed epoch deliverable
+    /// again.
     pub fn revoke(&mut self, revocation_epoch: u64) {
         self.revoked = true;
-        self.revocation_epoch = revocation_epoch;
+        self.revocation_epoch = self.revocation_epoch.max(revocation_epoch);
         self.pending = None;
         self.next = None;
         self.activation_at = None;
@@ -1023,7 +1043,9 @@ impl AstraProfile {
         ca_pq: &MlDsa87PublicKey,
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
+        ledger: &TrustLedger,
     ) -> Result<InstallOutcome, CertificateError> {
+        ledger.assert_not_revoked(&[transition.next_service_public_key.authority_fingerprint()])?;
         let fingerprint = transition.fingerprint();
         if self
             .next_service_key_transition_fingerprint
@@ -1062,8 +1084,10 @@ impl AstraProfile {
         ca_pq: &MlDsa87PublicKey,
         trust_domain_id: &TrustDomainId,
         ca_epoch: u64,
+        ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
+        ledger.assert_not_revoked(&[replacement.next_service_key_fingerprint])?;
         // Idempotency on the signed document. Comparing "same epoch, same next
         // key" would swallow a *different* replacement that happens to install
         // the same key — a different revocation epoch, a different effective
@@ -1180,6 +1204,14 @@ impl AstraIssuerState {
 /// being bounded.
 pub const MAX_SCHEDULED_REVOCATIONS: usize = 8;
 
+/// Largest number of revoked fingerprints remembered at once.
+///
+/// Generous next to the number of slots a holder has, because a tombstone may
+/// name something it never held. When it fills, [`TrustLedger::remember`]
+/// refuses rather than evicting: forgetting a revocation restores the ability
+/// to reinstall the leaf, and nothing later would notice.
+pub const MAX_REVOCATION_TOMBSTONES: usize = 32;
+
 /// Largest number of status-ordering entries kept.
 ///
 /// The targets are drawn from the slots the holder already has — two anchors,
@@ -1201,6 +1233,8 @@ pub struct ScheduledRevocation {
     pub effective_at: u64,
     pub revoked_tls_fingerprint: Option<Fingerprint>,
     pub revoked_pq_fingerprint: Option<Fingerprint>,
+    /// Fingerprint of the signed revocation, carried through to the tombstone.
+    pub revocation_fingerprint: Option<Fingerprint>,
 }
 
 impl ScheduledRevocation {
@@ -1217,6 +1251,47 @@ impl ScheduledRevocation {
             .flatten()
             .any(|revoked| occupied.iter().any(|held| held.matches(&revoked)))
     }
+}
+
+/// Which half of a generation a revoked fingerprint belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevokedFamily {
+    Tls,
+    Pq,
+}
+
+/// A revoked fingerprint, remembered after the decision took effect (§10.2).
+///
+/// Applying a revocation and then forgetting the fingerprint is the subtle
+/// half of the rule. Removing a leaf the holder currently has is visible and
+/// easy; what matters just as much is a revocation naming a leaf the holder
+/// does **not** have yet — a candidate still in flight, or a gateway leaf that
+/// has not been distributed. Consumed and then dropped, the decision is gone:
+/// the epoch has been spent, so the object can never be delivered again, and
+/// the next transition carrying that very leaf installs it as if nothing had
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationTombstone {
+    pub scope: RevocationScope,
+    pub family: RevokedFamily,
+    pub fingerprint: Fingerprint,
+    pub revocation_epoch: u64,
+    /// Instant past which the revoked certificate could not have been valid
+    /// anyway, when the holder knew it.
+    ///
+    /// `None` precisely when the revocation named something this holder never
+    /// had — the case the tombstone exists for. The spec asks for "at least
+    /// until the end of its cryptographic validity", so an unknown expiry is
+    /// kept until the ceiling forces a decision, never guessed.
+    pub expires_at: Option<u64>,
+    /// The signed revocation this came from.
+    ///
+    /// `None` for a local operator decision — `peer remove` on the gateway has
+    /// no signed object at all, and recording its absence is more honest than
+    /// fabricating a fingerprint for it.
+    pub revocation_fingerprint: Option<Fingerprint>,
 }
 
 /// Ordering key of the last status accepted for one target.
@@ -1249,6 +1324,9 @@ pub struct TrustLedger {
     pub gateway_revocation_epoch: u64,
     #[serde(default)]
     pub scheduled_revocations: Vec<ScheduledRevocation>,
+    /// Fingerprints already withdrawn, kept so no later object reinstalls one.
+    #[serde(default)]
+    pub revoked: Vec<RevocationTombstone>,
     /// Keyed by the target's fingerprint in lowercase hex.
     #[serde(default)]
     pub last_statuses: BTreeMap<String, StatusOrdering>,
@@ -1278,12 +1356,18 @@ impl TrustLedger {
             effective_at: revocation.effective_at,
             revoked_tls_fingerprint: revocation.revoked_tls_fingerprint,
             revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
+            revocation_fingerprint: Some(revocation.fingerprint()),
         });
         Ok(())
     }
 
     /// Applies every revocation that has reached its instant, to the state its
-    /// scope names. Returns whether anything moved.
+    /// scope names, and remembers the fingerprints it withdrew.
+    ///
+    /// The tombstone is written **before** the decision is applied: applying
+    /// it clears the very slot the cryptographic expiry would have been read
+    /// from, and a tombstone with an unknown expiry outlives one that could
+    /// have been pruned.
     pub fn apply_due(
         &mut self,
         gateway: &mut GatewayCertificateState,
@@ -1296,6 +1380,23 @@ impl TrustLedger {
             if now_unix < revocation.effective_at {
                 remaining.push(revocation);
                 continue;
+            }
+            for (family, fingerprint) in [
+                (RevokedFamily::Tls, revocation.revoked_tls_fingerprint),
+                (RevokedFamily::Pq, revocation.revoked_pq_fingerprint),
+            ] {
+                let Some(fingerprint) = fingerprint else {
+                    continue;
+                };
+                let expires_at = known_expiry(gateway, client, &fingerprint);
+                self.remember(RevocationTombstone {
+                    scope: revocation.scope,
+                    family,
+                    fingerprint,
+                    revocation_epoch: revocation.revocation_epoch,
+                    expires_at,
+                    revocation_fingerprint: revocation.revocation_fingerprint,
+                })?;
             }
             match revocation.scope {
                 RevocationScope::Client => {
@@ -1315,6 +1416,70 @@ impl TrustLedger {
         }
         self.scheduled_revocations = remaining;
         Ok(moved)
+    }
+
+    /// Records a withdrawn fingerprint, or refuses rather than forgetting one.
+    ///
+    /// When the list is full, tombstones whose cryptographic validity has run
+    /// out are dropped first — they can no longer protect anything. If that
+    /// frees nothing, the operation is **refused**. Evicting a live tombstone
+    /// to make room would silently restore the ability to reinstall a revoked
+    /// leaf, and a refused trust update is recoverable in a way that is not.
+    pub fn remember(&mut self, tombstone: RevocationTombstone) -> Result<(), CertificateError> {
+        if let Some(existing) = self
+            .revoked
+            .iter_mut()
+            .find(|held| held.fingerprint.matches(&tombstone.fingerprint))
+        {
+            // The same fingerprint withdrawn twice is one decision, kept at
+            // the highest counter that named it.
+            existing.revocation_epoch = existing.revocation_epoch.max(tombstone.revocation_epoch);
+            if existing.expires_at.is_none() {
+                existing.expires_at = tombstone.expires_at;
+            }
+            return Ok(());
+        }
+        if self.revoked.len() >= MAX_REVOCATION_TOMBSTONES {
+            return Err(CertificateError::InvalidTransaction(
+                "no room left for a revocation tombstone",
+            ));
+        }
+        self.revoked.push(tombstone);
+        Ok(())
+    }
+
+    /// Drops tombstones whose target could no longer be valid anyway.
+    ///
+    /// Only those with a **known** expiry: an unknown one is exactly the case
+    /// where the holder never saw the certificate, and guessing a date there
+    /// would be inventing the fact the tombstone exists to record.
+    pub fn forget_expired(&mut self, now_unix: u64) -> bool {
+        let before = self.revoked.len();
+        self.revoked
+            .retain(|tombstone| tombstone.expires_at.is_none_or(|expiry| now_unix < expiry));
+        self.revoked.len() != before
+    }
+
+    pub fn is_revoked(&self, fingerprint: &Fingerprint) -> bool {
+        self.revoked
+            .iter()
+            .any(|tombstone| tombstone.fingerprint.matches(fingerprint))
+    }
+
+    /// Refuses an installation that would reintroduce a revoked fingerprint.
+    ///
+    /// Every install path calls this, which is why it is a parameter of each
+    /// of them rather than a check a caller may remember to do: a revoked leaf
+    /// coming back through a path nobody wired up is indistinguishable, from
+    /// the outside, from a revocation that was never delivered.
+    pub fn assert_not_revoked(&self, fingerprints: &[Fingerprint]) -> Result<(), CertificateError> {
+        if fingerprints
+            .iter()
+            .any(|fingerprint| self.is_revoked(fingerprint))
+        {
+            return Err(CertificateError::Revoked);
+        }
+        Ok(())
     }
 
     pub fn last_status_for(&self, target: &Fingerprint) -> Option<(u64, u64)> {
@@ -1362,14 +1527,25 @@ impl TrustLedger {
             .u16(self.scheduled_revocations.len() as u16);
         for revocation in &self.scheduled_revocations {
             bytes
-                .u8(match revocation.scope {
-                    RevocationScope::Gateway => 0,
-                    RevocationScope::Client => 1,
-                })
+                .u8(scope_byte(revocation.scope))
                 .u64(revocation.revocation_epoch)
                 .u64(revocation.effective_at)
                 .optional_fingerprint(revocation.revoked_tls_fingerprint.as_ref())
-                .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref());
+                .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref())
+                .optional_fingerprint(revocation.revocation_fingerprint.as_ref());
+        }
+        bytes.u16(self.revoked.len() as u16);
+        for tombstone in &self.revoked {
+            bytes
+                .u8(scope_byte(tombstone.scope))
+                .u8(match tombstone.family {
+                    RevokedFamily::Tls => 0,
+                    RevokedFamily::Pq => 1,
+                })
+                .fingerprint(&tombstone.fingerprint)
+                .u64(tombstone.revocation_epoch)
+                .u64(tombstone.expires_at.unwrap_or(0))
+                .optional_fingerprint(tombstone.revocation_fingerprint.as_ref());
         }
         bytes.u16(self.last_statuses.len() as u16);
         for (target, ordering) in &self.last_statuses {
@@ -1381,6 +1557,61 @@ impl TrustLedger {
     }
 }
 
+const fn scope_byte(scope: RevocationScope) -> u8 {
+    match scope {
+        RevocationScope::Gateway => 0,
+        RevocationScope::Client => 1,
+    }
+}
+
+/// The instant a fingerprint the holder currently has stops being valid.
+///
+/// Read from the slots, never from the revocation: the object names what to
+/// withdraw, not how long the withdrawn thing would have lived. `None` when
+/// this holder has no such certificate — the case the tombstone exists for,
+/// and the one where an invented expiry would quietly drop the record.
+fn known_expiry(
+    gateway: &GatewayCertificateState,
+    client: &ClientCertificateState,
+    fingerprint: &Fingerprint,
+) -> Option<u64> {
+    for generation in [
+        Some(&client.active),
+        client.next.as_ref(),
+        client.pending.as_ref().map(|pending| &pending.candidate),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if generation.tls_certificate_fingerprint.matches(fingerprint)
+            || generation.pq_certificate_fingerprint.matches(fingerprint)
+        {
+            return Some(generation.not_after);
+        }
+    }
+
+    for (certificate, tls) in [
+        (Some(&gateway.active_gateway_certificate), None),
+        (gateway.next_gateway_certificate.as_ref(), None),
+        (None, Some(&gateway.active_gateway_tls_certificate)),
+        (None, gateway.next_gateway_tls_certificate.as_ref()),
+    ] {
+        if let Some(certificate) = certificate {
+            if pq_certificate_fingerprint(certificate).is_ok_and(|held| held.matches(fingerprint)) {
+                return Some(certificate.not_after_unix);
+            }
+        }
+        if let Some(tls) = tls {
+            if tls.fingerprint().matches(fingerprint) {
+                return crate::certificates::x509::inspect(tls)
+                    .ok()
+                    .map(|facts| facts.not_after);
+            }
+        }
+    }
+    None
+}
+
 /// The complete state a transaction is computed against (spec §8.1).
 ///
 /// Passed as one value rather than five arguments because the point is
@@ -1390,6 +1621,13 @@ pub struct TrustSnapshot<'a> {
     pub gateway: &'a GatewayCertificateState,
     pub client_tls_ca: &'a ClientTlsCaState,
     pub astra: &'a AstraProfile,
+    /// The anti-rollback counter, held **separately** from the delegation.
+    ///
+    /// A holder that has revoked its issuer, or never installed one, still
+    /// carries a counter that only moves forward. Deriving this number from
+    /// `issuer` would leave it out of the fingerprint in exactly that case,
+    /// and a transaction built before the counter advanced would still match.
+    pub issuer_epoch: u64,
     pub issuer: Option<&'a AstraIssuerState>,
     pub client: &'a ClientCertificateState,
     pub ledger: &'a TrustLedger,
@@ -1405,6 +1643,7 @@ pub fn base_state_fingerprint(snapshot: &TrustSnapshot) -> Result<Fingerprint, C
     snapshot.gateway.snapshot(&mut bytes)?;
     snapshot.client_tls_ca.snapshot(&mut bytes);
     snapshot.astra.snapshot(&mut bytes);
+    bytes.u64(snapshot.issuer_epoch);
     match snapshot.issuer {
         // The whole delegation, not just its number: an issuer swapped at the
         // same epoch changes which key may certify the next client leaf.
@@ -1860,7 +2099,9 @@ mod tests {
             let transition = transition(&ca, &state, 2, next.clone());
 
             assert_eq!(
-                state.install_transition(&transition, 500).expect("install"),
+                state
+                    .install_transition(&transition, &TrustLedger::default(), 500)
+                    .expect("install"),
                 InstallOutcome::Installed
             );
             assert_eq!(state.gateway_decision_epoch, 2);
@@ -1892,7 +2133,9 @@ mod tests {
             let candidate = keys();
             let mut state = state(&ca, leaf(&ca, &active, 1));
             let transition = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
-            state.install_transition(&transition, 500).expect("install");
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
             state.mark_published().expect("publish");
 
             let abort = abort(&ca, &transition, 1_500);
@@ -1912,7 +2155,9 @@ mod tests {
             let candidate = keys();
             let mut state = state(&ca, leaf(&ca, &active, 1));
             let staged = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
-            state.install_transition(&staged, 500).expect("install");
+            state
+                .install_transition(&staged, &TrustLedger::default(), 500)
+                .expect("install");
 
             let abort = abort(&ca, &staged, 1_500);
             assert_eq!(
@@ -1932,10 +2177,14 @@ mod tests {
 
             // A second attempt at the consumed epoch is refused; epoch 3 works.
             let retry = transition(&ca, &state, 2, leaf(&ca, &candidate, 3));
-            assert!(state.install_transition(&retry, 500).is_err());
+            assert!(state
+                .install_transition(&retry, &TrustLedger::default(), 500)
+                .is_err());
             let forward = transition(&ca, &state, 3, leaf(&ca, &candidate, 4));
             assert_eq!(
-                state.install_transition(&forward, 500).expect("install"),
+                state
+                    .install_transition(&forward, &TrustLedger::default(), 500)
+                    .expect("install"),
                 InstallOutcome::Installed
             );
         }
@@ -1948,20 +2197,136 @@ mod tests {
             let candidate = keys();
             let mut state = state(&ca, leaf(&ca, &active, 1));
             let first = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
-            state.install_transition(&first, 500).expect("install");
+            state
+                .install_transition(&first, &TrustLedger::default(), 500)
+                .expect("install");
 
             let second = transition(&ca, &state, 3, leaf(&ca, &candidate, 3));
             assert!(matches!(
-                state.install_transition(&second, 500),
+                state.install_transition(&second, &TrustLedger::default(), 500),
                 Err(CertificateError::IllegalStateTransition(_))
             ));
 
             // The identical one is an idempotent replay, not a refusal.
             assert_eq!(
-                state.install_transition(&first, 500).expect("replay"),
+                state
+                    .install_transition(&first, &TrustLedger::default(), 500)
+                    .expect("replay"),
                 InstallOutcome::AlreadyPresent
             );
         }
+
+        /// A revoked leaf never comes back through a later transition.
+        ///
+        /// This is the case a revocation applied and then forgotten misses
+        /// entirely: the decision named a leaf the holder did not have yet, so
+        /// nothing was removed and nothing was remembered — and the very next
+        /// transition installs it as though the revocation had never existed.
+        #[test]
+        fn a_revoked_leaf_is_refused_by_a_later_transition() {
+            let ca = keys();
+            let active = keys();
+            let candidate = keys();
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let next = leaf(&ca, &candidate, 2);
+            let transition = transition(&ca, &state, 2, next.clone());
+
+            let mut ledger = TrustLedger::default();
+            ledger
+                .remember(RevocationTombstone {
+                    scope: RevocationScope::Gateway,
+                    family: RevokedFamily::Pq,
+                    fingerprint: pq_certificate_fingerprint(&next).expect("fingerprint"),
+                    revocation_epoch: 1,
+                    // Never held, so no expiry is known — the case the
+                    // tombstone exists for.
+                    expires_at: None,
+                    revocation_fingerprint: Some(Fingerprint::of(b"the signed revocation")),
+                })
+                .expect("tombstone");
+
+            assert!(matches!(
+                state.install_transition(&transition, &ledger, 500),
+                Err(CertificateError::Revoked)
+            ));
+            assert!(state.next_gateway_certificate.is_none());
+
+            // And without the tombstone the very same document installs — so
+            // the refusal above is the tombstone's doing, not the window's.
+            assert_eq!(
+                state
+                    .install_transition(&transition, &TrustLedger::default(), 500)
+                    .expect("install"),
+                InstallOutcome::Installed
+            );
+        }
+    }
+
+    /// A tombstone is never traded away to make room for another.
+    #[test]
+    fn a_full_tombstone_list_refuses_rather_than_forgetting_a_revocation() {
+        let tombstone = |seed: u8, expires_at| RevocationTombstone {
+            scope: RevocationScope::Client,
+            family: RevokedFamily::Pq,
+            fingerprint: Fingerprint::of(&[seed]),
+            revocation_epoch: u64::from(seed),
+            expires_at,
+            revocation_fingerprint: None,
+        };
+
+        let mut ledger = TrustLedger::default();
+        for seed in 0..MAX_REVOCATION_TOMBSTONES as u8 {
+            ledger.remember(tombstone(seed, None)).expect("room");
+        }
+        assert!(matches!(
+            ledger.remember(tombstone(200, None)),
+            Err(CertificateError::InvalidTransaction(_))
+        ));
+        assert!(
+            ledger.is_revoked(&Fingerprint::of(&[0u8])),
+            "the first tombstone was not evicted to make room"
+        );
+
+        // Recording the same fingerprint twice is one decision, not two slots.
+        assert_eq!(ledger.revoked.len(), MAX_REVOCATION_TOMBSTONES);
+        ledger.remember(tombstone(0, Some(9_000))).expect("merge");
+        assert_eq!(ledger.revoked.len(), MAX_REVOCATION_TOMBSTONES);
+    }
+
+    /// Only a **known** cryptographic expiry lets a tombstone be dropped.
+    /// An unknown one is precisely the case where forgetting is unsafe.
+    #[test]
+    fn only_a_tombstone_with_a_known_expiry_is_ever_forgotten() {
+        let mut ledger = TrustLedger::default();
+        ledger
+            .remember(RevocationTombstone {
+                scope: RevocationScope::Client,
+                family: RevokedFamily::Tls,
+                fingerprint: Fingerprint::of(b"held once"),
+                revocation_epoch: 1,
+                expires_at: Some(5_000),
+                revocation_fingerprint: None,
+            })
+            .expect("tombstone");
+        ledger
+            .remember(RevocationTombstone {
+                scope: RevocationScope::Client,
+                family: RevokedFamily::Pq,
+                fingerprint: Fingerprint::of(b"never held"),
+                revocation_epoch: 2,
+                expires_at: None,
+                revocation_fingerprint: None,
+            })
+            .expect("tombstone");
+
+        assert!(!ledger.forget_expired(4_999));
+        assert!(ledger.forget_expired(5_000));
+        assert!(!ledger.is_revoked(&Fingerprint::of(b"held once")));
+        assert!(
+            ledger.is_revoked(&Fingerprint::of(b"never held")),
+            "an unknown expiry is kept: guessing one would drop the record"
+        );
+        assert!(!ledger.forget_expired(u64::MAX));
     }
 
     /// After the outgoing key is retired, no `status_epoch` revives it.

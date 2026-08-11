@@ -26,6 +26,22 @@
 //! old gateway — a state no participant ever intended. [`TrustStore::apply`]
 //! verifies the whole ordered set first and commits it with a single write;
 //! a failure anywhere leaves the live state untouched.
+//!
+//! # Limite connue : pas de migration de format
+//!
+//! [`TrustState`] carries `deny_unknown_fields`, and the shape of its bounded
+//! state has changed inside this lot — `ledger` replaced two flat fields, and
+//! the committed-stage record grew. There is deliberately **no** migration
+//! path, for one reason: nothing outside tests has ever written this file.
+//! `TrustStore` is constructed by the tests and by nothing that ships, so no
+//! instance of an earlier shape can exist on any disk.
+//!
+//! That is a fact about today, not a design choice to keep. Once a released
+//! Orion writes a trust store, the format is frozen and any later change needs
+//! an explicit migration with fixtures of the previous version. Until then the
+//! behaviour is the correct one for a bounded security state: an unreadable
+//! document fails loudly as [`TrustError::Corrupt`] rather than deserializing
+//! into a store that silently dropped the revocations it could not parse.
 
 use std::path::{Path, PathBuf};
 
@@ -159,6 +175,7 @@ impl TrustStore {
             gateway: &self.state.gateway,
             client_tls_ca: &self.state.client_tls_ca,
             astra: &self.state.astra,
+            issuer_epoch: self.state.issuer_epoch,
             issuer: self.state.issuer.as_ref(),
             client: &self.state.certificates,
             ledger: &self.state.ledger,
@@ -253,10 +270,11 @@ impl TrustStore {
         for object in objects {
             match object {
                 TrustUpdateObject::CaTransition(transition) => {
-                    if candidate
-                        .gateway
-                        .apply_ca_transition(transition, now_unix)?
-                        == InstallOutcome::Installed
+                    if candidate.gateway.apply_ca_transition(
+                        transition,
+                        &candidate.ledger,
+                        now_unix,
+                    )? == InstallOutcome::Installed
                     {
                         applied += 1;
                     }
@@ -267,6 +285,7 @@ impl TrustStore {
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
+                        &candidate.ledger,
                         now_unix,
                     )? == InstallOutcome::Installed
                     {
@@ -279,6 +298,7 @@ impl TrustStore {
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
+                        &candidate.ledger,
                     )? == InstallOutcome::Installed
                     {
                         applied += 1;
@@ -293,6 +313,7 @@ impl TrustStore {
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
                         candidate.gateway.ca_epoch,
+                        &candidate.ledger,
                         now_unix,
                     )? == InstallOutcome::Installed
                     {
@@ -331,8 +352,11 @@ impl TrustStore {
                     }
                 }
                 TrustUpdateObject::GatewayIdentityTransition(transition) => {
-                    if candidate.gateway.install_transition(transition, now_unix)?
-                        == InstallOutcome::Installed
+                    if candidate.gateway.install_transition(
+                        transition,
+                        &candidate.ledger,
+                        now_unix,
+                    )? == InstallOutcome::Installed
                     {
                         candidate.staged_gateway_transition = Some((**transition).clone());
                         applied += 1;
@@ -463,6 +487,10 @@ impl TrustStore {
             &mut candidate.certificates,
             now_unix,
         )?;
+        // A tombstone whose target could no longer be valid anyway protects
+        // nothing, and the list is bounded: keeping it costs a slot a live
+        // revocation may need. Only known expiries are pruned.
+        moved |= candidate.ledger.forget_expired(now_unix);
         // A promoted generation is gone from the state, so its status counter
         // is only occupying room in a bounded map.
         let held: Vec<Fingerprint> = status_targets(&candidate)
@@ -865,6 +893,59 @@ mod tests {
         )
     }
 
+    /// A document from before the ledger existed is refused, not silently
+    /// accepted with the revocations it carried dropped on the floor.
+    ///
+    /// Nothing that ships has ever written this file, so no such document can
+    /// exist today — but the failure mode is what matters if one ever does:
+    /// loud, and on the side of refusing to run.
+    #[test]
+    fn a_trust_store_from_an_earlier_shape_is_refused_rather_than_half_read() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("trust.json");
+        // The pre-ledger shape: two flat fields where `ledger` now is.
+        std::fs::write(
+            &path,
+            br#"{"trust_domain_id":"01010101010101010101010101010101",
+                 "scheduled_revocations":[],"last_status":null}"#,
+        )
+        .expect("write");
+        assert!(matches!(
+            TrustStore::load(&path),
+            Err(TrustError::Corrupt(_))
+        ));
+    }
+
+    /// The anti-rollback counter is bound even when no delegation is
+    /// installed. Deriving it from `issuer` would leave it out of the
+    /// fingerprint in exactly the case where the store has no issuer — and a
+    /// transaction built before the counter advanced would still match.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn the_issuer_counter_is_bound_even_with_no_delegation_installed() {
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        assert!(store.state().issuer.is_none());
+
+        let before = store.base_state_fingerprint().expect("fingerprint");
+        let mut moved = store.state().clone();
+        moved.issuer_epoch += 1;
+        let store = TrustStore::new(directory.path().join("trust.json"), moved);
+        assert_ne!(
+            before,
+            store.base_state_fingerprint().expect("fingerprint"),
+            "the counter moved, so the state a manifest was built against did too"
+        );
+    }
+
     /// A revocation dated for later is kept, not dropped: its epoch is already
     /// consumed, so it would never be delivered again.
     #[cfg(feature = "certificate-signing")]
@@ -1039,6 +1120,147 @@ mod tests {
             .expect("the client's own first revocation still verifies");
         store.refresh(2_500).expect("refresh");
         assert!(store.state().certificates.revoked);
+    }
+
+    /// Two revocations dated for different instants take effect in **clock**
+    /// order, not counter order. The later decision can therefore land first,
+    /// and writing its predecessor's number afterwards would make an epoch
+    /// that has already been consumed deliverable again.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn applying_revocations_out_of_counter_order_never_moves_the_counter_back() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+
+        let revocation = |epoch: u64, effective_at: u64, fingerprint| {
+            EmergencyCertificateRevocation {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                ca_epoch: 1,
+                scope: RevocationScope::Client,
+                identity_key: key(2),
+                server_name: None,
+                revocation_epoch: epoch,
+                revoked_tls_fingerprint: None,
+                revoked_pq_fingerprint: Some(fingerprint),
+                effective_at,
+                reason: RevocationReason::KeyCompromise,
+                replacement_transition_fingerprint: None,
+                ca_signature: MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchor_private)
+            .expect("sign")
+        };
+
+        // Epoch 1 is dated for later than epoch 2, so 2 reaches its instant
+        // first. Both are accepted in counter order, as they arrive.
+        let later = revocation(1, 9_000, Fingerprint::of(b"a leaf this client never held"));
+        let sooner = revocation(2, 2_000, active.pq_certificate_fingerprint);
+        store
+            .apply(
+                &[
+                    TrustUpdateObject::CertificateRevocation(Box::new(later)),
+                    TrustUpdateObject::CertificateRevocation(Box::new(sooner)),
+                ],
+                1_000,
+            )
+            .expect("both accepted");
+        assert_eq!(store.state().certificates.revocation_epoch, 2);
+
+        store.refresh(2_000).expect("refresh");
+        assert!(store.state().certificates.revoked);
+        assert_eq!(store.state().certificates.revocation_epoch, 2);
+
+        store.refresh(9_000).expect("refresh");
+        assert_eq!(
+            store.state().certificates.revocation_epoch,
+            2,
+            "applying the older decision must not make epoch 2 deliverable again"
+        );
+    }
+
+    /// A revocation naming a leaf the client does not hold yet is remembered,
+    /// not merely consumed. Otherwise its epoch is spent, the object can never
+    /// be delivered again, and the next transition carrying that leaf installs
+    /// it as if nothing had happened.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_revoked_fingerprint_is_remembered_even_when_it_was_never_held() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let unseen = Fingerprint::of(b"a candidate still in flight");
+
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: None,
+            revoked_pq_fingerprint: Some(unseen),
+            effective_at: 1_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateRevocation(Box::new(
+                    revocation,
+                ))],
+                1_000,
+            )
+            .expect("revocation accepted");
+
+        assert!(
+            !store.state().certificates.revoked,
+            "it named nothing this client holds, so nothing was withdrawn"
+        );
+        assert!(
+            store.state().ledger.is_revoked(&unseen),
+            "but the decision is remembered: its epoch is already spent"
+        );
+        let tombstone = store
+            .state()
+            .ledger
+            .revoked
+            .iter()
+            .find(|tombstone| tombstone.fingerprint.matches(&unseen))
+            .expect("tombstone");
+        assert_eq!(tombstone.revocation_epoch, 1);
+        assert!(
+            tombstone.expires_at.is_none(),
+            "the client never held it, so its cryptographic expiry is unknown"
+        );
+        assert!(tombstone.revocation_fingerprint.is_some());
     }
 
     /// A revocation naming another machine is refused before its counter is

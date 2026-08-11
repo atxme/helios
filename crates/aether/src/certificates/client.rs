@@ -504,6 +504,7 @@ impl ClientCertificateStageAuthorization {
         crate::certificates::x509::assert_client_leaf(
             &self.next_tls_certificate,
             self.window.activation_at,
+            self.window.not_after,
         )?;
         let intermediates: Vec<&DerCertificate> = self
             .issuer_authorization
@@ -518,6 +519,7 @@ impl ClientCertificateStageAuthorization {
             &intermediates,
             tls_anchors,
             self.window.activation_at,
+            self.window.not_after,
         )?;
         // The anchor the object *names* must be the one it actually chains to.
         if !tls_anchors.iter().any(|anchor| {
@@ -1059,6 +1061,7 @@ impl ClientCertificateRotationGrant {
         crate::certificates::x509::assert_client_leaf(
             &self.next_tls_certificate,
             self.window.activation_at,
+            self.window.not_after,
         )?;
         let intermediates: Vec<&DerCertificate> = self
             .issuer_authorization
@@ -1070,6 +1073,7 @@ impl ClientCertificateRotationGrant {
             &intermediates,
             tls_anchors,
             self.window.activation_at,
+            self.window.not_after,
         )?;
         if !tls_anchors.iter().any(|anchor| {
             anchor

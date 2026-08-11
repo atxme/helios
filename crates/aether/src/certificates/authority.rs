@@ -232,6 +232,16 @@ impl ClientTlsCaTransition {
         crate::certificates::x509::assert_certificate_authority(
             &self.next_client_tls_ca_certificate,
         )?;
+        // And it must still be an authority for the whole window it is being
+        // installed for. An anchor that expires between `activation_at` and
+        // `not_after` retires in the middle of the overlap it exists to carry,
+        // taking every leaf under it with it — after the outgoing anchor has
+        // already been scheduled for retirement.
+        crate::certificates::x509::assert_covers(
+            &self.next_client_tls_ca_certificate,
+            self.window.activation_at,
+            self.window.not_after,
+        )?;
         verify_ml_dsa_87(ca_pq, &self.signing_bytes(), &self.ca_pq_signature)
     }
 }
@@ -356,6 +366,15 @@ impl AstraIssuerAuthorization {
         if now_unix < self.not_before || now_unix >= self.not_after {
             return Err(CertificateError::IssuerAuthorizationExpired);
         }
+        // The intermediate must outlast the delegation. One that expires
+        // first leaves Astra holding a signed authorization it can no longer
+        // produce a usable leaf with, and the refusal lands at 80 % of a
+        // client's leaf — the one moment there is no fallback.
+        crate::certificates::x509::assert_covers(
+            &self.tls_intermediate_certificate,
+            self.not_before,
+            self.not_after,
+        )?;
         verify_ml_dsa_87(ca_pq, &self.signing_bytes(), &self.ca_pq_signature)
     }
 
