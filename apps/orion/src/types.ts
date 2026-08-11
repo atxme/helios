@@ -111,6 +111,7 @@ export type CertificateActionBlockKind =
   | 'nothing_expired'
   | 'no_previous_identity'
   | 'trust_material_missing'
+  | 'renewal_path_not_wired'
   | 'operator_credential_required'
 
 /** One action and whether it may run, as the shell decides. */
@@ -121,6 +122,18 @@ export interface CertificateActionState {
   blocked_by: { kind: CertificateActionBlockKind } | null
   /** The sentence to show, as-is. `null` when the action may run. */
   message: string | null
+}
+
+/** Everything the Certificates screen shows for one profile. */
+export interface ProfileCertificates {
+  name: string
+  /** Protected identity the profile names. Empty when it negotiates nothing. */
+  identity: string
+  /** The profile carries a key-negotiation block. */
+  negotiates: boolean
+  inventory: CertificateInventory
+  actions: CertificateActionState[]
+  last_error: string | null
 }
 
 export interface CertificateInventory {

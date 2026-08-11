@@ -14,6 +14,7 @@ import {
   backendKind,
   certificateActions,
   certificateInventory,
+  certificateOverview,
   connect,
   deleteProfile,
   disconnect,
@@ -56,6 +57,7 @@ describe('Orion Tauri bridge', () => {
     await keyNegotiationSupport()
     await certificateInventory(profile as never)
     await certificateActions(profile as never)
+    await certificateOverview()
     await runCertificateAction('portable', 'renew_now')
     await lastCertificateError('portable')
     await saveProfile(profile as never)
@@ -87,6 +89,7 @@ describe('Orion Tauri bridge', () => {
       ['key_negotiation_support'],
       ['certificate_inventory', { keyNegotiation: profile }],
       ['certificate_actions', { keyNegotiation: profile }],
+      ['certificate_overview'],
       ['run_certificate_action', { name: 'portable', action: 'renew_now' }],
       ['last_certificate_error', { name: 'portable' }],
       ['save_profile', { draft: profile }],

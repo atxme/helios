@@ -142,10 +142,8 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ajouter' }))
     expect(screen.getByText(/CA TLS absente/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Identité protégée'), { target: { value: 'workstation' } })
-    // The certificate panel is deferred like the validation: reading it
-    // unseals the protected identity, and a DPAPI call per keystroke would buy
-    // nothing.
-    await waitFor(() => expect(screen.getByText(/Aucune identité protégée nommée/)).toBeTruthy())
+    // Certificates live in their own destination now; what stays here is the
+    // machine-level fact, which is about this build rather than this profile.
     expect(screen.getByText(/Aucun stockage protégé d’identité/)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Afficher les données encodées' }))
@@ -408,60 +406,8 @@ describe('ProfilesView interactions', () => {
     expect(screen.getByRole('button', { name: 'Définir un PSK statique' })).toBeTruthy()
   })
 
-  /**
-   * The Certificates sub-screen of spec §12.2, inside the Profiles surface.
-   *
-   * It appears only with a negotiation block — a classic profile pins no
-   * certificate — and it carries the four actions by name, each disabled with
-   * the reason the shell gave.
-   */
-  it('shows the certificates sub-screen with the four actions of the specification', async () => {
-    api.certificateActions.mockResolvedValue([
-      {
-        action: 'renew_now',
-        label: 'Renouveler maintenant',
-        blocked_by: { kind: 'trust_material_missing' },
-        message: 'Ce profil ne porte pas le matériel de confiance…',
-      },
-      {
-        action: 'recover_expired',
-        label: 'Récupérer le certificat expiré',
-        blocked_by: { kind: 'nothing_expired' },
-        message: 'Aucun certificat de ce profil n’est expiré…',
-      },
-    ])
-    const handlers = callbacks()
-    render(
-      <ProfilesView
-        config={{
-          profiles: [
-            profile({
-              key_negotiation: {
-                mode: 'ml_kem',
-                minimum_mode: 'ml_kem',
-                endpoint: '203.0.113.10:51821',
-                server_name: '203.0.113.10',
-                gateway_ca_der: 'ca',
-                gateway_pq_certificate: 'pq',
-                identity: 'orion-portable',
-              },
-            }),
-          ],
-          selected: 'portable',
-        }}
-        pathImport={null}
-        {...handlers}
-      />,
-    )
-
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Certificats' })).toBeTruthy())
-    const renew = await screen.findByRole('button', { name: 'Renouveler maintenant' })
-    expect((renew as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getByRole('button', { name: 'Récupérer le certificat expiré' })).toBeTruthy()
-  })
-
-  /** A classic profile pins no certificate, so it gets no sub-screen. */
-  it('shows no certificates sub-screen on a profile without negotiation', async () => {
+  /** Certificates have their own destination: none of it leaks back here. */
+  it('shows no certificate surface on the profiles screen', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -472,6 +418,8 @@ describe('ProfilesView interactions', () => {
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
     expect(screen.queryByRole('heading', { name: 'Certificats' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Renouveler maintenant' })).toBeNull()
+    expect(api.certificateInventory).not.toHaveBeenCalled()
   })
 
   /** The other direction: asking for ML-KEM is what removes the PSK. */

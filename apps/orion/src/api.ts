@@ -14,6 +14,7 @@ import type {
   ImportOutcome,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
+  ProfileCertificates,
   ProfileDraft,
   ProfileIssues,
   TunnelState,
@@ -91,6 +92,16 @@ export const certificateInventory = (keyNegotiation: KeyNegotiationSettings | nu
  */
 export const certificateActions = (keyNegotiation: KeyNegotiationSettings | null) =>
   invoke<CertificateActionState[]>('certificate_actions', { keyNegotiation })
+
+/**
+ * The same, for every profile of this device, in one call.
+ *
+ * Reading a profile's certificates unseals its protected identity. A screen
+ * listing six profiles asking two questions each would make twelve DPAPI round
+ * trips to draw one view.
+ */
+export const certificateOverview = () =>
+  invoke<ProfileCertificates[]>('certificate_overview')
 
 /** Runs one of them, or rejects with the reason it cannot run. */
 export const runCertificateAction = (name: string, action: CertificateAction) =>

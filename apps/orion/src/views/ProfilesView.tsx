@@ -31,7 +31,6 @@ import {
 } from 'lucide-react'
 import * as api from '../api'
 import { readProfileDocument } from '../profileDocument'
-import { CertificatePanel } from '../components/CertificatePanel'
 import { CopyButton } from '../components/CopyButton'
 import {
   modeAllowed,
@@ -42,9 +41,6 @@ import {
 } from '../components/state'
 import { GUTTER } from '../theme'
 import type {
-  CertificateAction,
-  CertificateActionState,
-  CertificateInventory,
   ClientConfig,
   ClientProfile,
   ImportOutcome,
@@ -243,18 +239,6 @@ export function ProfilesView({
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
-  /**
-   * The four certificates this profile depends on, as the shell reports them.
-   *
-   * Replaces a fingerprint fetched on its own: the shell already has to open
-   * the pinned material and the protected store to answer, and answering one
-   * question at a time meant three round trips for three halves of one fact.
-   */
-  const [inventory, setInventory] = useState<CertificateInventory | null>(null)
-  /** The four actions of spec §12.2, and why each one can or cannot run. */
-  const [actions, setActions] = useState<CertificateActionState[]>([])
-  /** Last action that failed on this profile — §12.2 asks the surface for it. */
-  const [lastError, setLastError] = useState<string | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -278,90 +262,6 @@ export function ProfilesView({
       cancelled = true
     }
   }, [])
-
-  // Read on the Rust side, like the public key: the UI handles no crypto, and
-  // two of these certificates live in a protected store it must not reach. An
-  // unreadable one yields a named fault rather than a dash.
-  //
-  // Keyed on the negotiation block **by value**, and deferred like the
-  // validation: answering unseals the protected identity, and doing that on
-  // every keystroke of the profile name would be a DPAPI call per character
-  // for an answer that cannot have changed.
-  //
-  // The notice is a dependency too: sealing happens during an import, so the
-  // answer changes at exactly that moment.
-  const negotiationKey = JSON.stringify(draft.key_negotiation)
-  useEffect(() => {
-    let cancelled = false
-    const timer = setTimeout(() => {
-      api
-        .certificateInventory(JSON.parse(negotiationKey) as KeyNegotiationSettings | null)
-        .then((found) => {
-          if (!cancelled) setInventory(found)
-        })
-        .catch(() => {
-          if (!cancelled) setInventory(null)
-        })
-    }, VALIDATION_DELAY_MS)
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [negotiationKey, notice])
-
-  // Deferred with the inventory and for the same reason: deciding reads the
-  // same protected store.
-  useEffect(() => {
-    let cancelled = false
-    const timer = setTimeout(() => {
-      api
-        .certificateActions(JSON.parse(negotiationKey) as KeyNegotiationSettings | null)
-        .then((found) => {
-          if (!cancelled) setActions(found)
-        })
-        .catch(() => {
-          if (!cancelled) setActions([])
-        })
-    }, VALIDATION_DELAY_MS)
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [negotiationKey, notice])
-
-  // The stored profile's error, not the draft's: an action runs against what
-  // is saved, so an unsaved rename must not look like a profile with no
-  // history.
-  useEffect(() => {
-    let cancelled = false
-    api
-      .lastCertificateError(draft.name)
-      .then((found) => {
-        if (!cancelled) setLastError(found)
-      })
-      .catch(() => {
-        if (!cancelled) setLastError(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [draft.name, actions])
-
-  /**
-   * Runs one of the four actions against the **saved** profile.
-   *
-   * The refusal is recorded on the Rust side and read back, rather than shown
-   * from the rejection alone: it is what makes the message survive a rerender
-   * and match what a second press would say.
-   */
-  const runCertificateAction = async (action: CertificateAction) => {
-    try {
-      await api.runCertificateAction(draft.name, action)
-      setLastError(null)
-    } catch (cause) {
-      setLastError(String(cause))
-    }
-  }
 
   /**
    * The draft in the shape the shell accepts: public fields plus intents.
@@ -1238,28 +1138,6 @@ export function ProfilesView({
             onToggle={toggleNegotiation}
           />
 
-          {/* ── Certificats ─────────────────────────────────────────────────
-              The sub-screen spec §12.2 requires of the Profiles surface: what
-              is pinned and until when, the chosen renewal date, the last
-              error, and the four actions by name. Its own block rather than a
-              row inside the negotiation one — it answers a different question,
-              and it is the one a user opens this screen for when a profile
-              stops connecting. */}
-          {draft.key_negotiation && (
-            <>
-              <Divider sx={{ my: 1.75 }} />
-              <Typography component="h3" sx={{ mb: 1, fontSize: 12.5, fontWeight: 650 }}>
-                Certificats
-              </Typography>
-              <CertificatePanel
-                inventory={inventory}
-                identityName={draft.key_negotiation.identity}
-                actions={actions}
-                lastError={lastError}
-                onRun={(action) => void runCertificateAction(action)}
-              />
-            </>
-          )}
         </Box>
       </Box>
 

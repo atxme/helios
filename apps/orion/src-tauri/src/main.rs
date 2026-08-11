@@ -420,6 +420,62 @@ fn certificate_inventory(
     orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix())
 }
 
+/// Everything the Certificates screen shows, for every profile at once.
+///
+/// One command rather than two per profile, and the reason is the protected
+/// store: answering unseals it, and a screen listing six profiles would
+/// otherwise make twelve DPAPI round trips to build one view.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProfileCertificates {
+    name: String,
+    /// Protected identity the profile names. Empty when it negotiates nothing.
+    identity: String,
+    /// The profile carries a key-negotiation block.
+    negotiates: bool,
+    inventory: orion_core::CertificateInventory,
+    actions: Vec<orion_core::CertificateActionState>,
+    last_error: Option<String>,
+}
+
+#[tauri::command]
+async fn certificate_overview(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileCertificates>, String> {
+    let profiles: Vec<(String, Option<orion_core::KeyNegotiationSettings>)> = {
+        let cfg = state.config.lock().await;
+        cfg.profiles
+            .iter()
+            .map(|profile| (profile.name.clone(), profile.key_negotiation.clone()))
+            .collect()
+    };
+    let errors = state.last_certificate_error.lock().await.clone();
+    let identity_store = state.controller.key_negotiation_ready();
+    let now = now_unix();
+
+    Ok(profiles
+        .into_iter()
+        .map(|(name, settings)| {
+            let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            let actions = orion_core::certificate_actions::action_states(
+                settings.as_ref(),
+                &inventory,
+                identity_store,
+            );
+            ProfileCertificates {
+                identity: settings
+                    .as_ref()
+                    .map(|block| block.identity.clone())
+                    .unwrap_or_default(),
+                negotiates: settings.is_some(),
+                last_error: errors.get(&name).cloned(),
+                name,
+                inventory,
+                actions,
+            }
+        })
+        .collect())
+}
+
 /// State of the four certificate actions of spec §12.2, for one profile.
 ///
 /// Decided in `orion-core`, beside the state it reads. The screen renders the
@@ -1495,6 +1551,9 @@ async fn validate_profile(
 fn window_size_for(view: &str) -> (f64, f64) {
     match view {
         "profiles" => (800.0, 720.0),
+        // Certificates lists every Helios profile of the device with four
+        // rows and four actions each: it needs the height, not the width.
+        "certificates" => (800.0, 760.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the
         // height of the other views only produced a hole in the middle.
@@ -1962,6 +2021,7 @@ fn main() {
             key_negotiation_support,
             certificate_inventory,
             certificate_actions,
+            certificate_overview,
             run_certificate_action,
             last_certificate_error,
             vault_posture,
