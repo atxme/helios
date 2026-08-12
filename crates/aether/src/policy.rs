@@ -18,8 +18,19 @@ pub enum PolicyMode {
 /// intent, not nftables syntax.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallPolicy {
-    /// Interface towards the Internet (e.g. `eth0`, the Realtek RTL8111HS controller).
-    pub wan_iface: String,
+    /// Interfaces towards the Internet, in order of preference.
+    ///
+    /// A **set**, not a choice: a gateway with a cable and a radio must keep
+    /// working when the cable is unplugged, and the firewall is the one thing
+    /// that must not stand in the way. Every rule below that names the WAN is
+    /// emitted once per interface, so whichever one the kernel routes through
+    /// at the moment is permitted — failover costs no restart and no reload.
+    ///
+    /// The order carries the operator's preference and nothing else. What
+    /// decides where a packet actually leaves is the routing table, and route
+    /// metrics are where a preference between two live uplinks is expressed —
+    /// see `heliosd::uplink`.
+    pub wan_ifaces: Vec<String>,
     /// LAN-side interfaces whose traffic must go through the tunnel.
     pub lan_ifaces: Vec<String>,
     /// Peers (IP addresses) reachable in the clear for WireGuard transport

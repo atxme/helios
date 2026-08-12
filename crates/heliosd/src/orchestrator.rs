@@ -71,7 +71,9 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         private_key: network.wg_private_key.clone(),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
-        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(&network.wan_iface))),
+        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(
+            network.primary_wan_iface().unwrap_or_default(),
+        ))),
     };
     let peers = network
         .peers
@@ -199,7 +201,7 @@ pub async fn run(
             &policy,
         )
         .await?;
-        let wan = network.wan_iface.clone();
+        let wan = network.primary_wan_iface().unwrap_or_default().to_string();
         drop(network);
         spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
     }
@@ -217,7 +219,12 @@ pub async fn run(
 
     // 4. Network telemetry (/proc/net/dev).
     {
-        let wan = shared_network.read().await.wan_iface.clone();
+        let wan = shared_network
+            .read()
+            .await
+            .primary_wan_iface()
+            .unwrap_or_default()
+            .to_string();
         spawn_telemetry_loop(wan, event_tx.clone());
     }
 
@@ -404,7 +411,7 @@ async fn handle_external_cmd(
             );
             let network = shared_network.read().await;
             do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
-            let wan = network.wan_iface.clone();
+            let wan = network.primary_wan_iface().unwrap_or_default().to_string();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
             sync_policy(shared_policy, policy).await;
@@ -502,7 +509,7 @@ async fn handle_external_cmd(
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
                 do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
-                let wan = network.wan_iface.clone();
+                let wan = network.primary_wan_iface().unwrap_or_default().to_string();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
                 sync_policy(shared_policy, policy).await;
@@ -1233,7 +1240,7 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     );
     println!("  transport    : WireGuard UDP {WG_PORT}");
     println!("  web interface: http://{}", network.api_bind());
-    println!("  WAN          : {}", network.wan_iface);
+    println!("  WAN          : {}", network.wan_ifaces.join(", "));
     println!("  LAN          : {:?}", network.lan_ifaces);
     println!(
         "  WG interface : {} (UDP {})",
@@ -1286,7 +1293,7 @@ mod tests {
 
     fn configured_network() -> NetworkConfig {
         NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             wg_iface: "helios0".into(),
             wg_private_key: PRIVATE_KEY.into(),
             wg_address: "100.64.0.1/10".into(),

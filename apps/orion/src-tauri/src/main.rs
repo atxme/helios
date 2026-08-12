@@ -560,14 +560,21 @@ async fn last_certificate_error(
         .cloned())
 }
 
-/// Measures the data path to the gateway named by the active profile.
+/// Measures the raw WireGuard data path to the active gateway.
 ///
 /// This command is intentionally available only while WireGuard is `Up`: the
 /// gateway's API lives behind that tunnel, and the Rust engine targets its
-/// fixed in-tunnel address. The transfer implementation itself lives in
-/// `orion-core`, so it remains testable without Tauri or WebView.
+/// fixed in-tunnel address. TCP/UDP data is exchanged on a dedicated socket;
+/// this command only relays progress and keeps the expensive benchmark
+/// serialized. The transfer implementation itself lives in `orion-core`, so
+/// it remains testable without Tauri or WebView.
 #[tauri::command]
-async fn run_speed_test(state: State<'_, AppState>) -> Result<orion_core::SpeedTestResult, String> {
+async fn run_speed_test(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: String,
+    duration_secs: u16,
+) -> Result<orion_core::SpeedTestResult, String> {
     let _exclusive = state
         .speedtest
         .try_lock()
@@ -575,7 +582,12 @@ async fn run_speed_test(state: State<'_, AppState>) -> Result<orion_core::SpeedT
     if state.controller.state() != TunnelState::Up || !state.controller.adapter_is_up() {
         return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
     }
-    orion_core::run_speedtest()
+    let mode = orion_core::SpeedTestMode::parse(&mode).map_err(|error| error.to_string())?;
+    let progress_app = app.clone();
+    let progress: orion_core::SpeedTestProgressSink = Arc::new(move |update| {
+        let _ = progress_app.emit("helios://speedtest", &update);
+    });
+    orion_core::run_speedtest_with_progress(mode, duration_secs, progress)
         .await
         .map_err(|error| error.to_string())
 }

@@ -364,11 +364,42 @@ export interface TelemetrySample {
   tx_bps: number
 }
 
-/** One bounded Orion-to-Helios data-path measurement. */
+export type SpeedTestMode = 'tcp' | 'udp' | 'full'
+
+export type SpeedTestPhase =
+  | 'preparing'
+  | 'latency'
+  | 'tcp_download'
+  | 'tcp_upload'
+  | 'udp_download'
+  | 'udp_upload'
+  | 'complete'
+
+/** Progress of the direct TCP/UDP measurement. */
+export interface SpeedTestProgress {
+  phase: SpeedTestPhase
+  fraction: number
+  current_mbps: number
+  bytes: number
+  elapsed_ms: number
+  message: string
+}
+
+/** One raw WireGuard data-path measurement. */
 export interface SpeedTestResult {
   latency_ms: number
   jitter_ms: number
   latency_p95_ms: number
+  mode: SpeedTestMode
+  tcp_download_mbps: number | null
+  tcp_upload_mbps: number | null
+  udp_download_mbps: number | null
+  udp_upload_mbps: number | null
+  udp_loss_pct: number | null
+  udp_jitter_ms: number | null
+  tcp_streams: number
+  test_duration_secs: number
+  /** Compatibility projections used by older log consumers. */
   download_mbps: number
   upload_mbps: number
   download_variation_pct: number

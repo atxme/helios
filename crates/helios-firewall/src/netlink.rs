@@ -253,7 +253,9 @@ impl NetlinkBackend {
         //
         // Priority 100 (`NF_IP_PRI_NAT_SRC`): this is the expected place for
         // a source-NAT, after filtering.
-        if let Some(out_iface) = &rs.masquerade_out {
+        if !rs.masquerade_out.is_empty() {
+            // One chain, one rule per uplink. Creating the chain inside the
+            // loop would declare it several times in a single batch.
             let chain = Chain::new(&table)
                 .with_name("postrouting")
                 .with_hook(Hook::new(HookClass::PostRouting, 100))
@@ -262,12 +264,14 @@ impl NetlinkBackend {
                 // filtering verdict, it rewrites or lets through.
                 .add_to_batch(&mut batch);
 
-            NfRule::new(&chain)
-                .map_err(Self::err)?
-                .oiface(out_iface)
-                .map_err(Self::err)?
-                .with_expr(Masquerade::default())
-                .add_to_batch(&mut batch);
+            for out_iface in &rs.masquerade_out {
+                NfRule::new(&chain)
+                    .map_err(Self::err)?
+                    .oiface(out_iface)
+                    .map_err(Self::err)?
+                    .with_expr(Masquerade::default())
+                    .add_to_batch(&mut batch);
+            }
         }
 
         Ok(batch)
@@ -444,14 +448,14 @@ mod tests {
                 },
             ],
             mss_clamp: Some(1280),
-            masquerade_out: Some("eth0".into()),
+            masquerade_out: vec!["eth0".into()],
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
 
         let mut accept_by_default = ruleset;
         accept_by_default.default_verdict = Verdict::Accept;
-        accept_by_default.masquerade_out = None;
+        accept_by_default.masquerade_out = Vec::new();
         assert!(NetlinkBackend::new()
             .build_batch(&accept_by_default)
             .is_ok());
@@ -474,7 +478,7 @@ mod tests {
                     note: None,
                 }],
                 mss_clamp: None,
-                masquerade_out: None,
+                masquerade_out: Vec::new(),
             };
             assert!(
                 NetlinkBackend::new().build_batch(&ruleset).is_err(),
@@ -503,7 +507,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
-            masquerade_out: None,
+            masquerade_out: Vec::new(),
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());

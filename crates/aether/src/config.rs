@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{HeliosError, Result};
 use crate::policy::{FirewallPolicy, PolicyMode};
+use crate::speedtest::SPEEDTEST_PORT;
 
 const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
 
@@ -19,6 +20,32 @@ pub const DEFAULT_WG_API_URL: &str = "http://100.64.0.1:8080";
 /// from the outside.
 pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 
+/// Reads `wan_iface` as a single name or as a list.
+///
+/// Both spellings, because every `network.toml` in the field holds the
+/// singular one and a gateway with two uplinks needs the plural. Writing back
+/// always normalises to a list — one shape on disk after the first save, and
+/// the reader still accepts both forever.
+fn de_wan_ifaces<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        // An absent value and `wan_iface = ""` are the same thing: no uplink
+        // declared. Keeping the empty string would put a rule on an interface
+        // named nothing.
+        OneOrMany::One(name) if name.trim().is_empty() => Vec::new(),
+        OneOrMany::One(name) => vec![name],
+        OneOrMany::Many(names) => names,
+    })
+}
+
 /// Network configuration loadable by the operator via CLI or graphical interface.
 ///
 /// Persisted in `/var/lib/helios/network.toml`. It is the only configuration
@@ -26,8 +53,30 @@ pub const API_BIND_LOOPBACK: &str = "127.0.0.1:8080";
 /// firewall mode) are architectural constants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    #[serde(default)]
-    pub wan_iface: String,
+    /// Uplink interfaces, in order of preference, or a single
+    /// [`Self::WAN_IFACE_AUTO`] to let the daemon enumerate them.
+    ///
+    /// Reads both `wan_iface = "eth0"` and `wan_iface = ["enp3s0", "wlo1"]`:
+    /// the singular form is what every existing `network.toml` holds, and
+    /// breaking it to gain a list would be a migration for nothing.
+    ///
+    /// **All of them are permitted, none is selected.** The firewall opens
+    /// every rule that names the WAN once per interface, so a gateway with a
+    /// cable and a radio keeps working when the cable is unplugged — the
+    /// kernel moves its default route and the rules are already there. Which
+    /// one a packet actually leaves by is the routing table's decision, and a
+    /// preference between two live uplinks is a route metric.
+    // The TOML key stays `wan_iface`: every `network.toml` in the field holds
+    // it, and renaming a key to gain a plural would be a migration for
+    // nothing. `wan_ifaces` is accepted too, for whoever writes the obvious
+    // thing after seeing a list.
+    #[serde(
+        rename = "wan_iface",
+        alias = "wan_ifaces",
+        default,
+        deserialize_with = "de_wan_ifaces"
+    )]
+    pub wan_ifaces: Vec<String>,
     #[serde(default)]
     pub lan_ifaces: Vec<String>,
     /// CIDRs or IPs allowed for administrative SSH, even with the kill-switch engaged.
@@ -275,10 +324,22 @@ impl NetworkConfig {
     /// it only ever goes up. Reloading a file must not become the way to
     /// lower it.
     ///
+    /// [`Self::WAN_IFACE_AUTO`] is a third case, and the same shape: the file
+    /// states an intent, the daemon resolved it against the kernel at startup,
+    /// and the resolved name is not written back. Letting the marker through a
+    /// reload would rebuild the ruleset around an interface literally named
+    /// `auto` — every egress rule and the masquerade bound to a device that
+    /// does not exist, which is a gateway that drops its own traffic. The name
+    /// is also one of the values that cannot change under a running data
+    /// plane, so re-resolving here would be wrong even if it worked.
+    ///
     /// Everything else — the peer list itself, addresses, flags, ports —
     /// comes from the incoming configuration. That is the point: this is how
     /// a peer admitted on the console reaches the running gateway.
     pub fn adopt_runtime_secrets_from(&mut self, current: &Self) {
+        if self.wan_iface_is_auto() && !current.wan_iface_is_auto() {
+            self.wan_ifaces.clone_from(&current.wan_ifaces);
+        }
         if self.wg_private_key.trim().is_empty() {
             self.wg_private_key.clone_from(&current.wg_private_key);
         }
@@ -391,6 +452,23 @@ impl NetworkConfig {
     /// Validates relationships that cannot be expressed by serde defaults.
     pub fn validate(&self) -> Result<()> {
         self.validate_peer_identities()?;
+        // `auto` means « enumerate them all », so it cannot sit beside a name:
+        // the two readings — « these, plus whatever you find » and « just
+        // these » — differ, and a firewall built on the wrong one is a gateway
+        // that drops traffic it was told to pass.
+        if self.mentions_auto() && !self.wan_iface_is_auto() {
+            return Err(HeliosError::Config(
+                "wan_iface: « auto » stands alone, it does not combine with an interface name"
+                    .into(),
+            ));
+        }
+        if self.wan_ifaces.iter().any(|iface| iface.trim().is_empty()) {
+            return Err(HeliosError::Config(
+                "wan_iface: an empty interface name matches nothing and silently drops the \
+                 traffic it was meant to pass"
+                    .into(),
+            ));
+        }
         if let Some(port) = self.key_negotiation_port {
             if port == 0 {
                 return Err(HeliosError::Config(
@@ -440,12 +518,56 @@ impl NetworkConfig {
         }
     }
 
+    /// Address where the raw TCP/UDP speedtest service listens behind the
+    /// tunnel. It follows the same gateway VIP as the HTTP API, but has its
+    /// own port so no HTTP framing can enter the measurement.
+    pub fn speedtest_bind(&self) -> String {
+        if !self.wireguard_ready() {
+            return format!("127.0.0.1:{SPEEDTEST_PORT}");
+        }
+        match self.wg_address.split('/').next() {
+            Some(host) if !host.trim().is_empty() => format!("{}:{SPEEDTEST_PORT}", host.trim()),
+            _ => format!("127.0.0.1:{SPEEDTEST_PORT}"),
+        }
+    }
+
     /// Projects the network config onto the declarative firewall policy.
     /// Mode always `fail-closed` — non-configurable security invariant.
+    /// Asks the daemon to pick the uplink from the kernel, preferring a wired
+    /// link. Resolved once at startup; see `heliosd::uplink`.
+    pub const WAN_IFACE_AUTO: &'static str = "auto";
+
+    /// Whether the daemon is asked to enumerate the uplinks itself.
+    ///
+    /// Only meaningful alone: `["auto", "eth0"]` is a contradiction, and
+    /// [`Self::validate`] refuses it rather than picking a reading.
+    pub fn wan_iface_is_auto(&self) -> bool {
+        self.wan_ifaces.len() == 1
+            && self.wan_ifaces[0]
+                .trim()
+                .eq_ignore_ascii_case(Self::WAN_IFACE_AUTO)
+    }
+
+    /// The preferred uplink: the first declared.
+    ///
+    /// For the things that watch **one** interface — MTU probing, throughput
+    /// telemetry — where watching all of them would report a sum that
+    /// describes nothing. The firewall never uses it: it permits them all.
+    pub fn primary_wan_iface(&self) -> Option<&str> {
+        self.wan_ifaces.first().map(String::as_str)
+    }
+
+    /// Whether `auto` appears at all — including where it must not.
+    fn mentions_auto(&self) -> bool {
+        self.wan_ifaces
+            .iter()
+            .any(|iface| iface.trim().eq_ignore_ascii_case(Self::WAN_IFACE_AUTO))
+    }
+
     pub fn firewall_policy(&self) -> FirewallPolicy {
         let admin_port = self.admin_iface.as_ref().map(|_| API_PORT);
         FirewallPolicy {
-            wan_iface: self.wan_iface.clone(),
+            wan_ifaces: self.wan_ifaces.clone(),
             lan_ifaces: self.lan_ifaces.clone(),
             wg_peers: self.wg_peers(),
             // Server role: we only open the inbound port if the gateway is
@@ -569,7 +691,7 @@ mod tests {
     fn config_empty_by_default() {
         let cfg = NetworkConfig::default();
         assert!(cfg.peers.is_empty());
-        assert!(cfg.wan_iface.is_empty());
+        assert!(cfg.wan_ifaces.is_empty());
         assert!(
             !cfg.wireguard_ready(),
             "without a private key, nothing should come up"
@@ -591,7 +713,7 @@ mod tests {
             admin = true
         "#;
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.wan_iface, "eth0");
+        assert_eq!(cfg.wan_ifaces, vec!["eth0".to_string()]);
         // WireGuard defaults apply without being written.
         assert_eq!(cfg.wg_iface, "helios0");
         assert_eq!(cfg.wg_listen_port, 51820);
@@ -729,6 +851,17 @@ mod tests {
             API_BIND_LOOPBACK,
             "on loopback, provisioning would be unreachable"
         );
+    }
+
+    #[test]
+    fn the_raw_speedtest_uses_the_fixed_in_tunnel_port() {
+        let cfg = NetworkConfig {
+            wg_private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            wg_address: "100.64.0.1/10".into(),
+            ..NetworkConfig::default()
+        };
+        assert_eq!(cfg.speedtest_bind(), "100.64.0.1:5201");
+        assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:5201");
     }
 
     /// Without a configured gateway, no reason to expose the API: loopback.
@@ -878,9 +1011,64 @@ mod tests {
     fn port_not_opened_if_the_gateway_is_not_ready() {
         // No private key -> we don't open a port with nothing behind it.
         let cfg = NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             ..NetworkConfig::default()
         };
         assert_eq!(cfg.firewall_policy().wg_listen_port, None);
+    }
+    /// `auto` states an intent, and the daemon resolved it against the kernel
+    /// at startup. A reload must not put the marker back: every egress rule
+    /// and the masquerade would then be bound to an interface literally named
+    /// `auto`, and the gateway would drop its own traffic.
+    #[test]
+    fn a_reload_keeps_the_resolved_uplink_rather_than_the_marker() {
+        let mut from_disk = NetworkConfig {
+            wan_ifaces: vec!["auto".into()],
+            ..NetworkConfig::default()
+        };
+        let running = NetworkConfig {
+            wan_ifaces: vec!["eth0".into()],
+            ..NetworkConfig::default()
+        };
+        from_disk.adopt_runtime_secrets_from(&running);
+        assert_eq!(from_disk.wan_ifaces, vec!["eth0".to_string()]);
+        assert!(!from_disk.wan_iface_is_auto());
+    }
+
+    /// An operator who names an interface in the file gets that interface,
+    /// even if the running one was resolved: the file is the intent.
+    #[test]
+    fn a_reload_that_names_an_interface_replaces_the_resolved_one() {
+        let mut from_disk = NetworkConfig {
+            wan_ifaces: vec!["eth1".into()],
+            ..NetworkConfig::default()
+        };
+        let running = NetworkConfig {
+            wan_ifaces: vec!["eth0".into()],
+            ..NetworkConfig::default()
+        };
+        from_disk.adopt_runtime_secrets_from(&running);
+        assert_eq!(from_disk.wan_ifaces, vec!["eth1".to_string()]);
+    }
+
+    /// The marker is recognised however it is spelled and spaced, because a
+    /// missed one is a ruleset built around a device that does not exist.
+    #[test]
+    fn the_auto_marker_is_recognised_regardless_of_case_and_spacing() {
+        for spelling in ["auto", "AUTO", " Auto ", "aUtO"] {
+            let config = NetworkConfig {
+                wan_ifaces: vec![spelling.into()],
+                ..NetworkConfig::default()
+            };
+            assert!(config.wan_iface_is_auto(), "« {spelling} » is the marker");
+        }
+        let named = NetworkConfig {
+            wan_ifaces: vec!["auto0".into()],
+            ..NetworkConfig::default()
+        };
+        assert!(
+            !named.wan_iface_is_auto(),
+            "« auto0 » is a real interface name on some boards, not the marker"
+        );
     }
 }

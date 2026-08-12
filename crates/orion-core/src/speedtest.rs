@@ -1,28 +1,25 @@
 //! Measures the usable WireGuard path between Orion and its Helios gateway.
 //!
-//! The gateway API is reachable only through WireGuard, so every byte measured
-//! here follows the same route as the user's traffic. The engine deliberately
-//! avoids a fixed, single transfer: TCP slow start and a payload that is too
-//! short can under-report a fast path by an order of magnitude.
+//! The gateway service is reachable only through WireGuard, so every measured
+//! byte follows the same route as the user's traffic. The production path uses
+//! `std::net` TCP/UDP sockets directly: HTTP headers, body parsing, repeated
+//! requests and Tokio wake-ups are outside the timed data path.
 //!
-//! A run therefore has four stages:
-//!
-//! 1. warm the HTTP connection, then collect enough RTT samples for a robust
-//!    median and median absolute deviation;
-//! 2. calibrate a chunk size independently in each direction;
-//! 3. warm four HTTP/1 connections so the measured windows start at steady
-//!    state;
-//! 4. run three bounded windows and report their median rate and variation.
-//!
-//! Bodies are streamed and counted, never accumulated on download. Uploads
-//! share one immutable buffer between workers. Both the request size and the
-//! total measured traffic are bounded.
+//! A run collects robust UDP RTT samples, prepares four persistent TCP flows,
+//! then measures each requested direction for a configurable interval long
+//! enough for TCP to reach steady state. UDP uses fixed WireGuard-safe
+//! datagrams and reports loss where sequence counters are available. The old
+//! HTTP adapter remains only for controlled compatibility tests; Orion's
+//! command never selects it.
 
 use std::{
+    io::{Read as _, Write as _},
+    net::{Shutdown, SocketAddr, TcpStream, UdpSocket},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Barrier,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -31,13 +28,62 @@ use futures_util::{future::try_join_all, StreamExt as _};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 
-/// Fixed in-tunnel API destination used by the performance probe.
+/// Fixed in-tunnel HTTP destination retained for the compatibility adapter.
 ///
-/// The endpoint is deliberately not read from the editable profile: the
-/// speedtest is valid only when this request reaches Helios through the
-/// already-mounted WireGuard interface. The route itself is authenticated by
-/// the gateway's WireGuard peer middleware.
+/// The production speedtest uses [`aether::DEFAULT_WG_SPEEDTEST_ADDR`] and a
+/// raw socket. It is deliberately not read from the editable profile.
 pub const DEFAULT_GATEWAY_URL: &str = aether::DEFAULT_WG_API_URL;
+
+/// Transport selected for the raw measurement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedTestMode {
+    Tcp,
+    Udp,
+    Full,
+}
+
+impl SpeedTestMode {
+    /// Parses the value received from the Tauri UI.
+    pub fn parse(value: &str) -> Result<Self, SpeedTestError> {
+        match value {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            "full" => Ok(Self::Full),
+            other => Err(SpeedTestError::InvalidMode(other.to_string())),
+        }
+    }
+}
+
+/// Progress emitted while the raw socket test is running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct SpeedTestProgress {
+    pub phase: SpeedTestPhase,
+    pub fraction: f64,
+    pub current_mbps: f64,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+    pub message: String,
+}
+
+/// A phase is intentionally explicit so the UI never infers direction from
+/// a half-filled progress bar.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedTestPhase {
+    Preparing,
+    Latency,
+    TcpDownload,
+    TcpUpload,
+    UdpDownload,
+    UdpUpload,
+    Complete,
+}
+
+/// Callback used by the Tauri shell to relay progress without putting a UI
+/// concern into the transport engine.
+pub type SpeedTestProgressSink = Arc<dyn Fn(SpeedTestProgress) + Send + Sync>;
 
 /// Number of RTT observations retained after the two warm-up requests.
 pub const LATENCY_SAMPLES: usize = 11;
@@ -122,11 +168,24 @@ pub struct SpeedTestResult {
     pub upload_bytes: u64,
     pub parallel_streams: usize,
     pub measurement_rounds: usize,
+    /// Primary raw-socket result. HTTP compatibility probes leave this at
+    /// `None`; the Orion command always returns the direct TCP/UDP values.
+    pub mode: SpeedTestMode,
+    pub tcp_download_mbps: Option<f64>,
+    pub tcp_upload_mbps: Option<f64>,
+    pub udp_download_mbps: Option<f64>,
+    pub udp_upload_mbps: Option<f64>,
+    pub udp_loss_pct: Option<f64>,
+    pub udp_jitter_ms: Option<f64>,
+    pub tcp_streams: usize,
+    pub test_duration_secs: u16,
 }
 
 /// Failures returned to the Tauri shell and rendered by the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum SpeedTestError {
+    #[error("mode de speedtest invalide : {0}")]
+    InvalidMode(String),
     #[error("URL de la gateway invalide : {0}")]
     InvalidUrl(String),
     #[error("transport du speedtest impossible : {0}")]
@@ -171,9 +230,846 @@ struct RoundPlan {
     byte_budget: u64,
 }
 
-/// Runs the standard adaptive measurement against the gateway's in-tunnel API.
+/// Runs the raw-socket measurement against the gateway's in-tunnel service.
 pub async fn run() -> Result<SpeedTestResult, SpeedTestError> {
-    run_at(DEFAULT_GATEWAY_URL).await
+    run_with_progress(
+        SpeedTestMode::Full,
+        aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
+        Arc::new(|_| {}),
+    )
+    .await
+}
+
+/// Runs the direct TCP/UDP test and streams progress to the caller.
+pub async fn run_with_progress(
+    mode: SpeedTestMode,
+    duration_secs: u16,
+    progress: SpeedTestProgressSink,
+) -> Result<SpeedTestResult, SpeedTestError> {
+    validate_raw_duration(duration_secs)?;
+    tokio::task::spawn_blocking(move || run_raw_blocking(mode, duration_secs, progress))
+        .await
+        .map_err(|error| SpeedTestError::Transport(error.to_string()))?
+}
+
+fn run_raw_blocking(
+    mode: SpeedTestMode,
+    duration_secs: u16,
+    progress: SpeedTestProgressSink,
+) -> Result<SpeedTestResult, SpeedTestError> {
+    let target: SocketAddr = aether::DEFAULT_WG_SPEEDTEST_ADDR
+        .parse()
+        .map_err(|error| SpeedTestError::InvalidUrl(format!("cible socket invalide : {error}")))?;
+    run_raw_blocking_at(target, mode, duration_secs, progress)
+}
+
+fn run_raw_blocking_at(
+    target: SocketAddr,
+    mode: SpeedTestMode,
+    duration_secs: u16,
+    progress: SpeedTestProgressSink,
+) -> Result<SpeedTestResult, SpeedTestError> {
+    let started = Instant::now();
+    emit_progress(
+        &progress,
+        SpeedTestPhase::Preparing,
+        0.0,
+        0.0,
+        0,
+        started,
+        "Préparation des sockets directes",
+    );
+
+    emit_progress(
+        &progress,
+        SpeedTestPhase::Latency,
+        0.0,
+        0.0,
+        0,
+        started,
+        "Mesure de la latence UDP",
+    );
+    let (latency_ms, jitter_ms, latency_p95_ms) = measure_raw_latency(target)?;
+
+    let tcp_download = if matches!(mode, SpeedTestMode::Tcp | SpeedTestMode::Full) {
+        Some(measure_raw_tcp(
+            target,
+            aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+            duration_secs,
+            SpeedTestPhase::TcpDownload,
+            &progress,
+            started,
+        )?)
+    } else {
+        None
+    };
+    let tcp_upload = if matches!(mode, SpeedTestMode::Tcp | SpeedTestMode::Full) {
+        Some(measure_raw_tcp(
+            target,
+            aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+            duration_secs,
+            SpeedTestPhase::TcpUpload,
+            &progress,
+            started,
+        )?)
+    } else {
+        None
+    };
+    let udp_download = if matches!(mode, SpeedTestMode::Udp | SpeedTestMode::Full) {
+        Some(measure_raw_udp(
+            target,
+            aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+            duration_secs,
+            SpeedTestPhase::UdpDownload,
+            &progress,
+            started,
+        )?)
+    } else {
+        None
+    };
+    let udp_upload = if matches!(mode, SpeedTestMode::Udp | SpeedTestMode::Full) {
+        Some(measure_raw_udp(
+            target,
+            aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+            duration_secs,
+            SpeedTestPhase::UdpUpload,
+            &progress,
+            started,
+        )?)
+    } else {
+        None
+    };
+
+    let tcp_down_mbps = tcp_download.as_ref().map(|measurement| measurement.mbps);
+    let tcp_up_mbps = tcp_upload.as_ref().map(|measurement| measurement.mbps);
+    let udp_down_mbps = udp_download.as_ref().map(|measurement| measurement.mbps);
+    let udp_up_mbps = udp_upload.as_ref().map(|measurement| measurement.mbps);
+    let udp_loss_pct = [udp_download.as_ref(), udp_upload.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|measurement| measurement.loss_pct)
+        .reduce(|left, right| (left + right) / 2.0);
+    let udp_jitter_ms = [udp_download.as_ref(), udp_upload.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|measurement| measurement.jitter_ms)
+        .reduce(|left, right| (left + right) / 2.0);
+    let download_mbps = tcp_down_mbps.or(udp_down_mbps).unwrap_or_default();
+    let upload_mbps = tcp_up_mbps.or(udp_up_mbps).unwrap_or_default();
+    let download_bytes = tcp_download
+        .as_ref()
+        .map_or(0, |measurement| measurement.bytes)
+        .saturating_add(
+            udp_download
+                .as_ref()
+                .map_or(0, |measurement| measurement.bytes),
+        );
+    let upload_bytes = tcp_upload
+        .as_ref()
+        .map_or(0, |measurement| measurement.bytes)
+        .saturating_add(
+            udp_upload
+                .as_ref()
+                .map_or(0, |measurement| measurement.bytes),
+        );
+    let duration_ms = saturating_millis(started.elapsed());
+    let result = SpeedTestResult {
+        latency_ms,
+        jitter_ms,
+        latency_p95_ms,
+        download_mbps,
+        upload_mbps,
+        download_variation_pct: 0.0,
+        upload_variation_pct: 0.0,
+        duration_ms,
+        download_bytes,
+        upload_bytes,
+        parallel_streams: aether::speedtest::SPEEDTEST_TCP_STREAMS,
+        measurement_rounds: 1,
+        mode,
+        tcp_download_mbps: tcp_down_mbps,
+        tcp_upload_mbps: tcp_up_mbps,
+        udp_download_mbps: udp_down_mbps,
+        udp_upload_mbps: udp_up_mbps,
+        udp_loss_pct,
+        udp_jitter_ms,
+        tcp_streams: aether::speedtest::SPEEDTEST_TCP_STREAMS,
+        test_duration_secs: duration_secs,
+    };
+    emit_progress(
+        &progress,
+        SpeedTestPhase::Complete,
+        1.0,
+        result
+            .tcp_download_mbps
+            .or(result.udp_download_mbps)
+            .unwrap_or_default(),
+        result.download_bytes.saturating_add(result.upload_bytes),
+        started,
+        "Mesure terminée",
+    );
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawMeasurement {
+    mbps: f64,
+    bytes: u64,
+    loss_pct: Option<f64>,
+    jitter_ms: Option<f64>,
+}
+
+fn measure_raw_latency(target: SocketAddr) -> Result<(f64, f64, f64), SpeedTestError> {
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(raw_transport)?;
+    socket.connect(target).map_err(raw_transport)?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(raw_transport)?;
+    let mut samples = Vec::with_capacity(11);
+    let mut response = [0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES];
+    for _ in 0..11 {
+        let session = next_session();
+        let request = udp_frame(aether::speedtest::UDP_KIND_PING, 0, session, 0, 0, &[]);
+        let started = Instant::now();
+        socket.send(&request).map_err(raw_transport)?;
+        let length = socket.recv(&mut response).map_err(raw_transport)?;
+        let frame = parse_client_udp_frame(&response[..length])
+            .ok_or_else(|| SpeedTestError::BadResponse("pong UDP invalide".into()))?;
+        if frame.kind != aether::speedtest::UDP_KIND_PONG || frame.session != session {
+            return Err(SpeedTestError::BadResponse("pong UDP inattendu".into()));
+        }
+        samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let median = percentile_sorted(&samples, 0.5);
+    let mut deviations: Vec<f64> = samples
+        .iter()
+        .map(|sample| (sample - median).abs())
+        .collect();
+    deviations.sort_by(f64::total_cmp);
+    Ok((
+        median,
+        percentile_sorted(&deviations, 0.5),
+        percentile_sorted(&samples, 0.95),
+    ))
+}
+
+fn measure_raw_tcp(
+    target: SocketAddr,
+    mode: u8,
+    duration_secs: u16,
+    phase: SpeedTestPhase,
+    progress: &SpeedTestProgressSink,
+    global_started: Instant,
+) -> Result<RawMeasurement, SpeedTestError> {
+    let counter = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(aether::speedtest::SPEEDTEST_TCP_STREAMS + 1));
+    let mut workers = Vec::with_capacity(aether::speedtest::SPEEDTEST_TCP_STREAMS);
+    for _ in 0..aether::speedtest::SPEEDTEST_TCP_STREAMS {
+        let counter = Arc::clone(&counter);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            raw_tcp_stream(target, mode, duration_secs, barrier, counter)
+        }));
+    }
+    // All TCP connections and their control handshakes are complete. The
+    // timed interval starts only now, exactly like an iperf3 data interval;
+    // TCP setup latency cannot dilute the throughput number.
+    barrier.wait();
+    let measurement_started = Instant::now();
+    let phase_progress = Arc::clone(progress);
+    let phase_counter = Arc::clone(&counter);
+    let phase_finished = Arc::clone(&finished);
+    let monitor_started = measurement_started;
+    let monitor = thread::spawn(move || {
+        while !phase_finished.load(Ordering::Acquire) {
+            let elapsed = monitor_started.elapsed();
+            let bytes = phase_counter.load(Ordering::Relaxed);
+            emit_progress(
+                &phase_progress,
+                phase,
+                (elapsed.as_secs_f64() / f64::from(duration_secs as u32)).min(1.0),
+                rate_mbps(bytes, elapsed),
+                bytes,
+                global_started,
+                phase_message(phase),
+            );
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let mut bytes = 0u64;
+    let mut first_error = None;
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(value)) => bytes = bytes.saturating_add(value),
+            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+            Ok(Err(_)) => {}
+            Err(_) if first_error.is_none() => first_error = Some("flux TCP interrompu".into()),
+            Err(_) => {}
+        }
+    }
+    finished.store(true, Ordering::Release);
+    let _ = monitor.join();
+    if let Some(error) = first_error {
+        return Err(SpeedTestError::Transport(error));
+    }
+    let elapsed = monitor_started.elapsed();
+    if bytes == 0 {
+        return Err(SpeedTestError::BadResponse("aucun octet TCP mesuré".into()));
+    }
+    emit_progress(
+        progress,
+        phase,
+        1.0,
+        rate_mbps(bytes, elapsed),
+        bytes,
+        global_started,
+        phase_message(phase),
+    );
+    Ok(RawMeasurement {
+        mbps: rate_mbps(bytes, elapsed),
+        bytes,
+        loss_pct: None,
+        jitter_ms: None,
+    })
+}
+
+fn raw_tcp_stream(
+    target: SocketAddr,
+    mode: u8,
+    duration_secs: u16,
+    barrier: Arc<Barrier>,
+    counter: Arc<AtomicU64>,
+) -> Result<u64, String> {
+    let session = next_session();
+    // Every worker reaches the barrier, even when its connection or control
+    // handshake fails. Otherwise the parent and the other streams could wait
+    // forever for a peer that already returned an error.
+    let prepared = (|| -> Result<TcpStream, String> {
+        let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_nodelay(true)
+            .and_then(|_| {
+                stream.set_read_timeout(Some(Duration::from_secs(u64::from(duration_secs) + 5)))
+            })
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(&tcp_control(
+                aether::speedtest::TCP_KIND_HELLO,
+                mode,
+                duration_secs,
+                session,
+            ))
+            .map_err(|error| error.to_string())?;
+        let mut ready = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+        stream
+            .read_exact(&mut ready)
+            .map_err(|error| error.to_string())?;
+        let (kind, ready_mode, ready_duration, ready_session) =
+            parse_tcp_control(&ready).map_err(|error| error.to_string())?;
+        if (kind, ready_mode, ready_duration, ready_session)
+            != (
+                aether::speedtest::TCP_KIND_READY,
+                mode,
+                duration_secs,
+                session,
+            )
+        {
+            return Err("réponse de préparation TCP invalide".into());
+        }
+        Ok(stream)
+    })();
+    barrier.wait();
+    let mut stream = prepared?;
+    stream
+        .write_all(&tcp_control(
+            aether::speedtest::TCP_KIND_GO,
+            mode,
+            duration_secs,
+            session,
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = 0u64;
+    match mode {
+        aether::speedtest::SPEEDTEST_MODE_DOWNLOAD => {
+            let mut buffer = vec![0u8; aether::speedtest::SPEEDTEST_TCP_BUFFER_BYTES];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        bytes = bytes.saturating_add(read as u64);
+                        counter.fetch_add(read as u64, Ordering::Relaxed);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        aether::speedtest::SPEEDTEST_MODE_UPLOAD => {
+            let buffer = raw_buffer();
+            let deadline = Instant::now() + Duration::from_secs(u64::from(duration_secs));
+            while Instant::now() < deadline {
+                let written = stream.write(&buffer).map_err(|error| error.to_string())?;
+                if written == 0 {
+                    break;
+                }
+                bytes = bytes.saturating_add(written as u64);
+                counter.fetch_add(written as u64, Ordering::Relaxed);
+            }
+            stream
+                .shutdown(Shutdown::Write)
+                .map_err(|error| error.to_string())?;
+        }
+        _ => return Err("direction TCP invalide".into()),
+    }
+    Ok(bytes)
+}
+
+fn measure_raw_udp(
+    target: SocketAddr,
+    mode: u8,
+    duration_secs: u16,
+    phase: SpeedTestPhase,
+    progress: &SpeedTestProgressSink,
+    global_started: Instant,
+) -> Result<RawMeasurement, SpeedTestError> {
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(raw_transport)?;
+    socket.connect(target).map_err(raw_transport)?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(raw_transport)?;
+    let session = next_session();
+    socket
+        .send(&udp_frame(
+            aether::speedtest::UDP_KIND_HELLO,
+            mode,
+            session,
+            0,
+            duration_secs,
+            &[],
+        ))
+        .map_err(raw_transport)?;
+    let mut received = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+    loop {
+        let length = socket.recv(&mut received).map_err(raw_transport)?;
+        let frame = parse_client_udp_frame(&received[..length])
+            .ok_or_else(|| SpeedTestError::BadResponse("préparation UDP invalide".into()))?;
+        if frame.kind == aether::speedtest::UDP_KIND_READY
+            && frame.session == session
+            && frame.mode == mode
+        {
+            break;
+        }
+    }
+    socket
+        .send(&udp_frame(
+            aether::speedtest::UDP_KIND_GO,
+            mode,
+            session,
+            0,
+            duration_secs,
+            &[],
+        ))
+        .map_err(raw_transport)?;
+    let started = Instant::now();
+    match mode {
+        aether::speedtest::SPEEDTEST_MODE_DOWNLOAD => measure_udp_download(
+            &socket,
+            session,
+            duration_secs,
+            phase,
+            progress,
+            global_started,
+            started,
+        ),
+        aether::speedtest::SPEEDTEST_MODE_UPLOAD => measure_udp_upload(
+            &socket,
+            session,
+            duration_secs,
+            phase,
+            progress,
+            global_started,
+            started,
+        ),
+        _ => Err(SpeedTestError::BadResponse("direction UDP invalide".into())),
+    }
+}
+
+fn measure_udp_download(
+    socket: &UdpSocket,
+    session: u64,
+    duration_secs: u16,
+    phase: SpeedTestPhase,
+    progress: &SpeedTestProgressSink,
+    global_started: Instant,
+    started: Instant,
+) -> Result<RawMeasurement, SpeedTestError> {
+    let mut packet = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+    let deadline = started + Duration::from_secs(u64::from(duration_secs) + 2);
+    let mut bytes = 0u64;
+    let mut packets = 0u64;
+    let mut sent_packets = None;
+    let mut last_packet = None;
+    let mut last_interval: Option<f64> = None;
+    let mut jitter_sum = 0.0;
+    let mut jitter_samples = 0u64;
+    let mut last_report = Instant::now();
+    while Instant::now() < deadline {
+        match socket.recv(&mut packet) {
+            Ok(length) => {
+                let Some(frame) = parse_client_udp_frame(&packet[..length]) else {
+                    continue;
+                };
+                if frame.session != session {
+                    continue;
+                }
+                if frame.kind == aether::speedtest::UDP_KIND_DATA {
+                    let now = Instant::now();
+                    if let Some(previous) = last_packet.replace(now) {
+                        let interval = now.duration_since(previous).as_secs_f64() * 1_000.0;
+                        if let Some(previous_interval) = last_interval {
+                            jitter_sum += (interval - previous_interval).abs();
+                            jitter_samples = jitter_samples.saturating_add(1);
+                        }
+                        last_interval = Some(interval);
+                    }
+                    packets = packets.saturating_add(1);
+                    bytes = bytes.saturating_add(frame.payload.len() as u64);
+                } else if frame.kind == aether::speedtest::UDP_KIND_END {
+                    if frame.payload.len() >= 16 {
+                        sent_packets = Some(u64::from_be_bytes(
+                            frame.payload[..8].try_into().unwrap_or_default(),
+                        ));
+                    }
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(raw_transport(error)),
+        }
+        if last_report.elapsed() >= Duration::from_millis(250) {
+            emit_progress(
+                progress,
+                phase,
+                (started.elapsed().as_secs_f64() / f64::from(duration_secs as u32)).min(1.0),
+                rate_mbps(bytes, started.elapsed()),
+                bytes,
+                global_started,
+                phase_message(phase),
+            );
+            last_report = Instant::now();
+        }
+    }
+    if bytes == 0 {
+        return Err(SpeedTestError::BadResponse(
+            "aucun datagram UDP reçu".into(),
+        ));
+    }
+    let elapsed = started.elapsed();
+    let loss_pct = sent_packets.map(|sent| {
+        if sent == 0 {
+            0.0
+        } else {
+            sent.saturating_sub(packets) as f64 * 100.0 / sent as f64
+        }
+    });
+    let jitter_ms = (jitter_samples > 0).then_some(jitter_sum / jitter_samples as f64);
+    let result = RawMeasurement {
+        mbps: rate_mbps(bytes, elapsed),
+        bytes,
+        loss_pct,
+        jitter_ms,
+    };
+    emit_progress(
+        progress,
+        phase,
+        1.0,
+        result.mbps,
+        bytes,
+        global_started,
+        phase_message(phase),
+    );
+    Ok(result)
+}
+
+fn measure_udp_upload(
+    socket: &UdpSocket,
+    session: u64,
+    duration_secs: u16,
+    phase: SpeedTestPhase,
+    progress: &SpeedTestProgressSink,
+    global_started: Instant,
+    started: Instant,
+) -> Result<RawMeasurement, SpeedTestError> {
+    let payload_len = aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES
+        - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES;
+    let payload = raw_buffer();
+    let mut packet = vec![0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES];
+    packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..]
+        .copy_from_slice(&payload[..payload_len]);
+    let deadline = started + Duration::from_secs(u64::from(duration_secs));
+    let mut bytes = 0u64;
+    let mut sequence = 0u64;
+    let mut last_report = Instant::now();
+    while Instant::now() < deadline {
+        write_udp_header(
+            &mut packet,
+            aether::speedtest::UDP_KIND_DATA,
+            aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+            session,
+            sequence,
+            duration_secs,
+        );
+        let sent = socket.send(&packet).map_err(raw_transport)?;
+        if sent < aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES {
+            continue;
+        }
+        sequence = sequence.saturating_add(1);
+        bytes = bytes.saturating_add((sent - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES) as u64);
+        if last_report.elapsed() >= Duration::from_millis(250) {
+            emit_progress(
+                progress,
+                phase,
+                (started.elapsed().as_secs_f64() / f64::from(duration_secs as u32)).min(1.0),
+                rate_mbps(bytes, started.elapsed()),
+                bytes,
+                global_started,
+                phase_message(phase),
+            );
+            last_report = Instant::now();
+        }
+    }
+    socket
+        .send(&udp_frame(
+            aether::speedtest::UDP_KIND_FINISH,
+            aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+            session,
+            sequence,
+            0,
+            &[],
+        ))
+        .map_err(raw_transport)?;
+    let mut summary = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+    let receiver = loop {
+        match socket.recv(&mut summary) {
+            Ok(length) => {
+                let Some(frame) = parse_client_udp_frame(&summary[..length]) else {
+                    continue;
+                };
+                if frame.kind == aether::speedtest::UDP_KIND_SUMMARY
+                    && frame.session == session
+                    && frame.payload.len() >= 16
+                {
+                    break Some((
+                        u64::from_be_bytes(frame.payload[..8].try_into().unwrap_or_default()),
+                        u64::from_be_bytes(frame.payload[8..16].try_into().unwrap_or_default()),
+                    ));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break None
+            }
+            Err(error) => return Err(raw_transport(error)),
+        }
+    };
+    let elapsed = started.elapsed();
+    let loss_pct = receiver.map(|(_, packets)| {
+        if sequence == 0 {
+            0.0
+        } else {
+            sequence.saturating_sub(packets) as f64 * 100.0 / sequence as f64
+        }
+    });
+    let result = RawMeasurement {
+        mbps: rate_mbps(bytes, elapsed),
+        bytes,
+        loss_pct,
+        jitter_ms: None,
+    };
+    emit_progress(
+        progress,
+        phase,
+        1.0,
+        result.mbps,
+        bytes,
+        global_started,
+        phase_message(phase),
+    );
+    Ok(result)
+}
+
+fn emit_progress(
+    sink: &SpeedTestProgressSink,
+    phase: SpeedTestPhase,
+    fraction: f64,
+    current_mbps: f64,
+    bytes: u64,
+    started: Instant,
+    message: &str,
+) {
+    sink(SpeedTestProgress {
+        phase,
+        fraction: fraction.clamp(0.0, 1.0),
+        current_mbps,
+        bytes,
+        elapsed_ms: saturating_millis(started.elapsed()),
+        message: message.to_string(),
+    });
+}
+
+fn phase_message(phase: SpeedTestPhase) -> &'static str {
+    match phase {
+        SpeedTestPhase::Preparing => "Préparation des sockets directes",
+        SpeedTestPhase::Latency => "Mesure de la latence UDP",
+        SpeedTestPhase::TcpDownload => "TCP descendant · flux continus",
+        SpeedTestPhase::TcpUpload => "TCP montant · flux continus",
+        SpeedTestPhase::UdpDownload => "UDP descendant · perte et jitter",
+        SpeedTestPhase::UdpUpload => "UDP montant · perte et jitter",
+        SpeedTestPhase::Complete => "Mesure terminée",
+    }
+}
+
+fn validate_raw_duration(duration_secs: u16) -> Result<(), SpeedTestError> {
+    if !(1..=aether::speedtest::SPEEDTEST_MAX_DURATION_SECS).contains(&duration_secs) {
+        return Err(SpeedTestError::BadResponse(format!(
+            "durée comprise entre 1 et {} secondes",
+            aether::speedtest::SPEEDTEST_MAX_DURATION_SECS
+        )));
+    }
+    Ok(())
+}
+
+fn next_session() -> u64 {
+    static SESSION: AtomicU64 = AtomicU64::new(1);
+    SESSION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn raw_transport(error: std::io::Error) -> SpeedTestError {
+    SpeedTestError::Transport(error.to_string())
+}
+
+fn udp_frame(
+    kind: u8,
+    mode: u8,
+    session: u64,
+    sequence: u64,
+    duration: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = vec![0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES + payload.len()];
+    write_udp_header(&mut frame, kind, mode, session, sequence, duration);
+    frame[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..].copy_from_slice(payload);
+    frame
+}
+
+fn write_udp_header(
+    frame: &mut [u8],
+    kind: u8,
+    mode: u8,
+    session: u64,
+    sequence: u64,
+    duration: u16,
+) {
+    frame[..8].copy_from_slice(&aether::speedtest::SPEEDTEST_MAGIC);
+    frame[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION;
+    frame[9] = kind;
+    frame[10] = mode;
+    frame[11] = 0;
+    frame[12..20].copy_from_slice(&session.to_be_bytes());
+    frame[20..28].copy_from_slice(&sequence.to_be_bytes());
+    frame[28..30].copy_from_slice(&duration.to_be_bytes());
+    frame[30..32].fill(0);
+}
+
+fn tcp_control(
+    kind: u8,
+    mode: u8,
+    duration: u16,
+    session: u64,
+) -> [u8; aether::speedtest::TCP_CONTROL_BYTES] {
+    let mut frame = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+    frame[..8].copy_from_slice(&aether::speedtest::SPEEDTEST_MAGIC);
+    frame[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION;
+    frame[9] = kind;
+    frame[10] = mode;
+    frame[12..14].copy_from_slice(&duration.to_be_bytes());
+    frame[16..24].copy_from_slice(&session.to_be_bytes());
+    frame
+}
+
+fn parse_tcp_control(
+    frame: &[u8; aether::speedtest::TCP_CONTROL_BYTES],
+) -> anyhow::Result<(u8, u8, u16, u64)> {
+    anyhow::ensure!(
+        frame[..8] == aether::speedtest::SPEEDTEST_MAGIC,
+        "invalid speedtest TCP magic"
+    );
+    anyhow::ensure!(
+        frame[8] == aether::speedtest::SPEEDTEST_PROTOCOL_VERSION,
+        "unsupported speedtest TCP version"
+    );
+    Ok((
+        frame[9],
+        frame[10],
+        u16::from_be_bytes(frame[12..14].try_into()?),
+        u64::from_be_bytes(frame[16..24].try_into()?),
+    ))
+}
+
+fn raw_buffer() -> Vec<u8> {
+    let mut buffer = vec![0u8; aether::speedtest::SPEEDTEST_TCP_BUFFER_BYTES];
+    fill_payload(&mut buffer);
+    buffer
+}
+
+fn fill_payload(buffer: &mut [u8]) {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for chunk in buffer.chunks_exact_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+}
+
+struct ClientUdpFrame<'a> {
+    kind: u8,
+    mode: u8,
+    session: u64,
+    payload: &'a [u8],
+}
+
+fn parse_client_udp_frame(packet: &[u8]) -> Option<ClientUdpFrame<'_>> {
+    if packet.len() < aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES
+        || packet[..8] != aether::speedtest::SPEEDTEST_MAGIC
+        || packet[8] != aether::speedtest::SPEEDTEST_PROTOCOL_VERSION
+    {
+        return None;
+    }
+    Some(ClientUdpFrame {
+        kind: packet[9],
+        mode: packet[10],
+        session: u64::from_be_bytes(packet[12..20].try_into().ok()?),
+        payload: &packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..],
+    })
 }
 
 /// Runs a measurement against an explicit URL.
@@ -230,6 +1126,15 @@ async fn run_with_config(
         upload_bytes: upload.bytes,
         parallel_streams: config.parallel_streams,
         measurement_rounds: config.rounds,
+        mode: SpeedTestMode::Tcp,
+        tcp_download_mbps: Some(download.mbps),
+        tcp_upload_mbps: Some(upload.mbps),
+        udp_download_mbps: None,
+        udp_upload_mbps: None,
+        udp_loss_pct: None,
+        udp_jitter_ms: None,
+        tcp_streams: config.parallel_streams,
+        test_duration_secs: 0,
     })
 }
 
@@ -623,7 +1528,10 @@ fn saturating_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{
+        net::{Shutdown, TcpListener, TcpStream, UdpSocket},
+        sync::Mutex,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
@@ -680,6 +1588,263 @@ mod tests {
         assert!(paths
             .iter()
             .any(|path| path.starts_with("/api/speedtest/upload?bytes=")));
+    }
+
+    #[test]
+    fn raw_tcp_engine_counts_persistent_socket_bytes_and_reports_progress() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("tcp listener");
+        let address = tcp_listener.local_addr().expect("tcp address");
+        let udp_socket = UdpSocket::bind(address).expect("udp listener");
+        udp_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("udp timeout");
+
+        let udp_thread = std::thread::spawn(move || {
+            let mut packet = [0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES];
+            for _ in 0..11 {
+                let (length, peer) = udp_socket.recv_from(&mut packet).expect("udp ping");
+                let frame = parse_client_udp_frame(&packet[..length]).expect("ping frame");
+                assert_eq!(frame.kind, aether::speedtest::UDP_KIND_PING);
+                udp_socket
+                    .send_to(
+                        &udp_frame(
+                            aether::speedtest::UDP_KIND_PONG,
+                            0,
+                            frame.session,
+                            0,
+                            0,
+                            &[],
+                        ),
+                        peer,
+                    )
+                    .expect("udp pong");
+            }
+        });
+
+        let tcp_thread = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..(aether::speedtest::SPEEDTEST_TCP_STREAMS * 2) {
+                let (stream, _) = tcp_listener.accept().expect("tcp connection");
+                handlers.push(std::thread::spawn(move || {
+                    serve_direct_tcp_for_test(stream)
+                }));
+            }
+            for handler in handlers {
+                handler.join().expect("tcp handler");
+            }
+        });
+
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&progress);
+        let result = run_raw_blocking_at(
+            address,
+            SpeedTestMode::Tcp,
+            1,
+            Arc::new(move |update| captured.lock().unwrap().push(update)),
+        )
+        .expect("raw tcp speedtest");
+
+        tcp_thread.join().expect("tcp server");
+        udp_thread.join().expect("udp server");
+        assert_eq!(result.mode, SpeedTestMode::Tcp);
+        assert!(result.tcp_download_mbps.is_some_and(|rate| rate > 0.0));
+        assert!(result.tcp_upload_mbps.is_some_and(|rate| rate > 0.0));
+        assert!(progress
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| update.phase == SpeedTestPhase::TcpDownload));
+    }
+
+    #[test]
+    fn raw_udp_engine_reports_socket_rate_and_loss_counters() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("udp listener");
+        let address = socket.local_addr().expect("udp address");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("udp timeout");
+        let server = std::thread::spawn(move || {
+            let mut packet = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+            for _ in 0..11 {
+                let (length, peer) = socket.recv_from(&mut packet).expect("udp ping");
+                let frame = parse_client_udp_frame(&packet[..length]).expect("ping frame");
+                assert_eq!(frame.kind, aether::speedtest::UDP_KIND_PING);
+                socket
+                    .send_to(
+                        &udp_frame(
+                            aether::speedtest::UDP_KIND_PONG,
+                            0,
+                            frame.session,
+                            0,
+                            0,
+                            &[],
+                        ),
+                        peer,
+                    )
+                    .expect("udp pong");
+            }
+
+            let (length, peer) = socket.recv_from(&mut packet).expect("download hello");
+            let frame = parse_client_udp_frame(&packet[..length]).expect("download hello frame");
+            assert_eq!(frame.kind, aether::speedtest::UDP_KIND_HELLO);
+            assert_eq!(frame.mode, aether::speedtest::SPEEDTEST_MODE_DOWNLOAD);
+            let download_mode = frame.mode;
+            let download_session = frame.session;
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_READY,
+                        download_mode,
+                        download_session,
+                        0,
+                        1,
+                        &[],
+                    ),
+                    peer,
+                )
+                .expect("download ready");
+            let (length, _) = socket.recv_from(&mut packet).expect("download go");
+            let go = parse_client_udp_frame(&packet[..length]).expect("download go frame");
+            assert_eq!(go.kind, aether::speedtest::UDP_KIND_GO);
+
+            let payload = vec![
+                0x42;
+                aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES
+                    - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES
+            ];
+            let sent_packets = 64u64;
+            for sequence in 0..sent_packets {
+                socket
+                    .send_to(
+                        &udp_frame(
+                            aether::speedtest::UDP_KIND_DATA,
+                            download_mode,
+                            download_session,
+                            sequence,
+                            1,
+                            &payload,
+                        ),
+                        peer,
+                    )
+                    .expect("download data");
+            }
+            let mut end_payload = [0u8; 16];
+            end_payload[..8].copy_from_slice(&sent_packets.to_be_bytes());
+            end_payload[8..].copy_from_slice(&(sent_packets * payload.len() as u64).to_be_bytes());
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_END,
+                        download_mode,
+                        download_session,
+                        sent_packets,
+                        1,
+                        &end_payload,
+                    ),
+                    peer,
+                )
+                .expect("download end");
+
+            let (length, peer) = socket.recv_from(&mut packet).expect("upload hello");
+            let frame = parse_client_udp_frame(&packet[..length]).expect("upload hello frame");
+            assert_eq!(frame.kind, aether::speedtest::UDP_KIND_HELLO);
+            assert_eq!(frame.mode, aether::speedtest::SPEEDTEST_MODE_UPLOAD);
+            let upload_mode = frame.mode;
+            let upload_session = frame.session;
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_READY,
+                        upload_mode,
+                        upload_session,
+                        0,
+                        1,
+                        &[],
+                    ),
+                    peer,
+                )
+                .expect("upload ready");
+            let (length, _) = socket.recv_from(&mut packet).expect("upload go");
+            let go = parse_client_udp_frame(&packet[..length]).expect("upload go frame");
+            assert_eq!(go.kind, aether::speedtest::UDP_KIND_GO);
+            let mut received_packets = 0u64;
+            let mut received_bytes = 0u64;
+            loop {
+                let (length, _) = socket.recv_from(&mut packet).expect("upload data");
+                let frame = parse_client_udp_frame(&packet[..length]).expect("upload frame");
+                if frame.kind == aether::speedtest::UDP_KIND_FINISH {
+                    break;
+                }
+                if frame.kind == aether::speedtest::UDP_KIND_DATA {
+                    received_packets = received_packets.saturating_add(1);
+                    received_bytes = received_bytes.saturating_add(frame.payload.len() as u64);
+                }
+            }
+            let mut summary = [0u8; 16];
+            summary[..8].copy_from_slice(&received_bytes.to_be_bytes());
+            summary[8..].copy_from_slice(&received_packets.to_be_bytes());
+            socket
+                .send_to(
+                    &udp_frame(
+                        aether::speedtest::UDP_KIND_SUMMARY,
+                        aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+                        upload_session,
+                        received_packets,
+                        0,
+                        &summary,
+                    ),
+                    peer,
+                )
+                .expect("upload summary");
+        });
+
+        let result = run_raw_blocking_at(address, SpeedTestMode::Udp, 1, Arc::new(|_| {}))
+            .expect("raw udp speedtest");
+        server.join().expect("udp server");
+
+        assert_eq!(result.mode, SpeedTestMode::Udp);
+        assert!(result.udp_download_mbps.is_some_and(|rate| rate > 0.0));
+        assert!(result.udp_upload_mbps.is_some_and(|rate| rate > 0.0));
+        assert!(result
+            .udp_loss_pct
+            .is_some_and(|loss| (0.0..=100.0).contains(&loss)));
+    }
+
+    fn serve_direct_tcp_for_test(mut stream: TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("tcp timeout");
+        let mut hello = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+        stream.read_exact(&mut hello).expect("tcp hello");
+        let (kind, mode, duration, session) = parse_tcp_control(&hello).expect("hello frame");
+        assert_eq!(kind, aether::speedtest::TCP_KIND_HELLO);
+        stream
+            .write_all(&tcp_control(
+                aether::speedtest::TCP_KIND_READY,
+                mode,
+                duration,
+                session,
+            ))
+            .expect("tcp ready");
+        let mut go = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+        stream.read_exact(&mut go).expect("tcp go");
+        let (kind, go_mode, go_duration, go_session) = parse_tcp_control(&go).expect("go frame");
+        assert_eq!(kind, aether::speedtest::TCP_KIND_GO);
+        assert_eq!(
+            (go_mode, go_duration, go_session),
+            (mode, duration, session)
+        );
+        if mode == aether::speedtest::SPEEDTEST_MODE_DOWNLOAD {
+            let buffer = vec![0x5a; 64 * 1024];
+            let deadline = Instant::now() + Duration::from_secs(u64::from(duration));
+            while Instant::now() < deadline {
+                stream.write_all(&buffer).expect("tcp payload");
+            }
+            stream.shutdown(Shutdown::Write).expect("tcp shutdown");
+        } else {
+            let mut buffer = vec![0u8; 64 * 1024];
+            while stream.read(&mut buffer).expect("tcp upload") != 0 {}
+        }
     }
 
     async fn serve_one_request(mut stream: tokio::net::TcpStream, paths: Arc<Mutex<Vec<String>>>) {

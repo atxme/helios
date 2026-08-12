@@ -52,5 +52,7 @@ pub use profile_import::{
 };
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};
 pub use speedtest::{
-    run as run_speedtest, run_at as run_speedtest_at, SpeedTestError, SpeedTestResult,
+    run as run_speedtest, run_at as run_speedtest_at,
+    run_with_progress as run_speedtest_with_progress, SpeedTestError, SpeedTestMode,
+    SpeedTestProgress, SpeedTestProgressSink, SpeedTestResult,
 };

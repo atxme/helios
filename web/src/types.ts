@@ -37,7 +37,7 @@ export interface PeerSummary {
 export interface Status {
   state: TunnelState
   version: string
-  wan_iface: string
+  wan_ifaces: string[]
   lan_ifaces: string[]
   /** Static outbound peers (site-to-site), distinct from admitted clients. */
   wg_peers: string[]

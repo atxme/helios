@@ -156,7 +156,7 @@ sudo nano /var/lib/helios/network.toml
 Renseigner au minimum :
 
 ```toml
-wan_iface = "<interface relevée à l'étape 0>"
+wan_iface = "auto"
 lan_ifaces = []
 allow_ssh_from = ["<votre sous-réseau, ex. 192.168.1.0/24>"]
 wg_iface = "helios0"
@@ -164,6 +164,11 @@ wg_address = "100.64.0.1/10"
 wg_listen_port = 51820
 admin_iface = "helios0"
 ```
+
+`wan_iface = "auto"` fait choisir l'interface de sortie au démarrage, en
+préférant le lien filaire. `heliosd show-uplink` montre les candidats et la
+raison du choix ; nommer l'interface explicitement reste possible et reste ce
+qu'il faut faire si la machine a plusieurs sorties dont une seule doit servir.
 
 **`allow_ssh_from` n'est pas optionnel ici.** Sans lui, le premier démarrage
 vous coupe l'accès et il faudra redémarrer la machine.

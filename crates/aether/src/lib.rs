@@ -22,6 +22,7 @@ pub mod pq;
 pub mod private_file;
 pub mod secret;
 pub mod sig;
+pub mod speedtest;
 pub mod state;
 pub mod wg;
 
@@ -33,4 +34,5 @@ pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, Orches
 pub use policy::{FirewallPolicy, PolicyMode};
 pub use pq::{Kem, MlKem1024Kem, PqError, SharedSecret};
 pub use secret::SecretString;
+pub use speedtest::{DEFAULT_WG_SPEEDTEST_ADDR, SPEEDTEST_PORT};
 pub use state::{TunnelEvent, TunnelState};

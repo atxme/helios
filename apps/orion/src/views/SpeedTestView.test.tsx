@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientProfile, SpeedTestResult } from '../types'
 
-const api = vi.hoisted(() => ({ runSpeedTest: vi.fn() }))
+const api = vi.hoisted(() => ({
+  runSpeedTest: vi.fn(),
+  onSpeedTestProgress: vi.fn(async () => () => {}),
+}))
 vi.mock('../api', () => api)
 
 import { SpeedTestView } from './SpeedTestView'
@@ -31,6 +34,15 @@ const result: SpeedTestResult = {
   latency_ms: 12.4,
   jitter_ms: 1.2,
   latency_p95_ms: 18.7,
+  mode: 'tcp',
+  tcp_download_mbps: 123.4,
+  tcp_upload_mbps: 45.6,
+  udp_download_mbps: null,
+  udp_upload_mbps: null,
+  udp_loss_pct: null,
+  udp_jitter_ms: null,
+  tcp_streams: 4,
+  test_duration_secs: 8,
   download_mbps: 123.4,
   upload_mbps: 45.6,
   download_variation_pct: 2.1,
@@ -66,7 +78,7 @@ describe('SpeedTestView', () => {
     await waitFor(() => expect(screen.getByText('123,4 Mb/s')).toBeTruthy())
     expect(screen.getByText('45,6 Mb/s')).toBeTruthy()
     expect(screen.getByText('12 ms')).toBeTruthy()
-    expect(api.runSpeedTest).toHaveBeenCalledOnce()
+    expect(api.runSpeedTest).toHaveBeenCalledWith('tcp', 8)
   })
 
   it('surfaces a gateway refusal without leaving the button stuck', async () => {

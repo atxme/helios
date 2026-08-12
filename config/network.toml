@@ -7,7 +7,35 @@
 #   - API : 127.0.0.1:8080
 #   - Pare-feu : fail-closed (invariant de sécurité)
 
-wan_iface = "eth0"
+# Interfaces de sortie (WAN). Une chaîne ou une liste :
+#
+#   wan_iface = "auto"                   ← heliosd les énumère lui-même
+#   wan_iface = "eth0"                   ← une seule
+#   wan_iface = ["enp3s0", "wlo1"]       ← câble et radio
+#
+# **Toutes sont permises, aucune n'est choisie.** Chaque règle qui nomme le WAN
+# est émise une fois par interface, donc une gateway avec un câble et une radio
+# continue de fonctionner quand on débranche le câble : le noyau déplace sa
+# route par défaut, et les règles sont déjà là. Aucun redémarrage, aucune
+# fenêtre pendant laquelle le kill-switch jette ce qu'il devait laisser passer.
+#
+# Ce n'est donc PAS ici que se règle la préférence entre deux liens vivants :
+# c'est le routage qui décide par quelle interface un paquet sort, et une
+# préférence est une **métrique de route**. NetworkManager et systemd-networkd
+# donnent déjà une meilleure métrique au filaire qu'au Wi-Fi. Pour la forcer :
+#
+#   nmcli connection modify <profil-filaire> ipv4.route-metric 50
+#
+# « auto » énumère toute interface physique ayant une porteuse, la mieux routée
+# en tête, le filaire départageant à égalité. L'ordre ne sert qu'aux mesures qui
+# regardent un seul lien — sonde de MTU, télémétrie de débit. Un désaccord —
+# câble branché, noyau qui préfère la radio — est journalisé en nommant les deux
+# métriques. `heliosd show-uplink` montre les candidats et l'ordre retenu.
+#
+# L'ensemble est établi une fois, au démarrage. Un lien qui perd puis retrouve
+# sa porteuse continue de marcher ; une interface **apparue** depuis demande
+# `systemctl restart heliosd`.
+wan_iface = "auto"
 lan_ifaces = ["eth1"]
 
 # ── Plan de données WireGuard ────────────────────────────────────────────────

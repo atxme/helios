@@ -173,7 +173,7 @@ export function SecurityView({ status, state }: { status: Status | null; state: 
         <SectionCard title="Politique appliquée" icon={ShieldCheck} accent="state.up.main">
           {status ? (
             <Box>
-              <DataRow icon={Globe} label="WAN" value={status.wan_iface} />
+              <DataRow icon={Globe} label="WAN" value={status.wan_ifaces.join(', ')} />
               <DataRow icon={Network} label="LAN protégé" value={status.lan_ifaces.join(', ')} />
               <DataRow
                 icon={Wifi}

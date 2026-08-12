@@ -279,6 +279,24 @@ Valider avec accès console :
   d'audit diffère de `--expected-audit-head` doit **refuser le démarrage** —
   c'est la seule chose qui distingue une restauration d'un fork.
 
+- **uplinks multiples** (`wan_iface = "auto"`), sur une machine qui a les deux
+  liens. C'est la bascule qu'il faut éprouver, pas le choix :
+  `nft list ruleset` doit porter **les deux** interfaces — écouteur WireGuard,
+  écouteur de négociation, DHCP, sortie de la gateway, forward client et un
+  masquerade par lien. Puis, tunnel monté et client connecté, **débrancher le
+  câble** : le trafic client doit continuer par le Wi-Fi sans redémarrage et
+  sans coupure du tunnel. Rebrancher : il doit repartir par le filaire dès que
+  le noyau redéplace sa route.
+  Vérifier aussi qu'après une relecture à chaud de `network.toml` le ruleset
+  porte toujours la liste résolue et non `auto` ; et qu'un lien sans bail est
+  bien permis, sinon son DHCP ne passerait jamais.
+  La sortie inverse — un désaccord métrique — se force en abaissant la métrique
+  Wi-Fi sous celle du filaire : les deux restent permis, seul l'ordre et
+  l'avertissement changent.
+  La sélection elle-même est éprouvée hors noyau ; ce que seule la cible
+  établit, c'est que les marqueurs sysfs d'un vrai pilote Wi-Fi sont ceux que
+  le module lit, et qu'une bascule réelle ne coupe pas les clients.
+
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
 

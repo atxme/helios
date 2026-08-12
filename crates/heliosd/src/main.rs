@@ -5,6 +5,7 @@ mod gateway_key;
 mod key_negotiation;
 mod orchestrator;
 mod static_psk;
+mod uplink;
 
 use std::sync::Arc;
 
@@ -118,6 +119,12 @@ enum Command {
         #[arg(long)]
         webauthn_rp_id: String,
     },
+    /// Prints what `wan_iface = "auto"` resolves to, and why.
+    ///
+    /// Read-only. Every candidate the kernel exposes, its medium, its carrier
+    /// and its default-route metric — so a surprising choice is one command
+    /// away from being explained.
+    ShowUplink,
     /// Prints the key-negotiation identity this gateway serves.
     ///
     /// Read-only, public, and it unseals nothing: the two values a deployment
@@ -253,7 +260,14 @@ async fn main() -> anyhow::Result<()> {
             run(network, dry_run).await
         }
         Command::Status => {
-            let network = NetworkConfig::load().context("loading the network config")?;
+            let mut network = NetworkConfig::load().context("loading the network config")?;
+            // Resolved here too: `status` is what an operator reads to see what
+            // the daemon will do, and printing the marker instead of the
+            // interface would answer a different question. A failure is not
+            // fatal — a diagnostic command must still print the rest.
+            if let Err(error) = resolve_uplink(&mut network) {
+                warn!(%error, "WAN interface unresolved");
+            }
             let dry_run = resolve_dry_run(false);
             orchestrator::status(&network, dry_run)
         }
@@ -288,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
             &authority_url,
             &webauthn_rp_id,
         ),
+        Command::ShowUplink => show_uplink(),
         Command::ShowIdentity => show_identity(),
         Command::Peer { command } => {
             let network = NetworkConfig::load().context("loading the network config")?;
@@ -432,6 +447,71 @@ fn init_key_negotiation(
     println!("PQ certificate: {}", result.pq_certificate_path.display());
     println!("PQ sha256: {}", result.pq_certificate_sha256);
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
+    Ok(())
+}
+
+/// Resolves `wan_iface = "auto"` against the kernel, once.
+///
+/// Substituted into the in-memory configuration, so everything downstream —
+/// the firewall policy, the hot reload, the API view — sees a real interface
+/// name rather than a marker. The file keeps `auto`: it describes the
+/// operator's intent, not the machine's current cabling.
+fn resolve_uplink(network: &mut NetworkConfig) -> anyhow::Result<()> {
+    if !network.wan_iface_is_auto() {
+        return Ok(());
+    }
+    let selection = uplink::resolve().context("choosing the WAN interface")?;
+    for warning in &selection.warnings {
+        warn!("{warning}");
+    }
+    info!(
+        interfaces = %selection.interfaces.join(", "),
+        preferred = %selection.preferred(),
+        reason = %selection.reason,
+        "WAN interfaces enumerated from the kernel — all of them are permitted"
+    );
+    network.wan_ifaces = selection.interfaces;
+    Ok(())
+}
+
+/// Prints what `wan_iface = "auto"` would choose, and why.
+fn show_uplink() -> anyhow::Result<()> {
+    let facts = uplink::observe(
+        std::path::Path::new("/sys/class/net"),
+        std::path::Path::new("/proc"),
+    )
+    .context("reading the kernel's network state")?;
+    for interface in facts.iter().filter(|facts| facts.physical) {
+        println!(
+            "{:<12} {:<9} carrier={} default_route={}",
+            interface.name,
+            if interface.wireless {
+                "wireless"
+            } else {
+                "wired"
+            },
+            u8::from(interface.carrier),
+            match interface.default_route_metric {
+                Some(metric) => format!("metric {metric}"),
+                None => "none".to_string(),
+            }
+        );
+    }
+    println!();
+    match uplink::select(&facts) {
+        Ok(selection) => {
+            for warning in &selection.warnings {
+                println!("attention : {warning}");
+            }
+            println!("permises : {}", selection.interfaces.join(", "));
+            println!(
+                "préférée : {} — {}",
+                selection.preferred(),
+                selection.reason
+            );
+        }
+        Err(error) => println!("aucune interface retenue : {error}"),
+    }
     Ok(())
 }
 
@@ -854,9 +934,14 @@ fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
+async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // Before the TPM unseal below, which is where the first key appears.
     forbid_core_dumps(dry_run)?;
+
+    // The uplink, before any ruleset is built: every egress rule and the
+    // masquerade are bound to this name, and resolving it later would mean
+    // building the kill-switch around an interface we had not chosen yet.
+    resolve_uplink(&mut network)?;
 
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —
@@ -955,7 +1040,13 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     } else {
         shared_network.read().await.api_bind()
     };
+    let raw_speedtest_bind = if dry_run {
+        format!("127.0.0.1:{}", aether::SPEEDTEST_PORT)
+    } else {
+        shared_network.read().await.speedtest_bind()
+    };
     info!("web interface on http://{api_bind}");
+    info!("raw speedtest on {raw_speedtest_bind} (WireGuard TCP/UDP)");
 
     #[allow(unused_mut)]
     let mut state = AppState::new(
@@ -1024,6 +1115,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // The console reads the data plane through this snapshot; only the
     // orchestrator's poller writes it.
     let peer_runtime = Arc::clone(&state.peer_runtime);
+    let api_state = state.clone();
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —
         // which the orchestrator, started right after, has not yet assigned
@@ -1032,7 +1124,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // run for good without an API: no provisioning, no telemetry, for a
         // race lost by a few dozen milliseconds.
         for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::serve(state.clone(), &api_bind).await {
+            match helios_api::serve(api_state.clone(), &api_bind).await {
                 Ok(()) => return,
                 Err(e) if attempt < API_BIND_ATTEMPTS => {
                     warn!(
@@ -1044,6 +1136,29 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
                 Err(e) => {
                     tracing::error!(
                         "API server given up after {API_BIND_ATTEMPTS} attempts: {e:#}"
+                    );
+                }
+            }
+        }
+    });
+
+    let raw_speedtest_state = state.clone();
+    tokio::spawn(async move {
+        for attempt in 1..=API_BIND_ATTEMPTS {
+            match helios_api::speedtest::serve_raw(raw_speedtest_state.clone(), &raw_speedtest_bind)
+                .await
+            {
+                Ok(()) => return,
+                Err(error) if attempt < API_BIND_ATTEMPTS => {
+                    warn!(
+                        "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                         retrying: {error:#}"
+                    );
+                    tokio::time::sleep(API_BIND_DELAY).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "raw speedtest given up after {API_BIND_ATTEMPTS} attempts: {error:#}"
                     );
                 }
             }

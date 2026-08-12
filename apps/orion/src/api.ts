@@ -18,6 +18,8 @@ import type {
   ProfileDraft,
   ProfileIssues,
   SpeedTestResult,
+  SpeedTestMode,
+  SpeedTestProgress,
   TunnelState,
   VaultPosture,
 } from './types'
@@ -113,7 +115,13 @@ export const lastCertificateError = (name: string) =>
   invoke<string | null>('last_certificate_error', { name })
 
 /** Measures the authenticated WireGuard path to the active profile's gateway. */
-export const runSpeedTest = () => invoke<SpeedTestResult>('run_speed_test')
+export const runSpeedTest = (mode: SpeedTestMode = 'full', durationSecs = 8) =>
+  invoke<SpeedTestResult>('run_speed_test', { mode, durationSecs })
+
+/** Receives progress from the direct socket benchmark. */
+export function onSpeedTestProgress(cb: (progress: SpeedTestProgress) => void): Promise<UnlistenFn> {
+  return listen<SpeedTestProgress>('helios://speedtest', (event) => cb(event.payload))
+}
 
 /**
  * Draws a WireGuard key pair in Rust and returns its **public** half.

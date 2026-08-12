@@ -364,6 +364,27 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   `key_negotiation_port` décide de l’ouverture du service — absent, il reste
   fermé, sans erreur. Côté Orion, seul le stockage protégé d’identité reste
   conditionnel : il est propre à la machine, pas à la compilation.
+- **Uplink multiple** : `wan_iface` est un **ensemble**, pas un choix — une
+  chaîne ou une liste (`"auto"`, `"eth0"`, `["enp3s0", "wlo1"]`), la clé TOML
+  restant `wan_iface`. Chaque règle qui nomme le WAN est émise **une fois par
+  interface**, et le masquerade aussi : une gateway avec câble et radio survit
+  au débranchement sans redémarrage ni rechargement, parce que les règles de
+  l'autre lien sont déjà posées. Le pare-feu ne doit jamais être ce qui casse
+  une bascule. La préférence, elle, n'est pas ici : c'est le routage qui décide
+  par où un paquet sort, et elle s'exprime en **métrique de route**. `auto`
+  énumère toute interface physique ayant une porteuse — mieux routée en tête,
+  filaire départageant à égalité — et l'ordre ne sert qu'aux mesures qui
+  regardent un seul lien (sonde MTU, télémétrie). Un lien sans route est
+  **permis quand même** : le refuser ferait jeter l'échange DHCP qui lui
+  donnerait justement sa route. Le type ARPHRD ne distingue pas le Wi-Fi (il
+  vaut 1 comme Ethernet) : c'est `phy80211`, et `wireless/` pour les pilotes
+  antérieurs ; l'absence de lien `device` écarte les interfaces virtuelles,
+  sans quoi `docker0` serait candidat. L'ensemble est établi **une fois** — un
+  nom d'interface ne change pas sous un plan de données en marche — et
+  `adopt_runtime_secrets_from` reporte la liste résolue à chaque relecture :
+  laisser passer le marqueur reconstruirait le ruleset autour d'une interface
+  nommée `auto`. `heliosd show-uplink` montre les candidats, l'ordre et les
+  désaccords.
 - `network.toml` est relu à chaud : le démon le surveille et réapplique la
   table de pairs sans redémarrer (`orchestrator::spawn_network_config_watcher`).
   Toute relecture doit passer par `NetworkConfig::adopt_runtime_secrets_from` —

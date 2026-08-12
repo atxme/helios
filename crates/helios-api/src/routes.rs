@@ -12,7 +12,9 @@ use crate::AppState;
 pub struct StatusResponse {
     pub state: String,
     pub version: &'static str,
-    pub wan_iface: String,
+    /// Uplinks, in order of preference. Several when the gateway has a cable
+    /// and a radio: the firewall permits them all, the kernel picks.
+    pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub wg_peers: Vec<String>,
     pub allow_ssh_from: Vec<String>,
@@ -110,7 +112,7 @@ impl PeerSummary {
 /// PSKs into `GET /api/network`.
 #[derive(Serialize)]
 pub struct NetworkConfigView {
-    pub wan_iface: String,
+    pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
     /// Deliberately exposed: it isn't a secret, and a view that omitted it
@@ -154,7 +156,7 @@ pub struct NetworkPeerView {
 impl From<&NetworkConfig> for NetworkConfigView {
     fn from(config: &NetworkConfig) -> Self {
         Self {
-            wan_iface: config.wan_iface.clone(),
+            wan_ifaces: config.wan_ifaces.clone(),
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
@@ -305,7 +307,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         state: state.as_str().to_string(),
         version: env!("CARGO_PKG_VERSION"),
-        wan_iface: network.wan_iface.clone(),
+        wan_ifaces: network.wan_ifaces.clone(),
         lan_ifaces: network.lan_ifaces.clone(),
         wg_peers: network.wg_peers(),
         allow_ssh_from: network.allow_ssh_from.clone(),
@@ -603,12 +605,14 @@ pub async fn firewall_rules_get(State(s): State<AppState>) -> Json<FirewallRules
         }
         lines.push("  }".to_string());
     }
-    if let Some(out) = &rs.masquerade_out {
+    if !rs.masquerade_out.is_empty() {
         lines.push("  chain postrouting {".to_string());
         lines.push("    type nat hook postrouting priority srcnat;".to_string());
-        lines.push(format!(
-            "    oifname \"{out}\" masquerade  # tunnel clients' Internet egress"
-        ));
+        for out in &rs.masquerade_out {
+            lines.push(format!(
+                "    oifname \"{out}\" masquerade  # tunnel clients' Internet egress"
+            ));
+        }
         lines.push("  }".to_string());
     }
     if let Some(mss) = rs.mss_clamp {
@@ -733,7 +737,7 @@ mod tests {
 
     fn network() -> NetworkConfig {
         NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             lan_ifaces: vec!["lan0".into()],
             admin_iface: Some("helios0".into()),
             wg_private_key: PRIVATE_KEY.into(),

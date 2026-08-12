@@ -20,7 +20,7 @@ function mount(ui: React.ReactNode) {
 const STATUS: Status = {
   state: 'up',
   version: '0.1.0',
-  wan_iface: 'eth0',
+  wan_ifaces: ['eth0'],
   lan_ifaces: ['eth1'],
   wg_peers: [],
   allow_ssh_from: [],

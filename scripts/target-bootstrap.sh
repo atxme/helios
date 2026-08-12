@@ -105,9 +105,15 @@ case "$ESCROW_PUBLIC_KEY" in
 esac
 
 echo "==> Detecting gateway network"
+# Détecté pour le diagnostic et pour la question du bail DHCP ci-dessous ; ce
+# n'est **pas** ce qui est écrit dans network.toml. Le fichier reçoit « auto »,
+# et heliosd rechoisit à chaque démarrage en préférant le lien filaire : figer
+# le nom ici fait qu'un câble branché plus tard n'est jamais pris, et qu'une
+# machine qui renomme ses interfaces démarre sur une interface disparue.
 WAN_IFACE="$(ssh "$TARGET" "ip -4 route show default" |
     awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
 [ -n "$WAN_IFACE" ] || { echo "could not detect the gateway default interface" >&2; exit 1; }
+echo "    uplink actuel : $WAN_IFACE (écrit « auto » ; heliosd rechoisit au démarrage)"
 case "$WAN_IFACE" in
     *[!A-Za-z0-9_.:-]*) echo "unsafe WAN interface returned by gateway" >&2; exit 1 ;;
 esac
@@ -125,7 +131,7 @@ if ssh "$TARGET" "ip -4 addr show dev '$WAN_IFACE'" | grep -qw dynamic; then
 fi
 
 {
-    printf 'wan_iface = "%s"\n' "$WAN_IFACE"
+    printf 'wan_iface = "auto"\n'
     printf 'allow_ssh_from = ["%s"]\n' "$SSH_CIDR"
     if [ "${#DYNAMIC_ARG[@]}" -gt 0 ]; then
         printf 'allow_dhcp_on_wan = true\n'

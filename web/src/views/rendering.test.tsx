@@ -38,7 +38,7 @@ function peer(overrides: Partial<PeerSummary> = {}): PeerSummary {
 const STATUS: Status = {
   state: 'up',
   version: '0.1.0',
-  wan_iface: 'eth0',
+  wan_ifaces: ['eth0'],
   lan_ifaces: ['eth1'],
   wg_peers: ['site-lyon'],
   allow_ssh_from: ['192.168.1.0/24'],

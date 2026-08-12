@@ -24,7 +24,7 @@ impl FirewallBackend for DryRunBackend {
                 info!("  [{}] {}", kind.as_str(), rule);
             }
         }
-        if let Some(out) = &rs.masquerade_out {
+        for out in &rs.masquerade_out {
             info!("  [postrouting] oifname \"{out}\" masquerade  # client Internet egress");
         }
         if let Some(mss) = rs.mss_clamp {
@@ -46,7 +46,7 @@ mod tests {
 
     fn policy() -> FirewallPolicy {
         FirewallPolicy {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             lan_ifaces: vec!["eth1".into()],
             wg_peers: vec!["203.0.113.10".into()],
             wg_listen_port: Some(51820),

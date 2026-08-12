@@ -350,7 +350,7 @@ mod security_tests {
 
     fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
         let network = NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             admin_iface: Some("helios0".into()),
             wg_private_key: PRIVATE_KEY.into(),
             peers: vec![aether::WgPeer {
@@ -800,7 +800,11 @@ mod security_tests {
 
         match cmd_rx.recv().await {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
-                assert_eq!(config.wan_iface, "eth1", "the requested setting applies");
+                assert_eq!(
+                    config.wan_ifaces,
+                    vec!["eth1".to_string()],
+                    "the requested setting applies"
+                );
                 assert_eq!(
                     config.wg_private_key, PRIVATE_KEY,
                     "the gateway's identity was erased by a plain setting change"
