@@ -359,7 +359,13 @@ fn devices() -> Result<()> {
     for device in &visible {
         println!(
             "{} {:04x}:{:04x} {}",
-            if device.fido { "FIDO2 " } else { "      " },
+            match (device.fido, device.known_vendor) {
+                (true, _) => "FIDO2 ",
+                // Its vendor makes security keys, but no FIDO interface is
+                // readable on it — the interesting line of the whole listing.
+                (false, true) => "clé ? ",
+                (false, false) => "      ",
+            },
             device.vendor_id,
             device.product_id,
             device.product
@@ -370,7 +376,15 @@ fn devices() -> Result<()> {
     println!();
     println!("{} périphérique(s) HID, dont {fido} FIDO2.", visible.len());
     if fido == 0 {
+        let suspects = visible.iter().filter(|device| device.known_vendor).count();
         println!();
+        if suspects > 0 {
+            println!(
+                "{suspects} périphérique(s) marqués « clé ? » viennent d'un fabricant de clés de \
+                 sécurité : la clé est branchée et vue par le système, seule son interface FIDO \
+                 ne s'ouvre pas."
+            );
+        }
         println!(
             "Aucun n'expose l'usage page 0xF1D0. Ce n'est pas une question de modèle : rien ici \
              ne filtre sur le vendor ou le product."

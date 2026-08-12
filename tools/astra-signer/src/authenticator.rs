@@ -53,6 +53,25 @@
 
 use astra::vault::{SlotSecret, SALT_LEN};
 
+/// USB vendor identifiers of common security-key makers.
+///
+/// **Purely diagnostic.** Nothing selects, accepts or refuses a key on this
+/// list: that is the HID usage page's job, and a key from a vendor nobody
+/// listed works exactly the same. It exists so that « nothing found » can
+/// become « your key is right there, and here is what is blocking it », which
+/// is the difference between a dead end and a fix.
+const SECURITY_KEY_VENDORS: &[u16] = &[
+    0x1050, // Yubico
+    0x096e, // Feitian
+    0x20a0, // Nitrokey
+    0x0483, // SoloKeys (STMicroelectronics)
+    0x1d50, // OpenMoko — Solo 1, OnlyKey
+    0x2581, // Kensington / Plug-up
+    0x311f, // TrustKey
+    0x32a3, // Idem Key
+    0x2c97, // Ledger
+];
+
 /// Length of the `hmac-secret` output, in bytes. Fixed by CTAP2.
 pub const HMAC_SECRET_LEN: usize = 32;
 
@@ -142,6 +161,10 @@ pub struct VisibleDevice {
     /// Carries HID usage page `0xF1D0`. The only thing that makes a device a
     /// security key here — never its model.
     pub fido: bool,
+    /// Its vendor makes security keys. Diagnostic only: it selects nothing,
+    /// and a key from an unlisted vendor works identically. It is what turns
+    /// « nothing found » into « found, and blocked ».
+    pub known_vendor: bool,
     /// What the HID layer reports: usage page, usage, serial, path.
     pub detail: String,
 }
@@ -159,6 +182,7 @@ pub fn visible_devices() -> Vec<VisibleDevice> {
             vendor_id: device.vid,
             product_id: device.pid,
             fido: path_of(device).is_some_and(|path| fido_paths.contains(&path)),
+            known_vendor: SECURITY_KEY_VENDORS.contains(&device.vid),
             detail: device.info.clone(),
         })
         .collect()
@@ -213,28 +237,58 @@ mod ctap {
                     souris. C'est la pile HID du système qui ne répond pas, pas la clé"
                 .to_string();
         }
+
+        // A security-key vendor among the visible devices settles it: the
+        // object is on the bus, the system sees it, and only its FIDO
+        // interface is unreadable. Nothing *selects* a key by vendor — that
+        // stays the usage page's job — but naming one here turns « nothing
+        // found » into « found, and here is what is in the way ».
+        let suspects: Vec<String> = all
+            .iter()
+            .filter(|device| super::SECURITY_KEY_VENDORS.contains(&device.vid))
+            .map(|device| {
+                format!(
+                    "{} ({:04x}:{:04x})",
+                    if device.product_string.trim().is_empty() {
+                        "sans nom"
+                    } else {
+                        device.product_string.trim()
+                    },
+                    device.vid,
+                    device.pid
+                )
+            })
+            .collect();
+
         let mut diagnosis = format!(
-            "aucune clé de sécurité FIDO2 détectée, alors que {} périphérique(s) HID sont \
-             visibles. Une clé FIDO2 se reconnaît à son usage page HID 0xF1D0 — jamais à son \
-             modèle —, et lire cette valeur exige d'ouvrir le périphérique",
+            "aucune interface FIDO2 lisible, sur {} périphérique(s) HID visibles. Une clé FIDO2 \
+             se reconnaît à son usage page HID 0xF1D0 — jamais à son modèle —, et lire cette \
+             valeur exige d'ouvrir le périphérique",
             all.len()
         );
+        if !suspects.is_empty() {
+            diagnosis.push_str(&format!(
+                ".\n\nUne clé de sécurité EST pourtant visible : {}. Elle est donc bien \
+                 branchée et reconnue par le système ; c'est l'ouverture de son interface FIDO \
+                 qui est refusée",
+                suspects.join(", ")
+            ));
+        }
         if cfg!(windows) {
             diagnosis.push_str(
-                ". Sous Windows, ouvrir un HID FIDO est réservé aux processus élevés depuis \
-                 Windows 10 1903 : relancer cette commande dans une console **administrateur**. \
-                 Si elle l'est déjà, vérifier que l'application FIDO2 de la clé est activée \
-                 (`ykman config usb --list` sur une YubiKey) — désactivée, l'interface HID FIDO \
-                 n'existe pas du tout",
+                ".\n\nSous Windows, ouvrir un HID FIDO est réservé aux processus élevés depuis \
+                 Windows 10 1903. Une console PowerShell ordinaire ne suffit pas : il faut \
+                 « Exécuter en tant qu'administrateur » (le titre de la fenêtre doit porter \
+                 « Administrateur », et elle démarre dans C:\\WINDOWS\\system32)",
             );
         } else {
             diagnosis.push_str(
-                ". Sous Linux, il manque en général une règle udev donnant l'accès au \
-                 périphérique à l'utilisateur courant, ou l'application FIDO2 de la clé est \
-                 désactivée. `astra-signer devices` liste ce qui est visible",
+                ".\n\nSous Linux, il manque en général une règle udev donnant l'accès au \
+                 périphérique à l'utilisateur courant",
             );
         }
-        diagnosis.push_str(". `astra-signer devices` liste ce qui est visible");
+        diagnosis
+            .push_str("\n\n`astra-signer devices` liste chaque périphérique et son usage page.");
         diagnosis
     }
 
