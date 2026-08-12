@@ -105,11 +105,12 @@ case "$ESCROW_PUBLIC_KEY" in
 esac
 
 echo "==> Detecting gateway network"
-# Détecté pour le diagnostic et pour la question du bail DHCP ci-dessous ; ce
-# n'est **pas** ce qui est écrit dans network.toml. Le fichier reçoit « auto »,
-# et heliosd rechoisit à chaque démarrage en préférant le lien filaire : figer
-# le nom ici fait qu'un câble branché plus tard n'est jamais pris, et qu'une
-# machine qui renomme ses interfaces démarre sur une interface disparue.
+# Détecté pour le diagnostic et pour la question du bail DHCP ci-dessous — pas
+# pour être écrit dans network.toml. Ce qui y est écrit est « auto », par
+# l'argument `--wan` passé à network-bootstrap.sh plus bas : c'est lui qui
+# fusionne le fichier de la gateway, et lui seul. Figer le nom détecté ferait
+# qu\'un câble branché plus tard ne serait jamais permis, et qu\'une machine
+# renommant ses interfaces démarrerait sur une interface disparue.
 WAN_IFACE="$(ssh "$TARGET" "ip -4 route show default" |
     awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
 [ -n "$WAN_IFACE" ] || { echo "could not detect the gateway default interface" >&2; exit 1; }
@@ -149,7 +150,7 @@ echo "==> Merging network configuration"
 scp -q scripts/network-bootstrap.sh "$TARGET:/tmp/helios-network-bootstrap.sh"
 ssh -t "$TARGET" "sudo sh /tmp/helios-network-bootstrap.sh \
     --config '$REMOTE_NETWORK' \
-    --wan '$WAN_IFACE' \
+    --wan 'auto' \
     --ssh-cidr '$SSH_CIDR' \
     --wg-port '$WG_PORT' \
     --key-negotiation-port '$KEY_PORT' \
