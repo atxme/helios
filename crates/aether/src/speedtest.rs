@@ -11,7 +11,7 @@ pub const SPEEDTEST_PROTOCOL_VERSION: u8 = 1;
 /// Magic shared by the TCP and UDP control frames.
 pub const SPEEDTEST_MAGIC: [u8; 8] = *b"HELIOSST";
 /// Default duration of one direction, long enough for TCP to reach cruise.
-pub const SPEEDTEST_DEFAULT_DURATION_SECS: u16 = 8;
+pub const SPEEDTEST_DEFAULT_DURATION_SECS: u16 = 20;
 /// Absolute upper bound accepted by the gateway and Orion.
 pub const SPEEDTEST_MAX_DURATION_SECS: u16 = 30;
 /// Number of independent TCP congestion windows used by the default test.

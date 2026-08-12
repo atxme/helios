@@ -78,11 +78,17 @@ ont besoin.
   trousseau éditeur de développement dans toute compilation `--release`, et
   rien ici n'y gagne — le déverrouillage d'un key-slot est un HKDF-SHA256.
   Pour un binaire release, fournir `HELIOS_PUBLISHER_KEYRING_PATH`.
-- Une console **administrateur** sous Windows. Ouvrir un HID FIDO y est réservé
-  aux processus élevés depuis Windows 10 1903 — sans élévation la clé
-  disparaît de l'énumération, car lire son usage page HID `0xF1D0` demande
-  d'ouvrir le périphérique. `astra-signer devices` liste ce qui est visible et
-  distingue « aucun HID » de « des HID, mais aucun FIDO ».
+- Sous Windows, **aucune élévation n'est nécessaire** : le compagnon passe par
+  l'API WebAuthn du système (`--transport platform`, le défaut), qui demande
+  elle-même le PIN et le contact — le PIN n'entre donc jamais dans ce
+  processus. Elle exige `WEBAUTHN_API_VERSION_4` pour les sels `hmac-secret` ;
+  sur un Windows antérieur, le compagnon le dit et renvoie vers
+  `--transport hid`, qui parle CTAP2 directement mais **exige une console
+  administrateur** — Windows y réserve l'ouverture d'un HID FIDO aux processus
+  élevés depuis la 1903. `astra-signer devices` liste ce que la pile HID
+  montre, et distingue « aucun HID » de « des HID, mais aucun FIDO ».
+  Un credential est celui de la clé, pas celui de l'API : un coffre créé par un
+  transport s'ouvre par l'autre, tant que le RP ID est le même.
 
 ## Le détail, si quelque chose casse
 

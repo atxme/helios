@@ -122,8 +122,36 @@ pub struct Opened {
     pub secret: SlotSecret,
 }
 
+/// How this program reaches the security key.
+///
+/// Explicit, never inferred at runtime: which transport opened a vault decides
+/// what protected it — an elevated process talking raw HID, or the platform
+/// collecting the PIN itself — and an operator must not have to guess which
+/// one they got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// The operating system's own API. No elevation, and it collects the PIN
+    /// itself so the PIN never enters this process. Windows only.
+    #[cfg_attr(windows, default)]
+    Platform,
+    /// Raw CTAP2 over HID. Works everywhere; under Windows it needs an
+    /// elevated process, which for a program holding `CA-PQ` in the clear is
+    /// a privilege nobody should want.
+    #[cfg_attr(not(windows), default)]
+    Hid,
+}
+
 /// A security key, as this program needs it.
 pub trait Authenticator {
+    /// Whether the caller must collect the PIN and pass it in.
+    ///
+    /// False on the platform transport: the operating system asks for it in
+    /// its own dialog, and the value never crosses into this process. A caller
+    /// that prompted anyway would be asking for a secret it has no use for.
+    fn needs_pin(&self) -> bool {
+        true
+    }
+
     /// Registers a credential carrying `hmac-secret`, and returns its
     /// identifier.
     ///
@@ -195,13 +223,25 @@ fn path_of(device: &ctap_hid_fido2::HidInfo) -> Option<String> {
     }
 }
 
-/// Opens the single connected security key.
+/// Opens the single connected security key, over `transport`.
 ///
 /// Exactly one: a second key plugged in during an enrolment is how an operator
 /// registers the credential of one token into the slot they meant for another.
-pub fn connect() -> Result<Box<dyn Authenticator>> {
-    Ok(Box::new(ctap::Ctap2Authenticator::connect()?))
+pub fn connect(transport: Transport) -> Result<Box<dyn Authenticator>> {
+    match transport {
+        Transport::Hid => Ok(Box::new(ctap::Ctap2Authenticator::connect()?)),
+        #[cfg(windows)]
+        Transport::Platform => Ok(Box::new(webauthn::WebAuthnAuthenticator::connect()?)),
+        #[cfg(not(windows))]
+        Transport::Platform => Err(AuthenticatorError::Device(
+            "aucune API de plateforme sur ce système : seule `--transport hid` existe ici"
+                .to_string(),
+        )),
+    }
 }
+
+#[cfg(windows)]
+mod webauthn;
 
 mod ctap {
     use super::{AuthenticatorError, CredentialSubject, Opened, Result, HMAC_SECRET_LEN, SALT_LEN};
@@ -277,9 +317,9 @@ mod ctap {
         if cfg!(windows) {
             diagnosis.push_str(
                 ".\n\nSous Windows, ouvrir un HID FIDO est réservé aux processus élevés depuis \
-                 Windows 10 1903. Une console PowerShell ordinaire ne suffit pas : il faut \
-                 « Exécuter en tant qu'administrateur » (le titre de la fenêtre doit porter \
-                 « Administrateur », et elle démarre dans C:\\WINDOWS\\system32)",
+                 Windows 10 1903, et une console PowerShell ordinaire ne suffit pas. Depuis \
+                 celle-ci, pour en ouvrir une élevée au même endroit :\n\n    Start-Process \
+                 powershell -Verb RunAs -ArgumentList '-NoExit','-Command',\"cd '$PWD'\"",
             );
         } else {
             diagnosis.push_str(

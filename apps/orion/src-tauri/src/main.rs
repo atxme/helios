@@ -573,7 +573,6 @@ async fn run_speed_test(
     app: AppHandle,
     state: State<'_, AppState>,
     mode: String,
-    duration_secs: u16,
 ) -> Result<orion_core::SpeedTestResult, String> {
     let _exclusive = state
         .speedtest
@@ -587,9 +586,13 @@ async fn run_speed_test(
     let progress: orion_core::SpeedTestProgressSink = Arc::new(move |update| {
         let _ = progress_app.emit("helios://speedtest", &update);
     });
-    orion_core::run_speedtest_with_progress(mode, duration_secs, progress)
-        .await
-        .map_err(|error| error.to_string())
+    orion_core::run_speedtest_with_progress(
+        mode,
+        aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
+        progress,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Wall clock in Unix seconds, for the lifecycle's own arithmetic.

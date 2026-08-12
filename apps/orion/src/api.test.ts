@@ -94,7 +94,7 @@ describe('Orion Tauri bridge', () => {
       ['certificate_overview'],
       ['run_certificate_action', { name: 'portable', action: 'renew_now' }],
       ['last_certificate_error', { name: 'portable' }],
-      ['run_speed_test', { mode: 'full', durationSecs: 8 }],
+      ['run_speed_test', { mode: 'full' }],
       ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],

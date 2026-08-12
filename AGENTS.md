@@ -123,12 +123,22 @@ Restent ouverts :
   courant — une sauvegarde antérieure, elle, reste ouvrable par la clé retirée.
   CTAP n'est **pas** une feature de compilation, pas plus que la négociation de
   clé : tout binaire `astra-signer` porte la pile, et aucun chemin n'ouvre le
-  coffre sans clé. Le prix est `libudev` en dépendance de compilation, posée par
-  `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus.
-  **Limite connue** : le matériel ne s'exerce ni en WSL2 (aucun passthrough USB)
-  ni sans clé branchée, et sous Windows le compagnon demande un processus élevé.
-  La séquence au-dessus du matériel, elle, est éprouvée par
-  `tools/astra-signer/tests/enrolment.rs`.
+  coffre sans clé. **Deux transports**, choisis explicitement et jamais déduits
+  (`--transport`) : `platform` sous Windows passe par `webauthn.dll` — aucune
+  élévation, et le PIN est saisi par le système donc n'entre jamais dans le
+  processus ; `hid` parle CTAP2 directement, partout, mais sous Windows exige
+  un processus administrateur — pour un programme qui tient `CA-PQ` en clair,
+  c'est le privilège qu'on ne veut pas. Un credential appartient à la clé, pas
+  à l'API : un coffre créé par un transport s'ouvre par l'autre à RP ID égal.
+  Le prix du transport HID est `libudev` en dépendance de compilation, posée par
+  `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus ; celui du
+  transport plateforme est `WEBAUTHN_API_VERSION_4`, exigé par les sels
+  `hmac-secret` et refusé en nommant la version trouvée.
+  **Limite connue** : le matériel ne s'exerce pas en WSL2 (aucun passthrough
+  USB), et le module `webauthn` ne s'y compile même pas — il est type-vérifié
+  contre `x86_64-pc-windows-msvc` dans une caisse isolée, `aws-lc-sys` empêchant
+  le cross-check du workspace entier. La séquence au-dessus du matériel, elle,
+  est éprouvée par `tools/astra-signer/tests/enrolment.rs`.
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par

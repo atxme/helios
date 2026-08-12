@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use aether::certificates::encoding::TrustDomainId;
 use anyhow::{bail, Context, Result};
 use astra::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
+use astra_signer::authenticator::Transport;
 use astra_signer::gestures::{self, NewAuthority, NewKey};
 use astra_signer::{authenticator, handoff, store};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -64,8 +65,34 @@ struct Cli {
     /// Path of the encrypted vault. It is meant to be backed up.
     #[arg(long, env = "ASTRA_VAULT")]
     vault: Option<PathBuf>,
+    /// Comment joindre la clé de sécurité.
+    ///
+    /// `platform` sous Windows : l'API du système, sans élévation, et c'est
+    /// lui qui demande le PIN. `hid` parle CTAP2 directement — partout, mais
+    /// sous Windows uniquement depuis un processus administrateur.
+    #[arg(long, value_enum, default_value_t = TransportArg::default())]
+    transport: TransportArg,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum TransportArg {
+    /// L'API du système. Sans élévation ; le PIN est saisi par le système.
+    #[cfg_attr(windows, default)]
+    Platform,
+    /// CTAP2 sur HID. Sous Windows, exige une console administrateur.
+    #[cfg_attr(not(windows), default)]
+    Hid,
+}
+
+impl From<TransportArg> for Transport {
+    fn from(value: TransportArg) -> Self {
+        match value {
+            TransportArg::Platform => Transport::Platform,
+            TransportArg::Hid => Transport::Hid,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -149,6 +176,7 @@ fn main() -> Result<()> {
         None => store::default_path()?,
     };
 
+    let transport = cli.transport.into();
     match cli.command {
         Command::Init {
             rp_id,
@@ -161,13 +189,14 @@ fn main() -> Result<()> {
             trust_domain_id.as_deref(),
             &label,
             role.into(),
+            transport,
         ),
-        Command::Enrol { label, role } => enrol(&path, &label, role.into()),
-        Command::Verify => verify(&path),
+        Command::Enrol { label, role } => enrol(&path, &label, role.into(), transport),
+        Command::Verify => verify(&path, transport),
         Command::List => list(&path),
         Command::Devices => devices(),
         Command::Domain => domain(&path),
-        Command::Remove { slot } => remove(&path, &slot),
+        Command::Remove { slot } => remove(&path, &slot, transport),
         Command::Rename { slot, label } => rename(&path, &slot, &label),
     }
 }
@@ -178,6 +207,7 @@ fn init(
     trust_domain_id: Option<&str>,
     label: &str,
     role: SlotRole,
+    transport: Transport,
 ) -> Result<()> {
     if path.exists() {
         bail!(
@@ -194,8 +224,8 @@ fn init(
 
     eprintln!("Brancher la clé de sécurité à enregistrer, puis appuyer sur Entrée.");
     wait_for_operator()?;
-    let key = authenticator::connect()?;
-    let pin = ask_pin("PIN de la clé de sécurité : ")?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
 
     let created = gestures::create_authority(
         key.as_ref(),
@@ -236,7 +266,7 @@ fn init(
     Ok(())
 }
 
-fn enrol(path: &Path, label: &str, role: SlotRole) -> Result<()> {
+fn enrol(path: &Path, label: &str, role: SlotRole, transport: Transport) -> Result<()> {
     let mut vault = store::load(path)?;
     if vault.slots.len() >= MAX_SLOTS {
         bail!("le coffre est plafonné à {MAX_SLOTS} key-slots : en retirer un d'abord");
@@ -248,8 +278,8 @@ fn enrol(path: &Path, label: &str, role: SlotRole) -> Result<()> {
     eprintln!("Brancher une clé DÉJÀ enregistrée, puis appuyer sur Entrée.");
     wait_for_operator()?;
     let opening = {
-        let key = authenticator::connect()?;
-        let pin = ask_pin("PIN de la clé déjà enregistrée : ")?;
+        let key = authenticator::connect(transport)?;
+        let pin = pin_for(key.as_ref(), "PIN de la clé déjà enregistrée : ")?;
         let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
         let slot = vault.slot_for_credential(&opened.credential_id)?;
         eprintln!("Clé reconnue : « {} » ({}).", slot.label, slot.role);
@@ -259,8 +289,8 @@ fn enrol(path: &Path, label: &str, role: SlotRole) -> Result<()> {
     eprintln!();
     eprintln!("Débrancher cette clé, brancher la NOUVELLE, puis appuyer sur Entrée.");
     wait_for_operator()?;
-    let key = authenticator::connect()?;
-    let pin = ask_pin("PIN de la nouvelle clé : ")?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la nouvelle clé : ")?;
     let slot_id = gestures::add_key(
         key.as_ref(),
         &mut vault,
@@ -281,13 +311,13 @@ fn enrol(path: &Path, label: &str, role: SlotRole) -> Result<()> {
     Ok(())
 }
 
-fn verify(path: &Path) -> Result<()> {
+fn verify(path: &Path, transport: Transport) -> Result<()> {
     let vault = store::load(path)?;
 
     eprintln!("Brancher la clé de sécurité à éprouver, puis appuyer sur Entrée.");
     wait_for_operator()?;
-    let key = authenticator::connect()?;
-    let pin = ask_pin("PIN de la clé de sécurité : ")?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
     let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
     let slot = vault.slot_for_credential(&opened.credential_id)?.clone();
     gestures::prove_anchors_open(&vault, &opened)?;
@@ -321,7 +351,7 @@ fn list(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove(path: &Path, slot: &str) -> Result<()> {
+fn remove(path: &Path, slot: &str, transport: Transport) -> Result<()> {
     let mut vault = store::load(path)?;
     let removed = parse_slot_id(slot)?;
     let target: KeySlot = vault.slot(&removed)?.clone();
@@ -331,8 +361,8 @@ fn remove(path: &Path, slot: &str) -> Result<()> {
         target.label, target.role
     );
     wait_for_operator()?;
-    let key = authenticator::connect()?;
-    let pin = ask_pin("PIN de la clé autorisée : ")?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé autorisée : ")?;
     let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
 
     gestures::remove_key(&mut vault, &opened, &removed)?;
@@ -459,6 +489,22 @@ fn wait_for_operator() -> Result<()> {
         .read_line(&mut line)
         .context("lecture de la confirmation")?;
     Ok(())
+}
+
+/// Asks for the PIN only when the transport needs it.
+///
+/// On the platform transport the operating system collects it in its own
+/// dialog. Prompting here would ask an operator for a secret this process has
+/// no use for — and would then have to hold it.
+fn pin_for(
+    key: &dyn astra_signer::authenticator::Authenticator,
+    prompt: &str,
+) -> Result<Zeroizing<String>> {
+    if !key.needs_pin() {
+        eprintln!("Le système va demander le PIN et le contact de la clé.");
+        return Ok(Zeroizing::new(String::new()));
+    }
+    ask_pin(prompt)
 }
 
 fn ask_pin(prompt: &str) -> Result<Zeroizing<String>> {

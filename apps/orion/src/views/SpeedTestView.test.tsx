@@ -42,7 +42,7 @@ const result: SpeedTestResult = {
   udp_loss_pct: null,
   udp_jitter_ms: null,
   tcp_streams: 4,
-  test_duration_secs: 8,
+  test_duration_secs: 20,
   download_mbps: 123.4,
   upload_mbps: 45.6,
   download_variation_pct: 2.1,
@@ -78,7 +78,7 @@ describe('SpeedTestView', () => {
     await waitFor(() => expect(screen.getByText('123,4 Mb/s')).toBeTruthy())
     expect(screen.getByText('45,6 Mb/s')).toBeTruthy()
     expect(screen.getByText('12 ms')).toBeTruthy()
-    expect(api.runSpeedTest).toHaveBeenCalledWith('tcp', 8)
+    expect(api.runSpeedTest).toHaveBeenCalledWith('tcp')
   })
 
   it('surfaces a gateway refusal without leaving the button stuck', async () => {

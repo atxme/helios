@@ -114,9 +114,9 @@ export const runCertificateAction = (name: string, action: CertificateAction) =>
 export const lastCertificateError = (name: string) =>
   invoke<string | null>('last_certificate_error', { name })
 
-/** Measures the authenticated WireGuard path to the active profile's gateway. */
-export const runSpeedTest = (mode: SpeedTestMode = 'full', durationSecs = 8) =>
-  invoke<SpeedTestResult>('run_speed_test', { mode, durationSecs })
+/** Measures the authenticated WireGuard path for the fixed 20-second interval. */
+export const runSpeedTest = (mode: SpeedTestMode = 'full') =>
+  invoke<SpeedTestResult>('run_speed_test', { mode })
 
 /** Receives progress from the direct socket benchmark. */
 export function onSpeedTestProgress(cb: (progress: SpeedTestProgress) => void): Promise<UnlistenFn> {

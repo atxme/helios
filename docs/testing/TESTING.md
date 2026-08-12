@@ -252,9 +252,12 @@ Valider avec accès console :
   débranchements et redémarrages. Si elle ne l'était pas, le coffre ne se
   rouvrirait plus et aucun test hors matériel ne l'aurait dit.
 
-  WSL2 n'a aucun passthrough USB, et sous Windows l'accès HID direct aux
-  périphériques FIDO est réservé aux processus élevés depuis Windows 10 1903 :
-  le compagnon s'y lance en administrateur. CTAP n'est **pas** une feature de
+  Sous Windows, éprouver **les deux transports** : `--transport platform`
+  (défaut) doit fonctionner depuis une console ordinaire, le système demandant
+  lui-même PIN et contact ; `--transport hid` doit fonctionner depuis une
+  console administrateur et échouer sans, en nommant l'élévation. Vérifier
+  qu'un coffre créé par l'un s'ouvre par l'autre — le credential appartient à
+  la clé, pas à l'API. WSL2 n'a aucun passthrough USB. CTAP n'est **pas** une feature de
   compilation — tout binaire `astra-signer` porte la pile, et il n'existe aucun
   chemin qui ouvre le coffre sans clé. Le prix est une dépendance de
   compilation : `libudev` sous Linux, posée par `scripts/setup-dev.sh`, sans
