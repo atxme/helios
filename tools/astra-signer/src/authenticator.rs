@@ -96,7 +96,12 @@ pub enum AuthenticatorError {
     NoPin,
     #[error("la clé branchée ne détient aucun des credentials enregistrés dans ce coffre")]
     UnknownCredential,
-    #[error("la clé n'a rendu aucune sortie `hmac-secret` : l'extension a été ignorée")]
+    #[error(
+        "la clé n'a rendu aucune sortie `hmac-secret` : sans elle, aucun key-slot ne \
+         s'ouvre. Soit l'authentificateur ne porte pas l'extension, soit le credential a été \
+         créé sans elle — un credential enrôlé par un autre outil, ou avant que celui-ci ne \
+         demande PRF"
+    )]
     NoHmacOutput,
     #[error("dialogue avec la clé de sécurité : {0}")]
     Device(String),
