@@ -132,10 +132,16 @@ Restent ouverts :
   à l'API : un coffre créé par un transport s'ouvre par l'autre à RP ID égal —
   mais seulement parce que le chemin HID applique **lui aussi** la conversion
   PRF de WebAuthn, `SHA-256("WebAuthn PRF" || 0x00 || sel)`. Windows l'applique
-  dans `pHmacSecretSaltValues` sans offrir de s'en passer ; sans elle, le même
-  sel dériverait deux secrets différents selon le transport. De même, la
-  version d'options de `MakeCredential` doit être ≥ 5, sinon `bEnablePrf` n'est
-  jamais lu et le credential revient parfait pour ne rien déverrouiller.
+  par défaut dans `pHmacSecretSaltValues` ; le code laisse volontairement
+  `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG` désactivé, car demander les
+  sels CTAP bruts ferait dériver deux secrets différents selon le transport.
+  L'API WebAuthn 4 sait fournir ces sels avec `GetAssertion` v6, mais ne sait
+  créer qu'avec
+  `MakeCredential` v5 : ce chemin demande l'extension historique
+  `hmac-secret`. À partir de l'API 6 seulement, `MakeCredential` v6 et
+  `bEnablePrf` la remplacent. Annoncer v5 tout en remplissant `bEnablePrf`
+  laisse Windows ignorer silencieusement le champ et crée un credential qui ne
+  déverrouille rien.
   Le prix du transport HID est `libudev` en dépendance de compilation, posée par
   `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus ; celui du
   transport plateforme est `WEBAUTHN_API_VERSION_4`, exigé par les sels

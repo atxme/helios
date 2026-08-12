@@ -521,8 +521,17 @@ fn pin_for(
     ask_pin(prompt)
 }
 
+/// Reads the PIN without echoing it.
+///
+/// The prompt is printed by us rather than by `rpassword::prompt_password`:
+/// that one writes straight to the terminal device, bypassing the stream every
+/// other message goes through — and on a Windows console in a non-UTF-8 code
+/// page it comes out as mojibake, on the one line an operator has to read
+/// carefully.
 fn ask_pin(prompt: &str) -> Result<Zeroizing<String>> {
-    let pin = rpassword::prompt_password(prompt).context("lecture du PIN")?;
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let pin = rpassword::read_password().context("lecture du PIN")?;
     if pin.is_empty() {
         bail!("PIN vide : la vérification utilisateur est exigée");
     }

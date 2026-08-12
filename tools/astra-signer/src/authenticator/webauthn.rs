@@ -45,7 +45,7 @@
 //! *target-only*, comme DPAPI et le TPM.
 
 use windows_sys::core::HRESULT;
-use windows_sys::Win32::Foundation::{FALSE, HWND, TRUE};
+use windows_sys::Win32::Foundation::{BOOL, FALSE, HWND, TRUE};
 use windows_sys::Win32::Networking::WindowsWebServices::*;
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 
@@ -62,6 +62,13 @@ pub struct WebAuthnAuthenticator {
     /// one; without it the prompt would have no owner and could open behind
     /// everything.
     window: HWND,
+    /// Selects the newest options structure this Windows actually reads.
+    ///
+    /// API 4 already accepts PRF salts through GetAssertion v6, but only API
+    /// 6 accepts `bEnablePrf` through MakeCredential v6. Keeping the runtime
+    /// version prevents a field from looking set in Rust while Windows
+    /// silently ignores it because `dwVersion` ends before that field.
+    api_version: u32,
 }
 
 impl WebAuthnAuthenticator {
@@ -76,6 +83,7 @@ impl WebAuthnAuthenticator {
         }
         Ok(Self {
             window: unsafe { GetConsoleWindow() },
+            api_version: version,
         })
     }
 }
@@ -130,33 +138,43 @@ impl Authenticator for WebAuthnAuthenticator {
             pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
         };
 
-        // `bEnablePrf` below is the whole request, and the
-        // `hmac-secret` extension is deliberately **not** also set: they are
-        // two spellings of the same thing, the platform expects one, and
-        // sending both had it report PRF as not enabled at all.
-        //
-        // PRF is the spelling that matters here because the assertion side
-        // carries salts through `pHmacSecretSaltValues`, which is PRF's.
+        // API 4 introduced the assertion-side PRF salts but still accepts only
+        // MakeCredential options v5. On API 4 and 5, request the authenticator
+        // extension that creates CredRandom. API 6 introduced options v6 and
+        // `bEnablePrf`, so use that spelling there. Never send both: they name
+        // the same capability, and Windows has rejected that ambiguous input
+        // on real machines.
+        let enable_prf = self.api_version >= WEBAUTHN_API_VERSION_6;
+        let mut enable_hmac_secret: BOOL = TRUE;
+        let mut hmac_secret_extension = WEBAUTHN_EXTENSION {
+            pwszExtensionIdentifier: WEBAUTHN_EXTENSIONS_IDENTIFIER_HMAC_SECRET,
+            cbExtension: std::mem::size_of_val(&enable_hmac_secret) as u32,
+            pvExtension: (&mut enable_hmac_secret as *mut BOOL).cast(),
+        };
+        let extensions = if enable_prf {
+            WEBAUTHN_EXTENSIONS {
+                cExtensions: 0,
+                pExtensions: std::ptr::null_mut(),
+            }
+        } else {
+            WEBAUTHN_EXTENSIONS {
+                cExtensions: 1,
+                pExtensions: &mut hmac_secret_extension,
+            }
+        };
 
         // The exclusion list keeps one token from taking two slots of the same
         // vault: two slots on one object is not a recovery, though it reads as
         // one in `list`.
         let mut excluded = CredentialList::new(exclude);
         let mut options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
-            // Version 5, and not one less: `bEnablePrf` sits after
-            // `bBrowserInPrivateMode` in the structure, so a lower version
-            // means the platform never reads it — silently, and the credential
-            // comes back looking perfectly fine.
-            dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5,
+            dwVersion: make_credential_options_version(self.api_version),
             dwTimeoutMilliseconds: TIMEOUT_MS,
             CredentialList: WEBAUTHN_CREDENTIALS {
                 cCredentials: 0,
                 pCredentials: std::ptr::null_mut(),
             },
-            Extensions: WEBAUTHN_EXTENSIONS {
-                cExtensions: 0,
-                pExtensions: std::ptr::null_mut(),
-            },
+            Extensions: extensions,
             // Cross-platform, or Windows offers Hello — a platform
             // authenticator bound to this machine, which is not a key an
             // operator can carry to the recovery site.
@@ -173,7 +191,7 @@ impl Authenticator for WebAuthnAuthenticator {
             dwLargeBlobSupport: 0,
             bPreferResidentKey: FALSE,
             bBrowserInPrivateMode: FALSE,
-            bEnablePrf: TRUE,
+            bEnablePrf: if enable_prf { TRUE } else { FALSE },
             pLinkedDevice: std::ptr::null_mut(),
             cbJsonExt: 0,
             pbJsonExt: std::ptr::null_mut(),
@@ -256,7 +274,10 @@ impl Authenticator for WebAuthnAuthenticator {
 
         let mut allowed = CredentialList::new(credentials);
         let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
-            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_5,
+            // API 4 is the first runtime exposing this v6 structure. Version
+            // 5 ends before `pHmacSecretSaltValues` and silently drops the
+            // only output that can open the vault.
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
             dwTimeoutMilliseconds: TIMEOUT_MS,
             CredentialList: WEBAUTHN_CREDENTIALS {
                 cCredentials: 0,
@@ -336,6 +357,20 @@ impl Authenticator for WebAuthnAuthenticator {
             credential_id,
             secret: SlotSecret::new(secret),
         })
+    }
+}
+
+/// Highest MakeCredential options version supported by the runtime features
+/// this companion uses.
+///
+/// API 4 and 5 stop at options v5, where the legacy `hmac-secret` extension
+/// creates CredRandom. API 6 adds options v6 and `bEnablePrf`.
+fn make_credential_options_version(api_version: u32) -> u32 {
+    debug_assert!(api_version >= WEBAUTHN_API_VERSION_4);
+    if api_version >= WEBAUTHN_API_VERSION_6 {
+        WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_6
+    } else {
+        WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5
     }
 }
 
@@ -436,4 +471,29 @@ fn error_name(status: HRESULT) -> String {
     }
     let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, length) });
     format!("WebAuthn : {text} (HRESULT {status:#010x})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn make_credential_version_follows_the_runtime_capability() {
+        assert_eq!(
+            make_credential_options_version(WEBAUTHN_API_VERSION_4),
+            WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5
+        );
+        assert_eq!(
+            make_credential_options_version(WEBAUTHN_API_VERSION_5),
+            WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5
+        );
+        assert_eq!(
+            make_credential_options_version(WEBAUTHN_API_VERSION_6),
+            WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_6
+        );
+        assert_eq!(
+            make_credential_options_version(WEBAUTHN_API_VERSION_7),
+            WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_6
+        );
+    }
 }

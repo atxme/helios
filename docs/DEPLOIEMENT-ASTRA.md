@@ -17,7 +17,8 @@ automatisée — c'est le but d'une clé physique. La seconde fait le reste :
 image, transfert, amorçage d'Astra, amorçage du registre gateway, redémarrage.
 
 Aucune valeur n'est recopiée à la main. `init` écrit un **relais** public à côté
-du coffre (`~/.helios/astra/astra-domain.json`) : domaine, RP ID, ancre `CA-PQ`.
+du coffre (`~/.helios/astra/astra-domain.json`, `%APPDATA%\astra\` sous Windows) :
+domaine, RP ID, ancre `CA-PQ`.
 `deploy.sh` le lit, demande à la gateway son identité servie
 (`heliosd show-identity`), amorce Astra, **capture** dans sa sortie la clé de
 service et la tête de chaîne d'audit, les reporte dans le `.env` distant et
@@ -99,8 +100,8 @@ ont besoin.
 Génère `CA-PQ` (ML-DSA-87) et `CA-TLS`, les scelle sous un key-slot ouvert par
 la clé branchée, écrit le coffre et le relais.
 
-Le coffre est à `~/.helios/astra/authority-vault.json` (`%APPDATA%` sous
-Windows). **Sauvegardez-le.** Le perdre entièrement, c'est perdre le domaine ;
+Le coffre est à `~/.helios/astra/authority-vault.json`, et sous Windows à
+`%APPDATA%\astra\authority-vault.json`. **Sauvegardez-le.** Le perdre entièrement, c'est perdre le domaine ;
 il est déjà chiffré, donc une copie hors ligne ne coûte rien.
 
 Le relais, à côté, ne contient que du public. `astra-signer domain` le réécrit

@@ -701,8 +701,10 @@ où l'écart se voit.
 - **le code `cfg(windows)` ne se compile pas depuis WSL2**, et c’est une limite
   d’outillage, pas de conception : `cargo check --target x86_64-pc-windows-msvc`
   échoue en construisant `aws-lc-sys`, faute de compilateur C ciblant MSVC. Une
-  erreur de nom ou de type dans `vault/windows/` n’apparaît donc que sur le poste
-  Windows. Deux atténuations, aucune n’étant un substitut :
+  erreur de nom ou de type dans `vault/windows/` ou dans le transport WebAuthn
+  n’apparaît donc que sous Windows. Le job Windows applique Clippy strict et
+  les tests d'`astra-signer`, sans exiger de clé physique. Deux atténuations
+  locales, aucune n’étant un substitut :
   - les modules `#[cfg(windows)] mod imp` importent le parent par `use super::*`,
     pour qu’un élément ajouté au-dessus ne manque jamais à l’appel ;
   - les symboles `windows-sys` se vérifient hors compilation en lisant le crate

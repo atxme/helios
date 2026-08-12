@@ -228,8 +228,11 @@ fn path_of(device: &ctap_hid_fido2::HidInfo) -> Option<String> {
 /// WebAuthn's PRF extension does **not** pass the caller's value to
 /// `hmac-secret` as-is: it hashes it first, as
 /// `SHA-256("WebAuthn PRF" || 0x00 || value)`. Windows applies that conversion
-/// inside `pHmacSecretSaltValues` — the header says so in as many words — and
-/// offers no way to opt out.
+/// by default inside `pHmacSecretSaltValues` — the header says so in as many
+/// words. This code deliberately leaves
+/// `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG` disabled; enabling it would
+/// ask Windows to treat the input as a raw CTAP salt and break transport
+/// equivalence.
 ///
 /// So the raw CTAP path applies it too. Without this, the same vault salt would
 /// derive two different secrets depending on the transport: a vault created on
