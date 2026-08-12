@@ -85,11 +85,6 @@ pub enum AuthenticatorError {
     )]
     SeveralDevices,
     #[error(
-        "cette clé ne prend pas en charge l'extension CTAP2 `hmac-secret` : elle ne peut pas \
-         porter un key-slot d'autorité"
-    )]
-    NoHmacSecret,
-    #[error(
         "cette clé n'a pas de PIN configuré : la vérification utilisateur est exigée, et une \
          simple présence physique ne l'est pas"
     )]
@@ -283,7 +278,7 @@ mod ctap {
     use astra::vault::SlotSecret;
     use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension as AssertionExt;
     use ctap_hid_fido2::fidokey::get_assertion::GetAssertionArgsBuilder;
-    use ctap_hid_fido2::fidokey::get_info::{InfoOption, InfoParam};
+    use ctap_hid_fido2::fidokey::get_info::InfoOption;
     use ctap_hid_fido2::fidokey::make_credential::{
         Extension as CredentialExt, MakeCredentialArgsBuilder,
     };
@@ -392,20 +387,24 @@ mod ctap {
             Ok(authenticator)
         }
 
-        /// Refuses an unusable token **before** an operator is asked to touch
-        /// anything, and before a vault is created around a key that cannot
-        /// carry a slot.
+        /// Refuses a token that has no PIN, before an operator is asked to
+        /// touch anything.
+        ///
+        /// **Only** the PIN. `hmac-secret` is deliberately not gated on what
+        /// `getInfo` advertises: refusing on a capability report, before
+        /// attempting the operation, turns any misreading of that report into
+        /// « your key cannot do this » — which is what happened to a YubiKey 5
+        /// firmware 5.7.4 that does it perfectly well. The operation is the
+        /// proof: [`Ctap2Authenticator::register`] checks the attestation, and
+        /// `derive` fails with [`AuthenticatorError::NoHmacOutput`] if nothing
+        /// comes back. Both are facts rather than claims.
+        ///
+        /// The PIN is different in kind: `clientPin` absent means the model has
+        /// no PIN at all, present and false means one was never set. Both are
+        /// the same refusal — user verification is required, and physical
+        /// presence alone is not it — and the failure is otherwise reported by
+        /// CTAP as a bare status code.
         fn assert_capable(&self) -> Result<()> {
-            if !self
-                .key
-                .enable_info_param(&InfoParam::ExtensionsHmacSecret)
-                .map_err(device)?
-            {
-                return Err(AuthenticatorError::NoHmacSecret);
-            }
-            // `clientPin` absent means the model has no PIN at all; present and
-            // false means one was never set. Both are the same refusal: user
-            // verification is required, and presence alone is not it.
             if self
                 .key
                 .enable_info_option(&InfoOption::ClientPin)
@@ -415,6 +414,15 @@ mod ctap {
                 return Err(AuthenticatorError::NoPin);
             }
             Ok(())
+        }
+
+        /// What `getInfo` advertised, to enrich a failure rather than cause one.
+        fn advertised_extensions(&self) -> String {
+            match self.key.get_info() {
+                Ok(info) if info.extensions.is_empty() => "aucune annoncée".to_string(),
+                Ok(info) => info.extensions.join(", "),
+                Err(error) => format!("illisibles ({error})"),
+            }
         }
     }
 
@@ -458,7 +466,11 @@ mod ctap {
                 .iter()
                 .any(|ext| matches!(ext, CredentialExt::HmacSecret(Some(true))))
             {
-                return Err(AuthenticatorError::NoHmacSecret);
+                return Err(AuthenticatorError::Device(format!(
+                    "la clé a créé le credential sans activer `hmac-secret`, donc il n'ouvrira \
+                     aucun key-slot. Extensions annoncées par la clé : {}",
+                    self.advertised_extensions()
+                )));
             }
             Ok(credential_id)
         }

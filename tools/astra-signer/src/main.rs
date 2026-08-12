@@ -70,7 +70,11 @@ struct Cli {
     /// `platform` sous Windows : l'API du système, sans élévation, et c'est
     /// lui qui demande le PIN. `hid` parle CTAP2 directement — partout, mais
     /// sous Windows uniquement depuis un processus administrateur.
-    #[arg(long, value_enum, default_value_t = TransportArg::default())]
+    ///
+    /// Globale : elle est acceptée avant comme après la sous-commande, parce
+    /// qu'un opérateur qui bascule de transport la tape naturellement à la fin
+    /// de la ligne.
+    #[arg(long, value_enum, global = true, default_value_t = TransportArg::default())]
     transport: TransportArg,
     #[command(subcommand)]
     command: Command,
