@@ -23,6 +23,10 @@
 # jour : ./scripts/deploy.sh
 set -euo pipefail
 
+# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$(dirname "$0")/lib-remote.sh"
+
 cd "$(dirname "$0")/.."
 
 # La CA opérateur vit HORS du dépôt : c'est une clé privée, elle n'a rien à
@@ -227,7 +231,7 @@ if [ "$ROTATE_GW" -eq 0 ] &&
        test -f /var/lib/helios/key-negotiation-client-pq-ca-public.bin"; then
     echo "    existing gateway identity reused"
 else
-    if ! ssh -t "$CIBLE" "sudo \"$HELIOSD\" init-key-negotiation \
+    if ! helios_ssh_sudo "$CIBLE" "\"$HELIOSD\" init-key-negotiation \
             --server-name '$SERVER_NAME' \
             --client-ca /tmp/orion-client-ca.der \
             --client-pq-ca /tmp/orion-client-pq-ca-public.bin $ARG_ROTATE" 2>&1 \
@@ -301,7 +305,7 @@ mv "$TMP" "$CONF"
 echo "    key-negotiation port set to $PORT (backup: $CONF.bak)"
 EOF
 scp -q "$SORTIE/ouvrir-port.sh" "$CIBLE:/tmp/helios-ouvrir-port.sh"
-ssh -t "$CIBLE" "sudo sh /tmp/helios-ouvrir-port.sh && rm -f /tmp/helios-ouvrir-port.sh"
+helios_ssh_sudo "$CIBLE" "sh /tmp/helios-ouvrir-port.sh && rm -f /tmp/helios-ouvrir-port.sh"
 rm -f "$SORTIE/ouvrir-port.sh"
 else
     echo "    network configuration already managed by deploy"
@@ -313,20 +317,21 @@ fi
 # circulaire. Ces deux fichiers sont des certificats — publics par construction.
 echo "==> Récupération des certificats publics de la gateway"
 REMOTE_PUBLIC_DIR="/tmp/helios-key-negotiation-public"
-ssh -t "$CIBLE" "
+helios_ssh_sudo "$CIBLE" "
     set -e
     install -d -m 700 '$REMOTE_PUBLIC_DIR'
-    sudo install -m 600 /var/lib/helios/key-negotiation-cert.der \
+    install -m 600 /var/lib/helios/key-negotiation-cert.der \
         '$REMOTE_PUBLIC_DIR/gateway-cert.der'
-    sudo install -m 600 /var/lib/helios/key-negotiation-pq-cert.json \
+    install -m 600 /var/lib/helios/key-negotiation-pq-cert.json \
         '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json'
-    sudo install -m 600 /var/lib/helios/key-negotiation-client-ca.der \
+    install -m 600 /var/lib/helios/key-negotiation-client-ca.der \
         '$REMOTE_PUBLIC_DIR/client-ca.der'
-    sudo install -m 600 /var/lib/helios/key-negotiation-client-pq-ca-public.bin \
+    install -m 600 /var/lib/helios/key-negotiation-client-pq-ca-public.bin \
         '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin'
-    sudo /opt/helios/current/heliosd peer list \
+    /opt/helios/current/heliosd peer list \
         > '$REMOTE_PUBLIC_DIR/peer-list.log'
-    sudo chown \$(id -u):\$(id -g) '$REMOTE_PUBLIC_DIR/'*
+    chown \$(logname 2>/dev/null || echo '$USER'):\$(logname 2>/dev/null || echo '$USER') \
+        '$REMOTE_PUBLIC_DIR/'*
 "
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-cert.der" "$SORTIE/gateway-cert.der"
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-pq-cert.json" "$SORTIE/gateway-pq-cert.json"
@@ -503,7 +508,7 @@ trap - EXIT HUP INT TERM
 EOF
 scp -q "$LOCAL_ADMISSION_SCRIPT" "$CIBLE:$REMOTE_ADMISSION_SCRIPT"
 rm -f "$LOCAL_ADMISSION_SCRIPT"
-if ! ssh -t "$CIBLE" "sudo sh '$REMOTE_ADMISSION_SCRIPT'; \
+if ! helios_ssh_sudo "$CIBLE" "sh '$REMOTE_ADMISSION_SCRIPT'; \
     STATUS=\$?; rm -f '$REMOTE_ADMISSION_SCRIPT'; exit \$STATUS" 2>&1 |
     tee "$SORTIE/peer-add.log"; then
     echo "FAIL: admission refused; the previous peer table was restored." >&2

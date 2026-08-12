@@ -16,6 +16,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$(dirname "$0")/lib-remote.sh"
+
 ETAT="${HELIOS_DEPLOY_STATE:-$HOME/.helios/deploy.conf}"
 EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
@@ -153,16 +157,14 @@ if [ "$INSTALLER" = "0" ]; then
     exit 0
 fi
 
-echo "==> 5/7  Installation privilégiée (mot de passe sudo de la gateway)"
-# `-t` alloue un terminal : sans lui, l'invite de mot de passe de sudo n'a nulle
-# part où s'afficher et la commande échoue sans dire pourquoi.
+echo "==> 5/7  Installation privilégiée"
 # L'ancien répertoire extrait est retiré d'abord : sinon on lancerait
 # l'installateur de la version précédente sur l'archive de la nouvelle.
-ssh -t "$CIBLE" "
+helios_ssh_sudo "$CIBLE" "
     set -e
     rm -rf ~/$NOM
     tar xzf ~/$NOM.tar.gz
-    sudo ~/$NOM/helios-installer bootstrap --archive ~/$NOM.tar.gz
+    ~/$NOM/helios-installer bootstrap --archive ~/$NOM.tar.gz
     rm -rf ~/$NOM
 "
 
@@ -273,7 +275,7 @@ deployer_astra() {
 
         # ── L'autre moitié du domaine, sur la gateway ───────────────────────
         echo "    amorçage du registre gateway"
-        ssh -t "$CIBLE" "sudo heliosd init-trust-domain \
+        helios_ssh_sudo "$CIBLE" "heliosd init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
             --astra-service-public-key '$cle_service' \
             --authority-url '$url' --webauthn-rp-id '$rp' \
@@ -297,6 +299,10 @@ else
     # `set -e` masquerait ce qui a réussi derrière ce qui a échoué.
     deployer_astra || echo "    Astra non déployé — la gateway, elle, est en place" >&2
 fi
+
+# La connexion multiplexée a fait son travail ; la laisser ouverte deux minutes
+# de plus n'apporte rien et garde un socket sur la gateway.
+helios_ssh_close "$CIBLE"
 
 cat <<EOF
 

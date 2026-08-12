@@ -36,6 +36,10 @@
 # il le dit avant d'agir.
 set -euo pipefail
 
+# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$(dirname "$0")/lib-remote.sh"
+
 cd "$(dirname "$0")/.."
 
 ETAT="${HELIOS_PROVISION_STATE:-$HOME/.helios/provision.conf}"
@@ -331,7 +335,7 @@ REMOTE
 
 scp -q "$TRAVAIL/gateway.sh" "$CIBLE:/tmp/helios-provision-$$.sh"
 echo "==> Travail sur la gateway (sudo demandé une fois)"
-if ! ssh -t "$CIBLE" "sudo bash /tmp/helios-provision-$$.sh; rc=\$?; rm -f /tmp/helios-provision-$$.sh; exit \$rc"; then
+if ! helios_ssh_sudo "$CIBLE" "bash /tmp/helios-provision-$$.sh; rc=\$?; rm -f /tmp/helios-provision-$$.sh; exit \$rc"; then
     echo "La séquence privilégiée a échoué sur $CIBLE." >&2
     exit 1
 fi

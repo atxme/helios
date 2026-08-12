@@ -346,7 +346,8 @@
       "Bash(bash -n scripts/deploy-astra.sh)",
       "Bash(shellcheck scripts/deploy-astra.sh)",
       "Bash(ls /home/christophe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctap-hid-fido2-3.5.12/src/hid/)",
-      "Bash(echo \"=== get_hid_devices ===\")"
+      "Bash(echo \"=== get_hid_devices ===\")",
+      "Bash(bash /tmp/claude-1000/-home-christophe-helios/859fb8b0-3c46-42af-bb51-7aca9414f3b6/scratchpad/t.sh)"
     ]
   }
 }

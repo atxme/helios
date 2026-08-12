@@ -8,6 +8,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$(dirname "$0")/lib-remote.sh"
+
 TARGET="${1:-}"
 [ -n "$TARGET" ] || { echo "target-bootstrap.sh requires an SSH target" >&2; exit 2; }
 
@@ -148,7 +152,7 @@ chmod 600 "$TARGET_DIR/network-bootstrap.toml"
 
 echo "==> Merging network configuration"
 scp -q scripts/network-bootstrap.sh "$TARGET:/tmp/helios-network-bootstrap.sh"
-ssh -t "$TARGET" "sudo sh /tmp/helios-network-bootstrap.sh \
+helios_ssh_sudo "$TARGET" "sh /tmp/helios-network-bootstrap.sh \
     --config '$REMOTE_NETWORK' \
     --wan 'auto' \
     --ssh-cidr '$SSH_CIDR' \
@@ -156,7 +160,7 @@ ssh -t "$TARGET" "sudo sh /tmp/helios-network-bootstrap.sh \
     --key-negotiation-port '$KEY_PORT' \
     --escrow-public-key '$ESCROW_PUBLIC_KEY' \
     ${DYNAMIC_ARG[*]} && \
-    sudo '$REMOTE_HELIOSD' status && \
+    '$REMOTE_HELIOSD' status && \
     rm -f /tmp/helios-network-bootstrap.sh"
 
 NEED_TPM=0
@@ -165,12 +169,12 @@ ssh "$TARGET" "test -f /var/lib/helios/sealed.key" || NEED_TPM=1
 ssh "$TARGET" "test -f /var/lib/helios/wg-key.sealed" || NEED_WG_IDENTITY=1
 if [ "$NEED_TPM" -eq 1 ] || [ "$NEED_WG_IDENTITY" -eq 1 ]; then
     echo "==> Provisioning missing sealed identities"
-    ssh -t "$TARGET" "
+    helios_ssh_sudo "$TARGET" "
         if [ '$NEED_TPM' -eq 1 ]; then
-            sudo '$REMOTE_HELIOSD' provision-tpm
+            '$REMOTE_HELIOSD' provision-tpm
         fi
         if [ '$NEED_WG_IDENTITY' -eq 1 ]; then
-            sudo '$REMOTE_HELIOSD' init-identity
+            '$REMOTE_HELIOSD' init-identity
         fi
     " | tee "$TARGET_DIR/init-identity.log"
     if [ "$NEED_WG_IDENTITY" -eq 1 ]; then
@@ -246,14 +250,41 @@ fi
 
 echo "==> Starting deployed services and staging the encrypted escrow"
 REMOTE_ESCROW="/tmp/helios-wg-key.escrow"
-ssh -t "$TARGET" "
-    sudo systemctl enable heliosd helios-update.path >/dev/null
-    sudo systemctl restart heliosd
-    sudo systemctl start helios-update.path
-    sudo systemctl --no-pager --full status heliosd
-    if sudo test -f /var/lib/helios/wg-key.escrow; then
-        sudo install -m 600 /var/lib/helios/wg-key.escrow '$REMOTE_ESCROW'
-        sudo chown \$(id -u):\$(id -g) '$REMOTE_ESCROW'
+# `heliosd` reconstruit le pare-feu au démarrage, sur le lien même par lequel
+# cette session passe. Le redémarrer **dans** la session, c'est demander à la
+# commande de survivre à la coupure de son propre transport : la connexion se
+# fige sans jamais se fermer, et il ne reste que Ctrl+C.
+#
+# `systemd-run` le détache : la commande rend la main tout de suite, le
+# redémarrage se fait hors de la session, et l'état se relit ensuite sur une
+# connexion neuve.
+helios_ssh_sudo "$TARGET" "
+    systemctl enable heliosd helios-update.path >/dev/null
+    systemctl start helios-update.path
+    systemd-run --collect --unit=helios-deploy-restart \
+        systemctl restart heliosd >/dev/null
+"
+
+echo "    redémarrage détaché ; attente de la remontée du service"
+DEMARRE=0
+for _ in $(seq 1 30); do
+    sleep 2
+    if helios_ssh_sudo "$TARGET" "systemctl is-active --quiet heliosd" 2>/dev/null; then
+        DEMARRE=1
+        break
+    fi
+done
+if [ "$DEMARRE" = "0" ]; then
+    echo "    heliosd n'est pas remonté en 60 s :" >&2
+    helios_ssh_sudo "$TARGET" "systemctl --no-pager --full status heliosd" >&2 || true
+    exit 1
+fi
+helios_ssh_sudo "$TARGET" "systemctl --no-pager --full status heliosd" || true
+
+helios_ssh_sudo "$TARGET" "
+    if test -f /var/lib/helios/wg-key.escrow; then
+        install -m 600 /var/lib/helios/wg-key.escrow '$REMOTE_ESCROW'
+        chown \$(id -u):\$(id -g) '$REMOTE_ESCROW'
     fi
 "
 
