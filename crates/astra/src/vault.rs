@@ -138,6 +138,11 @@ pub enum VaultError {
     CredentialIdOutOfBounds,
     #[error("libellé de key-slot hors bornes")]
     LabelOutOfBounds,
+    #[error(
+        "la clé publique CA-PQ inscrite en clair sur le coffre ne correspond pas à celle qu'il \
+         scelle : le fichier a été modifié"
+    )]
+    AnchorMismatch,
     #[error("contenu du coffre illisible : {0}")]
     Corrupt(String),
 }
@@ -211,6 +216,13 @@ pub struct KeySlot {
 pub struct AuthoritySecrets {
     /// ML-DSA-87 private key of `CA-PQ`, base64.
     pub ca_pq_private_key: String,
+    /// The matching public key, base64.
+    ///
+    /// Sealed alongside the private half so the clear copy on the vault has
+    /// something to be checked against. `fips204` exposes no way to derive one
+    /// from the other, and a public anchor an operator hands to two other
+    /// programs must not be a value anybody can edit unnoticed.
+    pub ca_pq_public_key: String,
     /// PKCS#8 private key of the client `CA-TLS`, base64.
     pub ca_tls_private_key: String,
 }
@@ -225,6 +237,14 @@ pub struct AuthorityVault {
     pub format_version: u16,
     pub vault_id: [u8; 16],
     pub trust_domain_id: TrustDomainId,
+    /// Public `CA-PQ` key, base64. **Public by definition**, kept in the clear.
+    ///
+    /// Two other programs need it — `astra bootstrap` and `heliosd
+    /// init-trust-domain` — and needing a security key to read a public value
+    /// would be absurd. It is checked against the sealed copy every time the
+    /// vault is opened, so an edited file is caught at the next unlock rather
+    /// than propagated into a trust domain.
+    pub ca_pq_public_key: String,
     /// WebAuthn RP ID the credentials are registered under. An assertion must
     /// name the same one it was created with, so the vault carries it rather
     /// than asking an operator to remember it.
@@ -384,6 +404,7 @@ impl AuthorityVault {
             format_version: AUTHORITY_VAULT_VERSION,
             vault_id,
             trust_domain_id,
+            ca_pq_public_key: secrets.ca_pq_public_key.clone(),
             rp_id: rp_id.to_string(),
             created_at: now_unix,
             salt: encode(&salt),
@@ -495,8 +516,16 @@ impl AuthorityVault {
             &Unlock::Key(master),
             &blob,
         )?;
-        serde_json::from_slice(&payload)
-            .map_err(|error| VaultError::Corrupt(format!("corps du coffre : {error}")))
+        let secrets: AuthoritySecrets = serde_json::from_slice(&payload)
+            .map_err(|error| VaultError::Corrupt(format!("corps du coffre : {error}")))?;
+        // The clear anchor is what two other programs are handed. If it no
+        // longer matches the sealed one, someone edited the file — and the
+        // whole point of keeping it in the clear is that it is read without a
+        // key, so this is the only place the substitution can be caught.
+        if secrets.ca_pq_public_key != self.ca_pq_public_key {
+            return Err(VaultError::AnchorMismatch);
+        }
+        Ok(secrets)
     }
 
     /// Registers another authenticator.
@@ -681,6 +710,7 @@ mod tests {
     fn secrets() -> AuthoritySecrets {
         AuthoritySecrets {
             ca_pq_private_key: "Y2EtcHEtcHJpdmF0ZQ==".into(),
+            ca_pq_public_key: "Y2EtcHEtcHVibGlj".into(),
             ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
         }
     }
@@ -1050,5 +1080,25 @@ mod tests {
             vault.add_slot(&credential(1), &material(1), blank, &material(2)),
             Err(VaultError::LabelOutOfBounds)
         ));
+    }
+    /// The clear anchor is read without a security key, by two other programs.
+    /// Editing it must be caught — and the only moment that can happen is when
+    /// the sealed copy becomes readable.
+    #[test]
+    fn an_edited_clear_anchor_is_caught_at_the_next_unlock() {
+        let mut vault = vault();
+        vault.ca_pq_public_key = "YXV0cmUtYW5jcmU=".into();
+        assert!(matches!(
+            vault.open(&credential(1), &material(1)),
+            Err(VaultError::AnchorMismatch)
+        ));
+    }
+
+    /// And the nominal case still carries it, since that is what an operator
+    /// hands to `astra bootstrap`.
+    #[test]
+    fn the_clear_anchor_is_the_one_the_vault_seals() {
+        let vault = vault();
+        assert_eq!(vault.ca_pq_public_key, secrets().ca_pq_public_key);
     }
 }

@@ -95,6 +95,7 @@ mod tests {
             astra::vault::draw_salt().expect("salt"),
             &astra::vault::AuthoritySecrets {
                 ca_pq_private_key: "cHE=".into(),
+                ca_pq_public_key: "cHViCg==".into(),
                 ca_tls_private_key: "dGxz".into(),
             },
             SlotEnrolment {

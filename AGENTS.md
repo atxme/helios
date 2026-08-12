@@ -107,8 +107,11 @@ Restent ouverts :
   ancres de l'opérateur, donc elle tourne TPM indisponible. Sans elle le
   registre est absent, et un registre absent n'est **pas** un registre vide :
   les routes de cycle de vie in-tunnel restent fermées et le démarrage le dit.
-  Le conteneur est livré (`deploy/astra/`, `scripts/deploy-astra.sh`) ; la
-  séquence complète est dans
+  Le tout se déploie en **deux commandes** — `astra-signer init`, puis
+  `./scripts/deploy.sh` — et aucune valeur ne se recopie : `init` écrit un
+  relais public à côté du coffre, `deploy.sh` le lit, interroge la gateway par
+  `heliosd show-identity`, amorce Astra, capture clé de service et tête d'audit
+  dans sa sortie, et enchaîne sur `init-trust-domain`. Voir
   [DEPLOIEMENT-ASTRA](docs/DEPLOIEMENT-ASTRA.md).
   **Aucune clé de sécurité ne signe quoi que ce soit** : une YubiKey 5 ne
   produit pas d'ML-DSA, et tout champ de signature du cycle de vie est un
@@ -529,12 +532,13 @@ qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
 sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients
 déjà admis.
 
-`scripts/deploy-astra.sh` livre le conteneur Astra, qui n'entre **pas** dans le
-bundle signé de l'ADR-004 : c'est un conteneur séparé, sans capacité, rootfs en
-lecture seule, UID propre, un seul volume. Il ne crée aucun domaine de confiance
-— l'amorçage exige des valeurs qui naissent dans `astra-signer` sur le poste
-opérateur, et le script imprime la commande exacte plutôt que de deviner.
-Séquence complète : [DEPLOIEMENT-ASTRA](docs/DEPLOIEMENT-ASTRA.md).
+`scripts/deploy.sh` porte aussi Astra, en étape 7. Le conteneur n'entre **pas**
+dans le bundle signé de l'ADR-004 — il est séparé, sans capacité, rootfs en
+lecture seule, UID propre, un seul volume — mais le déployer par un second
+script obligeait à recopier six valeurs entre trois commandes, ce qui est
+exactement là où un déploiement casse. L'étape ne se déclenche que si un relais
+de domaine existe ; sinon elle est sautée en une ligne, et une gateway sans
+autorité reste une gateway qui marche. `--sans-astra` la saute explicitement.
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

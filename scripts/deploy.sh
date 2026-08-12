@@ -20,7 +20,11 @@ ETAT="${HELIOS_DEPLOY_STATE:-$HOME/.helios/deploy.conf}"
 EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
+ASTRA=1
 SEQUENCE=""
+# Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
+# Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
+RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
 
 usage() {
     cat >&2 <<'EOF'
@@ -29,6 +33,12 @@ Usage : ./scripts/deploy.sh [hôte-ssh] [options]
   --sequence N     Force la séquence de release (défaut : horodatage Unix)
   --copie-seule    Copie l'archive sans lancer l'installation privilégiée
   --canal C        testing ou production (défaut : production)
+  --sans-astra     Saute le conteneur d'autorité, même si un relais existe
+
+Astra (ADR-008) se déploie tout seul dès qu'un relais de domaine existe —
+celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
+partie est silencieusement sautée : une gateway sans autorité reste une
+gateway qui marche.
 
 L'hôte est retenu après le premier appel ; les appels suivants n'en ont plus
 besoin. Variables reconnues : HELIOS_PUBLISHER_EPOCH, HELIOS_DEPLOY_CHANNEL.
@@ -41,6 +51,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --sequence) SEQUENCE="${2:-}"; shift 2 ;;
         --copie-seule) INSTALLER=0; shift ;;
+        --sans-astra) ASTRA=0; shift ;;
         --canal) CANAL="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "option inconnue : $1" >&2; usage ;;
@@ -99,14 +110,14 @@ echo "==> Release   $VERSION séquence $SEQUENCE canal $CANAL"
 echo "==> Commit    $COMMIT"
 echo
 
-echo "==> 1/6  Construction"
+echo "==> 1/7  Construction"
 # `xtask bundle` rappelle les deux commandes suivantes à taper : elles sont
 # redondantes ici, ce script les enchaîne. On coupe à partir de ce rappel.
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOQUE/publisher-keyring.json" \
     cargo xtask bundle --target "$CIBLE_TRIPLE" \
     | sed '/^Signer sur le poste éditeur/,$d'
 
-echo "==> 2/6  Signature hors ligne (époque $EPOQUE_N)"
+echo "==> 2/7  Signature hors ligne (époque $EPOQUE_N)"
 cargo run --quiet -p helios-publisher -- bundle \
     --dir "$REP" \
     --key-epoch "$EPOQUE_N" \
@@ -119,12 +130,12 @@ cargo run --quiet -p helios-publisher -- bundle \
     --ml-dsa-65-private-key "$EPOQUE/ml-dsa-65-private.bin" \
     --keyring "$EPOQUE/publisher-keyring.json" > /dev/null
 
-echo "==> 3/6  Archivage"
+echo "==> 3/7  Archivage"
 EMPREINTE="$(cargo xtask pack --dir "$REP" 2>/dev/null | awk 'NF==2 {print $1; exit}')"
 [ -n "$EMPREINTE" ] || { echo "empreinte de l'archive illisible" >&2; exit 1; }
 echo "    $EMPREINTE"
 
-echo "==> 4/6  Copie vers $CIBLE"
+echo "==> 4/7  Copie vers $CIBLE"
 scp -q "$ARCHIVE" "$CIBLE:~/"
 DISTANTE="$(ssh "$CIBLE" "sha256sum ~/$NOM.tar.gz" | awk '{print $1}')"
 if [ "$DISTANTE" != "$EMPREINTE" ]; then
@@ -142,7 +153,7 @@ if [ "$INSTALLER" = "0" ]; then
     exit 0
 fi
 
-echo "==> 5/6  Installation privilégiée (mot de passe sudo de la gateway)"
+echo "==> 5/7  Installation privilégiée (mot de passe sudo de la gateway)"
 # `-t` alloue un terminal : sans lui, l'invite de mot de passe de sudo n'a nulle
 # part où s'afficher et la commande échoue sans dire pourquoi.
 # L'ancien répertoire extrait est retiré d'abord : sinon on lancerait
@@ -155,8 +166,137 @@ ssh -t "$CIBLE" "
     rm -rf ~/$NOM
 "
 
-echo "==> 6/6  Network, TPM, PKI and Orion identity bootstrap"
+echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
 ./scripts/target-bootstrap.sh "$CIBLE"
+
+# ── 7. Astra et le domaine de confiance (ADR-008) ────────────────────────────
+#
+# Tout est déduit ou capturé, rien n'est recopié : le relais donne le domaine,
+# le RP ID et l'ancre ; la leaf PQ servie donne le nom de serveur et la clé
+# WireGuard ; le bootstrap Astra rend la clé de service et la tête d'audit, qui
+# repartent aussitôt vers `heliosd init-trust-domain`. Le seul geste manuel de
+# toute la chaîne est celui qui exige une clé physique — `astra-signer init` —
+# et il a déjà eu lieu.
+deployer_astra() {
+    local compose etat wg_pub nom_serveur url rp domaine ancre sortie
+    local cle_service tete_audit
+
+    compose="$(ssh "$CIBLE" 'if docker compose version >/dev/null 2>&1; then echo "docker compose";
+        elif command -v docker-compose >/dev/null 2>&1; then echo docker-compose;
+        elif podman compose version >/dev/null 2>&1; then echo "podman compose";
+        else echo ""; fi')"
+    if [ -z "$compose" ]; then
+        echo "    ni docker compose ni podman compose sur $CIBLE — Astra non déployé" >&2
+        echo "    ssh $CIBLE 'sudo apt-get install -y docker.io docker-compose-v2'" >&2
+        return 0
+    fi
+
+    domaine="$(sed -n 's/.*"trust_domain_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
+    rp="$(sed -n 's/.*"rp_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
+    ancre="$(sed -n 's/.*"ca_pq_public_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
+    if [ -z "$domaine" ] || [ -z "$rp" ] || [ -z "$ancre" ]; then
+        echo "    relais illisible : $RELAIS" >&2
+        return 1
+    fi
+    # `astra-signer domain` le réécrit à l'identique depuis le coffre.
+    url="${ASTRA_AUTHORITY_URL:-https://$rp}"
+
+    echo "    domaine $domaine"
+    echo "    RP ID   $rp"
+
+    # Le nom de serveur et la clé WireGuard sortent de la leaf PQ que la
+    # gateway sert, lue par `heliosd` lui-même : le registre doit décrire
+    # l'identité réellement présentée, et un script qui va chercher ces valeurs
+    # au `sed` dans un certificat casse dès qu'un champ bouge.
+    local identite
+    identite="$(ssh "$CIBLE" 'sudo /opt/helios/current/heliosd show-identity' 2>/dev/null)" || {
+        echo "    la gateway n'a pas d'identité de négociation : lancer d'abord" >&2
+        echo "      sudo heliosd init-key-negotiation --server-name ..." >&2
+        return 1
+    }
+    nom_serveur="$(printf '%s\n' "$identite" | sed -n 's/^server_name=//p')"
+    wg_pub="$(printf '%s\n' "$identite" | sed -n 's/^wireguard_public_key=//p')"
+    if [ -z "$nom_serveur" ] || [ -z "$wg_pub" ]; then
+        echo "    identité de négociation illisible :" >&2
+        printf '%s\n' "$identite" >&2
+        return 1
+    fi
+    echo "    serveur $nom_serveur"
+
+    # ── Image et configuration ──────────────────────────────────────────────
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "    docker absent de ce poste : impossible de construire l'image" >&2
+        return 1
+    fi
+    docker build -q -f deploy/astra/Dockerfile -t helios/astra:latest . > /dev/null
+    docker save helios/astra:latest | gzip | ssh "$CIBLE" 'gunzip | docker load' > /dev/null
+    ssh "$CIBLE" 'mkdir -p ~/astra/deploy/astra'
+    scp -q deploy/astra/compose.yaml "$CIBLE:~/astra/deploy/astra/compose.yaml"
+
+    # Le fichier d'environnement existe avant toute interrogation : compose
+    # refuse un `--env-file` absent, et l'échec ressemblerait alors à « domaine
+    # non amorcé ». La valeur de passage n'est lue que par `command:`, que
+    # `run` remplace.
+    local env_distant='deploy/astra/.env'
+    ssh "$CIBLE" "cd ~/astra && [ -f $env_distant ] || \
+        { printf 'ASTRA_EXPECTED_AUDIT_HEAD=amorcage\n' > $env_distant; chmod 600 $env_distant; }"
+
+    etat="$(ssh "$CIBLE" "cd ~/astra && $compose -f deploy/astra/compose.yaml \
+        --env-file $env_distant run --rm --no-deps astra status >/dev/null 2>&1 \
+        && echo amorce || echo vierge")"
+
+    if [ "$etat" = "vierge" ]; then
+        echo "    amorçage du domaine"
+        sortie="$(ssh "$CIBLE" "cd ~/astra && $compose -f deploy/astra/compose.yaml \
+            --env-file $env_distant run --rm astra bootstrap \
+            --ca-public-key '$ancre' --trust-domain-id '$domaine' \
+            --gateway-wireguard-public-key '$wg_pub' --server-name '$nom_serveur' \
+            --authority-url '$url' --webauthn-rp-id '$rp'")" || {
+            echo "    l'amorçage d'Astra a échoué" >&2
+            return 1
+        }
+        cle_service="$(printf '%s\n' "$sortie" | sed -n 's/^service key *: *//p' | head -1)"
+        tete_audit="$(printf '%s\n' "$sortie" | sed -n 's/^audit head *: *//p' | head -1)"
+        if [ -z "$cle_service" ] || [ -z "$tete_audit" ]; then
+            echo "    sortie d'amorçage illisible :" >&2
+            printf '%s\n' "$sortie" >&2
+            return 1
+        fi
+        echo "    tête d'audit $tete_audit"
+
+        # Elle est reportée des deux côtés : sans elle, une restauration qui a
+        # forké est reprise en silence.
+        ssh "$CIBLE" "cd ~/astra && printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' \
+            > $env_distant && chmod 600 $env_distant"
+        mkdir -p "$(dirname "$RELAIS")"
+        printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
+
+        # ── L'autre moitié du domaine, sur la gateway ───────────────────────
+        echo "    amorçage du registre gateway"
+        ssh -t "$CIBLE" "sudo heliosd init-trust-domain \
+            --trust-domain-id '$domaine' --ca-public-key '$ancre' \
+            --astra-service-public-key '$cle_service' \
+            --authority-url '$url' --webauthn-rp-id '$rp' \
+            && sudo systemctl restart heliosd"
+    fi
+
+    echo "    démarrage"
+    ssh "$CIBLE" "cd ~/astra && $compose -f deploy/astra/compose.yaml \
+        --env-file $env_distant up -d" > /dev/null
+}
+
+if [ "$ASTRA" = "0" ]; then
+    echo "==> 7/7  Astra sauté (--sans-astra)"
+elif [ ! -f "$RELAIS" ]; then
+    echo "==> 7/7  Astra sauté : aucun relais de domaine"
+    echo "    en créer un, sur le poste où la clé de sécurité est branchée :"
+    echo "      astra-signer init --rp-id <nom> --label \"YubiKey ...\""
+else
+    echo "==> 7/7  Astra et domaine de confiance"
+    # Non fatal : la gateway est déjà installée à ce point, et l'écraser d'un
+    # `set -e` masquerait ce qui a réussi derrière ce qui a échoué.
+    deployer_astra || echo "    Astra non déployé — la gateway, elle, est en place" >&2
+fi
 
 cat <<EOF
 

@@ -118,6 +118,12 @@ enum Command {
         #[arg(long)]
         webauthn_rp_id: String,
     },
+    /// Prints the key-negotiation identity this gateway serves.
+    ///
+    /// Read-only, public, and it unseals nothing: the two values a deployment
+    /// needs — the server name clients pin and the WireGuard identity — are
+    /// read out of the served PQ leaf rather than retyped.
+    ShowIdentity,
     /// Local client admission, with console access.
     ///
     /// Used to bootstrap the first administrator peer — without it, no
@@ -282,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
             &authority_url,
             &webauthn_rp_id,
         ),
+        Command::ShowIdentity => show_identity(),
         Command::Peer { command } => {
             let network = NetworkConfig::load().context("loading the network config")?;
             peer_command(network, command)
@@ -425,6 +432,29 @@ fn init_key_negotiation(
     println!("PQ certificate: {}", result.pq_certificate_path.display());
     println!("PQ sha256: {}", result.pq_certificate_sha256);
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
+    Ok(())
+}
+
+/// Prints the served key-negotiation identity, for a deployment to read.
+///
+/// One value per line, `clé=valeur`, because the consumer is a shell script:
+/// a script that has to parse JSON over SSH parses it with `sed`, and a `sed`
+/// pattern over a certificate is a defect waiting for a field to move.
+fn show_identity() -> anyhow::Result<()> {
+    let Some(served) = key_negotiation::served_identity()? else {
+        anyhow::bail!(
+            "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
+        );
+    };
+    println!("server_name={}", served.pq_certificate.subject);
+    println!(
+        "wireguard_public_key={}",
+        served.pq_certificate.wireguard_public_key
+    );
+    println!(
+        "pq_certificate_not_after={}",
+        served.pq_certificate.not_after_unix
+    );
     Ok(())
 }
 

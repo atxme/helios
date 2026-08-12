@@ -10,4 +10,5 @@
 
 pub mod authenticator;
 pub mod gestures;
+pub mod handoff;
 pub mod store;

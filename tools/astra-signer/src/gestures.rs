@@ -77,6 +77,7 @@ pub fn create_authority(
         rcgen::KeyPair::generate().map_err(|error| GestureError::Anchors(error.to_string()))?;
     let secrets = AuthoritySecrets {
         ca_pq_private_key: encode(&ca_pq_private_key),
+        ca_pq_public_key: ca_pq_public_key.to_base64(),
         ca_tls_private_key: encode(&ca_tls_key.serialize_der()),
     };
 

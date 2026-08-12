@@ -5,19 +5,19 @@
 # clair, mais il décide de ce qui est distribué, et un conteneur qui peut
 # s'échapper décide de la même chose.
 #
-#   docker compose -f deploy/astra/compose.yaml --env-file .env up -d
+# `scripts/deploy.sh` fait tout cela tout seul dès qu'un relais de domaine
+# existe — celui qu'écrit `astra-signer init` à côté du coffre. Il construit
+# l'image, la transfère, amorce Astra, capture la clé de service et la tête
+# d'audit, écrit le `.env` ci-dessous et enchaîne sur `heliosd
+# init-trust-domain`. Rien n'est recopié à la main.
 #
-# Amorçage, une seule fois, sur le même volume :
+# À la main, si besoin :
 #
-#   docker compose -f deploy/astra/compose.yaml run --rm astra bootstrap \
-#     --ca-public-key "$CA_PQ_PUBLIC" --trust-domain-id "$TRUST_DOMAIN_ID" \
-#     --gateway-wireguard-public-key "$GATEWAY_WG_PUBLIC" \
-#     --server-name "$SERVER_NAME" --authority-url "$ASTRA_AUTHORITY_URL" \
-#     --webauthn-rp-id "$ASTRA_RP_ID"
+#   printf 'ASTRA_EXPECTED_AUDIT_HEAD=<tête>\n' > deploy/astra/.env
+#   docker compose -f deploy/astra/compose.yaml --env-file deploy/astra/.env up -d
 #
-# Puis relever la tête de chaîne d'audit imprimée et la reporter dans
-# ASTRA_EXPECTED_AUDIT_HEAD : sans elle, une restauration qui a forké est
-# reprise en silence au lieu d'être refusée.
+# La tête d'audit sort du bootstrap. Sans elle, une restauration de sauvegarde
+# qui a divergé est reprise en silence au lieu d'être refusée.
 
 services:
   astra:

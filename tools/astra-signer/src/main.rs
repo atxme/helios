@@ -49,7 +49,7 @@ use aether::certificates::encoding::TrustDomainId;
 use anyhow::{bail, Context, Result};
 use astra::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
 use astra_signer::gestures::{self, NewAuthority, NewKey};
-use astra_signer::{authenticator, store};
+use astra_signer::{authenticator, handoff, store};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
@@ -121,6 +121,11 @@ enum Command {
         #[arg(long)]
         slot: String,
     },
+    /// Réécrit le relais public à côté du coffre, et l'affiche.
+    ///
+    /// Needs no security key: everything in it is public, and it is read by a
+    /// deployment that must never see the authority.
+    Domain,
     /// Renames a slot. Needs no security key.
     Rename {
         #[arg(long)]
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
         Command::Enrol { label, role } => enrol(&path, &label, role.into()),
         Command::Verify => verify(&path),
         Command::List => list(&path),
+        Command::Domain => domain(&path),
         Command::Remove { slot } => remove(&path, &slot),
         Command::Rename { slot, label } => rename(&path, &slot, &label),
     }
@@ -195,8 +201,14 @@ fn init(
         now_unix(),
     )?;
     store::save_new(path, &created.vault)?;
+    // Written straight away: the three values below are what two other
+    // programs need, and retyping a base64 anchor is where a deployment goes
+    // wrong — silently, with the failure surfacing much later.
+    let handoff_path = handoff::path_beside(path);
+    handoff::save(&handoff_path, &handoff::DomainHandoff::of(&created.vault)?)?;
 
     println!("coffre            : {}", path.display());
+    println!("relais            : {}", handoff_path.display());
     println!("domaine           : {}", created.vault.trust_domain_id);
     println!("empreinte coffre  : {}", created.vault.fingerprint()?);
     println!(
@@ -209,9 +221,8 @@ fn init(
     );
     println!();
     println!(
-        "`astra bootstrap --ca-public-key <CA-PQ publique ci-dessus> --trust-domain-id {} \
-         --webauthn-rp-id {rp_id} …`",
-        created.vault.trust_domain_id
+        "`./scripts/deploy.sh` lit le relais et amorce Astra et la gateway sans qu'aucune de ces \
+         valeurs soit recopiée à la main"
     );
     report_bootstrap_state(&created.vault);
     Ok(())
@@ -327,6 +338,20 @@ fn remove(path: &Path, slot: &str) -> Result<()> {
          compromise, la réponse est une rotation de CA-PQ"
     );
     report_bootstrap_state(&vault);
+    Ok(())
+}
+
+fn domain(path: &Path) -> Result<()> {
+    let vault = store::load(path)?;
+    let handoff_path = handoff::path_beside(path);
+    let handoff = handoff::DomainHandoff::of(&vault)?;
+    handoff::save(&handoff_path, &handoff)?;
+
+    println!("relais           : {}", handoff_path.display());
+    println!("domaine          : {}", handoff.trust_domain_id);
+    println!("RP ID WebAuthn   : {}", handoff.rp_id);
+    println!("CA-PQ (publique) : {}", handoff.ca_pq_public_key);
+    println!("empreinte coffre : {}", handoff.vault_fingerprint);
     Ok(())
 }
 
