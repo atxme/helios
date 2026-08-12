@@ -121,6 +121,13 @@ enum Command {
         #[arg(long)]
         slot: String,
     },
+    /// Liste les périphériques HID visibles, et lesquels sont des clés FIDO2.
+    ///
+    /// À lancer quand `init` annonce qu'aucune clé n'est branchée alors qu'elle
+    /// l'est : une clé de sécurité se reconnaît à son usage page HID `0xF1D0`,
+    /// et lire cette valeur demande d'ouvrir le périphérique — ce qu'un
+    /// processus non élevé ne peut pas faire sous Windows.
+    Devices,
     /// Réécrit le relais public à côté du coffre, et l'affiche.
     ///
     /// Needs no security key: everything in it is public, and it is read by a
@@ -158,6 +165,7 @@ fn main() -> Result<()> {
         Command::Enrol { label, role } => enrol(&path, &label, role.into()),
         Command::Verify => verify(&path),
         Command::List => list(&path),
+        Command::Devices => devices(),
         Command::Domain => domain(&path),
         Command::Remove { slot } => remove(&path, &slot),
         Command::Rename { slot, label } => rename(&path, &slot, &label),
@@ -338,6 +346,48 @@ fn remove(path: &Path, slot: &str) -> Result<()> {
          compromise, la réponse est une rotation de CA-PQ"
     );
     report_bootstrap_state(&vault);
+    Ok(())
+}
+
+fn devices() -> Result<()> {
+    let visible = authenticator::visible_devices();
+    if visible.is_empty() {
+        println!("aucun périphérique HID visible.");
+        println!("ni clé, ni clavier, ni souris : c'est la pile HID du système qui ne répond pas.");
+        return Ok(());
+    }
+    for device in &visible {
+        println!(
+            "{} {:04x}:{:04x} {}",
+            if device.fido { "FIDO2 " } else { "      " },
+            device.vendor_id,
+            device.product_id,
+            device.product
+        );
+        println!("        {}", device.detail.trim());
+    }
+    let fido = visible.iter().filter(|device| device.fido).count();
+    println!();
+    println!("{} périphérique(s) HID, dont {fido} FIDO2.", visible.len());
+    if fido == 0 {
+        println!();
+        println!(
+            "Aucun n'expose l'usage page 0xF1D0. Ce n'est pas une question de modèle : rien ici \
+             ne filtre sur le vendor ou le product."
+        );
+        if cfg!(windows) {
+            println!(
+                "Sous Windows, ouvrir un HID FIDO est réservé aux processus élevés depuis \
+                 Windows 10 1903 — relancer dans une console administrateur. Si elle l'est déjà, \
+                 vérifier `ykman config usb --list` : FIDO2 désactivé, l'interface n'existe pas."
+            );
+        } else {
+            println!(
+                "Sous Linux, il manque en général une règle udev donnant l'accès à l'utilisateur \
+                 courant, ou l'application FIDO2 de la clé est désactivée."
+            );
+        }
+    }
     Ok(())
 }
 

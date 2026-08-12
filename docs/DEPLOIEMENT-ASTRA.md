@@ -74,9 +74,15 @@ ont besoin.
   l'autorité restera « non amorcée » et le dira à chaque commande, jusqu'à
   l'enrôlement de la seconde.
 - Le compagnon bâti sur la machine où la clé se branche :
-  `cargo build --release -p astra-signer`. Sous Windows il demande un processus
-  élevé — l'accès HID direct aux périphériques FIDO y est réservé aux processus
-  élevés depuis Windows 10 1903.
+  `cargo build -p astra-signer`. En **debug** : le garde-fou ADR-002 refuse le
+  trousseau éditeur de développement dans toute compilation `--release`, et
+  rien ici n'y gagne — le déverrouillage d'un key-slot est un HKDF-SHA256.
+  Pour un binaire release, fournir `HELIOS_PUBLISHER_KEYRING_PATH`.
+- Une console **administrateur** sous Windows. Ouvrir un HID FIDO y est réservé
+  aux processus élevés depuis Windows 10 1903 — sans élévation la clé
+  disparaît de l'énumération, car lire son usage page HID `0xF1D0` demande
+  d'ouvrir le périphérique. `astra-signer devices` liste ce qui est visible et
+  distingue « aucun HID » de « des HID, mais aucun FIDO ».
 
 ## Le détail, si quelque chose casse
 

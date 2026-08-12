@@ -58,8 +58,8 @@ pub const HMAC_SECRET_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthenticatorError {
-    #[error("aucune clé de sécurité FIDO2 branchée")]
-    NoDevice,
+    #[error("{0}")]
+    NoDevice(String),
     #[error(
         "plusieurs clés de sécurité branchées : n'en laisser qu'une, sinon l'opération porterait \
          sur celle que le système a listée en premier"
@@ -130,6 +130,47 @@ pub trait Authenticator {
     ) -> Result<Opened>;
 }
 
+/// One HID device, as the system exposes it.
+///
+/// Public because diagnosing « nothing found » is impossible from the outside:
+/// the interesting fact is whether the system shows *any* HID at all, and
+/// whether the ones it shows carry the FIDO usage page.
+pub struct VisibleDevice {
+    pub product: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// Carries HID usage page `0xF1D0`. The only thing that makes a device a
+    /// security key here — never its model.
+    pub fido: bool,
+    /// What the HID layer reports: usage page, usage, serial, path.
+    pub detail: String,
+}
+
+/// Every HID device the system exposes, FIDO or not.
+pub fn visible_devices() -> Vec<VisibleDevice> {
+    let fido_paths: std::collections::HashSet<String> = ctap_hid_fido2::get_fidokey_devices()
+        .iter()
+        .filter_map(path_of)
+        .collect();
+    ctap_hid_fido2::get_hid_devices()
+        .iter()
+        .map(|device| VisibleDevice {
+            product: device.product_string.clone(),
+            vendor_id: device.vid,
+            product_id: device.pid,
+            fido: path_of(device).is_some_and(|path| fido_paths.contains(&path)),
+            detail: device.info.clone(),
+        })
+        .collect()
+}
+
+fn path_of(device: &ctap_hid_fido2::HidInfo) -> Option<String> {
+    match &device.param {
+        ctap_hid_fido2::HidParam::Path(path) => Some(path.clone()),
+        ctap_hid_fido2::HidParam::VidPid { .. } => None,
+    }
+}
+
 /// Opens the single connected security key.
 ///
 /// Exactly one: a second key plugged in during an enrolment is how an operator
@@ -154,6 +195,49 @@ mod ctap {
         AuthenticatorError::Device(format!("{error:#}"))
     }
 
+    /// Says why nothing was found, rather than that nothing was found.
+    ///
+    /// A FIDO device is recognised by its HID **usage page** (`0xF1D0`), never
+    /// by a vendor or product identifier — so « we do not know this model » is
+    /// never the answer. Reading that usage page means opening the device, and
+    /// Windows refuses to open a FIDO HID to a process that is not elevated
+    /// since Windows 10 1903: the key is plugged in, visible as a HID device,
+    /// and filtered out because its usage page could not be read.
+    ///
+    /// Distinguishing « no HID at all » from « HID present, none FIDO » is
+    /// therefore the whole diagnosis, and it costs one more enumeration.
+    fn no_device_diagnosis() -> String {
+        let all = ctap_hid_fido2::get_hid_devices();
+        if all.is_empty() {
+            return "aucun périphérique HID n'est visible : ni clé de sécurité, ni clavier, ni \
+                    souris. C'est la pile HID du système qui ne répond pas, pas la clé"
+                .to_string();
+        }
+        let mut diagnosis = format!(
+            "aucune clé de sécurité FIDO2 détectée, alors que {} périphérique(s) HID sont \
+             visibles. Une clé FIDO2 se reconnaît à son usage page HID 0xF1D0 — jamais à son \
+             modèle —, et lire cette valeur exige d'ouvrir le périphérique",
+            all.len()
+        );
+        if cfg!(windows) {
+            diagnosis.push_str(
+                ". Sous Windows, ouvrir un HID FIDO est réservé aux processus élevés depuis \
+                 Windows 10 1903 : relancer cette commande dans une console **administrateur**. \
+                 Si elle l'est déjà, vérifier que l'application FIDO2 de la clé est activée \
+                 (`ykman config usb --list` sur une YubiKey) — désactivée, l'interface HID FIDO \
+                 n'existe pas du tout",
+            );
+        } else {
+            diagnosis.push_str(
+                ". Sous Linux, il manque en général une règle udev donnant l'accès au \
+                 périphérique à l'utilisateur courant, ou l'application FIDO2 de la clé est \
+                 désactivée. `astra-signer devices` liste ce qui est visible",
+            );
+        }
+        diagnosis.push_str(". `astra-signer devices` liste ce qui est visible");
+        diagnosis
+    }
+
     pub struct Ctap2Authenticator {
         key: FidoKeyHid,
     }
@@ -162,7 +246,7 @@ mod ctap {
         pub fn connect() -> Result<Self> {
             let devices = ctap_hid_fido2::get_fidokey_devices();
             match devices.len() {
-                0 => return Err(AuthenticatorError::NoDevice),
+                0 => return Err(AuthenticatorError::NoDevice(no_device_diagnosis())),
                 1 => {}
                 _ => return Err(AuthenticatorError::SeveralDevices),
             }

@@ -344,7 +344,9 @@
       "Bash(awk 'NR>=666 && /^    }$/ {last=NR} END{}' crates/helios-provisioning/src/certificates.rs)",
       "Bash(chmod +x scripts/deploy-astra.sh)",
       "Bash(bash -n scripts/deploy-astra.sh)",
-      "Bash(shellcheck scripts/deploy-astra.sh)"
+      "Bash(shellcheck scripts/deploy-astra.sh)",
+      "Bash(ls /home/christophe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ctap-hid-fido2-3.5.12/src/hid/)",
+      "Bash(echo \"=== get_hid_devices ===\")"
     ]
   }
 }
