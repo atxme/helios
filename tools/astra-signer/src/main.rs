@@ -170,6 +170,16 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("astra-signer".into())
+        .stack_size(astra_signer::WORK_STACK_BYTES)
+        .spawn(run)
+        .context("démarrage du fil de travail")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("le fil de travail s'est interrompu"))?
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = match cli.vault {
         Some(path) => path,

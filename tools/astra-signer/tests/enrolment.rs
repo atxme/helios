@@ -285,3 +285,35 @@ fn keys_still_open_the_vault_after_a_round_trip_through_disk() {
         prove_anchors_open(&finally, &opened).expect("the anchors read");
     }
 }
+
+/// The gesture must fit the stack the binary gives it.
+///
+/// ML-DSA-87 keeps its working state on the stack and a debug build copies
+/// every intermediate: key generation alone was measured between 768 KiB and
+/// 1 MiB. Windows hands a main thread exactly 1 MiB, so `init` overflowed
+/// there while passing everywhere else — found on the operator's machine, at
+/// the one command that creates the trust domain.
+///
+/// This runs the whole authority creation on a thread of exactly the size the
+/// binary reserves. A stack overflow aborts the process rather than failing a
+/// test, so the signal is blunt — which is the right volume for « the tool no
+/// longer starts on Windows ».
+#[test]
+fn the_authority_gesture_fits_the_stack_the_binary_reserves() {
+    let done = std::thread::Builder::new()
+        .stack_size(astra_signer::WORK_STACK_BYTES)
+        .spawn(|| {
+            let key = FakeKey::new(1);
+            let vault = create(&key);
+            // Opening exercises the other heavy half: the AEAD and the
+            // payload, on the same stack.
+            let opened = open_with_authorized_key(&key, &vault, PIN).expect("opens");
+            prove_anchors_open(&vault, &opened).expect("the anchors read");
+        })
+        .expect("spawn")
+        .join();
+    assert!(
+        done.is_ok(),
+        "the gesture completed within the reserved stack"
+    );
+}
