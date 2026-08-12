@@ -43,6 +43,10 @@ HELIOS_SSH_OPTS=(
     # avec, il échoue au bout d'une minute en le disant.
     -o ServerAliveInterval=15
     -o ServerAliveCountMax=4
+    # Le redémarrage de `heliosd` reconstruit le pare-feu sous la connexion :
+    # une tentative qui tombe dans le vide doit échouer vite, pas au bout d'une
+    # minute — le sondage d'état en enchaîne trente.
+    -o ConnectTimeout=10
 )
 
 # Demande le mot de passe une fois, si ce n'est pas déjà fait.

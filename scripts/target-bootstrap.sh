@@ -273,17 +273,18 @@ echo "    redémarrage détaché ; attente de la remontée du service"
 DEMARRE=0
 for _ in $(seq 1 30); do
     sleep 2
-    if helios_ssh_sudo "$TARGET" "systemctl is-active --quiet heliosd" 2>/dev/null; then
+    if ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl is-active --quiet heliosd' 2>/dev/null; then
         DEMARRE=1
         break
     fi
 done
 if [ "$DEMARRE" = "0" ]; then
     echo "    heliosd n'est pas remonté en 60 s :" >&2
-    helios_ssh_sudo "$TARGET" "systemctl --no-pager --full status heliosd" >&2 || true
+    ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" \
+        'systemctl --no-pager --full status heliosd' >&2 || true
     exit 1
 fi
-helios_ssh_sudo "$TARGET" "systemctl --no-pager --full status heliosd" || true
+ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl --no-pager --full status heliosd' || true
 
 helios_ssh_sudo "$TARGET" "
     if test -f /var/lib/helios/wg-key.escrow; then

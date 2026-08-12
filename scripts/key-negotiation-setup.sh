@@ -321,6 +321,13 @@ fi
 # circulaire. Ces deux fichiers sont des certificats — publics par construction.
 echo "==> Récupération des certificats publics de la gateway"
 REMOTE_PUBLIC_DIR="/tmp/helios-key-negotiation-public"
+# `$SUDO_UID` plutôt que `id -u` : sous `sudo`, ce dernier vaut 0, et les
+# fichiers repartiraient vers un `scp` non privilégié qui ne peut plus les lire.
+# Le répertoire lui-même est concerné — il est en 700, donc infranchissable pour
+# son propriétaire d'origine s'il reste à root.
+#
+# Le commentaire est **hors** de la commande distante : à l'intérieur, le `$` y
+# serait développé par le shell local, et un déploiement s'est arrêté là-dessus.
 helios_ssh_sudo "$CIBLE" "
     set -e
     install -d -m 700 '$REMOTE_PUBLIC_DIR'
@@ -334,10 +341,6 @@ helios_ssh_sudo "$CIBLE" "
         '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin'
     /opt/helios/current/heliosd peer list \
         > '$REMOTE_PUBLIC_DIR/peer-list.log'
-    # `$SUDO_UID` plutôt que `id -u` : sous `sudo`, ce dernier vaut 0, et les
-    # fichiers repartiraient vers un `scp` non privilégié qui ne peut plus les
-    # lire. Le répertoire lui-même est concerné — il est en 700, donc
-    # infranchissable pour son propriétaire d'origine s'il reste à root.
     chown \$SUDO_UID:\$SUDO_GID '$REMOTE_PUBLIC_DIR' '$REMOTE_PUBLIC_DIR/'*
 "
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-cert.der" "$SORTIE/gateway-cert.der"
