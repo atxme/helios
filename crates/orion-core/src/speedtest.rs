@@ -31,6 +31,14 @@ use futures_util::{future::try_join_all, StreamExt as _};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 
+/// Fixed in-tunnel API destination used by the performance probe.
+///
+/// The endpoint is deliberately not read from the editable profile: the
+/// speedtest is valid only when this request reaches Helios through the
+/// already-mounted WireGuard interface. The route itself is authenticated by
+/// the gateway's WireGuard peer middleware.
+pub const DEFAULT_GATEWAY_URL: &str = aether::DEFAULT_WG_API_URL;
+
 /// Number of RTT observations retained after the two warm-up requests.
 pub const LATENCY_SAMPLES: usize = 11;
 /// Independent HTTP/1/TCP flows used to fill the path without depending on a
@@ -163,8 +171,17 @@ struct RoundPlan {
     byte_budget: u64,
 }
 
-/// Runs the standard adaptive client-to-gateway measurement.
-pub async fn run(gateway_url: &str) -> Result<SpeedTestResult, SpeedTestError> {
+/// Runs the standard adaptive measurement against the gateway's in-tunnel API.
+pub async fn run() -> Result<SpeedTestResult, SpeedTestError> {
+    run_at(DEFAULT_GATEWAY_URL).await
+}
+
+/// Runs a measurement against an explicit URL.
+///
+/// This narrow entry point exists for local engine tests and controlled
+/// diagnostics. The Orion UI never supplies a URL; production calls use
+/// [`run`], which targets the gateway address inside WireGuard.
+pub async fn run_at(gateway_url: &str) -> Result<SpeedTestResult, SpeedTestError> {
     run_with_config(gateway_url, STANDARD_CONFIG).await
 }
 
@@ -756,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_http_urls_before_network_access() {
-        let error = run("file:///etc/hosts").await.expect_err("invalid URL");
+        let error = run_at("file:///etc/hosts").await.expect_err("invalid URL");
         assert!(matches!(error, SpeedTestError::InvalidUrl(_)));
     }
 }

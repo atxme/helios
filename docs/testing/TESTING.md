@@ -260,6 +260,25 @@ Valider avec accès console :
   compilation : `libudev` sous Linux, posée par `scripts/setup-dev.sh`, sans
   laquelle le workspace entier ne se bâtit plus.
 
+- domaine de confiance, les deux moitiés
+  ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md), guide :
+  [DEPLOIEMENT-ASTRA](../DEPLOIEMENT-ASTRA.md)) : `astra bootstrap` dans le
+  conteneur puis `heliosd init-trust-domain` sur la gateway, avec les valeurs
+  du même `astra-signer init`. Vérifier qu'un second appel de chacune est
+  refusé — une seconde histoire pour un domaine repartirait aux époques 1 face
+  à des clients qui en tiennent de plus hautes, et chacun la refuserait ; que
+  `heliosd init-trust-domain` réussit **TPM indisponible**, puisqu'il ne
+  descelle rien ; que le nom de serveur et la clé WireGuard écrits dans le
+  registre sont bien ceux de la leaf PQ servie et non des valeurs retapées ; et
+  qu'au redémarrage le journal passe de « no certificate registry » à
+  « certificate lifecycle ready ».
+
+  Le conteneur lui-même : rootfs en lecture seule effectif (une écriture hors
+  `/var/lib/astra` et `/tmp` doit échouer), aucune capacité, UID 10001, et le
+  volume d'état seul montage. Restaurer une sauvegarde du volume dont la tête
+  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage** —
+  c'est la seule chose qui distingue une restauration d'un fork.
+
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
 

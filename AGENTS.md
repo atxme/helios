@@ -95,11 +95,21 @@ Restent ouverts :
   `rename`. Restent ouverts : les **commandes de signature** du compagnon
   (certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes) et
   donc toute approbation opérateur (routes en `501`), le veth privé
-  Astra–Helios — donc la gateway ne détient encore **aucun objet pré-signé à
-  distribuer** et répond `503` à un client qu'elle sait en retard —, la
-  récupération d'une identité expirée, le discriminant de profil Orion et la
-  bascule du §13, et les deux surfaces IHM. La leaf PQ gateway servie reste
-  auto-signée tant que cette bascule n'a pas eu lieu.
+  Astra–Helios — `heliosd` n'a aucun client HTTP vers Astra, donc la gateway ne
+  détient encore **aucun objet pré-signé à distribuer** et répond `503` à un
+  client qu'elle sait en retard —, la récupération d'une identité expirée, le
+  discriminant de profil Orion et la bascule du §13, et les deux surfaces IHM.
+  La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
+  lieu.
+  Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
+  `heliosd init-trust-domain` de l'autre. La seconde n'ouvre aucun coffre et ne
+  génère aucune clé — elle relit les leaves servies sur disque et reçoit les
+  ancres de l'opérateur, donc elle tourne TPM indisponible. Sans elle le
+  registre est absent, et un registre absent n'est **pas** un registre vide :
+  les routes de cycle de vie in-tunnel restent fermées et le démarrage le dit.
+  Le conteneur est livré (`deploy/astra/`, `scripts/deploy-astra.sh`) ; la
+  séquence complète est dans
+  [DEPLOIEMENT-ASTRA](docs/DEPLOIEMENT-ASTRA.md).
   **Aucune clé de sécurité ne signe quoi que ce soit** : une YubiKey 5 ne
   produit pas d'ML-DSA, et tout champ de signature du cycle de vie est un
   `MlDsa87Signature`. Le jeton authentifie et dérive — `hmac-secret` ouvre un
@@ -518,6 +528,13 @@ chacune est un endroit où coller la mauvaise valeur ; et la panne ne se voit
 qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
 sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients
 déjà admis.
+
+`scripts/deploy-astra.sh` livre le conteneur Astra, qui n'entre **pas** dans le
+bundle signé de l'ADR-004 : c'est un conteneur séparé, sans capacité, rootfs en
+lecture seule, UID propre, un seul volume. Il ne crée aucun domaine de confiance
+— l'amorçage exige des valeurs qui naissent dans `astra-signer` sur le poste
+opérateur, et le script imprime la commande exacte plutôt que de deviner.
+Séquence complète : [DEPLOIEMENT-ASTRA](docs/DEPLOIEMENT-ASTRA.md).
 
 `scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
 signer hors ligne, archiver — puis copie et installe. La séparation garde son

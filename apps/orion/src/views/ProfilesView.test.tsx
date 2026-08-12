@@ -130,6 +130,9 @@ describe('ProfilesView interactions', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
     fireEvent.change(screen.getByLabelText('Trafic capté'), { target: { value: '100.64.0.0/10' } })
+    // The speedtest targets Helios through the established tunnel; there is
+    // no user-configurable API URL on a profile anymore.
+    expect(screen.queryByLabelText('URL Helios')).toBeNull()
     // Split tunnelling is a decision, not a defect: narrowing the range warns
     // about nothing.
     expect(screen.queryByText(/en clair/)).toBeNull()

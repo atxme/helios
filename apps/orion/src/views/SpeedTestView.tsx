@@ -52,7 +52,7 @@ export function SpeedTestView({ state, profile }: Props) {
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const connected = state === 'up'
-  const available = connected && Boolean(profile?.heliosd_url)
+  const available = connected
 
   const run = async () => {
     setRunning(true)
@@ -96,7 +96,8 @@ export function SpeedTestView({ state, profile }: Props) {
           <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 12, lineHeight: 1.55 }}>
             Mesure le chemin WireGuard entre ce client et la gateway du profil connecté.
             Le moteur adapte le volume, préchauffe quatre flux et retient la médiane de trois
-            fenêtres. Il ne mesure pas votre débit Internet général.
+            fenêtres. La sonde contacte le service interne de la gateway uniquement à travers
+            le tunnel ; elle ne mesure pas votre débit Internet général.
           </Typography>
         </Box>
 
@@ -110,12 +111,6 @@ export function SpeedTestView({ state, profile }: Props) {
             Connectez le profil « {profile.name} » avant de lancer le test.
           </Typography>
         )}
-        {profile && connected && !profile.heliosd_url && (
-          <Typography color="text.secondary" sx={{ fontSize: 12 }}>
-            Ce profil ne fournit pas d’URL interne Helios pour effectuer la mesure.
-          </Typography>
-        )}
-
         <Button
           variant="contained"
           startIcon={<Gauge size={17} aria-hidden />}

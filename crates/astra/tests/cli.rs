@@ -66,11 +66,19 @@ fn bootstrap_writes_a_registry_and_status_reads_the_same_audit_head() {
         String::from_utf8_lossy(&output.stderr)
     );
     let printed = String::from_utf8(output.stdout).expect("utf-8");
+    // Split on the colon rather than on a fixed prefix: the labels are padded
+    // so an operator can read the block, and a test that pins the padding
+    // fails on a column change while proving nothing.
     let head = printed
         .lines()
-        .find_map(|line| line.strip_prefix("audit head: "))
-        .expect("bootstrap prints the audit head")
-        .to_string();
+        .find(|line| line.trim_start().starts_with("audit head"))
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim().to_string())
+        .expect("bootstrap prints the audit head");
+    assert!(
+        !head.is_empty(),
+        "the audit head is printed, not just labelled"
+    );
     assert!(directory.path().join("registry.json").exists());
     assert!(
         directory.path().join("service-key.bin").exists(),

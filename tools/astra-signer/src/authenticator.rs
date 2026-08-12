@@ -302,7 +302,7 @@ mod ctap {
             } else {
                 assertion.credential_id.clone()
             };
-            if !credentials.iter().any(|known| *known == credential_id) {
+            if !credentials.contains(&credential_id) {
                 return Err(AuthenticatorError::UnknownCredential);
             }
 

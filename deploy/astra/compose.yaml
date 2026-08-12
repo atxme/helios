@@ -1,0 +1,79 @@
+# Astra — conteneur d'autorité (ADR-008 §1).
+#
+# Les contraintes ci-dessous ne sont pas du zèle : Astra tient le registre d'un
+# domaine de confiance et un émetteur délégué. Il ne détient jamais `CA-PQ` en
+# clair, mais il décide de ce qui est distribué, et un conteneur qui peut
+# s'échapper décide de la même chose.
+#
+#   docker compose -f deploy/astra/compose.yaml --env-file .env up -d
+#
+# Amorçage, une seule fois, sur le même volume :
+#
+#   docker compose -f deploy/astra/compose.yaml run --rm astra bootstrap \
+#     --ca-public-key "$CA_PQ_PUBLIC" --trust-domain-id "$TRUST_DOMAIN_ID" \
+#     --gateway-wireguard-public-key "$GATEWAY_WG_PUBLIC" \
+#     --server-name "$SERVER_NAME" --authority-url "$ASTRA_AUTHORITY_URL" \
+#     --webauthn-rp-id "$ASTRA_RP_ID"
+#
+# Puis relever la tête de chaîne d'audit imprimée et la reporter dans
+# ASTRA_EXPECTED_AUDIT_HEAD : sans elle, une restauration qui a forké est
+# reprise en silence au lieu d'être refusée.
+
+services:
+  astra:
+    build:
+      # Le contexte est la racine du dépôt : le Dockerfile compile le workspace.
+      context: ../..
+      dockerfile: deploy/astra/Dockerfile
+    image: helios/astra:latest
+    container_name: astra
+    command:
+      - run
+      - --bind
+      - 0.0.0.0:8443
+      - --expected-audit-head
+      - ${ASTRA_EXPECTED_AUDIT_HEAD:?relever la tête d_audit imprimée au bootstrap}
+
+    # Aucune capacité, rootfs en lecture seule, pas d'escalade. Astra n'ouvre
+    # qu'un socket TCP et n'écrit que dans son volume.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+
+    # `read_only` interdit d'écrire ailleurs que dans les volumes ; /tmp reste
+    # nécessaire au runtime. Il est en mémoire, donc rien du conteneur ne
+    # survit à son arrêt hors du volume d'état.
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+
+    # LE seul montage. Registre, chaîne d'audit, clé de service scellée.
+    # C'est aussi tout ce qu'il faut sauvegarder.
+    volumes:
+      - astra-state:/var/lib/astra
+
+    networks:
+      - astra-public
+
+    # Publié sur la boucle locale seulement : le terminateur TLS est devant.
+    # Exposer 8443 sur l'hôte servirait du HTTP clair au monde.
+    ports:
+      - "127.0.0.1:8443:8443"
+
+    mem_limit: 256m
+    pids_limit: 128
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  astra-state:
+
+networks:
+  astra-public:
+    driver: bridge

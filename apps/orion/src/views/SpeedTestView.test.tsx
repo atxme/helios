@@ -20,7 +20,9 @@ const profile: ClientProfile = {
   address: '100.64.1.2/32',
   allowed_ips: '0.0.0.0/0',
   persistent_keepalive: 25,
-  heliosd_url: 'http://100.64.0.1:8080',
+  // The speedtest target is fixed inside the WireGuard network; a profile
+  // URL is neither required nor consulted.
+  heliosd_url: null,
   ssh_target: null,
   key_negotiation: null,
 }

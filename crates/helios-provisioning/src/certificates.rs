@@ -82,6 +82,12 @@ pub enum RegistryError {
     Io(#[from] std::io::Error),
     #[error("certificate registry is unreadable: {0}")]
     Corrupt(String),
+    #[error(
+        "a certificate registry already exists at {0}: bootstrapping over it would give this \
+         gateway a second history for the same domain — fresh epochs at 1 against clients that \
+         already hold higher ones, and every one of them refused"
+    )]
+    AlreadyBootstrapped(PathBuf),
 }
 
 /// One peer's certificate generations, with the PQ leaves they resolve to.
@@ -157,6 +163,30 @@ impl CertificateRegistry {
 
     pub fn new(path: PathBuf, state: RegistryState) -> Self {
         Self { path, state }
+    }
+
+    /// Creates the registry of a trust domain, once and only once.
+    ///
+    /// The counterpart of `astra bootstrap` on this side of the wire, and it
+    /// refuses an existing file for the same reason: a domain has one history,
+    /// and a second one starting at epoch 1 would be refused by every client
+    /// already holding a higher one — while looking, locally, like a clean
+    /// install.
+    ///
+    /// Nothing here is secret. Every value is either public by construction
+    /// (the leaves this gateway already serves, the anchors it is told to
+    /// trust) or an identifier. The command that calls this therefore needs
+    /// no TPM: it opens no vault and unseals nothing.
+    pub fn bootstrap(path: PathBuf, state: RegistryState) -> Result<Self, RegistryError> {
+        if path.exists() {
+            return Err(RegistryError::AlreadyBootstrapped(path));
+        }
+        if let Some(parent) = path.parent() {
+            aether::private_file::create_private_dir(parent)?;
+        }
+        let mut registry = Self::new(path, state.clone());
+        registry.persist(state)?;
+        Ok(registry)
     }
 
     /// Loads the registry, or reports that the domain is not bootstrapped.
@@ -1469,5 +1499,37 @@ mod tests {
                 .stage(&client_key(2), &authorization, 1_200),
             Err(RegistryError::Certificate(CertificateError::Revoked))
         ));
+    }
+    /// A domain has one history. Bootstrapping over an existing registry would
+    /// restart the epochs at 1 while every client holds higher ones — a
+    /// gateway that looks freshly installed and is refused by its whole park.
+    #[test]
+    fn a_second_bootstrap_never_lands_on_the_first() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("nested").join("certificates.json");
+        let state = fixture().registry.state().clone();
+
+        let registry =
+            CertificateRegistry::bootstrap(path.clone(), state.clone()).expect("first bootstrap");
+        assert_eq!(registry.state(), &state);
+        assert!(matches!(
+            CertificateRegistry::bootstrap(path, state),
+            Err(RegistryError::AlreadyBootstrapped(_))
+        ));
+    }
+
+    /// What `bootstrap` wrote is what `load` reads back: the registry is the
+    /// file, and a lossy round trip would only surface at the first staging.
+    #[test]
+    fn a_bootstrapped_registry_reloads_identically() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("certificates.json");
+        let state = fixture().registry.state().clone();
+
+        CertificateRegistry::bootstrap(path.clone(), state.clone()).expect("bootstrap");
+        let reloaded = CertificateRegistry::load(&path)
+            .expect("load")
+            .expect("a bootstrapped domain is not an absent one");
+        assert_eq!(reloaded.state(), &state);
     }
 }

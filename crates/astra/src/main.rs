@@ -157,6 +157,7 @@ fn bootstrap(
     )
     .context("sealing the Astra service key")?;
 
+    let state_trust_domain = trust_domain_id;
     let state = AstraState {
         trust_domain_id,
         gateway_wg_public_key,
@@ -176,15 +177,26 @@ fn bootstrap(
     let mut registry = AstraRegistry::new(registry_path.clone(), state);
     registry.record(AuditEvent::DomainBootstrapped, now_unix())?;
 
-    println!("registry: {}", registry_path.display());
+    println!("registry            : {}", registry_path.display());
+    // The base64 key, not only its fingerprint: `heliosd init-trust-domain`
+    // pins the key itself, and a fingerprint is not something an operator can
+    // hand it. Printing only the digest left the value they need unreachable.
+    println!("service key         : {}", service_public_key.to_base64());
     println!(
-        "service key: {}",
+        "service fingerprint : {}",
         service_public_key.authority_fingerprint()
     );
-    println!("audit head: {}", registry.audit_head());
+    println!("audit head          : {}", registry.audit_head());
+    println!();
     println!(
         "record the audit head above: a restore that ends elsewhere is a fork, and `astra run \
          --expected-audit-head` is what refuses it"
+    );
+    println!(
+        "then, on the gateway: `heliosd init-trust-domain --trust-domain-id {} --ca-public-key \
+         <CA-PQ> --astra-service-public-key <service key above> --authority-url {} \
+         --webauthn-rp-id {}`",
+        state_trust_domain, authority_url, webauthn_rp_id
     );
     Ok(())
 }
@@ -298,6 +310,10 @@ fn status(state_dir: &Path) -> Result<()> {
         state.ca_public_key.authority_fingerprint()
     );
     println!("service key epoch: {}", state.astra_service_key_epoch);
+    println!(
+        "service key      : {}",
+        state.astra_service_public_key.to_base64()
+    );
     println!(
         "delegated issuer : {}",
         match &state.issuer {

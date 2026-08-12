@@ -563,10 +563,9 @@ async fn last_certificate_error(
 /// Measures the data path to the gateway named by the active profile.
 ///
 /// This command is intentionally available only while WireGuard is `Up`: the
-/// gateway's API lives behind that tunnel, and running it against a profile's
-/// public endpoint would measure a different path than the one Orion
-/// protects. The transfer implementation itself lives in `orion-core`, so it
-/// remains testable without Tauri or WebView.
+/// gateway's API lives behind that tunnel, and the Rust engine targets its
+/// fixed in-tunnel address. The transfer implementation itself lives in
+/// `orion-core`, so it remains testable without Tauri or WebView.
 #[tauri::command]
 async fn run_speed_test(state: State<'_, AppState>) -> Result<orion_core::SpeedTestResult, String> {
     let _exclusive = state
@@ -576,20 +575,7 @@ async fn run_speed_test(state: State<'_, AppState>) -> Result<orion_core::SpeedT
     if state.controller.state() != TunnelState::Up || !state.controller.adapter_is_up() {
         return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
     }
-    let gateway_url = {
-        let config = state.config.lock().await;
-        config
-            .selected
-            .as_deref()
-            .and_then(|name| config.find(name))
-            .or_else(|| config.profiles.first())
-            .and_then(|profile| profile.heliosd_url.clone())
-            .ok_or_else(|| {
-                "le profil connecté ne fournit pas d’URL interne Helios pour le speedtest"
-                    .to_string()
-            })?
-    };
-    orion_core::run_speedtest(&gateway_url)
+    orion_core::run_speedtest()
         .await
         .map_err(|error| error.to_string())
 }

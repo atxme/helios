@@ -703,8 +703,7 @@ export function ProfilesView({
     issues.allowed_ips ||
       issues.persistent_keepalive ||
       issues.ssh_target ||
-      (!draft.key_negotiation && issues.preshared_key) ||
-      issues.heliosd_url,
+      (!draft.key_negotiation && issues.preshared_key),
   )
 
   /**
@@ -1112,13 +1111,6 @@ export function ProfilesView({
                     placeholder="utilisateur@100.64.0.1"
                     value={draft.ssh_target ?? ''}
                     onChange={(value) => set('ssh_target', value || null)}
-                  />
-                  <Field
-                    label="URL Helios"
-                    error={issues.heliosd_url}
-                    placeholder="http://100.64.0.1:8080"
-                    value={draft.heliosd_url ?? ''}
-                    onChange={(value) => set('heliosd_url', value || null)}
                   />
                 </Box>
               </Collapse>

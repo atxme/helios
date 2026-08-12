@@ -51,4 +51,6 @@ pub use profile_import::{
     CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,
 };
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};
-pub use speedtest::{run as run_speedtest, SpeedTestError, SpeedTestResult};
+pub use speedtest::{
+    run as run_speedtest, run_at as run_speedtest_at, SpeedTestError, SpeedTestResult,
+};

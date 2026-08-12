@@ -9,6 +9,10 @@ const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
 
 /// TCP port of the REST/WS API (hardcoded, architectural invariant).
 pub const API_PORT: u16 = 8080;
+/// Default address of the gateway inside the WireGuard network.
+pub const DEFAULT_WG_ADDRESS: &str = "100.64.0.1/10";
+/// Default in-tunnel URL of the gateway API.
+pub const DEFAULT_WG_API_URL: &str = "http://100.64.0.1:8080";
 /// Listen address of the HTTP server in degraded mode (no tunnel interface).
 ///
 /// Loopback only: without a tunnel, the API has no reason to be reachable
@@ -138,9 +142,8 @@ fn default_wg_iface() -> String {
     "helios0".to_string()
 }
 
-/// `100.64.0.1/10`: first address of the shared CGNAT range (RFC 6598).
 fn default_wg_address() -> String {
-    "100.64.0.1/10".to_string()
+    DEFAULT_WG_ADDRESS.to_string()
 }
 
 fn default_wg_port() -> u16 {

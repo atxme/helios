@@ -338,7 +338,13 @@
       "Bash(rustc --version)",
       "Bash(pkg-config --exists libudev)",
       "Bash(timeout 60 cargo info rpassword)",
-      "Bash(timeout 240 sudo -n apt-get install -y libudev-dev)"
+      "Bash(timeout 240 sudo -n apt-get install -y libudev-dev)",
+      "Bash(apt-get download *)",
+      "Bash(pkg-config --libs --cflags libudev)",
+      "Bash(awk 'NR>=666 && /^    }$/ {last=NR} END{}' crates/helios-provisioning/src/certificates.rs)",
+      "Bash(chmod +x scripts/deploy-astra.sh)",
+      "Bash(bash -n scripts/deploy-astra.sh)",
+      "Bash(shellcheck scripts/deploy-astra.sh)"
     ]
   }
 }

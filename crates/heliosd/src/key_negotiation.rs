@@ -1384,6 +1384,44 @@ fn spawn_psk_reclaimer(
     });
 }
 
+/// The public identity material a trust-domain bootstrap needs.
+///
+/// Three files, all public by construction: the TLS leaf this gateway serves,
+/// its PQ leaf, and the client TLS anchor it was told to trust. Reading them
+/// opens no vault — which is why `init-trust-domain` needs no TPM, and can be
+/// run on a gateway whose boot chain has moved.
+///
+/// The PQ leaf is where the server name and the WireGuard identity come from,
+/// rather than from arguments an operator retypes: the registry must describe
+/// the identity actually being served, and two fields that must agree are two
+/// fields that can disagree.
+pub struct ServedIdentity {
+    pub tls_certificate: aether::certificates::encoding::DerCertificate,
+    pub pq_certificate: PqCertificate,
+    pub client_tls_ca: aether::certificates::encoding::DerCertificate,
+}
+
+pub fn served_identity() -> Result<Option<ServedIdentity>> {
+    use aether::certificates::encoding::DerCertificate;
+
+    let (Ok(tls_der), Ok(pq_json), Ok(client_ca_der)) = (
+        std::fs::read(CERTIFICATE_PATH),
+        std::fs::read(PQ_CERTIFICATE_PATH),
+        std::fs::read(CLIENT_CA_PATH),
+    ) else {
+        return Ok(None);
+    };
+    let pq_certificate: PqCertificate = serde_json::from_slice(&pq_json)
+        .with_context(|| format!("reading {PQ_CERTIFICATE_PATH}"))?;
+    Ok(Some(ServedIdentity {
+        tls_certificate: DerCertificate::new(tls_der)
+            .with_context(|| format!("reading {CERTIFICATE_PATH}"))?,
+        pq_certificate,
+        client_tls_ca: DerCertificate::new(client_ca_der)
+            .with_context(|| format!("reading {CLIENT_CA_PATH}"))?,
+    }))
+}
+
 /// Reads the public certificates the API republishes to the operator tooling.
 ///
 /// Deliberately independent from [`start`]: it opens neither the TPM nor the

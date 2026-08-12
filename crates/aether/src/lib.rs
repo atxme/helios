@@ -25,7 +25,9 @@ pub mod sig;
 pub mod state;
 pub mod wg;
 
-pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
+pub use config::{
+    NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT, DEFAULT_WG_ADDRESS, DEFAULT_WG_API_URL,
+};
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};
 pub use policy::{FirewallPolicy, PolicyMode};
