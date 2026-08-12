@@ -129,7 +129,13 @@ Restent ouverts :
   processus ; `hid` parle CTAP2 directement, partout, mais sous Windows exige
   un processus administrateur — pour un programme qui tient `CA-PQ` en clair,
   c'est le privilège qu'on ne veut pas. Un credential appartient à la clé, pas
-  à l'API : un coffre créé par un transport s'ouvre par l'autre à RP ID égal.
+  à l'API : un coffre créé par un transport s'ouvre par l'autre à RP ID égal —
+  mais seulement parce que le chemin HID applique **lui aussi** la conversion
+  PRF de WebAuthn, `SHA-256("WebAuthn PRF" || 0x00 || sel)`. Windows l'applique
+  dans `pHmacSecretSaltValues` sans offrir de s'en passer ; sans elle, le même
+  sel dériverait deux secrets différents selon le transport. De même, la
+  version d'options de `MakeCredential` doit être ≥ 5, sinon `bEnablePrf` n'est
+  jamais lu et le credential revient parfait pour ne rien déverrouiller.
   Le prix du transport HID est `libudev` en dépendance de compilation, posée par
   `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus ; celui du
   transport plateforme est `WEBAUTHN_API_VERSION_4`, exigé par les sels

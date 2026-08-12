@@ -132,9 +132,16 @@ impl Authenticator for WebAuthnAuthenticator {
             pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
         };
 
-        // `hmac-secret` asked for at creation. Without it the credential is
-        // minted without the secret, and the failure would only surface at the
-        // next unlock — with a key-slot that unwraps nothing.
+        // `hmac-secret` asked for at creation, both ways the platform accepts
+        // it. Without it the credential is minted without the secret, and the
+        // failure surfaces only at the next unlock — on a key-slot that
+        // unwraps nothing.
+        //
+        // The extension is the CTAP-level request; `bEnablePrf` below is what
+        // makes the platform serve salts at assertion time, and it is the one
+        // that matters here because `pHmacSecretSaltValues` carries PRF
+        // semantics. Asking for one without the other is exactly how this
+        // registered fine and then derived nothing.
         let mut wants_hmac: BOOL = TRUE;
         let mut extensions = [WEBAUTHN_EXTENSION {
             pwszExtensionIdentifier: WEBAUTHN_EXTENSIONS_IDENTIFIER_HMAC_SECRET,
@@ -147,7 +154,11 @@ impl Authenticator for WebAuthnAuthenticator {
         // one in `list`.
         let mut excluded = CredentialList::new(exclude);
         let mut options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
-            dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_3,
+            // Version 5, and not one less: `bEnablePrf` sits after
+            // `bBrowserInPrivateMode` in the structure, so a lower version
+            // means the platform never reads it — silently, and the credential
+            // comes back looking perfectly fine.
+            dwVersion: WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS_VERSION_5,
             dwTimeoutMilliseconds: TIMEOUT_MS,
             CredentialList: WEBAUTHN_CREDENTIALS {
                 cCredentials: 0,
@@ -173,7 +184,7 @@ impl Authenticator for WebAuthnAuthenticator {
             dwLargeBlobSupport: 0,
             bPreferResidentKey: FALSE,
             bBrowserInPrivateMode: FALSE,
-            bEnablePrf: FALSE,
+            bEnablePrf: TRUE,
             pLinkedDevice: std::ptr::null_mut(),
             cbJsonExt: 0,
             pbJsonExt: std::ptr::null_mut(),
@@ -197,20 +208,35 @@ impl Authenticator for WebAuthnAuthenticator {
 
         // From here every exit must free the attestation: it is Windows'
         // allocation, and returning early would leak it.
-        let credential_id = unsafe {
+        let (credential_id, prf_enabled) = unsafe {
             let attested = &*attestation;
             let id = std::slice::from_raw_parts(
                 attested.pbCredentialId,
                 attested.cbCredentialId as usize,
             )
             .to_vec();
+            // `bPrfEnabled` is only a field from attestation version 5; below
+            // that the platform has not told us, and claiming it did would be
+            // reading past what it filled in.
+            let prf = if attested.dwVersion >= WEBAUTHN_CREDENTIAL_ATTESTATION_VERSION_5 {
+                Some(attested.bPrfEnabled != FALSE)
+            } else {
+                None
+            };
             WebAuthNFreeCredentialAttestation(attestation);
-            id
+            (id, prf)
         };
         if credential_id.is_empty() {
             return Err(AuthenticatorError::Device(
                 "la clé n'a rendu aucun identifiant de credential".into(),
             ));
+        }
+        // Refused here rather than at the next unlock: a credential minted
+        // without the secret is a key-slot that unwraps nothing, and the
+        // operator would find out one command later, holding a vault they
+        // cannot open.
+        if prf_enabled == Some(false) {
+            return Err(AuthenticatorError::NoHmacSecret);
         }
         Ok(credential_id)
     }

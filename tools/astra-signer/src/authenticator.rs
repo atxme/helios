@@ -223,6 +223,36 @@ fn path_of(device: &ctap_hid_fido2::HidInfo) -> Option<String> {
     }
 }
 
+/// The salt the authenticator is actually handed, from the vault's salt.
+///
+/// WebAuthn's PRF extension does **not** pass the caller's value to
+/// `hmac-secret` as-is: it hashes it first, as
+/// `SHA-256("WebAuthn PRF" || 0x00 || value)`. Windows applies that conversion
+/// inside `pHmacSecretSaltValues` — the header says so in as many words — and
+/// offers no way to opt out.
+///
+/// So the raw CTAP path applies it too. Without this, the same vault salt would
+/// derive two different secrets depending on the transport: a vault created on
+/// Windows would refuse the very same key over raw HID, and the failure would
+/// arrive as an AEAD error naming nothing at all.
+///
+/// It is a domain separation either way, which is why adopting the platform's
+/// costs nothing: the value is public, and the secret comes from the
+/// credential's own `CredRandom`.
+fn prf_salt(salt: &[u8; SALT_LEN]) -> [u8; SALT_LEN] {
+    use aws_lc_rs::digest;
+    let mut input = Vec::with_capacity(PRF_PREFIX.len() + salt.len());
+    input.extend_from_slice(PRF_PREFIX);
+    input.extend_from_slice(salt);
+    let digest = digest::digest(&digest::SHA256, &input);
+    let mut out = [0u8; SALT_LEN];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// `"WebAuthn PRF"` and the separator the specification puts after it.
+const PRF_PREFIX: &[u8] = b"WebAuthn PRF\x00";
+
 /// Opens the single connected security key, over `transport`.
 ///
 /// Exactly one: a second key plugged in during an enrolment is how an operator
@@ -439,9 +469,12 @@ mod ctap {
                 return Err(AuthenticatorError::UnknownCredential);
             }
             let challenge = super::random_challenge()?;
+            // The platform's conversion, applied here: see `super::prf_salt`.
+            // Skipping it would make a vault created on Windows unopenable
+            // over this transport, with the same key.
             let mut builder = GetAssertionArgsBuilder::new(rp_id, &challenge)
                 .pin(pin)
-                .extensions(&[AssertionExt::HmacSecret(Some(*salt))]);
+                .extensions(&[AssertionExt::HmacSecret(Some(super::prf_salt(salt)))]);
             for credential in credentials {
                 builder = builder.add_credential_id(credential);
             }
@@ -514,4 +547,35 @@ fn random_challenge() -> Result<[u8; 32]> {
         .fill(&mut out)
         .map_err(|_| AuthenticatorError::Device("générateur aléatoire indisponible".into()))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The platform hashes the PRF value before it reaches `hmac-secret`, and
+    /// the raw path must do the same. If this ever becomes the identity again,
+    /// a vault created on Windows stops opening over HID — with the same key,
+    /// and an error naming only the AEAD.
+    #[test]
+    fn the_prf_salt_is_the_platform_transformation_and_not_the_salt() {
+        let salt = [0x5Au8; SALT_LEN];
+        let derived = prf_salt(&salt);
+        assert_ne!(derived, salt, "the value is hashed, not passed through");
+        assert_eq!(derived, prf_salt(&salt), "and deterministically so");
+        assert_ne!(
+            derived,
+            prf_salt(&[0x5Bu8; SALT_LEN]),
+            "a different vault salt gives a different secret"
+        );
+    }
+
+    /// The prefix is the specification's, byte for byte: `"WebAuthn PRF"` then
+    /// a `0x00`. A stray character here derives a secret nothing else agrees
+    /// with, and only a real key would ever notice.
+    #[test]
+    fn the_prf_prefix_is_the_one_the_specification_names() {
+        assert_eq!(PRF_PREFIX, b"WebAuthn PRF\0");
+        assert_eq!(PRF_PREFIX.len(), 13);
+    }
 }

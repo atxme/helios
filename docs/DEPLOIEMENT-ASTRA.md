@@ -88,7 +88,9 @@ ont besoin.
   élevés depuis la 1903. `astra-signer devices` liste ce que la pile HID
   montre, et distingue « aucun HID » de « des HID, mais aucun FIDO ».
   Un credential est celui de la clé, pas celui de l'API : un coffre créé par un
-  transport s'ouvre par l'autre, tant que le RP ID est le même.
+  transport s'ouvre par l'autre, tant que le RP ID est le même — le chemin HID
+  applique la même conversion PRF que la plateforme, faute de quoi le même sel
+  dériverait deux secrets différents.
 
 ## Le détail, si quelque chose casse
 
