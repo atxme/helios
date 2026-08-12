@@ -75,6 +75,10 @@ fi
 mkdir -p "$(dirname "$ETAT")"
 printf 'cible=%s\n' "$CIBLE" > "$ETAT"
 
+# Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
+# `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.
+helios_sudo_init "$CIBLE"
+
 # ── Clés éditeur ─────────────────────────────────────────────────────────────
 for f in ed25519-private.pk8 ml-dsa-65-private.bin publisher-keyring.json; do
     if [ ! -f "$EPOQUE/$f" ]; then
@@ -158,15 +162,18 @@ if [ "$INSTALLER" = "0" ]; then
 fi
 
 echo "==> 5/7  Installation privilégiée"
+# L'extraction reste **non privilégiée**, et seul l'installateur passe par
+# `sudo` : `~` désigne le répertoire de l'utilisateur qui l'écrit, et sous
+# `sudo` il vaudrait `/root`, où l'archive n'a jamais été copiée. Moindre
+# privilège et chemin correct, pour la même raison.
+#
 # L'ancien répertoire extrait est retiré d'abord : sinon on lancerait
 # l'installateur de la version précédente sur l'archive de la nouvelle.
-helios_ssh_sudo "$CIBLE" "
-    set -e
-    rm -rf ~/$NOM
-    tar xzf ~/$NOM.tar.gz
-    ~/$NOM/helios-installer bootstrap --archive ~/$NOM.tar.gz
-    rm -rf ~/$NOM
-"
+ssh "$CIBLE" "set -e; rm -rf ~/$NOM; tar xzf ~/$NOM.tar.gz"
+DISTANT_HOME="$(ssh "$CIBLE" 'echo "$HOME"')"
+helios_ssh_sudo "$CIBLE" \
+    "'$DISTANT_HOME/$NOM/helios-installer' bootstrap --archive '$DISTANT_HOME/$NOM.tar.gz'"
+ssh "$CIBLE" "rm -rf ~/$NOM"
 
 echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
 ./scripts/target-bootstrap.sh "$CIBLE"

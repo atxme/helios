@@ -173,6 +173,10 @@ if [ -z "$CIBLE" ]; then
     exit 1
 fi
 
+# Une seule invite, prise hors de tout pipeline : `helios_ssh_sudo` y tourne
+# en sous-shell, et le mot de passe capturé là y serait perdu.
+helios_sudo_init "$CIBLE"
+
 HOTE="${CIBLE#*@}"
 [ -n "$SERVER_NAME" ] || SERVER_NAME="$HOTE"
 [ -n "$ENDPOINT" ] || ENDPOINT="$SERVER_NAME:$PORT_WG"
@@ -330,8 +334,11 @@ helios_ssh_sudo "$CIBLE" "
         '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin'
     /opt/helios/current/heliosd peer list \
         > '$REMOTE_PUBLIC_DIR/peer-list.log'
-    chown \$(logname 2>/dev/null || echo '$USER'):\$(logname 2>/dev/null || echo '$USER') \
-        '$REMOTE_PUBLIC_DIR/'*
+    # `$SUDO_UID` plutôt que `id -u` : sous `sudo`, ce dernier vaut 0, et les
+    # fichiers repartiraient vers un `scp` non privilégié qui ne peut plus les
+    # lire. Le répertoire lui-même est concerné — il est en 700, donc
+    # infranchissable pour son propriétaire d'origine s'il reste à root.
+    chown \$SUDO_UID:\$SUDO_GID '$REMOTE_PUBLIC_DIR' '$REMOTE_PUBLIC_DIR/'*
 "
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-cert.der" "$SORTIE/gateway-cert.der"
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-pq-cert.json" "$SORTIE/gateway-pq-cert.json"

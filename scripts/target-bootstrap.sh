@@ -15,6 +15,10 @@ cd "$(dirname "$0")/.."
 TARGET="${1:-}"
 [ -n "$TARGET" ] || { echo "target-bootstrap.sh requires an SSH target" >&2; exit 2; }
 
+# Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
+# `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.
+helios_sudo_init "$TARGET"
+
 CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
 TARGET_HOST="${TARGET#*@}"
 TARGET_ID="$(printf '%s' "$TARGET_HOST" | tr -c 'A-Za-z0-9._-' '_')"
@@ -284,7 +288,7 @@ helios_ssh_sudo "$TARGET" "systemctl --no-pager --full status heliosd" || true
 helios_ssh_sudo "$TARGET" "
     if test -f /var/lib/helios/wg-key.escrow; then
         install -m 600 /var/lib/helios/wg-key.escrow '$REMOTE_ESCROW'
-        chown \$(id -u):\$(id -g) '$REMOTE_ESCROW'
+        chown \$SUDO_UID:\$SUDO_GID '$REMOTE_ESCROW'
     fi
 "
 

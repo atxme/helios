@@ -103,6 +103,10 @@ if [ -z "$CIBLE" ]; then
     echo "  ./scripts/provision-client.sh $CLIENT utilisateur@adresse" >&2
     exit 1
 fi
+# Une seule invite, prise hors de tout pipeline : `helios_ssh_sudo` y tourne
+# en sous-shell, et le mot de passe capturé là y serait perdu.
+helios_sudo_init "$CIBLE"
+
 mkdir -p "$(dirname "$ETAT")"
 printf 'cible=%s\n' "$CIBLE" > "$ETAT"
 

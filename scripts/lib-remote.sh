@@ -10,17 +10,25 @@
 # sont enchaînés, l'opérateur ne sait même pas combien il en reste.
 #
 # `helios_ssh_sudo` le demande une fois, puis le passe à `sudo -S` par l'entrée
-# standard. Jamais par la ligne de commande : `ps` la montre à tout le monde sur
-# la gateway. Jamais par l'environnement d'un processus distant non plus, pour
-# la même raison en `/proc`.
+# standard. Jamais par la ligne de commande : `ps` la montrerait à tout le monde
+# sur la gateway.
+#
+# # Appeler `helios_sudo_init` tôt, et depuis le shell principal
+#
+# `helios_ssh_sudo` est souvent utilisé dans un pipeline (`| tee …`), et un
+# pipeline s'exécute en sous-shell : une invite déclenchée là y capturerait le
+# mot de passe, qui disparaîtrait avec le sous-shell — et reviendrait au coup
+# suivant. Chaque script appelle donc `helios_sudo_init` une fois, au début,
+# hors de tout pipeline.
 #
 # # Limite connue
 #
-# Le mot de passe vit dans une variable du shell local pour la durée du
-# déploiement. C'est le poste de l'opérateur, qui détient déjà les clés
-# éditeur et la CA — mais ça reste un secret en mémoire, et c'est pourquoi
-# rien ne l'écrit sur disque ni ne le passe à un sous-processus qui n'en a pas
-# besoin.
+# Le mot de passe est **exporté**, pour que les scripts enchaînés
+# (`target-bootstrap.sh`, `key-negotiation-setup.sh`) n'aient pas à le
+# redemander. Il est donc lisible dans `/proc/<pid>/environ` des processus
+# fils, sur le poste de l'opérateur. C'est la machine qui détient déjà les clés
+# éditeur et la CA opérateur ; le compromis est assumé, et rien ne l'écrit sur
+# disque.
 
 # Multiplexage : une seule connexion TCP réutilisée par tous les appels. Ça ne
 # change rien au ticket sudo — c'est le pseudo-terminal qui le porte — mais ça
@@ -42,6 +50,9 @@ HELIOS_SSH_OPTS=(
 # `$1` : la cible SSH, pour que l'invite dise de quelle machine il s'agit.
 helios_sudo_init() {
     [ -n "${HELIOS_SUDO_PASSWORD:-}" ] && return 0
+    # Le cas NOPASSWD garde un mot de passe vide : sans ce second test, chaque
+    # script enchaîné resonderait la gateway pour rien.
+    [ "${HELIOS_SUDO_NOPASSWD:-0}" = "1" ] && return 0
     # Une gateway configurée en NOPASSWD n'a rien à demander : on le vérifie
     # avant d'embêter qui que ce soit.
     if ssh "${HELIOS_SSH_OPTS[@]}" "$1" 'sudo -n true' 2>/dev/null; then
