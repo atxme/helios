@@ -56,6 +56,15 @@ use std::fmt;
 
 use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};
 
+/// Networks NordVPN classifies as local for Meshnet's separate local-network
+/// permission.
+const PRIVATE_IPV4_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+];
+
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -487,12 +496,15 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         }
     }
 
-    // ── NordVPN Meshnet: transport and local overlay ────────────────────────
-    // Meshnet is locally terminated, so none of this belongs in `forward`.
+    // ── NordVPN Meshnet: transport, local services and routing ──────────────
     // Libtelio marks its relay, STUN and direct-path packets; accepting that
     // mark on a declared WAN lets paths and ports evolve without granting an
     // unmarked process arbitrary egress. Plaintext application packets are
     // separately scoped to nordlynx and the operator-selected peer networks.
+    // Forwarding mirrors NordVPN's per-peer permissions. NordVPN owns the NAT
+    // and applies a second independent filter; Helios still has to accept the
+    // same flows because every base chain must accept a packet for it to
+    // survive a drop policy.
     if let Some(meshnet) = &policy.nordvpn_meshnet {
         for wan in &wan_ifaces {
             rules.push(
@@ -556,6 +568,50 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                         .with_note("service exposed to an allowed Meshnet peer"),
                     );
                 }
+            }
+        }
+
+        for peer in &meshnet.traffic_routing_peer_cidrs {
+            let may_reach_local_network = meshnet.local_network_peer_cidrs.contains(peer);
+
+            if !may_reach_local_network {
+                for private_network in PRIVATE_IPV4_CIDRS {
+                    rules.push(
+                        Rule::new(
+                            Forward,
+                            vec![
+                                Match::InIface(meshnet.iface.clone()),
+                                Match::SourceNet(peer.clone()),
+                                Match::DestNet(private_network.into()),
+                            ],
+                            Verdict::Drop,
+                        )
+                        .with_note("Meshnet routing peer has no local-network permission"),
+                    );
+                }
+            }
+
+            let mut routed_out_ifaces = wan_ifaces.clone();
+            if may_reach_local_network {
+                for lan in &policy.lan_ifaces {
+                    if !routed_out_ifaces.contains(lan) {
+                        routed_out_ifaces.push(lan.clone());
+                    }
+                }
+            }
+            for out_iface in routed_out_ifaces {
+                rules.push(
+                    Rule::new(
+                        Forward,
+                        vec![
+                            Match::InIface(meshnet.iface.clone()),
+                            Match::SourceNet(peer.clone()),
+                            Match::OutIface(out_iface),
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("traffic from a NordVPN-authorized Meshnet routing peer"),
+                );
             }
         }
     }
@@ -914,6 +970,8 @@ mod tests {
             iface: "nordlynx".into(),
             fwmark: 0xe1f1,
             peer_cidrs: vec!["100.70.36.212/32".into()],
+            traffic_routing_peer_cidrs: Vec::new(),
+            local_network_peer_cidrs: Vec::new(),
             inbound_tcp_ports: vec![22, 9100],
             inbound_udp_ports: vec![51830],
             allow_icmp: true,
@@ -945,6 +1003,72 @@ mod tests {
             assert!(!rs.rules.iter().any(|rule| {
                 rule.matches
                     .contains(&Match::SourceNet("100.70.36.213/32".into()))
+            }));
+        }
+    }
+
+    #[test]
+    fn meshnet_routing_mirrors_per_peer_routing_and_local_network_permissions() {
+        let mut p = policy();
+        p.wan_ifaces = vec!["eth0".into(), "wlan0".into()];
+        p.lan_ifaces = vec!["lan0".into()];
+        p.allow_gateway_egress = true;
+        p.nordvpn_meshnet = Some(aether::NordvpnMeshnetPolicy {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["100.70.36.212/32".into(), "100.70.36.213/32".into()],
+            traffic_routing_peer_cidrs: vec!["100.70.36.212/32".into(), "100.70.36.213/32".into()],
+            local_network_peer_cidrs: vec!["100.70.36.213/32".into()],
+            inbound_tcp_ports: vec![22, 49111],
+            inbound_udp_ports: Vec::new(),
+            allow_icmp: true,
+        });
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let forward = text(&render(&p, state), ChainKind::Forward);
+
+            for private_network in PRIVATE_IPV4_CIDRS {
+                assert!(forward.iter().any(|rule| {
+                    rule
+                        == &format!(
+                            "iifname \"nordlynx\" ip saddr 100.70.36.212/32 ip daddr {private_network} drop"
+                        )
+                }));
+                assert!(!forward.iter().any(|rule| {
+                    rule.contains("100.70.36.213/32") && rule.contains(private_network)
+                }));
+            }
+            let private_drop = forward
+                .iter()
+                .position(|rule| {
+                    rule
+                        == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 ip daddr 192.168.0.0/16 drop"
+                })
+                .unwrap();
+            let wan_accept = forward
+                .iter()
+                .position(|rule| {
+                    rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 oifname \"eth0\" accept"
+                })
+                .unwrap();
+            assert!(
+                private_drop < wan_accept,
+                "the broad WAN acceptance must not precede the private-network denial"
+            );
+            for wan in ["eth0", "wlan0"] {
+                for peer in ["100.70.36.212/32", "100.70.36.213/32"] {
+                    assert!(forward.iter().any(|rule| {
+                        rule == &format!(
+                            "iifname \"nordlynx\" ip saddr {peer} oifname \"{wan}\" accept"
+                        )
+                    }));
+                }
+            }
+            assert!(forward.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.213/32 oifname \"lan0\" accept"
+            }));
+            assert!(!forward.iter().any(|rule| {
+                rule.contains("100.70.36.212/32") && rule.contains("oifname \"lan0\"")
             }));
         }
     }

@@ -14,6 +14,8 @@ KEY_NEGOTIATION_PORT="51821"
 ESCROW_PUBLIC_KEY=""
 DYNAMIC_WAN="0"
 MESHNET_PEER_CIDRS=""
+MESHNET_ROUTING_PEER_CIDRS=""
+MESHNET_LOCAL_NETWORK_PEER_CIDRS=""
 
 usage() {
     cat >&2 <<'EOF'
@@ -24,6 +26,8 @@ Usage: network-bootstrap.sh --wan IFACE --ssh-cidr CIDR --escrow-public-key KEY 
   --key-negotiation-port PORT
   --dynamic-wan
   --meshnet-peer-cidrs CIDR[,CIDR...]
+  --meshnet-routing-peer-cidrs CIDR[,CIDR...]
+  --meshnet-local-network-peer-cidrs CIDR[,CIDR...]
 EOF
     exit 2
 }
@@ -38,6 +42,8 @@ while [ "$#" -gt 0 ]; do
         --escrow-public-key) ESCROW_PUBLIC_KEY="${2:-}"; shift 2 ;;
         --dynamic-wan) DYNAMIC_WAN="1"; shift ;;
         --meshnet-peer-cidrs) MESHNET_PEER_CIDRS="${2:-}"; shift 2 ;;
+        --meshnet-routing-peer-cidrs) MESHNET_ROUTING_PEER_CIDRS="${2:-}"; shift 2 ;;
+        --meshnet-local-network-peer-cidrs) MESHNET_LOCAL_NETWORK_PEER_CIDRS="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
@@ -57,11 +63,12 @@ esac
 [ "$WG_PORT" != "$KEY_NEGOTIATION_PORT" ] ||
     { echo "WireGuard and key-negotiation ports must differ" >&2; exit 2; }
 
-MESHNET_TOML=""
-if [ -n "$MESHNET_PEER_CIDRS" ]; then
+cidr_list_to_toml() {
+    cidr_list="$1"
+    cidr_toml=""
     old_ifs=$IFS
     IFS=,
-    for cidr in $MESHNET_PEER_CIDRS; do
+    for cidr in $cidr_list; do
         case "$cidr" in
             ""|*[!0-9./]*) echo "invalid Meshnet peer CIDR: $cidr" >&2; exit 2 ;;
         esac
@@ -69,13 +76,38 @@ if [ -n "$MESHNET_PEER_CIDRS" ]; then
         prefix=${cidr##*/}
         [ "$address" != "$cidr" ] && [ "$prefix" -ge 0 ] 2>/dev/null && [ "$prefix" -le 32 ] ||
             { echo "invalid Meshnet peer CIDR: $cidr" >&2; exit 2; }
-        if [ -n "$MESHNET_TOML" ]; then
-            MESHNET_TOML="$MESHNET_TOML, "
+        if [ -n "$cidr_toml" ]; then
+            cidr_toml="$cidr_toml, "
         fi
-        MESHNET_TOML="$MESHNET_TOML\"$cidr\""
+        cidr_toml="$cidr_toml\"$cidr\""
     done
     IFS=$old_ifs
-    MESHNET_TOML="[$MESHNET_TOML]"
+    printf '[%s]' "$cidr_toml"
+}
+
+list_contains() {
+    case ",$1," in
+        *",$2,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+for cidr in $(printf '%s' "$MESHNET_ROUTING_PEER_CIDRS" | tr ',' ' '); do
+    list_contains "$MESHNET_PEER_CIDRS" "$cidr" ||
+        { echo "Meshnet routing peer is absent from peer inventory: $cidr" >&2; exit 2; }
+done
+for cidr in $(printf '%s' "$MESHNET_LOCAL_NETWORK_PEER_CIDRS" | tr ',' ' '); do
+    list_contains "$MESHNET_ROUTING_PEER_CIDRS" "$cidr" ||
+        { echo "Meshnet local-network peer has no routing permission: $cidr" >&2; exit 2; }
+done
+
+MESHNET_TOML=""
+MESHNET_ROUTING_TOML="[]"
+MESHNET_LOCAL_NETWORK_TOML="[]"
+if [ -n "$MESHNET_PEER_CIDRS" ]; then
+    MESHNET_TOML="$(cidr_list_to_toml "$MESHNET_PEER_CIDRS")"
+    MESHNET_ROUTING_TOML="$(cidr_list_to_toml "$MESHNET_ROUTING_PEER_CIDRS")"
+    MESHNET_LOCAL_NETWORK_TOML="$(cidr_list_to_toml "$MESHNET_LOCAL_NETWORK_PEER_CIDRS")"
 fi
 
 if [ ! -f "$CONFIG" ]; then
@@ -102,7 +134,9 @@ awk \
     -v key_port="$KEY_NEGOTIATION_PORT" \
     -v escrow_key="$ESCROW_PUBLIC_KEY" \
     -v dynamic_wan="$DYNAMIC_WAN" \
-    -v meshnet_cidrs="$MESHNET_TOML" '
+    -v meshnet_cidrs="$MESHNET_TOML" \
+    -v meshnet_routing_cidrs="$MESHNET_ROUTING_TOML" \
+    -v meshnet_local_cidrs="$MESHNET_LOCAL_NETWORK_TOML" '
 BEGIN {
     order[1] = "wan_iface"
     order[2] = "lan_ifaces"
@@ -170,7 +204,7 @@ BEGIN {
     desired["allow_ssh_over_tunnel"] = "true"
     desired["allow_gateway_egress"] = meshnet_cidrs != "" ? "true" : "false"
     if (meshnet_cidrs != "") {
-        desired["nordvpn_meshnet"] = "{ iface = \"nordlynx\", fwmark = 0xe1f1, peer_cidrs = " meshnet_cidrs ", inbound_tcp_ports = [22], inbound_udp_ports = [], allow_icmp = true }"
+        desired["nordvpn_meshnet"] = "{ iface = \"nordlynx\", fwmark = 0xe1f1, peer_cidrs = " meshnet_cidrs ", traffic_routing_peer_cidrs = " meshnet_routing_cidrs ", local_network_peer_cidrs = " meshnet_local_cidrs ", inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }"
     }
 
     forced["wan_iface"] = 1

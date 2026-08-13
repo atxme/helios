@@ -15,6 +15,10 @@ pub struct NordvpnMeshnetPolicy {
     pub fwmark: u32,
     /// Meshnet peers allowed to exchange application traffic with the gateway.
     pub peer_cidrs: Vec<String>,
+    /// Meshnet peers allowed by NordVPN to route traffic through the gateway.
+    pub traffic_routing_peer_cidrs: Vec<String>,
+    /// Routing peers additionally allowed by NordVPN to reach private LANs.
+    pub local_network_peer_cidrs: Vec<String>,
     /// TCP services exposed to those peers on the gateway.
     pub inbound_tcp_ports: Vec<u16>,
     /// UDP services exposed to those peers on the gateway.

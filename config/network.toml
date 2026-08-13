@@ -182,9 +182,11 @@ allow_gateway_egress = true
 # Helios autorise son transport Internet uniquement quand libtelio porte la
 # marque 0xe1f1, puis borne le trafic applicatif à nordlynx, aux pairs nommés
 # ici et aux seuls ports entrants nécessaires. Le pair ci-dessous est celui
-# observé sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH.
-# Ajouter un port UDP seulement si le logiciel de sauvegarde en exige un.
-nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32"], inbound_tcp_ports = [22], inbound_udp_ports = [], allow_icmp = true }
+# observé sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH et
+# TCP 49111 au service Nord Fileshare. Le routage Internet est accordé à ce
+# pair, mais l'accès aux réseaux privés reste fermé. Le déploiement reconstruit
+# ces deux listes depuis les permissions que NordVPN porte dans nftables.
+nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32"], traffic_routing_peer_cidrs = ["100.70.36.212/32"], local_network_peer_cidrs = [], inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }
 
 # ── ICMP sur le tunnel ───────────────────────────────────────────────────────
 # Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart

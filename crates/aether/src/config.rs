@@ -200,6 +200,10 @@ pub struct NordvpnMeshnetConfig {
     pub fwmark: u32,
     /// Meshnet addresses allowed to communicate with this gateway.
     pub peer_cidrs: Vec<String>,
+    /// Meshnet peers allowed to route traffic through this gateway.
+    pub traffic_routing_peer_cidrs: Vec<String>,
+    /// Routing peers allowed to reach private networks behind this gateway.
+    pub local_network_peer_cidrs: Vec<String>,
     /// TCP services exposed to the selected Meshnet peers.
     pub inbound_tcp_ports: Vec<u16>,
     /// UDP services exposed to the selected Meshnet peers.
@@ -214,6 +218,8 @@ impl Default for NordvpnMeshnetConfig {
             iface: "nordlynx".into(),
             fwmark: 0xe1f1,
             peer_cidrs: vec!["100.64.0.0/10".into()],
+            traffic_routing_peer_cidrs: Vec::new(),
+            local_network_peer_cidrs: Vec::new(),
             inbound_tcp_ports: Vec::new(),
             inbound_udp_ports: Vec::new(),
             allow_icmp: true,
@@ -227,6 +233,8 @@ impl From<&NordvpnMeshnetConfig> for NordvpnMeshnetPolicy {
             iface: config.iface.clone(),
             fwmark: config.fwmark,
             peer_cidrs: config.peer_cidrs.clone(),
+            traffic_routing_peer_cidrs: config.traffic_routing_peer_cidrs.clone(),
+            local_network_peer_cidrs: config.local_network_peer_cidrs.clone(),
             inbound_tcp_ports: config.inbound_tcp_ports.clone(),
             inbound_udp_ports: config.inbound_udp_ports.clone(),
             allow_icmp: config.allow_icmp,
@@ -588,6 +596,36 @@ impl NetworkConfig {
                     )));
                 }
             }
+            for (permission, peers) in [
+                ("traffic routing", &meshnet.traffic_routing_peer_cidrs),
+                ("local network access", &meshnet.local_network_peer_cidrs),
+            ] {
+                for peer in peers {
+                    if !valid_ipv4_cidr(peer) {
+                        return Err(HeliosError::Config(format!(
+                            "invalid nordvpn_meshnet {permission} peer CIDR `{peer}`"
+                        )));
+                    }
+                    if !meshnet.peer_cidrs.contains(peer) {
+                        return Err(HeliosError::Config(format!(
+                            "nordvpn_meshnet {permission} peer `{peer}` must also appear in peer_cidrs"
+                        )));
+                    }
+                }
+                let unique: HashSet<_> = peers.iter().collect();
+                if unique.len() != peers.len() {
+                    return Err(HeliosError::Config(format!(
+                        "nordvpn_meshnet {permission} peer CIDRs must not contain duplicates"
+                    )));
+                }
+            }
+            for peer in &meshnet.local_network_peer_cidrs {
+                if !meshnet.traffic_routing_peer_cidrs.contains(peer) {
+                    return Err(HeliosError::Config(format!(
+                        "nordvpn_meshnet local network peer `{peer}` must also have traffic routing permission"
+                    )));
+                }
+            }
             for (protocol, ports) in [
                 ("TCP", &meshnet.inbound_tcp_ports),
                 ("UDP", &meshnet.inbound_udp_ports),
@@ -919,6 +957,7 @@ mod tests {
 
             [nordvpn_meshnet]
             peer_cidrs = ["100.70.36.212/32"]
+            traffic_routing_peer_cidrs = ["100.70.36.212/32"]
             inbound_tcp_ports = [22, 9100]
         "#;
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
@@ -928,6 +967,8 @@ mod tests {
         assert_eq!(meshnet.iface, "nordlynx");
         assert_eq!(meshnet.fwmark, 0xe1f1);
         assert_eq!(meshnet.peer_cidrs, ["100.70.36.212/32"]);
+        assert_eq!(meshnet.traffic_routing_peer_cidrs, ["100.70.36.212/32"]);
+        assert!(meshnet.local_network_peer_cidrs.is_empty());
         assert_eq!(meshnet.inbound_tcp_ports, [22, 9100]);
         assert!(meshnet.inbound_udp_ports.is_empty());
         assert!(meshnet.allow_icmp);
@@ -964,6 +1005,31 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "the administration API must remain exclusive to the Helios tunnel"
+        );
+        cfg.nordvpn_meshnet
+            .as_mut()
+            .unwrap()
+            .inbound_tcp_ports
+            .clear();
+        cfg.nordvpn_meshnet
+            .as_mut()
+            .unwrap()
+            .traffic_routing_peer_cidrs = vec!["100.70.36.213/32".into()];
+        assert!(
+            cfg.validate().is_err(),
+            "routing permission must not name an undeclared peer"
+        );
+        cfg.nordvpn_meshnet
+            .as_mut()
+            .unwrap()
+            .traffic_routing_peer_cidrs = vec!["100.70.36.212/32".into()];
+        cfg.nordvpn_meshnet
+            .as_mut()
+            .unwrap()
+            .local_network_peer_cidrs = vec!["100.70.36.213/32".into()];
+        assert!(
+            cfg.validate().is_err(),
+            "local-network permission must be a subset of routing peers"
         );
     }
 

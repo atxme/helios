@@ -156,7 +156,34 @@ if [ -n "$MESHNET_CIDRS" ]; then
         *[!0-9.,/]*) echo "unsafe Meshnet CIDR inventory returned by gateway" >&2; exit 1 ;;
     esac
     MESHNET_ARG=(--meshnet-peer-cidrs "$MESHNET_CIDRS")
-    echo "    Meshnet      : $MESHNET_CIDRS (nordlynx, SSH entrant)"
+
+    # NordVPN keeps routing and LAN permissions in per-peer nftables sets.
+    # Mirror those sets into Helios instead of granting forwarding to every
+    # peer merely because it may contact a local service.
+    MESHNET_ROUTING_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+        nft list set inet nordvpn allow_peer_traffic_routing 2>/dev/null |
+            grep -Eo '\''([0-9]{1,3}\.){3}[0-9]{1,3}'\'' |
+            sort -u | sed '\''s|$|/32|'\'' | paste -sd, -
+    ')"
+    MESHNET_LOCAL_NETWORK_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+        nft list set inet nordvpn peer_local_network_access 2>/dev/null |
+            grep -Eo '\''([0-9]{1,3}\.){3}[0-9]{1,3}'\'' |
+            sort -u | sed '\''s|$|/32|'\'' | paste -sd, -
+    ')"
+    for permission_cidrs in "$MESHNET_ROUTING_CIDRS" "$MESHNET_LOCAL_NETWORK_CIDRS"; do
+        case "$permission_cidrs" in
+            *[!0-9.,/]*) echo "unsafe Meshnet permission inventory returned by gateway" >&2; exit 1 ;;
+        esac
+    done
+    if [ -n "$MESHNET_ROUTING_CIDRS" ]; then
+        MESHNET_ARG+=(--meshnet-routing-peer-cidrs "$MESHNET_ROUTING_CIDRS")
+    fi
+    if [ -n "$MESHNET_LOCAL_NETWORK_CIDRS" ]; then
+        MESHNET_ARG+=(--meshnet-local-network-peer-cidrs "$MESHNET_LOCAL_NETWORK_CIDRS")
+    fi
+    echo "    Meshnet      : $MESHNET_CIDRS (SSH et Fileshare entrants)"
+    echo "    Routage      : ${MESHNET_ROUTING_CIDRS:-aucun}"
+    echo "    Réseau local : ${MESHNET_LOCAL_NETWORK_CIDRS:-aucun}"
 fi
 
 {

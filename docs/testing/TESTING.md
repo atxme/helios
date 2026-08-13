@@ -666,8 +666,8 @@ confirmés puis corrigés avec test de non-régression :
 
 ### Défauts trouvés sur gateway en service (8 août 2026)
 
-Cinq autres, relevés en cherchant pourquoi des services locaux échouaient sur
-la gateway de production. Les quatre derniers sont à vérifier sur cible : ils ne
+Six autres, relevés en cherchant pourquoi des services locaux échouaient sur
+la gateway de production. Les cinq derniers sont à vérifier sur cible : ils ne
 sont pas observables ailleurs.
 
 | Défaut | Effet |
@@ -676,6 +676,7 @@ sont pas observables ailleurs.
 | `ct state established` appliqué là où `established,related` était affiché | `rustables::Rule::established()` ne masque que le bit `ESTABLISHED`. Le dry-run, l'API et la console affichaient la forme complète : la divergence n'était visible que dans `nft list`. Les erreurs ICMP `fragmentation needed` tombaient sous `drop`, donc trou noir de PMTU |
 | NordVPN Meshnet actif mais sans réception WireGuard | le contrôle HTTPS réussissait, puis DERP TCP 8765, STUN et les chemins directs marqués `0xe1f1` tombaient sous `drop`; même après transport, le trafic applicatif sur `nordlynx` restait fermé. Corrigé par le bloc borné `nordvpn_meshnet` |
 | marque NordVPN encodée en ordre réseau | la valeur `0xe1f1` était appliquée par nftables comme `0xf1e10000` sur x86_64 : la règle WAN ne pouvait donc jamais reconnaître les paquets Meshnet. Les valeurs de registre `meta mark` utilisent désormais l'ordre natif, avec test de non-régression |
+| tunnel Meshnet sain mais services et routage incomplets | Helios n'ouvrait que SSH en entrée et ne produisait aucune règle `forward`. TCP 49111 couvre désormais Nord Fileshare ; les listes `traffic_routing_peer_cidrs` et `local_network_peer_cidrs`, relues depuis les ensembles de permissions NordVPN au déploiement, bornent le routage pair par pair |
 | arrêt de `heliosd` figé après le retrait de `helios0` | le serveur brut de mesure attendait indéfiniment dans un `spawn_blocking`; Tokio attend les tâches bloquantes à la destruction du runtime, donc systemd finissait par tuer le démon après son délai. Les sockets TCP/UDP observent désormais un signal d'arrêt testé |
 
 Vérification cible du second, après déploiement :
@@ -695,13 +696,17 @@ Vérification Meshnet sur cible, avec l'adresse du pair déclarée dans
 ```sh
 sudo nft list chain inet helios output | grep -E 'e1f1|nordlynx'
 sudo nft list chain inet helios input | grep nordlynx
+sudo nft list chain inet helios forward | grep nordlynx
 sudo wg show nordlynx
 ping -c 3 100.70.36.212
 ```
 
 Le ruleset doit montrer la marque seulement sur le WAN, la destination du pair
 seulement sur `nordlynx`, et TCP 22 en entrée seulement avec `iifname
-"nordlynx"` et la source `/32`. La marque affichée doit être exactement
+"nordlynx"` et la source `/32` ; TCP 49111 est le service Nord Fileshare. Si
+NordVPN accorde le routage au pair, `forward` doit montrer ce même `/32` de
+`nordlynx` vers chaque WAN. Sans permission d'accès au réseau local, quatre
+règles `drop` RFC1918 doivent précéder ces acceptations. La marque affichée doit être exactement
 `0xe1f1`, jamais `0xf1e10000`. `wg show` doit ensuite afficher un handshake et
 des octets reçus ; le rendu et la transaction Netlink sont automatisés, mais ce
 dernier effet exige la gateway réelle.
