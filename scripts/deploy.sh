@@ -29,6 +29,10 @@ SEQUENCE=""
 # Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
 RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
+# L'installation ne met rien dans le PATH : `heliosd` n'existe que sous ce
+# chemin, et root ne le trouve pas autrement. Le nommer en clair évite un
+# « command not found » là où l'on croirait lire un refus d'amorçage.
+HELIOSD=/opt/helios/current/heliosd
 
 usage() {
     cat >&2 <<'EOF'
@@ -188,7 +192,7 @@ echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
 # et il a déjà eu lieu.
 deployer_astra() {
     local compose etat wg_pub nom_serveur url rp domaine ancre sortie
-    local cle_service tete_audit identite
+    local cle_service tete_audit identite moteur compose_env
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -208,6 +212,16 @@ deployer_astra() {
         return 0
     fi
     echo "    moteur  $compose"
+    case "$compose" in podman*) moteur="podman" ;; *) moteur="docker" ;; esac
+
+    # Compose ≥ 2.33 délègue par défaut la construction à `docker buildx bake`.
+    # Le paquet Ubuntu `docker-compose-v2` n'entraîne pas `docker-buildx`, et
+    # compose se contente alors d'un avertissement : la construction ne produit
+    # rien, mais ne rend pas d'erreur non plus. `COMPOSE_BAKE=0` la ramène au
+    # constructeur BuildKit embarqué dans compose, qui n'exige aucun greffon —
+    # plutôt qu'ajouter une dépendance à la gateway pour un Dockerfile qui
+    # n'utilise aucune syntaxe propre à buildx.
+    compose_env="COMPOSE_BAKE=0"
 
     domaine="$(sed -n 's/.*"trust_domain_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
     rp="$(sed -n 's/.*"rp_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
@@ -223,9 +237,9 @@ deployer_astra() {
     # Le nom de serveur et la clé WireGuard sortent de la leaf PQ que la
     # gateway sert, lue par `heliosd` lui-même — donc sous privilège, comme
     # tout ce qui touche à /var/lib/helios.
-    identite="$(helios_ssh_sudo_capture "$CIBLE" '/opt/helios/current/heliosd show-identity')" || {
+    identite="$(helios_ssh_sudo_capture "$CIBLE" "$HELIOSD show-identity")" || {
         echo "    la gateway n'a pas d'identité de négociation : lancer d'abord" >&2
-        echo "      sudo heliosd init-key-negotiation --server-name ..." >&2
+        echo "      sudo $HELIOSD init-key-negotiation --server-name ..." >&2
         return 1
     }
     nom_serveur="$(printf '%s\n' "$identite" | sed -n 's/^server_name=//p')"
@@ -243,7 +257,10 @@ deployer_astra() {
     # essai local.
     echo "    envoi des sources"
     git archive --format=tar HEAD | ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" \
-        'rm -rf ~/astra-build && mkdir -p ~/astra-build && tar -x -C ~/astra-build'
+        'rm -rf ~/astra-build && mkdir -p ~/astra-build && tar -x -C ~/astra-build' || {
+        echo "    l'envoi des sources a échoué" >&2
+        return 1
+    }
 
     local racine
     racine="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'echo "$HOME"')/astra-build"
@@ -251,8 +268,15 @@ deployer_astra() {
     # Le trousseau éditeur **public**, sans lequel `aether/build.rs` refuse
     # toute compilation `--release`. Il ne quitte pas le contexte de
     # construction, qui est jeté avec l'étage builder.
+    if [ ! -f "$EPOQUE/publisher-keyring.json" ]; then
+        echo "    trousseau éditeur public absent : $EPOQUE/publisher-keyring.json" >&2
+        return 1
+    fi
     scp -q "${HELIOS_SSH_OPTS[@]}" "$EPOQUE/publisher-keyring.json" \
-        "$CIBLE:$racine/publisher-keyring.json"
+        "$CIBLE:$racine/publisher-keyring.json" || {
+        echo "    envoi du trousseau éditeur impossible" >&2
+        return 1
+    }
     local env_distant="$racine/deploy/astra/.env"
 
     # Le fichier d'environnement existe avant toute interrogation : compose
@@ -263,18 +287,42 @@ deployer_astra() {
         { printf 'ASTRA_EXPECTED_AUDIT_HEAD=amorcage\n' > '$env_distant'; chmod 600 '$env_distant'; }"
 
     echo "    construction de l'image (peut prendre plusieurs minutes)"
-    helios_ssh_sudo "$CIBLE" \
-        "cd '$racine' && $compose -f deploy/astra/compose.yaml build" >/dev/null
+    # La sortie n'est **pas** jetée. Une construction qui échoue sans rien dire
+    # laisse l'image absente, et compose enchaîne alors sur un `pull` du nom
+    # local `helios/astra` — qui n'existe dans aucun registre. Le message qu'on
+    # lit est « pull access denied », qui désigne un registre alors que la
+    # panne est une compilation.
+    if ! sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+        $compose_env $compose -f deploy/astra/compose.yaml build 2>&1")"; then
+        echo "    la construction de l'image a échoué :" >&2
+        printf '%s\n' "$sortie" | tail -40 >&2
+        case "$sortie" in
+            *buildx*|*[Bb]ake*)
+                echo "    le constructeur embarqué a refusé aussi ; installer buildx :" >&2
+                echo "      ssh $CIBLE 'sudo apt-get install -y docker-buildx'" >&2
+                ;;
+        esac
+        return 1
+    fi
+
+    # `build` peut rendre 0 sans rien produire. Ce que la suite exige, c'est
+    # l'image ; c'est donc l'image qu'on vérifie, pas le code de retour.
+    if ! helios_ssh_sudo "$CIBLE" \
+        "$moteur image inspect helios/astra:latest >/dev/null 2>&1"; then
+        echo "    l'image helios/astra:latest est absente après construction :" >&2
+        printf '%s\n' "$sortie" | tail -40 >&2
+        return 1
+    fi
 
     etat="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-        $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
         run --rm --no-deps astra status >/dev/null 2>&1 && echo amorce || echo vierge" \
         | tr -d '\r' | tail -1)"
 
     if [ "$etat" = "vierge" ]; then
         echo "    amorçage du domaine"
         sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-            $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
             run --rm astra bootstrap \
             --ca-public-key '$ancre' --trust-domain-id '$domaine' \
             --gateway-wireguard-public-key '$wg_pub' --server-name '$nom_serveur' \
@@ -296,23 +344,39 @@ deployer_astra() {
         # reprise en silence.
         helios_ssh_sudo "$CIBLE" \
             "printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' > '$env_distant'
-             chmod 600 '$env_distant'"
+             chmod 600 '$env_distant'" || {
+            echo "    la tête d'audit n'a pas pu être écrite sur la cible :" >&2
+            echo "    $tete_audit" >&2
+            return 1
+        }
         mkdir -p "$(dirname "$RELAIS")"
         printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
 
         # ── L'autre moitié du domaine, sur la gateway ───────────────────────
         echo "    amorçage du registre gateway"
-        helios_ssh_sudo "$CIBLE" "heliosd init-trust-domain \
+        helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
             --astra-service-public-key '$cle_service' \
-            --authority-url '$url' --webauthn-rp-id '$rp'"
+            --authority-url '$url' --webauthn-rp-id '$rp'" || {
+            echo "    le registre gateway n'a pas été amorcé — Astra tourne, la" >&2
+            echo "    gateway ignore encore le domaine. Ses routes de cycle de" >&2
+            echo "    vie in-tunnel restent fermées." >&2
+            return 1
+        }
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
     fi
 
     echo "    démarrage"
     helios_ssh_sudo "$CIBLE" "cd '$racine' && \
-        $compose -f deploy/astra/compose.yaml --env-file '$env_distant' up -d" >/dev/null
+        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+        up -d" >/dev/null || {
+        echo "    le conteneur n'a pas démarré :" >&2
+        helios_ssh_sudo "$CIBLE" "cd '$racine' && \
+            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            logs --tail 40 astra" >&2 || true
+        return 1
+    }
 }
 
 if [ "$ASTRA" = "0" ]; then

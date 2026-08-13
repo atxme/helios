@@ -70,7 +70,12 @@ ont besoin.
   registre décrit les leaves effectivement servies ; sans elles il n'y a rien à
   décrire, et `deploy.sh` le dit.
 - Un moteur de conteneur sur la gateway (`docker compose` ou `podman compose`).
-  Absent, l'étape est sautée avec la commande d'installation en clair.
+  Absent, l'étape est sautée avec la commande d'installation en clair. `buildx`
+  n'est **pas** exigé : compose ≥ 2.33 délègue par défaut la construction à
+  `docker buildx bake`, que le paquet Ubuntu n'entraîne pas, et se contente
+  alors d'un avertissement — l'image n'est pas construite, mais rien n'échoue.
+  `deploy.sh` force donc `COMPOSE_BAKE=0`, vérifie que l'image existe après
+  construction, et n'avale plus la sortie du constructeur.
 - **Deux** clés de sécurité FIDO2 avec PIN. Une seule suffit pour commencer :
   l'autorité restera « non amorcée » et le dira à chaque commande, jusqu'à
   l'enrôlement de la seconde.
@@ -128,7 +133,10 @@ slot.
 2. lit le relais — domaine, RP ID, ancre ;
 3. `heliosd show-identity` : nom de serveur et clé WireGuard, lus dans la leaf
    PQ servie plutôt que retapés ;
-4. construit l'image, la transfère (`docker save | ssh docker load`) ;
+4. envoie les sources par `git archive HEAD` et construit l'image **sur la
+   gateway** — ce qui part est donc ce qui est commité, jamais l'arbre de
+   travail. Y compris le trousseau éditeur *public*, sans lequel `aether/build.rs`
+   refuse la compilation `--release` de l'image ;
 5. si le domaine n'est pas amorcé : `astra bootstrap`, capture de la clé de
    service et de la tête d'audit, écriture du `.env` distant, puis
    `heliosd init-trust-domain` et `systemctl restart heliosd` ;

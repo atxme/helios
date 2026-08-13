@@ -352,7 +352,8 @@
       "Bash(docker version *)",
       "Bash(git archive *)",
       "Bash(tar -t)",
-      "Bash(awk '{ok+=$4; ko+=$6} END {print \"passés:\",ok,\" échoués:\",ko}')"
+      "Bash(awk '{ok+=$4; ko+=$6} END {print \"passés:\",ok,\" échoués:\",ko}')",
+      "Bash(shellcheck -S warning scripts/deploy.sh scripts/lib-remote.sh)"
     ]
   }
 }
