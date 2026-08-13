@@ -18,6 +18,19 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY . .
+
+# `aether/build.rs` refuse le trousseau éditeur de développement dans toute
+# compilation `--release` (ADR-002), et une image de production compile en
+# release. Le trousseau **public** est donc déposé dans le contexte par
+# `scripts/deploy.sh`, à côté des sources. Il ne contient que des clés
+# publiques : rien de secret n'entre dans l'image, et rien n'y reste — cette
+# étape est jetée avec l'étage de construction.
+ENV HELIOS_PUBLISHER_KEYRING_PATH=/src/publisher-keyring.json
+RUN test -f "$HELIOS_PUBLISHER_KEYRING_PATH" || { \
+        echo "publisher-keyring.json absent du contexte de construction :" >&2; \
+        echo "  il est déposé par scripts/deploy.sh depuis \$HELIOS_PUBLISHER_EPOCH" >&2; \
+        exit 1; \
+    }
 RUN cargo build --release -p astra
 
 FROM debian:bookworm-slim

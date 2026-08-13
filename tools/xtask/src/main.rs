@@ -809,13 +809,30 @@ mod tests {
         for required in [
             "orion-windows:",
             "runs-on: windows-2025",
-            "cargo clippy -p orion-core -p orion --all-targets --all-features",
+            "cargo clippy",
             "cargo llvm-cov --package orion-core --package orion --all-features",
             "coverage-orion-windows",
         ] {
             assert!(
                 workflow.contains(required),
                 "Windows security regression is missing `{required}`"
+            );
+        }
+
+        // The packages, not the exact command line. Pinning the whole
+        // invocation made the test fail the day `astra-signer` was added to
+        // it — a legitimate widening, since its WebAuthn transport only
+        // compiles on Windows and that job is the only place it is linted.
+        // What matters is that each package is covered, not the order or the
+        // presence of others.
+        let clippy = workflow
+            .lines()
+            .find(|line| line.contains("cargo clippy"))
+            .expect("the Windows job must run clippy");
+        for package in ["-p orion-core", "-p orion ", "-p astra-signer"] {
+            assert!(
+                clippy.contains(package),
+                "the Windows clippy job must cover `{package}`: {clippy}"
             );
         }
     }
