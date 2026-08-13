@@ -139,6 +139,26 @@ if ssh "$TARGET" "ip -4 addr show dev '$WAN_IFACE'" | grep -qw dynamic; then
     DYNAMIC_ARG=(--dynamic-wan)
 fi
 
+# NordVPN owns the Meshnet peer inventory. Reading the running interface keeps
+# deployment generic: no account-specific Meshnet address is baked into this
+# repository, and every actual /32 is projected into Helios' bounded policy.
+MESHNET_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+    if wg show nordlynx >/dev/null 2>&1; then
+        wg show nordlynx allowed-ips |
+            awk '\''{ for (i = 2; i <= NF; i++) print $i }'\'' |
+            grep -E '\''^[0-9]+(\.[0-9]+){3}/32$'\'' |
+            sort -u | paste -sd, -
+    fi
+')"
+MESHNET_ARG=()
+if [ -n "$MESHNET_CIDRS" ]; then
+    case "$MESHNET_CIDRS" in
+        *[!0-9.,/]*) echo "unsafe Meshnet CIDR inventory returned by gateway" >&2; exit 1 ;;
+    esac
+    MESHNET_ARG=(--meshnet-peer-cidrs "$MESHNET_CIDRS")
+    echo "    Meshnet      : $MESHNET_CIDRS (nordlynx, SSH entrant)"
+fi
+
 {
     printf 'wan_iface = "auto"\n'
     printf 'allow_ssh_from = ["%s"]\n' "$SSH_CIDR"
@@ -163,6 +183,7 @@ helios_ssh_sudo "$TARGET" "sh /tmp/helios-network-bootstrap.sh \
     --wg-port '$WG_PORT' \
     --key-negotiation-port '$KEY_PORT' \
     --escrow-public-key '$ESCROW_PUBLIC_KEY' \
+    ${MESHNET_ARG[*]} \
     ${DYNAMIC_ARG[*]} && \
     '$REMOTE_HELIOSD' status && \
     rm -f /tmp/helios-network-bootstrap.sh"
@@ -271,7 +292,11 @@ helios_ssh_sudo "$TARGET" "
 
 echo "    redémarrage détaché ; attente de la remontée du service"
 DEMARRE=0
-for _ in $(seq 1 30); do
+# One deployment may still be stopping the previous binary, whose raw
+# speedtest listener waited for systemd's 90-second kill timeout. The new
+# binary exits promptly, but the first upgrade must wait long enough to cross
+# that old behavior once instead of falsely reporting a failed installation.
+for _ in $(seq 1 60); do
     sleep 2
     if ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl is-active --quiet heliosd' 2>/dev/null; then
         DEMARRE=1
@@ -279,7 +304,7 @@ for _ in $(seq 1 30); do
     fi
 done
 if [ "$DEMARRE" = "0" ]; then
-    echo "    heliosd n'est pas remonté en 60 s :" >&2
+    echo "    heliosd n'est pas remonté en 120 s :" >&2
     ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" \
         'systemctl --no-pager --full status heliosd' >&2 || true
     exit 1

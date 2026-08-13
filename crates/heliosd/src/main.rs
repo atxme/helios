@@ -7,7 +7,10 @@ mod orchestrator;
 mod static_psk;
 mod uplink;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use aether::{
     HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest, OrchestratorCmd,
@@ -1143,10 +1146,16 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     });
 
     let raw_speedtest_state = state.clone();
+    let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
+    let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);
     tokio::spawn(async move {
         for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::speedtest::serve_raw(raw_speedtest_state.clone(), &raw_speedtest_bind)
-                .await
+            match helios_api::speedtest::serve_raw(
+                raw_speedtest_state.clone(),
+                &raw_speedtest_bind,
+                Arc::clone(&raw_speedtest_task_shutdown),
+            )
+            .await
             {
                 Ok(()) => return,
                 Err(error) if attempt < API_BIND_ATTEMPTS => {
@@ -1165,7 +1174,7 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         }
     });
 
-    orchestrator::run(
+    let result = orchestrator::run(
         shared_network,
         dry_run,
         tunnel_state,
@@ -1178,7 +1187,9 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         boot,
         api_ready,
     )
-    .await
+    .await;
+    raw_speedtest_shutdown.store(true, Ordering::Release);
+    result
 }
 
 #[cfg(test)]

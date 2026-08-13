@@ -666,8 +666,8 @@ confirmés puis corrigés avec test de non-régression :
 
 ### Défauts trouvés sur gateway en service (8 août 2026)
 
-Trois autres, relevés en cherchant pourquoi des services locaux échouaient sur
-la gateway de production. Les deux derniers sont à vérifier sur cible : ils ne
+Quatre autres, relevés en cherchant pourquoi des services locaux échouaient sur
+la gateway de production. Les trois derniers sont à vérifier sur cible : ils ne
 sont pas observables ailleurs.
 
 | Défaut | Effet |
@@ -675,6 +675,7 @@ sont pas observables ailleurs.
 | chaîne `output` sans sortie propre à la gateway | ni DNS, ni NTP, ni paquets : `apt` affiche `Ign :` sur chaque source puis se fige à 0 %, et le symptôme désigne le résolveur au lieu du pare-feu. Corrigé par `allow_gateway_egress` |
 | `ct state established` appliqué là où `established,related` était affiché | `rustables::Rule::established()` ne masque que le bit `ESTABLISHED`. Le dry-run, l'API et la console affichaient la forme complète : la divergence n'était visible que dans `nft list`. Les erreurs ICMP `fragmentation needed` tombaient sous `drop`, donc trou noir de PMTU |
 | NordVPN Meshnet actif mais sans réception WireGuard | le contrôle HTTPS réussissait, puis DERP TCP 8765, STUN et les chemins directs marqués `0xe1f1` tombaient sous `drop`; même après transport, le trafic applicatif sur `nordlynx` restait fermé. Corrigé par le bloc borné `nordvpn_meshnet` |
+| arrêt de `heliosd` figé après le retrait de `helios0` | le serveur brut de mesure attendait indéfiniment dans un `spawn_blocking`; Tokio attend les tâches bloquantes à la destruction du runtime, donc systemd finissait par tuer le démon après son délai. Les sockets TCP/UDP observent désormais un signal d'arrêt testé |
 
 Vérification cible du second, après déploiement :
 

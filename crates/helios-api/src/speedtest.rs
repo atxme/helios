@@ -11,7 +11,10 @@ use std::{
     convert::Infallible,
     io::{Read as _, Write as _},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
-    sync::LazyLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -38,10 +41,14 @@ const UDP_END_GAP: Duration = Duration::from_millis(20);
 /// session is admitted, the measurement runs in blocking OS threads and uses
 /// `std::net` directly: no HTTP parser, response body stream or Tokio wake-up
 /// sits between the socket and the byte counter.
-pub async fn serve_raw(state: AppState, bind: &str) -> anyhow::Result<()> {
+pub async fn serve_raw(
+    state: AppState,
+    bind: &str,
+    shutdown: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let bind = bind.to_string();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || serve_raw_blocking(state, &bind, handle))
+    tokio::task::spawn_blocking(move || serve_raw_blocking(state, &bind, handle, shutdown))
         .await
         .map_err(|error| anyhow::anyhow!("raw speedtest task stopped: {error}"))??;
     Ok(())
@@ -51,20 +58,31 @@ fn serve_raw_blocking(
     state: AppState,
     bind: &str,
     runtime: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let tcp = TcpListener::bind(bind)
         .map_err(|error| anyhow::anyhow!("binding raw speedtest TCP on {bind}: {error}"))?;
     let udp = UdpSocket::bind(bind)
         .map_err(|error| anyhow::anyhow!("binding raw speedtest UDP on {bind}: {error}"))?;
+    tcp.set_nonblocking(true)?;
     udp.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
     tracing::info!("raw speedtest TCP/UDP listening on {bind}");
 
     let tcp_state = state.clone();
     let tcp_runtime = runtime.clone();
+    let tcp_shutdown = Arc::clone(&shutdown);
     let tcp_thread = thread::spawn(move || {
-        for accepted in tcp.incoming() {
-            let Ok(stream) = accepted else {
-                continue;
+        while !tcp_shutdown.load(Ordering::Acquire) {
+            let stream = match tcp.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(UDP_READ_TIMEOUT);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "raw speedtest TCP listener ended");
+                    break;
+                }
             };
             let Ok(peer) = stream.peer_addr() else {
                 continue;
@@ -84,7 +102,7 @@ fn serve_raw_blocking(
         }
     });
 
-    let result = run_udp_server(udp, state, runtime);
+    let result = run_udp_server(udp, state, runtime, shutdown);
     let _ = tcp_thread.join();
     result
 }
@@ -157,10 +175,14 @@ fn run_udp_server(
     socket: UdpSocket,
     state: AppState,
     runtime: tokio::runtime::Handle,
+    shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut buffer = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
     let mut sessions = HashMap::<(SocketAddr, u64), UdpSession>::new();
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let now = Instant::now();
         let expired: Vec<_> = sessions
             .iter()
@@ -647,6 +669,26 @@ pub async fn upload(
 mod tests {
     use super::*;
 
+    fn test_state() -> AppState {
+        let network = Arc::new(tokio::sync::RwLock::new(aether::NetworkConfig::default()));
+        let tunnel_state = Arc::new(tokio::sync::RwLock::new(aether::TunnelState::Down));
+        let policy = Arc::new(tokio::sync::RwLock::new(
+            aether::NetworkConfig::default().firewall_policy(),
+        ));
+        let (event_tx, _) = tokio::sync::broadcast::channel(4);
+        let (cmd_tx, _) = tokio::sync::mpsc::channel(4);
+        let (psk_tx, _) = tokio::sync::mpsc::channel(4);
+        AppState::new(
+            network,
+            true,
+            tunnel_state,
+            event_tx,
+            cmd_tx,
+            psk_tx,
+            policy,
+        )
+    }
+
     #[test]
     fn transfer_sizes_are_bounded_before_stream_creation() {
         assert!(TransferQuery { bytes: Some(0) }.requested_bytes().is_err());
@@ -667,5 +709,23 @@ mod tests {
     fn download_chunk_is_not_a_repeated_byte_pattern() {
         assert_eq!(DOWNLOAD_CHUNK.len(), STREAM_CHUNK_BYTES);
         assert!(DOWNLOAD_CHUNK.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[tokio::test]
+    async fn raw_server_stops_its_blocking_listeners_on_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let served = tokio::spawn(serve_raw(
+            test_state(),
+            "127.0.0.1:0",
+            Arc::clone(&shutdown),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.store(true, Ordering::Release);
+
+        tokio::time::timeout(Duration::from_secs(1), served)
+            .await
+            .expect("raw listeners must not keep heliosd alive")
+            .expect("raw server task")
+            .expect("clean raw server shutdown");
     }
 }

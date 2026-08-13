@@ -13,6 +13,7 @@ WG_PORT="51820"
 KEY_NEGOTIATION_PORT="51821"
 ESCROW_PUBLIC_KEY=""
 DYNAMIC_WAN="0"
+MESHNET_PEER_CIDRS=""
 
 usage() {
     cat >&2 <<'EOF'
@@ -22,6 +23,7 @@ Usage: network-bootstrap.sh --wan IFACE --ssh-cidr CIDR --escrow-public-key KEY 
   --wg-port PORT
   --key-negotiation-port PORT
   --dynamic-wan
+  --meshnet-peer-cidrs CIDR[,CIDR...]
 EOF
     exit 2
 }
@@ -35,6 +37,7 @@ while [ "$#" -gt 0 ]; do
         --key-negotiation-port) KEY_NEGOTIATION_PORT="${2:-}"; shift 2 ;;
         --escrow-public-key) ESCROW_PUBLIC_KEY="${2:-}"; shift 2 ;;
         --dynamic-wan) DYNAMIC_WAN="1"; shift ;;
+        --meshnet-peer-cidrs) MESHNET_PEER_CIDRS="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
@@ -53,6 +56,27 @@ esac
     { echo "invalid key-negotiation port: $KEY_NEGOTIATION_PORT" >&2; exit 2; }
 [ "$WG_PORT" != "$KEY_NEGOTIATION_PORT" ] ||
     { echo "WireGuard and key-negotiation ports must differ" >&2; exit 2; }
+
+MESHNET_TOML=""
+if [ -n "$MESHNET_PEER_CIDRS" ]; then
+    old_ifs=$IFS
+    IFS=,
+    for cidr in $MESHNET_PEER_CIDRS; do
+        case "$cidr" in
+            ""|*[!0-9./]*) echo "invalid Meshnet peer CIDR: $cidr" >&2; exit 2 ;;
+        esac
+        address=${cidr%/*}
+        prefix=${cidr##*/}
+        [ "$address" != "$cidr" ] && [ "$prefix" -ge 0 ] 2>/dev/null && [ "$prefix" -le 32 ] ||
+            { echo "invalid Meshnet peer CIDR: $cidr" >&2; exit 2; }
+        if [ -n "$MESHNET_TOML" ]; then
+            MESHNET_TOML="$MESHNET_TOML, "
+        fi
+        MESHNET_TOML="$MESHNET_TOML\"$cidr\""
+    done
+    IFS=$old_ifs
+    MESHNET_TOML="[$MESHNET_TOML]"
+fi
 
 if [ ! -f "$CONFIG" ]; then
     echo "network configuration does not exist: $CONFIG" >&2
@@ -77,7 +101,8 @@ awk \
     -v wg_port="$WG_PORT" \
     -v key_port="$KEY_NEGOTIATION_PORT" \
     -v escrow_key="$ESCROW_PUBLIC_KEY" \
-    -v dynamic_wan="$DYNAMIC_WAN" '
+    -v dynamic_wan="$DYNAMIC_WAN" \
+    -v meshnet_cidrs="$MESHNET_TOML" '
 BEGIN {
     order[1] = "wan_iface"
     order[2] = "lan_ifaces"
@@ -95,6 +120,13 @@ BEGIN {
     order[14] = "escrow_public_key"
     order[15] = "allow_tunnel_icmp"
     order[16] = "allow_ssh_over_tunnel"
+    order[17] = "allow_gateway_egress"
+    if (meshnet_cidrs != "") {
+        order[18] = "nordvpn_meshnet"
+        order_count = 18
+    } else {
+        order_count = 17
+    }
 
     managed["wan_iface"] = 1
     managed["lan_ifaces"] = 1
@@ -112,6 +144,10 @@ BEGIN {
     managed["escrow_public_key"] = 1
     managed["allow_tunnel_icmp"] = 1
     managed["allow_ssh_over_tunnel"] = 1
+    managed["allow_gateway_egress"] = 1
+    if (meshnet_cidrs != "") {
+        managed["nordvpn_meshnet"] = 1
+    }
 
     desired["wan_iface"] = "\"" wan_iface "\""
     desired["lan_ifaces"] = "[]"
@@ -132,6 +168,10 @@ BEGIN {
     # n est « forced » — l operateur qui les ferme les garde fermées.
     desired["allow_tunnel_icmp"] = "true"
     desired["allow_ssh_over_tunnel"] = "true"
+    desired["allow_gateway_egress"] = meshnet_cidrs != "" ? "true" : "false"
+    if (meshnet_cidrs != "") {
+        desired["nordvpn_meshnet"] = "{ iface = \"nordlynx\", fwmark = 0xe1f1, peer_cidrs = " meshnet_cidrs ", inbound_tcp_ports = [22], inbound_udp_ports = [], allow_icmp = true }"
+    }
 
     forced["wan_iface"] = 1
     forced["wg_listen_port"] = 1
@@ -140,13 +180,17 @@ BEGIN {
     if (dynamic_wan == "1") {
         forced["allow_dhcp_on_wan"] = 1
     }
+    if (meshnet_cidrs != "") {
+        forced["allow_gateway_egress"] = 1
+        forced["nordvpn_meshnet"] = 1
+    }
 }
 
 function emit_missing(    i, key) {
     if (emitted) {
         return
     }
-    for (i = 1; i <= 16; i++) {
+    for (i = 1; i <= order_count; i++) {
         key = order[i]
         if (!seen[key]) {
             print key " = " desired[key]
