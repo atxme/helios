@@ -3,7 +3,7 @@ use std::{collections::HashSet, net::Ipv4Addr, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HeliosError, Result};
-use crate::policy::{FirewallPolicy, PolicyMode};
+use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
 
 const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
@@ -44,6 +44,19 @@ where
         OneOrMany::One(name) => vec![name],
         OneOrMany::Many(names) => names,
     })
+}
+
+fn valid_ipv4_cidr(value: &str) -> bool {
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    if address.parse::<Ipv4Addr>().is_err() {
+        return false;
+    }
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    prefix <= 32
 }
 
 /// Network configuration loadable by the operator via CLI or graphical interface.
@@ -125,6 +138,14 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub split_tunnel_cidrs: Vec<String>,
 
+    /// A second, locally terminated WireGuard overlay managed by NordVPN.
+    ///
+    /// Absent by default. When present, the firewall admits only NordVPN's
+    /// marked transport on the WAN and application traffic scoped to this
+    /// interface, these peer networks and the declared inbound ports.
+    #[serde(default)]
+    pub nordvpn_meshnet: Option<NordvpnMeshnetConfig>,
+
     // ── WireGuard data plane (server role) ──────────────────────────────
     /// Name of the WireGuard interface created by the gateway.
     #[serde(default = "default_wg_iface")]
@@ -167,6 +188,50 @@ pub struct NetworkConfig {
     /// case.
     #[serde(default)]
     pub escrow_public_key: Option<String>,
+}
+
+/// Operator-facing NordVPN Meshnet firewall configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NordvpnMeshnetConfig {
+    /// Interface created by NordVPN/libtelio.
+    pub iface: String,
+    /// Packet mark configured on `nordlynx` (`0xe1f1` by NordVPN by default).
+    pub fwmark: u32,
+    /// Meshnet addresses allowed to communicate with this gateway.
+    pub peer_cidrs: Vec<String>,
+    /// TCP services exposed to the selected Meshnet peers.
+    pub inbound_tcp_ports: Vec<u16>,
+    /// UDP services exposed to the selected Meshnet peers.
+    pub inbound_udp_ports: Vec<u16>,
+    /// Whether selected Meshnet peers may ping the gateway.
+    pub allow_icmp: bool,
+}
+
+impl Default for NordvpnMeshnetConfig {
+    fn default() -> Self {
+        Self {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["100.64.0.0/10".into()],
+            inbound_tcp_ports: Vec::new(),
+            inbound_udp_ports: Vec::new(),
+            allow_icmp: true,
+        }
+    }
+}
+
+impl From<&NordvpnMeshnetConfig> for NordvpnMeshnetPolicy {
+    fn from(config: &NordvpnMeshnetConfig) -> Self {
+        Self {
+            iface: config.iface.clone(),
+            fwmark: config.fwmark,
+            peer_cidrs: config.peer_cidrs.clone(),
+            inbound_tcp_ports: config.inbound_tcp_ports.clone(),
+            inbound_udp_ports: config.inbound_udp_ports.clone(),
+            allow_icmp: config.allow_icmp,
+        }
+    }
 }
 
 /// Serde default for the flags that are open unless the operator closes them.
@@ -481,6 +546,70 @@ impl NetworkConfig {
                 ));
             }
         }
+        if let Some(meshnet) = &self.nordvpn_meshnet {
+            if !self.allow_gateway_egress {
+                return Err(HeliosError::Config(
+                    "nordvpn_meshnet requires allow_gateway_egress = true for NordVPN HTTPS control traffic"
+                        .into(),
+                ));
+            }
+            if meshnet.iface.trim().is_empty() {
+                return Err(HeliosError::Config(
+                    "nordvpn_meshnet.iface must not be empty".into(),
+                ));
+            }
+            if meshnet.iface == self.wg_iface {
+                return Err(HeliosError::Config(format!(
+                    "nordvpn_meshnet.iface must differ from the Helios WireGuard interface {}",
+                    self.wg_iface
+                )));
+            }
+            if self.wan_ifaces.iter().any(|wan| wan == &meshnet.iface) {
+                return Err(HeliosError::Config(format!(
+                    "nordvpn_meshnet.iface {} is an overlay and must not also be a WAN interface",
+                    meshnet.iface
+                )));
+            }
+            if meshnet.fwmark == 0 {
+                return Err(HeliosError::Config(
+                    "nordvpn_meshnet.fwmark must not be zero".into(),
+                ));
+            }
+            if meshnet.peer_cidrs.is_empty() {
+                return Err(HeliosError::Config(
+                    "nordvpn_meshnet.peer_cidrs must name at least one Meshnet peer or network"
+                        .into(),
+                ));
+            }
+            for peer in &meshnet.peer_cidrs {
+                if !valid_ipv4_cidr(peer) {
+                    return Err(HeliosError::Config(format!(
+                        "invalid nordvpn_meshnet peer CIDR `{peer}`"
+                    )));
+                }
+            }
+            for (protocol, ports) in [
+                ("TCP", &meshnet.inbound_tcp_ports),
+                ("UDP", &meshnet.inbound_udp_ports),
+            ] {
+                if ports.contains(&0) {
+                    return Err(HeliosError::Config(format!(
+                        "nordvpn_meshnet inbound {protocol} ports must not contain zero"
+                    )));
+                }
+                if protocol == "TCP" && ports.contains(&API_PORT) {
+                    return Err(HeliosError::Config(format!(
+                        "nordvpn_meshnet must not expose the Helios administration API port {API_PORT}"
+                    )));
+                }
+                let unique: HashSet<_> = ports.iter().collect();
+                if unique.len() != ports.len() {
+                    return Err(HeliosError::Config(format!(
+                        "nordvpn_meshnet inbound {protocol} ports must not contain duplicates"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -597,6 +726,7 @@ impl NetworkConfig {
             split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),
             mss_clamp: None,
             captive_portal_gateway: None,
+            nordvpn_meshnet: self.nordvpn_meshnet.as_ref().map(Into::into),
         }
     }
 }
@@ -779,6 +909,70 @@ mod tests {
         let cfg: NetworkConfig = toml::from_str(toml).unwrap();
         assert!(!cfg.wireguard_ready());
         assert!(cfg.firewall_policy().allow_gateway_egress);
+    }
+
+    #[test]
+    fn meshnet_config_projects_explicit_peer_and_service_limits() {
+        let toml = r#"
+            wan_iface = "eth0"
+            allow_gateway_egress = true
+
+            [nordvpn_meshnet]
+            peer_cidrs = ["100.70.36.212/32"]
+            inbound_tcp_ports = [22, 9100]
+        "#;
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        cfg.validate().unwrap();
+
+        let meshnet = cfg.firewall_policy().nordvpn_meshnet.unwrap();
+        assert_eq!(meshnet.iface, "nordlynx");
+        assert_eq!(meshnet.fwmark, 0xe1f1);
+        assert_eq!(meshnet.peer_cidrs, ["100.70.36.212/32"]);
+        assert_eq!(meshnet.inbound_tcp_ports, [22, 9100]);
+        assert!(meshnet.inbound_udp_ports.is_empty());
+        assert!(meshnet.allow_icmp);
+    }
+
+    #[test]
+    fn meshnet_rejects_ambiguous_or_unbounded_configuration() {
+        let valid = NordvpnMeshnetConfig {
+            peer_cidrs: vec!["100.70.36.212/32".into()],
+            ..NordvpnMeshnetConfig::default()
+        };
+        let mut cfg = NetworkConfig {
+            wan_ifaces: vec!["eth0".into()],
+            nordvpn_meshnet: Some(valid),
+            ..NetworkConfig::default()
+        };
+
+        assert!(cfg.validate().is_err(), "HTTPS control egress is required");
+        cfg.allow_gateway_egress = true;
+        assert!(cfg.validate().is_ok());
+
+        cfg.nordvpn_meshnet.as_mut().unwrap().iface = "eth0".into();
+        assert!(cfg.validate().is_err(), "the overlay cannot also be a WAN");
+        cfg.nordvpn_meshnet.as_mut().unwrap().iface = "nordlynx".into();
+        cfg.nordvpn_meshnet.as_mut().unwrap().peer_cidrs = vec!["100.70.36.212/99".into()];
+        assert!(cfg.validate().is_err(), "invalid CIDRs must fail closed");
+        cfg.nordvpn_meshnet.as_mut().unwrap().peer_cidrs = vec!["100.70.36.212/32".into()];
+        cfg.nordvpn_meshnet.as_mut().unwrap().inbound_tcp_ports = vec![22, 22];
+        assert!(
+            cfg.validate().is_err(),
+            "duplicate ports are configuration errors"
+        );
+        cfg.nordvpn_meshnet.as_mut().unwrap().inbound_tcp_ports = vec![API_PORT];
+        assert!(
+            cfg.validate().is_err(),
+            "the administration API must remain exclusive to the Helios tunnel"
+        );
+    }
+
+    #[test]
+    fn repository_network_example_is_valid() {
+        let cfg: NetworkConfig = toml::from_str(include_str!("../../../config/network.toml"))
+            .expect("the shipped network configuration must deserialize");
+        cfg.validate()
+            .expect("the shipped network configuration must validate");
     }
 
     /// Closing ICMP stays possible: the default is a choice, not a fixture.

@@ -64,6 +64,7 @@ mod tests {
             split_tunnel_cidrs: vec![],
             mss_clamp: Some(1360),
             captive_portal_gateway: None,
+            nordvpn_meshnet: None,
         }
     }
 

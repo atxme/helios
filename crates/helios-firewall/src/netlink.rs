@@ -41,7 +41,9 @@ use std::str::FromStr;
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Masquerade},
+    expr::{
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Masquerade, Meta, MetaType,
+    },
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily,
     Rule as NfRule, Table,
 };
@@ -103,6 +105,9 @@ impl NetlinkBackend {
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp => rule.icmp(),
+            Match::PacketMark(mark) => rule
+                .with_expr(Meta::new(MetaType::Mark))
+                .with_expr(Cmp::new(CmpOp::Eq, mark.to_be_bytes())),
         })
     }
 
@@ -436,6 +441,7 @@ mod tests {
                     chain: ChainKind::Forward,
                     matches: vec![
                         Match::OutIface("eth0".into()),
+                        Match::PacketMark(0xe1f1),
                         Match::DestPortSet {
                             ports: vec![53, 51820],
                             proto: L4::Udp,

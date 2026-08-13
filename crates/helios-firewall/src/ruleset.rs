@@ -131,6 +131,8 @@ pub enum Match {
     /// acceptées par `ct state established,related`. Ce qui la débloquerait :
     /// une expression `payload` brute, ou un `rustables` qui expose le type.
     Icmp,
+    /// Packet mark assigned by a privileged local networking service.
+    PacketMark(u32),
 }
 
 impl fmt::Display for Match {
@@ -147,6 +149,7 @@ impl fmt::Display for Match {
             Match::DestNet(a) => write!(f, "ip daddr {a}"),
             Match::SourceNet(a) => write!(f, "ip saddr {a}"),
             Match::Icmp => write!(f, "meta l4proto icmp"),
+            Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
         }
     }
 }
@@ -484,6 +487,79 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         }
     }
 
+    // ── NordVPN Meshnet: transport and local overlay ────────────────────────
+    // Meshnet is locally terminated, so none of this belongs in `forward`.
+    // Libtelio marks its relay, STUN and direct-path packets; accepting that
+    // mark on a declared WAN lets paths and ports evolve without granting an
+    // unmarked process arbitrary egress. Plaintext application packets are
+    // separately scoped to nordlynx and the operator-selected peer networks.
+    if let Some(meshnet) = &policy.nordvpn_meshnet {
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::PacketMark(meshnet.fwmark),
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("NordVPN Meshnet transport marked by libtelio"),
+            );
+        }
+
+        for peer in &meshnet.peer_cidrs {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(meshnet.iface.clone()),
+                        Match::DestNet(peer.clone()),
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("gateway application traffic to an allowed Meshnet peer"),
+            );
+
+            if meshnet.allow_icmp {
+                rules.push(
+                    Rule::new(
+                        Input,
+                        vec![
+                            Match::InIface(meshnet.iface.clone()),
+                            Match::SourceNet(peer.clone()),
+                            Match::Icmp,
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("ICMP from an allowed Meshnet peer"),
+                );
+            }
+            for (proto, ports) in [
+                (L4::Tcp, &meshnet.inbound_tcp_ports),
+                (L4::Udp, &meshnet.inbound_udp_ports),
+            ] {
+                if !ports.is_empty() {
+                    rules.push(
+                        Rule::new(
+                            Input,
+                            vec![
+                                Match::InIface(meshnet.iface.clone()),
+                                Match::SourceNet(peer.clone()),
+                                Match::DestPortSet {
+                                    ports: ports.clone(),
+                                    proto,
+                                },
+                            ],
+                            Verdict::Accept,
+                        )
+                        .with_note("service exposed to an allowed Meshnet peer"),
+                    );
+                }
+            }
+        }
+    }
+
     // ── ICMP and SSH on the tunnel interface ─────────────────────────────────
     //
     // Both are scoped by **interface**, never by source address, and that is
@@ -683,6 +759,7 @@ mod tests {
             split_tunnel_cidrs: vec![],
             mss_clamp: None,
             captive_portal_gateway: None,
+            nordvpn_meshnet: None,
         }
     }
 
@@ -826,6 +903,49 @@ mod tests {
                     .any(|r| r == "oifname \"eth0\" udp dport 53 accept"),
                 "state {st:?}: the gateway must still be able to resolve"
             );
+        }
+    }
+
+    #[test]
+    fn meshnet_is_scoped_to_its_mark_interface_peers_and_services() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+        p.nordvpn_meshnet = Some(aether::NordvpnMeshnetPolicy {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["100.70.36.212/32".into()],
+            inbound_tcp_ports: vec![22, 9100],
+            inbound_udp_ports: vec![51830],
+            allow_icmp: true,
+        });
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let rs = render(&p, state);
+            let output = text(&rs, ChainKind::Output);
+            let input = text(&rs, ChainKind::Input);
+
+            assert!(output
+                .iter()
+                .any(|rule| rule == "oifname \"eth0\" meta mark 0xe1f1 accept"));
+            assert!(output
+                .iter()
+                .any(|rule| { rule == "oifname \"nordlynx\" ip daddr 100.70.36.212/32 accept" }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 meta l4proto icmp accept"
+            }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 tcp dport { 22, 9100 } accept"
+            }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 udp dport { 51830 } accept"
+            }));
+            assert!(!text(&rs, ChainKind::Forward)
+                .iter()
+                .any(|rule| rule.contains("nordlynx") || rule.contains("0xe1f1")));
+            assert!(!rs.rules.iter().any(|rule| {
+                rule.matches
+                    .contains(&Match::SourceNet("100.70.36.213/32".into()))
+            }));
         }
     }
 

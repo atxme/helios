@@ -666,14 +666,15 @@ confirmés puis corrigés avec test de non-régression :
 
 ### Défauts trouvés sur gateway en service (8 août 2026)
 
-Deux autres, relevés en cherchant pourquoi `helios-ctl update` échouait sur la
-gateway de production. Le second est à vérifier sur cible : il n'est pas
-observable ailleurs.
+Trois autres, relevés en cherchant pourquoi des services locaux échouaient sur
+la gateway de production. Les deux derniers sont à vérifier sur cible : ils ne
+sont pas observables ailleurs.
 
 | Défaut | Effet |
 | --- | --- |
 | chaîne `output` sans sortie propre à la gateway | ni DNS, ni NTP, ni paquets : `apt` affiche `Ign :` sur chaque source puis se fige à 0 %, et le symptôme désigne le résolveur au lieu du pare-feu. Corrigé par `allow_gateway_egress` |
 | `ct state established` appliqué là où `established,related` était affiché | `rustables::Rule::established()` ne masque que le bit `ESTABLISHED`. Le dry-run, l'API et la console affichaient la forme complète : la divergence n'était visible que dans `nft list`. Les erreurs ICMP `fragmentation needed` tombaient sous `drop`, donc trou noir de PMTU |
+| NordVPN Meshnet actif mais sans réception WireGuard | le contrôle HTTPS réussissait, puis DERP TCP 8765, STUN et les chemins directs marqués `0xe1f1` tombaient sous `drop`; même après transport, le trafic applicatif sur `nordlynx` restait fermé. Corrigé par le bloc borné `nordvpn_meshnet` |
 
 Vérification cible du second, après déploiement :
 
@@ -685,6 +686,22 @@ sudo nft list chain inet helios input | grep 'ct state'
 Une sortie qui affiche `ct state established` seul signifie que le binaire
 installé est antérieur au correctif — la traduction Netlink est le seul endroit
 où l'écart se voit.
+
+Vérification Meshnet sur cible, avec l'adresse du pair déclarée dans
+`network.toml` :
+
+```sh
+sudo nft list chain inet helios output | grep -E 'e1f1|nordlynx'
+sudo nft list chain inet helios input | grep nordlynx
+sudo wg show nordlynx
+ping -c 3 100.70.36.212
+```
+
+Le ruleset doit montrer la marque seulement sur le WAN, la destination du pair
+seulement sur `nordlynx`, et TCP 22 en entrée seulement avec `iifname
+"nordlynx"` et la source `/32`. `wg show` doit ensuite afficher un handshake et
+des octets reçus ; le rendu et la transaction Netlink sont automatisés, mais ce
+dernier effet exige la gateway réelle.
 
 ## Limites connues
 

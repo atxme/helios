@@ -175,7 +175,16 @@ admin_iface = "helios0"
 #
 # Contrairement à `allow_client_internet`, l'ouverture ne suit pas l'état du
 # tunnel : on met une gateway à jour précisément quand son tunnel est baissé.
-# allow_gateway_egress = true
+allow_gateway_egress = true
+
+# ── Réseau de sauvegarde NordVPN Meshnet ────────────────────────────────────
+# Meshnet est un second overlay WireGuard local, jamais une interface WAN.
+# Helios autorise son transport Internet uniquement quand libtelio porte la
+# marque 0xe1f1, puis borne le trafic applicatif à nordlynx, aux pairs nommés
+# ici et aux seuls ports entrants nécessaires. Le pair ci-dessous est celui
+# observé sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH.
+# Ajouter un port UDP seulement si le logiciel de sauvegarde en exige un.
+nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32"], inbound_tcp_ports = [22], inbound_udp_ports = [], allow_icmp = true }
 
 # ── ICMP sur le tunnel ───────────────────────────────────────────────────────
 # Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart

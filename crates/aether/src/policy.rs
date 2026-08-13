@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// NordVPN Meshnet traffic explicitly admitted alongside the Helios tunnel.
+///
+/// Meshnet is a second authenticated WireGuard overlay, not an uplink. Its
+/// transport leaves through a WAN interface with NordVPN's packet mark, while
+/// application traffic enters and leaves through `iface`. Keeping both
+/// identities in the policy prevents `nordlynx` from being mistaken for a WAN
+/// and preserves the fail-closed treatment of forwarded traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NordvpnMeshnetPolicy {
+    /// Interface owned by NordVPN/libtelio.
+    pub iface: String,
+    /// Packet mark applied by libtelio to relay, STUN and direct-path traffic.
+    pub fwmark: u32,
+    /// Meshnet peers allowed to exchange application traffic with the gateway.
+    pub peer_cidrs: Vec<String>,
+    /// TCP services exposed to those peers on the gateway.
+    pub inbound_tcp_ports: Vec<u16>,
+    /// UDP services exposed to those peers on the gateway.
+    pub inbound_udp_ports: Vec<u16>,
+    /// Answers ICMP arriving from those peers through the Meshnet interface.
+    pub allow_icmp: bool,
+}
+
 /// Firewall behavior when the tunnel is not operational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -142,6 +165,8 @@ pub struct FirewallPolicy {
     /// rule is scoped to the tunnel interface instead, so it cannot be
     /// reached by anything WireGuard has not already authenticated.
     pub allow_ssh_over_tunnel: bool,
+    /// Optional NordVPN Meshnet overlay. Absent means no Meshnet opening.
+    pub nordvpn_meshnet: Option<NordvpnMeshnetPolicy>,
 }
 
 impl FirewallPolicy {
