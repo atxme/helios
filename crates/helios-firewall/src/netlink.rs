@@ -107,8 +107,15 @@ impl NetlinkBackend {
             Match::Icmp => rule.icmp(),
             Match::PacketMark(mark) => rule
                 .with_expr(Meta::new(MetaType::Mark))
-                .with_expr(Cmp::new(CmpOp::Eq, mark.to_be_bytes())),
+                .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
         })
+    }
+
+    /// Encodes a packet mark as the native `u32` stored in the nftables meta
+    /// register. Unlike IP addresses and ports, `meta mark` is not a network
+    /// protocol field and must therefore not use network byte order.
+    fn packet_mark_bytes(mark: u32) -> [u8; 4] {
+        mark.to_ne_bytes()
     }
 
     /// `ct state established,related`, built by hand.
@@ -413,6 +420,16 @@ mod tests {
         assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
         assert!(IpAddr::from_str("203.0.113.10").is_ok());
         assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn packet_mark_is_encoded_in_the_kernel_register_byte_order() {
+        let mark = 0xe1f1;
+
+        assert_eq!(
+            u32::from_ne_bytes(NetlinkBackend::packet_mark_bytes(mark)),
+            mark
+        );
     }
 
     /// Translation is the largest deterministic part of the real backend.
