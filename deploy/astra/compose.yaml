@@ -25,6 +25,23 @@ services:
       # Le contexte est la racine du dépôt : le Dockerfile compile le workspace.
       context: ../..
       dockerfile: deploy/astra/Dockerfile
+      # La construction emprunte la pile réseau de l'hôte, et c'est délibéré.
+      #
+      # Le pare-feu Helios a une chaîne `forward` en `drop` par défaut, et n'y
+      # ouvre que le LAN et le tunnel. Le pont Docker n'y figure pas : les
+      # paquets d'un conteneur sont donc jetés, et comme le premier d'entre eux
+      # est une requête DNS, la panne se lit « Temporary failure resolving
+      # deb.debian.org » — un message qui accuse le réseau du conteneur alors
+      # que c'est la politique de la gateway.
+      #
+      # L'ouvrir serait le mauvais geste : Astra n'a besoin d'aucune sortie
+      # Internet en fonctionnement, et un pont qui traverse le `forward`
+      # laisserait un conteneur sortir en clair pendant que le kill-switch est
+      # engagé. Seule la **construction** a besoin d'apt et de crates.io. Dans
+      # la pile de l'hôte, ce trafic est émis localement : il passe par
+      # `output`, que `allow_gateway_egress` régit déjà, et ne touche jamais
+      # `forward`. Le conteneur qui tourne, lui, garde son réseau isolé.
+      network: host
     image: helios/astra:latest
     container_name: astra
     command:

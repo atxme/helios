@@ -145,6 +145,27 @@ slot.
 L'URL d'autorité vaut `https://<rp_id>` par défaut ; `ASTRA_AUTHORITY_URL` la
 remplace.
 
+### Pourquoi la construction emprunte le réseau de l'hôte
+
+Le pare-feu Helios tient une chaîne `forward` en `drop` par défaut, et n'y ouvre
+que le LAN et le tunnel. Le pont Docker n'y figure pas — les paquets d'un
+conteneur sont donc jetés. Comme le premier d'entre eux est une requête DNS, la
+panne se lit `Temporary failure resolving 'deb.debian.org'`, qui accuse le
+réseau du conteneur alors que c'est la politique de la gateway.
+
+L'ouvrir serait le mauvais geste. Astra n'a besoin d'aucune sortie Internet en
+fonctionnement : il écoute sur la boucle locale et parlera à `heliosd` par un
+veth privé. Un pont qui traverse le `forward` laisserait en revanche un
+conteneur sortir en clair pendant que le kill-switch est engagé.
+
+Seule la **construction** a besoin d'apt et de crates.io, d'où `network: host`
+sur le seul bloc `build`. Ce trafic est alors émis localement : il passe par
+`output`, que `allow_gateway_egress` régit déjà, et ne touche jamais `forward`.
+Le conteneur qui tourne garde son réseau isolé.
+
+Le `pull` de l'image de base, lui, n'a jamais été concerné : il est émis par le
+démon Docker sur l'hôte.
+
 ### À la main
 
 Chaque commande imprime la suivante. `astra bootstrap` imprime la ligne

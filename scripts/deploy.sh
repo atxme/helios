@@ -294,15 +294,38 @@ deployer_astra() {
     # panne est une compilation.
     if ! sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
         $compose_env $compose -f deploy/astra/compose.yaml build 2>&1")"; then
-        echo "    la construction de l'image a échoué :" >&2
-        printf '%s\n' "$sortie" | tail -40 >&2
+        # `network: host` est indispensable — voir compose.yaml — mais certaines
+        # versions de BuildKit l'exigent habilitée explicitement. Le
+        # constructeur direct, lui, prend le drapeau sans condition. On le tente
+        # avant d'abandonner : c'est la même image et le même contexte.
         case "$sortie" in
-            *buildx*|*[Bb]ake*)
-                echo "    le constructeur embarqué a refusé aussi ; installer buildx :" >&2
-                echo "      ssh $CIBLE 'sudo apt-get install -y docker-buildx'" >&2
+            *entitlement*|*network.host*|*"network mode"*)
+                echo "    réseau hôte refusé par BuildKit, seconde tentative" >&2
+                sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+                    $moteur build --network=host \
+                    -f deploy/astra/Dockerfile -t helios/astra:latest . 2>&1")" || {
+                    echo "    la construction de l'image a échoué :" >&2
+                    printf '%s\n' "$sortie" | tail -40 >&2
+                    return 1
+                }
+                ;;
+            *)
+                echo "    la construction de l'image a échoué :" >&2
+                printf '%s\n' "$sortie" | tail -40 >&2
+                case "$sortie" in
+                    *"Temporary failure resolving"*)
+                        echo "    le conteneur de construction n'a pas de DNS : vérifier que" >&2
+                        echo "    'network: host' est bien dans deploy/astra/compose.yaml —" >&2
+                        echo "    le pare-feu jette le forward du pont Docker, par conception." >&2
+                        ;;
+                    *buildx*|*[Bb]ake*)
+                        echo "    le constructeur embarqué a refusé aussi ; installer buildx :" >&2
+                        echo "      ssh $CIBLE 'sudo apt-get install -y docker-buildx'" >&2
+                        ;;
+                esac
+                return 1
                 ;;
         esac
-        return 1
     fi
 
     # `build` peut rendre 0 sans rien produire. Ce que la suite exige, c'est

@@ -353,7 +353,10 @@
       "Bash(git archive *)",
       "Bash(tar -t)",
       "Bash(awk '{ok+=$4; ko+=$6} END {print \"passés:\",ok,\" échoués:\",ko}')",
-      "Bash(shellcheck -S warning scripts/deploy.sh scripts/lib-remote.sh)"
+      "Bash(shellcheck -S warning scripts/deploy.sh scripts/lib-remote.sh)",
+      "Bash(docker info *)",
+      "Bash(docker context *)",
+      "Bash(ASTRA_EXPECTED_AUDIT_HEAD=test COMPOSE_BAKE=0 docker compose -f deploy/astra/compose.yaml config)"
     ]
   }
 }
