@@ -6,6 +6,7 @@ mod key_negotiation;
 mod orchestrator;
 mod static_psk;
 mod uplink;
+mod vip_routing;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},

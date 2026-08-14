@@ -199,6 +199,7 @@ pub async fn run(
             &event_tx,
             fw.as_ref(),
             &policy,
+            dry_run,
         )
         .await?;
         let wan = network.primary_wan_iface().unwrap_or_default().to_string();
@@ -335,6 +336,10 @@ pub async fn run(
     if let Err(error) = wg.down().await {
         warn!("tearing down WireGuard at shutdown: {error}");
     }
+    // The interface is gone; routes naming it would linger in our table and
+    // the rule would keep sending the range at an empty lookup. Harmless, but
+    // it is state the daemon put there and must take back.
+    unpin_peer_vips(dry_run).await;
     Ok(())
 }
 
@@ -410,7 +415,7 @@ async fn handle_external_cmd(
                 "Connection requested via the web interface",
             );
             let network = shared_network.read().await;
-            do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
+            do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
             let wan = network.primary_wan_iface().unwrap_or_default().to_string();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -443,7 +448,7 @@ async fn handle_external_cmd(
                         warn!("tearing down before rotation: {e}");
                     }
                     let network = shared_network.read().await;
-                    do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
+                    do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
                     drop(network);
                     sync_policy(shared_policy, policy).await;
                 }
@@ -491,6 +496,7 @@ async fn handle_external_cmd(
                     &format!("Tearing down the interface: {e}"),
                 );
             }
+            unpin_peer_vips(dry_run).await;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -508,7 +514,7 @@ async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
+                do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
                 let wan = network.primary_wan_iface().unwrap_or_default().to_string();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
@@ -549,11 +555,17 @@ async fn handle_external_cmd(
             // Aligns the data plane with the new peer list (client
             // enrollment, or revocation).
             if wg.is_up() {
-                let (_, peers) = wg_config(&*shared_network.read().await);
+                let (iface, peers) = wg_config(&*shared_network.read().await);
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("WireGuard peer synchronization: {e}");
                     emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));
                 }
+                // An admission adds a VIP and a revocation removes one; the
+                // pinned table has to follow both, or a freshly admitted
+                // client is the only one still leaving through the wrong
+                // tunnel — the hardest case to diagnose, since every other
+                // client works.
+                pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
             }
             emit_log(event_tx, "info", "Network configuration applied");
         }
@@ -759,6 +771,7 @@ async fn do_connect(
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &FirewallPolicy,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     if !network.wireguard_ready() {
         emit_log(
@@ -800,6 +813,11 @@ async fn do_connect(
         .await
         .context("bringing up the WireGuard interface")?;
 
+    // After the interface exists — the peer routes name it — and before the
+    // state is announced: a client that handshakes in between would otherwise
+    // have its first replies handed to whichever VPN owns the CGNAT range.
+    pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
+
     emit_log(
         event_tx,
         "info",
@@ -809,6 +827,57 @@ async fn do_connect(
         ),
     );
     Ok(())
+}
+
+/// Pins the admitted peers' VIPs onto the tunnel interface.
+///
+/// # Why a failure is not fatal
+///
+/// On a gateway that has the CGNAT range to itself this changes nothing at
+/// all — the main table already routes it to `helios0`. Refusing to serve
+/// because a policy rule could not be written would therefore take down
+/// gateways that were never at risk. The warning names the consequence
+/// instead, because the symptom on the other side is invisible: packets are
+/// not dropped, they leave through the wrong tunnel.
+async fn pin_peer_vips(
+    dry_run: bool,
+    iface: &helios_wireguard::InterfaceConfig,
+    peers: &[helios_wireguard::PeerConfig],
+    event_tx: &broadcast::Sender<HeliosEvent>,
+) {
+    if dry_run {
+        return;
+    }
+    let plan = match crate::vip_routing::plan(&iface.name, &iface.address, peers) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!("peer VIP routing not planned: {error}");
+            return;
+        }
+    };
+    if let Err(error) = crate::vip_routing::apply(&plan).await {
+        warn!("peer VIP routing not installed: {error}");
+        emit_log(
+            event_tx,
+            "warn",
+            &format!(
+                "Client VIPs not pinned to {} ({error}). If another VPN on this host claims \
+                 100.64.0.0/10, traffic to clients leaves through it and no packet is dropped \
+                 to say so.",
+                iface.name
+            ),
+        );
+    }
+}
+
+/// Removes the pinning. Paired with every path that takes the interface down.
+async fn unpin_peer_vips(dry_run: bool) {
+    if dry_run {
+        return;
+    }
+    if let Err(error) = crate::vip_routing::withdraw().await {
+        warn!("peer VIP routing not withdrawn: {error}");
+    }
 }
 
 fn handshake_is_fresh(peer: &helios_wireguard::PeerStatus) -> bool {
@@ -1734,6 +1803,7 @@ mod tests {
             &events,
             &firewall,
             &network.firewall_policy(),
+            true,
         )
         .await
         .unwrap();

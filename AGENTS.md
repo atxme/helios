@@ -386,6 +386,23 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   `key_negotiation_port` décide de l’ouverture du service — absent, il reste
   fermé, sans erreur. Côté Orion, seul le stockage protégé d’identité reste
   conditionnel : il est propre à la machine, pas à la compilation.
+- **Plage CGNAT partagée** : Helios n'est pas seul à tirer ses adresses de
+  `100.64.0.0/10`. NordLynx, Tailscale et la plupart des clients VPN grand
+  public y puisent aussi, et surtout ils posent des **règles de routage** qui
+  consultent leur table avant la principale — NordVPN en 32765 vers une table
+  contenant `100.64.0.0/10 dev nordlynx`. À partir de là, tout paquet que la
+  gateway envoie à **ses propres** clients part dans l'autre tunnel : rien
+  n'est jeté, rien n'est journalisé, `ip route get` répond simplement une
+  autre interface. `heliosd::vip_routing` pose donc une table à lui, une
+  **route `/32` par pair admis** et une seule règle en 32000. Jamais la plage
+  entière : elle contient aussi les pairs de l'autre VPN, et la reprendre en
+  bloc réparerait Helios en cassant son voisin. Une destination absente de la
+  table retombe sur la règle suivante, exactement comme avant. La pose est
+  **inconditionnelle** : l'autre VPN peut se connecter longtemps après
+  `heliosd` et réinstalle ses règles à chaque fois, donc un test au démarrage
+  passerait sur une machine qui casse dix minutes plus tard. Un échec de pose
+  n'est pas fatal — sur une gateway qui a la plage pour elle seule, cela ne
+  change rien — mais il est journalisé en nommant la conséquence.
 - **Uplink multiple** : `wan_iface` est un **ensemble**, pas un choix — une
   chaîne ou une liste (`"auto"`, `"eth0"`, `["enp3s0", "wlo1"]`), la clé TOML
   restant `wan_iface`. Chaque règle qui nomme le WAN est émise **une fois par
