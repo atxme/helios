@@ -584,9 +584,12 @@ const KEY_NEGOTIATION_ATTEMPTS: u32 = 3;
 
 /// Pause between two negotiations.
 ///
-/// Long enough for a transient loss to clear, short enough that the user does
-/// not read the wait as a hang.
-const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// The gateway arms ten seconds of rest after rolling back a candidate that
+/// reached the data plane (v5, sections 4.5 and 11.3). Retrying sooner cannot
+/// succeed: it is deliberately rejected, and used to consume Orion's two
+/// remaining attempts in four seconds. One extra second keeps the client past
+/// the boundary despite scheduling and transport jitter.
+const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(11);
 
 /// Negotiates, mounts, and recovers from a desynchronised slot.
 ///
@@ -845,6 +848,14 @@ async fn wait_for_new_handshake(
 mod tests {
     use super::*;
     use crate::backend::dryrun::DryRunBackend;
+
+    #[test]
+    fn negotiation_retry_waits_out_the_gateway_rollback_rest() {
+        assert!(
+            KEY_NEGOTIATION_RETRY_DELAY > Duration::from_secs(10),
+            "a retry inside the gateway's ten-second rest period is guaranteed to be rejected"
+        );
+    }
 
     fn sink() -> EventSink {
         Arc::new(|_| {})

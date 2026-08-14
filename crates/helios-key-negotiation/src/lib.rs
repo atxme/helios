@@ -1073,6 +1073,11 @@ async fn handle_connection(
         Err(error) => {
             guard.roll_back().await;
             write_frame(&mut send, &ServerMessage::Error { error }).await?;
+            // The error is the final application frame, just like a commit.
+            // Returning immediately drops the stream before the peer has read
+            // it; Quinn then reports a connection loss and hides the public
+            // `rejected` result that was actually sent.
+            drain_then_close(&connection, &mut send, "negotiation rejected").await;
             return Ok(());
         }
     };
@@ -1975,6 +1980,7 @@ mod tests {
 
     struct Handler {
         expected_fingerprint: String,
+        reject_prepare: AtomicBool,
         confirmed: AtomicBool,
         rolled_back: AtomicBool,
         /// How many rollbacks actually ran to completion.
@@ -1999,6 +2005,7 @@ mod tests {
         fn with_rollback_permits(pki: &TestPki, permits: usize) -> Self {
             Self {
                 expected_fingerprint: pki.client_fingerprint.clone(),
+                reject_prepare: AtomicBool::new(false),
                 confirmed: AtomicBool::new(false),
                 rolled_back: AtomicBool::new(false),
                 rollbacks: std::sync::atomic::AtomicUsize::new(0),
@@ -2027,6 +2034,9 @@ mod tests {
             // pre-installation refusal: the public boundary must not let a
             // caller tell an unknown peer from a mismatched certificate.
             if certificate_sha256 != self.expected_fingerprint {
+                return Err(PublicError::Rejected);
+            }
+            if self.reject_prepare.load(Ordering::SeqCst) {
                 return Err(PublicError::Rejected);
             }
             Ok(PreparedNegotiation {
@@ -2287,6 +2297,40 @@ mod tests {
             !handler.rolled_back.load(Ordering::SeqCst),
             "closing the connection after commit must not undo anything"
         );
+
+        client.close(0u32.into(), b"test complete");
+        task.abort();
+    }
+
+    /// A terminal refusal must arrive as the public protocol error, not as a
+    /// transport reset. Dropping the send stream immediately after writing
+    /// this frame made Quinn discard it and Orion reported `connection lost`.
+    #[tokio::test]
+    async fn a_prepare_refusal_is_delivered_before_the_connection_closes() {
+        let pki = test_pki();
+        let (handler, task, client, server_addr) = bench(&pki);
+        handler.reject_prepare.store(true, Ordering::SeqCst);
+
+        let pending = request_challenge(&client, server_addr, "localhost", GATEWAY_WG_KEY)
+            .await
+            .unwrap();
+        let mut request = simple_request([9; KEY_NEGOTIATION_NONCE_LEN]);
+        request.server_challenge = pending.server_challenge();
+        request.server_name = "localhost".into();
+        let authenticated_request = authenticate_request(
+            request,
+            pki.client_pq_certificate.clone(),
+            &pki.client_pq_private_key,
+        )
+        .unwrap();
+
+        match negotiate(&client, pending, &authenticated_request).await {
+            Err(TransportError::Rejected(PublicError::Rejected)) => {}
+            Err(error) => {
+                panic!("the framed refusal must survive graceful connection teardown: {error}")
+            }
+            Ok(_) => panic!("a handler refusal must not produce a negotiated session"),
+        }
 
         client.close(0u32.into(), b"test complete");
         task.abort();

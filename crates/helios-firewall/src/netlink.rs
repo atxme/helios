@@ -97,6 +97,7 @@ impl NetlinkBackend {
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
+            Match::SourcePort { port, proto: p } => rule.sport(*port, proto(*p)),
             Match::DestPortSet { .. } => {
                 return Err(Self::err(
                     "port set: must be expanded by expand_port_sets before translation",

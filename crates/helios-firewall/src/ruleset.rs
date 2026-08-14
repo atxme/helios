@@ -120,6 +120,8 @@ pub enum Match {
     OutIface(String),
     /// `<proto> dport <port>`
     DestPort { port: u16, proto: L4 },
+    /// `<proto> sport <port>`
+    SourcePort { port: u16, proto: L4 },
     /// `<proto> dport { a, b }` — set of ports.
     DestPortSet { ports: Vec<u16>, proto: L4 },
     /// `ip daddr <addr>` — IP or CIDR.
@@ -151,6 +153,9 @@ impl fmt::Display for Match {
             Match::InIface(i) => write!(f, "iifname \"{i}\""),
             Match::OutIface(i) => write!(f, "oifname \"{i}\""),
             Match::DestPort { port, proto } => write!(f, "{} dport {port}", proto.as_str()),
+            Match::SourcePort { port, proto } => {
+                write!(f, "{} sport {port}", proto.as_str())
+            }
             Match::DestPortSet { ports, proto } => {
                 let list: Vec<String> = ports.iter().map(u16::to_string).collect();
                 write!(f, "{} dport {{ {} }}", proto.as_str(), list.join(", "))
@@ -349,6 +354,23 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 )
                 .with_note("WireGuard listener — without this rule, no client can handshake"),
             );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::SourcePort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "WireGuard listener transport — replies, rekeys and keep-alives may be new \
+                     conntrack flows, especially after an uplink change",
+                ),
+            );
         }
     }
 
@@ -371,6 +393,22 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                     Verdict::Accept,
                 )
                 .with_note("authenticated key-negotiation QUIC listener"),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::SourcePort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "key-negotiation QUIC replies — the final frame can outlive UDP conntrack",
+                ),
             );
         }
     }
@@ -848,6 +886,30 @@ mod tests {
         }
     }
 
+    /// UDP conntrack is not a transport contract. A WireGuard rekey or the
+    /// final QUIC frame can be emitted after its entry expired; with several
+    /// uplinks, the reply may also leave through a different interface. The
+    /// listeners therefore need a source-port-scoped output opening of their
+    /// own in every state.
+    #[test]
+    fn public_udp_listeners_can_answer_on_every_uplink() {
+        let mut p = policy();
+        p.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let output = text(&render(&p, state), ChainKind::Output);
+            for wan in ["enp3s0", "wlo1"] {
+                for port in [51820, 51821] {
+                    let expected = format!("oifname \"{wan}\" udp sport {port} accept");
+                    assert!(
+                        output.iter().any(|rule| rule == &expected),
+                        "state {state:?}: missing listener response rule `{expected}`"
+                    );
+                }
+            }
+        }
+    }
+
     /// The default stays closed: a gateway normally has a fixed address, and
     /// opening DHCP without reason would widen fail-closed for nothing.
     #[test]
@@ -1149,6 +1211,9 @@ mod tests {
         assert!(!text(&rs, ChainKind::Input)
             .iter()
             .any(|r| r.contains("udp dport 51820")));
+        assert!(!text(&rs, ChainKind::Output)
+            .iter()
+            .any(|r| r.contains("udp sport 51820")));
     }
 
     /// The WireGuard listener is in `input` (traffic towards the gateway),
