@@ -43,7 +43,6 @@ CA_DIR="${HELIOS_CLIENT_CA_DIR:-$CERTS_ROOT/internal-ca}"
 # la retirer quand la gateway la refuse.
 CA_CREEE=0
 SORTIE="${HELIOS_KEYNEGO_OUT:-$PWD/target/key-negotiation}"
-ETAT="${HELIOS_DEPLOY_STATE:-$HOME/.helios/deploy.conf}"
 NOM="portable"
 SERVER_NAME=""
 ENDPOINT=""
@@ -164,11 +163,13 @@ retirer_ca_creee() {
     rmdir "$CA_DIR" 2>/dev/null || true
 }
 
-if [ -z "$CIBLE" ] && [ -f "$ETAT" ]; then
-    CIBLE="$(sed -n 's/^cible=//p' "$ETAT")"
-fi
+# La gateway de lib-remote.sh, sauf argument explicite. Elle n'est plus relue
+# d'un fichier d'état écrit par `deploy.sh` : deux sources pour une adresse,
+# c'est une de trop, et c'était la copie périmée qui gagnait.
+CIBLE="${CIBLE:-$HELIOS_CIBLE}"
 if [ -z "$CIBLE" ]; then
-    echo "Aucune gateway connue. Premier appel :" >&2
+    echo "Aucune gateway : renseigner HELIOS_CIBLE dans scripts/lib-remote.sh," >&2
+    echo "ou passer l'hôte en argument :" >&2
     echo "  ./scripts/key-negotiation-setup.sh utilisateur@adresse" >&2
     exit 1
 fi

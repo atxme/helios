@@ -360,7 +360,13 @@
       "Bash(chmod +x scripts/diagnose-negotiation.sh)",
       "Bash(bash -n scripts/diagnose-negotiation.sh)",
       "Bash(awk '/Verdict::Drop/{print NR\": \"prev} {prev=$0}' crates/helios-firewall/src/ruleset.rs)",
-      "Bash(awk *)"
+      "Bash(awk *)",
+      "Bash(shellcheck -x scripts/deploy.sh scripts/target-bootstrap.sh scripts/key-negotiation-setup.sh scripts/provision-client.sh)",
+      "Bash(./deploy.sh --help)",
+      "Bash(echo \"=== exit=$? \\(1 attendu pour usage\\) ===\")",
+      "Bash(/home/christophe/helios/scripts/deploy.sh --help)",
+      "Bash(bash -c '. scripts/lib-remote.sh; echo \"par défaut : $HELIOS_CIBLE\"')",
+      "Bash(HELIOS_CIBLE=root@10.0.0.9 bash -c '. scripts/lib-remote.sh; echo \"override env : $HELIOS_CIBLE\"')"
     ]
   }
 }

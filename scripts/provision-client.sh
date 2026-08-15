@@ -42,7 +42,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-ETAT="${HELIOS_PROVISION_STATE:-$HOME/.helios/provision.conf}"
 SORTIE="${HELIOS_PROVISION_OUT:-$PWD}"
 REFAIRE_CA=0
 REMPLACER=0
@@ -95,20 +94,17 @@ done
 
 [ -n "$CLIENT" ] || usage
 
-if [ -z "$CIBLE" ] && [ -f "$ETAT" ]; then
-    CIBLE="$(sed -n 's/^cible=//p' "$ETAT")"
-fi
+# La gateway de lib-remote.sh, sauf argument explicite.
+CIBLE="${CIBLE:-$HELIOS_CIBLE}"
 if [ -z "$CIBLE" ]; then
-    echo "Aucune gateway connue. Premier appel :" >&2
+    echo "Aucune gateway : renseigner HELIOS_CIBLE dans scripts/lib-remote.sh," >&2
+    echo "ou passer l'hôte en argument :" >&2
     echo "  ./scripts/provision-client.sh $CLIENT utilisateur@adresse" >&2
     exit 1
 fi
 # Une seule invite, prise hors de tout pipeline : `helios_ssh_sudo` y tourne
 # en sous-shell, et le mot de passe capturé là y serait perdu.
 helios_sudo_init "$CIBLE"
-
-mkdir -p "$(dirname "$ETAT")"
-printf 'cible=%s\n' "$CIBLE" > "$ETAT"
 
 HOTE="${CIBLE#*@}"
 

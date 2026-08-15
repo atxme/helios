@@ -30,6 +30,20 @@
 # éditeur et la CA opérateur ; le compromis est assumé, et rien ne l'écrit sur
 # disque.
 
+# ── La gateway visée, en dur ─────────────────────────────────────────────────
+#
+# Un seul endroit pour l'adresse : la changer ici la change pour `deploy.sh`,
+# `key-negotiation-setup.sh` et `provision-client.sh`. Elle est écrite dans le
+# dépôt plutôt que retenue d'un appel précédent, et c'est délibéré — la version
+# précédente la mémorisait sous `~/.helios/*.conf`, ce qui répondait à
+# « pourquoi ça déploie sur la mauvaise machine » par un fichier caché que
+# personne ne pense à ouvrir. Ici, `grep` la trouve.
+#
+# `HELIOS_CIBLE` dans l'environnement l'emporte, et chaque script accepte
+# toujours un hôte en argument pour un déploiement ponctuel ailleurs — sans
+# rien enregistrer : l'appel suivant repart de la valeur ci-dessous.
+HELIOS_CIBLE="${HELIOS_CIBLE:-christophe@192.168.1.44}"
+
 # Multiplexage : une seule connexion TCP réutilisée par tous les appels. Ça ne
 # change rien au ticket sudo — c'est le pseudo-terminal qui le porte — mais ça
 # supprime une poignée de main SSH par commande, et elles sont nombreuses.

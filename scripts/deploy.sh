@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Déploiement complet d'une gateway, en une commande.
 #
-#   ./scripts/deploy.sh christophe@192.168.1.44   # première fois : l'hôte est retenu
-#   ./scripts/deploy.sh                           # ensuite
+#   ./scripts/deploy.sh          # depuis la racine du dépôt
+#   ./deploy.sh                  # ou depuis scripts/, les deux marchent
+#   ./scripts/deploy.sh root@autre-machine   # ponctuellement ailleurs
+#
+# L'adresse de la gateway est en dur dans `lib-remote.sh` (`HELIOS_CIBLE`) :
+# aucun argument à retaper, et un seul endroit à changer quand elle déménage.
 #
 # Enchaîne ce que l'ADR-004 sépare volontairement en trois outils : construire,
 # signer hors ligne, archiver — puis copie et installe. La séparation garde son
@@ -14,13 +18,21 @@
 # code, il livre ce qu'on lui donne.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# Le répertoire du script, en absolu et **avant** tout `cd`.
+#
+# `dirname "$0"` est relatif au répertoire courant : le résoudre après avoir
+# changé de répertoire le fait désigner autre chose. Lancé par `./deploy.sh`
+# depuis `scripts/`, `dirname` vaut « . », le `cd ..` mène à la racine, et le
+# « ./lib-remote.sh » qui suivait y était cherché — d'où le « No such file or
+# directory » qui ne se produisait que depuis ce répertoire-là.
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPTS/.."
 
-# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# Un seul mot de passe sudo pour tout le déploiement, et l'adresse de la
+# gateway : voir lib-remote.sh.
 # shellcheck source=scripts/lib-remote.sh
-. "$(dirname "$0")/lib-remote.sh"
+. "$SCRIPTS/lib-remote.sh"
 
-ETAT="${HELIOS_DEPLOY_STATE:-$HOME/.helios/deploy.conf}"
 EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
@@ -48,8 +60,12 @@ celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
 partie est silencieusement sautée : une gateway sans autorité reste une
 gateway qui marche.
 
-L'hôte est retenu après le premier appel ; les appels suivants n'en ont plus
-besoin. Variables reconnues : HELIOS_PUBLISHER_EPOCH, HELIOS_DEPLOY_CHANNEL.
+L'hôte est en dur dans scripts/lib-remote.sh (HELIOS_CIBLE) : la commande
+n'en prend aucun. L'argument reste accepté pour viser ponctuellement une
+autre machine, sans rien changer aux appels suivants.
+
+Variables reconnues : HELIOS_CIBLE, HELIOS_PUBLISHER_EPOCH,
+HELIOS_DEPLOY_CHANNEL.
 EOF
     exit 1
 }
@@ -67,17 +83,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# ── Cible : donnée une fois, retenue ensuite ─────────────────────────────────
-if [ -z "$CIBLE" ] && [ -f "$ETAT" ]; then
-    CIBLE="$(sed -n 's/^cible=//p' "$ETAT")"
-fi
+# ── Cible : celle de lib-remote.sh, sauf argument explicite ──────────────────
+# Un argument l'emporte mais ne s'enregistre pas : un déploiement de dépannage
+# vers une autre machine ne doit pas détourner silencieusement les suivants.
+CIBLE="${CIBLE:-$HELIOS_CIBLE}"
 if [ -z "$CIBLE" ]; then
-    echo "Aucune cible connue. Premier appel :" >&2
-    echo "  ./scripts/deploy.sh utilisateur@adresse" >&2
+    echo "Aucune gateway : renseigner HELIOS_CIBLE dans scripts/lib-remote.sh," >&2
+    echo "ou passer l'hôte en argument : ./scripts/deploy.sh utilisateur@adresse" >&2
     exit 1
 fi
-mkdir -p "$(dirname "$ETAT")"
-printf 'cible=%s\n' "$CIBLE" > "$ETAT"
 
 # Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
 # `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.

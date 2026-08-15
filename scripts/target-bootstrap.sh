@@ -6,13 +6,20 @@
 # fleet does not create a new trust root on every deployment.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# Absolute, and resolved **before** the `cd`: `dirname "$0"` is relative to the
+# working directory, so computing it afterwards makes it point somewhere else.
+# Invoked as `./target-bootstrap.sh` from `scripts/`, it resolved to «.», the
+# `cd ..` moved to the repository root, and the sourced path was looked up
+# there — failing only when called from that one directory.
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPTS/.."
 
-# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# Un seul mot de passe sudo pour tout le déploiement, et l'adresse de la
+# gateway : voir lib-remote.sh.
 # shellcheck source=scripts/lib-remote.sh
-. "$(dirname "$0")/lib-remote.sh"
+. "$SCRIPTS/lib-remote.sh"
 
-TARGET="${1:-}"
+TARGET="${1:-$HELIOS_CIBLE}"
 [ -n "$TARGET" ] || { echo "target-bootstrap.sh requires an SSH target" >&2; exit 2; }
 
 # Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
