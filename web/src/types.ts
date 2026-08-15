@@ -7,7 +7,14 @@ export type TunnelState = 'down' | 'connecting' | 'up' | 'failed' | 'captive_por
  */
 export type ProtectionMode = 'classic' | 'static_psk' | 'ml_kem'
 
-/** WireGuard peer admitted by the gateway. The PSK is never exposed. */
+/**
+ * WireGuard peer admitted by the gateway. The PSK is never exposed.
+ *
+ * The last four fields are the **runtime**: what the data plane last reported.
+ * They are absent — not zeroed — when the interface is down or the peer has
+ * never been seen, because "never observed" and "transferred nothing" are
+ * different facts and the console shows them differently.
+ */
 export interface PeerSummary {
   name: string
   public_key: string
@@ -20,13 +27,17 @@ export interface PeerSummary {
    * only a local edit of `network.toml` lowers it.
    */
   minimum_key_negotiation_mode: ProtectionMode
+  last_handshake_age_seconds: number | null
+  endpoint: string | null
+  rx_bytes: number | null
+  tx_bytes: number | null
 }
 
 /** Exact contract of GET /api/status. */
 export interface Status {
   state: TunnelState
   version: string
-  wan_iface: string
+  wan_ifaces: string[]
   lan_ifaces: string[]
   /** Static outbound peers (site-to-site), distinct from admitted clients. */
   wg_peers: string[]
@@ -40,6 +51,31 @@ export interface Status {
   split_tunnel_cidrs: string[]
   mss_clamp: number | null
   captive_portal_gateway: string | null
+  /**
+   * Age past which a handshake no longer proves a peer is there.
+   *
+   * Read from the daemon rather than hardcoded here: it is the same threshold
+   * the orchestrator uses to decide whether the kill-switch lifts, and a
+   * console applying its own would eventually show a client as connected after
+   * the firewall had already cut it.
+   */
+  handshake_stale_after_seconds: number
+}
+
+/**
+ * Request accepted by `POST /api/peers`.
+ *
+ * No address: the gateway derives the CGNAT VIP from the public key itself
+ * (`helios-provisioning`'s IPAM), so an operator never picks one — and cannot
+ * pick one already taken.
+ */
+export interface PeerAdmission {
+  name: string
+  public_key: string
+  admin?: boolean
+  key_negotiation_certificate_sha256?: string | null
+  key_negotiation_pq_certificate_sha256?: string | null
+  minimum_key_negotiation_mode?: ProtectionMode
 }
 
 /** An epoch of the publisher keyring. The key is never exposed, only its fingerprint. */
@@ -58,6 +94,35 @@ export interface Trust {
   development_keys: boolean
   reseal_domain: string
   reseal_format_version: number
+}
+
+/**
+ * Sealing posture of the gateway, without the secret behind it.
+ *
+ * `preserved_vaults: false` is the single most consequential thing this
+ * console reports: the sealed WireGuard identity and the negotiation identity
+ * no longer open, so the whole fleet has to be re-enrolled.
+ */
+export interface TpmSummary {
+  kind: 'disabled' | 'bypassed' | 'unsealed' | 'provisioned' | 'resealed' | 'window_resealed'
+  preserved_vaults: boolean
+}
+
+/**
+ * Health of the machine carrying the gateway.
+ *
+ * Every field is independent and optional: a kernel that publishes no thermal
+ * zone — every virtual machine, and WSL2 — must cost the other readings
+ * nothing.
+ */
+export interface Health {
+  uptime_seconds: number | null
+  load: [number, number, number] | null
+  cpu_count: number | null
+  memory_total_bytes: number | null
+  memory_available_bytes: number | null
+  temperature_celsius: number | null
+  tpm: TpmSummary | null
 }
 
 export type HeliosEvent =

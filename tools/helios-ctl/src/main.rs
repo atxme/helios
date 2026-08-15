@@ -257,7 +257,7 @@ enum PeerCmd {
         /// SHA-256 fingerprint of the client's key-negotiation certificate.
         #[arg(long)]
         key_negotiation_certificate_sha256: Option<String>,
-        /// SHA-256 fingerprint of the client's ML-DSA-65 certificate.
+        /// SHA-256 fingerprint of the client's ML-DSA-87 certificate.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
         /// Refuses every future network negotiation below this mode.

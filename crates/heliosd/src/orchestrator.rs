@@ -21,12 +21,12 @@ use std::{
 };
 
 use aether::{
-    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelEvent,
-    TunnelState,
+    FirewallPolicy, HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest,
+    OrchestratorCmd, TunnelEvent, TunnelState,
 };
 use anyhow::Context;
 use helios_firewall::{DryRunBackend, FirewallBackend};
-use helios_wireguard::{InterfaceConfig, PeerConfig, WireguardBackend, WG_LISTEN_PORT};
+use helios_wireguard::{InterfaceConfig, PeerConfig, PeerStatus, WireguardBackend, WG_LISTEN_PORT};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time,
@@ -38,7 +38,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WG_PORT: u16 = WG_LISTEN_PORT;
 
 /// Beyond this age, a peer's handshake is considered stale (ADR-001 §3).
-const HANDSHAKE_STALE_AFTER: Duration = Duration::from_secs(150);
+///
+/// Derived from the shared constant rather than restated: the console reports
+/// who is connected using the same threshold, and the two drifting apart would
+/// show a client as online after the kill-switch had already cut it.
+const HANDSHAKE_STALE_AFTER: Duration =
+    Duration::from_secs(helios_wireguard::HANDSHAKE_STALE_AFTER_SECS);
 
 /// Selects the WireGuard data plane. Like for the firewall: dry-run by
 /// default, real kernel backend behind the `wireguard` feature.
@@ -66,7 +71,9 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
         private_key: network.wg_private_key.clone(),
         listen_port: network.wg_listen_port,
         address: network.wg_address.clone(),
-        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(&network.wan_iface))),
+        mtu: Some(aether::mtu::tunnel_mtu(mtu_transport(
+            network.primary_wan_iface().unwrap_or_default(),
+        ))),
     };
     let peers = network
         .peers
@@ -75,6 +82,7 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
             public_key: p.public_key.clone(),
             allowed_ips: p.address.clone(),
             preshared_key: p.preshared_key.clone(),
+            persistent_keepalive_secs: p.persistent_keepalive_secs,
         })
         .collect();
     (iface, peers)
@@ -146,7 +154,15 @@ pub async fn run(
     // PSK installation requests from provisioning (dedicated channel: they
     // carry a secret and await an acknowledgment).
     mut psk_rx: mpsc::Receiver<InstallPskRequest>,
+    // Fresh reads of one peer's last handshake. Separate from `shared_peers`
+    // below, which is a ten-second-old republication: the key-negotiation
+    // commit needs the value *now* — see `ObserveHandshakeRequest`.
+    mut handshake_rx: mpsc::Receiver<ObserveHandshakeRequest>,
     shared_policy: Arc<RwLock<FirewallPolicy>>,
+    // Snapshot of the data plane, published for the API: it holds no
+    // WireGuard backend and must not, so the runtime reaches it the same way
+    // the tunnel state does.
+    shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
     boot: helio_tpm::BootDecision,
@@ -183,9 +199,10 @@ pub async fn run(
             &event_tx,
             fw.as_ref(),
             &policy,
+            dry_run,
         )
         .await?;
-        let wan = network.wan_iface.clone();
+        let wan = network.primary_wan_iface().unwrap_or_default().to_string();
         drop(network);
         spawn_mtu_probe_if_up(&wan, dry_run, &shared_state, &event_tx, &internal_tx).await;
     }
@@ -196,13 +213,19 @@ pub async fn run(
         Arc::clone(&wg),
         Arc::clone(&shared_state),
         Arc::clone(&shared_network),
+        Arc::clone(&shared_peers),
         event_tx.clone(),
         internal_tx.clone(),
     );
 
     // 4. Network telemetry (/proc/net/dev).
     {
-        let wan = shared_network.read().await.wan_iface.clone();
+        let wan = shared_network
+            .read()
+            .await
+            .primary_wan_iface()
+            .unwrap_or_default()
+            .to_string();
         spawn_telemetry_loop(wan, event_tx.clone());
     }
 
@@ -245,6 +268,15 @@ pub async fn run(
             psk_request = psk_rx.recv() => {
                 if let Some(request) = psk_request {
                     install_peer_psk(request, &shared_network, wg.as_ref(), &event_tx).await;
+                }
+            }
+
+            // Key negotiation, at the commit: has this peer handshaken since
+            // its candidate PSK was posed? Only the backend knows, and only
+            // this task holds it.
+            handshake_request = handshake_rx.recv() => {
+                if let Some(request) = handshake_request {
+                    observe_peer_handshake(request, wg.as_ref()).await;
                 }
             }
 
@@ -304,6 +336,10 @@ pub async fn run(
     if let Err(error) = wg.down().await {
         warn!("tearing down WireGuard at shutdown: {error}");
     }
+    // The interface is gone; routes naming it would linger in our table and
+    // the rule would keep sending the range at an empty lookup. Harmless, but
+    // it is state the daemon put there and must take back.
+    unpin_peer_vips(dry_run).await;
     Ok(())
 }
 
@@ -379,8 +415,8 @@ async fn handle_external_cmd(
                 "Connection requested via the web interface",
             );
             let network = shared_network.read().await;
-            do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
-            let wan = network.wan_iface.clone();
+            do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+            let wan = network.primary_wan_iface().unwrap_or_default().to_string();
             drop(network);
             spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
             sync_policy(shared_policy, policy).await;
@@ -412,7 +448,7 @@ async fn handle_external_cmd(
                         warn!("tearing down before rotation: {e}");
                     }
                     let network = shared_network.read().await;
-                    do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
+                    do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
                     drop(network);
                     sync_policy(shared_policy, policy).await;
                 }
@@ -460,6 +496,7 @@ async fn handle_external_cmd(
                     &format!("Tearing down the interface: {e}"),
                 );
             }
+            unpin_peer_vips(dry_run).await;
             sync_policy(shared_policy, policy).await;
         }
 
@@ -477,8 +514,8 @@ async fn handle_external_cmd(
                 transition(shared_state, event_tx, next, fw, policy).await?;
                 sync_policy(shared_policy, policy).await;
                 let network = shared_network.read().await;
-                do_connect(&network, wg, shared_state, event_tx, fw, policy).await?;
-                let wan = network.wan_iface.clone();
+                do_connect(&network, wg, shared_state, event_tx, fw, policy, dry_run).await?;
+                let wan = network.primary_wan_iface().unwrap_or_default().to_string();
                 drop(network);
                 spawn_mtu_probe_if_up(&wan, dry_run, shared_state, event_tx, internal_tx).await;
                 sync_policy(shared_policy, policy).await;
@@ -518,11 +555,17 @@ async fn handle_external_cmd(
             // Aligns the data plane with the new peer list (client
             // enrollment, or revocation).
             if wg.is_up() {
-                let (_, peers) = wg_config(&*shared_network.read().await);
+                let (iface, peers) = wg_config(&*shared_network.read().await);
                 if let Err(e) = wg.sync_peers(&peers).await {
                     warn!("WireGuard peer synchronization: {e}");
                     emit_log(event_tx, "warn", &format!("Peer synchronization: {e}"));
                 }
+                // An admission adds a VIP and a revocation removes one; the
+                // pinned table has to follow both, or a freshly admitted
+                // client is the only one still leaving through the wrong
+                // tunnel — the hardest case to diagnose, since every other
+                // client works.
+                pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
             }
             emit_log(event_tx, "info", "Network configuration applied");
         }
@@ -578,6 +621,25 @@ async fn handle_external_cmd(
 /// session keys are already derived, the new PSK will only be used on the
 /// next handshake (≤ 2 min). This is what makes hot application safe — see
 /// `helios_provisioning::rotation`.
+/// Answers one [`ObserveHandshakeRequest`] from the live data plane.
+///
+/// A peer absent from the backend answers `Ok(None)`, not an error: it has
+/// simply never handshaken, which is a fact the caller can act on. Only a
+/// backend that cannot be read at all is an `Err`, and the caller must treat
+/// that as "cannot tell" rather than as "no handshake" — a commit that
+/// accepted a failed read as proof would prove nothing.
+async fn observe_peer_handshake(request: ObserveHandshakeRequest, wg: &dyn WireguardBackend) {
+    let ObserveHandshakeRequest { public_key, reply } = request;
+    let answer = match wg.peers().await {
+        Ok(peers) => Ok(peers
+            .iter()
+            .find(|peer| peer.public_key_b64() == public_key)
+            .and_then(|peer| peer.last_handshake)),
+        Err(error) => Err(error.to_string()),
+    };
+    let _ = reply.send(answer);
+}
+
 async fn install_peer_psk(
     request: InstallPskRequest,
     shared_network: &Arc<RwLock<NetworkConfig>>,
@@ -709,6 +771,7 @@ async fn do_connect(
     event_tx: &broadcast::Sender<HeliosEvent>,
     fw: &dyn FirewallBackend,
     policy: &FirewallPolicy,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     if !network.wireguard_ready() {
         emit_log(
@@ -750,6 +813,11 @@ async fn do_connect(
         .await
         .context("bringing up the WireGuard interface")?;
 
+    // After the interface exists — the peer routes name it — and before the
+    // state is announced: a client that handshakes in between would otherwise
+    // have its first replies handed to whichever VPN owns the CGNAT range.
+    pin_peer_vips(dry_run, &iface, &peers, event_tx).await;
+
     emit_log(
         event_tx,
         "info",
@@ -759,6 +827,57 @@ async fn do_connect(
         ),
     );
     Ok(())
+}
+
+/// Pins the admitted peers' VIPs onto the tunnel interface.
+///
+/// # Why a failure is not fatal
+///
+/// On a gateway that has the CGNAT range to itself this changes nothing at
+/// all — the main table already routes it to `helios0`. Refusing to serve
+/// because a policy rule could not be written would therefore take down
+/// gateways that were never at risk. The warning names the consequence
+/// instead, because the symptom on the other side is invisible: packets are
+/// not dropped, they leave through the wrong tunnel.
+async fn pin_peer_vips(
+    dry_run: bool,
+    iface: &helios_wireguard::InterfaceConfig,
+    peers: &[helios_wireguard::PeerConfig],
+    event_tx: &broadcast::Sender<HeliosEvent>,
+) {
+    if dry_run {
+        return;
+    }
+    let plan = match crate::vip_routing::plan(&iface.name, &iface.address, peers) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!("peer VIP routing not planned: {error}");
+            return;
+        }
+    };
+    if let Err(error) = crate::vip_routing::apply(&plan).await {
+        warn!("peer VIP routing not installed: {error}");
+        emit_log(
+            event_tx,
+            "warn",
+            &format!(
+                "Client VIPs not pinned to {} ({error}). If another VPN on this host claims \
+                 100.64.0.0/10, traffic to clients leaves through it and no packet is dropped \
+                 to say so.",
+                iface.name
+            ),
+        );
+    }
+}
+
+/// Removes the pinning. Paired with every path that takes the interface down.
+async fn unpin_peer_vips(dry_run: bool) {
+    if dry_run {
+        return;
+    }
+    if let Err(error) = crate::vip_routing::withdraw().await {
+        warn!("peer VIP routing not withdrawn: {error}");
+    }
 }
 
 fn handshake_is_fresh(peer: &helios_wireguard::PeerStatus) -> bool {
@@ -963,6 +1082,7 @@ fn spawn_handshake_poller(
     wg: Arc<dyn WireguardBackend>,
     shared: Arc<RwLock<TunnelState>>,
     shared_network: Arc<RwLock<NetworkConfig>>,
+    shared_peers: Arc<RwLock<Vec<PeerStatus>>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     internal_tx: mpsc::Sender<OrchestratorCmd>,
 ) {
@@ -977,6 +1097,10 @@ fn spawn_handshake_poller(
         loop {
             ticker.tick().await;
             if !wg.is_up() {
+                // Emptied rather than left as it was: a console still listing
+                // yesterday's peers as connected, while the interface is down,
+                // is worse than one listing none.
+                shared_peers.write().await.clear();
                 continue;
             }
             let peers = match wg.peers().await {
@@ -986,6 +1110,10 @@ fn spawn_handshake_poller(
                     continue;
                 }
             };
+
+            // Published before the state is inferred: the snapshot is what the
+            // console reads, and it must never lag behind the state it explains.
+            *shared_peers.write().await = peers.clone();
 
             log_peer_transitions(&peers, &shared_network, &mut seen, &event_tx).await;
 
@@ -1181,7 +1309,7 @@ pub fn status(network: &NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     );
     println!("  transport    : WireGuard UDP {WG_PORT}");
     println!("  web interface: http://{}", network.api_bind());
-    println!("  WAN          : {}", network.wan_iface);
+    println!("  WAN          : {}", network.wan_ifaces.join(", "));
     println!("  LAN          : {:?}", network.lan_ifaces);
     println!(
         "  WG interface : {} (UDP {})",
@@ -1234,7 +1362,7 @@ mod tests {
 
     fn configured_network() -> NetworkConfig {
         NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             wg_iface: "helios0".into(),
             wg_private_key: PRIVATE_KEY.into(),
             wg_address: "100.64.0.1/10".into(),
@@ -1248,6 +1376,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         }
@@ -1276,6 +1405,7 @@ mod tests {
             wireguard,
             Arc::clone(&state),
             Arc::clone(&network),
+            Arc::new(RwLock::new(Vec::new())),
             event_tx,
             internal_tx,
         );
@@ -1673,6 +1803,7 @@ mod tests {
             &events,
             &firewall,
             &network.firewall_policy(),
+            true,
         )
         .await
         .unwrap();

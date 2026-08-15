@@ -41,8 +41,11 @@ use std::str::FromStr;
 use aether::{FirewallPolicy, HeliosError, Result, TunnelState};
 use async_trait::async_trait;
 use rustables::{
-    expr::Masquerade, Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol,
-    ProtocolFamily, Rule as NfRule, Table,
+    expr::{
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Masquerade, Meta, MetaType,
+    },
+    Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily,
+    Rule as NfRule, Table,
 };
 use tracing::{info, warn};
 
@@ -50,6 +53,14 @@ use crate::ruleset::{render, ChainKind, Match, Ruleset, Verdict, L4};
 use crate::FirewallBackend;
 
 const TABLE_NAME: &str = "helios";
+
+/// Conntrack states [`Match::Established`] accepts, as the kernel reads them.
+///
+/// Pinned as a constant so a refactor back to [`NfRule::established`] — which
+/// sets `ESTABLISHED` alone, i.e. `0b010` — fails a test instead of quietly
+/// halving what the rule matches.
+const ESTABLISHED_OR_RELATED: u32 =
+    ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
 
 pub struct NetlinkBackend {
     table_name: String,
@@ -82,10 +93,11 @@ impl NetlinkBackend {
         };
 
         Ok(match m {
-            Match::Established => rule.established().map_err(Self::err)?,
+            Match::Established => Self::established_or_related(rule)?,
             Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
             Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
             Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
+            Match::SourcePort { port, proto: p } => rule.sport(*port, proto(*p)),
             Match::DestPortSet { .. } => {
                 return Err(Self::err(
                     "port set: must be expanded by expand_port_sets before translation",
@@ -94,7 +106,46 @@ impl NetlinkBackend {
             Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
             Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
             Match::Icmp => rule.icmp(),
+            Match::PacketMark(mark) => rule
+                .with_expr(Meta::new(MetaType::Mark))
+                .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
         })
+    }
+
+    /// Encodes a packet mark as the native `u32` stored in the nftables meta
+    /// register. Unlike IP addresses and ports, `meta mark` is not a network
+    /// protocol field and must therefore not use network byte order.
+    fn packet_mark_bytes(mark: u32) -> [u8; 4] {
+        mark.to_ne_bytes()
+    }
+
+    /// `ct state established,related`, built by hand.
+    ///
+    /// [`NfRule::established`] would be the obvious call, and it is wrong
+    /// here: it masks `ESTABLISHED` alone, so what got applied was `ct state
+    /// established` while [`Match`] displayed — and the API served, and the
+    /// console showed — `ct state established,related`. Exactly the
+    /// display/applied divergence the `ruleset` module doc rules out, and the
+    /// kind that survives review because both sides read correct on their
+    /// own.
+    ///
+    /// What `related` covers is not decorative. It is how conntrack labels an
+    /// ICMP error attached to a tracked flow, `destination unreachable —
+    /// fragmentation needed` first among them. Dropping those under a
+    /// fail-closed policy black-holes path-MTU discovery: connections open,
+    /// then hang on the first full-size packet, and the tunnel gets blamed.
+    ///
+    /// The three expressions reproduce what `rustables` emits, with the mask
+    /// widened by one bit — same layout, same little-endian mask convention.
+    fn established_or_related(rule: NfRule) -> Result<NfRule> {
+        Ok(rule
+            .with_expr(Conntrack::new(ConntrackKey::State))
+            .with_expr(
+                Bitwise::new(ESTABLISHED_OR_RELATED.to_le_bytes(), 0u32.to_be_bytes())
+                    .map_err(Self::err)?,
+            )
+            // Non-zero after masking: the packet is in one of the two states.
+            .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
     }
 
     /// Applies an address match, accepting either a plain IP or a CIDR.
@@ -215,7 +266,9 @@ impl NetlinkBackend {
         //
         // Priority 100 (`NF_IP_PRI_NAT_SRC`): this is the expected place for
         // a source-NAT, after filtering.
-        if let Some(out_iface) = &rs.masquerade_out {
+        if !rs.masquerade_out.is_empty() {
+            // One chain, one rule per uplink. Creating the chain inside the
+            // loop would declare it several times in a single batch.
             let chain = Chain::new(&table)
                 .with_name("postrouting")
                 .with_hook(Hook::new(HookClass::PostRouting, 100))
@@ -224,12 +277,14 @@ impl NetlinkBackend {
                 // filtering verdict, it rewrites or lets through.
                 .add_to_batch(&mut batch);
 
-            NfRule::new(&chain)
-                .map_err(Self::err)?
-                .oiface(out_iface)
-                .map_err(Self::err)?
-                .with_expr(Masquerade::default())
-                .add_to_batch(&mut batch);
+            for out_iface in &rs.masquerade_out {
+                NfRule::new(&chain)
+                    .map_err(Self::err)?
+                    .oiface(out_iface)
+                    .map_err(Self::err)?
+                    .with_expr(Masquerade::default())
+                    .add_to_batch(&mut batch);
+            }
         }
 
         Ok(batch)
@@ -341,11 +396,41 @@ mod tests {
         assert_eq!(NetlinkBackend::expand_port_sets(&matches), vec![matches]);
     }
 
+    /// `related` is how conntrack labels an ICMP error attached to a tracked
+    /// flow — `fragmentation needed` above all. Matching `established` alone
+    /// black-holes path-MTU discovery under a drop policy: connections open,
+    /// then hang on the first full-size packet.
+    ///
+    /// Only the mask is checked here; that the kernel prints `ct state
+    /// established,related` is target-only, see `docs/testing/TESTING.md`.
+    #[test]
+    fn the_conntrack_mask_carries_related_and_not_established_alone() {
+        assert_eq!(
+            ESTABLISHED_OR_RELATED, 0b110,
+            "the mask the kernel reads must carry both states"
+        );
+        assert_ne!(
+            ESTABLISHED_OR_RELATED,
+            ConnTrackState::ESTABLISHED.bits(),
+            "`NfRule::established` is precisely what this constant exists to avoid"
+        );
+    }
+
     #[test]
     fn address_parsing() {
         assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
         assert!(IpAddr::from_str("203.0.113.10").is_ok());
         assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn packet_mark_is_encoded_in_the_kernel_register_byte_order() {
+        let mark = 0xe1f1;
+
+        assert_eq!(
+            u32::from_ne_bytes(NetlinkBackend::packet_mark_bytes(mark)),
+            mark
+        );
     }
 
     /// Translation is the largest deterministic part of the real backend.
@@ -374,6 +459,7 @@ mod tests {
                     chain: ChainKind::Forward,
                     matches: vec![
                         Match::OutIface("eth0".into()),
+                        Match::PacketMark(0xe1f1),
                         Match::DestPortSet {
                             ports: vec![53, 51820],
                             proto: L4::Udp,
@@ -386,14 +472,14 @@ mod tests {
                 },
             ],
             mss_clamp: Some(1280),
-            masquerade_out: Some("eth0".into()),
+            masquerade_out: vec!["eth0".into()],
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_ok());
 
         let mut accept_by_default = ruleset;
         accept_by_default.default_verdict = Verdict::Accept;
-        accept_by_default.masquerade_out = None;
+        accept_by_default.masquerade_out = Vec::new();
         assert!(NetlinkBackend::new()
             .build_batch(&accept_by_default)
             .is_ok());
@@ -416,7 +502,7 @@ mod tests {
                     note: None,
                 }],
                 mss_clamp: None,
-                masquerade_out: None,
+                masquerade_out: Vec::new(),
             };
             assert!(
                 NetlinkBackend::new().build_batch(&ruleset).is_err(),
@@ -445,7 +531,7 @@ mod tests {
                 note: None,
             }],
             mss_clamp: None,
-            masquerade_out: None,
+            masquerade_out: Vec::new(),
         };
 
         assert!(NetlinkBackend::new().build_batch(&ruleset).is_err());

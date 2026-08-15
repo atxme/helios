@@ -62,7 +62,7 @@ jobs:
           if-no-files-found: warn
 
   orion-windows:
-    name: Orion — sécurité Windows
+    name: Orion et Astra — sécurité Windows
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +81,9 @@ jobs:
           npm run test:unit --prefix apps/orion
           npm run build --prefix apps/orion
       - name: Analyse statique des chemins Windows
-        run: cargo clippy -p orion-core -p orion --all-targets --all-features -- -D warnings
+        run: cargo clippy -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
+      - name: Tests du compagnon Astra sous Windows
+        run: cargo test -p astra-signer --all-features
       - name: Outillage de couverture Rust
         run: cargo install cargo-llvm-cov --locked
       - name: Tests et couverture Orion sous Windows

@@ -38,7 +38,7 @@ export interface KeyNegotiationSettings {
   server_name: string
   /** Gateway CA certificate, DER encoded in base64. */
   gateway_ca_der: string
-  /** Pinned ML-DSA-65 gateway certificate: base64-encoded JSON. */
+  /** Pinned ML-DSA-87 gateway certificate: base64-encoded JSON. */
   gateway_pq_certificate: string
   /** Opaque lookup name in the protected identity store. */
   identity: string
@@ -54,6 +54,95 @@ export interface KeyNegotiationSettings {
 export interface KeyNegotiationSupport {
   /** A protected identity store is wired into the client core. */
   identity_store: boolean
+}
+
+/**
+ * Where a certificate stands on the renewal ladder of the spec's §4.3.
+ *
+ * Computed in Rust from the lifecycle's own `ValidityPeriod` — 80 %, 90 %,
+ * 95 % of the lifetime. The screen renders it; it does not derive it.
+ */
+export type CertificatePhase =
+  | 'not_yet_valid'
+  | 'valid'
+  | 'renewal_due'
+  | 'warning'
+  | 'critical'
+  | 'expired'
+
+/** One certificate, as the shell reports it. */
+export interface CertificateFacts {
+  subject: string
+  issuer: string
+  /** SHA-256, lowercase hex — the value read out to compare. */
+  fingerprint: string
+  not_before: number
+  not_after: number
+  /** Instant the renewal window opens: 80 % of the lifetime. */
+  renewal_at: number
+  phase: CertificatePhase
+}
+
+/**
+ * The four certificates a connection depends on.
+ *
+ * Two are pinned by the profile, two live in the protected identity store.
+ * An absent slot is an absence — no negotiation block, no protected store —
+ * while a slot that exists and could not be read appears in `faults`, named.
+ */
+/** The four actions spec §12.2 requires the Profiles surface to offer. */
+export type CertificateAction =
+  | 'renew_now'
+  | 'renew_every_profile'
+  | 'recover_expired'
+  | 'rollback_to_previous'
+
+/**
+ * Why an action cannot run.
+ *
+ * Each variant is a **different** thing for the user to do — import an
+ * enrolment file, run on a machine with a protected store, wait for a format
+ * migration — which is why they are not one flag.
+ */
+export type CertificateActionBlockKind =
+  | 'no_negotiation'
+  | 'no_identity_store'
+  | 'identity_missing'
+  | 'nothing_expired'
+  | 'no_previous_identity'
+  | 'trust_material_missing'
+  | 'renewal_path_not_wired'
+  | 'operator_credential_required'
+
+/** One action and whether it may run, as the shell decides. */
+export interface CertificateActionState {
+  action: CertificateAction
+  /** Fixed in Rust: §12.2 forbids an ambiguous « Renouveler ». */
+  label: string
+  blocked_by: { kind: CertificateActionBlockKind } | null
+  /** The sentence to show, as-is. `null` when the action may run. */
+  message: string | null
+}
+
+/** Everything the Certificates screen shows for one profile. */
+export interface ProfileCertificates {
+  name: string
+  /** Protected identity the profile names. Empty when it negotiates nothing. */
+  identity: string
+  /** The profile carries a key-negotiation block. */
+  negotiates: boolean
+  inventory: CertificateInventory
+  actions: CertificateActionState[]
+  last_error: string | null
+}
+
+export interface CertificateInventory {
+  gateway_pq: CertificateFacts | null
+  gateway_ca_tls: CertificateFacts | null
+  client_tls: CertificateFacts | null
+  client_pq: CertificateFacts | null
+  faults: string[]
+  identity_sealed: boolean
 }
 
 /**
@@ -85,6 +174,15 @@ export interface ImportOutcome {
    * refusal belongs at Connect, not at the file picker.
    */
   incomplete: string | null
+  /**
+   * What the document said that Orion read and does **not** apply.
+   *
+   * A wg-quick file routinely carries `DNS`, `MTU` or `Table`. Refusing the
+   * file over them made Orion unable to open an ordinary WireGuard
+   * configuration; dropping them without a word would hand back a tunnel that
+   * differs from the one the file describes.
+   */
+  notices: string[]
 }
 
 /**
@@ -264,6 +362,53 @@ export interface LogLine {
 export interface TelemetrySample {
   rx_bps: number
   tx_bps: number
+}
+
+export type SpeedTestMode = 'tcp' | 'udp' | 'full'
+
+export type SpeedTestPhase =
+  | 'preparing'
+  | 'latency'
+  | 'tcp_download'
+  | 'tcp_upload'
+  | 'udp_download'
+  | 'udp_upload'
+  | 'complete'
+
+/** Progress of the direct TCP/UDP measurement. */
+export interface SpeedTestProgress {
+  phase: SpeedTestPhase
+  fraction: number
+  current_mbps: number
+  bytes: number
+  elapsed_ms: number
+  message: string
+}
+
+/** One raw WireGuard data-path measurement. */
+export interface SpeedTestResult {
+  latency_ms: number
+  jitter_ms: number
+  latency_p95_ms: number
+  mode: SpeedTestMode
+  tcp_download_mbps: number | null
+  tcp_upload_mbps: number | null
+  udp_download_mbps: number | null
+  udp_upload_mbps: number | null
+  udp_loss_pct: number | null
+  udp_jitter_ms: number | null
+  tcp_streams: number
+  test_duration_secs: number
+  /** Compatibility projections used by older log consumers. */
+  download_mbps: number
+  upload_mbps: number
+  download_variation_pct: number
+  upload_variation_pct: number
+  duration_ms: number
+  download_bytes: number
+  upload_bytes: number
+  parallel_streams: number
+  measurement_rounds: number
 }
 
 /**

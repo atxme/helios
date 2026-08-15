@@ -69,6 +69,10 @@ struct AppState {
     store: Arc<orion_core::vault::ProfileStore>,
     config: Arc<Mutex<ClientConfig>>,
     telemetry: Arc<TelemetryManager>,
+    /// Serializes the expensive benchmark. The UI disables its button, but
+    /// the Rust boundary still refuses a second IPC invocation so two tests
+    /// cannot divide the same path and both report half of its capacity.
+    speedtest: Mutex<()>,
     pending_profile_paths: StdMutex<VecDeque<PathBuf>>,
     /// Imported profiles the user has not saved yet, keyed by display name.
     ///
@@ -129,6 +133,13 @@ struct AppState {
     /// file is the only trace left of a start that went wrong — and a path
     /// nobody can find is a file nobody reads. The About box states it.
     log_path: Option<PathBuf>,
+    /// Last certificate action that failed, per profile — the «dernière
+    /// erreur» spec §12.2 asks the Certificates surface to display.
+    ///
+    /// In memory rather than persisted: it describes an attempt made in this
+    /// session, and a message surviving a restart would outlive the situation
+    /// it described — an identity imported since, a store now available.
+    last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -392,35 +403,212 @@ fn key_negotiation_support(state: State<'_, AppState>) -> KeyNegotiationSupport 
     }
 }
 
-/// Is this profile's identity already sealed on this machine?
+/// The four certificates a connection depends on, with their dates.
 ///
-/// Answered without unsealing: the screen needs to know whether the import
-/// still has to happen, and that question must not depend on the session
-/// being able to decrypt. `false` also covers "no negotiation block" — a
-/// profile that needs no identity needs no import either.
+/// # Why the shell reads them rather than the screen
+///
+/// Two of them live in the protected identity store, which the WebView has no
+/// business reaching, and all four are parsed by the same validator the
+/// negotiation uses — `aether::certificates::x509` and the v5 PQ format. A
+/// screen that decoded base64 and read dates itself would be a second
+/// implementation of the lifecycle's arithmetic, and the day the two disagreed
+/// the interface would be the one lying.
+///
+/// Nothing secret crosses back. The bundle is unsealed inside `orion-core`,
+/// which keeps the two private halves and returns subjects, fingerprints and
+/// instants (ADR-006 §5).
 #[tauri::command]
-fn key_negotiation_identity_sealed(
+fn certificate_inventory(
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> bool {
-    // Takes the block alone rather than a whole profile: this answers a
-    // question about the negotiation identity, and passing the profile would
-    // have meant shipping its secrets across the IPC to read one field.
-    let Some(settings) = key_negotiation else {
-        return false;
-    };
-    ProtectedIdentityStore::for_current_user().is_ok_and(|store| store.contains(&settings.identity))
+) -> orion_core::CertificateInventory {
+    orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix())
 }
 
-/// Fingerprint of the gateway PQ certificate pinned by a profile.
+/// Everything the Certificates screen shows, for every profile at once.
 ///
-/// Same reasoning as [`profile_public_key`]: the value is derived on the Rust
-/// side and displayed so the user can compare it, out loud or by phone, with
-/// what `heliosd init-key-negotiation` printed on the gateway.
+/// One command rather than two per profile, and the reason is the protected
+/// store: answering unseals it, and a screen listing six profiles would
+/// otherwise make twelve DPAPI round trips to build one view.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProfileCertificates {
+    name: String,
+    /// Protected identity the profile names. Empty when it negotiates nothing.
+    identity: String,
+    /// The profile carries a key-negotiation block.
+    negotiates: bool,
+    inventory: orion_core::CertificateInventory,
+    actions: Vec<orion_core::CertificateActionState>,
+    last_error: Option<String>,
+}
+
 #[tauri::command]
-fn key_negotiation_fingerprint(
+async fn certificate_overview(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProfileCertificates>, String> {
+    let profiles: Vec<(String, Option<orion_core::KeyNegotiationSettings>)> = {
+        let cfg = state.config.lock().await;
+        cfg.profiles
+            .iter()
+            .map(|profile| (profile.name.clone(), profile.key_negotiation.clone()))
+            .collect()
+    };
+    let errors = state.last_certificate_error.lock().await.clone();
+    let identity_store = state.controller.key_negotiation_ready();
+    let now = now_unix();
+
+    Ok(profiles
+        .into_iter()
+        .map(|(name, settings)| {
+            let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            let actions = orion_core::certificate_actions::action_states(
+                settings.as_ref(),
+                &inventory,
+                identity_store,
+            );
+            ProfileCertificates {
+                identity: settings
+                    .as_ref()
+                    .map(|block| block.identity.clone())
+                    .unwrap_or_default(),
+                negotiates: settings.is_some(),
+                last_error: errors.get(&name).cloned(),
+                name,
+                inventory,
+                actions,
+            }
+        })
+        .collect())
+}
+
+/// State of the four certificate actions of spec §12.2, for one profile.
+///
+/// Decided in `orion-core`, beside the state it reads. The screen renders the
+/// reason it is given; a button greyed out with no sentence leaves the user
+/// with the question they opened the screen to answer.
+#[tauri::command]
+fn certificate_actions(
+    state: State<'_, AppState>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> Option<String> {
-    key_negotiation.and_then(|settings| settings.gateway_pq_fingerprint())
+) -> Vec<orion_core::CertificateActionState> {
+    let inventory =
+        orion_core::certificate_inventory::inventory(key_negotiation.as_ref(), now_unix());
+    orion_core::certificate_actions::action_states(
+        key_negotiation.as_ref(),
+        &inventory,
+        state.controller.key_negotiation_ready(),
+    )
+}
+
+/// Runs one of the four actions, or reports why it cannot run.
+///
+/// The refusal happens **before** a key pair is generated or an authority is
+/// asked to certify anything: a press that produced a key and then discovered
+/// it could not finish would leave a half-rotation behind every time.
+///
+/// The reason is recorded as this profile's last error, which is what §12.2
+/// asks the surface to display.
+#[tauri::command]
+async fn run_certificate_action(
+    state: State<'_, AppState>,
+    name: String,
+    action: orion_core::CertificateAction,
+) -> Result<(), String> {
+    let settings = {
+        let cfg = state.config.lock().await;
+        cfg.find(&name)
+            .and_then(|profile| profile.key_negotiation.clone())
+    };
+    let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now_unix());
+    let outcome = orion_core::certificate_actions::run(
+        action,
+        settings.as_ref(),
+        &inventory,
+        state.controller.key_negotiation_ready(),
+    );
+    match outcome {
+        Ok(()) => {
+            state.last_certificate_error.lock().await.remove(&name);
+            Ok(())
+        }
+        Err(block) => {
+            let message = block.message();
+            state
+                .last_certificate_error
+                .lock()
+                .await
+                .insert(name, message.clone());
+            Err(message)
+        }
+    }
+}
+
+/// The last certificate action that failed on this profile, if any.
+///
+/// Kept in memory rather than persisted: it describes an attempt made in this
+/// session, and a message surviving a restart would outlive the situation it
+/// described — a missing identity imported since, a store now available.
+#[tauri::command]
+async fn last_certificate_error(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Option<String>, String> {
+    Ok(state
+        .last_certificate_error
+        .lock()
+        .await
+        .get(&name)
+        .cloned())
+}
+
+/// Measures the raw WireGuard data path to the active gateway.
+///
+/// This command is intentionally available only while WireGuard is `Up`: the
+/// gateway's API lives behind that tunnel, and the Rust engine targets its
+/// fixed in-tunnel address. TCP/UDP data is exchanged on a dedicated socket;
+/// this command only relays progress and keeps the expensive benchmark
+/// serialized. The transfer implementation itself lives in `orion-core`, so
+/// it remains testable without Tauri or WebView.
+#[tauri::command]
+async fn run_speed_test(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: String,
+) -> Result<orion_core::SpeedTestResult, String> {
+    let _exclusive = state
+        .speedtest
+        .try_lock()
+        .map_err(|_| "un speedtest est déjà en cours".to_string())?;
+    if state.controller.state() != TunnelState::Up || !state.controller.adapter_is_up() {
+        return Err("le speedtest nécessite un tunnel WireGuard connecté".into());
+    }
+    let mode = orion_core::SpeedTestMode::parse(&mode).map_err(|error| error.to_string())?;
+    let progress_app = app.clone();
+    let progress: orion_core::SpeedTestProgressSink = Arc::new(move |update| {
+        let _ = progress_app.emit("helios://speedtest", &update);
+    });
+    orion_core::run_speedtest_with_progress(
+        mode,
+        aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
+        // No override: the UI runs `full`, where the UDP quality legs take
+        // their rate from the TCP throughput measured moments earlier.
+        None,
+        progress,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Wall clock in Unix seconds, for the lifecycle's own arithmetic.
+///
+/// A clock behind the certificate's `not_before` reads as "not yet valid" and
+/// one far ahead reads as expired, which is exactly what the connection would
+/// conclude: the panel is wrong in the same direction as the failure, rather
+/// than reassuring while the handshake refuses.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// A profile **as the interface is allowed to see it** (ADR-006 §5).
@@ -646,6 +834,14 @@ struct ImportOutcome {
     private_key_missing: Option<String>,
     /// What else the document leaves to fill in, if anything.
     incomplete: Option<String>,
+    /// What the document said that Orion read and does **not** apply.
+    ///
+    /// A wg-quick file routinely carries `DNS`, `MTU` or `Table`. Refusing the
+    /// file over them made Orion unable to open an ordinary WireGuard
+    /// configuration; dropping them without a word would hand back a tunnel
+    /// that differs from the one the file describes. They are imported, and
+    /// reported.
+    notices: Vec<String>,
 }
 
 /// Seals the identity shipped with a document, if any.
@@ -728,8 +924,13 @@ async fn finish_import(
     let (identity_sealed, identity_error) = seal_identity(imported.identity);
     let mut completed = {
         let config = state.config.lock().await;
-        complete_profile_import(imported.profile, &config, admitted.as_deref())
-            .map_err(|error| error.to_string())?
+        complete_profile_import(
+            imported.profile,
+            &config,
+            admitted.as_deref(),
+            imported.notices,
+        )
+        .map_err(|error| error.to_string())?
     };
 
     // The staged key is the missing candidate.
@@ -807,6 +1008,7 @@ async fn finish_import(
         identity_error,
         private_key_missing: completed.private_key_missing,
         incomplete: completed.incomplete,
+        notices: completed.notices,
     })
 }
 
@@ -1391,6 +1593,16 @@ async fn validate_profile(
 fn window_size_for(view: &str) -> (f64, f64) {
     match view {
         "profiles" => (800.0, 720.0),
+        // Certificates is a column of cards: a name, four dated rows and the
+        // four actions of §12.2, wrapped rather than stacked. It was given the
+        // width of a two-column form and the height of six profiles, and a
+        // device that holds one spent the difference on empty paper. Beyond
+        // what fits, the view scrolls.
+        "certificates" => (680.0, 620.0),
+        // The speedtest is a single centred column — a dial, two direction
+        // rows, three qualities. It was given the width of a two-column form
+        // and spent it on margins.
+        "speedtest" => (520.0, 620.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the
         // height of the other views only produced a hole in the middle.
@@ -1812,6 +2024,7 @@ fn main() {
             store,
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(TelemetryManager::default()),
+            speedtest: Mutex::new(()),
             pending_profile_paths: StdMutex::new(pending_profile_paths),
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
@@ -1819,6 +2032,7 @@ fn main() {
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
+            last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
@@ -1855,8 +2069,12 @@ fn main() {
             resize_for_view,
             validate_profile,
             key_negotiation_support,
-            key_negotiation_fingerprint,
-            key_negotiation_identity_sealed,
+            certificate_inventory,
+            certificate_actions,
+            certificate_overview,
+            run_certificate_action,
+            last_certificate_error,
+            run_speed_test,
             vault_posture,
         ])
         .run(tauri::generate_context!())
@@ -2141,7 +2359,7 @@ mod security_tests {
             window["minWidth"].as_f64().expect("minWidth"),
             window["minHeight"].as_f64().expect("minHeight"),
         );
-        for view in ["connect", "profiles", "logs"] {
+        for view in ["connect", "profiles", "certificates", "speedtest", "logs"] {
             let (w, h) = window_size_for(view);
             assert!(w >= min_w, "{view} : {w} < {min_w}");
             assert!(h >= min_h, "{view} : {h} < {min_h}");
@@ -2288,6 +2506,28 @@ mod security_tests {
             u16::from_le_bytes([icon[4], icon[5]]) >= 5,
             "the icon must carry the small sizes drawn for them"
         );
+    }
+
+    /// The WiX fragment must stay well-formed XML, comments included.
+    ///
+    /// `--` inside a comment body is illegal XML, and a command line quoted in
+    /// prose is the natural way to write one by accident. candle refuses the
+    /// file before reading an element, but the bundler logs its output at debug
+    /// level: the build then fails with `failed to run candle.exe` and no line
+    /// number, minutes into a release job that only runs on Windows.
+    #[test]
+    fn windows_wix_fragment_comments_are_well_formed() {
+        let mut rest = include_str!("../windows/orion-profile-icon.wxs");
+        while let Some(start) = rest.find("<!--") {
+            let body = &rest[start + "<!--".len()..];
+            let end = body.find("-->").expect("unterminated XML comment");
+            assert!(
+                !body[..end].contains("--"),
+                "an XML comment must not contain `--`: {}",
+                &body[..end]
+            );
+            rest = &body[end + "-->".len()..];
+        }
     }
 
     #[test]

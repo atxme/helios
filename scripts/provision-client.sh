@@ -36,9 +36,12 @@
 # il le dit avant d'agir.
 set -euo pipefail
 
+# Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$(dirname "$0")/lib-remote.sh"
+
 cd "$(dirname "$0")/.."
 
-ETAT="${HELIOS_PROVISION_STATE:-$HOME/.helios/provision.conf}"
 SORTIE="${HELIOS_PROVISION_OUT:-$PWD}"
 REFAIRE_CA=0
 REMPLACER=0
@@ -91,16 +94,17 @@ done
 
 [ -n "$CLIENT" ] || usage
 
-if [ -z "$CIBLE" ] && [ -f "$ETAT" ]; then
-    CIBLE="$(sed -n 's/^cible=//p' "$ETAT")"
-fi
+# La gateway de lib-remote.sh, sauf argument explicite.
+CIBLE="${CIBLE:-$HELIOS_CIBLE}"
 if [ -z "$CIBLE" ]; then
-    echo "Aucune gateway connue. Premier appel :" >&2
+    echo "Aucune gateway : renseigner HELIOS_CIBLE dans scripts/lib-remote.sh," >&2
+    echo "ou passer l'hôte en argument :" >&2
     echo "  ./scripts/provision-client.sh $CLIENT utilisateur@adresse" >&2
     exit 1
 fi
-mkdir -p "$(dirname "$ETAT")"
-printf 'cible=%s\n' "$CIBLE" > "$ETAT"
+# Une seule invite, prise hors de tout pipeline : `helios_ssh_sudo` y tourne
+# en sous-shell, et le mot de passe capturé là y serait perdu.
+helios_sudo_init "$CIBLE"
 
 HOTE="${CIBLE#*@}"
 
@@ -331,7 +335,7 @@ REMOTE
 
 scp -q "$TRAVAIL/gateway.sh" "$CIBLE:/tmp/helios-provision-$$.sh"
 echo "==> Travail sur la gateway (sudo demandé une fois)"
-if ! ssh -t "$CIBLE" "sudo bash /tmp/helios-provision-$$.sh; rc=\$?; rm -f /tmp/helios-provision-$$.sh; exit \$rc"; then
+if ! helios_ssh_sudo "$CIBLE" "bash /tmp/helios-provision-$$.sh; rc=\$?; rm -f /tmp/helios-provision-$$.sh; exit \$rc"; then
     echo "La séquence privilégiée a échoué sur $CIBLE." >&2
     exit 1
 fi

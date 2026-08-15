@@ -1,6 +1,6 @@
 [package]
 name = "aether"
-version.workspace = true
+version = "1.6.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -11,7 +11,7 @@ default = []
 # API de génération et de signature réservée à l'outil éditeur hors gateway.
 publisher-signing = ["fips204/default-rng"]
 # Runtime ML-DSA signing for authenticated key negotiation.
-key-negotiation-signing = ["fips204/default-rng"]
+key-negotiation-signing = ["fips204/default-rng", "dep:rcgen"]
 
 [dependencies]
 serde.workspace = true
@@ -24,6 +24,15 @@ hex.workspace = true
 serde_json.workspace = true
 fips204.workspace = true
 curve25519-dalek.workspace = true
+# Contrôles X.509 du cycle de vie des certificats : CA réelle, usage
+# `clientAuth`, chaîne vers une ancre déjà détenue et liaison CSR ↔ clé
+# certifiée. `verify` apporte la vérification de signature ; le crate est déjà
+# dans l'arbre via rcgen.
+x509-parser = { version = "0.16", features = ["verify"] }
+# Émission X.509 : seulement pour `test_x509`, le matériel de test partagé par
+# les crates qui vérifient des chaînes clientes. Une gateway qui ne fait que
+# vérifier n'active pas la feature et ne lie pas rcgen.
+rcgen = { workspace = true, optional = true }
 # Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
 # clé privée persistée d'un pair, par opposition aux clés éphémères.
 x25519-dalek.workspace = true

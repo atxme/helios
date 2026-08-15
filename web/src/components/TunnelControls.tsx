@@ -1,6 +1,26 @@
-import { DoorOpen, Lock, LockOpen, Shield, Wifi, WifiOff } from 'lucide-react'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
+import Stack from '@mui/material/Stack'
+import Typography from '@mui/material/Typography'
+import { DoorOpen, Lock, LockOpen, Power, PowerOff } from 'lucide-react'
 import { useState } from 'react'
+import { TUNNEL_STATE, toneColors } from '../state'
 import type { TunnelState } from '../types'
+
+/**
+ * The two commands that change what the gateway does.
+ *
+ * MD3's button hierarchy is used literally: exactly one filled button per
+ * card — the action being invited — and outlines for everything else. Which
+ * one is filled follows the state, so the screen always offers a single
+ * obvious next move.
+ *
+ * The kill-switch line at the bottom is a **readout, not a control**. It has
+ * no affordance on purpose: the kill-switch is not something an operator sets,
+ * it is what the tunnel state implies (`state.ts` holds that mapping). Making
+ * it look actionable would suggest traffic can be released without a handshake.
+ */
 
 interface Props {
   state: TunnelState
@@ -11,14 +31,6 @@ interface Props {
   onReleaseCaptivePortal: () => Promise<void>
 }
 
-const KILL_SWITCH: Record<TunnelState, { engaged: boolean; label: string; color: string; dot: string }> = {
-  up: { engaged: false, label: 'Trafic autorisé', color: 'text-emerald-600 dark:text-emerald-500', dot: 'bg-emerald-500' },
-  connecting: { engaged: true, label: 'Trafic bloqué', color: 'text-amber-600 dark:text-amber-500', dot: 'bg-amber-500 animate-pulse' },
-  down: { engaged: true, label: 'Trafic bloqué', color: 'text-slate-500', dot: 'bg-slate-400 dark:bg-slate-600' },
-  failed: { engaged: true, label: 'Trafic bloqué', color: 'text-red-500 dark:text-red-400', dot: 'bg-red-500' },
-  captive_portal: { engaged: true, label: 'Accès portail seul', color: 'text-amber-600 dark:text-amber-400', dot: 'bg-amber-500 animate-pulse' },
-}
-
 export function TunnelControls({
   state,
   daemonError,
@@ -27,16 +39,18 @@ export function TunnelControls({
   onDisconnect,
   onReleaseCaptivePortal,
 }: Props) {
-  const [loading, setLoading] = useState(false)
-  const killSwitch = KILL_SWITCH[state]
+  const [busy, setBusy] = useState(false)
+  const semantics = TUNNEL_STATE[state]
+  const tone = toneColors(semantics.tone)
+
   const run = async (action: () => Promise<void>) => {
-    setLoading(true)
+    setBusy(true)
     try {
       await action()
     } catch {
-      // The global banner shows the error surfaced by useHelios.
+      // The shell's banner already carries the error surfaced by useHelios.
     } finally {
-      setLoading(false)
+      setBusy(false)
     }
   }
 
@@ -44,47 +58,77 @@ export function TunnelControls({
   const canDisconnect = !daemonError && state !== 'down'
 
   return (
-    <div className="panel hud p-5 flex flex-col gap-4">
-      <h2 className="hud-title">Contrôle de la gateway</h2>
-      <p className="text-xs text-slate-500">
+    <Stack spacing={2} sx={{ height: '100%' }}>
+      <Typography variant="body2" sx={{ color: 'text.secondary' }}>
         Helios monte une interface WireGuard serveur et attend les handshakes des clients admis.
-      </p>
+      </Typography>
 
-      <button
-        onClick={() => run(onConnect)}
-        disabled={!canConnect || loading}
-        className="flex items-center justify-center gap-2 w-full py-3 px-4 rounded-lg text-sm font-semibold border border-cyan-400/50 bg-cyan-500/10 text-cyan-700 dark:text-cyan-200 disabled:opacity-30 disabled:cursor-not-allowed"
-      >
-        {loading && canConnect ? <Shield className="h-4 w-4 animate-pulse" /> : <Wifi className="h-4 w-4" />}
-        Monter l’interface
-      </button>
-
-      <button
-        onClick={() => run(onDisconnect)}
-        disabled={!canDisconnect || loading}
-        className="flex items-center justify-center gap-2 w-full py-3 px-4 rounded-lg text-sm border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-red-500/40 hover:text-red-500 disabled:opacity-30 disabled:cursor-not-allowed"
-      >
-        <WifiOff className="h-4 w-4" /> Arrêter l’interface
-      </button>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+        <Button
+          variant={canConnect ? 'contained' : 'outlined'}
+          disabled={!canConnect || busy}
+          onClick={() => void run(onConnect)}
+          startIcon={
+            busy && canConnect ? <CircularProgress size={16} color="inherit" /> : <Power size={18} />
+          }
+        >
+          Monter l’interface
+        </Button>
+        <Button
+          variant="outlined"
+          color="inherit"
+          disabled={!canDisconnect || busy}
+          onClick={() => void run(onDisconnect)}
+          startIcon={<PowerOff size={18} />}
+          sx={{
+            borderColor: 'divider',
+            color: 'text.secondary',
+            '&:hover': { borderColor: 'error.main', color: 'error.main' },
+          }}
+        >
+          Arrêter l’interface
+        </Button>
+      </Stack>
 
       {state === 'captive_portal' && (
-        <button
-          onClick={() => run(onReleaseCaptivePortal)}
-          disabled={loading}
-          className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-lg text-xs border border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+        <Button
+          variant="contained"
+          disableElevation
+          disabled={busy}
+          onClick={() => void run(onReleaseCaptivePortal)}
+          startIcon={<DoorOpen size={18} />}
+          sx={{
+            alignSelf: 'flex-start',
+            bgcolor: 'state.captivePortal.container',
+            color: 'state.captivePortal.onContainer',
+            '&:hover': { bgcolor: 'state.captivePortal.container', filter: 'brightness(0.95)' },
+          }}
         >
-          <DoorOpen className="h-4 w-4" /> Portail validé{captiveGateway ? ` (${captiveGateway})` : ''}
-        </button>
+          Portail validé{captiveGateway ? ` (${captiveGateway})` : ''}
+        </Button>
       )}
 
-      <div className="mt-auto pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center gap-2">
-        {killSwitch.engaged ? <Lock className="h-3 w-3 text-slate-500" /> : <LockOpen className="h-3 w-3 text-slate-500" />}
-        <span className="text-[10px] uppercase tracking-widest text-slate-500">Kill-switch</span>
-        <div className="flex items-center gap-1.5 ml-auto">
-          <span className={`h-1.5 w-1.5 rounded-full ${killSwitch.dot}`} />
-          <span className={`text-[10px] font-mono uppercase ${killSwitch.color}`}>{killSwitch.label}</span>
-        </div>
-      </div>
-    </div>
+      <Stack
+        direction="row"
+        spacing={1.5}
+        sx={{
+          mt: 'auto',
+          pt: 2,
+          alignItems: 'center',
+          borderTop: '1px solid',
+          borderColor: 'divider',
+        }}
+      >
+        <Box sx={{ color: 'text.secondary', display: 'flex' }}>
+          {semantics.killSwitchEngaged ? <Lock size={15} strokeWidth={1.8} /> : <LockOpen size={15} strokeWidth={1.8} />}
+        </Box>
+        <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+          Kill-switch
+        </Typography>
+        <Typography variant="overline" sx={{ ml: 'auto', color: tone.main }}>
+          {semantics.trafficLabel}
+        </Typography>
+      </Stack>
+    </Stack>
   )
 }

@@ -1,0 +1,96 @@
+# Astra — conteneur d'autorité (ADR-008 §1).
+#
+# Les contraintes ci-dessous ne sont pas du zèle : Astra tient le registre d'un
+# domaine de confiance et un émetteur délégué. Il ne détient jamais `CA-PQ` en
+# clair, mais il décide de ce qui est distribué, et un conteneur qui peut
+# s'échapper décide de la même chose.
+#
+# `scripts/deploy.sh` fait tout cela tout seul dès qu'un relais de domaine
+# existe — celui qu'écrit `astra-signer init` à côté du coffre. Il construit
+# l'image, la transfère, amorce Astra, capture la clé de service et la tête
+# d'audit, écrit le `.env` ci-dessous et enchaîne sur `heliosd
+# init-trust-domain`. Rien n'est recopié à la main.
+#
+# À la main, si besoin :
+#
+#   printf 'ASTRA_EXPECTED_AUDIT_HEAD=<tête>\n' > deploy/astra/.env
+#   docker compose -f deploy/astra/compose.yaml --env-file deploy/astra/.env up -d
+#
+# La tête d'audit sort du bootstrap. Sans elle, une restauration de sauvegarde
+# qui a divergé est reprise en silence au lieu d'être refusée.
+
+services:
+  astra:
+    build:
+      # Le contexte est la racine du dépôt : le Dockerfile compile le workspace.
+      context: ../..
+      dockerfile: deploy/astra/Dockerfile
+      # La construction emprunte la pile réseau de l'hôte, et c'est délibéré.
+      #
+      # Le pare-feu Helios a une chaîne `forward` en `drop` par défaut, et n'y
+      # ouvre que le LAN et le tunnel. Le pont Docker n'y figure pas : les
+      # paquets d'un conteneur sont donc jetés, et comme le premier d'entre eux
+      # est une requête DNS, la panne se lit « Temporary failure resolving
+      # deb.debian.org » — un message qui accuse le réseau du conteneur alors
+      # que c'est la politique de la gateway.
+      #
+      # L'ouvrir serait le mauvais geste : Astra n'a besoin d'aucune sortie
+      # Internet en fonctionnement, et un pont qui traverse le `forward`
+      # laisserait un conteneur sortir en clair pendant que le kill-switch est
+      # engagé. Seule la **construction** a besoin d'apt et de crates.io. Dans
+      # la pile de l'hôte, ce trafic est émis localement : il passe par
+      # `output`, que `allow_gateway_egress` régit déjà, et ne touche jamais
+      # `forward`. Le conteneur qui tourne, lui, garde son réseau isolé.
+      network: host
+    image: helios/astra:latest
+    container_name: astra
+    command:
+      - run
+      - --bind
+      - 0.0.0.0:8443
+      - --expected-audit-head
+      - ${ASTRA_EXPECTED_AUDIT_HEAD:?relever la tête d_audit imprimée au bootstrap}
+
+    # Aucune capacité, rootfs en lecture seule, pas d'escalade. Astra n'ouvre
+    # qu'un socket TCP et n'écrit que dans son volume.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+
+    # `read_only` interdit d'écrire ailleurs que dans les volumes ; /tmp reste
+    # nécessaire au runtime. Il est en mémoire, donc rien du conteneur ne
+    # survit à son arrêt hors du volume d'état.
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+
+    # LE seul montage. Registre, chaîne d'audit, clé de service scellée.
+    # C'est aussi tout ce qu'il faut sauvegarder.
+    volumes:
+      - astra-state:/var/lib/astra
+
+    networks:
+      - astra-public
+
+    # Publié sur la boucle locale seulement : le terminateur TLS est devant.
+    # Exposer 8443 sur l'hôte servirait du HTTP clair au monde.
+    ports:
+      - "127.0.0.1:8443:8443"
+
+    mem_limit: 256m
+    pids_limit: 128
+    restart: unless-stopped
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  astra-state:
+
+networks:
+  astra-public:
+    driver: bridge

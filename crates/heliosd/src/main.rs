@@ -1,14 +1,21 @@
 //! `heliosd` — control plane orchestrator daemon.
 
+mod certificates;
 mod gateway_key;
 mod key_negotiation;
 mod orchestrator;
 mod static_psk;
+mod uplink;
+mod vip_routing;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use aether::{
-    HeliosEvent, InstallPskRequest, NetworkConfig, OrchestratorCmd, TunnelState, API_BIND_LOOPBACK,
+    HeliosEvent, InstallPskRequest, NetworkConfig, ObserveHandshakeRequest, OrchestratorCmd,
+    TunnelState, API_BIND_LOOPBACK,
 };
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -84,6 +91,50 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// Creates this gateway's certificate registry (ADR-008).
+    ///
+    /// The counterpart of `astra bootstrap`, on this side of the wire. Until
+    /// it is run the registry is absent, and an absent registry is **not** an
+    /// empty one: the in-tunnel lifecycle routes stay closed and the gateway
+    /// says so at startup.
+    ///
+    /// It opens no vault and generates no key. Every value it writes is
+    /// public — the leaves this gateway already serves, read from disk, and
+    /// the anchors it is told to trust. It therefore runs on a gateway whose
+    /// TPM is unavailable, which is exactly when one wants to inspect it.
+    InitTrustDomain {
+        /// Trust domain identifier, 32 hex characters — printed by
+        /// `astra-signer init`.
+        #[arg(long)]
+        trust_domain_id: String,
+        /// Public `CA-PQ` key, base64 — printed by `astra-signer init`. The
+        /// anchor of the domain, and the only one this gateway ever trusts.
+        #[arg(long)]
+        ca_public_key: String,
+        /// Astra's service public key, base64 — printed by `astra bootstrap`.
+        /// It signs statuses and receipts; it certifies nothing.
+        #[arg(long)]
+        astra_service_public_key: String,
+        /// Public URL of the Astra endpoint.
+        #[arg(long)]
+        authority_url: String,
+        /// WebAuthn RP ID of the domain. The same value given to
+        /// `astra-signer init --rp-id` and to `astra bootstrap`.
+        #[arg(long)]
+        webauthn_rp_id: String,
+    },
+    /// Prints what `wan_iface = "auto"` resolves to, and why.
+    ///
+    /// Read-only. Every candidate the kernel exposes, its medium, its carrier
+    /// and its default-route metric — so a surprising choice is one command
+    /// away from being explained.
+    ShowUplink,
+    /// Prints the key-negotiation identity this gateway serves.
+    ///
+    /// Read-only, public, and it unseals nothing: the two values a deployment
+    /// needs — the server name clients pin and the WireGuard identity — are
+    /// read out of the served PQ leaf rather than retyped.
+    ShowIdentity,
     /// Local client admission, with console access.
     ///
     /// Used to bootstrap the first administrator peer — without it, no
@@ -213,7 +264,14 @@ async fn main() -> anyhow::Result<()> {
             run(network, dry_run).await
         }
         Command::Status => {
-            let network = NetworkConfig::load().context("loading the network config")?;
+            let mut network = NetworkConfig::load().context("loading the network config")?;
+            // Resolved here too: `status` is what an operator reads to see what
+            // the daemon will do, and printing the marker instead of the
+            // interface would answer a different question. A failure is not
+            // fatal — a diagnostic command must still print the rest.
+            if let Err(error) = resolve_uplink(&mut network) {
+                warn!(%error, "WAN interface unresolved");
+            }
             let dry_run = resolve_dry_run(false);
             orchestrator::status(&network, dry_run)
         }
@@ -235,6 +293,21 @@ async fn main() -> anyhow::Result<()> {
             let network = NetworkConfig::load().context("loading the network config")?;
             init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
         }
+        Command::InitTrustDomain {
+            trust_domain_id,
+            ca_public_key,
+            astra_service_public_key,
+            authority_url,
+            webauthn_rp_id,
+        } => init_trust_domain(
+            &trust_domain_id,
+            &ca_public_key,
+            &astra_service_public_key,
+            &authority_url,
+            &webauthn_rp_id,
+        ),
+        Command::ShowUplink => show_uplink(),
+        Command::ShowIdentity => show_identity(),
         Command::Peer { command } => {
             let network = NetworkConfig::load().context("loading the network config")?;
             peer_command(network, command)
@@ -378,6 +451,227 @@ fn init_key_negotiation(
     println!("PQ certificate: {}", result.pq_certificate_path.display());
     println!("PQ sha256: {}", result.pq_certificate_sha256);
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
+    Ok(())
+}
+
+/// Resolves `wan_iface = "auto"` against the kernel, once.
+///
+/// Substituted into the in-memory configuration, so everything downstream —
+/// the firewall policy, the hot reload, the API view — sees a real interface
+/// name rather than a marker. The file keeps `auto`: it describes the
+/// operator's intent, not the machine's current cabling.
+fn resolve_uplink(network: &mut NetworkConfig) -> anyhow::Result<()> {
+    if !network.wan_iface_is_auto() {
+        return Ok(());
+    }
+    let selection = uplink::resolve().context("choosing the WAN interface")?;
+    for warning in &selection.warnings {
+        warn!("{warning}");
+    }
+    info!(
+        interfaces = %selection.interfaces.join(", "),
+        preferred = %selection.preferred(),
+        reason = %selection.reason,
+        "WAN interfaces enumerated from the kernel — all of them are permitted"
+    );
+    network.wan_ifaces = selection.interfaces;
+    Ok(())
+}
+
+/// Prints what `wan_iface = "auto"` would choose, and why.
+fn show_uplink() -> anyhow::Result<()> {
+    let facts = uplink::observe(
+        std::path::Path::new("/sys/class/net"),
+        std::path::Path::new("/proc"),
+    )
+    .context("reading the kernel's network state")?;
+    for interface in facts.iter().filter(|facts| facts.physical) {
+        println!(
+            "{:<12} {:<9} carrier={} default_route={}",
+            interface.name,
+            if interface.wireless {
+                "wireless"
+            } else {
+                "wired"
+            },
+            u8::from(interface.carrier),
+            match interface.default_route_metric {
+                Some(metric) => format!("metric {metric}"),
+                None => "none".to_string(),
+            }
+        );
+    }
+    println!();
+    match uplink::select(&facts) {
+        Ok(selection) => {
+            for warning in &selection.warnings {
+                println!("attention : {warning}");
+            }
+            println!("permises : {}", selection.interfaces.join(", "));
+            println!(
+                "préférée : {} — {}",
+                selection.preferred(),
+                selection.reason
+            );
+        }
+        Err(error) => println!("aucune interface retenue : {error}"),
+    }
+    Ok(())
+}
+
+/// Prints the served key-negotiation identity, for a deployment to read.
+///
+/// One value per line, `clé=valeur`, because the consumer is a shell script:
+/// a script that has to parse JSON over SSH parses it with `sed`, and a `sed`
+/// pattern over a certificate is a defect waiting for a field to move.
+fn show_identity() -> anyhow::Result<()> {
+    let Some(served) = key_negotiation::served_identity()? else {
+        anyhow::bail!(
+            "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
+        );
+    };
+    println!("server_name={}", served.pq_certificate.subject);
+    println!(
+        "wireguard_public_key={}",
+        served.pq_certificate.wireguard_public_key
+    );
+    println!(
+        "pq_certificate_not_after={}",
+        served.pq_certificate.not_after_unix
+    );
+    Ok(())
+}
+
+/// Creates the gateway's certificate registry.
+///
+/// # Where each value comes from, and why not from an argument
+///
+/// The server name and the gateway's WireGuard identity are read out of the PQ
+/// leaf already on disk, never retyped: the registry has to describe the
+/// identity this gateway actually serves. An operator who mistyped either
+/// would produce a registry that disagrees with the certificate every client
+/// pins — and the disagreement would only surface at the first staging, as a
+/// refusal naming neither.
+///
+/// The anchors, by contrast, *must* come from the operator: `CA-PQ` is born on
+/// their machine inside `astra-signer`, and the Astra service key inside the
+/// container. Neither is derivable here, and confirming them out of band is
+/// the point (ADR-008 §3).
+fn init_trust_domain(
+    trust_domain_id: &str,
+    ca_public_key: &str,
+    astra_service_public_key: &str,
+    authority_url: &str,
+    webauthn_rp_id: &str,
+) -> anyhow::Result<()> {
+    use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
+    use aether::certificates::state::{
+        AstraProfile, ClientTlsCaState, GatewayCertificateState, TrustLedger,
+    };
+    use helios_provisioning::certificates::{CertificateRegistry, RegistryState};
+
+    let trust_domain_id =
+        TrustDomainId::parse_hex(trust_domain_id).context("reading the trust domain identifier")?;
+    let ca_public_key =
+        MlDsa87PublicKey::parse(ca_public_key).context("reading the CA-PQ public key")?;
+    let astra_service_public_key = MlDsa87PublicKey::parse(astra_service_public_key)
+        .context("reading the Astra service public key")?;
+
+    let Some(served) = key_negotiation::served_identity()? else {
+        anyhow::bail!(
+            "this gateway has no key-negotiation identity yet: run `heliosd \
+             init-key-negotiation` first, since the registry describes the leaves it serves"
+        );
+    };
+    let gateway_wg_public_key = WireGuardKey::parse(&served.pq_certificate.wireguard_public_key)
+        .context("reading the WireGuard identity out of the served PQ leaf")?;
+    let server_name = served.pq_certificate.subject.clone();
+
+    let state = RegistryState {
+        trust_domain_id,
+        gateway: GatewayCertificateState {
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name: server_name.clone(),
+            ca_epoch: 1,
+            current_ca_public_key: ca_public_key.clone(),
+            next_ca_public_key: None,
+            next_ca_transition_fingerprint: None,
+            ca_activation_at: None,
+            ca_retire_active_at: None,
+            active_gateway_identity_epoch: 1,
+            gateway_decision_epoch: 1,
+            next_gateway_identity_epoch: None,
+            next_transition_fingerprint: None,
+            last_aborted_transition: None,
+            active_gateway_tls_certificate: served.tls_certificate,
+            next_gateway_tls_certificate: None,
+            active_gateway_certificate: served.pq_certificate,
+            next_gateway_certificate: None,
+            activation_at: None,
+            retire_active_at: None,
+            published: false,
+            revoked: false,
+            revocation_epoch: 0,
+        },
+        client_tls_ca: ClientTlsCaState {
+            ca_tls_epoch: 1,
+            active_client_tls_ca_certificate: served.client_tls_ca,
+            next_client_tls_ca_certificate: None,
+            next_transition_fingerprint: None,
+            activation_at: None,
+            retire_active_at: None,
+        },
+        astra: AstraProfile {
+            authority_url: authority_url.to_string(),
+            webauthn_rp_id: webauthn_rp_id.to_string(),
+            active_astra_service_public_key: astra_service_public_key,
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            astra_service_key_epoch: 1,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
+        },
+        issuer: None,
+        // Peers are not seeded from `network.toml`: admission records
+        // fingerprints, and the registry needs the leaves themselves — it has
+        // to *verify* signatures made by them, not merely compare. Each peer
+        // enters at its first staging.
+        peers: Default::default(),
+        ledger: TrustLedger::default(),
+    };
+
+    let path = CertificateRegistry::path();
+    let registry = CertificateRegistry::bootstrap(path.clone(), state)
+        .context("creating the certificate registry")?;
+
+    println!("registry         : {}", path.display());
+    println!("trust domain     : {}", registry.state().trust_domain_id);
+    println!("server name      : {server_name}");
+    println!(
+        "gateway          : {}",
+        registry.state().gateway.gateway_wg_public_key
+    );
+    println!(
+        "CA-PQ fingerprint: {}",
+        ca_public_key.authority_fingerprint()
+    );
+    println!(
+        "gateway TLS      : {}",
+        registry.state().gateway.active_tls_fingerprint()
+    );
+    println!(
+        "gateway PQ       : {}",
+        registry.state().gateway.active_pq_fingerprint()?
+    );
+    println!();
+    println!(
+        "no delegated issuer yet: ordinary renewals stay refused until an \
+         `AstraIssuerAuthorization` is signed and installed in Astra"
+    );
+    println!("restart heliosd to open the in-tunnel lifecycle routes");
     Ok(())
 }
 
@@ -644,9 +938,14 @@ fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
+async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // Before the TPM unseal below, which is where the first key appears.
     forbid_core_dumps(dry_run)?;
+
+    // The uplink, before any ruleset is built: every egress rule and the
+    // masquerade are bound to this name, and resolving it later would mean
+    // building the kill-switch around an interface we had not chosen yet.
+    resolve_uplink(&mut network)?;
 
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —
@@ -727,11 +1026,12 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // Dedicated provisioning channel: it carries a secret and awaits an
     // acknowledgment, unlike the UI order flow.
     let (psk_tx, psk_rx) = mpsc::channel::<InstallPskRequest>(8);
+    // Read-only counterpart, for the one decision that cannot use the
+    // ten-second peer snapshot: proving a WireGuard handshake at the commit.
+    let (handshake_tx, handshake_rx) = mpsc::channel::<ObserveHandshakeRequest>(8);
     let tunnel_state = Arc::new(RwLock::new(TunnelState::Down));
     let shared_network = Arc::new(RwLock::new(network));
     let shared_policy = Arc::new(RwLock::new(shared_network.read().await.firewall_policy()));
-
-    key_negotiation::start(Arc::clone(&shared_network), psk_tx.clone(), &boot, dry_run).await?;
 
     // The API listens on the tunnel's address: this is how Orion clients
     // reach provisioning and telemetry. Filtering is still enforced by the
@@ -744,7 +1044,13 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     } else {
         shared_network.read().await.api_bind()
     };
+    let raw_speedtest_bind = if dry_run {
+        format!("127.0.0.1:{}", aether::SPEEDTEST_PORT)
+    } else {
+        shared_network.read().await.speedtest_bind()
+    };
     info!("web interface on http://{api_bind}");
+    info!("raw speedtest on {raw_speedtest_bind} (WireGuard TCP/UDP)");
 
     #[allow(unused_mut)]
     let mut state = AppState::new(
@@ -753,9 +1059,56 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         Arc::clone(&tunnel_state),
         event_tx.clone(),
         cmd_tx,
-        psk_tx,
+        psk_tx.clone(),
         Arc::clone(&shared_policy),
     );
+    // The sealing posture, as two non-secret facts. `boot` itself is moved
+    // into the orchestrator below — it holds the unlock secret, and only the
+    // orchestrator may seal.
+    state = state.with_tpm(boot.kind(), boot.preserved_vaults());
+    // Started here rather than earlier because the reclamation loop reads the
+    // same data-plane snapshot the console does, and that snapshot is owned
+    // by `AppState`. Polling the backend a second time would risk the two
+    // readers disagreeing on whether a peer is still there — and the whole
+    // point of v5's liveness is that there is one answer, read where the
+    // traffic is.
+    if let Some(handler) = key_negotiation::start(
+        Arc::clone(&shared_network),
+        psk_tx.clone(),
+        handshake_tx,
+        Arc::clone(&state.peer_runtime),
+        &boot,
+        dry_run,
+    )
+    .await?
+    {
+        // The certificate lifecycle, when this gateway has a trust domain. It
+        // signs its receipts through the negotiation handler — the same leaf
+        // the client already pins, unsealed once — and it is the single owner
+        // of the registry: a second one would give one slot two writers.
+        match certificates::CertificateService::load(
+            helios_provisioning::certificates::CertificateRegistry::path(),
+            Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
+        ) {
+            Ok(Some(service)) => {
+                info!("certificate lifecycle ready");
+                certificates::spawn_maintenance(Arc::clone(&service));
+                state = state.with_trust_update(service);
+            }
+            Ok(None) => info!(
+                "no certificate registry: the trust domain is not bootstrapped, and the \
+                 in-tunnel lifecycle routes stay closed"
+            ),
+            Err(error) => error!(
+                %error,
+                "certificate registry unusable — the in-tunnel lifecycle routes stay closed"
+            ),
+        }
+        // The in-tunnel `release` (spec §7.5) reaches the same state machine
+        // as the public negotiation, through the same per-peer serializer.
+        // A second instance here would give one slot two writers.
+        state = state.with_psk_release(handler);
+    }
     // Published for the operator tooling: `helios-ctl` builds a complete
     // Orion profile from the gateway rather than making the operator copy
     // certificates out of /var/lib/helios by hand.
@@ -763,6 +1116,10 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         state = state.with_key_negotiation(material);
     }
     let api_ready = Arc::clone(&state.api_ready);
+    // The console reads the data plane through this snapshot; only the
+    // orchestrator's poller writes it.
+    let peer_runtime = Arc::clone(&state.peer_runtime);
+    let api_state = state.clone();
     tokio::spawn(async move {
         // Outside simulation, the API listens on the WireGuard address —
         // which the orchestrator, started right after, has not yet assigned
@@ -771,7 +1128,7 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // run for good without an API: no provisioning, no telemetry, for a
         // race lost by a few dozen milliseconds.
         for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::serve(state.clone(), &api_bind).await {
+            match helios_api::serve(api_state.clone(), &api_bind).await {
                 Ok(()) => return,
                 Err(e) if attempt < API_BIND_ATTEMPTS => {
                     warn!(
@@ -789,18 +1146,51 @@ async fn run(network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         }
     });
 
-    orchestrator::run(
+    let raw_speedtest_state = state.clone();
+    let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
+    let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);
+    tokio::spawn(async move {
+        for attempt in 1..=API_BIND_ATTEMPTS {
+            match helios_api::speedtest::serve_raw(
+                raw_speedtest_state.clone(),
+                &raw_speedtest_bind,
+                Arc::clone(&raw_speedtest_task_shutdown),
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(error) if attempt < API_BIND_ATTEMPTS => {
+                    warn!(
+                        "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                         retrying: {error:#}"
+                    );
+                    tokio::time::sleep(API_BIND_DELAY).await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "raw speedtest given up after {API_BIND_ATTEMPTS} attempts: {error:#}"
+                    );
+                }
+            }
+        }
+    });
+
+    let result = orchestrator::run(
         shared_network,
         dry_run,
         tunnel_state,
         event_tx,
         cmd_rx,
         psk_rx,
+        handshake_rx,
         shared_policy,
+        peer_runtime,
         boot,
         api_ready,
     )
-    .await
+    .await;
+    raw_speedtest_shutdown.store(true, Ordering::Release);
+    result
 }
 
 #[cfg(test)]
@@ -1017,6 +1407,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };

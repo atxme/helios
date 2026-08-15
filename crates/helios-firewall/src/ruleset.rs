@@ -27,6 +27,21 @@
 //! is allowed: NAT is applied and removed together with the tunnel, otherwise
 //! the kill-switch would let out in the clear what it just cut off.
 //!
+//! # The gateway's own egress
+//!
+//! Neither of the two forms above covers the gateway's *own* traffic, and the
+//! `output` chain is the one nobody reads: under the fail-closed policy it
+//! accepts loopback, `established` flows, DHCP renewal and the site-to-site
+//! WireGuard transport, then drops the rest. So a gateway resolves no name,
+//! reaches no NTP server and fetches no package — including through
+//! `helios-ctl update`, which runs `apt-get` on that very machine.
+//!
+//! `allow_gateway_egress` opens it, on the WAN interface and on those ports
+//! only. It is separate from `allow_client_internet` because it answers a
+//! different question — what the gateway emits, not what it relays — and it
+//! does not follow the tunnel state, because an upgrade happens when the
+//! tunnel is down.
+//!
 //! # Known limitation: DNS is not tunneled
 //!
 //! Even with `allow_client_internet` active, the client keeps its own
@@ -39,7 +54,16 @@
 
 use std::fmt;
 
-use aether::{FirewallPolicy, TunnelState};
+use aether::{FirewallPolicy, TunnelState, SPEEDTEST_PORT};
+
+/// Networks NordVPN classifies as local for Meshnet's separate local-network
+/// permission.
+const PRIVATE_IPV4_CIDRS: [&str; 4] = [
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+];
 
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +120,8 @@ pub enum Match {
     OutIface(String),
     /// `<proto> dport <port>`
     DestPort { port: u16, proto: L4 },
+    /// `<proto> sport <port>`
+    SourcePort { port: u16, proto: L4 },
     /// `<proto> dport { a, b }` — set of ports.
     DestPortSet { ports: Vec<u16>, proto: L4 },
     /// `ip daddr <addr>` — IP or CIDR.
@@ -116,6 +142,8 @@ pub enum Match {
     /// acceptées par `ct state established,related`. Ce qui la débloquerait :
     /// une expression `payload` brute, ou un `rustables` qui expose le type.
     Icmp,
+    /// Packet mark assigned by a privileged local networking service.
+    PacketMark(u32),
 }
 
 impl fmt::Display for Match {
@@ -125,6 +153,9 @@ impl fmt::Display for Match {
             Match::InIface(i) => write!(f, "iifname \"{i}\""),
             Match::OutIface(i) => write!(f, "oifname \"{i}\""),
             Match::DestPort { port, proto } => write!(f, "{} dport {port}", proto.as_str()),
+            Match::SourcePort { port, proto } => {
+                write!(f, "{} sport {port}", proto.as_str())
+            }
             Match::DestPortSet { ports, proto } => {
                 let list: Vec<String> = ports.iter().map(u16::to_string).collect();
                 write!(f, "{} dport {{ {} }}", proto.as_str(), list.join(", "))
@@ -132,6 +163,7 @@ impl fmt::Display for Match {
             Match::DestNet(a) => write!(f, "ip daddr {a}"),
             Match::SourceNet(a) => write!(f, "ip saddr {a}"),
             Match::Icmp => write!(f, "meta l4proto icmp"),
+            Match::PacketMark(mark) => write!(f, "meta mark {mark:#x}"),
         }
     }
 }
@@ -194,10 +226,14 @@ pub struct Ruleset {
     /// MSS clamping, `rustables` can express it: the Netlink backend actually
     /// applies it.
     ///
-    /// `None` outside of states where traffic is allowed — NAT must never
+    /// One entry per uplink: a gateway with a cable and a radio masquerades on
+    /// whichever the kernel routes through, and neither entry matches a packet
+    /// that leaves by the other.
+    ///
+    /// **Empty** outside of states where traffic is allowed — NAT must never
     /// survive the tunnel going down, otherwise the kill-switch would leak
     /// what it is supposed to hold back.
-    pub masquerade_out: Option<String>,
+    pub masquerade_out: Vec<String>,
 }
 
 impl Ruleset {
@@ -217,7 +253,7 @@ impl Ruleset {
 pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     use ChainKind::{Forward, Input, Output};
     let mut rules = Vec::new();
-    let wan = policy.wan_iface.clone();
+    let wan_ifaces = policy.wan_ifaces.clone();
 
     // ── Administration: the API must only be reachable through the tunnel ──
     // At the head of the chain, even before loopback.
@@ -235,6 +271,34 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 Verdict::Accept,
             )
             .with_note("administration API: only via the tunnel interface"),
+        );
+        rules.push(
+            Rule::new(
+                Input,
+                vec![
+                    Match::DestPort {
+                        port: SPEEDTEST_PORT,
+                        proto: L4::Tcp,
+                    },
+                    Match::InIface(iface.to_string()),
+                ],
+                Verdict::Accept,
+            )
+            .with_note("raw speedtest TCP: only via the tunnel interface"),
+        );
+        rules.push(
+            Rule::new(
+                Input,
+                vec![
+                    Match::DestPort {
+                        port: SPEEDTEST_PORT,
+                        proto: L4::Udp,
+                    },
+                    Match::InIface(iface.to_string()),
+                ],
+                Verdict::Accept,
+            )
+            .with_note("raw speedtest UDP: only via the tunnel interface"),
         );
         rules.push(
             Rule::new(
@@ -275,20 +339,39 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     // scope by source. This is the sole inbound opening of the fail-closed
     // model, and it is indispensable for the handshake.
     if let Some(port) = policy.wg_listen_port {
-        rules.push(
-            Rule::new(
-                Input,
-                vec![
-                    Match::InIface(wan.clone()),
-                    Match::DestPort {
-                        port,
-                        proto: L4::Udp,
-                    },
-                ],
-                Verdict::Accept,
-            )
-            .with_note("WireGuard listener — without this rule, no client can handshake"),
-        );
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(wan.clone()),
+                        Match::DestPort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("WireGuard listener — without this rule, no client can handshake"),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::SourcePort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "WireGuard listener transport — replies, rekeys and keep-alives may be new \
+                     conntrack flows, especially after an uplink change",
+                ),
+            );
+        }
     }
 
     // ── Key-negotiation listener ─────────────────────────────────────────────
@@ -296,38 +379,58 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     // WireGuard handshake. It is opened only when the configured service is
     // ready; the administration API remains restricted to the tunnel.
     if let Some(port) = policy.key_negotiation_port {
-        rules.push(
-            Rule::new(
-                Input,
-                vec![
-                    Match::InIface(wan.clone()),
-                    Match::DestPort {
-                        port,
-                        proto: L4::Udp,
-                    },
-                ],
-                Verdict::Accept,
-            )
-            .with_note("authenticated key-negotiation QUIC listener"),
-        );
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(wan.clone()),
+                        Match::DestPort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("authenticated key-negotiation QUIC listener"),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::SourcePort {
+                            port,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "key-negotiation QUIC replies — the final frame can outlive UDP conntrack",
+                ),
+            );
+        }
     }
 
     // ── Outbound WireGuard transport to static peers (site-to-site) ─────────
     // Scoped by destination: opening 51820 outbound without restricting the
     // destination would be a leak.
     for peer in &policy.wg_peers {
-        rules.push(Rule::new(
-            Output,
-            vec![
-                Match::OutIface(wan.clone()),
-                Match::DestNet(peer.clone()),
-                Match::DestPort {
-                    port: 51820,
-                    proto: L4::Udp,
-                },
-            ],
-            Verdict::Accept,
-        ));
+        for wan in &wan_ifaces {
+            rules.push(Rule::new(
+                Output,
+                vec![
+                    Match::OutIface(wan.clone()),
+                    Match::DestNet(peer.clone()),
+                    Match::DestPort {
+                        port: 51820,
+                        proto: L4::Udp,
+                    },
+                ],
+                Verdict::Accept,
+            ));
+        }
     }
 
     // ── DHCP lease renewal on the WAN ────────────────────────────────────────
@@ -337,31 +440,218 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
     // out as a broadcast and the reply does not always attach to a tracked
     // flow.
     if policy.allow_dhcp_on_wan {
-        rules.push(
-            Rule::new(
-                Output,
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::DestPort {
+                            port: 67,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("DHCP: without renewal, the gateway loses its WAN address"),
+            );
+            rules.push(Rule::new(
+                Input,
                 vec![
-                    Match::OutIface(wan.clone()),
+                    Match::InIface(wan.clone()),
                     Match::DestPort {
-                        port: 67,
+                        port: 68,
                         proto: L4::Udp,
                     },
                 ],
                 Verdict::Accept,
-            )
-            .with_note("DHCP: without renewal, the gateway loses its WAN address"),
-        );
-        rules.push(Rule::new(
-            Input,
-            vec![
-                Match::InIface(wan.clone()),
-                Match::DestPort {
-                    port: 68,
-                    proto: L4::Udp,
-                },
-            ],
-            Verdict::Accept,
-        ));
+            ));
+        }
+    }
+
+    // ── The gateway's own egress ─────────────────────────────────────────────
+    // Name resolution, time and package fetching, for the gateway itself.
+    // Scoped to the WAN interface and to those ports, in `output` only: this
+    // forwards nothing and opens nothing inbound.
+    //
+    // Not gated on the tunnel state. The kill-switch exists to stop relayed
+    // traffic from leaving in the clear, and relaying lives in `forward`. The
+    // moment an operator most needs this opening is an upgrade, which is
+    // exactly a moment when the tunnel may be down.
+    if policy.allow_gateway_egress {
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::DestPort {
+                            port: 53,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "the gateway's own DNS: without it the resolver's query to the LAN is a \
+                     new flow, dropped by the policy — which reads as a name-resolution \
+                     failure and is not one",
+                ),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::DestPortSet {
+                            // 53 over TCP is not optional: a truncated answer
+                            // falls back to it, and so does anything DNSSEC-sized.
+                            ports: vec![53, 80, 443],
+                            proto: L4::Tcp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("package fetching — `helios-ctl update` runs `apt-get` on the gateway"),
+            );
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::DestPort {
+                            port: 123,
+                            proto: L4::Udp,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note(
+                    "NTP: the machine that checks certificate validity dates is the one whose \
+                     clock must not drift",
+                ),
+            );
+        }
+    }
+
+    // ── NordVPN Meshnet: transport, local services and routing ──────────────
+    // Libtelio marks its relay, STUN and direct-path packets; accepting that
+    // mark on a declared WAN lets paths and ports evolve without granting an
+    // unmarked process arbitrary egress. Plaintext application packets are
+    // separately scoped to nordlynx and the operator-selected peer networks.
+    // Forwarding mirrors NordVPN's per-peer permissions. NordVPN owns the NAT
+    // and applies a second independent filter; Helios still has to accept the
+    // same flows because every base chain must accept a packet for it to
+    // survive a drop policy.
+    if let Some(meshnet) = &policy.nordvpn_meshnet {
+        for wan in &wan_ifaces {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(wan.clone()),
+                        Match::PacketMark(meshnet.fwmark),
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("NordVPN Meshnet transport marked by libtelio"),
+            );
+        }
+
+        for peer in &meshnet.peer_cidrs {
+            rules.push(
+                Rule::new(
+                    Output,
+                    vec![
+                        Match::OutIface(meshnet.iface.clone()),
+                        Match::DestNet(peer.clone()),
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("gateway application traffic to an allowed Meshnet peer"),
+            );
+
+            if meshnet.allow_icmp {
+                rules.push(
+                    Rule::new(
+                        Input,
+                        vec![
+                            Match::InIface(meshnet.iface.clone()),
+                            Match::SourceNet(peer.clone()),
+                            Match::Icmp,
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("ICMP from an allowed Meshnet peer"),
+                );
+            }
+            for (proto, ports) in [
+                (L4::Tcp, &meshnet.inbound_tcp_ports),
+                (L4::Udp, &meshnet.inbound_udp_ports),
+            ] {
+                if !ports.is_empty() {
+                    rules.push(
+                        Rule::new(
+                            Input,
+                            vec![
+                                Match::InIface(meshnet.iface.clone()),
+                                Match::SourceNet(peer.clone()),
+                                Match::DestPortSet {
+                                    ports: ports.clone(),
+                                    proto,
+                                },
+                            ],
+                            Verdict::Accept,
+                        )
+                        .with_note("service exposed to an allowed Meshnet peer"),
+                    );
+                }
+            }
+        }
+
+        for peer in &meshnet.traffic_routing_peer_cidrs {
+            let may_reach_local_network = meshnet.local_network_peer_cidrs.contains(peer);
+
+            if !may_reach_local_network {
+                for private_network in PRIVATE_IPV4_CIDRS {
+                    rules.push(
+                        Rule::new(
+                            Forward,
+                            vec![
+                                Match::InIface(meshnet.iface.clone()),
+                                Match::SourceNet(peer.clone()),
+                                Match::DestNet(private_network.into()),
+                            ],
+                            Verdict::Drop,
+                        )
+                        .with_note("Meshnet routing peer has no local-network permission"),
+                    );
+                }
+            }
+
+            let mut routed_out_ifaces = wan_ifaces.clone();
+            if may_reach_local_network {
+                for lan in &policy.lan_ifaces {
+                    if !routed_out_ifaces.contains(lan) {
+                        routed_out_ifaces.push(lan.clone());
+                    }
+                }
+            }
+            for out_iface in routed_out_ifaces {
+                rules.push(
+                    Rule::new(
+                        Forward,
+                        vec![
+                            Match::InIface(meshnet.iface.clone()),
+                            Match::SourceNet(peer.clone()),
+                            Match::OutIface(out_iface),
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("traffic from a NordVPN-authorized Meshnet routing peer"),
+                );
+            }
+        }
     }
 
     // ── ICMP and SSH on the tunnel interface ─────────────────────────────────
@@ -402,6 +692,43 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 .with_note("administrative SSH arriving through the tunnel"),
             );
         }
+        // `iperf3`, and the only opening here that touches `output`.
+        //
+        // Both roles have to work: server on the gateway (the `input` rule),
+        // and server on the client with the gateway as `iperf3 -c` (the
+        // `output` one). Without the second, a new outbound flow on the tunnel
+        // interface matches nothing and the drop policy takes it — `iperf3`
+        // then hangs on "Connecting to host", which looks like a client that
+        // is not listening.
+        //
+        // TCP and UDP both: `iperf3 -u` is a different port role, not a
+        // different port.
+        if let Some(port) = policy.iperf_port {
+            for proto in [L4::Tcp, L4::Udp] {
+                rules.push(
+                    Rule::new(
+                        Input,
+                        vec![
+                            Match::InIface(policy.wg_iface.clone()),
+                            Match::DestPort { port, proto },
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("iperf3 server on the gateway: only via the tunnel interface"),
+                );
+                rules.push(
+                    Rule::new(
+                        Output,
+                        vec![
+                            Match::OutIface(policy.wg_iface.clone()),
+                            Match::DestPort { port, proto },
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("iperf3 client on the gateway, reaching a server on the peer"),
+                );
+            }
+        }
     }
 
     // ── Administrative SSH, regardless of tunnel state ───────────────────────
@@ -428,32 +755,36 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         match &policy.captive_portal_gateway {
             Some(gw) => {
                 for chain in [Output, Forward] {
-                    rules.push(
-                        Rule::new(
-                            chain,
-                            vec![
-                                Match::OutIface(wan.clone()),
-                                Match::DestNet(gw.clone()),
-                                ports.clone(),
-                            ],
-                            Verdict::Accept,
-                        )
-                        .with_note(format!("captive portal: HTTP/HTTPS to {gw}")),
-                    );
+                    for wan in &wan_ifaces {
+                        rules.push(
+                            Rule::new(
+                                chain,
+                                vec![
+                                    Match::OutIface(wan.clone()),
+                                    Match::DestNet(gw.clone()),
+                                    ports.clone(),
+                                ],
+                                Verdict::Accept,
+                            )
+                            .with_note(format!("captive portal: HTTP/HTTPS to {gw}")),
+                        );
+                    }
                 }
             }
             None => {
                 // Unknown gateway: let the browser reach the portal's landing
                 // page, whatever its destination.
                 for chain in [Output, Forward] {
-                    rules.push(
-                        Rule::new(
-                            chain,
-                            vec![Match::OutIface(wan.clone()), ports.clone()],
-                            Verdict::Accept,
-                        )
-                        .with_note("captive portal: unknown gateway"),
-                    );
+                    for wan in &wan_ifaces {
+                        rules.push(
+                            Rule::new(
+                                chain,
+                                vec![Match::OutIface(wan.clone()), ports.clone()],
+                                Verdict::Accept,
+                            )
+                            .with_note("captive portal: unknown gateway"),
+                        );
+                    }
                 }
             }
         }
@@ -470,11 +801,13 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         // Tunnel operational: forward the LAN. WireGuard encrypts on egress;
         // a packet not captured by the tunnel interface will not go out.
         for lan in &policy.lan_ifaces {
-            rules.push(Rule::new(
-                Forward,
-                vec![Match::InIface(lan.clone()), Match::OutIface(wan.clone())],
-                Verdict::Accept,
-            ));
+            for wan in &wan_ifaces {
+                rules.push(Rule::new(
+                    Forward,
+                    vec![Match::InIface(lan.clone()), Match::OutIface(wan.clone())],
+                    Verdict::Accept,
+                ));
+            }
         }
 
         // Internet egress for tunnel clients. The return path is covered by
@@ -482,17 +815,19 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         // the outbound direction is enough, and scoping to the client -> WAN
         // direction only avoids exposing the gateway's LAN to clients.
         if policy.allow_client_internet && !policy.wg_iface.is_empty() {
-            rules.push(
-                Rule::new(
-                    Forward,
-                    vec![
-                        Match::InIface(policy.wg_iface.clone()),
-                        Match::OutIface(wan.clone()),
-                    ],
-                    Verdict::Accept,
-                )
-                .with_note("Internet egress for tunnel clients (masquerade in postrouting)"),
-            );
+            for wan in &wan_ifaces {
+                rules.push(
+                    Rule::new(
+                        Forward,
+                        vec![
+                            Match::InIface(policy.wg_iface.clone()),
+                            Match::OutIface(wan.clone()),
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("Internet egress for tunnel clients (masquerade in postrouting)"),
+                );
+            }
         }
     }
 
@@ -513,11 +848,20 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         // NAT follows the tunnel state exactly: applied with it, removed with
         // it. A masquerade that survived the tunnel going down would let out
         // in the clear what the kill-switch just cut off.
-        masquerade_out: (state.traffic_allowed()
+        // One masquerade per uplink, and they enter the **same** transaction as
+        // the filtering: a masquerade that outlived the kill-switch would let
+        // out in the clear what it had just cut. Several is not a widening —
+        // each only ever matches packets that actually leave by its own
+        // interface, which is what makes an uplink failover survive without a
+        // reload.
+        masquerade_out: if state.traffic_allowed()
             && policy.allow_client_internet
             && !policy.wg_iface.is_empty()
-            && !wan.is_empty())
-        .then(|| wan.clone()),
+        {
+            wan_ifaces.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -528,7 +872,7 @@ mod tests {
 
     fn policy() -> FirewallPolicy {
         FirewallPolicy {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             lan_ifaces: vec!["eth1".into()],
             wg_peers: vec!["203.0.113.10".into()],
             wg_listen_port: Some(51820),
@@ -538,13 +882,16 @@ mod tests {
             allow_dhcp_on_wan: false,
             allow_client_internet: false,
             allow_tunnel_icmp: false,
+            allow_gateway_egress: false,
             allow_ssh_over_tunnel: false,
+            iperf_port: None,
             wg_iface: "helios0".into(),
             admin_port: None,
             admin_iface: None,
             split_tunnel_cidrs: vec![],
             mss_clamp: None,
             captive_portal_gateway: None,
+            nordvpn_meshnet: None,
         }
     }
 
@@ -574,6 +921,30 @@ mod tests {
                     .any(|r| r == "iifname \"eth0\" udp dport 51820 accept"),
                 "state {st:?}: the WireGuard listening port must stay reachable"
             );
+        }
+    }
+
+    /// UDP conntrack is not a transport contract. A WireGuard rekey or the
+    /// final QUIC frame can be emitted after its entry expired; with several
+    /// uplinks, the reply may also leave through a different interface. The
+    /// listeners therefore need a source-port-scoped output opening of their
+    /// own in every state.
+    #[test]
+    fn public_udp_listeners_can_answer_on_every_uplink() {
+        let mut p = policy();
+        p.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let output = text(&render(&p, state), ChainKind::Output);
+            for wan in ["enp3s0", "wlo1"] {
+                for port in [51820, 51821] {
+                    let expected = format!("oifname \"{wan}\" udp sport {port} accept");
+                    assert!(
+                        output.iter().any(|rule| rule == &expected),
+                        "state {state:?}: missing listener response rule `{expected}`"
+                    );
+                }
+            }
         }
     }
 
@@ -626,13 +997,189 @@ mod tests {
         }
     }
 
+    /// Closed by default like everything else — but the failure it produces
+    /// is a name-resolution timeout, which points nowhere near the firewall.
+    #[test]
+    fn gateway_egress_is_closed_by_default() {
+        let rs = render(&policy(), TunnelState::Up);
+        for port in ["dport 53", "dport 123", "dport 443"] {
+            assert!(
+                !text(&rs, ChainKind::Output)
+                    .iter()
+                    .any(|r| r.contains(port)),
+                "{port} open without the configuration requesting it"
+            );
+        }
+    }
+
+    /// The three openings the gateway needs for itself, and only in `output`:
+    /// this is what it emits, never what it relays.
+    #[test]
+    fn gateway_egress_opens_resolution_time_and_packages_on_the_wan() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+        let rs = render(&p, TunnelState::Up);
+        let out = text(&rs, ChainKind::Output);
+
+        for expected in [
+            "oifname \"eth0\" udp dport 53 accept",
+            "oifname \"eth0\" tcp dport { 53, 80, 443 } accept",
+            "oifname \"eth0\" udp dport 123 accept",
+        ] {
+            assert!(
+                out.iter().any(|r| r == expected),
+                "missing rule: {expected}"
+            );
+        }
+
+        for kind in [ChainKind::Input, ChainKind::Forward] {
+            assert!(
+                !text(&rs, kind)
+                    .iter()
+                    .any(|r| r.contains("dport 53") || r.contains("dport 123")),
+                "the gateway's own egress must open nothing in {}",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The moment an operator needs this opening is an upgrade, and that is
+    /// exactly a moment when the tunnel may be down. A flag that followed the
+    /// tunnel state would be closed precisely when it is needed —
+    /// `helios-ctl update` runs `apt-get` on the gateway itself.
+    #[test]
+    fn gateway_egress_does_not_follow_the_tunnel_state() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+
+        for st in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            assert!(
+                text(&render(&p, st), ChainKind::Output)
+                    .iter()
+                    .any(|r| r == "oifname \"eth0\" udp dport 53 accept"),
+                "state {st:?}: the gateway must still be able to resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn meshnet_is_scoped_to_its_mark_interface_peers_and_services() {
+        let mut p = policy();
+        p.allow_gateway_egress = true;
+        p.nordvpn_meshnet = Some(aether::NordvpnMeshnetPolicy {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["100.70.36.212/32".into()],
+            traffic_routing_peer_cidrs: Vec::new(),
+            local_network_peer_cidrs: Vec::new(),
+            inbound_tcp_ports: vec![22, 9100],
+            inbound_udp_ports: vec![51830],
+            allow_icmp: true,
+        });
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let rs = render(&p, state);
+            let output = text(&rs, ChainKind::Output);
+            let input = text(&rs, ChainKind::Input);
+
+            assert!(output
+                .iter()
+                .any(|rule| rule == "oifname \"eth0\" meta mark 0xe1f1 accept"));
+            assert!(output
+                .iter()
+                .any(|rule| { rule == "oifname \"nordlynx\" ip daddr 100.70.36.212/32 accept" }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 meta l4proto icmp accept"
+            }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 tcp dport { 22, 9100 } accept"
+            }));
+            assert!(input.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 udp dport { 51830 } accept"
+            }));
+            assert!(!text(&rs, ChainKind::Forward)
+                .iter()
+                .any(|rule| rule.contains("nordlynx") || rule.contains("0xe1f1")));
+            assert!(!rs.rules.iter().any(|rule| {
+                rule.matches
+                    .contains(&Match::SourceNet("100.70.36.213/32".into()))
+            }));
+        }
+    }
+
+    #[test]
+    fn meshnet_routing_mirrors_per_peer_routing_and_local_network_permissions() {
+        let mut p = policy();
+        p.wan_ifaces = vec!["eth0".into(), "wlan0".into()];
+        p.lan_ifaces = vec!["lan0".into()];
+        p.allow_gateway_egress = true;
+        p.nordvpn_meshnet = Some(aether::NordvpnMeshnetPolicy {
+            iface: "nordlynx".into(),
+            fwmark: 0xe1f1,
+            peer_cidrs: vec!["100.70.36.212/32".into(), "100.70.36.213/32".into()],
+            traffic_routing_peer_cidrs: vec!["100.70.36.212/32".into(), "100.70.36.213/32".into()],
+            local_network_peer_cidrs: vec!["100.70.36.213/32".into()],
+            inbound_tcp_ports: vec![22, 49111],
+            inbound_udp_ports: Vec::new(),
+            allow_icmp: true,
+        });
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let forward = text(&render(&p, state), ChainKind::Forward);
+
+            for private_network in PRIVATE_IPV4_CIDRS {
+                assert!(forward.iter().any(|rule| {
+                    rule
+                        == &format!(
+                            "iifname \"nordlynx\" ip saddr 100.70.36.212/32 ip daddr {private_network} drop"
+                        )
+                }));
+                assert!(!forward.iter().any(|rule| {
+                    rule.contains("100.70.36.213/32") && rule.contains(private_network)
+                }));
+            }
+            let private_drop = forward
+                .iter()
+                .position(|rule| {
+                    rule
+                        == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 ip daddr 192.168.0.0/16 drop"
+                })
+                .unwrap();
+            let wan_accept = forward
+                .iter()
+                .position(|rule| {
+                    rule == "iifname \"nordlynx\" ip saddr 100.70.36.212/32 oifname \"eth0\" accept"
+                })
+                .unwrap();
+            assert!(
+                private_drop < wan_accept,
+                "the broad WAN acceptance must not precede the private-network denial"
+            );
+            for wan in ["eth0", "wlan0"] {
+                for peer in ["100.70.36.212/32", "100.70.36.213/32"] {
+                    assert!(forward.iter().any(|rule| {
+                        rule == &format!(
+                            "iifname \"nordlynx\" ip saddr {peer} oifname \"{wan}\" accept"
+                        )
+                    }));
+                }
+            }
+            assert!(forward.iter().any(|rule| {
+                rule == "iifname \"nordlynx\" ip saddr 100.70.36.213/32 oifname \"lan0\" accept"
+            }));
+            assert!(!forward.iter().any(|rule| {
+                rule.contains("100.70.36.212/32") && rule.contains("oifname \"lan0\"")
+            }));
+        }
+    }
+
     /// Closed by default: a gateway granting access to internal resources has
     /// no reason to route Internet traffic.
     #[test]
     fn client_internet_egress_is_closed_by_default() {
         let rs = render(&policy(), TunnelState::Up);
         assert!(
-            rs.masquerade_out.is_none(),
+            rs.masquerade_out.is_empty(),
             "NAT applied without requesting it"
         );
         assert!(!text(&rs, ChainKind::Forward)
@@ -649,7 +1196,7 @@ mod tests {
         p.allow_client_internet = true;
 
         let up = render(&p, TunnelState::Up);
-        assert_eq!(up.masquerade_out.as_deref(), Some("eth0"));
+        assert_eq!(up.masquerade_out, vec!["eth0".to_string()]);
         assert!(
             text(&up, ChainKind::Forward)
                 .iter()
@@ -665,7 +1212,7 @@ mod tests {
         ] {
             let rs = render(&p, st);
             assert!(
-                rs.masquerade_out.is_none(),
+                rs.masquerade_out.is_empty(),
                 "state {st:?}: NAT must not exist outside the tunnel"
             );
             assert!(
@@ -702,6 +1249,9 @@ mod tests {
         assert!(!text(&rs, ChainKind::Input)
             .iter()
             .any(|r| r.contains("udp dport 51820")));
+        assert!(!text(&rs, ChainKind::Output)
+            .iter()
+            .any(|r| r.contains("udp sport 51820")));
     }
 
     /// The WireGuard listener is in `input` (traffic towards the gateway),
@@ -859,6 +1409,68 @@ mod tests {
             accept < drop,
             "the scoped accept must take precedence over the drop"
         );
+        assert!(input
+            .iter()
+            .any(|r| r.contains("tcp dport 5201") && r.contains("iifname \"helios0\"")));
+        assert!(input
+            .iter()
+            .any(|r| r.contains("udp dport 5201") && r.contains("iifname \"helios0\"")));
+        assert!(!input
+            .iter()
+            .any(|r| r == "tcp dport 5201 accept" || r == "udp dport 5201 accept"));
+    }
+
+    /// Closed unless asked for: an always-open `iperf3` is always-open surface.
+    #[test]
+    fn iperf_is_closed_until_a_port_is_configured() {
+        let rs = render(&policy(), TunnelState::Up);
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain).iter().any(|r| r.contains("5202")),
+                "no iperf opening without a configured port"
+            );
+        }
+    }
+
+    /// The half that is easy to forget, and whose absence looks like the peer
+    /// being at fault: the gateway acting as `iperf3 -c` opens a **new**
+    /// outbound flow on the tunnel interface, which the drop policy takes
+    /// unless the `output` chain accepts it.
+    #[test]
+    fn iperf_opens_both_directions_on_the_tunnel_interface() {
+        let mut p = policy();
+        p.iperf_port = Some(5202);
+        let rs = render(&p, TunnelState::Up);
+
+        let input = text(&rs, ChainKind::Input);
+        let output = text(&rs, ChainKind::Output);
+        for proto in ["tcp", "udp"] {
+            assert!(
+                input
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport 5202"))
+                        && r.contains("iifname \"helios0\"")),
+                "server on the gateway: {proto} must be accepted inbound"
+            );
+            assert!(
+                output
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport 5202"))
+                        && r.contains("oifname \"helios0\"")),
+                "client on the gateway: {proto} must be accepted outbound"
+            );
+        }
+
+        // Interface-scoped, never a bare port accept: a match on the address
+        // alone would be satisfiable from the WAN by forging a CGNAT source.
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain)
+                    .iter()
+                    .any(|r| r == "tcp dport 5202 accept" || r == "udp dport 5202 accept"),
+                "no unscoped iperf accept"
+            );
+        }
     }
 
     #[test]
@@ -904,5 +1516,93 @@ mod tests {
         p.mss_clamp = Some(1380);
         assert_eq!(render(&p, TunnelState::Up).mss_clamp, Some(1380));
         assert_eq!(render(&p, TunnelState::Down).mss_clamp, None);
+    }
+    /// A gateway with a cable and a radio: every rule that names the WAN is
+    /// emitted for both. This is what makes an uplink failover survive with no
+    /// restart — the kernel moves its default route and the rules are already
+    /// there.
+    #[test]
+    fn every_wan_rule_is_emitted_for_every_uplink() {
+        let mut policy = policy();
+        policy.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+        policy.allow_gateway_egress = true;
+        policy.allow_client_internet = true;
+        policy.allow_dhcp_on_wan = true;
+        let rs = render(&policy, TunnelState::Up);
+
+        for iface in ["enp3s0", "wlo1"] {
+            let inbound: Vec<&Rule> = rs
+                .chain(ChainKind::Input)
+                .filter(|rule| rule.matches.contains(&Match::InIface(iface.into())))
+                .collect();
+            let opens = |port: u16| {
+                inbound.iter().any(|rule| {
+                    rule.matches.contains(&Match::DestPort {
+                        port,
+                        proto: L4::Udp,
+                    })
+                })
+            };
+            assert!(opens(51820), "the WireGuard listener is open on {iface}");
+            assert!(
+                opens(68),
+                "DHCP replies are accepted on {iface}: a lease renewed on one link only \
+                 would strand the other"
+            );
+            assert!(
+                rs.chain(ChainKind::Output)
+                    .any(|rule| rule.matches.contains(&Match::OutIface(iface.into()))),
+                "the gateway's own egress leaves by {iface}"
+            );
+            assert!(
+                rs.chain(ChainKind::Forward)
+                    .any(|rule| rule.matches.contains(&Match::OutIface(iface.into()))),
+                "tunnel clients reach the Internet through {iface}"
+            );
+        }
+        assert_eq!(
+            rs.masquerade_out,
+            vec!["enp3s0".to_string(), "wlo1".to_string()],
+            "one masquerade per uplink: each only matches what leaves by its own interface"
+        );
+    }
+
+    /// The kill-switch is unchanged by any of it: several uplinks is not a
+    /// reason for NAT to outlive the tunnel.
+    #[test]
+    fn several_uplinks_do_not_outlive_the_kill_switch() {
+        let mut policy = policy();
+        policy.wan_ifaces = vec!["enp3s0".into(), "wlo1".into()];
+        policy.allow_client_internet = true;
+        for state in [TunnelState::Down, TunnelState::Connecting] {
+            let rs = render(&policy, state);
+            assert!(
+                rs.masquerade_out.is_empty(),
+                "a masquerade surviving the kill-switch would let out in the clear what it \
+                 has just cut, on either uplink"
+            );
+        }
+    }
+
+    /// No uplink declared emits no WAN rule at all — never a rule on an
+    /// interface named nothing, which would match everything or nothing
+    /// depending on the backend.
+    #[test]
+    fn no_uplink_emits_no_wan_rule() {
+        let mut policy = policy();
+        policy.wan_ifaces = Vec::new();
+        policy.allow_gateway_egress = true;
+        policy.allow_client_internet = true;
+        let rs = render(&policy, TunnelState::Up);
+        assert!(
+            !rs.rules
+                .iter()
+                .any(|rule| rule.matches.iter().any(|m| matches!(
+                    m,
+                    Match::InIface(name) | Match::OutIface(name) if name.is_empty()
+                ))),
+            "no rule is emitted on an empty interface name"
+        );
+        assert!(rs.masquerade_out.is_empty());
     }
 }

@@ -64,6 +64,15 @@ pub async fn require_peer(
     }
 }
 
+/// Resolves the source of a raw socket service to an admitted WireGuard peer.
+///
+/// Raw TCP/UDP speedtest connections do not carry HTTP's `ConnectInfo`, so
+/// they use the same source-VIP lookup directly. Keeping this lookup here
+/// prevents the socket service from growing a second, weaker identity table.
+pub async fn resolve_source(state: &AppState, source: IpAddr) -> Option<Caller> {
+    resolve(state, Some(source)).await
+}
+
 /// Additionally requires the `admin` permission and a consistent browser origin.
 pub async fn require_admin(
     State(state): State<AppState>,
@@ -173,6 +182,7 @@ mod tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };

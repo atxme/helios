@@ -31,7 +31,7 @@ use aether::key_negotiation::ProtectionMode;
 
 /// Version written today. Any version not listed below is refused, never
 /// guessed.
-const MANIFEST_VERSION: u8 = 2;
+const MANIFEST_VERSION: u8 = 3;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -48,6 +48,11 @@ const MANIFEST_VERSION: u8 = 2;
 /// save. The decoder stays strict about everything else: an unknown version
 /// is still refused, and trailing bytes still are.
 const MANIFEST_VERSION_WITHOUT_SSH: u8 = 1;
+
+/// Previous version, still readable: it lacks the trailing trust material of
+/// spec §19. A profile sealed by an older Orion keeps decoding byte for byte,
+/// and re-sealing writes the current version.
+const MANIFEST_VERSION_WITHOUT_TRUST: u8 = 2;
 
 /// Bound on a decoded manifest, checked before any allocation.
 ///
@@ -214,6 +219,21 @@ impl ProfileManifest {
                 codec::put(&mut out, settings.gateway_ca_der.as_bytes())?;
                 codec::put(&mut out, settings.gateway_pq_certificate.as_bytes())?;
                 codec::put(&mut out, settings.identity.as_bytes())?;
+                match &settings.trust {
+                    None => out.push(0),
+                    Some(trust) => {
+                        out.push(1);
+                        codec::put(&mut out, trust.trust_domain_id.as_bytes())?;
+                        out.extend_from_slice(&trust.ca_epoch.to_be_bytes());
+                        codec::put(&mut out, trust.ca_pq_public_key.as_bytes())?;
+                        out.extend_from_slice(&trust.ca_tls_epoch.to_be_bytes());
+                        codec::put(&mut out, trust.client_tls_ca_der.as_bytes())?;
+                        out.extend_from_slice(&trust.client_generation.to_be_bytes());
+                        codec::put(&mut out, trust.astra_authority_url.as_bytes())?;
+                        out.extend_from_slice(&trust.astra_service_key_epoch.to_be_bytes());
+                        codec::put(&mut out, trust.astra_service_public_key.as_bytes())?;
+                    }
+                }
             }
         }
         if out.len() > MAX_MANIFEST_BYTES {
@@ -229,7 +249,10 @@ impl ProfileManifest {
         }
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
-        if version != MANIFEST_VERSION && version != MANIFEST_VERSION_WITHOUT_SSH {
+        if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_TRUST
+            && version != MANIFEST_VERSION_WITHOUT_SSH
+        {
             return Err(VaultError::UnsupportedManifest(version));
         }
         let generation = SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?));
@@ -244,7 +267,7 @@ impl ProfileManifest {
         let heliosd_url = cursor.option_text()?;
         // The one field whose presence depends on the version. Read where it
         // was written, so v1 keeps decoding byte for byte as it always did.
-        let ssh_target = if version == MANIFEST_VERSION {
+        let ssh_target = if version != MANIFEST_VERSION_WITHOUT_SSH {
             cursor.option_text()?
         } else {
             None
@@ -259,6 +282,31 @@ impl ProfileManifest {
                 gateway_ca_der: cursor.text()?,
                 gateway_pq_certificate: cursor.text()?,
                 identity: cursor.text()?,
+                // Read where it was written, so a v2 manifest keeps decoding
+                // byte for byte as it always did.
+                trust: if version == MANIFEST_VERSION {
+                    match cursor.byte()? {
+                        0 => None,
+                        1 => Some(crate::config::TrustMaterial {
+                            trust_domain_id: cursor.text()?,
+                            ca_epoch: u64::from_be_bytes(cursor.array::<8>()?),
+                            ca_pq_public_key: cursor.text()?,
+                            ca_tls_epoch: u64::from_be_bytes(cursor.array::<8>()?),
+                            client_tls_ca_der: cursor.text()?,
+                            client_generation: u64::from_be_bytes(cursor.array::<8>()?),
+                            astra_authority_url: cursor.text()?,
+                            astra_service_key_epoch: u64::from_be_bytes(cursor.array::<8>()?),
+                            astra_service_public_key: cursor.text()?,
+                        }),
+                        other => {
+                            return Err(VaultError::ManifestEncoding(format!(
+                                "invalid trust-material presence byte {other}"
+                            )))
+                        }
+                    }
+                } else {
+                    None
+                },
             }),
             other => {
                 return Err(VaultError::ManifestEncoding(format!(
@@ -321,6 +369,7 @@ mod tests {
             gateway_ca_der: "MIIB".into(),
             gateway_pq_certificate: "e30=".into(),
             identity: "orion-poste".into(),
+            trust: None,
         }
     }
 
@@ -400,6 +449,88 @@ mod tests {
         // And re-sealing writes the current version, so the migration happens
         // on the next save without anyone being asked to do anything.
         let resealed = ProfileManifest::from_profile(&rebuilt, SecurityGeneration(9))
+            .encode()
+            .expect("encode");
+        assert_eq!(resealed[0], MANIFEST_VERSION);
+    }
+
+    /// The trust material of spec §19 survives a seal and an open.
+    #[test]
+    fn the_trust_material_round_trips() {
+        let mut source = profile();
+        let block = source.key_negotiation.as_mut().expect("negotiation block");
+        block.trust = Some(crate::config::TrustMaterial {
+            trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
+            ca_epoch: 3,
+            ca_pq_public_key: "Y2EtcHE=".into(),
+            ca_tls_epoch: 2,
+            client_tls_ca_der: "Y2EtdGxz".into(),
+            client_generation: 4,
+            astra_authority_url: "https://astra.example".into(),
+            astra_service_key_epoch: 5,
+            astra_service_public_key: "c2VydmljZQ==".into(),
+        });
+
+        let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(1))
+            .encode()
+            .expect("encode");
+        let decoded = ProfileManifest::decode(&encoded).expect("decode");
+        let trust = decoded
+            .to_profile()
+            .key_negotiation
+            .and_then(|block| block.trust)
+            .expect("the trust material survives");
+        assert_eq!(trust.trust_domain_id, "0102030405060708090a0b0c0d0e0f10");
+        assert_eq!(trust.ca_epoch, 3);
+        assert_eq!(trust.ca_tls_epoch, 2);
+        assert_eq!(trust.client_generation, 4);
+        assert_eq!(trust.astra_service_key_epoch, 5);
+        assert_eq!(trust.astra_authority_url, "https://astra.example");
+    }
+
+    /// A profile sealed before the trust material existed must still open.
+    ///
+    /// Built byte for byte in the v2 layout, like the v1 test above and for
+    /// the same reason: reusing the encoder would only prove it agrees with
+    /// itself.
+    #[test]
+    fn a_manifest_sealed_before_the_trust_material_still_decodes() {
+        let source = profile();
+        let block = source.key_negotiation.as_ref().expect("negotiation block");
+        let mut v2: Vec<u8> = Vec::new();
+        v2.push(MANIFEST_VERSION_WITHOUT_TRUST);
+        v2.extend_from_slice(&11u64.to_be_bytes());
+        codec::put(&mut v2, source.name.as_bytes()).unwrap();
+        codec::put(&mut v2, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v2, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v2, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v2, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v2, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v2, source.allowed_ips.as_bytes()).unwrap();
+        v2.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v2, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v2, source.ssh_target.as_deref().map(str::as_bytes)).unwrap();
+        v2.push(1);
+        v2.push(mode_id(block.mode));
+        v2.push(mode_id(block.minimum_mode));
+        codec::put(&mut v2, block.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v2, block.server_name.as_bytes()).unwrap();
+        codec::put(&mut v2, block.gateway_ca_der.as_bytes()).unwrap();
+        codec::put(&mut v2, block.gateway_pq_certificate.as_bytes()).unwrap();
+        codec::put(&mut v2, block.identity.as_bytes()).unwrap();
+        // No trust block here — that is the whole point of the version.
+
+        let decoded = ProfileManifest::decode(&v2).expect("a v2 manifest must still open");
+        assert_eq!(decoded.generation, SecurityGeneration(11));
+        let rebuilt = decoded.to_profile();
+        let opened = rebuilt.key_negotiation.clone().expect("negotiation block");
+        assert_eq!(opened.identity, "orion-poste");
+        assert_eq!(opened.trust, None, "absent, not invented");
+        assert_eq!(rebuilt.ssh_target, source.ssh_target);
+
+        // And re-sealing writes the current version: the migration happens on
+        // the next save without anyone being asked to do anything.
+        let resealed = ProfileManifest::from_profile(&rebuilt, SecurityGeneration(11))
             .encode()
             .expect("encode");
         assert_eq!(resealed[0], MANIFEST_VERSION);

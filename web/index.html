@@ -3,9 +3,40 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#09090b" />
-    <meta name="description" content="Helios — Passerelle IPsec sécurisée" />
-    <title>HELIOS · Gateway</title>
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fff8f3" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#16130e" />
+    <meta name="description" content="Helios — passerelle WireGuard post-quantique" />
+    <title>Helios · Passerelle</title>
+    <script>
+      /*
+        Chooses the color scheme before the first paint.
+
+        MUI ships <InitColorSchemeScript /> for this, but it emits its script
+        through dangerouslySetInnerHTML: inserted that way by React, a script
+        never executes. It only works on server-rendered markup — and this app
+        is served as a static bundle by heliosd. So the job is done here,
+        against MUI's documented default storage keys ('mui-mode',
+        'mui-color-scheme') and the 'data' selector configured in theme.ts.
+
+        Without it, ThemeProvider reads the stored mode in an effect and a
+        console pinned to dark flashes light on every reload.
+      */
+      ;(function () {
+        try {
+          var mode = localStorage.getItem('mui-mode') || 'system'
+          var scheme =
+            mode === 'system'
+              ? window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light'
+              : mode
+          document.documentElement.setAttribute('data-mui-color-scheme', scheme)
+          document.documentElement.style.colorScheme = scheme
+        } catch (error) {
+          /* Private browsing denies localStorage: the default scheme applies. */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

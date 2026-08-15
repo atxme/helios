@@ -22,6 +22,9 @@
 //! [`aether::TunnelState::Up`].
 
 pub mod backend;
+pub mod certificate_actions;
+pub mod certificate_inventory;
+pub mod certificates;
 pub mod config;
 pub mod events;
 pub mod identity_store;
@@ -30,10 +33,13 @@ pub mod mtu;
 pub mod net_pin;
 pub mod profile_import;
 pub mod provisioning;
+pub mod speedtest;
 pub mod telemetry;
 pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};
+pub use certificate_actions::{CertificateAction, CertificateActionBlock, CertificateActionState};
+pub use certificate_inventory::{CertificateFacts, CertificateInventory, CertificatePhase};
 pub use config::{
     ClientConfig, ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS,
     DEFAULT_KEEPALIVE_SECS,
@@ -45,3 +51,8 @@ pub use profile_import::{
     CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,
 };
 pub use provisioning::{provision, ProvisionError, ProvisionOutcome};
+pub use speedtest::{
+    run as run_speedtest, run_at as run_speedtest_at,
+    run_with_progress as run_speedtest_with_progress, SpeedTestError, SpeedTestMode,
+    SpeedTestProgress, SpeedTestProgressSink, SpeedTestResult,
+};

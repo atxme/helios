@@ -6,10 +6,25 @@
 # fleet does not create a new trust root on every deployment.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# Absolute, and resolved **before** the `cd`: `dirname "$0"` is relative to the
+# working directory, so computing it afterwards makes it point somewhere else.
+# Invoked as `./target-bootstrap.sh` from `scripts/`, it resolved to «.», the
+# `cd ..` moved to the repository root, and the sourced path was looked up
+# there — failing only when called from that one directory.
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPTS/.."
 
-TARGET="${1:-}"
+# Un seul mot de passe sudo pour tout le déploiement, et l'adresse de la
+# gateway : voir lib-remote.sh.
+# shellcheck source=scripts/lib-remote.sh
+. "$SCRIPTS/lib-remote.sh"
+
+TARGET="${1:-$HELIOS_CIBLE}"
 [ -n "$TARGET" ] || { echo "target-bootstrap.sh requires an SSH target" >&2; exit 2; }
+
+# Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
+# `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.
+helios_sudo_init "$TARGET"
 
 CERTS_ROOT="${HELIOS_CERTS_ROOT:-$HOME/.helios/certs}"
 TARGET_HOST="${TARGET#*@}"
@@ -105,9 +120,16 @@ case "$ESCROW_PUBLIC_KEY" in
 esac
 
 echo "==> Detecting gateway network"
+# Détecté pour le diagnostic et pour la question du bail DHCP ci-dessous — pas
+# pour être écrit dans network.toml. Ce qui y est écrit est « auto », par
+# l'argument `--wan` passé à network-bootstrap.sh plus bas : c'est lui qui
+# fusionne le fichier de la gateway, et lui seul. Figer le nom détecté ferait
+# qu\'un câble branché plus tard ne serait jamais permis, et qu\'une machine
+# renommant ses interfaces démarrerait sur une interface disparue.
 WAN_IFACE="$(ssh "$TARGET" "ip -4 route show default" |
     awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
 [ -n "$WAN_IFACE" ] || { echo "could not detect the gateway default interface" >&2; exit 1; }
+echo "    uplink actuel : $WAN_IFACE (écrit « auto » ; heliosd rechoisit au démarrage)"
 case "$WAN_IFACE" in
     *[!A-Za-z0-9_.:-]*) echo "unsafe WAN interface returned by gateway" >&2; exit 1 ;;
 esac
@@ -124,8 +146,55 @@ if ssh "$TARGET" "ip -4 addr show dev '$WAN_IFACE'" | grep -qw dynamic; then
     DYNAMIC_ARG=(--dynamic-wan)
 fi
 
+# NordVPN owns the Meshnet peer inventory. Reading the running interface keeps
+# deployment generic: no account-specific Meshnet address is baked into this
+# repository, and every actual /32 is projected into Helios' bounded policy.
+MESHNET_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+    if wg show nordlynx >/dev/null 2>&1; then
+        wg show nordlynx allowed-ips |
+            awk '\''{ for (i = 2; i <= NF; i++) print $i }'\'' |
+            grep -E '\''^[0-9]+(\.[0-9]+){3}/32$'\'' |
+            sort -u | paste -sd, -
+    fi
+')"
+MESHNET_ARG=()
+if [ -n "$MESHNET_CIDRS" ]; then
+    case "$MESHNET_CIDRS" in
+        *[!0-9.,/]*) echo "unsafe Meshnet CIDR inventory returned by gateway" >&2; exit 1 ;;
+    esac
+    MESHNET_ARG=(--meshnet-peer-cidrs "$MESHNET_CIDRS")
+
+    # NordVPN keeps routing and LAN permissions in per-peer nftables sets.
+    # Mirror those sets into Helios instead of granting forwarding to every
+    # peer merely because it may contact a local service.
+    MESHNET_ROUTING_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+        nft list set inet nordvpn allow_peer_traffic_routing 2>/dev/null |
+            grep -Eo '\''([0-9]{1,3}\.){3}[0-9]{1,3}'\'' |
+            sort -u | sed '\''s|$|/32|'\'' | paste -sd, -
+    ')"
+    MESHNET_LOCAL_NETWORK_CIDRS="$(helios_ssh_sudo_capture "$TARGET" '
+        nft list set inet nordvpn peer_local_network_access 2>/dev/null |
+            grep -Eo '\''([0-9]{1,3}\.){3}[0-9]{1,3}'\'' |
+            sort -u | sed '\''s|$|/32|'\'' | paste -sd, -
+    ')"
+    for permission_cidrs in "$MESHNET_ROUTING_CIDRS" "$MESHNET_LOCAL_NETWORK_CIDRS"; do
+        case "$permission_cidrs" in
+            *[!0-9.,/]*) echo "unsafe Meshnet permission inventory returned by gateway" >&2; exit 1 ;;
+        esac
+    done
+    if [ -n "$MESHNET_ROUTING_CIDRS" ]; then
+        MESHNET_ARG+=(--meshnet-routing-peer-cidrs "$MESHNET_ROUTING_CIDRS")
+    fi
+    if [ -n "$MESHNET_LOCAL_NETWORK_CIDRS" ]; then
+        MESHNET_ARG+=(--meshnet-local-network-peer-cidrs "$MESHNET_LOCAL_NETWORK_CIDRS")
+    fi
+    echo "    Meshnet      : $MESHNET_CIDRS (SSH et Fileshare entrants)"
+    echo "    Routage      : ${MESHNET_ROUTING_CIDRS:-aucun}"
+    echo "    Réseau local : ${MESHNET_LOCAL_NETWORK_CIDRS:-aucun}"
+fi
+
 {
-    printf 'wan_iface = "%s"\n' "$WAN_IFACE"
+    printf 'wan_iface = "auto"\n'
     printf 'allow_ssh_from = ["%s"]\n' "$SSH_CIDR"
     if [ "${#DYNAMIC_ARG[@]}" -gt 0 ]; then
         printf 'allow_dhcp_on_wan = true\n'
@@ -141,15 +210,16 @@ chmod 600 "$TARGET_DIR/network-bootstrap.toml"
 
 echo "==> Merging network configuration"
 scp -q scripts/network-bootstrap.sh "$TARGET:/tmp/helios-network-bootstrap.sh"
-ssh -t "$TARGET" "sudo sh /tmp/helios-network-bootstrap.sh \
+helios_ssh_sudo "$TARGET" "sh /tmp/helios-network-bootstrap.sh \
     --config '$REMOTE_NETWORK' \
-    --wan '$WAN_IFACE' \
+    --wan 'auto' \
     --ssh-cidr '$SSH_CIDR' \
     --wg-port '$WG_PORT' \
     --key-negotiation-port '$KEY_PORT' \
     --escrow-public-key '$ESCROW_PUBLIC_KEY' \
+    ${MESHNET_ARG[*]} \
     ${DYNAMIC_ARG[*]} && \
-    sudo '$REMOTE_HELIOSD' status && \
+    '$REMOTE_HELIOSD' status && \
     rm -f /tmp/helios-network-bootstrap.sh"
 
 NEED_TPM=0
@@ -158,12 +228,12 @@ ssh "$TARGET" "test -f /var/lib/helios/sealed.key" || NEED_TPM=1
 ssh "$TARGET" "test -f /var/lib/helios/wg-key.sealed" || NEED_WG_IDENTITY=1
 if [ "$NEED_TPM" -eq 1 ] || [ "$NEED_WG_IDENTITY" -eq 1 ]; then
     echo "==> Provisioning missing sealed identities"
-    ssh -t "$TARGET" "
+    helios_ssh_sudo "$TARGET" "
         if [ '$NEED_TPM' -eq 1 ]; then
-            sudo '$REMOTE_HELIOSD' provision-tpm
+            '$REMOTE_HELIOSD' provision-tpm
         fi
         if [ '$NEED_WG_IDENTITY' -eq 1 ]; then
-            sudo '$REMOTE_HELIOSD' init-identity
+            '$REMOTE_HELIOSD' init-identity
         fi
     " | tee "$TARGET_DIR/init-identity.log"
     if [ "$NEED_WG_IDENTITY" -eq 1 ]; then
@@ -239,14 +309,46 @@ fi
 
 echo "==> Starting deployed services and staging the encrypted escrow"
 REMOTE_ESCROW="/tmp/helios-wg-key.escrow"
-ssh -t "$TARGET" "
-    sudo systemctl enable heliosd helios-update.path >/dev/null
-    sudo systemctl restart heliosd
-    sudo systemctl start helios-update.path
-    sudo systemctl --no-pager --full status heliosd
-    if sudo test -f /var/lib/helios/wg-key.escrow; then
-        sudo install -m 600 /var/lib/helios/wg-key.escrow '$REMOTE_ESCROW'
-        sudo chown \$(id -u):\$(id -g) '$REMOTE_ESCROW'
+# `heliosd` reconstruit le pare-feu au démarrage, sur le lien même par lequel
+# cette session passe. Le redémarrer **dans** la session, c'est demander à la
+# commande de survivre à la coupure de son propre transport : la connexion se
+# fige sans jamais se fermer, et il ne reste que Ctrl+C.
+#
+# `systemd-run` le détache : la commande rend la main tout de suite, le
+# redémarrage se fait hors de la session, et l'état se relit ensuite sur une
+# connexion neuve.
+helios_ssh_sudo "$TARGET" "
+    systemctl enable heliosd helios-update.path >/dev/null
+    systemctl start helios-update.path
+    systemd-run --collect --unit=helios-deploy-restart \
+        systemctl restart heliosd >/dev/null
+"
+
+echo "    redémarrage détaché ; attente de la remontée du service"
+DEMARRE=0
+# One deployment may still be stopping the previous binary, whose raw
+# speedtest listener waited for systemd's 90-second kill timeout. The new
+# binary exits promptly, but the first upgrade must wait long enough to cross
+# that old behavior once instead of falsely reporting a failed installation.
+for _ in $(seq 1 60); do
+    sleep 2
+    if ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl is-active --quiet heliosd' 2>/dev/null; then
+        DEMARRE=1
+        break
+    fi
+done
+if [ "$DEMARRE" = "0" ]; then
+    echo "    heliosd n'est pas remonté en 120 s :" >&2
+    ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" \
+        'systemctl --no-pager --full status heliosd' >&2 || true
+    exit 1
+fi
+ssh "${HELIOS_SSH_OPTS[@]}" "$TARGET" 'systemctl --no-pager --full status heliosd' || true
+
+helios_ssh_sudo "$TARGET" "
+    if test -f /var/lib/helios/wg-key.escrow; then
+        install -m 600 /var/lib/helios/wg-key.escrow '$REMOTE_ESCROW'
+        chown \$SUDO_UID:\$SUDO_GID '$REMOTE_ESCROW'
     fi
 "
 

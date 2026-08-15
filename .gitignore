@@ -22,3 +22,4 @@ __pycache__/
 *.orionprofile
 *.orion
 
+deploy/astra/.env

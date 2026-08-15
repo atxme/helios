@@ -248,26 +248,30 @@ export function protectionMeta(
  */
 export const PROTECTION_MODES: ProtectionMode[] = ['classic', 'static_psk', 'ml_kem']
 
+/**
+ * The modes a negotiation block may actually request.
+ *
+ * `classic` is missing on purpose, and it is not an omission of the screen:
+ * `aether::key_negotiation` refuses it at validation with
+ * `ClassicNotNegotiable`. A negotiated `classic` means "no preshared key at
+ * all", which is what a plain WireGuard profile already expresses without
+ * touching the negotiation port — offering it here would only build profiles
+ * the gateway rejects before the first handshake.
+ *
+ * Classic is therefore not a mode in this list: it is the **absence** of the
+ * block, and the way to reach it is to remove one.
+ */
+export const NEGOTIABLE_MODES: ProtectionMode[] = ['static_psk', 'ml_kem']
+
 export interface ModeMeta {
-  /** Chip label. */
+  /** Chip label. Only a label: what a mode does is not a caption. */
   label: string
-  /** What this mode gives, and what it costs. */
-  detail: string
 }
 
 const MODE_META: Record<ProtectionMode, ModeMeta> = {
-  classic: {
-    label: 'Classique',
-    detail: 'Aucun PSK négocié.',
-  },
-  static_psk: {
-    label: 'PSK',
-    detail: 'Le PSK du profil, retrouvé par empreinte. La valeur ne circule pas.',
-  },
-  ml_kem: {
-    label: 'ML-KEM',
-    detail: 'Nouveau PSK à chaque connexion, jamais écrit sur disque.',
-  },
+  classic: { label: 'Classique' },
+  static_psk: { label: 'PSK' },
+  ml_kem: { label: 'ML-KEM' },
 }
 
 export function modeMeta(mode: ProtectionMode): ModeMeta {

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether::key_negotiation::{
-    authenticate_request, derive_negotiated_psk, generate_ml_dsa_65_keypair, issue_pq_certificate,
+    authenticate_request, derive_negotiated_psk, generate_ml_dsa_87_keypair, issue_pq_certificate,
     KeyNegotiationRequest, KeyNegotiationResponse, PqCertificate, PqCertificateRole,
     ProtectionMode, KEY_NEGOTIATION_VERSION, PQ_CERTIFICATE_VERSION,
 };
@@ -57,6 +57,13 @@ fn now_unix() -> u64 {
 fn some_wg_key(seed: u8) -> String {
     b64().encode([seed; 32])
 }
+
+/// Nom serveur des transcriptions fabriquées hors gateway.
+///
+/// Il entre dans la signature de la requête **et** dans `info` du HKDF depuis
+/// la v5 : deux gateways partageant la même CA ne dérivent plus le même PSK
+/// d'une transcription identique.
+const CAMPAIGN_SERVER_NAME: &str = "campagne.helios.test";
 
 // ─── Famille crypto : primitives seules ──────────────────────────────────────
 
@@ -131,22 +138,29 @@ fn transcript() -> (KeyNegotiationRequest, KeyNegotiationResponse, Vec<u8>) {
     let (ciphertext, _) = MlKem1024Kem::encapsulate(&public).expect("ML-KEM");
     let request = KeyNegotiationRequest {
         protocol_version: KEY_NEGOTIATION_VERSION,
+        server_challenge: [44; 32],
         transaction_id: [11; 16],
         mode: ProtectionMode::MlKem,
         client_wg_public_key: some_wg_key(1),
+        gateway_wg_public_key: some_wg_key(2),
+        server_name: CAMPAIGN_SERVER_NAME.into(),
+        gateway_certificate_fingerprint: "c".repeat(64),
         client_nonce: [22; 16],
         timestamp_unix: now_unix(),
         kem_public_key: Some(public),
-        static_psk_fingerprint: None,
+        static_psk_commitment: None,
     };
     let response = KeyNegotiationResponse {
         protocol_version: KEY_NEGOTIATION_VERSION,
         transaction_id: request.transaction_id,
+        server_challenge: request.server_challenge,
         selected_mode: ProtectionMode::MlKem,
         gateway_wg_public_key: some_wg_key(2),
+        client_wg_public_key: request.client_wg_public_key.clone(),
         gateway_nonce: [33; 16],
         kem_ciphertext: Some(ciphertext.clone()),
         confirmation_timeout_secs: 45,
+        psk_lifetime_secs: aether::key_negotiation::NEGOTIATED_PSK_LIFETIME_SECS,
     };
     let shared = MlKem1024Kem::decapsulate(&secret, &ciphertext).expect("ML-KEM");
     (request, response, shared.as_slice().to_vec())
@@ -201,14 +215,14 @@ fn scenario_psk_outside_ml_kem() -> Outcome {
     }
 }
 
-/// Identité PQ : une signature ML-DSA-65 valide passe, une signature d'un
+/// Identité PQ : une signature ML-DSA-87 valide passe, une signature d'un
 /// octet près est refusée.
 fn scenario_ml_dsa_signature() -> Outcome {
-    let Ok((ca_private, ca_public)) = generate_ml_dsa_65_keypair() else {
-        return Outcome::fail("génération ML-DSA-65 impossible");
+    let Ok((ca_private, ca_public)) = generate_ml_dsa_87_keypair() else {
+        return Outcome::fail("génération ML-DSA-87 impossible");
     };
-    let Ok((client_private, client_public)) = generate_ml_dsa_65_keypair() else {
-        return Outcome::fail("génération ML-DSA-65 impossible");
+    let Ok((client_private, client_public)) = generate_ml_dsa_87_keypair() else {
+        return Outcome::fail("génération ML-DSA-87 impossible");
     };
     let client_wg = some_wg_key(1);
     let certificate = match issue_pq_certificate(
@@ -219,10 +233,10 @@ fn scenario_ml_dsa_signature() -> Outcome {
             issuer: "campagne-ca".into(),
             role: PqCertificateRole::Client,
             wireguard_public_key: client_wg.clone(),
-            ml_dsa_65_public_key: b64().encode(&client_public),
+            ml_dsa_87_public_key: b64().encode(&client_public),
             not_before_unix: now_unix() - 60,
             not_after_unix: now_unix() + 3600,
-            ml_dsa_65_signature: String::new(),
+            ml_dsa_87_signature: String::new(),
         },
         &ca_private,
     ) {
@@ -233,15 +247,34 @@ fn scenario_ml_dsa_signature() -> Outcome {
         return Outcome::fail("empreinte du certificat illisible");
     };
 
+    // `static_psk` plutôt que `classic` : depuis la v5 ce dernier n'est plus
+    // un mode négociable et la requête serait refusée au décodage, avant
+    // d'atteindre la signature que ce scénario éprouve.
+    let static_psk = b64().encode([7u8; 32]);
+    let commitment = match aether::key_negotiation::static_psk_commitment(
+        &static_psk,
+        &[7; 16],
+        &[8; 16],
+        &[44; 32],
+        &client_wg,
+        &some_wg_key(2),
+    ) {
+        Ok(commitment) => commitment,
+        Err(error) => return Outcome::fail(format!("engagement PSK statique : {error}")),
+    };
     let request = KeyNegotiationRequest {
         protocol_version: KEY_NEGOTIATION_VERSION,
+        server_challenge: [44; 32],
         transaction_id: [7; 16],
-        mode: ProtectionMode::Classic,
+        mode: ProtectionMode::StaticPsk,
         client_wg_public_key: client_wg,
+        gateway_wg_public_key: some_wg_key(2),
+        server_name: CAMPAIGN_SERVER_NAME.into(),
+        gateway_certificate_fingerprint: "c".repeat(64),
         client_nonce: [8; 16],
         timestamp_unix: now_unix(),
         kem_public_key: None,
-        static_psk_fingerprint: None,
+        static_psk_commitment: Some(commitment),
     };
     let signed = match authenticate_request(request, certificate, &client_private) {
         Ok(signed) => signed,
@@ -253,12 +286,12 @@ fn scenario_ml_dsa_signature() -> Outcome {
 
     // Un octet de signature retourné : le refus doit être net.
     let mut tampered = signed.clone();
-    let mut raw = match b64().decode(&tampered.ml_dsa_65_signature) {
+    let mut raw = match b64().decode(&tampered.ml_dsa_87_signature) {
         Ok(raw) => raw,
         Err(_) => return Outcome::fail("signature illisible"),
     };
     raw[0] ^= 0x01;
-    tampered.ml_dsa_65_signature = b64().encode(&raw);
+    tampered.ml_dsa_87_signature = b64().encode(&raw);
     match tampered.verify(&ca_public, &fingerprint, now_unix()) {
         Err(_) => Outcome::pass("signature valide acceptée, signature altérée refusée"),
         Ok(()) => Outcome::fail("une signature altérée est acceptée"),
@@ -271,8 +304,8 @@ fn scenario_ml_dsa_signature() -> Outcome {
 /// C'est ce qui empêche un profil volé de servir à parler à une autre gateway
 /// — et une gateway compromise de se faire passer pour la bonne.
 fn scenario_certificate_pinning() -> Outcome {
-    let Ok((private, public)) = generate_ml_dsa_65_keypair() else {
-        return Outcome::fail("génération ML-DSA-65 impossible");
+    let Ok((private, public)) = generate_ml_dsa_87_keypair() else {
+        return Outcome::fail("génération ML-DSA-87 impossible");
     };
     let gateway_wg = some_wg_key(9);
     let certificate = match issue_pq_certificate(
@@ -283,10 +316,10 @@ fn scenario_certificate_pinning() -> Outcome {
             issuer: "gateway.example".into(),
             role: PqCertificateRole::Gateway,
             wireguard_public_key: gateway_wg.clone(),
-            ml_dsa_65_public_key: b64().encode(&public),
+            ml_dsa_87_public_key: b64().encode(&public),
             not_before_unix: now_unix() - 60,
             not_after_unix: now_unix() + 3600,
-            ml_dsa_65_signature: String::new(),
+            ml_dsa_87_signature: String::new(),
         },
         &private,
     ) {
@@ -352,7 +385,7 @@ pub fn crypto_scenarios() -> Vec<(&'static str, Outcome)> {
             "dérivation refusée hors ML-KEM",
             scenario_psk_outside_ml_kem(),
         ),
-        ("signature ML-DSA-65", scenario_ml_dsa_signature()),
+        ("signature ML-DSA-87", scenario_ml_dsa_signature()),
         ("certificat épinglé", scenario_certificate_pinning()),
     ]
 }
@@ -544,38 +577,62 @@ async fn scenario_rollback_releases_peer(enrolled: &Enrolled) -> Outcome {
     }
 }
 
-/// Le lien de vivacité survit au silence.
+/// Le tunnel survit à la fermeture de la connexion de négociation.
 ///
-/// Régression du défaut qui coupait tous les tunnels au bout de trois
-/// minutes : sans keep-alive, QUIC déclarait la connexion morte après 30 s, la
-/// gateway libérait le PSK, et le tunnel mourait au renouvellement de clé
-/// suivant. Le scénario attend donc **plus** que ce délai, exprès.
-async fn scenario_link_survives_silence(enrolled: &Enrolled) -> Outcome {
+/// C'est l'inverse exact du scénario v4, et la propriété que la v5 achète en
+/// échange. En v4 la connexion QUIC était le lien de vivacité : la laisser
+/// silencieuse trente secondes suffisait à faire libérer le PSK par la
+/// gateway, et le tunnel mourait au renouvellement de clé suivant — deux à
+/// trois minutes plus tard, sans que rien ne relie les deux événements.
+///
+/// En v5 la connexion est fermée **exprès** juste après le commit. Ce
+/// scénario vérifie donc qu'après cette fermeture, et après un silence plus
+/// long que l'ancien délai de 35 s, le PSK est toujours posé : une seconde
+/// négociation réussit, ce qui n'est possible que si le pair est toujours
+/// admis et que rien n'a été défait derrière lui.
+async fn scenario_tunnel_survives_closed_connection(enrolled: &Enrolled) -> Outcome {
     let negotiated =
         match prepare_for_profile(&enrolled.profile, enrolled.identities.as_ref()).await {
             Ok(negotiated) => negotiated,
             Err(error) => return Outcome::fail(format!("{error:#}")),
         };
-    let link = match negotiated.confirm().await {
-        Ok(link) => link,
-        Err(error) => return Outcome::fail(format!("confirmation refusée : {error:#}")),
-    };
+    let installed = negotiated.transaction_id();
+    if let Err(error) = negotiated.confirm().await {
+        return Outcome::fail(format!("confirmation refusée : {error:#}"));
+    }
 
+    // Plus long que les 35 s qui tuaient un tunnel en v4.
     let silence = Duration::from_secs(40);
-    let closed = tokio::time::timeout(silence, link.closed()).await.is_ok();
-    link.close();
-    Outcome::check(
-        !closed,
-        format!(
-            "lien encore ouvert après {} s de silence",
+    tokio::time::sleep(silence).await;
+
+    // Le seul moyen de constater de l'extérieur que la gateway n'a rien
+    // défait : renégocier. Un pair dont le slot aurait été libéré à tort
+    // reste admis, donc ce n'est pas une preuve du PSK lui-même — c'est la
+    // preuve qu'aucune transaction fantôme ne bloque le pair, ce qui est
+    // exactement ce que la fermeture cassait en v4.
+    match prepare_for_profile(&enrolled.profile, enrolled.identities.as_ref()).await {
+        Ok(second) => {
+            let outcome = second.confirm().await;
+            Outcome::check(
+                outcome.is_ok(),
+                format!(
+                    "après {} s de silence connexion fermée, le pair renégocie encore \
+                     (transaction initiale {})",
+                    silence.as_secs(),
+                    b64().encode(&installed[..4])
+                ),
+                format!(
+                    "renégociation refusée après {} s : une transaction fantôme retient \
+                     le pair",
+                    silence.as_secs()
+                ),
+            )
+        }
+        Err(error) => Outcome::fail(format!(
+            "renégociation impossible après {} s de silence : {error:#}",
             silence.as_secs()
-        ),
-        format!(
-            "lien fermé avant {} s : la gateway a libéré le PSK, le tunnel serait mort au \
-             prochain renouvellement de clé",
-            silence.as_secs()
-        ),
-    )
+        )),
+    }
 }
 
 pub async fn gateway_scenarios(enrolled: &Enrolled, soak: bool) -> Vec<(&'static str, Outcome)> {
@@ -591,9 +648,9 @@ pub async fn gateway_scenarios(enrolled: &Enrolled, soak: bool) -> Vec<(&'static
         ),
     ];
     scenarios.push((
-        "lien de vivacité maintenu (40 s)",
+        "tunnel maintenu connexion fermée (40 s)",
         if soak {
-            scenario_link_survives_silence(enrolled).await
+            scenario_tunnel_survives_closed_connection(enrolled).await
         } else {
             Outcome::skip("demande --soak : le scénario dure 40 s")
         },

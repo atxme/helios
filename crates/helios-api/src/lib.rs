@@ -18,9 +18,13 @@
 //! (RwLock shared with the orchestrator).
 
 pub mod auth;
+pub mod certificates;
 pub mod embed;
+pub mod health;
+pub mod key_negotiation;
 pub mod provision;
-pub mod routes;
+mod routes;
+pub mod speedtest;
 pub mod update;
 pub mod ws;
 
@@ -34,12 +38,14 @@ use aether::{
 };
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use helios_wireguard::PeerStatus;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// State shared across all Axum handlers.
@@ -72,6 +78,33 @@ pub struct AppState {
     /// a complete Orion profile from the gateway itself, instead of copying
     /// certificate files off `/var/lib/helios` by hand.
     pub key_negotiation: Option<Arc<KeyNegotiationMaterial>>,
+    /// Gateway side of the in-tunnel PSK release, `None` when the gateway
+    /// runs no key-negotiation service.
+    ///
+    /// A trait object, and deliberately so: the API must not own a WireGuard
+    /// backend — it would then be able to change the data plane from an HTTP
+    /// handler. It hands an authenticated command to the state machine that
+    /// owns the per-peer serializer, and learns nothing back beyond a refusal
+    /// class.
+    pub psk_release: Option<Arc<dyn key_negotiation::PskReleaseHandler>>,
+    /// Gateway side of the certificate lifecycle, `None` when the trust
+    /// domain is not bootstrapped. Absent, the in-tunnel trust-update route
+    /// answers `404` — the same answer an older gateway gives, so Orion has a
+    /// single behaviour to implement.
+    pub trust_update: Option<Arc<dyn certificates::TrustUpdateHandler>>,
+    /// Non-secret summary of the boot-time sealing decision, `None` when the
+    /// daemon runs without TPM validation. A projection: `BootDecision` itself
+    /// carries the unlock secret and must not reach this crate.
+    pub tpm: Option<health::TpmSummary>,
+    /// Last observation of the data plane, written by the orchestrator's
+    /// handshake poller.
+    ///
+    /// The API holds no WireGuard backend — it must not, it would then be able
+    /// to change the data plane from an HTTP handler. So the runtime arrives
+    /// the same way the tunnel state and the firewall policy do: a snapshot
+    /// the orchestrator publishes. It is emptied when the interface goes down,
+    /// because a stale list of "connected" peers is worse than no list.
+    pub peer_runtime: Arc<RwLock<Vec<PeerStatus>>>,
 }
 
 /// Public key-negotiation material, exactly as an Orion profile pins it.
@@ -110,7 +143,24 @@ impl AppState {
             )),
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
+            psk_release: None,
+            trust_update: None,
+            tpm: None,
+            peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Publishes the gateway's sealing posture, without its secret.
+    ///
+    /// A builder rather than a `new` parameter: a daemon built without the
+    /// `tpm` feature, or started with validation disabled, is the ordinary
+    /// case in development and must not have to name an absent value.
+    pub fn with_tpm(mut self, kind: &'static str, preserved_vaults: bool) -> Self {
+        self.tpm = Some(health::TpmSummary {
+            kind,
+            preserved_vaults,
+        });
+        self
     }
 
     /// Publishes the key-negotiation certificates read from disk at startup.
@@ -120,6 +170,24 @@ impl AppState {
     /// have to name an absent value.
     pub fn with_key_negotiation(mut self, material: KeyNegotiationMaterial) -> Self {
         self.key_negotiation = Some(Arc::new(material));
+        self
+    }
+
+    /// Wires the in-tunnel PSK release to the running key-negotiation service.
+    ///
+    /// A builder, like the two above: a gateway with no `key_negotiation_port`
+    /// runs no such service, and must not have to name an absent value.
+    pub fn with_psk_release(
+        mut self,
+        handler: Arc<dyn key_negotiation::PskReleaseHandler>,
+    ) -> Self {
+        self.psk_release = Some(handler);
+        self
+    }
+
+    /// Wires the certificate lifecycle, once the trust domain exists.
+    pub fn with_trust_update(mut self, handler: Arc<dyn certificates::TrustUpdateHandler>) -> Self {
+        self.trust_update = Some(handler);
         self
     }
 }
@@ -154,6 +222,46 @@ pub fn router(state: AppState) -> Router {
 
     let authenticated_peer = Router::new()
         .route("/api/provision", post(provision::provision))
+        .route("/api/speedtest/ping", get(speedtest::ping))
+        .route("/api/speedtest/download", get(speedtest::download))
+        .route(
+            "/api/speedtest/upload",
+            post(speedtest::upload).layer(DefaultBodyLimit::max(speedtest::MAX_TRANSFER_BYTES)),
+        )
+        // Explicit teardown of a negotiated PSK, sent through the tunnel
+        // before the client unmounts its adapter (spec §7.5). Behind
+        // `require_peer` like provisioning: the source VIP is what ties the
+        // command to a peer, and the body's key is only ever compared to it.
+        .route(
+            "/api/key-negotiation/release",
+            // The 32 KiB bound is applied by the transport, so an oversized
+            // body is refused before it is buffered — the handler's own check
+            // is what keeps that guarantee true when it is called directly.
+            post(key_negotiation::release).layer(DefaultBodyLimit::max(
+                key_negotiation::MAX_RELEASE_BODY_BYTES,
+            )),
+        )
+        // Certificate lifecycle inside the tunnel (spec §7 and §8.1). Same
+        // `require_peer` resolution as the release: the source VIP names the
+        // peer, the body only ever confirms it.
+        .route(
+            "/api/key-negotiation/trust-update",
+            post(certificates::trust_update).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/stage",
+            post(certificates::stage).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/stage-commit",
+            post(certificates::stage_commit).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
         .route("/ws", get(ws::handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -164,6 +272,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(routes::status))
         // Publisher trust anchor compiled into the binary (ADR-002).
         .route("/api/trust", get(routes::trust))
+        .route("/api/health", get(health::health))
         .route("/api/network", get(routes::network_get))
         .route("/api/key-negotiation", get(routes::key_negotiation_get))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
@@ -182,16 +291,17 @@ async fn require_json_for_mutations(request: Request<Body>, next: Next) -> Respo
     if matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH
-    ) && !request
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-        })
+    ) && request.uri().path() != "/api/speedtest/upload"
+        && !request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            })
     {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
@@ -240,7 +350,7 @@ mod security_tests {
 
     fn state_with_mode(dry_run: bool) -> (AppState, mpsc::Receiver<OrchestratorCmd>) {
         let network = NetworkConfig {
-            wan_iface: "eth0".into(),
+            wan_ifaces: vec!["eth0".into()],
             admin_iface: Some("helios0".into()),
             wg_private_key: PRIVATE_KEY.into(),
             peers: vec![aether::WgPeer {
@@ -252,6 +362,7 @@ mod security_tests {
                 key_negotiation_certificate_sha256: None,
                 key_negotiation_pq_certificate_sha256: None,
                 minimum_key_negotiation_mode: aether::key_negotiation::ProtectionMode::Classic,
+                persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
             }],
             ..NetworkConfig::default()
         };
@@ -372,6 +483,63 @@ mod security_tests {
     }
 
     #[tokio::test]
+    async fn speedtest_upload_accepts_a_bounded_binary_body_only_for_a_peer() {
+        let (app_state, _cmd_rx) = state();
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/speedtest/upload?bytes=4")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, "4")
+            .body(Body::from("test"))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let (app_state, _cmd_rx) = state_real();
+        let response = router(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/speedtest/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn speedtest_download_is_bounded_and_returns_the_requested_size() {
+        let (app_state, _cmd_rx) = state();
+        let mut request = Request::builder()
+            .uri("/api/speedtest/download?bytes=32")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64).await.unwrap();
+        assert_eq!(body.len(), 32);
+
+        let (app_state, _cmd_rx) = state();
+        let uri = format!(
+            "/api/speedtest/download?bytes={}",
+            speedtest::MAX_TRANSFER_BYTES + 1
+        );
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(app_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn mutation_requires_the_admin_peer_identified_by_its_vip() {
         let (non_admin_state, mut cmd_rx) = state();
         non_admin_state.network.write().await.peers[0].admin = false;
@@ -408,6 +576,17 @@ mod security_tests {
 
     /// Test public key, distinct from the already-admitted peer's.
     const NEW_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    /// Ce que la v5 exige de toute admission : les deux empreintes.
+    ///
+    /// Un pair sans identité PQ est refusé, et le plancher `ml_kem` est
+    /// imposé — le défaut v4, qui retombait sur `classic` en l'absence de
+    /// certificat, produisait des pairs au premier handshake nu.
+    const ADMIT_IDENTITY: &str = concat!(
+        r#""key_negotiation_certificate_sha256":"#,
+        r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+        r#""key_negotiation_pq_certificate_sha256":"#,
+        r#""bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb""#
+    );
 
     #[tokio::test]
     async fn admission_allocates_a_vip_and_notifies_the_orchestrator() {
@@ -417,7 +596,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -463,7 +642,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -497,7 +676,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -521,16 +700,23 @@ mod security_tests {
 
         for (body, expected) in [
             (
-                format!(r#"{{"name":"workstation","public_key":"{NEW_KEY}"}}"#),
+                format!(r#"{{"name":"workstation","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"other","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}"#
-                    .to_string(),
+                format!(
+                    r#"{{"name":"other","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",{ADMIT_IDENTITY}}}"#
+                ),
                 StatusCode::CONFLICT,
             ),
             (
-                r#"{"name":"other","public_key":"not-a-key"}"#.to_string(),
+                format!(r#"{{"name":"other","public_key":"not-a-key",{ADMIT_IDENTITY}}}"#),
+                StatusCode::BAD_REQUEST,
+            ),
+            // Nouveau en v5 : une admission sans identité PQ est refusée, et
+            // c'est une erreur d'entrée, pas un conflit d'état.
+            (
+                format!(r#"{{"name":"nu","public_key":"{NEW_KEY}"}}"#),
                 StatusCode::BAD_REQUEST,
             ),
         ] {
@@ -585,7 +771,7 @@ mod security_tests {
         let response = router(state)
             .oneshot(admin_request(
                 "/api/peers",
-                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}"}}"#),
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
             ))
             .await
             .unwrap();
@@ -614,7 +800,11 @@ mod security_tests {
 
         match cmd_rx.recv().await {
             Some(OrchestratorCmd::LoadNetworkConfig(config)) => {
-                assert_eq!(config.wan_iface, "eth1", "the requested setting applies");
+                assert_eq!(
+                    config.wan_ifaces,
+                    vec!["eth1".to_string()],
+                    "the requested setting applies"
+                );
                 assert_eq!(
                     config.wg_private_key, PRIVATE_KEY,
                     "the gateway's identity was erased by a plain setting change"

@@ -82,7 +82,41 @@ pub struct PeerConfig {
     pub allowed_ips: String,
     /// Post-quantum PSK derived from the ML-KEM exchange, in base64. **Secret.**
     pub preshared_key: Option<String>,
+    /// Seconds between keep-alives the **gateway** sends this peer. `0` is off.
+    ///
+    /// Set by the gateway rather than inherited from the client, so that the
+    /// handshake ages both ends read stay meaningful on an idle tunnel. See
+    /// `aether::config::WgPeer::persistent_keepalive_secs`.
+    pub persistent_keepalive_secs: u16,
 }
+
+/// Beyond this age, a handshake no longer proves anything.
+///
+/// WireGuard is connectionless: nothing announces a disconnection, and the
+/// only evidence a peer is still there is a recent handshake. The value lives
+/// here, next to [`PeerStatus`], because two very different consumers must
+/// agree on it — the orchestrator, which infers the tunnel state from it and
+/// therefore decides whether the kill-switch lifts, and the API, which reports
+/// to the console who is connected. A console applying its own threshold would
+/// eventually show a client as online while the firewall had already cut it.
+pub const HANDSHAKE_STALE_AFTER_SECS: u64 = 150;
+
+/// Beyond this age, a negotiated PSK is reclaimed.
+///
+/// A **third** threshold, deliberately longer than
+/// [`HANDSHAKE_STALE_AFTER_SECS`], because it answers a different question.
+/// At 150 seconds the gateway stops counting a peer as connected; at 300 it
+/// destroys that peer's secret. Freeing a resource is not the same moment as
+/// ceasing to believe in a presence, and collapsing the two would delete a PSK
+/// the instant a peer looked briefly absent.
+///
+/// It also sits above the 180 seconds after which WireGuard abandons a session
+/// on its own: at 300 the gateway never destroys something still working, it
+/// records what the data plane already settled.
+///
+/// Only meaningful for peers the gateway sends keep-alives to — which
+/// `NetworkConfig::validate` makes mandatory for every negotiated peer.
+pub const PSK_RECLAIM_AFTER_STALE_SECS: u64 = 300;
 
 /// Observed state of a peer, read from the data plane.
 #[derive(Debug, Clone)]

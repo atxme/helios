@@ -51,41 +51,27 @@ pub enum AdmissionError {
     Ipam(#[from] crate::ipam::IpamError),
     #[error("certificate fingerprint must be 64 lowercase SHA-256 hexadecimal characters")]
     CertificateFingerprint,
-}
-
-/// Admits a peer and assigns it its VIP.
-///
-/// The configuration is only modified on success: a refusal leaves `config`
-/// intact, which lets the caller persist it unconditionally after an `Ok`.
-pub fn admit(
-    config: &mut NetworkConfig,
-    name: &str,
-    public_key: &str,
-    admin: bool,
-) -> Result<WgPeer, AdmissionError> {
-    admit_with_certificate(config, name, public_key, admin, None)
-}
-
-/// Admits a peer and binds its key-negotiation certificate fingerprint.
-pub fn admit_with_certificate(
-    config: &mut NetworkConfig,
-    name: &str,
-    public_key: &str,
-    admin: bool,
-    certificate_sha256: Option<&str>,
-) -> Result<WgPeer, AdmissionError> {
-    admit_with_key_negotiation(
-        config,
-        name,
-        public_key,
-        admin,
-        certificate_sha256,
-        None,
-        ProtectionMode::Classic,
-    )
+    #[error(
+        "admission requires both the TLS and the PQ key-negotiation certificate; the \
+         classic path leaves the first handshake unprotected and is retired on 2027-02-01"
+    )]
+    MissingNegotiationIdentity,
+    #[error(
+        "admission floor must be `ml_kem`, not `{0:?}`; a weaker floor is only reachable \
+         by editing network.toml locally"
+    )]
+    FloorBelowMlKem(ProtectionMode),
 }
 
 /// Admits a peer with both transport and PQ identity bindings.
+///
+/// The configuration is only modified on success: a refusal leaves `config`
+/// intact, which lets the caller persist it unconditionally after an `Ok`.
+///
+/// The v4 shims that admitted a peer without a certificate, or with only the
+/// TLS one, are gone rather than deprecated. Under v5 rules they could only
+/// ever return [`AdmissionError::MissingNegotiationIdentity`], and a function
+/// whose every call fails is worse than no function.
 pub fn admit_with_key_negotiation(
     config: &mut NetworkConfig,
     name: &str,
@@ -104,13 +90,21 @@ pub fn admit_with_key_negotiation(
         return Err(AdmissionError::EmptyName);
     }
     wg::validate_key(public_key)?;
-    if let Some(fingerprint) = certificate_sha256 {
+    // v5 admits no peer without both identities, and every admission lands on
+    // the `ml_kem` floor. The v4 default — no certificate, therefore
+    // `classic` — is gone: it produced peers whose first handshake was
+    // unprotected while nothing in any interface distinguished them from the
+    // others. A weaker floor remains reachable, but only by editing
+    // `network.toml` by hand, which is a deliberate act rather than a default.
+    let (certificate_sha256, pq_certificate_sha256) = certificate_sha256
+        .zip(pq_certificate_sha256)
+        .ok_or(AdmissionError::MissingNegotiationIdentity)?;
+    for fingerprint in [certificate_sha256, pq_certificate_sha256] {
         aether::key_negotiation::validate_certificate_fingerprint(fingerprint)
             .map_err(|_| AdmissionError::CertificateFingerprint)?;
     }
-    if let Some(fingerprint) = pq_certificate_sha256 {
-        aether::key_negotiation::validate_certificate_fingerprint(fingerprint)
-            .map_err(|_| AdmissionError::CertificateFingerprint)?;
+    if minimum_mode != ProtectionMode::MlKem {
+        return Err(AdmissionError::FloorBelowMlKem(minimum_mode));
     }
 
     if let Some(existing) = config.peers.iter().find(|peer| peer.name.trim() == name) {
@@ -138,9 +132,13 @@ pub fn admit_with_key_negotiation(
         // knows, and a PSK slot filled on only one side breaks every
         // handshake of the peer.
         preshared_key: None,
-        key_negotiation_certificate_sha256: certificate_sha256.map(str::to_string),
-        key_negotiation_pq_certificate_sha256: pq_certificate_sha256.map(str::to_string),
+        key_negotiation_certificate_sha256: Some(certificate_sha256.to_string()),
+        key_negotiation_pq_certificate_sha256: Some(pq_certificate_sha256.to_string()),
         minimum_key_negotiation_mode: minimum_mode,
+        // Posed by the gateway, never inherited from the client: it is what
+        // makes the handshake age a readable signal on an idle tunnel, and
+        // the gateway cannot inspect a client's configuration to check it.
+        persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
     };
     config.peers.push(peer.clone());
     Ok(peer)
@@ -233,6 +231,26 @@ mod tests {
         }
     }
 
+    /// A v5-conforming admission, so the tests below stay about what they were
+    /// written for — VIP assignment, duplicates, name and key validation —
+    /// instead of restating the identity requirements at every call.
+    fn admit(
+        config: &mut NetworkConfig,
+        name: &str,
+        public_key: &str,
+        admin: bool,
+    ) -> Result<WgPeer, AdmissionError> {
+        admit_with_key_negotiation(
+            config,
+            name,
+            public_key,
+            admin,
+            Some(&"a".repeat(64)),
+            Some(&"b".repeat(64)),
+            ProtectionMode::MlKem,
+        )
+    }
+
     #[test]
     fn admission_assigns_a_32_vip_within_the_cgnat() {
         let mut config = config();
@@ -251,21 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn admission_binds_a_canonical_certificate_fingerprint() {
+    fn admission_binds_both_canonical_certificate_fingerprints() {
         let mut config = config();
-        let fingerprint = "a".repeat(64);
-        let peer = admit_with_certificate(
-            &mut config,
-            "workstation",
-            &key(1),
-            false,
-            Some(&fingerprint),
-        )
-        .expect("admission");
+        let peer = admit(&mut config, "workstation", &key(1), false).expect("admission");
 
         assert_eq!(
             peer.key_negotiation_certificate_sha256.as_deref(),
-            Some(fingerprint.as_str())
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            peer.key_negotiation_pq_certificate_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
         );
     }
 
@@ -273,10 +287,86 @@ mod tests {
     fn invalid_certificate_fingerprint_is_refused_before_any_write() {
         let mut config = config();
         assert!(matches!(
-            admit_with_certificate(&mut config, "workstation", &key(1), false, Some("AABB")),
+            admit_with_key_negotiation(
+                &mut config,
+                "workstation",
+                &key(1),
+                false,
+                Some("AABB"),
+                Some(&"b".repeat(64)),
+                ProtectionMode::MlKem,
+            ),
             Err(AdmissionError::CertificateFingerprint)
         ));
         assert!(config.peers.is_empty());
+    }
+
+    /// Le défaut v4 — pas de certificat, donc `classic` — produisait des pairs
+    /// dont le premier handshake était nu sans que rien ne les distingue.
+    #[test]
+    fn an_admission_without_a_pq_identity_is_refused() {
+        let mut config = config();
+        for (tls, pq) in [
+            (None, None),
+            (Some("a".repeat(64)), None),
+            (None, Some("b".repeat(64))),
+        ] {
+            assert!(matches!(
+                admit_with_key_negotiation(
+                    &mut config,
+                    "workstation",
+                    &key(1),
+                    false,
+                    tls.as_deref(),
+                    pq.as_deref(),
+                    ProtectionMode::MlKem,
+                ),
+                Err(AdmissionError::MissingNegotiationIdentity)
+            ));
+        }
+        assert!(config.peers.is_empty());
+    }
+
+    /// Un plancher plus faible reste atteignable, mais seulement en éditant
+    /// `network.toml` — jamais par un défaut d'admission.
+    #[test]
+    fn an_admission_below_the_ml_kem_floor_is_refused() {
+        let mut config = config();
+        for weaker in [ProtectionMode::Classic, ProtectionMode::StaticPsk] {
+            assert!(matches!(
+                admit_with_key_negotiation(
+                    &mut config,
+                    "workstation",
+                    &key(1),
+                    false,
+                    Some(&"a".repeat(64)),
+                    Some(&"b".repeat(64)),
+                    weaker,
+                ),
+                Err(AdmissionError::FloorBelowMlKem(_))
+            ));
+        }
+        assert!(config.peers.is_empty());
+    }
+
+    /// La gateway pose le keep-alive elle-même : sans lui, ni la récupération
+    /// de slot ni la renégociation client ne se déclenchent jamais.
+    #[test]
+    fn admission_poses_the_gateway_keep_alive() {
+        let mut config = config();
+        let peer = admit(&mut config, "workstation", &key(1), false).expect("admission");
+        assert_eq!(
+            peer.persistent_keepalive_secs,
+            aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS
+        );
+        assert_ne!(peer.persistent_keepalive_secs, 0);
+        config.validate_peer_identities().expect("pair conforme");
+
+        config.peers[0].persistent_keepalive_secs = 0;
+        assert!(
+            config.validate_peer_identities().is_err(),
+            "un pair négocié sans keep-alive doit être refusé au chargement"
+        );
     }
 
     /// The point of going through the IPAM: the gateway and the client

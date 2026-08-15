@@ -1,6 +1,6 @@
 [package]
 name = "orion-core"
-version.workspace = true
+version = "1.31.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -16,6 +16,12 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+futures-util.workspace = true
+bytes.workspace = true
+# The parsed URL's `Host` type. `reqwest` re-exports `Url` but not this type,
+# and distinguishing an IP literal from a name must use the exact structure
+# consumed by the HTTP client, never a second parse of the source string.
+url = "2"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -82,6 +88,10 @@ default = []
 # machine disposant du plan de données WireGuard — comme la feature `netlink`
 # côté heliosd. Les anciens backends IKEv2 ont été supprimés avec la bascule.
 wireguard = ["dep:defguard_wireguard_rs"]
+# Signature ML-DSA-87 des objets de cycle de vie, pour les tests du magasin de
+# confiance. Un Orion livré ne signe aucun objet d'autorité : il en vérifie.
+certificate-signing = ["aether/key-negotiation-signing"]
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

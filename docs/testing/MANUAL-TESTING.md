@@ -500,3 +500,93 @@ La recette de sécurité attendue est :
 Le provisioning ML-KEM peut être testé au niveau protocole, mais son PSK ne doit
 pas être considéré comme installé automatiquement tant que le câblage atomique
 du plan de données gateway n'est pas terminé.
+
+## Recouper le speedtest avec `iperf3`
+
+Le speedtest intégré mesure le plan de données WireGuard avec ses propres
+sockets. Pour savoir si ses chiffres sont justes, il faut une seconde mesure
+qui ne partage aucun code avec lui — `iperf3` est la référence.
+
+### Ouvrir le port
+
+Rien n'est ouvert par défaut : un `iperf3` joignable en permanence est une
+surface joignable en permanence. Dans `/var/lib/helios/network.toml` :
+
+```toml
+iperf_port = 5202
+```
+
+Le fichier est relu à chaud, donc le pare-feu se reconstruit sans redémarrer
+`heliosd`. Le port s'ouvre **dans les deux sens** sur l'interface du tunnel, et
+c'est la moitié `output` qui compte : la gateway en rôle client ouvre un flux
+sortant *neuf* sur `helios0`, que la politique `drop` prend si la chaîne
+`output` ne l'accepte pas. Le symptôme est un `iperf3 -c` figé sur
+« Connecting to host », qui se lit comme un serveur en face qui n'écoute pas.
+
+Le port est fermé tant que `wireguard_ready()` est faux : une règle portant sur
+une interface qui ne peut pas exister ne vaut rien.
+
+Vérifier après rechargement :
+
+```sh
+sudo nft list chain inet helios input  | grep 5202
+sudo nft list chain inet helios output | grep 5202
+```
+
+Quatre lignes attendues — TCP et UDP, `iifname` et `oifname`.
+
+### Serveur sur la gateway
+
+```sh
+sudo apt-get install -y iperf3      # exige allow_gateway_egress
+iperf3 --server --port 5202 --bind 100.64.0.1
+```
+
+`--bind` sur la VIP est délibéré : sans lui `iperf3` écoute sur `0.0.0.0`,
+donc aussi sur le WAN. Le pare-feu le refuserait de toute façon, mais un
+service qui n'écoute pas là où il ne doit pas est une défense de moins à
+solliciter.
+
+Depuis le client, tunnel monté :
+
+```sh
+iperf3 -c 100.64.0.1 -p 5202          # descendant : -R
+iperf3 -c 100.64.0.1 -p 5202 -u -b 0  # UDP
+```
+
+### Serveur sur le client
+
+C'est le sens le plus courant — on est déjà assis devant cette machine. Sous
+Windows, ouvrir aussi le pare-feu Windows sur 5202, que ce port soit atteint
+par l'adaptateur WireGuard :
+
+```powershell
+New-NetFirewallRule -DisplayName "iperf3 Helios" -Direction Inbound `
+  -Protocol TCP -LocalPort 5202 -Action Allow -Profile Any
+New-NetFirewallRule -DisplayName "iperf3 Helios UDP" -Direction Inbound `
+  -Protocol UDP -LocalPort 5202 -Action Allow -Profile Any
+iperf3.exe --server --port 5202
+```
+
+Puis, depuis la gateway, vers la VIP du client :
+
+```sh
+iperf3 -c 100.64.1.2 -p 5202
+```
+
+### Lire le résultat
+
+Comparer au speedtest d'Orion, qui mesure la même chose par un autre chemin :
+
+* **débit TCP proche** des deux côtés — le speedtest est juste ;
+* **perte UDP proche de zéro** sous `iperf3 -u -b <débit TCP>` — c'est la même
+  question que pose la jambe de qualité, cadencée à 85 % du débit TCP ;
+* un `iperf3 -u -b 0` renvoie une perte énorme, et c'est **normal** : sans
+  `-b`, `iperf3` émet à fond, et la perte mesure alors l'écart entre son
+  émetteur et le lien, pas le lien. C'est exactement le défaut que la cadence
+  corrige côté Helios ; ne pas comparer ce chiffre-là à celui d'Orion.
+
+### Refermer
+
+Retirer `iperf_port` de `network.toml` une fois la mesure faite. Le pare-feu
+se referme au rechargement, sans redémarrage.

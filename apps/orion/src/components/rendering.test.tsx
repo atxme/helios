@@ -42,7 +42,6 @@ function postureHtml(selected: ClientProfile, vault: VaultPosture | null): strin
       adapterUp
       profile={selected}
       psk="ml_kem"
-      backend="wireguard-nt"
       vault={vault}
     />,
   )
@@ -183,8 +182,6 @@ describe('Orion presentational branches', () => {
 
     expect(html).toContain('203.0.113.10:51821')
     expect(html).toContain('100.64.0.0/10')
-    expect(html).toContain('hors tunnel')
-    expect(html).toContain('wireguard-nt')
   })
 
   it('server-renders the initial application without starting platform effects', () => {
@@ -250,7 +247,12 @@ describe('Orion presentational branches', () => {
     expect(waived).toContain('exigence levée')
   })
 
-  it('claims the hardware seal only when it holds', () => {
+  /// A nominal vault reports nothing at all.
+  ///
+  /// Rows stating that the seal holds, the volume is encrypted and memory is
+  /// locked gave the user nothing to act on while pushing the degraded rows —
+  /// the only ones worth a glance — out of sight. Silence is the healthy state.
+  it('stays silent about a vault that has nothing to report', () => {
     const clean: VaultPosture = {
       hardwareBacked: true,
       softwareKeystore: false,
@@ -266,8 +268,9 @@ describe('Orion presentational branches', () => {
     }
     const html = postureHtml(profile(), clean)
 
-    expect(html).toContain('scellés au TPM')
-    expect(html).toContain('verrouillée')
+    expect(html).not.toContain('scellés')
+    expect(html).not.toContain('verrouillée')
+    expect(html).not.toContain('non couvert')
     expect(html).not.toContain('fichier en clair présent')
   })
 

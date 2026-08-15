@@ -204,6 +204,13 @@ prochain handshake, il n'existe pas de liste de révocation.
 
 ## 5. PKI et key-negotiation
 
+> **État actuel.** Les commandes de cette section décrivent le chemin encore
+> servi. La cible acceptée par
+> [ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) déplace le cycle de
+> vie vers Astra, conserve les CA maîtresses chiffrées et les ouvre localement
+> avec `astra-signer` et une YubiKey. Ce lot n'est pas encore implémenté ; les
+> commandes ci-dessous restent donc nécessaires jusque-là.
+
 Créer l’autorité cliente sur le poste opérateur, jamais sur la gateway :
 
 ```sh

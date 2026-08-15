@@ -4,11 +4,15 @@
  * Grammar shared by the project's two marks (cf. `OrionMark` on the client
  * side): a containment ring, a solid center, an elliptical trajectory that
  * passes *behind* that center. Institutional aerospace register: monoline,
- * symmetric, no frills — the mark must stay legible at 20 px in a sidebar
- * as well as at 400 px on a supervision screen.
+ * symmetric, no frills — the mark must stay legible at 20 px in a navigation
+ * rail as well as at 400 px on a supervision screen.
  *
- * Here the center is the solar disk and its corona: Helios is the source,
- * the fixed point around which clients orbit.
+ * Here the center is the solar disk and its corona: Helios is the source, the
+ * fixed point around which clients orbit.
+ *
+ * The mark draws itself in `currentColor`, so a parent decides its color the
+ * MUI way — `sx={{ color: 'primary.main' }}` — and it follows the color
+ * scheme without knowing one exists.
  */
 
 const RAYS = 12
@@ -36,21 +40,23 @@ function rays() {
 }
 
 interface Props {
-  className?: string
+  size?: number
   /** Hides the orbital trajectory — compact version for very small sizes. */
   compact?: boolean
   title?: string
 }
 
-export function HeliosMark({ className = '', compact = false, title }: Props) {
+export function HeliosMark({ size = 32, compact = false, title }: Props) {
   return (
     <svg
       viewBox="0 0 48 48"
+      width={size}
+      height={size}
       fill="none"
-      className={className}
       role={title ? 'img' : undefined}
       aria-hidden={title ? undefined : true}
       aria-label={title}
+      style={{ display: 'block', flexShrink: 0 }}
     >
       {title && <title>{title}</title>}
 
@@ -82,19 +88,3 @@ export function HeliosMark({ className = '', compact = false, title }: Props) {
   )
 }
 
-/** Mark + typography, for a header. */
-export function HeliosLockup({ className = '' }: { className?: string }) {
-  return (
-    <div className={`flex items-center gap-3 ${className}`}>
-      <HeliosMark className="h-8 w-8 shrink-0 text-amber-500 dark:text-amber-400" title="Helios" />
-      <div className="min-w-0 leading-none">
-        <div className="font-bold tracking-[0.28em] text-[13px] text-amber-600 dark:text-amber-300">
-          HELIOS
-        </div>
-        <div className="mt-1 text-[9px] uppercase tracking-[0.16em] text-cyan-700/75 dark:text-cyan-500/70 font-mono">
-          WireGuard · PQ Gateway
-        </div>
-      </div>
-    </div>
-  )
-}

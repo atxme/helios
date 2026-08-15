@@ -1,6 +1,6 @@
 [package]
 name = "helios-provisioning"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -14,3 +14,15 @@ aws-lc-rs.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Signature ML-DSA-87 des objets de cycle de vie : réservée aux tests et aux
+# chemins opérateur. Une gateway qui ne fait que vérifier ne lie aucune
+# implémentation de signature.
+certificate-signing = ["aether/key-negotiation-signing"]
+
+[dev-dependencies]
+tempfile = "3"

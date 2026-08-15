@@ -3,11 +3,18 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ClientProfile, ImportOutcome, ProfileIssues } from '../types'
+import type {
+  CertificateInventory,
+  ClientProfile,
+  ImportOutcome,
+  ProfileIssues,
+} from '../types'
 
 const api = vi.hoisted(() => ({
-  keyNegotiationFingerprint: vi.fn(),
-  keyNegotiationIdentitySealed: vi.fn(),
+  certificateActions: vi.fn(),
+  certificateInventory: vi.fn(),
+  lastCertificateError: vi.fn(),
+  runCertificateAction: vi.fn(),
   keyNegotiationSupport: vi.fn(),
   validateProfile: vi.fn(),
   generatePrivateKey: vi.fn(),
@@ -39,6 +46,21 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   ...overrides,
 })
 
+/**
+ * What the shell reports for a profile whose identity is not on this machine.
+ *
+ * The default in these tests, because it is the default of a fresh machine:
+ * the material is pinned, the protected store holds nothing yet.
+ */
+const emptyInventory: CertificateInventory = {
+  gateway_pq: null,
+  gateway_ca_tls: null,
+  client_tls: null,
+  client_pq: null,
+  faults: [],
+  identity_sealed: false,
+}
+
 const noIssues: ProfileIssues = {
   name: null,
   endpoint: null,
@@ -65,8 +87,10 @@ function callbacks() {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.keyNegotiationFingerprint.mockResolvedValue('sha256:fingerprint')
-  api.keyNegotiationIdentitySealed.mockResolvedValue(false)
+  api.certificateInventory.mockResolvedValue(emptyInventory)
+  api.certificateActions.mockResolvedValue([])
+  api.lastCertificateError.mockResolvedValue(null)
+  api.runCertificateAction.mockResolvedValue(undefined)
   api.keyNegotiationSupport.mockResolvedValue({ identity_store: false })
   api.validateProfile.mockResolvedValue(noIssues)
   api.generatePrivateKey.mockResolvedValue('clé-publique-générée')
@@ -106,16 +130,23 @@ describe('ProfilesView interactions', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
     fireEvent.change(screen.getByLabelText('Trafic capté'), { target: { value: '100.64.0.0/10' } })
-    expect(screen.getByText(/ce qui en sort part/)).toBeTruthy()
-    expect(screen.getByText(/désactive/)).toBeTruthy()
+    // The speedtest targets Helios through the established tunnel; there is
+    // no user-configurable API URL on a profile anymore.
+    expect(screen.queryByLabelText('URL Helios')).toBeNull()
+    // Split tunnelling is a decision, not a defect: narrowing the range warns
+    // about nothing.
+    expect(screen.queryByText(/en clair/)).toBeNull()
     expect(screen.queryByDisplayValue('static-secret')).toBeNull()
+    // No negotiation block on this profile, so the PSK is a plain WireGuard
+    // setting and lives here.
     fireEvent.click(screen.getByRole('button', { name: 'Retirer le PSK statique' }))
     fireEvent.click(screen.getByRole('button', { name: 'Générer une nouvelle clé' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Ajouter' }))
     expect(screen.getByText(/CA TLS absente/)).toBeTruthy()
     fireEvent.change(screen.getByLabelText('Identité protégée'), { target: { value: 'workstation' } })
-    expect(screen.getByText(/Aucune identité protégée nommée/)).toBeTruthy()
+    // Certificates live in their own destination now; what stays here is the
+    // machine-level fact, which is about this build rather than this profile.
     expect(screen.getByText(/Aucun stockage protégé d’identité/)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Afficher les données encodées' }))
@@ -128,7 +159,7 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Fermer' }))
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
 
-    fireEvent.click(screen.getByRole('button', { name: /Retirer la négociation/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(screen.getByText(/« workstation » enregistré/)).toBeTruthy()
@@ -271,7 +302,7 @@ describe('ProfilesView interactions', () => {
    * treats mode and PSK as a single decision, so a screen that set them apart
    * could only build profiles it would then have to mark invalid.
    */
-  it('takes a static PSK and moves the negotiation to the mode it belongs to', async () => {
+  it('takes a static PSK under the mode that owns it, never among the WireGuard settings', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
@@ -296,8 +327,18 @@ describe('ProfilesView interactions', () => {
       />,
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
-    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
 
+    // Under ML-KEM there is no PSK row at all — not a greyed one, not one
+    // with a sentence explaining why it is unusable. Nor is it hiding under
+    // «Avancé»: a negotiation block owns the PSK, the WireGuard block does
+    // not.
+    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
+
+    // Choosing the mode is what brings the field with it.
+    const modes = within(screen.getByLabelText('Mode'))
+    fireEvent.click(modes.getByRole('button', { name: 'PSK' }))
     fireEvent.click(screen.getByRole('button', { name: 'Définir un PSK statique' }))
     const field = screen.getByLabelText('PSK WireGuard (base64)') as HTMLInputElement
     expect(field.type).toBe('password')
@@ -310,13 +351,78 @@ describe('ProfilesView interactions', () => {
     expect(document.body.innerHTML).not.toContain('cHNrLXNlY3JldA==')
     expect(screen.getByText('nouveau PSK — à enregistrer')).toBeTruthy()
 
-    // The mode followed, and the save says so on both fields.
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     const sent = handlers.onSave.mock.calls[0][0]
     expect(sent.useStagedPsk).toBe(true)
     expect(sent.clearPresharedKey).toBe(false)
     expect(sent.key_negotiation.mode).toBe('static_psk')
+  })
+
+  /**
+   * `classic` is the absence of the block, never a mode inside it.
+   *
+   * The gateway refuses a negotiated `classic` by name
+   * (`ClassicNotNegotiable`), so offering it here would only build profiles
+   * that fail before the first handshake.
+   */
+  it('offers only the two negotiable modes, and reaches classic by removing the block', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [
+            profile({
+              key_negotiation: {
+                mode: 'ml_kem',
+                minimum_mode: 'classic',
+                endpoint: '203.0.113.10:51821',
+                server_name: '203.0.113.10',
+                gateway_ca_der: 'ca',
+                gateway_pq_certificate: 'pq',
+                identity: 'orion-portable',
+              },
+            }),
+          ],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+
+    const modes = within(screen.getByLabelText('Mode'))
+    expect(modes.getAllByRole('button').map((button) => button.textContent)).toEqual([
+      'PSK',
+      'ML-KEM',
+    ])
+    // The floor still shows all three: it is a ratchet, and seeing what one
+    // has climbed past is the point.
+    expect(within(screen.getByLabelText('Plancher')).getAllByRole('button')).toHaveLength(3)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
+    await waitFor(() => expect(screen.getByText('aucune')).toBeTruthy())
+    // And the PSK comes back to the WireGuard settings, where it is plain
+    // WireGuard again.
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.getByRole('button', { name: 'Définir un PSK statique' })).toBeTruthy()
+  })
+
+  /** Certificates have their own destination: none of it leaks back here. */
+  it('shows no certificate surface on the profiles screen', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    expect(screen.queryByRole('heading', { name: 'Certificats' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Renouveler maintenant' })).toBeNull()
+    expect(api.certificateInventory).not.toHaveBeenCalled()
   })
 
   /** The other direction: asking for ML-KEM is what removes the PSK. */
@@ -346,14 +452,17 @@ describe('ProfilesView interactions', () => {
       />,
     )
     await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
-    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    // Still there, and still offered: nothing has asked for it to go.
+    // Shown with its mode, without opening «Avancé»: the PSK belongs to the
+    // negotiation block now.
     expect(screen.getByText('scellé dans le coffre')).toBeTruthy()
 
-    // Scoped to the mode group: the floor row offers the same three labels.
+    // Scoped to the mode group: the floor row offers the same labels.
     const modes = within(screen.getByLabelText('Mode'))
     fireEvent.click(modes.getByRole('button', { name: 'ML-KEM' }))
-    await waitFor(() => expect(screen.getByText('aucun')).toBeTruthy())
+    // The row goes away with the mode that owned it, rather than lingering as
+    // an "aucun" with a sentence about the floor.
+    await waitFor(() => expect(screen.queryByText('scellé dans le coffre')).toBeNull())
+    expect(screen.queryByRole('button', { name: 'Définir un PSK statique' })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
@@ -411,6 +520,39 @@ describe('ProfilesView interactions', () => {
     await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledWith('portable'))
   })
 
+  /**
+   * A wg-quick file carries `DNS`, `MTU`, `Table`. The profile imports, and
+   * what will not be honoured is said — dropping it silently would hand back a
+   * tunnel that differs from the one the file describes.
+   */
+  it('reports what an imported WireGuard file said and Orion does not apply', async () => {
+    const handlers = callbacks()
+    handlers.onImport.mockResolvedValue({
+      profile: profile({ name: 'fournisseur' }),
+      identity_sealed: false,
+      identity_error: null,
+      private_key_missing: null,
+      incomplete: null,
+      notices: ['DNS = 100.64.0.1 : Orion n’applique pas de serveur DNS.'],
+    })
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(input, 'files', {
+      value: [new File(['[Interface]'], 'fournisseur.conf')],
+    })
+    fireEvent.change(input)
+
+    await waitFor(() => expect(screen.getByText(/n’applique pas de serveur DNS/)).toBeTruthy())
+    // Appended, not substituted: the profile still loaded.
+    expect(screen.getByText(/« fournisseur » chargé/)).toBeTruthy()
+  })
+
   it('imports normal, incomplete, oversized and unreadable documents', async () => {
     const handlers = callbacks()
     const outcome = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
@@ -419,6 +561,7 @@ describe('ProfilesView interactions', () => {
       identity_error: null,
       private_key_missing: null,
       incomplete: null,
+      notices: [],
       ...overrides,
     })
     handlers.onImport.mockResolvedValueOnce(outcome())

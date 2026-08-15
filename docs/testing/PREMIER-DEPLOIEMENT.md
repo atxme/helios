@@ -78,9 +78,16 @@ fabriquer une.
 archivage, copie, vérification d'empreinte et installation privilégiée :
 
 ```sh
-./scripts/deploy.sh christophe@192.168.1.44   # première fois : l'hôte est retenu
-./scripts/deploy.sh                           # ensuite
+./scripts/deploy.sh                       # l'adresse est en dur, aucun argument
+./scripts/deploy.sh root@autre-machine    # ponctuellement ailleurs
 ```
+
+L'adresse de la gateway vit dans `scripts/lib-remote.sh`, sur la ligne
+`HELIOS_CIBLE` : c'est le seul endroit à changer quand elle déménage, et
+`provision-client.sh`, `key-negotiation-setup.sh` et `target-bootstrap.sh` la
+lisent au même endroit. Un argument l'emporte pour l'appel en cours sans rien
+enregistrer — les scripts ne mémorisent plus d'hôte sous `~/.helios`, où une
+copie périmée finissait par gagner contre celle qu'on venait de changer.
 
 Il demande le mot de passe `sudo` de la gateway au moment de l'installation, et
 rien d'autre. La séquence de release est un horodatage Unix : l'anti-rollback
@@ -156,7 +163,7 @@ sudo nano /var/lib/helios/network.toml
 Renseigner au minimum :
 
 ```toml
-wan_iface = "<interface relevée à l'étape 0>"
+wan_iface = "auto"
 lan_ifaces = []
 allow_ssh_from = ["<votre sous-réseau, ex. 192.168.1.0/24>"]
 wg_iface = "helios0"
@@ -164,6 +171,11 @@ wg_address = "100.64.0.1/10"
 wg_listen_port = 51820
 admin_iface = "helios0"
 ```
+
+`wan_iface = "auto"` fait choisir l'interface de sortie au démarrage, en
+préférant le lien filaire. `heliosd show-uplink` montre les candidats et la
+raison du choix ; nommer l'interface explicitement reste possible et reste ce
+qu'il faut faire si la machine a plusieurs sorties dont une seule doit servir.
 
 **`allow_ssh_from` n'est pas optionnel ici.** Sans lui, le premier démarrage
 vous coupe l'accès et il faudra redémarrer la machine.

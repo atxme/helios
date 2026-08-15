@@ -999,6 +999,7 @@ mod tests {
             gateway_ca_der: "Q0EtT1JJR0lORQ==".into(),
             gateway_pq_certificate: "Q0VSVC1PUklHSU5F".into(),
             identity: "poste".into(),
+            trust: None,
         }
     }
 

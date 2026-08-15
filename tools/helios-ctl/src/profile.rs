@@ -472,14 +472,14 @@ mod tests {
     #[test]
     fn the_enrollment_document_is_read_back_whole() {
         use aether::key_negotiation::{
-            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
             PQ_CERTIFICATE_VERSION,
         };
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
         let client_key = aether::wg::generate_keypair().unwrap();
         let gateway_key = aether::wg::generate_keypair().unwrap();
-        let (gateway_pq_private, gateway_pq_public) = generate_ml_dsa_65_keypair().unwrap();
+        let (gateway_pq_private, gateway_pq_public) = generate_ml_dsa_87_keypair().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -492,10 +492,10 @@ mod tests {
                 issuer: "vpn.example.net".into(),
                 role: PqCertificateRole::Gateway,
                 wireguard_public_key: gateway_key.public_key.clone(),
-                ml_dsa_65_public_key: STANDARD.encode(&gateway_pq_public),
+                ml_dsa_87_public_key: STANDARD.encode(&gateway_pq_public),
                 not_before_unix: now - 60,
                 not_after_unix: now + 3600,
-                ml_dsa_65_signature: String::new(),
+                ml_dsa_87_signature: String::new(),
             },
             &gateway_pq_private,
         )

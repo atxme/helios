@@ -232,6 +232,74 @@ Valider avec accès console :
   campagne automatisée couvre la vérification et les refus, pas l'interaction
   avec systemd ni la persistance à travers un redémarrage.
 
+- coffre d'autorité Astra ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) §4),
+  sur le poste où la clé de sécurité est branchée — Windows en administrateur,
+  ou un Linux avec accès au périphérique HID :
+  `astra-signer init` crée le coffre et enregistre la première clé, puis
+  `astra-signer verify` la rouvre après avoir débranché et rebranché ;
+  `astra-signer enrol` enregistre la seconde en la branchant à la place de la
+  première, et **chacune** des deux rouvre ensuite les ancres seule. Vérifier
+  aussi qu'une troisième clé s'enrôle exactement de la même façon, qu'une clé
+  jamais enrôlée est refusée sans ambiguïté, que rebrancher une clé déjà
+  enregistrée pour un second slot est refusé par la clé elle-même — c'est
+  l'`excludeList` CTAP2 qui répond, pas le coffre —, et que `remove` ne laisse
+  jamais moins de deux slots. Un mauvais PIN doit refuser, pas ouvrir.
+
+  Ce qui **n'est pas** exerçable ailleurs : rien d'autre. La séquence complète
+  est éprouvée en dur par `tools/astra-signer/tests/enrolment.rs` contre des
+  clés simulées ; ce que seule la cible établit, c'est que la clé produit bien
+  une sortie `hmac-secret` stable pour un couple (credential, sel) à travers
+  débranchements et redémarrages. Si elle ne l'était pas, le coffre ne se
+  rouvrirait plus et aucun test hors matériel ne l'aurait dit.
+
+  Sous Windows, éprouver **les deux transports** : `--transport platform`
+  (défaut) doit fonctionner depuis une console ordinaire, le système demandant
+  lui-même PIN et contact ; `--transport hid` doit fonctionner depuis une
+  console administrateur et échouer sans, en nommant l'élévation. Vérifier
+  qu'un coffre créé par l'un s'ouvre par l'autre — le credential appartient à
+  la clé, pas à l'API. WSL2 n'a aucun passthrough USB. CTAP n'est **pas** une feature de
+  compilation — tout binaire `astra-signer` porte la pile, et il n'existe aucun
+  chemin qui ouvre le coffre sans clé. Le prix est une dépendance de
+  compilation : `libudev` sous Linux, posée par `scripts/setup-dev.sh`, sans
+  laquelle le workspace entier ne se bâtit plus.
+
+- domaine de confiance, les deux moitiés
+  ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md), guide :
+  [DEPLOIEMENT-ASTRA](../DEPLOIEMENT-ASTRA.md)) : `astra bootstrap` dans le
+  conteneur puis `heliosd init-trust-domain` sur la gateway, avec les valeurs
+  du même `astra-signer init`. Vérifier qu'un second appel de chacune est
+  refusé — une seconde histoire pour un domaine repartirait aux époques 1 face
+  à des clients qui en tiennent de plus hautes, et chacun la refuserait ; que
+  `heliosd init-trust-domain` réussit **TPM indisponible**, puisqu'il ne
+  descelle rien ; que le nom de serveur et la clé WireGuard écrits dans le
+  registre sont bien ceux de la leaf PQ servie et non des valeurs retapées ; et
+  qu'au redémarrage le journal passe de « no certificate registry » à
+  « certificate lifecycle ready ».
+
+  Le conteneur lui-même : rootfs en lecture seule effectif (une écriture hors
+  `/var/lib/astra` et `/tmp` doit échouer), aucune capacité, UID 10001, et le
+  volume d'état seul montage. Restaurer une sauvegarde du volume dont la tête
+  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage** —
+  c'est la seule chose qui distingue une restauration d'un fork.
+
+- **uplinks multiples** (`wan_iface = "auto"`), sur une machine qui a les deux
+  liens. C'est la bascule qu'il faut éprouver, pas le choix :
+  `nft list ruleset` doit porter **les deux** interfaces — écouteur WireGuard,
+  écouteur de négociation, DHCP, sortie de la gateway, forward client et un
+  masquerade par lien. Puis, tunnel monté et client connecté, **débrancher le
+  câble** : le trafic client doit continuer par le Wi-Fi sans redémarrage et
+  sans coupure du tunnel. Rebrancher : il doit repartir par le filaire dès que
+  le noyau redéplace sa route.
+  Vérifier aussi qu'après une relecture à chaud de `network.toml` le ruleset
+  porte toujours la liste résolue et non `auto` ; et qu'un lien sans bail est
+  bien permis, sinon son DHCP ne passerait jamais.
+  La sortie inverse — un désaccord métrique — se force en abaissant la métrique
+  Wi-Fi sous celle du filaire : les deux restent permis, seul l'ordre et
+  l'avertissement changent.
+  La sélection elle-même est éprouvée hors noyau ; ce que seule la cible
+  établit, c'est que les marqueurs sysfs d'un vrai pilote Wi-Fi sont ceux que
+  le module lit, et qu'une bascule réelle ne coupe pas les clients.
+
 Ces essais modifient le pare-feu, les routes, le TPM et le binaire installé : ne
 jamais les lancer contre une appliance de production.
 
@@ -596,6 +664,53 @@ confirmés puis corrigés avec test de non-régression :
 | `iif "lo"` sur la chaîne `output` | ne matche jamais ; tout le trafic loopback sortant tombait sous `drop` |
 | API liée avant la création de la VIP | `bind` en échec, erreur avalée : gateway opérationnelle mais définitivement sans API |
 
+### Défauts trouvés sur gateway en service (8 août 2026)
+
+Six autres, relevés en cherchant pourquoi des services locaux échouaient sur
+la gateway de production. Les cinq derniers sont à vérifier sur cible : ils ne
+sont pas observables ailleurs.
+
+| Défaut | Effet |
+| --- | --- |
+| chaîne `output` sans sortie propre à la gateway | ni DNS, ni NTP, ni paquets : `apt` affiche `Ign :` sur chaque source puis se fige à 0 %, et le symptôme désigne le résolveur au lieu du pare-feu. Corrigé par `allow_gateway_egress` |
+| `ct state established` appliqué là où `established,related` était affiché | `rustables::Rule::established()` ne masque que le bit `ESTABLISHED`. Le dry-run, l'API et la console affichaient la forme complète : la divergence n'était visible que dans `nft list`. Les erreurs ICMP `fragmentation needed` tombaient sous `drop`, donc trou noir de PMTU |
+| NordVPN Meshnet actif mais sans réception WireGuard | le contrôle HTTPS réussissait, puis DERP TCP 8765, STUN et les chemins directs marqués `0xe1f1` tombaient sous `drop`; même après transport, le trafic applicatif sur `nordlynx` restait fermé. Corrigé par le bloc borné `nordvpn_meshnet` |
+| marque NordVPN encodée en ordre réseau | la valeur `0xe1f1` était appliquée par nftables comme `0xf1e10000` sur x86_64 : la règle WAN ne pouvait donc jamais reconnaître les paquets Meshnet. Les valeurs de registre `meta mark` utilisent désormais l'ordre natif, avec test de non-régression |
+| tunnel Meshnet sain mais services et routage incomplets | Helios n'ouvrait que SSH en entrée et ne produisait aucune règle `forward`. TCP 49111 couvre désormais Nord Fileshare ; les listes `traffic_routing_peer_cidrs` et `local_network_peer_cidrs`, relues depuis les ensembles de permissions NordVPN au déploiement, bornent le routage pair par pair |
+| arrêt de `heliosd` figé après le retrait de `helios0` | le serveur brut de mesure attendait indéfiniment dans un `spawn_blocking`; Tokio attend les tâches bloquantes à la destruction du runtime, donc systemd finissait par tuer le démon après son délai. Les sockets TCP/UDP observent désormais un signal d'arrêt testé |
+
+Vérification cible du second, après déploiement :
+
+```sh
+sudo nft list chain inet helios input | grep 'ct state'
+# attendu : ct state established,related accept
+```
+
+Une sortie qui affiche `ct state established` seul signifie que le binaire
+installé est antérieur au correctif — la traduction Netlink est le seul endroit
+où l'écart se voit.
+
+Vérification Meshnet sur cible, avec l'adresse du pair déclarée dans
+`network.toml` :
+
+```sh
+sudo nft list chain inet helios output | grep -E 'e1f1|nordlynx'
+sudo nft list chain inet helios input | grep nordlynx
+sudo nft list chain inet helios forward | grep nordlynx
+sudo wg show nordlynx
+ping -c 3 100.70.36.212
+```
+
+Le ruleset doit montrer la marque seulement sur le WAN, la destination du pair
+seulement sur `nordlynx`, et TCP 22 en entrée seulement avec `iifname
+"nordlynx"` et la source `/32` ; TCP 49111 est le service Nord Fileshare. Si
+NordVPN accorde le routage au pair, `forward` doit montrer ce même `/32` de
+`nordlynx` vers chaque WAN. Sans permission d'accès au réseau local, quatre
+règles `drop` RFC1918 doivent précéder ces acceptations. La marque affichée doit être exactement
+`0xe1f1`, jamais `0xf1e10000`. `wg show` doit ensuite afficher un handshake et
+des octets reçus ; le rendu et la transaction Netlink sont automatisés, mais ce
+dernier effet exige la gateway réelle.
+
 ## Limites connues
 
 - le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;
@@ -611,8 +726,10 @@ confirmés puis corrigés avec test de non-régression :
 - **le code `cfg(windows)` ne se compile pas depuis WSL2**, et c’est une limite
   d’outillage, pas de conception : `cargo check --target x86_64-pc-windows-msvc`
   échoue en construisant `aws-lc-sys`, faute de compilateur C ciblant MSVC. Une
-  erreur de nom ou de type dans `vault/windows/` n’apparaît donc que sur le poste
-  Windows. Deux atténuations, aucune n’étant un substitut :
+  erreur de nom ou de type dans `vault/windows/` ou dans le transport WebAuthn
+  n’apparaît donc que sous Windows. Le job Windows applique Clippy strict et
+  les tests d'`astra-signer`, sans exiger de clé physique. Deux atténuations
+  locales, aucune n’étant un substitut :
   - les modules `#[cfg(windows)] mod imp` importent le parent par `use super::*`,
     pour qu’un élément ajouté au-dessus ne manque jamais à l’appel ;
   - les symboles `windows-sys` se vérifient hors compilation en lisant le crate
@@ -626,6 +743,18 @@ confirmés puis corrigés avec test de non-régression :
     pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
     `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
+- **le cycle de vie des certificats est vérifié en logique, pas en
+  exploitation.** `aether::certificates`, le registre gateway, le magasin Orion
+  et le binaire `astra` sont couverts par des tests déterministes qui prennent
+  l’horloge en argument : fenêtres, générations, avortement antidaté, commit
+  tardif, couples TLS/PQ mixtes, transaction chunkée invisible avant son
+  dernier fragment. Ce qui **n’est pas** exercé, et ne peut pas l’être en
+  WSL2 : l’extension CTAP2 `hmac-secret` d’une YubiKey réelle, l’ouverture du
+  coffre HVLT par le compagnon `astra-signer`, le veth privé Astra–Helios et
+  ses garanties TLS 1.3, le redémarrage de `heliosd` sur une nouvelle identité
+  gateway, et la bascule coordonnée d’un parc existant. Les routes qui
+  dépendent d’un credential matériel répondent `501` par une variante d’erreur
+  nommée — c’est un refus franc, pas une couverture ;
 - le job Windows valide les chemins Tauri et Win32 compilables sans matériel ;
   WireGuard-NT, le TPM physique, BitLocker réellement actif et les effets WER
   dans un vidage exigent toujours la campagne sur cible ;

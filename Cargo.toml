@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aether",
+    "crates/astra",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
@@ -12,6 +13,7 @@ members = [
     "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
+    "tools/astra-signer",
     "tools/helios-ctl",
     "tools/helios-publisher",
     "tools/helios-installer",
@@ -27,6 +29,7 @@ members = [
 # et il n'y a aucune dépendance GTK.
 default-members = [
     "crates/aether",
+    "crates/astra",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
@@ -37,6 +40,7 @@ default-members = [
     "crates/helios-vault",
     "crates/orion-core",
     "crates/heliosd",
+    "tools/astra-signer",
     "tools/helios-ctl",
     "tools/helios-installer",
     "tools/xtask",
@@ -74,12 +78,13 @@ clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 futures-util = "0.3"
+bytes = "1"
 netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # Backend crypto : AWS-LC (aws-lc-sys), non-FIPS → statique, builder `cc`, aucune
 # toolchain CMake/Go/Ninja ni bindgen (bindings pré-générés). ML-KEM-768 (FIPS 203)
@@ -87,9 +92,16 @@ netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 # La feature `fips` (validation FIPS 140-3) reste activable plus tard sans changer
 # le code — voir le trait `Kem` dans aether::pq et ADR-001 §2.
 aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
-# ML-DSA-65 (FIPS 204), épinglé après lecture de la source 0.4.6. Les autres
-# jeux de paramètres et le RNG par défaut restent désactivés côté vérification.
-fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65"] }
+# ML-DSA (FIPS 204), épinglé après lecture de la source 0.4.6. Le RNG par défaut
+# reste désactivé côté vérification.
+#
+# **Les deux jeux de paramètres sont nécessaires, et l'un ne remplace pas
+# l'autre** : `ml-dsa-65` porte les signatures d'artefacts éditeur d'ADR-002
+# (`aether::sig`, `REQUIRED_ALGS`, trousseau compilé), `ml-dsa-87` porte la PKI
+# de négociation de clé v5 (ADR-005, amendement du 6 août 2026). Remplacer le
+# premier par le second invaliderait la vérification de toutes les releases
+# déjà signées.
+fips204 = { version = "=0.4.6", default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
 # Précontrôles Ed25519 stricts (points faibles + scalaires canoniques) avant AWS-LC.
 # Déjà présent transitivement via x25519-dalek ; ce n'est pas un backend de signature.
 curve25519-dalek = "4"
@@ -97,6 +109,9 @@ blake3 = "1"
 zeroize = "1"
 base64 = "0.22"
 hex = "0.4"
+# Saisie du PIN FIDO2 sans écho. Un PIN d'authentificateur affiché dans un
+# terminal se retrouve dans un scrollback, une capture d'écran ou un partage.
+rpassword = "7"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -106,6 +121,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 defguard_wireguard_rs = "0.11"
 
 aether = { path = "crates/aether" }
+astra = { path = "crates/astra" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }

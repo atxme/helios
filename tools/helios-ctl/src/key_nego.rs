@@ -7,7 +7,7 @@ use std::{
 };
 
 use aether::key_negotiation::{
-    generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+    generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
     ProtectionMode, PQ_CERTIFICATE_VERSION,
 };
 use anyhow::{Context, Result};
@@ -44,7 +44,7 @@ pub const CLIENT_CA_DIR_ENV: &str = "HELIOS_CLIENT_CA_DIR";
 ///
 /// # Ce qu'il contient
 ///
-/// Deux clés privées de CA — TLS et ML-DSA-65 — c'est-à-dire le pouvoir
+/// Deux clés privées de CA — TLS et ML-DSA-87 — c'est-à-dire le pouvoir
 /// d'émettre des certificats que la gateway croira. Le répertoire naît en 0700
 /// et les fichiers en 0600.
 pub fn default_client_ca_dir() -> PathBuf {
@@ -280,7 +280,7 @@ fn init_client_ca(name: &str, output_dir: &Path) -> Result<()> {
     )?;
     write_secret(&output_dir.join(CA_PRIVATE_KEY_FILE), &key.serialize_der())?;
     let (pq_private_key, pq_public_key) =
-        generate_ml_dsa_65_keypair().context("generating the client PQ CA")?;
+        generate_ml_dsa_87_keypair().context("generating the client PQ CA")?;
     write_public(&output_dir.join(PQ_CA_PUBLIC_KEY_FILE), &pq_public_key)?;
     write_secret(
         &output_dir.join(PQ_CA_PRIVATE_KEY_FILE),
@@ -364,7 +364,7 @@ pub fn issue_client_material(
 
     let ca_pq_private_key = Zeroizing::new(read(ca_pq_private_key_path)?);
     let (client_pq_private_key, client_pq_public_key) =
-        generate_ml_dsa_65_keypair().context("generating the Orion PQ identity")?;
+        generate_ml_dsa_87_keypair().context("generating the Orion PQ identity")?;
     let now = unix_time_now()?;
     let pq_certificate = issue_pq_certificate(
         PqCertificate {
@@ -374,11 +374,11 @@ pub fn issue_client_material(
             issuer: "orion-client-pq-ca".to_string(),
             role: PqCertificateRole::Client,
             wireguard_public_key: wireguard_public_key.trim().to_string(),
-            ml_dsa_65_public_key: base64::engine::general_purpose::STANDARD
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
                 .encode(client_pq_public_key),
             not_before_unix: now.saturating_sub(300),
             not_after_unix: now + 825 * 24 * 60 * 60,
-            ml_dsa_65_signature: String::new(),
+            ml_dsa_87_signature: String::new(),
         },
         ca_pq_private_key.as_slice(),
     )
@@ -557,6 +557,16 @@ fn check_private_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that write `HELIOS_CLIENT_CA_DIR`.
+    ///
+    /// The variable is process-wide and `cargo test` runs threads in
+    /// parallel, so "this test owns it" is only true if something enforces
+    /// it. Nothing did: one test set the variable while the other removed
+    /// it, and which won depended on timing. It stayed hidden until the
+    /// ML-DSA-87 migration made neighbouring tests slower and widened the
+    /// window — a latent race does not become real, it becomes visible.
+    static CLIENT_CA_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The CA location must not depend on where the command was launched.
     ///
     /// The old default was `./orion-client-ca`. A `cd` therefore silently
@@ -566,7 +576,11 @@ mod tests {
     /// A default that turns a `cd` into an incident is not a default.
     #[test]
     fn the_client_ca_location_is_absolute_and_stable() {
-        // The environment override is process-wide; this test owns it.
+        // The environment override is process-wide; the lock is what makes
+        // owning it true.
+        let _owned = CLIENT_CA_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var(CLIENT_CA_DIR_ENV);
 
         let from_root = {
@@ -596,6 +610,9 @@ mod tests {
     /// error message naming no directory at all — unusable.
     #[test]
     fn the_environment_variable_moves_the_client_ca_unless_it_is_empty() {
+        let _owned = CLIENT_CA_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let elsewhere = std::env::temp_dir().join("helios-ctl-ca-ailleurs");
         std::env::set_var(CLIENT_CA_DIR_ENV, &elsewhere);
         assert_eq!(default_client_ca_dir(), elsewhere);

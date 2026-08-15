@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// NordVPN Meshnet traffic explicitly admitted alongside the Helios tunnel.
+///
+/// Meshnet is a second authenticated WireGuard overlay, not an uplink. Its
+/// transport leaves through a WAN interface with NordVPN's packet mark, while
+/// application traffic enters and leaves through `iface`. Keeping both
+/// identities in the policy prevents `nordlynx` from being mistaken for a WAN
+/// and preserves the fail-closed treatment of forwarded traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NordvpnMeshnetPolicy {
+    /// Interface owned by NordVPN/libtelio.
+    pub iface: String,
+    /// Packet mark applied by libtelio to relay, STUN and direct-path traffic.
+    pub fwmark: u32,
+    /// Meshnet peers allowed to exchange application traffic with the gateway.
+    pub peer_cidrs: Vec<String>,
+    /// Meshnet peers allowed by NordVPN to route traffic through the gateway.
+    pub traffic_routing_peer_cidrs: Vec<String>,
+    /// Routing peers additionally allowed by NordVPN to reach private LANs.
+    pub local_network_peer_cidrs: Vec<String>,
+    /// TCP services exposed to those peers on the gateway.
+    pub inbound_tcp_ports: Vec<u16>,
+    /// UDP services exposed to those peers on the gateway.
+    pub inbound_udp_ports: Vec<u16>,
+    /// Answers ICMP arriving from those peers through the Meshnet interface.
+    pub allow_icmp: bool,
+}
+
 /// Firewall behavior when the tunnel is not operational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -18,8 +45,19 @@ pub enum PolicyMode {
 /// intent, not nftables syntax.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallPolicy {
-    /// Interface towards the Internet (e.g. `eth0`, the Realtek RTL8111HS controller).
-    pub wan_iface: String,
+    /// Interfaces towards the Internet, in order of preference.
+    ///
+    /// A **set**, not a choice: a gateway with a cable and a radio must keep
+    /// working when the cable is unplugged, and the firewall is the one thing
+    /// that must not stand in the way. Every rule below that names the WAN is
+    /// emitted once per interface, so whichever one the kernel routes through
+    /// at the moment is permitted — failover costs no restart and no reload.
+    ///
+    /// The order carries the operator's preference and nothing else. What
+    /// decides where a packet actually leaves is the routing table, and route
+    /// metrics are where a preference between two live uplinks is expressed —
+    /// see `heliosd::uplink`.
+    pub wan_ifaces: Vec<String>,
     /// LAN-side interfaces whose traffic must go through the tunnel.
     pub lan_ifaces: Vec<String>,
     /// Peers (IP addresses) reachable in the clear for WireGuard transport
@@ -89,6 +127,37 @@ pub struct FirewallPolicy {
     /// one test people reach for first is the one that cannot distinguish
     /// success from failure.
     pub allow_tunnel_icmp: bool,
+    /// Lets the gateway open outbound connections **for itself**: name
+    /// resolution, time synchronization and package fetching, on the WAN
+    /// interface only.
+    ///
+    /// Closed by default, like everything else here. But what closing it
+    /// costs is not obvious, because the `output` chain is the one nobody
+    /// looks at: under the fail-closed policy it accepts loopback,
+    /// `established` traffic, DHCP renewal and the site-to-site WireGuard
+    /// transport — and nothing else. A gateway in that state cannot resolve a
+    /// name, cannot reach an NTP server and cannot fetch a package. It is not
+    /// a DNS failure, though that is exactly what it looks like: `apt` prints
+    /// `Ign` for every source and hangs at 0 %, because the resolver's query
+    /// to the LAN leaves as a **new** flow and the policy drops it.
+    ///
+    /// Two consequences that are worth naming, since neither announces
+    /// itself. `helios-ctl update` runs `apt-get update` **on the gateway**,
+    /// so the product's own OS-upgrade path cannot work while its own
+    /// kill-switch is applied. And without NTP the clock drifts, on the
+    /// machine whose job is to check certificate validity dates.
+    ///
+    /// Note what this does **not** do: it opens nothing inbound, forwards
+    /// nothing, and gives no client anything. It is the gateway's own
+    /// traffic, which was never meant to go through a tunnel — the
+    /// kill-switch protects what the gateway *relays*, and that stays in the
+    /// `forward` chain, untouched by this flag.
+    ///
+    /// Deliberately **not** gated on the tunnel state, unlike
+    /// [`Self::allow_client_internet`]: an operator upgrades a gateway
+    /// precisely when its tunnel is down, and a flag that closed itself in
+    /// that moment would be closed exactly when it is needed.
+    pub allow_gateway_egress: bool,
     /// Accepts SSH **arriving through the tunnel**.
     ///
     /// Closed by default: administrative access is what an attacker wants
@@ -100,6 +169,29 @@ pub struct FirewallPolicy {
     /// rule is scoped to the tunnel interface instead, so it cannot be
     /// reached by anything WireGuard has not already authenticated.
     pub allow_ssh_over_tunnel: bool,
+    /// Port of an `iperf3` measurement, on the tunnel interface, **both ways**.
+    ///
+    /// `None` — the default — keeps it closed. This is a diagnostic, not a
+    /// service: it exists to check the built-in speedtest against a reference
+    /// implementation, and an always-open `iperf3` is an always-open surface.
+    ///
+    /// # Why both chains, unlike every other opening here
+    ///
+    /// The other tunnel rules answer for the gateway: something arrives, the
+    /// reply leaves under `ct state established`. `iperf3` is used in both
+    /// roles. Server on the gateway, the `input` rule is enough. Server on the
+    /// **client** — the usual case, since that is the machine one already sits
+    /// at — the gateway opens the connection, and a new outbound flow on
+    /// `wg_iface` matches nothing in the `output` chain: under the fail-closed
+    /// policy it is dropped. The symptom is `iperf3 -c` hanging at
+    /// "Connecting to host", which reads as a client that is not listening.
+    ///
+    /// Scoped by **interface**, never by address, for the reason spelled out
+    /// on [`Self::allow_ssh_over_tunnel`]: only WireGuard puts packets on
+    /// `wg_iface`, and only for an already-authenticated peer.
+    pub iperf_port: Option<u16>,
+    /// Optional NordVPN Meshnet overlay. Absent means no Meshnet opening.
+    pub nordvpn_meshnet: Option<NordvpnMeshnetPolicy>,
 }
 
 impl FirewallPolicy {

@@ -12,7 +12,7 @@
 //!
 //! 1. read the gateway's WireGuard identity and negotiation certificates;
 //! 2. resolve the client's WireGuard key — supplied, or generated here;
-//! 3. issue the client's TLS and ML-DSA-65 certificates from the operator CA;
+//! 3. issue the client's TLS and ML-DSA-87 certificates from the operator CA;
 //! 4. admit the peer with both fingerprints and the anti-downgrade floor;
 //! 5. write one Orion document carrying the profile **and** the identity.
 //!
@@ -604,13 +604,13 @@ mod tests {
     #[test]
     fn the_offline_material_is_read_entirely_from_the_gateway_certificates() {
         use aether::key_negotiation::{
-            generate_ml_dsa_65_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+            generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
             PQ_CERTIFICATE_VERSION,
         };
         use base64::engine::general_purpose::STANDARD;
 
         let gateway_key = aether::wg::generate_keypair().unwrap();
-        let (private_key, public_key) = generate_ml_dsa_65_keypair().unwrap();
+        let (private_key, public_key) = generate_ml_dsa_87_keypair().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -623,10 +623,10 @@ mod tests {
                 issuer: "vpn.example.net".into(),
                 role: PqCertificateRole::Gateway,
                 wireguard_public_key: gateway_key.public_key.clone(),
-                ml_dsa_65_public_key: STANDARD.encode(&public_key),
+                ml_dsa_87_public_key: STANDARD.encode(&public_key),
                 not_before_unix: now - 60,
                 not_after_unix: now + 3600,
-                ml_dsa_65_signature: String::new(),
+                ml_dsa_87_signature: String::new(),
             },
             &private_key,
         )

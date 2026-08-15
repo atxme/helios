@@ -9,6 +9,7 @@
 //! present. This only requires a C compiler, no CMake/Go toolchain (see
 //! ADR-001 §2 and the vigilance notes).
 
+pub mod certificates;
 pub mod config;
 pub mod enroll;
 pub mod error;
@@ -21,13 +22,18 @@ pub mod pq;
 pub mod private_file;
 pub mod secret;
 pub mod sig;
+pub mod speedtest;
 pub mod state;
 pub mod wg;
 
-pub use config::{NetworkConfig, WgPeer, API_BIND_LOOPBACK, API_PORT};
+pub use config::{
+    NetworkConfig, NordvpnMeshnetConfig, WgPeer, API_BIND_LOOPBACK, API_PORT, DEFAULT_WG_ADDRESS,
+    DEFAULT_WG_API_URL,
+};
 pub use error::{HeliosError, Result};
-pub use events::{HeliosEvent, InstallPskRequest, OrchestratorCmd};
-pub use policy::{FirewallPolicy, PolicyMode};
+pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};
+pub use policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
 pub use pq::{Kem, MlKem1024Kem, PqError, SharedSecret};
 pub use secret::SecretString;
+pub use speedtest::{DEFAULT_WG_SPEEDTEST_ADDR, SPEEDTEST_PORT};
 pub use state::{TunnelEvent, TunnelState};

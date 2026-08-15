@@ -71,6 +71,14 @@ impl KernelBackend {
                 .map_err(|e| WgError::BadKey(format!("post-quantum PSK: {e}")))?;
             peer.preshared_key = Some(psk);
         }
+        // The gateway sends its own keep-alives rather than trusting the
+        // client's setting, which it cannot inspect. Without them an idle
+        // tunnel produces no handshake, and both liveness thresholds — the
+        // client's renegotiation and this side's slot reclamation — would
+        // read an ancient timestamp on a peer that is perfectly fine.
+        if cfg.persistent_keepalive_secs > 0 {
+            peer.persistent_keepalive_interval = Some(cfg.persistent_keepalive_secs);
+        }
         Ok(peer)
     }
 
@@ -198,6 +206,7 @@ mod tests {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
             preshared_key: None,
+            persistent_keepalive_secs: 25,
         })
         .unwrap();
 
@@ -215,6 +224,7 @@ mod tests {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
             preshared_key: Some(KEY_B.into()),
+            persistent_keepalive_secs: 25,
         })
         .unwrap();
         assert!(peer.preshared_key.is_some());
@@ -226,6 +236,7 @@ mod tests {
             public_key: KEY_B.into(),
             allowed_ips: "100.64.1.2/32".into(),
             preshared_key: Some("   ".into()),
+            persistent_keepalive_secs: 25,
         })
         .unwrap();
         assert!(without_psk.preshared_key.is_none());
@@ -235,6 +246,7 @@ mod tests {
                 public_key: KEY_B.into(),
                 allowed_ips: "100.64.1.2/32".into(),
                 preshared_key: Some("not-a-key".into()),
+                persistent_keepalive_secs: 25,
             }),
             Err(WgError::BadKey(message)) if message.contains("post-quantum PSK")
         ));
@@ -247,11 +259,13 @@ mod tests {
                 public_key: KEY_B.into(),
                 allowed_ips: "100.64.1.2/32".into(),
                 preshared_key: None,
+                persistent_keepalive_secs: 25,
             },
             PeerConfig {
                 public_key: "invalid".into(),
                 allowed_ips: "100.64.1.3/32".into(),
                 preshared_key: None,
+                persistent_keepalive_secs: 25,
             },
         ];
 
@@ -265,6 +279,7 @@ mod tests {
             public_key: "not-base64".into(),
             allowed_ips: "100.64.1.2/32".into(),
             preshared_key: None,
+            persistent_keepalive_secs: 25,
         })
         .is_err());
 
@@ -272,6 +287,7 @@ mod tests {
             public_key: KEY_B.into(),
             allowed_ips: "not-an-address".into(),
             preshared_key: None,
+            persistent_keepalive_secs: 25,
         })
         .is_err());
     }

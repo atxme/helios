@@ -12,6 +12,9 @@ import {
   aboutOrion,
   adapterIsUp,
   backendKind,
+  certificateActions,
+  certificateInventory,
+  certificateOverview,
   connect,
   deleteProfile,
   disconnect,
@@ -19,14 +22,15 @@ import {
   getState,
   importProfile,
   importProfilePath,
-  keyNegotiationFingerprint,
-  keyNegotiationIdentitySealed,
   keyNegotiationSupport,
+  lastCertificateError,
   onConfigChanged,
   onEvent,
   onProfilePath,
   onTrayView,
   resizeForView,
+  runCertificateAction,
+  runSpeedTest,
   saveProfile,
   selectProfile,
   validateProfile,
@@ -49,11 +53,15 @@ describe('Orion Tauri bridge', () => {
     await importProfile('{"format":"orion-profile"}', 'portable.json')
     await importProfilePath('C:\\Profils\\portable.orion')
     await importProfilePath()
-    await keyNegotiationIdentitySealed(profile as never)
     await validateProfile(profile as never)
     await vaultPosture()
     await keyNegotiationSupport()
-    await keyNegotiationFingerprint(profile as never)
+    await certificateInventory(profile as never)
+    await certificateActions(profile as never)
+    await certificateOverview()
+    await runCertificateAction('portable', 'renew_now')
+    await lastCertificateError('portable')
+    await runSpeedTest('udp')
     await saveProfile(profile as never)
     await deleteProfile('portable')
     await selectProfile('portable')
@@ -78,11 +86,15 @@ describe('Orion Tauri bridge', () => {
         { path: 'C:\\Profils\\portable.orion' },
       ],
       ['import_profile_path', { path: null }],
-      ['key_negotiation_identity_sealed', { keyNegotiation: profile }],
       ['validate_profile', { draft: profile }],
       ['vault_posture'],
       ['key_negotiation_support'],
-      ['key_negotiation_fingerprint', { keyNegotiation: profile }],
+      ['certificate_inventory', { keyNegotiation: profile }],
+      ['certificate_actions', { keyNegotiation: profile }],
+      ['certificate_overview'],
+      ['run_certificate_action', { name: 'portable', action: 'renew_now' }],
+      ['last_certificate_error', { name: 'portable' }],
+      ['run_speed_test', { mode: 'udp' }],
       ['save_profile', { draft: profile }],
       ['delete_profile', { name: 'portable' }],
       ['select_profile', { name: 'portable' }],

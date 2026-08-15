@@ -108,3 +108,32 @@ pub struct InstallPskRequest {
     /// Acknowledgment: `Ok` only if the PSK is actually set on the peer.
     pub reply: oneshot::Sender<Result<(), String>>,
 }
+
+/// A **fresh** read of one peer's last handshake, straight from the backend.
+///
+/// # Why not the published snapshot
+///
+/// The orchestrator already republishes the whole peer table every ten
+/// seconds, and the API reads that. The key-negotiation commit cannot: it
+/// must decide whether a handshake happened *since* the candidate PSK was
+/// posed, and the client confirms within a second or two of that handshake.
+/// A snapshot up to ten seconds old would routinely still show the previous
+/// value, and the gateway would refuse confirmations that are entirely
+/// legitimate — turning a security check into an outage.
+///
+/// Hence a second channel rather than a second reader: the backend lives in
+/// the orchestrator and nowhere else, so a caller that needs the current
+/// value asks the task that owns it. The channel carries no secret, but it
+/// does carry a `oneshot` for the same reason [`InstallPskRequest`] does —
+/// the answer is what the caller is about to make a decision on.
+#[derive(Debug)]
+pub struct ObserveHandshakeRequest {
+    /// Curve25519 public key of the peer concerned (base64).
+    pub public_key: String,
+    /// Last successful handshake, or `None` if the peer never handshook.
+    ///
+    /// `Err` is a backend failure, which is **not** the same answer as
+    /// `Ok(None)`: one means the gateway cannot tell, the other means it can
+    /// and the answer is "never".
+    pub reply: oneshot::Sender<Result<Option<std::time::SystemTime>, String>>,
+}
