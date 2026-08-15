@@ -35,21 +35,27 @@ coffre d'autorité ouvert par clé de sécurité, un Astra qui tourne et tient s
 registre et sa chaîne d'audit, une gateway dont les routes de cycle de vie
 in-tunnel sont ouvertes.
 
-Vous n'avez **pas** de rotation automatique de certificats. Il manque :
+Vous n'avez **pas** encore de renouvellement de certificats fonctionnel. Il
+manque :
 
-- les **commandes de signature** d'`astra-signer` — certificat auto-signé
-  `CA-TLS`, `AstraIssuerAuthorization`, campagnes. Sans la deuxième, Astra n'a
-  pas d'émetteur délégué et refuse tout renouvellement ordinaire ; il le
-  journalise au démarrage. Les trois routes qui exigent une approbation
-  opérateur répondent `501` ;
-- le **veth privé Astra–Helios** du §2 : `heliosd` n'a aucun client HTTP vers
-  Astra. Les deux services connaissent le même domaine, mais ne se parlent pas
-  encore ;
+- les **commandes de signature et d'approbation** d'`astra-signer` — certificat
+  auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes et approbation
+  YubiKey liée à chaque demande cliente. Sans la deuxième, Astra n'a pas
+  d'émetteur délégué ; sans l'approbation exacte, il doit refuser tout
+  renouvellement ordinaire. Les routes qui exigent ce geste opérateur
+  répondent encore `501` ;
+- le **relais typé WireGuard–veth Astra–Helios** du §2 : `heliosd` n'a aucun
+  client HTTP vers Astra. Les deux services connaissent le même domaine, mais
+  ne se parlent pas encore. Le renouvellement actif ne doit pas exposer Astra
+  publiquement : Orion appelle Helios dans WireGuard, puis Helios transmet sur
+  le veth privé mTLS ;
 - le **pilote client** du §7 dans `orion-core`, et les routes de rotation
   client d'Astra.
 
-Ce qui est donc réellement éprouvé ici : l'image, le réseau, les volumes, la
-sauvegarde, le durcissement, et la cohérence des deux moitiés du domaine.
+Ce qui est donc réellement éprouvé ici : la construction de l'image, le
+démarrage du conteneur, les volumes, la sauvegarde, le durcissement et la
+cohérence des deux moitiés du domaine. Le veth et le relais applicatif ne le
+sont pas encore.
 
 ## Le choix qu'on ne refait pas
 
@@ -63,6 +69,10 @@ explicitement toute phrase de passe de secours.
 Choisissez un nom que vous garderez : `astra.helios.local` en interne, ou un nom
 public si Astra sort. Il se propage ensuite tout seul aux trois endroits qui en
 ont besoin.
+
+Ce nom reste le RP ID et l'origine logique de l'assertion WebAuthn même quand
+le renouvellement ordinaire voyage par l'adresse WireGuard de Helios. Il
+n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
 
 ## Prérequis
 
@@ -158,7 +168,11 @@ la configuration de la gateway :
 ```
 
 L'URL d'autorité vaut `https://<rp_id>` par défaut ; `ASTRA_AUTHORITY_URL` la
-remplace.
+remplace. Elle sert à la récupération et au statut authentifié quand WireGuard
+ne peut plus être monté, ainsi qu'aux opérations opérateur hors tunnel, pas au
+renouvellement ordinaire. Le veth utilisera deux adresses IP statiques locales
+à la gateway, absentes du DNS et des profils Orion ; leur câblage fait encore
+partie du lot non livré.
 
 ### Pourquoi la construction emprunte le réseau de l'hôte
 

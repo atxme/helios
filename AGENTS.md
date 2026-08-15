@@ -101,6 +101,20 @@ Restent ouverts :
   discriminant de profil Orion et la bascule du §13, et les deux surfaces IHM.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
+  L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
+  restant : un Orion dont le tunnel fonctionne ne contacte jamais Astra
+  directement. Il appelle des routes typées de `helios-api` dans WireGuard ;
+  `heliosd` authentifie la VIP du pair puis relaie les objets canoniques vers
+  l'IP privée d'Astra sur le veth mTLS. Le canal HTTPS public est réservé à la
+  récupération sans tunnel et aux opérations opérateur hors tunnel. Chaque
+  renouvellement client, planifié ou manuel, attend une approbation YubiKey
+  liée au hash exact de la demande. Le grant transporte l'assertion WebAuthn et
+  le binding public du credential signé par `CA-PQ`, afin qu'Helios et Orion ne
+  fassent pas confiance à la seule affirmation d'Astra. Cette assertion
+  autorise l'émetteur délégué, n'ouvre pas le coffre maître et ne produit aucune
+  signature ML-DSA.
+  Le seuil de 80 % prépare donc une opération `awaiting_operator`; il ne peut
+  plus achever silencieusement la rotation.
   Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
   `heliosd init-trust-domain` de l'autre. La seconde n'ouvre aucun coffre et ne
   génère aucune clé — elle relit les leaves servies sur disque et reçoit les
