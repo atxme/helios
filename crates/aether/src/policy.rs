@@ -169,6 +169,27 @@ pub struct FirewallPolicy {
     /// rule is scoped to the tunnel interface instead, so it cannot be
     /// reached by anything WireGuard has not already authenticated.
     pub allow_ssh_over_tunnel: bool,
+    /// Port of an `iperf3` measurement, on the tunnel interface, **both ways**.
+    ///
+    /// `None` — the default — keeps it closed. This is a diagnostic, not a
+    /// service: it exists to check the built-in speedtest against a reference
+    /// implementation, and an always-open `iperf3` is an always-open surface.
+    ///
+    /// # Why both chains, unlike every other opening here
+    ///
+    /// The other tunnel rules answer for the gateway: something arrives, the
+    /// reply leaves under `ct state established`. `iperf3` is used in both
+    /// roles. Server on the gateway, the `input` rule is enough. Server on the
+    /// **client** — the usual case, since that is the machine one already sits
+    /// at — the gateway opens the connection, and a new outbound flow on
+    /// `wg_iface` matches nothing in the `output` chain: under the fail-closed
+    /// policy it is dropped. The symptom is `iperf3 -c` hanging at
+    /// "Connecting to host", which reads as a client that is not listening.
+    ///
+    /// Scoped by **interface**, never by address, for the reason spelled out
+    /// on [`Self::allow_ssh_over_tunnel`]: only WireGuard puts packets on
+    /// `wg_iface`, and only for an already-authenticated peer.
+    pub iperf_port: Option<u16>,
     /// Optional NordVPN Meshnet overlay. Absent means no Meshnet opening.
     pub nordvpn_meshnet: Option<NordvpnMeshnetPolicy>,
 }

@@ -58,6 +58,7 @@ mod tests {
             allow_tunnel_icmp: true,
             allow_gateway_egress: true,
             allow_ssh_over_tunnel: true,
+            iperf_port: None,
             wg_iface: "helios0".into(),
             admin_port: Some(8080),
             admin_iface: Some("helios0".into()),

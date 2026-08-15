@@ -692,6 +692,43 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                 .with_note("administrative SSH arriving through the tunnel"),
             );
         }
+        // `iperf3`, and the only opening here that touches `output`.
+        //
+        // Both roles have to work: server on the gateway (the `input` rule),
+        // and server on the client with the gateway as `iperf3 -c` (the
+        // `output` one). Without the second, a new outbound flow on the tunnel
+        // interface matches nothing and the drop policy takes it — `iperf3`
+        // then hangs on "Connecting to host", which looks like a client that
+        // is not listening.
+        //
+        // TCP and UDP both: `iperf3 -u` is a different port role, not a
+        // different port.
+        if let Some(port) = policy.iperf_port {
+            for proto in [L4::Tcp, L4::Udp] {
+                rules.push(
+                    Rule::new(
+                        Input,
+                        vec![
+                            Match::InIface(policy.wg_iface.clone()),
+                            Match::DestPort { port, proto },
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("iperf3 server on the gateway: only via the tunnel interface"),
+                );
+                rules.push(
+                    Rule::new(
+                        Output,
+                        vec![
+                            Match::OutIface(policy.wg_iface.clone()),
+                            Match::DestPort { port, proto },
+                        ],
+                        Verdict::Accept,
+                    )
+                    .with_note("iperf3 client on the gateway, reaching a server on the peer"),
+                );
+            }
+        }
     }
 
     // ── Administrative SSH, regardless of tunnel state ───────────────────────
@@ -847,6 +884,7 @@ mod tests {
             allow_tunnel_icmp: false,
             allow_gateway_egress: false,
             allow_ssh_over_tunnel: false,
+            iperf_port: None,
             wg_iface: "helios0".into(),
             admin_port: None,
             admin_iface: None,
@@ -1380,6 +1418,59 @@ mod tests {
         assert!(!input
             .iter()
             .any(|r| r == "tcp dport 5201 accept" || r == "udp dport 5201 accept"));
+    }
+
+    /// Closed unless asked for: an always-open `iperf3` is always-open surface.
+    #[test]
+    fn iperf_is_closed_until_a_port_is_configured() {
+        let rs = render(&policy(), TunnelState::Up);
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain).iter().any(|r| r.contains("5202")),
+                "no iperf opening without a configured port"
+            );
+        }
+    }
+
+    /// The half that is easy to forget, and whose absence looks like the peer
+    /// being at fault: the gateway acting as `iperf3 -c` opens a **new**
+    /// outbound flow on the tunnel interface, which the drop policy takes
+    /// unless the `output` chain accepts it.
+    #[test]
+    fn iperf_opens_both_directions_on_the_tunnel_interface() {
+        let mut p = policy();
+        p.iperf_port = Some(5202);
+        let rs = render(&p, TunnelState::Up);
+
+        let input = text(&rs, ChainKind::Input);
+        let output = text(&rs, ChainKind::Output);
+        for proto in ["tcp", "udp"] {
+            assert!(
+                input
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport 5202"))
+                        && r.contains("iifname \"helios0\"")),
+                "server on the gateway: {proto} must be accepted inbound"
+            );
+            assert!(
+                output
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport 5202"))
+                        && r.contains("oifname \"helios0\"")),
+                "client on the gateway: {proto} must be accepted outbound"
+            );
+        }
+
+        // Interface-scoped, never a bare port accept: a match on the address
+        // alone would be satisfiable from the WAN by forging a CGNAT source.
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain)
+                    .iter()
+                    .any(|r| r == "tcp dport 5202 accept" || r == "udp dport 5202 accept"),
+                "no unscoped iperf accept"
+            );
+        }
     }
 
     #[test]

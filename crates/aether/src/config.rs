@@ -130,6 +130,13 @@ pub struct NetworkConfig {
     /// from the WAN would satisfy it.
     #[serde(default)]
     pub allow_ssh_over_tunnel: bool,
+    /// Port of an `iperf3` measurement on the tunnel interface, both ways.
+    ///
+    /// Absent — the default — keeps it closed. See
+    /// [`crate::FirewallPolicy::iperf_port`] for why this one opens the
+    /// `output` chain as well, which no other tunnel rule does.
+    #[serde(default)]
+    pub iperf_port: Option<u16>,
     /// Exclusive network interface for administration access.
     /// Must be the WireGuard interface (`wg_iface`): the API lives behind the tunnel.
     #[serde(default)]
@@ -758,6 +765,7 @@ impl NetworkConfig {
             // listener openings above go through.
             allow_tunnel_icmp: self.allow_tunnel_icmp && self.wireguard_ready(),
             allow_ssh_over_tunnel: self.allow_ssh_over_tunnel && self.wireguard_ready(),
+            iperf_port: self.wireguard_ready().then_some(self.iperf_port).flatten(),
             wg_iface: self.wg_iface.clone(),
             admin_port,
             admin_iface: self.admin_iface.clone(),
@@ -907,12 +915,13 @@ mod tests {
         );
     }
 
-    /// Both tunnel openings are worth nothing until the interface can exist.
+    /// The tunnel openings are worth nothing until the interface can exist.
     #[test]
     fn the_tunnel_openings_follow_wireguard_readiness() {
         let toml = r#"
             wan_iface = "eth0"
             allow_ssh_over_tunnel = true
+            iperf_port = 5202
         "#;
         let mut cfg: NetworkConfig = toml::from_str(toml).unwrap();
         assert!(
@@ -922,11 +931,21 @@ mod tests {
         let policy = cfg.firewall_policy();
         assert!(!policy.allow_tunnel_icmp);
         assert!(!policy.allow_ssh_over_tunnel);
+        assert_eq!(policy.iperf_port, None);
 
         cfg.wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
         let policy = cfg.firewall_policy();
         assert!(policy.allow_tunnel_icmp);
         assert!(policy.allow_ssh_over_tunnel);
+        assert_eq!(policy.iperf_port, Some(5202));
+    }
+
+    /// A diagnostic, so it is absent unless asked for by name.
+    #[test]
+    fn iperf_is_absent_from_a_default_configuration() {
+        let cfg = NetworkConfig::default();
+        assert_eq!(cfg.iperf_port, None);
+        assert_eq!(cfg.firewall_policy().iperf_port, None);
     }
 
     /// Unlike the two tunnel openings, this one is scoped to the WAN and must
