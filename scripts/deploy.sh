@@ -37,6 +37,7 @@ EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
 ASTRA=1
+ASTRA_ONLY=0
 SEQUENCE=""
 # Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
@@ -54,6 +55,7 @@ Usage : ./scripts/deploy.sh [hôte-ssh] [options]
   --copie-seule    Copie l'archive sans lancer l'installation privilégiée
   --canal C        testing ou production (défaut : production)
   --sans-astra     Saute le conteneur d'autorité, même si un relais existe
+  --astra    Reprend uniquement l'étape Astra, sans relivrer la gateway
 
 Astra (ADR-008) se déploie tout seul dès qu'un relais de domaine existe —
 celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
@@ -76,6 +78,7 @@ while [ $# -gt 0 ]; do
         --sequence) SEQUENCE="${2:-}"; shift 2 ;;
         --copie-seule) INSTALLER=0; shift ;;
         --sans-astra) ASTRA=0; shift ;;
+        --astra) ASTRA_ONLY=1; shift ;;
         --canal) CANAL="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "option inconnue : $1" >&2; usage ;;
@@ -92,13 +95,21 @@ if [ -z "$CIBLE" ]; then
     echo "ou passer l'hôte en argument : ./scripts/deploy.sh utilisateur@adresse" >&2
     exit 1
 fi
+if [ "$ASTRA_ONLY" = "1" ] && [ "$ASTRA" = "0" ]; then
+    echo "--astra et --sans-astra sont incompatibles" >&2
+    exit 1
+fi
 
 # Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
 # `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.
 helios_sudo_init "$CIBLE"
 
 # ── Clés éditeur ─────────────────────────────────────────────────────────────
-for f in ed25519-private.pk8 ml-dsa-65-private.bin publisher-keyring.json; do
+FICHIERS_EPOQUE="publisher-keyring.json"
+if [ "$ASTRA_ONLY" = "0" ]; then
+    FICHIERS_EPOQUE="ed25519-private.pk8 ml-dsa-65-private.bin $FICHIERS_EPOQUE"
+fi
+for f in $FICHIERS_EPOQUE; do
     if [ ! -f "$EPOQUE/$f" ]; then
         echo "Époque éditeur incomplète : $EPOQUE/$f introuvable." >&2
         echo "En créer une :" >&2
@@ -116,6 +127,12 @@ EPOQUE_N="$(sed -n 's/.*"key_epoch"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' \
 # qu'on réinstalle la gateway ; l'horodatage Unix est croissant par
 # construction, sans état à conserver nulle part.
 [ -n "$SEQUENCE" ] || SEQUENCE="$(date +%s)"
+case "$SEQUENCE" in
+    *[!0-9]*)
+        echo "Séquence invalide : $SEQUENCE (un entier non signé est attendu)." >&2
+        exit 1
+        ;;
+esac
 
 # ── Traçabilité : un arbre modifié ne doit pas se faire passer pour un commit ─
 COMMIT="$(git rev-parse --short=16 HEAD)"
@@ -136,6 +153,7 @@ echo "==> Release   $VERSION séquence $SEQUENCE canal $CANAL"
 echo "==> Commit    $COMMIT"
 echo
 
+if [ "$ASTRA_ONLY" = "0" ]; then
 echo "==> 1/7  Construction"
 # `xtask bundle` rappelle les deux commandes suivantes à taper : elles sont
 # redondantes ici, ce script les enchaîne. On coupe à partir de ce rappel.
@@ -195,6 +213,9 @@ ssh "$CIBLE" "rm -rf ~/$NOM"
 
 echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
 ./scripts/target-bootstrap.sh "$CIBLE"
+else
+    echo "==> Reprise Astra seule sur $CIBLE"
+fi
 
 # ── 7. Astra et le domaine de confiance (ADR-008) ────────────────────────────
 #
@@ -206,7 +227,9 @@ echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
 # et il a déjà eu lieu.
 deployer_astra() {
     local compose etat wg_pub nom_serveur url rp domaine ancre sortie
-    local cle_service tete_audit identite moteur compose_env
+    local cle_service tete_audit identite moteur compose_env statut_astra
+    local tete_attendue registre_gateway
+    local unite_build etat_build resultat_build code_build tentative
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -291,7 +314,12 @@ deployer_astra() {
         echo "    envoi du trousseau éditeur impossible" >&2
         return 1
     }
-    local env_distant="$racine/deploy/astra/.env"
+    # Le contexte de compilation est jetable : il est supprimé et recréé à
+    # chaque déploiement. La tête d'audit, elle, est un témoin durable. La
+    # ranger sous ce contexte la remplaçait donc par « amorcage » à chaque
+    # passage ; un volume Astra déjà amorcé redémarrait ensuite en boucle parce
+    # que sa vraie tête ne pouvait évidemment pas correspondre à ce marqueur.
+    local env_distant="/var/lib/helios/astra-compose.env"
 
     # Le fichier d'environnement existe avant toute interrogation : compose
     # refuse un `--env-file` absent, et l'échec ressemblerait alors à « domaine
@@ -306,8 +334,53 @@ deployer_astra() {
     # local `helios/astra` — qui n'existe dans aucun registre. Le message qu'on
     # lit est « pull access denied », qui désigne un registre alors que la
     # panne est une compilation.
-    if ! sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-        $compose_env $compose -f deploy/astra/compose.yaml build 2>&1")"; then
+    # Une compilation propre est assez longue pour croiser une reconstruction
+    # du pare-feu ou une bascule de lien. Si l'unique session SSH portait aussi
+    # BuildKit, sa perte annulait le contexte côté démon (`context canceled`) :
+    # Cargo s'arrêtait sans erreur, exactement après « Downloading crates ».
+    # Le build vit donc dans une unité transitoire distante ; les connexions
+    # suivantes ne font que sonder son résultat et peuvent être recréées.
+    unite_build="helios-astra-build-$SEQUENCE"
+    helios_ssh_sudo "$CIBLE" "
+        systemctl reset-failed '$unite_build' >/dev/null 2>&1 || true
+        systemd-run --unit='$unite_build' --working-directory='$racine' \
+            --setenv=COMPOSE_BAKE=0 --property=RuntimeMaxSec=30min \
+            $compose -f deploy/astra/compose.yaml build >/dev/null
+    " || {
+        echo "    impossible de lancer la construction distante" >&2
+        return 1
+    }
+
+    etat_build=active
+    resultat_build=
+    code_build=
+    for tentative in $(seq 1 900); do
+        if statut_astra="$(helios_ssh_sudo_capture "$CIBLE" \
+            "systemctl show '$unite_build' \
+                -p ActiveState -p Result -p ExecMainStatus --value")"; then
+            etat_build="$(printf '%s\n' "$statut_astra" | sed -n '1p')"
+            resultat_build="$(printf '%s\n' "$statut_astra" | sed -n '2p')"
+            code_build="$(printf '%s\n' "$statut_astra" | sed -n '3p')"
+            case "$etat_build" in
+                active|activating|reloading) ;;
+                *) break ;;
+            esac
+        fi
+        if [ $((tentative % 15)) -eq 0 ]; then
+            echo "      build toujours actif ($((tentative * 2)) s)"
+        fi
+        sleep 2
+    done
+    sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+        "journalctl -u '$unite_build' --no-pager -o cat -n 200" 2>&1 || true)"
+
+    if [ "$etat_build" = "active" ] || [ "$etat_build" = "activating" ]; then
+        echo "    la construction dépasse sa borne de 30 minutes :" >&2
+        printf '%s\n' "$sortie" | tail -40 >&2
+        return 1
+    fi
+
+    if [ "$resultat_build" != "success" ] || [ "$code_build" != "0" ]; then
         # `network: host` est indispensable — voir compose.yaml — mais certaines
         # versions de BuildKit l'exigent habilitée explicitement. Le
         # constructeur direct, lui, prend le drapeau sans condition. On le tente
@@ -315,13 +388,42 @@ deployer_astra() {
         case "$sortie" in
             *entitlement*|*network.host*|*"network mode"*)
                 echo "    réseau hôte refusé par BuildKit, seconde tentative" >&2
-                sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-                    $moteur build --network=host \
-                    -f deploy/astra/Dockerfile -t helios/astra:latest . 2>&1")" || {
+                # Ce repli ne doit pas réintroduire la dépendance à une session
+                # SSH longue : il est détaché pour la même raison que compose.
+                unite_build="${unite_build}-direct"
+                helios_ssh_sudo "$CIBLE" "
+                    systemctl reset-failed '$unite_build' >/dev/null 2>&1 || true
+                    systemd-run --unit='$unite_build' --working-directory='$racine' \
+                        --property=RuntimeMaxSec=30min $moteur build --network=host \
+                        -f deploy/astra/Dockerfile -t helios/astra:latest . >/dev/null
+                " || {
+                    echo "    impossible de lancer la seconde construction" >&2
+                    return 1
+                }
+                etat_build=active
+                resultat_build=
+                code_build=
+                for tentative in $(seq 1 900); do
+                    if statut_astra="$(helios_ssh_sudo_capture "$CIBLE" \
+                        "systemctl show '$unite_build' \
+                            -p ActiveState -p Result -p ExecMainStatus --value")"; then
+                        etat_build="$(printf '%s\n' "$statut_astra" | sed -n '1p')"
+                        resultat_build="$(printf '%s\n' "$statut_astra" | sed -n '2p')"
+                        code_build="$(printf '%s\n' "$statut_astra" | sed -n '3p')"
+                        case "$etat_build" in
+                            active|activating|reloading) ;;
+                            *) break ;;
+                        esac
+                    fi
+                    sleep 2
+                done
+                sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+                    "journalctl -u '$unite_build' --no-pager -o cat -n 200" 2>&1 || true)"
+                if [ "$resultat_build" != "success" ] || [ "$code_build" != "0" ]; then
                     echo "    la construction de l'image a échoué :" >&2
                     printf '%s\n' "$sortie" | tail -40 >&2
                     return 1
-                }
+                fi
                 ;;
             *)
                 echo "    la construction de l'image a échoué :" >&2
@@ -351,10 +453,9 @@ deployer_astra() {
         return 1
     fi
 
-    etat="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+    statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
         $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-        run --rm --no-deps astra status >/dev/null 2>&1 && echo amorce || echo vierge" \
-        | tr -d '\r' | tail -1)"
+        run --rm --no-deps astra status 2>&1")" && etat=amorce || etat=vierge
 
     if [ "$etat" = "vierge" ]; then
         echo "    amorçage du domaine"
@@ -388,8 +489,51 @@ deployer_astra() {
         }
         mkdir -p "$(dirname "$RELAIS")"
         printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
+    else
+        # Un déploiement interrompu peut avoir amorcé le volume avant d'avoir
+        # écrit le témoin compose ou le registre Helios. `status` rend les deux
+        # valeurs publiques nécessaires pour reprendre, sans recréer de clé ni
+        # de chaîne.
+        cle_service="$(printf '%s\n' "$statut_astra" |
+            sed -n 's/^service key[[:space:]]*:[[:space:]]*//p' | head -1)"
+        tete_audit="$(printf '%s\n' "$statut_astra" |
+            sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
+        if [ -z "$cle_service" ] || [ -z "$tete_audit" ]; then
+            echo "    état Astra illisible :" >&2
+            printf '%s\n' "$statut_astra" >&2
+            return 1
+        fi
 
-        # ── L'autre moitié du domaine, sur la gateway ───────────────────────
+        tete_attendue="$(sed -n '1p' "$(dirname "$RELAIS")/audit-head" 2>/dev/null || true)"
+        if [ -z "$tete_attendue" ]; then
+            echo "    Astra est amorcé mais le témoin d'audit opérateur est absent :" >&2
+            echo "      $(dirname "$RELAIS")/audit-head" >&2
+            echo "    tête présentée par Astra : $tete_audit" >&2
+            echo "    confirmer ce point de reprise hors bande avant de le réenregistrer" >&2
+            return 1
+        fi
+        if [ "$tete_attendue" != "$tete_audit" ]; then
+            echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
+            echo "    attendue : $tete_attendue" >&2
+            echo "    présente : $tete_audit" >&2
+            return 1
+        fi
+        helios_ssh_sudo "$CIBLE" \
+            "printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' > '$env_distant'
+             chmod 600 '$env_distant'" || {
+            echo "    impossible de restaurer le témoin compose Astra" >&2
+            return 1
+        }
+    fi
+
+    # ── L'autre moitié du domaine, sur la gateway ───────────────────────────
+    # Elle peut manquer alors que le volume Astra existe déjà : une coupure
+    # entre les deux amorçages ne doit ni fabriquer une seconde autorité, ni
+    # laisser les routes de cycle de vie fermées pour toujours.
+    registre_gateway="$(helios_ssh_sudo_capture "$CIBLE" \
+        "if test -f /var/lib/helios/certificates.json; then echo present; else echo absent; fi" \
+        | tr -d '\r' | tail -1)"
+    if [ "$registre_gateway" = "absent" ]; then
         echo "    amorçage du registre gateway"
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
@@ -433,6 +577,14 @@ fi
 # de plus n'apporte rien et garde un socket sur la gateway.
 helios_ssh_close "$CIBLE"
 
+if [ "$ASTRA_ONLY" = "1" ]; then
+    cat <<EOF
+
+──────────────────────────────────────────────────────────────
+  Astra repris sur $CIBLE — gateway laissée inchangée
+──────────────────────────────────────────────────────────────
+EOF
+else
 cat <<EOF
 
 ──────────────────────────────────────────────────────────────
@@ -442,3 +594,4 @@ cat <<EOF
   target state directory printed above. The service is enabled and running.
 ──────────────────────────────────────────────────────────────
 EOF
+fi

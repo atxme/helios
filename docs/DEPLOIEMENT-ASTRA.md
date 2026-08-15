@@ -136,11 +136,26 @@ slot.
 4. envoie les sources par `git archive HEAD` et construit l'image **sur la
    gateway** — ce qui part est donc ce qui est commité, jamais l'arbre de
    travail. Y compris le trousseau éditeur *public*, sans lequel `aether/build.rs`
-   refuse la compilation `--release` de l'image ;
+   refuse la compilation `--release` de l'image. La construction tourne dans
+   une unité systemd transitoire : une coupure SSH n'annule pas BuildKit, et le
+   script se reconnecte pour lire son résultat et son journal ;
 5. si le domaine n'est pas amorcé : `astra bootstrap`, capture de la clé de
    service et de la tête d'audit, écriture du `.env` distant, puis
    `heliosd init-trust-domain` et `systemctl restart heliosd` ;
 6. `compose up -d`.
+
+Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
+témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
+dans `/var/lib/helios/astra-compose.env`. Sur une reprise, `deploy.sh` relit la
+tête du volume, la compare au témoin opérateur `~/.helios/astra/audit-head`, et
+refuse un écart au lieu d'adopter silencieusement une histoire restaurée.
+
+Après une panne limitée à cette étape, la reprise ne relivre ni les binaires ni
+la configuration de la gateway :
+
+```bash
+./scripts/deploy.sh --astra
+```
 
 L'URL d'autorité vaut `https://<rp_id>` par défaut ; `ASTRA_AUTHORITY_URL` la
 remplace.

@@ -45,6 +45,17 @@ const entry = (overrides: Partial<ProfileCertificates> = {}): ProfileCertificate
   ...overrides,
 })
 
+/** A certificate whose validity is long past, whatever «now» happens to be. */
+const expiredFacts = () => ({
+  subject: 'CN=workstation',
+  issuer: 'CN=CA-TLS',
+  fingerprint: 'b'.repeat(64),
+  not_before: 0,
+  not_after: 100_000,
+  renewal_at: 80_000,
+  phase: 'expired' as const,
+})
+
 beforeEach(() => {
   vi.clearAllMocks()
   api.runCertificateAction.mockResolvedValue(undefined)
@@ -86,6 +97,47 @@ describe('CertificatesView', () => {
     await waitFor(() =>
       expect(screen.getByText(/Aucun profil de ce poste ne négocie de clé/)).toBeTruthy(),
     )
+  })
+
+  /**
+   * The screen is opened because something stopped connecting. The profile
+   * that explains it has to be the first one, not the one that happens to sit
+   * first in the configuration file.
+   */
+  it('puts the profiles in trouble before the healthy ones', async () => {
+    const healthy = entry({ name: 'sain' })
+    const broken = entry({
+      name: 'casse',
+      inventory: { ...entry().inventory, gateway_pq: null, client_pq: expiredFacts() },
+    })
+    api.certificateOverview.mockResolvedValue([healthy, broken])
+    render(<CertificatesView />)
+
+    await waitFor(() => expect(screen.getByText('casse')).toBeTruthy())
+    const names = screen.getAllByRole('heading', { level: 3 }).map((node) => node.textContent)
+    expect(names).toEqual(['casse', 'sain'])
+  })
+
+  /**
+   * An unanswered read is not an empty device: reporting the two the same way
+   * told a user with six profiles that they had none.
+   */
+  it('distinguishes a failed read from a device that negotiates nothing', async () => {
+    api.certificateOverview.mockRejectedValue('DPAPI indisponible')
+    render(<CertificatesView />)
+
+    await waitFor(() => expect(screen.getByText(/n’ont pas pu être lus/)).toBeTruthy())
+    expect(screen.queryByText(/Aucun profil de ce poste ne négocie de clé/)).toBeNull()
+  })
+
+  /** The reload says what it does: «Relire» read as an undo. */
+  it('offers the reload as an explicit refresh', async () => {
+    api.certificateOverview.mockResolvedValue([entry()])
+    render(<CertificatesView />)
+
+    const button = await screen.findByRole('button', { name: 'Actualiser' })
+    fireEvent.click(button)
+    await waitFor(() => expect(api.certificateOverview).toHaveBeenCalledTimes(2))
   })
 
   /**

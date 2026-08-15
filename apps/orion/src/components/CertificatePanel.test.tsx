@@ -57,6 +57,26 @@ describe('CertificatePanel', () => {
   })
 
   /**
+   * The remaining life is the value that decides whether the user acts today.
+   * A date alone makes them subtract, and subtracting wrong is the whole
+   * failure this panel exists to prevent.
+   */
+  it('states how long is left, not only the instant', () => {
+    const now = Date.now() / 1000
+    render(
+      <CertificatePanel
+        inventory={inventory({
+          gateway_pq: facts('valid', { not_after: now + 12 * 86_400 }),
+          client_pq: facts('expired', { not_after: now - 3 * 86_400 }),
+        })}
+        identityName="orion-poste"
+      />,
+    )
+    expect(screen.getByText('dans 12 jours')).toBeTruthy()
+    expect(screen.getByText('depuis 3 jours')).toBeTruthy()
+  })
+
+  /**
    * The renewal ladder is the protocol's. Each rung has a distinct label,
    * because "bientôt" for both 80 % and 95 % is what makes a user ignore the
    * first one and be surprised by the second.

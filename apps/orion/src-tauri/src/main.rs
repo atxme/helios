@@ -1593,9 +1593,12 @@ async fn validate_profile(
 fn window_size_for(view: &str) -> (f64, f64) {
     match view {
         "profiles" => (800.0, 720.0),
-        // Certificates lists every Helios profile of the device with four
-        // rows and four actions each: it needs the height, not the width.
-        "certificates" => (800.0, 760.0),
+        // Certificates is a column of cards: a name, four dated rows and the
+        // four actions of §12.2, wrapped rather than stacked. It was given the
+        // width of a two-column form and the height of six profiles, and a
+        // device that holds one spent the difference on empty paper. Beyond
+        // what fits, the view scrolls.
+        "certificates" => (680.0, 620.0),
         // The speedtest is a single centred column — a dial, two direction
         // rows, three qualities. It was given the width of a two-column form
         // and spent it on margins.
