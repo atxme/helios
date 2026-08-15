@@ -1,15 +1,12 @@
 import { useEffect, useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
-import ToggleButton from '@mui/material/ToggleButton'
-import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
 import Typography from '@mui/material/Typography'
-import { ArrowDown, ArrowUp, Gauge, RotateCcw, Timer } from 'lucide-react'
+import { ArrowDown, ArrowUp, Gauge } from 'lucide-react'
 
 import * as api from '../api'
-import { EMERALD, GUTTER, INK, MINT, PINE, RULE, SLATE } from '../theme'
+import { EMERALD, GUTTER, INK, PINE, RULE } from '../theme'
 import type {
   ClientProfile,
   SpeedTestMode,
@@ -19,14 +16,72 @@ import type {
   TunnelState,
 } from '../types'
 
+/**
+ * Speedtest — one number, two directions, three qualities.
+ *
+ * # Why the transport is no longer a question
+ *
+ * The screen used to open on a TCP / UDP / TCP+UDP toggle. WireGuard carries
+ * **UDP only** on the wire: whatever the in-tunnel sockets speak, the datagrams
+ * that leave the machine are UDP either way. Asking the user to pick made them
+ * answer a question about the measurement harness in order to learn their line
+ * rate — and the wrong answer silently doubled the run.
+ *
+ * So the transport is decided here, once, and never surfaces: the run is UDP,
+ * and the phases are named by **direction** rather than by protocol. The other
+ * two modes stay in `orion-core` — `helios-ctl` still reaches them, and a
+ * transport comparison is a diagnostic, not a client feature.
+ *
+ * # The dial lost its needle
+ *
+ * A needle, nine ticks, a drop shadow and a radial gradient stated one scalar.
+ * What remains is the arc that fills, because it is the part that reads at a
+ * glance, and the value at its centre in the unit the engine actually
+ * produces — megabits, `bytes * 8 / s / 1e6`. The old caption said `MB/S` over
+ * that same number, off by a factor of eight.
+ *
+ * # No captions
+ *
+ * Values, not prose: the headline, the paragraph about raw sockets and the
+ * fixed-duration badge are gone. What the measurement is worth belongs to the
+ * numbers it prints.
+ */
+
 interface Props {
   state: TunnelState
   profile: ClientProfile | null
 }
 
-const TEST_DURATION_SECS = 20
-const DIAL_CENTER = 150
-const DIAL_RADIUS = 112
+/**
+ * The transport this screen measures, fixed.
+ *
+ * Not a default the user may override — the choice is gone from the UI, and
+ * this constant is the whole of it.
+ */
+const MODE: SpeedTestMode = 'udp'
+
+const DIAL_BOX = 200
+const DIAL_CENTER = DIAL_BOX / 2
+const DIAL_RADIUS = 84
+const DIAL_STROKE = 13
+/** Arc opening, in degrees: a 270° sweep leaves the gap at the bottom. */
+const DIAL_START = 135
+const DIAL_SWEEP = 270
+
+/**
+ * Ceilings the dial is allowed to adopt, in Mb/s.
+ *
+ * A ladder rather than `ceil(rate / 100) * 100`: that rounding gave every
+ * domestic line the same 0–100 scale, so a 12 Mb/s uplink filled a tenth of
+ * the arc and looked broken. The ladder keeps a slow line legible and still
+ * has room for a gigabit one.
+ */
+const CEILINGS = [10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000]
+
+function ceilingFor(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return CEILINGS[0]
+  return CEILINGS.find((step) => rate <= step) ?? CEILINGS[CEILINGS.length - 1]
+}
 
 function decimal(value: number, digits = 1): string {
   return value.toLocaleString('fr-FR', {
@@ -35,16 +90,17 @@ function decimal(value: number, digits = 1): string {
   })
 }
 
-function duration(milliseconds: number): string {
-  if (milliseconds < 1_000) return `${Math.max(1, Math.round(milliseconds))} ms`
-  return `${decimal(milliseconds / 1_000)} s`
+function milliseconds(value: number): string {
+  return value < 10 ? `${decimal(value)} ms` : `${Math.round(value)} ms`
 }
 
-function bytes(value: number): string {
-  if (value < 1_024 * 1_024) return `${decimal(value / 1_024)} Ko`
-  return `${decimal(value / (1_024 * 1_024))} Mo`
-}
-
+/**
+ * What the run is doing, said by direction.
+ *
+ * The engine's own `message` is deliberately ignored: it names the transport
+ * («TCP descendant · flux continus», «Mesure de la latence UDP»), which is
+ * exactly the vocabulary this screen no longer puts in front of the user.
+ */
 function phaseLabel(phase: SpeedTestPhase): string {
   switch (phase) {
     case 'preparing':
@@ -52,263 +108,281 @@ function phaseLabel(phase: SpeedTestPhase): string {
     case 'latency':
       return 'Latence'
     case 'tcp_download':
-      return 'TCP descendant'
-    case 'tcp_upload':
-      return 'TCP montant'
     case 'udp_download':
-      return 'UDP descendant'
+      return 'Réception'
+    case 'tcp_upload':
     case 'udp_upload':
-      return 'UDP montant'
+      return 'Émission'
     case 'complete':
       return 'Terminé'
   }
 }
 
-function modeDescription(mode: SpeedTestMode): string {
-  if (mode === 'tcp') return 'Débit brut principal · quatre flux persistants'
-  if (mode === 'udp') return 'Débit, perte de paquets et jitter'
-  return 'TCP principal puis qualification UDP'
+function isUploadPhase(phase: SpeedTestPhase): boolean {
+  return phase === 'tcp_upload' || phase === 'udp_upload'
+}
+
+function isDownloadPhase(phase: SpeedTestPhase): boolean {
+  return phase === 'tcp_download' || phase === 'udp_download'
+}
+
+/**
+ * Share of the whole run already behind us.
+ *
+ * The engine reports a fraction **per phase**, so a bar driven by it alone
+ * would fill three times. Latency is given a thin slice because it is short;
+ * the two transfers split the rest evenly, since they run for the same fixed
+ * interval.
+ */
+function overallFraction(progress: SpeedTestProgress | null): number {
+  if (!progress) return 0
+  const within = Math.min(1, Math.max(0, progress.fraction))
+  switch (progress.phase) {
+    case 'preparing':
+      return 0
+    case 'latency':
+      return 0.02 + within * 0.06
+    case 'tcp_download':
+    case 'udp_download':
+      return 0.08 + within * 0.46
+    case 'tcp_upload':
+    case 'udp_upload':
+      return 0.54 + within * 0.46
+    case 'complete':
+      return 1
+  }
 }
 
 function resultRate(result: SpeedTestResult, direction: 'download' | 'upload'): number {
   if (direction === 'download') {
-    return result.tcp_download_mbps ?? result.udp_download_mbps ?? result.download_mbps
+    return result.udp_download_mbps ?? result.tcp_download_mbps ?? result.download_mbps
   }
-  return result.tcp_upload_mbps ?? result.udp_upload_mbps ?? result.upload_mbps
+  return result.udp_upload_mbps ?? result.tcp_upload_mbps ?? result.upload_mbps
 }
 
-function gaugeScale(rate: number): number {
-  if (!Number.isFinite(rate) || rate <= 0) return 100
-  return Math.max(100, Math.ceil(rate / 100) * 100)
-}
-
-function gaugeFraction(rate: number): number {
-  const scale = gaugeScale(rate)
-  return Math.min(1, Math.max(0, rate / scale))
-}
-
-function point(angle: number, radius: number): [number, number] {
+function polar(angle: number, radius: number): [number, number] {
   const radians = (angle * Math.PI) / 180
   return [DIAL_CENTER + Math.cos(radians) * radius, DIAL_CENTER + Math.sin(radians) * radius]
 }
 
-function arcPath(): string {
-  const [startX, startY] = point(135, DIAL_RADIUS)
-  const [endX, endY] = point(405, DIAL_RADIUS)
+/** The 270° track, drawn once: neither end moves. */
+const DIAL_PATH = (() => {
+  const [startX, startY] = polar(DIAL_START, DIAL_RADIUS)
+  const [endX, endY] = polar(DIAL_START + DIAL_SWEEP, DIAL_RADIUS)
   return `M ${startX} ${startY} A ${DIAL_RADIUS} ${DIAL_RADIUS} 0 1 1 ${endX} ${endY}`
-}
+})()
 
-const DIAL_PATH = arcPath()
-
-function Dial({ rate, label, running }: { rate: number; label: string; running: boolean }) {
-  const fraction = gaugeFraction(rate)
-  const pointerRotation = 225 + fraction * 270
-  const scale = gaugeScale(rate)
-  const ticks = Array.from({ length: 9 }, (_, index) => {
-    const angle = 135 + (index / 8) * 270
-    const [x1, y1] = point(angle, 92)
-    const [x2, y2] = point(angle, index === 0 || index === 8 ? 101 : 98)
-    return { x1, y1, x2, y2 }
-  })
+function Dial({
+  rate,
+  ceiling,
+  caption,
+  idle,
+}: {
+  rate: number
+  ceiling: number
+  caption: string
+  idle: boolean
+}) {
+  const fraction = Math.min(1, Math.max(0, rate / ceiling))
 
   return (
     <Box
       role="img"
-      aria-label={`${label} : ${decimal(rate)} mégabits par seconde`}
-      sx={{ position: 'relative', width: 'min(100%, 370px)', aspectRatio: '1', mx: 'auto' }}
+      aria-label={`${caption} : ${decimal(rate)} mégabits par seconde`}
+      sx={{ position: 'relative', width: DIAL_BOX, height: DIAL_BOX, mx: 'auto' }}
     >
-      <svg viewBox="0 0 300 300" width="100%" height="100%" aria-hidden="true">
+      <svg viewBox={`0 0 ${DIAL_BOX} ${DIAL_BOX}`} width="100%" height="100%" aria-hidden="true">
         <defs>
-          <linearGradient id="speedtest-dial-gradient" x1="0" y1="1" x2="1" y2="0">
+          <linearGradient id="speedtest-arc" x1="0" y1="1" x2="1" y2="0">
             <stop offset="0%" stopColor={PINE} />
             <stop offset="100%" stopColor={EMERALD} />
           </linearGradient>
-          <filter id="speedtest-dial-shadow" x="-30%" y="-30%" width="160%" height="160%">
-            <feDropShadow dx="0" dy="4" stdDeviation="5" floodColor={PINE} floodOpacity="0.16" />
-          </filter>
         </defs>
 
-        <circle cx={DIAL_CENTER} cy={DIAL_CENTER} r="125" fill="#FFFFFF" opacity="0.74" />
         <path
           d={DIAL_PATH}
           fill="none"
           stroke={RULE}
-          strokeWidth="14"
+          strokeWidth={DIAL_STROKE}
           strokeLinecap="round"
           pathLength="100"
         />
         <path
           d={DIAL_PATH}
           fill="none"
-          stroke="url(#speedtest-dial-gradient)"
-          strokeWidth="14"
+          stroke="url(#speedtest-arc)"
+          strokeWidth={DIAL_STROKE}
           strokeLinecap="round"
           pathLength="100"
           strokeDasharray="100"
           strokeDashoffset={100 - fraction * 100}
-          style={{ transition: 'stroke-dashoffset 320ms ease-out' }}
-        />
-        {ticks.map((tick, index) => (
-          <line
-            key={index}
-            x1={tick.x1}
-            y1={tick.y1}
-            x2={tick.x2}
-            y2={tick.y2}
-            stroke={index === 0 || index === 8 ? PINE : SLATE}
-            strokeWidth={index === 0 || index === 8 ? 2.5 : 1.5}
-            strokeLinecap="round"
-          />
-        ))}
-        <line
-          x1={DIAL_CENTER}
-          y1={DIAL_CENTER}
-          x2={DIAL_CENTER}
-          y2="66"
-          stroke={PINE}
-          strokeWidth="4"
-          strokeLinecap="round"
-          filter="url(#speedtest-dial-shadow)"
           style={{
-            transformOrigin: `${DIAL_CENTER}px ${DIAL_CENTER}px`,
-            transform: `rotate(${pointerRotation}deg)`,
-            transition: 'transform 320ms ease-out',
+            transition: 'stroke-dashoffset 320ms ease-out',
+            opacity: idle ? 0 : 1,
           }}
         />
-        <circle cx={DIAL_CENTER} cy={DIAL_CENTER} r="11" fill={PINE} />
-        <circle cx={DIAL_CENTER} cy={DIAL_CENTER} r="4" fill="#FFFFFF" />
       </svg>
 
       <Box
         sx={{
           position: 'absolute',
-          inset: '38% 0 auto',
-          textAlign: 'center',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
           pointerEvents: 'none',
         }}
       >
         <Typography
           sx={{
-            color: INK,
-            fontSize: { xs: 34, sm: 42 },
+            color: idle ? 'text.disabled' : INK,
+            fontSize: 40,
             fontWeight: 760,
-            letterSpacing: '-0.055em',
+            letterSpacing: '-0.05em',
             lineHeight: 1,
             fontVariantNumeric: 'tabular-nums',
           }}
         >
-          {decimal(rate)}
+          {idle ? '—' : decimal(rate)}
         </Typography>
-        <Typography sx={{ mt: 0.45, color: PINE, fontSize: 11, fontWeight: 750, letterSpacing: '0.12em' }}>
-          MB/S
+        <Typography
+          sx={{ mt: 0.5, color: PINE, fontSize: 11, fontWeight: 750, letterSpacing: '0.1em' }}
+        >
+          Mb/s
         </Typography>
-        <Typography color="text.secondary" sx={{ mt: 1.25, fontSize: 11, fontWeight: 650 }}>
-          {running ? label : rate > 0 ? label : 'Prêt à mesurer'}
+        <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5, fontWeight: 650 }}>
+          {caption}
         </Typography>
       </Box>
-
-      <Typography
-        color="text.disabled"
-        sx={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          bottom: '6%',
-          textAlign: 'center',
-          fontSize: 10,
-          fontFamily: 'monospace',
-        }}
-      >
-        0 — {decimal(scale, 0)} Mb/s
-      </Typography>
     </Box>
   )
 }
 
-function ResultMetric({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <Paper
-      variant="outlined"
-      sx={{
-        p: 1.5,
-        flex: '1 1 165px',
-        minWidth: 0,
-        borderRadius: 2,
-        backgroundColor: '#FFFFFFB8',
-      }}
-    >
-      <Typography variant="overline" color="text.secondary">
-        {label}
-      </Typography>
-      <Typography sx={{ mt: 0.5, fontSize: 21, fontWeight: 720, fontVariantNumeric: 'tabular-nums' }}>
-        {value}
-      </Typography>
-      <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11 }}>
-        {detail}
-      </Typography>
-    </Paper>
-  )
-}
-
-function DirectionMetric({
+/**
+ * One direction, with its bar.
+ *
+ * Both bars share a scale — the faster of the two — so their lengths compare.
+ * Scaling each to its own maximum would draw a 4 Mb/s uplink and a 400 Mb/s
+ * downlink as two identical bars.
+ */
+function DirectionRow({
   direction,
   value,
+  ceiling,
   active,
 }: {
   direction: 'download' | 'upload'
   value: number | null
+  ceiling: number
   active: boolean
 }) {
   const download = direction === 'download'
+  const filled = value === null ? 0 : Math.min(1, Math.max(0, value / ceiling))
+
   return (
-    <Box
-      sx={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 1,
-        flex: '1 1 145px',
-        minWidth: 0,
-        opacity: active || value !== null ? 1 : 0.48,
-      }}
-    >
-      <Box
-        sx={{
-          display: 'grid',
-          placeItems: 'center',
-          width: 30,
-          height: 30,
-          flexShrink: 0,
-          borderRadius: '50%',
-          color: PINE,
-          backgroundColor: MINT,
-        }}
-      >
-        {download ? <ArrowDown size={16} aria-hidden /> : <ArrowUp size={16} aria-hidden />}
-      </Box>
-      <Box sx={{ minWidth: 0 }}>
-        <Typography color="text.secondary" sx={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em' }}>
-          {download ? 'DESCENDANT' : 'MONTANT'}
+    <Box sx={{ minWidth: 0 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+        {download ? (
+          <ArrowDown size={14} aria-hidden style={{ color: active ? EMERALD : PINE }} />
+        ) : (
+          <ArrowUp size={14} aria-hidden style={{ color: active ? EMERALD : PINE }} />
+        )}
+        <Typography
+          sx={{ fontSize: 12, fontWeight: active ? 700 : 600, color: active ? INK : 'text.secondary' }}
+        >
+          {download ? 'Réception' : 'Émission'}
         </Typography>
-        <Typography sx={{ fontSize: 18, fontWeight: 720, fontVariantNumeric: 'tabular-nums' }}>
+        <Typography
+          sx={{
+            ml: 'auto',
+            color: value === null ? 'text.disabled' : INK,
+            fontSize: 15,
+            fontWeight: 720,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
           {value === null ? '—' : `${decimal(value)} Mb/s`}
         </Typography>
+      </Box>
+      <Box
+        aria-hidden
+        sx={{
+          mt: 0.6,
+          height: 5,
+          borderRadius: 3,
+          bgcolor: RULE,
+          overflow: 'hidden',
+        }}
+      >
+        <Box
+          sx={{
+            width: `${filled * 100}%`,
+            height: '100%',
+            borderRadius: 3,
+            background: `linear-gradient(90deg, ${PINE}, ${EMERALD})`,
+            transition: 'width 320ms ease-out',
+          }}
+        />
       </Box>
     </Box>
   )
 }
 
-/** Measures the established WireGuard data plane with direct socket traffic. */
+function Quality({ label, value }: { label: string; value: string }) {
+  return (
+    <Box sx={{ flex: '1 1 0', minWidth: 0, textAlign: 'center' }}>
+      <Typography variant="overline" color="text.disabled" sx={{ display: 'block', fontSize: 9 }}>
+        {label}
+      </Typography>
+      <Typography
+        sx={{ mt: 0.2, fontSize: 15, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}
+      >
+        {value}
+      </Typography>
+    </Box>
+  )
+}
+
+/** Measures the established WireGuard data plane with direct UDP traffic. */
 export function SpeedTestView({ state, profile }: Props) {
   const [result, setResult] = useState<SpeedTestResult | null>(null)
   const [progress, setProgress] = useState<SpeedTestProgress | null>(null)
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [mode, setMode] = useState<SpeedTestMode>('tcp')
+  /**
+   * Last rate seen in each direction while the run is under way.
+   *
+   * Kept here rather than read off `progress`: the reception figure has to
+   * stay on screen once emission takes over, otherwise the row the user was
+   * just watching blanks out halfway through the run.
+   */
+  const [live, setLive] = useState<{ down: number | null; up: number | null }>({
+    down: null,
+    up: null,
+  })
+  /**
+   * Dial scale for the run in progress — it only ever grows.
+   *
+   * Recomputing it from the current rate made the arc lurch backwards each
+   * time the measurement crossed a rung of the ladder: the same throughput
+   * would suddenly occupy less of the dial.
+   */
+  const [ceiling, setCeiling] = useState(CEILINGS[0])
+
   const connected = state === 'up'
   const available = connected && profile !== null
 
   useEffect(() => {
-    const unlisten = api.onSpeedTestProgress(setProgress)
+    const unlisten = api.onSpeedTestProgress((update) => {
+      setProgress(update)
+      if (isDownloadPhase(update.phase)) {
+        setLive((seen) => ({ ...seen, down: update.current_mbps }))
+      } else if (isUploadPhase(update.phase)) {
+        setLive((seen) => ({ ...seen, up: update.current_mbps }))
+      }
+      setCeiling((seen) => Math.max(seen, ceilingFor(update.current_mbps)))
+    })
     return () => {
       unlisten.then((remove) => remove())
     }
@@ -319,157 +393,110 @@ export function SpeedTestView({ state, profile }: Props) {
     setError(null)
     setResult(null)
     setProgress(null)
+    setLive({ down: null, up: null })
+    setCeiling(CEILINGS[0])
     try {
-      setResult(await api.runSpeedTest(mode))
+      const measured = await api.runSpeedTest(MODE)
+      setResult(measured)
+      setCeiling((seen) =>
+        Math.max(seen, ceilingFor(Math.max(resultRate(measured, 'download'), resultRate(measured, 'upload')))),
+      )
     } catch (cause) {
       setError(String(cause))
+      // The dial falls back to «—» on failure; leaving the rows on the last
+      // frames received would have the screen state a rate it just disowned.
+      setLive({ down: null, up: null })
+      setProgress(null)
     } finally {
       setRunning(false)
     }
   }
 
-  const activeRate = running && progress ? progress.current_mbps : result ? resultRate(result, 'download') : 0
-  const activeLabel = running && progress ? phaseLabel(progress.phase) : result ? 'Débit descendant' : 'Prêt à mesurer'
-  const activePhase = progress?.phase ?? 'preparing'
-  const isUpload = activePhase.endsWith('upload')
-  const downloadRate = result ? resultRate(result, 'download') : null
-  const uploadRate = result ? resultRate(result, 'upload') : null
+  const phase = progress?.phase ?? 'preparing'
+  const downRate = result ? resultRate(result, 'download') : live.down
+  const upRate = result ? resultRate(result, 'upload') : live.up
+
+  // The dial carries the live rate while measuring, then rests on reception —
+  // the figure a line is usually judged by.
+  const dialRate = running ? (progress?.current_mbps ?? 0) : (downRate ?? 0)
+  const idle = !running && result === null
+  const caption = running ? phaseLabel(phase) : result ? 'Réception' : 'Prêt'
+  const barCeiling = Math.max(downRate ?? 0, upRate ?? 0, 1)
+  const fraction = running ? overallFraction(progress) : 0
 
   return (
     <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
-      <Stack spacing={1.75} sx={{ maxWidth: 820, mx: 'auto', pb: 2 }}>
+      <Stack spacing={2} sx={{ maxWidth: 460, mx: 'auto', pb: 1 }}>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <Gauge size={18} aria-hidden style={{ color: PINE }} />
           <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700 }}>
-            Speedtest réseau
+            Speedtest
           </Typography>
-          {result && (
-            <Button
-              size="small"
-              variant="text"
-              color="inherit"
-              startIcon={<RotateCcw size={14} aria-hidden />}
-              onClick={() => void run()}
-              disabled={running || !available}
-              sx={{ ml: 'auto', color: 'text.secondary', fontSize: 11 }}
-            >
-              Refaire
-            </Button>
-          )}
         </Box>
 
-        <Paper
-          variant="outlined"
-          sx={{
-            overflow: 'hidden',
-            borderRadius: 3,
-            background: `radial-gradient(circle at 50% 38%, ${MINT} 0%, #FFFFFF 56%)`,
-          }}
-        >
-          <Box sx={{ px: { xs: 1.5, sm: 3 }, pt: { xs: 2, sm: 2.5 } }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: 'flex-start' }}>
-              <Box>
-                <Typography component="h3" sx={{ fontSize: { xs: 19, sm: 22 }, fontWeight: 750, letterSpacing: '-0.03em' }}>
-                  La ligne WireGuard, au ras du réseau
-                </Typography>
-                <Typography color="text.secondary" sx={{ mt: 0.65, maxWidth: 590, fontSize: 11.5, lineHeight: 1.5 }}>
-                  Flux TCP et UDP directs entre Orion et Helios. Aucun HTTP, aucun header, aucune requête répétée.
-                </Typography>
-              </Box>
-              <Box
-                sx={{
-                  display: { xs: 'none', sm: 'flex' },
-                  alignItems: 'center',
-                  gap: 0.75,
-                  flexShrink: 0,
-                  px: 1.25,
-                  py: 0.75,
-                  border: `1px solid ${RULE}`,
-                  borderRadius: 2,
-                  backgroundColor: '#FFFFFFA8',
-                }}
-              >
-                <Timer size={14} aria-hidden style={{ color: PINE }} />
-                <Typography sx={{ color: PINE, fontSize: 11, fontWeight: 750 }}>20 s / direction</Typography>
-              </Box>
-            </Box>
-
-            <Dial rate={activeRate} label={activeLabel} running={running} />
-
+        <Box>
+          <Dial rate={dialRate} ceiling={ceiling} caption={caption} idle={idle} />
+          {/* Progress of the whole run, not of the current phase: a bar that
+              refills at each direction tells the user nothing about how long
+              is left. */}
+          <Box
+            aria-hidden
+            sx={{
+              mt: 0.5,
+              mx: 'auto',
+              width: DIAL_BOX,
+              height: 3,
+              borderRadius: 2,
+              bgcolor: RULE,
+              opacity: running ? 1 : 0,
+              transition: 'opacity 200ms ease',
+              overflow: 'hidden',
+            }}
+          >
             <Box
               sx={{
-                display: 'flex',
-                gap: { xs: 1.5, sm: 4 },
-                px: { xs: 1, sm: 5 },
-                pb: 2,
-                justifyContent: 'center',
+                width: `${fraction * 100}%`,
+                height: '100%',
+                borderRadius: 2,
+                bgcolor: EMERALD,
+                transition: 'width 320ms linear',
               }}
-            >
-              <DirectionMetric direction="download" value={downloadRate} active={running && !isUpload} />
-              <DirectionMetric direction="upload" value={uploadRate} active={running && isUpload} />
-            </Box>
+            />
           </Box>
+        </Box>
 
-          <Box sx={{ borderTop: `1px solid ${RULE}`, px: { xs: 1.5, sm: 3 }, py: 1.5 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1, alignItems: 'center', mb: 1 }}>
-              <Typography sx={{ fontSize: 11, fontWeight: 750 }}>Mode de mesure</Typography>
-              <Typography color="text.secondary" sx={{ fontSize: 10.5 }}>
-                {modeDescription(mode)}
-              </Typography>
-            </Box>
-            <ToggleButtonGroup
-              exclusive
-              fullWidth
-              size="small"
-              value={mode}
-              onChange={(_, value: SpeedTestMode | null) => value && setMode(value)}
-              aria-label="Méthode du speedtest"
-              disabled={running}
-              sx={{
-                '& .MuiToggleButton-root': { py: 0.8, fontSize: 11, borderColor: RULE },
-                '& .Mui-selected': { color: `${PINE} !important`, backgroundColor: `${MINT} !important`, fontWeight: 750 },
-              }}
-            >
-              <ToggleButton value="tcp">TCP brut</ToggleButton>
-              <ToggleButton value="udp">UDP brut</ToggleButton>
-              <ToggleButton value="full">TCP + UDP</ToggleButton>
-            </ToggleButtonGroup>
-            <Typography color="text.disabled" sx={{ display: { xs: 'block', sm: 'none' }, mt: 1, fontSize: 10 }}>
-              Durée fixe : {TEST_DURATION_SECS} secondes par direction
-            </Typography>
-          </Box>
-        </Paper>
+        <Stack spacing={1.25} aria-live="polite">
+          <DirectionRow
+            direction="download"
+            value={downRate}
+            ceiling={barCeiling}
+            active={running && isDownloadPhase(phase)}
+          />
+          <DirectionRow
+            direction="upload"
+            value={upRate}
+            ceiling={barCeiling}
+            active={running && isUploadPhase(phase)}
+          />
+        </Stack>
 
-        {!profile && (
-          <Typography color="text.secondary" sx={{ fontSize: 12 }}>
-            Aucun profil sélectionné.
-          </Typography>
-        )}
-        {profile && !connected && (
-          <Typography color="text.secondary" sx={{ fontSize: 12 }}>
-            Connectez le profil « {profile.name} » avant de lancer le test.
-          </Typography>
-        )}
-
-        {running && progress && (
+        {result && (
           <Box
             aria-live="polite"
             sx={{
               display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
               gap: 1,
-              px: 1.5,
-              py: 1,
-              borderRadius: 2,
-              color: PINE,
-              backgroundColor: MINT,
+              py: 1.25,
+              borderTop: `1px solid ${RULE}`,
+              borderBottom: `1px solid ${RULE}`,
             }}
           >
-            <Typography sx={{ fontSize: 11, fontWeight: 750 }}>{progress.message}</Typography>
-            <Typography sx={{ flexShrink: 0, fontSize: 10.5, fontFamily: 'monospace' }}>
-              {decimal(progress.current_mbps)} Mb/s · {duration(progress.elapsed_ms)}
-            </Typography>
+            <Quality label="Latence" value={milliseconds(result.latency_ms)} />
+            <Quality label="Gigue" value={milliseconds(result.jitter_ms)} />
+            <Quality
+              label="Perte"
+              value={result.udp_loss_pct === null ? '—' : `${decimal(result.udp_loss_pct)} %`}
+            />
           </Box>
         )}
 
@@ -479,38 +506,26 @@ export function SpeedTestView({ state, profile }: Props) {
           onClick={() => void run()}
           disabled={running || !available}
           aria-busy={running}
-          sx={{ alignSelf: 'center', minWidth: 230, minHeight: 44, borderRadius: 2.5 }}
+          sx={{ alignSelf: 'center', minWidth: 220, minHeight: 44, borderRadius: 2.5 }}
         >
-          {running ? 'Mesure directe en cours…' : result ? 'Relancer le speedtest' : 'Lancer le speedtest'}
+          {running ? 'Mesure en cours…' : result ? 'Relancer le speedtest' : 'Lancer le speedtest'}
         </Button>
+
+        {!profile && (
+          <Typography color="text.secondary" sx={{ fontSize: 12, textAlign: 'center' }}>
+            Aucun profil sélectionné.
+          </Typography>
+        )}
+        {profile && !connected && (
+          <Typography color="text.secondary" sx={{ fontSize: 12, textAlign: 'center' }}>
+            Connectez le profil « {profile.name} » avant de lancer le test.
+          </Typography>
+        )}
 
         {error && (
           <Typography role="alert" color="error.main" sx={{ fontSize: 12, lineHeight: 1.5, textAlign: 'center' }}>
             Speedtest impossible : {error}
           </Typography>
-        )}
-
-        {result && (
-          <Box aria-live="polite" aria-label="Résultats détaillés du speedtest">
-            <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap' }}>
-              <ResultMetric
-                label="Latence WireGuard"
-                value={duration(result.latency_ms)}
-                detail={`jitter ${decimal(result.jitter_ms)} ms · p95 ${decimal(result.latency_p95_ms)} ms`}
-              />
-              {result.udp_loss_pct !== null && (
-                <ResultMetric
-                  label="Qualité UDP"
-                  value={`${decimal(result.udp_loss_pct)} % perdu`}
-                  detail={`jitter ${result.udp_jitter_ms === null ? 'n/d' : `${decimal(result.udp_jitter_ms)} ms`}`}
-                />
-              )}
-              <ResultMetric label="Durée" value={`${TEST_DURATION_SECS} s / sens`} detail="intervalle fixé" />
-            </Stack>
-            <Typography color="text.disabled" sx={{ mt: 1, fontSize: 10.5, fontFamily: 'monospace', textAlign: 'center' }}>
-              {bytes(result.download_bytes)} reçus · {bytes(result.upload_bytes)} envoyés · {result.mode.toUpperCase()}
-            </Typography>
-          </Box>
         )}
       </Stack>
     </Box>

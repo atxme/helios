@@ -1593,7 +1593,10 @@ fn window_size_for(view: &str) -> (f64, f64) {
         // Certificates lists every Helios profile of the device with four
         // rows and four actions each: it needs the height, not the width.
         "certificates" => (800.0, 760.0),
-        "speedtest" => (720.0, 600.0),
+        // The speedtest is a single centred column — a dial, two direction
+        // rows, three qualities. It was given the width of a two-column form
+        // and spent it on margins.
+        "speedtest" => (520.0, 620.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the
         // height of the other views only produced a hole in the middle.

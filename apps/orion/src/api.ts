@@ -114,8 +114,14 @@ export const runCertificateAction = (name: string, action: CertificateAction) =>
 export const lastCertificateError = (name: string) =>
   invoke<string | null>('last_certificate_error', { name })
 
-/** Measures the authenticated WireGuard path for the fixed 20-second interval. */
-export const runSpeedTest = (mode: SpeedTestMode = 'full') =>
+/**
+ * Measures the authenticated WireGuard path for the fixed 20-second interval.
+ *
+ * The mode is required rather than defaulted: it decides how many phases run,
+ * and therefore how long the call blocks. A silent `full` doubled that for any
+ * caller who left it out.
+ */
+export const runSpeedTest = (mode: SpeedTestMode) =>
   invoke<SpeedTestResult>('run_speed_test', { mode })
 
 /** Receives progress from the direct socket benchmark. */
