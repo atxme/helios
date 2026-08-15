@@ -345,7 +345,8 @@ deployer_astra() {
         systemctl reset-failed '$unite_build' >/dev/null 2>&1 || true
         systemd-run --unit='$unite_build' --working-directory='$racine' \
             --setenv=COMPOSE_BAKE=0 --property=RuntimeMaxSec=30min \
-            $compose -f deploy/astra/compose.yaml build >/dev/null
+            $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            build >/dev/null
     " || {
         echo "    impossible de lancer la construction distante" >&2
         return 1
