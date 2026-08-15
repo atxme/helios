@@ -589,6 +589,9 @@ async fn run_speed_test(
     orion_core::run_speedtest_with_progress(
         mode,
         aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
+        // No override: the UI runs `full`, where the UDP quality legs take
+        // their rate from the TCP throughput measured moments earlier.
+        None,
         progress,
     )
     .await

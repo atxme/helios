@@ -27,10 +27,11 @@ import type {
  * answer a question about the measurement harness in order to learn their line
  * rate — and the wrong answer silently doubled the run.
  *
- * So the transport is decided here, once, and never surfaces: the run is UDP,
- * and the phases are named by **direction** rather than by protocol. The other
- * two modes stay in `orion-core` — `helios-ctl` still reaches them, and a
- * transport comparison is a diagnostic, not a client feature.
+ * So the transport is decided here, once, and never surfaces. The run does
+ * both: TCP finds the rate, then two short UDP legs paced just under it report
+ * loss and jitter. The phases are named by **direction** — «Réception»,
+ * «Émission», «Qualité» — and no screen says TCP or UDP. See `MODE` for why
+ * the honest answer to «WireGuard, c'est de l'UDP» is not to measure with it.
  *
  * # The dial lost its needle
  *
@@ -53,12 +54,24 @@ interface Props {
 }
 
 /**
- * The transport this screen measures, fixed.
+ * What the run measures, fixed.
  *
  * Not a default the user may override — the choice is gone from the UI, and
  * this constant is the whole of it.
+ *
+ * # Why it is not `udp`
+ *
+ * «WireGuard ne transporte que de l'UDP» is true of the wire and says nothing
+ * about the payload: the tunnel carries whatever it is given, and what real
+ * usage gives it is TCP. It matters here because **throughput needs
+ * congestion control to be measured at all**. A UDP sender has none: driven
+ * flat out it reports the speed of its own syscall loop and drops the rest,
+ * which is how this screen came to show ~80 % loss on a healthy link.
+ *
+ * So TCP finds the rate, and the UDP legs — paced just under it — report loss
+ * and jitter. Both run, the user is asked nothing, and no screen says «TCP».
  */
-const MODE: SpeedTestMode = 'udp'
+const MODE: SpeedTestMode = 'full'
 
 const DIAL_BOX = 200
 const DIAL_CENTER = DIAL_BOX / 2
@@ -108,56 +121,80 @@ function phaseLabel(phase: SpeedTestPhase): string {
     case 'latency':
       return 'Latence'
     case 'tcp_download':
-    case 'udp_download':
       return 'Réception'
     case 'tcp_upload':
-    case 'udp_upload':
       return 'Émission'
+    // The two quality legs are one step to the user: they re-run both
+    // directions at a fixed rate to observe loss, not to find a speed.
+    case 'udp_download':
+    case 'udp_upload':
+      return 'Qualité'
     case 'complete':
       return 'Terminé'
   }
 }
 
-function isUploadPhase(phase: SpeedTestPhase): boolean {
-  return phase === 'tcp_upload' || phase === 'udp_upload'
+/**
+ * Phases whose live rate is a throughput figure.
+ *
+ * The quality legs are deliberately excluded. They run *just under* the rate
+ * TCP just found, so feeding their progress into the direction rows would
+ * walk a 500 Mb/s reading down to 425 and then snap it back when the result
+ * lands — the screen would look like it lost its own measurement.
+ */
+function isThroughputPhase(phase: SpeedTestPhase): boolean {
+  return phase === 'tcp_download' || phase === 'tcp_upload'
 }
 
 function isDownloadPhase(phase: SpeedTestPhase): boolean {
-  return phase === 'tcp_download' || phase === 'udp_download'
+  return phase === 'tcp_download'
+}
+
+function isUploadPhase(phase: SpeedTestPhase): boolean {
+  return phase === 'tcp_upload'
 }
 
 /**
  * Share of the whole run already behind us.
  *
  * The engine reports a fraction **per phase**, so a bar driven by it alone
- * would fill three times. Latency is given a thin slice because it is short;
- * the two transfers split the rest evenly, since they run for the same fixed
- * interval.
+ * would fill five times over.
  */
 function overallFraction(progress: SpeedTestProgress | null): number {
   if (!progress) return 0
   const within = Math.min(1, Math.max(0, progress.fraction))
+  // Weights follow the legs' real durations — two throughput legs of 10 s and
+  // two quality legs of 5 s — so the bar advances at a steady pace instead of
+  // stalling on the long ones and leaping through the short ones.
   switch (progress.phase) {
     case 'preparing':
       return 0
     case 'latency':
-      return 0.02 + within * 0.06
+      return 0.01 + within * 0.02
     case 'tcp_download':
-    case 'udp_download':
-      return 0.08 + within * 0.46
+      return 0.03 + within * 0.32
     case 'tcp_upload':
+      return 0.35 + within * 0.32
+    case 'udp_download':
+      return 0.67 + within * 0.16
     case 'udp_upload':
-      return 0.54 + within * 0.46
+      return 0.83 + within * 0.16
     case 'complete':
       return 1
   }
 }
 
+/**
+ * Throughput of one direction — the TCP figure whenever there is one.
+ *
+ * The UDP fallbacks are a paced quality rate, not a capacity: they are worth
+ * showing only when no TCP leg ran at all.
+ */
 function resultRate(result: SpeedTestResult, direction: 'download' | 'upload'): number {
   if (direction === 'download') {
-    return result.udp_download_mbps ?? result.tcp_download_mbps ?? result.download_mbps
+    return result.tcp_download_mbps ?? result.udp_download_mbps ?? result.download_mbps
   }
-  return result.udp_upload_mbps ?? result.tcp_upload_mbps ?? result.upload_mbps
+  return result.tcp_upload_mbps ?? result.udp_upload_mbps ?? result.upload_mbps
 }
 
 function polar(angle: number, radius: number): [number, number] {
@@ -376,9 +413,10 @@ export function SpeedTestView({ state, profile }: Props) {
   useEffect(() => {
     const unlisten = api.onSpeedTestProgress((update) => {
       setProgress(update)
+      if (!isThroughputPhase(update.phase)) return
       if (isDownloadPhase(update.phase)) {
         setLive((seen) => ({ ...seen, down: update.current_mbps }))
-      } else if (isUploadPhase(update.phase)) {
+      } else {
         setLive((seen) => ({ ...seen, up: update.current_mbps }))
       }
       setCeiling((seen) => Math.max(seen, ceilingFor(update.current_mbps)))
@@ -416,9 +454,11 @@ export function SpeedTestView({ state, profile }: Props) {
   const downRate = result ? resultRate(result, 'download') : live.down
   const upRate = result ? resultRate(result, 'upload') : live.up
 
-  // The dial carries the live rate while measuring, then rests on reception —
-  // the figure a line is usually judged by.
-  const dialRate = running ? (progress?.current_mbps ?? 0) : (downRate ?? 0)
+  // The dial carries the live rate while a throughput leg runs, and holds the
+  // reception figure through the quality legs and at rest — the number a line
+  // is usually judged by.
+  const dialRate =
+    running && isThroughputPhase(phase) ? (progress?.current_mbps ?? 0) : (downRate ?? 0)
   const idle = !running && result === null
   const caption = running ? phaseLabel(phase) : result ? 'Réception' : 'Prêt'
   const barCeiling = Math.max(downRate ?? 0, upRate ?? 0, 1)

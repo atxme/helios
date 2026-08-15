@@ -359,7 +359,8 @@
       "Bash(ASTRA_EXPECTED_AUDIT_HEAD=test COMPOSE_BAKE=0 docker compose -f deploy/astra/compose.yaml config)",
       "Bash(chmod +x scripts/diagnose-negotiation.sh)",
       "Bash(bash -n scripts/diagnose-negotiation.sh)",
-      "Bash(awk '/Verdict::Drop/{print NR\": \"prev} {prev=$0}' crates/helios-firewall/src/ruleset.rs)"
+      "Bash(awk '/Verdict::Drop/{print NR\": \"prev} {prev=$0}' crates/helios-firewall/src/ruleset.rs)",
+      "Bash(awk *)"
     ]
   }
 }

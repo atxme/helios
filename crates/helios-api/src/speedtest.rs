@@ -28,6 +28,8 @@ use axum::{
 use futures_util::{stream, StreamExt as _};
 use serde::Deserialize;
 
+use aether::speedtest::Pacer;
+
 use crate::{auth, AppState};
 
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(35);
@@ -259,6 +261,7 @@ fn run_udp_server(
                     session: frame.session,
                     mode: frame.mode,
                     duration: frame.duration,
+                    rate: frame.rate,
                     deadline: None,
                     received_bytes: 0,
                     received_packets: 0,
@@ -290,7 +293,14 @@ fn run_udp_server(
                     let address = session.address;
                     let session_id = session.session;
                     let duration = session.duration;
-                    thread::spawn(move || send_udp_download(sender, address, session_id, duration));
+                    // The rate comes from the HELLO, not the GO: the session
+                    // was admitted on those terms, and reading it back from
+                    // the frame that merely starts the leg would let a peer
+                    // negotiate one rate and then drive another.
+                    let rate = session.rate;
+                    thread::spawn(move || {
+                        send_udp_download(sender, address, session_id, duration, rate)
+                    });
                 }
             }
             aether::speedtest::UDP_KIND_DATA => {
@@ -330,16 +340,26 @@ struct UdpSession {
     session: u64,
     mode: u8,
     duration: u16,
+    /// Rate the download leg is driven at, as requested in the HELLO.
+    rate: u16,
     deadline: Option<Instant>,
     received_bytes: u64,
     received_packets: u64,
 }
 
-fn send_udp_download(socket: UdpSocket, address: SocketAddr, session: u64, duration: u16) {
+fn send_udp_download(
+    socket: UdpSocket,
+    address: SocketAddr,
+    session: u64,
+    duration: u16,
+    rate: u16,
+) {
     let mut packet = vec![0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES];
     let payload_len = packet.len() - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES;
     fill_payload(&mut packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..]);
-    let deadline = Instant::now() + Duration::from_secs(u64::from(duration));
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(u64::from(duration));
+    let mut pacer = Pacer::new(aether::speedtest::decode_rate(rate), packet.len(), started);
     let mut sequence = 0u64;
     let mut bytes = 0u64;
     while Instant::now() < deadline {
@@ -350,12 +370,14 @@ fn send_udp_download(socket: UdpSocket, address: SocketAddr, session: u64, durat
             session,
             sequence,
             duration,
+            rate,
         );
         if socket.send_to(&packet, address).is_err() {
             return;
         }
         sequence = sequence.saturating_add(1);
         bytes = bytes.saturating_add(payload_len as u64);
+        pacer.after_sending(sequence, deadline);
     }
     let mut end_payload = [0u8; 16];
     end_payload[..8].copy_from_slice(&sequence.to_be_bytes());
@@ -397,6 +419,9 @@ fn send_udp_summary(
     );
 }
 
+// A control frame is fully described by its header, and the header has this
+// many fields. Bundling them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 fn send_udp_frame(
     socket: &UdpSocket,
     address: SocketAddr,
@@ -408,7 +433,17 @@ fn send_udp_frame(
     payload: &[u8],
 ) {
     let mut packet = vec![0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES + payload.len()];
-    write_udp_header(&mut packet, kind, mode, session, sequence, duration);
+    // Control frames carry no measured data, so they carry no rate: the field
+    // describes a data leg, and the client already knows what it asked for.
+    write_udp_header(
+        &mut packet,
+        kind,
+        mode,
+        session,
+        sequence,
+        duration,
+        aether::speedtest::SPEEDTEST_RATE_UNPACED,
+    );
     packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..].copy_from_slice(payload);
     let _ = socket.send_to(&packet, address);
 }
@@ -418,6 +453,9 @@ struct UdpFrame<'a> {
     mode: u8,
     session: u64,
     duration: u16,
+    /// Requested sending rate for a data leg, in the header's own unit.
+    /// `SPEEDTEST_RATE_UNPACED` asks the sender not to pace.
+    rate: u16,
     payload: &'a [u8],
 }
 
@@ -433,6 +471,7 @@ fn parse_udp_frame(packet: &[u8]) -> Option<UdpFrame<'_>> {
         mode: packet[10],
         session: u64::from_be_bytes(packet[12..20].try_into().ok()?),
         duration: u16::from_be_bytes(packet[28..30].try_into().ok()?),
+        rate: u16::from_be_bytes(packet[30..32].try_into().ok()?),
         payload: &packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..],
     })
 }
@@ -444,6 +483,7 @@ fn write_udp_header(
     session: u64,
     sequence: u64,
     duration: u16,
+    rate: u16,
 ) {
     packet[..8].copy_from_slice(&aether::speedtest::SPEEDTEST_MAGIC);
     packet[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION;
@@ -453,7 +493,7 @@ fn write_udp_header(
     packet[12..20].copy_from_slice(&session.to_be_bytes());
     packet[20..28].copy_from_slice(&sequence.to_be_bytes());
     packet[28..30].copy_from_slice(&duration.to_be_bytes());
-    packet[30..32].fill(0);
+    packet[30..32].copy_from_slice(&rate.to_be_bytes());
 }
 
 fn tcp_control(
@@ -727,5 +767,66 @@ mod tests {
             .expect("raw listeners must not keep heliosd alive")
             .expect("raw server task")
             .expect("clean raw server shutdown");
+    }
+
+    /// The regression this whole field exists for.
+    ///
+    /// Unpaced, this loop emitted tens of thousands of datagrams a second and
+    /// the client reported ~80 % loss on a healthy tunnel — a ratio between
+    /// two syscall loops, not a property of the path. A leg driven at 1 Mb/s
+    /// owes ~104 datagrams a second, and that is what the sender must produce.
+    #[test]
+    fn a_download_leg_honours_the_rate_it_was_given() {
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("receiver timeout");
+        let target = receiver.local_addr().expect("receiver address");
+
+        let rate = aether::speedtest::encode_rate(1.0);
+        let counter = thread::spawn(move || {
+            let mut packet = [0u8; aether::speedtest::SPEEDTEST_UDP_DATAGRAM_BYTES + 64];
+            let mut data = 0usize;
+            while let Ok(length) = receiver.recv(&mut packet) {
+                if parse_udp_frame(&packet[..length])
+                    .is_some_and(|frame| frame.kind == aether::speedtest::UDP_KIND_DATA)
+                {
+                    data += 1;
+                }
+            }
+            data
+        });
+
+        send_udp_download(sender, target, 7, 1, rate);
+        let observed = counter.join().expect("receiver thread");
+
+        // ~104 expected over one second. The bounds are wide because the
+        // scheduler is not a clock, but three orders of magnitude below the
+        // unpaced blast this replaced.
+        assert!(
+            (40..=400).contains(&observed),
+            "paced leg emitted {observed} datagrams, expected around 104"
+        );
+    }
+
+    /// The rate travels in the header, so a leg that asks for pacing must be
+    /// distinguishable on the wire from one that does not.
+    #[test]
+    fn the_header_carries_the_requested_rate() {
+        let mut packet = vec![0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES];
+        let rate = aether::speedtest::encode_rate(12.5);
+        write_udp_header(
+            &mut packet,
+            aether::speedtest::UDP_KIND_HELLO,
+            aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
+            42,
+            0,
+            10,
+            rate,
+        );
+        let frame = parse_udp_frame(&packet).expect("frame");
+        assert_eq!(frame.rate, rate);
+        assert_eq!(aether::speedtest::decode_rate(frame.rate), Some(12_500_000));
     }
 }

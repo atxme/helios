@@ -12,6 +12,7 @@
 //! HTTP adapter remains only for controlled compatibility tests; Orion's
 //! command never selects it.
 
+use aether::speedtest::Pacer;
 use std::{
     io::{Read as _, Write as _},
     net::{Shutdown, SocketAddr, TcpStream, UdpSocket},
@@ -186,6 +187,11 @@ pub struct SpeedTestResult {
 pub enum SpeedTestError {
     #[error("mode de speedtest invalide : {0}")]
     InvalidMode(String),
+    #[error(
+        "le mode {0} exige un débit de référence : sans mesure TCP préalable, \
+         une perte UDP ne mesure que l'écart entre l'émetteur et le lien"
+    )]
+    MissingQualityRate(&'static str),
     #[error("URL de la gateway invalide : {0}")]
     InvalidUrl(String),
     #[error("transport du speedtest impossible : {0}")]
@@ -235,38 +241,55 @@ pub async fn run() -> Result<SpeedTestResult, SpeedTestError> {
     run_with_progress(
         SpeedTestMode::Full,
         aether::speedtest::SPEEDTEST_DEFAULT_DURATION_SECS,
+        None,
         Arc::new(|_| {}),
     )
     .await
 }
 
 /// Runs the direct TCP/UDP test and streams progress to the caller.
+/// Runs the direct TCP/UDP test and streams progress to the caller.
+///
+/// `quality_rate_mbps` overrides the rate the UDP legs are driven at. Leave it
+/// `None` in [`SpeedTestMode::Full`], where the rate is derived from the TCP
+/// throughput just measured — that is the reference that makes a loss figure
+/// mean something. [`SpeedTestMode::Udp`] has no such reference and therefore
+/// **requires** the override; without it the run is refused rather than
+/// reporting the loss of an unpaced blast.
 pub async fn run_with_progress(
     mode: SpeedTestMode,
     duration_secs: u16,
+    quality_rate_mbps: Option<f64>,
     progress: SpeedTestProgressSink,
 ) -> Result<SpeedTestResult, SpeedTestError> {
     validate_raw_duration(duration_secs)?;
-    tokio::task::spawn_blocking(move || run_raw_blocking(mode, duration_secs, progress))
-        .await
-        .map_err(|error| SpeedTestError::Transport(error.to_string()))?
+    if matches!(mode, SpeedTestMode::Udp) && quality_rate_mbps.is_none() {
+        return Err(SpeedTestError::MissingQualityRate("udp"));
+    }
+    tokio::task::spawn_blocking(move || {
+        run_raw_blocking(mode, duration_secs, quality_rate_mbps, progress)
+    })
+    .await
+    .map_err(|error| SpeedTestError::Transport(error.to_string()))?
 }
 
 fn run_raw_blocking(
     mode: SpeedTestMode,
     duration_secs: u16,
+    quality_rate_mbps: Option<f64>,
     progress: SpeedTestProgressSink,
 ) -> Result<SpeedTestResult, SpeedTestError> {
     let target: SocketAddr = aether::DEFAULT_WG_SPEEDTEST_ADDR
         .parse()
         .map_err(|error| SpeedTestError::InvalidUrl(format!("cible socket invalide : {error}")))?;
-    run_raw_blocking_at(target, mode, duration_secs, progress)
+    run_raw_blocking_at(target, mode, duration_secs, quality_rate_mbps, progress)
 }
 
 fn run_raw_blocking_at(
     target: SocketAddr,
     mode: SpeedTestMode,
     duration_secs: u16,
+    quality_rate_mbps: Option<f64>,
     progress: SpeedTestProgressSink,
 ) -> Result<SpeedTestResult, SpeedTestError> {
     let started = Instant::now();
@@ -315,11 +338,25 @@ fn run_raw_blocking_at(
     } else {
         None
     };
+    // Each quality leg is driven just under the throughput its own direction
+    // reached. Reusing one figure for both would probe a 500/50 line at 425
+    // Mb/s upstream and report the pacer's own loss as the path's.
+    let quality_rate = |measured: Option<&RawMeasurement>| -> Result<f64, SpeedTestError> {
+        match (measured, quality_rate_mbps) {
+            (Some(reference), _) => Ok(aether::speedtest::quality_rate_mbps(reference.mbps)),
+            (None, Some(explicit)) => Ok(aether::speedtest::quality_rate_mbps(explicit)),
+            (None, None) => Err(SpeedTestError::MissingQualityRate("udp")),
+        }
+    };
+    // Shorter than a throughput leg: loss and jitter at a known rate settle in
+    // seconds, and four full-length legs made the run a 80-second wait.
+    let quality_secs = duration_secs.min(aether::speedtest::SPEEDTEST_QUALITY_DURATION_SECS);
     let udp_download = if matches!(mode, SpeedTestMode::Udp | SpeedTestMode::Full) {
         Some(measure_raw_udp(
             target,
             aether::speedtest::SPEEDTEST_MODE_DOWNLOAD,
-            duration_secs,
+            quality_secs,
+            quality_rate(tcp_download.as_ref())?,
             SpeedTestPhase::UdpDownload,
             &progress,
             started,
@@ -331,7 +368,8 @@ fn run_raw_blocking_at(
         Some(measure_raw_udp(
             target,
             aether::speedtest::SPEEDTEST_MODE_UPLOAD,
-            duration_secs,
+            quality_secs,
+            quality_rate(tcp_upload.as_ref())?,
             SpeedTestPhase::UdpUpload,
             &progress,
             started,
@@ -429,7 +467,15 @@ fn measure_raw_latency(target: SocketAddr) -> Result<(f64, f64, f64), SpeedTestE
     let mut response = [0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES];
     for _ in 0..11 {
         let session = next_session();
-        let request = udp_frame(aether::speedtest::UDP_KIND_PING, 0, session, 0, 0, &[]);
+        let request = udp_frame(
+            aether::speedtest::UDP_KIND_PING,
+            0,
+            session,
+            0,
+            0,
+            aether::speedtest::SPEEDTEST_RATE_UNPACED,
+            &[],
+        );
         let started = Instant::now();
         socket.send(&request).map_err(raw_transport)?;
         let length = socket.recv(&mut response).map_err(raw_transport)?;
@@ -634,14 +680,23 @@ fn raw_tcp_stream(
     Ok(bytes)
 }
 
+/// Runs one UDP quality leg at a **known** sending rate.
+///
+/// `rate_mbps` is not a nicety: loss and jitter only describe the path when
+/// the sender's speed is fixed and below capacity. Driven flat out, both ends
+/// report the difference between the sender's syscall loop and the link, which
+/// on a healthy tunnel reads as ~80 % loss. See
+/// [`aether::speedtest::SPEEDTEST_RATE_UNPACED`].
 fn measure_raw_udp(
     target: SocketAddr,
     mode: u8,
     duration_secs: u16,
+    rate_mbps: f64,
     phase: SpeedTestPhase,
     progress: &SpeedTestProgressSink,
     global_started: Instant,
 ) -> Result<RawMeasurement, SpeedTestError> {
+    let rate = aether::speedtest::encode_rate(rate_mbps);
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(raw_transport)?;
     socket.connect(target).map_err(raw_transport)?;
     socket
@@ -655,6 +710,7 @@ fn measure_raw_udp(
             session,
             0,
             duration_secs,
+            rate,
             &[],
         ))
         .map_err(raw_transport)?;
@@ -677,6 +733,7 @@ fn measure_raw_udp(
             session,
             0,
             duration_secs,
+            rate,
             &[],
         ))
         .map_err(raw_transport)?;
@@ -695,6 +752,7 @@ fn measure_raw_udp(
             &socket,
             session,
             duration_secs,
+            rate,
             phase,
             progress,
             global_started,
@@ -805,10 +863,14 @@ fn measure_udp_download(
     Ok(result)
 }
 
+// Session identity, leg shape and progress plumbing, none of which outlive
+// the call: a struct here would be a parameter list with a name.
+#[allow(clippy::too_many_arguments)]
 fn measure_udp_upload(
     socket: &UdpSocket,
     session: u64,
     duration_secs: u16,
+    rate: u16,
     phase: SpeedTestPhase,
     progress: &SpeedTestProgressSink,
     global_started: Instant,
@@ -821,6 +883,7 @@ fn measure_udp_upload(
     packet[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..]
         .copy_from_slice(&payload[..payload_len]);
     let deadline = started + Duration::from_secs(u64::from(duration_secs));
+    let mut pacer = Pacer::new(aether::speedtest::decode_rate(rate), packet.len(), started);
     let mut bytes = 0u64;
     let mut sequence = 0u64;
     let mut last_report = Instant::now();
@@ -832,6 +895,7 @@ fn measure_udp_upload(
             session,
             sequence,
             duration_secs,
+            rate,
         );
         let sent = socket.send(&packet).map_err(raw_transport)?;
         if sent < aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES {
@@ -839,6 +903,7 @@ fn measure_udp_upload(
         }
         sequence = sequence.saturating_add(1);
         bytes = bytes.saturating_add((sent - aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES) as u64);
+        pacer.after_sending(sequence, deadline);
         if last_report.elapsed() >= Duration::from_millis(250) {
             emit_progress(
                 progress,
@@ -859,6 +924,7 @@ fn measure_udp_upload(
             session,
             sequence,
             0,
+            aether::speedtest::SPEEDTEST_RATE_UNPACED,
             &[],
         ))
         .map_err(raw_transport)?;
@@ -898,9 +964,15 @@ fn measure_udp_upload(
             sequence.saturating_sub(packets) as f64 * 100.0 / sequence as f64
         }
     });
+    // The gateway's count, not ours. `bytes` is what this process handed to
+    // `send()`, which the kernel accepts long after the link stopped carrying
+    // it: an upload figure taken from it describes the local socket buffer and
+    // can exceed the line by an order of magnitude. What crossed the tunnel is
+    // what the receiver counted.
+    let delivered = receiver.map(|(received, _)| received).unwrap_or(bytes);
     let result = RawMeasurement {
-        mbps: rate_mbps(bytes, elapsed),
-        bytes,
+        mbps: rate_mbps(delivered, elapsed),
+        bytes: delivered,
         loss_pct,
         jitter_ms: None,
     };
@@ -972,10 +1044,11 @@ fn udp_frame(
     session: u64,
     sequence: u64,
     duration: u16,
+    rate: u16,
     payload: &[u8],
 ) -> Vec<u8> {
     let mut frame = vec![0u8; aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES + payload.len()];
-    write_udp_header(&mut frame, kind, mode, session, sequence, duration);
+    write_udp_header(&mut frame, kind, mode, session, sequence, duration, rate);
     frame[aether::speedtest::SPEEDTEST_UDP_HEADER_BYTES..].copy_from_slice(payload);
     frame
 }
@@ -987,6 +1060,7 @@ fn write_udp_header(
     session: u64,
     sequence: u64,
     duration: u16,
+    rate: u16,
 ) {
     frame[..8].copy_from_slice(&aether::speedtest::SPEEDTEST_MAGIC);
     frame[8] = aether::speedtest::SPEEDTEST_PROTOCOL_VERSION;
@@ -996,7 +1070,7 @@ fn write_udp_header(
     frame[12..20].copy_from_slice(&session.to_be_bytes());
     frame[20..28].copy_from_slice(&sequence.to_be_bytes());
     frame[28..30].copy_from_slice(&duration.to_be_bytes());
-    frame[30..32].fill(0);
+    frame[30..32].copy_from_slice(&rate.to_be_bytes());
 }
 
 fn tcp_control(
@@ -1613,6 +1687,7 @@ mod tests {
                             frame.session,
                             0,
                             0,
+                            aether::speedtest::SPEEDTEST_RATE_UNPACED,
                             &[],
                         ),
                         peer,
@@ -1640,6 +1715,8 @@ mod tests {
             address,
             SpeedTestMode::Tcp,
             1,
+            // No UDP leg runs in this mode, so no reference is needed.
+            None,
             Arc::new(move |update| captured.lock().unwrap().push(update)),
         )
         .expect("raw tcp speedtest");
@@ -1677,6 +1754,7 @@ mod tests {
                             frame.session,
                             0,
                             0,
+                            aether::speedtest::SPEEDTEST_RATE_UNPACED,
                             &[],
                         ),
                         peer,
@@ -1698,6 +1776,7 @@ mod tests {
                         download_session,
                         0,
                         1,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
                         &[],
                     ),
                     peer,
@@ -1722,6 +1801,7 @@ mod tests {
                             download_session,
                             sequence,
                             1,
+                            aether::speedtest::SPEEDTEST_RATE_UNPACED,
                             &payload,
                         ),
                         peer,
@@ -1739,6 +1819,7 @@ mod tests {
                         download_session,
                         sent_packets,
                         1,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
                         &end_payload,
                     ),
                     peer,
@@ -1759,6 +1840,7 @@ mod tests {
                         upload_session,
                         0,
                         1,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
                         &[],
                     ),
                     peer,
@@ -1791,6 +1873,7 @@ mod tests {
                         upload_session,
                         received_packets,
                         0,
+                        aether::speedtest::SPEEDTEST_RATE_UNPACED,
                         &summary,
                     ),
                     peer,
@@ -1798,8 +1881,11 @@ mod tests {
                 .expect("upload summary");
         });
 
-        let result = run_raw_blocking_at(address, SpeedTestMode::Udp, 1, Arc::new(|_| {}))
-            .expect("raw udp speedtest");
+        // UDP alone has no TCP throughput to pace against, so the reference
+        // is supplied explicitly — the engine refuses the mode without one.
+        let result =
+            run_raw_blocking_at(address, SpeedTestMode::Udp, 1, Some(50.0), Arc::new(|_| {}))
+                .expect("raw udp speedtest");
         server.join().expect("udp server");
 
         assert_eq!(result.mode, SpeedTestMode::Udp);

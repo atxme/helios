@@ -38,11 +38,13 @@ const result: SpeedTestResult = {
   latency_ms: 12.4,
   jitter_ms: 1.2,
   latency_p95_ms: 18.7,
-  mode: 'udp',
-  tcp_download_mbps: null,
-  tcp_upload_mbps: null,
-  udp_download_mbps: 123.4,
-  udp_upload_mbps: 45.6,
+  mode: 'full',
+  tcp_download_mbps: 123.4,
+  tcp_upload_mbps: 45.6,
+  // The quality legs run just under the TCP figures: they report loss, not
+  // capacity, and the screen must never show them as the line rate.
+  udp_download_mbps: 104.9,
+  udp_upload_mbps: 38.8,
   udp_loss_pct: 0.4,
   udp_jitter_ms: 0.9,
   tcp_streams: 4,
@@ -86,11 +88,11 @@ describe('SpeedTestView', () => {
   })
 
   /**
-   * WireGuard carries UDP only, so the screen no longer asks. The mode is not
-   * merely a default here: there is no control left that could change it, and
-   * a run that went out as `tcp` or `full` would double its own duration.
+   * The transport question is gone from the screen, but the measurement still
+   * needs TCP: only congestion control finds a line's capacity. A run sent as
+   * `udp` reports the sender's own syscall loop and ~80 % loss.
    */
-  it('measures UDP without offering a transport choice', async () => {
+  it('measures both transports without offering a choice', async () => {
     api.runSpeedTest.mockResolvedValue(result)
     render(<SpeedTestView state="up" profile={profile} />)
 
@@ -99,7 +101,7 @@ describe('SpeedTestView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
 
-    await waitFor(() => expect(api.runSpeedTest).toHaveBeenCalledWith('udp'))
+    await waitFor(() => expect(api.runSpeedTest).toHaveBeenCalledWith('full'))
   })
 
   /**
@@ -108,7 +110,7 @@ describe('SpeedTestView', () => {
    * has to stay legible once emission takes over, and «TCP montant» must
    * never reach the user.
    */
-  it('keeps both directions on screen and names them by direction', async () => {
+  it('holds the throughput figures through the quality legs', async () => {
     const sinks: ((update: SpeedTestProgress) => void)[] = []
     api.onSpeedTestProgress.mockImplementation((cb) => {
       sinks.push(cb)
@@ -128,30 +130,45 @@ describe('SpeedTestView', () => {
     await waitFor(() => expect(sinks.length).toBe(1))
 
     emit({
-      phase: 'udp_download',
+      phase: 'tcp_download',
       fraction: 0.5,
       current_mbps: 90.5,
       bytes: 1024,
-      elapsed_ms: 10_000,
-      message: 'UDP descendant · perte et jitter',
+      elapsed_ms: 5_000,
+      message: 'TCP descendant · flux continus',
     })
     expect(screen.getByText('90,5 Mb/s')).toBeTruthy()
 
     emit({
-      phase: 'udp_upload',
+      phase: 'tcp_upload',
       fraction: 0.25,
       current_mbps: 30.25,
       bytes: 2048,
-      elapsed_ms: 25_000,
-      message: 'UDP montant · perte et jitter',
+      elapsed_ms: 12_000,
+      message: 'TCP montant · flux continus',
     })
 
     // Reception keeps the figure it reached; emission shows its own.
     expect(screen.getByText('30,3 Mb/s')).toBeTruthy()
     expect(screen.getByText('90,5 Mb/s')).toBeTruthy()
-    expect(screen.queryByText(/UDP montant/)).toBeNull()
+    expect(screen.queryByText(/TCP montant/)).toBeNull()
     // Twice: the dial names the phase it is metering, the row names its own.
     expect(screen.getAllByText('Émission')).toHaveLength(2)
+
+    // The quality leg runs *below* the rate TCP just found. Letting its
+    // progress reach the rows would walk the reading down and then snap it
+    // back when the result lands.
+    emit({
+      phase: 'udp_upload',
+      fraction: 0.5,
+      current_mbps: 25.7,
+      bytes: 4096,
+      elapsed_ms: 24_000,
+      message: 'UDP montant · perte et jitter',
+    })
+    expect(screen.queryByText('25,7 Mb/s')).toBeNull()
+    expect(screen.getByText('30,3 Mb/s')).toBeTruthy()
+    expect(screen.getByText('Qualité')).toBeTruthy()
   })
 
   it('surfaces a gateway refusal without leaving the button stuck', async () => {
