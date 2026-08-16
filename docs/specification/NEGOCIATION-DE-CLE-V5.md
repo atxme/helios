@@ -575,8 +575,14 @@ source d'entropie plateforme fail-closed
 ```
 
 Deux mécanismes seulement sont admis : **HMAC-DRBG-SHA-512** ou
-**CTR-DRBG-AES-256 avec fonction de dérivation activée** (`use_df = true`). Ils
-fournissent une force de sécurité de 256 bits. Le mécanisme vient de la
+**CTR-DRBG-AES-256**. Ils fournissent une force de sécurité de 256 bits. Pour
+CTR-DRBG, deux instanciations sont acceptables et une seule doit être annoncée :
+avec **fonction de dérivation** (`use_df = true`, SP 800-90Ar1 §10.2.1.3.2), ou
+avec une **entrée d'entropie pleine** d'exactement un `seedlen`
+(§10.2.1.3.1) — le cas que la fonction de dérivation existe pour éviter, et
+qu'un fournisseur alimenté par une source de pleine entropie satisfait. Le
+démarrage annonce laquelle est en service ; il n'existe pas de troisième forme,
+ni d'annonce par défaut. Le mécanisme vient de la
 bibliothèque cryptographique du projet, pas d'un générateur écrit ici : Helios,
 Orion et leurs caisses communes ne réimplémentent ni DRBG, ni dérivation de
 seed, ni tests de santé. Une adaptation de type et de configuration est admise
@@ -2655,9 +2661,9 @@ déclarer la v5 implémentée.
   cryptographique, refusant toute sortie après échec de la source plateforme ou
   du reseed, avec au plus `2^20` appels entre deux apports d'entropie,
   réinstanciation ou reseed dans l'enfant après fork, et aucun octet partiel
-  rendu en erreur ; fournisseur absent, CTR-DRBG sans DF et DRBG applicatif
-  maison refusés ; une valeur nulle filtrée ne compte jamais comme un succès du
-  générateur ;
+  rendu en erreur ; fournisseur absent, CTR-DRBG ni dérivé ni semé en pleine
+  entropie, et DRBG applicatif maison refusés ; une valeur nulle filtrée ne
+  compte jamais comme un succès du générateur ;
 - horodatages `0`, `u64::MAX`, juste dans et juste hors de la fenêtre : aucun
   overflow ni panic, résultat déterministe ;
 - `confirmation_timeout_secs` hors de `[1, 45]` refusé par Orion, même signé ;

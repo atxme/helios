@@ -287,7 +287,10 @@ source d'entropie plateforme fail-closed
 Deux mécanismes seulement sont admis :
 
 - **HMAC-DRBG-SHA-512** ;
-- **CTR-DRBG-AES-256 avec fonction de dérivation activée** (`use_df = true`).
+- **CTR-DRBG-AES-256**, soit avec fonction de dérivation (`use_df = true`,
+  SP 800-90Ar1 §10.2.1.3.2), soit avec une entrée d'entropie pleine
+  d'exactement un `seedlen` (§10.2.1.3.1). Le démarrage annonce laquelle est en
+  service.
 
 Le mécanisme fournit une force de sécurité de 256 bits et vient de la
 bibliothèque cryptographique du projet. Le choix est local, explicite et
@@ -2850,7 +2853,8 @@ qu'il sert.
   plateforme/reseed, avec au plus
   `2^20` appels entre deux apports d'entropie, réinstanciation ou reseed dans
   l'enfant après fork et aucun octet partiel écrit ; fournisseur absent,
-  CTR-DRBG sans DF et DRBG applicatif maison refusés ;
+  CTR-DRBG ni dérivé ni semé en pleine entropie, et DRBG applicatif maison
+  refusés ;
 - identifiants et challenges nuls refusés à la réception, sans que le test de
   non-nullité puisse remplacer les garanties du fournisseur ;
 - route veth incapable d'atteindre un pair, le plan de données, les coffres ou
