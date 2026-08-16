@@ -68,8 +68,14 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > WireGuard de la requête étant vérifiée contre le pair résolu au lieu de
 > servir elle-même de clé de recherche.
 >
-> **Ce qui n'est pas implémenté**, au 2026-08-08 :
+> **Ce qui n'est pas implémenté**, au 2026-08-16 :
 >
+> - l'**alignement cryptographique du 16 août** : les signatures ML-DSA-87
+>   emploient encore un `ctx` FIPS 204 vide au lieu du contexte non vide fixé
+>   par type au §8, et les appels au CSPRNG système ne matérialisent pas encore
+>   l'état HMAC-DRBG-SHA-512, son reseed et ses erreurs fermes du §4.3. Le
+>   préfixe présent dans les octets signés et la qualité du CSPRNG sous-jacent
+>   ne rendent pas ces deux contrats implicitement satisfaits ;
 > - le **discriminant de type de profil Orion**
 >   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
 >   `classic` est bien refusé à la validation d'une requête v5 et à la
@@ -549,15 +555,37 @@ clés ML-KEM et ML-DSA — suit le même pipeline :
 TRNG matériel  →  seed / reseed  →  DRBG approuvé  →  octets consommés
 ```
 
-Le TRNG fournit l'entropie de démarrage et de réensemencement. Un DRBG ou
-CSPRNG approuvé produit ensuite les octets. Il n'est **pas** exigé que les
-32 octets d'un PSK soient lus directement d'une source matérielle : les
-standards NIST distinguent explicitement source d'entropie et générateur
-déterministe, et le bon modèle est celui ci-dessus.
+Le DRBG approuvé est **HMAC-DRBG-SHA-512**. Un processus n'émet un identifiant,
+une clé, un PSK ou un challenge que si son DRBG est à l'état `instantiated` et
+que sa dernière opération d'apport d'entropie TRNG — instanciation initiale ou
+reseed — a réussi. Sinon l'appel retourne une erreur fatale et n'écrit aucun
+octet de sortie.
 
-Un échec du TRNG, un échec de seed ou de reseed, ou un échec du test de santé
-de la source d'entropie est une **erreur ferme**. Aucun repli vers une source
-plus faible, aucune dégradation silencieuse, aucune génération « au mieux ».
+```text
+instantiate : entropy_input >= 32 octets issus du TRNG plateforme
+              + nonce >= 16 octets issu d'un tirage distinct
+reseed      : au moins toutes les 2^20 générations, après chaque fork,
+              et avant toute génération de clé privée ML-DSA-87, ML-KEM
+              ou TLS
+generate    : prediction_resistance = true pour une clé privée ;
+              false admis pour un transaction_id, nonce ou challenge public
+```
+
+Une « génération » est un appel au DRBG, indépendamment du nombre d'octets
+demandé. Le compteur est remis à zéro après instanciation ou reseed ; au plus
+`2^20` appels `generate` sont permis avant le reseed suivant, et l'appel qui
+dépasserait cette borne échoue sans sortie. Dans le processus enfant d'un fork,
+l'état hérité est invalide et aucune sortie n'est permise avant reseed. Il
+n'est **pas** exigé que les 32 octets d'un PSK soient lus directement du TRNG :
+les standards NIST distinguent source d'entropie et générateur déterministe, et
+le bon modèle est celui ci-dessus.
+
+Un identifiant, nonce ou challenge entièrement nul est refusé à la réception,
+mais ce contrôle ne remplace pas le DRBG : un générateur défaillant n'a pas le
+droit de produire puis filtrer la valeur. Un échec du TRNG, de son test de
+santé, d'instanciation, de reseed ou de génération est une **erreur ferme**.
+Aucun repli vers l'heure, un UUID, un PRNG généraliste ou un compteur, aucune
+sortie partielle et aucune génération « au mieux ».
 
 ### 4.4 Niveau post-quantique
 
@@ -1017,6 +1045,26 @@ sa révocation ou son échéance. Voir
 
 Les signatures ML-DSA utilisent une sérialisation binaire dédiée. Le JSON ne
 sert jamais de message signé.
+
+Elles emploient **ML-DSA pur** de FIPS 204, jamais HashML-DSA. Le paramètre
+externe `ctx` est non vide et vaut exactement le domaine ASCII du type, sans
+NUL final, normalisation ni encodage de longueur :
+
+| Type | `ctx` ML-DSA-87 exact |
+| --- | --- |
+| certificat PQ v2 | `helios-key-negotiation-pq-certificate-v2` |
+| requête v5 | `helios-key-negotiation-pq-request-v5` |
+| réponse v5 | `helios-key-negotiation-pq-response-v5` |
+| confirmation v5 | `helios-key-negotiation-pq-confirmation-v5` |
+| commit v5 | `helios-key-negotiation-pq-commit-v5` |
+| libération in-tunnel v5 | `helios-key-negotiation-pq-in-tunnel-release-v5` |
+
+Le message `M` conserve ce même domaine comme préfixe : `ctx` et le préfixe
+interne sont deux contrôles distincts. Les deux signatures d'un même type
+emploient le même contexte quelle que soit la clé signataire, notamment
+lorsque `CA-PQ` émet un certificat. Un `ctx` vide, celui d'un autre type ou une
+signature HashML-DSA sont refusés. Une bibliothèque qui ne sait pas passer le
+contexte externe est non conforme ; préfixer seulement `M` ne l'émule pas.
 
 Les entiers sont big-endian. Les champs de longueur sont des `u32`. Un champ
 optionnel est encodé par :
@@ -2556,6 +2604,14 @@ déclarer la v5 implémentée.
 - refus de clés ML-KEM de 1568 octets qui échouent au contrôle d'entrée FIPS
   203, de ciphertexts non valides et des représentations base64/hex non
   canoniques ;
+- chaque certificat et message ML-DSA-87 accepté avec le `ctx` exact de §8,
+  puis refusé avec `ctx = ""`, le contexte d'un autre type, un NUL final ou
+  HashML-DSA, y compris sous une signature `CA-PQ` cryptographiquement valide ;
+- HMAC-DRBG-SHA-512 refusant toute sortie avant instanciation ou après échec du
+  TRNG/reseed, au plus `2^20` appels entre deux apports d'entropie et reseed
+  dans l'enfant après fork, `prediction_resistance = true` avant toute clé
+  privée et aucun octet partiel rendu en erreur ; une valeur nulle filtrée ne
+  compte jamais comme un succès du générateur ;
 - horodatages `0`, `u64::MAX`, juste dans et juste hors de la fenêtre : aucun
   overflow ni panic, résultat déterministe ;
 - `confirmation_timeout_secs` hors de `[1, 45]` refusé par Orion, même signé ;

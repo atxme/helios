@@ -1,9 +1,10 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
 **Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
-(revu le 2026-08-09, amendé le 2026-08-15). Le protocole de négociation servi
-est déjà la v5. Le §12.3 nomme précisément ce qui est livré et ce qui ne l'est
-pas ; ne pas lire le reste de la note comme une capacité disponible.
+(revu le 2026-08-09, amendé les 2026-08-15 et 2026-08-16). Le protocole de
+négociation servi est déjà la v5. Le §12.3 nomme précisément ce qui est livré
+et ce qui ne l'est pas ; ne pas lire le reste de la note comme une capacité
+disponible.
 
 Le lot livré ferme le chemin « demande → autorisation → persistance gateway →
 reçu → grant → commit » et le branche au démon. Ce qui manque est
@@ -59,7 +60,7 @@ de rotation de parc défini ci-dessous.
 | exploitation | coordinateur Astra co-implanté dans un conteneur séparé sur la gateway ; opérations ordinaires relayées de WireGuard vers un veth privé mTLS, HTTPS public réservé aux chemins sans tunnel et aux campagnes opérateur hors tunnel |
 | garde des CA | clés maîtresses `CA-PQ` et `CA-TLS` dans un coffre HVLT chiffré ; déverrouillage hors de la gateway par une YubiKey opérateur |
 | émission ordinaire | clé Astra déléguée, bornée à une gateway, un domaine, une fenêtre et aux leafs de pairs déjà admis ; émission impossible sans approbation YubiKey liée à la demande exacte |
-| YubiKey | deux credentials matériels 1-sur-N au bootstrap ; une présence obligatoire par renouvellement, récupération expirée, rollback ou campagne manuelle ; ce modèle mono-opérateur n'est pas un quorum humain |
+| YubiKey | deux credentials matériels 1-sur-N au bootstrap ; un credential actif pour un renouvellement client ordinaire, une récupération expirée avec continuité ou un rollback ; deux credentials actifs distincts pour une ancre, `trust_authorities` ou une réadmission sans continuité ; une campagne applique le maximum exigé par ses cibles ; ce modèle mono-opérateur n'est pas un quorum humain |
 | renouvellement | préparation planifiée à 80 % de la validité écoulée, puis état `awaiting_operator` jusqu'à une approbation YubiKey ; aucune émission silencieuse |
 | expiration | une leaf expirée reste refusée par la négociation ; elle peut seulement prouver une continuité historique dans la récupération Astra |
 | rotation de `CA-PQ` | transition signée par l'ancienne **et** la nouvelle CA, générations consécutives |
@@ -115,6 +116,32 @@ Le veth conserve TLS 1.3 mTLS même avec deux adresses IP statiques : cette
 protection authentifie les processus et protège les captures, tandis que les
 signatures applicatives portent l'autorisation. DNS et certificat HTTPS public
 ne participent pas à ce lien privé.
+
+### 0.5 Fermeture de la revue de cohérence du 16 août 2026
+
+La projection opérationnelle est alignée sur l'amendement précédent :
+
+- le stage ordinaire suit un seul flux, Astra → Helios sur le veth ; Orion ne
+  transporte jamais `ClientCertificateStageAuthorization` ;
+- le reçu Helios atteste un candidat `pending_grant`, pas un slot `next` ; seul
+  `ClientCertificateStageCommit` crée `next_committed` ;
+- la requête de confiance distingue le snapshot TLS/PQ actif de l'empreinte de
+  la leaf PQ effectivement présentée ;
+- la révocation gateway vise une empreinte depuis toute phase : atteindre
+  l'active rend l'identité terminale, atteindre seulement la suivante retire
+  le candidat sans révoquer l'active.
+
+La même revue fixe l'époque candidate gateway, l'égalité
+`retire_active_at = transition.not_after`, les sous-ensembles d'état par
+famille, les champs de l'avortement, les versions de la récupération et la
+cérémonie unique qui lie son approbation à l'ouverture du coffre.
+
+Elle ferme aussi les contrats cryptographiques laissés implicites : chaque
+empreinte gateway optionnelle possède son propre discriminant `0|1`, chaque
+type signé possède un `ctx` ML-DSA-87 non vide et exhaustivement fixé, HVLT v1
+fixe AEAD, KDF, sels et AAD, la politique Astra est épinglée hors bande, les
+capacités du compagnon ont un format HKDF/HMAC exact et tout aléa suit le
+pipeline TRNG → HMAC-DRBG-SHA-512 de la négociation v5.
 
 ## 1. Périmètre
 
@@ -184,6 +211,108 @@ et prouve sa propre possession par une seconde signature.
 Toutes les empreintes occupent 32 octets dans les données signées et sont
 rendues en hexadécimal minuscule dans JSON.
 
+#### 2.3.1 Contexte ML-DSA-87
+
+Toute signature ML-DSA-87 de ce cycle emploie **ML-DSA pur** de FIPS 204, avec
+un contexte externe non vide. HashML-DSA est interdit : ni le signataire ni le
+vérificateur ne préhachent le message par une variante HashML-DSA.
+
+Pour chaque type, `ctx` est exactement la chaîne ASCII qui ouvre sa
+transcription canonique, par exemple
+`helios-gateway-identity-transition-v5`. Elle est passée telle quelle à
+`ML-DSA.Sign`/`ML-DSA.Verify`, sans NUL final, normalisation ni encodage de
+longueur, et sa longueur doit être comprise entre 1 et 255 octets. Le message
+`M` conserve aussi ce même préfixe comme premiers octets de sa transcription :
+le contexte externe et le préfixe interne sont deux contrôles distincts.
+
+Le tableau suivant est exhaustif. Deux signatures portant le même type d'objet
+emploient le même contexte, même lorsqu'elles sont produites par des clés
+différentes :
+
+| Type signé ou preuve signée | `ctx` ML-DSA-87 exact |
+| --- | --- |
+| `TrustBaseState` | `helios-trust-base-state-v5` |
+| `GatewayCertificateRequest` | `helios-gateway-certificate-request-v5` |
+| `GatewayIdentityTransition` | `helios-gateway-identity-transition-v5` |
+| `GatewayTransitionAbort` | `helios-gateway-identity-transition-abort-v5` |
+| `ClientCertificateRotationRequest` | `helios-client-certificate-rotation-request-v5` |
+| `ClientCertificateStageAuthorization` | `helios-client-certificate-stage-authorization-v5` |
+| `GatewayCertificateStageReceipt` | `helios-gateway-certificate-stage-receipt-v5` |
+| `ClientCertificateRotationGrant` | `helios-client-certificate-rotation-grant-v5` |
+| `ClientCertificateStageCommit` | `helios-client-certificate-stage-commit-v5` |
+| `ExpiredCertificateRecoveryRequest` | `helios-expired-client-certificate-recovery-request-v5` |
+| `AstraCredentialBinding` | `helios-astra-credential-binding-v5` |
+| `AstraCredentialApprovalRequest` | `helios-astra-credential-approval-request-v5` |
+| `AstraRenewalApproval` | `helios-astra-renewal-approval-v5` |
+| `AstraIssuerAuthorization` | `helios-astra-issuer-authorization-v5` |
+| `AuthenticatedTrustUpdateRequest` | `helios-in-tunnel-trust-update-request-v5` |
+| `TrustUpdateTransactionManifest` | `helios-trust-update-transaction-manifest-v5` |
+| `TrustUpdateChunk` | `helios-trust-update-chunk-v5` |
+| `OrionTrustUpdateDocument` | `helios-orion-trust-update-document-v5` |
+| `AstraCertificateStatus` | `helios-astra-certificate-status-v5` |
+| requête authentifiée de statut | `helios-astra-certificate-status-query-v5` |
+| `AstraSignerRequest` | `helios-astra-signer-request-v5` |
+| `CertificateServiceRollbackAuthorization` | `helios-certificate-service-rollback-authorization-v5` |
+| `CaTransition`, pour chacune des deux signatures | `helios-ca-transition-v5` |
+| `ClientTlsCaTransition` | `helios-client-tls-ca-transition-v5` |
+| `AstraServiceKeyTransition`, pour chacune des trois signatures | `helios-astra-service-key-transition-v5` |
+| `EmergencyAstraServiceKeyReplacement`, pour chacune de ses signatures | `helios-astra-service-key-emergency-replacement-v5` |
+| `CertificateEmergencyRevocation` | `helios-certificate-emergency-revocation-v5` |
+
+Le `ctx` est indépendant des octets `M` : chacun des domaines ci-dessus reste
+aussi le préfixe de la transcription canonique correspondante. Un type absent
+du tableau est non signable jusqu'à un amendement de version. Une bibliothèque
+qui ne permet que `ctx = ""` ne peut pas émuler cette exigence en préfixant le
+message : elle est non conforme. En particulier, toute signature produite par
+`CA-PQ` avec un contexte vide est refusée.
+
+Les domaines `helios-astra-client-renewal-approval-v5`,
+`helios-astra-expired-recovery-approval-v5` et
+`helios-astra-rotation-campaign-approval-v5` forment des challenges WebAuthn
+hachés ; `helios-astra-issuance-policy-v1` forme une empreinte et
+`helios-astra-capability-token-v1` dérive une clé MAC. Aucun n'est un `ctx`
+ML-DSA par lui-même.
+
+#### 2.3.2 Aléa
+
+Les identifiants, challenges, sels, nonces, secrets de capacité et clés privées
+de ce cycle suivent la même règle que la négociation v5 :
+
+```text
+TRNG plateforme -> seed / reseed -> HMAC-DRBG-SHA-512 -> octets consommés
+```
+
+Un processus n'émet un identifiant, une clé ou un challenge que si son
+HMAC-DRBG est à l'état `instantiated` et que sa dernière opération d'apport
+d'entropie TRNG — instanciation initiale ou reseed — a réussi. Sinon l'appel
+retourne une erreur fatale et n'écrit aucun octet de sortie.
+
+```text
+instantiate : entropy_input >= 32 octets issus du TRNG plateforme
+              + nonce >= 16 octets issu d'un tirage distinct
+reseed      : au moins toutes les 2^20 générations, après chaque fork,
+              et avant toute génération de clé privée ML-DSA-87, ML-KEM
+              ou TLS
+generate    : prediction_resistance = true pour une clé privée ;
+              false admis pour un request_id ou un identifiant public
+```
+
+Une « génération » désigne un appel au DRBG, quelle que soit la longueur
+demandée. Le compteur est remis à zéro après instanciation ou reseed ; au plus
+`2^20` appels `generate` sont permis avant le reseed suivant, et l'appel qui
+dépasserait cette borne échoue sans sortie. Dans le processus enfant d'un fork,
+l'état hérité est immédiatement invalide et aucun octet n'est rendu avant
+reseed. Un échec de test de santé du TRNG, d'instanciation, de reseed ou de
+génération est ferme ; il n'existe ni repli vers l'heure, un UUID, un PRNG
+généraliste ou un compteur, ni sortie partielle.
+
+Un `request_id`, `operation_id`, `stage_id`, `transaction_id`, `vault_id`,
+`slot_id`, challenge ou nonce entièrement nul est refusé à la réception. Ce
+contrôle de forme ne remplace jamais le DRBG : un générateur défaillant n'a pas
+le droit de produire puis de filtrer la valeur. Les octets AEAD, sels HVLT et
+clés maîtresses suivent la même règle, avec `prediction_resistance = true`
+pour toute clé ou secret durable.
+
 ### 2.4 Identité Astra et liaison aux YubiKeys
 
 Chaque profil Helios contient :
@@ -192,6 +321,7 @@ Chaque profil Helios contient :
 AstraProfile {
     authority_url: HttpsUrl,
     webauthn_rp_id: DnsName,
+    astra_policy_fingerprint: [u8; 32],
     active_astra_service_public_key: MlDsa87PublicKey,
     next_astra_service_public_key: Option<MlDsa87PublicKey>,
     astra_service_key_epoch: u64,
@@ -200,6 +330,38 @@ AstraProfile {
     service_key_retire_active_at: Option<u64>
 }
 ```
+
+`astra_policy_fingerprint` n'est pas appris depuis une délégation. Il est remis
+dans le document d'enrôlement, affiché avec l'empreinte `CA-PQ`, confirmé hors
+bande par l'opérateur puis scellé dans le profil Orion et dans le registre
+Helios. Il est non nul et vaut SHA-256 de :
+
+```text
+"helios-astra-issuance-policy-v1"
+|| format_version:u16=1
+|| trust_domain_id:16
+|| gateway_wg_public_key:32
+|| len(server_name):u32 || server_name
+|| allowed_usage:u8=1
+|| maximum_leaf_lifetime_secs:u64
+|| maximum_stage_lease_secs:u64
+|| maximum_overlap_secs:u64
+|| renewal_start_percent:u8=80
+|| ordinary_approval_credentials:u8=1
+|| expired_recovery_credentials:u8
+|| authority_mutation_credentials:u8=2
+```
+
+`maximum_stage_lease_secs` est compris entre 1 et 86 400,
+`maximum_overlap_secs` entre 1 et 2 592 000, et
+`expired_recovery_credentials` vaut 1 ou 2. La valeur `allowed_usage = 1`
+signifie uniquement `operator_approved_admitted_client_leaf_renewal`. La
+délégation `AstraIssuerAuthorization`, toute campagne et tout grant doivent
+porter cette
+empreinte exacte ; Helios et Orion la comparent au pin avant de vérifier les
+droits délégués. Une signature `CA-PQ` sur une autre politique ne remplace pas
+ce pin. La v1 ne définit pas de transition en ligne de politique : la modifier
+exige un document de profil réémis et une nouvelle confirmation hors bande.
 
 `authority_url` est l'origine HTTPS de récupération et d'exploitation hors
 tunnel, distincte de l'API Helios et du port QUIC. Elle n'est jamais utilisée
@@ -259,6 +421,75 @@ contre un poste qui extrait la CA après un déverrouillage légitime. Les IHM e
 l'ADR doivent l'appeler « confirmation par deux clés », jamais « M-sur-N » ou
 « double contrôle ». Un vrai seuil impose des parts cryptographiques et des
 identités d'opérateurs distinctes ; il reste hors de la v1.
+
+#### 2.4.1 Format cryptographique du coffre HVLT
+
+Le document `AuthorityVault` est un JSON strict qui transporte des conteneurs
+binaires HVLT v1 en base64. Chaque conteneur suit exactement :
+
+```text
+HVLT || version:u8=1 || kdf_id:u8 || domain_len:u8 || context_len:u16be
+     || domain || object_context || kdf_salt:16 || nonce:12
+     || ciphertext || tag_AES_GCM:16
+
+AAD = "helios-vault/v1" || tous les octets de l'en-tête,
+      depuis HVLT jusqu'au nonce inclus
+AEAD = AES-256-GCM
+```
+
+Une version, un KDF ou une longueur inconnus sont refusés ; chaque conteneur
+binaire HVLT est borné à 256 Kio avant allocation. Le nonce de 96 bits et
+chaque sel interne de 16 octets proviennent du DRBG de §2.3.2 et sont neufs à
+chaque scellement. Une même clé AES ne réalise jamais plus de `2^32`
+scellements.
+
+Le contexte est une suite de champs sans ambiguïté :
+
+```text
+label_len:u8 || label_ASCII || value_len:u32be || value
+```
+
+L'ordre des champs fait partie du contexte. Deux usages emploient les règles
+suivantes :
+
+| Conteneur | `domain` | KDF et clé | `object_context` |
+| --- | --- | --- | --- |
+| `KeySlot.wrapped_master` | `helios/astra-authority-slot/v1` | `kdf_id = 3`, HKDF-SHA-256 ; IKM = sortie PRF/`hmac-secret` de 32 octets ; sel = `kdf_salt` propre à ce slot et à ce scellement ; `info = "helios/astra-authority-slot-wrapping/v1"` ; sortie 32 octets | `vault = vault_id`, puis `slot = slot_id` |
+| `sealed_payload` | `helios/astra-authority-payload/v1` | `kdf_id = 0`, clé brute = clé maîtresse aléatoire de 32 octets ; le `kdf_salt` reste présent et authentifié mais n'entre pas dans la dérivation | `vault = vault_id`, puis `domain = trust_domain_id`, puis `slots = slot_table_digest` |
+
+Le sel WebAuthn de 32 octets porté en clair par `AuthorityVault.salt` est tiré
+une fois **par coffre** et remis à l'extension PRF/`hmac-secret`. Il n'est pas
+le `kdf_salt` HVLT : chaque credential possède son propre secret interne et
+chaque `wrapped_master` possède en plus son sel HKDF frais de 16 octets. Un sel
+WebAuthn par slot empêcherait de résoudre le credential et dériver son secret
+dans une seule assertion sans ajouter d'isolation cryptographique utile.
+
+`slot_table_digest` vaut SHA-256 de la forme suivante, les lignes étant triées
+lexicographiquement par `slot_id` :
+
+```text
+slot_count:u32be
+|| repeated(
+     slot_id:16
+     || len(credential_id_base64):u32be || credential_id_base64
+     || len(wrapped_master_base64):u32be || wrapped_master_base64
+   )
+```
+
+Le tag de chaque slot authentifie son en-tête complet, son contexte et la clé
+maîtresse enveloppée. Le tag du payload authentifie son en-tête complet, les
+clés privées, la copie scellée de la clé publique `CA-PQ`, le domaine, le
+`vault_id` et le digest exact de la table de slots. Après ouverture, la copie
+publique `ca_pq_public_key` doit égaler la copie scellée. `rp_id`, le sel
+WebAuthn et `credential_id` participent nécessairement à l'obtention du secret
+qui ouvre le slot ; leur modification fait échouer l'ouverture.
+
+`label`, `role`, `enrolled_at` et `created_at` sont des métadonnées
+opérationnelles en clair et ne prennent part ni au contexte AEAD ni à une
+décision d'autorisation ; aucune règle de sécurité ne peut les consulter.
+Renommer un slot ne rescelle donc pas le coffre. L'empreinte du document complet
+permet de détecter leur modification dans un relais ou une sauvegarde, mais ne
+les transforme pas en autorité cryptographique.
 
 Une opération nécessitant la clé maîtresse transporte une requête pour le
 compagnon local :
@@ -429,6 +660,19 @@ d'une tentative annulée. `last_aborted_transition` suffit à rendre idempotent
 le dernier avortement ; toute époque plus ancienne est déjà refusée par le
 compteur de décision.
 
+Dans une demande ou une transition, le champ filaire
+`gateway_identity_epoch` nomme l'époque **candidate**, donc la décision
+`gateway_decision_epoch + 1`; il ne prétend pas nommer la leaf encore servie.
+Un avortement consomme cette époque sans modifier
+`active_gateway_identity_epoch`. Les époques des leafs effectivement promues
+peuvent par conséquent contenir des trous, tandis que les décisions restent
+strictement séquentielles.
+
+Quand un slot suivant existe, `retire_active_at` n'est pas une seconde source
+de calendrier : il vaut obligatoirement le `not_after` de la transition exacte
+qui a créé ce slot. Il est absent avec le slot suivant et est effacé avec lui à
+l'avortement, la révocation ou la promotion.
+
 ### 3.3 État client dans l'admission
 
 TLS et PQ forment une **génération indivisible** :
@@ -460,6 +704,14 @@ ClientCertificatePendingStage {
     stage_expires_at: u64
 }
 ```
+
+Ce type est partagé, mais ses états sont propres au détenteur. Helios ne
+persiste qu'un `pending_grant` et le conserve ainsi jusqu'au commit ; Orion ne
+passe son candidat à `pending_commit` qu'après avoir vérifié et persisté le
+grant. Le champ `next` signifie normativement `next_committed` : aucun reçu,
+grant ou écoulement du temps ne le renseigne. Quand il existe,
+`retire_active_at` vaut exactement le `not_after` de la fenêtre du grant qui a
+été committé.
 
 La gateway ne traite pas les empreintes TLS et PQ comme deux ensembles
 indépendants. Une connexion mTLS reconnue sous la génération `N+1` doit
@@ -501,7 +753,7 @@ AstraIssuerState {
 | `tls_intermediate_certificate` | CA intermédiaire, usage client-auth seulement |
 | `allowed_usage` | valeur unique `operator_approved_admitted_client_leaf_renewal` |
 | `maximum_leaf_lifetime_secs` | positive et bornée par la politique du domaine |
-| `policy_fingerprint` | SHA-256 de la politique canonique Astra |
+| `policy_fingerprint` | pin exact `astra_policy_fingerprint` de §2.4 |
 | `not_before`, `not_after` | fenêtre de délégation positive |
 | `ca_pq_signature` | signature par `CA-PQ` |
 | `ca_tls_signature` | chaîne TLS depuis `CA-TLS` |
@@ -524,7 +776,8 @@ La signature PQ couvre :
 
 Une leaf ou un grant signé par Astra transporte l'autorisation complète et
 `issuer_epoch`. Le vérificateur contrôle d'abord `CA-PQ`, puis la portée de la
-délégation, puis la signature opérationnelle. L'émetteur refuse et les
+délégation, l'égalité de `policy_fingerprint` avec le pin local, puis la
+signature opérationnelle. L'émetteur refuse et les
 consommateurs rejettent un premier enrôlement, une récupération expirée, une
 réadmission, une rotation gateway ou CA, un pair révoqué, une génération autre
 que `active + 1`, une validité supérieure au plafond ou l'absence d'une
@@ -635,7 +888,9 @@ expiration.
 
 Le planificateur ordinaire exige une YubiKey et ne peut employer que
 l'émetteur Astra actif, pour un pair admis et non révoqué, avec les preuves de
-la génération active et suivante. Un refus, une annulation ou l'absence de
+continuité par la génération active et les preuves de possession des clés
+**candidates** TLS et PQ. À ce stade, aucune génération `next` n'existe encore :
+elle ne naît qu'au commit de §7.3. Un refus, une annulation ou l'absence de
 l'opérateur laisse la leaf actuelle inchangée et l'opération en attente jusqu'à
 son échéance ; aucun repli silencieux n'émet sans approbation. Astra peut
 avancer la fenêtre par un statut signé en cas d'incident ; elle ne peut jamais
@@ -665,7 +920,7 @@ sans recevoir de clé privée :
 | `gateway_wg_public_key` | identité stable |
 | `server_name` | identité stable |
 | `new_ml_dsa_87_public_key` | clé générée et scellée sur la gateway |
-| `request_id` | 16 octets aléatoires non nuls |
+| `request_id` | 16 octets produits selon §2.3.2 ; la valeur nulle est refusée à la réception sans tenir lieu de contrôle du DRBG |
 | `created_at`, `expires_at` | durée positive de 24 heures au plus |
 | `new_key_proof` | signature ML-DSA-87 par la nouvelle clé |
 | `current_key_authorization` | signature de la leaf active pour un renouvellement normal |
@@ -732,12 +987,20 @@ s'autoriser lui-même.
 || gateway_wg_public_key:32
 || len(server_name):u32 || server_name
 || active_gateway_tls_certificate_fingerprint:32
-|| optional(SHA-256(next_gateway_tls_certificate_der))
+|| next_gateway_tls_certificate_present:u8
+|| SHA-256(next_gateway_tls_certificate_der):32 si present == 1
 || active_gateway_certificate_fingerprint:32
-|| optional(next_gateway_certificate_fingerprint)
+|| next_gateway_certificate_present:u8
+|| next_gateway_certificate_fingerprint:32 si present == 1
 || not_before:u64 || activation_at:u64 || not_after:u64
 || reason:u8
 ```
+
+Chaque discriminant `present` vaut exactement `0` ou `1`; toute autre valeur
+est refusée. À `0`, aucun octet de valeur ne suit. À `1`, exactement 32 octets
+suivent. Les deux optionnels sont décodés indépendamment et dans l'ordre
+ci-dessus. Ainsi, une transition TLS seule et une transition PQ seule ne
+partagent jamais la même transcription, même si elles ont la même longueur.
 
 Le document transporte les certificats complets, mais signe leurs empreintes
 canoniques. Une substitution de certificat modifie donc la signature. Le
@@ -754,7 +1017,6 @@ active
   -> promoted
 
 staged -> aborted
-staged | published | overlap -> revoked
 ```
 
 1. `active` : une seule identité est admise.
@@ -770,11 +1032,24 @@ staged | published | overlap -> revoked
 6. `aborted` : avant publication et `activation_at`, la tentative est annulée,
    le slot suivant est supprimé et synchronisé, l'ancienne identité reste seule
    active et un tombstone conserve l'époque consommée.
-7. `revoked` : la règle d'urgence de §10 retire immédiatement l'empreinte
-   nommée et domine les dates.
+7. `revoked` : état terminal de l'identité gateway quand la règle d'urgence de
+   §10 nomme une leaf de la génération active ; il domine toutes les phases et
+   toutes les dates.
+
+La révocation n'est pas une simple arête de cette machine, car elle vise une
+empreinte et non une phase. Depuis `active`, `staged`, `published`, `aborted`,
+`overlap` ou `promoted`, une révocation qui atteint la génération active place
+l'identité gateway entière en `revoked`, retire tout candidat et interdit
+rotation, récupération et rollback. Si elle n'atteint que la génération
+suivante en `staged`, `published` ou `overlap`, cette transition est retirée et
+son tombstone de révocation empêche sa réintroduction, mais l'identité active
+non visée reste `active`. Si les deux générations sont visées, la règle de la
+génération active gagne. Ces effets sont atomiques avec l'avancement de
+`revocation_epoch`.
 
 L'avortement emploie un `GatewayTransitionAbort` contenant
-`format_version`, `trust_domain_id`, `ca_epoch`, la gateway, le
+`format_version`, `protocol_version`, `trust_domain_id`, `ca_epoch`,
+`gateway_wg_public_key`, `server_name`, le
 `gateway_identity_epoch` avorté, l'empreinte complète de
 `GatewayIdentityTransition`, `aborted_at`, le motif `operator_cancelled` ou
 `superseded_before_activation`, l'empreinte de la campagne YubiKey et une
@@ -836,7 +1111,8 @@ Les nouvelles clés TLS et ML-DSA-87 naissent dans le stockage protégé d'Orion
 `ClientCertificateRotationRequest` contient :
 
 - `format_version = 1`, `protocol_version = 5` ;
-- `request_id` aléatoire de 16 octets ;
+- `request_id` de 16 octets produit selon §2.3.2 ; la valeur nulle est refusée
+  à la réception sans tenir lieu de contrôle du DRBG ;
 - `trust_domain_id`, `gateway_wg_public_key`, `server_name` ;
 - `client_wg_public_key`, qui ne change pas ;
 - la génération active et la génération demandée, exactement active + 1 ;
@@ -915,11 +1191,15 @@ Les raisons `expired_recovery`, `readmission`, `emergency_replacement` et
 peut viser des leafs actives si la campagne YubiKey ne change ni admission, ni
 autorité, ni politique.
 
-Orion remet cette autorisation à Helios dans WireGuard quand le tunnel existe.
-Pour la récupération de §7.5, Astra la remet par son veth privé. Helios vérifie
-la propriété du pair, les empreintes, la génération, la révocation, la
-signature et l'objet d'approbation exact transporté avec l'autorisation. Il
-exige
+Dans tous les chemins, Astra remet cette autorisation **directement à Helios**
+par le veth privé mTLS et attend le reçu sur cette même relation. Orion ne voit
+jamais cette autorisation et ne sert jamais de messager entre Astra et Helios.
+Ce qui change selon le chemin est seulement l'entrée de la demande : Helios la
+reçoit de la VIP du pair dans WireGuard pour un renouvellement ordinaire ;
+Astra la reçoit en HTTPS public pour la récupération de §7.5. Helios vérifie
+la propriété du pair déjà liée à l'opération, les empreintes, la génération, la
+révocation, la signature et l'objet d'approbation exact transporté avec
+l'autorisation. Il exige
 `issued_at < stage_expires_at <= min(request.expires_at, activation_at)` et une
 lease d'au plus 24 heures, puis persiste le candidat dans l'état
 `pending_grant` avant toute réponse. Ce candidat n'est pas encore un slot
@@ -952,6 +1232,10 @@ GatewayCertificateStageReceipt {
     gateway_signature
 }
 ```
+
+Le préfixe `Gateway` nomme ici **l'émetteur et le signataire du reçu**. L'objet
+atteste toujours le staging d'un certificat client ; ce n'est ni une demande,
+ni un reçu de rotation du certificat gateway.
 
 La signature ML-DSA-87 de la leaf gateway active couvre tous les champs sous le
 domaine `helios-gateway-certificate-stage-receipt-v5`. Un reçu n'est émis
@@ -1061,6 +1345,7 @@ Les signatures ancienne et suivante couvrent :
 
 ```text
 "helios-expired-client-certificate-recovery-request-v5"
+|| format_version:u16 || protocol_version:u16
 || trust_domain_id:16 || astra_challenge:32
 || request_id:16
 || gateway_wg_public_key:32
@@ -1094,6 +1379,15 @@ contrôle signature, chaîne, identités, empreintes et dernière génération
 enregistrée, mais ne contrôle pas la période ; il est un type séparé et ne peut
 pas être appelé par la négociation.
 
+La récupération emploie une seule cérémonie `GetAssertion` pour le credential
+requis. Le challenge est celui ci-dessus et la même requête transporte le sel
+PRF/`hmac-secret` du coffre : le toucher et le PIN produisent à la fois
+l'assertion vérifiable liée à la demande et le secret qui ouvre le key-slot.
+Le compagnon vérifie l'assertion avant d'employer ce secret, puis le zéroïse
+avec les clés maîtresses. Une politique exigeant deux credentials répète cette
+cérémonie une fois par credential distinct. Le renouvellement ordinaire, lui,
+ne demande aucun sel de coffre et n'ouvre jamais `CA-PQ` ni `CA-TLS`.
+
 La récupération est refusée si le pair est absent ou `revoked`, si une
 génération plus récente existe, si l'ancienne clé n'est plus possédée ou si les
 nouvelles preuves échouent. `CA-PQ`, jamais l'émetteur Astra, autorise alors le
@@ -1122,7 +1416,8 @@ Une action manuelle crée un `AstraRotationCampaign` qui contient :
   `full_certificate_chain` ou `trust_authorities` ;
 - pour chaque cible, type, clé WireGuard, époque, génération et empreintes
   actives exactes ;
-- `reason`, `requested_by` et le hash de politique Astra ;
+- `reason`, `requested_by` et le pin exact `astra_policy_fingerprint` de
+  §2.4 ;
 - le nombre de credentials opérateur exigé.
 
 La YubiKey approuve le SHA-256 de la représentation canonique complète sous le
@@ -1183,12 +1478,26 @@ table. Cette résolution prouve que l'appel traverse un tunnel établi par la
 clé WireGuard admise.
 
 `AuthenticatedTrustUpdateRequest` contient la requête, le certificat PQ client
-de la génération courante et une signature ML-DSA-87. La requête contient un
-`request_id` aléatoire de 16 octets non nuls, les identités WireGuard, les
-générations connues et les empreintes actives. Elle ne contient ni challenge
-public, ni horodatage : l'anti-rejeu du transport WireGuard protège le paquet,
-et les générations ainsi que les empreintes signées empêchent tout rollback de
-l'état applicatif. La signature couvre :
+d'une génération admissible à l'instant courant et une signature ML-DSA-87.
+La requête contient un `request_id` de 16 octets produit selon §2.3.2 — la
+valeur nulle est refusée à la réception sans tenir lieu de contrôle du DRBG —,
+les identités WireGuard, les générations connues et les empreintes actives.
+Elle ne contient ni challenge public, ni horodatage : l'anti-rejeu du transport
+WireGuard protège le paquet, et les générations ainsi que les empreintes
+signées empêchent tout rollback de l'état applicatif. La signature couvre :
+
+```text
+AuthenticatedTrustUpdateRequest {
+    request: TrustUpdateRequest,
+    certificate: PqCertificate,
+    ml_dsa_87_signature: MlDsa87Signature
+}
+```
+
+L'enveloppe n'ajoute aucun champ signé implicite. Les octets signés sont
+exactement la forme suivante ; le certificat complet est lié par
+`client_pq_certificate_fingerprint`, recalculée avant vérification de la
+signature :
 
 ```text
 "helios-in-tunnel-trust-update-request-v5"
@@ -1207,13 +1516,27 @@ l'état applicatif. La signature couvre :
 || client_pq_certificate_fingerprint:32
 ```
 
-La gateway exige que le pair WireGuard résolu, le certificat PQ présenté et
-les deux empreintes clientes de la requête désignent le même couple autorisé à
-l'instant courant : actif, ou suivant seulement à partir de son
-`activation_at`. Une répétition de `request_id` peut être servie de manière
-idempotente ; sa mémorisation est une borne opérationnelle et non la défense
-anti-rejeu principale. Les objets de réponse restent rejouables sans rollback
-grâce à leurs générations et signatures.
+Les trois empreintes clientes ont des rôles distincts. Les champs
+`active_client_tls_certificate_fingerprint` et
+`active_client_pq_certificate_fingerprint` forment le snapshot indivisible de
+la génération encore enregistrée comme `active`, dont le numéro est
+`client_identity_generation`. Le champ
+`client_pq_certificate_fingerprint` nomme la leaf PQ complète transportée avec
+la requête et dont la clé signe ces octets. Hors chevauchement, cette troisième
+empreinte est donc égale à l'empreinte PQ active. Pendant le chevauchement,
+elle peut être celle de `next`, mais seulement à partir de `activation_at`,
+tandis que les deux champs `active_*` continuent de décrire l'ancien slot
+jusqu'à sa promotion atomique.
+
+La gateway exige que le pair WireGuard résolu, le certificat PQ présenté, sa
+génération retrouvée par son empreinte et le snapshot TLS/PQ désignent cet
+unique état autorisé. Elle refuse un snapshot actif mélangé, une leaf présentée
+qui ne correspond pas à un des slots admissibles ou un `next` présenté trop
+tôt. Une répétition de `request_id` peut être servie de manière idempotente ;
+sa mémorisation est une
+borne opérationnelle et non la défense anti-rejeu principale. Les objets de
+réponse restent rejouables sans rollback grâce à leurs générations et
+signatures.
 
 La réponse `200 OK` contient le statut Astra signé de l'identité cliente et,
 facultativement, un `TrustUpdateChunk`; l'absence de chunk signifie que la
@@ -1338,10 +1661,11 @@ canal public ou n'omet l'approbation YubiKey.
 
 ### 8.2 Canal public Astra
 
-Le profil contient `authority_url` et `webauthn_rp_id`. Orion ne contacte cette
-origine directement que lorsqu'il ne peut plus établir WireGuard, ou pour une
-opération opérateur explicitement hors tunnel. Le port QUIC n'est jamais un
-repli. Les routes publiques versionnées sont :
+Le profil contient `authority_url`, `webauthn_rp_id` et le pin
+`astra_policy_fingerprint`. Orion ne contacte cette origine directement que
+lorsqu'il ne peut plus établir WireGuard, ou pour une opération opérateur
+explicitement hors tunnel. Le port QUIC n'est jamais un repli. Les routes
+publiques versionnées sont :
 
 ```text
 POST /v1/status/challenge
@@ -1394,6 +1718,59 @@ sur le même identifiant est un conflit. Le navigateur ne reçoit pas ce jeton
 et ne décide jamais qu'une signature a réussi : les IHM interrogent l'état
 signé de l'opération.
 
+Le jeton v1 est un bearer MACé, transmis uniquement dans
+`Authorization: Bearer <base64url-sans-padding>` et jamais dans une URL, un
+cookie ou un journal. Au démarrage, Astra tire avec §2.3.2 une clé
+`K_capability` de 32 octets avec `prediction_resistance = true`, conservée
+seulement en mémoire et zéroïsée à l'arrêt. Un redémarrage invalide les jetons
+encore vivants ; une opération authentifiée peut en faire émettre de nouveaux.
+
+Chaque scope possède un jeton distinct : `0 = signer_request_read` pour
+`GET /v1/signer-requests/<operation_id>`, `1 = encrypted_vault_read` pour
+`GET /v1/vaults/<fingerprint>` et `2 = signer_result_submit` pour
+`POST /v1/signer-results/<operation_id>`. Le scope vaut exactement ces valeurs
+et lie donc aussi la méthode et le gabarit de route. Le payload canonique est :
+
+```text
+token_version:u8=1
+|| scope:u8
+|| operation_id:16
+|| operation_manifest_fingerprint:32
+|| vault_present:u8
+|| encrypted_vault_fingerprint:32 si vault_present == 1
+|| issued_at:u64 || expires_at:u64
+|| token_nonce:16
+```
+
+`vault_present` vaut seulement 0 ou 1. Le scope `encrypted_vault_read` exige 1
+et les deux autres répètent la valeur de l'opération. `token_nonce` vient du
+DRBG et n'est jamais nul. La clé MAC est dérivée ainsi :
+
+```text
+PRK = HKDF-Extract-SHA-256(salt = operation_id, IKM = K_capability)
+K_token = HKDF-Expand-SHA-256(
+    PRK,
+    info = "helios-astra-capability-token-v1"
+           || scope:u8
+           || operation_manifest_fingerprint:32
+           || vault_present:u8
+           || encrypted_vault_fingerprint:32 si vault_present == 1
+           || issued_at:u64 || expires_at:u64,
+    L = 32
+)
+tag = HMAC-SHA-256(K_token, payload_canonique)
+jeton = base64url_sans_padding(payload_canonique || tag:32)
+```
+
+Les entiers sont big-endian et l'optionnel suit le même discriminant strict que
+§6.2. Astra compare le tag en temps constant, exige
+`issued_at <= now < expires_at <= operation.expires_at` et
+`expires_at - issued_at <= 300`. Les lectures peuvent être rejouées à
+l'identique pendant cette fenêtre ; `signer_result_submit` est consommé
+atomiquement au premier résultat accepté. Le jeton ne dérive ni d'une clé CA,
+ni de la clé de service Astra, et ne confère aucun droit sur une autre
+opération, un autre manifeste, un autre coffre, scope, chemin ou méthode.
+
 Astra publie un statut signé :
 
 ```text
@@ -1405,7 +1782,7 @@ AstraCertificateStatus {
     generation,
     status: active | renewal_due | awaiting_operator | pending_grant |
             pending_commit | staged | published | aborted | overlap |
-            expired | revoked,
+            promoted | expired | revoked,
     suggested_window_start,
     suggested_window_end,
     produced_at,
@@ -1415,6 +1792,25 @@ AstraCertificateStatus {
     astra_signature
 }
 ```
+
+Le champ reste une chaîne sur le fil, mais son type logique est sélectionné par
+`certificate_kind`; il n'existe pas un enum libre commun à toutes les familles.
+Le décodeur **doit** refuser une combinaison absente de ce tableau :
+
+| Famille issue de `certificate_kind` | États admis |
+| --- | --- |
+| `client_tls`, `client_pq` | `active`, `renewal_due`, `awaiting_operator`, `pending_grant`, `pending_commit`, `overlap`, `promoted`, `expired`, `revoked` |
+| `gateway_tls`, `gateway_pq` | `active`, `renewal_due`, `staged`, `published`, `aborted`, `overlap`, `promoted`, `expired`, `revoked` |
+| `ca_pq`, `ca_tls`, `astra_service_key` | `active`, `renewal_due`, `staged`, `overlap`, `promoted`, `expired`, `revoked` |
+| `astra_issuer` | `active`, `renewal_due`, `expired`, `revoked` |
+
+`awaiting_operator` décrit l'opération de renouvellement de la leaf cliente
+active, avant l'existence du certificat candidat. `pending_grant` et
+`pending_commit` décrivent ensuite le candidat exact. `promoted` atteste la
+mutation qui vient de rendre la génération active ; un statut ultérieur sans
+nouvelle mutation la décrit comme `active`. `aborted` ne s'applique qu'à
+l'empreinte candidate de la transition gateway annulée, jamais à la leaf
+active restée servie.
 
 La signature couvre la forme canonique sous le domaine
 `helios-astra-certificate-status-v5`. `status_epoch` monte pour chaque mutation
@@ -1438,12 +1834,13 @@ est le seul client de l'API Astra privée et Astra le seul client de l'API
 Helios privée. Le namespace Astra n'a ni route par défaut sur cette interface,
 ni forwarding, ni accès aux adresses de pairs.
 
-L'API Helios appelée par Astra porte la récupération et les campagnes qui ne
-peuvent pas provenir d'un tunnel actif :
+L'API Helios appelée par Astra porte le staging de **tout** candidat client,
+ainsi que le commit de récupération et les campagnes qui ne peuvent pas
+provenir d'un tunnel actif :
 
 ```text
 POST /internal/v1/certificates/stage
-POST /internal/v1/certificates/stage-commit
+POST /internal/v1/certificates/stage-commit   # récupération seulement
 POST /internal/v1/certificates/revoke
 GET  /internal/v1/certificates/state/<identity>
 POST /internal/v1/campaigns/apply
@@ -1483,10 +1880,13 @@ révocation par `helios_provisioning::admission`. Astra ne réalise jamais de
 *read-modify-write* du fichier de configuration. Une réponse de succès n'est
 envoyée qu'après la persistance décrite au §7.3.
 
-Ce canal est le chemin de staging d'une récupération expirée, parce que le
-tunnel WireGuard n'existe alors potentiellement plus. Il n'est pas un repli
-pour une demande ordinaire venant d'un Orion actif : celle-ci passe dans
-WireGuard afin de conserver la preuve du pair source.
+Ce canal est l'unique chemin de
+`ClientCertificateStageAuthorization` et du reçu correspondant, renouvellement
+ordinaire compris. Pour une récupération expirée, il porte aussi le commit,
+parce que le tunnel WireGuard n'existe alors potentiellement plus. Il n'est pas
+un repli pour **l'entrée de la demande** ordinaire venant d'un Orion actif, ni
+pour son commit : tous deux passent dans WireGuard afin de conserver la preuve
+du pair source.
 
 ### 8.4 Document hors ligne
 
@@ -1696,8 +2096,38 @@ transport suit sa PKI Web et ne peut modifier la clé applicative épinglée.
 | `ca_signature` | signature de la CA fiable |
 
 Au moins une empreinte est présente. L'objet est signé sous le domaine
-`helios-certificate-emergency-revocation-v5` avec tous les champs ci-dessus,
-dans l'ordre et l'encodage binaire canonique de la v5.
+`helios-certificate-emergency-revocation-v5`. Ses octets canoniques sont :
+
+```text
+"helios-certificate-emergency-revocation-v5"
+|| format_version:u16
+|| trust_domain_id:16 || ca_epoch:u64
+|| scope:u8 || identity_key:32
+|| len(server_name):u32 || server_name
+|| revocation_epoch:u64
+|| revoked_tls_present:u8
+|| revoked_tls_fingerprint:32 || revoked_tls_not_after:u64
+                                                   si revoked_tls_present == 1
+|| revoked_pq_present:u8
+|| revoked_pq_fingerprint:32 || revoked_pq_not_after:u64
+                                                   si revoked_pq_present == 1
+|| effective_at:u64 || reason:u8
+|| replacement_transition_present:u8
+|| replacement_transition_fingerprint:32
+                                                   si replacement_transition_present == 1
+```
+
+`scope` vaut `0` pour `gateway` et `1` pour `client`, toute autre valeur étant
+refusée. `server_name` est non vide et canonique pour `gateway`; pour `client`,
+sa longueur vaut zéro et aucun octet de valeur ne suit. `reason` vaut
+respectivement `0`, `1`, `2` ou `3` pour `key_compromise`,
+`suspected_compromise`, `cessation` ou `superseded`. Chacun des trois
+discriminants `present` vaut exactement `0` ou `1`. À `0`, aucun octet du champ
+optionnel ne suit ; à `1`, le couple TLS ou PQ contient exactement `32 + 8`
+octets et l'empreinte de remplacement exactement 32 octets. Les couples
+empreinte/`not_after` sont donc derrière un seul drapeau et ne peuvent jamais
+être décodés séparément. Au moins un des deux drapeaux `revoked_*_present` vaut
+`1`.
 
 Les couples `empreinte/not_after` sont indivisibles. L'expiration est portée
 par la décision signée même lorsque le destinataire n'a jamais détenu la leaf :
@@ -1743,6 +2173,11 @@ lever `revoked` : seule une réadmission explicite crée une nouvelle admission.
 
 ## 11. Ordre des opérations
 
+Ce chapitre est la projection opérationnelle des machines et transports des
+§§6 à 10, pas un second protocole. Il ne peut changer ni le porteur d'un objet,
+ni l'instant où un slot devient `next`; toute divergence avec les sections
+normatives précédentes est une erreur de spécification.
+
 ### 11.1 Renouvellement gateway normal
 
 1. Générer et sceller la nouvelle clé sur la gateway.
@@ -1780,8 +2215,8 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
 4. Astra consomme l'approbation, émet les deux certificats et
    `ClientCertificateStageAuthorization`, puis renvoie l'ensemble à Helios sur
    le veth.
-5. Helios vérifie l'approbation et l'autorisation, installe et synchronise la
-   génération suivante, puis signe
+5. Helios vérifie l'approbation et l'autorisation, persiste et synchronise le
+   candidat en `pending_grant` — sans créer de slot `next` —, puis signe
    `GatewayCertificateStageReceipt`.
 6. Helios relaie le reçu à Astra ; Astra le vérifie, signe le grant et le remet
    à Orion à travers Helios.
@@ -1800,12 +2235,14 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
    les nouvelles clés.
 2. Il produit `ExpiredCertificateRecoveryRequest` avec les preuves ancienne et
    nouvelle.
-3. Orion lance `astra-signer`, qui affiche la cible ; la YubiKey opérateur
-   approuve le hash exact et ouvre localement le coffre maître.
+3. Orion lance `astra-signer`, qui affiche la cible ; une seule cérémonie
+   `GetAssertion` de la YubiKey opérateur approuve le hash exact et dérive le
+   secret qui ouvre localement le coffre maître.
 4. Astra vérifie la dernière génération historique et l'absence de révocation,
    puis le compagnon signe l'autorisation exacte par `CA-PQ`.
 5. Astra remet l'autorisation à Helios par le veth privé.
-6. Helios persiste la génération suivante et signe le reçu.
+6. Helios persiste le candidat en `pending_grant`, sans créer de slot `next`,
+   et signe le reçu.
 7. Astra signe le grant seulement après ce reçu et le remet à Orion.
 8. Orion persiste le candidat et signe le commit ; Astra le relaie à Helios sur
    le veth sous l'autorisation de récupération encore valide.
@@ -1875,6 +2312,16 @@ YubiKeys ; aucune formulation courte ne l'assimile à un renouvellement banal.
   sans forwarding, TLS 1.3 `(EC)DHE` sans reprise ni 0-RTT ;
 - coffre maître HVLT à deux key-slots YubiKey, compagnon de signature et
   procédures d'ajout, perte et remplacement d'un credential ;
+- conteneurs HVLT v1 stricts sous AES-256-GCM, dérivation HKDF-SHA-256 des
+  key-slots, sels frais et AAD/contextes exacts de §2.4.1 ;
+- ML-DSA-87 pur avec le `ctx` non vide fixé pour chaque type au §2.3.1, sans
+  HashML-DSA ;
+- pipeline TRNG → HMAC-DRBG-SHA-512 et erreurs fermes de §2.3.2 pour tout
+  identifiant, challenge, nonce, sel, secret et clé ;
+- `astra_policy_fingerprint` confirmé hors bande et épinglé dans les profils
+  Orion et le registre Helios ;
+- jetons de capacité du compagnon liés au scope, à l'opération, au manifeste,
+  au coffre et à une fenêtre de cinq minutes selon §8.2 ;
 - `AstraIssuerAuthorization`, intermédiaire TLS et émetteur ML-DSA-87 délégué,
   avec portée et validité vérifiées par Helios et Orion ;
 - `AstraCredentialApprovalRequest` et `AstraRenewalApproval` obligatoires pour
@@ -1902,9 +2349,10 @@ YubiKeys ; aucune formulation courte ne l'assimile à un renouvellement banal.
 - sérialisation de la révocation d'admission, de la génération cliente et du
   retrait du plan de données, afin que l'état terminal `revoked` domine aussi
   en concurrence ;
-- affichage clair de l'état `active`, `awaiting_operator`, `pending_grant`,
-  `pending_commit`, `staged`, `published`, `aborted`, `overlap`, `expired` ou
-  `revoked` ;
+- affichage clair de l'état `active`, `renewal_due`, `awaiting_operator`,
+  `pending_grant`, `pending_commit`, `staged`, `published`, `aborted`,
+  `overlap`, `promoted`, `expired` ou `revoked`, limité au sous-ensemble légal
+  de la famille visée ;
 - tests du §14.
 
 Une livraison partielle peut être testée et déployée derrière un refus
@@ -1946,7 +2394,7 @@ libellé montre avant approbation le nombre de cibles, les générations et si u
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
 
-### 12.3 État de l'implémentation au 15 août 2026
+### 12.3 État de l'implémentation au 16 août 2026
 
 **Livré et testé.**
 
@@ -1954,7 +2402,9 @@ libellé ambigu « Renouveler ».
   « demande → autorisation → reçu → grant → commit » antérieurs à l'amendement
   du 15 août, l'encodage canonique, les empreintes, les générations, les
   fenêtres, le calcul 80 % et les états bornés actif/suivant. L'idempotence
-  porte sur l'empreinte du **document** signé, pas sur son contenu.
+  porte sur l'empreinte du **document** signé, pas sur son contenu. Les
+  empreintes optionnelles utilisent déjà un octet de présence strict ; §6.2
+  décrit désormais les octets réellement produits.
 - `aether::certificates::x509` : CA réelle, auto-émise et auto-signée,
   `basicConstraints`, `keyCertSign`, `clientAuth`, `serverAuth`,
   `digitalSignature` dès qu'un `keyUsage` est déclaré, SAN DNS et
@@ -1996,7 +2446,9 @@ libellé ambigu « Renouveler ».
   une copie, écrite, puis adoptée : un échec d'écriture laisse le registre
   décrivant ce que le disque contient.
 - `helios-api` : `trust-update`, `stage` et `stage-commit` dans le tunnel,
-  derrière la résolution de source.
+  derrière la résolution de source. La route `stage` décrit ici l'état du code
+  antérieur à §0.5 : elle doit disparaître du canal Orion et ne doit pas être
+  ouverte en exploitation.
 - `heliosd::certificates` : propriétaire unique du registre, signature des
   reçus par la leaf servie, boucle de balayage des leases et des
   chevauchements.
@@ -2015,10 +2467,31 @@ libellé ambigu « Renouveler ».
 - `astra::vault` et `astra-signer` : coffre maître HVLT, key-slots FIDO2
   `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove` et
   `rename`. Le coffre exige deux credentials avant d'être tenu pour amorcé et
-  en accepte huit.
+  en accepte huit. Les deux couches AES-256-GCM, HKDF-SHA-256, sels, contextes
+  et AAD sont celles désormais figées au §2.4.1.
 
 **Non livré.** Ces points sont refusés explicitement à l'exécution, jamais
 contournés :
+
+- l'**alignement filaire du 16 août** : portage exclusif de
+  `ClientCertificateStageAuthorization` et du reçu sur le veth, retrait de la
+  route `stage` Orion, liaison de `operator_approval_fingerprint` dans le reçu,
+  versions dans les octets signés de la récupération, sous-ensembles de statut
+  par famille avec `awaiting_operator`/`promoted`, cérémonie combinée de
+  récupération et encodage de chaque couple révoqué
+  empreinte/`not_after` derrière un seul drapeau de présence. Les invariants
+  déjà présents — trois empreintes de la requête
+  de confiance, `pending_grant` jusqu'au commit, révocation de l'active depuis
+  toute phase et égalité de `retire_active_at` — restent la base à conserver ;
+
+- l'**alignement cryptographique du 16 août** : les helpers ML-DSA-87 passent
+  encore `ctx = ""` et doivent recevoir le contexte ASCII du type ; le profil
+  ne porte pas encore `astra_policy_fingerprint`; les jetons de capacité HKDF/
+  HMAC ne sont pas implémentés ; et les appels directs au CSPRNG système ne
+  matérialisent pas encore l'état, le reseed et les erreurs fermes du contrat
+  HMAC-DRBG-SHA-512 de §2.3.2. Aucun de ces écarts ne peut être masqué par le
+  seul préfixe du message, une signature `CA-PQ`, un UUID ou un filtre de
+  valeurs nulles ;
 
 - les **commandes de signature et d'approbation** d'`astra-signer` : certificat
   auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes,
@@ -2089,7 +2562,8 @@ auto-signée. L'enrôlement initial crée directement :
 - deux credentials YubiKey opérateur vérifiés ;
 - `astra_service_key_epoch = 1`, `issuer_epoch = 1`,
   `credential_registry_epoch = 1` et une délégation bornée ;
-- `authority_url` et `webauthn_rp_id` dans chaque profil Helios.
+- `authority_url`, `webauthn_rp_id` et `astra_policy_fingerprint` confirmé hors
+  bande dans chaque profil Helios.
 
 ### 13.2 Parc v5 existant
 
@@ -2179,6 +2653,13 @@ qu'il sert.
 - deux leafs maximum par famille, y compris après hot-reload et reprise après
   crash ;
 - transition gateway TLS seule, PQ seule et TLS + PQ atomique ;
+- transcriptions TLS seule et PQ seule distinctes grâce aux deux octets de
+  présence, refus de `present > 1`, d'une valeur après `present = 0` et d'une
+  valeur tronquée après `present = 1` ;
+- révocation TLS seule, PQ seule et TLS + PQ produisant trois transcriptions
+  distinctes ; refus d'un discriminant supérieur à 1, d'un couple
+  empreinte/`not_after` incomplet ou séparé et d'une empreinte de remplacement
+  dont le discriminant ne correspond pas aux octets présents ;
 - avortement gateway accepté seulement avant publication et activation,
   tombstone persisté, époque consommée et transition suivante obligatoirement
   séquentielle ;
@@ -2192,8 +2673,17 @@ qu'il sert.
 - unicité globale des empreintes actives et suivantes ;
 - demande cliente : signature active, CSR TLS et preuve PQ suivante toutes
   obligatoires ;
+- autorisation de stage ordinaire acceptée seulement depuis l'API veth Astra,
+  sans route permettant à Orion de la remettre dans WireGuard ; reçu renvoyé
+  uniquement à Astra ;
 - `AstraIssuerAuthorization` refusée sous une autre gateway, hors période, avec
   un usage ou plafond élargi, une politique différente ou une époque reculée ;
+- délégation refusée quand `policy_fingerprint` diffère du pin hors bande du
+  profil, même sous une signature `CA-PQ` valide ; profil refusé avec une
+  empreinte de politique nulle ;
+- chaque type ML-DSA-87 accepté sous son `ctx` ASCII exact et refusé avec
+  `ctx = ""`, le contexte d'un autre type, un NUL final ou HashML-DSA ; même
+  refus obligatoire pour une signature cryptographiquement valide de `CA-PQ` ;
 - émetteur Astra incapable d'enrôler, réadmettre, récupérer une leaf expirée,
   tourner une CA, signer une génération sautée ou émettre une leaf ordinaire
   sans `AstraRenewalApproval` exacte ;
@@ -2212,6 +2702,9 @@ qu'il sert.
 - candidat client jamais activable avant un commit signé par les clés active
   et suivante ; commit ordinaire refusé hors du tunnel du pair et commit de
   récupération refusé sans l'opération YubiKey exacte ;
+- réception et signature du reçu laissant Helios en `pending_grant`, sans slot
+  `next`, puis commit seul produisant `next_committed` et
+  `retire_active_at = grant.not_after` ;
 - stage orphelin purgé à sa lease, commit tardif refusé et génération
   `active + 1` réutilisable seulement sous un nouveau `stage_id` ;
 - commit arrivé à l'échéance ou antidaté après elle perdant la course face à
@@ -2223,6 +2716,12 @@ qu'il sert.
 - même `stage_id` identique idempotent et conflit d'octets refusé ;
 - récupération expirée refusée sans preuve ancienne, nouvelle preuve,
   YubiKey opérateur, challenge frais ou dernière génération exacte ;
+- mutation de `format_version` ou `protocol_version` dans la récupération, ou
+  de `protocol_version`/`server_name` dans l'avortement gateway, rompant la
+  signature canonique ;
+- récupération à un credential exerçant une seule cérémonie `GetAssertion`
+  liée au challenge et au sel du coffre, tandis qu'un renouvellement ordinaire
+  n'obtient aucune sortie PRF et n'ouvre aucun key-slot ;
 - validateur historique inaccessible depuis mTLS et QUIC, où la leaf expirée
   reste refusée ;
 - récupération et rollback refusés pour `revoked`, même avec deux YubiKeys ;
@@ -2234,6 +2733,10 @@ qu'il sert.
 - mutation d'un octet d'`AstraCredentialApprovalRequest`, de
   `AstraRenewalApproval`, du stage ou du grant rompant leur chaîne d'empreintes ;
 - ajout et retrait de YubiKey incapables de laisser zéro credential de secours ;
+- fixtures HVLT vérifiant AES-256-GCM, identifiants de KDF, HKDF-SHA-256, sels
+  et AAD ; permutation de `vault_id`, `slot_id`, domaine, table de slots, sel,
+  nonce, ciphertext ou tag rendant le coffre illisible ; mutation d'un libellé
+  n'influençant aucune décision cryptographique ;
 - rollback de service borné au chevauchement, sans baisse de compteur ni
   réapparition d'un slot supprimé ;
 - transition CA refusée sans l'une des deux signatures ou avec un saut de
@@ -2247,9 +2750,15 @@ qu'il sert.
   à l'époque de service suivante ;
 - statut public refusé avec une empreinte seule, un challenge expiré ou rejoué,
   et accepté seulement sous la preuve PQ de l'identité exacte ;
+- statut refusé quand son état n'appartient pas à la famille de
+  `certificate_kind`, avec `promoted` accepté pour gateway, client, CA et clé
+  de service mais refusé pour l'émetteur Astra ;
 - application séquentielle de trois transitions CA hors ligne sans jamais
   conserver trois ancres simultanément ;
 - révocation dominante dans chaque état et callback obsolète sans effet ;
+- révocation de la génération gateway active depuis chaque phase produisant
+  l'état terminal, et révocation de la seule suivante supprimant le candidat
+  sans retirer l'active ;
 - transaction chunkée `CA-PQ -> CA-TLS -> clé Astra -> gateway -> client`
   invisible tant qu'un chunk manque, publiée par une seule écriture si tout est
   valide et entièrement purgée à l'expiration ;
@@ -2264,12 +2773,24 @@ qu'il sert.
   vers QUIC, une leaf expirée, un pin unique ou un mode plus faible ;
 - refus de la route depuis une source hors tunnel, une VIP inconnue, un pair
   différent de la clé signée ou une identité PQ d'une autre génération ;
+- requête de confiance refusée si le snapshot actif TLS/PQ est mélangé, si
+  l'empreinte PQ présentée ne correspond pas au certificat complet ou si la
+  leaf suivante est présentée avant `activation_at` ;
 - routes de renouvellement ordinaires absentes du canal public Astra et aucun
   repli vers celui-ci après une erreur du relais ;
 - relais Helios refusant méthode, chemin, en-tête ou corps non typé et liant
   lecture d'opération, requête de compagnon, assertion et commit au même pair ;
 - API Astra bornée par taille, nombre de cibles, identité et préfixe réseau,
   avec erreurs indifférenciées avant authentification ;
+- jeton de capacité refusé sous un autre scope, chemin, méthode, opération,
+  manifeste ou coffre, après cinq minutes, après redémarrage d'Astra ou après
+  consommation de `signer_result_submit`; comparaison du tag en temps constant ;
+- DRBG refusant toute sortie avant instanciation ou après échec TRNG/reseed,
+  au plus `2^20` appels entre deux apports d'entropie et reseed dans l'enfant
+  après fork, résistance à la prédiction avant chaque clé privée, sans octet
+  partiel écrit ;
+- identifiants et challenges nuls refusés à la réception, sans que le test de
+  non-nullité puisse remplacer les tests du HMAC-DRBG-SHA-512 ;
 - route veth incapable d'atteindre un pair, le plan de données, les coffres ou
   une autre API Helios ;
 - TLS veth refusant TLS 1.2, `psk_ke`, tickets de reprise et 0-RTT, avec clés de

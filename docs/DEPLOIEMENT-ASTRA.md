@@ -48,9 +48,18 @@ manque :
   client HTTP vers Astra. Les deux services connaissent le même domaine, mais
   ne se parlent pas encore. Le renouvellement actif ne doit pas exposer Astra
   publiquement : Orion appelle Helios dans WireGuard, puis Helios transmet sur
-  le veth privé mTLS ;
+  le veth privé mTLS. L'autorisation de stage et le reçu circulent uniquement
+  entre Astra et Helios sur ce veth ; l'ancienne route `stage` Orion ne doit
+  pas être ouverte et sera retirée lors de cet alignement ;
 - le **pilote client** du §7 dans `orion-core`, et les routes de rotation
-  client d'Astra.
+  client d'Astra ;
+- l'**alignement cryptographique** du 16 août : contextes ML-DSA-87 non vides,
+  pin de politique dans les profils, jetons de capacité du compagnon et
+  pipeline TRNG → HMAC-DRBG-SHA-512. Le format binaire, l'AEAD, la KDF et l'AAD
+  de HVLT ainsi que les octets de présence des empreintes optionnelles sont
+  déjà conformes ; l'aléa employé par HVLT doit cependant rejoindre le même
+  DRBG. Les écarts restants sont des refus de mise en production, pas des
+  améliorations facultatives.
 
 Ce qui est donc réellement éprouvé ici : la construction de l'image, le
 démarrage du conteneur, les volumes, la sauvegarde, le durcissement et la

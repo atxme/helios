@@ -115,6 +115,35 @@ Restent ouverts :
   signature ML-DSA.
   Le seuil de 80 % prépare donc une opération `awaiting_operator`; il ne peut
   plus achever silencieusement la rotation.
+  L'amendement du 16 août 2026 ferme les contradictions relevées dans le document :
+  `ClientCertificateStageAuthorization` voyage toujours d'Astra vers Helios
+  sur le veth et le reçu revient à Astra sur ce même lien ; Orion ne transporte
+  aucun des deux. Helios reste en `pending_grant` après le reçu et ne crée
+  `next_committed` qu'au commit. Les trois empreintes clientes de
+  `AuthenticatedTrustUpdateRequest` sont intentionnelles — snapshot TLS/PQ de
+  l'active, puis leaf PQ effectivement présentée — et les statuts sont validés
+  par famille. La révocation de l'active domine depuis toute phase ; celle de
+  la seule suivante retire le candidat sans révoquer l'active. Le code n'est
+  pas encore aligné sur tous ces écarts filaires : voir §12.3 de la
+  spécification avant de poursuivre le développement.
+  La fermeture cryptographique du même jour ajoute six invariants. Les deux
+  optionnels de `GatewayIdentityTransition` portent chacun un octet de présence
+  `0|1` avant leur empreinte — le code le faisait déjà, la transcription ne le
+  disait pas. Toute signature ML-DSA-87 de la négociation v5 et du cycle de vie
+  emploie l'algorithme pur avec un `ctx` FIPS 204 non vide égal au domaine
+  ASCII du type ; HashML-DSA et `ctx = ""` sont refusés, y compris sous
+  `CA-PQ`. Le coffre Astra est exactement les deux
+  couches HVLT v1 AES-256-GCM/HKDF-SHA-256 décrites au §2.4.1 : sel WebAuthn
+  par coffre, mais sel HKDF frais dans chaque enveloppe de slot. La politique
+  Astra possède une empreinte confirmée hors bande et épinglée dans le profil ;
+  une signature `CA-PQ` ne peut la remplacer. Les capacités du compagnon sont
+  des jetons HKDF-SHA-256 + HMAC-SHA-256, bornés à cinq minutes, une opération,
+  un manifeste, un coffre et un scope. Enfin tout aléa du protocole suit
+  TRNG → HMAC-DRBG-SHA-512, reseed au plus tard toutes les `2^20` générations,
+  après fork et avant toute clé privée ; un échec ne rend aucun octet. À part
+  les octets de présence et les primitives/formats HVLT déjà présents, cet
+  alignement reste à implémenter ; la source d'aléa de HVLT doit elle aussi
+  passer par le nouveau DRBG.
   Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
   `heliosd init-trust-domain` de l'autre. La seconde n'ouvre aucun coffre et ne
   génère aucune clé — elle relit les leaves servies sur disque et reçoit les

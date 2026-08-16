@@ -45,6 +45,12 @@ base64.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Les contrôles X.509 se testent sur du matériel réel, jamais sur une chaîne
+# d'octets factice : `x509.rs` émet ses CA, ses leafs et ses CSR au moment du
+# test. En dépendance de développement, ces tests tournent sous un `cargo test
+# -p aether` nu, sans que la feature de signature soit exigée et sans qu'une
+# gateway qui ne fait que vérifier lie rcgen (voir `dependencies`).
+rcgen.workspace = true
 
 # `mlock` / `VirtualLock` : empêche un secret d'atteindre le fichier d'échange
 # ou celui d'hibernation, que `zeroize` ne peut pas nettoyer (ADR-006 §5).

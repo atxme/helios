@@ -7,11 +7,22 @@ des leases de staging, de la rotation de clé de service, des statuts
 authentifiés, du transport atomique chunké et clarification du modèle YubiKey
 1-sur-2.
 
-**Amendement du 2026-08-15** : le renouvellement d'une identité encore active
-reste intégralement dans WireGuard et `heliosd` relaie les échanges vers Astra
-sur le veth privé. Chaque renouvellement exige désormais une approbation
+**Amendement du 2026-08-15** : un Orion dont l'identité est encore active reste
+intégralement dans WireGuard et `heliosd` relaie les échanges nécessaires vers
+Astra sur le veth privé. Chaque renouvellement exige désormais une approbation
 YubiKey liée à sa demande exacte ; cette approbation autorise l'émetteur
 délégué et n'ouvre pas les clés maîtresses.
+
+**Clarification du 2026-08-16** : dans ce relais, la demande et le commit Orion
+passent dans WireGuard ; l'autorisation de stage et le reçu passent directement
+entre Astra et Helios sur le veth. Le reçu laisse le candidat en
+`pending_grant`; seul le commit crée `next_committed`.
+
+La clarification ferme aussi les contrats cryptographiques : discriminants
+explicites des deux leafs gateway optionnelles, `ctx` ML-DSA-87 non vide fixé
+par type, HVLT v1 sous AES-256-GCM/HKDF-SHA-256, politique confirmée hors bande,
+capacités HKDF/HMAC du compagnon et aléa TRNG → HMAC-DRBG-SHA-512. Leur forme
+normative est dans la spécification §§2.3, 2.4, 6.2 et 8.2.
 
 **Portée** : exploitation de la PKI de négociation v5, renouvellement distant,
 récupération d'une identité expirée et commandes manuelles de rotation. Les
@@ -105,6 +116,12 @@ Ce transport impose TLS 1.3 avec échange `(EC)DHE` éphémère, sans TLS 1.2,
 ultérieure des clés mTLS ne doit pas déchiffrer une capture ancienne ; les
 signatures applicatives restent l'autorisation normative.
 
+Toutes ces signatures emploient ML-DSA-87 pur, jamais HashML-DSA. Le `ctx`
+FIPS 204 est non vide et fixé par type : il vaut exactement le domaine ASCII
+qui préfixe déjà la transcription canonique, sans NUL final. Préfixer seulement
+le message avec `ctx = ""` n'est pas équivalent et est refusé, en particulier
+pour toute signature de `CA-PQ`.
+
 Le canal WireGuard est obligatoire dès qu'il existe. Une opération ordinaire
 initiée par Orion, y compris la récupération de la requête par `astra-signer`
 et le dépôt de son assertion WebAuthn, passe par des routes typées de l'API
@@ -114,6 +131,12 @@ canonique vers Astra par le veth. Il n'est jamais un reverse proxy générique e
 n'accepte aucun en-tête de proxy. Le canal public Astra ne contourne ce chemin
 que pour une identité qui ne peut plus négocier et pour les opérations
 opérateur explicitement lancées hors tunnel.
+
+Les trois routes du compagnon n'acceptent pas un simple identifiant comme
+autorité. Elles exigent une capacité bearer MACée, distincte par scope, liée à
+l'opération, au manifeste, au coffre éventuel et à cinq minutes au plus. La clé
+racine de ces capacités est éphémère au processus Astra : un redémarrage les
+invalide, sans dériver aucun droit d'une CA ou de la clé de service.
 
 ### 3. Une ancre maîtresse et un émetteur Astra délégué
 
@@ -135,6 +158,14 @@ Cette délégation autorise seulement le renouvellement séquentiel de leafs de
 clients déjà admis et non révoqués. Elle interdit le premier enrôlement, la
 réadmission, la récupération d'une identité expirée, la rotation gateway, la
 rotation de CA, la révocation et toute génération autre que `active + 1`.
+
+L'empreinte de politique n'est pas une valeur que la délégation choisit pour
+elle-même. Le document d'enrôlement la présente avec `CA-PQ`; l'opérateur la
+confirme hors bande et Orion comme Helios la scellent dans leur profil. Tout
+objet — délégation, campagne ou grant — portant une autre empreinte est refusé,
+même sous une signature `CA-PQ` valide. La v1 ne tourne pas ce pin en ligne :
+changer la politique impose de réémettre et reconfirmer le profil. Sa forme
+canonique est fixée par la spécification §2.4.
 
 La clé opérationnelle est scellée dans l'état Astra de la gateway. Une
 compromission de l'hôte peut donc abuser de cette délégation jusqu'à son
@@ -183,6 +214,14 @@ l'émetteur Astra délégué produit les leafs ordinaires. Une assertion destin�
 L'approbation transporte l'assertion WebAuthn complète et la liaison publique
 du credential signée par `CA-PQ`; Astra, Helios et Orion la vérifient chacun.
 Elle n'est donc pas une simple affirmation du coordinateur en ligne.
+
+La récupération expirée, qui doit employer `CA-PQ`, combine au contraire les
+deux fonctions dans une seule cérémonie `GetAssertion` par credential : le
+challenge signe le hash exact de la récupération et l'extension PRF/
+`hmac-secret` dérive simultanément le secret du key-slot. Le compagnon vérifie
+l'assertion avant d'ouvrir le coffre. Une opération exigeant deux credentials
+répète cette cérémonie avec deux clés distinctes. Cette combinaison ne vaut
+jamais pour le renouvellement ordinaire, qui n'ouvre aucun coffre maître.
 
 Orion et la console Helios ne parlent pas directement à CTAP. Ils créent une
 opération Astra puis ouvrent `astra-signer` par un lien local enregistré qui ne
@@ -247,12 +286,23 @@ retirée, définitivement, comme toute sauvegarde LUKS l'est par une phrase
 supprimée depuis. La réponse à un credential réellement compromis est une
 rotation de `CA-PQ`, pas un retrait de slot.
 
-Un sel unique par coffre, et non par slot : `hmac-secret` rend
+Un sel **WebAuthn** unique par coffre, et non par slot : `hmac-secret` rend
 `HMAC(CredRandom, sel)` et `CredRandom` est tiré par l'authentificateur pour
 chaque credential, donc deux slots d'un même coffre dérivent déjà deux secrets
-distincts. Un sel par slot n'ajouterait rien et coûterait la résolution en une
-seule assertion — le jeton nomme le credential qu'il détient parmi ceux
+distincts. Un sel WebAuthn par slot n'ajouterait rien et coûterait la résolution
+en une seule assertion — le jeton nomme le credential qu'il détient parmi ceux
 proposés, et rend son secret, d'un seul contact.
+
+Ce sel WebAuthn partagé par le coffre ne doit pas être confondu avec le sel de
+KDF interne de chaque key-slot. Chaque enveloppe est un conteneur HVLT v1
+AES-256-GCM séparé : HKDF-SHA-256 dérive sa clé depuis la sortie
+`hmac-secret`, avec un sel aléatoire frais de 16 octets et le label
+`helios/astra-authority-slot-wrapping/v1`; son contexte authentifié lie
+`vault_id` et `slot_id`. Le payload est un second HVLT v1 sous la clé maîtresse
+aléatoire de 32 octets ; son contexte lie `vault_id`, `trust_domain_id` et le
+digest canonique de la table de slots. L'AAD couvre l'en-tête HVLT complet,
+sel et nonce inclus. Le format exact et les métadonnées qui ne portent aucune
+autorité sont fixés par la spécification §2.4.1.
 
 ### 5. Renouvellement ordinaire assisté, ouvert à 80 %
 
@@ -310,10 +360,12 @@ historique ignore seulement l'échéance après avoir vérifié toutes les autre
 propriétés ; elle n'appelle jamais le validateur du chemin de négociation en
 mode dégradé.
 
-Astra fait persister la nouvelle génération par Helios et exige un
-`GatewayCertificateStageReceipt` signé avant de remettre le grant. Orion peut
-alors négocier avec la nouvelle leaf et seulement ensuite établir WireGuard.
-Une identité révoquée ne suit jamais ce chemin.
+Astra fait persister par Helios un candidat `pending_grant`, sans slot `next`,
+et exige un `GatewayCertificateStageReceipt` signé avant de remettre le grant.
+Orion persiste ce grant puis signe le commit ; Astra le relaie sur le veth et
+seul son succès fait créer `next_committed` par Helios. Orion peut alors
+négocier avec la nouvelle leaf et seulement ensuite établir WireGuard. Une
+identité révoquée ne suit jamais ce chemin.
 
 Une YubiKey suffit à cette récupération parce que l'ancienne clé PQ privée est
 une seconde preuve indépendante et que la clé WireGuard, le domaine et la
@@ -377,6 +429,13 @@ grant puis envoyé un commit signé par les clés active et candidate. Sans comm
 avant l'échéance, Helios purge atomiquement le candidat et refuse tout callback
 tardif. La récupération expirée relaie ce commit par Astra et le veth ; le
 renouvellement ordinaire l'envoie dans WireGuard.
+
+L'autorisation de stage suit, elle, un porteur unique : Astra la remet toujours
+directement à Helios par le veth mTLS et Helios lui retourne le reçu sur cette
+même relation. Orion ne transporte jamais cet objet. Pour un renouvellement
+ordinaire, seule la demande initiale et le commit Orion passent dans WireGuard ;
+pour une récupération expirée, la demande arrive en HTTPS public et le commit
+est relayé par Astra sous l'autorisation de récupération.
 
 La limite de 64 Kio fractionne seulement le transport d'une mise à jour de
 confiance. Tous les chunks appartiennent à un manifeste signé unique et restent
