@@ -140,8 +140,8 @@ Elle ferme aussi les contrats cryptographiques laissés implicites : chaque
 empreinte gateway optionnelle possède son propre discriminant `0|1`, chaque
 type signé possède un `ctx` ML-DSA-87 non vide et exhaustivement fixé, HVLT v1
 fixe AEAD, KDF, sels et AAD, la politique Astra est épinglée hors bande, les
-capacités du compagnon ont un format HKDF/HMAC exact et tout aléa suit le
-pipeline TRNG → HMAC-DRBG-SHA-512 de la négociation v5.
+capacités du compagnon ont un format HKDF/HMAC exact et tout aléa provient d'un
+DRBG SP 800-90A certifié à 256 bits, semé par la plateforme en mode fail-closed.
 
 ## 1. Périmètre
 
@@ -279,30 +279,65 @@ Les identifiants, challenges, sels, nonces, secrets de capacité et clés privé
 de ce cycle suivent la même règle que la négociation v5 :
 
 ```text
-TRNG plateforme -> seed / reseed -> HMAC-DRBG-SHA-512 -> octets consommés
+source d'entropie plateforme fail-closed
+    -> DRBG SP 800-90A de la bibliothèque cryptographique, force 256 bits
+    -> octets consommés
 ```
 
-Un processus n'émet un identifiant, une clé ou un challenge que si son
-HMAC-DRBG est à l'état `instantiated` et que sa dernière opération d'apport
-d'entropie TRNG — instanciation initiale ou reseed — a réussi. Sinon l'appel
-retourne une erreur fatale et n'écrit aucun octet de sortie.
+Deux mécanismes seulement sont admis :
+
+- **HMAC-DRBG-SHA-512** ;
+- **CTR-DRBG-AES-256 avec fonction de dérivation activée** (`use_df = true`).
+
+Le mécanisme fournit une force de sécurité de 256 bits et vient de la
+bibliothèque cryptographique du projet. Le choix est local, explicite et
+journalisé ; il ne change aucun format filaire et deux pairs peuvent employer
+des mécanismes autorisés différents. L'absence de fournisseur utilisable est
+une erreur de démarrage. Il n'existe ni bascule silencieuse vers l'autre
+mécanisme, ni acceptation d'un générateur au seul motif qu'une API le nomme
+« CSPRNG ».
+
+**La validation CAVP/ACVP n'est pas exigée par cette version.** Un déploiement
+qui la veut construit la même bibliothèque dans sa variante validée : mécanisme
+et format filaire identiques, seule la paperasse change. Tant que cette
+variante n'est pas celle qui tourne, aucun code, journal ni document du projet
+ne présente le pipeline comme validé.
+
+Le démarrage journalise sans secret le fournisseur, sa version, le mécanisme
+choisi, l'activation de `use_df` pour CTR-DRBG et l'intervalle de reseed
+annoncé.
+
+Helios, Astra et Orion **n'implémentent pas le DRBG** : aucun état
+HMAC-DRBG/CTR-DRBG, primitive de mise à jour, dérivation de seed ou test de
+santé n'est recodé dans le projet. Ils appellent l'interface du fournisseur
+validé, configurent le profil ci-dessous et propagent ses erreurs sans produire
+d'octets. Une mince adaptation de type et de configuration est permise ; elle
+ne génère aucun octet elle-même. Un faux fournisseur déterministe est admis
+uniquement sous `cfg(test)`, ne peut pas être sélectionné par un binaire livré
+et n'est jamais présenté comme un DRBG conforme.
+
+Un processus n'émet un identifiant, une clé ou un challenge que si le DRBG du
+fournisseur est `instantiated` dans un mécanisme autorisé et que sa dernière
+opération d'apport d'entropie plateforme — instanciation initiale ou reseed — a
+réussi. Sinon l'appel retourne une erreur fatale et n'écrit aucun octet de
+sortie.
 
 ```text
-instantiate : entropy_input >= 32 octets issus du TRNG plateforme
+instantiate : entropy_input >= 32 octets issus de la source plateforme
               + nonce >= 16 octets issu d'un tirage distinct
-reseed      : au moins toutes les 2^20 générations, après chaque fork,
-              et avant toute génération de clé privée ML-DSA-87, ML-KEM
-              ou TLS
+reseed      : intervalle fournisseur configuré <= 2^20 appels generate,
+              après chaque fork, et avant toute génération de clé privée
+              ML-DSA-87, ML-KEM ou TLS
 generate    : prediction_resistance = true pour une clé privée ;
               false admis pour un request_id ou un identifiant public
 ```
 
 Une « génération » désigne un appel au DRBG, quelle que soit la longueur
-demandée. Le compteur est remis à zéro après instanciation ou reseed ; au plus
-`2^20` appels `generate` sont permis avant le reseed suivant, et l'appel qui
-dépasserait cette borne échoue sans sortie. Dans le processus enfant d'un fork,
-l'état hérité est immédiatement invalide et aucun octet n'est rendu avant
-reseed. Un échec de test de santé du TRNG, d'instanciation, de reseed ou de
+demandée. La borne de `2^20` est configurée dans le fournisseur ou garantie par
+son profil validé ; elle n'est pas réalisée par un second DRBG applicatif.
+Dans le processus enfant d'un fork, le contexte fournisseur hérité est invalide
+et aucun octet n'est rendu avant réinstanciation ou reseed réussi. Un échec de
+la source plateforme, de son test de santé, d'instanciation, de reseed ou de
 génération est ferme ; il n'existe ni repli vers l'heure, un UUID, un PRNG
 généraliste ou un compteur, ni sortie partielle.
 
@@ -2316,8 +2351,10 @@ YubiKeys ; aucune formulation courte ne l'assimile à un renouvellement banal.
   key-slots, sels frais et AAD/contextes exacts de §2.4.1 ;
 - ML-DSA-87 pur avec le `ctx` non vide fixé pour chaque type au §2.3.1, sans
   HashML-DSA ;
-- pipeline TRNG → HMAC-DRBG-SHA-512 et erreurs fermes de §2.3.2 pour tout
-  identifiant, challenge, nonce, sel, secret et clé ;
+- DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique,
+  HMAC-DRBG-SHA-512 ou
+  CTR-DRBG-AES-256 avec DF, et erreurs fermes de §2.3.2 pour tout identifiant,
+  challenge, nonce, sel, secret et clé, sans DRBG applicatif maison ;
 - `astra_policy_fingerprint` confirmé hors bande et épinglé dans les profils
   Orion et le registre Helios ;
 - jetons de capacité du compagnon liés au scope, à l'opération, au manifeste,
@@ -2484,14 +2521,36 @@ contournés :
   de confiance, `pending_grant` jusqu'au commit, révocation de l'active depuis
   toute phase et égalité de `retire_active_at` — restent la base à conserver ;
 
-- l'**alignement cryptographique du 16 août** : les helpers ML-DSA-87 passent
-  encore `ctx = ""` et doivent recevoir le contexte ASCII du type ; le profil
-  ne porte pas encore `astra_policy_fingerprint`; les jetons de capacité HKDF/
-  HMAC ne sont pas implémentés ; et les appels directs au CSPRNG système ne
-  matérialisent pas encore l'état, le reseed et les erreurs fermes du contrat
-  HMAC-DRBG-SHA-512 de §2.3.2. Aucun de ces écarts ne peut être masqué par le
-  seul préfixe du message, une signature `CA-PQ`, un UUID ou un filtre de
-  valeurs nulles ;
+- l'**alignement cryptographique du 16 août**, partiellement livré. Ce qui est
+  fait : toute signature ML-DSA-87 du cycle passe par `aether::ml_dsa`, un
+  point d'entrée unique qui exige le `ctx` ASCII non vide du §2.3.1 et refuse
+  un contexte vide, celui d'un autre type, un NUL ou un octet non imprimable —
+  y compris sous `CA-PQ`. Le contexte n'est plus un paramètre qu'un appelant
+  choisit : `CanonicalBytes::finish_signed` rend un `SignedTranscript` qui
+  porte son domaine, et signer ou vérifier refuse un message qui ne s'ouvre pas
+  dessus. Le préfixe interne et le contexte externe restent donc deux contrôles,
+  et les deux s'appliquent. HashML-DSA n'est appelé nulle part et ne vérifie pas
+  sous ce chemin. Tout tirage passe par `aether::random`, qui **ne réimplémente
+  aucun DRBG** — pas d'état, pas de fonction de mise à jour, pas de dérivation
+  de seed, pas de test de santé : une adaptation de type vers le fournisseur,
+  un refus ferme quand il échoue, un faux fournisseur déterministe sous
+  `cfg(test)` seulement, et la bannière de démarrage exigée par §2.3.2.
+  La source est `aws_lc_rs::rand::SystemRandom` — le `RAND_bytes` d'AWS-LC déjà
+  employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256 avec DF, état par
+  thread, reseed toutes les 4096 générations et réinstanciation avant toute
+  sortie après fork ou reprise d'instantané. La validation CAVP/ACVP est hors
+  périmètre et rien ne la revendique.
+  Ce qui reste ouvert : la **résistance à la prédiction par appel**, présente
+  dans l'API C d'AWS-LC (`RAND_bytes_with_user_prediction_resistance`) mais
+  absente du binding Rust — `fill_secret` en porte l'intention sans changer
+  l'appel, et la réaliser au-dessus reviendrait à détenir l'état DRBG que ce
+  paragraphe interdit. Restent également ouverts le `astra_policy_fingerprint`
+  dans le profil et les jetons de capacité HKDF/HMAC. Aucun de ces écarts ne peut être masqué par le seul préfixe du
+  message, une signature `CA-PQ`, un UUID, un filtre de valeurs nulles ou un
+  DRBG réimplémenté dans Helios ;
+
+  **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
+  émis avant ce changement cesse de vérifier et le parc se ré-émet ;
 
 - les **commandes de signature et d'approbation** d'`astra-signer` : certificat
   auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes,
@@ -2785,12 +2844,15 @@ qu'il sert.
 - jeton de capacité refusé sous un autre scope, chemin, méthode, opération,
   manifeste ou coffre, après cinq minutes, après redémarrage d'Astra ou après
   consommation de `signer_result_submit`; comparaison du tag en temps constant ;
-- DRBG refusant toute sortie avant instanciation ou après échec TRNG/reseed,
-  au plus `2^20` appels entre deux apports d'entropie et reseed dans l'enfant
-  après fork, résistance à la prédiction avant chaque clé privée, sans octet
-  partiel écrit ;
+- l'un des deux mécanismes DRBG autorisés, fourni par la bibliothèque
+  cryptographique, refusant
+  toute sortie avant instanciation ou après échec de la source
+  plateforme/reseed, avec au plus
+  `2^20` appels entre deux apports d'entropie, réinstanciation ou reseed dans
+  l'enfant après fork et aucun octet partiel écrit ; fournisseur absent,
+  CTR-DRBG sans DF et DRBG applicatif maison refusés ;
 - identifiants et challenges nuls refusés à la réception, sans que le test de
-  non-nullité puisse remplacer les tests du HMAC-DRBG-SHA-512 ;
+  non-nullité puisse remplacer les garanties du fournisseur ;
 - route veth incapable d'atteindre un pair, le plan de données, les coffres ou
   une autre API Helios ;
 - TLS veth refusant TLS 1.2, `psk_ke`, tickets de reprise et 0-RTT, avec clés de

@@ -464,16 +464,13 @@ async fn resolve_remote(value: &str) -> Result<SocketAddr> {
 }
 
 fn random_identifier() -> Result<[u8; KEY_NEGOTIATION_NONCE_LEN]> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
     let mut value = [0u8; KEY_NEGOTIATION_NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut value)
-        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    aether::random::fill_public(&mut value)
+        .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
+    // A shape check, not a generator check: the DRBG above is what makes the
+    // value unpredictable, and an all-zero identifier is refused on receipt.
     if value.iter().all(|byte| *byte == 0) {
-        return Err(anyhow::anyhow!(
-            "system CSPRNG returned an invalid identifier"
-        ));
+        return Err(anyhow::anyhow!("the DRBG returned an invalid identifier"));
     }
     Ok(value)
 }

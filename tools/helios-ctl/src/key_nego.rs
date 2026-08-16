@@ -483,12 +483,9 @@ fn set_validity(params: &mut CertificateParams, days: i64) {
 }
 
 fn random_serial() -> Result<[u8; 16]> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
     let mut serial = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut serial)
-        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    aether::random::fill_public(&mut serial)
+        .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
     Ok(serial)
 }
 

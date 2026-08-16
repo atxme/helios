@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     encoding::{
         verify_ml_dsa_87, CanonicalBytes, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature,
-        TrustDomainId, WireGuardKey,
+        SignedTranscript, TrustDomainId, WireGuardKey,
     },
     CertificateError, CERTIFICATE_FORMAT_VERSION,
 };
@@ -150,7 +150,7 @@ pub struct AstraCertificateStatus {
 }
 
 impl AstraCertificateStatus {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(STATUS_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -165,7 +165,7 @@ impl AstraCertificateStatus {
             .u64(self.next_update)
             .u64(self.status_epoch)
             .u64(self.astra_service_key_epoch);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Ordering key: the service key epoch dominates the status epoch.
@@ -243,7 +243,7 @@ pub fn status_query_signing_bytes(
     gateway_wg_public_key: &WireGuardKey,
     client_wg_public_key: &WireGuardKey,
     certificate_fingerprint: &Fingerprint,
-) -> Vec<u8> {
+) -> SignedTranscript {
     let mut bytes = CanonicalBytes::new(STATUS_QUERY_DOMAIN);
     bytes
         .id(trust_domain_id)
@@ -252,7 +252,7 @@ pub fn status_query_signing_bytes(
         .key(gateway_wg_public_key)
         .key(client_wg_public_key)
         .fingerprint(certificate_fingerprint);
-    bytes.finish()
+    bytes.finish_signed()
 }
 
 /// What a manual campaign covers (spec §7.6).
@@ -434,7 +434,7 @@ pub struct AstraSignerRequest {
 }
 
 impl AstraSignerRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(SIGNER_REQUEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -446,7 +446,7 @@ impl AstraSignerRequest {
             .u64(self.created_at)
             .u64(self.expires_at)
             .u64(self.astra_service_key_epoch);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Verified by the companion under the service key **it already pins**.
@@ -508,7 +508,7 @@ pub struct CertificateServiceRollbackAuthorization {
 }
 
 impl CertificateServiceRollbackAuthorization {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(SERVICE_ROLLBACK_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -520,7 +520,7 @@ impl CertificateServiceRollbackAuthorization {
             .fingerprint(&self.selected_certificate_fingerprint)
             .fingerprint(&self.campaign_fingerprint)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Verifies the authorization against the overlap it claims to be inside.

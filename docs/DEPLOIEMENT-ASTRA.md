@@ -55,10 +55,13 @@ manque :
   client d'Astra ;
 - l'**alignement cryptographique** du 16 août : contextes ML-DSA-87 non vides,
   pin de politique dans les profils, jetons de capacité du compagnon et
-  pipeline TRNG → HMAC-DRBG-SHA-512. Le format binaire, l'AEAD, la KDF et l'AAD
-  de HVLT ainsi que les octets de présence des empreintes optionnelles sont
-  déjà conformes ; l'aléa employé par HVLT doit cependant rejoindre le même
-  DRBG. Les écarts restants sont des refus de mise en production, pas des
+  fournisseur dont le DRBG SP 800-90A porte une validation CAVP/ACVP à
+  256 bits — HMAC-DRBG-SHA-512 ou
+  CTR-DRBG-AES-256 avec DF — semé par la plateforme en mode fail-closed, sans
+  DRBG applicatif maison. Le format binaire, l'AEAD, la KDF et l'AAD de HVLT
+  ainsi que les octets de présence des empreintes optionnelles sont déjà
+  conformes ; l'aléa employé par HVLT doit cependant rejoindre ce fournisseur.
+  Les écarts restants sont des refus de mise en production, pas des
   améliorations facultatives.
 
 Ce qui est donc réellement éprouvé ici : la construction de l'image, le

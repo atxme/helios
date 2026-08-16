@@ -8,6 +8,7 @@ const ML_DSA_65_PUBLIC_KEY_LEN: usize = 1_952;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HELIOS_PUBLISHER_KEYRING_PATH");
+    emit_drbg_provider_version();
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let configured = env::var_os("HELIOS_PUBLISHER_KEYRING_PATH").map(PathBuf::from);
@@ -99,4 +100,44 @@ fn rust_array(bytes: &[u8]) -> String {
     }
     output.push(']');
     output
+}
+
+/// Records the version of the validated DRBG provider for the startup banner.
+///
+/// The specification asks the log to name the provider *and its version*, and
+/// no crate exposes that at runtime: `aws-lc-rs` publishes no version constant,
+/// and reaching into `aws-lc-sys` for one means a per-target binding this crate
+/// has no other reason to depend on. The lock file is the authority anyway —
+/// it is what the build actually resolved.
+///
+/// A missing lock file yields `unknown`, and the banner then says `unknown`
+/// rather than a version nobody verified.
+fn emit_drbg_provider_version() {
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let lock = manifest_dir
+        .ancestors()
+        .map(|directory| directory.join("Cargo.lock"))
+        .find(|candidate| candidate.exists());
+    let version = lock
+        .as_ref()
+        .and_then(|path| {
+            println!("cargo:rerun-if-changed={}", path.display());
+            fs::read_to_string(path).ok()
+        })
+        .and_then(|contents| locked_version(&contents, "aws-lc-rs"))
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=HELIOS_DRBG_PROVIDER_VERSION={version}");
+}
+
+/// The version of one package in a `Cargo.lock`.
+fn locked_version(lock: &str, package: &str) -> Option<String> {
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != format!("name = \"{package}\"") {
+            continue;
+        }
+        let version = lines.next()?.trim().strip_prefix("version = ")?;
+        return Some(version.trim_matches('"').to_string());
+    }
+    None
 }

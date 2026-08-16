@@ -138,12 +138,44 @@ Restent ouverts :
   Astra possède une empreinte confirmée hors bande et épinglée dans le profil ;
   une signature `CA-PQ` ne peut la remplacer. Les capacités du compagnon sont
   des jetons HKDF-SHA-256 + HMAC-SHA-256, bornés à cinq minutes, une opération,
-  un manifeste, un coffre et un scope. Enfin tout aléa du protocole suit
-  TRNG → HMAC-DRBG-SHA-512, reseed au plus tard toutes les `2^20` générations,
-  après fork et avant toute clé privée ; un échec ne rend aucun octet. À part
-  les octets de présence et les primitives/formats HVLT déjà présents, cet
-  alignement reste à implémenter ; la source d'aléa de HVLT doit elle aussi
-  passer par le nouveau DRBG.
+  un manifeste, un coffre et un scope. Enfin tout aléa du protocole vient du
+  DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique —
+  HMAC-DRBG-SHA-512 ou CTR-DRBG-AES-256 avec DF —, semé par la source
+  plateforme en mode fail-closed, reseed au plus tard toutes les `2^20`
+  générations et après fork ; un échec ne rend aucun octet. Aucun DRBG
+  applicatif n'est écrit dans Helios, et la validation CAVP/ACVP du fournisseur
+  n'est pas exigée par cette version.
+  **Le socle de cet alignement est livré.** `aether::ml_dsa` est le point
+  d'entrée unique des signatures ML-DSA-87 : il exige le `ctx` du type, refuse
+  contexte vide, contexte d'un autre type, NUL et octet non imprimable, et
+  refuse un message qui ne s'ouvre pas sur son domaine — le contexte n'est plus
+  un paramètre libre, `CanonicalBytes::finish_signed` rend un
+  `SignedTranscript` qui porte le sien. HashML-DSA n'est appelé nulle part et
+  ne vérifie pas. `aether::random` porte l'autre moitié et **ne réimplémente
+  aucun DRBG** : interface vers le fournisseur, refus ferme, faux fournisseur
+  déterministe sous `cfg(test)` seulement, bannière de démarrage nommant
+  fournisseur, version, mécanisme, `use_df`, intervalle de reseed et validation.
+  Plus aucun appel direct au CSPRNG système ne subsiste hors de ce module —
+  négociation, cycle de vie, HVLT, coffres Orion, séquestre TPM et outils
+  compris.
+  La source est **`aws_lc_rs::rand::SystemRandom`**, c'est-à-dire le
+  `RAND_bytes` d'AWS-LC déjà utilisé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256
+  avec fonction de dérivation — l'un des deux mécanismes admis —, état par
+  thread, reseed toutes les 4096 générations (`kCtrDrbgReseedInterval`, deux
+  cent cinquante fois sous le plafond de `2^20`), et réinstanciation avant toute
+  sortie après fork ou reprise d'instantané de VM (`crypto/ube`). C'est
+  précisément pourquoi `aether::random` n'a **pas** de détection de fork à lui :
+  le fournisseur la fait, et mieux qu'une comparaison de PID.
+  La **validation FIPS est hors périmètre** et assumée comme telle : la
+  construction `aws-lc-fips-sys` porte les certificats CAVP/CMVP mais exige les
+  chaînes CMake et Go qu'ADR-001 §2 tient hors du build, pour le même mécanisme.
+  Rien dans le code ne revendique de validation. Une limite subsiste, nommée
+  dans le doc-comment : la **résistance à la prédiction par appel** existe en C
+  (`RAND_bytes_with_user_prediction_resistance`) mais pas dans le binding Rust,
+  donc `fill_secret` porte l'intention sans changer l'appel — la réaliser
+  au-dessus reviendrait à détenir l'état DRBG que la spécification interdit.
+  **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
+  émis avant ce lot cesse de vérifier et le parc se ré-émet.
   Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
   `heliosd init-trust-domain` de l'autre. La seconde n'ouvre aucun coffre et ne
   génère aucune clé — elle relit les leaves servies sur disque et reçoit les
@@ -556,6 +588,11 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `aether` : états, config, politique, ML-KEM, protocole et signatures hybrides.
   `aether::certificates` y ajoute le cycle de vie des certificats : objets
   signés, encodage canonique, générations et états bornés à deux slots.
+  `aether::ml_dsa` est le **seul** point d'entrée ML-DSA-87 de la négociation
+  v5 et du cycle de vie — pur, `ctx` non vide par type, HashML-DSA refusé —,
+  et `aether::random` la **seule** porte vers l'aléa : une interface vers
+  `aws_lc_rs::rand::SystemRandom`, jamais un DRBG écrit ici. Aucun autre module
+  du dépôt n'appelle `SystemRandom`, `aws_lc_rs::rand::fill` ni `getrandom`.
 - `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
   conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
   distingue une restauration d'un fork, émetteur délégué borné et endpoint

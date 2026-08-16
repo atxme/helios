@@ -25,20 +25,22 @@
 //!
 //! # Limites connues
 //!
-//! Three parts of ADR-008 are specified here and not implemented, and are
-//! refused explicitly rather than approximated:
+//! Three integration parts of ADR-008 are not implemented, and are refused
+//! explicitly rather than approximated:
 //!
-//! - the **operator credential layer** — FIDO2 `hmac-secret` key slots, the
-//!   `astra-signer` companion, the one- and two-credential approval policies.
-//!   It needs a physical authenticator, which no WSL2 build can provide. The
-//!   routes that would use it answer `501` through
+//! - the **operator approval protocol**. The FIDO2 `hmac-secret` key slots,
+//!   encrypted HVLT vault and `astra-signer` companion exist; the signing
+//!   commands, capability exchange and one- or two-credential approval routes
+//!   do not. Those routes answer `501` through
 //!   [`service::ServiceError::OperatorCredentialUnavailable`];
 //! - the **private veth channel** to `heliosd` and its mutually authenticated
-//!   TLS 1.3 transport. Ordinary renewals do not need it — they travel in the
-//!   client's own WireGuard tunnel — but the recovery of an expired identity
-//!   does, so that path is not yet reachable end to end;
-//! - the **encrypted HVLT vault** and its backup, which belong with the
-//!   credential layer.
+//!   TLS 1.3 transport. An active Orion reaches `heliosd` through WireGuard,
+//!   but `heliosd` must then relay the canonical request to Astra over this
+//!   veth; stage authorization and receipt also stay on it. Expired recovery
+//!   uses the public Astra side and the same private channel;
+//! - the **end-to-end orchestration** which joins approval, delegated issuance,
+//!   gateway staging, receipt, grant and commit without exposing a direct Astra
+//!   route to an Orion whose tunnel still works.
 //!
 //! See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md) for what
 //! a WSL2 build does and does not prove.

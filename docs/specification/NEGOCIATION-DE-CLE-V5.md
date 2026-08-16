@@ -70,12 +70,29 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >
 > **Ce qui n'est pas implémenté**, au 2026-08-16 :
 >
-> - l'**alignement cryptographique du 16 août** : les signatures ML-DSA-87
->   emploient encore un `ctx` FIPS 204 vide au lieu du contexte non vide fixé
->   par type au §8, et les appels au CSPRNG système ne matérialisent pas encore
->   l'état HMAC-DRBG-SHA-512, son reseed et ses erreurs fermes du §4.3. Le
->   préfixe présent dans les octets signés et la qualité du CSPRNG sous-jacent
->   ne rendent pas ces deux contrats implicitement satisfaits ;
+> - la **validation du fournisseur d'aléa** du §4.3. Le reste de l'alignement
+>   cryptographique du 16 août est livré : toute signature ML-DSA-87 passe par
+>   `aether::ml_dsa`, qui exige le `ctx` non vide du §8, refuse un contexte
+>   vide, celui d'un autre type, un NUL ou un octet non imprimable, et refuse
+>   un message qui ne s'ouvre pas sur son domaine — le préfixe interne et le
+>   contexte externe sont deux contrôles distincts, tous deux appliqués. Une
+>   signature HashML-DSA ne vérifie pas sous ce chemin, et aucun appel n'emprunte
+>   une variante préhachée. Tout tirage passe de même par `aether::random`,
+>   qui ne contient **aucun** état DRBG : c'est une adaptation de type vers le
+>   fournisseur, un refus ferme quand il échoue, et la bannière de démarrage que
+>   ce paragraphe exige. La source est `aws_lc_rs::rand::SystemRandom` — le
+>   `RAND_bytes` d'AWS-LC déjà employé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256
+>   avec DF, état par thread, reseed toutes les 4096 générations, et
+>   réinstanciation avant toute sortie après fork ou reprise d'instantané, ce
+>   qui est précisément pourquoi le module n'a pas de détection de fork à lui.
+>   La validation CAVP/ACVP est hors périmètre et rien ne la revendique.
+>   Reste ouverte la **résistance à la prédiction par appel**, présente dans
+>   l'API C d'AWS-LC mais absente du binding Rust ; la réaliser au-dessus
+>   reviendrait à détenir ici l'état DRBG que ce même paragraphe interdit ;
+>
+>   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
+>   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet
+>   (`scripts/provision-client.sh`, `heliosd init-key-negotiation --rotate`) ;
 > - le **discriminant de type de profil Orion**
 >   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
 >   `classic` est bien refusé à la validation d'une requête v5 et à la
@@ -473,7 +490,7 @@ SHA-256 de la sérialisation `serde_json` n'est plus acceptée ; voir
 | champs inconnus | refusés par `deny_unknown_fields` |
 | longueur transaction / nonce | 16 octets |
 | longueur du challenge gateway | 32 octets |
-| source aléatoire | CSPRNG système, voir [§4.3](#43-exigences-sur-laléa) |
+| source aléatoire | DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique, voir [§4.3](#43-exigences-sur-laléa) |
 | taille maximale d'un datagramme QUIC | 1200 octets |
 | découverte de MTU | désactivée |
 
@@ -552,40 +569,67 @@ Tout matériel aléatoire du protocole — `transaction_id`, `client_nonce`,
 clés ML-KEM et ML-DSA — suit le même pipeline :
 
 ```text
-TRNG matériel  →  seed / reseed  →  DRBG approuvé  →  octets consommés
+source d'entropie plateforme fail-closed
+    → DRBG SP 800-90A de la bibliothèque cryptographique, force 256 bits
+    → octets consommés
 ```
 
-Le DRBG approuvé est **HMAC-DRBG-SHA-512**. Un processus n'émet un identifiant,
-une clé, un PSK ou un challenge que si son DRBG est à l'état `instantiated` et
-que sa dernière opération d'apport d'entropie TRNG — instanciation initiale ou
-reseed — a réussi. Sinon l'appel retourne une erreur fatale et n'écrit aucun
-octet de sortie.
+Deux mécanismes seulement sont admis : **HMAC-DRBG-SHA-512** ou
+**CTR-DRBG-AES-256 avec fonction de dérivation activée** (`use_df = true`). Ils
+fournissent une force de sécurité de 256 bits. Le mécanisme vient de la
+bibliothèque cryptographique du projet, pas d'un générateur écrit ici : Helios,
+Orion et leurs caisses communes ne réimplémentent ni DRBG, ni dérivation de
+seed, ni tests de santé. Une adaptation de type et de configuration est admise
+seulement si elle ne produit aucun octet elle-même. Un faux fournisseur
+déterministe est permis uniquement sous `cfg(test)`, ne peut être sélectionné
+par aucun binaire livré et n'est jamais présenté comme conforme.
+
+**La validation CAVP/ACVP du fournisseur n'est pas exigée par cette version.**
+Un déploiement qui la veut construit la même bibliothèque dans sa variante
+validée : le mécanisme et le format filaire sont identiques, seule la
+paperasse change. Réciproquement, aucun code, journal ni document du projet ne
+présente le pipeline comme validé tant que cette variante n'est pas celle qui
+tourne, et un numéro de certificat ne s'affirme jamais depuis une constante
+compilée.
+
+Le démarrage journalise sans secret le fournisseur, sa version, le mécanisme
+choisi, l'activation de `use_df` pour CTR-DRBG et l'intervalle de reseed
+annoncé.
+
+Le choix du mécanisme est local, explicite et journalisé ; il ne se négocie pas
+sur le fil. L'absence de fournisseur utilisable est une erreur de démarrage,
+sans bascule silencieuse vers un PRNG généraliste. Un processus n'émet un
+identifiant, une clé, un PSK ou un challenge que si le DRBG du fournisseur est
+`instantiated` et que sa dernière opération d'apport d'entropie plateforme —
+instanciation initiale ou reseed — a réussi. Sinon l'appel retourne une erreur
+fatale et n'écrit aucun octet de sortie.
 
 ```text
-instantiate : entropy_input >= 32 octets issus du TRNG plateforme
+instantiate : entropy_input >= 32 octets issus de la source plateforme
               + nonce >= 16 octets issu d'un tirage distinct
-reseed      : au moins toutes les 2^20 générations, après chaque fork,
-              et avant toute génération de clé privée ML-DSA-87, ML-KEM
-              ou TLS
+reseed      : intervalle fournisseur configuré <= 2^20 appels generate,
+              après chaque fork, et avant toute génération de clé privée
+              ML-DSA-87, ML-KEM ou TLS
 generate    : prediction_resistance = true pour une clé privée ;
               false admis pour un transaction_id, nonce ou challenge public
 ```
 
 Une « génération » est un appel au DRBG, indépendamment du nombre d'octets
-demandé. Le compteur est remis à zéro après instanciation ou reseed ; au plus
-`2^20` appels `generate` sont permis avant le reseed suivant, et l'appel qui
-dépasserait cette borne échoue sans sortie. Dans le processus enfant d'un fork,
-l'état hérité est invalide et aucune sortie n'est permise avant reseed. Il
-n'est **pas** exigé que les 32 octets d'un PSK soient lus directement du TRNG :
-les standards NIST distinguent source d'entropie et générateur déterministe, et
-le bon modèle est celui ci-dessus.
+demandé. La borne de `2^20` est configurée dans le fournisseur ou garantie par
+son profil validé ; elle n'est pas réalisée par un second DRBG applicatif.
+Dans le processus enfant d'un fork, le contexte fournisseur hérité est invalide
+et aucune sortie n'est permise avant réinstanciation ou reseed réussi. Il n'est
+**pas** exigé que les 32 octets d'un PSK soient lus directement de la source
+plateforme : l'architecture NIST distingue source d'entropie et générateur
+déterministe, et le bon modèle est celui ci-dessus.
 
 Un identifiant, nonce ou challenge entièrement nul est refusé à la réception,
-mais ce contrôle ne remplace pas le DRBG : un générateur défaillant n'a pas le
-droit de produire puis filtrer la valeur. Un échec du TRNG, de son test de
-santé, d'instanciation, de reseed ou de génération est une **erreur ferme**.
-Aucun repli vers l'heure, un UUID, un PRNG généraliste ou un compteur, aucune
-sortie partielle et aucune génération « au mieux ».
+mais ce contrôle ne remplace pas le fournisseur : un générateur défaillant n'a
+pas le droit de produire puis filtrer la valeur. Un échec de la source
+plateforme, de son test de santé, d'instanciation, de reseed ou de génération
+est une **erreur ferme**. Aucun repli vers l'heure, un UUID, un PRNG généraliste
+ou un compteur, aucune sortie partielle, aucune génération « au mieux » et
+aucun DRBG applicatif maison.
 
 ### 4.4 Niveau post-quantique
 
@@ -2607,11 +2651,13 @@ déclarer la v5 implémentée.
 - chaque certificat et message ML-DSA-87 accepté avec le `ctx` exact de §8,
   puis refusé avec `ctx = ""`, le contexte d'un autre type, un NUL final ou
   HashML-DSA, y compris sous une signature `CA-PQ` cryptographiquement valide ;
-- HMAC-DRBG-SHA-512 refusant toute sortie avant instanciation ou après échec du
-  TRNG/reseed, au plus `2^20` appels entre deux apports d'entropie et reseed
-  dans l'enfant après fork, `prediction_resistance = true` avant toute clé
-  privée et aucun octet partiel rendu en erreur ; une valeur nulle filtrée ne
-  compte jamais comme un succès du générateur ;
+- l'un des deux mécanismes DRBG autorisés, fourni par la bibliothèque
+  cryptographique, refusant toute sortie après échec de la source plateforme ou
+  du reseed, avec au plus `2^20` appels entre deux apports d'entropie,
+  réinstanciation ou reseed dans l'enfant après fork, et aucun octet partiel
+  rendu en erreur ; fournisseur absent, CTR-DRBG sans DF et DRBG applicatif
+  maison refusés ; une valeur nulle filtrée ne compte jamais comme un succès du
+  générateur ;
 - horodatages `0`, `u64::MAX`, juste dans et juste hors de la fenêtre : aucun
   overflow ni panic, résultat déterministe ;
 - `confirmation_timeout_secs` hors de `[1, 45]` refusé par Orion, même signé ;

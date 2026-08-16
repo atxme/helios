@@ -1,22 +1,25 @@
-//! In-tunnel trust updates and the private Astra ↔ Helios lifecycle API.
-//!
-//! Two surfaces, two threat models, one crate:
+//! In-tunnel certificate lifecycle API.
 //!
 //! - `POST /api/key-negotiation/trust-update` lives **inside the WireGuard
 //!   tunnel**, behind [`crate::auth::require_peer`]. It is how an Orion that
 //!   still has a working tunnel learns about transitions (spec §8.1).
-//! - `/internal/v1/certificates/*` lives on the **veth** to the Astra
-//!   container. It carries the staging of a recovery that has no tunnel left,
-//!   and the commit that follows it (spec §8.3).
+//! - `POST /api/key-negotiation/stage-commit` carries an ordinary client commit
+//!   through that same tunnel.
+//!
+//! The `/internal/v1/certificates/*` surface belongs on a separate listener on
+//! the private Astra–Helios veth. It is not mounted by this router yet. In
+//! particular there is deliberately no in-tunnel `stage` route: Astra sends a
+//! stage authorization directly to Helios over the veth and receives the
+//! signed receipt there (spec §§7.2 and 8.1.2).
 //!
 //! # Why the public route is not a fallback for the private one
 //!
-//! An ordinary renewal always travels in the tunnel, because that is what
-//! proves the peer: the source address resolves to exactly one admitted
-//! `/32`, and no proxy header is ever consulted. The veth path exists only for
-//! the case where WireGuard cannot exist yet — a client whose leaf expired
-//! while it was offline. Letting an active Orion use the veth would throw away
-//! the proof that the call came from the peer it names.
+//! An ordinary renewal request and its final commit travel in the tunnel,
+//! because that is what proves the peer: the source address resolves to exactly
+//! one admitted `/32`, and no proxy header is ever consulted. Helios relays the
+//! request to Astra; the stage authorization and receipt never transit through
+//! Orion. Recovery without a tunnel reaches Astra publicly, then uses the same
+//! private veth surface.
 //!
 //! # Why the errors are coarse
 //!
@@ -27,10 +30,7 @@
 //! oracle on other peers' generations.
 
 use aether::certificates::{
-    client::{
-        ClientCertificateRotationGrant, ClientCertificateStageAuthorization,
-        ClientCertificateStageCommit,
-    },
+    client::{ClientCertificateRotationGrant, ClientCertificateStageCommit},
     status::AstraCertificateStatus,
     transport::{
         AuthenticatedTrustUpdateRequest, TrustUpdateChunk, TrustUpdateTransactionManifest,
@@ -119,13 +119,28 @@ pub trait TrustUpdateHandler: Send + Sync {
         caller_wg_public_key: &str,
         request: Box<StageCommitRequest>,
     ) -> Result<(), TrustUpdateRefusal>;
+}
 
-    /// Staging authorization handed over by an Orion that still has a tunnel.
-    async fn stage(
+/// Private Astra-to-Helios staging contract.
+///
+/// This trait deliberately has no route in the in-tunnel router. The future
+/// veth listener owns its mTLS authentication and calls it only for an Astra
+/// peer pinned by the local trust domain.
+#[async_trait]
+pub trait AstraStageHandler: Send + Sync {
+    async fn stage_from_astra(
         &self,
-        caller_wg_public_key: &str,
-        authorization: Box<ClientCertificateStageAuthorization>,
+        authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
     ) -> Result<Box<aether::certificates::client::GatewayCertificateStageReceipt>, TrustUpdateRefusal>;
+}
+
+/// Tombstone for the pre-amendment Orion-to-Helios staging route.
+///
+/// The global router serves the web application as its fallback, including for
+/// unknown paths. Keeping this explicit `404` prevents a retired API call from
+/// receiving an HTML `200` that a client could mistake for a protocol answer.
+pub async fn retired_in_tunnel_stage() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 impl TrustUpdateRefusal {
@@ -177,37 +192,6 @@ pub async fn trust_update(
     };
     match handler.trust_update(caller_key, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(refusal) => refusal.status().into_response(),
-    }
-}
-
-/// `POST /api/key-negotiation/stage`, inside the tunnel (spec §7.2).
-///
-/// Orion hands over the authorization it obtained from Astra; the gateway
-/// persists the candidate and answers with the signed receipt.
-pub async fn stage(
-    State(s): State<AppState>,
-    Extension(caller): Extension<crate::auth::Caller>,
-    body: Bytes,
-) -> Response {
-    let Some(caller_key) = caller.public_key.as_deref() else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    let authorization: ClientCertificateStageAuthorization = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(peer = %caller_key, %error, "staging refused: unreadable body");
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-    let Some(handler) = s.trust_update.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match handler.stage(caller_key, Box::new(authorization)).await {
-        Ok(receipt) => (StatusCode::OK, Json(*receipt)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }
 }
@@ -279,17 +263,6 @@ mod tests {
             _request: Box<StageCommitRequest>,
         ) -> Result<(), TrustUpdateRefusal> {
             Ok(())
-        }
-
-        async fn stage(
-            &self,
-            _caller_wg_public_key: &str,
-            _authorization: Box<ClientCertificateStageAuthorization>,
-        ) -> Result<
-            Box<aether::certificates::client::GatewayCertificateStageReceipt>,
-            TrustUpdateRefusal,
-        > {
-            Err(TrustUpdateRefusal::Internal)
         }
     }
 

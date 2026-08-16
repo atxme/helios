@@ -1872,6 +1872,13 @@ fn main() {
         "démarrage d'Orion"
     );
 
+    // The randomness pipeline is named before anything draws from it, and an
+    // unusable provider stops the start-up: a client that cannot draw a
+    // transaction identifier cannot negotiate, and failing here says why
+    // (NEGOCIATION-DE-CLE-V5 §4.3).
+    let drbg = aether::random::configure().expect("no usable DRBG provider for the negotiation");
+    tracing::info!(%drbg, "randomness provider");
+
     #[cfg(debug_assertions)]
     let _frontend_dev_server =
         ensure_frontend_dev_server().expect("unable to prepare Orion's development UI");

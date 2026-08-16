@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, Fingerprint, MlDsa87PublicKey,
-        MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     window::require_next_generation,
     CertificateError, CERTIFICATE_FORMAT_VERSION,
@@ -103,7 +103,7 @@ pub struct EmergencyCertificateRevocation {
 }
 
 impl EmergencyCertificateRevocation {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(REVOCATION_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -120,11 +120,11 @@ impl EmergencyCertificateRevocation {
             .u64(self.effective_at)
             .u8(self.reason.domain_byte())
             .optional_fingerprint(self.replacement_transition_fingerprint.as_ref());
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.ca_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }

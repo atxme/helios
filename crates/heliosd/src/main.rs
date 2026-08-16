@@ -257,6 +257,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // The randomness pipeline is named before anything draws from it. Both
+    // specifications require the banner (§4.3, §2.3.2), and an unusable
+    // provider is a start-up error rather than a refusal the first client to
+    // negotiate discovers.
+    let drbg = aether::random::configure().context("resolving the DRBG provider")?;
+    info!(%drbg, "randomness provider");
+
     match cli.command {
         Command::Run { dev } => {
             let network = NetworkConfig::load().context("loading the network config")?;

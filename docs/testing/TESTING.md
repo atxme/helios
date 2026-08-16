@@ -743,6 +743,22 @@ dernier effet exige la gateway réelle.
     pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
     `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
+- **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
+  n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse
+  fermement quand celui-ci échoue, et journalise au démarrage fournisseur,
+  version, mécanisme, `use_df` et intervalle de reseed. Les tests couvrent ce
+  qui est du ressort du dépôt — refus sans octet produit quand le fournisseur
+  échoue, refus d’un bloc entièrement nul à la sonde de démarrage, borne par
+  appel, propagation vers `fips204`, profil annoncé tenant sous le plafond de
+  `2^20` — au moyen d’un faux fournisseur déterministe, **thread-local**, qu’aucun
+  binaire livré ne peut sélectionner. Ce qui relève du fournisseur ne s’éprouve
+  pas ici et n’a pas à l’être : le CTR-DRBG-AES-256 avec DF, son reseed à 4096
+  générations et sa réinstanciation après fork ou reprise d’instantané sont dans
+  le code AWS-LC embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). La
+  **validation FIPS est hors périmètre** — la construction `aws-lc-fips-sys`
+  exige Go (« Go is required for FIPS »), et aucun déploiement d’Helios ne
+  revendique de certificat. Reste non couverte la résistance à la prédiction
+  **par appel**, absente du binding Rust ;
 - **le cycle de vie des certificats est vérifié en logique, pas en
   exploitation.** `aether::certificates`, le registre gateway, le magasin Orion
   et le binaire `astra` sont couverts par des tests déterministes qui prennent

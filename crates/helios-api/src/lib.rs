@@ -250,11 +250,12 @@ pub fn router(state: AppState) -> Router {
                 aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
             )),
         )
+        // Tombstone of the pre-15-August flow. Astra, not Orion, stages the
+        // candidate through the private veth API; an explicit 404 also keeps
+        // the SPA fallback from returning HTML with status 200.
         .route(
             "/api/key-negotiation/stage",
-            post(certificates::stage).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
-            )),
+            post(certificates::retired_in_tunnel_stage),
         )
         .route(
             "/api/key-negotiation/stage-commit",
@@ -428,6 +429,16 @@ mod security_tests {
             }
         });
         tx
+    }
+
+    #[tokio::test]
+    async fn orion_cannot_relay_astra_stage_authorizations() {
+        let (state, _cmd_rx) = state();
+        let response = router(state)
+            .oneshot(admin_request("/api/key-negotiation/stage", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

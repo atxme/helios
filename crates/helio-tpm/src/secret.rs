@@ -10,10 +10,11 @@ use crate::{Result, TpmError};
 pub struct SecretKey([u8; 32]);
 
 impl SecretKey {
-    /// Generates a random secret via the OS CSPRNG (provisioning / resealing).
+    /// Generates a sealing secret from the approved DRBG (provisioning /
+    /// resealing), with prediction resistance: it is a lasting secret.
     pub(crate) fn generate() -> Result<Self> {
         let mut buf = [0u8; 32];
-        getrandom::getrandom(&mut buf).map_err(|e| TpmError::Rng(e.to_string()))?;
+        aether::random::fill_secret(&mut buf).map_err(|e| TpmError::Rng(e.to_string()))?;
         Ok(Self(buf))
     }
 

@@ -180,13 +180,11 @@ pub async fn provision(
     finish(profile, &secret_key, &client_nonce, &response)
 }
 
-/// Draws a session nonce from the system's CSPRNG.
+/// Draws a session nonce from the approved DRBG.
 fn fresh_nonce() -> [u8; 16] {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
     let mut nonce = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .expect("system CSPRNG unavailable — cannot provision safely");
+    aether::random::fill_public(&mut nonce)
+        .expect("the approved DRBG cannot produce a session nonce");
     nonce
 }
 

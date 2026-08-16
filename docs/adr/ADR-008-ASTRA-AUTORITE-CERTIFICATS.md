@@ -21,7 +21,10 @@ entre Astra et Helios sur le veth. Le reçu laisse le candidat en
 La clarification ferme aussi les contrats cryptographiques : discriminants
 explicites des deux leafs gateway optionnelles, `ctx` ML-DSA-87 non vide fixé
 par type, HVLT v1 sous AES-256-GCM/HKDF-SHA-256, politique confirmée hors bande,
-capacités HKDF/HMAC du compagnon et aléa TRNG → HMAC-DRBG-SHA-512. Leur forme
+capacités HKDF/HMAC du compagnon et aléa fourni par un DRBG SP 800-90A dont
+l'implémentation porte une validation CAVP/ACVP à 256 bits —
+HMAC-DRBG-SHA-512 ou CTR-DRBG-AES-256 avec DF — semé
+par la plateforme en mode fail-closed, sans DRBG applicatif maison. Leur forme
 normative est dans la spécification §§2.3, 2.4, 6.2 et 8.2.
 
 **Portée** : exploitation de la PKI de négociation v5, renouvellement distant,

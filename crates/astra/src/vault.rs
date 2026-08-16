@@ -315,12 +315,17 @@ fn payload_context(
         .field("slots", slots.as_bytes())
 }
 
+/// Draws vault material from the approved DRBG, with prediction resistance.
+///
+/// Everything this returns — master key, HVLT salts, vault and slot
+/// identifiers — outlives the process that drew it, so it all takes the rule
+/// the specification states for a lasting secret rather than the cheaper one
+/// for a throwaway identifier.
 fn random_bytes<const N: usize>() -> Result<[u8; N]> {
-    use aws_lc_rs::rand::SecureRandom as _;
     let mut out = [0u8; N];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut out)
-        .map_err(|_| VaultError::Corrupt("générateur aléatoire indisponible".into()))?;
+    aether::random::fill_secret(&mut out).map_err(|error| {
+        VaultError::Corrupt(format!("générateur approuvé indisponible: {error}"))
+    })?;
     Ok(out)
 }
 

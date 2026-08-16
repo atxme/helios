@@ -1568,11 +1568,9 @@ fn hex_prefix(bytes: &[u8]) -> String {
 }
 
 fn random_nonce() -> Result<[u8; 16]> {
-    use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
     let mut nonce = [0u8; 16];
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| anyhow::anyhow!("system CSPRNG unavailable"))?;
+    aether::random::fill_public(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("the approved DRBG refused: {error}"))?;
     Ok(nonce)
 }
 

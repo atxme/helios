@@ -37,7 +37,7 @@ use super::{
     authority::RotationReason,
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16,
-        MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87PublicKey, MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     window::{require_next_generation, TransitionWindow, MAX_REQUEST_LIFETIME_SECS},
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
@@ -97,7 +97,7 @@ pub struct GatewayCertificateRequest {
 }
 
 impl GatewayCertificateRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(GATEWAY_REQUEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -109,11 +109,11 @@ impl GatewayCertificateRequest {
             .id(&self.request_id)
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.new_key_proof.as_bytes());
         match &self.current_key_authorization {
             Some(signature) => {
@@ -215,7 +215,7 @@ pub struct GatewayIdentityTransition {
 }
 
 impl GatewayIdentityTransition {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_tls = self
             .next_gateway_tls_certificate
             .as_ref()
@@ -243,12 +243,12 @@ impl GatewayIdentityTransition {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     /// Identifies the exact document an abort names (spec §6.3).
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.ca_signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -402,7 +402,7 @@ pub struct GatewayTransitionAbort {
 }
 
 impl GatewayTransitionAbort {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(GATEWAY_ABORT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -416,11 +416,11 @@ impl GatewayTransitionAbort {
             .u64(self.aborted_at)
             .u8(self.reason.domain_byte())
             .fingerprint(&self.campaign_fingerprint);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.ca_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }

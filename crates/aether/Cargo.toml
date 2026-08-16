@@ -36,6 +36,10 @@ rcgen = { workspace = true, optional = true }
 # Clés Curve25519 du plan de données WireGuard (`wg`) : `StaticSecret` porte la
 # clé privée persistée d'un pair, par opposition aux clés éphémères.
 x25519-dalek.workspace = true
+# `rand_core` 0.6 : l'interface que `fips204` attend pour recevoir un
+# générateur. C'est par elle que la génération de clés et la signature hedged
+# tirent du DRBG approuvé de `random` plutôt que du CSPRNG système.
+rand_core = { version = "0.6", default-features = false }
 # `sync` seul : aether ne tire aucun runtime, uniquement le `oneshot` qui porte
 # l'acquittement d'installation du PSK (voir `events::InstallPskRequest`).
 tokio = { workspace = true, features = ["sync"] }

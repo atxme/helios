@@ -54,7 +54,6 @@
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use aws_lc_rs::hkdf;
-use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
 use zeroize::Zeroizing;
 
 use crate::{Result, TpmError};
@@ -96,9 +95,8 @@ pub fn seal_to_operator(operator_public_key: &[u8], plaintext: &[u8]) -> Result<
 
     // Ephemeral pair: discarded as soon as the secret is derived.
     let mut ephemeral_bytes = Zeroizing::new([0u8; KEY_LEN]);
-    SystemRandom::new()
-        .fill(ephemeral_bytes.as_mut_slice())
-        .map_err(|_| TpmError::Rng("CSPRNG unavailable for escrow".into()))?;
+    aether::random::fill_secret(ephemeral_bytes.as_mut_slice())
+        .map_err(|error| TpmError::Rng(format!("approved DRBG unavailable for escrow: {error}")))?;
     let ephemeral_secret = x25519_dalek::StaticSecret::from(*ephemeral_bytes);
     let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral_secret);
 
@@ -110,9 +108,8 @@ pub fn seal_to_operator(operator_public_key: &[u8], plaintext: &[u8]) -> Result<
     )?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| TpmError::Rng("CSPRNG unavailable for nonce".into()))?;
+    aether::random::fill_secret(&mut nonce_bytes)
+        .map_err(|error| TpmError::Rng(format!("approved DRBG unavailable for nonce: {error}")))?;
 
     let mut in_out = plaintext.to_vec();
     key.seal_in_place_append_tag(
@@ -207,9 +204,8 @@ fn to_array(key: &[u8]) -> Result<[u8; KEY_LEN]> {
 /// Generates an escrow keypair. Operator tool: the private half stays off the gateway.
 pub fn generate_operator_keypair() -> Result<(Zeroizing<[u8; KEY_LEN]>, [u8; KEY_LEN])> {
     let mut private = Zeroizing::new([0u8; KEY_LEN]);
-    SystemRandom::new()
-        .fill(private.as_mut_slice())
-        .map_err(|_| TpmError::Rng("CSPRNG unavailable".into()))?;
+    aether::random::fill_secret(private.as_mut_slice())
+        .map_err(|error| TpmError::Rng(format!("approved DRBG unavailable: {error}")))?;
     let secret = x25519_dalek::StaticSecret::from(*private);
     let public = x25519_dalek::PublicKey::from(&secret);
     Ok((private, *public.as_bytes()))

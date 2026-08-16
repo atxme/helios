@@ -39,7 +39,8 @@ use aether::certificates::{encoding::WireGuardKey, CertificateError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use helios_api::certificates::{
-    StageCommitRequest, TrustUpdateHandler, TrustUpdateRefusal, TrustUpdateResponse,
+    AstraStageHandler, StageCommitRequest, TrustUpdateHandler, TrustUpdateRefusal,
+    TrustUpdateResponse,
 };
 use helios_provisioning::certificates::{CertificateRegistry, RegistryError};
 use tokio::sync::Mutex;
@@ -104,6 +105,36 @@ impl CertificateService {
             tracing::info!(peer = %peer, "certificate generation promoted at the end of its overlap");
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl AstraStageHandler for CertificateService {
+    /// Persists a stage authorization received from Astra on the private veth.
+    ///
+    /// The private listener calls this only after mutual TLS has authenticated
+    /// Astra. The client identity comes from the signed authorization itself;
+    /// Orion never relays this object and no in-tunnel route exposes it.
+    async fn stage_from_astra(
+        &self,
+        authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
+    ) -> Result<Box<GatewayCertificateStageReceipt>, TrustUpdateRefusal> {
+        let caller = authorization.client_wg_public_key;
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let receipt = registry
+            .stage(&caller, &authorization, now)
+            .map_err(|error| {
+                tracing::warn!(peer = %caller, %error, "staging from Astra refused");
+                classify(error)
+            })?;
+        // `stage` has durably written the candidate before returning. Only then
+        // may the served gateway leaf attest the receipt.
+        let receipt = self
+            .signer
+            .sign_stage_receipt(receipt)
+            .map_err(|_| TrustUpdateRefusal::Internal)?;
+        Ok(Box::new(receipt))
     }
 }
 
@@ -253,32 +284,6 @@ impl TrustUpdateHandler for CertificateService {
              distribute; the private Astra channel is not implemented"
         );
         Err(TrustUpdateRefusal::Unavailable)
-    }
-
-    async fn stage(
-        &self,
-        caller_wg_public_key: &str,
-        authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
-    ) -> Result<Box<aether::certificates::client::GatewayCertificateStageReceipt>, TrustUpdateRefusal>
-    {
-        let caller =
-            WireGuardKey::parse(caller_wg_public_key).map_err(|_| TrustUpdateRefusal::Rejected)?;
-        let now = now_unix();
-        let mut registry = self.registry.lock().await;
-        let receipt = registry
-            .stage(&caller, &authorization, now)
-            .map_err(|error| {
-                tracing::warn!(peer = %caller_wg_public_key, %error, "staging refused");
-                classify(error)
-            })?;
-        // The candidate is on disk and synced by now: `stage` writes before it
-        // returns, which is what makes this signature a statement about a fact
-        // rather than an intention.
-        let receipt = self
-            .signer
-            .sign_stage_receipt(receipt)
-            .map_err(|_| TrustUpdateRefusal::Internal)?;
-        Ok(Box::new(receipt))
     }
 
     async fn stage_commit(

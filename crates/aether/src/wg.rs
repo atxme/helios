@@ -59,9 +59,13 @@ pub struct Keypair {
 }
 
 /// Generates a fresh WireGuard key pair.
+///
+/// The scalar comes from the approved DRBG with prediction resistance, like
+/// every other private key of the two protocols: a data-plane key is what the
+/// negotiation ends up protecting, so it does not get a weaker pipeline.
 pub fn generate_keypair() -> Result<Keypair, WgKeyError> {
     let mut raw = [0u8; KEY_LEN];
-    aws_lc_rs::rand::fill(&mut raw).map_err(|_| WgKeyError::Rng)?;
+    crate::random::fill_secret(&mut raw).map_err(|_| WgKeyError::Rng)?;
     let clamped = curve25519_dalek::scalar::clamp_integer(raw);
     let secret = x25519_dalek::StaticSecret::from(clamped);
     let public = x25519_dalek::PublicKey::from(&secret);

@@ -81,12 +81,6 @@ pub struct DelegatedIssuer {
     tls_intermediate_key_der: Zeroizing<Vec<u8>>,
 }
 
-/// Transcript the startup check signs to prove key ownership.
-///
-/// Domain-separated like every other signature here, and over a constant: it
-/// proves possession, and it must never be confusable with an object.
-const ISSUER_KEY_PROBE: &[u8] = b"helios-astra-delegated-issuer-key-probe-v5";
-
 impl DelegatedIssuer {
     pub fn new(
         authorization: AstraIssuerAuthorization,
@@ -118,15 +112,11 @@ impl DelegatedIssuer {
         pq_private_key: Zeroizing<Vec<u8>>,
         tls_intermediate_key_der: Zeroizing<Vec<u8>>,
     ) -> Result<Self, IssuerError> {
-        let proof =
-            aether::certificates::encoding::sign_ml_dsa_87(&pq_private_key, ISSUER_KEY_PROBE)
-                .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
-        aether::certificates::encoding::verify_ml_dsa_87(
-            &authorization.pq_issuer_public_key,
-            ISSUER_KEY_PROBE,
-            &proof,
-        )
-        .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+        let derived = aether::certificates::encoding::derive_ml_dsa_87_public_key(&pq_private_key)
+            .map_err(|_| IssuerError::IssuerKeyMismatch("ML-DSA-87"))?;
+        if derived != authorization.pq_issuer_public_key {
+            return Err(IssuerError::IssuerKeyMismatch("ML-DSA-87"));
+        }
 
         let tls_key = KeyPair::try_from(tls_intermediate_key_der.as_slice())
             .map_err(|_| IssuerError::IssuerKeyMismatch("TLS"))?;

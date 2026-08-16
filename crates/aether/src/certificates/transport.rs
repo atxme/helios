@@ -40,7 +40,7 @@ use super::{
     client::{ClientCertificateRotationGrant, ClientCertificateStageAuthorization},
     encoding::{
         verify_ml_dsa_87, CanonicalBytes, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature,
-        TrustDomainId, WireGuardKey,
+        SignedTranscript, TrustDomainId, WireGuardKey,
     },
     gateway::{pq_certificate_fingerprint, GatewayIdentityTransition, GatewayTransitionAbort},
     revocation::EmergencyCertificateRevocation,
@@ -88,7 +88,7 @@ pub struct TrustUpdateRequest {
 }
 
 impl TrustUpdateRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(TRUST_UPDATE_REQUEST_DOMAIN);
         bytes
             .u16(self.protocol_version)
@@ -108,7 +108,7 @@ impl TrustUpdateRequest {
             .fingerprint(&self.active_client_tls_certificate_fingerprint)
             .fingerprint(&self.active_client_pq_certificate_fingerprint)
             .fingerprint(&self.client_pq_certificate_fingerprint);
-        bytes.finish()
+        bytes.finish_signed()
     }
 }
 
@@ -314,7 +314,7 @@ pub struct TrustUpdateTransactionManifest {
 }
 
 impl TrustUpdateTransactionManifest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(TRANSACTION_MANIFEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -338,11 +338,11 @@ impl TrustUpdateTransactionManifest {
         bytes
             .u8(self.manifest_authority_kind.domain_byte())
             .u64(self.manifest_authority_epoch);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -622,7 +622,7 @@ pub struct OrionTrustUpdateDocument {
 }
 
 impl OrionTrustUpdateDocument {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let mut bytes = CanonicalBytes::new(OFFLINE_DOCUMENT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -633,7 +633,7 @@ impl OrionTrustUpdateDocument {
                 .u8(object.apply_order())
                 .fingerprint(&object.fingerprint()?);
         }
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     /// Verifies the document under the CA active at the **start** of the

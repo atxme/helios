@@ -192,6 +192,8 @@ pub enum CertificateError {
     InvalidSignatureEncoding,
     #[error("ML-DSA-87 signature does not verify over the canonical transcript")]
     InvalidSignature,
+    #[error("the ML-DSA-87 context is not the domain opening the transcript")]
+    InvalidSigningContext,
     #[error("DER certificate is empty or larger than the bound")]
     InvalidDerCertificate,
     #[error("X.509 certificate refused: {0}")]

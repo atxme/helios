@@ -95,6 +95,11 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Named before anything draws from it, and fatal when unusable
+    // (ROTATION-CERTIFICATS §2.3.2).
+    let drbg = aether::random::configure().context("resolving the DRBG provider")?;
+    tracing::info!(%drbg, "randomness provider");
+
     let cli = Cli::parse();
     match cli.command {
         Command::Bootstrap {

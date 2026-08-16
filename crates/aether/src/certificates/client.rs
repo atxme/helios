@@ -44,7 +44,7 @@ use super::{
     authority::{AstraIssuerAuthorization, RotationReason},
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16,
-        MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        MlDsa87PublicKey, MlDsa87Signature, SignedTranscript, TrustDomainId, WireGuardKey,
     },
     gateway::pq_certificate_fingerprint,
     window::{
@@ -185,7 +185,7 @@ pub struct ClientCertificateRotationRequest {
 }
 
 impl ClientCertificateRotationRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(ROTATION_REQUEST_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -203,12 +203,12 @@ impl ClientCertificateRotationRequest {
             .length_prefixed(self.new_ml_dsa_87_public_key.as_bytes())
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// Spec §7.2: the signed bytes, then each signature length-prefixed.
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.active_pq_signature.as_bytes())
             .length_prefixed(self.new_pq_signature.as_bytes());
@@ -329,7 +329,7 @@ pub struct ClientCertificateStageAuthorization {
 }
 
 impl ClientCertificateStageAuthorization {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_pq = pq_certificate_fingerprint(&self.next_pq_certificate)?;
         let mut bytes = CanonicalBytes::new(STAGE_AUTHORIZATION_DOMAIN);
         bytes
@@ -359,11 +359,11 @@ impl ClientCertificateStageAuthorization {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -630,7 +630,7 @@ pub struct GatewayCertificateStageReceipt {
 }
 
 impl GatewayCertificateStageReceipt {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(STAGE_RECEIPT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -650,11 +650,11 @@ impl GatewayCertificateStageReceipt {
             .u64(self.active_gateway_identity_epoch)
             .u64(self.gateway_decision_epoch)
             .fingerprint(&self.gateway_certificate_fingerprint);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.gateway_signature.as_bytes());
         Fingerprint::of(&bytes.finish())
     }
@@ -770,7 +770,7 @@ pub struct ClientCertificateRotationGrant {
 }
 
 impl ClientCertificateRotationGrant {
-    fn signing_bytes(&self) -> Result<Vec<u8>, CertificateError> {
+    fn signing_bytes(&self) -> Result<SignedTranscript, CertificateError> {
         let next_pq = pq_certificate_fingerprint(&self.next_pq_certificate)?;
         let mut bytes = CanonicalBytes::new(ROTATION_GRANT_DOMAIN);
         bytes
@@ -799,11 +799,11 @@ impl ClientCertificateRotationGrant {
             .u64(self.window.activation_at)
             .u64(self.window.not_after)
             .u8(self.reason.domain_byte());
-        Ok(bytes.finish())
+        Ok(bytes.finish_signed())
     }
 
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes()?);
+        let mut bytes = CanonicalBytes::new(self.signing_bytes()?.as_bytes());
         bytes.length_prefixed(self.signature.as_bytes());
         Ok(Fingerprint::of(&bytes.finish()))
     }
@@ -1177,7 +1177,7 @@ pub struct ClientCertificateStageCommit {
 }
 
 impl ClientCertificateStageCommit {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(STAGE_COMMIT_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -1194,7 +1194,7 @@ impl ClientCertificateStageCommit {
             .fingerprint(&self.staged_pq_certificate_fingerprint)
             .u64(self.stage_expires_at)
             .u64(self.committed_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     /// SHA-256 of the signed transcript followed by both client signatures.
@@ -1203,7 +1203,7 @@ impl ClientCertificateStageCommit {
     /// become `next`, nothing else about the commit is still comparable, and
     /// "the same stage identifier" is not the same document.
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.active_pq_signature.as_bytes())
             .length_prefixed(self.staged_pq_signature.as_bytes());
@@ -1321,7 +1321,7 @@ pub struct ExpiredCertificateRecoveryRequest {
 }
 
 impl ExpiredCertificateRecoveryRequest {
-    fn signing_bytes(&self) -> Vec<u8> {
+    fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(RECOVERY_REQUEST_DOMAIN);
         bytes
             .id(&self.trust_domain_id)
@@ -1342,11 +1342,11 @@ impl ExpiredCertificateRecoveryRequest {
             .fingerprint(&Fingerprint::of(&self.credential_id))
             .u64(self.created_at)
             .u64(self.expires_at);
-        bytes.finish()
+        bytes.finish_signed()
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        let mut bytes = CanonicalBytes::new(&self.signing_bytes());
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes
             .length_prefixed(self.expired_pq_signature.as_bytes())
             .length_prefixed(self.new_pq_signature.as_bytes());

@@ -547,11 +547,9 @@ fn parse_slot_id(value: &str) -> Result<[u8; 16]> {
 }
 
 fn random_id() -> Result<[u8; 16]> {
-    use aws_lc_rs::rand::SecureRandom as _;
     let mut out = [0u8; 16];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut out)
-        .map_err(|_| anyhow::anyhow!("générateur aléatoire indisponible"))?;
+    aether::random::fill_secret(&mut out)
+        .map_err(|error| anyhow::anyhow!("générateur approuvé indisponible: {error}"))?;
     Ok(out)
 }
 

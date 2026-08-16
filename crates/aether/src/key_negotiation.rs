@@ -35,7 +35,7 @@ use aws_lc_rs::{digest, hkdf, hmac};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use fips204::{
     ml_dsa_87::{self, PublicKey},
-    traits::{SerDes, Verifier},
+    traits::SerDes,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -210,18 +210,25 @@ impl PqCertificate {
         )?;
         PublicKey::try_from_bytes(subject_public_key)
             .map_err(|_| KeyNegotiationError::InvalidPqCertificate)?;
-        let issuer_public_key = <[u8; ml_dsa_87::PK_LEN]>::try_from(issuer_public_key)
-            .map_err(|_| KeyNegotiationError::InvalidPqCertificate)?;
-        let issuer_public_key = PublicKey::try_from_bytes(issuer_public_key)
-            .map_err(|_| KeyNegotiationError::InvalidPqCertificate)?;
         let signature = decode_exact::<{ ml_dsa_87::SIG_LEN }>(
             &self.ml_dsa_87_signature,
             KeyNegotiationError::InvalidPqCertificate,
         )?;
-        if !issuer_public_key.verify(&pq_certificate_signing_bytes(self)?, &signature, &[]) {
-            return Err(KeyNegotiationError::InvalidPqCertificateSignature);
-        }
-        Ok(())
+        crate::ml_dsa::verify(
+            issuer_public_key,
+            signing_context(PQ_CERTIFICATE_DOMAIN)?,
+            &pq_certificate_signing_bytes(self)?,
+            &signature,
+        )
+        // A malformed issuer key is a malformed certificate, not a signature
+        // that failed to verify: the two send an operator looking in different
+        // places, even though the public port collapses both to `rejected`.
+        .map_err(|error| match error {
+            crate::ml_dsa::MlDsaError::InvalidPublicKey => {
+                KeyNegotiationError::InvalidPqCertificate
+            }
+            _ => KeyNegotiationError::InvalidPqCertificateSignature,
+        })
     }
 
     pub fn verify_self_signed(
@@ -350,6 +357,7 @@ impl AuthenticatedKeyNegotiationRequest {
         }
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
+            PQ_REQUEST_DOMAIN,
             &pq_request_signing_bytes(&self.request, &self.certificate)?,
             &self.ml_dsa_87_signature,
         )
@@ -388,6 +396,7 @@ impl AuthenticatedKeyNegotiationResponse {
         }
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
+            PQ_RESPONSE_DOMAIN,
             &pq_response_signing_bytes(&self.response, &self.certificate)?,
             &self.ml_dsa_87_signature,
         )
@@ -686,6 +695,7 @@ impl AuthenticatedKeyNegotiationConfirmation {
         }
         verify_protocol_signature(
             client_public_key,
+            PQ_CONFIRMATION_DOMAIN,
             &pq_transaction_signing_bytes(
                 PQ_CONFIRMATION_DOMAIN,
                 self.confirmation.protocol_version,
@@ -716,6 +726,7 @@ impl AuthenticatedKeyNegotiationCommit {
         }
         verify_protocol_signature(
             gateway_public_key,
+            PQ_COMMIT_DOMAIN,
             &pq_transaction_signing_bytes(
                 PQ_COMMIT_DOMAIN,
                 self.protocol_version,
@@ -804,6 +815,7 @@ impl AuthenticatedPskRelease {
         }
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
+            PQ_IN_TUNNEL_RELEASE_DOMAIN,
             &pq_release_signing_bytes(&self.release, &self.certificate)?,
             &self.ml_dsa_87_signature,
         )
@@ -1128,8 +1140,18 @@ fn pq_transaction_signing_bytes(
     output
 }
 
+/// The external ML-DSA-87 context of one signed type (spec §8).
+///
+/// Every domain below also opens the transcript it covers, and
+/// [`crate::ml_dsa`] refuses the pair if it does not: the prefix and the
+/// context are two controls, and neither stands in for the other.
+fn signing_context(domain: &[u8]) -> Result<crate::ml_dsa::Context<'_>, KeyNegotiationError> {
+    crate::ml_dsa::Context::new(domain).map_err(|_| KeyNegotiationError::InvalidPqProtocolSignature)
+}
+
 fn verify_protocol_signature(
     public_key: &str,
+    domain: &[u8],
     message: &[u8],
     signature: &str,
 ) -> Result<(), KeyNegotiationError> {
@@ -1137,46 +1159,36 @@ fn verify_protocol_signature(
         public_key,
         KeyNegotiationError::InvalidPqProtocolSignature,
     )?;
-    let public_key = PublicKey::try_from_bytes(public_key)
-        .map_err(|_| KeyNegotiationError::InvalidPqProtocolSignature)?;
     let signature = decode_exact::<{ ml_dsa_87::SIG_LEN }>(
         signature,
         KeyNegotiationError::InvalidPqProtocolSignature,
     )?;
-    if !public_key.verify(message, &signature, &[]) {
-        return Err(KeyNegotiationError::InvalidPqProtocolSignature);
-    }
-    Ok(())
+    crate::ml_dsa::verify(&public_key, signing_context(domain)?, message, &signature)
+        .map_err(|_| KeyNegotiationError::InvalidPqProtocolSignature)
 }
 
 #[cfg(feature = "key-negotiation-signing")]
-fn sign_ml_dsa_87(private_key: &[u8], message: &[u8]) -> Result<String, KeyNegotiationError> {
-    use fips204::{
-        ml_dsa_87::PrivateKey,
-        traits::{SerDes as _, Signer as _},
-    };
+fn sign_ml_dsa_87(
+    private_key: &[u8],
+    domain: &[u8],
+    message: &[u8],
+) -> Result<String, KeyNegotiationError> {
+    use crate::ml_dsa::MlDsaError;
 
-    let private_key = <[u8; ml_dsa_87::SK_LEN]>::try_from(private_key)
-        .map_err(|_| KeyNegotiationError::InvalidPqPrivateKey)?;
-    let private_key = PrivateKey::try_from_bytes(private_key)
-        .map_err(|_| KeyNegotiationError::InvalidPqPrivateKey)?;
-    let signature = private_key
-        .try_sign(message, &[])
-        .map_err(|_| KeyNegotiationError::PqSigning)?;
+    let signature =
+        crate::ml_dsa::sign(private_key, signing_context(domain)?, message).map_err(|error| {
+            match error {
+                MlDsaError::InvalidPrivateKey => KeyNegotiationError::InvalidPqPrivateKey,
+                _ => KeyNegotiationError::PqSigning,
+            }
+        })?;
     Ok(STANDARD.encode(signature))
 }
 
 /// Generates an ML-DSA-87 identity. The private half is zeroized on drop.
 #[cfg(feature = "key-negotiation-signing")]
 pub fn generate_ml_dsa_87_keypair() -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), KeyNegotiationError> {
-    use fips204::traits::SerDes as _;
-
-    let (public_key, private_key) =
-        ml_dsa_87::try_keygen().map_err(|_| KeyNegotiationError::PqSigning)?;
-    Ok((
-        Zeroizing::new(private_key.into_bytes().to_vec()),
-        public_key.into_bytes().to_vec(),
-    ))
+    crate::ml_dsa::generate_keypair().map_err(|_| KeyNegotiationError::PqSigning)
 }
 
 /// Signs a new PQ certificate with an ML-DSA-87 issuer key.
@@ -1188,6 +1200,7 @@ pub fn issue_pq_certificate(
     certificate.ml_dsa_87_signature.clear();
     certificate.ml_dsa_87_signature = sign_ml_dsa_87(
         issuer_private_key,
+        PQ_CERTIFICATE_DOMAIN,
         &pq_certificate_signing_bytes(&certificate)?,
     )?;
     Ok(certificate)
@@ -1203,6 +1216,7 @@ pub fn authenticate_request(
     request.validate()?;
     let signature = sign_ml_dsa_87(
         subject_private_key,
+        PQ_REQUEST_DOMAIN,
         &pq_request_signing_bytes(&request, &certificate)?,
     )?;
     Ok(AuthenticatedKeyNegotiationRequest {
@@ -1221,6 +1235,7 @@ pub fn authenticate_response(
 ) -> Result<AuthenticatedKeyNegotiationResponse, KeyNegotiationError> {
     let signature = sign_ml_dsa_87(
         subject_private_key,
+        PQ_RESPONSE_DOMAIN,
         &pq_response_signing_bytes(&response, &certificate)?,
     )?;
     Ok(AuthenticatedKeyNegotiationResponse {
@@ -1243,6 +1258,7 @@ pub fn authenticate_confirmation(
     };
     let signature = sign_ml_dsa_87(
         client_private_key,
+        PQ_CONFIRMATION_DOMAIN,
         &pq_transaction_signing_bytes(
             PQ_CONFIRMATION_DOMAIN,
             confirmation.protocol_version,
@@ -1265,6 +1281,7 @@ pub fn authenticate_commit(
     let protocol_version = KEY_NEGOTIATION_VERSION;
     let signature = sign_ml_dsa_87(
         gateway_private_key,
+        PQ_COMMIT_DOMAIN,
         &pq_transaction_signing_bytes(
             PQ_COMMIT_DOMAIN,
             protocol_version,
@@ -1288,6 +1305,7 @@ pub fn authenticate_release(
 ) -> Result<AuthenticatedPskRelease, KeyNegotiationError> {
     let signature = sign_ml_dsa_87(
         client_private_key,
+        PQ_IN_TUNNEL_RELEASE_DOMAIN,
         &pq_release_signing_bytes(&release, &certificate)?,
     )?;
     Ok(AuthenticatedPskRelease {
@@ -1854,6 +1872,59 @@ mod tests {
         .unwrap()
     }
 
+    /// A `CA-PQ` signature is refused when its external context is not the
+    /// one of §8, however valid the arithmetic is.
+    ///
+    /// The transcript prefix cannot catch this: the bytes signed here are
+    /// exactly the ones a conforming issuer signs. Only the context differs —
+    /// empty in the first case, another type's in the second — and that is the
+    /// whole point of carrying it outside `M`.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_certificate_signed_outside_its_context_is_refused() {
+        use fips204::{ml_dsa_87::PrivateKey, traits::Signer as _};
+
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (_, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        certificate
+            .verify(
+                &ca_public,
+                PqCertificateRole::Client,
+                Some("orion"),
+                CLIENT_WG_KEY,
+                test_now(),
+            )
+            .expect("the conforming context verifies");
+
+        let transcript = pq_certificate_signing_bytes(&certificate).unwrap();
+        let issuer = PrivateKey::try_from_bytes(
+            <[u8; ml_dsa_87::SK_LEN]>::try_from(ca_private.as_slice()).unwrap(),
+        )
+        .unwrap();
+        for context in [b"".as_slice(), PQ_REQUEST_DOMAIN] {
+            let mut forged = certificate.clone();
+            forged.ml_dsa_87_signature =
+                STANDARD.encode(issuer.try_sign(&transcript, context).unwrap());
+            assert_eq!(
+                forged.verify(
+                    &ca_public,
+                    PqCertificateRole::Client,
+                    Some("orion"),
+                    CLIENT_WG_KEY,
+                    test_now(),
+                ),
+                Err(KeyNegotiationError::InvalidPqCertificateSignature)
+            );
+        }
+    }
+
     /// Le pire cas ML-DSA-87 doit tenir sous la borne de trame — vérifié, pas
     /// déduit d'un calcul au dos d'une enveloppe.
     #[cfg(feature = "key-negotiation-signing")]
@@ -2071,12 +2142,14 @@ mod tests {
         let mut public_domain_bytes = pq_release_signing_bytes(&release, &client_certificate)
             .unwrap()
             .split_off(PQ_IN_TUNNEL_RELEASE_DOMAIN.len());
-        let mut rebuilt = b"helios-key-negotiation-pq-release-v5".to_vec();
+        const PUBLIC_RELEASE_DOMAIN: &[u8] = b"helios-key-negotiation-pq-release-v5";
+        let mut rebuilt = PUBLIC_RELEASE_DOMAIN.to_vec();
         rebuilt.append(&mut public_domain_bytes);
-        let mut replayed = authenticated.clone();
-        replayed.ml_dsa_87_signature = sign_ml_dsa_87(client_private.as_slice(), &rebuilt).unwrap();
+        // The retired public message is not merely invalid when presented to
+        // the in-tunnel verifier: its context is absent from the exhaustive v5
+        // registry, so no conforming signing path can mint it anymore.
         assert_eq!(
-            replayed.verify(&ca_public, &fingerprint, test_now()),
+            sign_ml_dsa_87(client_private.as_slice(), PUBLIC_RELEASE_DOMAIN, &rebuilt),
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
         );
 

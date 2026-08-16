@@ -63,12 +63,8 @@ pub struct ProfileId([u8; 16]);
 impl ProfileId {
     /// Draws a new identifier.
     pub fn generate() -> Result<Self, VaultError> {
-        use aws_lc_rs::rand::{SecureRandom as _, SystemRandom};
-
         let mut id = [0u8; 16];
-        SystemRandom::new()
-            .fill(&mut id)
-            .map_err(|_| VaultError::Rng)?;
+        aether::random::fill_public(&mut id).map_err(|_| VaultError::Rng)?;
         // An all-zero identifier is what an uninitialised buffer looks like;
         // refusing it turns a silent bug into a loud one.
         if id.iter().all(|byte| *byte == 0) {

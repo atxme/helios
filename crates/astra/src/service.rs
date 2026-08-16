@@ -17,9 +17,10 @@
 //! # Limite connue
 //!
 //! The operator-credential routes of spec §8.2 — campaigns, signer requests,
-//! encrypted vault download and signer results — need a FIDO2 authenticator
-//! and the `astra-signer` companion, neither of which exists yet and neither
-//! of which can be exercised in WSL2. They are refused explicitly with
+//! encrypted vault download and signer results — are not wired yet. The HVLT
+//! vault, FIDO2 transports and `astra-signer` companion exist, but the signing
+//! commands and capability-bound exchange do not; physical ceremonies also
+//! cannot be exercised in WSL2. The routes are refused explicitly with
 //! [`ServiceError::OperatorCredentialUnavailable`] and answer `501`, rather
 //! than offering a path that would look like an approval without one. See
 //! [`docs/testing/TESTING.md`](../../../../docs/testing/TESTING.md).
@@ -69,8 +70,8 @@ pub enum ServiceError {
     #[error("too many requests from this source")]
     Throttled,
     #[error(
-        "this operation needs an operator hardware credential and the `astra-signer` companion, \
-         which this build does not implement"
+        "this operation needs the operator approval protocol, whose routes and signing commands \
+         are not implemented"
     )]
     OperatorCredentialUnavailable,
     #[error("internal error")]
@@ -259,7 +260,7 @@ async fn status_challenge(
     service.charge(source.ip(), now).await?;
 
     let mut challenge = [0u8; 32];
-    aws_lc_random(&mut challenge).map_err(|_| ServiceError::Internal)?;
+    approved_random(&mut challenge).map_err(|_| ServiceError::Internal)?;
     if !service.challenges.lock().await.issue(challenge, now) {
         // Full rather than evicting: a flood must not invalidate the
         // challenges of clients that are mid-request.
@@ -390,11 +391,9 @@ async fn operator_credential_required() -> ServiceError {
     ServiceError::OperatorCredentialUnavailable
 }
 
-fn aws_lc_random(buffer: &mut [u8]) -> Result<(), ()> {
-    use aws_lc_rs::rand::SecureRandom as _;
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(buffer)
-        .map_err(|_| ())
+/// A public challenge, from the approved DRBG of the specification §2.3.2.
+fn approved_random(buffer: &mut [u8]) -> Result<(), ()> {
+    aether::random::fill_public(buffer).map_err(|_| ())
 }
 
 #[cfg(test)]

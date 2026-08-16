@@ -13,3 +13,7 @@ thiserror.workspace = true
 aws-lc-rs.workspace = true
 # Le texte clair rendu par `open` ne doit pas survivre à sa portée.
 zeroize.workspace = true
+# `aether::random` : sel et nonce d'une enveloppe HVLT viennent du DRBG
+# approuvé, comme tout le reste du cycle (ROTATION-CERTIFICATS §2.3.2). La
+# dépendance ne va que dans ce sens — `aether` ne connaît pas ce format.
+aether.workspace = true

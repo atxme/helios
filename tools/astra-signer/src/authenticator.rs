@@ -561,11 +561,10 @@ mod ctap {
 /// would let a captured assertion be replayed against a token that is no longer
 /// present.
 fn random_challenge() -> Result<[u8; 32]> {
-    use aws_lc_rs::rand::SecureRandom as _;
     let mut out = [0u8; 32];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut out)
-        .map_err(|_| AuthenticatorError::Device("générateur aléatoire indisponible".into()))?;
+    aether::random::fill_public(&mut out).map_err(|error| {
+        AuthenticatorError::Device(format!("générateur approuvé indisponible: {error}"))
+    })?;
     Ok(out)
 }
 

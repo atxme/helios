@@ -1222,11 +1222,10 @@ fn consume_challenge(
 }
 
 fn random_challenge() -> Result<[u8; SERVER_CHALLENGE_LEN], TransportError> {
-    use aws_lc_rs::rand::SecureRandom as _;
     let mut challenge = [0u8; SERVER_CHALLENGE_LEN];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut challenge)
-        .map_err(|_| TransportError::Protocol("system RNG failed to produce a challenge".into()))?;
+    aether::random::fill_public(&mut challenge).map_err(|error| {
+        TransportError::Protocol(format!("the approved DRBG produced no challenge: {error}"))
+    })?;
     Ok(challenge)
 }
 

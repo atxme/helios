@@ -62,7 +62,6 @@ use std::{
 use aws_lc_rs::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN},
     hkdf, pbkdf2,
-    rand::{SecureRandom as _, SystemRandom},
 };
 use zeroize::Zeroizing;
 
@@ -322,11 +321,13 @@ pub fn seal(
     }
     let kdf_id = unlock.id();
 
-    let random = SystemRandom::new();
+    // Salt and nonce come from the approved DRBG with prediction resistance:
+    // both are sealed into a file that outlives the process, and a repeated
+    // nonce under one key is what breaks AES-GCM outright.
     let mut salt = [0u8; SALT_LEN];
-    random.fill(&mut salt).map_err(|_| VaultError::Rng)?;
+    aether::random::fill_secret(&mut salt).map_err(|_| VaultError::Rng)?;
     let mut nonce = [0u8; NONCE_LEN];
-    random.fill(&mut nonce).map_err(|_| VaultError::Rng)?;
+    aether::random::fill_secret(&mut nonce).map_err(|_| VaultError::Rng)?;
 
     let mut blob = Vec::with_capacity(total);
     blob.extend_from_slice(MAGIC);
