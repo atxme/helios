@@ -81,7 +81,14 @@ mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = { version = "0.13", features = ["x509-parser"] }
+# `aws_lc_rs` plutôt que le défaut `ring` : rcgen tire ses **clés privées X.509**
+# de son fournisseur, et par défaut c'est le CSPRNG de `ring` — un second
+# générateur, à côté de celui que NEGOCIATION-DE-CLE-V5 §4.3 impose. Ce réglage
+# met CA-TLS, les leafs clientes, le matériel de l'émetteur délégué Astra et les
+# fixtures de test sur le même CTR-DRBG que le reste du protocole. Sans effet
+# sur `rustls`/`quinn`, dont le fournisseur reste `ring` : voir la « Limite
+# connue » de `aether::random`.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
 time = "0.3"
 futures-util = "0.3"
 bytes = "1"

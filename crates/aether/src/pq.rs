@@ -12,6 +12,17 @@
 //! ML-KEM-1024 lives in the standard `kem` API, not behind FIPS. The `Kem` trait
 //! keeps the backend swappable: enabling aws-lc-rs' `fips` feature later (FIPS
 //! 140-3 validation) needs no change here.
+//!
+//! # Where the randomness comes from
+//!
+//! Neither [`Kem::generate_keypair`] nor [`Kem::encapsulate`] takes an RNG, so
+//! it is worth stating where their bytes originate rather than leaving a reader
+//! to hope: AWS-LC's ML-KEM routes every draw through `mlk_randombytes`, which
+//! is `RAND_bytes` — the very generator [`crate::random`] hands to the rest of
+//! the protocol. The seed of a decapsulation key and the `m` of an
+//! encapsulation therefore come from the same CTR-DRBG as a PSK or a WireGuard
+//! key, with the same fail-closed behaviour, and this module needs no
+//! adaptation to say so.
 
 use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_1024};
 use zeroize::Zeroizing;

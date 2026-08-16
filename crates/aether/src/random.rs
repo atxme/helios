@@ -24,27 +24,43 @@
 //! fails. Writing a second DRBG in front of the library's would not add a
 //! control — it would move unreviewed bytes back to the front of the pipeline.
 //!
-//! # The provider, and why this one is right
+//! # The provider, read out of its source rather than assumed
 //!
 //! [`aws_lc_rs::rand::SystemRandom`], the same AWS-LC the rest of the
 //! workspace already uses for AES-GCM, HKDF and HMAC. Behind
-//! [`aws_lc_rs::rand::SecureRandom::fill`] sits `RAND_bytes`, whose vendored
-//! source says exactly what it is (`crypto/fipsmodule/rand/`):
+//! [`aws_lc_rs::rand::SecureRandom::fill`] sits `RAND_bytes`, and every line
+//! below was checked against the vendored source rather than inferred from the
+//! library's reputation:
 //!
-//! - a **CTR-DRBG-AES-256 with the derivation function**, one of the two
-//!   mechanisms the specifications admit, at 256-bit strength;
-//! - **per-thread state**, seeded from the platform entropy source and from
-//!   CPU jitter, so no lock is contended on the negotiation path;
-//! - **reseeded every 4096 generate calls** (`kCtrDrbgReseedInterval`), two
-//!   hundred and fifty times more often than the ceiling of
-//!   [`MAX_GENERATES_BETWEEN_RESEEDS`] this protocol sets;
+//! - a **CTR-DRBG-AES-256**, 256-bit strength, **without a derivation
+//!   function**: `CTR_DRBG_init` takes exactly `CTR_DRBG_ENTROPY_LEN` = 48
+//!   bytes — one seedlen — and XORs the personalization string into it. That
+//!   is SP 800-90Ar1 §10.2.1.3.1, the full-entropy instantiation, not
+//!   §10.2.1.3.2. See the limit below: the two specifications name
+//!   `use_df = true`, and this is the one place the shipped provider and their
+//!   wording do not line up;
+//! - **per-thread state** (`OPENSSL_THREAD_LOCAL_PRIVATE_RAND`), so no lock is
+//!   contended on the negotiation path;
+//! - **seeded from a jitter-rooted tree DRBG, personalized from the OS**. The
+//!   roles swap under a hypervisor: when a VM uniqueness-breaking environment
+//!   is detected, the OS becomes the seed and the CPU hardware RNG the extra
+//!   entropy. Two independent sources either way, by construction;
+//! - **reseeded every 4096 generate calls** (`kCtrDrbgReseedInterval`), 256
+//!   times inside the ceiling [`MAX_GENERATES_BETWEEN_RESEEDS`] this protocol
+//!   sets;
 //! - **fork and VM-snapshot aware**: before generating, the state is checked
-//!   against a uniqueness-breaking-event counter (`crypto/ube/`), and a state
-//!   inherited by a child — or restored with a snapshot — is reseeded before
-//!   it returns a byte. This is why the module below has no fork detection of
-//!   its own: the provider does it, and does it better than a PID comparison;
-//! - a refusal is a refusal: on failure the call returns an error and no
-//!   bytes, which is what this module propagates.
+//!   against a uniqueness-breaking-event counter (`crypto/ube/`, built on
+//!   `MADV_WIPEONFORK`), and a state inherited by a child — or restored with a
+//!   snapshot — is reseeded before it returns a byte. When that detection is
+//!   *unavailable*, the check fails closed and forces a reseed before **every**
+//!   generate. This is why the module below has no fork detection of its own:
+//!   the provider does it, and does it better than a PID comparison;
+//! - **a failure kills the process.** `RAND_bytes` returns 1 unconditionally;
+//!   an entropy source that cannot deliver, a failed instantiation, a failed
+//!   reseed and a failed generate all reach `abort()`. Fail-closed to the
+//!   letter — stricter than the specification asks — and the reason
+//!   [`RandomError::ProviderFailed`] is close to unreachable in a shipped
+//!   binary rather than a routine outcome.
 //!
 //! **FIPS validation is deliberately out of scope.** `aws-lc-rs` also ships an
 //! `aws-lc-fips-sys` build carrying CAVP/CMVP certificates, and this project
@@ -53,6 +69,59 @@
 //! DRBG above is the same mechanism either way; what the validated build adds
 //! is paperwork, not entropy. Nothing here should be read as a validation
 //! claim, and the banner names the ordinary module by name.
+//!
+//! # What else in the workspace draws from this same DRBG
+//!
+//! The pipeline is only worth its name if nothing important sits outside it,
+//! so the provenance of every key was traced rather than assumed:
+//!
+//! - **ML-KEM-1024** ([`crate::pq`]) — key generation and encapsulation go
+//!   through AWS-LC's `mlk_randombytes`, which is `RAND_bytes`. Same DRBG, no
+//!   adaptation needed;
+//! - **ML-DSA-87** — [`crate::ml_dsa`] hands `fips204` a [`DrbgRng`], so key
+//!   generation and hedged signing draw from here. (AWS-LC's own ML-DSA also
+//!   calls `RAND_bytes`, but this project uses the `fips204` implementation.);
+//! - **X.509 private keys** produced by `rcgen` — CA-TLS, client leaves, the
+//!   Astra delegated issuer's material, test fixtures. `rcgen` defaults to
+//!   `ring`, whose CSPRNG is a *second, unrelated* generator; the workspace
+//!   manifest therefore pins its `aws_lc_rs` feature so these keys come from
+//!   the DRBG above.
+//!
+//! # Limite connue
+//!
+//! **The derivation function.** Both specifications admit CTR-DRBG-AES-256
+//! only "with the derivation function activated (`use_df = true`)", and the
+//! provider does not use one — it relies on a full-entropy seed input instead,
+//! which is the case SP 800-90Ar1 §10.2.1.3.1 exists for and which the
+//! jitter-rooted source satisfies. The security argument holds; the wording
+//! does not. [`ProviderDescription::use_df`] reports `false` so the gap is
+//! visible on every start-up rather than assumed away. What closes it is an
+//! arbitration: amend the two specifications to admit the full-entropy
+//! instantiation, or move to a provider that runs the derivation function.
+//!
+//! **Per-call prediction resistance is not reachable through `aws-lc-rs`.**
+//! AWS-LC does expose it in C — `RAND_bytes_with_user_prediction_resistance`
+//! mixes caller-supplied prediction resistance into a generate — but the Rust
+//! wrapper offers only the plain fill, so [`PredictionResistance::Required`]
+//! records the intent without changing the call. What the provider does give
+//! is a fresh state randomized with prediction resistance on its **first** use,
+//! and only where the CPU carries RDRAND or RNDR — without one, the entropy
+//! source declares no prediction-resistance method at all. Implementing the
+//! missing flag above the wrapper would mean owning DRBG state here, which is
+//! exactly what the specification forbids; what unblocks it is that entry
+//! point on the `aws-lc-rs` side.
+//!
+//! **TLS session material is still on `ring`.** `rustls` and `quinn` are built
+//! with their `ring` provider, so the ephemeral (EC)DHE keys, the handshake
+//! randoms and the session keys of the negotiation transport come from ring's
+//! CSPRNG, not from the DRBG above — while §4.3 names TLS among the keys the
+//! pipeline must cover. Long-lived material is unaffected: WireGuard keys,
+//! PSKs, ML-KEM, ML-DSA and every X.509 private key are on AWS-LC. What blocks
+//! the swap is `reqwest` 0.12, whose only rustls provider feature is `ring`;
+//! its `-no-provider` variant compiles but then requires
+//! `CryptoProvider::install_default` in **every** binary and test that builds a
+//! client, which is a change to make deliberately rather than as a side effect
+//! of this module.
 //!
 //! # The rules, and what each one refuses
 //!
@@ -89,8 +158,11 @@ const PROVIDER_VERSION: &str = env!("HELIOS_DRBG_PROVIDER_VERSION");
 
 /// Bytes a single call may ask for.
 ///
-/// SP 800-90A caps one generate request at 2^19 bits. Nothing in these two
-/// protocols comes close: the largest single draw is a key seed.
+/// The same 65536 as AWS-LC's `CTR_DRBG_MAX_GENERATE_LENGTH`, the SP 800-90A
+/// per-request cap. The provider would chunk a larger request by itself, so
+/// this bound is the module's own: nothing in these two protocols draws
+/// anything near it — the largest single draw is a key seed — and a call that
+/// did would be a bug worth naming rather than quietly satisfying.
 pub const MAX_BYTES_PER_REQUEST: usize = 1 << 16;
 
 /// Generate calls the specification allows between two entropy inputs.
@@ -108,9 +180,14 @@ pub enum RandomError {
     /// answers from an operator.
     #[error("no DRBG provider is reachable")]
     ProviderUnavailable,
-    /// The provider refused: entropy source, instantiation, reseed or
-    /// generate. Which one is the provider's to know; that it failed is
-    /// enough to stop here.
+    /// The provider refused.
+    ///
+    /// Close to unreachable with the shipped provider: AWS-LC answers an
+    /// entropy, instantiation, reseed or generate failure with `abort()`, and
+    /// `RAND_bytes` returns 1 unconditionally. The variant stays because the
+    /// trait admits other providers — the `cfg(test)` ones exercise exactly
+    /// this path — and because a call site must handle a refusal without ever
+    /// being tempted to continue past it.
     #[error("the DRBG provider produced no bytes")]
     ProviderFailed,
     /// The provider answered with the block an unfilled buffer would have.
@@ -124,22 +201,26 @@ pub enum RandomError {
     },
 }
 
-/// The SP 800-90A mechanisms the specification admits — and only these two.
+/// The SP 800-90A mechanism families the specifications name.
+///
+/// The derivation function is **not** part of the variant: it is a separate
+/// field, because a name that carried it would have to be trusted, whereas a
+/// field can be read against the provider. That distinction is not academic —
+/// see the module's "Limite connue".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrbgMechanism {
     /// HMAC-DRBG-SHA-512.
     HmacSha512,
-    /// CTR-DRBG-AES-256, derivation function enabled.
-    CtrAes256WithDerivationFunction,
+    /// CTR-DRBG-AES-256. Whether a derivation function is used is
+    /// [`ProviderDescription::use_df`].
+    CtrAes256,
 }
 
 impl std::fmt::Display for DrbgMechanism {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HmacSha512 => f.write_str("HMAC-DRBG-SHA-512"),
-            // `use_df` has its own field on the banner; naming it twice invites
-            // the two to disagree.
-            Self::CtrAes256WithDerivationFunction => f.write_str("CTR-DRBG-AES-256"),
+            Self::CtrAes256 => f.write_str("CTR-DRBG-AES-256"),
         }
     }
 }
@@ -157,7 +238,9 @@ pub struct ProviderDescription {
     pub version: &'static str,
     /// Mechanism in use. Local, explicit, never negotiated on the wire.
     pub mechanism: DrbgMechanism,
-    /// Derivation function, meaningful for CTR-DRBG only.
+    /// Whether the mechanism runs a derivation function over its entropy
+    /// input. Meaningful for CTR-DRBG only, and `false` for the provider this
+    /// project ships — the divergence the module's "Limite connue" describes.
     pub use_df: bool,
     /// Generate calls the provider allows between two entropy inputs.
     pub reseed_interval_generates: u64,
@@ -229,8 +312,12 @@ impl DrbgProvider for AwsLcProvider {
         ProviderDescription {
             provider: "AWS-LC (aws-lc-rs)",
             version: PROVIDER_VERSION,
-            mechanism: DrbgMechanism::CtrAes256WithDerivationFunction,
-            use_df: true,
+            mechanism: DrbgMechanism::CtrAes256,
+            // `CTR_DRBG_init` consumes exactly one seedlen of full entropy and
+            // XORs the personalization string into it: SP 800-90Ar1
+            // §10.2.1.3.1, no derivation function. Reported as it is, not as
+            // the specifications wish it were.
+            use_df: false,
             reseed_interval_generates: AWS_LC_RESEED_INTERVAL,
             per_call_prediction_resistance: false,
         }
@@ -482,20 +569,29 @@ mod tests {
     /// The provider's own profile has to sit inside what the protocol asks
     /// for — otherwise the specification's reseed rule would be a sentence
     /// nobody checks against the library actually linked.
+    ///
+    /// The banner is a claim about someone else's code, so what it claims is
+    /// pinned here: a description that drifts from the vendored AWS-LC source
+    /// has to break a test, not merely become quietly untrue.
     #[test]
     fn the_shipped_provider_matches_the_profile_the_specification_asks_for() {
         let _shipped = TestProvider::shipped();
         let description = AwsLcProvider::default().describe();
-        assert_eq!(
-            description.mechanism,
-            DrbgMechanism::CtrAes256WithDerivationFunction
-        );
-        assert!(description.use_df);
+        assert_eq!(description.mechanism, DrbgMechanism::CtrAes256);
+        // No derivation function: `CTR_DRBG_init` takes one seedlen of full
+        // entropy (SP 800-90Ar1 §10.2.1.3.1). Announcing `true` here would be
+        // the comfortable answer and the false one.
+        assert!(!description.use_df);
+        // The provider reseeds far inside the protocol's ceiling; if AWS-LC
+        // ever raised its interval past it, this is where it would show.
         assert!(description.reseed_interval_generates <= MAX_GENERATES_BETWEEN_RESEEDS);
         assert_eq!(
             description.reseed_interval_generates,
             AWS_LC_RESEED_INTERVAL
         );
+        // Per-call prediction resistance is not reachable through the wrapper;
+        // claiming it would make `fill_secret` promise what it cannot keep.
+        assert!(!description.per_call_prediction_resistance);
         // The banner carries every field, secrets excepted: a deployment reads
         // what it runs on its first journal line.
         let banner = description.to_string();

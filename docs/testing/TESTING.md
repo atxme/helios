@@ -751,14 +751,21 @@ dernier effet exige la gateway réelle.
   échoue, refus d’un bloc entièrement nul à la sonde de démarrage, borne par
   appel, propagation vers `fips204`, profil annoncé tenant sous le plafond de
   `2^20` — au moyen d’un faux fournisseur déterministe, **thread-local**, qu’aucun
-  binaire livré ne peut sélectionner. Ce qui relève du fournisseur ne s’éprouve
-  pas ici et n’a pas à l’être : le CTR-DRBG-AES-256 avec DF, son reseed à 4096
-  générations et sa réinstanciation après fork ou reprise d’instantané sont dans
-  le code AWS-LC embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). La
-  **validation FIPS est hors périmètre** — la construction `aws-lc-fips-sys`
-  exige Go (« Go is required for FIPS »), et aucun déploiement d’Helios ne
-  revendique de certificat. Reste non couverte la résistance à la prédiction
-  **par appel**, absente du binding Rust ;
+  binaire livré ne peut sélectionner. Un test épingle en outre le **profil
+  annoncé** — mécanisme, `use_df`, intervalle de reseed, résistance à la
+  prédiction — pour qu’une bannière qui divergerait de la source AWS-LC embarquée
+  casse un test au lieu de devenir silencieusement fausse. Ce qui relève du
+  fournisseur ne s’éprouve pas ici et n’a pas à l’être : le CTR-DRBG-AES-256, son
+  reseed à 4096 générations, sa réinstanciation après fork ou reprise
+  d’instantané et son `abort()` sur échec d’entropie sont dans le code AWS-LC
+  embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). Trois écarts restent non
+  couverts et sont documentés dans `aether::random` : l’**absence de fonction de
+  dérivation** (SP 800-90Ar1 §10.2.1.3.1, alors que les spécifications écrivent
+  `use_df = true`), la **résistance à la prédiction par appel** absente du
+  binding Rust, et le **matériel de session TLS** de `rustls`/`quinn` resté sur
+  le CSPRNG de `ring`. La **validation FIPS est hors périmètre** — la
+  construction `aws-lc-fips-sys` exige Go (« Go is required for FIPS »), et aucun
+  déploiement d’Helios ne revendique de certificat ;
 - **le cycle de vie des certificats est vérifié en logique, pas en
   exploitation.** `aether::certificates`, le registre gateway, le magasin Orion
   et le binaire `astra` sont couverts par des tests déterministes qui prennent

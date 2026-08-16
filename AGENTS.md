@@ -140,7 +140,7 @@ Restent ouverts :
   des jetons HKDF-SHA-256 + HMAC-SHA-256, bornés à cinq minutes, une opération,
   un manifeste, un coffre et un scope. Enfin tout aléa du protocole vient du
   DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique —
-  HMAC-DRBG-SHA-512 ou CTR-DRBG-AES-256 avec DF —, semé par la source
+  HMAC-DRBG-SHA-512 ou CTR-DRBG-AES-256 —, semé par la source
   plateforme en mode fail-closed, reseed au plus tard toutes les `2^20`
   générations et après fork ; un échec ne rend aucun octet. Aucun DRBG
   applicatif n'est écrit dans Helios, et la validation CAVP/ACVP du fournisseur
@@ -154,26 +154,43 @@ Restent ouverts :
   ne vérifie pas. `aether::random` porte l'autre moitié et **ne réimplémente
   aucun DRBG** : interface vers le fournisseur, refus ferme, faux fournisseur
   déterministe sous `cfg(test)` seulement, bannière de démarrage nommant
-  fournisseur, version, mécanisme, `use_df`, intervalle de reseed et validation.
+  fournisseur, version, mécanisme, `use_df` et intervalle de reseed.
   Plus aucun appel direct au CSPRNG système ne subsiste hors de ce module —
   négociation, cycle de vie, HVLT, coffres Orion, séquestre TPM et outils
   compris.
   La source est **`aws_lc_rs::rand::SystemRandom`**, c'est-à-dire le
-  `RAND_bytes` d'AWS-LC déjà utilisé pour AES-GCM, HKDF et HMAC : CTR-DRBG-AES-256
-  avec fonction de dérivation — l'un des deux mécanismes admis —, état par
-  thread, reseed toutes les 4096 générations (`kCtrDrbgReseedInterval`, deux
-  cent cinquante fois sous le plafond de `2^20`), et réinstanciation avant toute
-  sortie après fork ou reprise d'instantané de VM (`crypto/ube`). C'est
-  précisément pourquoi `aether::random` n'a **pas** de détection de fork à lui :
-  le fournisseur la fait, et mieux qu'une comparaison de PID.
+  `RAND_bytes` d'AWS-LC déjà utilisé pour AES-GCM, HKDF et HMAC. Le lot a été
+  audité contre la source vendorée plutôt que contre la réputation de la
+  bibliothèque : CTR-DRBG-AES-256, état par thread, seed issu d'un arbre DRBG
+  enraciné dans le jitter CPU et personnalisation par l'OS — les deux rôles
+  s'échangeant sous hyperviseur —, reseed toutes les 4096 générations
+  (`kCtrDrbgReseedInterval`, 256 fois sous le plafond de `2^20`), et
+  réinstanciation avant toute sortie après fork ou reprise d'instantané de VM
+  (`crypto/ube`, bâti sur `MADV_WIPEONFORK`). C'est précisément pourquoi
+  `aether::random` n'a **pas** de détection de fork à lui : le fournisseur la
+  fait, et mieux qu'une comparaison de PID — et quand cette détection est
+  indisponible, elle échoue fermée et impose un reseed avant *chaque*
+  génération. Un échec d'entropie n'est pas une erreur rendue : AWS-LC
+  `abort()`, et `RAND_bytes` retourne 1 inconditionnellement, donc le refus est
+  plus strict que ce que la spécification demande.
+  **Trois écarts sont nommés plutôt que masqués.** Le fournisseur n'emploie
+  **pas** de fonction de dérivation — `CTR_DRBG_init` consomme exactement un
+  seedlen de pleine entropie, SP 800-90Ar1 §10.2.1.3.1 —, alors que les deux
+  spécifications n'admettent CTR-DRBG qu'avec `use_df = true` ; la bannière
+  annonce donc `use_df=false` et l'arbitrage reste à rendre. La **résistance à
+  la prédiction par appel** existe en C
+  (`RAND_bytes_with_user_prediction_resistance`) mais pas dans le binding Rust,
+  donc `fill_secret` porte l'intention sans changer l'appel. Enfin le **matériel
+  de session TLS** de `rustls`/`quinn` reste sur le CSPRNG de `ring` : `reqwest`
+  0.12 n'offre que le fournisseur `ring`, et sa variante `-no-provider` exige un
+  `CryptoProvider::install_default` dans chaque binaire. En revanche les **clés
+  privées X.509** produites par `rcgen` sont passées sur AWS-LC (feature
+  `aws_lc_rs` épinglée au manifeste), et ML-KEM comme ML-DSA tirent déjà du même
+  `RAND_bytes`.
   La **validation FIPS est hors périmètre** et assumée comme telle : la
   construction `aws-lc-fips-sys` porte les certificats CAVP/CMVP mais exige les
   chaînes CMake et Go qu'ADR-001 §2 tient hors du build, pour le même mécanisme.
-  Rien dans le code ne revendique de validation. Une limite subsiste, nommée
-  dans le doc-comment : la **résistance à la prédiction par appel** existe en C
-  (`RAND_bytes_with_user_prediction_resistance`) mais pas dans le binding Rust,
-  donc `fill_secret` porte l'intention sans changer l'appel — la réaliser
-  au-dessus reviendrait à détenir l'état DRBG que la spécification interdit.
+  Rien dans le code ne revendique de validation.
   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
   émis avant ce lot cesse de vérifier et le parc se ré-émet.
   Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
