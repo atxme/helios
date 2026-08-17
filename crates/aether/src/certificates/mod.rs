@@ -34,22 +34,30 @@
 //!
 //! # Limite connue
 //!
-//! The operator credential layer of ADR-008 §4 — FIDO2 `hmac-secret` key
-//! slots and the `astra-signer` companion — is not exercised by this crate: it
-//! needs a physical authenticator, which no WSL2 build can provide.
+//! The operator credential layer of ADR-008 §4 is only half exercisable here.
+//! The **verifying** half is real code with real arithmetic:
+//! [`approval::AstraCredentialBinding`] is checked under `CA-PQ` and
+//! [`webauthn::verify_assertion`] checks an assertion under the credential's
+//! own public key, both on synthetic material. The **producing** half — a
+//! FIDO2 `hmac-secret` key slot, a physical touch, the `astra-signer`
+//! companion — needs an authenticator no WSL2 build can provide.
 //!
 //! It is worth being exact about what that layer does, because the obvious
 //! guess is wrong. The authenticator **never signs anything verified here**,
 //! and it could not: a YubiKey holds RSA, P-256/P-384 and Ed25519, and every
 //! signature field in this module is an `MlDsa87Signature`. What presence and
-//! user verification release is a `hmac-secret` output, which unwraps a
-//! key-slot of the authority vault; the anchors inside it are what sign. The
-//! objects here carry the campaign fingerprint the companion **displays**
+//! user verification release is either an authorization — the assertion of
+//! [`approval::AstraRenewalApproval`], which opens no key-slot — or a
+//! `hmac-secret` output, which unwraps a key-slot of the authority vault so
+//! that the anchors inside it can sign. The objects here also carry the
+//! campaign fingerprint the companion **displays**
 //! ([`status::AstraRotationCampaign`]) and refuse an operation whose campaign
 //! does not match. See
 //! [`docs/testing/TESTING.md`](../../../../docs/testing/TESTING.md).
 
+pub mod approval;
 pub mod authority;
+pub mod capability;
 pub mod client;
 pub mod encoding;
 pub mod gateway;
@@ -57,6 +65,7 @@ pub mod revocation;
 pub mod state;
 pub mod status;
 pub mod transport;
+pub mod webauthn;
 pub mod window;
 pub mod x509;
 
@@ -149,10 +158,16 @@ pub mod test_x509 {
     }
 }
 
+pub use approval::{
+    AstraCredentialApprovalRequest, AstraCredentialBinding, AstraIssuancePolicy, AstraPolicyPin,
+    AstraRenewalApproval, CredentialState,
+};
+pub use capability::{CapabilityGrant, CapabilityRequirement, CapabilityScope, CapabilityTokens};
 pub use encoding::{
     verify_ml_dsa_87, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature,
     TrustDomainId, WireGuardKey,
 };
+pub use webauthn::WebAuthnAssertion;
 pub use window::{
     classify_generation, GenerationStep, TransitionWindow, ValidityPeriod, WindowPhase,
 };
@@ -202,6 +217,8 @@ pub enum CertificateError {
     InvalidServerName,
     #[error("signing operation failed")]
     Signing,
+    #[error("the approved randomness provider produced no bytes")]
+    RandomnessUnavailable,
 
     #[error("transition window must satisfy not_before < activation_at < not_after")]
     InvalidWindow,
@@ -279,6 +296,33 @@ pub enum CertificateError {
     CampaignMismatch,
     #[error("this operation requires {required} operator credentials, {provided} given")]
     InsufficientApprovals { required: u8, provided: u8 },
+    #[error("Astra issuance policy is outside the bounds of the specification: {0}")]
+    InvalidPolicy(&'static str),
+    #[error(
+        "the Astra issuance policy fingerprint is unset; it is confirmed out of band, never learned from a signature"
+    )]
+    PolicyNotPinned,
+    #[error("operator credential binding refused: {0}")]
+    InvalidCredentialBinding(&'static str),
+    #[error("the approving credential is not one this operation admits")]
+    UnknownCredential,
+    #[error("operator approval does not cover this operation: {0}")]
+    ApprovalMismatch(&'static str),
+    #[error("WebAuthn assertion refused: {0}")]
+    InvalidAssertion(&'static str),
+    #[error("the credential's COSE algorithm is not one this build can verify")]
+    UnsupportedCredentialAlgorithm,
+    #[error("WebAuthn origin is not an HTTPS origin governed by the relying party")]
+    InvalidOrigin,
+
+    #[error("capability token is malformed or not authenticated")]
+    InvalidCapabilityToken,
+    #[error("capability token is outside its window, or outlives its operation")]
+    CapabilityTokenExpired,
+    #[error("capability token has already been consumed")]
+    CapabilityTokenConsumed,
+    #[error("capability token confers nothing here: {0}")]
+    CapabilityScopeViolation(&'static str),
 
     #[error("transition is not in a state where this operation is allowed: {0}")]
     IllegalStateTransition(&'static str),

@@ -258,7 +258,7 @@ pub enum AllowedUsage {
 }
 
 impl AllowedUsage {
-    const fn domain_byte(self) -> u8 {
+    pub(crate) const fn domain_byte(self) -> u8 {
         match self {
             Self::AdmittedClientLeafRenewal => 1,
         }

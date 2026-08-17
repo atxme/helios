@@ -269,9 +269,17 @@ message : elle est non conforme. En particulier, toute signature produite par
 Les domaines `helios-astra-client-renewal-approval-v5`,
 `helios-astra-expired-recovery-approval-v5` et
 `helios-astra-rotation-campaign-approval-v5` forment des challenges WebAuthn
-hachés ; `helios-astra-issuance-policy-v1` forme une empreinte et
+hachés ; `helios-astra-issuance-policy-v1` et
+`helios-astra-webauthn-assertion-fingerprint-v5` forment une empreinte et
 `helios-astra-capability-token-v1` dérive une clé MAC. Aucun n'est un `ctx`
 ML-DSA par lui-même.
+
+`helios-astra-webauthn-assertion-fingerprint-v5` couvre les trois champs de
+l'assertion — `authenticator_data`, `clientDataJSON`, `signature` — chacun
+préfixé par sa longueur `u32`, et produit l'`assertion_fingerprint` que
+`AstraRenewalApproval` transporte. Le §2.4 nommait ce champ sans fixer sa
+transcription ; elle l'est ici parce qu'Astra, Helios et Orion la recalculent
+tous les trois à partir des mêmes octets.
 
 #### 2.3.2 Aléa
 
