@@ -51,6 +51,13 @@ services:
       - --expected-audit-head
       - ${ASTRA_EXPECTED_AUDIT_HEAD:?relever la tête d_audit imprimée au bootstrap}
 
+    # Le canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3). Les deux valeurs
+    # sortent de `heliosd init-astra-channel` et `deploy.sh` les écrit dans le
+    # `.env` ; absentes, Astra sert son endpoint public seul et le journalise.
+    environment:
+      ASTRA_GATEWAY_CHANNEL: ${ASTRA_GATEWAY_CHANNEL:-}
+      ASTRA_GATEWAY_CERTIFICATE: ${ASTRA_GATEWAY_CERTIFICATE:-}
+
     # Aucune capacité, rootfs en lecture seule, pas d'escalade. Astra n'ouvre
     # qu'un socket TCP et n'écrit que dans son volume.
     read_only: true
@@ -71,7 +78,12 @@ services:
       - astra-state:/var/lib/astra
 
     networks:
-      - astra-public
+      astra-public: {}
+      # Le veth privé du §8.3. Adresse fixe : `heliosd` écoute sur l'autre bout
+      # et n'accepte qu'une identité épinglée, donc les deux extrémités sont
+      # nommées une fois pour toutes plutôt que découvertes.
+      astra-private:
+        ipv4_address: 10.88.7.2
 
     # Publié sur la boucle locale seulement : le terminateur TLS est devant.
     # Exposer 8443 sur l'hôte servirait du HTTP clair au monde.
@@ -94,3 +106,23 @@ volumes:
 networks:
   astra-public:
     driver: bridge
+
+  # Le canal privé vers `heliosd` — ADR-008 §2, ROTATION-CERTIFICATS §8.3.
+  #
+  # `internal: true` est ce qui en fait un veth *privé* : Docker n'y pose ni
+  # route par défaut, ni masquerade, ni règle de sortie. Le namespace Astra n'a
+  # donc sur cette interface qu'une route vers le /29 ci-dessous, et rien
+  # d'autre — ni Internet, ni le LAN, ni une adresse de pair WireGuard. Le
+  # `forward` du pare-feu Helios, en `drop` par défaut, referme ce qui
+  # resterait.
+  #
+  # Un /29 et pas davantage : le réseau ne contient que ses deux extrémités,
+  # `10.88.7.1` côté hôte — celle que `heliosd init-astra-channel --bind`
+  # nomme — et `10.88.7.2` côté conteneur. Une plage plus large laisserait un
+  # second conteneur s'y attacher et parler au listener de cycle de vie.
+  astra-private:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.7.0/29

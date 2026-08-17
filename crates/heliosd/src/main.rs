@@ -1,5 +1,6 @@
 //! `heliosd` — control plane orchestrator daemon.
 
+mod astra_channel;
 mod certificates;
 mod gateway_key;
 mod key_negotiation;
@@ -122,6 +123,31 @@ enum Command {
         /// `astra-signer init --rp-id` and to `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
+    },
+    /// Creates this gateway's end of the private Astra veth channel (§8.3).
+    ///
+    /// It generates a transport identity — a service identity, unrelated to
+    /// `CA-PQ` and to every client — and pins Astra's, byte for byte. It seals
+    /// nothing and unseals nothing, so it runs on a gateway whose TPM is
+    /// unavailable, like `init-trust-domain`.
+    ///
+    /// Without it the private listener stays closed, and the gateway keeps
+    /// working: an authority is an addition, not a prerequisite.
+    InitAstraChannel {
+        /// Address of the gateway's end of the veth, with its port. Never a
+        /// wildcard: this API belongs on one interface with no default route.
+        #[arg(long)]
+        bind: std::net::SocketAddr,
+        /// Astra's transport certificate, DER — printed by
+        /// `astra init-channel`. The only client identity this listener will
+        /// ever accept.
+        #[arg(long)]
+        astra_certificate: std::path::PathBuf,
+        /// Replaces an existing identity. **Astra must be re-pinned**: it
+        /// holds these exact bytes, and changing them without telling it stops
+        /// the two from talking.
+        #[arg(long)]
+        rotate: bool,
     },
     /// Prints what `wan_iface = "auto"` resolves to, and why.
     ///
@@ -313,6 +339,11 @@ async fn main() -> anyhow::Result<()> {
             &authority_url,
             &webauthn_rp_id,
         ),
+        Command::InitAstraChannel {
+            bind,
+            astra_certificate,
+            rotate,
+        } => init_astra_channel(bind, &astra_certificate, rotate),
         Command::ShowUplink => show_uplink(),
         Command::ShowIdentity => show_identity(),
         Command::Peer { command } => {
@@ -545,6 +576,28 @@ fn show_identity() -> anyhow::Result<()> {
     println!(
         "pq_certificate_not_after={}",
         served.pq_certificate.not_after_unix
+    );
+    Ok(())
+}
+
+/// Creates the gateway's end of the private Astra channel (spec §8.3).
+///
+/// Prints its certificate in the same `clé=valeur` shape `show-identity` uses,
+/// and for the same reason: the consumer is `deploy.sh` over SSH, and a script
+/// that has to parse JSON parses it with `sed`.
+fn init_astra_channel(
+    bind: std::net::SocketAddr,
+    astra_certificate: &std::path::Path,
+    rotate: bool,
+) -> anyhow::Result<()> {
+    let served = astra_channel::initialize(bind, astra_certificate, rotate)?;
+    println!("bind={bind}");
+    println!("gateway_channel_certificate={}", served.to_base64());
+    println!("gateway_channel_fingerprint={}", served.fingerprint());
+    println!();
+    println!(
+        "hand the certificate above to Astra: it pins these exact bytes and accepts no other \
+         gateway"
     );
     Ok(())
 }
@@ -1100,6 +1153,13 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             Ok(Some(service)) => {
                 info!("certificate lifecycle ready");
                 certificates::spawn_maintenance(Arc::clone(&service));
+                // The private veth listener, on its own socket. Never a path
+                // on the administration API: two listeners make "Astra may
+                // not admit a peer" a fact about which socket the packet
+                // arrived on, rather than about middleware ordering.
+                astra_channel::spawn(
+                    Arc::clone(&service) as Arc<dyn helios_api::internal::AstraChannelHandler>
+                );
                 state = state.with_trust_update(service);
             }
             Ok(None) => info!(

@@ -204,6 +204,15 @@ pub struct AstraService {
     pub budgets: Mutex<SourceBudget>,
     /// Signs statuses, challenges and operational answers. Never a leaf.
     pub service_private_key: Zeroizing<Vec<u8>>,
+    /// The private veth link to `heliosd`, when the deployment has one.
+    ///
+    /// It lives here because this is where staging will be driven from: an
+    /// approved rotation issues the two leaves, sends the authorization to the
+    /// gateway and reads back its signed receipt on this same link (spec §8.3,
+    /// amendment of 16 August 2026). Nothing in this build produces that
+    /// authorization — it needs the operator approval whose routes answer
+    /// `501` — so the channel is opened, its pin checked, and held.
+    pub gateway: Option<crate::gateway::GatewayChannel>,
 }
 
 impl AstraService {

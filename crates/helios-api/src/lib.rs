@@ -21,6 +21,7 @@ pub mod auth;
 pub mod certificates;
 pub mod embed;
 pub mod health;
+pub mod internal;
 pub mod key_negotiation;
 pub mod provision;
 mod routes;

@@ -46,6 +46,10 @@ RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
 # chemin, et root ne le trouve pas autrement. Le nommer en clair évite un
 # « command not found » là où l'on croirait lire un refus d'amorçage.
 HELIOSD=/opt/helios/current/heliosd
+# Bout gateway du veth privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3).
+# La même adresse que le réseau `astra-private` de `deploy/astra/compose.yaml` :
+# un /29 qui ne contient que ses deux extrémités, sans route par défaut.
+CANAL_PRIVE="${HELIOS_CANAL_PRIVE:-10.88.7.1:8444}"
 
 usage() {
     cat >&2 <<'EOF'
@@ -230,6 +234,7 @@ deployer_astra() {
     local cle_service tete_audit identite moteur compose_env statut_astra
     local tete_attendue registre_gateway
     local unite_build etat_build resultat_build code_build tentative
+    local canal_present cert_astra cert_gateway
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -547,6 +552,59 @@ deployer_astra() {
         }
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
+    fi
+
+    # ── Le canal privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3) ───────────
+    # Deux identités de transport, une de chaque côté du veth, épinglées l'une
+    # par l'autre. Aucune n'est recopiée à la main : chaque `init` imprime son
+    # certificat et le script le porte à l'autre bout. Les deux commandes sont
+    # idempotentes, donc une reprise après coupure finit ce qu'une première a
+    # commencé.
+    #
+    # Non fatal : sans ce canal, Astra sert son endpoint public et la gateway
+    # garde ses routes in-tunnel. C'est exactement l'état d'avant ce lot.
+    canal_present="$(helios_ssh_sudo_capture "$CIBLE" \
+        "if test -f /var/lib/helios/astra-channel.json; then echo present; else echo absent; fi" \
+        | tr -d '\r' | tail -1)"
+    if sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+        run --rm --no-deps astra init-channel 2>&1")"; then
+        cert_astra="$(printf '%s\n' "$sortie" |
+            sed -n 's/^astra_channel_certificate=//p' | tr -d '\r' | head -1)"
+    fi
+    if [ -z "${cert_astra:-}" ]; then
+        echo "    identité de transport Astra illisible — canal privé non monté" >&2
+        printf '%s\n' "${sortie:-}" | tail -10 >&2
+    else
+        # Le DER traverse en base64 puis est décodé sur la cible : `heliosd`
+        # attend un fichier DER, et faire transiter du binaire par SSH est le
+        # genre de détail qui casse une fois sur dix sans dire pourquoi.
+        sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+            "umask 077 && printf '%s' '$cert_astra' | base64 -d > /run/astra-channel.der && \
+             $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
+                 --astra-certificate /run/astra-channel.der 2>&1; \
+             code=\$?; rm -f /run/astra-channel.der; exit \$code")" && \
+            cert_gateway="$(printf '%s\n' "$sortie" |
+                sed -n 's/^gateway_channel_certificate=//p' | tr -d '\r' | head -1)"
+        if [ -z "${cert_gateway:-}" ]; then
+            echo "    la gateway n'a pas pu monter son bout du canal privé :" >&2
+            printf '%s\n' "$sortie" | tail -10 >&2
+        else
+            helios_ssh_sudo "$CIBLE" \
+                "printf 'ASTRA_GATEWAY_CHANNEL=%s\nASTRA_GATEWAY_CERTIFICATE=%s\n' \
+                     '$CANAL_PRIVE' '$cert_gateway' >> '$env_distant'" || {
+                echo "    le canal privé n'a pas pu être écrit dans l'environnement" >&2
+                return 1
+            }
+            echo "    canal privé $CANAL_PRIVE"
+            # `heliosd` lit ce document au démarrage et le sert jusqu'à l'arrêt,
+            # comme l'identité de négociation : un document neuf sous un démon
+            # en marche ne change rien tant qu'il n'a pas redémarré.
+            if [ "$canal_present" = "absent" ]; then
+                helios_ssh_sudo "$CIBLE" "systemd-run --collect \
+                    --unit=helios-channel-restart systemctl restart heliosd >/dev/null"
+            fi
+        fi
     fi
 
     echo "    démarrage"

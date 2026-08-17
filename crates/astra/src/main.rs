@@ -74,6 +74,17 @@ enum Command {
         #[arg(long)]
         webauthn_rp_id: String,
     },
+    /// Creates Astra's transport identity for the private veth channel (§8.3).
+    ///
+    /// It generates a service identity — unrelated to `CA-PQ`, to the service
+    /// key and to every client — and prints its certificate. `heliosd
+    /// init-astra-channel` pins those exact bytes.
+    InitChannel {
+        /// Replaces an existing identity. **The gateway must be re-pinned**:
+        /// it holds these exact bytes and accepts no other client.
+        #[arg(long)]
+        rotate: bool,
+    },
     /// Serves the public endpoint.
     Run {
         #[arg(long, default_value = "127.0.0.1:8443")]
@@ -82,6 +93,18 @@ enum Command {
         /// that forked away from it is refused instead of continued.
         #[arg(long)]
         expected_audit_head: Option<String>,
+        /// Address of the gateway's private lifecycle listener, on the veth.
+        ///
+        /// Absent, the private channel stays closed and Astra serves its
+        /// public endpoint alone — a supported state, and the one every
+        /// deployment starts in.
+        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
+        gateway_channel: Option<SocketAddr>,
+        /// The gateway's transport certificate, DER base64 — printed by
+        /// `heliosd init-astra-channel`. The only server identity Astra will
+        /// accept on that address, byte for byte.
+        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
+        gateway_certificate: Option<String>,
     },
     /// Prints the authority's state and the head of its audit chain.
     Status,
@@ -118,10 +141,19 @@ fn main() -> Result<()> {
             &authority_url,
             &webauthn_rp_id,
         ),
+        Command::InitChannel { rotate } => init_channel(&cli.state_dir, rotate),
         Command::Run {
             bind,
             expected_audit_head,
-        } => run(&cli.state_dir, bind, expected_audit_head.as_deref()),
+            gateway_channel,
+            gateway_certificate,
+        } => run(
+            &cli.state_dir,
+            bind,
+            expected_audit_head.as_deref(),
+            gateway_channel,
+            gateway_certificate.as_deref(),
+        ),
         Command::Status => status(&cli.state_dir),
     }
 }
@@ -206,7 +238,72 @@ fn bootstrap(
     Ok(())
 }
 
-fn run(state_dir: &Path, bind: SocketAddr, expected_audit_head: Option<&str>) -> Result<()> {
+/// Creates Astra's end of the private channel, and prints its certificate.
+///
+/// One value per line, `clé=valeur`, because the consumer is `deploy.sh` over
+/// SSH: a script that has to parse JSON parses it with `sed`, and a `sed`
+/// pattern over a certificate is a defect waiting for a field to move.
+fn init_channel(state_dir: &Path, rotate: bool) -> Result<()> {
+    let certificate = astra::gateway::initialize(state_dir, rotate)
+        .context("creating the Astra transport identity")?;
+    println!("astra_channel_certificate={}", certificate.to_base64());
+    println!("astra_channel_fingerprint={}", certificate.fingerprint());
+    println!();
+    println!(
+        "then, on the gateway: `heliosd init-astra-channel --bind <veth address:port> \
+         --astra-certificate <the DER of the certificate above>`"
+    );
+    Ok(())
+}
+
+/// Opens the private channel to the gateway, when this deployment has one.
+///
+/// The pin is checked here, at startup, rather than at the first rotation: an
+/// unusable pairing found at deployment costs a command, and the same pairing
+/// found at 80 % of a leaf's life costs a night. It performs no network I/O —
+/// the gateway may legitimately come up after the authority does.
+fn open_gateway_channel(
+    state_dir: &Path,
+    address: Option<SocketAddr>,
+    certificate: Option<&str>,
+) -> Result<Option<astra::gateway::GatewayChannel>> {
+    let (Some(address), Some(certificate)) = (address, certificate) else {
+        if address.is_some() != certificate.is_some() {
+            // Half a pairing is an operator error, not a deployment choice: it
+            // means someone meant to have a channel and will not.
+            anyhow::bail!(
+                "the private gateway channel needs both its address and the gateway's pinned \
+                 certificate; only one was given"
+            );
+        }
+        tracing::info!(
+            "no private gateway channel configured: Astra serves its public endpoint alone, and \
+             stages nothing on the gateway"
+        );
+        return Ok(None);
+    };
+    let pinned = aether::certificates::encoding::DerCertificate::parse(certificate)
+        .map_err(|error| anyhow::anyhow!("the pinned gateway certificate: {error}"))?;
+    let channel = astra::gateway::GatewayChannel::open(state_dir, address, &pinned)
+        .map_err(|error| anyhow::anyhow!("opening the private gateway channel: {error}"))?;
+    tracing::info!(
+        gateway = %channel.address(),
+        pinned_gateway_sha256 = %pinned.fingerprint(),
+        "private gateway channel ready"
+    );
+    Ok(Some(channel))
+}
+
+fn run(
+    state_dir: &Path,
+    bind: SocketAddr,
+    expected_audit_head: Option<&str>,
+    gateway_channel: Option<SocketAddr>,
+    gateway_certificate: Option<&str>,
+) -> Result<()> {
+    // Before the registry is touched: a mispinned channel is a deployment
+    // error, and reporting it after "Astra ready" buries it under a success.
+    let gateway = open_gateway_channel(state_dir, gateway_channel, gateway_certificate)?;
     let expected = expected_audit_head
         .map(Fingerprint::parse_hex)
         .transpose()
@@ -232,6 +329,7 @@ fn run(state_dir: &Path, bind: SocketAddr, expected_audit_head: Option<&str>) ->
         challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
         budgets: Mutex::new(SourceBudget::default()),
         service_private_key,
+        gateway,
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

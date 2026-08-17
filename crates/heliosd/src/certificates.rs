@@ -138,6 +138,105 @@ impl AstraStageHandler for CertificateService {
     }
 }
 
+/// The two other routes of the private veth API (spec §8.3).
+///
+/// Staging lives in [`AstraStageHandler`] above; this adds revocation and the
+/// read-back of one peer's state. All three go through the **same** mutex as
+/// the in-tunnel commit and the maintenance sweep: a revocation has to dominate
+/// a staging that is running concurrently, and it can only do that if both take
+/// one serializer.
+///
+/// # Limite connue
+///
+/// A revocation whose scope is `gateway` is refused. Withdrawing the gateway's
+/// own leaf is not a registry mutation but the identity transition of spec §6 —
+/// it changes what the negotiation service serves, and that identity is read
+/// once at startup and served until the process stops. Applying it here would
+/// mark a state nothing acts on, which is worse than refusing. Delivering §6's
+/// transition path, with the restart it implies, is what unblocks it.
+#[async_trait]
+impl helios_api::internal::AstraChannelHandler for CertificateService {
+    async fn revoke(
+        &self,
+        revocation: Box<aether::certificates::revocation::EmergencyCertificateRevocation>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        use aether::certificates::revocation::RevocationScope;
+
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let state = registry.state();
+
+        if revocation.scope != RevocationScope::Client {
+            tracing::warn!(
+                identity = %revocation.identity_key,
+                "revocation refused: only a client scope is applied on the private channel; a \
+                 gateway identity is withdrawn by the §6 transition, which this build does not \
+                 implement"
+            );
+            return Err(TrustUpdateRefusal::Rejected);
+        }
+        // The peer is resolved **before** the signature is checked, because the
+        // counter the signature is checked against belongs to that peer: two
+        // peers' revocation counters are independent, and comparing against a
+        // global one would let a busy peer's decisions block a quiet one's.
+        let peer = registry.peer(&revocation.identity_key).ok_or_else(|| {
+            tracing::warn!(
+                identity = %revocation.identity_key,
+                "revocation refused: no admitted peer holds this identity"
+            );
+            TrustUpdateRefusal::Rejected
+        })?;
+        let current_epoch = peer.state.revocation_epoch;
+        // Under `CA-PQ` alone. The delegated issuer may renew a leaf; it may
+        // never withdraw one (ADR-008 §3), and the object's own `ca_epoch`
+        // pins which anchor it was signed under.
+        revocation
+            .verify(
+                &state.gateway.current_ca_public_key,
+                &state.trust_domain_id,
+                state.gateway.ca_epoch,
+                current_epoch,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    identity = %revocation.identity_key, %error,
+                    "revocation refused"
+                );
+                classify(RegistryError::Certificate(error))
+            })?;
+
+        registry
+            .revoke(&revocation.identity_key, revocation.revocation_epoch, now)
+            .map_err(|error| {
+                tracing::warn!(
+                    identity = %revocation.identity_key, %error,
+                    "revocation could not be applied"
+                );
+                classify(error)
+            })?;
+        tracing::warn!(
+            identity = %revocation.identity_key,
+            revocation_epoch = revocation.revocation_epoch,
+            "client certificate identity revoked by the authority"
+        );
+        Ok(())
+    }
+
+    async fn peer_state(
+        &self,
+        identity: &WireGuardKey,
+    ) -> Result<helios_api::internal::PeerCertificateStateView, TrustUpdateRefusal> {
+        let registry = self.registry.lock().await;
+        let peer = registry
+            .peer(identity)
+            .ok_or(TrustUpdateRefusal::Rejected)?;
+        Ok(helios_api::internal::PeerCertificateStateView {
+            name: peer.name.clone(),
+            state: peer.state.clone(),
+        })
+    }
+}
+
 /// How often the lifecycle sweeps leases and overlaps.
 ///
 /// A minute: the shortest deadline it enforces is a 24-hour lease, and the

@@ -33,11 +33,16 @@
 //!   commands, capability exchange and one- or two-credential approval routes
 //!   do not. Those routes answer `501` through
 //!   [`service::ServiceError::OperatorCredentialUnavailable`];
-//! - the **private veth channel** to `heliosd` and its mutually authenticated
-//!   TLS 1.3 transport. An active Orion reaches `heliosd` through WireGuard,
-//!   but `heliosd` must then relay the canonical request to Astra over this
-//!   veth; stage authorization and receipt also stay on it. Expired recovery
-//!   uses the public Astra side and the same private channel;
+//! - the **objects that would travel on the private veth channel**. The
+//!   channel itself exists: [`gateway`] dials `heliosd`'s
+//!   `/internal/v1/certificates/*` listener under mutually authenticated TLS
+//!   1.3 with pinned identities, no resumption and no 0-RTT, and `astra run`
+//!   opens it — and checks its pin — at startup. What is missing is what would
+//!   be sent: issuing a staging authorization needs the operator approval
+//!   above. The reverse relay of the 15 August 2026 amendment, in which
+//!   `heliosd` forwards an active Orion's canonical request to Astra, has no
+//!   Astra-side route in §8.3 and is a specification change rather than an
+//!   implementation gap;
 //! - the **end-to-end orchestration** which joins approval, delegated issuance,
 //!   gateway staging, receipt, grant and commit without exposing a direct Astra
 //!   route to an Orion whose tunnel still works.
@@ -46,6 +51,7 @@
 //! a WSL2 build does and does not prove.
 
 pub mod audit;
+pub mod gateway;
 pub mod issuer;
 pub mod planner;
 pub mod registry;
