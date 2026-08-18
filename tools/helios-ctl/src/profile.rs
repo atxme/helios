@@ -109,6 +109,8 @@ pub struct KeyNegotiation {
     pub gateway_ca_der: String,
     pub gateway_pq_certificate: String,
     pub identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<orion_core::TrustMaterial>,
 }
 
 /// Renders the document, and checks it against the consumer before writing.
@@ -519,6 +521,7 @@ mod tests {
                 gateway_pq_certificate: STANDARD
                     .encode(serde_json::to_vec(&gateway_certificate).unwrap()),
                 identity: "orion-portable".into(),
+                trust: None,
             }),
             key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
                 identity: "orion-portable".into(),

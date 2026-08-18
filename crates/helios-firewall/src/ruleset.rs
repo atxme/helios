@@ -65,6 +65,16 @@ const PRIVATE_IPV4_CIDRS: [&str; 4] = [
     "192.168.0.0/16",
 ];
 
+/// Fixed, host-visible bridge of the Astra private channel (spec §8.3).
+///
+/// Compose gives the bridge this exact name; keeping the tuple here avoids an
+/// interface wildcard turning a source-spoofed packet into an authority call.
+const ASTRA_PRIVATE_IFACE: &str = "astra0";
+const ASTRA_PRIVATE_HOST: &str = "10.88.7.1/32";
+const ASTRA_PRIVATE_PEER: &str = "10.88.7.2/32";
+const HELIOS_LIFECYCLE_PORT: u16 = 8444;
+const ASTRA_LIFECYCLE_PORT: u16 = 8445;
+
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -333,6 +343,43 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         rules.push(Rule::new(chain, vec![loopback], Verdict::Accept));
         rules.push(Rule::new(chain, vec![Match::Established], Verdict::Accept));
     }
+
+    // ── Private Astra ↔ Helios lifecycle channel ───────────────────────────
+    // These openings name all four coordinates: interface, source, target and
+    // port. They are harmless when the optional bridge does not exist and do
+    // not grant the container any forwarding or general host access.
+    rules.push(
+        Rule::new(
+            Input,
+            vec![
+                Match::InIface(ASTRA_PRIVATE_IFACE.into()),
+                Match::SourceNet(ASTRA_PRIVATE_PEER.into()),
+                Match::DestNet(ASTRA_PRIVATE_HOST.into()),
+                Match::DestPort {
+                    port: HELIOS_LIFECYCLE_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Astra mTLS client to the private Helios lifecycle API"),
+    );
+    rules.push(
+        Rule::new(
+            Output,
+            vec![
+                Match::OutIface(ASTRA_PRIVATE_IFACE.into()),
+                Match::SourceNet(ASTRA_PRIVATE_HOST.into()),
+                Match::DestNet(ASTRA_PRIVATE_PEER.into()),
+                Match::DestPort {
+                    port: ASTRA_LIFECYCLE_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Helios mTLS client to the private Astra lifecycle API"),
+    );
 
     // ── WireGuard listener (server role) ─────────────────────────────────────
     // Road-warrior clients arrive from unknown, changing IPs: impossible to
@@ -922,6 +969,22 @@ mod tests {
                 "state {st:?}: the WireGuard listening port must stay reachable"
             );
         }
+    }
+
+    #[test]
+    fn astra_channel_is_open_only_on_its_fixed_bridge_tuple() {
+        let rs = render(&policy(), TunnelState::Down);
+        let input = text(&rs, ChainKind::Input);
+        let output = text(&rs, ChainKind::Output);
+        assert!(input.iter().any(|rule| {
+            rule == "iifname \"astra0\" ip saddr 10.88.7.2/32 ip daddr 10.88.7.1/32 tcp dport 8444 accept"
+        }));
+        assert!(output.iter().any(|rule| {
+            rule == "oifname \"astra0\" ip saddr 10.88.7.1/32 ip daddr 10.88.7.2/32 tcp dport 8445 accept"
+        }));
+        assert!(!text(&rs, ChainKind::Forward)
+            .iter()
+            .any(|rule| rule.contains("astra0") || rule.contains("10.88.7.")));
     }
 
     /// UDP conntrack is not a transport contract. A WireGuard rekey or the

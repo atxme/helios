@@ -96,6 +96,16 @@ pub struct TrustMaterial {
     /// Generation this client's current identity is at.
     pub client_generation: u64,
     pub astra_authority_url: String,
+    /// RP ID of the operator WebAuthn ceremony. It is stable across a TLS
+    /// certificate rotation of Astra and is never inferred from a relay URL.
+    #[serde(default)]
+    pub webauthn_rp_id: String,
+    /// Out-of-band policy pin, lowercase SHA-256 hexadecimal.
+    #[serde(default)]
+    pub astra_policy_fingerprint: String,
+    /// Highest CA-PQ-signed credential registry decision this profile saw.
+    #[serde(default)]
+    pub credential_registry_epoch: u64,
     pub astra_service_key_epoch: u64,
     /// Astra's service key, base64 ML-DSA-87.
     pub astra_service_public_key: String,
@@ -136,16 +146,30 @@ impl TrustMaterial {
         aether::certificates::x509::assert_certificate_authority(&certificate)
             .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))?;
 
-        if self.astra_authority_url.trim().is_empty() {
-            anyhow::bail!("l'URL de l'autorité Astra est vide");
+        let authority = url::Url::parse(self.astra_authority_url.trim())
+            .map_err(|_| anyhow::anyhow!("l'URL de l'autorité Astra est illisible"))?;
+        if authority.scheme() != "https" || authority.host_str().is_none() {
+            anyhow::bail!("l'URL de l'autorité Astra doit être une origine https://");
         }
-        // Astra authenticates itself by its pinned ML-DSA-87 service key, not
-        // by its transport (spec §9.6). `https` is still required: without it
-        // an observer reads which client renews, and when.
-        if !self.astra_authority_url.trim().starts_with("https://") {
-            anyhow::bail!("l'URL de l'autorité Astra doit être en https://");
+        aether::certificates::encoding::validate_server_name(self.webauthn_rp_id.trim())
+            .map_err(|_| anyhow::anyhow!("RP ID WebAuthn Astra invalide"))?;
+        let host = authority.host_str().expect("checked above");
+        let rp_id = self.webauthn_rp_id.trim();
+        if host != rp_id && !host.ends_with(&format!(".{rp_id}")) {
+            anyhow::bail!("le RP ID WebAuthn Astra ne gouverne pas l'origine de l'autorité");
         }
-        if self.ca_epoch == 0 || self.ca_tls_epoch == 0 || self.astra_service_key_epoch == 0 {
+        let policy = aether::certificates::encoding::Fingerprint::parse_hex(
+            self.astra_policy_fingerprint.trim(),
+        )
+        .map_err(|_| anyhow::anyhow!("empreinte de politique Astra illisible"))?;
+        aether::certificates::AstraPolicyPin::new(policy)
+            .map_err(|_| anyhow::anyhow!("empreinte de politique Astra absente"))?;
+        if self.ca_epoch == 0
+            || self.ca_tls_epoch == 0
+            || self.client_generation == 0
+            || self.astra_service_key_epoch == 0
+            || self.credential_registry_epoch == 0
+        {
             anyhow::bail!("les compteurs d'autorité commencent à 1");
         }
         Ok(())
@@ -170,6 +194,15 @@ impl TrustMaterial {
             .map_err(|_| anyhow::anyhow!("CA TLS cliente : base64 illisible"))?;
         aether::certificates::encoding::DerCertificate::new(der)
             .map_err(|error| anyhow::anyhow!("CA TLS cliente : {error}"))
+    }
+
+    pub fn astra_policy_pin(&self) -> Result<aether::certificates::AstraPolicyPin> {
+        let fingerprint = aether::certificates::encoding::Fingerprint::parse_hex(
+            self.astra_policy_fingerprint.trim(),
+        )
+        .map_err(|_| anyhow::anyhow!("empreinte de politique Astra illisible"))?;
+        aether::certificates::AstraPolicyPin::new(fingerprint)
+            .map_err(|error| anyhow::anyhow!("empreinte de politique Astra : {error}"))
     }
 }
 

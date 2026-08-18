@@ -323,6 +323,10 @@ impl TrustStore {
                     // A delegation is not an anchor, but it decides which key
                     // may have issued the client's own next leaf. Ignoring it
                     // would make every renewed identity unverifiable here.
+                    candidate
+                        .astra
+                        .astra_policy_fingerprint
+                        .assert_authorizes(delegation)?;
                     delegation.verify(
                         &candidate.gateway.current_ca_public_key,
                         &candidate.trust_domain_id,
@@ -878,6 +882,12 @@ mod tests {
                 astra: AstraProfile {
                     authority_url: "https://astra.example".into(),
                     webauthn_rp_id: "astra.example".into(),
+                    astra_policy_fingerprint: aether::certificates::approval::AstraPolicyPin::new(
+                        Fingerprint::of(b"policy"),
+                    )
+                    .expect("policy pin"),
+                    credential_registry_epoch: 1,
+                    credential_bindings: Default::default(),
                     active_astra_service_public_key: service,
                     next_astra_service_public_key: None,
                     next_service_key_transition_fingerprint: None,

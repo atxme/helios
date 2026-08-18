@@ -122,6 +122,32 @@ pub struct AstraIssuancePolicy {
 }
 
 impl AstraIssuancePolicy {
+    /// The fixed policy profile shipped by this protocol version.
+    ///
+    /// Both Astra and Helios compute it independently from the gateway identity
+    /// during bootstrap.  The resulting fingerprint is then displayed and
+    /// carried by enrollment documents; it is never learned from a delegation.
+    pub fn standard(
+        trust_domain_id: TrustDomainId,
+        gateway_wg_public_key: WireGuardKey,
+        server_name: String,
+    ) -> Self {
+        Self {
+            format_version: ISSUANCE_POLICY_FORMAT_VERSION,
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name,
+            allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 90 * 86_400,
+            maximum_stage_lease_secs: MAX_STAGE_LEASE_SECS,
+            maximum_overlap_secs: MAX_OVERLAP_SECS,
+            renewal_start_percent: POLICY_RENEWAL_START_PERCENT,
+            ordinary_approval_credentials: ORDINARY_APPROVAL_CREDENTIALS,
+            expired_recovery_credentials: 1,
+            authority_mutation_credentials: AUTHORITY_MUTATION_CREDENTIALS,
+        }
+    }
+
     /// Every bound §2.4 fixes, refused by name rather than clamped.
     ///
     /// A policy outside these bounds has no fingerprint at all — see
@@ -610,7 +636,16 @@ impl AstraCredentialApprovalRequest {
 pub struct AstraRenewalApproval {
     pub format_version: u16,
     pub operation_id: Id16,
+    /// Fingerprint of the client rotation request of spec §7.1.
+    ///
+    /// This deliberately has the same meaning as
+    /// [`AstraCredentialApprovalRequest::request_fingerprint`].  The signed
+    /// approval-request document has its own fingerprint below; conflating the
+    /// two made two interoperable implementations impossible.
     pub request_fingerprint: Fingerprint,
+    /// Fingerprint of the signed [`AstraCredentialApprovalRequest`] whose
+    /// WebAuthn challenge was answered.
+    pub approval_request_fingerprint: Fingerprint,
     /// The `CA-PQ`-signed binding of the credential that answered, carried
     /// whole so no consumer has to ask Astra's registry what it means.
     pub credential_binding: AstraCredentialBinding,
@@ -630,6 +665,7 @@ impl AstraRenewalApproval {
             .u16(self.format_version)
             .id(&self.operation_id)
             .fingerprint(&self.request_fingerprint)
+            .fingerprint(&self.approval_request_fingerprint)
             .fingerprint(&self.credential_fingerprint)
             .fingerprint(&self.assertion_fingerprint)
             .u64(self.approved_at)
@@ -675,8 +711,19 @@ impl AstraRenewalApproval {
         }
         // The binding to the exact request: the amendment of 15 August 2026
         // makes this the difference between an approval and a licence.
-        if !self.request_fingerprint.matches(&request.fingerprint()) {
+        if !self
+            .request_fingerprint
+            .matches(&request.request_fingerprint)
+        {
             return Err(CertificateError::ApprovalMismatch("request fingerprint"));
+        }
+        if !self
+            .approval_request_fingerprint
+            .matches(&request.fingerprint())
+        {
+            return Err(CertificateError::ApprovalMismatch(
+                "approval request fingerprint",
+            ));
         }
         if self.astra_service_key_epoch != service_key_epoch {
             return Err(CertificateError::UnauthorizedIssuer);
@@ -742,6 +789,75 @@ impl AstraRenewalApproval {
         )?;
 
         verify_ml_dsa_87(service_key, &self.signing_bytes(), &self.astra_signature)
+    }
+}
+
+/// The complete evidence transported with a delegated client renewal.
+///
+/// A fingerprint alone cannot be checked by Helios or Orion: both consumers
+/// need the service-signed request to reconstruct the WebAuthn challenge and
+/// the approval carrying the assertion and the CA-PQ-signed credential
+/// binding.  Keeping the pair in one strict object prevents a route or a
+/// persistence layer from accidentally forwarding only the convenient half.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AstraRenewalApprovalEvidence {
+    pub approval_request: AstraCredentialApprovalRequest,
+    pub approval: AstraRenewalApproval,
+}
+
+impl AstraRenewalApprovalEvidence {
+    /// The value carried as `operator_approval_fingerprint` by stage, receipt
+    /// and grant.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.approval.fingerprint()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        expected_rotation_request: &Fingerprint,
+        ca_pq: &MlDsa87PublicKey,
+        service_key: &MlDsa87PublicKey,
+        service_key_epoch: u64,
+        trust_domain_id: &TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+        client_wg_public_key: &WireGuardKey,
+        webauthn_rp_id: &str,
+        active_generation: u64,
+        ca_epoch: u64,
+        minimum_registry_epoch: u64,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        if !self
+            .approval_request
+            .request_fingerprint
+            .matches(expected_rotation_request)
+        {
+            return Err(CertificateError::ApprovalMismatch(
+                "rotation request fingerprint",
+            ));
+        }
+        self.approval_request.verify(
+            service_key,
+            service_key_epoch,
+            trust_domain_id,
+            gateway_wg_public_key,
+            client_wg_public_key,
+            webauthn_rp_id,
+            active_generation,
+            now_unix,
+        )?;
+        self.approval.verify(
+            &self.approval_request,
+            ca_pq,
+            service_key,
+            service_key_epoch,
+            trust_domain_id,
+            ca_epoch,
+            minimum_registry_epoch,
+            now_unix,
+        )
     }
 }
 
@@ -903,7 +1019,8 @@ mod tests {
         AstraRenewalApproval {
             format_version: CERTIFICATE_FORMAT_VERSION,
             operation_id: request.operation_id,
-            request_fingerprint: request.fingerprint(),
+            request_fingerprint: request.request_fingerprint,
+            approval_request_fingerprint: request.fingerprint(),
             credential_binding: binding.clone(),
             credential_fingerprint: binding.fingerprint(),
             assertion_fingerprint: assertion.fingerprint(),
@@ -996,7 +1113,8 @@ mod tests {
         altered.requested_generation = 6;
         let altered = altered.sign(&fixture.service.private).expect("sign");
         let mut approval = fixture.approval.clone();
-        approval.request_fingerprint = altered.fingerprint();
+        approval.request_fingerprint = altered.request_fingerprint;
+        approval.approval_request_fingerprint = altered.fingerprint();
         let approval = approval.sign(&fixture.service.private).expect("sign");
         assert!(matches!(
             approval.verify(
@@ -1020,7 +1138,8 @@ mod tests {
         narrowed.allowed_credential_ids = vec![b"credential-two".to_vec()];
         let narrowed = narrowed.sign(&fixture.service.private).expect("sign");
         let mut approval = fixture.approval.clone();
-        approval.request_fingerprint = narrowed.fingerprint();
+        approval.request_fingerprint = narrowed.request_fingerprint;
+        approval.approval_request_fingerprint = narrowed.fingerprint();
         let approval = approval.sign(&fixture.service.private).expect("sign");
         assert!(matches!(
             approval.verify(

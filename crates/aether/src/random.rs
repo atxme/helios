@@ -16,7 +16,7 @@
 //! reimplement** a DRBG — no HMAC-DRBG or CTR-DRBG state, no update function,
 //! no seed derivation, no health test is recoded here. Two mechanisms are
 //! admissible and both belong to the provider: HMAC-DRBG-SHA-512, or
-//! CTR-DRBG-AES-256 with the derivation function enabled.
+//! CTR-DRBG-AES-256 with a derivation function or a full-entropy seedlen input.
 //!
 //! So what lives here is a **type and configuration adaptation that produces
 //! no byte of its own**: one door to the provider, the description its
@@ -36,9 +36,8 @@
 //!   function**: `CTR_DRBG_init` takes exactly `CTR_DRBG_ENTROPY_LEN` = 48
 //!   bytes — one seedlen — and XORs the personalization string into it. That
 //!   is SP 800-90Ar1 §10.2.1.3.1, the full-entropy instantiation, not
-//!   §10.2.1.3.2. See the limit below: the two specifications name
-//!   `use_df = true`, and this is the one place the shipped provider and their
-//!   wording do not line up;
+//!   §10.2.1.3.2. The specifications admit explicitly this full-entropy
+//!   instantiation alongside `use_df = true`;
 //! - **per-thread state** (`OPENSSL_THREAD_LOCAL_PRIVATE_RAND`), so no lock is
 //!   contended on the negotiation path;
 //! - **seeded from a jitter-rooted tree DRBG, personalized from the OS**. The
@@ -87,37 +86,21 @@
 //!   manifest therefore pins its `aws_lc_rs` feature so these keys come from
 //!   the DRBG above.
 //!
-//! # Limite connue
+//! **Per-call prediction resistance uses AWS-LC's own native entry point.**
+//! `aws-lc-rs` does not wrap `RAND_bytes_with_user_prediction_resistance`, so
+//! this module calls the matching `aws-lc-sys` symbol for secret draws and
+//! feeds it 32 bytes from AWS-LC's separate public DRBG. This is an ABI
+//! adaptation only: no DRBG state, update primitive, seed derivation or health
+//! test exists in Helios.
 //!
-//! **The derivation function.** Both specifications admit CTR-DRBG-AES-256
-//! only "with the derivation function activated (`use_df = true`)", and the
-//! provider does not use one — it relies on a full-entropy seed input instead,
-//! which is the case SP 800-90Ar1 §10.2.1.3.1 exists for and which the
-//! jitter-rooted source satisfies. The security argument holds; the wording
-//! does not. [`ProviderDescription::use_df`] reports `false` so the gap is
-//! visible on every start-up rather than assumed away. What closes it is an
-//! arbitration: amend the two specifications to admit the full-entropy
-//! instantiation, or move to a provider that runs the derivation function.
-//!
-//! **Per-call prediction resistance is not reachable through `aws-lc-rs`.**
-//! AWS-LC does expose it in C — `RAND_bytes_with_user_prediction_resistance`
-//! mixes caller-supplied prediction resistance into a generate — but the Rust
-//! wrapper offers only the plain fill, so [`PredictionResistance::Required`]
-//! records the intent without changing the call. What the provider does give
-//! is a fresh state randomized with prediction resistance on its **first** use,
-//! and only where the CPU carries RDRAND or RNDR — without one, the entropy
-//! source declares no prediction-resistance method at all. Implementing the
-//! missing flag above the wrapper would mean owning DRBG state here, which is
-//! exactly what the specification forbids; what unblocks it is that entry
-//! point on the `aws-lc-rs` side.
-//!
-//! **TLS session material is still on `ring`.** `rustls` and `quinn` are built
-//! with their `ring` provider, so the ephemeral (EC)DHE keys, the handshake
-//! randoms and the session keys of the negotiation transport come from ring's
-//! CSPRNG, not from the DRBG above — while §4.3 names TLS among the keys the
-//! pipeline must cover. Long-lived material is unaffected: WireGuard keys,
-//! PSKs, ML-KEM, ML-DSA and every X.509 private key are on AWS-LC. What blocks
-//! the swap is `reqwest` 0.12, whose only rustls provider feature is `ring`;
+//! **TLS session material outside the private Astra channel is still on
+//! `ring`.** That private mTLS configuration selects AWS-LC explicitly. The
+//! public QUIC negotiation and reqwest clients still select ring, so their
+//! ephemeral (EC)DHE keys, handshake randoms and session keys do not use the
+//! DRBG above — while §4.3 names TLS among the keys the pipeline must cover.
+//! Long-lived material is unaffected: WireGuard keys, PSKs, ML-KEM, ML-DSA and
+//! every X.509 private key are on AWS-LC. What blocks the remaining swap is
+//! `reqwest` 0.12, whose only rustls provider feature is `ring`;
 //! its `-no-provider` variant compiles but then requires
 //! `CryptoProvider::install_default` in **every** binary and test that builds a
 //! client, which is a change to make deliberately rather than as a side effect
@@ -132,23 +115,10 @@
 //!   are reported by [`ProviderDescription`], never re-enforced here;
 //! - a secret is drawn through [`fill_secret`] and a public value through
 //!   [`fill_public`]. The distinction is [`PredictionResistance`], which the
-//!   provider does not currently take — see the limit below — and which
-//!   nonetheless says at every call site which draws are key material;
+//!   provider uses to select the native prediction-resistant entry point;
 //! - a deterministic provider exists only under `cfg(test)`. No shipped binary
 //!   has a path that installs one, and none is ever described as conforming.
 //!
-//! # Limite connue
-//!
-//! **Per-call prediction resistance is not reachable through `aws-lc-rs`.**
-//! AWS-LC does expose it in C — `RAND_bytes_with_user_prediction_resistance`
-//! mixes caller-supplied prediction resistance into a generate — but the Rust
-//! wrapper offers only the plain fill, so [`PredictionResistance::Required`]
-//! records the intent without changing the call. What the provider does give
-//! is a state randomized with prediction resistance on its first use and
-//! reseeded every 4096 calls. Implementing the missing flag above the wrapper
-//! would mean owning DRBG state here, which is exactly what the specification
-//! forbids; what unblocks it is that entry point on the `aws-lc-rs` side.
-
 use std::sync::OnceLock;
 
 use zeroize::Zeroizing;
@@ -315,24 +285,48 @@ impl DrbgProvider for AwsLcProvider {
             mechanism: DrbgMechanism::CtrAes256,
             // `CTR_DRBG_init` consumes exactly one seedlen of full entropy and
             // XORs the personalization string into it: SP 800-90Ar1
-            // §10.2.1.3.1, no derivation function. Reported as it is, not as
-            // the specifications wish it were.
+            // §10.2.1.3.1, no derivation function. Reported exactly as it is.
             use_df: false,
             reseed_interval_generates: AWS_LC_RESEED_INTERVAL,
-            per_call_prediction_resistance: false,
+            per_call_prediction_resistance: true,
         }
     }
 
-    fn fill(&self, out: &mut [u8], _resistance: PredictionResistance) -> Result<(), RandomError> {
+    fn fill(&self, out: &mut [u8], resistance: PredictionResistance) -> Result<(), RandomError> {
         use aws_lc_rs::rand::SecureRandom as _;
 
-        // The requested resistance travels to this boundary and stops here:
-        // `aws-lc-rs` exposes one entry point, and the reseed profile behind it
-        // is what the description reports. Nothing supplements it — supplementing
-        // it would mean generating bytes, which this module must not do.
-        self.source
-            .fill(out)
-            .map_err(|_| RandomError::ProviderFailed)
+        if resistance == PredictionResistance::NotRequired {
+            return self
+                .source
+                .fill(out)
+                .map_err(|_| RandomError::ProviderFailed);
+        }
+
+        let mut user_material = Zeroizing::new([0u8; 32]);
+        let mut generated = Zeroizing::new(vec![0u8; out.len()]);
+        // SAFETY: both pointers address live writable buffers for exactly the
+        // lengths passed. `user_material` is the required non-null 32-byte
+        // RAND_PRED_RESISTANCE_LEN input. AWS-LC retains neither pointer.
+        let public_ok = unsafe {
+            aws_lc_sys::RAND_public_bytes(user_material.as_mut_ptr(), user_material.len())
+        };
+        if public_ok != 1 {
+            return Err(RandomError::ProviderFailed);
+        }
+        // SAFETY: `generated` is valid for its announced length and the third
+        // pointer addresses the 32 initialized bytes obtained above.
+        let private_ok = unsafe {
+            aws_lc_sys::RAND_bytes_with_user_prediction_resistance(
+                generated.as_mut_ptr(),
+                generated.len(),
+                user_material.as_ptr(),
+            )
+        };
+        if private_ok != 1 {
+            return Err(RandomError::ProviderFailed);
+        }
+        out.copy_from_slice(&generated);
+        Ok(())
     }
 }
 
@@ -589,9 +583,8 @@ mod tests {
             description.reseed_interval_generates,
             AWS_LC_RESEED_INTERVAL
         );
-        // Per-call prediction resistance is not reachable through the wrapper;
-        // claiming it would make `fill_secret` promise what it cannot keep.
-        assert!(!description.per_call_prediction_resistance);
+        assert!(description.per_call_prediction_resistance);
+
         // The banner carries every field, secrets excepted: a deployment reads
         // what it runs on its first journal line.
         let banner = description.to_string();

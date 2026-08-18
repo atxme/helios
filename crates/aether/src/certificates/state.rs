@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::key_negotiation::PqCertificate;
 
 use super::{
+    approval::{AstraCredentialBinding, AstraPolicyPin},
     authority::{
         AstraIssuerAuthorization, AstraServiceKeyTransition, CaTransition, ClientTlsCaTransition,
         EmergencyAstraServiceKeyReplacement,
@@ -992,6 +993,14 @@ fn generation_snapshot(bytes: &mut CanonicalBytes, generation: &ClientCertificat
 pub struct AstraProfile {
     pub authority_url: String,
     pub webauthn_rp_id: String,
+    /// Policy confirmed independently of any CA-PQ-signed delegation.
+    pub astra_policy_fingerprint: AstraPolicyPin,
+    /// Highest credential-registry epoch accepted by this consumer.
+    pub credential_registry_epoch: u64,
+    /// Last CA-PQ-signed decision per credential identifier. The global epoch
+    /// alone cannot make `revoked` terminal against a later forged restore.
+    #[serde(default)]
+    pub credential_bindings: BTreeMap<String, AstraCredentialBinding>,
     pub active_astra_service_public_key: MlDsa87PublicKey,
     pub next_astra_service_public_key: Option<MlDsa87PublicKey>,
     /// Fingerprint of the `AstraServiceKeyTransition` document that staged it.
@@ -1013,6 +1022,30 @@ pub struct AstraProfile {
 }
 
 impl AstraProfile {
+    /// Applies one credential decision without allowing rollback or revival.
+    pub fn accept_credential_binding(
+        &mut self,
+        binding: &AstraCredentialBinding,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if binding.credential_registry_epoch < self.credential_registry_epoch {
+            return Err(CertificateError::GenerationRollback {
+                current: self.credential_registry_epoch,
+                proposed: binding.credential_registry_epoch,
+            });
+        }
+        let key = Fingerprint::of(&binding.credential_id).to_string();
+        let previous = self.credential_bindings.get(&key);
+        binding.supersedes(previous)?;
+        if previous.is_some_and(|known| known.fingerprint().matches(&binding.fingerprint())) {
+            return Ok(InstallOutcome::AlreadyPresent);
+        }
+        self.credential_registry_epoch = self
+            .credential_registry_epoch
+            .max(binding.credential_registry_epoch);
+        self.credential_bindings.insert(key, binding.clone());
+        Ok(InstallOutcome::Installed)
+    }
+
     /// The key that verifies a response announcing `epoch`.
     ///
     /// A response never selects its own verifier: the epoch it declares is
@@ -2441,6 +2474,10 @@ mod tests {
         let profile = AstraProfile {
             authority_url: "https://astra.example".into(),
             webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy"),
+            credential_registry_epoch: 1,
+            credential_bindings: BTreeMap::new(),
             active_astra_service_public_key: active,
             next_astra_service_public_key: Some(next),
             next_service_key_transition_fingerprint: None,
@@ -2454,5 +2491,49 @@ mod tests {
         assert!(profile.service_key_for(4, 999).is_none());
         assert!(profile.service_key_for(4, 1_000).is_some());
         assert!(profile.service_key_for(3, 2_000).is_none());
+    }
+
+    #[test]
+    fn the_astra_profile_refuses_a_binding_older_than_its_global_registry() {
+        let Ok(service_key) = MlDsa87PublicKey::new(vec![1; 2_592]) else {
+            return;
+        };
+        let mut profile = AstraProfile {
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy"),
+            credential_registry_epoch: 7,
+            credential_bindings: BTreeMap::new(),
+            active_astra_service_public_key: service_key,
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            astra_service_key_epoch: 1,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
+        };
+        let stale = AstraCredentialBinding {
+            format_version: crate::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1],
+            credential_public_key: vec![1],
+            aaguid: [0; 16],
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            state: crate::certificates::approval::CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 6,
+            ca_epoch: 1,
+            created_at: 1,
+            ca_pq_signature: super::super::encoding::MlDsa87Signature::placeholder(),
+        };
+        assert!(matches!(
+            profile.accept_credential_binding(&stale),
+            Err(CertificateError::GenerationRollback {
+                current: 7,
+                proposed: 6
+            })
+        ));
     }
 }

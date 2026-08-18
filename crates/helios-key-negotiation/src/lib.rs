@@ -496,10 +496,20 @@ pub fn server_endpoint(
     roots
         .add(CertificateDer::from(client_ca))
         .map_err(|_| TransportError::InvalidCertificate)?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .map_err(|error| TransportError::Tls(error.to_string()))?;
-    let mut tls = rustls::ServerConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|error| TransportError::Tls(error.to_string()))?;
+    // The workspace intentionally carries both rustls providers: the public
+    // QUIC path remains on `ring`, while the private Astra link uses AWS-LC.
+    // Never ask rustls to guess a process-wide default from unified Cargo
+    // features — a workspace test (or a future binary) can enable both.
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| TransportError::Tls(error.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;
@@ -583,7 +593,10 @@ fn client_config(
     roots
         .add(CertificateDer::from(gateway_ca))
         .map_err(|_| TransportError::InvalidCertificate)?;
-    let mut tls = rustls::ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| TransportError::Tls(error.to_string()))?
         .with_root_certificates(roots)
         .with_client_auth_cert(identity.certificates(), identity.private_key()?)
         .map_err(|error| TransportError::Tls(error.to_string()))?;

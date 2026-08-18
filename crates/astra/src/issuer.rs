@@ -26,6 +26,7 @@
 //! degraded path.
 
 use aether::certificates::{
+    approval::AstraRenewalApprovalEvidence,
     authority::{AstraIssuerAuthorization, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
@@ -219,6 +220,7 @@ impl DelegatedIssuer {
         issued_at: u64,
         stage_expires_at: u64,
         reason: RotationReason,
+        renewal_approval: AstraRenewalApprovalEvidence,
     ) -> Result<ClientCertificateStageAuthorization, IssuerError> {
         if !reason.is_delegable() {
             return Err(IssuerError::MasterAuthorityRequired);
@@ -235,6 +237,8 @@ impl DelegatedIssuer {
             issuer_authorization: Some(self.authorization.clone()),
             stage_id,
             request_fingerprint: request.fingerprint(),
+            operator_approval_fingerprint: renewal_approval.fingerprint(),
+            renewal_approval: Some(renewal_approval),
             gateway_wg_public_key: self.authorization.gateway_wg_public_key,
             server_name: self.authorization.server_name.clone(),
             client_wg_public_key: request.client_wg_public_key,
@@ -286,6 +290,8 @@ impl DelegatedIssuer {
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
+            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_approval: authorization.renewal_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
             stage_receipt: receipt.clone(),
             gateway_wg_public_key: authorization.gateway_wg_public_key,
@@ -327,9 +333,16 @@ impl DelegatedIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether::certificates::authority::AllowedUsage;
     use aether::certificates::encoding::{
         generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::{
+        approval::{
+            AstraCredentialApprovalRequest, AstraCredentialBinding, AstraPolicyPin,
+            AstraRenewalApproval, CredentialState,
+        },
+        authority::AllowedUsage,
+        webauthn::WebAuthnAssertion,
     };
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
@@ -477,6 +490,72 @@ mod tests {
         .expect("sign request")
     }
 
+    /// Syntactically complete approval evidence for issuer unit tests.
+    ///
+    /// The cryptographic verification of this object is covered in `aether`;
+    /// these tests exercise only the delegated issuer's field propagation.
+    fn approval_evidence(
+        request: &ClientCertificateRotationRequest,
+    ) -> AstraRenewalApprovalEvidence {
+        let operation_id = Id16::new([8; 16]).expect("operation");
+        let approval_request = AstraCredentialApprovalRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            request_fingerprint: request.fingerprint(),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            active_generation: 4,
+            requested_generation: 5,
+            credential_registry_epoch: 1,
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+            allowed_credential_ids: vec![vec![1]],
+            required_credentials: 1,
+            created_at: 1_000,
+            expires_at: 1_300,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        };
+        let assertion = WebAuthnAssertion {
+            authenticator_data: vec![1],
+            client_data_json: vec![1],
+            signature: vec![1],
+        };
+        let binding = AstraCredentialBinding {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1],
+            credential_public_key: vec![1],
+            aaguid: [0; 16],
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            state: CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: 1_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        };
+        let approval = AstraRenewalApproval {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id,
+            request_fingerprint: request.fingerprint(),
+            approval_request_fingerprint: approval_request.fingerprint(),
+            credential_fingerprint: binding.fingerprint(),
+            assertion_fingerprint: assertion.fingerprint(),
+            credential_binding: binding,
+            webauthn_assertion: assertion,
+            approved_at: 1_000,
+            expires_at: 1_300,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        };
+        AstraRenewalApprovalEvidence {
+            approval_request,
+            approval,
+        }
+    }
+
     /// The whole point of the delegation: the leaves it issues verify under
     /// **it**, and the object it signs verifies as an `astra` issuance.
     #[test]
@@ -505,6 +584,7 @@ mod tests {
                 1_000,
                 1_000 + 3_600,
                 RotationReason::Scheduled,
+                approval_evidence(&request),
             )
             .expect("authorization");
 
@@ -519,6 +599,7 @@ mod tests {
                 &client_key(),
                 &active(),
                 &[&fixture.tls_anchor],
+                Some(&AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("policy pin")),
                 None,
                 1_100,
             )
@@ -612,6 +693,7 @@ mod tests {
                     1_000,
                     1_000 + 3_600,
                     forbidden,
+                    approval_evidence(&request),
                 ),
                 Err(IssuerError::MasterAuthorityRequired)
             ));
@@ -667,6 +749,7 @@ mod tests {
                 1_000,
                 1_000 + 3_600,
                 RotationReason::Scheduled,
+                approval_evidence(&request),
             )
             .expect("authorization");
 
@@ -683,6 +766,7 @@ mod tests {
             stage_id: authorization.stage_id,
             stage_authorization_fingerprint: authorization.fingerprint().expect("fingerprint"),
             request_fingerprint: authorization.request_fingerprint,
+            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
             gateway_wg_public_key: gateway_key(),
             client_wg_public_key: client_key(),
             active_generation: 4,

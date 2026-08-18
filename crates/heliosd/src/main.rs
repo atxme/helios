@@ -646,6 +646,13 @@ fn init_trust_domain(
     let gateway_wg_public_key = WireGuardKey::parse(&served.pq_certificate.wireguard_public_key)
         .context("reading the WireGuard identity out of the served PQ leaf")?;
     let server_name = served.pq_certificate.subject.clone();
+    let astra_policy_fingerprint = aether::certificates::AstraIssuancePolicy::standard(
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name.clone(),
+    )
+    .pin()
+    .context("building the pinned Astra issuance policy")?;
 
     let state = RegistryState {
         trust_domain_id,
@@ -685,6 +692,9 @@ fn init_trust_domain(
         astra: AstraProfile {
             authority_url: authority_url.to_string(),
             webauthn_rp_id: webauthn_rp_id.to_string(),
+            astra_policy_fingerprint,
+            credential_registry_epoch: 1,
+            credential_bindings: Default::default(),
             active_astra_service_public_key: astra_service_public_key,
             next_astra_service_public_key: None,
             next_service_key_transition_fingerprint: None,
@@ -717,6 +727,14 @@ fn init_trust_domain(
     println!(
         "CA-PQ fingerprint: {}",
         ca_public_key.authority_fingerprint()
+    );
+    println!(
+        "Astra policy pin : {}",
+        registry
+            .state()
+            .astra
+            .astra_policy_fingerprint
+            .fingerprint()
     );
     println!(
         "gateway TLS      : {}",

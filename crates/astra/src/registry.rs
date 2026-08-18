@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
+    approval::AstraPolicyPin,
     client::ClientCertificateGeneration,
     encoding::{Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
     state::AstraIssuerState,
@@ -70,6 +71,8 @@ pub struct AstraState {
     pub server_name: String,
     pub authority_url: String,
     pub webauthn_rp_id: String,
+    pub astra_policy_fingerprint: AstraPolicyPin,
+    pub credential_registry_epoch: u64,
 
     pub ca_epoch: u64,
     pub ca_public_key: MlDsa87PublicKey,
@@ -405,6 +408,9 @@ mod tests {
             server_name: "gateway.example".into(),
             authority_url: "https://astra.example".into(),
             webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy pin"),
+            credential_registry_epoch: 1,
             ca_epoch: 1,
             ca_public_key: ca,
             ca_tls_epoch: 1,

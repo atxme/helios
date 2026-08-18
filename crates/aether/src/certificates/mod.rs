@@ -160,7 +160,7 @@ pub mod test_x509 {
 
 pub use approval::{
     AstraCredentialApprovalRequest, AstraCredentialBinding, AstraIssuancePolicy, AstraPolicyPin,
-    AstraRenewalApproval, CredentialState,
+    AstraRenewalApproval, AstraRenewalApprovalEvidence, CredentialState,
 };
 pub use capability::{CapabilityGrant, CapabilityRequirement, CapabilityScope, CapabilityTokens};
 pub use encoding::{

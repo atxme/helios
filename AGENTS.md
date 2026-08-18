@@ -94,8 +94,9 @@ Restent ouverts :
   les éprouve et en retire — `init`, `enrol`, `verify`, `list`, `remove`,
   `rename`. Restent ouverts : les **commandes de signature** du compagnon
   (certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes) et
-  donc toute approbation opérateur (routes en `501`), le veth privé
-  Astra–Helios — `heliosd` n'a aucun client HTTP vers Astra, donc la gateway ne
+  donc toute approbation opérateur (routes en `501`). La moitié Astra → Helios
+  du veth privé est livrée et confinée par le ruleset (`astra0`, adresses et
+  port exacts) ; `heliosd` n'a aucun client HTTP vers l'API Astra opposée, donc la gateway ne
   détient encore **aucun objet pré-signé à distribuer** et répond `503` à un
   client qu'elle sait en retard —, la récupération d'une identité expirée, le
   discriminant de profil Orion et la bascule du §13, et les deux surfaces IHM.
@@ -173,15 +174,15 @@ Restent ouverts :
   génération. Un échec d'entropie n'est pas une erreur rendue : AWS-LC
   `abort()`, et `RAND_bytes` retourne 1 inconditionnellement, donc le refus est
   plus strict que ce que la spécification demande.
-  **Trois écarts sont nommés plutôt que masqués.** Le fournisseur n'emploie
-  **pas** de fonction de dérivation — `CTR_DRBG_init` consomme exactement un
-  seedlen de pleine entropie, SP 800-90Ar1 §10.2.1.3.1 —, alors que les deux
-  spécifications n'admettent CTR-DRBG qu'avec `use_df = true` ; la bannière
-  annonce donc `use_df=false` et l'arbitrage reste à rendre. La **résistance à
-  la prédiction par appel** existe en C
-  (`RAND_bytes_with_user_prediction_resistance`) mais pas dans le binding Rust,
-  donc `fill_secret` porte l'intention sans changer l'appel. Enfin le **matériel
-  de session TLS** de `rustls`/`quinn` reste sur le CSPRNG de `ring` : `reqwest`
+  Le fournisseur n'emploie **pas** de fonction de dérivation :
+  `CTR_DRBG_init` consomme un seedlen de pleine entropie conformément à
+  SP 800-90Ar1 §10.2.1.3.1, cas désormais admis par les deux spécifications ;
+  la bannière annonce `use_df=false`. La résistance à la prédiction des
+  tirages secrets appelle directement
+  `RAND_bytes_with_user_prediction_resistance`, alimenté par le DRBG public
+  séparé d'AWS-LC, sans état applicatif. Le canal privé rustls emploie également
+  le fournisseur AWS-LC. Le **matériel de session TLS** des autres chemins
+  `rustls`/`quinn` reste sur le CSPRNG de `ring` : `reqwest`
   0.12 n'offre que le fournisseur `ring`, et sa variante `-no-provider` exige un
   `CryptoProvider::install_default` dans chaque binaire. En revanche les **clés
   privées X.509** produites par `rcgen` sont passées sur AWS-LC (feature

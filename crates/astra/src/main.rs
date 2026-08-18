@@ -183,6 +183,13 @@ fn bootstrap(
         TrustDomainId::parse_hex(trust_domain_id).context("reading the trust domain identifier")?;
     let gateway_wg_public_key = WireGuardKey::parse(gateway_wireguard_public_key)
         .context("reading the gateway WireGuard public key")?;
+    let astra_policy_fingerprint = aether::certificates::AstraIssuancePolicy::standard(
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name.to_string(),
+    )
+    .pin()
+    .context("building the pinned Astra issuance policy")?;
 
     // The service key is Astra's own voice — it signs statuses and operation
     // receipts. It is not an issuer and it certifies nothing.
@@ -201,6 +208,8 @@ fn bootstrap(
         server_name: server_name.to_string(),
         authority_url: authority_url.to_string(),
         webauthn_rp_id: webauthn_rp_id.to_string(),
+        astra_policy_fingerprint,
+        credential_registry_epoch: 1,
         ca_epoch: 1,
         ca_public_key,
         ca_tls_epoch: 1,
@@ -224,6 +233,10 @@ fn bootstrap(
         service_public_key.authority_fingerprint()
     );
     println!("audit head          : {}", registry.audit_head());
+    println!(
+        "policy fingerprint  : {}",
+        registry.state().astra_policy_fingerprint.fingerprint()
+    );
     println!();
     println!(
         "record the audit head above: a restore that ends elsewhere is a fork, and `astra run \
@@ -383,6 +396,11 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
         Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
     let tls_private_key =
         Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
+    registry
+        .state()
+        .astra_policy_fingerprint
+        .assert_authorizes(&installed.authorization)
+        .context("the delegated issuer does not match the pinned Astra policy")?;
     // Present is not the same as correct: the keys and the delegation come
     // from two different places, and a mismatch would only show up at the
     // first renewal.

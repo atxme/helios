@@ -604,7 +604,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
 /// the two lines: an unreachable suite is one configuration mistake away from
 /// being offered, and a suite that is not in the list cannot be.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider
         .cipher_suites
         .retain(|suite| suite.version().version == rustls::ProtocolVersion::TLSv1_3);
@@ -617,7 +617,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// the pinned verifier refuses a 1.2 signature a second time. No resumption
 /// ticket is ever issued and no early data is ever accepted, which is also what
 /// removes `psk_ke`: rustls only offers a Diffie-Hellman-less PSK against a
-/// ticket, and there are none. Every TLS 1.3 suite the `ring` provider carries
+/// ticket, and there are none. Every TLS 1.3 suite the AWS-LC provider carries
 /// negotiates `(EC)DHE`.
 pub fn server_config(
     identity: &ChannelIdentity,

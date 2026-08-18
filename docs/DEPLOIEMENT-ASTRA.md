@@ -182,9 +182,9 @@ la configuration de la gateway :
 L'URL d'autorité vaut `https://<rp_id>` par défaut ; `ASTRA_AUTHORITY_URL` la
 remplace. Elle sert à la récupération et au statut authentifié quand WireGuard
 ne peut plus être monté, ainsi qu'aux opérations opérateur hors tunnel, pas au
-renouvellement ordinaire. Le veth utilisera deux adresses IP statiques locales
-à la gateway, absentes du DNS et des profils Orion ; leur câblage fait encore
-partie du lot non livré.
+renouvellement ordinaire. Le veth utilise deux adresses IP statiques locales à
+la gateway, absentes du DNS et des profils Orion. Sa moitié Astra → Helios est
+livrée ; le client Helios vers l'API Astra opposée reste le lot suivant.
 
 ### Pourquoi la construction emprunte le réseau de l'hôte
 
@@ -203,6 +203,12 @@ Seule la **construction** a besoin d'apt et de crates.io, d'où `network: host`
 sur le seul bloc `build`. Ce trafic est alors émis localement : il passe par
 `output`, que `allow_gateway_egress` régit déjà, et ne touche jamais `forward`.
 Le conteneur qui tourne garde son réseau isolé.
+
+Le bridge privé porte le nom stable `astra0`. Le ruleset atomique Helios
+n'ouvre que `10.88.7.2 → 10.88.7.1:8444` pour l'API Helios et réserve le sens
+opposé `10.88.7.1 → 10.88.7.2:8445` pour l'API Astra. Interface, source,
+destination et port sont tous comparés ; aucune règle `forward` n'est ajoutée.
+Ces coordonnées ne sont donc pas des paramètres libres de déploiement.
 
 Le `pull` de l'image de base, lui, n'a jamais été concerné : il est émis par le
 démon Docker sur l'hôte.

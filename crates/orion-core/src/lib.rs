@@ -41,7 +41,7 @@ pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHA
 pub use certificate_actions::{CertificateAction, CertificateActionBlock, CertificateActionState};
 pub use certificate_inventory::{CertificateFacts, CertificateInventory, CertificatePhase};
 pub use config::{
-    ClientConfig, ClientProfile, KeyNegotiationSettings, DEFAULT_ALLOWED_IPS,
+    ClientConfig, ClientProfile, KeyNegotiationSettings, TrustMaterial, DEFAULT_ALLOWED_IPS,
     DEFAULT_KEEPALIVE_SECS,
 };
 pub use events::{ClientEvent, PskKind};

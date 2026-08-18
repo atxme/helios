@@ -276,6 +276,10 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
             gateway_ca_der: material.gateway_ca_der.clone(),
             gateway_pq_certificate: material.gateway_pq_certificate.clone(),
             identity: identity_name.clone(),
+            // Filled once the gateway exposes the per-peer trust enrollment
+            // document. Omitting it is explicit: Orion connects, but keeps
+            // renewal disabled and asks for a reissued complete profile.
+            trust: None,
         }),
         key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
             identity: identity_name.clone(),

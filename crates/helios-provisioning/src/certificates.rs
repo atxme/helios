@@ -49,7 +49,7 @@ use aether::certificates::{
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
-        GatewayCertificateStageReceipt,
+        GatewayCertificateStageReceipt, IssuerKind,
     },
     encoding::{Fingerprint, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
     state::{
@@ -332,9 +332,38 @@ impl CertificateRegistry {
             caller_wg_public_key,
             &peer.state.active,
             &state.client_tls_ca.acceptable_anchors(now_unix),
+            Some(&state.astra.astra_policy_fingerprint),
             None,
             now_unix,
         )?;
+
+        if authorization.issuer_kind == IssuerKind::Astra {
+            let evidence = authorization.renewal_approval.as_ref().ok_or(
+                CertificateError::ApprovalMismatch("delegated renewal approval"),
+            )?;
+            let service_epoch = evidence.approval_request.astra_service_key_epoch;
+            let service_key = state
+                .astra
+                .service_key_for(service_epoch, now_unix)
+                .ok_or(CertificateError::UnauthorizedIssuer)?;
+            evidence.verify(
+                &authorization.request_fingerprint,
+                &state.gateway.current_ca_public_key,
+                service_key,
+                service_epoch,
+                &state.trust_domain_id,
+                &state.gateway.gateway_wg_public_key,
+                caller_wg_public_key,
+                &state.astra.webauthn_rp_id,
+                peer.state.active.generation,
+                state.gateway.ca_epoch,
+                state.astra.credential_registry_epoch,
+                now_unix,
+            )?;
+            state
+                .astra
+                .accept_credential_binding(&evidence.approval.credential_binding)?;
+        }
 
         let candidate = authorization.candidate()?;
         assert_fingerprints_free(
@@ -370,6 +399,7 @@ impl CertificateRegistry {
             stage_id: authorization.stage_id,
             stage_authorization_fingerprint: authorization.fingerprint()?,
             request_fingerprint: authorization.request_fingerprint,
+            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
             gateway_wg_public_key: self.state.gateway.gateway_wg_public_key,
             client_wg_public_key: *caller_wg_public_key,
             active_generation,
@@ -469,6 +499,7 @@ impl CertificateRegistry {
             &pending.candidate,
             &pending.stage_id,
             &self.state.client_tls_ca.acceptable_anchors(now_unix),
+            Some(&self.state.astra.astra_policy_fingerprint),
             now_unix,
         )?;
         // The commit must name *this* grant and *this* receipt. One that
@@ -488,6 +519,39 @@ impl CertificateRegistry {
             ));
         }
 
+        let accepted_credential_binding = if grant.issuer_kind == IssuerKind::Astra {
+            let evidence =
+                grant
+                    .renewal_approval
+                    .as_ref()
+                    .ok_or(CertificateError::ApprovalMismatch(
+                        "delegated renewal approval",
+                    ))?;
+            let service_epoch = evidence.approval_request.astra_service_key_epoch;
+            let service_key = self
+                .state
+                .astra
+                .service_key_for(service_epoch, now_unix)
+                .ok_or(CertificateError::UnauthorizedIssuer)?;
+            evidence.verify(
+                &grant.request_fingerprint,
+                &self.state.gateway.current_ca_public_key,
+                service_key,
+                service_epoch,
+                &self.state.trust_domain_id,
+                &self.state.gateway.gateway_wg_public_key,
+                caller_wg_public_key,
+                &self.state.astra.webauthn_rp_id,
+                peer.state.active.generation,
+                self.state.gateway.ca_epoch,
+                self.state.astra.credential_registry_epoch,
+                now_unix,
+            )?;
+            Some(evidence.approval.credential_binding.clone())
+        } else {
+            None
+        };
+
         // Reading the clock once, here, is what makes the race with the purge
         // deterministic: a commit at the deadline is late, not lucky.
         commit.verify(
@@ -505,6 +569,9 @@ impl CertificateRegistry {
 
         let stage_id = pending.stage_id;
         let mut state = self.state.clone();
+        if let Some(binding) = &accepted_credential_binding {
+            state.astra.accept_credential_binding(binding)?;
+        }
         let peer = state
             .peers
             .get_mut(&caller_wg_public_key.to_base64())
@@ -811,6 +878,12 @@ mod tests {
             astra: AstraProfile {
                 authority_url: "https://astra.example".into(),
                 webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: aether::certificates::AstraPolicyPin::new(
+                    Fingerprint::of(b"policy"),
+                )
+                .expect("policy"),
+                credential_registry_epoch: 1,
+                credential_bindings: Default::default(),
                 active_astra_service_public_key: astra_key.public.clone(),
                 next_astra_service_public_key: None,
                 next_service_key_transition_fingerprint: None,
@@ -864,6 +937,8 @@ mod tests {
             issuer_authorization: None,
             stage_id: Id16::new([stage_id; 16]).expect("stage"),
             request_fingerprint: Fingerprint::of(b"request"),
+            operator_approval_fingerprint: Fingerprint::of(b"operator approval"),
+            renewal_approval: None,
             gateway_wg_public_key: gateway_key(),
             server_name: SERVER_NAME.into(),
             client_wg_public_key: client_key(2),
@@ -907,6 +982,8 @@ mod tests {
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
+            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_approval: authorization.renewal_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
             stage_receipt: receipt,
             gateway_wg_public_key: authorization.gateway_wg_public_key,

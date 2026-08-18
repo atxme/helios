@@ -616,7 +616,8 @@ de sa consommation unique, Astra persiste :
 AstraRenewalApproval {
     format_version: 1,
     operation_id: [u8; 16],
-    request_fingerprint: [u8; 32],
+    request_fingerprint: [u8; 32],          # ClientCertificateRotationRequest
+    approval_request_fingerprint: [u8; 32], # AstraCredentialApprovalRequest signé
     credential_binding: AstraCredentialBinding,
     credential_fingerprint: [u8; 32],
     assertion_fingerprint: [u8; 32],
@@ -627,6 +628,21 @@ AstraRenewalApproval {
     astra_signature: MlDsa87Signature
 }
 ```
+
+La signature de service couvre :
+
+```text
+"helios-astra-renewal-approval-v5"
+|| format_version:u16 || operation_id:16
+|| request_fingerprint:32 || approval_request_fingerprint:32
+|| credential_fingerprint:32 || assertion_fingerprint:32
+|| approved_at:u64 || expires_at:u64 || astra_service_key_epoch:u64
+```
+
+Les deux empreintes ne sont pas interchangeables. La première désigne la
+demande de rotation cliente de §7.1 ; la seconde désigne la demande
+d'approbation signée qui a produit le challenge WebAuthn. Chaque consommateur
+recalcule les deux, puis recalcule le challenge depuis la seconde demande.
 
 `approved_at <= expires_at <= min(request.expires_at, approved_at + 300)` est
 vérifié sous l'horloge Astra.
@@ -2551,12 +2567,12 @@ contournés :
   thread, reseed toutes les 4096 générations et réinstanciation avant toute
   sortie après fork ou reprise d'instantané. La validation CAVP/ACVP est hors
   périmètre et rien ne la revendique.
-  Ce qui reste ouvert : la **résistance à la prédiction par appel**, présente
-  dans l'API C d'AWS-LC (`RAND_bytes_with_user_prediction_resistance`) mais
-  absente du binding Rust — `fill_secret` en porte l'intention sans changer
-  l'appel, et la réaliser au-dessus reviendrait à détenir l'état DRBG que ce
-  paragraphe interdit. Restent également ouverts le `astra_policy_fingerprint`
-  dans le profil et les jetons de capacité HKDF/HMAC. Aucun de ces écarts ne peut être masqué par le seul préfixe du
+  La **résistance à la prédiction par appel** des tirages secrets passe par
+  l'API native AWS-LC `RAND_bytes_with_user_prediction_resistance`, alimentée
+  par les 32 octets du DRBG public séparé d'AWS-LC ; l'adaptation ne détient
+  aucun état DRBG. `astra_policy_fingerprint`, le RP ID et l'époque du registre
+  de credentials sont présents dans le profil et dans son manifeste scellé.
+  Les jetons de capacité HKDF/HMAC sont livrés. Aucun de ces contrôles ne peut être remplacé par le seul préfixe du
   message, une signature `CA-PQ`, un UUID, un filtre de valeurs nulles ou un
   DRBG réimplémenté dans Helios ;
 

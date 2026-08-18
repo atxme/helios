@@ -31,7 +31,7 @@ use aether::key_negotiation::ProtectionMode;
 
 /// Version written today. Any version not listed below is refused, never
 /// guessed.
-const MANIFEST_VERSION: u8 = 3;
+const MANIFEST_VERSION: u8 = 4;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -53,6 +53,11 @@ const MANIFEST_VERSION_WITHOUT_SSH: u8 = 1;
 /// spec §19. A profile sealed by an older Orion keeps decoding byte for byte,
 /// and re-sealing writes the current version.
 const MANIFEST_VERSION_WITHOUT_TRUST: u8 = 2;
+
+/// Previous version. It carries the first §19 trust block but predates the
+/// policy pin, WebAuthn RP ID and credential-registry anti-rollback counter.
+/// It remains readable so the UI can name the required profile re-issuance.
+const MANIFEST_VERSION_WITHOUT_ASTRA_POLICY: u8 = 3;
 
 /// Bound on a decoded manifest, checked before any allocation.
 ///
@@ -185,6 +190,24 @@ impl ProfileManifest {
                 field(settings.gateway_ca_der.as_bytes());
                 field(settings.gateway_pq_certificate.as_bytes());
                 field(&[mode_id(settings.minimum_mode)]);
+                match &settings.trust {
+                    None => field(b""),
+                    Some(trust) => {
+                        field(b"orion-trust-material-v2");
+                        field(trust.trust_domain_id.as_bytes());
+                        field(&trust.ca_epoch.to_be_bytes());
+                        field(trust.ca_pq_public_key.as_bytes());
+                        field(&trust.ca_tls_epoch.to_be_bytes());
+                        field(trust.client_tls_ca_der.as_bytes());
+                        field(&trust.client_generation.to_be_bytes());
+                        field(trust.astra_authority_url.as_bytes());
+                        field(trust.webauthn_rp_id.as_bytes());
+                        field(trust.astra_policy_fingerprint.as_bytes());
+                        field(&trust.credential_registry_epoch.to_be_bytes());
+                        field(&trust.astra_service_key_epoch.to_be_bytes());
+                        field(trust.astra_service_public_key.as_bytes());
+                    }
+                }
             }
         }
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
@@ -230,6 +253,9 @@ impl ProfileManifest {
                         codec::put(&mut out, trust.client_tls_ca_der.as_bytes())?;
                         out.extend_from_slice(&trust.client_generation.to_be_bytes());
                         codec::put(&mut out, trust.astra_authority_url.as_bytes())?;
+                        codec::put(&mut out, trust.webauthn_rp_id.as_bytes())?;
+                        codec::put(&mut out, trust.astra_policy_fingerprint.as_bytes())?;
+                        out.extend_from_slice(&trust.credential_registry_epoch.to_be_bytes());
                         out.extend_from_slice(&trust.astra_service_key_epoch.to_be_bytes());
                         codec::put(&mut out, trust.astra_service_public_key.as_bytes())?;
                     }
@@ -250,6 +276,7 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
             && version != MANIFEST_VERSION_WITHOUT_TRUST
             && version != MANIFEST_VERSION_WITHOUT_SSH
         {
@@ -284,7 +311,9 @@ impl ProfileManifest {
                 identity: cursor.text()?,
                 // Read where it was written, so a v2 manifest keeps decoding
                 // byte for byte as it always did.
-                trust: if version == MANIFEST_VERSION {
+                trust: if version == MANIFEST_VERSION
+                    || version == MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
+                {
                     match cursor.byte()? {
                         0 => None,
                         1 => Some(crate::config::TrustMaterial {
@@ -295,6 +324,21 @@ impl ProfileManifest {
                             client_tls_ca_der: cursor.text()?,
                             client_generation: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_authority_url: cursor.text()?,
+                            webauthn_rp_id: if version == MANIFEST_VERSION {
+                                cursor.text()?
+                            } else {
+                                String::new()
+                            },
+                            astra_policy_fingerprint: if version == MANIFEST_VERSION {
+                                cursor.text()?
+                            } else {
+                                String::new()
+                            },
+                            credential_registry_epoch: if version == MANIFEST_VERSION {
+                                u64::from_be_bytes(cursor.array::<8>()?)
+                            } else {
+                                0
+                            },
                             astra_service_key_epoch: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_service_public_key: cursor.text()?,
                         }),
@@ -467,9 +511,27 @@ mod tests {
             client_tls_ca_der: "Y2EtdGxz".into(),
             client_generation: 4,
             astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 6,
             astra_service_key_epoch: 5,
             astra_service_public_key: "c2VydmljZQ==".into(),
         });
+
+        let original_digest =
+            ProfileManifest::from_profile(&source, SecurityGeneration(1)).security_digest();
+        let mut changed_policy = source.clone();
+        changed_policy
+            .key_negotiation
+            .as_mut()
+            .and_then(|block| block.trust.as_mut())
+            .expect("trust material")
+            .astra_policy_fingerprint = "22".repeat(32);
+        assert_ne!(
+            original_digest,
+            ProfileManifest::from_profile(&changed_policy, SecurityGeneration(1)).security_digest(),
+            "a restored policy pin must be observed as a security change"
+        );
 
         let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(1))
             .encode()
@@ -534,6 +596,61 @@ mod tests {
             .encode()
             .expect("encode");
         assert_eq!(resealed[0], MANIFEST_VERSION);
+    }
+
+    /// Version 3 carried trust anchors but not the out-of-band Astra policy.
+    /// It remains decryptable so Orion can ask for a re-issued profile; the
+    /// three missing fields stay conspicuously invalid rather than being
+    /// invented from a signed delegation or a URL.
+    #[test]
+    fn a_v3_manifest_opens_but_cannot_invent_the_astra_policy() {
+        let source = profile();
+        let block = source.key_negotiation.as_ref().expect("negotiation block");
+        let mut v3 = Vec::new();
+        v3.push(MANIFEST_VERSION_WITHOUT_ASTRA_POLICY);
+        v3.extend_from_slice(&12u64.to_be_bytes());
+        codec::put(&mut v3, source.name.as_bytes()).unwrap();
+        codec::put(&mut v3, source.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v3, source.private_key.as_bytes()).unwrap();
+        codec::put(&mut v3, source.peer_public_key.as_bytes()).unwrap();
+        codec::put_option(&mut v3, source.preshared_key.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v3, source.address.as_deref().map(str::as_bytes)).unwrap();
+        codec::put(&mut v3, source.allowed_ips.as_bytes()).unwrap();
+        v3.extend_from_slice(&source.persistent_keepalive.to_be_bytes());
+        codec::put_option(&mut v3, source.heliosd_url.as_deref().map(str::as_bytes)).unwrap();
+        codec::put_option(&mut v3, source.ssh_target.as_deref().map(str::as_bytes)).unwrap();
+        v3.push(1);
+        v3.push(mode_id(block.mode));
+        v3.push(mode_id(block.minimum_mode));
+        codec::put(&mut v3, block.endpoint.as_bytes()).unwrap();
+        codec::put(&mut v3, block.server_name.as_bytes()).unwrap();
+        codec::put(&mut v3, block.gateway_ca_der.as_bytes()).unwrap();
+        codec::put(&mut v3, block.gateway_pq_certificate.as_bytes()).unwrap();
+        codec::put(&mut v3, block.identity.as_bytes()).unwrap();
+        v3.push(1);
+        codec::put(&mut v3, b"0102030405060708090a0b0c0d0e0f10").unwrap();
+        v3.extend_from_slice(&3u64.to_be_bytes());
+        codec::put(&mut v3, b"Y2EtcHE=").unwrap();
+        v3.extend_from_slice(&2u64.to_be_bytes());
+        codec::put(&mut v3, b"Y2EtdGxz").unwrap();
+        v3.extend_from_slice(&4u64.to_be_bytes());
+        codec::put(&mut v3, b"https://astra.example").unwrap();
+        v3.extend_from_slice(&5u64.to_be_bytes());
+        codec::put(&mut v3, b"c2VydmljZQ==").unwrap();
+
+        let decoded = ProfileManifest::decode(&v3).expect("v3 remains decryptable");
+        let trust = decoded
+            .to_profile()
+            .key_negotiation
+            .and_then(|settings| settings.trust)
+            .expect("old trust block");
+        assert!(trust.webauthn_rp_id.is_empty());
+        assert!(trust.astra_policy_fingerprint.is_empty());
+        assert_eq!(trust.credential_registry_epoch, 0);
+        assert!(
+            trust.validate().is_err(),
+            "an old profile must be re-issued, not silently upgraded"
+        );
     }
 
     /// An unknown version is still refused — compatibility is a list, not a

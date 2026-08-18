@@ -433,6 +433,9 @@ mod tests {
             client_tls_ca_der: String::new(),
             client_generation: 4,
             astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 1,
             astra_service_key_epoch: 1,
             astra_service_public_key: String::new(),
         });

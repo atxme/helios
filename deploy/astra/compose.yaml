@@ -122,6 +122,8 @@ networks:
   # second conteneur s'y attacher et parler au listener de cycle de vie.
   astra-private:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: astra0
     internal: true
     ipam:
       config:

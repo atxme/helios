@@ -49,7 +49,10 @@ HELIOSD=/opt/helios/current/heliosd
 # Bout gateway du veth privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3).
 # La même adresse que le réseau `astra-private` de `deploy/astra/compose.yaml` :
 # un /29 qui ne contient que ses deux extrémités, sans route par défaut.
-CANAL_PRIVE="${HELIOS_CANAL_PRIVE:-10.88.7.1:8444}"
+# Cette coordonnée fait partie du ruleset atomique Helios et du bridge `astra0`
+# de compose. La rendre surchargeable sans recompiler le pare-feu créerait un
+# listener que la politique refuse — ou, pire, une ouverture sans listener.
+CANAL_PRIVE="10.88.7.1:8444"
 
 usage() {
     cat >&2 <<'EOF'

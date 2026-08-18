@@ -758,12 +758,13 @@ dernier effet exige la gateway réelle.
   fournisseur ne s’éprouve pas ici et n’a pas à l’être : le CTR-DRBG-AES-256, son
   reseed à 4096 générations, sa réinstanciation après fork ou reprise
   d’instantané et son `abort()` sur échec d’entropie sont dans le code AWS-LC
-  embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). Trois écarts restent non
-  couverts et sont documentés dans `aether::random` : l’**absence de fonction de
-  dérivation** (SP 800-90Ar1 §10.2.1.3.1, alors que les spécifications écrivent
-  `use_df = true`), la **résistance à la prédiction par appel** absente du
-  binding Rust, et le **matériel de session TLS** de `rustls`/`quinn` resté sur
-  le CSPRNG de `ring`. La **validation FIPS est hors périmètre** — la
+  embarqué (`crypto/fipsmodule/rand`, `crypto/ube`). L'instanciation sans DF à
+  seed de pleine entropie est admise par les spécifications. Les tirages
+  secrets utilisent l'entrée native
+  `RAND_bytes_with_user_prediction_resistance`, avec matériau issu du DRBG
+  public séparé ; le canal privé rustls sélectionne AWS-LC explicitement.
+  L’écart restant est le **matériel de session TLS** des autres chemins
+  `rustls`/`quinn`, encore sur le CSPRNG de `ring`. La **validation FIPS est hors périmètre** — la
   construction `aws-lc-fips-sys` exige Go (« Go is required for FIPS »), et aucun
   déploiement d’Helios ne revendique de certificat ;
 - **le cycle de vie des certificats est vérifié en logique, pas en
