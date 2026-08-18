@@ -853,6 +853,12 @@ fn check_ssh_target(value: Option<String>) -> Result<Option<String>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Two rustls providers are compiled in — `ring` for the negotiation's QUIC
+    // stack, AWS-LC for the private channel — so the process-level default is
+    // ambiguous, and `hyper-rustls` builds `reqwest`'s TLS config without
+    // naming one (`connector.rs:269`). Settled here, before the first client.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
     let client = Client::new();
     let base = cli.url.trim_end_matches('/');

@@ -603,6 +603,24 @@ impl rustls::client::danger::ServerCertVerifier for PinnedPeer {
 /// absent. On a link that carries authority material the difference is worth
 /// the two lines: an unreachable suite is one configuration mistake away from
 /// being offered, and a suite that is not in the list cannot be.
+/// Settles the process-level provider, once, for the crates that cannot name
+/// one themselves.
+///
+/// Two providers are compiled in — `ring` for the negotiation's QUIC stack,
+/// AWS-LC for this channel — so `rustls` refuses to pick a default and panics
+/// instead of choosing. Everything in this workspace names its provider, but
+/// `hyper-rustls` does not: it builds `reqwest`'s configuration through
+/// `rustls::ClientConfig::builder()` (`connector.rs:269`), and that call is
+/// the one that aborts. Calling this at start-up, before the first HTTP
+/// client, replaces a runtime panic with a decision — and it is the same
+/// engine the rest of the protocol already draws on.
+///
+/// Idempotent: a second call, or a provider installed earlier by someone else,
+/// is not an error.
+pub fn install_process_default_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider

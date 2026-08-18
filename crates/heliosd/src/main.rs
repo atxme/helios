@@ -287,6 +287,10 @@ async fn main() -> anyhow::Result<()> {
     // specifications require the banner (§4.3, §2.3.2), and an unusable
     // provider is a start-up error rather than a refusal the first client to
     // negotiate discovers.
+    // Settled before the first HTTP client: two rustls providers are compiled
+    // in, so an unnamed one is a panic rather than a choice.
+    helios_api::internal::install_process_default_provider();
+
     let drbg = aether::random::configure().context("resolving the DRBG provider")?;
     info!(%drbg, "randomness provider");
 
