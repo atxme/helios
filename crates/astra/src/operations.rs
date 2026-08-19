@@ -86,6 +86,8 @@ pub enum OperationError {
     NotAwaitingOperator,
     #[error("an operation is already in flight for this peer")]
     AlreadyInFlight,
+    #[error("this operation identifier already names another operation")]
+    IdentifierConflict,
     #[error(
         "the authority is holding as many operations as it will: the oldest have to expire before \
          a new renewal can be opened"
@@ -351,6 +353,9 @@ impl OperationStore {
             return Err(OperationError::AlreadyInFlight);
         }
         let id = *operation.operation_id.as_bytes();
+        if self.operations.contains_key(&id) {
+            return Err(OperationError::IdentifierConflict);
+        }
         self.by_peer.insert(peer, id);
         self.operations.insert(id, operation);
         Ok(())

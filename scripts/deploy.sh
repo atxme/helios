@@ -467,9 +467,36 @@ deployer_astra() {
         return 1
     fi
 
+    # Trois états, pas deux. `status` échoue aussi bien parce qu'il n'y a rien
+    # à lire que parce que ce qu'il y a est illisible, et confondre les deux
+    # est ce qui a mené un déploiement réel à enchaîner sur un `bootstrap` que
+    # le registre existant refusait — en n'affichant que ce refus, jamais la
+    # cause. On regarde donc le volume avant de conclure.
     statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
         $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-        run --rm --no-deps astra status 2>&1")" && etat=amorce || etat=vierge
+        run --rm --no-deps astra status 2>&1")" && etat=amorce || etat=inconnu
+    if [ "$etat" = "inconnu" ]; then
+        registre_present="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            run --rm --no-deps --entrypoint /bin/sh astra -c \
+            'test -f /var/lib/astra/registry.json && echo present || echo absent' 2>/dev/null" \
+            | tr -d '\r' | tail -1)"
+        case "$registre_present" in
+            absent) etat=vierge ;;
+            *)
+                # Le registre est là et ne se lit pas. Amorcer par-dessus
+                # démarrerait une seconde histoire pour le même domaine, et le
+                # binaire le refuse — mais c'est ici qu'il faut s'arrêter, en
+                # montrant l'erreur réelle plutôt que celle du refus.
+                echo "    Astra a un registre et ne peut pas le lire :" >&2
+                printf '%s\n' "$statut_astra" | tail -20 >&2
+                echo "    ne pas amorcer par-dessus : ce volume porte déjà une clé de service," >&2
+                echo "    une chaîne d'audit et un domaine. Sauvegarder /var/lib/astra avant" >&2
+                echo "    toute autre action." >&2
+                return 1
+                ;;
+        esac
+    fi
 
     if [ "$etat" = "vierge" ]; then
         echo "    amorçage du domaine"

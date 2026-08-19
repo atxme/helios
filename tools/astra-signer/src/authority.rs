@@ -64,7 +64,9 @@ use aether::certificates::encoding::{
     TrustDomainId, WireGuardKey,
 };
 use aether::certificates::status::AstraRotationCampaign;
-use aether::certificates::webauthn::{verify_assertion, AssertionExpectation, WebAuthnAssertion};
+use aether::certificates::webauthn::{
+    validate_https_origin, verify_assertion, AssertionExpectation, WebAuthnAssertion,
+};
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
 use astra::vault::{AuthoritySecrets, AuthorityVault};
@@ -290,6 +292,11 @@ pub fn authorize_issuer(
     bounds: &DelegationBounds,
     now_unix: u64,
 ) -> Result<AstraIssuerAuthorization> {
+    // The certificate supplied beside the vault is a pinned anchor, not an
+    // arbitrary issuer template.  Prove both its structure and that the
+    // private key held by this vault really recreates this exact certificate
+    // before issuing anything below it.
+    aether::certificates::x509::assert_certificate_authority(ca_tls_certificate)?;
     let requested_domain = TrustDomainId::parse_hex(request.trust_domain_id.trim())?;
     if requested_domain != identity.trust_domain_id {
         return Err(GestureError::Anchors(format!(
@@ -348,6 +355,20 @@ pub fn authorize_issuer(
         let intermediate = csr
             .signed_by(&ca, &ca_tls_key)
             .map_err(|error| GestureError::Anchors(format!("émission intermédiaire : {error}")))?;
+        let intermediate = DerCertificate::new(intermediate.der().to_vec())?;
+        aether::certificates::x509::assert_issued_by(&intermediate, ca_tls_certificate)?;
+        let intermediate_facts = aether::certificates::x509::inspect(&intermediate)?;
+        if !intermediate_facts.is_certificate_authority || !intermediate_facts.can_sign_certificates
+        {
+            return Err(GestureError::Anchors(
+                "l'intermédiaire émis ne peut pas signer de certificats".into(),
+            ));
+        }
+        aether::certificates::x509::assert_covers(
+            ca_tls_certificate,
+            bounds.not_before,
+            bounds.not_after,
+        )?;
 
         let authorization = AstraIssuerAuthorization {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -358,7 +379,7 @@ pub fn authorize_issuer(
             server_name: identity.server_name.clone(),
             issuer_epoch: request.issuer_epoch,
             pq_issuer_public_key,
-            tls_intermediate_certificate: DerCertificate::new(intermediate.der().to_vec())?,
+            tls_intermediate_certificate: intermediate,
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: bounds.maximum_leaf_lifetime_secs,
             policy_fingerprint,
@@ -406,10 +427,33 @@ pub fn sign_credential_bindings(
     now_unix: u64,
 ) -> Result<CredentialRegistry> {
     if let Some(previous) = previous {
-        previous
-            .assert_describes(&identity.trust_domain_id, &identity.gateway_wg_public_key)
-            .map_err(|error| GestureError::Anchors(error.to_string()))?;
+        let current_ca = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+        previous.verify(
+            &current_ca,
+            &identity.trust_domain_id,
+            &identity.gateway_wg_public_key,
+            identity.ca_epoch,
+            previous.credential_registry_epoch,
+        )?;
     }
+    sign_credential_bindings_from_verified_previous(
+        vault, opening, identity, previous, overrides, now_unix,
+    )
+}
+
+/// Signs a new snapshot after the caller proved the previous one.
+///
+/// Kept separate for `CA-PQ` rotation: there the previous snapshot verifies
+/// under the outgoing anchor, while the result must be signed under the new
+/// one after the vault body has moved.
+fn sign_credential_bindings_from_verified_previous(
+    vault: &AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    identity: &DomainIdentity,
+    previous: Option<&CredentialRegistry>,
+    overrides: &[(Vec<u8>, CredentialState)],
+    now_unix: u64,
+) -> Result<CredentialRegistry> {
     let registry_epoch = previous
         .map(|previous| previous.credential_registry_epoch)
         .unwrap_or(0)
@@ -570,6 +614,7 @@ pub fn approve_renewal(
     service_key: &MlDsa87PublicKey,
     service_key_epoch: u64,
     identity: &DomainIdentity,
+    ca_pq_public_key: &MlDsa87PublicKey,
     bindings: &CredentialRegistry,
     webauthn_rp_id: &str,
     active_generation: Option<u64>,
@@ -588,9 +633,13 @@ pub fn approve_renewal(
         active_generation.unwrap_or(request.active_generation),
         now_unix,
     )?;
-    bindings
-        .assert_describes(&identity.trust_domain_id, &identity.gateway_wg_public_key)
-        .map_err(|error| GestureError::Anchors(error.to_string()))?;
+    bindings.verify(
+        ca_pq_public_key,
+        &identity.trust_domain_id,
+        &identity.gateway_wg_public_key,
+        identity.ca_epoch,
+        request.credential_registry_epoch,
+    )?;
 
     // Only active credentials, and only those the request enumerated: the
     // allow-list handed to the token is the intersection, so a token holding a
@@ -683,15 +732,20 @@ pub fn approve_campaign(
     campaign: &AstraRotationCampaign,
     bindings: &CredentialRegistry,
     identity: &DomainIdentity,
+    ca_pq_public_key: &MlDsa87PublicKey,
     webauthn_rp_id: &str,
     webauthn_origin: &str,
     pins: &[&str],
     now_unix: u64,
 ) -> Result<CampaignApproval> {
     campaign.validate(now_unix)?;
-    bindings
-        .assert_describes(&identity.trust_domain_id, &identity.gateway_wg_public_key)
-        .map_err(|error| GestureError::Anchors(error.to_string()))?;
+    bindings.verify(
+        ca_pq_public_key,
+        &identity.trust_domain_id,
+        &identity.gateway_wg_public_key,
+        identity.ca_epoch,
+        bindings.credential_registry_epoch,
+    )?;
     if campaign.trust_domain_id != identity.trust_domain_id
         || campaign.gateway_wg_public_key != identity.gateway_wg_public_key
     {
@@ -704,6 +758,7 @@ pub fn approve_campaign(
         .policy()?
         .pin()?
         .assert_matches(&campaign.policy_fingerprint)?;
+    validate_https_origin(webauthn_origin, webauthn_rp_id)?;
 
     let required = usize::from(campaign.required_credentials);
     if keys.len() != required || pins.len() != required {
@@ -830,6 +885,16 @@ pub fn rotate_ca_pq(
         let secrets = vault.open(&opening.credential_id, &opening.secret)?;
         drop(secrets);
     }
+    if let Some(previous) = previous {
+        let current_ca = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+        previous.verify(
+            &current_ca,
+            &identity.trust_domain_id,
+            &identity.gateway_wg_public_key,
+            identity.ca_epoch,
+            previous.credential_registry_epoch,
+        )?;
+    }
     window.validate()?;
     let next_ca_epoch = identity
         .ca_epoch
@@ -884,7 +949,7 @@ pub fn rotate_ca_pq(
         ca_epoch: next_ca_epoch,
         ..identity.clone()
     };
-    let bindings = sign_credential_bindings(
+    let bindings = sign_credential_bindings_from_verified_previous(
         vault,
         openings[0],
         &rotated_identity,

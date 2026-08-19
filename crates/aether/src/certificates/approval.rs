@@ -383,6 +383,9 @@ impl AstraCredentialBinding {
         if self.ca_epoch != ca_epoch {
             return Err(CertificateError::UnauthorizedIssuer);
         }
+        if self.ca_epoch == 0 || self.credential_epoch == 0 || self.credential_registry_epoch == 0 {
+            return Err(CertificateError::InvalidCredentialBinding("zero epoch"));
+        }
         if self.credential_id.is_empty()
             || self.credential_id.len() > super::client::MAX_CREDENTIAL_ID_BYTES
         {
@@ -433,6 +436,22 @@ impl AstraCredentialBinding {
         if previous.state == CredentialState::Revoked {
             return Err(CertificateError::Revoked);
         }
+        // A credential identifier names one authenticator key for its whole
+        // life.  Letting a later registry row replace that key (or its AAGUID)
+        // would turn the monotonic counter into a re-enrolment primitive.
+        if self.credential_public_key != previous.credential_public_key
+            || self.aaguid != previous.aaguid
+        {
+            return Err(CertificateError::InvalidCredentialBinding(
+                "credential identity changed",
+            ));
+        }
+        if self.credential_epoch < previous.credential_epoch {
+            return Err(CertificateError::GenerationRollback {
+                current: previous.credential_epoch,
+                proposed: self.credential_epoch,
+            });
+        }
         if self.credential_registry_epoch < previous.credential_registry_epoch {
             return Err(CertificateError::GenerationRollback {
                 current: previous.credential_registry_epoch,
@@ -444,6 +463,20 @@ impl AstraCredentialBinding {
         {
             return Err(CertificateError::GenerationConflict {
                 generation: self.credential_registry_epoch,
+            });
+        }
+        let state_changed = self.state != previous.state;
+        let expected_credential_epoch = if state_changed {
+            previous
+                .credential_epoch
+                .checked_add(1)
+                .ok_or(CertificateError::ArithmeticOverflow)?
+        } else {
+            previous.credential_epoch
+        };
+        if self.credential_epoch != expected_credential_epoch {
+            return Err(CertificateError::GenerationConflict {
+                generation: self.credential_epoch,
             });
         }
         Ok(())
@@ -538,6 +571,9 @@ impl CredentialRegistry {
         if self.ca_epoch != ca_epoch {
             return Err(CertificateError::UnauthorizedIssuer);
         }
+        if self.ca_epoch == 0 || self.credential_registry_epoch == 0 {
+            return Err(CertificateError::InvalidCredentialBinding("zero epoch"));
+        }
         if self.credential_registry_epoch < minimum_registry_epoch {
             return Err(CertificateError::GenerationRollback {
                 current: minimum_registry_epoch,
@@ -558,6 +594,15 @@ impl CredentialRegistry {
                 ));
             }
             seen.push(&binding.credential_id);
+            // A registry is one signed snapshot, not a bag of decisions from
+            // several historical snapshots.  Without equality here its clear
+            // header could advertise epoch N while all authenticated rows
+            // still belonged to N-1.
+            if binding.credential_registry_epoch != self.credential_registry_epoch {
+                return Err(CertificateError::InvalidCredentialBinding(
+                    "mixed registry epochs",
+                ));
+            }
             binding.verify(
                 ca_pq,
                 trust_domain_id,
@@ -820,6 +865,37 @@ impl AstraRenewalApproval {
         minimum_registry_epoch: u64,
         now_unix: u64,
     ) -> Result<(), CertificateError> {
+        self.verify_operator_evidence(
+            request,
+            ca_pq,
+            service_key_epoch,
+            trust_domain_id,
+            ca_epoch,
+            minimum_registry_epoch,
+            now_unix,
+        )?;
+        verify_ml_dsa_87(service_key, &self.signing_bytes(), &self.astra_signature)
+    }
+
+    /// Verifies what the offline companion produced, before Astra signs it.
+    ///
+    /// The companion deliberately cannot create `astra_signature`.  Astra
+    /// must therefore establish the request binding, the `CA-PQ` credential
+    /// binding and the WebAuthn assertion first, then countersign that proven
+    /// fact.  Calling [`Self::verify`] on the placeholder would reject every
+    /// legitimate approval; signing first would make the online key sign
+    /// attacker-chosen invalid evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_operator_evidence(
+        &self,
+        request: &AstraCredentialApprovalRequest,
+        ca_pq: &MlDsa87PublicKey,
+        service_key_epoch: u64,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        minimum_registry_epoch: u64,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
         if self.format_version != CERTIFICATE_FORMAT_VERSION {
             return Err(CertificateError::UnsupportedFormatVersion {
                 received: self.format_version,
@@ -908,7 +984,7 @@ impl AstraRenewalApproval {
             },
         )?;
 
-        verify_ml_dsa_87(service_key, &self.signing_bytes(), &self.astra_signature)
+        Ok(())
     }
 }
 
@@ -1358,6 +1434,55 @@ mod tests {
         assert!(matches!(
             restored.supersedes(Some(&revoked)),
             Err(CertificateError::Revoked)
+        ));
+    }
+
+    #[test]
+    fn a_registry_cannot_claim_an_epoch_its_signed_rows_do_not_carry() {
+        let fixture = fixture();
+        let mut registry = CredentialRegistry {
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway(),
+            ca_epoch: 1,
+            credential_registry_epoch: fixture.binding.credential_registry_epoch,
+            bindings: vec![fixture.binding.clone()],
+        };
+        registry
+            .verify(&fixture.ca.public, &domain(), &gateway(), 1, 4)
+            .expect("one coherent snapshot");
+
+        registry.credential_registry_epoch += 1;
+        assert!(matches!(
+            registry.verify(&fixture.ca.public, &domain(), &gateway(), 1, 4),
+            Err(CertificateError::InvalidCredentialBinding(
+                "mixed registry epochs"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_credential_counter_moves_exactly_with_its_decision_and_never_its_key() {
+        let fixture = fixture();
+
+        let mut changed_state = fixture.binding.clone();
+        changed_state.state = CredentialState::Lost;
+        changed_state.credential_registry_epoch += 1;
+        let changed_state = changed_state.sign(&fixture.ca.private).expect("sign");
+        assert!(matches!(
+            changed_state.supersedes(Some(&fixture.binding)),
+            Err(CertificateError::GenerationConflict { .. })
+        ));
+
+        let other_credential = Credential::generate();
+        let mut changed_key = fixture.binding.clone();
+        changed_key.credential_public_key = other_credential.cose_public_key();
+        changed_key.credential_registry_epoch += 1;
+        let changed_key = changed_key.sign(&fixture.ca.private).expect("sign");
+        assert!(matches!(
+            changed_key.supersedes(Some(&fixture.binding)),
+            Err(CertificateError::InvalidCredentialBinding(
+                "credential identity changed"
+            ))
         ));
     }
 

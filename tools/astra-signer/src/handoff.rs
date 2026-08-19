@@ -124,12 +124,14 @@ impl DomainHandoff {
     /// Loads the hand-off beside a vault, or builds a fresh one.
     pub fn beside(vault_path: &Path, vault: &AuthorityVault) -> Result<Self> {
         let path = path_beside(vault_path);
-        match load(&path) {
-            Ok(mut handoff) => {
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                let mut handoff = load(&path)?;
                 handoff.adopt(vault)?;
                 Ok(handoff)
             }
-            Err(_) => Self::of(vault),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::of(vault),
+            Err(error) => Err(error).with_context(|| format!("lecture de {}", path.display())),
         }
     }
 
@@ -243,5 +245,19 @@ mod tests {
         save(&path, &handoff).expect("save");
         save(&path, &handoff).expect("save again");
         assert_eq!(load(&path).expect("load"), handoff);
+    }
+
+    #[test]
+    fn a_corrupt_handoff_is_not_mistaken_for_an_absent_one() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let vault_path = directory.path().join("authority-vault.json");
+        let path = path_beside(&vault_path);
+        std::fs::write(&path, b"not a handoff").expect("write corrupt handoff");
+
+        assert!(DomainHandoff::beside(&vault_path, &vault()).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("still present"),
+            b"not a handoff"
+        );
     }
 }

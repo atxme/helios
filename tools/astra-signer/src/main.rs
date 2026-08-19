@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::approval::CredentialState;
 use aether::certificates::encoding::{
-    DerCertificate, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
+    validate_server_name, DerCertificate, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
 };
 use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
@@ -535,12 +535,16 @@ fn remove(path: &Path, slot: &str, transport: Transport) -> Result<()> {
     let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
 
     gestures::remove_key(&mut vault, &opened, &removed)?;
-    store::save(path, &vault)?;
     // Re-signed here, and this is where the withdrawn credential gets its
     // `revoked` row: «absent du document» n'est pas une décision qu'un
-    // consommateur peut appliquer, un état signé l'est.
+    // consommateur peut appliquer, un état signé l'est. Publish that terminal
+    // decision first: a crash may then refuse a credential still present in
+    // the old vault (fail closed), but can never leave an absent slot marked
+    // active — ordinary approval does not open the vault and could otherwise
+    // continue using the removed token.
     let opened = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
     resign_bindings(path, &vault, &opened)?;
+    store::save(path, &vault)?;
 
     println!("key-slot retiré  : {}", hex::encode(removed));
     println!("empreinte coffre : {}", vault.fingerprint()?);
@@ -631,6 +635,7 @@ fn domain(
         handoff.gateway_wg_public_key = Some(value.trim().to_string());
     }
     if let Some(value) = server_name {
+        validate_server_name(value.trim()).context("nom de service de la gateway")?;
         handoff.server_name = Some(value.trim().to_string());
     }
     if let Some(value) = astra_service_public_key {
@@ -638,6 +643,9 @@ fn domain(
         handoff.astra_service_public_key = Some(value.trim().to_string());
     }
     if let Some(epoch) = astra_service_key_epoch {
+        if epoch == 0 {
+            bail!("l'époque de la clé de service Astra doit être non nulle");
+        }
         handoff.astra_service_key_epoch = Some(epoch);
     }
     handoff::save(&handoff_path, &handoff)?;
@@ -760,6 +768,13 @@ fn resign_bindings(path: &Path, vault: &AuthorityVault, opening: &Opened) -> Res
 fn issue_ca_tls(path: &Path, days: u64, out: Option<&Path>, transport: Transport) -> Result<()> {
     let vault = store::load(path)?;
     let mut handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    if handoff.ca_tls_certificate.is_some() {
+        bail!(
+            "ce domaine porte déjà une CA-TLS à l'époque {} : `issue-ca-tls` initialise l'ancre, \
+             il ne la remplace pas ; employer la transition CA-TLS du §9.4",
+            handoff.ca_tls_epoch.unwrap_or(1)
+        );
+    }
     let identity = identity_of(&handoff)?;
     let not_before = now_unix();
     let not_after = not_before
@@ -916,7 +931,12 @@ fn approve(
         "la clé de service d'Astra",
         "--astra-service-public-key",
     )?)?;
-    let service_key_epoch = handoff.astra_service_key_epoch.unwrap_or(1);
+    let service_key_epoch = *handoff.require(
+        handoff.astra_service_key_epoch.as_ref(),
+        "l'époque de la clé de service d'Astra",
+        "--astra-service-key-epoch",
+    )?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!(
             "aucun document de credentials : l'émettre par `astra-signer bindings` avant \
@@ -952,6 +972,7 @@ fn approve(
         &service_key,
         service_key_epoch,
         &identity,
+        &ca_pq_public_key,
         &registry,
         &vault.rp_id,
         active_generation,
@@ -980,6 +1001,7 @@ fn approve_campaign(
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
@@ -1018,6 +1040,7 @@ fn approve_campaign(
         &campaign,
         &registry,
         &identity,
+        &ca_pq_public_key,
         &vault.rp_id,
         &origin,
         &pin_refs,

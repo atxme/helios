@@ -73,13 +73,6 @@ use crate::service::AstraService;
 /// exists and cannot be used.
 pub const STAGE_LEASE_SECS: u64 = 3_600;
 
-/// Shortest overlap a candidate is given.
-///
-/// A transition with no overlap cuts every client that has not observed it
-/// yet, and [`TransitionWindow::validate`] refuses one. An hour is the floor
-/// used when the active leaf is closer to expiry than that.
-pub const MINIMUM_OVERLAP_SECS: u64 = 3_600;
-
 /// Life of a client leaf when the delegation allows at least that much.
 ///
 /// Ninety days. The ceiling that actually applies is
@@ -355,10 +348,8 @@ pub async fn signer_result(
     )
     .await?;
 
-    let evidence = AstraRenewalApprovalEvidence {
-        approval_request: (*operation.approval_request).clone(),
-        approval: *approval,
-    };
+    let approval_request = (*operation.approval_request).clone();
+    let mut approval = *approval;
     let request = operation.request.clone();
     let request_fingerprint = operation.request_fingerprint;
 
@@ -392,6 +383,30 @@ pub async fn signer_result(
     if peer.revoked {
         return Err(RenewalError::Revoked);
     }
+
+    // `astra-signer` cannot hold the online service key and deliberately
+    // submits a placeholder signature.  Verify every independent proof before
+    // countersigning it: otherwise a valid companion result is always refused
+    // (full verification on the placeholder), or Astra signs invalid evidence
+    // before discovering it.
+    approval
+        .verify_operator_evidence(
+            &approval_request,
+            &ca_public_key,
+            service_epoch,
+            &trust_domain_id,
+            ca_epoch,
+            registry_epoch,
+            now_unix,
+        )
+        .map_err(RenewalError::Approval)?;
+    approval = approval
+        .sign(&service.service_private_key)
+        .map_err(RenewalError::Approval)?;
+    let evidence = AstraRenewalApprovalEvidence {
+        approval_request,
+        approval,
+    };
 
     evidence
         .verify(
@@ -671,24 +686,45 @@ fn plan_window(
 ) -> Result<WindowPlan, RenewalError> {
     use aether::certificates::CertificateError;
 
-    let stage_expires_at = (now_unix + STAGE_LEASE_SECS)
+    let desired_stage_expires_at = now_unix
+        .checked_add(STAGE_LEASE_SECS)
+        .ok_or(CertificateError::ArithmeticOverflow)
+        .map_err(RenewalError::Internal)?
         .min(request_expires_at)
-        .min(now_unix + MAX_STAGE_LEASE_SECS);
+        .min(
+            now_unix
+                .checked_add(MAX_STAGE_LEASE_SECS)
+                .ok_or(CertificateError::ArithmeticOverflow)
+                .map_err(RenewalError::Internal)?,
+        );
+    // The outgoing generation must still be cryptographically valid at
+    // activation and the overlap must remain strictly positive.  Shorten the
+    // lease when necessary; never manufacture an overlap past the old leaf's
+    // expiry as the previous code did.
+    let last_activation = active
+        .not_after
+        .checked_sub(1)
+        .ok_or(CertificateError::InvalidValidityPeriod)
+        .map_err(RenewalError::Internal)?;
+    let stage_expires_at = desired_stage_expires_at.min(last_activation);
     if stage_expires_at <= now_unix {
         return Err(RenewalError::Internal(CertificateError::InvalidLease));
     }
     let activation_at = stage_expires_at;
-    // The outgoing leaf stays acceptable until it expires, bounded by the
-    // 30-day ceiling and floored so the overlap is never empty.
-    let not_after = active
-        .not_after
-        .max(activation_at + MINIMUM_OVERLAP_SECS)
-        .min(activation_at + MAX_OVERLAP_SECS);
+    let not_after = active.not_after.min(
+        activation_at
+            .checked_add(MAX_OVERLAP_SECS)
+            .ok_or(CertificateError::ArithmeticOverflow)
+            .map_err(RenewalError::Internal)?,
+    );
     let window = TransitionWindow::new(now_unix, activation_at, not_after)
         .map_err(RenewalError::Internal)?;
 
     let lifetime = DEFAULT_CLIENT_LEAF_LIFETIME_SECS.min(maximum_leaf_lifetime_secs);
-    let leaf_not_after = now_unix + lifetime;
+    let leaf_not_after = now_unix
+        .checked_add(lifetime)
+        .ok_or(CertificateError::ArithmeticOverflow)
+        .map_err(RenewalError::Internal)?;
     if leaf_not_after <= not_after {
         // The delegation's ceiling is shorter than the overlap the candidate
         // would have to carry. Refused here rather than at the gateway, where
@@ -742,7 +778,10 @@ fn build_approval_request(
         allowed_credential_ids,
         required_credentials: ORDINARY_APPROVAL_CREDENTIALS,
         created_at: now_unix,
-        expires_at: now_unix + MAX_APPROVAL_LIFETIME_SECS,
+        expires_at: now_unix
+            .checked_add(MAX_APPROVAL_LIFETIME_SECS)
+            .ok_or(aether::certificates::CertificateError::ArithmeticOverflow)
+            .map_err(RenewalError::Internal)?,
         astra_service_key_epoch,
         astra_signature: MlDsa87Signature::placeholder(),
     };
@@ -944,15 +983,17 @@ mod tests {
         );
     }
 
-    /// An active leaf about to expire still gets a non-empty overlap: a
-    /// transition with none cuts every client that has not observed it.
+    /// An active leaf about to expire gets only the overlap it can honestly
+    /// provide; the window never extends its validity on paper.
     #[test]
     fn an_almost_expired_leaf_still_gets_an_overlap() {
         let active = generation(0, 1_000);
         let plan =
             plan_window(&active, 100_000, DEFAULT_CLIENT_LEAF_LIFETIME_SECS, 990).expect("plan");
         plan.window.validate().expect("window");
-        assert!(plan.window.overlap_secs() >= MINIMUM_OVERLAP_SECS);
+        assert_eq!(plan.window.activation_at, 999);
+        assert_eq!(plan.window.not_after, active.not_after);
+        assert_eq!(plan.window.overlap_secs(), 1);
     }
 
     /// Only `scheduled` reaches the delegated issuer from this path.

@@ -273,6 +273,21 @@ fn bindings_describe_the_slot_table_and_nothing_else() {
         next.binding(&withdrawn).expect("the row stays").state,
         CredentialState::Revoked
     );
+
+    // Epochs and terminal rows are learned only from a registry authenticated
+    // under the current anchor.  Trusting its clear header here would let a
+    // modified file get re-signed by the master authority.
+    let mut tampered = registry.clone();
+    tampered.bindings[0].created_at += 1;
+    assert!(authority::sign_credential_bindings(
+        &vault,
+        &opening,
+        &identity,
+        Some(&tampered),
+        &[],
+        NOW + 2,
+    )
+    .is_err());
 }
 
 fn service_key() -> (zeroize::Zeroizing<Vec<u8>>, MlDsa87PublicKey) {
@@ -330,6 +345,7 @@ fn an_ordinary_renewal_approves_without_opening_the_vault() {
         &service_public,
         2,
         &identity,
+        &ca_pq_public_key(&vault),
         &registry,
         RP_ID,
         Some(3),
@@ -369,6 +385,7 @@ fn an_ordinary_renewal_approves_without_opening_the_vault() {
         &service_public,
         2,
         &identity,
+        &ca_pq_public_key(&vault),
         &registry,
         RP_ID,
         Some(3),
@@ -400,6 +417,7 @@ fn an_approval_does_not_travel_to_a_second_request() {
         &service_public,
         2,
         &identity(),
+        &ca_pq_public_key(&vault),
         &registry,
         RP_ID,
         Some(3),
@@ -478,6 +496,7 @@ fn a_two_credential_campaign_refuses_two_touches_of_one_token() {
         &campaign,
         &registry,
         &identity(),
+        &ca_pq_public_key(&vault),
         RP_ID,
         ORIGIN,
         &[PIN, PIN],
@@ -494,6 +513,7 @@ fn a_two_credential_campaign_refuses_two_touches_of_one_token() {
         &campaign,
         &registry,
         &identity(),
+        &ca_pq_public_key(&vault),
         RP_ID,
         ORIGIN,
         &[PIN, PIN],
@@ -601,6 +621,7 @@ fn the_signing_gestures_fit_the_stack_the_binary_reserves() {
                 &service_public,
                 2,
                 &identity(),
+                &ca_pq_public_key(&vault),
                 &registry,
                 RP_ID,
                 Some(3),
