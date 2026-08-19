@@ -196,6 +196,13 @@ pub enum SpeedTestError {
     InvalidUrl(String),
     #[error("transport du speedtest impossible : {0}")]
     Transport(String),
+    #[error(
+        "la gateway ne sert pas le speedtest Helios sur le port {port} ({detail}). Soit heliosd \
+         n’a pas pu s’y lier — un autre programme l’occupe, iperf3 en écoute sur \
+         0.0.0.0:{port} étant le cas courant —, soit le service est tombé. Le journal de heliosd \
+         le dit : « raw speedtest »"
+    )]
+    ServiceAbsent { port: u16, detail: String },
     #[error("la gateway a refusé le speedtest (HTTP {status}) : {body}")]
     Rejected { status: u16, body: String },
     #[error("réponse du speedtest illisible : {0}")]
@@ -477,10 +484,10 @@ fn measure_raw_latency(target: SocketAddr) -> Result<(f64, f64, f64), SpeedTestE
             &[],
         );
         let started = Instant::now();
-        socket.send(&request).map_err(raw_transport)?;
-        let length = socket.recv(&mut response).map_err(raw_transport)?;
+        socket.send(&request).map_err(raw_udp_transport)?;
+        let length = socket.recv(&mut response).map_err(raw_udp_transport)?;
         let frame = parse_client_udp_frame(&response[..length])
-            .ok_or_else(|| SpeedTestError::BadResponse("pong UDP invalide".into()))?;
+            .ok_or_else(|| service_absent("réponse UDP illisible"))?;
         if frame.kind != aether::speedtest::UDP_KIND_PONG || frame.session != session {
             return Err(SpeedTestError::BadResponse("pong UDP inattendu".into()));
         }
@@ -608,13 +615,21 @@ fn raw_tcp_stream(
                 duration_secs,
                 session,
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         let mut ready = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+        // The one place a foreign listener shows itself: the connection was
+        // accepted, our control frame went out, and the answer never came —
+        // because whatever is on this port does not speak this protocol.
         stream
             .read_exact(&mut ready)
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         let (kind, ready_mode, ready_duration, ready_session) =
-            parse_tcp_control(&ready).map_err(|error| error.to_string())?;
+            parse_tcp_control(&ready).map_err(|error| {
+                // Sixteen bytes arrived and they are not ours. Same conclusion
+                // as a reset, reached from the other side: the port answers,
+                // and not with Helios.
+                foreign_service(&error.to_string())
+            })?;
         if (kind, ready_mode, ready_duration, ready_session)
             != (
                 aether::speedtest::TCP_KIND_READY,
@@ -1036,6 +1051,73 @@ fn next_session() -> u64 {
 
 fn raw_transport(error: std::io::Error) -> SpeedTestError {
     SpeedTestError::Transport(error.to_string())
+}
+
+/// A UDP failure, named for what it most likely is.
+///
+/// Applied to the latency probe, which is the **first** thing a run does: a
+/// gateway with no speedtest service is therefore reported before ten seconds
+/// of throughput are attempted against it.
+fn raw_udp_transport(error: std::io::Error) -> SpeedTestError {
+    if looks_like_a_foreign_listener(&error) {
+        service_absent(&error.to_string())
+    } else {
+        SpeedTestError::Transport(error.to_string())
+    }
+}
+
+/// The rendered text of [`SpeedTestError::ForeignService`].
+///
+/// The worker threads exchange failures as strings — they cross a barrier and
+/// a `join` — so the diagnosis is rendered here rather than carried as a type
+/// and re-wrapped at every layer.
+fn foreign_service(detail: &str) -> String {
+    service_absent(detail).to_string()
+}
+
+/// The refusal that names what a reset on this port actually means.
+fn service_absent(detail: &str) -> SpeedTestError {
+    SpeedTestError::ServiceAbsent {
+        port: aether::speedtest::SPEEDTEST_PORT,
+        detail: detail.to_string(),
+    }
+}
+
+/// A control-channel I/O failure, named for what it most likely is.
+fn foreign_or_transport(error: std::io::Error) -> String {
+    if looks_like_a_foreign_listener(&error) {
+        foreign_service(&error.to_string())
+    } else {
+        error.to_string()
+    }
+}
+
+/// Whether a failure means "nothing of ours is on this port".
+///
+/// The distinction matters because the two have opposite remedies. A path
+/// problem is transient and worth retrying; a port served by something else —
+/// or by nothing at all — is a fact about the gateway, and an operator faced
+/// with « une connexion existante a dû être fermée par l’hôte distant » has
+/// no reason to go and read heliosd’s journal, which is where the answer is.
+///
+/// Both transports land here, for two different reasons that mean the same
+/// thing:
+///
+/// - **TCP**: the connection is accepted, then dies as soon as our control
+///   frame arrives — a service that speaks another protocol reading sixteen
+///   bytes of nonsense and hanging up;
+/// - **UDP**: there is no socket at all, the host answers ICMP port
+///   unreachable, and Windows surfaces that on the *next* `recv` of a
+///   connected socket as `WSAECONNRESET` — the very `os error 10054` this
+///   diagnosis exists for.
+fn looks_like_a_foreign_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 fn udp_frame(

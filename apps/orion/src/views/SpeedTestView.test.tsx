@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
 }))
 vi.mock('../api', () => api)
 
+import * as store from '../speedtest-store'
 import { SpeedTestView } from './SpeedTestView'
 
 const profile: ClientProfile = {
@@ -62,6 +63,10 @@ const result: SpeedTestResult = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The run now lives above the component, at module scope, so it survives an
+  // unmount — which is the point, and which means one test's measurement would
+  // otherwise be the next one's starting state.
+  store.resetForTests()
 })
 
 afterEach(cleanup)
@@ -179,5 +184,80 @@ describe('SpeedTestView', () => {
 
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('gateway indisponible'))
     expect(screen.getByRole('button', { name: 'Lancer le speedtest' })).toHaveProperty('disabled', false)
+  })
+
+  /**
+   * The defect this store exists for.
+   *
+   * A run takes about forty seconds, and the speedtest screen is the one a
+   * user has every reason to leave while it works. With the state inside the
+   * component, that navigation unmounted it: the measurement kept running in
+   * Rust, its progress landed on a listener that no longer existed, and coming
+   * back showed « Prêt ». Forty seconds lost, silently.
+   */
+  it('keeps a run alive across leaving the screen and coming back', async () => {
+    let settle: (value: SpeedTestResult) => void = () => {}
+    api.runSpeedTest.mockReturnValue(
+      new Promise<SpeedTestResult>((resolve) => {
+        settle = resolve
+      }),
+    )
+    const first = render(<SpeedTestView state="up" profile={profile} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Mesure en cours…' })).toBeTruthy(),
+    )
+
+    // The user goes to another screen. The router unmounts this one.
+    first.unmount()
+    await act(async () => {
+      settle(result)
+    })
+
+    // …and comes back to the finished measurement, not to an empty dial.
+    render(<SpeedTestView state="up" profile={profile} />)
+    expect(screen.getByText('123,4 Mb/s')).toBeTruthy()
+    expect(screen.getByText('45,6 Mb/s')).toBeTruthy()
+    expect(api.runSpeedTest).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * The previous runs are what turn a number into an answer: « 123 Mb/s » says
+   * nothing on its own, « 123 après 450 » says the line changed.
+   */
+  it('keeps the five previous runs beside the current one', async () => {
+    for (let index = 0; index < 7; index += 1) {
+      api.runSpeedTest.mockResolvedValue({ ...result, tcp_download_mbps: 100 + index })
+      await act(async () => {
+        await store.start('full')
+      })
+    }
+    render(<SpeedTestView state="up" profile={profile} />)
+
+    // The newest is the dial; the five kept rows are the ones before it, and
+    // the seventh run has pushed the first two out.
+    expect(screen.getByText('106,0 Mb/s')).toBeTruthy()
+    expect(screen.getAllByText(/Mb\/s/).length).toBeGreaterThan(5)
+    expect(screen.getByText('Mesures précédentes')).toBeTruthy()
+    expect(screen.getByText('105,0')).toBeTruthy()
+    expect(screen.getByText('101,0')).toBeTruthy()
+    expect(screen.queryByText('100,0')).toBeNull()
+  })
+
+  /**
+   * Two runs at once would share the dial, the progress stream and the history
+   * slot, and report each other's rates.
+   */
+  it('refuses to start a second run while one is under way', async () => {
+    // Deliberately never settled: the first run has to still be under way when
+    // the second is asked for. Neither call is awaited — the first one never
+    // returns, which is the whole point of the fixture.
+    api.runSpeedTest.mockReturnValue(new Promise<SpeedTestResult>(() => {}))
+    await act(async () => {
+      void store.start('full')
+      void store.start('full')
+    })
+    expect(store.getSnapshot().running).toBe(true)
+    expect(api.runSpeedTest).toHaveBeenCalledTimes(1)
   })
 })

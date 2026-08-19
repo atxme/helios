@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useSyncExternalStore } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
 import { ArrowDown, ArrowUp, Gauge } from 'lucide-react'
 
-import * as api from '../api'
+import * as store from '../speedtest-store'
 import { EMERALD, GUTTER, INK, PINE, RULE } from '../theme'
 import type {
   ClientProfile,
@@ -381,74 +381,106 @@ function Quality({ label, value }: { label: string; value: string }) {
   )
 }
 
+/** The hour a run finished, which is all that dates it usefully. */
+function clock(at: number): string {
+  return new Date(at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+}
+
+/**
+ * The last runs, oldest on the right.
+ *
+ * One line each, and the same three figures the dial shows: a history whose
+ * rows carried different values than the live screen would be a second way of
+ * reading the same measurement, and the two would disagree the first time one
+ * of them changed.
+ *
+ * The current result is **excluded** — it is already the dial, right above.
+ * Repeating it as the first row would make an unchanged line look like two
+ * identical measurements.
+ */
+function History({ records }: { records: store.SpeedTestRecord[] }) {
+  if (records.length === 0) return null
+  return (
+    <Box>
+      <Typography variant="overline" color="text.disabled" sx={{ display: 'block', fontSize: 9 }}>
+        Mesures précédentes
+      </Typography>
+      <Stack sx={{ mt: 0.5, borderTop: `1px solid ${RULE}` }}>
+        {records.map((record) => (
+          <Box
+            key={record.id}
+            sx={{
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: 1,
+              py: 0.6,
+              borderBottom: `1px solid ${RULE}`,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            <Typography color="text.disabled" sx={{ fontSize: 11, width: 44, flexShrink: 0 }}>
+              {clock(record.at)}
+            </Typography>
+            <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.4, flex: '1 1 0' }}>
+              <ArrowDown size={11} aria-hidden style={{ color: EMERALD }} />
+              <Typography sx={{ fontSize: 12, fontWeight: 700 }}>
+                {decimal(resultRate(record.result, 'download'))}
+              </Typography>
+              <Typography color="text.disabled" sx={{ fontSize: 10 }}>
+                Mb/s
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.4, flex: '1 1 0' }}>
+              <ArrowUp size={11} aria-hidden style={{ color: PINE }} />
+              <Typography sx={{ fontSize: 12, fontWeight: 700 }}>
+                {decimal(resultRate(record.result, 'upload'))}
+              </Typography>
+              <Typography color="text.disabled" sx={{ fontSize: 10 }}>
+                Mb/s
+              </Typography>
+            </Box>
+            <Typography color="text.disabled" sx={{ fontSize: 11, width: 56, textAlign: 'right' }}>
+              {milliseconds(record.result.latency_ms)}
+            </Typography>
+          </Box>
+        ))}
+      </Stack>
+    </Box>
+  )
+}
+
 /** Measures the established WireGuard data plane with direct UDP traffic. */
 export function SpeedTestView({ state, profile }: Props) {
-  const [result, setResult] = useState<SpeedTestResult | null>(null)
-  const [progress, setProgress] = useState<SpeedTestProgress | null>(null)
-  const [running, setRunning] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  /**
-   * Last rate seen in each direction while the run is under way.
-   *
-   * Kept here rather than read off `progress`: the reception figure has to
-   * stay on screen once emission takes over, otherwise the row the user was
-   * just watching blanks out halfway through the run.
-   */
-  const [live, setLive] = useState<{ down: number | null; up: number | null }>({
-    down: null,
-    up: null,
-  })
+  // The run lives above this component: leaving the screen mid-measurement
+  // used to unmount it and lose forty seconds of work, silently. See
+  // `speedtest-store`.
+  const { running, result, progress, error, live, history } = useSyncExternalStore(
+    store.subscribe,
+    store.getSnapshot,
+  )
+
   /**
    * Dial scale for the run in progress — it only ever grows.
    *
    * Recomputing it from the current rate made the arc lurch backwards each
    * time the measurement crossed a rung of the ladder: the same throughput
    * would suddenly occupy less of the dial.
+   *
+   * Derived rather than stored: the store carries measurements, and a scale is
+   * a property of this screen. Deriving it also makes it correct on re-entry —
+   * a run joined halfway shows the arc at the size its rates deserve, instead
+   * of restarting at the lowest rung.
    */
-  const [ceiling, setCeiling] = useState(CEILINGS[0])
+  const ceiling = Math.max(
+    ceilingFor(live.down ?? 0),
+    ceilingFor(live.up ?? 0),
+    result ? ceilingFor(Math.max(resultRate(result, 'download'), resultRate(result, 'upload'))) : CEILINGS[0],
+  )
 
   const connected = state === 'up'
   const available = connected && profile !== null
 
-  useEffect(() => {
-    const unlisten = api.onSpeedTestProgress((update) => {
-      setProgress(update)
-      if (!isThroughputPhase(update.phase)) return
-      if (isDownloadPhase(update.phase)) {
-        setLive((seen) => ({ ...seen, down: update.current_mbps }))
-      } else {
-        setLive((seen) => ({ ...seen, up: update.current_mbps }))
-      }
-      setCeiling((seen) => Math.max(seen, ceilingFor(update.current_mbps)))
-    })
-    return () => {
-      unlisten.then((remove) => remove())
-    }
-  }, [])
-
-  const run = async () => {
-    setRunning(true)
-    setError(null)
-    setResult(null)
-    setProgress(null)
-    setLive({ down: null, up: null })
-    setCeiling(CEILINGS[0])
-    try {
-      const measured = await api.runSpeedTest(MODE)
-      setResult(measured)
-      setCeiling((seen) =>
-        Math.max(seen, ceilingFor(Math.max(resultRate(measured, 'download'), resultRate(measured, 'upload')))),
-      )
-    } catch (cause) {
-      setError(String(cause))
-      // The dial falls back to «—» on failure; leaving the rows on the last
-      // frames received would have the screen state a rate it just disowned.
-      setLive({ down: null, up: null })
-      setProgress(null)
-    } finally {
-      setRunning(false)
-    }
-  }
+  const run = () => void store.start(MODE)
 
   const phase = progress?.phase ?? 'preparing'
   const downRate = result ? resultRate(result, 'download') : live.down
@@ -567,6 +599,9 @@ export function SpeedTestView({ state, profile }: Props) {
             Speedtest impossible : {error}
           </Typography>
         )}
+
+        {/* The current result is the dial; these are the ones before it. */}
+        <History records={result ? history.slice(1) : history} />
       </Stack>
     </Box>
   )

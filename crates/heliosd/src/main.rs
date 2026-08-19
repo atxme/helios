@@ -36,6 +36,12 @@ const API_BIND_ATTEMPTS: u32 = 20;
 
 /// Wait between two API listen attempts.
 const API_BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Cadence at which the raw speedtest keeps trying to bind, past the burst.
+///
+/// Thirty seconds: slow enough that a lasting conflict costs nothing, quick
+/// enough that freeing the port brings the service back before an operator has
+/// finished reading why it was gone.
+const RAW_SPEEDTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "heliosd", version, about = "Gateway VPN WireGuard Helios")]
@@ -1288,7 +1294,22 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
     let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);
     tokio::spawn(async move {
-        for attempt in 1..=API_BIND_ATTEMPTS {
+        // It never gives up, and that is the point. The tunnel address appears
+        // when WireGuard comes up, so the first binds legitimately fail — that
+        // is what the fast burst is for. But the port can also be held by
+        // **another program**, and that is not transient: `iperf3` listening on
+        // `0.0.0.0:5201` wins the port and keeps it, and a gateway that stopped
+        // trying after ten seconds served no speedtest until someone restarted
+        // the daemon. Worse, it said so once, in a line long gone by the time a
+        // client reports « connexion fermée par l'hôte ».
+        //
+        // So after the burst it keeps retrying slowly, and logs only when the
+        // situation *changes* — a conflict that persists for a day is one line,
+        // not a hundred and seventy thousand.
+        let mut attempt: u32 = 0;
+        let mut reported: Option<String> = None;
+        loop {
+            attempt = attempt.saturating_add(1);
             match helios_api::speedtest::serve_raw(
                 raw_speedtest_state.clone(),
                 &raw_speedtest_bind,
@@ -1297,17 +1318,30 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             .await
             {
                 Ok(()) => return,
-                Err(error) if attempt < API_BIND_ATTEMPTS => {
-                    warn!(
-                        "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
-                         retrying: {error:#}"
-                    );
-                    tokio::time::sleep(API_BIND_DELAY).await;
-                }
                 Err(error) => {
-                    tracing::error!(
-                        "raw speedtest given up after {API_BIND_ATTEMPTS} attempts: {error:#}"
-                    );
+                    let reason = format!("{error:#}");
+                    if attempt < API_BIND_ATTEMPTS {
+                        warn!(
+                            "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                             retrying: {reason}"
+                        );
+                        tokio::time::sleep(API_BIND_DELAY).await;
+                        continue;
+                    }
+                    if reported.as_deref() != Some(reason.as_str()) {
+                        tracing::error!(
+                            bind = %raw_speedtest_bind,
+                            "raw speedtest still unavailable after {attempt} attempts: {reason}. \
+                             A client asking for a speedtest will be told the service is absent. \
+                             If the address is in use, another program holds this port — \
+                             `ss -tlnp | grep {port}` names it, iperf3 on 0.0.0.0 being the \
+                             usual one. Retrying every {retry}s.",
+                            port = aether::speedtest::SPEEDTEST_PORT,
+                            retry = RAW_SPEEDTEST_RETRY.as_secs(),
+                        );
+                        reported = Some(reason);
+                    }
+                    tokio::time::sleep(RAW_SPEEDTEST_RETRY).await;
                 }
             }
         }
