@@ -111,7 +111,7 @@ export type CertificateActionBlockKind =
   | 'nothing_expired'
   | 'no_previous_identity'
   | 'trust_material_missing'
-  | 'renewal_path_not_wired'
+  | 'companion_transport_missing'
   | 'operator_credential_required'
 
 /** One action and whether it may run, as the shell decides. */
@@ -123,6 +123,19 @@ export interface CertificateActionState {
   /** The sentence to show, as-is. `null` when the action may run. */
   message: string | null
 }
+
+/**
+ * Where a renewal stands after one press (spec §8.1.2).
+ *
+ * `awaiting_operator` is a step and not a failure: it is where every renewal
+ * legitimately waits, sometimes for hours, while a human finds their key.
+ * `companion_command` is the exact line that approves this operation — a value
+ * the operator runs, which is why it is carried rather than described.
+ */
+export type RenewalProgress =
+  | { step: 'awaiting_operator'; operation_id: string; companion_command: string }
+  | { step: 'issuing'; operation_id: string }
+  | { step: 'committed'; generation: number }
 
 /** Everything the Certificates screen shows for one profile. */
 export interface ProfileCertificates {

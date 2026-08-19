@@ -37,8 +37,8 @@ const entry = (overrides: Partial<ProfileCertificates> = {}): ProfileCertificate
     {
       action: 'renew_now',
       label: 'Renouveler maintenant',
-      blocked_by: { kind: 'renewal_path_not_wired' },
-      message: 'Le chemin de renouvellement du §7 n’est pas encore branché.',
+      blocked_by: null,
+      message: null,
     },
   ],
   last_error: null,
@@ -58,7 +58,11 @@ const expiredFacts = () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.runCertificateAction.mockResolvedValue(undefined)
+  api.runCertificateAction.mockResolvedValue({
+    step: 'awaiting_operator',
+    operation_id: 'f'.repeat(32),
+    companion_command: 'astra-signer approve --heliosd-url http://100.64.0.1:8080',
+  })
 })
 
 afterEach(cleanup)
@@ -169,5 +173,98 @@ describe('CertificatesView', () => {
     await waitFor(() => expect(screen.getByText(/Le chemin n’est pas branché/)).toBeTruthy())
     expect(api.runCertificateAction).toHaveBeenCalledWith('portable', 'renew_now')
     expect(api.certificateOverview).toHaveBeenCalledTimes(2)
+  })
+
+  /**
+   * `awaiting_operator` is where every renewal legitimately waits. What the
+   * user needs there is not an explanation but the command that ends the wait.
+   */
+  it('shows the operation and the command that approves it', async () => {
+    const command =
+      'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
+    api.certificateOverview.mockResolvedValue([
+      entry({
+        actions: [
+          {
+            action: 'renew_now',
+            label: 'Renouveler maintenant',
+            blocked_by: null,
+            message: null,
+          },
+        ],
+      }),
+    ])
+    api.runCertificateAction.mockResolvedValue({
+      step: 'awaiting_operator',
+      operation_id: 'f'.repeat(32),
+      companion_command: command,
+    })
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+
+    await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
+    expect(screen.getByText('f'.repeat(32))).toBeTruthy()
+    // The command is meant to be carried out of Orion, like every other value
+    // on this screen: selecting truncated monospace text is where that fails.
+    expect(screen.getByRole('button', { name: 'Copier approbation' })).toBeTruthy()
+  })
+
+  /** A committed renewal names the generation, and nothing to run. */
+  it('reports a committed renewal by its generation', async () => {
+    api.certificateOverview.mockResolvedValue([
+      entry({
+        actions: [
+          {
+            action: 'renew_now',
+            label: 'Renouveler maintenant',
+            blocked_by: null,
+            message: null,
+          },
+        ],
+      }),
+    ])
+    api.runCertificateAction.mockResolvedValue({ step: 'committed', generation: 5 })
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+
+    await waitFor(() => expect(screen.getByText('génération suivante')).toBeTruthy())
+    expect(screen.getByText('5')).toBeTruthy()
+    expect(screen.queryByText(/astra-signer/)).toBeNull()
+  })
+
+  /**
+   * A refused press drops the step it followed. Leaving it on screen beside
+   * the new error would show one renewal as progressing and refused at once.
+   */
+  it('drops the previous step when a later press is refused', async () => {
+    const command = 'astra-signer approve --operation-id ' + 'f'.repeat(32)
+    api.certificateOverview.mockResolvedValue([
+      entry({
+        actions: [
+          {
+            action: 'renew_now',
+            label: 'Renouveler maintenant',
+            blocked_by: null,
+            message: null,
+          },
+        ],
+      }),
+    ])
+    api.runCertificateAction.mockResolvedValueOnce({
+      step: 'awaiting_operator',
+      operation_id: 'f'.repeat(32),
+      companion_command: command,
+    })
+    render(<CertificatesView />)
+
+    const button = await screen.findByRole('button', { name: 'Renouveler maintenant' })
+    fireEvent.click(button)
+    await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
+
+    api.runCertificateAction.mockRejectedValue('la gateway a refusé')
+    fireEvent.click(screen.getByRole('button', { name: 'Renouveler maintenant' }))
+    await waitFor(() => expect(screen.queryByText(command)).toBeNull())
   })
 })

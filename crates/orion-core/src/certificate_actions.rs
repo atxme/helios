@@ -304,13 +304,17 @@ pub fn action_states(
         .collect()
 }
 
-/// Runs an action, or says why it cannot.
+/// Decides whether an action may run, without running it.
 ///
-/// Every path currently returns the block, and that is deliberate: the failure
-/// happens **before** a key pair is generated or an authority is asked to
-/// certify anything. A button that produced a key and then discovered it could
-/// not finish would leave a half-rotation behind on every press.
-pub fn run(
+/// The check is deliberately separate from the work, and it happens **before**
+/// a key pair is generated or an authority is asked to certify anything: an
+/// action that produced a key and then discovered it could not finish would
+/// leave a half-rotation behind on every press.
+///
+/// What follows an `Ok` is [`crate::certificate_renewal::begin`] for the two
+/// renewals. The other two have no driver yet and are still refused by
+/// [`action_states`], each for its own reason.
+pub fn admits(
     action: CertificateAction,
     settings: Option<&KeyNegotiationSettings>,
     inventory: &CertificateInventory,
@@ -322,8 +326,6 @@ pub fn run(
         .ok_or(CertificateActionBlock::NoNegotiation)?;
     match state.blocked_by {
         Some(block) => Err(block),
-        // Unreachable while the trust material is missing, and left as the
-        // shape the §7 driver will fill rather than an `unreachable!()`.
         None => Ok(()),
     }
 }
@@ -514,14 +516,14 @@ mod tests {
     /// Running a blocked action fails **before** anything is generated: a
     /// half-rotation left behind on every press is worse than a refusal.
     #[test]
-    fn running_a_blocked_action_refuses_with_its_own_reason() {
+    fn admitting_a_blocked_action_refuses_with_its_own_reason() {
         let settings = settings();
         let inventory = CertificateInventory {
             identity_sealed: true,
             ..CertificateInventory::default()
         };
         assert_eq!(
-            run(
+            admits(
                 CertificateAction::RenewNow,
                 Some(&settings),
                 &inventory,

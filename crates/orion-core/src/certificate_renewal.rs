@@ -57,13 +57,20 @@
 //! `awaiting_operator` and stops there, which is why [`RenewalStep`] names
 //! that state rather than treating it as an error.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aether::certificates::client::ClientCertificateGeneration;
 use aether::certificates::client::{
     ClientCertificateRotationGrant, ClientCertificateRotationRequest, ClientCertificateStageCommit,
 };
 use aether::certificates::encoding::{
-    generate_ml_dsa_87_keypair, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature,
+    generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
+    MlDsa87Signature, WireGuardKey,
+};
+use aether::certificates::gateway::pq_certificate_fingerprint;
+use aether::certificates::state::{
+    AstraProfile, ClientCertificateState, ClientTlsCaState, GatewayCertificateState, TrustLedger,
 };
 use aether::certificates::transport::{ClientRenewalOperationState, ClientRenewalOperationView};
 use aether::certificates::x509::{client_rotation_csr, ClientRotationCsr};
@@ -73,8 +80,12 @@ use aether::certificates::{
 use base64::Engine as _;
 use zeroize::Zeroizing;
 
-use crate::certificates::TrustStore;
-use crate::identity_store::ClientIdentityBundle;
+use aether::key_negotiation::PqCertificate;
+
+use crate::certificates::{TrustState, TrustStore};
+use crate::config::TrustMaterial;
+use crate::identity_store::{ClientIdentityBundle, ProtectedIdentityStore};
+use crate::KeyNegotiationSettings;
 
 /// How long a rotation request stays valid once signed.
 ///
@@ -136,6 +147,315 @@ pub enum RenewalError {
     GrantMissing,
     #[error("the local clock is before the Unix epoch")]
     Clock,
+    #[error(
+        "ce profil ne porte pas le matériel de confiance qu'un renouvellement exige — domaine, \
+         autorité Astra épinglée et CA TLS cliente. Demander à l'opérateur un document réémis."
+    )]
+    TrustMaterialMissing,
+    #[error(
+        "le magasin de confiance de ce poste ({path}) décrit « {held} » et non « {expected} ». \
+         Il n'est ni adopté ni remplacé : il porte des décisions — générations préparées, \
+         révocations — qu'un écrasement perdrait en silence."
+    )]
+    ForeignTrustStore {
+        path: String,
+        held: String,
+        expected: String,
+    },
+    #[error(
+        "le certificat client actif a expiré (échéance {not_after}). Il ne peut plus signer la \
+         preuve de continuité qu'une rotation exige : c'est la récupération du §7.5 qu'il faut, \
+         pas un renouvellement."
+    )]
+    ActiveExpired { not_after: u64 },
+}
+
+/// Where the trust store lives, beside the profile file.
+///
+/// One store per machine and not per profile: the bounded state it holds —
+/// anchors, generations, revocation ledger — belongs to the trust *domain*,
+/// and a second copy per profile would let two profiles of the same domain
+/// disagree about which anchor is current.
+///
+/// **Limite connue** : cette version suppose donc **un seul domaine de
+/// confiance par poste**. Un poste admis dans deux domaines écrirait deux états
+/// dans le même fichier ; [`open_or_seed`] le refuse en nommant le domaine
+/// trouvé plutôt qu'en écrasant. Ce qui débloque : un fichier par
+/// `trust_domain_id`, dès qu'un cas réel l'exige.
+pub fn trust_store_path() -> Result<PathBuf, RenewalError> {
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    Ok(config
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("trust.json"))
+}
+
+/// Opens the trust store, or seeds it from the profile and the sealed identity.
+///
+/// # Why seeding is legitimate here
+///
+/// Every field of the initial state is already pinned somewhere the operator
+/// signed for: the trust domain, the anchors and the Astra profile come from
+/// the `.orion` document's trust block, and the active generation's own
+/// fingerprints come from the certificates in the protected store. Nothing is
+/// invented, and nothing is fetched — a store seeded from the network would be
+/// a store an attacker chooses.
+///
+/// # Why the file wins once it exists
+///
+/// The store is the record. It may hold a staged `next` generation, a
+/// revocation the profile never heard of, or a counter that has moved; the
+/// profile is a static document an operator emitted months earlier. Re-seeding
+/// over it would silently drop exactly the decisions that matter most.
+///
+/// What is checked instead is that the two describe the **same** identity: a
+/// store belonging to another client, or another domain, is refused rather
+/// than adopted or replaced.
+/// The path is passed in rather than resolved here: one process-wide location
+/// is a fine default and a poor test seam, and a store that only ever exists
+/// at an environment variable's mercy is one an operator cannot inspect.
+pub fn open_or_seed(
+    path: &Path,
+    settings: &KeyNegotiationSettings,
+    bundle: &ClientIdentityBundle,
+    now_unix: u64,
+) -> Result<TrustStore, RenewalError> {
+    let trust = settings
+        .trust
+        .as_ref()
+        .ok_or(RenewalError::TrustMaterialMissing)?;
+
+    let trust_domain_id = trust
+        .trust_domain()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let client_wg_public_key = client_key_of(bundle)?;
+
+    if let Some(existing) = TrustStore::load(path)? {
+        let state = existing.state();
+        if state.trust_domain_id != trust_domain_id {
+            return Err(RenewalError::ForeignTrustStore {
+                path: path.display().to_string(),
+                held: state.trust_domain_id.to_hex(),
+                expected: trust_domain_id.to_hex(),
+            });
+        }
+        if state.client_wg_public_key != client_wg_public_key {
+            return Err(RenewalError::ForeignTrustStore {
+                path: path.display().to_string(),
+                held: state.client_wg_public_key.to_base64(),
+                expected: client_wg_public_key.to_base64(),
+            });
+        }
+        return Ok(existing);
+    }
+
+    let seeded = seed(settings, trust, bundle, client_wg_public_key, now_unix)?;
+    let store = TrustStore::new(path.to_path_buf(), seeded);
+    store.save()?;
+    Ok(store)
+}
+
+/// The client's own WireGuard key, derived from its PQ leaf.
+///
+/// Read off the certificate rather than off the profile's private key: the
+/// certificate is what the gateway admitted, and a mismatch between the two is
+/// a profile that will not connect at all — a failure the renewal has no
+/// business discovering, and none of masking.
+fn client_key_of(bundle: &ClientIdentityBundle) -> Result<WireGuardKey, RenewalError> {
+    let leaf = client_pq_leaf(bundle)?;
+    WireGuardKey::parse(&leaf.wireguard_public_key).map_err(RenewalError::Certificate)
+}
+
+fn client_pq_leaf(bundle: &ClientIdentityBundle) -> Result<PqCertificate, RenewalError> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(bundle.pq_certificate.trim())
+        .map_err(|_| RenewalError::Identity("certificat PQ client : base64 illisible".into()))?;
+    serde_json::from_slice(&raw)
+        .map_err(|_| RenewalError::Identity("certificat PQ client : JSON illisible".into()))
+}
+
+fn client_tls_leaf(bundle: &ClientIdentityBundle) -> Result<DerCertificate, RenewalError> {
+    let leaf = bundle
+        .certificate_chain
+        .first()
+        .ok_or_else(|| RenewalError::Identity("chaîne de certificats cliente vide".into()))?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(leaf.trim())
+        .map_err(|_| RenewalError::Identity("certificat TLS client : base64 illisible".into()))?;
+    DerCertificate::new(der).map_err(RenewalError::Certificate)
+}
+
+fn seed(
+    settings: &KeyNegotiationSettings,
+    trust: &TrustMaterial,
+    bundle: &ClientIdentityBundle,
+    client_wg_public_key: WireGuardKey,
+    now_unix: u64,
+) -> Result<TrustState, RenewalError> {
+    let gateway_leaf = settings
+        .gateway_pq_certificate()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let gateway_wg_public_key = WireGuardKey::parse(&gateway_leaf.wireguard_public_key)
+        .map_err(RenewalError::Certificate)?;
+    let gateway_tls = base64::engine::general_purpose::STANDARD
+        .decode(settings.gateway_ca_der.trim())
+        .map_err(|_| RenewalError::Identity("CA TLS gateway : base64 illisible".into()))
+        .and_then(|der| DerCertificate::new(der).map_err(RenewalError::Certificate))?;
+    let client_tls_ca = trust
+        .client_tls_ca()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let client_pq = client_pq_leaf(bundle)?;
+    let client_tls = client_tls_leaf(bundle)?;
+
+    let active = ClientCertificateGeneration {
+        generation: trust.client_generation,
+        ca_tls_epoch: trust.ca_tls_epoch,
+        tls_ca_certificate_fingerprint: client_tls_ca.fingerprint(),
+        tls_certificate_fingerprint: client_tls.fingerprint(),
+        pq_certificate_fingerprint: pq_certificate_fingerprint(&client_pq)?,
+        not_before: client_pq.not_before_unix,
+        not_after: client_pq.not_after_unix,
+    };
+    // A leaf outside its own validity cannot sign the continuity proof of a
+    // renewal, and seeding a state around it would move the failure to the
+    // authority — which refuses without saying that the local clock, or the
+    // certificate, is the problem.
+    if now_unix >= active.not_after {
+        return Err(RenewalError::ActiveExpired {
+            not_after: active.not_after,
+        });
+    }
+
+    Ok(TrustState {
+        trust_domain_id: trust
+            .trust_domain()
+            .map_err(|error| RenewalError::Identity(error.to_string()))?,
+        client_wg_public_key,
+        gateway: GatewayCertificateState {
+            trust_domain_id: trust
+                .trust_domain()
+                .map_err(|error| RenewalError::Identity(error.to_string()))?,
+            gateway_wg_public_key,
+            server_name: settings.server_name.trim().to_string(),
+            ca_epoch: trust.ca_epoch,
+            current_ca_public_key: trust
+                .ca_pq()
+                .map_err(|error| RenewalError::Identity(error.to_string()))?,
+            next_ca_public_key: None,
+            next_ca_transition_fingerprint: None,
+            ca_activation_at: None,
+            ca_retire_active_at: None,
+            active_gateway_identity_epoch: 0,
+            gateway_decision_epoch: 0,
+            next_gateway_identity_epoch: None,
+            next_transition_fingerprint: None,
+            last_aborted_transition: None,
+            active_gateway_tls_certificate: gateway_tls,
+            next_gateway_tls_certificate: None,
+            active_gateway_certificate: gateway_leaf,
+            next_gateway_certificate: None,
+            activation_at: None,
+            retire_active_at: None,
+            published: false,
+            revoked: false,
+            revocation_epoch: 0,
+        },
+        client_tls_ca: ClientTlsCaState {
+            ca_tls_epoch: trust.ca_tls_epoch,
+            active_client_tls_ca_certificate: client_tls_ca,
+            next_client_tls_ca_certificate: None,
+            next_transition_fingerprint: None,
+            activation_at: None,
+            retire_active_at: None,
+        },
+        astra: AstraProfile {
+            authority_url: trust.astra_authority_url.trim().to_string(),
+            webauthn_rp_id: trust.webauthn_rp_id.trim().to_string(),
+            astra_policy_fingerprint: trust
+                .astra_policy_pin()
+                .map_err(|error| RenewalError::Identity(error.to_string()))?,
+            credential_registry_epoch: trust.credential_registry_epoch,
+            credential_bindings: Default::default(),
+            active_astra_service_public_key: MlDsa87PublicKey::parse(
+                trust.astra_service_public_key.trim(),
+            )
+            .map_err(RenewalError::Certificate)?,
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            astra_service_key_epoch: trust.astra_service_key_epoch,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
+        },
+        issuer_epoch: 0,
+        issuer: None,
+        certificates: ClientCertificateState::new(active),
+        staged_gateway_transition: None,
+        ledger: TrustLedger::default(),
+    })
+}
+
+/// Name the candidate identity is sealed under until it activates.
+///
+/// A second entry rather than a replacement, and that is the whole point: the
+/// active generation keeps connecting for the length of the overlap, and its
+/// private keys have to stay exactly where the tunnel expects them. Sealing
+/// the candidate over the top would break every handshake between the commit
+/// and the activation the window schedules — an outage the renewal is
+/// precisely supposed to avoid.
+///
+/// The suffix survives [`ProtectedIdentityStore`]'s name sanitising, which
+/// keeps `-` and drops separators: it can never designate a file elsewhere.
+pub fn candidate_identity_of(identity: &str) -> String {
+    format!("{}-next", identity.trim())
+}
+
+/// Promotes a candidate whose activation instant has come.
+///
+/// Two things move together, and the order is what matters: the sealed keys
+/// go into place **before** the state says the candidate is active. A crash
+/// between the two leaves the store still naming the old generation, which
+/// still has its keys — the renewal is retried, not lost. The reverse order
+/// leaves a state pointing at a certificate whose private half is under
+/// another name, and the tunnel fails at the next handshake.
+///
+/// Returns whether anything moved. Called from the same place that refreshes
+/// the store, so a client that was offline across its own activation instant
+/// catches up at the next launch rather than at the next renewal.
+pub fn promote_due(
+    store: &mut TrustStore,
+    identities: &ProtectedIdentityStore,
+    identity: &str,
+    now_unix: u64,
+) -> Result<bool, RenewalError> {
+    let due = store
+        .state()
+        .certificates
+        .next
+        .as_ref()
+        .zip(store.state().certificates.activation_at)
+        .is_some_and(|(_, activation_at)| now_unix >= activation_at);
+    if !due {
+        // Everything else the store promotes on its own schedule — anchors,
+        // gateway identity, service key — has no local key material to move.
+        return Ok(store.refresh(now_unix)?);
+    }
+
+    let candidate_identity = candidate_identity_of(identity);
+    let candidate = identities
+        .load(&candidate_identity)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let promoted = ClientIdentityBundle {
+        identity: identity.trim().to_string(),
+        ..candidate
+    };
+    identities
+        .store(&promoted)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    store.refresh(now_unix)?;
+    Ok(true)
 }
 
 /// The five in-tunnel routes, resolved against one gateway.
@@ -279,6 +599,26 @@ pub struct ActiveIdentity {
     /// written at commit time can keep the active certificate usable until
     /// the candidate activates.
     pub tls_private_key_der: Zeroizing<Vec<u8>>,
+}
+
+impl ActiveIdentity {
+    /// Reads both private halves out of a sealed bundle.
+    ///
+    /// Kept here rather than on the bundle: `identity_store` deals in base64
+    /// documents, and turning one into signing material is a decision of the
+    /// renewal — the same bundle is read elsewhere for entirely public facts.
+    pub fn from_bundle(bundle: &ClientIdentityBundle) -> Result<Self, RenewalError> {
+        let decode = |value: &str, label: &str| -> Result<Zeroizing<Vec<u8>>, RenewalError> {
+            base64::engine::general_purpose::STANDARD
+                .decode(value.trim())
+                .map(Zeroizing::new)
+                .map_err(|_| RenewalError::Identity(format!("{label} : base64 illisible")))
+        };
+        Ok(Self {
+            pq_private_key: decode(&bundle.pq_private_key, "clé privée PQ cliente")?,
+            tls_private_key_der: decode(&bundle.private_key, "clé privée TLS cliente")?,
+        })
+    }
 }
 
 /// One renewal, from the request to the commit.
@@ -434,6 +774,8 @@ impl RenewalSession {
     pub async fn advance(
         &mut self,
         store: &mut TrustStore,
+        identities: &ProtectedIdentityStore,
+        identity: &str,
         active: &ActiveIdentity,
         now_unix: u64,
     ) -> Result<RenewalStep, RenewalError> {
@@ -450,7 +792,8 @@ impl RenewalSession {
             ClientRenewalOperationState::Failed => Err(RenewalError::OperationFailed),
             ClientRenewalOperationState::PendingCommit => {
                 let grant = view.grant.ok_or(RenewalError::GrantMissing)?;
-                self.commit(store, active, *grant, now_unix).await
+                self.commit(store, identities, identity, active, *grant, now_unix)
+                    .await
             }
         }
     }
@@ -464,9 +807,12 @@ impl RenewalSession {
     /// and then failed to reach the gateway would hold a `next` generation the
     /// gateway has never heard of, and would present it at activation to a
     /// peer that refuses it.
+    #[allow(clippy::too_many_arguments)]
     async fn commit(
         &mut self,
         store: &mut TrustStore,
+        identities: &ProtectedIdentityStore,
+        identity: &str,
         active: &ActiveIdentity,
         grant: ClientCertificateRotationGrant,
         now_unix: u64,
@@ -493,6 +839,17 @@ impl RenewalSession {
             Some(&state.astra.astra_policy_fingerprint),
             now_unix,
         )?;
+
+        // The private keys are sealed **first**, under the candidate's own
+        // name. They exist only in this process's memory until now, and the
+        // slot is about to name a certificate they belong to: committing
+        // before sealing would leave a `next` generation whose private half a
+        // crash had just lost, with no way to notice until activation.
+        let candidate_identity = candidate_identity_of(identity);
+        let bundle = self.candidate_bundle(&candidate_identity, &grant)?;
+        identities
+            .store(&bundle)
+            .map_err(|error| RenewalError::Identity(error.to_string()))?;
 
         // Persisted before the commit travels, in state `pending_commit`: an
         // interruption after this point resumes by replaying the same signed
@@ -688,6 +1045,78 @@ impl RenewalSession {
     }
 }
 
+/// One renewal, driven from a profile to whatever it can reach in one go.
+///
+/// # Why this returns rather than loops
+///
+/// A renewal waits on a human. The authority opens an operation and stops
+/// there until an operator touches a security key, which may be minutes or
+/// hours later — a driver that blocked on that would hold the interface, and a
+/// driver that polled in a loop would decide, on the user's behalf, how long
+/// they are allowed to take.
+///
+/// So this goes as far as it can and reports where it stopped.
+/// [`RenewalStep::AwaitingOperator`] carries the operation, and the caller
+/// shows [`RenewalSession::companion_invocation`] beside it; calling
+/// [`resume`] later with the same session finishes the job.
+///
+/// # Why the session is returned even on the first step
+///
+/// It holds the candidate private keys. Dropping it is what makes an
+/// abandoned renewal leave nothing behind — and it is also why a caller that
+/// wants to finish one has to keep it.
+pub async fn begin(
+    settings: &KeyNegotiationSettings,
+    heliosd_url: &str,
+    now_unix: u64,
+) -> Result<(RenewalSession, TrustStore, RenewalStep), RenewalError> {
+    let identity = settings.identity.trim();
+    if identity.is_empty() {
+        return Err(RenewalError::Identity(
+            "ce profil ne nomme aucune identité protégée".into(),
+        ));
+    }
+    let identities = ProtectedIdentityStore::for_current_user()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let bundle = identities
+        .load(identity)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+
+    let mut store = open_or_seed(&trust_store_path()?, settings, &bundle, now_unix)?;
+    // Anything already due is applied before a new generation is asked for: a
+    // renewal computed against a state that has not caught up would name the
+    // generation it is replacing.
+    promote_due(&mut store, &identities, identity, now_unix)?;
+
+    let active = ActiveIdentity::from_bundle(&bundle)?;
+    let mut session = RenewalSession::prepare(&store, identity, heliosd_url, now_unix)?;
+    session.sign(&active)?;
+    let step = session.open().await?;
+    Ok((session, store, step))
+}
+
+/// Takes one more step on a renewal already opened.
+///
+/// Idempotent by the operation: called while the operator is still absent it
+/// reports [`RenewalStep::AwaitingOperator`] again and changes nothing.
+pub async fn resume(
+    session: &mut RenewalSession,
+    store: &mut TrustStore,
+    settings: &KeyNegotiationSettings,
+    now_unix: u64,
+) -> Result<RenewalStep, RenewalError> {
+    let identity = settings.identity.trim();
+    let identities = ProtectedIdentityStore::for_current_user()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let bundle = identities
+        .load(identity)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let active = ActiveIdentity::from_bundle(&bundle)?;
+    session
+        .advance(store, &identities, identity, &active, now_unix)
+        .await
+}
+
 #[cfg(all(test, feature = "certificate-signing"))]
 mod tests {
     use super::*;
@@ -725,6 +1154,7 @@ mod tests {
         gateway_leaf: PqCertificate,
         active_client_private: Zeroizing<Vec<u8>>,
         active_client_leaf: PqCertificate,
+        active_client_tls: DerCertificate,
         tls_ca: rcgen::Certificate,
         tls_ca_key: KeyPair,
         tls_ca_der: DerCertificate,
@@ -806,6 +1236,28 @@ mod tests {
         let tls_ca = params.self_signed(&tls_ca_key).expect("CA-TLS");
         let tls_ca_der = DerCertificate::new(tls_ca.der().to_vec()).expect("der");
 
+        // The leaf the machine is currently connecting with. Issued by the
+        // same CA-TLS, because that is what an admitted client holds.
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        leaf_params.distinguished_name = name(SUBJECT);
+        leaf_params.not_before = seconds_since_epoch(NOW - 3_600);
+        leaf_params.not_after = seconds_since_epoch(NOW + 10 * 86_400);
+        let active_client_tls = DerCertificate::new(
+            leaf_params
+                .signed_by(
+                    &KeyPair::generate().expect("leaf key"),
+                    &tls_ca,
+                    &tls_ca_key,
+                )
+                .expect("client leaf")
+                .der()
+                .to_vec(),
+        )
+        .expect("der");
+
         Domain {
             ca_pq_private,
             ca_pq_public,
@@ -813,6 +1265,7 @@ mod tests {
             gateway_leaf,
             active_client_private,
             active_client_leaf,
+            active_client_tls,
             tls_ca,
             tls_ca_key,
             tls_ca_der,
@@ -899,6 +1352,47 @@ mod tests {
                 ledger: TrustLedger::default(),
             },
         )
+    }
+
+    /// A profile as `helios-ctl profile emit` writes one since §19.
+    fn settings(domain: &Domain) -> KeyNegotiationSettings {
+        KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "gateway.example:51821".into(),
+            server_name: SERVER_NAME.into(),
+            gateway_ca_der: STANDARD.encode(vec![1u8; 64]),
+            gateway_pq_certificate: STANDARD
+                .encode(serde_json::to_vec(&domain.gateway_leaf).expect("gateway leaf")),
+            identity: SUBJECT.into(),
+            trust: Some(TrustMaterial {
+                trust_domain_id: domain_id().to_hex(),
+                ca_epoch: 1,
+                ca_pq_public_key: domain.ca_pq_public.to_base64(),
+                ca_tls_epoch: 1,
+                client_tls_ca_der: STANDARD.encode(domain.tls_ca_der.as_bytes()),
+                client_generation: 4,
+                astra_authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: Fingerprint::of(b"policy").to_hex(),
+                credential_registry_epoch: 1,
+                astra_service_key_epoch: 1,
+                astra_service_public_key: domain.service_public.to_base64(),
+            }),
+        }
+    }
+
+    /// The sealed identity as it exists on an enrolled machine — read here
+    /// straight from the fixture, because DPAPI seals nothing outside Windows.
+    fn bundle(domain: &Domain) -> ClientIdentityBundle {
+        ClientIdentityBundle {
+            identity: SUBJECT.into(),
+            certificate_chain: vec![STANDARD.encode(domain.active_client_tls.as_bytes())],
+            private_key: STANDARD.encode(vec![7u8; 64]),
+            pq_certificate: STANDARD
+                .encode(serde_json::to_vec(&domain.active_client_leaf).expect("client leaf")),
+            pq_private_key: STANDARD.encode(domain.active_client_private.as_slice()),
+        }
     }
 
     fn active_identity(domain: &Domain) -> ActiveIdentity {
@@ -1275,6 +1769,124 @@ mod tests {
             session.adopt(view),
             Err(RenewalError::OperationFailed)
         ));
+    }
+
+    /// A profile plus a sealed identity is enough to seed the bounded state.
+    ///
+    /// Nothing is fetched and nothing is invented: the anchors come from the
+    /// document the operator signed for, and the active generation's own
+    /// fingerprints come from the certificates in the protected store.
+    #[test]
+    fn a_profile_and_its_identity_seed_the_trust_store() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+
+        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        let state = store.state();
+        assert_eq!(state.trust_domain_id, domain_id());
+        assert_eq!(state.client_wg_public_key, client_key());
+        assert_eq!(state.gateway.gateway_wg_public_key, gateway_key());
+        assert_eq!(state.gateway.server_name, SERVER_NAME);
+        assert_eq!(state.certificates.active.generation, 4);
+        assert_eq!(
+            state.certificates.active.pq_certificate_fingerprint,
+            aether::certificates::gateway::pq_certificate_fingerprint(&domain.active_client_leaf)
+                .expect("fingerprint"),
+            "the active generation is the certificate the store actually holds"
+        );
+        assert_eq!(
+            state.client_tls_ca.active_client_tls_ca_certificate,
+            domain.tls_ca_der
+        );
+        assert!(path.exists(), "seeding writes, so a restart resumes");
+    }
+
+    /// Once the file exists it is the record: it may hold a staged generation
+    /// or a revocation the static profile never heard of.
+    #[test]
+    fn an_existing_store_is_not_reseeded_from_the_profile() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+
+        // The operator re-emits a document claiming a generation that has
+        // already been superseded locally.
+        settings.trust.as_mut().expect("trust").client_generation = 1;
+        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("reopened");
+        assert_eq!(
+            store.state().certificates.active.generation,
+            4,
+            "the store is the record, not the document"
+        );
+    }
+
+    /// A store belonging to another domain is refused, never replaced: it
+    /// carries decisions an overwrite would drop in silence.
+    #[test]
+    fn a_store_describing_another_domain_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+
+        let mut stranger = settings.clone();
+        stranger.trust.as_mut().expect("trust").trust_domain_id = "ab".repeat(16);
+        assert!(matches!(
+            open_or_seed(&path, &stranger, &bundle, NOW),
+            Err(RenewalError::ForeignTrustStore { .. })
+        ));
+    }
+
+    /// An expired leaf cannot sign the continuity proof a rotation needs, so
+    /// the refusal names the recovery rather than letting the authority refuse
+    /// without saying which side is wrong.
+    #[test]
+    fn an_expired_active_leaf_is_named_rather_than_seeded() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        assert!(matches!(
+            open_or_seed(&path, &settings, &bundle, NOW + 20 * 86_400),
+            Err(RenewalError::ActiveExpired { .. })
+        ));
+        assert!(!path.exists(), "a refused seed writes nothing");
+    }
+
+    /// A profile enrolled before §19 carries no trust block, and the refusal
+    /// is that — not a store that could not be written.
+    #[test]
+    fn a_profile_without_trust_material_is_named() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings.trust = None;
+        assert!(matches!(
+            open_or_seed(
+                &directory.path().join("trust.json"),
+                &settings,
+                &bundle(&domain),
+                NOW
+            ),
+            Err(RenewalError::TrustMaterialMissing)
+        ));
+    }
+
+    /// The candidate is sealed beside the active identity, never over it: the
+    /// active generation keeps connecting for the length of the overlap.
+    #[test]
+    fn the_candidate_is_sealed_under_a_name_of_its_own() {
+        assert_eq!(candidate_identity_of("poste-windows"), "poste-windows-next");
+        assert_ne!(candidate_identity_of("poste"), "poste");
     }
 
     /// The command the surface launches is complete and names this operation.

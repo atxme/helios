@@ -139,13 +139,24 @@ Restent ouverts :
   pair par sa VIP, pas par un jeton porteur. Le transport ne décide de rien :
   la demande reste vérifiée sous la clé de service épinglée, et le RP ID
   annoncé par la gateway est **comparé** à celui du coffre, jamais adopté.
+  **Le bouton existe** : l'écran *Certificats* d'Orion ouvre l'opération,
+  affiche la ligne exacte qui l'approuve, la reprend au clic suivant et
+  committe le grant. Le magasin de confiance s'amorce tout seul depuis le
+  profil et l'identité scellée (`open_or_seed`) ; une fois écrit, c'est lui qui
+  fait foi, et un magasin décrivant un autre domaine est refusé plutôt
+  qu'écrasé. Le candidat est scellé sous `<identité>-next` **avant** le commit,
+  jamais par-dessus l'actif — qui monte le tunnel pendant tout le
+  chevauchement — et `promote_due` remet les deux en place à l'activation, clés
+  d'abord, état ensuite. **Limite connue** : ces deux écritures passent par
+  DPAPI, donc un renouvellement complet ne s'exerce pas en WSL2 ; tout le reste
+  du chemin y est éprouvé (voir [TESTING.md](docs/testing/TESTING.md)).
   Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
   `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
   `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en
-  dépend ; le **lancement** du compagnon par l'IHM — `companion_invocation()`
-  en rend la ligne exacte, il reste à la poser derrière un bouton ; le
-  discriminant de profil Orion et la bascule du §13 ; et les deux surfaces
-  IHM.
+  dépend ; les trois autres actions du §12.2, sans pilote et refusées en le
+  disant ; le lancement automatique du compagnon plutôt que sa ligne de
+  commande ; le discriminant de profil Orion et la bascule du §13 ; et la
+  surface *Certificats* de la console Helios.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin

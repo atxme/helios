@@ -2530,7 +2530,18 @@ libellé ambigu « Renouveler ».
 - `orion-core::certificates` : ancre, slots, planificateur dispersé stable,
   vérification complète d'une transaction chunkée et application par une seule
   écriture, révocations différées appliquées à leur instant.
-- `orion-core::certificate_renewal` : la **moitié cliente** du §8.1.2. Les
+- `orion-core::certificate_renewal` : la **moitié cliente** du §8.1.2, du
+  magasin de confiance au commit. `open_or_seed` amorce l'état borné depuis le
+  profil et l'identité scellée — rien n'y est inventé ni récupéré sur le
+  réseau : les ancres viennent du document que l'opérateur a signé, les
+  empreintes de la génération active viennent des certificats du magasin
+  protégé. Une fois le fichier écrit, c'est **lui** qui fait foi : un profil
+  réémis ne le réamorce pas, et un magasin décrivant un autre domaine ou un
+  autre client est refusé plutôt qu'adopté ou remplacé. Le candidat est scellé
+  sous `<identité>-next` **avant** le commit, jamais par-dessus l'actif — qui
+  continue de monter le tunnel pendant tout le chevauchement — et
+  `promote_due` remet les deux en place à l'activation, clés d'abord, état
+  ensuite. Les
   deux clés candidates naissent dans le processus et n'en sortent pas — ce qui
   voyage est une PKCS#10 et une clé publique, chacune couverte par une
   signature de la moitié privée correspondante. La requête est bâtie depuis le
@@ -2631,9 +2642,7 @@ contournés :
   routes publiques à jeton de capacité `signer-requests`, `vaults` et
   `signer-results` du §8.2 répondent `501`. Ces routes-là servent l'opérateur
   **hors** tunnel — le cas que le canal in-tunnel ne couvre pas, et dont dépend
-  la récupération d'une identité expirée. Reste aussi le **lancement** du
-  compagnon par l'IHM Orion : `RenewalSession::companion_invocation` en rend la
-  ligne exacte, et c'est le §12.2 qui la posera derrière un bouton ;
+  la récupération d'une identité expirée ;
 - la **distribution des objets de transition** par `trust-update`. Le canal
   privé bidirectionnel des §§8.1.2 et 8.3 est livré. Ce qui manque est la
   distribution des transitions elles-mêmes : la gateway ne détient aucun
@@ -2649,7 +2658,17 @@ contournés :
   deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
   coordonnée du §13 ;
-- les **surfaces IHM** du §12.2, côté Orion comme côté console Helios ;
+- les **surfaces IHM** du §12.2, partiellement. Côté Orion, la destination
+  *Certificats* existe : elle liste les quatre certificats par profil avec
+  leurs échéances et leur phase 80/90/95 %, les quatre actions avec la raison
+  de chaque refus, la dernière erreur, et — depuis ce lot — l'étape où le
+  renouvellement s'est arrêté, avec la ligne exacte qui l'approuve. Le bouton
+  « Renouveler maintenant » **agit** : il ouvre l'opération, la reprend au
+  clic suivant et committe le grant. Manquent encore : les trois autres
+  actions, qui n'ont pas de pilote (`RenewEveryProfile`, `RecoverExpired`,
+  `RollbackToPrevious` sont refusées en le disant), le lancement automatique
+  du compagnon plutôt que sa ligne de commande, et l'affichage des credentials
+  opérateur enregistrés. Côté console Helios, rien n'existe encore ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné

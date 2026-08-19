@@ -8,6 +8,7 @@ import type {
   About,
   CertificateAction,
   CertificateActionState,
+  RenewalProgress,
   CertificateInventory,
   ClientConfig,
   ClientEvent,
@@ -106,9 +107,15 @@ export const certificateActions = (keyNegotiation: KeyNegotiationSettings | null
 export const certificateOverview = () =>
   invoke<ProfileCertificates[]>('certificate_overview')
 
-/** Runs one of them, or rejects with the reason it cannot run. */
+/**
+ * Runs one of them, or rejects with the reason it cannot run.
+ *
+ * Resolves with where the renewal stopped rather than with nothing: a renewal
+ * waits on a human, so «lancé» is not an outcome the screen can show. Pressing
+ * again on an operation already open resumes it — it never opens a second one.
+ */
 export const runCertificateAction = (name: string, action: CertificateAction) =>
-  invoke<void>('run_certificate_action', { name, action })
+  invoke<RenewalProgress>('run_certificate_action', { name, action })
 
 /** The last certificate action that failed on this profile, if any. */
 export const lastCertificateError = (name: string) =>

@@ -742,6 +742,20 @@ dernier effet exige la gateway réelle.
     C’est ainsi qu’ont été validés `OpenProcessToken` (dans `System::Threading`,
     pas `Security`) et le `dwflags: OBJECT_SECURITY_INFORMATION` de
     `NCryptGetProperty`. Seule une compilation sur cible fait foi ;
+- **le renouvellement de certificat ne se boucle pas en WSL2**, et pour la même
+  raison : ses deux écritures locales scellent des clés privées. `open_or_seed`,
+  la construction et la double signature de la requête, la vérification du
+  grant, la pose du candidat et le commit sont tous éprouvés hors matériel —
+  `crates/orion-core/src/certificate_renewal.rs`, quatorze essais dont un qui
+  fait émettre une vraie `CA-TLS` **depuis la CSR que le client a produite**.
+  Ce qui n’est pas exercé ici est le scellement du candidat sous
+  `<identité>-next` et sa promotion à l’activation : les deux passent par
+  `ProtectedIdentityStore`, donc par DPAPI. Un renouvellement complet est donc
+  une recette cible : Orion sous Windows, tunnel monté, gateway avec Astra
+  déployé, et `astra-signer approve --heliosd-url … --operation-id …` lancé sur
+  la même machine avec la clé branchée. Le transport du compagnon, lui,
+  s’éprouve hors matériel contre une gateway factice
+  (`tools/astra-signer/tests/tunnel.rs`) ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
 - **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
   n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse

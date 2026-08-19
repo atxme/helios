@@ -9,8 +9,14 @@ import { RefreshCw } from 'lucide-react'
 
 import * as api from '../api'
 import { CertificatePanel, PhasePill, isAlarming, worstPhase } from '../components/CertificatePanel'
-import { GUTTER } from '../theme'
-import type { CertificateAction, CertificatePhase, ProfileCertificates } from '../types'
+import { CopyButton } from '../components/CopyButton'
+import { GUTTER, RULE } from '../theme'
+import type {
+  CertificateAction,
+  CertificatePhase,
+  ProfileCertificates,
+  RenewalProgress,
+} from '../types'
 
 /**
  * Certificates — its own destination, between Profiles and the log.
@@ -50,6 +56,10 @@ export function CertificatesView() {
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
+  // Where each profile's renewal stopped, from the press that opened it.
+  // Not persisted and not refreshed: it describes one attempt made here, and a
+  // step surviving a reload would outlive the operation it names.
+  const [progress, setProgress] = useState<Record<string, RenewalProgress>>({})
   const [reloading, setReloading] = useState(false)
 
   const refresh = useCallback(async () => {
@@ -74,11 +84,20 @@ export function CertificatesView() {
   const run = async (name: string, action: CertificateAction) => {
     setBusy(true)
     try {
-      await api.runCertificateAction(name, action)
+      const step = await api.runCertificateAction(name, action)
+      setProgress((current) => ({ ...current, [name]: step }))
     } catch {
       // The refusal is recorded on the Rust side and comes back with the
       // refreshed overview: showing it from the rejection as well would print
       // it twice, and the two could disagree after a concurrent change.
+      //
+      // The previous step is dropped: it described an attempt that a later one
+      // has now failed, and leaving it on screen beside the new error would
+      // show a renewal as progressing and refused at once.
+      setProgress((current) => {
+        const { [name]: _dropped, ...rest } = current
+        return rest
+      })
     } finally {
       setBusy(false)
       await refresh()
@@ -160,6 +179,7 @@ export function CertificatesView() {
               lastError={profile.last_error}
               onRun={busy ? undefined : (action) => void run(profile.name, action)}
             />
+            <RenewalStep step={progress[profile.name]} />
           </Paper>
         ))}
       </Box>
@@ -171,6 +191,62 @@ export function CertificatesView() {
           sans négociation : {classic.map((profile) => profile.name).join(', ')}
         </Typography>
       )}
+    </Box>
+  )
+}
+
+/**
+ * Where the renewal this press opened has stopped.
+ *
+ * Values only. `awaiting_operator` is not a warning to explain — it is where
+ * every renewal legitimately waits — so what the row carries is the two things
+ * an operator acts on: the operation, and the exact command that approves it.
+ * The command is copyable for the same reason every other value here is:
+ * selecting truncated monospace text with the mouse is where it goes wrong.
+ */
+function RenewalStep({ step }: { step: RenewalProgress | undefined }) {
+  if (!step) return null
+  return (
+    <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
+      {step.step === 'committed' ? (
+        <Row label="génération suivante" value={String(step.generation)} />
+      ) : (
+        <>
+          <Row label="opération" value={step.operation_id} copyable />
+          {step.step === 'awaiting_operator' && (
+            <Row label="approbation" value={step.companion_command} copyable />
+          )}
+        </>
+      )}
+    </Box>
+  )
+}
+
+function Row({
+  label,
+  value,
+  copyable,
+}: {
+  label: string
+  value: string
+  copyable?: boolean
+}) {
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0, py: 0.3 }}>
+      <Typography
+        color="text.disabled"
+        sx={{ fontSize: 10.5, width: 96, flexShrink: 0, textTransform: 'uppercase' }}
+      >
+        {label}
+      </Typography>
+      <Typography
+        noWrap
+        sx={{ minWidth: 0, flex: '1 1 0', fontFamily: 'monospace', fontSize: 11 }}
+        title={value}
+      >
+        {value}
+      </Typography>
+      {copyable && <CopyButton value={value} label={label} />}
     </Box>
   )
 }

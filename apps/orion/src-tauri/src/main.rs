@@ -140,6 +140,22 @@ struct AppState {
     /// session, and a message surviving a restart would outlive the situation
     /// it described — an identity imported since, a store now available.
     last_certificate_error: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Renewals opened in this session, by profile name.
+    ///
+    /// Held in memory and nowhere else, because the session carries the
+    /// candidate **private keys**. That is what makes an abandoned renewal
+    /// leave nothing behind: closing Orion drops them, the authority's
+    /// operation expires on its own, and the active generation was never
+    /// touched. The cost is that a restart reopens rather than resumes — the
+    /// cheap failure, since nothing was committed.
+    renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+}
+
+/// One renewal in progress: what drives it, and the state it writes into.
+struct InFlightRenewal {
+    session: orion_core::certificate_renewal::RenewalSession,
+    store: orion_core::certificates::TrustStore,
+    settings: orion_core::KeyNegotiationSettings,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -512,34 +528,162 @@ async fn run_certificate_action(
     state: State<'_, AppState>,
     name: String,
     action: orion_core::CertificateAction,
-) -> Result<(), String> {
-    let settings = {
+) -> Result<RenewalProgress, String> {
+    let (settings, heliosd_url) = {
         let cfg = state.config.lock().await;
-        cfg.find(&name)
-            .and_then(|profile| profile.key_negotiation.clone())
+        let profile = cfg.find(&name);
+        (
+            profile.and_then(|profile| profile.key_negotiation.clone()),
+            profile.and_then(|profile| profile.heliosd_url.clone()),
+        )
     };
     let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now_unix());
-    let outcome = orion_core::certificate_actions::run(
+    if let Err(block) = orion_core::certificate_actions::admits(
         action,
         settings.as_ref(),
         &inventory,
         state.controller.key_negotiation_ready(),
-    );
-    match outcome {
-        Ok(()) => {
-            state.last_certificate_error.lock().await.remove(&name);
-            Ok(())
+    ) {
+        return Err(record_certificate_error(&state, &name, block.message()).await);
+    }
+
+    // The two renewals are the ones that have a driver. The other two are
+    // refused above, each for its own reason, and reaching this point with one
+    // of them would mean `action_states` and this match had drifted apart.
+    let outcome = match action {
+        orion_core::CertificateAction::RenewNow => {
+            drive_renewal(&state, &name, settings, heliosd_url).await
         }
-        Err(block) => {
-            let message = block.message();
-            state
-                .last_certificate_error
-                .lock()
-                .await
-                .insert(name, message.clone());
-            Err(message)
+        orion_core::CertificateAction::RenewEveryProfile
+        | orion_core::CertificateAction::RecoverExpired
+        | orion_core::CertificateAction::RollbackToPrevious => Err(
+            "cette action n'a pas encore de pilote : seul « Renouveler maintenant » en a un."
+                .to_string(),
+        ),
+    };
+    match outcome {
+        Ok(progress) => {
+            state.last_certificate_error.lock().await.remove(&name);
+            Ok(progress)
+        }
+        Err(message) => Err(record_certificate_error(&state, &name, message).await),
+    }
+}
+
+/// Where a renewal stands, as the Certificates surface states it.
+///
+/// `companion_command` is a **value**, not advice: it is the exact line that
+/// approves this operation, and the screen shows it because the operator has
+/// to run it. It is present only while an operator is awaited.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "step")]
+enum RenewalProgress {
+    AwaitingOperator {
+        operation_id: String,
+        companion_command: String,
+    },
+    Issuing {
+        operation_id: String,
+    },
+    Committed {
+        generation: u64,
+    },
+}
+
+impl RenewalProgress {
+    fn of(
+        step: &orion_core::certificate_renewal::RenewalStep,
+        session: &orion_core::certificate_renewal::RenewalSession,
+    ) -> Self {
+        use orion_core::certificate_renewal::RenewalStep;
+        match step {
+            RenewalStep::AwaitingOperator { operation_id } => Self::AwaitingOperator {
+                operation_id: operation_id.to_hex(),
+                companion_command: session
+                    .companion_invocation()
+                    .map(|invocation| invocation.command_line())
+                    .unwrap_or_default(),
+            },
+            RenewalStep::Issuing { operation_id } => Self::Issuing {
+                operation_id: operation_id.to_hex(),
+            },
+            RenewalStep::Committed { generation } => Self::Committed {
+                generation: *generation,
+            },
         }
     }
+}
+
+/// Opens a renewal, or takes one more step on the one already open.
+///
+/// Resuming rather than restarting is the whole reason the session is kept:
+/// a second `begin` would generate a second key pair and open a second
+/// operation, burning a generation for nothing while the first one still waits
+/// on the same operator.
+async fn drive_renewal(
+    state: &State<'_, AppState>,
+    name: &str,
+    settings: Option<orion_core::KeyNegotiationSettings>,
+    heliosd_url: Option<String>,
+) -> Result<RenewalProgress, String> {
+    let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+    let url = heliosd_url.ok_or_else(|| {
+        "ce profil ne porte pas l'adresse de l'API de la gateway dans le tunnel : sans elle il n'y          a aucune route de renouvellement à appeler."
+            .to_string()
+    })?;
+
+    let mut renewals = state.renewals.lock().await;
+    if let Some(in_flight) = renewals.get_mut(name) {
+        let step = orion_core::certificate_renewal::resume(
+            &mut in_flight.session,
+            &mut in_flight.store,
+            &in_flight.settings,
+            now_unix(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let progress = RenewalProgress::of(&step, &in_flight.session);
+        if matches!(
+            step,
+            orion_core::certificate_renewal::RenewalStep::Committed { .. }
+        ) {
+            renewals.remove(name);
+        }
+        return Ok(progress);
+    }
+
+    let (session, store, step) =
+        orion_core::certificate_renewal::begin(&settings, &url, now_unix())
+            .await
+            .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of(&step, &session);
+    if !matches!(
+        step,
+        orion_core::certificate_renewal::RenewalStep::Committed { .. }
+    ) {
+        renewals.insert(
+            name.to_string(),
+            InFlightRenewal {
+                session,
+                store,
+                settings,
+            },
+        );
+    }
+    Ok(progress)
+}
+
+async fn record_certificate_error(
+    state: &State<'_, AppState>,
+    name: &str,
+    message: String,
+) -> String {
+    state
+        .last_certificate_error
+        .lock()
+        .await
+        .insert(name.to_string(), message.clone());
+    message
 }
 
 /// The last certificate action that failed on this profile, if any.
@@ -2040,6 +2184,7 @@ fn main() {
             vault_error,
             log_path,
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]
