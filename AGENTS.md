@@ -132,12 +132,20 @@ Restent ouverts :
   ne devient `next` qu'après confirmation de la gateway, donc une interruption
   ne laisse ni identité à demi scellée, ni clé orpheline, ni slot nommant un
   certificat sans clé privée.
-  Restent ouverts : le **transport des documents du compagnon** (routes §8.2
-  en `501`, donc copie de fichiers) — désormais le **seul** maillon manquant du
-  renouvellement ordinaire, les deux bouts du §8.1.2 se vérifiant l'un l'autre
-  et une demande ouverte s'arrêtant sur `awaiting_operator` —, la récupération
-  d'une identité expirée, le discriminant de profil Orion et la bascule du §13,
-  et les deux surfaces IHM.
+  **Le renouvellement client ordinaire se boucle donc de bout en bout** :
+  `astra-signer approve --heliosd-url --operation-id` récupère sa demande et
+  dépose son assertion par les mêmes routes in-tunnel, ce qui tient parce que
+  le compagnon tourne sur la machine du client — ces routes authentifient le
+  pair par sa VIP, pas par un jeton porteur. Le transport ne décide de rien :
+  la demande reste vérifiée sous la clé de service épinglée, et le RP ID
+  annoncé par la gateway est **comparé** à celui du coffre, jamais adopté.
+  Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
+  `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
+  `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en
+  dépend ; le **lancement** du compagnon par l'IHM — `companion_invocation()`
+  en rend la ligne exacte, il reste à la poser derrière un bouton ; le
+  discriminant de profil Orion et la bascule du §13 ; et les deux surfaces
+  IHM.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
@@ -663,9 +671,12 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `astra-signer` : compagnon du **poste opérateur** (ADR-008 §4), le seul
   programme du dépôt qui détienne `CA-PQ` en clair, et seulement le temps d'une
   opération. Il parle à CTAP2 directement — jamais un navigateur, jamais Orion,
-  jamais la console. Trois modules : `authenticator` (la seule frontière avec
+  jamais la console. Quatre modules : `authenticator` (la seule frontière avec
   le matériel), `gestures` (les séquences, éprouvées hors terminal), `store`
-  (le fichier).
+  (le fichier) et `tunnel` (le transport in-tunnel du §8.1.2 : il récupère la
+  demande d'approbation et dépose l'assertion par les routes de `helios-api`,
+  et ne décide de rien — la demande reste vérifiée sous la clé de service
+  épinglée, le RP ID annoncé est comparé à celui du coffre).
 - `helios-firewall` : ruleset structuré, dry-run, backend Netlink.
 - `helios-wireguard` : interface gateway et table de pairs.
 - `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.

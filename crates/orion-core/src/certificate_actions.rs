@@ -34,12 +34,15 @@
 //!
 //! That material now has a home — `KeyNegotiationSettings::trust`, carried by
 //! the `.orion` document and the vault manifest — so a profile enrolled since
-//! §19 holds it, and [`crate::certificate_renewal`] now signs the request,
-//! drives the operation and commits the grant. What is still missing is one
-//! step further out and is nobody's fault on this side: the operator's
-//! companion cannot fetch its own approval request through the tunnel, so an
-//! opened renewal parks on `awaiting_operator` and expires there.
-//! [`CertificateActionBlock::CompanionTransportMissing`] names that.
+//! §19 holds it, and [`crate::certificate_renewal`] signs the request, drives
+//! the operation and commits the grant. The operator's companion closes the
+//! chain over the same tunnel (`astra-signer approve --heliosd-url`), so the
+//! ordinary renewal has no missing link left and is no longer blocked here.
+//!
+//! What the interface still owes the user is the **launch** of that companion.
+//! That is a surface concern and not a refusal:
+//! `RenewalSession::companion_invocation` hands it the exact command, which is
+//! a value to render rather than a caveat to write.
 //!
 //! Either way the refusal happens **before** a key pair is generated or an
 //! authority is asked to certify anything: a button that produced a key and
@@ -113,6 +116,10 @@ pub enum CertificateActionBlock {
     TrustMaterialMissing,
     /// The trust material is there and the client half of §7 is wired; what
     /// is missing is the operator companion's own transport.
+    ///
+    /// **Plus émis** depuis que `astra-signer approve --heliosd-url` existe :
+    /// la variante survit pour qu'un état sérialisé antérieur se relise, et
+    /// [`renewal_block`] ne la rend plus.
     CompanionTransportMissing,
     /// Needs a hardware credential and the `astra-signer` companion.
     OperatorCredentialRequired,
@@ -218,13 +225,16 @@ fn renewal_block(
     if settings.trust.is_none() {
         return Some(CertificateActionBlock::TrustMaterialMissing);
     }
-    // Everything the client owns is in place: `certificate_renewal` signs the
-    // rotation request, drives the operation and commits the grant. What still
-    // cannot happen is step 4 — the operator's companion has no way to fetch
-    // its own request through the tunnel. Pressing the button would open an
-    // operation that parks on `awaiting_operator` and expires, so the refusal
-    // names that instead of producing a renewal nobody can finish.
-    Some(CertificateActionBlock::CompanionTransportMissing)
+    // Nothing blocks it any more. `certificate_renewal` signs the rotation
+    // request, drives the operation and commits the grant; `astra-signer
+    // approve --heliosd-url` fetches its own request through the same tunnel
+    // and posts the operator's assertion back. The chain closes.
+    //
+    // What the interface still owes the user is the **launch** of the
+    // companion, and that is a surface concern rather than a refusal:
+    // `RenewalSession::companion_invocation` hands it the exact command, which
+    // is a value to render, not a caveat to write.
+    None
 }
 
 /// Whether anything this profile depends on has already expired.
@@ -431,12 +441,11 @@ mod tests {
             .is_some_and(|message| message.contains("domaine de confiance")));
     }
 
-    /// A profile enrolled since §19 carries the material, so the reason moves
-    /// to the one thing left: the client half of the exchange. Naming the
-    /// format gap there would send the operator re-issuing a document that is
-    /// already correct.
+    /// A profile enrolled since §19 carries the material, and the whole chain
+    /// exists behind it. Blocking here would send the operator re-issuing a
+    /// document that is already correct, for a path that already works.
     #[test]
-    fn a_profile_carrying_its_trust_material_is_blocked_on_the_path_instead() {
+    fn a_profile_carrying_its_trust_material_may_renew() {
         let mut settings = settings();
         settings.trust = Some(crate::config::TrustMaterial {
             trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
@@ -462,7 +471,8 @@ mod tests {
                 CertificateAction::RenewNow
             )
             .blocked_by,
-            Some(CertificateActionBlock::CompanionTransportMissing)
+            None,
+            "a profile carrying its trust material may renew: the chain closes"
         );
     }
 

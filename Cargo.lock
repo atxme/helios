@@ -271,6 +271,7 @@ dependencies = [
  "ctap-hid-fido2",
  "hex",
  "rcgen",
+ "reqwest 0.12.28",
  "rpassword",
  "serde",
  "serde_json",

@@ -30,3 +30,4 @@ pub mod documents;
 pub mod gestures;
 pub mod handoff;
 pub mod store;
+pub mod tunnel;

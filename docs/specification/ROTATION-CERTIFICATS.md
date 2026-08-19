@@ -2554,6 +2554,17 @@ libellé ambigu « Renouveler ».
   aucun secret de slot et produit une assertion WebAuthn vérifiable ; les deux
   couches AES-256-GCM, HKDF-SHA-256, sels, contextes et AAD sont celles figées
   au §2.4.1.
+- `astra_signer::tunnel` : le **transport in-tunnel du compagnon** (§8.1.2).
+  `approve --heliosd-url --operation-id` lit l'opération, prend ses deux jetons
+  de capacité, récupère la demande d'approbation sous le premier et dépose
+  l'assertion sous le second. Il tient debout parce que le compagnon tourne sur
+  la machine du client : ces routes authentifient le pair par sa VIP source,
+  pas par un jeton porteur. Le transport ne décide de rien — la demande reste
+  vérifiée sous la clé de service épinglée par le relais de domaine, et le
+  RP ID annoncé par la gateway est **comparé** à celui du coffre, jamais
+  adopté. Le jeton n'est accepté que si l'empreinte du manifeste auquel il est
+  lié est bien celle de la demande reçue, et une opération qui n'attend plus
+  d'opérateur est refusée avant que la clé soit touchée.
 - la **moitié serveur du renouvellement relayé**, et sa moitié cliente : les
   routes Orion → Helios
   authentifient la VIP, Helios relaie des objets typés vers Astra, Astra
@@ -2608,24 +2619,21 @@ contournés :
   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
   émis avant ce changement cesse de vérifier et le parc se ré-émet ;
 
-- le **transport** des demandes et des résultats d'`astra-signer`. Les gestes
-  eux-mêmes sont livrés et éprouvés : certificat auto-signé `CA-TLS`,
-  `AstraIssuerAuthorization` bornée, bindings de credentials sous `CA-PQ`
-  réémis depuis la table de key-slots, approbation d'une
-  `AstraCredentialApprovalRequest` en `AstraRenewalApproval` — sans ouvrir le
-  coffre —, campagnes à deux credentials distincts et rotation de `CA-PQ`.
-  Chacun lit une demande sur disque et écrit son résultat à côté, parce que les
-  routes publiques `signer-requests`, `vaults` et `signer-results` du §8.2
-  répondent encore `501`. Le backend privé du renouvellement ordinaire accepte
-  et vérifie déjà le résultat relayé, et l'émetteur délégué n'émet rien avant
-  cette preuve YubiKey ; en revanche le binaire `astra-signer` ne sait pas
-  encore utiliser `heliosd_url`, et Orion ne sait pas encore le lancer.
-  **C'est désormais le seul maillon manquant du renouvellement ordinaire** :
-  les deux bouts du §8.1.2 existent et se vérifient l'un l'autre, et une
-  demande ouverte s'arrête sur `awaiting_operator` faute de pouvoir présenter
-  sa demande à une clé matérielle. `certificate_actions` le dit en toutes
-  lettres plutôt que d'offrir un bouton qui ouvrirait une opération que
-  personne ne peut achever ;
+- le **transport hors tunnel** du compagnon. Les gestes eux-mêmes sont livrés et
+  éprouvés : certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization` bornée,
+  bindings de credentials sous `CA-PQ` réémis depuis la table de key-slots,
+  approbation d'une `AstraCredentialApprovalRequest` en `AstraRenewalApproval`
+  — sans ouvrir le coffre —, campagnes à deux credentials distincts et rotation
+  de `CA-PQ`. L'approbation ordinaire voyage désormais **dans le tunnel**
+  (`approve --heliosd-url`), donc le renouvellement client se boucle de bout en
+  bout. Les trois autres commandes lisent encore une demande sur disque et
+  écrivent leur résultat à côté, et le coffre se copie à la main, parce que les
+  routes publiques à jeton de capacité `signer-requests`, `vaults` et
+  `signer-results` du §8.2 répondent `501`. Ces routes-là servent l'opérateur
+  **hors** tunnel — le cas que le canal in-tunnel ne couvre pas, et dont dépend
+  la récupération d'une identité expirée. Reste aussi le **lancement** du
+  compagnon par l'IHM Orion : `RenewalSession::companion_invocation` en rend la
+  ligne exacte, et c'est le §12.2 qui la posera derrière un bouton ;
 - la **distribution des objets de transition** par `trust-update`. Le canal
   privé bidirectionnel des §§8.1.2 et 8.3 est livré. Ce qui manque est la
   distribution des transitions elles-mêmes : la gateway ne détient aucun
