@@ -46,6 +46,12 @@ RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
 # chemin, et root ne le trouve pas autrement. Le nommer en clair évite un
 # « command not found » là où l'on croirait lire un refus d'amorçage.
 HELIOSD=/opt/helios/current/heliosd
+# Chemin du binaire Astra **dans** son image. Nécessaire parce que `docker
+# compose exec` n'applique pas l'`ENTRYPOINT` : il exécute l'argv tel quel, donc
+# « status » y serait cherché dans le PATH comme un programme. Les deux autres
+# accès de l'étape 7 (`run` et le conteneur jetable) passent, eux, par
+# l'entrypoint et ne le prennent pas.
+ASTRA_BIN=/usr/local/bin/astra
 # Bout gateway du veth privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3).
 # La même adresse que le réseau `astra-private` de `deploy/astra/compose.yaml` :
 # un /29 qui ne contient que ses deux extrémités, sans route par défaut.
@@ -499,7 +505,12 @@ deployer_astra() {
     compose_astra="$compose_env $compose -f deploy/astra/compose.yaml \
         --env-file '$env_distant'"
     if [ "$astra_en_marche" = oui ]; then
-        astra_lire="$compose_astra exec -T astra"
+        # Le chemin absolu, et pas le sous-verbe seul : `exec` n'applique pas
+        # l'`ENTRYPOINT` de l'image, il exécute l'argv tel quel. « status » y
+        # est un nom de programme, que le runtime cherche dans le PATH et ne
+        # trouve évidemment pas. `run` et le conteneur jetable, eux, passent
+        # bien par l'entrypoint — d'où trois formes et non une.
+        astra_lire="$compose_astra exec -T astra $ASTRA_BIN"
         astra_lire_shell="$compose_astra exec -T astra /bin/sh -c"
     elif [ -n "$conteneur_astra" ]; then
         # Le volume se lit sans passer par le service. `--network none` est ce
@@ -524,6 +535,33 @@ deployer_astra() {
         astra_lire_shell="$compose_astra run --rm --no-deps --entrypoint /bin/sh astra -c"
     fi
 
+    # Ce que le runtime refuse n'est pas ce qu'Astra refuse.
+    #
+    # Une sortie qui vient du démon — conteneur arrêté, exécutable introuvable,
+    # réseau impossible — dit qu'`astra status` n'a **jamais tourné**. En tirer
+    # une conclusion sur le registre revient à lui imputer une panne que
+    # personne n'a observée, et c'est exactement ce qu'un déploiement réel a
+    # affiché deux fois de suite pour deux causes différentes.
+    astra_sonde_muette() {
+        echo "    impossible d'interroger le volume Astra : la sonde n'a pas répondu." >&2
+        echo "    Rien n'est su du registre, donc rien n'est amorcé." >&2
+        [ -z "${1:-}" ] || echo "    Réponse de la sonde : $1" >&2
+        printf '%s\n' "$statut_astra" | tail -20 >&2
+        case "$statut_astra" in
+            *"Address already in use"*|*"address already in use"*)
+                echo "    L'adresse 10.88.7.2 du veth privé est déjà prise. Un conteneur" >&2
+                echo "    Astra antérieur la retient — même arrêté, sa réservation tient" >&2
+                echo "    jusqu'à sa suppression :" >&2
+                echo "      ssh $CIBLE 'sudo $moteur ps -a --filter name=astra'" >&2
+                echo "      ssh $CIBLE 'sudo $moteur rm <id>'" >&2
+                ;;
+            *"executable file not found"*)
+                echo "    Le runtime n'a pas trouvé le programme à lancer : c'est l'appel qui" >&2
+                echo "    est fautif, pas le volume. $ASTRA_BIN est le chemin attendu." >&2
+                ;;
+        esac
+    }
+
     # Trois états, pas deux. `status` échoue aussi bien parce qu'il n'y a rien
     # à lire que parce que ce qu'il y a est illisible, et confondre les deux
     # est ce qui a mené un déploiement réel à enchaîner sur un `bootstrap` que
@@ -532,6 +570,13 @@ deployer_astra() {
     statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
         $astra_lire status 2>&1")" && etat=amorce || etat=inconnu
     if [ "$etat" = "inconnu" ]; then
+        case "$statut_astra" in
+            *"OCI runtime"*|*"executable file not found"*|*"Error response from daemon"*|\
+            *"failed to set up container networking"*|*"is not running"*|*"No such container"*)
+                astra_sonde_muette
+                return 1
+                ;;
+        esac
         registre_present="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
             $astra_lire_shell \
             'test -f /var/lib/astra/registry.json && echo present || echo absent' 2>/dev/null" \
@@ -539,7 +584,8 @@ deployer_astra() {
         case "$registre_present" in
             absent) etat=vierge ;;
             present)
-                # Le registre est là et ne se lit pas. Amorcer par-dessus
+                # Astra a bien tourné, a bien lu, et a refusé. C'est la seule
+                # combinaison où le registre est en cause. Amorcer par-dessus
                 # démarrerait une seconde histoire pour le même domaine, et le
                 # binaire le refuse — mais c'est ici qu'il faut s'arrêter, en
                 # montrant l'erreur réelle plutôt que celle du refus.
@@ -552,24 +598,11 @@ deployer_astra() {
                 ;;
             *)
                 # Quatrième cas, et il ne se confond avec aucun des trois : la
-                # sonde elle-même n'a pas répondu. On ne sait donc **rien** du
-                # volume. Le ranger avec « registre illisible » accusait le
-                # registre d'une panne que personne n'avait observée, et le
-                # ranger avec « vierge » enchaînerait sur un amorçage par-dessus
-                # une autorité existante — la seule erreur irrattrapable ici.
-                echo "    impossible d'interroger le volume Astra : la sonde n'a pas répondu." >&2
-                echo "    Rien n'est su du registre, donc rien n'est amorcé." >&2
-                echo "    Réponse de la sonde : ${registre_present:-<vide>}" >&2
-                printf '%s\n' "$statut_astra" | tail -20 >&2
-                case "$statut_astra" in
-                    *"Address already in use"*|*"address already in use"*)
-                        echo "    L'adresse 10.88.7.2 du veth privé est déjà prise. Un conteneur" >&2
-                        echo "    Astra antérieur la retient — même arrêté, sa réservation tient" >&2
-                        echo "    jusqu'à sa suppression :" >&2
-                        echo "      ssh $CIBLE 'sudo $moteur ps -a --filter name=astra'" >&2
-                        echo "      ssh $CIBLE 'sudo $moteur rm <id>'" >&2
-                        ;;
-                esac
+                # sonde du volume n'a pas répondu non plus. Le ranger avec
+                # « registre illisible » accuserait le registre ; le ranger avec
+                # « vierge » enchaînerait sur un amorçage par-dessus une autorité
+                # existante — la seule erreur irrattrapable ici.
+                astra_sonde_muette "${registre_present:-<vide>}"
                 return 1
                 ;;
         esac

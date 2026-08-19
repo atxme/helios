@@ -241,6 +241,19 @@ L'étape 7 choisit donc son accès selon l'état du service :
 Le troisième cas est le seul où `run` est sûr. Les trois écritures de l'étape —
 sonde, `bootstrap`, `init-channel` — passent par le même accès.
 
+`exec` ne se contente pas d'une forme différente : il **n'applique pas
+l'`ENTRYPOINT`** de l'image et exécute l'argv tel quel. `exec -T astra status`
+demande donc au runtime un programme nommé « status », qu'il cherche dans le
+`PATH` et ne trouve pas. Le chemin complet, `/usr/local/bin/astra status`, est
+obligatoire — et seulement là : `run` et le conteneur jetable passent par
+l'entrypoint.
+
+Une sortie qui vient du démon — conteneur arrêté, exécutable introuvable,
+réseau impossible — dit qu'`astra status` n'a **jamais tourné**, et l'étape la
+range avec les sondes muettes plutôt qu'avec les refus d'Astra. La seule
+combinaison qui met le registre en cause est celle où Astra a tourné, a lu, et
+a refusé.
+
 Si la sonde ne répond malgré tout rien, l'étape **s'arrête**. Elle ne suppose
 ni « registre illisible » — cela accuserait le registre d'une panne que
 personne n'a observée — ni « volume vierge », qui enchaînerait sur un amorçage
