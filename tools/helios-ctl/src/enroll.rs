@@ -106,6 +106,35 @@ pub struct OfflineInputs {
     pub address: String,
     /// Internal API URL, for telemetry only. Absent is fine.
     pub heliosd_url: Option<String>,
+    /// The §19 trust block, as `heliosd show-trust-enrolment` printed it.
+    ///
+    /// Offline there is no API to ask, and the values are not guessable: they
+    /// are the domain's anchors and this peer's generation. Absent, the
+    /// profile omits the block and Orion says renewal is unavailable — which
+    /// is true, and better than a button that fails at its last step.
+    pub trust_material: Option<PathBuf>,
+}
+
+/// Reads a trust block printed by `heliosd show-trust-enrolment`.
+///
+/// Validated here rather than at import: an operator running this command has
+/// the gateway in front of them, and a block that is wrong is one SSH call
+/// away from being reprinted. The same block discovered as invalid on a user's
+/// machine is a redeployment.
+fn read_trust_material(path: &Path) -> Result<orion_core::TrustMaterial> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("reading the trust block from {}", path.display()))?;
+    let material: orion_core::TrustMaterial = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "{} is not a trust block — it is what `heliosd show-trust-enrolment --public-key \
+             <clé>` prints",
+            path.display()
+        )
+    })?;
+    material
+        .validate()
+        .with_context(|| format!("the trust block in {} is unusable", path.display()))?;
+    Ok(material)
 }
 
 /// Gateway-side material a profile pins, however it was obtained.
@@ -258,6 +287,26 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
         None => admit(client, base, &options, &public_key, &client_material).await?,
     };
 
+    // The §19 trust block, read from the gateway once the peer is admitted —
+    // the generation it carries is that peer's, so it cannot be fetched
+    // earlier. Offline, there is nobody to ask: the document then omits it and
+    // Orion says so rather than offering a renewal that would fail at its last
+    // step.
+    let trust = match &options.offline {
+        Some(inputs) => match &inputs.trust_material {
+            Some(path) => Some(read_trust_material(path)?),
+            None => None,
+        },
+        None => api::trust_enrolment(client, base, &public_key).await?,
+    };
+    if trust.is_none() {
+        eprintln!(
+            "note : ce profil ne portera pas de matériel de confiance — cette gateway n'a pas de \
+             domaine amorcé (`heliosd init-trust-domain`). Le client se connectera, mais ne \
+             pourra pas renouveler son certificat."
+        );
+    }
+
     let encoder = base64::engine::general_purpose::STANDARD;
     let json = profile::render(profile::Profile {
         name: &options.name,
@@ -276,10 +325,7 @@ pub async fn run(client: &Client, base: &str, options: EnrollOptions) -> Result<
             gateway_ca_der: material.gateway_ca_der.clone(),
             gateway_pq_certificate: material.gateway_pq_certificate.clone(),
             identity: identity_name.clone(),
-            // Filled once the gateway exposes the per-peer trust enrollment
-            // document. Omitting it is explicit: Orion connects, but keeps
-            // renewal disabled and asks for a reissued complete profile.
-            trust: None,
+            trust,
         }),
         key_negotiation_identity: Some(orion_core::ClientIdentityBundle {
             identity: identity_name.clone(),
@@ -648,6 +694,7 @@ mod tests {
             gateway_pq_certificate: json.clone(),
             address: "100.64.1.2/32".into(),
             heliosd_url: None,
+            trust_material: None,
         };
         let material = offline_material(&inputs).expect("material read from the certificates");
         assert_eq!(material.server_name, "vpn.example.net");

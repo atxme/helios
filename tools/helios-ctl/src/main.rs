@@ -168,6 +168,13 @@ enum Cmd {
         /// URL de l'API interne, pour la seule télémétrie.
         #[arg(long)]
         heliosd_url: Option<String>,
+        /// Bloc de confiance §19, tel que `heliosd show-trust-enrolment` l'imprime.
+        ///
+        /// Sans lui le profil se connecte mais ne peut pas renouveler son
+        /// certificat, et Orion le dit. Les valeurs ne sont pas devinables :
+        /// ce sont les ancres du domaine et la génération de ce pair.
+        #[arg(long, requires = "gateway_certificate")]
+        trust_material: Option<PathBuf>,
     },
     /// Escrow of the gateway identity — **operator workstation**.
     ///
@@ -956,6 +963,7 @@ async fn main() -> Result<()> {
             gateway_pq_certificate,
             address,
             heliosd_url,
+            trust_material,
         } => {
             // Checked before the gateway is contacted: a missing CA must not
             // be discovered after a peer has been admitted.
@@ -969,6 +977,7 @@ async fn main() -> Result<()> {
                         gateway_pq_certificate,
                         address,
                         heliosd_url,
+                        trust_material,
                     })
                 }
                 // `requires` in the parser already rules out partial

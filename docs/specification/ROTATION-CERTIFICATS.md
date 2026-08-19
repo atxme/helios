@@ -2672,7 +2672,16 @@ contournés :
 - la **récupération d'une identité expirée** de bout en bout, qui dépend des
   deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
-  coordonnée du §13 ;
+  coordonnée du §13. Le **bloc de confiance**, lui, est livré : la gateway le
+  sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
+  `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose dans le document
+  — en ligne depuis l'API, hors ligne depuis `--trust-material` —, et
+  `provision-client.sh` le rapatrie à côté des deux certificats qu'il copie
+  déjà. Onze valeurs publiques lues sous un seul verrou : une époque prise à un
+  instant à côté d'une ancre prise à un autre épinglerait un couple qui n'a
+  jamais existé ensemble, et l'écart ne se verrait qu'au premier
+  renouvellement. Un profil émis avant ce lot n'en porte pas ; Orion le dit
+  plutôt que d'offrir un bouton qui échouerait à sa dernière étape ;
 - les **surfaces IHM** du §12.2, partiellement. Côté Orion, la destination
   *Certificats* existe : elle liste les quatre certificats par profil avec
   leurs échéances et leur phase 80/90/95 %, les quatre actions avec la raison

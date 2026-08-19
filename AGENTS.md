@@ -161,6 +161,15 @@ Restent ouverts :
   auteur. Reste que rien ne **dépose** encore de transaction, faute des routes
   §8.2 et d'un constructeur de manifeste côté Astra : un client en retard
   reçoit donc toujours `503`, jamais un « à jour » qui l'arrêterait pour de bon.
+  Le **bloc de confiance du §19 est enfin porté par le document** : la gateway
+  le sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
+  `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose — en ligne depuis
+  l'API, hors ligne depuis `--trust-material` —, et `provision-client.sh` le
+  rapatrie à côté des deux certificats qu'il copie déjà. Onze valeurs publiques
+  lues sous un seul verrou : une époque prise à un instant à côté d'une ancre
+  prise à un autre épinglerait un couple qui n'a jamais existé ensemble.
+  **Un profil émis avant ce lot n'en porte pas** — il se connecte, mais Orion
+  refuse le renouvellement en le disant ; il faut le réémettre.
   Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
   `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
   `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en

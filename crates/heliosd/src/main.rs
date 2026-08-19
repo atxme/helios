@@ -130,6 +130,23 @@ enum Command {
         #[arg(long)]
         webauthn_rp_id: String,
     },
+    /// Prints the trust block a client's profile must carry (spec §19).
+    ///
+    /// Read from the certificate registry in one pass, and printed as the
+    /// JSON an Orion profile embeds verbatim. Eleven public values: anchors,
+    /// epochs, the Astra origin and the generation this peer is at. None is
+    /// secret, and none is meant to be retyped — a value pasted wrong here
+    /// fails months later, at 80 % of a leaf's life, on a client with no
+    /// fallback.
+    ///
+    /// Exists beside the API route because an enrolment happens **before** the
+    /// client has a tunnel, and `provision-client.sh` reaches this gateway over
+    /// SSH rather than over the admin API.
+    ShowTrustEnrolment {
+        /// The peer's WireGuard public key, base64, as it was admitted.
+        #[arg(long)]
+        public_key: String,
+    },
     /// Creates this gateway's end of the private Astra veth channel (§8.3).
     ///
     /// It generates a transport identity — a service identity, unrelated to
@@ -349,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             let network = NetworkConfig::load().context("loading the network config")?;
             init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
         }
+        Command::ShowTrustEnrolment { public_key } => show_trust_enrolment(&public_key),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -667,6 +685,42 @@ fn init_astra_channel(
 /// their machine inside `astra-signer`, and the Astra service key inside the
 /// container. Neither is derivable here, and confirming them out of band is
 /// the point (ADR-008 §3).
+/// Prints one peer's §19 trust block, as an Orion profile embeds it.
+///
+/// JSON on stdout and nothing else, so a script can capture it into a file:
+/// `provision-client.sh` carries it beside the two gateway certificates it
+/// already copies. The same block the admin API serves, from the same reading
+/// of the same registry — a second shape here would be a second thing to keep
+/// equal by hand.
+fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
+    use aether::certificates::encoding::WireGuardKey;
+    use helios_provisioning::certificates::CertificateRegistry;
+
+    let path = CertificateRegistry::path();
+    let registry = CertificateRegistry::load(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this gateway has no trust domain: run `heliosd init-trust-domain` first. An \
+                 absent registry is not an empty one — the lifecycle routes stay closed."
+            )
+        })?;
+    let key = WireGuardKey::parse(public_key.trim())
+        .map_err(|error| anyhow::anyhow!("invalid WireGuard public key: {error}"))?;
+    let peer = registry.peer(&key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no such peer in the certificate registry — admit it first, with `heliosd peer add` \
+             or `helios-ctl peer add`"
+        )
+    })?;
+    let view = certificates::enrolment_view(registry.state(), peer);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).context("encoding the trust block")?
+    );
+    Ok(())
+}
+
 fn init_trust_domain(
     trust_domain_id: &str,
     ca_public_key: &str,

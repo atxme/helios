@@ -384,6 +384,40 @@ fn caller_is_current(
             .matches(&peer.state.active.pq_certificate_fingerprint))
 }
 
+/// The §19 trust block for one peer, from one reading of the registry.
+///
+/// A free function over the persisted state, like [`caller_is_current`] and
+/// for the same reason: it can then be exercised without a runtime, a lock or
+/// a signer — and the values it copies are exactly the ones a profile pins for
+/// years.
+pub fn enrolment_view(
+    state: &helios_provisioning::certificates::RegistryState,
+    peer: &helios_provisioning::certificates::PeerCertificates,
+) -> helios_api::certificates::TrustEnrolmentView {
+    use base64::Engine as _;
+
+    let encoder = base64::engine::general_purpose::STANDARD;
+    helios_api::certificates::TrustEnrolmentView {
+        trust_domain_id: state.trust_domain_id.to_hex(),
+        ca_epoch: state.gateway.ca_epoch,
+        ca_pq_public_key: state.gateway.current_ca_public_key.to_base64(),
+        ca_tls_epoch: state.client_tls_ca.ca_tls_epoch,
+        client_tls_ca_der: encoder.encode(
+            state
+                .client_tls_ca
+                .active_client_tls_ca_certificate
+                .as_bytes(),
+        ),
+        client_generation: peer.state.active.generation,
+        astra_authority_url: state.astra.authority_url.clone(),
+        webauthn_rp_id: state.astra.webauthn_rp_id.clone(),
+        astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),
+        credential_registry_epoch: state.astra.credential_registry_epoch,
+        astra_service_key_epoch: state.astra.astra_service_key_epoch,
+        astra_service_public_key: state.astra.active_astra_service_public_key.to_base64(),
+    }
+}
+
 /// Maps a registry refusal to the bounded class the API may report.
 ///
 /// The detail goes to the protected log. A peer learns only the class, exactly
@@ -402,6 +436,26 @@ fn classify(error: RegistryError) -> TrustUpdateRefusal {
 
 #[async_trait]
 impl TrustUpdateHandler for CertificateService {
+    /// The public trust material a profile must carry for one peer (spec §19).
+    ///
+    /// Every value is read from the registry in one lock, and that matters: an
+    /// epoch taken from one moment beside an anchor from another would produce
+    /// a profile that pins a pair which never existed together, and the
+    /// mismatch would only surface at the first renewal — 80 % into a leaf's
+    /// life, on a client with no fallback.
+    async fn trust_enrolment(
+        &self,
+        peer_wg_public_key: &str,
+    ) -> Result<helios_api::certificates::TrustEnrolmentView, TrustUpdateRefusal> {
+        let peer_key =
+            WireGuardKey::parse(peer_wg_public_key).map_err(|_| TrustUpdateRefusal::Rejected)?;
+        let registry = self.registry.lock().await;
+        let peer = registry
+            .peer(&peer_key)
+            .ok_or(TrustUpdateRefusal::Rejected)?;
+        Ok(enrolment_view(registry.state(), peer))
+    }
+
     async fn trust_update(
         &self,
         caller_wg_public_key: &str,
@@ -598,7 +652,14 @@ mod tests {
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 2,
-                active_client_tls_ca_certificate: DerCertificate::new(vec![2; 64]).expect("der"),
+                // A genuine anchor, not a stub: the enrolment block ships this
+                // certificate to every client, and Orion parses it at import.
+                // A placeholder here would let the block pass these tests and
+                // be refused on the machine it was emitted for.
+                active_client_tls_ca_certificate: aether::certificates::test_x509::client_material(
+                    "workstation",
+                )
+                .authority,
                 next_client_tls_ca_certificate: None,
                 next_transition_fingerprint: None,
                 activation_at: None,
@@ -665,6 +726,39 @@ mod tests {
             active_client_pq_certificate_fingerprint: peer.state.active.pq_certificate_fingerprint,
             client_pq_certificate_fingerprint: Fingerprint::of(b"presented"),
         }
+    }
+
+    /// The block a profile carries is exactly what the registry holds, and it
+    /// is readable by the consumer that will use it. Eleven values copied by
+    /// hand between two shells is eleven places to paste the wrong one, and
+    /// the failure surfaces months later at 80 % of a leaf's life.
+    #[test]
+    fn the_enrolment_block_is_the_registry_and_orion_accepts_it() {
+        let state = state();
+        let peer = peer();
+        let view = enrolment_view(&state, &peer);
+
+        assert_eq!(view.trust_domain_id, state.trust_domain_id.to_hex());
+        assert_eq!(view.ca_epoch, state.gateway.ca_epoch);
+        assert_eq!(
+            view.ca_pq_public_key,
+            state.gateway.current_ca_public_key.to_base64()
+        );
+        assert_eq!(view.ca_tls_epoch, state.client_tls_ca.ca_tls_epoch);
+        assert_eq!(view.client_generation, peer.state.active.generation);
+        assert_eq!(
+            view.astra_service_public_key,
+            state.astra.active_astra_service_public_key.to_base64()
+        );
+
+        // The consumer is the judge: a block this gateway serves and Orion
+        // refuses is a profile that cannot renew, discovered on the client.
+        let material: orion_core::TrustMaterial =
+            serde_json::from_value(serde_json::to_value(&view).expect("encode"))
+                .expect("Orion reads what the gateway serves");
+        material
+            .validate()
+            .expect("Orion accepts what the gateway serves");
     }
 
     #[test]

@@ -330,6 +330,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health::health))
         .route("/api/network", get(routes::network_get))
         .route("/api/key-negotiation", get(routes::key_negotiation_get))
+        // What a profile must carry for its holder to renew (spec §19). An
+        // operator read, on the admin surface: it is consulted while the
+        // client is being enrolled, hence before it has any tunnel.
+        .route(
+            "/api/key-negotiation/trust-enrolment/:public_key",
+            get(certificates::trust_enrolment),
+        )
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .merge(admin)
         .merge(authenticated_peer)

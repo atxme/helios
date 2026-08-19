@@ -374,6 +374,16 @@ sed -n 's/^[[:space:]]*key_negotiation_port[[:space:]]*=[[:space:]]*\([0-9][0-9]
 
 cp /var/lib/helios/key-negotiation-cert.der "\$DEPOT/gw-cert.der"
 cp /var/lib/helios/key-negotiation-pq-cert.json "\$DEPOT/gw-pq-cert.json"
+
+# Le bloc de confiance du §19, sans lequel le client se connecte mais ne peut
+# pas renouveler son certificat. Il se lit apres l'admission : il porte la
+# generation de CE pair. Une gateway sans domaine amorce n'en a pas — ce n'est
+# pas une erreur, le fichier reste absent et l'enrolement le dit.
+if ! "\$HELIOSD" show-trust-enrolment --public-key '$WG_PUBLIQUE' \
+        > "\$DEPOT/trust.json" 2>"\$DEPOT/trust.err"; then
+    rm -f "\$DEPOT/trust.json"
+    echo "-- pas de bloc de confiance : \$(tail -1 "\$DEPOT/trust.err")"
+fi
 # Rendus au compte qui a lance sudo : scp les reprendra sans privilege.
 # Ni backticks ni \$(...) dans ce heredoc : il n'est pas quote — il ne peut pas
 # l'etre, les valeurs locales doivent s'y substituer — donc tout backtick y
@@ -394,6 +404,9 @@ scp -q "$CIBLE:$DEPOT/peer.txt" "$TRAVAIL/peer.txt"
 scp -q "$CIBLE:$DEPOT/port.txt" "$TRAVAIL/port.txt"
 scp -q "$CIBLE:$DEPOT/gw-cert.der" "$TRAVAIL/gw-cert.der"
 scp -q "$CIBLE:$DEPOT/gw-pq-cert.json" "$TRAVAIL/gw-pq-cert.json"
+# Absent quand la gateway n'a pas de domaine de confiance : `scp` échoue, et
+# c'est un cas légitime, pas une panne.
+scp -q "$CIBLE:$DEPOT/trust.json" "$TRAVAIL/trust.json" 2>/dev/null || true
 ssh "$CIBLE" "rm -rf -- '$DEPOT'"
 
 VIP="$(tr -d '\r' < "$TRAVAIL/peer.txt" | cut -f2)"
@@ -417,6 +430,17 @@ echo "    négociation $NEGOCIATION"
 [ -s "$TRAVAIL/gw-cert.der" ] || { echo "certificat TLS de la gateway vide" >&2; exit 1; }
 [ -s "$TRAVAIL/gw-pq-cert.json" ] || { echo "certificat PQ de la gateway vide" >&2; exit 1; }
 
+# Le bloc de confiance est facultatif : une gateway sans domaine amorcé en
+# produit aucun, et le client se connecte quand même — il ne pourra simplement
+# pas renouveler son certificat, ce qu'Orion affiche.
+ARG_CONFIANCE=()
+if [ -s "$TRAVAIL/trust.json" ]; then
+    ARG_CONFIANCE=(--trust-material "$TRAVAIL/trust.json")
+    echo "    matériel de confiance présent : le renouvellement sera disponible"
+else
+    echo "    aucun domaine de confiance sur la gateway : profil sans renouvellement"
+fi
+
 # ── 6. Enrôlement ────────────────────────────────────────────────────────────
 # Retiré juste avant l'écriture, jamais plus tôt : un échec entre l'annonce et
 # ici laisserait l'opérateur sans profil ancien ni profil neuf.
@@ -434,7 +458,7 @@ echo "==> Enrôlement"
     --gateway-certificate "$TRAVAIL/gw-cert.der" \
     --gateway-pq-certificate "$TRAVAIL/gw-pq-cert.json" \
     --address "$VIP" \
-    --output "$PROFIL" "${ARG_TRAFIC[@]}"
+    --output "$PROFIL" "${ARG_TRAFIC[@]}" "${ARG_CONFIANCE[@]}"
 
 echo
 echo "==> Profil écrit : $PROFIL"

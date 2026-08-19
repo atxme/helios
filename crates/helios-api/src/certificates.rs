@@ -108,6 +108,63 @@ pub enum TrustUpdateRefusal {
     Internal,
 }
 
+/// What a client needs in order to renew its own identity (spec §19).
+///
+/// Everything here is public: anchors, epochs and URLs. It is what an Orion
+/// profile has to carry so that `certificate_renewal` can seed a trust store
+/// without asking the network for it — a seed fetched at renewal time would be
+/// a seed an attacker chooses.
+///
+/// Read from the gateway's registry rather than typed by an operator: eleven
+/// values copied by hand between two shells is eleven places to paste the
+/// wrong one, and the failure surfaces months later at 80 % of a leaf's life.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustEnrolmentView {
+    pub trust_domain_id: String,
+    pub ca_epoch: u64,
+    pub ca_pq_public_key: String,
+    pub ca_tls_epoch: u64,
+    pub client_tls_ca_der: String,
+    /// Generation the named peer's identity is at, right now.
+    pub client_generation: u64,
+    pub astra_authority_url: String,
+    pub webauthn_rp_id: String,
+    pub astra_policy_fingerprint: String,
+    pub credential_registry_epoch: u64,
+    pub astra_service_key_epoch: u64,
+    pub astra_service_public_key: String,
+}
+
+/// `GET /api/key-negotiation/trust-enrolment/:public_key`, on the admin
+/// surface.
+///
+/// `404` and not an empty body, for the same reason `/api/key-negotiation`
+/// answers `404`: a tool handed `null` would have to guess between "no trust
+/// domain on this gateway", "this peer is not admitted" and "read failure",
+/// and would emit a profile that cannot renew without saying so.
+pub async fn trust_enrolment(
+    State(s): State<AppState>,
+    axum::extract::Path(public_key): axum::extract::Path<String>,
+) -> Response {
+    let Some(handler) = s.trust_update.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this gateway has no trust domain — run `heliosd init-trust-domain`",
+        )
+            .into_response();
+    };
+    match handler.trust_enrolment(public_key.trim()).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(TrustUpdateRefusal::Rejected) => (
+            StatusCode::NOT_FOUND,
+            "no such admitted peer in the certificate registry",
+        )
+            .into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
 /// The gateway side of a trust update, implemented by the daemon.
 ///
 /// A trait for the same reason the PSK release is one: the API process must
@@ -115,6 +172,17 @@ pub enum TrustUpdateRefusal {
 /// an authenticated request to whatever owns the serializer.
 #[async_trait]
 pub trait TrustUpdateHandler: Send + Sync {
+    /// The public trust material a profile must carry for `peer` (spec §19).
+    ///
+    /// On the **admin** surface, not in the tunnel: it is read while a client
+    /// is being enrolled, which is by definition before that client has a
+    /// tunnel. Nothing here is secret, so no peer resolution guards it — what
+    /// guards it is `admin_iface`, like every other operator read.
+    async fn trust_enrolment(
+        &self,
+        peer_wg_public_key: &str,
+    ) -> Result<TrustEnrolmentView, TrustUpdateRefusal>;
+
     /// `caller_wg_public_key` is the identity `require_peer` resolved from the
     /// source address — the trusted one. The request's own copy is only ever
     /// compared against it.
@@ -489,6 +557,13 @@ mod tests {
 
     #[async_trait]
     impl TrustUpdateHandler for SpyHandler {
+        async fn trust_enrolment(
+            &self,
+            _peer_wg_public_key: &str,
+        ) -> Result<TrustEnrolmentView, TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
         async fn trust_update(
             &self,
             caller_wg_public_key: &str,
