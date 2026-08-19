@@ -373,6 +373,70 @@ pub fn assert_csr_matches(
     Ok(())
 }
 
+/// Signing side: the material a client generates before asking to be renewed.
+///
+/// Kept in `aether` rather than in Orion because the shape of the request is
+/// not the client's to choose. `CA-TLS` will only certify a leaf whose
+/// `keyUsage` and `extendedKeyUsage` are the ones [`assert_client_leaf`]
+/// checks for, and a CSR built a hundred lines away from that check drifts
+/// from it silently — the divergence surfaces as a refusal from the authority
+/// at 80 % of a leaf's life, with nothing on the client naming the field that
+/// is wrong.
+#[cfg(feature = "key-negotiation-signing")]
+mod signing {
+    use super::*;
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    use zeroize::Zeroizing;
+
+    /// A fresh TLS key pair and the PKCS#10 request that proves possession.
+    ///
+    /// The private half never leaves the process that will hold the resulting
+    /// certificate: the CSR is what travels, and it carries only the public
+    /// key and a self-signature over it.
+    pub struct ClientRotationCsr {
+        /// PKCS#10, DER — what goes into the rotation request.
+        pub csr: DerCertificate,
+        /// PKCS#8, DER. **Secret.**
+        pub private_key_der: Zeroizing<Vec<u8>>,
+    }
+
+    /// Builds the CSR for a client leaf renewal (spec §7.1).
+    ///
+    /// `subject` is the common name the operator admitted this client under.
+    /// It is carried through unchanged: the authority decides what the leaf
+    /// finally says, and a client that renamed itself here would be asking for
+    /// a different identity rather than for a new certificate.
+    pub fn client_rotation_csr(subject: &str) -> Result<ClientRotationCsr, CertificateError> {
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return Err(CertificateError::InvalidX509("empty CSR subject"));
+        }
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|_| CertificateError::InvalidX509("CSR parameters"))?;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, subject);
+        params.distinguished_name = name;
+
+        let key = KeyPair::generate().map_err(|_| CertificateError::Signing)?;
+        let csr = params
+            .serialize_request(&key)
+            .map_err(|_| CertificateError::Signing)?;
+        Ok(ClientRotationCsr {
+            csr: DerCertificate::new(csr.der().to_vec())?,
+            private_key_der: Zeroizing::new(key.serialize_der()),
+        })
+    }
+}
+
+#[cfg(feature = "key-negotiation-signing")]
+pub use signing::{client_rotation_csr, ClientRotationCsr};
+
 #[cfg(test)]
 mod tests {
     use super::*;

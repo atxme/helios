@@ -1036,3 +1036,86 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// The relayed renewal, as Orion sees it (spec §8.1.2).
+// ---------------------------------------------------------------------------
+//
+// These three live here rather than in `helios-api` because both ends parse
+// them: the gateway serves them on the four in-tunnel routes, and Orion reads
+// them off the wire. A second definition on the client side is a wire contract
+// that two crates would have to be kept equal by hand, and the way that fails
+// is silent — a field added on one side is simply dropped by the other, or
+// refused by `deny_unknown_fields` with nothing naming which field.
+//
+// The private-link envelopes stay in `helios-api`: `caller_wg_public_key` is
+// the gateway's own resolution of the peer, so an Orion has no business
+// holding a type that carries it.
+
+/// Where a renewal operation stands, as the authority reports it (spec §8.2).
+///
+/// Deliberately not [`super::status::CertificateStatus`]: that
+/// enum describes a **certificate**, and until an operator has approved
+/// anything there is no candidate certificate to describe. This describes the
+/// operation, which is what `awaiting_operator` is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientRenewalOperationState {
+    /// Prepared past the 80 % threshold and waiting for a hardware credential.
+    /// Nothing is issued and no candidate exists.
+    AwaitingOperator,
+    /// The operator approval is persisted and Astra is issuing or replaying
+    /// the exact staging authorization towards the gateway. A restart resumes
+    /// this state under the same operation identifier.
+    PendingGrant,
+    /// The gateway persisted the candidate and signed its receipt; the grant
+    /// is available and the client has yet to commit it.
+    PendingCommit,
+    /// The operation ended without a grant. No further assertion is accepted
+    /// under this identifier — the client opens a new one.
+    Failed,
+}
+
+/// What the authority answers about one operation.
+///
+/// The two capability tokens are minted for **this** read and live five
+/// minutes at most (spec §8.2). The client that owns the operation hands them
+/// to the companion; they confer nothing outside that operation, that manifest
+/// and that scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRenewalOperationView {
+    pub operation_id: Id16,
+    pub state: ClientRenewalOperationState,
+    pub client_wg_public_key: WireGuardKey,
+    pub request_fingerprint: Fingerprint,
+    /// SHA-256 of the signed approval request the companion will be shown —
+    /// the manifest the capability tokens are bound to.
+    pub operation_manifest_fingerprint: Fingerprint,
+    pub created_at: u64,
+    pub expires_at: u64,
+    /// Bearer token for the companion's read route, absent once the operation
+    /// no longer accepts one.
+    pub signer_request_token: Option<String>,
+    /// Bearer token for the companion's submission route. Reusing it for the
+    /// identical result is idempotent; another body under the operation is a
+    /// conflict decided by Astra's persisted operation record.
+    pub signer_result_token: Option<String>,
+    /// Present only in [`ClientRenewalOperationState::PendingCommit`].
+    pub grant: Option<Box<super::client::ClientCertificateRotationGrant>>,
+}
+
+/// What the companion fetches, and everything it needs in order to answer.
+///
+/// No private material: the approval request is signed by the Astra service
+/// key the companion already pins, and the WebAuthn challenge is **derived**
+/// from it rather than carried beside it — which is what stops an assertion
+/// from being moved to another operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRenewalSignerRequest {
+    pub operation_id: Id16,
+    pub approval_request: Box<super::approval::AstraCredentialApprovalRequest>,
+    pub authority_url: String,
+    pub webauthn_rp_id: String,
+}

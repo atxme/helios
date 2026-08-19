@@ -34,8 +34,12 @@
 //!
 //! That material now has a home — `KeyNegotiationSettings::trust`, carried by
 //! the `.orion` document and the vault manifest — so a profile enrolled since
-//! §19 holds it. What remains is the client half of the §7 exchange itself,
-//! and [`CertificateActionBlock::RenewalPathNotWired`] names that instead.
+//! §19 holds it, and [`crate::certificate_renewal`] now signs the request,
+//! drives the operation and commits the grant. What is still missing is one
+//! step further out and is nobody's fault on this side: the operator's
+//! companion cannot fetch its own approval request through the tunnel, so an
+//! opened renewal parks on `awaiting_operator` and expires there.
+//! [`CertificateActionBlock::CompanionTransportMissing`] names that.
 //!
 //! Either way the refusal happens **before** a key pair is generated or an
 //! authority is asked to certify anything: a button that produced a key and
@@ -107,8 +111,9 @@ pub enum CertificateActionBlock {
     /// The profile carries no trust domain, no Astra authority and no client
     /// `CA-TLS`: §19's discriminant.
     TrustMaterialMissing,
-    /// The trust material is there; the client half of §7 is not wired yet.
-    RenewalPathNotWired,
+    /// The trust material is there and the client half of §7 is wired; what
+    /// is missing is the operator companion's own transport.
+    CompanionTransportMissing,
     /// Needs a hardware credential and the `astra-signer` companion.
     OperatorCredentialRequired,
 }
@@ -149,10 +154,12 @@ impl CertificateActionBlock {
                  document réémis, qui les portera."
                     .into()
             }
-            Self::RenewalPathNotWired => {
-                "Ce profil porte bien son matériel de confiance, mais le chemin de \
-                 renouvellement du §7 — requête au délégué Astra, staging relayé à la gateway, \
-                 commit du grant — n'est pas encore branché côté client."
+            Self::CompanionTransportMissing => {
+                "Ce profil peut demander son renouvellement : la requête part, l'autorité ouvre \
+                 l'opération et attend la clé matérielle de l'opérateur. C'est là que la chaîne \
+                 s'arrête — le compagnon « astra-signer » ne sait pas encore lire sa demande à \
+                 travers le tunnel, et ses routes publiques répondent 501. Le renouvellement \
+                 reste donc en attente d'opérateur jusqu'à ce que ce transport existe."
                     .into()
             }
             Self::OperatorCredentialRequired => {
@@ -211,7 +218,13 @@ fn renewal_block(
     if settings.trust.is_none() {
         return Some(CertificateActionBlock::TrustMaterialMissing);
     }
-    Some(CertificateActionBlock::RenewalPathNotWired)
+    // Everything the client owns is in place: `certificate_renewal` signs the
+    // rotation request, drives the operation and commits the grant. What still
+    // cannot happen is step 4 — the operator's companion has no way to fetch
+    // its own request through the tunnel. Pressing the button would open an
+    // operation that parks on `awaiting_operator` and expires, so the refusal
+    // names that instead of producing a renewal nobody can finish.
+    Some(CertificateActionBlock::CompanionTransportMissing)
 }
 
 /// Whether anything this profile depends on has already expired.
@@ -449,7 +462,7 @@ mod tests {
                 CertificateAction::RenewNow
             )
             .blocked_by,
-            Some(CertificateActionBlock::RenewalPathNotWired)
+            Some(CertificateActionBlock::CompanionTransportMissing)
         );
     }
 

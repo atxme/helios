@@ -2530,6 +2530,22 @@ libellé ambigu « Renouveler ».
 - `orion-core::certificates` : ancre, slots, planificateur dispersé stable,
   vérification complète d'une transaction chunkée et application par une seule
   écriture, révocations différées appliquées à leur instant.
+- `orion-core::certificate_renewal` : la **moitié cliente** du §8.1.2. Les
+  deux clés candidates naissent dans le processus et n'en sortent pas — ce qui
+  voyage est une PKCS#10 et une clé publique, chacune couverte par une
+  signature de la moitié privée correspondante. La requête est bâtie depuis le
+  magasin de confiance et depuis rien d'autre, signée deux fois (continuité par
+  la génération sortante, possession par celle qui demande à être certifiée),
+  puis remise à la route `request`. L'interrogation de l'opération refuse une
+  vue qui nomme une autre demande, un autre pair ou un autre identifiant.
+  À l'arrivée du grant, la vérification passe **avant** toute écriture : elle
+  lie le grant à la requête locale, et `assert_csr_matches` refuse une leaf qui
+  certifierait une clé que cette machine ne détient pas. Le candidat est
+  ensuite persisté en `pending_commit`, le commit signé part, et seul son
+  succès promeut le slot en `next`. Une interruption ne laisse donc rien : ni
+  identité à demi scellée, ni clé orpheline, ni slot nommant un certificat sans
+  clé privée. Le prix est qu'un arrêt perd les clés candidates et rouvre
+  l'opération — l'échec bon marché, la génération active étant intacte.
 - `astra::vault` et `astra-signer` : coffre maître HVLT, key-slots FIDO2
   `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove`,
   `rename`, `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
@@ -2538,7 +2554,8 @@ libellé ambigu « Renouveler ».
   aucun secret de slot et produit une assertion WebAuthn vérifiable ; les deux
   couches AES-256-GCM, HKDF-SHA-256, sels, contextes et AAD sont celles figées
   au §2.4.1.
-- la **moitié serveur du renouvellement relayé** : les routes Orion → Helios
+- la **moitié serveur du renouvellement relayé**, et sa moitié cliente : les
+  routes Orion → Helios
   authentifient la VIP, Helios relaie des objets typés vers Astra, Astra
   persiste `awaiting_operator`, puis l'approbation et les octets exacts du
   stage avant émission. L'autorisation et le reçu restent sur le veth, le grant
@@ -2602,7 +2619,13 @@ contournés :
   répondent encore `501`. Le backend privé du renouvellement ordinaire accepte
   et vérifie déjà le résultat relayé, et l'émetteur délégué n'émet rien avant
   cette preuve YubiKey ; en revanche le binaire `astra-signer` ne sait pas
-  encore utiliser `heliosd_url`, et Orion ne sait pas encore le lancer ;
+  encore utiliser `heliosd_url`, et Orion ne sait pas encore le lancer.
+  **C'est désormais le seul maillon manquant du renouvellement ordinaire** :
+  les deux bouts du §8.1.2 existent et se vérifient l'un l'autre, et une
+  demande ouverte s'arrête sur `awaiting_operator` faute de pouvoir présenter
+  sa demande à une clé matérielle. `certificate_actions` le dit en toutes
+  lettres plutôt que d'offrir un bouton qui ouvrirait une opération que
+  personne ne peut achever ;
 - la **distribution des objets de transition** par `trust-update`. Le canal
   privé bidirectionnel des §§8.1.2 et 8.3 est livré. Ce qui manque est la
   distribution des transitions elles-mêmes : la gateway ne détient aucun

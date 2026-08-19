@@ -94,4 +94,12 @@ certificate-signing = ["aether/key-negotiation-signing"]
 
 [dev-dependencies]
 tempfile = "3"
+# Fixtures only. The renewal path is tested against a **real** CA-TLS issuing a
+# **real** leaf from the CSR the client produced: a grant carrying a hand-made
+# certificate would pass the checks that matter — the CSR binding above all —
+# without ever proving them.
+rcgen = { workspace = true }
+# `CertificateParams::not_before` is an `OffsetDateTime`; rcgen exposes the type
+# without re-exporting the crate that defines it.
+time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

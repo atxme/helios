@@ -106,8 +106,9 @@ Restent ouverts :
   transport, qui passe encore par des fichiers — les routes publiques à jeton
   de capacité du §8.2 répondent `501`, et le binaire ne sait pas encore
   utiliser les routes privées relayées par `heliosd_url`. Le backend Astra
-  vérifie et consomme déjà une approbation relayée avant toute émission, mais
-  Orion ne peut pas encore piloter cette cérémonie. Le veth privé est
+  vérifie et consomme déjà une approbation relayée avant toute émission, et
+  Orion pilote l'opération de bout en bout — ce qu'il ne sait pas faire, c'est
+  lancer le compagnon. Le veth privé est
   livré **dans ses deux sens**, confiné par le ruleset (`astra0`, adresses et
   ports exacts) : Astra → Helios en 8444 porte le staging, le reçu et la leaf
   servie que la gateway relit sur demande ; Helios → Astra en 8445 porte le
@@ -120,9 +121,23 @@ Restent ouverts :
   en-têtes du client. Côté Astra, le seuil de 80 % ouvre une opération
   `awaiting_operator` qui ne détient aucun certificat, et rien n'est émis avant
   qu'une assertion réponde au challenge exact de cette opération.
+  Le **client de renouvellement Orion** existe aussi : `orion-core::certificate_renewal`
+  fait naître les deux clés candidates dans le processus, signe la requête de
+  rotation deux fois — continuité par la génération sortante, possession par
+  celle qui demande à être certifiée —, pilote l'opération et, au retour du
+  grant, le vérifie **avant toute écriture** contre ce que le magasin épingle
+  déjà. Orion étant le bout qui ne voit jamais l'autorisation de staging, il
+  pose son candidat depuis le grant (`stage_from_grant`), directement en
+  `pending_commit` : sur ce bout il n'existe aucun instant antérieur. Le slot
+  ne devient `next` qu'après confirmation de la gateway, donc une interruption
+  ne laisse ni identité à demi scellée, ni clé orpheline, ni slot nommant un
+  certificat sans clé privée.
   Restent ouverts : le **transport des documents du compagnon** (routes §8.2
-  en `501`, donc copie de fichiers), la récupération d'une identité expirée, le
-  discriminant de profil Orion et la bascule du §13, et les deux surfaces IHM.
+  en `501`, donc copie de fichiers) — désormais le **seul** maillon manquant du
+  renouvellement ordinaire, les deux bouts du §8.1.2 se vérifiant l'un l'autre
+  et une demande ouverte s'arrêtant sur `awaiting_operator` —, la récupération
+  d'une identité expirée, le discriminant de profil Orion et la bascule du §13,
+  et les deux surfaces IHM.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
@@ -673,6 +688,12 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `helios-update` : mises à jour applicatives signées (ADR-003).
 - `heliosd` : orchestration gateway.
 - `orion-core` / `apps/orion` : cœur client et shell Tauri React.
+  `orion-core::certificate_renewal` y tient la moitié cliente du §8.1.2 :
+  génération des clés candidates, requête de rotation signée deux fois,
+  pilotage de l'opération, vérification du grant **avant** toute écriture, pose
+  du candidat depuis ce grant — jamais depuis l'autorisation de staging, qu'un
+  client ne voit pas — et commit. Rien n'est écrit tant que le grant n'a pas
+  vérifié, donc une interruption ne laisse aucun état à recoller.
 - `xtask` : fabrique de bundles d’installation (poste de build, jamais la
   gateway) — `cargo xtask bundle`, `cargo xtask pack`, et
   `cargo xtask orion-msi` pour l’installateur Windows (même commande que la CI

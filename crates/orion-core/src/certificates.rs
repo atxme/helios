@@ -46,13 +46,13 @@
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
-    client::ClientCertificateGeneration,
-    encoding::{Fingerprint, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
+    client::{ClientCertificateGeneration, ClientCertificateRotationGrant},
+    encoding::{Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey},
     gateway::{pq_certificate_fingerprint, GatewayIdentityTransition},
     revocation::RevocationScope,
     state::{
         base_state_fingerprint, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome, TrustLedger, TrustSnapshot,
+        GatewayCertificateState, InstallOutcome, PendingStageState, TrustLedger, TrustSnapshot,
     },
     status::{AstraCertificateStatus, CertificateKind},
     transport::{
@@ -453,6 +453,58 @@ impl TrustStore {
         self.write(&candidate)?;
         self.state = candidate;
         Ok(applied)
+    }
+
+    /// Persists a candidate whose grant the caller has already verified.
+    ///
+    /// **Orion stages from the grant**, not from the staging authorization:
+    /// the §0.5 amendment keeps `ClientCertificateStageAuthorization` on the
+    /// Astra–Helios veth, and a client never carries one. What the grant
+    /// embeds is the receipt the gateway signed over that authorization, so
+    /// the stage identifier, its fingerprint and its lease are attested rather
+    /// than asserted.
+    ///
+    /// The verification is deliberately the caller's: it needs the rotation
+    /// request, which only the session that signed it holds, and this store
+    /// has no business keeping a copy of a signed object it did not produce.
+    /// See [`crate::certificate_renewal`].
+    pub fn stage_verified_grant(
+        &mut self,
+        grant: &ClientCertificateRotationGrant,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, TrustError> {
+        let mut candidate = self.state.clone();
+        let outcome =
+            candidate
+                .certificates
+                .stage_from_grant(grant, &candidate.ledger, now_unix)?;
+        self.write(&candidate)?;
+        self.state = candidate;
+        Ok(outcome)
+    }
+
+    /// Turns the pending candidate into `next`, once the gateway confirmed.
+    ///
+    /// `PendingCommit` is passed explicitly rather than accepted from whatever
+    /// the slot holds: the two ends commit from different states, and a client
+    /// that adopted the gateway's rule would commit a candidate before the
+    /// grant that releases it ever arrived.
+    pub fn commit_staged_candidate(
+        &mut self,
+        stage_id: &Id16,
+        commit_fingerprint: &Fingerprint,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, TrustError> {
+        let mut candidate = self.state.clone();
+        let outcome = candidate.certificates.commit(
+            stage_id,
+            commit_fingerprint,
+            PendingStageState::PendingCommit,
+            now_unix,
+        )?;
+        self.write(&candidate)?;
+        self.state = candidate;
+        Ok(outcome)
     }
 
     /// Applies an offline `orion-trust-update` document (spec §8.4).

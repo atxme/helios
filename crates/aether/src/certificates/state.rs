@@ -43,7 +43,10 @@ use super::{
         AstraIssuerAuthorization, AstraServiceKeyTransition, CaTransition, ClientTlsCaTransition,
         EmergencyAstraServiceKeyReplacement,
     },
-    client::{ClientCertificateGeneration, ClientCertificateStageAuthorization},
+    client::{
+        ClientCertificateGeneration, ClientCertificateRotationGrant,
+        ClientCertificateStageAuthorization,
+    },
     encoding::{
         CanonicalBytes, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, TrustDomainId,
         WireGuardKey,
@@ -727,6 +730,74 @@ impl ClientCertificateState {
             state: PendingStageState::PendingGrant,
             stage_expires_at: authorization.stage_expires_at,
             window: authorization.window,
+        });
+        Ok(InstallOutcome::Installed)
+    }
+
+    /// Persists a candidate from the **grant**, as Orion does (spec §8.1.2).
+    ///
+    /// The two ends stage from different documents, and that asymmetry is the
+    /// §0.5 amendment rather than an accident: `ClientCertificateStageAuthorization`
+    /// travels Astra → Helios on the veth and Orion never carries it. What
+    /// Orion holds is the grant, and the grant embeds the receipt the gateway
+    /// signed over that authorization — so the stage identifier, the
+    /// authorization fingerprint and the lease are all attested here, none of
+    /// them taken on the client's word.
+    ///
+    /// The candidate lands directly in [`PendingStageState::PendingCommit`]:
+    /// on this end there is no earlier moment. A client holds no candidate at
+    /// all until the grant exists, and `pending_grant` would describe a state
+    /// Orion is never in.
+    ///
+    /// The caller must have verified the grant first. This installs; it does
+    /// not authenticate.
+    pub fn stage_from_grant(
+        &mut self,
+        grant: &ClientCertificateRotationGrant,
+        ledger: &TrustLedger,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if self.revoked {
+            return Err(CertificateError::Revoked);
+        }
+        let candidate = grant.candidate()?;
+        ledger.assert_not_revoked(&[
+            candidate.tls_certificate_fingerprint,
+            candidate.pq_certificate_fingerprint,
+        ])?;
+        let receipt = &grant.stage_receipt;
+        if let Some(pending) = &self.pending {
+            if pending.stage_id == receipt.stage_id {
+                // Same rule as `stage`, read through the receipt: the identity
+                // of a staging is the signed authorization behind it, not the
+                // consequences two authorizations happen to share.
+                if pending
+                    .authorization_fingerprint
+                    .matches(&receipt.stage_authorization_fingerprint)
+                {
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                return Err(CertificateError::GenerationConflict {
+                    generation: candidate.generation,
+                });
+            }
+            return Err(CertificateError::StageAlreadyPresent);
+        }
+        if self.next.is_some() {
+            return Err(CertificateError::StageAlreadyPresent);
+        }
+        if now_unix >= receipt.stage_expires_at {
+            return Err(CertificateError::StageExpired);
+        }
+
+        self.pending = Some(ClientCertificatePendingStage {
+            stage_id: receipt.stage_id,
+            authorization_fingerprint: receipt.stage_authorization_fingerprint,
+            request_fingerprint: receipt.request_fingerprint,
+            candidate,
+            state: PendingStageState::PendingCommit,
+            stage_expires_at: receipt.stage_expires_at,
+            window: grant.window,
         });
         Ok(InstallOutcome::Installed)
     }

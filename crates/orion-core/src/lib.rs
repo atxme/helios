@@ -24,6 +24,7 @@
 pub mod backend;
 pub mod certificate_actions;
 pub mod certificate_inventory;
+pub mod certificate_renewal;
 pub mod certificates;
 pub mod config;
 pub mod events;
