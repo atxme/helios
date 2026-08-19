@@ -467,23 +467,78 @@ deployer_astra() {
         return 1
     fi
 
+    # Le service tourne-t-il déjà ? La question précède l'interrogation, et
+    # elle n'est pas une optimisation.
+    #
+    # `compose run` crée un **second** conteneur du service, donc attaché aux
+    # mêmes réseaux — et `astra-private` épingle `ipv4_address: 10.88.7.2`. Si
+    # le service tourne, cette adresse est prise, et Docker répond « failed to
+    # set up container networking: Address already in use ». C'est-à-dire que
+    # `run` échoue systématiquement dans le seul cas où le registre existe
+    # vraiment. Un déploiement réel s'est arrêté là en accusant un registre
+    # illisible alors que rien n'avait été lu.
+    #
+    # Un conteneur **arrêté** garde sa réservation jusqu'à sa suppression, donc
+    # le cas se produit aussi service éteint. Trois manières de lire, une par
+    # situation, et chacune est la seule qui marche dans la sienne :
+    #
+    #   en marche      → `exec`, qui n'alloue rien ;
+    #   présent, arrêté → un conteneur jetable **sans réseau du tout**, monté
+    #                     directement sur le volume ;
+    #   absent          → `compose run`, sans concurrent possible.
+    conteneur_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
+        ps -aq astra 2>/dev/null" | tr -d '\r' | tail -1)"
+    astra_en_marche=non
+    if [ -n "$conteneur_astra" ] && helios_ssh_sudo "$CIBLE" \
+        "$moteur inspect -f '{{.State.Running}}' '$conteneur_astra' 2>/dev/null | grep -qx true"
+    then
+        astra_en_marche=oui
+    fi
+
+    compose_astra="$compose_env $compose -f deploy/astra/compose.yaml \
+        --env-file '$env_distant'"
+    if [ "$astra_en_marche" = oui ]; then
+        astra_lire="$compose_astra exec -T astra"
+        astra_lire_shell="$compose_astra exec -T astra /bin/sh -c"
+    elif [ -n "$conteneur_astra" ]; then
+        # Le volume se lit sans passer par le service. `--network none` est ce
+        # qui rend la lecture toujours possible : aucune adresse n'est demandée,
+        # donc aucune ne peut être prise. Le nom du volume est lu sur le
+        # conteneur lui-même plutôt que deviné depuis le nom de projet compose,
+        # qui dépend du répertoire de travail.
+        volume_astra="$(helios_ssh_sudo_capture "$CIBLE" "$moteur inspect \
+            -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/astra\"}}{{.Name}}{{end}}{{end}}' \
+            '$conteneur_astra' 2>/dev/null" | tr -d '\r' | tail -1)"
+        if [ -z "$volume_astra" ]; then
+            echo "    le conteneur Astra existant ne monte aucun volume sur /var/lib/astra." >&2
+            echo "    Rien n'est su de son état, donc rien n'est amorcé." >&2
+            return 1
+        fi
+        astra_lire="$moteur run --rm --network none \
+            -v '$volume_astra':/var/lib/astra helios/astra:latest"
+        astra_lire_shell="$moteur run --rm --network none \
+            -v '$volume_astra':/var/lib/astra --entrypoint /bin/sh helios/astra:latest -c"
+    else
+        astra_lire="$compose_astra run --rm --no-deps astra"
+        astra_lire_shell="$compose_astra run --rm --no-deps --entrypoint /bin/sh astra -c"
+    fi
+
     # Trois états, pas deux. `status` échoue aussi bien parce qu'il n'y a rien
     # à lire que parce que ce qu'il y a est illisible, et confondre les deux
     # est ce qui a mené un déploiement réel à enchaîner sur un `bootstrap` que
     # le registre existant refusait — en n'affichant que ce refus, jamais la
     # cause. On regarde donc le volume avant de conclure.
     statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-        run --rm --no-deps astra status 2>&1")" && etat=amorce || etat=inconnu
+        $astra_lire status 2>&1")" && etat=amorce || etat=inconnu
     if [ "$etat" = "inconnu" ]; then
         registre_present="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-            run --rm --no-deps --entrypoint /bin/sh astra -c \
+            $astra_lire_shell \
             'test -f /var/lib/astra/registry.json && echo present || echo absent' 2>/dev/null" \
             | tr -d '\r' | tail -1)"
         case "$registre_present" in
             absent) etat=vierge ;;
-            *)
+            present)
                 # Le registre est là et ne se lit pas. Amorcer par-dessus
                 # démarrerait une seconde histoire pour le même domaine, et le
                 # binaire le refuse — mais c'est ici qu'il faut s'arrêter, en
@@ -495,14 +550,38 @@ deployer_astra() {
                 echo "    toute autre action." >&2
                 return 1
                 ;;
+            *)
+                # Quatrième cas, et il ne se confond avec aucun des trois : la
+                # sonde elle-même n'a pas répondu. On ne sait donc **rien** du
+                # volume. Le ranger avec « registre illisible » accusait le
+                # registre d'une panne que personne n'avait observée, et le
+                # ranger avec « vierge » enchaînerait sur un amorçage par-dessus
+                # une autorité existante — la seule erreur irrattrapable ici.
+                echo "    impossible d'interroger le volume Astra : la sonde n'a pas répondu." >&2
+                echo "    Rien n'est su du registre, donc rien n'est amorcé." >&2
+                echo "    Réponse de la sonde : ${registre_present:-<vide>}" >&2
+                printf '%s\n' "$statut_astra" | tail -20 >&2
+                case "$statut_astra" in
+                    *"Address already in use"*|*"address already in use"*)
+                        echo "    L'adresse 10.88.7.2 du veth privé est déjà prise. Un conteneur" >&2
+                        echo "    Astra antérieur la retient — même arrêté, sa réservation tient" >&2
+                        echo "    jusqu'à sa suppression :" >&2
+                        echo "      ssh $CIBLE 'sudo $moteur ps -a --filter name=astra'" >&2
+                        echo "      ssh $CIBLE 'sudo $moteur rm <id>'" >&2
+                        ;;
+                esac
+                return 1
+                ;;
         esac
     fi
 
     if [ "$etat" = "vierge" ]; then
         echo "    amorçage du domaine"
+        # Le **même** accès que la sonde, pour la même raison : un conteneur
+        # arrêté qui retient 10.88.7.2 ferait échouer un `compose run` ici aussi,
+        # et l'amorçage est l'étape où un échec obscur coûte le plus cher.
         sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-            $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-            run --rm astra bootstrap \
+            $astra_lire bootstrap \
             --ca-public-key '$ancre' --trust-domain-id '$domaine' \
             --gateway-wireguard-public-key '$wg_pub' --server-name '$nom_serveur' \
             --authority-url '$url' --webauthn-rp-id '$rp'")" || {
@@ -601,9 +680,10 @@ deployer_astra() {
     canal_present="$(helios_ssh_sudo_capture "$CIBLE" \
         "if test -f /var/lib/helios/astra-channel.json; then echo present; else echo absent; fi" \
         | tr -d '\r' | tail -1)"
+    # Encore le même accès : `init-channel` écrit dans le même volume, et un
+    # `compose run` y buterait sur la même adresse retenue.
     if sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
-        $compose_env $compose -f deploy/astra/compose.yaml --env-file '$env_distant' \
-        run --rm --no-deps astra init-channel 2>&1")"; then
+        $astra_lire init-channel 2>&1")"; then
         cert_astra="$(printf '%s\n' "$sortie" |
             sed -n 's/^astra_channel_certificate=//p' | tr -d '\r' | head -1)"
         cert_autorite="$(printf '%s\n' "$sortie" |

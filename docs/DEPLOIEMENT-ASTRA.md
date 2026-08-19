@@ -211,6 +211,42 @@ Ces coordonnées ne sont donc pas des paramètres libres de déploiement.
 Le `pull` de l'image de base, lui, n'a jamais été concerné : il est émis par le
 démon Docker sur l'hôte.
 
+### Pourquoi l'étape 7 ne lit jamais le volume par `compose run`
+
+L'adresse du conteneur Astra sur le veth privé est **épinglée** :
+`ipv4_address: 10.88.7.2`. C'est délibéré — `heliosd` écoute sur l'autre bout
+et n'accepte qu'une identité épinglée, donc les deux extrémités sont nommées
+une fois pour toutes plutôt que découvertes.
+
+La conséquence n'est pas évidente : `docker compose run` crée un **second**
+conteneur du service, attaché aux mêmes réseaux, qui redemande donc la même
+adresse. Elle est déjà prise, et Docker répond :
+
+```text
+failed to set up container networking: Address already in use
+```
+
+Autrement dit `compose run` échoue précisément quand Astra est déployé et
+fonctionne — le seul cas où son registre existe vraiment. Un conteneur
+**arrêté** retient sa réservation de la même façon, jusqu'à sa suppression.
+
+L'étape 7 choisit donc son accès selon l'état du service :
+
+| État du conteneur | Comment le volume est lu |
+| --- | --- |
+| en marche | `compose exec -T`, qui n'alloue aucune adresse |
+| présent, arrêté | un conteneur jetable `--network none` monté sur le volume |
+| absent | `compose run --rm --no-deps`, sans concurrent possible |
+
+Le troisième cas est le seul où `run` est sûr. Les trois écritures de l'étape —
+sonde, `bootstrap`, `init-channel` — passent par le même accès.
+
+Si la sonde ne répond malgré tout rien, l'étape **s'arrête**. Elle ne suppose
+ni « registre illisible » — cela accuserait le registre d'une panne que
+personne n'a observée — ni « volume vierge », qui enchaînerait sur un amorçage
+par-dessus une autorité existante. C'est la seule erreur irrattrapable de cette
+étape.
+
 ### À la main
 
 Chaque commande imprime la suivante. `astra bootstrap` imprime la ligne
