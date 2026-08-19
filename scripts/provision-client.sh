@@ -36,6 +36,13 @@
 # il le dit avant d'agir.
 set -euo pipefail
 
+# Résolu AVANT le `cd` : plus bas, un garde-fou relit ce fichier avec awk, et
+# `$0` relatif — `./provision-client.sh` lancé depuis `scripts/` — ne désigne
+# plus rien une fois le répertoire changé. Le garde-fou échouait alors sans
+# bruit : awk se plaignait, `grep -q` ne trouvait rien, et le test passait à
+# vide. Un contrôle qui ne s'exécute pas est pire que pas de contrôle.
+CE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 # Un seul mot de passe sudo pour tout le déploiement : voir lib-remote.sh.
 # shellcheck source=scripts/lib-remote.sh
 . "$(dirname "$0")/lib-remote.sh"
@@ -176,11 +183,41 @@ CTL=(cargo run --quiet -p helios-ctl --)
 ARG_TRAFIC=()
 [ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
 
+# Décidé ici, avant que quoi que ce soit ne bouge sur la gateway.
+#
+# `enroll` refuse d'écraser un profil — il porte des clés privées, et un
+# écrasement silencieux est la mauvaise valeur par défaut. Mais découvrir ce
+# refus À LA FIN laisse le pire état possible : la négociation de la gateway
+# refaite, le pair réadmis sous de nouveaux certificats, et aucun profil pour
+# s'y connecter — le matériel client vient d'être généré dans un répertoire
+# temporaire que la sortie efface. C'est exactement ce qui est arrivé.
+#
+# Le fichier est donc retiré maintenant, et seulement après l'avoir annoncé :
+# provisionner « $CLIENT » signifie faire marcher ce client-là, et l'ancien
+# profil devient invalide à la seconde où le pair est réadmis. Le même
+# raisonnement que pour l'admission, qui est nominative et se recrée.
+mkdir -p "$SORTIE"
+PROFIL="$SORTIE/$CLIENT.orion"
+
 echo "==> Client     $CLIENT"
 echo "==> Gateway    $CIBLE   (SSH)"
 echo "==> Public     $ENDPOINT   (nom authentifié : $SERVER_NAME, mode $MODE)"
 echo "==> CA         $CA_DIR"
 echo "==> Trafic     ${TRAFIC:-0.0.0.0/0 (tunnel complet)}"
+echo "==> Profil     $PROFIL"
+if [ -e "$PROFIL" ]; then
+    echo "               un profil de ce nom existe : il sera remplacé, et il"
+    echo "               cesse de fonctionner de toute façon dès la réadmission"
+fi
+# Le répertoire doit être inscriptible maintenant, pas après la gateway.
+if ! : > "$PROFIL.essai" 2>/dev/null; then
+    echo >&2
+    echo "Le profil ne peut pas être écrit dans $SORTIE." >&2
+    echo "Corriger les droits — ou choisir un autre --sortie — avant de toucher" >&2
+    echo "à la gateway : une fois la négociation refaite, il n'y a pas de retour." >&2
+    exit 1
+fi
+rm -f -- "$PROFIL.essai"
 echo
 
 TRAVAIL="$(mktemp -d)"
@@ -273,7 +310,12 @@ fi
 # backticks dans un commentaire lancait scp sans argument, puis un « tail -1 »
 # faisait bloquer le script sur une lecture d'entree standard. Le test suivant
 # echoue tout de suite plutot que de laisser la surprise au poste de l'operateur.
-if awk '/^cat > "\$TRAVAIL\/gateway.sh" <<REMOTE$/,/^REMOTE$/' "$0" | grep -q '`'; then
+if [ ! -r "$CE_SCRIPT" ]; then
+    echo "Bug interne : ce script ne se relit pas ($CE_SCRIPT)." >&2
+    echo "Le garde-fou du heredoc distant ne peut pas s'executer." >&2
+    exit 1
+fi
+if awk '/^cat > "\$TRAVAIL\/gateway.sh" <<REMOTE$/,/^REMOTE$/' "$CE_SCRIPT" | grep -q '`'; then
     echo "Bug interne : un backtick subsiste dans le heredoc du script distant." >&2
     echo "Il serait execute a la construction. Le remplacer par des guillemets." >&2
     exit 1
@@ -293,6 +335,13 @@ if [ "$REFAIRE_CA" = 1 ]; then
         --client-pq-ca /tmp/orion-client-pq-ca-public.bin \
         --rotate
     rm -f /tmp/orion-client-ca.der /tmp/orion-client-pq-ca-public.bin
+    # L'identite de negociation n'est pas relue a chaud : elle est lue une fois
+    # au demarrage et servie jusqu'a l'arret. Sans ce redemarrage la gateway
+    # sert encore l'ancien certificat pendant que le profil epingle le neuf, et
+    # le client refuse le handshake QUIC sur « invalid peer certificate:
+    # BadSignature » — qui nomme une signature, pas l'ecart derriere elle.
+    echo "-- redemarrage de heliosd"
+    systemctl restart heliosd || echo "!! heliosd n'a pas redemarre : le faire a la main"
 fi
 
 # Le pair du meme nom est retire d'office, et ce n'est pas une commodite :
@@ -369,8 +418,9 @@ echo "    négociation $NEGOCIATION"
 [ -s "$TRAVAIL/gw-pq-cert.json" ] || { echo "certificat PQ de la gateway vide" >&2; exit 1; }
 
 # ── 6. Enrôlement ────────────────────────────────────────────────────────────
-mkdir -p "$SORTIE"
-PROFIL="$SORTIE/$CLIENT.orion"
+# Retiré juste avant l'écriture, jamais plus tôt : un échec entre l'annonce et
+# ici laisserait l'opérateur sans profil ancien ni profil neuf.
+rm -f -- "$PROFIL"
 echo "==> Enrôlement"
 "${CTL[@]}" enroll \
     --name "$CLIENT" \
@@ -393,6 +443,7 @@ echo "Il porte les clés privées du client : le transmettre par un canal"
 echo "contrôlé, l'importer dans Orion, puis le détruire des deux côtés."
 if [ "$REFAIRE_CA" = 1 ]; then
     echo
-    echo "⚠  La négociation de la gateway a été réinitialisée : tous les autres"
-    echo "   clients doivent être réenrôlés avec ce même script."
+    echo "⚠  La négociation de la gateway a été réinitialisée, et le démon"
+    echo "   redémarré pour la servir : tous les autres clients doivent être"
+    echo "   réenrôlés avec ce même script."
 fi
