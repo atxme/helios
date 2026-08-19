@@ -93,6 +93,17 @@ impl AstraChannelHandler for Recorder {
         Err(TrustUpdateRefusal::Rejected)
     }
 
+    async fn distribute(
+        &self,
+        distribution: Box<helios_api::internal::TrustDistribution>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        self.seen.lock().unwrap().push(format!(
+            "distribute {}",
+            distribution.manifest.client_wg_public_key
+        ));
+        Err(TrustUpdateRefusal::Rejected)
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("identity".into());
         let pq_certificate = served_leaf();

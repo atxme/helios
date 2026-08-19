@@ -2643,17 +2643,32 @@ contournés :
   `signer-results` du §8.2 répondent `501`. Ces routes-là servent l'opérateur
   **hors** tunnel — le cas que le canal in-tunnel ne couvre pas, et dont dépend
   la récupération d'une identité expirée ;
-- la **distribution des objets de transition** par `trust-update`. Le canal
-  privé bidirectionnel des §§8.1.2 et 8.3 est livré. Ce qui manque est la
-  distribution des transitions elles-mêmes : la gateway ne détient aucun
-  objet pré-signé, donc
-  `trust-update` répond `503` à un client qu'elle sait en retard au lieu de lui
-  annoncer qu'il est à jour ; et sa réponse ne porte **jamais** de statut signé,
-  parce qu'un statut est signé par la clé de service Astra, que `heliosd` ne
-  détient pas et ne doit pas détenir. La comparaison qui décide « à jour »
-  couvre en revanche tous les compteurs et toutes les empreintes actives,
-  gateway comme client : une omission y répondrait « rien à récupérer » à un
-  client en retard, et c'est le seul refus dont il ne se relève pas ;
+- la **production** des transactions de transition. Leur distribution, elle,
+  est livrée : `POST /internal/v1/certificates/distribution` sur le veth prend
+  une transaction signée adressée à un pair, la gateway la met en file dans son
+  registre, et `trust-update` en rend un fragment par requête fraîche — le
+  manifeste accompagnant **chaque** fragment, pour qu'un client qui a perdu sa
+  copie puisse encore les attribuer. Un `request_id` rejoué reçoit le même
+  fragment : avancer sur une retransmission ferait sauter un chunk sur un lien
+  qui perd, et le client interrogerait indéfiniment une transaction qu'il ne
+  peut plus compléter. La gateway ne vérifie **aucune** signature ici, et c'est
+  la conception : elle ne détient ni `CA-PQ` ni la clé de service, donc tout
+  contrôle qu'elle écrirait devrait nommer une autorité qu'elle possède —
+  exactement la substitution que la vérification du destinataire existe pour
+  refuser. Elle vérifie l'adressage, la cohérence du jeu de fragments et
+  l'échéance ; Orion vérifie les signatures sous ses propres ancres.
+  Ce qui manque en amont : rien ne **dépose** encore de transaction. Il faut
+  qu'une transition signée entre dans Astra — les routes du §8.2 sont en `501`
+  — et qu'Astra bâtisse par client un manifeste signé, ce que seule la clé de
+  service (objets clients uniquement) ou le compagnon (tout le reste) peut
+  faire. Tant que rien n'est déposé, un client en retard reçoit toujours `503`,
+  et jamais un « à jour » qui l'arrêterait pour de bon.
+  La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
+  statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
+  ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche
+  tous les compteurs et toutes les empreintes actives, gateway comme client :
+  une omission y répondrait « rien à récupérer » à un client en retard, et
+  c'est le seul refus dont il ne se relève pas ;
 - la **récupération d'une identité expirée** de bout en bout, qui dépend des
   deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule

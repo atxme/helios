@@ -127,6 +127,17 @@ pub const STAGE_COMMIT_PATH: &str = "/internal/v1/certificates/stage-commit";
 pub const REVOKE_PATH: &str = "/internal/v1/certificates/revoke";
 const STATE_ROUTE: &str = "/internal/v1/certificates/state/:identity";
 
+/// Where the authority leaves a pre-signed transaction for one peer (§8.1.1).
+///
+/// The gateway signs nothing here and verifies no signature: it holds neither
+/// `CA-PQ` nor the service key, and «la gateway n'appelle jamais une clé CA et
+/// ne réalise aucune signature de CA à la demande». It queues what arrives and
+/// hands it to the peer the manifest names; the peer verifies it under anchors
+/// it already trusts. Without this route the in-tunnel `trust-update` has
+/// nothing to distribute and answers `503` to a client it knows is behind —
+/// the one refusal a client does not recover from.
+pub const DISTRIBUTION_PATH: &str = "/internal/v1/certificates/distribution";
+
 /// The served gateway leaf, read back by the authority.
 ///
 /// **A route §8.3 does not list**, and added deliberately. Astra has to verify
@@ -243,6 +254,27 @@ pub trait AstraChannelHandler: AstraStageHandler {
     /// The gateway's own served leaf, so the authority can verify a receipt
     /// under the key that signed it rather than under a copy it was handed.
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal>;
+
+    /// Queues a pre-signed transaction for the peer its manifest names.
+    async fn distribute(
+        &self,
+        distribution: Box<TrustDistribution>,
+    ) -> Result<(), TrustUpdateRefusal>;
+}
+
+/// One signed transaction, addressed to one peer.
+///
+/// The peer is read off the manifest and never carried beside it: a second
+/// copy of the address would be a second thing to compare, and the manifest's
+/// own `client_wg_public_key` is the one the signature covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustDistribution {
+    pub manifest: aether::certificates::transport::TrustUpdateTransactionManifest,
+    /// Every fragment, in index order. All of them at once, because a
+    /// transaction is atomic for the receiver: a queue able to hold half of one
+    /// would leave a client polling for a fragment that never arrives.
+    pub chunks: Vec<aether::certificates::transport::TrustUpdateChunk>,
 }
 
 /// What the gateway publishes about the identity it currently serves.
@@ -261,7 +293,7 @@ pub struct GatewayIdentityView {
     pub gateway_decision_epoch: u64,
 }
 
-/// Builds the private router — the five routes, and a refusal for the rest.
+/// Builds the private router — the six routes, and a refusal for the rest.
 pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
     Router::new()
         .route(STAGE_PATH, post(stage))
@@ -269,6 +301,7 @@ pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
         .route(REVOKE_PATH, post(revoke))
         .route(STATE_ROUTE, get(peer_state))
         .route(GATEWAY_IDENTITY_PATH, get(gateway_identity))
+        .route(DISTRIBUTION_PATH, post(distribute))
         .fallback(refuse_unknown_route)
         .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY_BYTES))
         .with_state(handler)
@@ -288,6 +321,24 @@ async fn stage(State(handler): State<Arc<dyn AstraChannelHandler>>, body: Bytes)
     };
     match handler.stage_from_astra(Box::new(authorization)).await {
         Ok(receipt) => (StatusCode::OK, Json(*receipt)).into_response(),
+        Err(refusal) => InternalRefusal::from(refusal).into_response(),
+    }
+}
+
+/// `POST /internal/v1/certificates/distribution` (spec §8.1.1).
+async fn distribute(State(handler): State<Arc<dyn AstraChannelHandler>>, body: Bytes) -> Response {
+    if body.len() > MAX_INTERNAL_BODY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let distribution: TrustDistribution = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "private channel: unreadable trust distribution");
+            return InternalRefusal::Protocol.into_response();
+        }
+    };
+    match handler.distribute(Box::new(distribution)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(refusal) => InternalRefusal::from(refusal).into_response(),
     }
 }
@@ -840,6 +891,20 @@ impl GatewayLifecycleClient {
 
     /// Reads the leaf the gateway serves, so a receipt can be verified under
     /// the key that actually signed it.
+    /// Leaves a signed transaction for the peer the manifest names (§8.1.1).
+    ///
+    /// The gateway queues it and hands the fragments to that peer as it polls.
+    /// Nothing crosses back: there is no receipt to sign here, because the
+    /// gateway attests nothing about a transaction it did not author.
+    pub async fn distribute(&self, distribution: &TrustDistribution) -> Result<(), ChannelError> {
+        let body = serde_json::to_vec(distribution)
+            .map_err(|error| ChannelError::Body(error.to_string()))?;
+        self.http
+            .request("POST", DISTRIBUTION_PATH, Some(body), None)
+            .await?;
+        Ok(())
+    }
+
     pub async fn gateway_identity(&self) -> Result<GatewayIdentityView, ChannelError> {
         let answer = self
             .http
@@ -1204,6 +1269,14 @@ mod tests {
             _revocation: Box<EmergencyCertificateRevocation>,
         ) -> Result<(), TrustUpdateRefusal> {
             self.seen.lock().unwrap().push("revoke");
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn distribute(
+            &self,
+            _distribution: Box<TrustDistribution>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            self.seen.lock().unwrap().push("distribute");
             Err(TrustUpdateRefusal::Rejected)
         }
 

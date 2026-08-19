@@ -14,22 +14,31 @@
 //! and never calls an authority key on demand: every object it distributes was
 //! pre-signed by Astra or by the operator companion (spec §8.1).
 //!
-//! # Limite connue
+//! # The gateway is a queue, not an author
 //!
-//! The trust-update route can currently only answer "your trust is current".
-//! Distributing a transition needs the private Astra ↔ Helios veth channel,
-//! which is not implemented: the gateway has no store of pre-signed objects to
-//! hand out. A caller that is provably behind therefore receives
+//! A transition reaches a client in two hops: the authority leaves a signed
+//! transaction on the private veth (`POST
+//! /internal/v1/certificates/distribution`), and the client collects its
+//! fragments through `trust-update`. Nothing in between verifies a signature,
+//! and that is the design: this process holds neither `CA-PQ` nor Astra's
+//! service key, so any check it wrote would have to name an authority it does
+//! have — exactly the substitution the receiver's own verification exists to
+//! refuse. What it checks is the addressing, the fragment set and the
+//! deadline; Orion checks the signatures, under anchors it already trusts.
+//!
+//! A caller that is provably behind with nothing queued for it still receives
 //! [`TrustUpdateRefusal::Unavailable`] — a `503` — rather than an empty update,
 //! because an empty update tells a client the opposite of the truth and it
 //! would stop asking.
 //!
-//! For the same reason the response never carries a signed status. A status is
-//! signed by the **Astra service key**, which this process does not hold and
-//! must not hold; the gateway can only forward one it was given, and nothing
-//! gives it one yet. Answering with an unsigned status, or with one signed by
-//! the gateway leaf, would be inventing an authority — so the field stays
-//! `None` until the private channel exists.
+//! # Limite connue : la réponse ne porte jamais de statut signé
+//!
+//! A status is signed by the **Astra service key**, which this process does not
+//! hold and must not hold. Answering with an unsigned status, or with one
+//! signed by the gateway leaf, would be inventing an authority. A client that
+//! needs a signed freshness statement asks the authority for it through the
+//! public channel of §8.2; what it gets here is the transaction itself, which
+//! is what it actually has to apply.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -272,6 +281,33 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
             gateway_decision_epoch: state.gateway.gateway_decision_epoch,
         })
     }
+
+    /// Queues a pre-signed transaction for the peer its manifest names.
+    ///
+    /// Nothing here verifies a signature, and that is the design rather than
+    /// an omission: this gateway holds neither `CA-PQ` nor Astra's service key,
+    /// so any verification it wrote would have to pick an authority it does
+    /// have — which is precisely the substitution the receiver's own check
+    /// exists to refuse. It checks the addressing, the fragment set and the
+    /// deadline; Orion checks the signatures, under anchors it already trusts.
+    async fn distribute(
+        &self,
+        distribution: Box<helios_api::internal::TrustDistribution>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        let peer = distribution.manifest.client_wg_public_key;
+        let mut registry = self.registry.lock().await;
+        registry
+            .stage_distribution(
+                &peer,
+                distribution.manifest,
+                distribution.chunks,
+                now_unix(),
+            )
+            .map_err(|error| {
+                tracing::warn!(%peer, %error, "trust distribution refused");
+                classify(error)
+            })
+    }
 }
 
 /// How often the lifecycle sweeps leases and overlaps.
@@ -412,14 +448,42 @@ impl TrustUpdateHandler for CertificateService {
                 chunk: None,
             });
         }
-        // Behind, and nothing signed to hand over — see the module's known
-        // limitation. Saying so beats claiming the client is up to date.
-        tracing::warn!(
-            peer = %caller_wg_public_key,
-            "trust update: the caller is behind and no signed object is available to \
-             distribute; the private Astra channel is not implemented"
-        );
-        Err(TrustUpdateRefusal::Unavailable)
+
+        // Behind. Whether there is anything to hand over is a question about
+        // the queue, not about the comparison — and the two are kept apart
+        // because a client that is current must never pay for a queue read.
+        let request_id = request.request.request_id;
+        drop(registry);
+        let mut registry = self.registry.lock().await;
+        let served = registry
+            .take_distribution_chunk(&caller, &request_id, now)
+            .map_err(|error| {
+                tracing::warn!(peer = %caller_wg_public_key, %error, "trust distribution unreadable");
+                classify(error)
+            })?;
+        match served {
+            Some((manifest, chunk)) => Ok(TrustUpdateResponse {
+                // Never a status: one is signed by Astra's service key, which
+                // this gateway does not hold and must not hold. A client that
+                // needs a signed freshness statement asks the authority for it
+                // (§8.2); what it gets here is the transaction itself.
+                status: None,
+                manifest: Some(manifest),
+                chunk: Some(chunk),
+            }),
+            None => {
+                // Behind, and the authority has left nothing here. Saying so
+                // beats claiming the client is up to date: an empty update is
+                // the one answer a client does not recover from, because it
+                // stops asking.
+                tracing::warn!(
+                    peer = %caller_wg_public_key,
+                    "trust update: the caller is behind and the authority has queued nothing \
+                     for it"
+                );
+                Err(TrustUpdateRefusal::Unavailable)
+            }
+        }
     }
 
     async fn stage_commit(
@@ -570,6 +634,7 @@ mod tests {
             state: ClientCertificateState::new(generation()),
             active_pq_certificate: signed_leaf(PqCertificateRole::Client, "workstation", 2),
             staged_pq_certificate: None,
+            distribution: None,
         }
     }
 

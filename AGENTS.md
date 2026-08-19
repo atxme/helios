@@ -150,6 +150,17 @@ Restent ouverts :
   d'abord, état ensuite. **Limite connue** : ces deux écritures passent par
   DPAPI, donc un renouvellement complet ne s'exerce pas en WSL2 ; tout le reste
   du chemin y est éprouvé (voir [TESTING.md](docs/testing/TESTING.md)).
+  La **distribution** des transitions est livrée côté gateway : le veth prend
+  une transaction signée adressée à un pair (`/internal/v1/certificates/distribution`),
+  le registre la met en file, et `trust-update` en rend un fragment par requête
+  fraîche — manifeste compris à chaque fois, et même fragment pour un
+  `request_id` rejoué. La gateway ne vérifie aucune signature là : elle ne
+  détient ni `CA-PQ` ni la clé de service, donc tout contrôle qu'elle écrirait
+  nommerait une autorité qu'elle possède, ce que la vérification du
+  destinataire existe précisément pour refuser. Elle est une file, pas un
+  auteur. Reste que rien ne **dépose** encore de transaction, faute des routes
+  §8.2 et d'un constructeur de manifeste côté Astra : un client en retard
+  reçoit donc toujours `503`, jamais un « à jour » qui l'arrêterait pour de bon.
   Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
   `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
   `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en

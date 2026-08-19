@@ -51,12 +51,15 @@ use aether::certificates::{
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
         GatewayCertificateStageReceipt, IssuerKind,
     },
-    encoding::{Fingerprint, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
+    encoding::{
+        Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+    },
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
         GatewayCertificateState, InstallOutcome, PendingStageState, RevocationTombstone,
         RevokedFamily, TrustLedger,
     },
+    transport::{TrustUpdateChunk, TrustUpdateTransactionManifest},
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
 };
 use aether::key_negotiation::PqCertificate;
@@ -107,6 +110,71 @@ pub struct PeerCertificates {
     /// state machine guarantees `pending` and `next` are never both set, so a
     /// single slot covers both.
     pub staged_pq_certificate: Option<PqCertificate>,
+    /// Pre-signed transaction waiting to be handed to this peer (spec §8.1.1).
+    ///
+    /// Absent for the whole life of a domain where nothing rotates, which is
+    /// the ordinary case: `trust-update` then answers "you are current" and
+    /// costs a comparison.
+    #[serde(default)]
+    pub distribution: Option<PendingDistribution>,
+}
+
+/// A signed transaction the authority left here for one peer.
+///
+/// # Why the gateway stores rather than builds
+///
+/// The manifest is signed by `CA-PQ` or by Astra's service key, and `heliosd`
+/// holds neither — deliberately, and §8.1.1 says so: «la gateway n'appelle
+/// jamais une clé CA et ne réalise aucune signature de CA à la demande». What
+/// arrives over the veth is already signed for exactly this peer, against the
+/// state snapshot that peer declared. The gateway is a queue, not an author.
+///
+/// # Why the cursor is here and not in the request
+///
+/// [`aether::certificates::transport::TrustUpdateRequest`] carries no chunk
+/// index, by design: adding one would let a peer choose which fragment it is
+/// served, and a peer that only ever asked for chunk 0 would sit forever on an
+/// incomplete transaction while believing it was progressing. So the gateway
+/// walks the fragments itself, one per fresh request. A repeated `request_id`
+/// is served the **same** fragment — §8.1.1 allows an idempotent replay, and
+/// advancing on a retransmission would skip a chunk over a lossy link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingDistribution {
+    pub manifest: TrustUpdateTransactionManifest,
+    /// Every fragment, in index order. Held whole: a transaction is atomic for
+    /// the receiver, and a queue that could lose one fragment would leave a
+    /// client polling for something that will never arrive.
+    pub chunks: Vec<TrustUpdateChunk>,
+    /// Index of the fragment the next fresh request receives.
+    pub cursor: u16,
+    /// Request the current cursor position was already served to.
+    pub last_request_id: Option<Id16>,
+}
+
+impl PendingDistribution {
+    /// The fragment this request gets, and whether the cursor moved.
+    ///
+    /// Returns `None` once every fragment has been handed over: the peer has
+    /// the whole transaction and either applied it or refused it, and neither
+    /// outcome is the gateway's to retry.
+    fn serve(&mut self, request_id: &Id16) -> Option<&TrustUpdateChunk> {
+        if self.last_request_id.as_ref() == Some(request_id) {
+            // A replay: the same fragment, at the position it was served from.
+            let index = usize::from(self.cursor).checked_sub(1)?;
+            return self.chunks.get(index);
+        }
+        let index = usize::from(self.cursor);
+        let chunk = self.chunks.get(index)?;
+        self.cursor = self.cursor.saturating_add(1);
+        self.last_request_id = Some(*request_id);
+        Some(chunk)
+    }
+
+    /// Whether the peer has been handed everything.
+    fn drained(&self) -> bool {
+        usize::from(self.cursor) >= self.chunks.len()
+    }
 }
 
 impl PeerCertificates {
@@ -283,6 +351,7 @@ impl CertificateRegistry {
                 state: ClientCertificateState::new(active),
                 active_pq_certificate,
                 staged_pq_certificate: None,
+                distribution: None,
             },
         );
         self.persist(candidate)
@@ -594,6 +663,130 @@ impl CertificateRegistry {
         )?;
         self.persist(state)?;
         Ok(outcome)
+    }
+
+    /// Accepts a pre-signed transaction the authority left for one peer.
+    ///
+    /// # What is checked here, and what deliberately is not
+    ///
+    /// The gateway verifies that the transaction **addresses this domain and
+    /// this peer**, that its fragments are the ones the manifest names, and
+    /// that it has not already expired. It does **not** verify the manifest's
+    /// signature or the objects inside it — it holds neither `CA-PQ` nor the
+    /// service key, and a verification it cannot complete is worse than none:
+    /// it would have to be written against whichever authority happened to be
+    /// available, and that is exactly the check an attacker chooses.
+    ///
+    /// The receiver verifies, under anchors it already trusts. That is the
+    /// whole shape of §8.1: an object is authorized by what the receiver holds,
+    /// never by the envelope that delivered it — and here the gateway *is* the
+    /// envelope.
+    ///
+    /// Replacing an undrained transaction is allowed and is the point: a newer
+    /// decision supersedes an older one, and a client that never came back for
+    /// its fragments must not pin the queue.
+    pub fn stage_distribution(
+        &mut self,
+        wg_public_key: &WireGuardKey,
+        manifest: TrustUpdateTransactionManifest,
+        chunks: Vec<TrustUpdateChunk>,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        let mut state = self.state.clone();
+        if manifest.trust_domain_id != state.trust_domain_id {
+            return Err(RegistryError::Certificate(
+                CertificateError::TrustDomainMismatch,
+            ));
+        }
+        if manifest.gateway_wg_public_key != state.gateway.gateway_wg_public_key {
+            return Err(RegistryError::Certificate(
+                CertificateError::GatewayIdentityMismatch,
+            ));
+        }
+        if manifest.client_wg_public_key != *wg_public_key {
+            return Err(RegistryError::Certificate(
+                CertificateError::ClientIdentityMismatch,
+            ));
+        }
+        if now_unix >= manifest.expires_at {
+            return Err(RegistryError::Certificate(CertificateError::StageExpired));
+        }
+        if chunks.len() != usize::from(manifest.chunk_count) || chunks.is_empty() {
+            return Err(RegistryError::Certificate(CertificateError::MissingProof(
+                "transaction fragments",
+            )));
+        }
+        // Each fragment must be the one the manifest expects at that index.
+        // Serving a fragment the manifest does not cover would have the client
+        // refuse the whole transaction after collecting all of it — a failure
+        // that costs a full poll cycle to discover.
+        let manifest_fingerprint = manifest.fingerprint();
+        for (index, chunk) in chunks.iter().enumerate() {
+            if usize::from(chunk.chunk_index) != index
+                || chunk.chunk_count != manifest.chunk_count
+                || !chunk.manifest_fingerprint.matches(&manifest_fingerprint)
+            {
+                return Err(RegistryError::Certificate(CertificateError::MissingProof(
+                    "transaction fragment",
+                )));
+            }
+        }
+
+        let peer = state
+            .peers
+            .get_mut(&wg_public_key.to_base64())
+            .ok_or(RegistryError::UnknownPeer)?;
+        peer.distribution = Some(PendingDistribution {
+            manifest,
+            chunks,
+            cursor: 0,
+            last_request_id: None,
+        });
+        self.persist(state)
+    }
+
+    /// The fragment this request is owed, if any.
+    ///
+    /// Returns the manifest alongside the fragment on **every** call and not
+    /// only the first: a client that lost its copy between two polls would
+    /// otherwise hold fragments it cannot attribute, and §8.1.1 has it refuse
+    /// exactly that. Sending it again costs one signed object on a route that
+    /// is already carrying the fragment.
+    pub fn take_distribution_chunk(
+        &mut self,
+        wg_public_key: &WireGuardKey,
+        request_id: &Id16,
+        now_unix: u64,
+    ) -> Result<Option<(TrustUpdateTransactionManifest, TrustUpdateChunk)>, RegistryError> {
+        let mut state = self.state.clone();
+        let peer = state
+            .peers
+            .get_mut(&wg_public_key.to_base64())
+            .ok_or(RegistryError::UnknownPeer)?;
+        let Some(distribution) = peer.distribution.as_mut() else {
+            return Ok(None);
+        };
+        // An expired transaction is dropped rather than served: past
+        // `expires_at` the receiver refuses it, and handing it over would burn
+        // a poll cycle to reach that refusal.
+        if now_unix >= distribution.manifest.expires_at {
+            peer.distribution = None;
+            self.persist(state)?;
+            return Ok(None);
+        }
+        let manifest = distribution.manifest.clone();
+        let served = distribution
+            .serve(request_id)
+            .map(|chunk| (manifest, chunk.clone()));
+        // Kept until it is drained **and** re-asked for: dropping it on the
+        // last fragment would leave a client whose final poll was lost with no
+        // way to ask again.
+        let drained = distribution.drained();
+        if served.is_none() && drained {
+            peer.distribution = None;
+        }
+        self.persist(state)?;
+        Ok(served)
     }
 
     /// Drops every candidate whose lease has run out, and returns their peers.
@@ -925,6 +1118,202 @@ mod tests {
             active_client,
             _directory: directory,
         }
+    }
+
+    /// A transaction as the authority signs one. The signature is never
+    /// checked here — the gateway holds no authority key, and that is the
+    /// point of these tests — so a placeholder is exactly right.
+    fn distribution(
+        client: &WireGuardKey,
+        chunk_count: u16,
+        expires_at: u64,
+    ) -> (TrustUpdateTransactionManifest, Vec<TrustUpdateChunk>) {
+        let manifest = TrustUpdateTransactionManifest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            transaction_id: Id16::new([9; 16]).expect("id"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: *client,
+            base_state_fingerprint: Fingerprint::of(b"base state"),
+            created_at: 0,
+            expires_at,
+            minimum_activation_at: expires_at,
+            chunk_count,
+            objects: Vec::new(),
+            manifest_authority_kind: aether::certificates::transport::ManifestAuthority::CaPq,
+            manifest_authority_epoch: 1,
+            signature: MlDsa87Signature::placeholder(),
+        };
+        let manifest_fingerprint = manifest.fingerprint();
+        let chunks = (0..chunk_count)
+            .map(|index| TrustUpdateChunk {
+                manifest_fingerprint,
+                chunk_index: index,
+                chunk_count,
+                first_object_index: index,
+                objects: Vec::new(),
+            })
+            .collect();
+        (manifest, chunks)
+    }
+
+    /// The fragments come back in order, one per fresh request, and the
+    /// manifest travels with every one of them.
+    #[test]
+    fn a_queued_transaction_is_served_one_fragment_per_request() {
+        let mut fixture = fixture();
+        let (manifest, chunks) = distribution(&client_key(2), 3, 10_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, chunks, 0)
+            .expect("queued");
+
+        for index in 0..3u16 {
+            let request = Id16::new([index as u8 + 1; 16]).expect("request id");
+            let (manifest, chunk) = fixture
+                .registry
+                .take_distribution_chunk(&client_key(2), &request, 0)
+                .expect("readable")
+                .expect("a fragment is owed");
+            assert_eq!(chunk.chunk_index, index);
+            assert_eq!(
+                chunk.manifest_fingerprint,
+                manifest.fingerprint(),
+                "a client must be able to attribute every fragment it holds"
+            );
+        }
+
+        // Drained: nothing more is owed, and the queue stops answering.
+        let last = Id16::new([99; 16]).expect("request id");
+        assert!(fixture
+            .registry
+            .take_distribution_chunk(&client_key(2), &last, 0)
+            .expect("readable")
+            .is_none());
+    }
+
+    /// A retransmission gets the fragment it already got. Advancing on a
+    /// replay would skip one over a lossy link, and the client would poll
+    /// forever for a transaction it can never complete.
+    #[test]
+    fn a_repeated_request_is_served_the_same_fragment() {
+        let mut fixture = fixture();
+        let (manifest, chunks) = distribution(&client_key(2), 2, 10_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, chunks, 0)
+            .expect("queued");
+
+        let request = Id16::new([7; 16]).expect("request id");
+        let first = fixture
+            .registry
+            .take_distribution_chunk(&client_key(2), &request, 0)
+            .expect("readable")
+            .expect("owed")
+            .1;
+        let replayed = fixture
+            .registry
+            .take_distribution_chunk(&client_key(2), &request, 0)
+            .expect("readable")
+            .expect("owed")
+            .1;
+        assert_eq!(first.chunk_index, 0);
+        assert_eq!(replayed.chunk_index, 0);
+    }
+
+    /// Past its deadline the receiver refuses the whole transaction, so
+    /// handing it over would only spend a poll cycle reaching that refusal.
+    #[test]
+    fn an_expired_transaction_is_dropped_rather_than_served() {
+        let mut fixture = fixture();
+        let (manifest, chunks) = distribution(&client_key(2), 1, 1_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, chunks, 0)
+            .expect("queued");
+
+        let request = Id16::new([7; 16]).expect("request id");
+        assert!(fixture
+            .registry
+            .take_distribution_chunk(&client_key(2), &request, 1_000)
+            .expect("readable")
+            .is_none());
+        assert!(
+            fixture
+                .registry
+                .peer(&client_key(2))
+                .expect("peer")
+                .distribution
+                .is_none(),
+            "an expired transaction does not stay in the queue"
+        );
+    }
+
+    /// A transaction addressed elsewhere is refused. The manifest names its
+    /// target and the signature covers that name: queueing it under another
+    /// peer would hand one client a decision signed for another.
+    #[test]
+    fn a_transaction_for_another_peer_is_refused() {
+        let mut fixture = fixture();
+        let (manifest, chunks) = distribution(&client_key(3), 1, 10_000);
+        assert!(matches!(
+            fixture
+                .registry
+                .stage_distribution(&client_key(2), manifest, chunks, 0),
+            Err(RegistryError::Certificate(
+                CertificateError::ClientIdentityMismatch
+            ))
+        ));
+    }
+
+    /// A fragment set that does not match the manifest is refused at the door.
+    /// Accepting it would have the client collect everything and only then
+    /// refuse — a full poll cycle spent to discover a fault the gateway could
+    /// see immediately.
+    #[test]
+    fn a_fragment_set_that_contradicts_its_manifest_is_refused() {
+        let mut fixture = fixture();
+        let (manifest, mut chunks) = distribution(&client_key(2), 2, 10_000);
+        chunks.pop();
+        assert!(fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest.clone(), chunks, 0)
+            .is_err());
+
+        let (_, mut reordered) = distribution(&client_key(2), 2, 10_000);
+        reordered.reverse();
+        assert!(fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, reordered, 0)
+            .is_err());
+    }
+
+    /// A newer decision supersedes an older one. A client that never came back
+    /// for its fragments must not pin the queue against the authority.
+    #[test]
+    fn a_newer_transaction_replaces_one_left_undrained() {
+        let mut fixture = fixture();
+        let (first, first_chunks) = distribution(&client_key(2), 3, 10_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), first, first_chunks, 0)
+            .expect("queued");
+        let (second, second_chunks) = distribution(&client_key(2), 1, 20_000);
+        let expected = second.fingerprint();
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), second, second_chunks, 0)
+            .expect("replaced");
+
+        let request = Id16::new([7; 16]).expect("request id");
+        let (manifest, chunk) = fixture
+            .registry
+            .take_distribution_chunk(&client_key(2), &request, 0)
+            .expect("readable")
+            .expect("owed");
+        assert_eq!(manifest.fingerprint(), expected);
+        assert_eq!(chunk.chunk_count, 1);
     }
 
     fn authorization(
