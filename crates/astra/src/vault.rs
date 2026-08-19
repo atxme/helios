@@ -110,6 +110,12 @@ pub const REQUIRED_SLOTS: usize = 2;
 /// file that would drive an allocation.
 pub const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
 
+/// Largest COSE credential public key accepted, in bytes.
+///
+/// WebAuthn's own ceiling, repeated here so a vault file is bounded before it
+/// reaches the verifier that shares it.
+pub const MAX_CREDENTIAL_PUBLIC_KEY_BYTES: usize = 1024;
+
 /// Longest operator-facing slot label, in characters.
 pub const MAX_LABEL_CHARS: usize = 64;
 
@@ -143,6 +149,13 @@ pub enum VaultError {
          scelle : le fichier a été modifié"
     )]
     AnchorMismatch,
+    #[error("clé publique de credential hors bornes")]
+    CredentialKeyOutOfBounds,
+    #[error(
+        "ce key-slot a été enregistré sans la clé publique de son credential : aucun \
+         `AstraCredentialBinding` ne peut le décrire. Le retirer et réenrôler la clé"
+    )]
+    CredentialKeyMissing,
     #[error("contenu du coffre illisible : {0}")]
     Corrupt(String),
 }
@@ -203,10 +216,52 @@ pub struct KeySlot {
     pub label: String,
     /// CTAP2 credential identifier, base64.
     pub credential_id: String,
+    /// COSE public key of the credential, base64, exactly as the authenticator
+    /// attested it.
+    ///
+    /// Public, and kept here because the `AstraCredentialBinding` that `CA-PQ`
+    /// signs must name the key an approval assertion is verified under. It is
+    /// deliberately outside [`AuthorityVault::slot_table_digest`]: it is not a
+    /// wrapping input, and re-sealing the body on account of it would make a
+    /// value the token already published into an unlock condition.
+    ///
+    /// Defaulted for a vault written before bindings existed. Such a slot
+    /// still opens the anchors and is still refused a binding by name —
+    /// [`VaultError::CredentialKeyMissing`] — rather than described by a
+    /// guessed one.
+    #[serde(default)]
+    pub credential_public_key: String,
+    /// Authenticator model identifier. All-zero by design on many models, so
+    /// it is raw bytes rather than an identifier type that refuses that value.
+    #[serde(default)]
+    pub aaguid: [u8; 16],
     /// When this credential was registered.
     pub enrolled_at: u64,
     /// The master key, sealed under this slot's wrapping key, base64.
     pub wrapped_master: String,
+}
+
+impl KeySlot {
+    /// The decoded COSE public key of this slot's credential.
+    ///
+    /// Refuses by name when the slot predates bindings, rather than handing
+    /// back an empty key that would be signed into a document claiming to
+    /// describe a credential.
+    pub fn credential_public_key(&self) -> Result<Vec<u8>> {
+        if self.credential_public_key.trim().is_empty() {
+            return Err(VaultError::CredentialKeyMissing);
+        }
+        let bytes = decode(&self.credential_public_key, "clé publique de credential")?;
+        if bytes.is_empty() || bytes.len() > MAX_CREDENTIAL_PUBLIC_KEY_BYTES {
+            return Err(VaultError::CredentialKeyOutOfBounds);
+        }
+        Ok(bytes)
+    }
+
+    /// The decoded CTAP2 credential identifier of this slot.
+    pub fn credential_id(&self) -> Result<Vec<u8>> {
+        decode(&self.credential_id, "identifiant de credential")
+    }
 }
 
 /// The private anchors of the domain. Never leaves `astra-signer`.
@@ -264,6 +319,13 @@ pub struct SlotEnrolment {
     pub label: String,
     /// CTAP2 credential identifier of the authenticator being registered.
     pub credential_id: Vec<u8>,
+    /// COSE public key the authenticator attested for this credential.
+    ///
+    /// Required at enrolment, unlike on [`KeySlot`], where it is defaulted for
+    /// files written before bindings existed: a key registered from now on
+    /// always has one, so a new slot without a binding cannot be created.
+    pub credential_public_key: Vec<u8>,
+    pub aaguid: [u8; 16],
     pub enrolled_at: u64,
 }
 
@@ -271,6 +333,11 @@ impl SlotEnrolment {
     fn validate(&self) -> Result<()> {
         if self.credential_id.is_empty() || self.credential_id.len() > MAX_CREDENTIAL_ID_BYTES {
             return Err(VaultError::CredentialIdOutOfBounds);
+        }
+        if self.credential_public_key.is_empty()
+            || self.credential_public_key.len() > MAX_CREDENTIAL_PUBLIC_KEY_BYTES
+        {
+            return Err(VaultError::CredentialKeyOutOfBounds);
         }
         if self.label.trim().is_empty() || self.label.chars().count() > MAX_LABEL_CHARS {
             return Err(VaultError::LabelOutOfBounds);
@@ -392,6 +459,8 @@ impl AuthorityVault {
             role: first.role,
             label: first.label,
             credential_id: encode(&first.credential_id),
+            credential_public_key: encode(&first.credential_public_key),
+            aaguid: first.aaguid,
             enrolled_at: now_unix,
             wrapped_master,
         }];
@@ -579,6 +648,8 @@ impl AuthorityVault {
             role: enrolment.role,
             label: enrolment.label,
             credential_id,
+            credential_public_key: encode(&enrolment.credential_public_key),
+            aaguid: enrolment.aaguid,
             enrolled_at: enrolment.enrolled_at,
             wrapped_master,
         });
@@ -609,6 +680,44 @@ impl AuthorityVault {
         let mut slots = self.slots.clone();
         slots.retain(|slot| slot.slot_id != *removed);
         self.reseal(slots, &master, &secrets)
+    }
+
+    /// Replaces the sealed anchors, under the slot table already in place.
+    ///
+    /// This is what a `CA-PQ` rotation lands (spec §9.1): the key-slots do not
+    /// move — every credential that opened the vault before opens it after —
+    /// and only the body changes. It takes an opening credential for the same
+    /// reason [`Self::add_slot`] does: re-sealing needs the master key, and the
+    /// master key needs a slot.
+    ///
+    /// The clear `ca_pq_public_key` is advanced in the **same** call, so the
+    /// copy two other programs read can never describe a different anchor from
+    /// the one the body holds.
+    pub fn replace_anchors(
+        &mut self,
+        opening_credential: &[u8],
+        opening_secret: &SlotSecret,
+        secrets: &AuthoritySecrets,
+    ) -> Result<()> {
+        if secrets.ca_pq_private_key.trim().is_empty()
+            || secrets.ca_pq_public_key.trim().is_empty()
+            || secrets.ca_tls_private_key.trim().is_empty()
+        {
+            return Err(VaultError::Corrupt(
+                "ancres de remplacement incomplètes".into(),
+            ));
+        }
+        let opening_slot = self.slot_for_credential(opening_credential)?.slot_id;
+        let master = self.master(&opening_slot, opening_secret)?;
+        // The current body must open before it is replaced: an operator who
+        // cannot read the anchors is not entitled to overwrite them, and this
+        // is where a corrupt file says so rather than producing a second one.
+        let _ = self.open_payload(&master)?;
+        let slots = self.slots.clone();
+        let public_key = secrets.ca_pq_public_key.clone();
+        self.reseal(slots, &master, secrets)?;
+        self.ca_pq_public_key = public_key;
+        Ok(())
     }
 
     /// Renames a slot. Never re-seals: the label is outside the digest, which
@@ -733,6 +842,8 @@ mod tests {
             role,
             label: format!("clé {seed}"),
             credential_id: credential(seed),
+            credential_public_key: vec![0xa5, seed],
+            aaguid: [seed; 16],
             enrolled_at: 2_000,
         }
     }

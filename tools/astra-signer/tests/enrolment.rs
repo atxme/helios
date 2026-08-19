@@ -1,9 +1,8 @@
 //! The authority gestures, end to end, against simulated security keys.
 //!
-//! What is simulated is exactly one thing: the CTAP2 boundary. A fake token
-//! holds a per-credential secret it never releases, and answers an assertion
-//! with `HMAC(secret, salt)` — which is what `hmac-secret` is. Everything
-//! above that is the production code, including the vault.
+//! What is simulated is exactly one thing: the CTAP2 boundary — see
+//! [`support::FakeKey`]. Everything above it is the production code, including
+//! the vault.
 //!
 //! So these tests do not prove a YubiKey works; nothing outside a real machine
 //! can (see `docs/testing/TESTING.md`). They prove the sequence around it does:
@@ -11,109 +10,16 @@
 //! that a third and a fourth do too, that a key which was never enrolled opens
 //! nothing, and that withdrawing one leaves everyone else working.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+mod support;
 
 use aether::certificates::encoding::TrustDomainId;
-use astra::vault::{AuthorityVault, SlotRole, SlotSecret};
-use astra_signer::authenticator::{Authenticator, AuthenticatorError, CredentialSubject, Opened};
+use astra::vault::{AuthorityVault, SlotRole};
+use astra_signer::authenticator::{Authenticator, AuthenticatorError, CredentialSubject};
 use astra_signer::gestures::{
     self, add_key, create_authority, open_with_authorized_key, prove_anchors_open, remove_key,
     NewAuthority, NewKey,
 };
-
-const RP_ID: &str = "astra.helios.test";
-const PIN: &str = "123456";
-
-/// One simulated security key.
-///
-/// `serial` stands for the physical object: two tokens with the same serial
-/// are the same token, and a credential minted on one is unknown to the other.
-struct FakeKey {
-    serial: u8,
-    /// Credentials this token minted, and the secret behind each. The secret
-    /// never leaves — only a derivation of it does.
-    credentials: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
-    minted: RefCell<u8>,
-}
-
-impl FakeKey {
-    fn new(serial: u8) -> Self {
-        Self {
-            serial,
-            credentials: RefCell::new(HashMap::new()),
-            minted: RefCell::new(0),
-        }
-    }
-}
-
-impl Authenticator for FakeKey {
-    fn register(
-        &self,
-        _rp_id: &str,
-        _subject: &CredentialSubject,
-        exclude: &[Vec<u8>],
-        pin: &str,
-    ) -> Result<Vec<u8>, AuthenticatorError> {
-        if pin != PIN {
-            return Err(AuthenticatorError::Device("PIN invalide".into()));
-        }
-        // CTAP2's `excludeList`: a token that already holds one of these
-        // refuses rather than minting a second.
-        if exclude
-            .iter()
-            .any(|candidate| self.credentials.borrow().contains_key(candidate))
-        {
-            return Err(AuthenticatorError::Device(
-                "cette clé détient déjà un credential de ce coffre".into(),
-            ));
-        }
-        let mut minted = self.minted.borrow_mut();
-        *minted += 1;
-        let credential_id = vec![self.serial, *minted, 0xC0, 0xDE]
-            .into_iter()
-            .cycle()
-            .take(64)
-            .collect::<Vec<u8>>();
-        let mut secret = [0u8; 32];
-        secret[0] = self.serial;
-        secret[1] = *minted;
-        self.credentials
-            .borrow_mut()
-            .insert(credential_id.clone(), secret);
-        Ok(credential_id)
-    }
-
-    fn derive(
-        &self,
-        _rp_id: &str,
-        credentials: &[Vec<u8>],
-        salt: &[u8; 32],
-        pin: &str,
-    ) -> Result<Opened, AuthenticatorError> {
-        if pin != PIN {
-            return Err(AuthenticatorError::Device("PIN invalide".into()));
-        }
-        let held = self.credentials.borrow();
-        let credential_id = credentials
-            .iter()
-            .find(|candidate| held.contains_key(*candidate))
-            .ok_or(AuthenticatorError::UnknownCredential)?
-            .clone();
-        let secret = held[&credential_id];
-
-        // `hmac-secret`, in shape if not in algorithm: a value determined by
-        // the credential's secret and the salt, and by nothing else.
-        let mut output = [0u8; 32];
-        for index in 0..32 {
-            output[index] = secret[index] ^ salt[index];
-        }
-        Ok(Opened {
-            credential_id,
-            secret: SlotSecret::new(output.to_vec()),
-        })
-    }
-}
+use support::{FakeKey, PIN, RP_ID};
 
 fn domain() -> TrustDomainId {
     TrustDomainId::new([0x2A; 16]).expect("domain")

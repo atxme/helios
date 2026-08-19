@@ -102,6 +102,8 @@ mod tests {
                 role: SlotRole::Primary,
                 label: "clé".into(),
                 credential_id: vec![1; 64],
+                credential_public_key: vec![0xa5, 0x01],
+                aaguid: [0; 16],
                 enrolled_at: 10,
             },
             &SlotSecret::new(vec![1; 32]),

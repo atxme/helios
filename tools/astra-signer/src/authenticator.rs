@@ -1,24 +1,31 @@
 //! The one place that talks to a security key.
 //!
-//! Two gestures, and no others, because the vault needs no others:
+//! Three gestures, and no others, because the authority needs no others:
 //!
 //! - [`Authenticator::register`] creates a credential carrying `hmac-secret`,
-//!   and returns its identifier. That identifier is public; the secret behind
-//!   it never leaves the token.
+//!   and returns its identifier, its COSE public key and its AAGUID. All three
+//!   are public; the secret behind them never leaves the token.
 //! - [`Authenticator::derive`] hands the token the vault's salt and an
 //!   allow-list of registered credentials. The token answers with the one it
 //!   holds and the 32 bytes `hmac-secret` produced for it. One touch resolves
 //!   *which key this is* and *what it unwraps*, together.
+//! - [`Authenticator::approve`] asks for presence and user verification over
+//!   one exact `clientDataJSON`, and returns the WebAuthn assertion. It takes
+//!   **no salt**, so it can obtain no `hmac-secret` output and open no
+//!   key-slot — spec §14.1 asks for exactly that separation, and here it is a
+//!   signature rather than a convention.
 //!
 //! # What a security key does here, and what it never does
 //!
-//! It authenticates, and it derives. It **signs nothing this program keeps.**
-//! An assertion carries a signature; we read the extension output and drop the
-//! signature on the floor, because no field of the certificate lifecycle holds
-//! anything but an `MlDsa87Signature` and no FIDO2 authenticator produces one.
-//! The token's job is to be a secret that cannot be copied, released only on
-//! presence and verification — which is exactly what unwrapping a key-slot
-//! asks for (ADR-008 §4).
+//! It authenticates, it derives, and it authorizes. It **produces no signature
+//! of this protocol.** [`Authenticator::approve`] returns an assertion
+//! signature, and that signature authorizes the use of the delegated issuer —
+//! it never becomes a field of the certificate lifecycle, because every one of
+//! those is an `MlDsa87Signature` and no FIDO2 authenticator produces one. In
+//! [`Authenticator::derive`] the assertion's signature is dropped on the floor
+//! entirely; only the extension output is read. The token's job is to be a
+//! secret that cannot be copied, released only on presence and verification —
+//! which is exactly what unwrapping a key-slot asks for (ADR-008 §4).
 //!
 //! # Non-discoverable credentials
 //!
@@ -51,7 +58,8 @@
 //!
 //! [`docs/testing/TESTING.md`]: ../../../docs/testing/TESTING.md
 
-use astra::vault::{SlotSecret, SALT_LEN};
+use aether::certificates::webauthn::{WebAuthnAssertion, MAX_CREDENTIAL_PUBLIC_KEY_BYTES};
+use astra::vault::{SlotSecret, MAX_CREDENTIAL_ID_BYTES, SALT_LEN};
 
 /// USB vendor identifiers of common security-key makers.
 ///
@@ -100,6 +108,11 @@ pub enum AuthenticatorError {
     NoHmacOutput,
     #[error("dialogue avec la clé de sécurité : {0}")]
     Device(String),
+    #[error(
+        "la clé n'a pas rendu les données de credential attestées : sans sa clé publique COSE et \
+         son AAGUID, aucun `AstraCredentialBinding` ne peut décrire ce key-slot ({0})"
+    )]
+    NoAttestedCredential(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, AuthenticatorError>;
@@ -120,6 +133,32 @@ pub struct Opened {
     /// The credential the token turned out to hold, among those offered.
     pub credential_id: Vec<u8>,
     pub secret: SlotSecret,
+}
+
+/// The public half of one freshly created credential.
+///
+/// All three fields go into the `AstraCredentialBinding` `CA-PQ` signs in the
+/// same operation as the key-slot. A registration that returned only the
+/// identifier would leave the binding unable to name the key an assertion is
+/// verified under — and the gap would be found at the first approval, which is
+/// the one moment there is no fallback.
+pub struct Registration {
+    pub credential_id: Vec<u8>,
+    /// COSE public key, exactly as the authenticator attested it.
+    pub credential_public_key: Vec<u8>,
+    /// Authenticator model identifier. Frequently all-zero by design.
+    pub aaguid: [u8; 16],
+}
+
+/// What one approval ceremony produced.
+///
+/// There is deliberately no field for an `hmac-secret` output: the method that
+/// returns this value is handed no salt, so there is nothing to put in one.
+/// An ordinary renewal therefore cannot open a key-slot even by mistake.
+pub struct Approval {
+    /// The credential the token turned out to hold, among those offered.
+    pub credential_id: Vec<u8>,
+    pub assertion: WebAuthnAssertion,
 }
 
 /// How this program reaches the security key.
@@ -164,7 +203,7 @@ pub trait Authenticator {
         subject: &CredentialSubject,
         exclude: &[Vec<u8>],
         pin: &str,
-    ) -> Result<Vec<u8>>;
+    ) -> Result<Registration>;
 
     /// Resolves which of `credentials` the token holds, and derives its slot
     /// secret from `salt`.
@@ -175,6 +214,26 @@ pub trait Authenticator {
         salt: &[u8; SALT_LEN],
         pin: &str,
     ) -> Result<Opened>;
+
+    /// Asks for presence and user verification over one exact
+    /// `clientDataJSON`, and returns the assertion.
+    ///
+    /// `client_data_json` is composed by the caller and carries the challenge
+    /// of the operation being approved — the SHA-256 of a canonical request,
+    /// never a value this module chooses. The bytes are returned unchanged
+    /// inside the assertion so a verifier re-derives the challenge from them
+    /// rather than being told what it was.
+    ///
+    /// No salt, and that is the point: §14.1 requires an ordinary renewal to
+    /// obtain no PRF output and open no key-slot, and a method with nowhere to
+    /// put one obeys that whatever its callers do.
+    fn approve(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        pin: &str,
+    ) -> Result<Approval>;
 }
 
 /// One HID device, as the system exposes it.
@@ -256,6 +315,158 @@ fn prf_salt(salt: &[u8; SALT_LEN]) -> [u8; SALT_LEN] {
 /// `"WebAuthn PRF"` and the separator the specification puts after it.
 const PRF_PREFIX: &[u8] = b"WebAuthn PRF\x00";
 
+/// Offset of the attested credential data inside authenticator data.
+///
+/// `rpIdHash(32) || flags(1) || signCount(4)`, then — when the AT flag is set
+/// — `aaguid(16) || credentialIdLength(2) || credentialId || COSEKey`.
+const ATTESTED_CREDENTIAL_OFFSET: usize = 32 + 1 + 4;
+
+/// The AT flag: authenticator data carries attested credential data.
+const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
+
+/// The public credential material a `MakeCredential` attested.
+///
+/// Read from the authenticator data both transports already return, rather
+/// than from whatever shape each API re-exposes it in: `webauthn.dll` publishes
+/// no COSE key at all, and `ctap-hid-fido2` re-encodes it into an SPKI that has
+/// lost the algorithm labels a binding must carry. The authenticator data is
+/// the one representation both hand back untouched, so it is the one parsed.
+pub(crate) struct AttestedCredential {
+    pub aaguid: [u8; 16],
+    pub credential_id: Vec<u8>,
+    pub credential_public_key: Vec<u8>,
+}
+
+/// Extracts the attested credential data from authenticator data.
+///
+/// Bounded at every step, because these bytes come from a device: the
+/// credential identifier is checked against the vault's own ceiling and the
+/// COSE key against WebAuthn's, before either is copied.
+pub(crate) fn attested_credential(authenticator_data: &[u8]) -> Result<AttestedCredential> {
+    let mut cursor = ATTESTED_CREDENTIAL_OFFSET;
+    if authenticator_data.len() <= cursor {
+        return Err(AuthenticatorError::NoAttestedCredential(
+            "données d'authentificateur trop courtes",
+        ));
+    }
+    if authenticator_data[32] & FLAG_ATTESTED_CREDENTIAL_DATA == 0 {
+        return Err(AuthenticatorError::NoAttestedCredential(
+            "drapeau AT absent",
+        ));
+    }
+
+    let aaguid: [u8; 16] = authenticator_data
+        .get(cursor..cursor + 16)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(AuthenticatorError::NoAttestedCredential("AAGUID tronqué"))?;
+    cursor += 16;
+
+    let length = authenticator_data
+        .get(cursor..cursor + 2)
+        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+        .map(u16::from_be_bytes)
+        .ok_or(AuthenticatorError::NoAttestedCredential(
+            "longueur de credential tronquée",
+        ))? as usize;
+    cursor += 2;
+    if length == 0 || length > MAX_CREDENTIAL_ID_BYTES {
+        return Err(AuthenticatorError::NoAttestedCredential(
+            "identifiant de credential hors bornes",
+        ));
+    }
+    let credential_id = authenticator_data
+        .get(cursor..cursor + length)
+        .ok_or(AuthenticatorError::NoAttestedCredential(
+            "identifiant de credential tronqué",
+        ))?
+        .to_vec();
+    cursor += length;
+
+    let remainder = &authenticator_data[cursor..];
+    let key_length = cose_key_length(remainder)?;
+    Ok(AttestedCredential {
+        aaguid,
+        credential_id,
+        credential_public_key: remainder[..key_length].to_vec(),
+    })
+}
+
+/// Length of the COSE key opening `bytes`, so extension output that follows it
+/// is left out.
+///
+/// A COSE key is a definite-length CBOR map of integer labels to integers and
+/// byte strings, and this reads exactly that — no tags, no indefinite lengths,
+/// no nested containers. Anything else is refused rather than skipped: a
+/// reader that tolerated more than the shape it needs would decide where a key
+/// ends by guessing, and the guess would end up inside a signed binding.
+fn cose_key_length(bytes: &[u8]) -> Result<usize> {
+    fn refuse() -> AuthenticatorError {
+        AuthenticatorError::NoAttestedCredential("clé publique COSE illisible")
+    }
+
+    /// Reads one CBOR head, returning `(major type, argument, bytes read)`.
+    fn head(bytes: &[u8], offset: usize) -> Result<(u8, u64, usize)> {
+        let initial = *bytes.get(offset).ok_or_else(refuse)?;
+        let major = initial >> 5;
+        let extra = initial & 0x1f;
+        let (argument, width) = match extra {
+            value @ 0..=23 => (u64::from(value), 0usize),
+            24 => (u64::from(*bytes.get(offset + 1).ok_or_else(refuse)?), 1),
+            25 => (
+                u64::from(u16::from_be_bytes(
+                    bytes
+                        .get(offset + 1..offset + 3)
+                        .and_then(|slice| <[u8; 2]>::try_from(slice).ok())
+                        .ok_or_else(refuse)?,
+                )),
+                2,
+            ),
+            26 => (
+                u64::from(u32::from_be_bytes(
+                    bytes
+                        .get(offset + 1..offset + 5)
+                        .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+                        .ok_or_else(refuse)?,
+                )),
+                4,
+            ),
+            // 64-bit arguments and the indefinite-length marker have no place
+            // in a COSE key of the two shapes a FIDO2 credential registers.
+            _ => return Err(refuse()),
+        };
+        Ok((major, argument, 1 + width))
+    }
+
+    let (major, entries, mut offset) = head(bytes, 0)?;
+    if major != 5 {
+        return Err(refuse());
+    }
+    for _ in 0..entries {
+        for position in 0..2 {
+            let (major, argument, width) = head(bytes, offset)?;
+            offset += width;
+            match major {
+                // Unsigned and negative integers: the labels, the key type,
+                // the algorithm and the curve.
+                0 | 1 => {}
+                // Byte strings: the coordinates. Never a label.
+                2 if position == 1 => {
+                    let length = usize::try_from(argument).map_err(|_| refuse())?;
+                    offset = offset.checked_add(length).ok_or_else(refuse)?;
+                    if offset > bytes.len() {
+                        return Err(refuse());
+                    }
+                }
+                _ => return Err(refuse()),
+            }
+        }
+    }
+    if offset == 0 || offset > MAX_CREDENTIAL_PUBLIC_KEY_BYTES || offset > bytes.len() {
+        return Err(refuse());
+    }
+    Ok(offset)
+}
+
 /// Opens the single connected security key, over `transport`.
 ///
 /// Exactly one: a second key plugged in during an enrolment is how an operator
@@ -277,7 +488,11 @@ pub fn connect(transport: Transport) -> Result<Box<dyn Authenticator>> {
 mod webauthn;
 
 mod ctap {
-    use super::{AuthenticatorError, CredentialSubject, Opened, Result, HMAC_SECRET_LEN, SALT_LEN};
+    use super::{
+        Approval, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
+        HMAC_SECRET_LEN, SALT_LEN,
+    };
+    use aether::certificates::webauthn::WebAuthnAssertion;
     use astra::vault::SlotSecret;
     use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension as AssertionExt;
     use ctap_hid_fido2::fidokey::get_assertion::GetAssertionArgsBuilder;
@@ -436,7 +651,7 @@ mod ctap {
             subject: &CredentialSubject,
             exclude: &[Vec<u8>],
             pin: &str,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<Registration> {
             let challenge = super::random_challenge()?;
             let user = PublicKeyCredentialUserEntity::new(
                 Some(&subject.user_id),
@@ -461,6 +676,16 @@ mod ctap {
                     "la clé n'a rendu aucun identifiant de credential".into(),
                 ));
             }
+            // The COSE key and the AAGUID come out of the authenticator data
+            // rather than out of `credential_publickey`: that field has already
+            // been re-encoded into an SPKI, which no longer says which COSE
+            // algorithm the credential registered under.
+            let attested = super::attested_credential(&attestation.auth_data)?;
+            if attested.credential_id != credential_id {
+                return Err(AuthenticatorError::NoAttestedCredential(
+                    "l'identifiant attesté diffère de celui rendu",
+                ));
+            }
             // A token that registered the credential without the extension
             // would hand back an identifier that unwraps nothing — and the
             // failure would only surface at the next unlock.
@@ -475,7 +700,11 @@ mod ctap {
                     self.advertised_extensions()
                 )));
             }
-            Ok(credential_id)
+            Ok(Registration {
+                credential_id,
+                credential_public_key: attested.credential_public_key,
+                aaguid: attested.aaguid,
+            })
         }
 
         fn derive(
@@ -552,6 +781,73 @@ mod ctap {
                 secret: SlotSecret::new(output.to_vec()),
             })
         }
+
+        fn approve(
+            &self,
+            rp_id: &str,
+            credentials: &[Vec<u8>],
+            client_data_json: &[u8],
+            pin: &str,
+        ) -> Result<Approval> {
+            if credentials.is_empty() {
+                return Err(AuthenticatorError::UnknownCredential);
+            }
+            // CTAP2 signs a `clientDataHash`, and this crate hashes whatever it
+            // is handed as the challenge. Handing it the `clientDataJSON`
+            // therefore produces exactly WebAuthn's own hash — and the caller
+            // keeps the pre-image, which is what a verifier re-derives the
+            // challenge from.
+            //
+            // No `Extension::HmacSecret` here, and no salt to put in one: this
+            // ceremony authorizes, it does not unwrap.
+            let mut builder = GetAssertionArgsBuilder::new(rp_id, client_data_json).pin(pin);
+            for credential in credentials {
+                builder = builder.add_credential_id(credential);
+            }
+            let assertions =
+                self.key
+                    .get_assertion_with_args(&builder.build())
+                    .map_err(|error| {
+                        let text = format!("{error:#}");
+                        if text.contains("0x2E") || text.to_lowercase().contains("no_credentials") {
+                            AuthenticatorError::UnknownCredential
+                        } else {
+                            AuthenticatorError::Device(text)
+                        }
+                    })?;
+            let assertion = assertions
+                .into_iter()
+                .next()
+                .ok_or(AuthenticatorError::UnknownCredential)?;
+
+            // Same rule as `derive`: CTAP2 may omit the credential when the
+            // allow-list held exactly one entry, and falling back to it then is
+            // not a guess.
+            let credential_id = if assertion.credential_id.is_empty() {
+                if credentials.len() != 1 {
+                    return Err(AuthenticatorError::Device(
+                        "la clé n'a pas nommé le credential utilisé alors que plusieurs étaient \
+                         proposés"
+                            .into(),
+                    ));
+                }
+                credentials[0].clone()
+            } else {
+                assertion.credential_id.clone()
+            };
+            if !credentials.contains(&credential_id) {
+                return Err(AuthenticatorError::UnknownCredential);
+            }
+
+            Ok(Approval {
+                credential_id,
+                assertion: WebAuthnAssertion {
+                    authenticator_data: assertion.auth_data,
+                    client_data_json: client_data_json.to_vec(),
+                    signature: assertion.signature,
+                },
+            })
+        }
     }
 }
 
@@ -596,5 +892,83 @@ mod tests {
     fn the_prf_prefix_is_the_one_the_specification_names() {
         assert_eq!(PRF_PREFIX, b"WebAuthn PRF\0");
         assert_eq!(PRF_PREFIX.len(), 13);
+    }
+
+    /// A canonical ES256 COSE key, in the shape CTAP2 emits: a five-entry map
+    /// of `kty`, `alg`, `crv`, `x` and `y`.
+    fn es256_cose_key() -> Vec<u8> {
+        let mut key = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        key.extend_from_slice(&[0x11; 32]);
+        key.extend_from_slice(&[0x22, 0x58, 0x20]);
+        key.extend_from_slice(&[0x22; 32]);
+        key
+    }
+
+    fn authenticator_data(credential_id: &[u8], trailing: &[u8]) -> Vec<u8> {
+        let mut data = vec![0x5A; 32];
+        data.push(FLAG_ATTESTED_CREDENTIAL_DATA | 0x05);
+        data.extend_from_slice(&7u32.to_be_bytes());
+        data.extend_from_slice(&[0x3B; 16]);
+        data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        data.extend_from_slice(credential_id);
+        data.extend_from_slice(&es256_cose_key());
+        data.extend_from_slice(trailing);
+        data
+    }
+
+    /// The three public values a credential binding needs come out of the
+    /// authenticator data, and out of nothing else.
+    #[test]
+    fn attested_credential_data_yields_the_key_the_binding_carries() {
+        let credential_id = vec![0xC0, 0xDE, 0x01, 0x02];
+        let attested = attested_credential(&authenticator_data(&credential_id, &[]))
+            .expect("attested credential data");
+        assert_eq!(attested.credential_id, credential_id);
+        assert_eq!(attested.aaguid, [0x3B; 16]);
+        assert_eq!(attested.credential_public_key, es256_cose_key());
+    }
+
+    /// Extension output follows the COSE key inside authenticator data. Taking
+    /// « everything after the credential identifier » would fold it into the
+    /// signed binding, and the key would then verify nothing.
+    #[test]
+    fn extension_output_after_the_cose_key_is_left_out_of_it() {
+        let trailing = vec![
+            0xa1, 0x6b, b'h', b'm', b'a', b'c', b'-', b'-', b'-', b'-', b'-', b'-', b'-', 0xf5,
+        ];
+        let attested = attested_credential(&authenticator_data(&[9; 32], &trailing))
+            .expect("attested credential data");
+        assert_eq!(attested.credential_public_key, es256_cose_key());
+    }
+
+    /// Without the AT flag there is no attested credential data at all, and
+    /// the refusal names that rather than failing somewhere inside a parse.
+    #[test]
+    fn authenticator_data_without_the_attested_flag_is_refused() {
+        let mut data = authenticator_data(&[1; 16], &[]);
+        data[32] &= !FLAG_ATTESTED_CREDENTIAL_DATA;
+        assert!(matches!(
+            attested_credential(&data),
+            Err(AuthenticatorError::NoAttestedCredential(_))
+        ));
+    }
+
+    /// The reader claims to understand one CBOR shape and refuses the rest.
+    /// A parser that guessed where a key ended would put the guess into a
+    /// document `CA-PQ` signs.
+    #[test]
+    fn a_cose_key_outside_the_shape_this_reader_claims_is_refused() {
+        // An array where a map belongs.
+        assert!(cose_key_length(&[0x85, 0x01]).is_err());
+        // A text-string value: never part of the two shapes registered here.
+        assert!(cose_key_length(&[0xa1, 0x01, 0x61, b'x']).is_err());
+        // A byte string in label position.
+        assert!(cose_key_length(&[0xa1, 0x41, 0x01, 0x02]).is_err());
+        // An indefinite-length map.
+        assert!(cose_key_length(&[0xbf, 0x01, 0x02, 0xff]).is_err());
+        // A truncated coordinate.
+        let mut truncated = es256_cose_key();
+        truncated.truncate(truncated.len() - 1);
+        assert!(cose_key_length(&truncated).is_err());
     }
 }

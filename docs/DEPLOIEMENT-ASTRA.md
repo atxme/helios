@@ -38,12 +38,13 @@ in-tunnel sont ouvertes.
 Vous n'avez **pas** encore de renouvellement de certificats fonctionnel. Il
 manque :
 
-- les **commandes de signature et d'approbation** d'`astra-signer` — certificat
-  auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes et approbation
-  YubiKey liée à chaque demande cliente. Sans la deuxième, Astra n'a pas
-  d'émetteur délégué ; sans l'approbation exacte, il doit refuser tout
-  renouvellement ordinaire. Les routes qui exigent ce geste opérateur
-  répondent encore `501` ;
+- le **dépôt** des demandes et des résultats d'`astra-signer`. Les commandes
+  existent — `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
+  `approve-campaign`, `rotate-ca-pq` — mais elles lisent une demande sur disque
+  et écrivent leur résultat à côté : les routes à jeton de capacité qui les
+  relieraient à Astra répondent encore `501`. Il faut donc copier les fichiers
+  entre le poste opérateur et Astra à la main, et les routes qui exigent le
+  geste opérateur côté Astra répondent `501` ;
 - le **relais typé WireGuard–veth Astra–Helios** du §2 : `heliosd` n'a aucun
   client HTTP vers Astra. Les deux services connaissent le même domaine, mais
   ne se parlent pas encore. Le renouvellement actif ne doit pas exposer Astra

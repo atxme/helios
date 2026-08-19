@@ -15,7 +15,11 @@ name = "astra-signer"
 path = "src/main.rs"
 
 [dependencies]
-aether.workspace = true
+# `key-negotiation-signing` sans condition : sans elle il n'existe aucune
+# fonction `sign`, et le compagnon est précisément le seul programme du dépôt
+# qui signe sous `CA-PQ`. La construire sans donnerait un binaire qui ouvre le
+# coffre et ne peut rien en faire.
+aether = { workspace = true, features = ["key-negotiation-signing"] }
 astra.workspace = true
 anyhow.workspace = true
 aws-lc-rs.workspace = true
@@ -27,6 +31,8 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Les périodes de validité X.509 que `rcgen` attend.
+time.workspace = true
 zeroize.workspace = true
 # Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
 # compagnon qui ne parle à aucune clé n'ouvre aucun coffre, et la spécification
@@ -38,6 +44,11 @@ ctap-hid-fido2 = { version = "3.5", default-features = false, features = ["aws-l
 
 [dev-dependencies]
 tempfile = "3"
+# Le certificat `CA-TLS` que le compagnon auto-signe se relit avec un parseur
+# X.509 réel plutôt qu'avec l'émetteur qui vient de l'écrire : c'est la
+# signature et le `basicConstraints` qui comptent, pas ce que `rcgen` croit
+# avoir posé. Même version que celle qu'`aether` vérifie déjà.
+x509-parser = { version = "0.16", features = ["verify"] }
 
 # API WebAuthn de Windows, générée depuis les métadonnées Microsoft : aucune
 # déclaration FFI écrite à la main. C'est le chemin qui n'exige pas

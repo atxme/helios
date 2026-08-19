@@ -50,8 +50,10 @@ use windows_sys::Win32::Networking::WindowsWebServices::*;
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 
 use super::{
-    Authenticator, AuthenticatorError, CredentialSubject, Opened, Result, HMAC_SECRET_LEN,
+    Approval, Authenticator, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
+    HMAC_SECRET_LEN,
 };
+use aether::certificates::webauthn::WebAuthnAssertion;
 use astra::vault::{SlotSecret, SALT_LEN};
 
 /// Longest an operator is asked to look for their key before we give up.
@@ -100,7 +102,7 @@ impl Authenticator for WebAuthnAuthenticator {
         subject: &CredentialSubject,
         exclude: &[Vec<u8>],
         _pin: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Registration> {
         let rp_id_w = wide(rp_id);
         let rp_name_w = wide("Helios");
         let user_name_w = wide(&subject.user_name);
@@ -214,20 +216,36 @@ impl Authenticator for WebAuthnAuthenticator {
         }
 
         // From here every exit must free the attestation: it is Windows'
-        // allocation, and returning early would leak it.
-        let credential_id = unsafe {
+        // allocation, and returning early would leak it. Both values are
+        // copied out under one `unsafe`, and the allocation is released before
+        // anything can fail.
+        let (credential_id, authenticator_data) = unsafe {
             let attested = &*attestation;
             let id = std::slice::from_raw_parts(
                 attested.pbCredentialId,
                 attested.cbCredentialId as usize,
             )
             .to_vec();
+            let data = std::slice::from_raw_parts(
+                attested.pbAuthenticatorData,
+                attested.cbAuthenticatorData as usize,
+            )
+            .to_vec();
             WebAuthNFreeCredentialAttestation(attestation);
-            id
+            (id, data)
         };
         if credential_id.is_empty() {
             return Err(AuthenticatorError::Device(
                 "la clé n'a rendu aucun identifiant de credential".into(),
+            ));
+        }
+        // Windows publishes no COSE key of its own, so the binding's material
+        // is read out of the authenticator data — the same bytes, and the same
+        // parser, as the raw CTAP transport.
+        let attested = super::attested_credential(&authenticator_data)?;
+        if attested.credential_id != credential_id {
+            return Err(AuthenticatorError::NoAttestedCredential(
+                "l'identifiant attesté diffère de celui rendu",
             ));
         }
         // `bPrfEnabled` is deliberately **not** consulted. Every caller derives
@@ -235,7 +253,11 @@ impl Authenticator for WebAuthnAuthenticator {
         // assertion is the proof — it either yields the bytes or it does not.
         // Refusing on the flag instead turned a YubiKey 5 that works into a
         // key the tool declared incapable.
-        Ok(credential_id)
+        Ok(Registration {
+            credential_id,
+            credential_public_key: attested.credential_public_key,
+            aaguid: attested.aaguid,
+        })
     }
 
     fn derive(
@@ -356,6 +378,106 @@ impl Authenticator for WebAuthnAuthenticator {
         Ok(Opened {
             credential_id,
             secret: SlotSecret::new(secret),
+        })
+    }
+
+    fn approve(
+        &self,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        _pin: &str,
+    ) -> Result<Approval> {
+        if credentials.is_empty() {
+            return Err(AuthenticatorError::UnknownCredential);
+        }
+        let rp_id_w = wide(rp_id);
+        // The caller's bytes, unchanged: they carry the challenge of the exact
+        // operation being approved, and a verifier re-derives it from them.
+        let mut client_data_json = client_data_json.to_vec();
+        let client = WEBAUTHN_CLIENT_DATA {
+            dwVersion: WEBAUTHN_CLIENT_DATA_CURRENT_VERSION,
+            cbClientDataJSON: client_data_json.len() as u32,
+            pbClientDataJSON: client_data_json.as_mut_ptr(),
+            pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
+        };
+
+        let mut allowed = CredentialList::new(credentials);
+        let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
+            dwVersion: WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS_VERSION_6,
+            dwTimeoutMilliseconds: TIMEOUT_MS,
+            CredentialList: WEBAUTHN_CREDENTIALS {
+                cCredentials: 0,
+                pCredentials: std::ptr::null_mut(),
+            },
+            Extensions: WEBAUTHN_EXTENSIONS {
+                cExtensions: 0,
+                pExtensions: std::ptr::null_mut(),
+            },
+            dwAuthenticatorAttachment: WEBAUTHN_AUTHENTICATOR_ATTACHMENT_CROSS_PLATFORM,
+            dwUserVerificationRequirement: WEBAUTHN_USER_VERIFICATION_REQUIREMENT_REQUIRED,
+            dwFlags: 0,
+            pwszU2fAppId: std::ptr::null(),
+            pbU2fAppId: std::ptr::null_mut(),
+            pCancellationId: std::ptr::null_mut(),
+            pAllowCredentialList: allowed.as_ptr(),
+            dwCredLargeBlobOperation: 0,
+            cbCredLargeBlob: 0,
+            pbCredLargeBlob: std::ptr::null_mut(),
+            // Null, and that is the whole difference with `derive`: an
+            // approval asks for no PRF output, so Windows returns none and no
+            // key-slot can be opened by this ceremony (spec §14.1).
+            pHmacSecretSaltValues: std::ptr::null_mut(),
+            bBrowserInPrivateMode: FALSE,
+            pLinkedDevice: std::ptr::null_mut(),
+            bAutoFill: FALSE,
+            cbJsonExt: 0,
+            pbJsonExt: std::ptr::null_mut(),
+        };
+
+        let mut assertion: *mut WEBAUTHN_ASSERTION = std::ptr::null_mut();
+        let status = unsafe {
+            WebAuthNAuthenticatorGetAssertion(
+                self.window,
+                rp_id_w.as_ptr(),
+                &client,
+                &options,
+                &mut assertion,
+            )
+        };
+        if status != 0 || assertion.is_null() {
+            return Err(AuthenticatorError::Device(error_name(status)));
+        }
+
+        let (credential_id, authenticator_data, signature) = unsafe {
+            let asserted = &*assertion;
+            let credential_id = std::slice::from_raw_parts(
+                asserted.Credential.pbId,
+                asserted.Credential.cbId as usize,
+            )
+            .to_vec();
+            let authenticator_data = std::slice::from_raw_parts(
+                asserted.pbAuthenticatorData,
+                asserted.cbAuthenticatorData as usize,
+            )
+            .to_vec();
+            let signature =
+                std::slice::from_raw_parts(asserted.pbSignature, asserted.cbSignature as usize)
+                    .to_vec();
+            WebAuthNFreeAssertion(assertion);
+            (credential_id, authenticator_data, signature)
+        };
+        if !credentials.contains(&credential_id) {
+            return Err(AuthenticatorError::UnknownCredential);
+        }
+
+        Ok(Approval {
+            credential_id,
+            assertion: WebAuthnAssertion {
+                authenticator_data,
+                client_data_json,
+                signature,
+            },
         })
     }
 }

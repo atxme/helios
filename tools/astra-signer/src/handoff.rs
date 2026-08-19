@@ -15,6 +15,22 @@
 //! It could be. The file exists so a deployment needs neither the vault nor a
 //! security key — it carries only what is public, and can be copied to a build
 //! machine that must never see the authority itself.
+//!
+//! # Why the signing commands read it too
+//!
+//! Signing a delegation, approving a renewal or emitting a credential binding
+//! all need values the vault does not hold: the gateway's WireGuard key, the
+//! server name, the Astra service key the companion **pins**, and the two
+//! authority epochs. Retyping them on every command is where an operator
+//! eventually signs a delegation for the wrong gateway — an object `CA-PQ`
+//! vouches for, which no later check can undo.
+//!
+//! So they are recorded here once, next to the anchor, and every later command
+//! reads them. They are all optional because they arrive in the order a
+//! deployment produces them: the vault exists before the gateway does, and the
+//! Astra service key exists only after `astra bootstrap`. A command that needs
+//! one and does not find it says which value is missing and which flag records
+//! it, rather than proceeding on a default.
 
 use std::path::{Path, PathBuf};
 
@@ -39,15 +55,92 @@ pub struct DomainHandoff {
     /// Fingerprint of the vault as it stood when this was written, so an
     /// operator can tell which vault a hand-off belongs to.
     pub vault_fingerprint: String,
+    /// Epoch of `CA-PQ`. Advanced by an anchor rotation, and by nothing else.
+    #[serde(default)]
+    pub ca_epoch: Option<u64>,
+    /// Epoch of `CA-TLS`. Advanced when a new client TLS CA is self-signed.
+    #[serde(default)]
+    pub ca_tls_epoch: Option<u64>,
+    /// The self-signed client `CA-TLS` certificate, DER base64.
+    ///
+    /// Public: it is what the gateway pins and what a delegated intermediate
+    /// chains to. The private half stays in the sealed body.
+    #[serde(default)]
+    pub ca_tls_certificate: Option<String>,
+    /// WireGuard public key of the gateway this domain serves, base64.
+    ///
+    /// Every `CA-PQ`-signed object of the lifecycle names it, so recording it
+    /// once removes it from every command line.
+    #[serde(default)]
+    pub gateway_wg_public_key: Option<String>,
+    /// Server name of the gateway. Part of the pinned issuance policy.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// The Astra service key this companion **pins**, base64.
+    ///
+    /// Printed by `astra bootstrap`. A companion that learned the service key
+    /// from the request it is about to trust would authenticate nothing, so it
+    /// is recorded here and compared afterwards.
+    #[serde(default)]
+    pub astra_service_public_key: Option<String>,
+    #[serde(default)]
+    pub astra_service_key_epoch: Option<u64>,
 }
 
 impl DomainHandoff {
+    /// A hand-off carrying only what the vault itself knows.
     pub fn of(vault: &AuthorityVault) -> Result<Self> {
-        Ok(Self {
-            trust_domain_id: vault.trust_domain_id.to_hex(),
-            rp_id: vault.rp_id.clone(),
-            ca_pq_public_key: vault.ca_pq_public_key.clone(),
-            vault_fingerprint: vault.fingerprint()?.to_hex(),
+        let mut handoff = Self {
+            trust_domain_id: String::new(),
+            rp_id: String::new(),
+            ca_pq_public_key: String::new(),
+            vault_fingerprint: String::new(),
+            ca_epoch: None,
+            ca_tls_epoch: None,
+            ca_tls_certificate: None,
+            gateway_wg_public_key: None,
+            server_name: None,
+            astra_service_public_key: None,
+            astra_service_key_epoch: None,
+        };
+        handoff.adopt(vault)?;
+        Ok(handoff)
+    }
+
+    /// Refreshes the vault-derived half, leaving everything recorded later.
+    ///
+    /// Rewriting the file from the vault alone would silently drop the gateway
+    /// key and the pinned service key — and the next command would then ask an
+    /// operator to retype them, which is the failure this file exists to
+    /// prevent.
+    pub fn adopt(&mut self, vault: &AuthorityVault) -> Result<()> {
+        self.trust_domain_id = vault.trust_domain_id.to_hex();
+        self.rp_id = vault.rp_id.clone();
+        self.ca_pq_public_key = vault.ca_pq_public_key.clone();
+        self.vault_fingerprint = vault.fingerprint()?.to_hex();
+        Ok(())
+    }
+
+    /// Loads the hand-off beside a vault, or builds a fresh one.
+    pub fn beside(vault_path: &Path, vault: &AuthorityVault) -> Result<Self> {
+        let path = path_beside(vault_path);
+        match load(&path) {
+            Ok(mut handoff) => {
+                handoff.adopt(vault)?;
+                Ok(handoff)
+            }
+            Err(_) => Self::of(vault),
+        }
+    }
+
+    /// A value the deployment recorded, or a refusal naming the flag that
+    /// records it.
+    pub fn require<'a, T>(&self, value: Option<&'a T>, what: &str, flag: &str) -> Result<&'a T> {
+        value.ok_or_else(|| {
+            anyhow::anyhow!(
+                "le relais de domaine ne porte pas {what} : le renseigner par `astra-signer \
+                 domain {flag} <valeur>`"
+            )
         })
     }
 }
@@ -100,6 +193,8 @@ mod tests {
                 role: SlotRole::Primary,
                 label: "clé".into(),
                 credential_id: vec![4; 64],
+                credential_public_key: vec![0xa5, 0x01],
+                aaguid: [0; 16],
                 enrolled_at: 10,
             },
             &SlotSecret::new(vec![4; 32]),

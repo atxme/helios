@@ -92,9 +92,20 @@ Restent ouverts :
   `astra::vault` enveloppe `CA-PQ` et `CA-TLS` sous un key-slot par credential
   FIDO2, et le compagnon **`astra-signer`** crée le coffre, y enrôle des clés,
   les éprouve et en retire — `init`, `enrol`, `verify`, `list`, `remove`,
-  `rename`. Restent ouverts : les **commandes de signature** du compagnon
-  (certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes) et
-  donc toute approbation opérateur (routes en `501`). La moitié Astra → Helios
+  `rename`. Ses **commandes de signature** sont livrées : `issue-ca-tls`
+  auto-signe la CA TLS cliente, `authorize-issuer` signe une
+  `AstraIssuerAuthorization` bornée, `bindings` réémet le document de
+  credentials depuis la table de key-slots — automatiquement à chaque geste qui
+  la déplace —, `approve` approuve un renouvellement client **sans ouvrir le
+  coffre** (§14.1 : la méthode d'approbation ne reçoit aucun sel, donc aucune
+  sortie PRF n'existe pour elle), `approve-campaign` approuve une campagne à
+  autant de clés distinctes que sa portée l'exige, et `rotate-ca-pq` fait
+  tourner l'ancre sous deux clés. Aucune valeur ne se retape : `domain`
+  enregistre gateway, nom de service et clé de service Astra dans le relais
+  public, et chaque commande y lit. Reste ouvert du côté compagnon : le
+  transport, qui passe encore par des fichiers — les routes à jeton de
+  capacité du §8.2 répondent `501`, donc il n'y a rien à appeler. Toute
+  approbation opérateur côté Astra reste donc à câbler. La moitié Astra → Helios
   du veth privé est livrée et confinée par le ruleset (`astra0`, adresses et
   port exacts) ; `heliosd` n'a aucun client HTTP vers l'API Astra opposée, donc la gateway ne
   détient encore **aucun objet pré-signé à distribuer** et répond `503` à un

@@ -276,7 +276,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "windows-sys 0.59.0",
+ "x509-parser 0.16.0",
  "zeroize",
 ]
 

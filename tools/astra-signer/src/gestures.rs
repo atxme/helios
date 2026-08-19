@@ -32,6 +32,8 @@ pub enum GestureError {
     Vault(#[from] VaultError),
     #[error(transparent)]
     Authenticator(#[from] AuthenticatorError),
+    #[error("objet de cycle de vie refusé : {0}")]
+    Certificate(#[from] aether::certificates::CertificateError),
     #[error("génération des ancres d'autorité : {0}")]
     Anchors(String),
 }
@@ -81,14 +83,14 @@ pub fn create_authority(
         ca_tls_private_key: encode(&ca_tls_key.serialize_der()),
     };
 
-    let credential_id =
+    let registration =
         key.register(&request.rp_id, &subject(&request.trust_domain_id), &[], pin)?;
     // The salt has to exist before the vault does: the first slot's secret is
     // this token's `hmac-secret` output *for this salt*.
     let salt = draw_salt()?;
     let opened = key.derive(
         &request.rp_id,
-        std::slice::from_ref(&credential_id),
+        std::slice::from_ref(&registration.credential_id),
         &salt,
         pin,
     )?;
@@ -101,7 +103,9 @@ pub fn create_authority(
         SlotEnrolment {
             role: request.role,
             label: request.label.clone(),
-            credential_id,
+            credential_id: registration.credential_id,
+            credential_public_key: registration.credential_public_key,
+            aaguid: registration.aaguid,
             enrolled_at: now_unix,
         },
         &opened.secret,
@@ -147,11 +151,10 @@ pub fn add_key(
 ) -> Result<[u8; 16]> {
     let known = vault.credential_ids()?;
     let salt = vault.salt()?;
-    let credential_id =
-        new.register(&vault.rp_id, &subject(&vault.trust_domain_id), &known, pin)?;
+    let registration = new.register(&vault.rp_id, &subject(&vault.trust_domain_id), &known, pin)?;
     let new_secret = new.derive(
         &vault.rp_id,
-        std::slice::from_ref(&credential_id),
+        std::slice::from_ref(&registration.credential_id),
         &salt,
         pin,
     )?;
@@ -161,7 +164,9 @@ pub fn add_key(
         SlotEnrolment {
             role: request.role,
             label: request.label.clone(),
-            credential_id,
+            credential_id: registration.credential_id,
+            credential_public_key: registration.credential_public_key,
+            aaguid: registration.aaguid,
             enrolled_at: now_unix,
         },
         &new_secret.secret,

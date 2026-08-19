@@ -24,6 +24,9 @@
 pub const WORK_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 pub mod authenticator;
+pub mod authority;
+pub mod credentials;
+pub mod documents;
 pub mod gestures;
 pub mod handoff;
 pub mod store;

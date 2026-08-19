@@ -8,9 +8,10 @@ disponible.
 
 Le lot livré ferme le chemin « demande → autorisation → persistance gateway →
 reçu → grant → commit » et le branche au démon. Ce qui manque est
-l'exploitation : les commandes de signature et d'approbation du compagnon, le
-relais typé WireGuard–veth, la distribution effective des objets de transition,
-la bascule de profil du §13 et les deux IHM.
+l'exploitation : le dépôt des demandes et des résultats du compagnon par les
+routes du §8.2 — ses gestes de signature, eux, sont livrés —, le relais typé
+WireGuard–veth, la distribution effective des objets de transition, la bascule
+de profil du §13 et les deux IHM.
 
 ## 0. État de départ et décisions
 
@@ -2579,11 +2580,16 @@ contournés :
   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
   émis avant ce changement cesse de vérifier et le parc se ré-émet ;
 
-- les **commandes de signature et d'approbation** d'`astra-signer` : certificat
-  auto-signé `CA-TLS`, `AstraIssuerAuthorization`, campagnes,
-  bindings de credentials sous `CA-PQ`, `AstraCredentialApprovalRequest` et
-  `AstraRenewalApproval`. Les routes d'approbation répondent encore `501` et
-  l'émetteur délégué n'applique pas encore la nouvelle obligation YubiKey ;
+- le **transport** des demandes et des résultats d'`astra-signer`. Les gestes
+  eux-mêmes sont livrés et éprouvés : certificat auto-signé `CA-TLS`,
+  `AstraIssuerAuthorization` bornée, bindings de credentials sous `CA-PQ`
+  réémis depuis la table de key-slots, approbation d'une
+  `AstraCredentialApprovalRequest` en `AstraRenewalApproval` — sans ouvrir le
+  coffre —, campagnes à deux credentials distincts et rotation de `CA-PQ`.
+  Chacun lit une demande sur disque et écrit son résultat à côté, parce que les
+  routes `signer-requests`, `vaults` et `signer-results` du §8.2 répondent
+  encore `501`. Côté Astra, les routes d'approbation répondent `501` et
+  l'émetteur délégué n'applique pas encore l'obligation YubiKey ;
 - le **relais typé WireGuard–veth** et le canal privé bidirectionnel Astra–Helios
   des §§8.1.2 et 8.3, TLS 1.3 `(EC)DHE` sans reprise ni 0-RTT. Deux conséquences
   directes : la gateway ne
