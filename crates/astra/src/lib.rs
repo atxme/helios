@@ -53,8 +53,10 @@
 pub mod audit;
 pub mod gateway;
 pub mod issuer;
+pub mod operations;
 pub mod planner;
 pub mod registry;
+pub mod renewal;
 pub mod service;
 pub mod vault;
 

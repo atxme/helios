@@ -75,11 +75,46 @@ struct StoredChannel {
     /// Astra's transport certificate, DER, base64. The only client identity
     /// this listener accepts, byte for byte.
     astra_certificate: String,
+    /// Address of Astra's own private listener, on the same veth.
+    ///
+    /// The direction this gateway **dials**, to relay a client renewal
+    /// (spec §8.1.2). Optional because a deployment may have the staging half
+    /// and not the renewal half — that is what an older document is — and the
+    /// renewal routes then answer `503` rather than the daemon refusing to
+    /// start.
+    #[serde(default)]
+    authority: Option<SocketAddr>,
+    /// This gateway's **client** certificate, DER, base64. Astra pins it.
+    ///
+    /// A second identity from the one served above, because the two are pinned
+    /// by different peers under different names and different extended key
+    /// usages. One certificate carrying both roles would let either end be
+    /// replayed into the other's.
+    #[serde(default)]
+    client_certificate: Option<String>,
+    /// Its PKCS#8 private key, DER, base64.
+    #[serde(default)]
+    client_private_key: Option<String>,
+    /// Astra's **server** certificate, DER, base64. The only authority this
+    /// gateway will dial, byte for byte.
+    #[serde(default)]
+    astra_authority_certificate: Option<String>,
 }
 
 /// A loaded, checked channel: ready to serve.
 pub struct AstraChannel {
     pub bind: SocketAddr,
+    identity: ChannelIdentity,
+    astra_certificate: DerCertificate,
+    /// The dialling half, present only when the document carries all three of
+    /// its values. Two of three is refused at load: half a pairing is an
+    /// operator error, and it would surface as a renewal that never works.
+    authority: Option<AuthorityEndpoint>,
+}
+
+/// Everything needed to dial Astra's private listener.
+struct AuthorityEndpoint {
+    address: SocketAddr,
     identity: ChannelIdentity,
     astra_certificate: DerCertificate,
 }
@@ -125,6 +160,32 @@ impl AstraChannel {
         let astra_certificate =
             DerCertificate::new(decode("the Astra certificate", &stored.astra_certificate)?)
                 .map_err(|error| anyhow::anyhow!("pinned Astra certificate: {error}"))?;
+        let authority = match (
+            stored.authority,
+            &stored.client_certificate,
+            &stored.client_private_key,
+            &stored.astra_authority_certificate,
+        ) {
+            (Some(address), Some(certificate), Some(key), Some(astra)) => Some(AuthorityEndpoint {
+                address,
+                identity: ChannelIdentity {
+                    certificate_der: decode("the gateway client certificate", certificate)?,
+                    private_key_der: decode("the gateway client private key", key)?,
+                },
+                astra_certificate: DerCertificate::new(decode(
+                    "the Astra authority certificate",
+                    astra,
+                )?)
+                .map_err(|error| anyhow::anyhow!("pinned Astra authority certificate: {error}"))?,
+            }),
+            (None, None, None, None) => None,
+            _ => anyhow::bail!(
+                "the Astra channel document carries only part of the dialling half: it needs the \
+                 authority address, this gateway's client certificate and key, and Astra's \
+                 authority certificate — re-run `heliosd init-astra-channel` with --authority \
+                 and --astra-authority-certificate"
+            ),
+        };
         Ok(Some(Self {
             bind: stored.bind,
             identity: ChannelIdentity {
@@ -132,7 +193,26 @@ impl AstraChannel {
                 private_key_der: decode("the gateway private key", &stored.private_key)?,
             },
             astra_certificate,
+            authority,
         }))
+    }
+
+    /// The typed client for Astra's private routes, when this gateway has one.
+    ///
+    /// Built here rather than by the caller so the pin is checked at start-up:
+    /// an unusable pairing found at deployment costs a command, and the same
+    /// pairing found at 80 % of a leaf's life costs a night.
+    pub fn authority_client(&self) -> Result<Option<helios_api::internal::AstraLifecycleClient>> {
+        let Some(authority) = &self.authority else {
+            return Ok(None);
+        };
+        let tls =
+            helios_api::internal::client_config(&authority.identity, &authority.astra_certificate)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(Some(helios_api::internal::AstraLifecycleClient::new(
+            authority.address,
+            tls,
+        )))
     }
 
     /// Builds the TLS configuration, refusing a pin that cannot serve.
@@ -187,7 +267,14 @@ pub fn spawn(handler: Arc<dyn AstraChannelHandler>) {
         // keeps a genuine misconfiguration visible instead of retrying for
         // ever.
         for attempt in 1..=BIND_ATTEMPTS {
-            match helios_api::internal::serve(bind, config.clone(), router.clone()).await {
+            match helios_api::internal::serve(
+                bind,
+                config.clone(),
+                router.clone(),
+                helios_api::internal::INTERNAL_PREFIX,
+            )
+            .await
+            {
                 Ok(()) => return,
                 Err(error) if attempt < BIND_ATTEMPTS => {
                     tracing::warn!(
@@ -230,10 +317,17 @@ const BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 pub fn initialize(
     bind: SocketAddr,
     astra_certificate_path: &Path,
+    authority: Option<SocketAddr>,
+    astra_authority_certificate_path: Option<&Path>,
     rotate: bool,
-) -> Result<DerCertificate> {
+) -> Result<TransportIdentities> {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
+    anyhow::ensure!(
+        authority.is_some() == astra_authority_certificate_path.is_some(),
+        "the dialling half needs both --authority and --astra-authority-certificate; only one \
+         was given, and half a pairing is a renewal that never works"
+    );
     let path = path();
     if !rotate {
         if let Some(existing) = AstraChannel::load_from(&path)? {
@@ -243,15 +337,35 @@ pub fn initialize(
                     astra_certificate_path.display()
                 )
             })?;
+            // The dialling half is compared too: a second run that named a
+            // different authority, or none where one was recorded, would
+            // otherwise return the certificate already served and leave the
+            // document describing the previous deployment.
+            let same_authority = match (&existing.authority, authority) {
+                (Some(existing), Some(wanted)) => existing.address == wanted,
+                (None, None) => true,
+                _ => false,
+            };
             anyhow::ensure!(
-                existing.bind == bind && existing.astra_certificate.as_bytes() == wanted,
+                existing.bind == bind
+                    && existing.astra_certificate.as_bytes() == wanted
+                    && same_authority,
                 "an Astra channel identity already exists at {} and it pins something else; use \
                  --rotate to replace it explicitly — the gateway's certificate changes with it, \
                  and Astra must be re-pinned in the same breath",
                 path.display()
             );
-            return DerCertificate::new(existing.identity.certificate_der)
-                .map_err(|error| anyhow::anyhow!("the served channel certificate: {error}"));
+            let client = existing
+                .authority
+                .as_ref()
+                .map(|authority| DerCertificate::new(authority.identity.certificate_der.clone()))
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("the client channel certificate: {error}"))?;
+            return Ok(TransportIdentities {
+                served: DerCertificate::new(existing.identity.certificate_der)
+                    .map_err(|error| anyhow::anyhow!("the served channel certificate: {error}"))?,
+                client,
+            });
         }
     }
     anyhow::ensure!(
@@ -284,11 +398,52 @@ pub fn initialize(
     let certificate_der = DerCertificate::new(certificate.der().to_vec())
         .map_err(|error| anyhow::anyhow!("generated channel certificate: {error}"))?;
 
+    // The dialling half, when this deployment has one. A `clientAuth`
+    // certificate under a different name: the two ends pin each other in two
+    // roles, and one certificate holding both would let each be replayed into
+    // the other's.
+    let dialling = match astra_authority_certificate_path {
+        Some(astra_authority_path) => {
+            let astra_authority =
+                DerCertificate::new(std::fs::read(astra_authority_path).with_context(|| {
+                    format!(
+                        "reading Astra's authority certificate {}",
+                        astra_authority_path.display()
+                    )
+                })?)
+                .map_err(|error| anyhow::anyhow!("Astra's authority certificate: {error}"))?;
+            let mut params = CertificateParams::new(vec![CLIENT_IDENTITY_NAME.to_string()])
+                .context("building the client channel certificate parameters")?;
+            params.is_ca = IsCa::NoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+            params.not_after =
+                time::OffsetDateTime::now_utc() + time::Duration::days(IDENTITY_VALIDITY_DAYS);
+            let key_pair = KeyPair::generate().context("generating the client channel key")?;
+            let certificate = params
+                .self_signed(&key_pair)
+                .context("creating the client channel certificate")?;
+            let der = DerCertificate::new(certificate.der().to_vec())
+                .map_err(|error| anyhow::anyhow!("generated client certificate: {error}"))?;
+            Some((der, key_pair.serialize_der(), astra_authority))
+        }
+        None => None,
+    };
+
     let stored = StoredChannel {
         bind,
         certificate: certificate_der.to_base64(),
         private_key: base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_der()),
         astra_certificate: astra_certificate.to_base64(),
+        authority,
+        client_certificate: dialling
+            .as_ref()
+            .map(|(certificate, _, _)| certificate.to_base64()),
+        client_private_key: dialling
+            .as_ref()
+            .map(|(_, key, _)| base64::engine::general_purpose::STANDARD.encode(key)),
+        astra_authority_certificate: dialling.as_ref().map(|(_, _, astra)| astra.to_base64()),
     };
     if let Some(parent) = path.parent() {
         aether::private_file::create_private_dir(parent)
@@ -305,7 +460,225 @@ pub fn initialize(
     let channel = AstraChannel::load_from(&path)?
         .context("the Astra channel document was written and cannot be read back")?;
     channel.server_config()?;
-    Ok(certificate_der)
+    channel.authority_client()?;
+    Ok(TransportIdentities {
+        served: certificate_der,
+        client: dialling.map(|(certificate, _, _)| certificate),
+    })
+}
+
+/// The name the gateway's client certificate carries.
+///
+/// Distinct from [`helios_api::internal::INTERNAL_SERVER_NAME`], which the
+/// served certificate carries: two identities, two names, so a mis-pinned pair
+/// cannot look like a working one right up to the pin comparison.
+const CLIENT_IDENTITY_NAME: &str = "helios-gateway-client.internal";
+
+/// What `heliosd init-astra-channel` produced, in both directions.
+pub struct TransportIdentities {
+    /// `serverAuth`. Astra pins it to dial this gateway.
+    pub served: DerCertificate,
+    /// `clientAuth`, absent when this deployment has no dialling half. Astra
+    /// pins it to accept this gateway on its own listener.
+    pub client: Option<DerCertificate>,
+}
+
+/// The gateway's half of the relayed client renewal (spec §8.1.2).
+///
+/// # Why this is not a proxy
+///
+/// Each method takes an identity the API layer **resolved from a source VIP**
+/// and an object it deserialized into a named type. Nothing the client chose —
+/// method, path, header, redirect — travels: the request that reaches Astra is
+/// built here, and `caller_wg_public_key` is this gateway's own resolution
+/// rather than a field the peer filled in. Astra compares the object's copy
+/// against it and refuses a mismatch, so neither end has to trust the other's
+/// word about who is asking.
+///
+/// # What it does not decide
+///
+/// Nothing. It holds no registry lock and takes no view on whether a renewal
+/// is due, approved or refused: that is the authority's, and the gateway's own
+/// registry only learns about it later, when Astra stages the candidate on the
+/// other direction of this same veth. Every refusal is relayed as its coarse
+/// class, because a finer one on the in-tunnel route would be an oracle about
+/// other peers.
+pub struct AstraRenewalRelay {
+    client: helios_api::internal::AstraLifecycleClient,
+}
+
+impl AstraRenewalRelay {
+    pub fn new(client: helios_api::internal::AstraLifecycleClient) -> Self {
+        Self { client }
+    }
+
+    /// The caller, parsed once, before anything is relayed.
+    fn caller(
+        raw: &str,
+    ) -> Result<
+        aether::certificates::encoding::WireGuardKey,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        aether::certificates::encoding::WireGuardKey::parse(raw).map_err(|error| {
+            tracing::error!(%error, "the resolved caller is not a WireGuard key");
+            helios_api::certificates::TrustUpdateRefusal::Internal
+        })
+    }
+
+    /// One channel failure, logged with its reason and answered with a class.
+    fn refuse(
+        route: &str,
+        error: helios_api::internal::ChannelError,
+    ) -> helios_api::certificates::TrustUpdateRefusal {
+        use helios_api::certificates::TrustUpdateRefusal;
+        use helios_api::internal::ChannelError;
+        match error {
+            // A status the authority chose is relayed as what it means, not as
+            // a gateway failure: `403` is a refusal the peer earned, and
+            // reporting it as `500` would send an Orion into retrying
+            // something that will never succeed.
+            ChannelError::Status(status) => {
+                tracing::warn!(route, %status, "the authority refused a relayed renewal");
+                match status.as_u16() {
+                    400 => TrustUpdateRefusal::Protocol,
+                    403 => TrustUpdateRefusal::Rejected,
+                    501 | 503 => TrustUpdateRefusal::Unavailable,
+                    _ => TrustUpdateRefusal::Internal,
+                }
+            }
+            error => {
+                // The authority is unreachable, or answered something this
+                // client cannot read. Either way the peer is not at fault and
+                // retrying later is the right advice.
+                tracing::error!(route, %error, "the authority could not be reached");
+                TrustUpdateRefusal::Unavailable
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
+    async fn open(
+        &self,
+        caller_wg_public_key: &str,
+        request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
+    ) -> Result<
+        helios_api::internal::ClientRenewalOperationView,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        let caller = Self::caller(caller_wg_public_key)?;
+        self.client
+            .request_rotation(&helios_api::internal::RelayedRotationRequest {
+                caller_wg_public_key: caller,
+                request,
+            })
+            .await
+            .map_err(|error| Self::refuse("request", error))
+    }
+
+    async fn operation(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+    ) -> Result<
+        helios_api::internal::ClientRenewalOperationView,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        let caller = Self::caller(caller_wg_public_key)?;
+        self.client
+            .operation(
+                operation,
+                &helios_api::internal::RelayedOperationQuery {
+                    caller_wg_public_key: caller,
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("operation", error))
+    }
+
+    async fn signer_request(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+    ) -> Result<
+        helios_api::internal::ClientRenewalSignerRequest,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        let caller = Self::caller(caller_wg_public_key)?;
+        self.client
+            .signer_request(
+                operation,
+                capability_token,
+                &helios_api::internal::RelayedOperationQuery {
+                    caller_wg_public_key: caller,
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("signer-request", error))
+    }
+
+    async fn signer_result(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+        approval: Box<aether::certificates::approval::AstraRenewalApproval>,
+    ) -> Result<
+        helios_api::internal::ClientRenewalOperationView,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        let caller = Self::caller(caller_wg_public_key)?;
+        self.client
+            .signer_result(
+                operation,
+                capability_token,
+                &helios_api::internal::ClientRenewalSignerResult {
+                    caller_wg_public_key: caller,
+                    approval,
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("signer-result", error))
+    }
+}
+
+/// The relay, when this gateway has a dialling half.
+///
+/// `Ok(None)` is a deployment whose authority only receives — a supported
+/// state, and the one every deployment starts in. The renewal routes then
+/// answer `503`: the route exists and the client is right to use it; what is
+/// missing is the authority behind it.
+pub fn relay() -> Option<AstraRenewalRelay> {
+    let channel = match AstraChannel::load() {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(%error, "the Astra channel document is unusable — no renewal relay");
+            return None;
+        }
+    };
+    match channel.authority_client() {
+        Ok(Some(client)) => {
+            tracing::info!(
+                authority = %client.address(),
+                "client renewal relay ready; renewals are relayed on the private veth"
+            );
+            Some(AstraRenewalRelay::new(client))
+        }
+        Ok(None) => {
+            tracing::info!(
+                "no authority address in the Astra channel document: the four renewal routes \
+                 answer 503 until `heliosd init-astra-channel --authority` is run"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(%error, "the renewal relay identity is unusable — the routes stay 503");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -353,10 +726,11 @@ mod tests {
         let _guard = isolated(directory.path());
         let astra = astra_certificate(directory.path());
 
-        let served = initialize("10.88.0.1:8444".parse().unwrap(), &astra, false).unwrap();
+        let served =
+            initialize("10.88.0.1:8444".parse().unwrap(), &astra, None, None, false).unwrap();
         let channel = AstraChannel::load().unwrap().expect("channel");
         assert_eq!(channel.bind, "10.88.0.1:8444".parse().unwrap());
-        assert_eq!(channel.identity.certificate_der, served.as_bytes());
+        assert_eq!(channel.identity.certificate_der, served.served.as_bytes());
         assert_eq!(
             channel.astra_certificate.as_bytes(),
             std::fs::read(&astra).unwrap()
@@ -365,21 +739,23 @@ mod tests {
 
         // Run again with the same pairing: the same certificate comes back, so
         // a resumed deployment finishes what an interrupted one started.
-        let again = initialize("10.88.0.1:8444".parse().unwrap(), &astra, false).unwrap();
-        assert_eq!(again.as_bytes(), served.as_bytes());
+        let again =
+            initialize("10.88.0.1:8444".parse().unwrap(), &astra, None, None, false).unwrap();
+        assert_eq!(again.served.as_bytes(), served.served.as_bytes());
 
         // A different pin, on the other hand, is a replacement — and a
         // replacement the other end has not been told about breaks the link.
         let other = astra_certificate(&directory.path().join("other"));
         assert!(
-            initialize("10.88.0.1:8444".parse().unwrap(), &other, false).is_err(),
+            initialize("10.88.0.1:8444".parse().unwrap(), &other, None, None, false).is_err(),
             "a changed pin was adopted without --rotate"
         );
         // So is a different address: the pairing includes where it is served.
-        assert!(initialize("10.88.0.1:9999".parse().unwrap(), &astra, false).is_err());
+        assert!(initialize("10.88.0.1:9999".parse().unwrap(), &astra, None, None, false).is_err());
 
-        let rotated = initialize("10.88.0.1:8444".parse().unwrap(), &other, true).unwrap();
-        assert_ne!(rotated.as_bytes(), served.as_bytes());
+        let rotated =
+            initialize("10.88.0.1:8444".parse().unwrap(), &other, None, None, true).unwrap();
+        assert_ne!(rotated.served.as_bytes(), served.served.as_bytes());
     }
 
     /// A wildcard bind publishes the lifecycle API on the WAN and inside the
@@ -391,9 +767,9 @@ mod tests {
         let _guard = isolated(directory.path());
         let astra = astra_certificate(directory.path());
 
-        assert!(initialize("0.0.0.0:8444".parse().unwrap(), &astra, false).is_err());
+        assert!(initialize("0.0.0.0:8444".parse().unwrap(), &astra, None, None, false).is_err());
 
-        initialize("10.88.0.1:8444".parse().unwrap(), &astra, true).unwrap();
+        initialize("10.88.0.1:8444".parse().unwrap(), &astra, None, None, true).unwrap();
         let path = path();
         let mut stored: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -422,6 +798,6 @@ mod tests {
         let wrong = directory.path().join("wrong.der");
         std::fs::write(&wrong, certificate.der().as_ref()).unwrap();
 
-        assert!(initialize("10.88.0.1:8444".parse().unwrap(), &wrong, false).is_err());
+        assert!(initialize("10.88.0.1:8444".parse().unwrap(), &wrong, None, None, false).is_err());
     }
 }

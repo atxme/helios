@@ -3,14 +3,26 @@
 //! - `POST /api/key-negotiation/trust-update` lives **inside the WireGuard
 //!   tunnel**, behind [`crate::auth::require_peer`]. It is how an Orion that
 //!   still has a working tunnel learns about transitions (spec §8.1).
+//! - the four `/api/key-negotiation/certificate-renewal/*` routes carry an
+//!   ordinary renewal end to end (spec §8.1.2): the request, the polling of
+//!   the operation, and the two exchanges the signing companion needs.
 //! - `POST /api/key-negotiation/stage-commit` carries an ordinary client commit
 //!   through that same tunnel.
 //!
 //! The `/internal/v1/certificates/*` surface belongs on a separate listener on
-//! the private Astra–Helios veth. It is not mounted by this router yet. In
+//! the private Astra–Helios veth. It is not mounted by this router. In
 //! particular there is deliberately no in-tunnel `stage` route: Astra sends a
 //! stage authorization directly to Helios over the veth and receives the
 //! signed receipt there (spec §§7.2 and 8.1.2).
+//!
+//! # Why the gateway is not a reverse proxy
+//!
+//! Every renewal route accepts one type and one size, resolves the caller from
+//! its source VIP, compares the body's identity against that resolution and
+//! then relays a **canonical object** it built itself. Nothing the client
+//! chooses — method, path, header, redirect — is forwarded (spec §8.1.2). A
+//! generic proxy would make the peer's own bytes decide what the authority is
+//! asked, which is the one thing the source-VIP proof is there to prevent.
 //!
 //! # Why the public route is not a fallback for the private one
 //!
@@ -121,6 +133,55 @@ pub trait TrustUpdateHandler: Send + Sync {
     ) -> Result<(), TrustUpdateRefusal>;
 }
 
+/// The gateway's half of the relayed client renewal (spec §8.1.2).
+///
+/// Four operations, one per in-tunnel route, and every one of them takes the
+/// **resolved** caller as its first argument — the identity `require_peer`
+/// derived from the source VIP. Nothing here takes an identity out of a body:
+/// the body's copy is compared against this one further down, exactly as the
+/// PSK release does.
+///
+/// A trait for the same reason [`TrustUpdateHandler`] is one: the API process
+/// holds no registry lock and no client towards Astra. It hands an
+/// authenticated, typed object to whatever owns both, and learns back one
+/// refusal class.
+#[async_trait]
+pub trait ClientRenewalRelay: Send + Sync {
+    /// Opens an operation for the caller's own rotation request.
+    ///
+    /// The answer is always an operation, never a certificate: at this point
+    /// no operator has approved anything, so there is nothing to issue.
+    async fn open(
+        &self,
+        caller_wg_public_key: &str,
+        request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
+    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+
+    /// Reads one operation the caller owns.
+    async fn operation(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+
+    /// Fetches what the signing companion has to display and answer.
+    async fn signer_request(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+    ) -> Result<crate::internal::ClientRenewalSignerRequest, TrustUpdateRefusal>;
+
+    /// Delivers the operator's assertion and returns what it produced.
+    async fn signer_result(
+        &self,
+        caller_wg_public_key: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+        approval: Box<aether::certificates::approval::AstraRenewalApproval>,
+    ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
+}
+
 /// Private Astra-to-Helios staging contract.
 ///
 /// This trait deliberately has no route in the in-tunnel router. The future
@@ -222,6 +283,186 @@ pub async fn stage_commit(
         Ok(()) => StatusCode::NO_CONTENT,
         Err(refusal) => refusal.status(),
     }
+}
+
+/// The renewal routes' common preamble: a caller, and an operation identifier.
+///
+/// Written once because it is the property the whole surface rests on. Every
+/// route resolves the peer **before** it deserializes anything cryptographic,
+/// and a route that forgot to would be indistinguishable from one that did.
+fn renewal_caller(caller: &crate::auth::Caller, route: &str) -> Option<String> {
+    match caller.public_key.as_deref() {
+        Some(key) => Some(key.to_string()),
+        None => {
+            // `require_peer` also admits the `--dev` loopback identity, which
+            // has no WireGuard key. A renewal is about one peer's generations;
+            // without a key there is no peer to renew for.
+            tracing::warn!(
+                source = %caller.source,
+                route,
+                "certificate renewal refused: the caller is not tied to a WireGuard peer"
+            );
+            None
+        }
+    }
+}
+
+/// Parses an operation identifier out of a path segment.
+fn parse_operation_id(
+    raw: &str,
+) -> Result<aether::certificates::encoding::Id16, aether::certificates::CertificateError> {
+    aether::certificates::encoding::Id16::parse_hex(raw)
+}
+
+/// `POST /api/key-negotiation/certificate-renewal/request` (spec §8.1.2).
+///
+/// Step 1 of the relayed flow. The gateway resolves the peer, hands the
+/// canonical request to Astra and returns the `awaiting_operator` operation it
+/// opened. It never returns a certificate, because at this point none exists.
+pub async fn renewal_request(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    body: Bytes,
+) -> Response {
+    let Some(caller_key) = renewal_caller(&caller, "request") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let request: aether::certificates::client::ClientCertificateRotationRequest =
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(peer = %caller_key, %error, "renewal refused: unreadable request");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+    let Some(relay) = s.client_renewal.as_ref() else {
+        return renewal_unavailable(&caller_key, "request");
+    };
+    match relay.open(&caller_key, Box::new(request)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `GET /api/key-negotiation/certificate-renewal/operations/<operation_id>`.
+///
+/// Steps 3 and 7: the client polls its own operation, and collects the grant
+/// once the gateway's receipt has produced one. Another peer asking for this
+/// identifier is refused — the operation is bound to the peer that opened it.
+pub async fn renewal_operation(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+) -> Response {
+    let Some(caller_key) = renewal_caller(&caller, "operation") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relay) = s.client_renewal.as_ref() else {
+        return renewal_unavailable(&caller_key, "operation");
+    };
+    match relay.operation(&caller_key, &operation).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `GET /api/key-negotiation/certificate-renewal/signer-requests/<operation_id>`.
+///
+/// Step 4a: the companion reads what it must display before it asks for a
+/// touch. It needs the capability token the operation handed the client, and
+/// the token is bound to that operation, that manifest and that scope.
+pub async fn renewal_signer_request(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(caller_key) = renewal_caller(&caller, "signer-request") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(token) = crate::internal::bearer_token(&headers) else {
+        // Missing is refused exactly like wrong: the answer must not tell a
+        // caller whether the operation it named exists.
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let token = token.to_string();
+    let Some(relay) = s.client_renewal.as_ref() else {
+        return renewal_unavailable(&caller_key, "signer-request");
+    };
+    match relay.signer_request(&caller_key, &operation, &token).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/key-negotiation/certificate-renewal/signer-results/<operation_id>`.
+///
+/// Step 4b and step 5: the companion delivers the assertion, and the answer is
+/// the operation Astra reached with it — `pending_commit` with a grant when
+/// the whole chain succeeded, `failed` when it did not.
+pub async fn renewal_signer_result(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(caller_key) = renewal_caller(&caller, "signer-result") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(token) = crate::internal::bearer_token(&headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let token = token.to_string();
+    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let approval: aether::certificates::approval::AstraRenewalApproval =
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(peer = %caller_key, %error, "renewal refused: unreadable approval");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+    let Some(relay) = s.client_renewal.as_ref() else {
+        return renewal_unavailable(&caller_key, "signer-result");
+    };
+    match relay
+        .signer_result(&caller_key, &operation, &token, Box::new(approval))
+        .await
+    {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// The answer of a gateway that has no authority to relay to.
+///
+/// `503` and not `404`: the route exists and the client is right to be using
+/// it. What is missing is the private channel, and a client told "unknown
+/// route" would conclude its gateway is too old and stop trying — the same
+/// mistake as answering "you are up to date" to a client that is behind.
+fn renewal_unavailable(caller_key: &str, route: &str) -> Response {
+    tracing::warn!(
+        peer = %caller_key,
+        route,
+        "certificate renewal unavailable: this gateway has no private channel to the authority, \
+         so no renewal can be relayed and no grant can be delivered"
+    );
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
 }
 
 #[cfg(test)]

@@ -56,6 +56,15 @@ pub trait StageReceiptSigner: Send + Sync {
         &self,
         receipt: GatewayCertificateStageReceipt,
     ) -> Result<GatewayCertificateStageReceipt, CertificateError>;
+
+    /// The leaf this daemon actually serves.
+    ///
+    /// The **served** one, and that is the whole point: a rotation the daemon
+    /// has not restarted for leaves a newer certificate on disk that no client
+    /// is offered, and an authority verifying a receipt against the file would
+    /// be verifying against a key that signed nothing. It comes from the same
+    /// holder as the private half, so the two cannot disagree.
+    fn served_pq_certificate(&self) -> aether::key_negotiation::PqCertificate;
 }
 
 /// Owner of the registry, and the only writer of its file.
@@ -233,6 +242,34 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
         Ok(helios_api::internal::PeerCertificateStateView {
             name: peer.name.clone(),
             state: peer.state.clone(),
+        })
+    }
+
+    /// The served leaf and the two counters that date it.
+    ///
+    /// The certificate comes from the negotiation handler — what is *served* —
+    /// while the epochs come from the registry, which is what every other
+    /// object of the lifecycle is numbered against. They are read under the
+    /// same lock as everything else so an authority never sees a certificate
+    /// from one moment and a counter from another.
+    async fn gateway_identity(
+        &self,
+    ) -> Result<helios_api::internal::GatewayIdentityView, TrustUpdateRefusal> {
+        let registry = self.registry.lock().await;
+        let state = registry.state();
+        let pq_certificate = self.signer.served_pq_certificate();
+        let pq_certificate_fingerprint = aether::certificates::gateway::pq_certificate_fingerprint(
+            &pq_certificate,
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "the served gateway leaf has no fingerprint");
+            TrustUpdateRefusal::Internal
+        })?;
+        Ok(helios_api::internal::GatewayIdentityView {
+            pq_certificate_fingerprint,
+            pq_certificate,
+            active_gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
+            gateway_decision_epoch: state.gateway.gateway_decision_epoch,
         })
     }
 }

@@ -32,8 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aether::certificates::approval::{AstraCredentialBinding, CredentialState};
-use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
+use aether::certificates::approval::CredentialState;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 
@@ -48,72 +47,26 @@ pub const CREDENTIALS_FILE: &str = "astra-credentials.json";
 const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
 
 /// Every signed credential decision of one trust domain.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialRegistry {
-    pub trust_domain_id: TrustDomainId,
-    /// The gateway the bindings are bound to. Fixed at the first emission and
-    /// compared afterwards: a binding under another gateway is a binding for
-    /// another domain's consumers, and would verify nowhere.
-    pub gateway_wg_public_key: WireGuardKey,
-    pub ca_epoch: u64,
-    pub credential_registry_epoch: u64,
-    pub bindings: Vec<AstraCredentialBinding>,
-}
+///
+/// Defined in `aether` rather than here: Astra reads the same file to decide
+/// which credentials a renewal may name, and two definitions of one format is
+/// where the two ends quietly stop agreeing about a field.
+pub use aether::certificates::approval::CredentialRegistry;
 
-impl CredentialRegistry {
-    /// The binding of one credential identifier, if this document holds one.
-    pub fn binding(&self, credential_id: &[u8]) -> Option<&AstraCredentialBinding> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.credential_id == credential_id)
-    }
-
-    /// The bindings a renewal approval may be answered by (spec §2.4).
-    pub fn approvable(&self) -> Vec<&AstraCredentialBinding> {
-        self.bindings
-            .iter()
-            .filter(|binding| binding.state == CredentialState::Active)
-            .collect()
-    }
-
-    /// Refuses a document that does not describe the vault it sits beside.
-    pub fn assert_describes(
-        &self,
-        trust_domain_id: &TrustDomainId,
-        gateway_wg_public_key: &WireGuardKey,
-    ) -> Result<()> {
-        if self.trust_domain_id != *trust_domain_id {
-            bail!(
-                "le document de credentials décrit le domaine {} et non {}",
-                self.trust_domain_id,
-                trust_domain_id
-            );
-        }
-        if self.gateway_wg_public_key != *gateway_wg_public_key {
-            bail!(
-                "le document de credentials est lié à une autre gateway : {} plutôt que {}",
-                self.gateway_wg_public_key,
-                gateway_wg_public_key
-            );
-        }
-        Ok(())
-    }
-
-    /// One line per credential, for an operator to read before touching a key.
-    pub fn summarize(&self) -> Vec<String> {
-        self.bindings
-            .iter()
-            .map(|binding| {
-                format!(
-                    "  {} — {} — époque {}",
-                    short(&binding.credential_id),
-                    state_label(binding.state),
-                    binding.credential_epoch
-                )
-            })
-            .collect()
-    }
+/// One line per credential, for an operator to read before touching a key.
+pub fn summarize(registry: &CredentialRegistry) -> Vec<String> {
+    registry
+        .bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "  {} — {} — époque {}",
+                short(&binding.credential_id),
+                state_label(binding.state),
+                binding.credential_epoch
+            )
+        })
+        .collect()
 }
 
 /// The operator-facing name of a credential state.
@@ -178,6 +131,8 @@ pub fn save(path: &Path, registry: &CredentialRegistry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::certificates::approval::AstraCredentialBinding;
+    use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
 
     fn binding(credential_id: Vec<u8>, state: CredentialState) -> AstraCredentialBinding {
         AstraCredentialBinding {

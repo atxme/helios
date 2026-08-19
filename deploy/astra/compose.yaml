@@ -51,12 +51,21 @@ services:
       - --expected-audit-head
       - ${ASTRA_EXPECTED_AUDIT_HEAD:?relever la tête d_audit imprimée au bootstrap}
 
-    # Le canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3). Les deux valeurs
-    # sortent de `heliosd init-astra-channel` et `deploy.sh` les écrit dans le
-    # `.env` ; absentes, Astra sert son endpoint public seul et le journalise.
+    # Le canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3), dans ses deux
+    # sens. Les quatre valeurs sortent de `astra init-channel` et de `heliosd
+    # init-astra-channel`, et `deploy.sh` les écrit dans le `.env` — aucune ne
+    # se recopie à la main.
+    #
+    # Les deux premières sont la direction qu'Astra appelle : staging d'un
+    # candidat et lecture d'un reçu. Les deux suivantes sont celle qu'il
+    # **écoute**, où la gateway relaie le renouvellement d'un client (§8.1.2).
+    # Chaque moitié est indépendante : absente, elle est journalisée et l'autre
+    # continue de fonctionner.
     environment:
       ASTRA_GATEWAY_CHANNEL: ${ASTRA_GATEWAY_CHANNEL:-}
       ASTRA_GATEWAY_CERTIFICATE: ${ASTRA_GATEWAY_CERTIFICATE:-}
+      ASTRA_PRIVATE_BIND: ${ASTRA_PRIVATE_BIND:-}
+      ASTRA_GATEWAY_CLIENT_CERTIFICATE: ${ASTRA_GATEWAY_CLIENT_CERTIFICATE:-}
 
     # Aucune capacité, rootfs en lecture seule, pas d'escalade. Astra n'ouvre
     # qu'un socket TCP et n'écrit que dans son volume.

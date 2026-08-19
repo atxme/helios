@@ -895,7 +895,7 @@ fn bindings(path: &Path, lost: &[String], active: &[String], transport: Transpor
 
     println!("credentials      : {}", registry_path.display());
     println!("époque registre  : {}", registry.credential_registry_epoch);
-    for line in registry.summarize() {
+    for line in credentials::summarize(&registry) {
         println!("{line}");
     }
     Ok(())

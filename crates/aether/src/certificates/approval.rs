@@ -450,6 +450,126 @@ impl AstraCredentialBinding {
     }
 }
 
+/// Largest number of credential decisions one document may carry.
+///
+/// Eight key-slots plus the credentials they replaced, with headroom. Bounded
+/// before a file is parsed rather than after: a document is read from disk on
+/// three machines, and an unbounded list is an allocation driven by whoever
+/// wrote the file.
+pub const MAX_CREDENTIAL_BINDINGS: usize = 64;
+
+/// Every signed credential decision of one trust domain (spec §2.4).
+///
+/// One document rather than loose bindings, and one **definition** rather than
+/// one per consumer: the companion writes it, Astra reads it to decide which
+/// credentials a renewal may name, and the two disagreeing about a field is
+/// the kind of gap that surfaces at the first approval — the one moment there
+/// is no fallback.
+///
+/// It is never *edited*. Every change of the key-slot table rebuilds it from
+/// that table: one `active` row per slot present, one `revoked` row per
+/// credential withdrawn. A row describing a slot the vault no longer holds is
+/// therefore not refused — it is constructed by nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialRegistry {
+    pub trust_domain_id: TrustDomainId,
+    /// The gateway the rows are bound to. Fixed at the first emission and
+    /// compared afterwards: a binding under another gateway is a binding for
+    /// another domain's consumers, and would verify nowhere.
+    pub gateway_wg_public_key: WireGuardKey,
+    pub ca_epoch: u64,
+    /// Only ever rises, and every consumer keeps the highest it has seen.
+    pub credential_registry_epoch: u64,
+    pub bindings: Vec<AstraCredentialBinding>,
+}
+
+impl CredentialRegistry {
+    /// The row of one credential identifier, if this document holds one.
+    pub fn binding(&self, credential_id: &[u8]) -> Option<&AstraCredentialBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.credential_id == credential_id)
+    }
+
+    /// The rows a renewal approval may be answered by.
+    ///
+    /// `active` only: a request naming a lost or revoked credential asks an
+    /// operator for a touch the verifier then refuses, which is a ceremony
+    /// spent on a refusal.
+    pub fn approvable(&self) -> Vec<&AstraCredentialBinding> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.state == CredentialState::Active)
+            .collect()
+    }
+
+    /// Refuses a document that does not describe the domain it was loaded for.
+    pub fn assert_describes(
+        &self,
+        trust_domain_id: &TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+    ) -> Result<(), CertificateError> {
+        if self.trust_domain_id != *trust_domain_id {
+            return Err(CertificateError::TrustDomainMismatch);
+        }
+        if self.gateway_wg_public_key != *gateway_wg_public_key {
+            return Err(CertificateError::GatewayIdentityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Every row, under `CA-PQ`, for the domain this consumer already pins.
+    ///
+    /// A consumer that verified only the rows it intended to use would accept
+    /// a document carrying one forged row beside the honest ones — and the
+    /// forged row is exactly what a later `supersedes` would be compared
+    /// against. Two identical credential identifiers are refused for the same
+    /// reason: which of the two decides is then a question of iteration order.
+    pub fn verify(
+        &self,
+        ca_pq: &MlDsa87PublicKey,
+        trust_domain_id: &TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+        ca_epoch: u64,
+        minimum_registry_epoch: u64,
+    ) -> Result<(), CertificateError> {
+        self.assert_describes(trust_domain_id, gateway_wg_public_key)?;
+        if self.ca_epoch != ca_epoch {
+            return Err(CertificateError::UnauthorizedIssuer);
+        }
+        if self.credential_registry_epoch < minimum_registry_epoch {
+            return Err(CertificateError::GenerationRollback {
+                current: minimum_registry_epoch,
+                proposed: self.credential_registry_epoch,
+            });
+        }
+        if self.bindings.is_empty() {
+            return Err(CertificateError::InvalidCredentialBinding("empty document"));
+        }
+        if self.bindings.len() > MAX_CREDENTIAL_BINDINGS {
+            return Err(CertificateError::TooManyObjects);
+        }
+        let mut seen: Vec<&[u8]> = Vec::with_capacity(self.bindings.len());
+        for binding in &self.bindings {
+            if seen.contains(&binding.credential_id.as_slice()) {
+                return Err(CertificateError::InvalidCredentialBinding(
+                    "duplicate credential",
+                ));
+            }
+            seen.push(&binding.credential_id);
+            binding.verify(
+                ca_pq,
+                trust_domain_id,
+                gateway_wg_public_key,
+                ca_epoch,
+                minimum_registry_epoch,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// What Astra asks an operator to approve, before any certificate exists.
 ///
 /// It is signed by the Astra service key so the companion can display fields

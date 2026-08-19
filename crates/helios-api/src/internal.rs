@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use aether::certificates::{
     client::ClientCertificateStageAuthorization,
-    encoding::{DerCertificate, WireGuardKey},
+    encoding::{DerCertificate, Fingerprint, Id16, WireGuardKey},
     revocation::EmergencyCertificateRevocation,
     state::ClientCertificateState,
     x509,
@@ -126,6 +126,16 @@ pub const STAGE_PATH: &str = "/internal/v1/certificates/stage";
 pub const STAGE_COMMIT_PATH: &str = "/internal/v1/certificates/stage-commit";
 pub const REVOKE_PATH: &str = "/internal/v1/certificates/revoke";
 const STATE_ROUTE: &str = "/internal/v1/certificates/state/:identity";
+
+/// The served gateway leaf, read back by the authority.
+///
+/// **A route §8.3 does not list**, and added deliberately. Astra has to verify
+/// a receipt under the leaf the gateway actually serves, and it does not issue
+/// that leaf: without this it would need the certificate copied into its state
+/// out of band — one more value to paste between two shells, which is exactly
+/// the class of deployment error `deploy.sh` exists to remove. Nothing secret
+/// crosses: the leaf is the public object every client already pins.
+pub const GATEWAY_IDENTITY_PATH: &str = "/internal/v1/certificates/gateway-identity";
 
 /// The name the client puts in SNI.
 ///
@@ -229,15 +239,36 @@ pub trait AstraChannelHandler: AstraStageHandler {
         &self,
         identity: &WireGuardKey,
     ) -> Result<PeerCertificateStateView, TrustUpdateRefusal>;
+
+    /// The gateway's own served leaf, so the authority can verify a receipt
+    /// under the key that signed it rather than under a copy it was handed.
+    async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal>;
 }
 
-/// Builds the private router — the four routes, and a refusal for the rest.
+/// What the gateway publishes about the identity it currently serves.
+///
+/// Public by construction: this is the leaf every admitted client already pins.
+/// No private key, no PSK, no TPM secret — the same rule the peer state follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayIdentityView {
+    /// The active gateway PQ leaf, exactly as it is served.
+    pub pq_certificate: aether::key_negotiation::PqCertificate,
+    /// Its fingerprint, recomputed by the reader anyway — carried so a
+    /// mismatch is caught as a disagreement rather than as a bad signature.
+    pub pq_certificate_fingerprint: Fingerprint,
+    pub active_gateway_identity_epoch: u64,
+    pub gateway_decision_epoch: u64,
+}
+
+/// Builds the private router — the five routes, and a refusal for the rest.
 pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
     Router::new()
         .route(STAGE_PATH, post(stage))
         .route(STAGE_COMMIT_PATH, post(stage_commit))
         .route(REVOKE_PATH, post(revoke))
         .route(STATE_ROUTE, get(peer_state))
+        .route(GATEWAY_IDENTITY_PATH, get(gateway_identity))
         .fallback(refuse_unknown_route)
         .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY_BYTES))
         .with_state(handler)
@@ -303,6 +334,14 @@ async fn peer_state(
         return InternalRefusal::Protocol.into_response();
     };
     match handler.peer_state(&identity).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => InternalRefusal::from(refusal).into_response(),
+    }
+}
+
+/// `GET /internal/v1/certificates/gateway-identity`.
+async fn gateway_identity(State(handler): State<Arc<dyn AstraChannelHandler>>) -> Response {
+    match handler.gateway_identity().await {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(refusal) => InternalRefusal::from(refusal).into_response(),
     }
@@ -693,10 +732,14 @@ pub fn client_config(
 /// A refused handshake closes that one connection and is logged; it never takes
 /// the listener down, and the listener going down never takes the gateway down.
 /// A gateway without an authority is a gateway that works.
+///
+/// `prefix` is the only path space the router serves; it is named in the log so
+/// the two directions of the veth are told apart at a glance.
 pub async fn serve(
     bind: SocketAddr,
     config: rustls::ServerConfig,
     router: Router,
+    prefix: &'static str,
 ) -> std::io::Result<()> {
     use hyper_util::rt::TokioIo;
     use hyper_util::service::TowerToHyperService;
@@ -706,8 +749,7 @@ pub async fn serve(
     tracing::info!(
         %bind,
         alpn = %String::from_utf8_lossy(INTERNAL_ALPN),
-        "private Astra channel listening; it serves only {}*",
-        INTERNAL_PREFIX
+        "private lifecycle channel listening; it serves only {prefix}*"
     );
     loop {
         let (stream, source) = listener.accept().await?;
@@ -717,7 +759,7 @@ pub async fn serve(
             let stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    tracing::warn!(%source, %error, "private Astra channel: handshake refused");
+                    tracing::warn!(%source, %error, "private lifecycle channel: handshake refused");
                     return;
                 }
             };
@@ -726,7 +768,7 @@ pub async fn serve(
                 .serve_connection(TokioIo::new(stream), service)
                 .await
             {
-                tracing::debug!(%source, %error, "private Astra channel: connection ended");
+                tracing::debug!(%source, %error, "private lifecycle channel: connection ended");
             }
         });
     }
@@ -739,20 +781,18 @@ pub async fn serve(
 /// revalidated against a certificate that may have been rotated meanwhile, and
 /// a fresh handshake is the cheapest way to know the pin still holds.
 pub struct GatewayLifecycleClient {
-    address: SocketAddr,
-    tls: Arc<rustls::ClientConfig>,
+    http: PinnedHttpClient,
 }
 
 impl GatewayLifecycleClient {
     pub fn new(address: SocketAddr, tls: rustls::ClientConfig) -> Self {
         Self {
-            address,
-            tls: Arc::new(tls),
+            http: PinnedHttpClient::new(address, tls, INTERNAL_SERVER_NAME),
         }
     }
 
     pub fn address(&self) -> SocketAddr {
-        self.address
+        self.http.address
     }
 
     /// Hands a staging authorization to the gateway and returns its receipt.
@@ -762,7 +802,10 @@ impl GatewayLifecycleClient {
     ) -> Result<aether::certificates::client::GatewayCertificateStageReceipt, ChannelError> {
         let body = serde_json::to_vec(authorization)
             .map_err(|error| ChannelError::Body(error.to_string()))?;
-        let answer = self.request("POST", STAGE_PATH, Some(body)).await?;
+        let answer = self
+            .http
+            .request("POST", STAGE_PATH, Some(body), None)
+            .await?;
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
 
@@ -773,7 +816,9 @@ impl GatewayLifecycleClient {
     ) -> Result<(), ChannelError> {
         let body = serde_json::to_vec(revocation)
             .map_err(|error| ChannelError::Body(error.to_string()))?;
-        self.request("POST", REVOKE_PATH, Some(body)).await?;
+        self.http
+            .request("POST", REVOKE_PATH, Some(body), None)
+            .await?;
         Ok(())
     }
 
@@ -789,21 +834,60 @@ impl GatewayLifecycleClient {
             "{INTERNAL_PREFIX}state/{}",
             percent_encode_segment(&identity.to_base64())
         );
-        let answer = self.request("GET", &path, None).await?;
+        let answer = self.http.request("GET", &path, None, None).await?;
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
 
+    /// Reads the leaf the gateway serves, so a receipt can be verified under
+    /// the key that actually signed it.
+    pub async fn gateway_identity(&self) -> Result<GatewayIdentityView, ChannelError> {
+        let answer = self
+            .http
+            .request("GET", GATEWAY_IDENTITY_PATH, None, None)
+            .await?;
+        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+    }
+}
+
+/// One pinned mTLS connection, opened per call, on either direction of the
+/// veth.
+///
+/// Both typed clients are built on this because both carry the same bounds: a
+/// bounded response, a `Host` and SNI that match the pinned identity, and a
+/// connection driver that outlives the request in flight. A second copy of
+/// this plumbing is how one direction quietly stops bounding its answers.
+struct PinnedHttpClient {
+    address: SocketAddr,
+    tls: Arc<rustls::ClientConfig>,
+    /// SNI and `Host`. Not how the peer is authenticated — the pinned DER is —
+    /// but it must match the certificate the peer was built with.
+    server_name: &'static str,
+}
+
+impl PinnedHttpClient {
+    fn new(address: SocketAddr, tls: rustls::ClientConfig, server_name: &'static str) -> Self {
+        Self {
+            address,
+            tls: Arc::new(tls),
+            server_name,
+        }
+    }
+
+    /// `bearer` carries a capability token when the route requires one. It is
+    /// set on the header and nowhere else: never a query parameter, never a
+    /// path segment, never a log line (spec §8.2).
     async fn request(
         &self,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
+        bearer: Option<&str>,
     ) -> Result<Bytes, ChannelError> {
         use http_body_util::BodyExt as _;
         use hyper_util::rt::TokioIo;
 
         let stream = tokio::net::TcpStream::connect(self.address).await?;
-        let name = ServerName::try_from(INTERNAL_SERVER_NAME)
+        let name = ServerName::try_from(self.server_name)
             .map_err(|error| ChannelError::Tls(error.to_string()))?;
         let stream = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls))
             .connect(name, stream)
@@ -818,11 +902,15 @@ impl GatewayLifecycleClient {
             let _ = connection.await;
         });
 
-        let request = hyper::Request::builder()
+        let mut builder = hyper::Request::builder()
             .method(method)
             .uri(path)
-            .header(hyper::header::HOST, INTERNAL_SERVER_NAME)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::HOST, self.server_name)
+            .header(hyper::header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            builder = builder.header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let request = builder
             .body(http_body_util::Full::new(Bytes::from(
                 body.unwrap_or_default(),
             )))
@@ -865,6 +953,233 @@ fn percent_encode_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+// ---------------------------------------------------------------------------
+// The other direction: the gateway dials the authority (spec §8.1.2, §8.3).
+// ---------------------------------------------------------------------------
+
+/// Path prefix Astra's private listener serves. Everything outside it is
+/// refused, exactly as on the gateway's own listener.
+pub const ASTRA_INTERNAL_PREFIX: &str = "/internal/v1/client-rotation/";
+
+pub const ROTATION_REQUEST_PATH: &str = "/internal/v1/client-rotation/request";
+pub const ROTATION_OPERATION_ROUTE: &str = "/internal/v1/client-rotation/operations/:operation";
+pub const ROTATION_SIGNER_REQUEST_ROUTE: &str =
+    "/internal/v1/client-rotation/signer-requests/:operation";
+pub const ROTATION_SIGNER_RESULT_ROUTE: &str =
+    "/internal/v1/client-rotation/signer-results/:operation";
+
+/// The name the gateway puts in SNI when it dials Astra.
+///
+/// A second constant rather than a reuse of [`INTERNAL_SERVER_NAME`]: the two
+/// ends hold two different certificates, and one shared name would let a
+/// mis-pinned pair look like a working one right up to the pin comparison.
+pub const ASTRA_INTERNAL_SERVER_NAME: &str = "helios-authority.internal";
+
+/// Where a renewal operation stands, as the authority reports it (spec §8.2).
+///
+/// Deliberately not [`aether::certificates::status::CertificateStatus`]: that
+/// enum describes a **certificate**, and until an operator has approved
+/// anything there is no candidate certificate to describe. This describes the
+/// operation, which is what `awaiting_operator` is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientRenewalOperationState {
+    /// Prepared past the 80 % threshold and waiting for a hardware credential.
+    /// Nothing is issued and no candidate exists.
+    AwaitingOperator,
+    /// The gateway persisted the candidate and signed its receipt; the grant
+    /// is available and the client has yet to commit it.
+    PendingCommit,
+    /// The operation ended without a grant. No further assertion is accepted
+    /// under this identifier — the client opens a new one.
+    Failed,
+}
+
+/// What the gateway relays once it has resolved the caller from its VIP.
+///
+/// `caller_wg_public_key` is the gateway's own resolution, never a value the
+/// client chose: Astra compares the request's copy against it and refuses a
+/// mismatch. Relaying the request alone would make the authority trust a field
+/// the client filled in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedRotationRequest {
+    pub caller_wg_public_key: WireGuardKey,
+    pub request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
+}
+
+/// A read of one operation, on behalf of one caller.
+///
+/// The caller travels with every read for the same reason it travels with the
+/// request: on this link the authenticated party is the gateway, not the peer,
+/// so the authority can only refuse a peer asking about somebody else's
+/// operation if it is told which peer is asking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperationQuery {
+    pub caller_wg_public_key: WireGuardKey,
+}
+
+/// What the authority answers about one operation.
+///
+/// The two capability tokens are minted for **this** read and live five
+/// minutes at most (spec §8.2). The client that owns the operation hands them
+/// to the companion; they confer nothing outside that operation, that manifest
+/// and that scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRenewalOperationView {
+    pub operation_id: Id16,
+    pub state: ClientRenewalOperationState,
+    pub client_wg_public_key: WireGuardKey,
+    pub request_fingerprint: Fingerprint,
+    /// SHA-256 of the signed approval request the companion will be shown —
+    /// the manifest the capability tokens are bound to.
+    pub operation_manifest_fingerprint: Fingerprint,
+    pub created_at: u64,
+    pub expires_at: u64,
+    /// Bearer token for the companion's read route, absent once the operation
+    /// no longer accepts one.
+    pub signer_request_token: Option<String>,
+    /// Bearer token for the companion's submission route. Single use.
+    pub signer_result_token: Option<String>,
+    /// Present only in [`ClientRenewalOperationState::PendingCommit`].
+    pub grant: Option<Box<aether::certificates::client::ClientCertificateRotationGrant>>,
+}
+
+/// What the companion fetches, and everything it needs in order to answer.
+///
+/// No private material: the approval request is signed by the Astra service
+/// key the companion already pins, and the WebAuthn challenge is **derived**
+/// from it rather than carried beside it — which is what stops an assertion
+/// from being moved to another operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRenewalSignerRequest {
+    pub operation_id: Id16,
+    pub approval_request: Box<aether::certificates::approval::AstraCredentialApprovalRequest>,
+    pub authority_url: String,
+    pub webauthn_rp_id: String,
+}
+
+/// What the companion posts back.
+///
+/// Only the approval. Astra holds the request it answers, and an approval
+/// verified against a request the same message supplied would verify nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRenewalSignerResult {
+    pub caller_wg_public_key: WireGuardKey,
+    pub approval: Box<aether::certificates::approval::AstraRenewalApproval>,
+}
+
+/// The gateway's typed client for Astra's private routes.
+///
+/// One connection per call, like [`GatewayLifecycleClient`] and for the same
+/// reason: a rotation is a handful of requests, and a fresh handshake is the
+/// cheapest way to know the pin still holds.
+pub struct AstraLifecycleClient {
+    http: PinnedHttpClient,
+}
+
+impl AstraLifecycleClient {
+    pub fn new(address: SocketAddr, tls: rustls::ClientConfig) -> Self {
+        Self {
+            http: PinnedHttpClient::new(address, tls, ASTRA_INTERNAL_SERVER_NAME),
+        }
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.http.address
+    }
+
+    /// Relays one client's rotation request and returns the operation it
+    /// opened — always `awaiting_operator`, never a certificate.
+    pub async fn request_rotation(
+        &self,
+        relayed: &RelayedRotationRequest,
+    ) -> Result<ClientRenewalOperationView, ChannelError> {
+        self.post(ROTATION_REQUEST_PATH, relayed, None).await
+    }
+
+    /// Reads one operation on behalf of the peer that owns it.
+    pub async fn operation(
+        &self,
+        operation: &Id16,
+        query: &RelayedOperationQuery,
+    ) -> Result<ClientRenewalOperationView, ChannelError> {
+        self.post(&operation_path("operations", operation), query, None)
+            .await
+    }
+
+    /// Fetches what the companion has to display and answer.
+    pub async fn signer_request(
+        &self,
+        operation: &Id16,
+        token: &str,
+        query: &RelayedOperationQuery,
+    ) -> Result<ClientRenewalSignerRequest, ChannelError> {
+        self.post(
+            &operation_path("signer-requests", operation),
+            query,
+            Some(token),
+        )
+        .await
+    }
+
+    /// Delivers the operator's assertion and returns the operation it produced.
+    pub async fn signer_result(
+        &self,
+        operation: &Id16,
+        token: &str,
+        result: &ClientRenewalSignerResult,
+    ) -> Result<ClientRenewalOperationView, ChannelError> {
+        self.post(
+            &operation_path("signer-results", operation),
+            result,
+            Some(token),
+        )
+        .await
+    }
+
+    async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        bearer: Option<&str>,
+    ) -> Result<R, ChannelError> {
+        let body =
+            serde_json::to_vec(body).map_err(|error| ChannelError::Body(error.to_string()))?;
+        let answer = self.http.request("POST", path, Some(body), bearer).await?;
+        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+    }
+}
+
+/// Builds one of Astra's operation paths.
+///
+/// The identifier is hexadecimal, so nothing in it can escape a path segment
+/// today — and it goes through the same percent-encoder as a WireGuard key
+/// anyway, because "this value happens to be safe" is how the next change of
+/// encoding introduces a traversal.
+fn operation_path(collection: &str, operation: &Id16) -> String {
+    format!(
+        "{ASTRA_INTERNAL_PREFIX}{collection}/{}",
+        percent_encode_segment(&operation.to_string())
+    )
+}
+
+/// The `Authorization: Bearer` value of a capability token, or `None`.
+///
+/// One reader and one writer: the token never travels in a URL, a cookie or a
+/// log (spec §8.2), and a second extraction site is how it ends up in one.
+pub fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 #[cfg(test)]
@@ -950,6 +1265,11 @@ mod tests {
             _identity: &WireGuardKey,
         ) -> Result<PeerCertificateStateView, TrustUpdateRefusal> {
             self.seen.lock().unwrap().push("peer_state");
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
+            self.seen.lock().unwrap().push("gateway_identity");
             Err(TrustUpdateRefusal::Rejected)
         }
     }

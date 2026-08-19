@@ -1470,6 +1470,10 @@ impl crate::certificates::StageReceiptSigner for GatewayHandler {
     > {
         receipt.sign(&self.gateway_pq_private_key)
     }
+
+    fn served_pq_certificate(&self) -> PqCertificate {
+        self.gateway_pq_certificate.clone()
+    }
 }
 
 /// Object context of the negotiation identity: the gateway WireGuard public

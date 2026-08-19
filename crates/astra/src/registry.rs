@@ -203,6 +203,45 @@ impl AstraRegistry {
         self.save()
     }
 
+    /// Un-reserves a rotation the gateway refused, before its lease runs out.
+    ///
+    /// A staging that fails must not leave the peer holding a reservation
+    /// nobody can clear: `active + 1` would stay unavailable until the lease
+    /// expired, for a renewal that never happened. It names the stage it is
+    /// clearing and clears nothing else — a refusal arriving after a later
+    /// rotation opened would otherwise cancel that one instead.
+    ///
+    /// A rotation already `granted` is **not** cleared. Past that point Astra
+    /// has released the leaves and the client may commit at any moment; taking
+    /// the reservation back would let a second candidate be issued for a
+    /// generation the gateway is about to promote.
+    pub fn abandon_rotation(
+        &mut self,
+        key: &WireGuardKey,
+        stage_id: &Id16,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        let peer = self
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .ok_or(RegistryError::UnknownPeer)?;
+        let rotation = peer.pending.as_ref().ok_or(RegistryError::NoRotation)?;
+        if rotation.stage_id != *stage_id || rotation.granted {
+            return Err(RegistryError::NoRotation);
+        }
+        let rotation = peer.pending.take().expect("checked immediately above");
+        let name = peer.name.clone();
+        self.state.audit.append(
+            AuditEvent::ClientStagePurged {
+                peer: name,
+                generation: rotation.candidate.generation,
+            },
+            now_unix,
+        );
+        self.save()
+    }
+
     /// Marks a rotation as granted — the point past which Astra has released
     /// the leaves and can no longer withhold them.
     pub fn mark_granted(&mut self, key: &WireGuardKey, now_unix: u64) -> Result<(), RegistryError> {

@@ -30,6 +30,10 @@ base64.workspace = true
 clap.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true
+# La configuration TLS du listener privé. Le type traverse l'API de
+# `helios_api::internal`, qui la construit ; `astra` doit pouvoir la nommer
+# pour la porter jusqu'au serveur.
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -93,6 +93,11 @@ pub struct AppState {
     /// answers `404` — the same answer an older gateway gives, so Orion has a
     /// single behaviour to implement.
     pub trust_update: Option<Arc<dyn certificates::TrustUpdateHandler>>,
+    /// Gateway side of the relayed client renewal (spec §8.1.2), `None` when
+    /// this gateway has no private channel to the authority. Absent, the four
+    /// renewal routes answer `503` — the route exists and the client is right
+    /// to use it; what is missing is the authority behind it.
+    pub client_renewal: Option<Arc<dyn certificates::ClientRenewalRelay>>,
     /// Non-secret summary of the boot-time sealing decision, `None` when the
     /// daemon runs without TPM validation. A projection: `BootDecision` itself
     /// carries the unlock secret and must not reach this crate.
@@ -146,6 +151,7 @@ impl AppState {
             key_negotiation: None,
             psk_release: None,
             trust_update: None,
+            client_renewal: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
@@ -189,6 +195,17 @@ impl AppState {
     /// Wires the certificate lifecycle, once the trust domain exists.
     pub fn with_trust_update(mut self, handler: Arc<dyn certificates::TrustUpdateHandler>) -> Self {
         self.trust_update = Some(handler);
+        self
+    }
+
+    /// Wires the relayed client renewal, once the gateway can reach Astra.
+    ///
+    /// Separate from [`Self::with_trust_update`] on purpose: a gateway may hold
+    /// a registry and yet have no private channel, and in that state the
+    /// trust-update route must keep working while the renewal routes report
+    /// that the authority is unreachable.
+    pub fn with_client_renewal(mut self, relay: Arc<dyn certificates::ClientRenewalRelay>) -> Self {
+        self.client_renewal = Some(relay);
         self
     }
 }
@@ -260,6 +277,42 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/key-negotiation/stage-commit",
+            post(certificates::stage_commit).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        // The relayed ordinary renewal (spec §8.1.2). Four routes, all behind
+        // the same source-VIP resolution: a peer opens an operation, polls it,
+        // and passes its companion through the two `signer-*` exchanges. None
+        // of them reaches Astra's public origin, and none of them is a proxy —
+        // each accepts one type, one size, and relays an object the gateway
+        // built itself.
+        .route(
+            "/api/key-negotiation/certificate-renewal/request",
+            post(certificates::renewal_request).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/key-negotiation/certificate-renewal/operations/:operation",
+            get(certificates::renewal_operation),
+        )
+        .route(
+            "/api/key-negotiation/certificate-renewal/signer-requests/:operation",
+            get(certificates::renewal_signer_request),
+        )
+        .route(
+            "/api/key-negotiation/certificate-renewal/signer-results/:operation",
+            post(certificates::renewal_signer_result).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
+        )
+        // The commit of §8.1.2 is the route above under its historical path.
+        // Both are mounted on the same handler: the spec's list names the
+        // renewal prefix, and a client already built against the shorter path
+        // must not stop committing because a path moved.
+        .route(
+            "/api/key-negotiation/certificate-renewal/stage-commit",
             post(certificates::stage_commit).layer(DefaultBodyLimit::max(
                 aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
             )),

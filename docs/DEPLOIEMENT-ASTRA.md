@@ -45,12 +45,12 @@ manque :
   relieraient à Astra répondent encore `501`. Il faut donc copier les fichiers
   entre le poste opérateur et Astra à la main, et les routes qui exigent le
   geste opérateur côté Astra répondent `501` ;
-- le **relais typé WireGuard–veth Astra–Helios** du §2 : `heliosd` n'a aucun
-  client HTTP vers Astra. Les deux services connaissent le même domaine, mais
-  ne se parlent pas encore. Le renouvellement actif ne doit pas exposer Astra
-  publiquement : Orion appelle Helios dans WireGuard, puis Helios transmet sur
-  le veth privé mTLS. L'autorisation de stage et le reçu circulent uniquement
-  entre Astra et Helios sur ce veth ; l'ancienne route `stage` Orion ne doit
+- la **distribution des objets de transition** : le relais typé
+  WireGuard–veth du §2 est livré dans ses deux sens — Orion appelle Helios dans
+  WireGuard, Helios relaie sur le veth privé mTLS, et l'autorisation de stage
+  comme le reçu circulent uniquement entre Astra et Helios — mais la gateway ne
+  détient encore aucun objet pré-signé à distribuer par `trust-update`.
+  L'ancienne route `stage` Orion ne doit
   pas être ouverte et sera retirée lors de cet alignement ;
 - le **pilote client** du §7 dans `orion-core`, et les routes de rotation
   client d'Astra ;

@@ -143,6 +143,19 @@ enum Command {
         /// ever accept.
         #[arg(long)]
         astra_certificate: std::path::PathBuf,
+        /// Address of Astra's own private listener, on the same veth.
+        ///
+        /// The direction this gateway dials, to relay a client renewal
+        /// (spec §8.1.2). Absent, the four renewal routes answer `503` and the
+        /// staging half keeps working — an authority that only receives is a
+        /// supported deployment.
+        #[arg(long)]
+        authority: Option<std::net::SocketAddr>,
+        /// Astra's **authority** certificate, DER — printed by
+        /// `astra init-channel` beside its transport one. The only server
+        /// identity this gateway will dial.
+        #[arg(long)]
+        astra_authority_certificate: Option<std::path::PathBuf>,
         /// Replaces an existing identity. **Astra must be re-pinned**: it
         /// holds these exact bytes, and changing them without telling it stops
         /// the two from talking.
@@ -346,8 +359,16 @@ async fn main() -> anyhow::Result<()> {
         Command::InitAstraChannel {
             bind,
             astra_certificate,
+            authority,
+            astra_authority_certificate,
             rotate,
-        } => init_astra_channel(bind, &astra_certificate, rotate),
+        } => init_astra_channel(
+            bind,
+            &astra_certificate,
+            authority,
+            astra_authority_certificate.as_deref(),
+            rotate,
+        ),
         Command::ShowUplink => show_uplink(),
         Command::ShowIdentity => show_identity(),
         Command::Peer { command } => {
@@ -592,16 +613,35 @@ fn show_identity() -> anyhow::Result<()> {
 fn init_astra_channel(
     bind: std::net::SocketAddr,
     astra_certificate: &std::path::Path,
+    authority: Option<std::net::SocketAddr>,
+    astra_authority_certificate: Option<&std::path::Path>,
     rotate: bool,
 ) -> anyhow::Result<()> {
-    let served = astra_channel::initialize(bind, astra_certificate, rotate)?;
+    let identities = astra_channel::initialize(
+        bind,
+        astra_certificate,
+        authority,
+        astra_authority_certificate,
+        rotate,
+    )?;
     println!("bind={bind}");
-    println!("gateway_channel_certificate={}", served.to_base64());
-    println!("gateway_channel_fingerprint={}", served.fingerprint());
+    println!(
+        "gateway_channel_certificate={}",
+        identities.served.to_base64()
+    );
+    println!(
+        "gateway_channel_fingerprint={}",
+        identities.served.fingerprint()
+    );
+    if let Some(client) = &identities.client {
+        println!("gateway_client_certificate={}", client.to_base64());
+        println!("gateway_client_fingerprint={}", client.fingerprint());
+    }
     println!();
     println!(
-        "hand the certificate above to Astra: it pins these exact bytes and accepts no other \
-         gateway"
+        "hand the certificates above to Astra: it pins these exact bytes and accepts no other \
+         gateway — the served one to dial this listener, the client one to accept this gateway \
+         on its own"
     );
     Ok(())
 }
@@ -1182,6 +1222,15 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
                 astra_channel::spawn(
                     Arc::clone(&service) as Arc<dyn helios_api::internal::AstraChannelHandler>
                 );
+                // And the other direction: the four in-tunnel renewal routes
+                // relay into Astra's own listener. Separate from the trust
+                // update on purpose — a gateway may hold a registry and have
+                // no way to dial the authority, and in that state the
+                // trust-update route must keep working while the renewal
+                // routes report the authority unreachable.
+                if let Some(relay) = astra_channel::relay() {
+                    state = state.with_client_renewal(Arc::new(relay));
+                }
                 state = state.with_trust_update(service);
             }
             Ok(None) => info!(

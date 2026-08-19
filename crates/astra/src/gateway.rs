@@ -42,13 +42,26 @@ use aether::certificates::client::{
 use aether::certificates::encoding::{DerCertificate, WireGuardKey};
 use aether::certificates::revocation::EmergencyCertificateRevocation;
 use helios_api::internal::{
-    ChannelError, ChannelIdentity, GatewayLifecycleClient, PeerCertificateStateView,
+    ChannelError, ChannelIdentity, GatewayIdentityView, GatewayLifecycleClient,
+    PeerCertificateStateView,
 };
 
 /// Astra's transport certificate inside its state volume.
+///
+/// The **client** half: Astra dials the gateway with it, and the gateway pins
+/// these exact bytes.
 pub const CHANNEL_CERTIFICATE_FILE: &str = "channel-cert.der";
 /// Its PKCS#8 private key. `0600`, in the same volume, and nothing else.
 pub const CHANNEL_KEY_FILE: &str = "channel-key.der";
+/// Astra's **server** certificate, for the direction the gateway dials.
+///
+/// A second identity rather than the same one in both roles. The two are
+/// pinned by different peers under different names and different extended key
+/// usages, and a single certificate carrying `clientAuth` and `serverAuth`
+/// would let either end be replayed into the other's role by whoever holds it.
+pub const AUTHORITY_CERTIFICATE_FILE: &str = "authority-cert.der";
+/// Its PKCS#8 private key.
+pub const AUTHORITY_KEY_FILE: &str = "authority-key.der";
 
 /// How long a freshly created transport identity is valid.
 ///
@@ -117,6 +130,16 @@ impl GatewayChannel {
     ) -> Result<PeerCertificateStateView, ChannelError> {
         self.client.peer_state(identity).await
     }
+
+    /// Reads back the leaf the gateway **serves**.
+    ///
+    /// Not the one Astra recorded: a receipt is signed by what the daemon
+    /// actually presents, and a rotation it has not restarted for leaves the
+    /// two different. Verifying against Astra's copy would be verifying
+    /// against a key that signed nothing.
+    pub async fn gateway_identity(&self) -> Result<GatewayIdentityView, ChannelError> {
+        self.client.gateway_identity().await
+    }
 }
 
 /// Creates Astra's transport identity in its state volume, or reads back the
@@ -129,10 +152,69 @@ impl GatewayChannel {
 /// that is what `--rotate` is, and it breaks the pairing until the gateway is
 /// told.
 pub fn initialize(state_dir: &Path, rotate: bool) -> Result<DerCertificate, ChannelInitError> {
+    initialize_pair(state_dir, rotate).map(|pair| pair.client)
+}
+
+/// Both of Astra's transport identities: the one it dials with, and the one it
+/// answers on.
+pub struct TransportIdentities {
+    /// `clientAuth`, named `astra.internal`. The gateway pins it.
+    pub client: DerCertificate,
+    /// `serverAuth`, named [`helios_api::internal::ASTRA_INTERNAL_SERVER_NAME`].
+    /// The gateway pins it too, for the direction it dials.
+    pub authority: DerCertificate,
+}
+
+/// Creates — or reads back — both identities in one call.
+///
+/// One call because a deployment that had to run two commands would eventually
+/// run one of them, and half a pairing is a channel that handshakes in one
+/// direction and refuses in the other, at the first renewal rather than at
+/// deployment.
+pub fn initialize_pair(
+    state_dir: &Path,
+    rotate: bool,
+) -> Result<TransportIdentities, ChannelInitError> {
+    Ok(TransportIdentities {
+        client: identity(
+            state_dir,
+            rotate,
+            CHANNEL_CERTIFICATE_FILE,
+            CHANNEL_KEY_FILE,
+            "astra.internal",
+            Role::Client,
+        )?,
+        authority: identity(
+            state_dir,
+            rotate,
+            AUTHORITY_CERTIFICATE_FILE,
+            AUTHORITY_KEY_FILE,
+            helios_api::internal::ASTRA_INTERNAL_SERVER_NAME,
+            Role::Server,
+        )?,
+    })
+}
+
+/// Which direction one identity serves. Never both.
+#[derive(Clone, Copy)]
+enum Role {
+    Client,
+    Server,
+}
+
+/// Reads one transport identity back, or creates it.
+fn identity(
+    state_dir: &Path,
+    rotate: bool,
+    certificate_file: &str,
+    key_file: &str,
+    name: &str,
+    role: Role,
+) -> Result<DerCertificate, ChannelInitError> {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
-    let certificate_path = state_dir.join(CHANNEL_CERTIFICATE_FILE);
-    let key_path = state_dir.join(CHANNEL_KEY_FILE);
+    let certificate_path = state_dir.join(certificate_file);
+    let key_path = state_dir.join(key_file);
     if !rotate && certificate_path.exists() {
         // Both halves, or neither: a certificate whose key never landed would
         // look like a usable identity and fail at the first handshake.
@@ -144,13 +226,18 @@ pub fn initialize(state_dir: &Path, rotate: bool) -> Result<DerCertificate, Chan
     }
     aether::private_file::create_private_dir(state_dir)?;
 
-    let mut params = CertificateParams::new(vec!["astra.internal".to_string()])
+    let mut params = CertificateParams::new(vec![name.to_string()])
         .map_err(|error| ChannelInitError::Certificate(error.to_string()))?;
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    // `clientAuth` and nothing else: Astra dials, it never answers on this
-    // link, and the gateway's verifier refuses a pin that cannot be a client.
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    // One usage, never two: the pinned verifier on the far end refuses a
+    // certificate that cannot hold the role it was pinned for, and a
+    // certificate holding both roles would let each end be replayed into the
+    // other's.
+    params.extended_key_usages = vec![match role {
+        Role::Client => ExtendedKeyUsagePurpose::ClientAuth,
+        Role::Server => ExtendedKeyUsagePurpose::ServerAuth,
+    }];
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
     params.not_after =
         time::OffsetDateTime::now_utc() + time::Duration::days(IDENTITY_VALIDITY_DAYS);
@@ -167,6 +254,14 @@ pub fn initialize(state_dir: &Path, rotate: bool) -> Result<DerCertificate, Chan
     std::fs::write(&certificate_path, certificate.der().as_ref())?;
     DerCertificate::new(certificate.der().to_vec())
         .map_err(|error| ChannelInitError::Certificate(error.to_string()))
+}
+
+/// The identity Astra answers on, ready to serve.
+pub fn authority_identity(state_dir: &Path) -> Result<ChannelIdentity, ChannelInitError> {
+    Ok(ChannelIdentity {
+        certificate_der: std::fs::read(state_dir.join(AUTHORITY_CERTIFICATE_FILE))?,
+        private_key_der: std::fs::read(state_dir.join(AUTHORITY_KEY_FILE))?,
+    })
 }
 
 /// Why a transport identity could not be created.

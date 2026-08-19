@@ -2590,20 +2590,18 @@ contournés :
   routes `signer-requests`, `vaults` et `signer-results` du §8.2 répondent
   encore `501`. Côté Astra, les routes d'approbation répondent `501` et
   l'émetteur délégué n'applique pas encore l'obligation YubiKey ;
-- le **relais typé WireGuard–veth** et le canal privé bidirectionnel Astra–Helios
-  des §§8.1.2 et 8.3, TLS 1.3 `(EC)DHE` sans reprise ni 0-RTT. Deux conséquences
-  directes : la gateway ne
-  détient aucun objet pré-signé à distribuer, donc `trust-update` répond `503`
-  à un client qu'elle sait en retard au lieu de lui annoncer qu'il est à jour ;
-  et sa réponse ne porte **jamais** de statut signé, parce qu'un statut est
-  signé par la clé de service Astra, que `heliosd` ne détient pas et ne doit
-  pas détenir. La comparaison qui décide « à jour » couvre en revanche tous les
-  compteurs et toutes les empreintes actives, gateway comme client : une
-  omission y répondrait « rien à récupérer » à un client en retard, et c'est le
-  seul refus dont il ne se relève pas ;
-- les **routes de renouvellement Orion–Helios**, le client Helios vers l'API
-  Astra privée et la liaison de l'approbation opérateur au stage, au reçu et au
-  grant ;
+- la **distribution des objets de transition** par `trust-update`. Le canal
+  privé bidirectionnel des §§8.1.2 et 8.3 est livré — TLS 1.3 `(EC)DHE`, sans
+  reprise ni 0-RTT, deux identités de transport par bout — et le renouvellement
+  relayé passe par lui de bout en bout. Ce qui manque est la distribution des
+  transitions elles-mêmes : la gateway ne détient aucun objet pré-signé, donc
+  `trust-update` répond `503` à un client qu'elle sait en retard au lieu de lui
+  annoncer qu'il est à jour ; et sa réponse ne porte **jamais** de statut signé,
+  parce qu'un statut est signé par la clé de service Astra, que `heliosd` ne
+  détient pas et ne doit pas détenir. La comparaison qui décide « à jour »
+  couvre en revanche tous les compteurs et toutes les empreintes actives,
+  gateway comme client : une omission y répondrait « rien à récupérer » à un
+  client en retard, et c'est le seul refus dont il ne se relève pas ;
 - la **récupération d'une identité expirée** de bout en bout, qui dépend des
   deux points précédents ;
 - le **discriminant de profil Orion** `helios_key_negotiation` et la bascule

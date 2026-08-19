@@ -30,7 +30,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use aether::certificates::{
-    encoding::{Fingerprint, Id16, MlDsa87Signature, WireGuardKey},
+    capability::CapabilityTokens,
+    encoding::{Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, WireGuardKey},
     status::status_query_signing_bytes,
 };
 use axum::{
@@ -204,6 +205,28 @@ pub struct AstraService {
     pub budgets: Mutex<SourceBudget>,
     /// Signs statuses, challenges and operational answers. Never a leaf.
     pub service_private_key: Zeroizing<Vec<u8>>,
+    /// Its public half, so an object Astra signed can be verified here before
+    /// it is handed on. A companion approval is checked against the request
+    /// Astra itself signed, and re-deriving that key from the private one at
+    /// every call would be the same value computed in two places.
+    pub service_public_key: MlDsa87PublicKey,
+    /// Renewals waiting for an operator, and those that have one.
+    ///
+    /// In memory, and deliberately: an operation holds no certificate — the
+    /// issuance happens after the assertion — so losing the table on a restart
+    /// loses nothing but the wait. Persisting it would persist an
+    /// `awaiting_operator` that outlived the five-minute challenge inside it.
+    pub operations: Mutex<crate::operations::OperationStore>,
+    /// `K_capability`, drawn at start-up (spec §8.2).
+    pub capabilities: Mutex<CapabilityTokens>,
+    /// The credentials an ordinary renewal may be approved by.
+    ///
+    /// Read from the signed credential document the companion emits, and
+    /// **only** the `active` ones: a request naming a lost or revoked
+    /// credential would ask an operator for a touch the verifier then refuses.
+    /// Empty means no operator can approve anything, and every renewal is
+    /// refused by name rather than left to time out.
+    pub approval_credential_ids: Vec<Vec<u8>>,
     /// The private veth link to `heliosd`, when the deployment has one.
     ///
     /// It lives here because this is where staging will be driven from: an

@@ -105,11 +105,21 @@ Restent ouverts :
   public, et chaque commande y lit. Reste ouvert du côté compagnon : le
   transport, qui passe encore par des fichiers — les routes à jeton de
   capacité du §8.2 répondent `501`, donc il n'y a rien à appeler. Toute
-  approbation opérateur côté Astra reste donc à câbler. La moitié Astra → Helios
-  du veth privé est livrée et confinée par le ruleset (`astra0`, adresses et
-  port exacts) ; `heliosd` n'a aucun client HTTP vers l'API Astra opposée, donc la gateway ne
-  détient encore **aucun objet pré-signé à distribuer** et répond `503` à un
-  client qu'elle sait en retard —, la récupération d'une identité expirée, le
+  approbation opérateur côté Astra reste donc à câbler. Le veth privé est
+  livré **dans ses deux sens**, confiné par le ruleset (`astra0`, adresses et
+  ports exacts) : Astra → Helios en 8444 porte le staging, le reçu et la leaf
+  servie que la gateway relit sur demande ; Helios → Astra en 8445 porte le
+  renouvellement relayé du §8.1.2. Deux identités de transport par bout, jamais
+  une seule en double rôle — un certificat portant `clientAuth` et `serverAuth`
+  laisserait rejouer chaque bout dans le rôle de l'autre. Un Orion dont le
+  tunnel marche appelle donc quatre routes typées de `helios-api` dans
+  WireGuard ; `heliosd` résout le pair par sa VIP source et relaie un objet
+  **canonique qu'il construit lui-même** — jamais la méthode, le chemin ni les
+  en-têtes du client. Côté Astra, le seuil de 80 % ouvre une opération
+  `awaiting_operator` qui ne détient aucun certificat, et rien n'est émis avant
+  qu'une assertion réponde au challenge exact de cette opération.
+  Restent ouverts : le **transport des documents du compagnon** (routes §8.2
+  en `501`, donc copie de fichiers), la récupération d'une identité expirée, le
   discriminant de profil Orion et la bascule du §13, et les deux surfaces IHM.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
@@ -625,7 +635,11 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
   conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
   distingue une restauration d'un fork, émetteur délégué borné et endpoint
-  public. Il ne détient **jamais** `CA-PQ` en clair. `astra::vault` y ajoute le
+  public. `astra::operations` tient les renouvellements qui attendent un
+  opérateur — en mémoire, parce qu'une opération ne détient aucun certificat et
+  qu'en persister une survivrait au challenge de cinq minutes qu'elle porte —,
+  et `astra::renewal` enchaîne demande, approbation, émission, staging sur le
+  veth, reçu et grant. Il ne détient **jamais** `CA-PQ` en clair. `astra::vault` y ajoute le
   format du coffre d'autorité — key-slots FIDO2, corps scellé lié à la table de
   slots. Astra le transporte et le sauvegarde ; il ne l'ouvre pas, et rien dans
   le conteneur ne le peut.

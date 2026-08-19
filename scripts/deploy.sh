@@ -53,6 +53,11 @@ HELIOSD=/opt/helios/current/heliosd
 # de compose. La rendre surchargeable sans recompiler le pare-feu créerait un
 # listener que la politique refuse — ou, pire, une ouverture sans listener.
 CANAL_PRIVE="10.88.7.1:8444"
+# Bout Astra du même veth, pour la direction opposée : c'est Helios qui appelle,
+# pour relayer le renouvellement d'un client (§8.1.2). Un second port plutôt
+# qu'un second réseau — le ruleset atomique nomme déjà les deux sens, adresses
+# et ports exacts, et `helios-firewall::ruleset` refuse tout le reste.
+CANAL_AUTORITE="10.88.7.2:8445"
 
 usage() {
     cat >&2 <<'EOF'
@@ -574,6 +579,8 @@ deployer_astra() {
         run --rm --no-deps astra init-channel 2>&1")"; then
         cert_astra="$(printf '%s\n' "$sortie" |
             sed -n 's/^astra_channel_certificate=//p' | tr -d '\r' | head -1)"
+        cert_autorite="$(printf '%s\n' "$sortie" |
+            sed -n 's/^astra_authority_certificate=//p' | tr -d '\r' | head -1)"
     fi
     if [ -z "${cert_astra:-}" ]; then
         echo "    identité de transport Astra illisible — canal privé non monté" >&2
@@ -582,13 +589,29 @@ deployer_astra() {
         # Le DER traverse en base64 puis est décodé sur la cible : `heliosd`
         # attend un fichier DER, et faire transiter du binaire par SSH est le
         # genre de détail qui casse une fois sur dix sans dire pourquoi.
+        # Les deux certificats d'Astra traversent en base64 puis sont décodés
+        # sur la cible : `heliosd` attend des fichiers DER, et faire transiter
+        # du binaire par SSH est le genre de détail qui casse une fois sur dix
+        # sans dire pourquoi. Le second n'est passé que s'il existe — un Astra
+        # antérieur à ce lot n'en imprime pas, et la moitié « relais » reste
+        # alors fermée sans que la moitié « staging » en souffre.
         sortie="$(helios_ssh_sudo_capture "$CIBLE" \
             "umask 077 && printf '%s' '$cert_astra' | base64 -d > /run/astra-channel.der && \
-             $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
-                 --astra-certificate /run/astra-channel.der 2>&1; \
-             code=\$?; rm -f /run/astra-channel.der; exit \$code")" && \
+             printf '%s' '${cert_autorite:-}' | base64 -d > /run/astra-authority.der 2>/dev/null; \
+             if test -s /run/astra-authority.der; then \
+                 $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
+                     --astra-certificate /run/astra-channel.der \
+                     --authority '$CANAL_AUTORITE' \
+                     --astra-authority-certificate /run/astra-authority.der 2>&1; \
+             else \
+                 $HELIOSD init-astra-channel --bind '$CANAL_PRIVE' \
+                     --astra-certificate /run/astra-channel.der 2>&1; \
+             fi; \
+             code=\$?; rm -f /run/astra-channel.der /run/astra-authority.der; exit \$code")" && \
             cert_gateway="$(printf '%s\n' "$sortie" |
-                sed -n 's/^gateway_channel_certificate=//p' | tr -d '\r' | head -1)"
+                sed -n 's/^gateway_channel_certificate=//p' | tr -d '\r' | head -1)" && \
+            cert_client="$(printf '%s\n' "$sortie" |
+                sed -n 's/^gateway_client_certificate=//p' | tr -d '\r' | head -1)"
         if [ -z "${cert_gateway:-}" ]; then
             echo "    la gateway n'a pas pu monter son bout du canal privé :" >&2
             printf '%s\n' "$sortie" | tail -10 >&2
@@ -600,6 +623,21 @@ deployer_astra() {
                 return 1
             }
             echo "    canal privé $CANAL_PRIVE"
+            # La direction opposée, seulement si les deux bouts l'ont produite.
+            # Sans elle Astra ne sert pas son listener et la gateway répond 503
+            # sur ses quatre routes de renouvellement : un état supporté, et
+            # celui de toute installation antérieure à ce lot.
+            if [ -n "${cert_client:-}" ]; then
+                helios_ssh_sudo "$CIBLE" \
+                    "printf 'ASTRA_PRIVATE_BIND=%s\nASTRA_GATEWAY_CLIENT_CERTIFICATE=%s\n' \
+                         '$CANAL_AUTORITE' '$cert_client' >> '$env_distant'" || {
+                    echo "    le relais de renouvellement n'a pas pu être écrit" >&2
+                    return 1
+                }
+                echo "    relais de renouvellement $CANAL_AUTORITE"
+            else
+                echo "    relais de renouvellement non monté : la gateway répondra 503"
+            fi
             # `heliosd` lit ce document au démarrage et le sert jusqu'à l'arrêt,
             # comme l'identité de négociation : un document neuf sous un démon
             # en marche ne change rien tant qu'il n'a pas redémarré.

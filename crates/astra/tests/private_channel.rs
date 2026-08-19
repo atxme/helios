@@ -15,12 +15,47 @@ use aether::certificates::client::{
     GatewayCertificateStageReceipt,
 };
 use aether::certificates::encoding::{DerCertificate, Fingerprint, WireGuardKey};
+use aether::certificates::gateway::pq_certificate_fingerprint;
 use aether::certificates::revocation::EmergencyCertificateRevocation;
 use aether::certificates::state::ClientCertificateState;
+use aether::key_negotiation::{
+    generate_ml_dsa_87_keypair, issue_pq_certificate, PqCertificate, PqCertificateRole,
+    PQ_CERTIFICATE_VERSION,
+};
 use astra::gateway::GatewayChannel;
 use async_trait::async_trait;
+use base64::Engine as _;
 use helios_api::certificates::{AstraStageHandler, TrustUpdateRefusal};
-use helios_api::internal::{AstraChannelHandler, ChannelIdentity, PeerCertificateStateView};
+use helios_api::internal::{
+    AstraChannelHandler, ChannelIdentity, GatewayIdentityView, PeerCertificateStateView,
+};
+
+/// The leaf this fake gateway serves.
+///
+/// Signed, because a PQ certificate's fingerprint covers its signature: an
+/// unsigned placeholder has no fingerprint at all, and the round trip below
+/// checks that the fingerprint the authority recomputes is the one the gateway
+/// sent.
+fn served_leaf() -> PqCertificate {
+    let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+    let (_, subject_public) = generate_ml_dsa_87_keypair().expect("keygen");
+    issue_pq_certificate(
+        PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [0x31; 16],
+            subject: "gateway".into(),
+            issuer: "CA-PQ".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: WireGuardKey::from_bytes([0x11; 32]).to_base64(),
+            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(&subject_public),
+            not_before_unix: 0,
+            not_after_unix: 1_000_000,
+            ml_dsa_87_signature: String::new(),
+        },
+        &ca_private,
+    )
+    .expect("signed leaf")
+}
 
 /// A handler that records what it was asked and refuses everything.
 ///
@@ -56,6 +91,18 @@ impl AstraChannelHandler for Recorder {
             .unwrap()
             .push(format!("revoke {}", revocation.identity_key));
         Err(TrustUpdateRefusal::Rejected)
+    }
+
+    async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
+        self.seen.lock().unwrap().push("identity".into());
+        let pq_certificate = served_leaf();
+        Ok(GatewayIdentityView {
+            pq_certificate_fingerprint: pq_certificate_fingerprint(&pq_certificate)
+                .expect("fingerprint"),
+            pq_certificate,
+            active_gateway_identity_epoch: 3,
+            gateway_decision_epoch: 7,
+        })
     }
 
     async fn peer_state(
@@ -120,7 +167,13 @@ async fn listen(
     drop(listener);
     let router = helios_api::internal::router(handler);
     tokio::spawn(async move {
-        let _ = helios_api::internal::serve(address, config, router).await;
+        let _ = helios_api::internal::serve(
+            address,
+            config,
+            router,
+            helios_api::internal::INTERNAL_PREFIX,
+        )
+        .await;
     });
     // The listener is spawned; give it the moment it needs to bind before the
     // first dial, rather than racing it and reporting a connection refusal as
