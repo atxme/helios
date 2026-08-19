@@ -41,10 +41,11 @@ manque :
 - le **dépôt** des demandes et des résultats d'`astra-signer`. Les commandes
   existent — `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
   `approve-campaign`, `rotate-ca-pq` — mais elles lisent une demande sur disque
-  et écrivent leur résultat à côté : les routes à jeton de capacité qui les
-  relieraient à Astra répondent encore `501`. Il faut donc copier les fichiers
-  entre le poste opérateur et Astra à la main, et les routes qui exigent le
-  geste opérateur côté Astra répondent `501` ;
+  et écrivent leur résultat à côté. Le backend privé sait vérifier un résultat
+  relayé, mais le compagnon ne sait pas encore utiliser `heliosd_url` : les
+  routes publiques du §8.2 répondent `501` et Orion ne lance pas encore le
+  compagnon. La copie de fichiers reste donc un geste d'outillage, pas un
+  renouvellement Orion fonctionnel ;
 - la **distribution des objets de transition** : le relais typé
   WireGuard–veth du §2 est livré dans ses deux sens — Orion appelle Helios dans
   WireGuard, Helios relaie sur le veth privé mTLS, et l'autorisation de stage
@@ -52,23 +53,19 @@ manque :
   détient encore aucun objet pré-signé à distribuer par `trust-update`.
   L'ancienne route `stage` Orion ne doit
   pas être ouverte et sera retirée lors de cet alignement ;
-- le **pilote client** du §7 dans `orion-core`, et les routes de rotation
-  client d'Astra ;
-- l'**alignement cryptographique** du 16 août : contextes ML-DSA-87 non vides,
-  pin de politique dans les profils, jetons de capacité du compagnon et
-  fournisseur dont le DRBG SP 800-90A porte une validation CAVP/ACVP à
-  256 bits — HMAC-DRBG-SHA-512 ou
-  CTR-DRBG-AES-256 avec DF — semé par la plateforme en mode fail-closed, sans
-  DRBG applicatif maison. Le format binaire, l'AEAD, la KDF et l'AAD de HVLT
-  ainsi que les octets de présence des empreintes optionnelles sont déjà
-  conformes ; l'aléa employé par HVLT doit cependant rejoindre ce fournisseur.
-  Les écarts restants sont des refus de mise en production, pas des
-  améliorations facultatives.
+- le **pilote client** du §7 dans `orion-core` : création des clés candidates,
+  ouverture et suivi de l'opération, lancement du compagnon, vérification et
+  persistance du grant, puis `stage-commit` ;
+- la **bascule de confiance** du §13 et les objets pré-signés de `trust-update`.
+  L'alignement cryptographique du 16 août (ctx ML-DSA, HVLT, pin de politique,
+  jetons de capacité et fournisseur d'aléa sans DRBG applicatif) est livré ; la
+  validation CAVP/ACVP n'est pas exigée par cette version de la spécification.
 
 Ce qui est donc réellement éprouvé ici : la construction de l'image, le
-démarrage du conteneur, les volumes, la sauvegarde, le durcissement et la
-cohérence des deux moitiés du domaine. Le veth et le relais applicatif ne le
-sont pas encore.
+démarrage du conteneur, les volumes, la sauvegarde, le durcissement, la
+cohérence des deux moitiés du domaine et le relais applicatif serveur sur une
+paire TLS de test. Le veth noyau réel et le parcours Orion complet ne le sont
+pas encore.
 
 ## Le choix qu'on ne refait pas
 

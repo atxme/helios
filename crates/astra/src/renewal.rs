@@ -30,18 +30,19 @@
 //!
 //! # What a failure leaves behind
 //!
-//! A staging refused by the gateway un-reserves the rotation in the registry
-//! and fails the operation. It never leaves a reservation nobody can clear:
-//! that would make `active + 1` unavailable until the lease ran out, for a
-//! renewal that never happened.
+//! Once the operator approval is accepted, its exact evidence and the exact
+//! random issuance bytes are persisted. A transport failure therefore leaves
+//! `pending_grant`, not a second ceremony: polling the same `operation_id`
+//! replays the same authorization. The gateway treats that stage idempotently
+//! and its signed lease bounds any reservation that cannot be completed.
 //!
 //! # Limite connue
 //!
 //! `RotationReason::Scheduled` only. `manual_global` — the campaign case §7.2
-//! allows the delegated issuer to sign — needs an approved campaign object,
-//! which needs the companion's signing commands (§12.3). It is refused by
-//! [`RenewalError::ReasonNotDelegable`] rather than approximated, and
-//! delivering `astra-signer`'s campaign signing is what unblocks it.
+//! allows the delegated issuer to sign — needs the approved campaign to be
+//! wired into this operation path. The companion command exists, but its
+//! transport and campaign executor do not. It is refused by
+//! [`RenewalError::ReasonNotDelegable`] rather than approximated.
 
 use std::sync::Arc;
 
@@ -149,6 +150,7 @@ impl RenewalError {
         use helios_api::certificates::TrustUpdateRefusal as Refusal;
         match self {
             Self::Registry(RegistryError::Io(_) | RegistryError::Corrupt(_))
+            | Self::Operation(OperationError::Persistence(_) | OperationError::Corrupt(_))
             | Self::Internal(_) => Refusal::Internal,
             Self::NoIssuer | Self::NoGatewayChannel | Self::Gateway(_) => Refusal::Unavailable,
             _ => Refusal::Rejected,
@@ -175,7 +177,7 @@ pub async fn open(
         return Err(RenewalError::CallerMismatch);
     }
 
-    let (peer, trust_domain_id, gateway_key, server_name, rp_id, registry_epoch, service_epoch) = {
+    let (peer, trust_domain_id, gateway_key, server_name, rp_id, service_epoch) = {
         let registry = service.registry.lock().await;
         let state = registry.state();
         let peer = registry
@@ -188,7 +190,6 @@ pub async fn open(
             state.gateway_wg_public_key,
             state.server_name.clone(),
             state.webauthn_rp_id.clone(),
-            state.credential_registry_epoch,
             state.astra_service_key_epoch,
         )
     };
@@ -227,7 +228,7 @@ pub async fn open(
         trust_domain_id,
         gateway_key,
         &rp_id,
-        registry_epoch,
+        service.approval_credential_registry_epoch,
         service_epoch,
         now_unix,
     )?;
@@ -241,25 +242,37 @@ pub async fn open(
     );
     let mut operations = service.operations.lock().await;
     operations.open(operation, now_unix)?;
-    let operation = operations
+    operations.persist()?;
+    let requested_generation = operations
         .get(&operation_id, caller, now_unix)
-        .map_err(RenewalError::Operation)?;
+        .map_err(RenewalError::Operation)?
+        .request
+        .requested_generation;
+    drop(operations);
 
     let mut registry = service.registry.lock().await;
-    registry.record(
+    if let Err(error) = registry.record(
         crate::audit::AuditEvent::ClientRenewalRequested {
             peer: peer.name.clone(),
-            generation: operation.request.requested_generation,
+            generation: requested_generation,
         },
         now_unix,
-    )?;
+    ) {
+        drop(registry);
+        let mut operations = service.operations.lock().await;
+        operations.remove(&operation_id);
+        operations.persist()?;
+        return Err(RenewalError::Registry(error));
+    }
     tracing::info!(
         peer = %peer.name,
         operation = %operation_id,
-        generation = operation.request.requested_generation,
+        generation = requested_generation,
         "renewal prepared and awaiting an operator credential"
     );
     drop(registry);
+    let operations = service.operations.lock().await;
+    let operation = operations.get(&operation_id, caller, now_unix)?;
     mint_view(service, operation, now_unix).await
 }
 
@@ -284,7 +297,20 @@ pub async fn read(
             refresh_challenge(service, &mut operations, caller, operation_id, now_unix).await?;
         let operation = operations.get_mut(operation_id, caller, now_unix)?;
         operation.refresh_approval_request(Box::new(refreshed))?;
+        operations.persist()?;
     }
+    let state = operations.get(operation_id, caller, now_unix)?.state;
+    drop(operations);
+    match state {
+        helios_api::internal::ClientRenewalOperationState::PendingGrant => {
+            resume_stage(service, caller, operation_id, now_unix).await?;
+        }
+        helios_api::internal::ClientRenewalOperationState::PendingCommit => {
+            reconcile_released_grant(service, caller, operation_id, now_unix).await?;
+        }
+        _ => {}
+    }
+    let operations = service.operations.lock().await;
     let operation = operations.get(operation_id, caller, now_unix)?;
     mint_view(service, operation, now_unix).await
 }
@@ -348,9 +374,26 @@ pub async fn signer_result(
     )
     .await?;
 
+    let submission_fingerprint = approval.fingerprint();
+    if operation.is_idempotent_submission(&submission_fingerprint)? {
+        let state = operation.state;
+        drop(operations);
+        match state {
+            helios_api::internal::ClientRenewalOperationState::PendingGrant => {
+                resume_stage(service, caller, operation_id, now_unix).await?;
+            }
+            helios_api::internal::ClientRenewalOperationState::PendingCommit => {
+                reconcile_released_grant(service, caller, operation_id, now_unix).await?;
+            }
+            _ => {}
+        }
+        let operations = service.operations.lock().await;
+        let operation = operations.get(operation_id, caller, now_unix)?;
+        return mint_view(service, operation, now_unix).await;
+    }
+
     let approval_request = (*operation.approval_request).clone();
     let mut approval = *approval;
-    let request = operation.request.clone();
     let request_fingerprint = operation.request_fingerprint;
 
     let (
@@ -376,7 +419,7 @@ pub async fn signer_result(
             state.ca_public_key.clone(),
             state.ca_epoch,
             state.astra_service_key_epoch,
-            state.credential_registry_epoch,
+            service.approval_credential_registry_epoch,
             peer,
         )
     };
@@ -425,42 +468,16 @@ pub async fn signer_result(
         )
         .map_err(RenewalError::Approval)?;
 
-    // Spent before anything is issued: a verification that succeeded twice
-    // would authorize two issuances under one touch.
-    let approval_fingerprint = evidence.fingerprint();
+    // Recorded before anything is issued. The exact same companion document
+    // can retrieve the completed operation after a lost response; different
+    // bytes under this identifier can never authorize a second issuance.
     operations
         .get_mut(operation_id, caller, now_unix)?
-        .consume_approval(approval_fingerprint)?;
+        .consume_approval(submission_fingerprint, Box::new(evidence))?;
+    operations.persist()?;
     drop(operations);
 
-    match stage(
-        service,
-        caller,
-        operation_id,
-        &request,
-        &peer,
-        evidence,
-        now_unix,
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(error) => {
-            // The operation ends here rather than pretending an operator may
-            // try again: the capability token of this operation is spent.
-            let mut operations = service.operations.lock().await;
-            if let Ok(operation) = operations.get_mut(operation_id, caller, now_unix) {
-                operation.fail();
-            }
-            tracing::error!(
-                peer = %peer.name,
-                operation = %operation_id,
-                %error,
-                "renewal failed after the operator approved it; the client has to open a new one"
-            );
-            return Err(error);
-        }
-    }
+    resume_stage(service, caller, operation_id, now_unix).await?;
 
     let operations = service.operations.lock().await;
     let operation = operations.get(operation_id, caller, now_unix)?;
@@ -470,15 +487,12 @@ pub async fn signer_result(
 /// Steps 5 to 7: issue, stage on the veth, read the receipt back, grant.
 ///
 /// Split out because it is the part that can fail after a human has already
-/// touched a key, and its caller has to undo the operation as a whole when it
-/// does.
-async fn stage(
+/// touched a key. Every random output is persisted before it leaves Astra, so
+/// retries resume this exact issuance rather than spending another approval.
+async fn resume_stage(
     service: &Arc<AstraService>,
     caller: &WireGuardKey,
     operation_id: &Id16,
-    request: &ClientCertificateRotationRequest,
-    peer: &crate::registry::PeerRecord,
-    evidence: AstraRenewalApprovalEvidence,
     now_unix: u64,
 ) -> Result<(), RenewalError> {
     let issuer = service.issuer.as_ref().ok_or(RenewalError::NoIssuer)?;
@@ -489,37 +503,76 @@ async fn stage(
     if !RotationReason::Scheduled.is_delegable() {
         return Err(RenewalError::ReasonNotDelegable);
     }
+    let (request, evidence, stored_authorization, stored_receipt) = {
+        let operations = service.operations.lock().await;
+        let operation = operations.get(operation_id, caller, now_unix)?;
+        if operation.state != helios_api::internal::ClientRenewalOperationState::PendingGrant {
+            return Ok(());
+        }
+        (
+            operation.request.clone(),
+            operation
+                .approval_evidence()
+                .cloned()
+                .ok_or(OperationError::Corrupt("approval evidence missing"))?,
+            operation.stage_authorization().cloned(),
+            operation.receipt().cloned(),
+        )
+    };
+    let peer = {
+        let registry = service.registry.lock().await;
+        registry
+            .peer(caller)
+            .ok_or(RenewalError::UnknownPeer)?
+            .clone()
+    };
+    if peer.revoked {
+        return Err(RenewalError::Revoked);
+    }
 
-    let plan = plan_window(
-        &peer.active,
-        request.expires_at,
-        issuer.authorization.maximum_leaf_lifetime_secs,
-        now_unix,
-    )?;
-    let (tls_leaf, pq_leaf) = issuer.issue_generation(
-        request,
-        &peer.name,
-        &plan.window,
-        (plan.leaf_not_before, plan.leaf_not_after),
-        fresh_serial().map_err(RenewalError::Internal)?,
-    )?;
-    let stage_id = fresh_id().map_err(RenewalError::Internal)?;
-    let authorization = issuer.authorize_stage(
-        request,
-        &peer.active,
-        stage_id,
-        // The anchor the peer's active generation already chains to. A
-        // candidate that named another one would be describing a CA-TLS
-        // rotation, which is a master-authority path and not this one.
-        peer.active.tls_ca_certificate_fingerprint,
-        tls_leaf,
-        pq_leaf,
-        plan.window,
-        now_unix,
-        plan.stage_expires_at,
-        RotationReason::Scheduled,
-        evidence,
-    )?;
+    let authorization = match stored_authorization {
+        Some(authorization) => authorization,
+        None => {
+            let plan = plan_window(
+                &peer.active,
+                request.expires_at,
+                issuer.authorization.maximum_leaf_lifetime_secs,
+                now_unix,
+            )?;
+            let (tls_leaf, pq_leaf) = issuer.issue_generation(
+                &request,
+                &peer.name,
+                &plan.window,
+                (plan.leaf_not_before, plan.leaf_not_after),
+                fresh_serial().map_err(RenewalError::Internal)?,
+            )?;
+            let stage_id = fresh_id().map_err(RenewalError::Internal)?;
+            let authorization = issuer.authorize_stage(
+                &request,
+                &peer.active,
+                stage_id,
+                // The anchor the peer's active generation already chains to.
+                peer.active.tls_ca_certificate_fingerprint,
+                tls_leaf,
+                pq_leaf,
+                plan.window,
+                now_unix,
+                plan.stage_expires_at,
+                RotationReason::Scheduled,
+                evidence,
+            )?;
+            // Persist all random issuance material before reserving or sending
+            // it. A restart replays these exact bytes and never creates a
+            // second candidate under the same operator touch.
+            let mut operations = service.operations.lock().await;
+            operations
+                .get_mut(operation_id, caller, now_unix)?
+                .record_stage(Box::new(authorization.clone()))?;
+            operations.persist()?;
+            authorization
+        }
+    };
+    let stage_id = authorization.stage_id;
     let candidate =
         crate::DelegatedIssuer::candidate(&authorization).map_err(RenewalError::Internal)?;
 
@@ -534,28 +587,21 @@ async fn stage(
                 stage_id,
                 request_fingerprint: authorization.request_fingerprint,
                 candidate,
-                window: plan.window,
-                stage_expires_at: plan.stage_expires_at,
+                window: authorization.window,
+                stage_expires_at: authorization.stage_expires_at,
                 granted: false,
             },
             now_unix,
         )?;
     }
-    {
-        let mut operations = service.operations.lock().await;
-        operations
-            .get_mut(operation_id, caller, now_unix)?
-            .record_stage(stage_id);
-    }
-
     // The authorization goes to the gateway and the receipt comes back on the
     // same relationship. Orion sees neither (§8.3, 16 August 2026).
-    let receipt = match gateway.stage(&authorization).await {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            abandon(service, caller, stage_id, now_unix).await;
-            return Err(RenewalError::Gateway(error.to_string()));
-        }
+    let receipt = match stored_receipt {
+        Some(receipt) => receipt,
+        None => gateway
+            .stage(&authorization)
+            .await
+            .map_err(|error| RenewalError::Gateway(error.to_string()))?,
     };
 
     let gateway_leaf = &peer.active_pq_certificate;
@@ -563,7 +609,6 @@ async fn stage(
     let (gateway_pq_key, gateway_leaf_fingerprint) = match gateway_identity(service).await {
         Ok(identity) => identity,
         Err(error) => {
-            abandon(service, caller, stage_id, now_unix).await;
             return Err(error);
         }
     };
@@ -578,7 +623,6 @@ async fn stage(
     ) {
         Ok(grant) => grant,
         Err(error) => {
-            abandon(service, caller, stage_id, now_unix).await;
             return Err(RenewalError::Issuer(error));
         }
     };
@@ -588,9 +632,9 @@ async fn stage(
         let operation = operations.get_mut(operation_id, caller, now_unix)?;
         operation.record_receipt(Box::new(receipt))?;
         operation.record_grant(Box::new(grant))?;
+        operations.persist()?;
     }
-    let mut registry = service.registry.lock().await;
-    registry.mark_granted(caller, now_unix)?;
+    reconcile_released_grant(service, caller, operation_id, now_unix).await?;
     tracing::info!(
         peer = %peer.name,
         operation = %operation_id,
@@ -600,25 +644,44 @@ async fn stage(
     Ok(())
 }
 
-/// Clears a reservation whose staging never completed.
+/// Repairs the only cross-file cut in grant publication.
 ///
-/// Best effort and loud: a reservation nobody clears makes `active + 1`
-/// unavailable until its lease runs out, for a renewal that did not happen.
-async fn abandon(
+/// The complete signed grant is persisted in the operation journal first: at
+/// that instant a client may already have received it, so Astra may never
+/// withdraw it.  The registry audit bit is a second atomic file.  A crash
+/// between both writes is repaired on the next poll by matching the exact
+/// `stage_id` before setting the bit idempotently.
+async fn reconcile_released_grant(
     service: &Arc<AstraService>,
     caller: &WireGuardKey,
-    stage_id: Id16,
+    operation_id: &Id16,
     now_unix: u64,
-) {
+) -> Result<(), RenewalError> {
+    let stage_id = {
+        let operations = service.operations.lock().await;
+        let operation = operations.get(operation_id, caller, now_unix)?;
+        if operation.state != helios_api::internal::ClientRenewalOperationState::PendingCommit {
+            return Ok(());
+        }
+        operation
+            .stage_id()
+            .ok_or(OperationError::Corrupt("granted operation has no stage"))?
+    };
+
     let mut registry = service.registry.lock().await;
-    if let Err(error) = registry.abandon_rotation(caller, &stage_id, now_unix) {
-        tracing::error!(
-            %error,
-            stage = %stage_id,
-            "a staging reservation could not be cleared; this peer cannot renew until its lease \
-             expires"
-        );
+    let pending = registry
+        .peer(caller)
+        .ok_or(RenewalError::UnknownPeer)?
+        .pending
+        .as_ref()
+        .ok_or(RegistryError::NoRotation)?;
+    if pending.stage_id != stage_id {
+        return Err(RenewalError::Operation(OperationError::Corrupt(
+            "grant and registry name different stages",
+        )));
     }
+    registry.mark_granted(caller, now_unix)?;
+    Ok(())
 }
 
 /// The gateway leaf a receipt must be signed by.
@@ -807,11 +870,10 @@ async fn refresh_challenge(
     };
     let registry = service.registry.lock().await;
     let state = registry.state();
-    let (domain, gateway, rp_id, registry_epoch, service_epoch) = (
+    let (domain, gateway, rp_id, service_epoch) = (
         state.trust_domain_id,
         state.gateway_wg_public_key,
         state.webauthn_rp_id.clone(),
-        state.credential_registry_epoch,
         state.astra_service_key_epoch,
     );
     drop(registry);
@@ -823,7 +885,7 @@ async fn refresh_challenge(
         domain,
         gateway,
         &rp_id,
-        registry_epoch,
+        service.approval_credential_registry_epoch,
         service_epoch,
         now_unix,
     )

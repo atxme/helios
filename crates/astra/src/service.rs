@@ -212,10 +212,10 @@ pub struct AstraService {
     pub service_public_key: MlDsa87PublicKey,
     /// Renewals waiting for an operator, and those that have one.
     ///
-    /// In memory, and deliberately: an operation holds no certificate — the
-    /// issuance happens after the assertion — so losing the table on a restart
-    /// loses nothing but the wait. Persisting it would persist an
-    /// `awaiting_operator` that outlived the five-minute challenge inside it.
+    /// Persisted atomically.  The signed approval request inside it may outlive
+    /// its five-minute challenge; a poll re-mints that request and fresh
+    /// process-local capability tokens without changing `operation_id`, the
+    /// client request or its candidate keys.
     pub operations: Mutex<crate::operations::OperationStore>,
     /// `K_capability`, drawn at start-up (spec §8.2).
     pub capabilities: Mutex<CapabilityTokens>,
@@ -227,14 +227,22 @@ pub struct AstraService {
     /// Empty means no operator can approve anything, and every renewal is
     /// refused by name rather than left to time out.
     pub approval_credential_ids: Vec<Vec<u8>>,
+    /// Epoch of the signed credential registry those identifiers came from.
+    ///
+    /// This is deliberately not inferred from Astra's general registry: the
+    /// companion advances the credential document whenever a key is enrolled,
+    /// lost or revoked.  A challenge naming rows from epoch N while signing
+    /// epoch N-1 would make the verifier and the authenticator describe two
+    /// different allow-lists.
+    pub approval_credential_registry_epoch: u64,
     /// The private veth link to `heliosd`, when the deployment has one.
     ///
     /// It lives here because this is where staging will be driven from: an
     /// approved rotation issues the two leaves, sends the authorization to the
     /// gateway and reads back its signed receipt on this same link (spec §8.3,
-    /// amendment of 16 August 2026). Nothing in this build produces that
-    /// authorization — it needs the operator approval whose routes answer
-    /// `501` — so the channel is opened, its pin checked, and held.
+    /// amendment of 16 August 2026). The relayed renewal drives this channel;
+    /// the still-unimplemented `501` routes are the separate public/offline
+    /// companion transport of §8.2.
     pub gateway: Option<crate::gateway::GatewayChannel>,
 }
 

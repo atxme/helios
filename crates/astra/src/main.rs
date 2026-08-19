@@ -39,6 +39,7 @@ const REGISTRY_FILE: &str = "registry.json";
 const SERVICE_KEY_FILE: &str = "service-key.bin";
 const ISSUER_PQ_KEY_FILE: &str = "issuer-pq-key.bin";
 const ISSUER_TLS_KEY_FILE: &str = "issuer-tls-key.der";
+const OPERATIONS_FILE: &str = "client-renewal-operations.json";
 /// The signed credential decisions of the domain, as the companion emits them.
 ///
 /// Copied into Astra's state volume by an operator (spec §8.2 would carry it,
@@ -382,8 +383,12 @@ fn run(
     );
 
     let issuer = load_issuer(state_dir, &registry)?;
-    let approval_credential_ids = load_approval_credentials(state_dir, &registry)?;
+    let (approval_credential_ids, approval_credential_registry_epoch) =
+        load_approval_credentials(state_dir, &registry)?;
     let service_public_key = registry.state().astra_service_public_key.clone();
+    let operations =
+        astra::operations::OperationStore::load(&state_dir.join(OPERATIONS_FILE), now_unix())
+            .context("loading the client renewal operations")?;
     let service = Arc::new(AstraService {
         registry: Mutex::new(registry),
         issuer,
@@ -391,12 +396,13 @@ fn run(
         budgets: Mutex::new(SourceBudget::default()),
         service_private_key,
         service_public_key,
-        operations: Mutex::new(astra::operations::OperationStore::new()),
+        operations: Mutex::new(operations),
         capabilities: Mutex::new(
             aether::certificates::capability::CapabilityTokens::new()
                 .context("drawing the capability key")?,
         ),
         approval_credential_ids,
+        approval_credential_registry_epoch,
         gateway,
     });
 
@@ -504,7 +510,10 @@ fn private_listener(
 /// A missing document is not fatal: the authority still serves statuses and
 /// still holds the channel. Every ordinary renewal is then refused by name,
 /// which is what an incomplete install should look like.
-fn load_approval_credentials(state_dir: &Path, registry: &AstraRegistry) -> Result<Vec<Vec<u8>>> {
+fn load_approval_credentials(
+    state_dir: &Path,
+    registry: &AstraRegistry,
+) -> Result<(Vec<Vec<u8>>, u64)> {
     let path = state_dir.join(CREDENTIALS_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::warn!(
@@ -512,7 +521,7 @@ fn load_approval_credentials(state_dir: &Path, registry: &AstraRegistry) -> Resu
             "no credential document: no operator credential can approve a renewal, so every \
              ordinary rotation will be refused until `astra-signer bindings` is copied here"
         );
-        return Ok(Vec::new());
+        return Ok((Vec::new(), registry.state().credential_registry_epoch));
     };
     if metadata.len() > MAX_CREDENTIALS_BYTES {
         anyhow::bail!(
@@ -548,7 +557,7 @@ fn load_approval_credentials(state_dir: &Path, registry: &AstraRegistry) -> Resu
         registry_epoch = document.credential_registry_epoch,
         "credential document loaded"
     );
-    Ok(approvable)
+    Ok((approvable, document.credential_registry_epoch))
 }
 
 /// Builds the delegated issuer, when the domain has one **and** its private

@@ -103,9 +103,11 @@ Restent ouverts :
   tourner l'ancre sous deux clés. Aucune valeur ne se retape : `domain`
   enregistre gateway, nom de service et clé de service Astra dans le relais
   public, et chaque commande y lit. Reste ouvert du côté compagnon : le
-  transport, qui passe encore par des fichiers — les routes à jeton de
-  capacité du §8.2 répondent `501`, donc il n'y a rien à appeler. Toute
-  approbation opérateur côté Astra reste donc à câbler. Le veth privé est
+  transport, qui passe encore par des fichiers — les routes publiques à jeton
+  de capacité du §8.2 répondent `501`, et le binaire ne sait pas encore
+  utiliser les routes privées relayées par `heliosd_url`. Le backend Astra
+  vérifie et consomme déjà une approbation relayée avant toute émission, mais
+  Orion ne peut pas encore piloter cette cérémonie. Le veth privé est
   livré **dans ses deux sens**, confiné par le ruleset (`astra0`, adresses et
   ports exacts) : Astra → Helios en 8444 porte le staging, le reçu et la leaf
   servie que la gateway relit sur demande ; Helios → Astra en 8445 porte le

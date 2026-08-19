@@ -989,6 +989,10 @@ pub enum ClientRenewalOperationState {
     /// Prepared past the 80 % threshold and waiting for a hardware credential.
     /// Nothing is issued and no candidate exists.
     AwaitingOperator,
+    /// The operator approval is persisted and Astra is issuing or replaying
+    /// the exact staging authorization towards the gateway. A restart resumes
+    /// this state under the same operation identifier.
+    PendingGrant,
     /// The gateway persisted the candidate and signed its receipt; the grant
     /// is available and the client has yet to commit it.
     PendingCommit,
@@ -1043,7 +1047,9 @@ pub struct ClientRenewalOperationView {
     /// Bearer token for the companion's read route, absent once the operation
     /// no longer accepts one.
     pub signer_request_token: Option<String>,
-    /// Bearer token for the companion's submission route. Single use.
+    /// Bearer token for the companion's submission route. Reusing it for the
+    /// identical result is idempotent; another body under the operation is a
+    /// conflict decided by Astra's persisted operation record.
     pub signer_result_token: Option<String>,
     /// Present only in [`ClientRenewalOperationState::PendingCommit`].
     pub grant: Option<Box<aether::certificates::client::ClientCertificateRotationGrant>>,

@@ -77,6 +77,29 @@ use zeroize::Zeroizing;
 /// line, because that is the unit an operator reasons about.
 const DAY_SECS: u64 = 86_400;
 
+/// Prepared before any of the four files of a CA-PQ rotation is replaced.
+///
+/// A filesystem cannot atomically rename four unrelated destinations.  This
+/// private journal makes the operation replayable instead: after it exists,
+/// every destination is an idempotent projection of these exact bytes.  A
+/// crash can therefore leave an old or new value at each path, never an
+/// unrecoverable rotation whose outgoing private key vanished before its
+/// public transition was written.
+const CA_PQ_ROTATION_JOURNAL: &str = "ca-pq-rotation.pending.json";
+const CA_PQ_ROTATION_JOURNAL_VERSION: u16 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaPqRotationJournal {
+    format_version: u16,
+    output_path: PathBuf,
+    current_ca_public_key: MlDsa87PublicKey,
+    vault: AuthorityVault,
+    bindings: aether::certificates::approval::CredentialRegistry,
+    transition: aether::certificates::authority::CaTransition,
+    handoff: handoff::DomainHandoff,
+}
+
 #[derive(Parser)]
 #[command(
     name = "astra-signer",
@@ -1067,9 +1090,30 @@ fn rotate_ca_pq(
     overlap_days: u64,
     transport: Transport,
 ) -> Result<()> {
+    let output_path = absolute_path(out)?;
+    let journal_path = ca_pq_rotation_journal_path(path);
+    if journal_path.exists() {
+        let journal: CaPqRotationJournal =
+            documents::read(&journal_path).context("reprise de la rotation CA-PQ préparée")?;
+        if journal.output_path != output_path {
+            bail!(
+                "une rotation CA-PQ interrompue doit être reprise avec --out {}",
+                journal.output_path.display()
+            );
+        }
+        validate_ca_pq_rotation_journal(&journal)?;
+        apply_ca_pq_rotation(path, &journal)?;
+        std::fs::remove_file(&journal_path)
+            .with_context(|| format!("suppression de {}", journal_path.display()))?;
+        print_ca_pq_rotation(&journal);
+        println!("reprise           : rotation préparée terminée sans nouvelle cérémonie");
+        return Ok(());
+    }
+
     let mut vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = identity_of(&handoff)?;
+    let current_ca_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
     let now = now_unix();
     let activation_at = now
         .checked_add(
@@ -1122,32 +1166,108 @@ fn rotate_ca_pq(
         window,
         now,
     )?;
-    // The vault first: it holds the private half, and a transition published
-    // for an anchor the vault does not hold is a document nothing can honour.
-    store::save(path, &vault)?;
-    credentials::save(&registry_path, &rotated.bindings)?;
-    documents::write(out, &rotated.transition)?;
-    let mut handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    handoff.ca_epoch = Some(identity.ca_epoch + 1);
-    handoff::save(&handoff::path_beside(path), &handoff)?;
+    let mut next_handoff = handoff;
+    next_handoff.adopt(&vault)?;
+    next_handoff.ca_epoch = Some(identity.ca_epoch + 1);
+    let journal = CaPqRotationJournal {
+        format_version: CA_PQ_ROTATION_JOURNAL_VERSION,
+        output_path,
+        current_ca_public_key,
+        vault,
+        bindings: rotated.bindings,
+        transition: rotated.transition,
+        handoff: next_handoff,
+    };
+    validate_ca_pq_rotation_journal(&journal)?;
+    documents::write(&journal_path, &journal)
+        .context("préparation durable de la rotation CA-PQ")?;
+    apply_ca_pq_rotation(path, &journal)?;
+    std::fs::remove_file(&journal_path)
+        .with_context(|| format!("suppression de {}", journal_path.display()))?;
 
-    println!("coffre           : {}", path.display());
-    println!("transition       : {}", out.display());
-    println!("époque CA-PQ     : {}", identity.ca_epoch + 1);
+    print_ca_pq_rotation(&journal);
+    println!("les key-slots n'ont pas bougé : chaque clé qui ouvrait le coffre l'ouvre encore");
+    Ok(())
+}
+
+fn ca_pq_rotation_journal_path(vault_path: &Path) -> PathBuf {
+    vault_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(CA_PQ_ROTATION_JOURNAL)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("lecture du répertoire courant")?
+            .join(path))
+    }
+}
+
+fn validate_ca_pq_rotation_journal(journal: &CaPqRotationJournal) -> Result<()> {
+    if journal.format_version != CA_PQ_ROTATION_JOURNAL_VERSION {
+        bail!("version de journal de rotation CA-PQ non supportée");
+    }
+    let domain = TrustDomainId::parse_hex(&journal.handoff.trust_domain_id)?;
+    let gateway = WireGuardKey::parse(journal.handoff.require(
+        journal.handoff.gateway_wg_public_key.as_ref(),
+        "la clé publique de la gateway",
+        "--gateway-wg-public-key",
+    )?)?;
+    journal.transition.verify(
+        &journal.current_ca_public_key,
+        &domain,
+        journal.transition.current_ca_epoch,
+    )?;
+    let next_ca = MlDsa87PublicKey::parse(journal.vault.ca_pq_public_key.trim())?;
+    if next_ca != journal.transition.next_ca_public_key
+        || journal.handoff.ca_epoch != Some(journal.transition.next_ca_epoch)
+        || journal.handoff.ca_pq_public_key != journal.vault.ca_pq_public_key
+        || journal.handoff.vault_fingerprint != journal.vault.fingerprint()?.to_hex()
+    {
+        bail!("le journal CA-PQ ne décrit pas un coffre, une transition et un relais uniques");
+    }
+    journal.bindings.verify(
+        &next_ca,
+        &domain,
+        &gateway,
+        journal.transition.next_ca_epoch,
+        journal.bindings.credential_registry_epoch,
+    )?;
+    Ok(())
+}
+
+fn apply_ca_pq_rotation(vault_path: &Path, journal: &CaPqRotationJournal) -> Result<()> {
+    // Every write is itself atomic. The journal remains until all four have
+    // landed, so any prefix of this sequence is safely replayed.
+    store::save(vault_path, &journal.vault)?;
+    credentials::save(&credentials::path_beside(vault_path), &journal.bindings)?;
+    documents::write(&journal.output_path, &journal.transition)?;
+    handoff::save(&handoff::path_beside(vault_path), &journal.handoff)?;
+    Ok(())
+}
+
+fn print_ca_pq_rotation(journal: &CaPqRotationJournal) {
+    println!("transition       : {}", journal.output_path.display());
+    println!("époque CA-PQ     : {}", journal.transition.next_ca_epoch);
     println!(
         "CA-PQ (publique) : {}",
-        rotated.next_ca_public_key.to_base64()
+        journal.transition.next_ca_public_key.to_base64()
     );
     println!(
         "CA-PQ empreinte  : {}",
-        rotated.next_ca_public_key.authority_fingerprint()
+        journal
+            .transition
+            .next_ca_public_key
+            .authority_fingerprint()
     );
     println!(
         "credentials      : époque {}",
-        rotated.bindings.credential_registry_epoch
+        journal.bindings.credential_registry_epoch
     );
-    println!("les key-slots n'ont pas bougé : chaque clé qui ouvrait le coffre l'ouvre encore");
-    Ok(())
 }
 
 /// The PEM form of a certificate, for the tools that read one.

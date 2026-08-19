@@ -20,9 +20,11 @@
 //! challenge of this operation's approval request does. That is the whole
 //! difference between "the planner decided" and "the planner may act".
 //!
-//! From there an operation reaches `pending_commit` — the gateway persisted
-//! the candidate, signed a receipt, and the grant is available — or `failed`.
-//! There is no state in between that a client could mistake for permission.
+//! From there an operation reaches `pending_grant` once the approval has been
+//! consumed.  That internal, non-activable state durably holds the exact
+//! evidence and staging bytes while Astra obtains the gateway receipt.  Only
+//! then does it reach `pending_commit`, where the grant is available to the
+//! client, or `failed`.  Neither intermediate state is permission to activate.
 //!
 //! # Why the order is enforced here as well as in the issuer
 //!
@@ -33,30 +35,27 @@
 //! differently — the issuer's is cryptographic and this one is a state
 //! machine, and a refactor that lost one would almost certainly keep the other.
 //!
-//! # Limite connue
+//! # Persistence and retries
 //!
-//! One approval attempt per operation. The single-use capability token of
-//! [`aether::certificates::capability`] is consumed by `operation_id`, on
-//! successful authentication, before this module sees the result — so a
-//! staging that fails **after** a valid assertion ends the operation rather
-//! than asking for a second one, which is what §8.1.2 would otherwise allow
-//! ("une assertion expirée peut être redemandée pour la même demande non
-//! expirée"). The client opens a new operation for the same generation once
-//! the previous stage lease has been purged. Consuming the token on the
-//! accepted *result* instead of on the authenticated *token* — a change to
-//! `CapabilityTokens`, in `aether` — is what would close it.
+//! The table is an atomically replaced private file. A restart discards only
+//! capability tokens (their key is process-local); polling the same operation
+//! mints fresh ones. The exact companion submission fingerprint is persisted
+//! before issuance, an identical retry returns the same completed operation,
+//! and different bytes under the same identifier conflict.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use aether::certificates::{
-    approval::AstraCredentialApprovalRequest,
+    approval::{AstraCredentialApprovalRequest, AstraRenewalApprovalEvidence},
     client::{
         ClientCertificateRotationGrant, ClientCertificateRotationRequest,
-        GatewayCertificateStageReceipt,
+        ClientCertificateStageAuthorization, GatewayCertificateStageReceipt,
     },
     encoding::{Fingerprint, Id16, WireGuardKey},
 };
 use helios_api::internal::{ClientRenewalOperationState, ClientRenewalOperationView};
+use serde::{Deserialize, Serialize};
 
 /// Largest number of operations held at once.
 ///
@@ -67,12 +66,17 @@ use helios_api::internal::{ClientRenewalOperationState, ClientRenewalOperationVi
 /// rotations already in flight.
 pub const MAX_LIVE_OPERATIONS: usize = 4_096;
 
+/// Disk bound checked before parsing the operation journal.
+pub const MAX_OPERATION_STORE_BYTES: u64 = 256 * 1024 * 1024;
+
+const OPERATION_STORE_FORMAT_VERSION: u16 = 1;
+
 /// Why an operation refused a transition.
 ///
 /// Every variant is a refusal the caller may legitimately hit, and none of
 /// them reaches a client unchanged: [`crate::service`] and the private router
 /// map them to their coarse class before answering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OperationError {
     #[error("no operation holds this identifier")]
     Unknown,
@@ -100,15 +104,26 @@ pub enum OperationError {
     ReceiptRequired,
     #[error("this operation already carries a receipt for another staging")]
     ReceiptConflict,
+    #[error("this operation already carries another staging authorization")]
+    StageConflict,
+    #[error("this operation already carries another grant")]
+    GrantConflict,
     #[error(
         "this operation's approval has already been spent: one assertion opens one issuance, and \
          a second would renew twice under one touch"
     )]
     ApprovalAlreadySpent,
+    #[error("this operation already accepted a different approval result")]
+    ApprovalConflict,
+    #[error("operation store input/output: {0}")]
+    Persistence(String),
+    #[error("operation store is inconsistent: {0}")]
+    Corrupt(&'static str),
 }
 
 /// One renewal, from the threshold that prepared it to the grant that ends it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Operation {
     pub operation_id: Id16,
     pub client_wg_public_key: WireGuardKey,
@@ -123,11 +138,17 @@ pub struct Operation {
     pub state: ClientRenewalOperationState,
     pub created_at: u64,
     pub expires_at: u64,
-    /// Set when the approval is consumed, so a replay of the same assertion is
-    /// a refusal rather than a second issuance.
+    /// Fingerprint of the exact companion result accepted for this operation.
+    /// An identical upload is idempotent; different bytes conflict.
     approved_with: Option<Fingerprint>,
+    /// Fully verified and Astra-countersigned evidence. Persisted before any
+    /// certificate is issued so a restart never asks for a second touch.
+    approval_evidence: Option<Box<AstraRenewalApprovalEvidence>>,
     /// Identifier of the staging sent to the gateway, once one was.
     stage_id: Option<Id16>,
+    /// Exact authorization replayed after a cut; random leaf material is never
+    /// regenerated under the same operation.
+    stage_authorization: Option<Box<ClientCertificateStageAuthorization>>,
     /// The gateway's signed receipt. The only door to a grant.
     receipt: Option<Box<GatewayCertificateStageReceipt>>,
     grant: Option<Box<ClientCertificateRotationGrant>>,
@@ -154,7 +175,9 @@ impl Operation {
             created_at,
             expires_at,
             approved_with: None,
+            approval_evidence: None,
             stage_id: None,
+            stage_authorization: None,
             receipt: None,
             grant: None,
         }
@@ -173,6 +196,128 @@ impl Operation {
 
     pub fn is_expired(&self, now_unix: u64) -> bool {
         now_unix >= self.expires_at
+    }
+
+    fn validate_persisted(&self) -> Result<(), OperationError> {
+        if self.client_wg_public_key != self.request.client_wg_public_key
+            || self.request_fingerprint != self.request.fingerprint()
+            || self.operation_id != self.approval_request.operation_id
+            || self.request_fingerprint != self.approval_request.request_fingerprint
+            || self.expires_at != self.request.expires_at
+            || self.created_at >= self.expires_at
+        {
+            return Err(OperationError::Corrupt("identity or request binding"));
+        }
+        if let Some(evidence) = &self.approval_evidence {
+            if evidence.approval_request != *self.approval_request
+                || evidence.approval.operation_id != self.operation_id
+                || !evidence
+                    .approval
+                    .request_fingerprint
+                    .matches(&self.request_fingerprint)
+            {
+                return Err(OperationError::Corrupt("approval evidence binding"));
+            }
+        }
+        if let Some(authorization) = &self.stage_authorization {
+            if self.stage_id != Some(authorization.stage_id)
+                || authorization.client_wg_public_key != self.client_wg_public_key
+                || !authorization
+                    .request_fingerprint
+                    .matches(&self.request_fingerprint)
+                || authorization.renewal_approval.as_ref() != self.approval_evidence.as_deref()
+            {
+                return Err(OperationError::Corrupt("stage authorization binding"));
+            }
+        }
+        if let Some(receipt) = &self.receipt {
+            let authorization = self
+                .stage_authorization
+                .as_ref()
+                .ok_or(OperationError::Corrupt("receipt without authorization"))?;
+            let authorization_fingerprint = authorization
+                .fingerprint()
+                .map_err(|_| OperationError::Corrupt("invalid authorization"))?;
+            if receipt.stage_id != authorization.stage_id
+                || !receipt
+                    .stage_authorization_fingerprint
+                    .matches(&authorization_fingerprint)
+                || !receipt
+                    .request_fingerprint
+                    .matches(&authorization.request_fingerprint)
+                || !receipt
+                    .operator_approval_fingerprint
+                    .matches(&authorization.operator_approval_fingerprint)
+                || receipt.client_wg_public_key != self.client_wg_public_key
+                || receipt.staged_generation != authorization.next_generation
+            {
+                return Err(OperationError::Corrupt("receipt binding"));
+            }
+        }
+        if let Some(grant) = &self.grant {
+            let authorization = self
+                .stage_authorization
+                .as_ref()
+                .ok_or(OperationError::Corrupt("grant without authorization"))?;
+            let receipt = self
+                .receipt
+                .as_ref()
+                .ok_or(OperationError::Corrupt("grant without receipt"))?;
+            if grant.stage_receipt != **receipt
+                || !grant
+                    .request_fingerprint
+                    .matches(&authorization.request_fingerprint)
+                || !grant
+                    .operator_approval_fingerprint
+                    .matches(&authorization.operator_approval_fingerprint)
+                || grant.client_wg_public_key != self.client_wg_public_key
+                || grant.active_generation != authorization.active_generation
+                || grant.next_generation != authorization.next_generation
+                || grant.stage_expires_at != authorization.stage_expires_at
+                || grant.renewal_approval.as_ref() != self.approval_evidence.as_deref()
+            {
+                return Err(OperationError::Corrupt("grant binding"));
+            }
+        }
+        match self.state {
+            ClientRenewalOperationState::AwaitingOperator
+                if self.approved_with.is_some()
+                    || self.approval_evidence.is_some()
+                    || self.stage_id.is_some()
+                    || self.stage_authorization.is_some()
+                    || self.receipt.is_some()
+                    || self.grant.is_some() =>
+            {
+                Err(OperationError::Corrupt(
+                    "awaiting operation carries approval state",
+                ))
+            }
+            ClientRenewalOperationState::PendingGrant
+                if self.approved_with.is_none()
+                    || self.approval_evidence.is_none()
+                    || self.grant.is_some() =>
+            {
+                Err(OperationError::Corrupt(
+                    "incomplete pending-grant operation",
+                ))
+            }
+            ClientRenewalOperationState::PendingCommit
+                if self.approved_with.is_none()
+                    || self.approval_evidence.is_none()
+                    || self.stage_id.is_none()
+                    || self.stage_authorization.is_none()
+                    || self.receipt.is_none()
+                    || self.grant.is_none() =>
+            {
+                Err(OperationError::Corrupt(
+                    "incomplete pending-commit operation",
+                ))
+            }
+            ClientRenewalOperationState::Failed if self.grant.is_some() => {
+                Err(OperationError::Corrupt("failed operation carries a grant"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Refuses a caller that does not own this operation.
@@ -214,6 +359,7 @@ impl Operation {
     pub fn consume_approval(
         &mut self,
         approval_fingerprint: Fingerprint,
+        evidence: Box<AstraRenewalApprovalEvidence>,
     ) -> Result<(), OperationError> {
         if self.state != ClientRenewalOperationState::AwaitingOperator {
             return Err(OperationError::NotAwaitingOperator);
@@ -221,7 +367,18 @@ impl Operation {
         if self.approved_with.is_some() {
             return Err(OperationError::ApprovalAlreadySpent);
         }
+        if evidence.approval_request != *self.approval_request
+            || evidence.approval.operation_id != self.operation_id
+            || !evidence
+                .approval
+                .request_fingerprint
+                .matches(&self.request_fingerprint)
+        {
+            return Err(OperationError::Corrupt("approval evidence binding"));
+        }
         self.approved_with = Some(approval_fingerprint);
+        self.approval_evidence = Some(evidence);
+        self.state = ClientRenewalOperationState::PendingGrant;
         Ok(())
     }
 
@@ -230,13 +387,53 @@ impl Operation {
         self.approved_with
     }
 
+    pub fn approval_evidence(&self) -> Option<&AstraRenewalApprovalEvidence> {
+        self.approval_evidence.as_deref()
+    }
+
+    /// Whether this is the result that already completed the operation.
+    pub fn is_idempotent_submission(
+        &self,
+        submission_fingerprint: &Fingerprint,
+    ) -> Result<bool, OperationError> {
+        match self.approved_with {
+            None => Ok(false),
+            Some(previous) if previous.matches(submission_fingerprint) => Ok(true),
+            Some(previous) if !previous.matches(submission_fingerprint) => {
+                Err(OperationError::ApprovalConflict)
+            }
+            Some(_) => Err(OperationError::NotAwaitingOperator),
+        }
+    }
+
     /// Records which staging was sent to the gateway.
-    pub fn record_stage(&mut self, stage_id: Id16) {
-        self.stage_id = Some(stage_id);
+    pub fn record_stage(
+        &mut self,
+        authorization: Box<ClientCertificateStageAuthorization>,
+    ) -> Result<(), OperationError> {
+        if self.state != ClientRenewalOperationState::PendingGrant {
+            return Err(OperationError::NotAwaitingOperator);
+        }
+        if let Some(existing) = &self.stage_authorization {
+            if matches!(
+                (existing.fingerprint(), authorization.fingerprint()),
+                (Ok(left), Ok(right)) if left.matches(&right)
+            ) {
+                return Ok(());
+            }
+            return Err(OperationError::StageConflict);
+        }
+        self.stage_id = Some(authorization.stage_id);
+        self.stage_authorization = Some(authorization);
+        Ok(())
     }
 
     pub fn stage_id(&self) -> Option<Id16> {
         self.stage_id
+    }
+
+    pub fn stage_authorization(&self) -> Option<&ClientCertificateStageAuthorization> {
+        self.stage_authorization.as_deref()
     }
 
     /// Records the receipt the gateway signed after persisting the candidate.
@@ -272,6 +469,15 @@ impl Operation {
     ) -> Result<(), OperationError> {
         if self.receipt.is_none() {
             return Err(OperationError::ReceiptRequired);
+        }
+        if let Some(existing) = &self.grant {
+            if matches!(
+                (existing.fingerprint(), grant.fingerprint()),
+                (Ok(left), Ok(right)) if left.matches(&right)
+            ) {
+                return Ok(());
+            }
+            return Err(OperationError::GrantConflict);
         }
         self.grant = Some(grant);
         self.state = ClientRenewalOperationState::PendingCommit;
@@ -319,15 +525,97 @@ impl Operation {
 /// every poll, and "does this peer already have one" on every request. One
 /// operation per peer at a time is the same bound the registry enforces on
 /// rotations — two candidates for one identity make `active + 1` ambiguous.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperations {
+    format_version: u16,
+    operations: Vec<Operation>,
+}
+
 #[derive(Debug, Default)]
 pub struct OperationStore {
     operations: BTreeMap<[u8; 16], Operation>,
     by_peer: BTreeMap<[u8; 32], [u8; 16]>,
+    path: Option<PathBuf>,
 }
 
 impl OperationStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Loads the durable operation journal, or creates an empty one.
+    ///
+    /// Capability tokens are intentionally absent: their process-lifetime key
+    /// is redrawn at restart, and polling the surviving operation mints fresh
+    /// tokens as §8.2 requires.
+    pub fn load(path: &Path, now_unix: u64) -> Result<Self, OperationError> {
+        let bytes = match std::fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.len() > MAX_OPERATION_STORE_BYTES {
+                    return Err(OperationError::Corrupt("file too large"));
+                }
+                std::fs::read(path)
+                    .map_err(|error| OperationError::Persistence(error.to_string()))?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let store = Self {
+                    path: Some(path.to_path_buf()),
+                    ..Self::default()
+                };
+                store.persist()?;
+                return Ok(store);
+            }
+            Err(error) => return Err(OperationError::Persistence(error.to_string())),
+        };
+        let persisted: PersistedOperations =
+            serde_json::from_slice(&bytes).map_err(|_| OperationError::Corrupt("invalid JSON"))?;
+        if persisted.format_version != OPERATION_STORE_FORMAT_VERSION {
+            return Err(OperationError::Corrupt("unsupported format version"));
+        }
+        if persisted.operations.len() > MAX_LIVE_OPERATIONS {
+            return Err(OperationError::Corrupt("too many operations"));
+        }
+        let mut store = Self {
+            path: Some(path.to_path_buf()),
+            ..Self::default()
+        };
+        for operation in persisted.operations {
+            operation.validate_persisted()?;
+            if operation.is_expired(now_unix) {
+                continue;
+            }
+            store.open(operation, now_unix)?;
+        }
+        // Also removes expired entries from the on-disk representation.
+        store.persist()?;
+        Ok(store)
+    }
+
+    /// Atomically publishes the complete operation journal.
+    pub fn persist(&self) -> Result<(), OperationError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let persisted = PersistedOperations {
+            format_version: OPERATION_STORE_FORMAT_VERSION,
+            operations: self.operations.values().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec_pretty(&persisted)
+            .map_err(|_| OperationError::Corrupt("cannot encode operation"))?;
+        if bytes.len() as u64 > MAX_OPERATION_STORE_BYTES {
+            return Err(OperationError::Corrupt("file too large"));
+        }
+        aether::private_file::write_private_atomic(path, &bytes)
+            .map_err(|error| OperationError::Persistence(error.to_string()))
+    }
+
+    /// Removes an operation whose surrounding durable transaction failed.
+    pub fn remove(&mut self, operation_id: &Id16) {
+        if let Some(operation) = self.operations.remove(operation_id.as_bytes()) {
+            self.by_peer
+                .remove(operation.client_wg_public_key.as_bytes());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -419,8 +707,12 @@ impl OperationStore {
 mod tests {
     use super::*;
     use aether::certificates::{
-        approval::MAX_APPROVAL_LIFETIME_SECS,
+        approval::{
+            AstraCredentialBinding, AstraRenewalApproval, CredentialState,
+            MAX_APPROVAL_LIFETIME_SECS,
+        },
         encoding::{DerCertificate, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId},
+        webauthn::WebAuthnAssertion,
         CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
     };
 
@@ -475,13 +767,52 @@ mod tests {
     }
 
     fn operation(seed: u8, client: WireGuardKey) -> Operation {
-        Operation::awaiting_operator(
-            Id16::new([seed; 16]).expect("id"),
-            client,
-            request(client),
-            approval_request(client),
-            1_000,
-        )
+        let operation_id = Id16::new([seed; 16]).expect("id");
+        let request = request(client);
+        let mut approval_request = approval_request(client);
+        approval_request.operation_id = operation_id;
+        approval_request.request_fingerprint = request.fingerprint();
+        Operation::awaiting_operator(operation_id, client, request, approval_request, 1_000)
+    }
+
+    fn evidence(operation: &Operation) -> Box<AstraRenewalApprovalEvidence> {
+        let request = operation.approval_request.clone();
+        let binding = AstraCredentialBinding {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![1, 2, 3],
+            credential_public_key: vec![0xa5, 0x01],
+            aaguid: [0; 16],
+            trust_domain_id: request.trust_domain_id,
+            gateway_wg_public_key: request.gateway_wg_public_key,
+            state: CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: 1_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        };
+        let assertion = WebAuthnAssertion {
+            authenticator_data: vec![1],
+            client_data_json: vec![2],
+            signature: vec![3],
+        };
+        Box::new(AstraRenewalApprovalEvidence {
+            approval_request: (*request).clone(),
+            approval: AstraRenewalApproval {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                operation_id: request.operation_id,
+                request_fingerprint: request.request_fingerprint,
+                approval_request_fingerprint: request.fingerprint(),
+                credential_fingerprint: binding.fingerprint(),
+                credential_binding: binding,
+                assertion_fingerprint: assertion.fingerprint(),
+                webauthn_assertion: assertion,
+                approved_at: 1_001,
+                expires_at: 1_200,
+                astra_service_key_epoch: 1,
+                astra_signature: MlDsa87Signature::placeholder(),
+            },
+        })
     }
 
     fn receipt() -> Box<GatewayCertificateStageReceipt> {
@@ -573,6 +904,49 @@ mod tests {
         assert!(view.grant.is_none());
         assert_eq!(view.signer_request_token.as_deref(), Some("read"));
         assert_eq!(view.signer_result_token.as_deref(), Some("submit"));
+    }
+
+    #[test]
+    fn an_operation_survives_restart_but_an_expired_one_does_not() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("operations.json");
+        let id = Id16::new([1; 16]).expect("id");
+        let mut store = OperationStore::load(&path, 1_000).expect("new store");
+        store.open(operation(1, key(2)), 1_000).expect("open");
+        store.persist().expect("persist");
+
+        let restarted = OperationStore::load(&path, 1_001).expect("restart");
+        restarted.get(&id, &key(2), 1_001).expect("survives");
+
+        let expired = OperationStore::load(&path, 5_000).expect("purges expired");
+        assert!(expired.is_empty());
+        assert!(matches!(
+            expired.get(&id, &key(2), 5_000),
+            Err(OperationError::Unknown)
+        ));
+    }
+
+    #[test]
+    fn an_approved_operation_resumes_without_a_second_touch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("operations.json");
+        let id = Id16::new([1; 16]).expect("id");
+        let mut operation = operation(1, key(2));
+        let approval = Fingerprint::of(b"an approval");
+        let accepted_evidence = evidence(&operation);
+        operation
+            .consume_approval(approval, accepted_evidence)
+            .expect("approval");
+
+        let mut store = OperationStore::load(&path, 1_000).expect("new store");
+        store.open(operation, 1_000).expect("open");
+        store.persist().expect("persist");
+
+        let restarted = OperationStore::load(&path, 1_001).expect("restart");
+        let resumed = restarted.get(&id, &key(2), 1_001).expect("operation");
+        assert_eq!(resumed.state, ClientRenewalOperationState::PendingGrant);
+        assert_eq!(resumed.approved_with(), Some(approval));
+        assert!(resumed.approval_evidence().is_some());
     }
 
     /// A grant before the receipt would be the authority releasing an identity
@@ -703,23 +1077,47 @@ mod tests {
     fn an_approval_is_spent_once() {
         let mut operation = operation(1, key(2));
         let approval = Fingerprint::of(b"an approval");
-        operation.consume_approval(approval).expect("first");
+        let accepted_evidence = evidence(&operation);
+        operation
+            .consume_approval(approval, accepted_evidence)
+            .expect("first");
         assert_eq!(operation.approved_with(), Some(approval));
+        let replayed_evidence = evidence(&operation);
         assert_eq!(
-            operation.consume_approval(approval),
-            Err(OperationError::ApprovalAlreadySpent)
+            operation.consume_approval(approval, replayed_evidence),
+            Err(OperationError::NotAwaitingOperator)
         );
+        let conflicting_evidence = evidence(&operation);
         assert_eq!(
-            operation.consume_approval(Fingerprint::of(b"another approval")),
-            Err(OperationError::ApprovalAlreadySpent)
+            operation.consume_approval(Fingerprint::of(b"another approval"), conflicting_evidence),
+            Err(OperationError::NotAwaitingOperator)
         );
 
         // And past `awaiting_operator` no approval is accepted at all.
         operation.record_receipt(receipt()).expect("receipt");
         operation.record_grant(grant()).expect("grant");
+        let late_evidence = evidence(&operation);
         assert_eq!(
-            operation.consume_approval(Fingerprint::of(b"late")),
+            operation.consume_approval(Fingerprint::of(b"late"), late_evidence),
             Err(OperationError::NotAwaitingOperator)
+        );
+    }
+
+    #[test]
+    fn an_accepted_submission_is_idempotent_only_for_identical_bytes() {
+        let mut operation = operation(1, key(2));
+        let submitted = Fingerprint::of(b"companion result");
+        let accepted_evidence = evidence(&operation);
+        operation
+            .consume_approval(submitted, accepted_evidence)
+            .expect("first submission");
+
+        assert!(operation
+            .is_idempotent_submission(&submitted)
+            .expect("same result"));
+        assert_eq!(
+            operation.is_idempotent_submission(&Fingerprint::of(b"different result")),
+            Err(OperationError::ApprovalConflict)
         );
     }
 

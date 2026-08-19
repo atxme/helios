@@ -358,7 +358,11 @@ impl CertificateRegistry {
                 peer.state.active.generation,
                 state.gateway.ca_epoch,
                 state.astra.credential_registry_epoch,
-                now_unix,
+                // The approval is a five-minute authorization to *issue*, not
+                // a five-minute lifetime for the staged certificate. Prove it
+                // was live when Astra signed this authorization; the stage's
+                // own lease governs replay afterwards.
+                authorization.issued_at,
             )?;
             state
                 .astra
@@ -545,7 +549,11 @@ impl CertificateRegistry {
                 peer.state.active.generation,
                 self.state.gateway.ca_epoch,
                 self.state.astra.credential_registry_epoch,
-                now_unix,
+                // Helios already verified the approval at stage issuance.
+                // Re-check its signatures at commit without turning the
+                // five-minute operator ceremony into a five-minute commit
+                // deadline; `stage_expires_at` is that deadline.
+                evidence.approval.approved_at,
             )?;
             Some(evidence.approval.credential_binding.clone())
         } else {

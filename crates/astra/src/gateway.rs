@@ -23,15 +23,12 @@
 //! authorizes the mutation, and the gateway verifies it after the handshake has
 //! already been passed.
 //!
-//! # Limite connue
-//!
-//! Nothing in this build calls [`GatewayChannel::stage`] on its own: issuing a
-//! staging authorization needs the operator approval of the 15 August 2026
-//! amendment, whose routes answer `501`. The channel is opened at startup
-//! anyway — and its pin checked there — because an unusable pairing found at
-//! deployment costs a command, and the same pairing found at the first rotation
-//! costs a night. See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md)
-//! for what a WSL2 build does and does not prove about the veth itself.
+//! The ordinary relayed renewal calls [`GatewayChannel::stage`] after Astra
+//! has verified and durably consumed the operator approval. The public/offline
+//! companion routes of §8.2 still answer `501`; they are a separate transport
+//! and are not a fallback for an Orion whose tunnel works. See
+//! [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md) for what a
+//! WSL2 build does and does not prove about the veth itself.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

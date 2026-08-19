@@ -269,6 +269,9 @@ impl AstraRegistry {
             return Err(RegistryError::Revoked);
         }
         if let Some(existing) = &peer.pending {
+            if existing == &rotation {
+                return Ok(());
+            }
             // An expired stage is not "in flight": it is debris, and it must
             // not block the renewal it was supposed to perform.
             if now_unix < existing.stage_expires_at {
@@ -337,6 +340,9 @@ impl AstraRegistry {
             .ok_or(RegistryError::UnknownPeer)?;
         let name = peer.name.clone();
         let rotation = peer.pending.as_mut().ok_or(RegistryError::NoRotation)?;
+        if rotation.granted {
+            return Ok(());
+        }
         rotation.granted = true;
         let generation = rotation.candidate.generation;
         self.state.audit.append(

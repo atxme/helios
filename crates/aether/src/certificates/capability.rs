@@ -27,14 +27,16 @@
 //! be recomputed at all. The field comparisons that follow are the second
 //! control, not the only one.
 //!
-//! # Single consumption
+//! # Replay is decided by the operation
 //!
 //! Reads are idempotent within the window: fetching the same signer request
-//! twice is not an attack, and the companion legitimately retries. The result
-//! submission is not — the first accepted result consumes it, so a replayed
-//! `POST` cannot deliver a second, different result under one approval.
-
-use std::collections::BTreeSet;
+//! twice is not an attack, and the companion legitimately retries. A result
+//! token authenticates the route but does not know the result body. The
+//! operation therefore records the accepted body's fingerprint: an identical
+//! `POST` is idempotent as §8.2 requires, while different bytes under the same
+//! operation are a conflict. Spending the token before reading the body made a
+//! malformed upload consume the only retry and made identical replay
+//! impossible.
 
 use aws_lc_rs::{hkdf, hmac};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -102,11 +104,6 @@ impl CapabilityScope {
             2 => Ok(Self::SignerResultSubmit),
             _ => Err(CertificateError::CapabilityScopeViolation("scope")),
         }
-    }
-
-    /// Whether the first accepted use ends the token's life.
-    const fn is_single_use(self) -> bool {
-        matches!(self, Self::SignerResultSubmit)
     }
 }
 
@@ -226,14 +223,9 @@ pub struct CapabilityRequirement<'a> {
     pub operation_expires_at: u64,
 }
 
-/// `K_capability` and the record of what has already been spent.
-///
-/// Both halves belong together: a verifier that could be constructed without
-/// the consumption ledger would be a verifier that silently makes
-/// `signer_result_submit` replayable.
+/// Process-local `K_capability`.
 pub struct CapabilityTokens {
     secret: Zeroizing<[u8; CAPABILITY_SECRET_LEN]>,
-    consumed: BTreeSet<[u8; ID_LEN]>,
 }
 
 impl CapabilityTokens {
@@ -245,10 +237,7 @@ impl CapabilityTokens {
     pub fn new() -> Result<Self, CertificateError> {
         let secret = crate::random::secret_bytes::<CAPABILITY_SECRET_LEN>()
             .map_err(|_| CertificateError::RandomnessUnavailable)?;
-        Ok(Self {
-            secret,
-            consumed: BTreeSet::new(),
-        })
+        Ok(Self { secret })
     }
 
     /// Mints the bearer form: `base64url` of payload followed by its tag.
@@ -269,11 +258,7 @@ impl CapabilityTokens {
         Ok(URL_SAFE_NO_PAD.encode(token))
     }
 
-    /// Authenticates a bearer token and, for a single-use scope, spends it.
-    ///
-    /// One entry point on purpose: a separate `verify` would eventually be
-    /// called on the submission route, and the replay it allows has no second
-    /// line of defence.
+    /// Authenticates a bearer token for one exact route and operation.
     pub fn authenticate(
         &mut self,
         token: &str,
@@ -321,9 +306,6 @@ impl CapabilityTokens {
             return Err(CertificateError::CapabilityTokenExpired);
         }
 
-        if grant.scope.is_single_use() && !self.consumed.insert(*grant.operation_id.as_bytes()) {
-            return Err(CertificateError::CapabilityTokenConsumed);
-        }
         Ok(grant)
     }
 
@@ -468,9 +450,10 @@ mod tests {
         assert_eq!(authenticated, grant);
     }
 
-    /// A read is legitimately retried inside its window.
+    /// A route token is legitimately retried inside its window. The operation
+    /// layer, which sees the body, decides identical replay versus conflict.
     #[test]
-    fn a_read_token_is_replayable_inside_its_window_and_a_submission_is_not() {
+    fn read_and_submission_tokens_are_replayable_inside_their_window() {
         let mut tokens = CapabilityTokens::new().expect("tokens");
         let read = tokens
             .issue(&grant(CapabilityScope::SignerRequestRead), 2_000)
@@ -486,10 +469,9 @@ mod tests {
         tokens
             .authenticate(&submit, &submissions, 1_100)
             .expect("first");
-        assert!(matches!(
-            tokens.authenticate(&submit, &submissions, 1_101),
-            Err(CertificateError::CapabilityTokenConsumed)
-        ));
+        tokens
+            .authenticate(&submit, &submissions, 1_101)
+            .expect("identical route retry");
     }
 
     #[test]

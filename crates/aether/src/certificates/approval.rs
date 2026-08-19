@@ -1287,6 +1287,33 @@ mod tests {
         verify(&fixture, &fixture.approval).expect("approval");
     }
 
+    #[test]
+    fn astra_verifies_the_companion_evidence_before_adding_its_signature() {
+        let fixture = fixture();
+        let mut companion = fixture.approval.clone();
+        companion.astra_signature = MlDsa87Signature::placeholder();
+
+        companion
+            .verify_operator_evidence(
+                &fixture.request,
+                &fixture.ca.public,
+                7,
+                &domain(),
+                1,
+                4,
+                1_100,
+            )
+            .expect("the independent evidence is complete");
+        assert!(matches!(
+            verify(&fixture, &companion),
+            Err(CertificateError::InvalidSignature)
+        ));
+        let countersigned = companion
+            .sign(&fixture.service.private)
+            .expect("countersign");
+        verify(&fixture, &countersigned).expect("the completed approval verifies");
+    }
+
     /// The refusal the amendment of 15 August 2026 exists for.
     #[test]
     fn an_approval_bound_to_another_request_hash_is_refused() {

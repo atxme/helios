@@ -6,12 +6,13 @@ négociation servi est déjà la v5. Le §12.3 nomme précisément ce qui est li
 et ce qui ne l'est pas ; ne pas lire le reste de la note comme une capacité
 disponible.
 
-Le lot livré ferme le chemin « demande → autorisation → persistance gateway →
-reçu → grant → commit » et le branche au démon. Ce qui manque est
-l'exploitation : le dépôt des demandes et des résultats du compagnon par les
-routes du §8.2 — ses gestes de signature, eux, sont livrés —, le relais typé
-WireGuard–veth, la distribution effective des objets de transition, la bascule
-de profil du §13 et les deux IHM.
+Le lot livré ferme les moitiés serveur du chemin « demande → autorisation →
+persistance gateway → reçu → grant → commit » et les branche aux deux démons.
+Le relais typé WireGuard–veth est livré. Ce qui manque est l'exploitation de
+bout en bout : `astra-signer` ne récupère ni ne dépose encore ses documents par
+`heliosd_url`, Orion ne pilote pas encore l'opération ni le commit, les objets
+de transition ne sont pas distribués, et la bascule de profil du §13 comme les
+deux IHM restent à faire.
 
 ## 0. État de départ et décisions
 
@@ -2530,10 +2531,20 @@ libellé ambigu « Renouveler ».
   vérification complète d'une transaction chunkée et application par une seule
   écriture, révocations différées appliquées à leur instant.
 - `astra::vault` et `astra-signer` : coffre maître HVLT, key-slots FIDO2
-  `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove` et
-  `rename`. Le coffre exige deux credentials avant d'être tenu pour amorcé et
-  en accepte huit. Les deux couches AES-256-GCM, HKDF-SHA-256, sels, contextes
-  et AAD sont celles désormais figées au §2.4.1.
+  `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove`,
+  `rename`, `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
+  `approve-campaign` et `rotate-ca-pq`. Le coffre exige deux credentials avant
+  d'être tenu pour amorcé et en accepte huit. L'approbation ordinaire ne reçoit
+  aucun secret de slot et produit une assertion WebAuthn vérifiable ; les deux
+  couches AES-256-GCM, HKDF-SHA-256, sels, contextes et AAD sont celles figées
+  au §2.4.1.
+- la **moitié serveur du renouvellement relayé** : les routes Orion → Helios
+  authentifient la VIP, Helios relaie des objets typés vers Astra, Astra
+  persiste `awaiting_operator`, puis l'approbation et les octets exacts du
+  stage avant émission. L'autorisation et le reçu restent sur le veth, le grant
+  n'est libéré qu'après le reçu, et une reprise réutilise le même
+  `operation_id` sans deuxième cérémonie. Les deux directions mTLS emploient
+  deux identités distinctes, TLS 1.3 `(EC)DHE`, sans reprise ni 0-RTT.
 
 **Non livré.** Ces points sont refusés explicitement à l'exécution, jamais
 contournés :
@@ -2587,14 +2598,15 @@ contournés :
   `AstraCredentialApprovalRequest` en `AstraRenewalApproval` — sans ouvrir le
   coffre —, campagnes à deux credentials distincts et rotation de `CA-PQ`.
   Chacun lit une demande sur disque et écrit son résultat à côté, parce que les
-  routes `signer-requests`, `vaults` et `signer-results` du §8.2 répondent
-  encore `501`. Côté Astra, les routes d'approbation répondent `501` et
-  l'émetteur délégué n'applique pas encore l'obligation YubiKey ;
+  routes publiques `signer-requests`, `vaults` et `signer-results` du §8.2
+  répondent encore `501`. Le backend privé du renouvellement ordinaire accepte
+  et vérifie déjà le résultat relayé, et l'émetteur délégué n'émet rien avant
+  cette preuve YubiKey ; en revanche le binaire `astra-signer` ne sait pas
+  encore utiliser `heliosd_url`, et Orion ne sait pas encore le lancer ;
 - la **distribution des objets de transition** par `trust-update`. Le canal
-  privé bidirectionnel des §§8.1.2 et 8.3 est livré — TLS 1.3 `(EC)DHE`, sans
-  reprise ni 0-RTT, deux identités de transport par bout — et le renouvellement
-  relayé passe par lui de bout en bout. Ce qui manque est la distribution des
-  transitions elles-mêmes : la gateway ne détient aucun objet pré-signé, donc
+  privé bidirectionnel des §§8.1.2 et 8.3 est livré. Ce qui manque est la
+  distribution des transitions elles-mêmes : la gateway ne détient aucun
+  objet pré-signé, donc
   `trust-update` répond `503` à un client qu'elle sait en retard au lieu de lui
   annoncer qu'il est à jour ; et sa réponse ne porte **jamais** de statut signé,
   parce qu'un statut est signé par la clé de service Astra, que `heliosd` ne
