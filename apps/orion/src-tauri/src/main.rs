@@ -1054,6 +1054,18 @@ impl ProfileDraft {
     }
 }
 
+/// Selects the profile that is actually being edited.
+///
+/// An import is a replacement transaction, not a suggestion layered over a
+/// profile with the same display name. In particular, its private WireGuard
+/// key and its sealed negotiation identity were issued as one pair.
+fn profile_edit_base<'a>(
+    pending_import: Option<&'a ClientProfile>,
+    stored: Option<&'a ClientProfile>,
+) -> Option<&'a ClientProfile> {
+    pending_import.or(stored)
+}
+
 #[tauri::command]
 async fn get_config(state: State<'_, AppState>) -> Result<ConfigView, String> {
     Ok(ConfigView::from(&*state.config.lock().await))
@@ -1483,18 +1495,20 @@ async fn save_profile(
 ) -> Result<ConfigView, String> {
     let mut cfg = state.config.lock().await;
     require_protected_volume(&state)?;
-    // A profile already stored wins over a pending import of the same name:
-    // editing an existing profile must not silently adopt the key of a
-    // document imported earlier in the session and never saved.
-    let stored = match cfg.find(&draft.name).cloned() {
-        Some(profile) => Some(profile),
-        None => state.pending_imports.lock().await.remove(&draft.name),
-    };
+    // A pending import wins over the stored profile of the same name. An
+    // imported document may carry a *new* WireGuard private key together
+    // with a newly sealed key-negotiation identity. Keeping the old profile
+    // here would pair those two identities from different admissions: the
+    // gateway accepts the TLS certificate, then rejects the request because
+    // its WireGuard key is the old one. Ordinary edits never have a pending
+    // import, so they still use the stored profile and preserve its secrets.
+    let pending = state.pending_imports.lock().await.remove(&draft.name);
+    let stored = profile_edit_base(pending.as_ref(), cfg.find(&draft.name));
     // Taken, not peeked: the key is now the profile's, and leaving a copy in
     // the slot would let the next profile saved adopt it too.
     let staged = state.staged_key.lock().await.take();
     let staged_psk = state.staged_psk.lock().await.take();
-    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
+    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
     let selected = profile.name.clone();
     state
         .store
@@ -1809,18 +1823,18 @@ async fn validate_profile(
     // "clé privée requise" on every profile that has one — a red field the
     // user cannot clear, on a value they are not allowed to see.
     let cfg = state.config.lock().await;
-    let stored = match cfg.find(&draft.name).cloned() {
-        Some(profile) => Some(profile),
-        // Peeked, not removed: validation runs on every keystroke, and
-        // consuming the import here would make the third character typed lose
-        // the key the first two had.
-        None => state.pending_imports.lock().await.get(&draft.name).cloned(),
-    };
+    // The pending import is the profile being edited, even when it replaces a
+    // stored profile with the same name. Looking at the stored key here would
+    // report a valid replacement as if its new negotiation identity belonged
+    // to the old WireGuard key, then `save_profile` would persist that split.
+    // Peeked, not removed: validation runs on every keystroke.
+    let pending = state.pending_imports.lock().await.get(&draft.name).cloned();
+    let stored = profile_edit_base(pending.as_ref(), cfg.find(&draft.name));
     // Validation runs on every keystroke: the staged secrets are read, never
     // taken.
     let staged = state.staged_key.lock().await;
     let staged_psk = state.staged_psk.lock().await;
-    let profile = draft.merge(stored.as_ref(), staged.as_ref(), staged_psk.as_ref())?;
+    let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
     Ok(inspect_profile(&profile))
 }
 
@@ -2373,6 +2387,22 @@ mod security_tests {
             use_staged_psk: false,
             ssh_target: None,
         }
+    }
+
+    #[test]
+    fn a_pending_import_replaces_the_stored_wireguard_identity() {
+        let stored = profile("poste-windows");
+        let imported = profile("poste-windows");
+        assert_ne!(stored.private_key, imported.private_key);
+
+        let base = super::profile_edit_base(Some(&imported), Some(&stored))
+            .expect("an imported profile is the edit base");
+        let merged = draft("poste-windows")
+            .merge(Some(base), None, None)
+            .expect("the imported profile remains complete");
+
+        assert_eq!(merged.private_key, imported.private_key);
+        assert_ne!(merged.private_key, stored.private_key);
     }
 
     /// The payload the screen actually sends must deserialise.
