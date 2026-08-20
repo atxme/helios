@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
+    approval::AstraIssuancePolicy,
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
@@ -64,6 +65,7 @@ use aether::certificates::{
 };
 use aether::key_negotiation::PqCertificate;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Default location of the registry, beside `network.toml`.
 const CERTIFICATE_REGISTRY_PATH: &str = "/var/lib/helios/certificates.json";
@@ -265,12 +267,28 @@ impl CertificateRegistry {
     pub fn load(path: &Path) -> Result<Option<Self>, RegistryError> {
         match std::fs::read(path) {
             Ok(raw) => {
-                let state: RegistryState = serde_json::from_slice(&raw)
+                let mut document: Value = serde_json::from_slice(&raw)
                     .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
-                Ok(Some(Self {
+                let migrated = migrate_legacy_registry(&mut document)?;
+                let state: RegistryState = serde_json::from_value(document)
+                    .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+                let mut registry = Self {
                     path: path.to_path_buf(),
                     state,
-                }))
+                };
+                if migrated {
+                    // The migration is part of loading, but it still follows
+                    // the registry's normal written-first rule. A daemon
+                    // restart therefore cannot leave a legacy document on
+                    // disk after it has served the current state in memory.
+                    let state = registry.state.clone();
+                    registry.persist(state)?;
+                    tracing::info!(
+                        path = %path.display(),
+                        "migrated the certificate registry to the current Astra trust schema"
+                    );
+                }
+                Ok(Some(registry))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(RegistryError::Io(error)),
@@ -880,6 +898,80 @@ impl CertificateRegistry {
         peer.staged_pq_certificate = None;
         self.persist(state)
     }
+}
+
+/// Adds fields introduced after the first trust-domain registry format.
+///
+/// The gateway registry is deliberately not bootstrapped again when a file is
+/// already present: doing so would erase its certificate generations and
+/// ledger. Newer binaries therefore migrate the small, deterministic Astra
+/// profile extension in place. The policy pin is recomputed from the same
+/// three public inputs used by `heliosd init-trust-domain`; it is never copied
+/// from an operator-signed object or accepted from an untrusted default.
+fn migrate_legacy_registry(document: &mut Value) -> Result<bool, RegistryError> {
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| RegistryError::Corrupt("registry root is not an object".into()))?;
+
+    let trust_domain_id: TrustDomainId = serde_json::from_value(
+        root.get("trust_domain_id")
+            .cloned()
+            .ok_or_else(|| RegistryError::Corrupt("missing field `trust_domain_id`".into()))?,
+    )
+    .map_err(|error| RegistryError::Corrupt(format!("invalid `trust_domain_id`: {error}")))?;
+
+    let gateway = root
+        .get("gateway")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RegistryError::Corrupt("missing field `gateway`".into()))?;
+    let gateway_wg_public_key: WireGuardKey = serde_json::from_value(
+        gateway
+            .get("gateway_wg_public_key")
+            .cloned()
+            .ok_or_else(|| {
+                RegistryError::Corrupt("missing field `gateway.gateway_wg_public_key`".into())
+            })?,
+    )
+    .map_err(|error| {
+        RegistryError::Corrupt(format!("invalid `gateway.gateway_wg_public_key`: {error}"))
+    })?;
+    let server_name = gateway
+        .get("server_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RegistryError::Corrupt("missing field `gateway.server_name`".into()))?
+        .to_owned();
+
+    let astra = root
+        .get_mut("astra")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| RegistryError::Corrupt("missing field `astra`".into()))?;
+
+    let mut migrated = false;
+    if !astra.contains_key("astra_policy_fingerprint") {
+        let pin =
+            AstraIssuancePolicy::standard(trust_domain_id, gateway_wg_public_key, server_name)
+                .pin()
+                .map_err(|error| {
+                    RegistryError::Corrupt(format!("building the Astra policy pin: {error}"))
+                })?;
+        let encoded = serde_json::to_value(pin.fingerprint())
+            .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+        astra.insert("astra_policy_fingerprint".into(), encoded);
+        migrated = true;
+    }
+    if !astra.contains_key("credential_registry_epoch") {
+        astra.insert("credential_registry_epoch".into(), Value::from(1_u64));
+        migrated = true;
+    }
+    if !astra.contains_key("credential_bindings") {
+        astra.insert(
+            "credential_bindings".into(),
+            Value::Object(Default::default()),
+        );
+        migrated = true;
+    }
+
+    Ok(migrated)
 }
 
 /// Drops every candidate whose lease has run out, in place.
@@ -2005,5 +2097,68 @@ mod tests {
             .expect("load")
             .expect("a bootstrapped domain is not an absent one");
         assert_eq!(reloaded.state(), &state);
+    }
+
+    /// Registries written before the Astra policy pin was added keep their
+    /// generations and ledger, while the three deterministic Astra fields are
+    /// filled and persisted on the first read by a current daemon.
+    #[test]
+    fn a_legacy_registry_is_migrated_without_losing_peers() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("certificates.json");
+        let fixture = fixture();
+        let state = fixture.registry.state().clone();
+        let old_peer = state.peers.clone();
+        let old_ledger = state.ledger.clone();
+        let expected_policy = AstraIssuancePolicy::standard(
+            state.trust_domain_id,
+            state.gateway.gateway_wg_public_key,
+            state.gateway.server_name.clone(),
+        )
+        .pin()
+        .expect("standard policy");
+
+        let mut legacy = serde_json::to_value(&state).expect("encode state");
+        let astra = legacy
+            .get_mut("astra")
+            .and_then(Value::as_object_mut)
+            .expect("astra object");
+        astra.remove("astra_policy_fingerprint");
+        astra.remove("credential_registry_epoch");
+        astra.remove("credential_bindings");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("encode legacy state"),
+        )
+        .expect("write legacy state");
+
+        let migrated = CertificateRegistry::load(&path)
+            .expect("migrate")
+            .expect("registry");
+        assert_eq!(migrated.state().peers, old_peer);
+        assert_eq!(migrated.state().ledger, old_ledger);
+        assert!(migrated
+            .state()
+            .astra
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(expected_policy.fingerprint()));
+        assert_eq!(migrated.state().astra.credential_registry_epoch, 1);
+        assert!(migrated.state().astra.credential_bindings.is_empty());
+
+        // The migration is durable; a second load takes the normal path.
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("persisted JSON");
+        let persisted_astra = persisted
+            .get("astra")
+            .and_then(Value::as_object)
+            .expect("persisted Astra object");
+        assert!(persisted_astra.contains_key("astra_policy_fingerprint"));
+        assert!(persisted_astra.contains_key("credential_registry_epoch"));
+        assert!(persisted_astra.contains_key("credential_bindings"));
+        let reloaded = CertificateRegistry::load(&path)
+            .expect("reload")
+            .expect("registry");
+        assert_eq!(reloaded.state(), migrated.state());
     }
 }
