@@ -162,6 +162,13 @@ pub fn check(path: &Path) -> Result<()> {
             "  (tunnel fractionné — le reste sort en clair)"
         }
     );
+    println!(
+        "  API dans tunnel : {}",
+        profile
+            .heliosd_url
+            .as_deref()
+            .unwrap_or("— absente : le profil se connecte, mais ne peut pas renouveler")
+    );
     // Ce que l'import fera de la clé privée absente est la question qu'on
     // pose le plus souvent à cette commande : la clé admise est ce qui
     // désigne le profil local à compléter, et l'afficher permet de la

@@ -384,6 +384,14 @@ rm -f /tmp/helios-client-cert-$$.der /tmp/helios-client-pq-cert-$$.json
 sed -n 's/^[[:space:]]*key_negotiation_port[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
     /var/lib/helios/network.toml | head -1 > "\$DEPOT/port.txt"
 
+# L'API de cycle de vie n'est pas l'endpoint public et ne se devine pas depuis
+# l'adresse SSH : elle écoute sur l'adresse de la gateway dans le tunnel. Le
+# chemin hors API doit donc transmettre cette valeur à enroll, sinon le
+# profil peut se connecter mais Orion n'a aucune route à appeler au
+# renouvellement. Le port 8080 est le contrat aether::API_PORT.
+sed -n 's/^[[:space:]]*wg_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    /var/lib/helios/network.toml | head -1 > "\$DEPOT/wg-address.txt"
+
 cp /var/lib/helios/key-negotiation-cert.der "\$DEPOT/gw-cert.der"
 cp /var/lib/helios/key-negotiation-pq-cert.json "\$DEPOT/gw-pq-cert.json"
 
@@ -426,6 +434,7 @@ fi
 echo "==> Récupération des résultats"
 scp -q "$CIBLE:$DEPOT/peer.txt" "$TRAVAIL/peer.txt"
 scp -q "$CIBLE:$DEPOT/port.txt" "$TRAVAIL/port.txt"
+scp -q "$CIBLE:$DEPOT/wg-address.txt" "$TRAVAIL/wg-address.txt"
 scp -q "$CIBLE:$DEPOT/gw-cert.der" "$TRAVAIL/gw-cert.der"
 scp -q "$CIBLE:$DEPOT/gw-pq-cert.json" "$TRAVAIL/gw-pq-cert.json"
 # Absent quand la gateway n'a pas de domaine de confiance : `scp` échoue, et
@@ -451,6 +460,18 @@ fi
 # laquelle ce script a joint la gateway en SSH.
 NEGOCIATION="${ENDPOINT%:*}:$PORT_NEGO"
 echo "    négociation $NEGOCIATION"
+
+WG_ADDRESS="$(tr -d '\r' < "$TRAVAIL/wg-address.txt")"
+WG_HOST="${WG_ADDRESS%%/*}"
+if [ -z "$WG_HOST" ] || [ "$WG_HOST" = "$WG_ADDRESS" ]; then
+    echo "La gateway ne publie pas un wg_address CIDR lisible dans network.toml." >&2
+    exit 1
+fi
+case "$WG_HOST" in
+    *:*) HELIOSD_URL="http://[$WG_HOST]:8080" ;;
+    *)   HELIOSD_URL="http://$WG_HOST:8080" ;;
+esac
+echo "    API dans le tunnel $HELIOSD_URL"
 [ -s "$TRAVAIL/gw-cert.der" ] || { echo "certificat TLS de la gateway vide" >&2; exit 1; }
 [ -s "$TRAVAIL/gw-pq-cert.json" ] || { echo "certificat PQ de la gateway vide" >&2; exit 1; }
 
@@ -482,6 +503,7 @@ echo "==> Enrôlement"
     --gateway-certificate "$TRAVAIL/gw-cert.der" \
     --gateway-pq-certificate "$TRAVAIL/gw-pq-cert.json" \
     --address "$VIP" \
+    --heliosd-url "$HELIOSD_URL" \
     --output "$PROFIL" "${ARG_TRAFIC[@]}" "${ARG_CONFIANCE[@]}"
 
 echo
