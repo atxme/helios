@@ -591,6 +591,24 @@ const KEY_NEGOTIATION_ATTEMPTS: u32 = 3;
 /// the boundary despite scheduling and transport jitter.
 const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(11);
 
+/// Errors that cannot be repaired by opening the same authenticated session
+/// again.  In particular, a `BadSignature` means that the certificate the
+/// gateway serves does not match the one pinned by the profile; retrying it
+/// only keeps the UI in `Connexion…` while no state can change.
+///
+/// Transport timeouts, refused UDP packets and lost responses remain
+/// retryable: those are the desynchronisation and transient-network cases the
+/// bounded retry loop exists to recover from.
+fn is_terminal_negotiation_error(error: &anyhow::Error) -> bool {
+    let rendered = format!("{error:#}");
+    rendered.contains("invalid peer certificate")
+        || rendered.contains("BadSignature")
+        || rendered.contains("invalid certificate")
+        || rendered.contains("TLS configuration failed")
+        || rendered.contains("invalid PKCS#8 private key")
+        || rendered.contains("peer did not present a certificate")
+}
+
 /// Negotiates, mounts, and recovers from a desynchronised slot.
 ///
 /// # The failure this guards against
@@ -606,9 +624,11 @@ const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(11);
 /// both ends at once. Without this loop the tunnel stayed dead until the user
 /// happened to disconnect and reconnect by hand.
 ///
-/// Preparation failures are **not** retried: nothing has been installed yet,
-/// so there is nothing to resynchronise, and repeating a missing identity
-/// three times would only delay an error the user needs now.
+/// Preparation failures with a deterministic local or certificate cause are
+/// not retried: nothing has been installed yet, so there is nothing to
+/// resynchronise, and repeating a missing identity three times would only
+/// delay an error the user needs now. Network and response failures still use
+/// the bounded retry loop below.
 ///
 /// If every attempt fails, the adapter deliberately stays mounted with its
 /// desynchronised PSK: WireGuard drops the packets, which is the anti-leak
@@ -666,6 +686,16 @@ async fn connect_with_key_negotiation(
                          {error:#}. Aucun PSK installé sur le plan de données."
                         ),
                     ));
+                    let terminal = is_terminal_negotiation_error(&error);
+                    if terminal {
+                        sink(ClientEvent::log(
+                            "error",
+                            "échec cryptographique définitif : aucune nouvelle tentative de \
+                         négociation ne peut réparer l’identité présentée."
+                                .to_string(),
+                        ));
+                        return Err(error);
+                    }
                     last_error = Some(error);
                     if attempt < KEY_NEGOTIATION_ATTEMPTS {
                         tokio::time::sleep(KEY_NEGOTIATION_RETRY_DELAY).await;
@@ -855,6 +885,22 @@ mod tests {
             KEY_NEGOTIATION_RETRY_DELAY > Duration::from_secs(10),
             "a retry inside the gateway's ten-second rest period is guaranteed to be rejected"
         );
+    }
+
+    #[test]
+    fn certificate_signature_failure_is_terminal() {
+        let error = anyhow::anyhow!(
+            "performing key negotiation: QUIC connection failed: invalid peer certificate: BadSignature"
+        );
+        assert!(is_terminal_negotiation_error(&error));
+    }
+
+    #[test]
+    fn network_timeout_remains_retryable() {
+        let error = anyhow::anyhow!(
+            "no answer from the key-negotiation service after 10 s — check its UDP port"
+        );
+        assert!(!is_terminal_negotiation_error(&error));
     }
 
     fn sink() -> EventSink {
