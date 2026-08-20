@@ -62,7 +62,7 @@ use aether::certificates::encoding::{
 };
 use aether::certificates::status::AstraRotationCampaign;
 use aether::certificates::webauthn::{
-    validate_https_origin, verify_assertion, AssertionExpectation, WebAuthnAssertion,
+    validate_https_origin, verify_assertion, AssertionExpectation,
 };
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
@@ -73,7 +73,6 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::credentials::CredentialRegistry;
 use crate::gestures::{GestureError, Result};
@@ -127,32 +126,15 @@ pub struct DelegationBounds {
 /// two things to keep equal.
 pub use helios_fido::DomainIdentity;
 
-/// One credential's answer to a challenge, and the binding it answered under.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialAssertion {
-    pub credential_id: Vec<u8>,
-    pub credential_fingerprint: Fingerprint,
-    pub assertion: WebAuthnAssertion,
-    pub assertion_fingerprint: Fingerprint,
-}
-
-/// What the companion returns for a manual campaign (spec §7.6).
+/// The companion's campaign result, and the assertions inside it.
 ///
-/// There is no `aether` type for this yet — the specification names the
-/// challenge domain and the refusal, not a persisted document — so the shape
-/// lives here, next to the gesture that produces it. What matters is checked
-/// rather than described: the campaign fingerprint is the challenge, and
-/// `assert_unchanged` refuses a campaign whose targets moved after approval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CampaignApproval {
-    pub campaign_id: aether::certificates::encoding::Id16,
-    pub campaign_fingerprint: Fingerprint,
-    pub required_credentials: u8,
-    pub approved_at: u64,
-    pub approvals: Vec<CredentialAssertion>,
-}
+/// Defined in `aether` rather than here, because it is a **wire type**: this
+/// program writes it and Astra reads it, on another machine. A shape owned by
+/// the companion would make Astra depend on the one binary in the repository
+/// that holds `CA-PQ` in the clear — the dependency ADR-008 §4 exists to
+/// forbid. What the gesture below produces, `CampaignApproval::verify`
+/// re-derives from the campaign and the `CA-PQ`-signed registry.
+pub use aether::certificates::status::{CampaignApproval, CredentialAssertion};
 
 fn decode(value: &str, what: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD

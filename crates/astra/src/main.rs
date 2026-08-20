@@ -66,6 +66,18 @@ const OPERATIONS_FILE: &str = "client-renewal-operations.json";
 const CREDENTIALS_FILE: &str = "astra-credentials.json";
 /// Largest credential document read, in bytes.
 const MAX_CREDENTIALS_BYTES: u64 = 1024 * 1024;
+/// The encrypted authority vault, as the companion wrote it.
+///
+/// Astra transports and backs it up; it does not open it, and nothing in this
+/// container can — the key-slots unwrap under a FIDO2 `hmac-secret` output
+/// that never leaves the operator's token. Copied in by an operator, exactly
+/// like the credential document.
+const VAULT_FILE: &str = "authority-vault.json";
+/// Largest vault file read, in bytes.
+///
+/// The same ceiling the companion applies to its own copy: a file larger than
+/// this is not a vault with more key-slots, it is a mistake or a wedge.
+const MAX_VAULT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -151,8 +163,52 @@ enum Command {
         #[command(subcommand)]
         command: IssuerCommand,
     },
+    /// Opens a manual rotation campaign for an operator to approve (§7.6).
+    Campaign {
+        #[command(subcommand)]
+        command: CampaignCommand,
+    },
     /// Prints the authority's state and the head of its audit chain.
     Status,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CampaignScopeArg {
+    /// The fleet's client leaves. Rotates no authority.
+    FleetLeafs,
+}
+
+#[derive(Subcommand)]
+enum CampaignCommand {
+    /// Resolves a campaign over the current fleet and deposits it.
+    ///
+    /// # Why a local command and not a public route
+    ///
+    /// §11.6 has an interface ask Astra to resolve a campaign over the
+    /// **current** targets and generations. On the public origin that would be
+    /// an unauthenticated route answering every caller with the domain's
+    /// inventory, and the authentication such a route would need is not
+    /// settled anywhere. So the resolution happens here, on the machine that
+    /// already runs Astra, and the result is deposited for the running service
+    /// to adopt — the shape `heliosd peer add` uses for the same reason.
+    ///
+    /// What it prints is an opaque operation identifier. Everything else — the
+    /// capability tokens, the campaign itself — the companion fetches from the
+    /// endpoint under that identifier.
+    Open {
+        /// What the campaign covers.
+        #[arg(long, value_enum)]
+        scope: CampaignScopeArg,
+        /// Free text shown to the operator before the touch.
+        #[arg(long)]
+        reason: String,
+        /// Who asked for it. Shown to the operator, and audited.
+        #[arg(long)]
+        requested_by: String,
+        /// How long the operator has, in seconds.
+        #[arg(long, default_value_t = 300)]
+        window_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -244,6 +300,14 @@ fn main() -> Result<()> {
             IssuerCommand::Install { authorization } => {
                 issuer_install(&cli.state_dir, authorization.as_deref())
             }
+        },
+        Command::Campaign { command } => match command {
+            CampaignCommand::Open {
+                scope,
+                reason,
+                requested_by,
+                window_secs,
+            } => campaign_open(&cli.state_dir, scope, &reason, &requested_by, window_secs),
         },
         Command::Status => status(&cli.state_dir),
     }
@@ -450,6 +514,7 @@ fn run(
     let operations =
         astra::operations::OperationStore::load(&state_dir.join(OPERATIONS_FILE), now_unix())
             .context("loading the client renewal operations")?;
+    let encrypted_vault = load_encrypted_vault(state_dir)?;
     let service = Arc::new(AstraService {
         registry: Mutex::new(registry),
         issuer,
@@ -465,6 +530,8 @@ fn run(
         approval_credential_ids,
         approval_credential_registry_epoch,
         approval_credential_registry,
+        signing: Mutex::new(astra::signing::SigningOperationStore::new()),
+        encrypted_vault,
         gateway,
     });
 
@@ -500,6 +567,7 @@ fn run(
                 }
             });
         }
+        spawn_campaign_drain(service.clone(), state_dir.to_path_buf());
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .with_context(|| format!("binding {bind}"))?;
@@ -511,6 +579,84 @@ fn run(
         .await
         .context("serving the Astra public endpoint")
     })
+}
+
+/// Adopts the campaigns a local operator command deposited.
+///
+/// The store lives in this process, in memory; `astra campaign open` runs in
+/// another one. This is the same arrangement `heliosd` uses for console
+/// admissions, and for the same reason: one owner of the state, and a second
+/// process that may only leave something for it.
+///
+/// A deposit that does not verify is **removed**, not retried. It sat between
+/// two processes on disk, and re-reading it every two seconds until its window
+/// closes would turn one bad file into a log the operator has to scroll past.
+fn spawn_campaign_drain(service: Arc<AstraService>, state_dir: PathBuf) {
+    tokio::spawn(async move {
+        let directory = state_dir.join(astra::signing::CAMPAIGN_INBOX_DIR);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            astra::signing::INBOX_POLL_INTERVAL_SECS,
+        ));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                match adopt_campaign_file(&service, &path).await {
+                    Ok(operation_id) => tracing::info!(
+                        %operation_id,
+                        "manual campaign adopted; the companion may fetch it"
+                    ),
+                    Err(error) => tracing::error!(
+                        file = %path.display(),
+                        %error,
+                        "manual campaign refused: nothing was opened, and the operator has to \
+                         run `astra campaign open` again"
+                    ),
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    });
+}
+
+/// Reads one deposit and opens the operation it describes.
+async fn adopt_campaign_file(
+    service: &Arc<AstraService>,
+    path: &Path,
+) -> Result<aether::certificates::encoding::Id16> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > astra::signing::MAX_INBOX_ENTRY_BYTES {
+        anyhow::bail!("{} bytes: this is not a campaign", metadata.len());
+    }
+    let bytes = std::fs::read(path)?;
+    let deposit: astra::signing::CampaignDeposit =
+        serde_json::from_slice(&bytes).context("decoding the campaign")?;
+    let (service_public_key, service_key_epoch, authority_url) = {
+        let registry = service.registry.lock().await;
+        let state = registry.state();
+        (
+            state.astra_service_public_key.clone(),
+            state.astra_service_key_epoch,
+            state.authority_url.clone(),
+        )
+    };
+    let mut store = service.signing.lock().await;
+    astra::signing::adopt_deposit(
+        &mut store,
+        deposit,
+        &service_public_key,
+        service_key_epoch,
+        &authority_url,
+        now_unix(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Astra's own listener on the veth, when this deployment has one.
@@ -583,6 +729,45 @@ type ApprovalCredentials = (
     u64,
     Option<Box<aether::certificates::approval::CredentialRegistry>>,
 );
+
+/// Reads the encrypted vault, if an operator has copied one into the volume.
+///
+/// The bytes are kept exactly as written and never parsed: Astra serves them
+/// to a companion that holds the key-slots, and a value it had opinions about
+/// would be a value it could substitute. Its fingerprint is what the signed
+/// `AstraSignerRequest` names, so a wrong file is refused by the companion —
+/// not by this read.
+///
+/// Absent is a supported state, and the ordinary one: only a campaign that
+/// rotates an anchor needs it. Saying so at start-up beats discovering it in
+/// the middle of a ceremony.
+fn load_encrypted_vault(state_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = state_dir.join(VAULT_FILE);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        tracing::info!(
+            path = %path.display(),
+            "no encrypted vault in the state volume: campaigns that rotate an anchor are refused \
+             by name; every other scope is unaffected"
+        );
+        return Ok(None);
+    };
+    if metadata.len() > MAX_VAULT_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes, over the {MAX_VAULT_BYTES}-byte ceiling: this is not a vault",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let fingerprint = aether::certificates::encoding::Fingerprint::of(&bytes);
+    tracing::info!(
+        path = %path.display(),
+        vault_sha256 = %fingerprint,
+        bytes = bytes.len(),
+        "encrypted vault held for the companion — this process cannot open it"
+    );
+    Ok(Some(bytes))
+}
 
 fn load_approval_credentials(
     state_dir: &Path,
@@ -696,6 +881,172 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
 /// for the epoch to advance from. Until an authorization comes back, these two
 /// files are a key pair no signed object names — which is exactly the state an
 /// interrupted ceremony should leave behind.
+/// A non-zero 16-byte identifier from the approved DRBG (spec §2.3.2).
+fn fresh_id() -> Result<aether::certificates::encoding::Id16> {
+    let bytes = aether::random::public_bytes::<16>()
+        .map_err(|error| anyhow::anyhow!("drawing an identifier: {error}"))?;
+    aether::certificates::encoding::Id16::new(bytes)
+        .map_err(|error| anyhow::anyhow!("drawing an identifier: {error}"))
+}
+
+/// Resolves a campaign over the fleet as it stands, and deposits it (§7.6).
+///
+/// Every target is pinned to the generation and the **exact** fingerprints the
+/// registry holds right now. That is what makes the operator's touch an
+/// approval of a specific set rather than of a list evaluated later: a target
+/// that moves in between changes the campaign fingerprint, and
+/// `assert_unchanged` refuses it instead of quietly recomputing.
+///
+/// A revoked peer is not a target. `revoked` is terminal — no credential lifts
+/// it — so including one would put an object in the campaign that every
+/// downstream step must then refuse, and would make the count the operator
+/// reads on their screen wrong.
+fn campaign_open(
+    state_dir: &Path,
+    scope: CampaignScopeArg,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+) -> Result<()> {
+    use aether::certificates::status::{
+        AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, CertificateKind,
+        MAX_CAMPAIGN_TARGETS,
+    };
+
+    if reason.trim().is_empty() || requested_by.trim().is_empty() {
+        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
+    }
+    // The specification bounds the campaign window at five minutes: the
+    // approval is a challenge, and a challenge with a long life is a challenge
+    // worth capturing.
+    if window_secs == 0 || window_secs > 300 {
+        anyhow::bail!("--window-secs must be between 1 and 300");
+    }
+
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let state = registry.state();
+    let scope = match scope {
+        CampaignScopeArg::FleetLeafs => CampaignScope::FleetLeafs,
+    };
+
+    let targets: Vec<CampaignTarget> = state
+        .peers
+        .values()
+        .filter(|peer| !peer.revoked)
+        .map(|peer| CampaignTarget {
+            certificate_kind: CertificateKind::ClientPq,
+            identity_key: peer.client_wg_public_key,
+            epoch: state.ca_epoch,
+            generation: peer.active.generation,
+            active_tls_certificate_fingerprint: peer.active.tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: peer.active.pq_certificate_fingerprint,
+        })
+        .collect();
+    if targets.is_empty() {
+        anyhow::bail!(
+            "no admitted peer in this registry: there is nothing for an operator to approve"
+        );
+    }
+    if targets.len() > MAX_CAMPAIGN_TARGETS {
+        anyhow::bail!(
+            "{} targets, over the {MAX_CAMPAIGN_TARGETS} ceiling of §8.2",
+            targets.len()
+        );
+    }
+
+    let now = now_unix();
+    let expires_at = now
+        .checked_add(window_secs)
+        .context("campaign window overflow")?;
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: fresh_id()?,
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway_wg_public_key,
+        server_name: state.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope,
+        targets,
+        reason: reason.trim().to_string(),
+        requested_by: requested_by.trim().to_string(),
+        // The pin the domain was bootstrapped with, not one computed here: a
+        // campaign carrying a policy it derived itself would be a campaign
+        // that chose the policy it is checked against (§2.4).
+        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+        required_credentials: scope.required_credentials(),
+    };
+    campaign.validate(now).map_err(|error| {
+        anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
+    })?;
+
+    let service_private_key = Zeroizing::new(
+        std::fs::read(state_dir.join(SERVICE_KEY_FILE)).context("reading the Astra service key")?,
+    );
+    // The vault fingerprint is part of the signed request, so a scope that
+    // needs no vault still names one. All-zero would be a value the companion
+    // could be pointed at; the vault actually held is the honest answer, and
+    // `SigningOperation::vault_fingerprint` is what decides whether a token is
+    // ever minted for it.
+    let vault_fingerprint = load_encrypted_vault(state_dir)?
+        .map(|bytes| Fingerprint::of(&bytes))
+        .unwrap_or_else(|| Fingerprint::of(b"no encrypted vault in this state volume"));
+    let signer_request = AstraSignerRequest {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        operation_id: fresh_id()?,
+        campaign_fingerprint: campaign.fingerprint(),
+        authority_url: state.authority_url.clone(),
+        encrypted_vault_fingerprint: vault_fingerprint,
+        required_credentials: campaign.required_credentials,
+        created_at: now,
+        expires_at,
+        astra_service_key_epoch: state.astra_service_key_epoch,
+        astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&service_private_key)
+    .map_err(|error| anyhow::anyhow!("signing the companion request: {error}"))?;
+
+    let operation_id = signer_request.operation_id;
+    let deposit = astra::signing::CampaignDeposit {
+        campaign: Box::new(campaign),
+        signer_request: Box::new(signer_request),
+    };
+    let directory = state_dir.join(astra::signing::CAMPAIGN_INBOX_DIR);
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let path = directory.join(format!("{}.json", operation_id.to_hex()));
+    let temporary = directory.join(format!("{}.tmp", operation_id.to_hex()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&deposit).context("encoding the campaign")?,
+    )
+    .with_context(|| format!("writing {}", temporary.display()))?;
+    // Renamed into place, so the drain never reads a half-written campaign and
+    // refuses a deposit that was merely still being made.
+    std::fs::rename(&temporary, &path).with_context(|| format!("publishing {}", path.display()))?;
+
+    println!("{}", operation_id.to_hex());
+    eprintln!(
+        "campagne déposée : {} cible(s), {} credential(s), fenêtre de {window_secs} s",
+        deposit.campaign.targets.len(),
+        deposit.campaign.required_credentials
+    );
+    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    eprintln!(
+        "approuver depuis le poste opérateur :\n  astra-signer approve-campaign \\\n    \
+         --authority-url {} \\\n    --operation-id {}",
+        deposit.signer_request.authority_url,
+        operation_id.to_hex()
+    );
+    eprintln!(
+        "limite connue : l'approbation sera enregistrée, et rien ne l'applique encore. Produire \
+         les objets signés et les déposer sur le veth est le lot suivant — cette commande sert à \
+         éprouver la cérémonie, pas à faire tourner un parc."
+    );
+    Ok(())
+}
+
 fn issuer_request(state_dir: &Path, out: Option<&Path>) -> Result<()> {
     use base64::Engine as _;
 

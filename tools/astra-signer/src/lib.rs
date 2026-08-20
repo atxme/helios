@@ -35,5 +35,6 @@ pub mod credentials;
 pub mod documents;
 pub mod gestures;
 pub mod handoff;
+pub mod origin;
 pub mod store;
 pub mod tunnel;

@@ -306,6 +306,11 @@ pub enum CertificateError {
     InvalidCredentialBinding(&'static str),
     #[error("the approving credential is not one this operation admits")]
     UnknownCredential,
+    #[error(
+        "the same operator credential answered twice: two confirmations require two distinct \
+         objects, not two touches of one"
+    )]
+    DuplicateApproval,
     #[error("operator approval does not cover this operation: {0}")]
     ApprovalMismatch(&'static str),
     #[error("WebAuthn assertion refused: {0}")]

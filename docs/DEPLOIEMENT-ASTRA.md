@@ -285,6 +285,37 @@ Sans lui, Astra tourne, sert ses statuts et tient son canal — et refuse chaque
 renouvellement ordinaire en le disant. C'est ce à quoi une installation
 incomplète doit ressembler.
 
+### Le coffre chiffré, et pourquoi il ne se copie pas tout seul
+
+Une campagne qui fait signer une ancre — la portée `trust_authorities` — exige
+que le compagnon **ouvre** le coffre. Il le télécharge par
+`GET /v1/vaults/<empreinte>`, sous un jeton de capacité, et Astra ne peut le
+servir que s'il en détient une copie : `/var/lib/astra/authority-vault.json`.
+
+Le déploiement ne la fait pas à votre place, et c'est délibéré. Le coffre
+contient `CA-PQ` — chiffré, inouvrable sans deux clés de sécurité, mais c'est
+le seul fichier du domaine dont la perte ou la fuite compte vraiment. Le poser
+sur la gateway est une décision d'exploitation : elle donne une sauvegarde hors
+du poste opérateur, et elle met le fichier là où tourne le service. Les deux
+sont défendables ; aucune n'est un défaut à choisir dans un script.
+
+Copier :
+
+```sh
+scp ~/.helios/astra/authority-vault.json cible:/tmp/vault.json
+ssh cible 'sudo docker compose -f /opt/helios/astra/docker-compose.yml     cp /tmp/vault.json astra:/var/lib/astra/authority-vault.json'
+ssh cible 'sudo docker compose -f /opt/helios/astra/docker-compose.yml restart astra'
+rm ~/…/tmp/vault.json
+```
+
+Il est lu au démarrage, comme le document de credentials, et pour la même
+raison : ce sont des octets qu'Astra transporte, jamais qu'il interprète.
+Son empreinte apparaît au journal de démarrage — c'est elle que la demande
+signée nomme, et que le compagnon compare avant d'ouvrir quoi que ce soit.
+
+Sans lui, seules les campagnes qui font signer une ancre sont refusées, en le
+disant. Toutes les autres portées sont inchangées.
+
 ### L'émetteur délégué
 
 Sans lui, Astra tourne et refuse chaque renouvellement ordinaire en le disant :

@@ -2630,19 +2630,31 @@ contournés :
   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
   émis avant ce changement cesse de vérifier et le parc se ré-émet ;
 
-- le **transport hors tunnel** du compagnon. Les gestes eux-mêmes sont livrés et
-  éprouvés : certificat auto-signé `CA-TLS`, `AstraIssuerAuthorization` bornée,
-  bindings de credentials sous `CA-PQ` réémis depuis la table de key-slots,
-  approbation d'une `AstraCredentialApprovalRequest` en `AstraRenewalApproval`
-  — sans ouvrir le coffre —, campagnes à deux credentials distincts et rotation
-  de `CA-PQ`. L'approbation ordinaire voyage désormais **dans le tunnel**
-  (`approve --heliosd-url`), donc le renouvellement client se boucle de bout en
-  bout. Les trois autres commandes lisent encore une demande sur disque et
-  écrivent leur résultat à côté, et le coffre se copie à la main, parce que les
-  routes publiques à jeton de capacité `signer-requests`, `vaults` et
-  `signer-results` du §8.2 répondent `501`. Ces routes-là servent l'opérateur
-  **hors** tunnel — le cas que le canal in-tunnel ne couvre pas, et dont dépend
-  la récupération d'une identité expirée ;
+- l'**ouverture d'une campagne depuis l'origine publique**. Le transport hors
+  tunnel du compagnon, lui, est livré : `GET /v1/operations/<id>`,
+  `GET /v1/signer-requests/<id>`, `GET /v1/vaults/<empreinte>` et
+  `POST /v1/signer-results/<id>` servent les opérations opérateur, avec un
+  jeton de capacité par scope, lié à l'opération, à l'empreinte de campagne —
+  qui est aussi le challenge de la clé — et à cinq minutes. Le jeton de coffre
+  n'est émis que pour une portée qui fait signer une ancre, et le coffre est
+  servi chiffré : Astra ne détient aucun secret de key-slot. Les opérations
+  opérateur vivent dans un magasin distinct de celui des renouvellements
+  clients, ce qui rend structurelle la règle « un `operation_id` de
+  renouvellement ordinaire reçoit le même refus grossier qu'un identifiant
+  inconnu » : il y est absent, pas écarté. `astra campaign open` résout la
+  campagne sur les cibles courantes et la dépose ; `astra-signer
+  approve-campaign --authority-url --operation-id` la récupère, l'affiche,
+  recueille les assertions et les dépose.
+  Ce qui manque est `POST /v1/campaigns`, et le §11.6 dit pourquoi : cette
+  route **résout** une campagne sur les cibles et générations courantes, donc
+  sur un canal public non authentifié elle répondrait l'inventaire du domaine à
+  n'importe quel appelant. L'authentification qu'elle exige — « les budgets
+  s'appliquent par IPv4 ou préfixe IPv6 `/64`, credential, pair et domaine » —
+  n'est décrite nulle part pour ce cas, et l'inventer serait construire le
+  trou. La résolution se fait donc localement.
+  `authorize-issuer` et `rotate-ca-pq` lisent encore une demande sur disque :
+  elles ne portent aucune campagne, donc rien ne les rattache à une opération,
+  et les jetons du §8.2 sont liés à une opération et à un manifeste ;
 - la **production** des transactions de transition. Leur distribution, elle,
   est livrée : `POST /internal/v1/certificates/distribution` sur le veth prend
   une transaction signée adressée à un pair, la gateway la met en file dans son
@@ -2657,12 +2669,14 @@ contournés :
   exactement la substitution que la vérification du destinataire existe pour
   refuser. Elle vérifie l'adressage, la cohérence du jeu de fragments et
   l'échéance ; Orion vérifie les signatures sous ses propres ancres.
-  Ce qui manque en amont : rien ne **dépose** encore de transaction. Il faut
-  qu'une transition signée entre dans Astra — les routes du §8.2 sont en `501`
-  — et qu'Astra bâtisse par client un manifeste signé, ce que seule la clé de
-  service (objets clients uniquement) ou le compagnon (tout le reste) peut
-  faire. Tant que rien n'est déposé, un client en retard reçoit toujours `503`,
-  et jamais un « à jour » qui l'arrêterait pour de bon.
+  Ce qui manque en amont : rien ne **dépose** encore de transaction. Une
+  campagne s'ouvre et s'approuve désormais de bout en bout — `astra campaign
+  open`, puis les routes du §8.2 —, mais l'approbation obtenue n'est pas encore
+  transformée en objets : il faut qu'Astra bâtisse par client un manifeste
+  signé, ce que seule la clé de service (objets clients uniquement) ou le
+  compagnon (tout le reste) peut faire. Tant que rien n'est déposé, un client
+  en retard reçoit toujours `503`, et jamais un « à jour » qui l'arrêterait
+  pour de bon.
   La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
   statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
   ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche

@@ -197,12 +197,34 @@ Restent ouverts :
   ne redescend jamais. Les journaux d'Astra passent sur **stderr** : la sortie
   standard porte ce qu'une commande produit, et la demande de délégation se
   pipe hors du conteneur.
-  Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
-  `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
-  `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en
-  dépend ; les trois autres actions du §12.2, sans pilote et refusées en le
-  disant ; le lancement automatique du compagnon plutôt que sa ligne de
-  commande ; et le discriminant de profil Orion avec la bascule du §13.
+  Le **transport hors tunnel du compagnon est livré** : `astra campaign open`
+  résout une campagne sur les cibles courantes et la dépose ; le service
+  l'adopte, et les quatre routes du §8.2 — lecture d'opération, demande de
+  signature, coffre chiffré, dépôt du résultat — la servent. Trois jetons de
+  capacité, un par scope, liés à l'opération, à l'empreinte de campagne qui est
+  aussi le challenge de l'opérateur, et à cinq minutes ; le jeton de coffre
+  n'est émis que pour une portée qui fait signer une ancre. `astra-signer
+  approve-campaign --authority-url --operation-id` boucle l'ensemble.
+  Deux **magasins séparés**, pas une énumération : les routes publiques ne
+  regardent que les opérations opérateur, donc un identifiant de renouvellement
+  ordinaire y est **absent** plutôt qu'écarté par une comparaison qu'on peut
+  oublier d'écrire — c'est la règle du §8.2, portée par la structure.
+  Le coffre est servi **chiffré**, et il n'y a pas d'autre forme : ce processus
+  ne détient aucun secret de key-slot. Ses octets sont comparés à l'empreinte
+  que la demande **signée** nomme, des deux côtés.
+  Reste `POST /v1/campaigns` en `501`, et c'est délibéré : le §11.6 fait
+  *résoudre* la campagne par Astra sur les cibles courantes, ce qui sur une
+  route publique non authentifiée répondrait l'inventaire du domaine à
+  n'importe qui — et l'authentification qu'il faudrait n'est tranchée nulle
+  part. `astra campaign open` fait la résolution localement.
+  `client-rotation/recovery` reste en `501` pour sa propre raison : le
+  validateur historique du §7.5.
+  Restent ouverts : la récupération d'une identité expirée ;
+  `authorize-issuer` et `rotate-ca-pq`, qui ne portent aucune campagne et n'ont
+  donc pas d'opération à laquelle se rattacher ; les trois autres actions du
+  §12.2, sans pilote et refusées en le disant ; le lancement automatique du
+  compagnon plutôt que sa ligne de commande ; et le discriminant de profil
+  Orion avec la bascule du §13.
   La **console Helios lit enfin le domaine** : `GET /api/certificates` rend en
   une lecture sous un seul verrou les ancres, les époques, l'émetteur délégué
   et chaque pair du registre — génération, échéance, barreau de l'échelle §4.3,
@@ -769,7 +791,11 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
 - `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
   conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
   distingue une restauration d'un fork, émetteur délégué borné et endpoint
-  public. `astra::operations` tient les renouvellements qui attendent un
+  public. `astra::signing` tient les campagnes manuelles qu'un opérateur
+  **sans tunnel** approuve par l'origine publique — un magasin séparé de celui
+  des renouvellements clients, ce qui porte par la structure la règle du §8.2
+  selon laquelle un identifiant de renouvellement ordinaire n'existe pas sur ce
+  canal. `astra::operations` tient les renouvellements qui attendent un
   opérateur — en mémoire, parce qu'une opération ne détient aucun certificat et
   qu'en persister une survivrait au challenge de cinq minutes qu'elle porte —,
   et `astra::renewal` enchaîne demande, approbation, émission, staging sur le

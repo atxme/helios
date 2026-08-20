@@ -56,14 +56,21 @@
 //! détient déjà — exactement comme une demande lue dans un fichier, puisque
 //! c'est l'objet qui porte la signature et non le fil par lequel il arrive.
 //!
-//! # Limite connue : les autres documents voyagent encore par fichiers
+//! `approve-campaign` a maintenant les **deux** transports : hors ligne par
+//! `--campaign` et `--out`, ou par l'origine publique du §8.2 avec
+//! `--authority-url` et `--operation-id`. C'est le canal que le relais
+//! in-tunnel ne couvre pas — un opérateur sur son propre poste n'a aucune VIP
+//! que la gateway résoudrait. L'origine ne décide de rien : la demande reste
+//! vérifiée sous la clé de service que ce compagnon épingle, et le RP ID
+//! annoncé est **comparé** à celui du coffre, jamais adopté.
 //!
-//! Les commandes d'autorité — `authorize-issuer`, `approve-campaign`,
-//! `rotate-ca-pq` — lisent une demande sur disque et écrivent leur résultat à
-//! côté, et le coffre lui-même se copie à la main. Les routes à jeton de
-//! capacité du §8.2 restent en `501` côté Astra : elles servent l'opérateur
-//! **hors** tunnel, cas que le canal in-tunnel ne couvre pas. Ce qui débloque :
-//! les routes `signer-requests`, `vaults` et `signer-results` côté Astra.
+//! # Limite connue : deux commandes voyagent encore par fichiers
+//!
+//! `authorize-issuer` et `rotate-ca-pq` lisent une demande sur disque et
+//! écrivent leur résultat à côté. Elles ne portent pas de campagne, donc rien
+//! ne les rattache à une opération : les routes du §8.2 sont liées à un
+//! `operation_id` et à un manifeste, et il n'existe pas encore d'opération qui
+//! les décrive.
 //!
 //! # Limite connue : le matériel ne s'exerce pas en WSL2
 //!
@@ -310,11 +317,27 @@ enum Command {
     /// Approuve une campagne de rotation manuelle (spec §7.6).
     ApproveCampaign {
         /// `AstraRotationCampaign` en JSON.
-        #[arg(long)]
-        campaign: PathBuf,
+        ///
+        /// Hors ligne seulement. Avec `--authority-url`, la campagne se
+        /// récupère et son approbation se dépose par les routes du §8.2.
+        #[arg(long, conflicts_with_all = ["authority_url", "operation_id"])]
+        campaign: Option<PathBuf>,
         /// Où écrire l'approbation, en JSON.
-        #[arg(long)]
-        out: PathBuf,
+        #[arg(long, conflicts_with_all = ["authority_url", "operation_id"])]
+        out: Option<PathBuf>,
+        /// Origine HTTPS publique d'Astra, p. ex. https://astra.example.
+        ///
+        /// Le canal hors tunnel : c'est le cas que le relais in-tunnel ne
+        /// couvre pas, un opérateur sur son propre poste, sans VIP que la
+        /// gateway résoudrait.
+        #[arg(long, requires = "operation_id")]
+        authority_url: Option<String>,
+        /// Opération à approuver, 32 caractères hexadécimaux.
+        ///
+        /// Imprimée par `astra campaign open` sur la machine qui fait tourner
+        /// Astra.
+        #[arg(long, requires = "authority_url")]
+        operation_id: Option<String>,
         /// Origine WebAuthn signée d'Astra. À défaut, `https://` suivi du RP ID.
         #[arg(long)]
         origin: Option<String>,
@@ -416,8 +439,18 @@ fn run() -> Result<()> {
         Command::ApproveCampaign {
             campaign,
             out,
+            authority_url,
+            operation_id,
             origin,
-        } => approve_campaign(&path, &campaign, &out, origin.as_deref(), transport),
+        } => approve_campaign(
+            &path,
+            campaign.as_deref(),
+            out.as_deref(),
+            authority_url.as_deref(),
+            operation_id.as_deref(),
+            origin.as_deref(),
+            transport,
+        ),
         Command::RotateCaPq {
             out,
             prepare_days,
@@ -1159,10 +1192,28 @@ fn approve(
     Ok(())
 }
 
+/// Approves a manual campaign, offline or through Astra's public origin.
+///
+/// # Two transports, one ceremony
+///
+/// The gesture below is the same either way, and that is the point: what the
+/// operator's key answers is the campaign fingerprint, recomputed from the
+/// campaign itself. A campaign read from a file and one fetched from the
+/// origin are the same object with the same signature over it — the wire
+/// carries no authority.
+///
+/// The origin is the case the in-tunnel relay cannot cover (§8.2): an operator
+/// on their own workstation has no VIP the gateway would resolve. What comes
+/// back is compared against the vault's own relying party rather than adopted:
+/// an assertion produced under another RP ID would be valid for another
+/// domain.
+#[allow(clippy::too_many_arguments)]
 fn approve_campaign(
     path: &Path,
-    campaign_path: &Path,
-    out: &Path,
+    campaign_path: Option<&Path>,
+    out: Option<&Path>,
+    authority_url: Option<&str>,
+    operation_id: Option<&str>,
     origin: Option<&str>,
     transport: Transport,
 ) -> Result<()> {
@@ -1173,8 +1224,71 @@ fn approve_campaign(
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
-    let campaign: aether::certificates::status::AstraRotationCampaign =
-        documents::read(campaign_path)?;
+
+    let online = match (authority_url, operation_id) {
+        (Some(url), Some(id)) => {
+            let operation =
+                Id16::parse_hex(id).map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+            let origin_client = astra_signer::origin::Origin::new(url)?;
+            let request = origin_client_fetch(&origin_client, &operation)?;
+            Some((origin_client, request))
+        }
+        _ => None,
+    };
+
+    let campaign = match &online {
+        Some((_, request)) => {
+            // Signed by Astra's service key, verified under the key this
+            // companion already pins. A request that carried the key it is
+            // checked against would authenticate nothing.
+            //
+            // The URL is checked **inside** the signature rather than against
+            // a local copy: Astra signs the origin it serves itself, so an
+            // operator pointed at another host gets a request whose
+            // `authority_url` does not match what they dialled — and no
+            // signature under the pinned service key can be produced for one
+            // that does. That is why the hand-off records the key and not the
+            // address.
+            let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
+                     `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
+                )
+            })?;
+            let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {
+                anyhow::anyhow!("ce relais de domaine ne porte pas l'époque de la clé de service")
+            })?;
+            request.signer_request.verify(
+                &MlDsa87PublicKey::parse(service_key)?,
+                service_key_epoch,
+                authority_url.unwrap_or_default(),
+                now_unix(),
+            )?;
+            if request.webauthn_rp_id != vault.rp_id {
+                bail!(
+                    "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} ». Rien \
+                     n'est signé : une assertion produite sous un autre RP ID vaudrait pour un \
+                     autre domaine.",
+                    request.webauthn_rp_id,
+                    vault.rp_id
+                );
+            }
+            request.campaign.as_ref().clone()
+        }
+        None => {
+            let Some(campaign_path) = campaign_path else {
+                bail!(
+                    "donner soit --campaign et --out, soit --authority-url et --operation-id : \
+                     un fichier hors ligne, ou l'origine publique du §8.2"
+                );
+            };
+            if out.is_none() {
+                bail!("--out est requis avec --campaign : sans lui l'approbation est perdue");
+            }
+            documents::read(campaign_path)?
+        }
+    };
+
     let origin = match origin {
         Some(origin) => origin.to_string(),
         None => format!("https://{}", vault.rp_id),
@@ -1185,6 +1299,8 @@ fn approve_campaign(
     println!("portée           : {:?}", campaign.scope);
     println!("cibles           : {}", campaign.targets.len());
     println!("motif            : {}", campaign.reason);
+    println!("demandée par     : {}", campaign.requested_by);
+    println!("empreinte        : {}", campaign.fingerprint());
     println!("confirmations    : {required} clé(s) distincte(s)");
 
     // Plugged one at a time, and each connection is its own: two touches of
@@ -1214,9 +1330,23 @@ fn approve_campaign(
         &pin_refs,
         now_unix(),
     )?;
-    documents::write(out, &approval)?;
 
-    println!("approbation      : {}", out.display());
+    match (&online, out) {
+        (Some((client, request)), _) => {
+            let state = client.submit(&request.operation_id, &request.result_token, &approval)?;
+            println!("opération        : {}", request.operation_id.to_hex());
+            println!("état             : {state:?}");
+            println!(
+                "limite connue    : l'autorité a enregistré l'approbation, et rien ne l'applique \
+                 encore. Aucun certificat n'a été émis, aucune transition déposée."
+            );
+        }
+        (None, Some(out)) => {
+            documents::write(out, &approval)?;
+            println!("approbation      : {}", out.display());
+        }
+        (None, None) => unreachable!("--out is required above when there is no origin"),
+    }
     println!(
         "empreinte        : {}",
         approval.campaign_fingerprint.to_hex()
@@ -1226,6 +1356,18 @@ fn approve_campaign(
          refusée, pas réapprouvée"
     );
     Ok(())
+}
+
+/// Reads the operation and its campaign, before anything is displayed.
+///
+/// Split out so the borrow of the client and the request it produced do not
+/// have to be created in the same expression — and so the failure to fetch is
+/// reported before an operator is asked to plug anything in.
+fn origin_client_fetch(
+    client: &astra_signer::origin::Origin,
+    operation_id: &Id16,
+) -> Result<astra_signer::origin::CampaignRequest> {
+    client.fetch(operation_id)
 }
 
 fn rotate_ca_pq(

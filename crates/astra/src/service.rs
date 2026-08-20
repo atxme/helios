@@ -14,15 +14,30 @@
 //! Knowing a fingerprint observed on the wire therefore reveals neither
 //! generation, nor window, nor rotation schedule.
 //!
-//! # Limite connue
+//! # The companion's out-of-tunnel exchange
 //!
-//! The operator-credential routes of spec §8.2 — campaigns, signer requests,
-//! encrypted vault download and signer results — are not wired yet. The HVLT
-//! vault, FIDO2 transports and `astra-signer` companion exist, but the signing
-//! commands and capability-bound exchange do not; physical ceremonies also
-//! cannot be exercised in WSL2. The routes are refused explicitly with
-//! [`ServiceError::OperatorCredentialUnavailable`] and answer `501`, rather
-//! than offering a path that would look like an approval without one. See
+//! Four routes serve an operator who has no tunnel: the operation read, and
+//! the three capability-bound exchanges of §8.2 — the signer request, the
+//! encrypted vault, and the result. They serve **only** the operator
+//! operations of [`crate::signing`], which is a separate store from the client
+//! renewals; an ordinary renewal identifier is therefore absent rather than
+//! filtered out, and receives the same coarse refusal as one nobody issued.
+//!
+//! # Limite connue : ouvrir une campagne reste une commande locale
+//!
+//! `POST /v1/campaigns` still answers `501`. §11.6 has an interface ask Astra
+//! to **resolve** a campaign over the fleet's current targets, and on an
+//! unauthenticated public route that would answer every caller with the
+//! domain's inventory. The authentication such a route needs is not settled
+//! anywhere in the specification, and inventing one here is how a hole gets
+//! built. Campaigns are opened by `astra campaign open`, on the machine that
+//! already runs Astra, and deposited for this process to adopt.
+//!
+//! `POST /v1/client-rotation/recovery` likewise stays `501`: recovering an
+//! expired identity needs the historical validator of §7.5, which is its own
+//! lot.
+//!
+//! Physical ceremonies cannot be exercised in WSL2 — see
 //! [`docs/testing/TESTING.md`](../../../../docs/testing/TESTING.md).
 
 use std::collections::HashMap;
@@ -35,10 +50,10 @@ use aether::certificates::{
     status::status_query_signing_bytes,
 };
 use axum::{
-    extract::{ConnectInfo, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -57,6 +72,14 @@ pub const SOURCE_BUDGET: u32 = 30;
 pub const BUDGET_WINDOW_SECS: u64 = 60;
 /// Largest number of challenges held at once.
 pub const MAX_LIVE_CHALLENGES: usize = 4096;
+/// Largest body this endpoint writes back (spec §8.2).
+///
+/// It bounds the encrypted vault too: a vault above this cannot travel the
+/// public channel at all, which is a deployment fact worth refusing loudly
+/// rather than a download that dies halfway through a ceremony.
+pub const MAX_RESPONSE_BYTES: usize = 128 * 1024;
+/// Largest opaque identifier accepted in a path segment (spec §8.2).
+pub const MAX_PATH_IDENTIFIER_BYTES: usize = 128;
 
 /// Refusals the public endpoint may produce.
 ///
@@ -244,14 +267,28 @@ pub struct AstraService {
     /// `approval_credential_ids` is empty.
     pub approval_credential_registry:
         Option<Box<aether::certificates::approval::CredentialRegistry>>,
+    /// Manual campaigns waiting for an operator who has no tunnel (§7.6).
+    ///
+    /// A store of its own, next to `operations` rather than merged into it,
+    /// and the separation carries a rule of §8.2 for free: the public
+    /// companion routes look only here, so an ordinary renewal identifier is
+    /// absent rather than filtered out by a comparison somebody could forget.
+    pub signing: Mutex<crate::signing::SigningOperationStore>,
+    /// The encrypted authority vault, byte for byte as the companion wrote it.
+    ///
+    /// Astra transports and backs it up; it cannot open it, and nothing in
+    /// this container can. `None` when no vault has been copied into the state
+    /// volume, which is also when a campaign that rotates an anchor is refused
+    /// by name rather than left to fail at the download.
+    pub encrypted_vault: Option<Vec<u8>>,
     /// The private veth link to `heliosd`, when the deployment has one.
     ///
     /// It lives here because this is where staging will be driven from: an
     /// approved rotation issues the two leaves, sends the authorization to the
     /// gateway and reads back its signed receipt on this same link (spec §8.3,
     /// amendment of 16 August 2026). The relayed renewal drives this channel;
-    /// the still-unimplemented `501` routes are the separate public/offline
-    /// companion transport of §8.2.
+    /// the public companion transport of §8.2 is the separate out-of-tunnel
+    /// path served below.
     pub gateway: Option<crate::gateway::GatewayChannel>,
 }
 
@@ -277,15 +314,27 @@ pub fn router(service: Arc<AstraService>) -> Router {
     Router::new()
         .route("/v1/status/challenge", post(status_challenge))
         .route("/v1/status/query", post(status_query))
+        // Creating a campaign from the public origin is deliberately still
+        // refused: §11.6 has an interface ask Astra to *resolve* one over the
+        // fleet's current targets, and an unauthenticated route that did that
+        // would answer every caller with the domain's inventory. The
+        // authentication that route needs is not settled, and inventing one
+        // here is how a hole gets built. Campaigns are opened locally, by
+        // `astra campaign open`, on the machine that already runs Astra.
         .route("/v1/campaigns", post(operator_credential_required))
         .route(
             "/v1/client-rotation/recovery",
             post(operator_credential_required),
         )
-        .route(
-            "/v1/signer-results/:operation",
-            post(operator_credential_required),
-        )
+        // The companion's three capability-bound exchanges, plus the read an
+        // interface follows progress with. They serve **only** the operator
+        // operations opened out of tunnel: an ordinary renewal identifier is
+        // absent from this store, so it receives the same coarse refusal as an
+        // identifier nobody ever issued (§8.2).
+        .route("/v1/operations/:operation", get(signing_operation))
+        .route("/v1/signer-requests/:operation", get(signer_request))
+        .route("/v1/vaults/:fingerprint", get(encrypted_vault))
+        .route("/v1/signer-results/:operation", post(signer_result))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(service)
 }
@@ -440,6 +489,343 @@ async fn operator_credential_required() -> ServiceError {
     ServiceError::OperatorCredentialUnavailable
 }
 
+/// The bearer token of §8.2, from the one place it is allowed to travel.
+///
+/// `Authorization: Bearer <base64url>` and nowhere else — never a URL, never a
+/// cookie, never a log line. A token in a path would be in every proxy log and
+/// every browser history on the way; that is the whole reason the header is
+/// named in the specification rather than left to taste.
+fn bearer(headers: &HeaderMap) -> Result<&str, ServiceError> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && token.len() <= MAX_PATH_IDENTIFIER_BYTES * 8)
+        .ok_or(ServiceError::Protocol)
+}
+
+/// One opaque identifier out of a path segment.
+///
+/// The length ceiling is applied before parsing, so a caller cannot make this
+/// process do work proportional to a string it chose.
+fn path_id(raw: &str) -> Result<Id16, ServiceError> {
+    if raw.len() > MAX_PATH_IDENTIFIER_BYTES {
+        return Err(ServiceError::Protocol);
+    }
+    Id16::parse_hex(raw).map_err(|_| ServiceError::Refused)
+}
+
+/// The relying party and its origin, as **the domain** defines them.
+///
+/// Derived from the registry rather than taken from anything a caller sends:
+/// an assertion produced under another relying party would be valid for
+/// another domain, and one checked against an origin the message named would
+/// be checked against nothing.
+async fn relying_party(service: &Arc<AstraService>) -> (String, String) {
+    let rp_id = service.registry.lock().await.state().webauthn_rp_id.clone();
+    let origin = format!("https://{rp_id}");
+    (rp_id, origin)
+}
+
+/// Mints this operation's capability tokens and builds its view.
+///
+/// Three scopes, three tokens, each bound to the operation, to the campaign
+/// fingerprint that is also the operator's challenge, and to at most five
+/// minutes. The vault token exists only for a scope that makes an anchor sign
+/// — an ordinary campaign's token is not a vault-download token, because there
+/// is no vault in its grant to match against.
+async fn mint_view(
+    service: &Arc<AstraService>,
+    operation: &crate::signing::SigningOperation,
+    now_unix: u64,
+) -> crate::signing::SigningOperationView {
+    use aether::certificates::capability::{
+        CapabilityGrant, CapabilityScope, MAX_CAPABILITY_TOKEN_LIFETIME_SECS,
+    };
+
+    let manifest = operation.manifest_fingerprint();
+    let vault = operation.vault_fingerprint();
+    let expires_at = (now_unix + MAX_CAPABILITY_TOKEN_LIFETIME_SECS).min(operation.expires_at);
+    let mut view = crate::signing::SigningOperationView {
+        operation_id: operation.operation_id,
+        state: operation.state,
+        scope: operation.campaign.scope,
+        target_count: operation.campaign.targets.len(),
+        required_credentials: operation.campaign.required_credentials,
+        campaign_fingerprint: manifest,
+        created_at: operation.created_at,
+        expires_at: operation.expires_at,
+        signer_request_token: None,
+        vault_token: None,
+        signer_result_token: None,
+    };
+    if expires_at <= now_unix {
+        return view;
+    }
+    let tokens = service.capabilities.lock().await;
+    let mint = |scope, vault: Option<Fingerprint>| -> Option<String> {
+        let grant = CapabilityGrant::new(
+            scope,
+            operation.operation_id,
+            manifest,
+            vault,
+            now_unix,
+            expires_at,
+        )
+        .ok()?;
+        tokens.issue(&grant, operation.expires_at).ok()
+    };
+    view.signer_request_token = mint(CapabilityScope::SignerRequestRead, None);
+    view.signer_result_token = mint(CapabilityScope::SignerResultSubmit, None);
+    view.vault_token =
+        vault.and_then(|fingerprint| mint(CapabilityScope::EncryptedVaultRead, Some(fingerprint)));
+    view
+}
+
+/// Authenticates a bearer against **this** route's own requirement.
+///
+/// Every field of the requirement is read from the operation Astra holds, and
+/// none from the token being checked: a requirement taken out of the
+/// credential would require nothing.
+async fn authenticate(
+    service: &Arc<AstraService>,
+    scope: aether::certificates::capability::CapabilityScope,
+    operation: &crate::signing::SigningOperation,
+    vault: Option<&Fingerprint>,
+    token: &str,
+    now_unix: u64,
+) -> Result<(), ServiceError> {
+    let manifest = operation.manifest_fingerprint();
+    let requirement = aether::certificates::capability::CapabilityRequirement {
+        scope,
+        operation_id: &operation.operation_id,
+        operation_manifest_fingerprint: &manifest,
+        encrypted_vault_fingerprint: vault,
+        operation_expires_at: operation.expires_at,
+    };
+    service
+        .capabilities
+        .lock()
+        .await
+        .authenticate(token, &requirement, now_unix)
+        .map(|_| ())
+        .map_err(|_| ServiceError::Refused)
+}
+
+/// `GET /v1/operations/<operation_id>`.
+///
+/// No token: the identifier is 128 bits from the DRBG and is the secret. What
+/// it returns is progress plus freshly minted tokens — never a decision. The
+/// interface concludes that a signature succeeded from the signed objects, not
+/// from this.
+async fn signing_operation(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+) -> Result<Json<crate::signing::SigningOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    let operations = service.signing.lock().await;
+    let operation = operations
+        .get(&operation_id, now)
+        .map_err(|_| ServiceError::Refused)?;
+    Ok(Json(mint_view(&service, operation, now).await))
+}
+
+/// What the companion fetches before it asks for a touch.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignerRequestResponse {
+    pub signer_request: Box<aether::certificates::status::AstraSignerRequest>,
+    /// The campaign itself, because the companion must display its scope, its
+    /// target count and their exact current fingerprints — and must recompute
+    /// the challenge from it rather than be handed one.
+    pub campaign: Box<aether::certificates::status::AstraRotationCampaign>,
+    /// The allow-list, signed by `CA-PQ`.
+    ///
+    /// It travels because whoever runs the ceremony verifies it under the
+    /// anchor themselves: an allow-list this service merely asserted would let
+    /// a compromised Astra name a credential nobody enrolled.
+    pub credential_registry: Box<aether::certificates::approval::CredentialRegistry>,
+    pub webauthn_rp_id: String,
+    pub webauthn_origin: String,
+}
+
+/// `GET /v1/signer-requests/<operation_id>`, scope `signer_request_read`.
+async fn signer_request(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SignerRequestResponse>, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    let token = bearer(&headers)?;
+    let (webauthn_rp_id, webauthn_origin) = relying_party(&service).await;
+    let credential_registry = service
+        .approval_credential_registry
+        .clone()
+        .ok_or(ServiceError::Refused)?;
+
+    let operations = service.signing.lock().await;
+    let operation = operations
+        .get(&operation_id, now)
+        .map_err(|_| ServiceError::Refused)?;
+    authenticate(
+        &service,
+        CapabilityScope::SignerRequestRead,
+        operation,
+        None,
+        token,
+        now,
+    )
+    .await?;
+    Ok(Json(SignerRequestResponse {
+        signer_request: operation.signer_request.clone(),
+        campaign: operation.campaign.clone(),
+        credential_registry,
+        webauthn_rp_id,
+        webauthn_origin,
+    }))
+}
+
+/// `GET /v1/vaults/<encrypted_vault_fingerprint>`, scope `encrypted_vault_read`.
+///
+/// Served encrypted, and that is not a caveat: this process holds no key-slot
+/// secret and no PRF output, so there is no other form it could serve. The
+/// fingerprint in the path is compared against the one **the operation's
+/// signed request names**, so a token cannot be pointed at another file.
+async fn encrypted_vault(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    if raw.len() > MAX_PATH_IDENTIFIER_BYTES {
+        return Err(ServiceError::Protocol);
+    }
+    let requested = Fingerprint::parse_hex(&raw).map_err(|_| ServiceError::Refused)?;
+    let token = bearer(&headers)?;
+    let vault = service
+        .encrypted_vault
+        .as_ref()
+        .ok_or(ServiceError::Refused)?;
+    if vault.len() > MAX_RESPONSE_BYTES {
+        // A deployment fault, not a caller's: refusing it here beats a
+        // truncated vault the companion would fail to open with a message
+        // about corruption.
+        tracing::error!(
+            bytes = vault.len(),
+            "the encrypted vault is over the §8.2 response ceiling and cannot travel this channel"
+        );
+        return Err(ServiceError::Internal);
+    }
+    // The token names one operation; the operation names one vault. Both must
+    // agree with the path, and the path is the only one of the three a caller
+    // chose.
+    let operations = service.signing.lock().await;
+    let mut authorized = None;
+    for candidate in operations.awaiting_vault(&requested, now) {
+        if authenticate(
+            &service,
+            CapabilityScope::EncryptedVaultRead,
+            candidate,
+            Some(&requested),
+            token,
+            now,
+        )
+        .await
+        .is_ok()
+        {
+            authorized = Some(candidate);
+            break;
+        }
+    }
+    authorized.ok_or(ServiceError::Refused)?;
+    if !Fingerprint::of(vault).matches(&requested) {
+        // The operation names a vault this volume does not hold: the operator
+        // copied an older file, or none. Naming it is the whole content.
+        tracing::error!(
+            requested = %requested,
+            held = %Fingerprint::of(vault),
+            "the vault this campaign names is not the one in the state volume"
+        );
+        return Err(ServiceError::Internal);
+    }
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        vault.clone(),
+    )
+        .into_response())
+}
+
+/// `POST /v1/signer-results/<operation_id>`, scope `signer_result_submit`.
+///
+/// The approval is verified against **this operation's own** campaign, which
+/// Astra holds — never against one the same message supplied. An identical
+/// replay is idempotent; different bytes under the same identifier are a
+/// conflict, not a second success.
+async fn signer_result(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    headers: HeaderMap,
+    Json(approval): Json<Box<aether::certificates::status::CampaignApproval>>,
+) -> Result<Json<crate::signing::SigningOperationView>, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    let token = bearer(&headers)?;
+    let (webauthn_rp_id, webauthn_origin) = relying_party(&service).await;
+    let registry = service
+        .approval_credential_registry
+        .clone()
+        .ok_or(ServiceError::Refused)?;
+
+    let mut operations = service.signing.lock().await;
+    {
+        let operation = operations
+            .get(&operation_id, now)
+            .map_err(|_| ServiceError::Refused)?;
+        authenticate(
+            &service,
+            CapabilityScope::SignerResultSubmit,
+            operation,
+            None,
+            token,
+            now,
+        )
+        .await?;
+    }
+    let operation = operations
+        .submit(
+            &operation_id,
+            approval,
+            &registry,
+            &webauthn_rp_id,
+            &webauthn_origin,
+            now,
+        )
+        .map_err(|error| {
+            tracing::warn!(%operation_id, %error, "operator result refused");
+            ServiceError::Refused
+        })?;
+    let view = mint_view(&service, operation, now).await;
+    Ok(Json(view))
+}
+
 /// A public challenge, from the approved DRBG of the specification §2.3.2.
 fn approved_random(buffer: &mut [u8]) -> Result<(), ()> {
     aether::random::fill_public(buffer).map_err(|_| ())
@@ -547,5 +933,47 @@ mod tests {
         ] {
             assert_eq!(error.into_response().status(), expected, "{error:?}");
         }
+    }
+
+    /// A capability token travels in one header, and nowhere else (§8.2).
+    ///
+    /// A token in a path would be in every proxy log and every browser history
+    /// on the way. Accepting one from anywhere else is how it ends up there.
+    #[test]
+    fn a_bearer_is_read_from_the_authorization_header_alone() {
+        let mut headers = HeaderMap::new();
+        assert!(bearer(&headers).is_err(), "no header, no token");
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc123".parse().expect("header"),
+        );
+        assert_eq!(bearer(&headers).expect("token"), "abc123");
+
+        // Neither an empty credential nor another scheme is one.
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().expect("header"),
+        );
+        assert!(bearer(&headers).is_err());
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic abc123".parse().expect("header"),
+        );
+        assert!(bearer(&headers).is_err());
+    }
+
+    /// The length ceiling is applied before parsing, so a caller cannot make
+    /// this process do work proportional to a string it chose.
+    #[test]
+    fn an_oversized_path_identifier_is_refused_before_it_is_parsed() {
+        let long = "a".repeat(MAX_PATH_IDENTIFIER_BYTES + 1);
+        assert!(matches!(path_id(&long), Err(ServiceError::Protocol)));
+
+        // Inside the ceiling, a malformed identifier is a refusal and not a
+        // protocol complaint: before a valid proof the endpoint says nothing
+        // about what exists.
+        assert!(matches!(path_id("not-hex"), Err(ServiceError::Refused)));
+        assert!(path_id(&"ab".repeat(16)).is_ok());
     }
 }

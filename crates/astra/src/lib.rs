@@ -28,11 +28,16 @@
 //! Three integration parts of ADR-008 are not implemented, and are refused
 //! explicitly rather than approximated:
 //!
-//! - the **operator approval protocol**. The FIDO2 `hmac-secret` key slots,
-//!   encrypted HVLT vault and `astra-signer` companion exist; the signing
-//!   commands, capability exchange and one- or two-credential approval routes
-//!   do not. Those routes answer `501` through
-//!   [`service::ServiceError::OperatorCredentialUnavailable`];
+//! - **opening a campaign from the public origin**. The approval itself is
+//!   live in both directions: in the tunnel through [`renewal`], and out of it
+//!   through [`signing`] and the three capability-bound routes of §8.2. What
+//!   stays `501` is `POST /v1/campaigns`, because §11.6 has that route
+//!   *resolve* a campaign over the fleet's current targets — on an
+//!   unauthenticated public route, that answers every caller with the domain's
+//!   inventory, and the authentication it would need is not settled anywhere.
+//!   `astra campaign open` does the resolution locally instead. Recovery of an
+//!   expired identity answers `501` for its own reason: it needs the
+//!   historical validator of §7.5;
 //! - the **objects that would travel on the private veth channel**. The
 //!   channel itself exists: [`gateway`] dials `heliosd`'s
 //!   `/internal/v1/certificates/*` listener under mutually authenticated TLS
@@ -58,6 +63,7 @@ pub mod planner;
 pub mod registry;
 pub mod renewal;
 pub mod service;
+pub mod signing;
 pub mod vault;
 
 pub use audit::{AuditChain, AuditEvent};

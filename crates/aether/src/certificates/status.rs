@@ -412,6 +412,135 @@ impl AstraRotationCampaign {
     }
 }
 
+/// One credential's answer to a campaign challenge, and the row it answered
+/// under.
+///
+/// The binding is named rather than embedded: the verifier holds the credential
+/// registry already, signed by `CA-PQ`, and an approval that carried its own
+/// row would be an approval that chose the key it is checked against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialAssertion {
+    pub credential_id: Vec<u8>,
+    pub credential_fingerprint: Fingerprint,
+    pub assertion: super::webauthn::WebAuthnAssertion,
+    pub assertion_fingerprint: Fingerprint,
+}
+
+/// What the companion returns for a manual campaign (spec §7.6).
+///
+/// # Why it lives here and not beside the gesture that produces it
+///
+/// It is a wire type: the companion writes it, Astra reads it, and the two run
+/// on different machines and in different processes. A shape defined in the
+/// companion would make Astra depend on the one program in the repository that
+/// holds `CA-PQ` in the clear, which is the dependency ADR-008 §4 exists to
+/// forbid.
+///
+/// It carries **no** PRF output, no unlock key and no private key — only
+/// assertions, which are public by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignApproval {
+    pub campaign_id: Id16,
+    pub campaign_fingerprint: Fingerprint,
+    pub required_credentials: u8,
+    pub approved_at: u64,
+    pub approvals: Vec<CredentialAssertion>,
+}
+
+impl CampaignApproval {
+    /// Everything this document is, as bytes, for idempotency comparison.
+    ///
+    /// §8.2 makes a replayed result idempotent and any divergence on the same
+    /// identifier a conflict, and "identical" has to mean the exact bytes: two
+    /// approvals differing only in which credential answered first are two
+    /// different decisions by two different people.
+    pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| CertificateError::InvalidAssertion("encoding"))?;
+        Ok(Fingerprint::of(&encoded))
+    }
+
+    /// Re-derives every claim against material the verifier already holds.
+    ///
+    /// Nothing here is taken from the approval: the challenge is recomputed
+    /// from the campaign, each credential's public key comes from the registry
+    /// row `CA-PQ` signed, and the relying party and origin come from the
+    /// domain. An approval that supplied any of those would be an approval of
+    /// nothing.
+    ///
+    /// Distinct credentials are required, and that is the point of a two-key
+    /// scope: two touches of one token read as two people and are one.
+    pub fn verify(
+        &self,
+        campaign: &AstraRotationCampaign,
+        registry: &super::approval::CredentialRegistry,
+        webauthn_rp_id: &str,
+        webauthn_origin: &str,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        use super::webauthn::{verify_assertion, AssertionExpectation};
+
+        campaign.validate(now_unix)?;
+        if self.campaign_id != campaign.campaign_id {
+            return Err(CertificateError::CampaignMismatch);
+        }
+        // The targets must not have moved since the operator read them.
+        campaign.assert_unchanged(&self.campaign_fingerprint)?;
+        // The count the *campaign* demands, never the count the approval
+        // announces: a document that carried its own threshold would set it.
+        let required = usize::from(campaign.required_credentials);
+        if self.required_credentials != campaign.required_credentials
+            || self.approvals.len() != required
+        {
+            return Err(CertificateError::InsufficientApprovals {
+                required: campaign.required_credentials,
+                provided: u8::try_from(self.approvals.len()).unwrap_or(u8::MAX),
+            });
+        }
+
+        let challenge = campaign.fingerprint();
+        for (index, approval) in self.approvals.iter().enumerate() {
+            if self.approvals[..index]
+                .iter()
+                .any(|earlier| earlier.credential_id == approval.credential_id)
+            {
+                return Err(CertificateError::DuplicateApproval);
+            }
+            let binding = registry
+                .binding(&approval.credential_id)
+                .ok_or(CertificateError::UnknownCredential)?;
+            if binding.state != super::approval::CredentialState::Active {
+                return Err(CertificateError::UnknownCredential);
+            }
+            if !binding
+                .fingerprint()
+                .matches(&approval.credential_fingerprint)
+            {
+                return Err(CertificateError::InvalidAssertion("credential binding"));
+            }
+            if !approval
+                .assertion
+                .fingerprint()
+                .matches(&approval.assertion_fingerprint)
+            {
+                return Err(CertificateError::InvalidAssertion("assertion fingerprint"));
+            }
+            verify_assertion(
+                &approval.assertion,
+                &binding.credential_public_key,
+                &AssertionExpectation {
+                    relying_party_id: webauthn_rp_id,
+                    origin: webauthn_origin,
+                    challenge: &challenge,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// What Astra hands to the local signing companion (spec §2.4).
 ///
 /// It carries no private material and no vault: only the identifiers the
@@ -761,6 +890,252 @@ mod tests {
             CertificateStatus::Aborted,
         ] {
             assert!(!status.is_terminal(), "{status:?}");
+        }
+    }
+
+    mod campaign_approval {
+        use super::*;
+        use crate::certificates::approval::{
+            AstraCredentialBinding, CredentialRegistry, CredentialState,
+        };
+        use crate::certificates::encoding::generate_ml_dsa_87_keypair;
+        use crate::certificates::webauthn::test_credentials::Credential;
+        use crate::certificates::webauthn::WebAuthnAssertion;
+        use aws_lc_rs::digest;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        const RELYING_PARTY: &str = "astra.example";
+        const ORIGIN: &str = "https://astra.example";
+
+        fn binding(
+            ca_private: &[u8],
+            credential: &Credential,
+            id: &[u8],
+        ) -> AstraCredentialBinding {
+            AstraCredentialBinding {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                credential_id: id.to_vec(),
+                credential_public_key: credential.cose_public_key(),
+                aaguid: [0; 16],
+                trust_domain_id: domain(),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                state: CredentialState::Active,
+                credential_epoch: 1,
+                credential_registry_epoch: 4,
+                ca_epoch: 1,
+                created_at: 500,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            }
+            .sign(ca_private)
+            .expect("sign")
+        }
+
+        fn assertion(credential: &Credential, challenge: &Fingerprint) -> WebAuthnAssertion {
+            let mut authenticator_data = Fingerprint::of(RELYING_PARTY.as_bytes())
+                .as_bytes()
+                .to_vec();
+            // User presence and user verification.
+            authenticator_data.push(0x05);
+            authenticator_data.extend_from_slice(&11u32.to_be_bytes());
+            let client_data_json = format!(
+                r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"}}"#,
+                URL_SAFE_NO_PAD.encode(challenge.as_bytes())
+            )
+            .into_bytes();
+            let mut message = authenticator_data.clone();
+            message.extend_from_slice(digest::digest(&digest::SHA256, &client_data_json).as_ref());
+            WebAuthnAssertion {
+                authenticator_data,
+                client_data_json,
+                signature: credential.sign(&message),
+            }
+        }
+
+        fn answer(
+            credential: &Credential,
+            binding: &AstraCredentialBinding,
+            challenge: &Fingerprint,
+        ) -> CredentialAssertion {
+            let assertion = assertion(credential, challenge);
+            CredentialAssertion {
+                credential_id: binding.credential_id.clone(),
+                credential_fingerprint: binding.fingerprint(),
+                assertion_fingerprint: assertion.fingerprint(),
+                assertion,
+            }
+        }
+
+        struct Domain {
+            registry: CredentialRegistry,
+            first: Credential,
+            second: Credential,
+            first_binding: AstraCredentialBinding,
+            second_binding: AstraCredentialBinding,
+        }
+
+        fn domain_with_two_credentials() -> Domain {
+            let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+            let first = Credential::generate();
+            let second = Credential::generate();
+            let first_binding = binding(&ca_private, &first, b"credential-one");
+            let second_binding = binding(&ca_private, &second, b"credential-two");
+            Domain {
+                registry: CredentialRegistry {
+                    trust_domain_id: domain(),
+                    gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                    ca_epoch: 1,
+                    credential_registry_epoch: 4,
+                    bindings: vec![first_binding.clone(), second_binding.clone()],
+                },
+                first,
+                second,
+                first_binding,
+                second_binding,
+            }
+        }
+
+        fn approval(
+            campaign: &AstraRotationCampaign,
+            answers: Vec<CredentialAssertion>,
+        ) -> CampaignApproval {
+            CampaignApproval {
+                campaign_id: campaign.campaign_id,
+                campaign_fingerprint: campaign.fingerprint(),
+                required_credentials: campaign.required_credentials,
+                approved_at: 1_100,
+                approvals: answers,
+            }
+        }
+
+        #[test]
+        fn one_credential_approves_an_ordinary_campaign() {
+            let domain = domain_with_two_credentials();
+            let campaign = campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+            let challenge = campaign.fingerprint();
+            let approval = approval(
+                &campaign,
+                vec![answer(&domain.first, &domain.first_binding, &challenge)],
+            );
+
+            approval
+                .verify(&campaign, &domain.registry, RELYING_PARTY, ORIGIN, 1_100)
+                .expect("one active credential is what this scope demands");
+        }
+
+        /// Two touches of one token read as two people and are one.
+        ///
+        /// The whole value of a two-credential scope is that two objects were
+        /// present; accepting the same identifier twice would make the count a
+        /// formality.
+        #[test]
+        fn the_same_credential_cannot_answer_twice() {
+            let domain = domain_with_two_credentials();
+            let campaign = campaign(CampaignScope::TrustAuthorities, vec![target(3)]);
+            let challenge = campaign.fingerprint();
+            let once = answer(&domain.first, &domain.first_binding, &challenge);
+            let twice = approval(&campaign, vec![once.clone(), once]);
+
+            assert!(matches!(
+                twice.verify(&campaign, &domain.registry, RELYING_PARTY, ORIGIN, 1_100),
+                Err(CertificateError::DuplicateApproval)
+            ));
+
+            // Two distinct ones pass, so the refusal above is about identity
+            // and not about the count.
+            let distinct = approval(
+                &campaign,
+                vec![
+                    answer(&domain.first, &domain.first_binding, &challenge),
+                    answer(&domain.second, &domain.second_binding, &challenge),
+                ],
+            );
+            distinct
+                .verify(&campaign, &domain.registry, RELYING_PARTY, ORIGIN, 1_100)
+                .expect("two distinct credentials");
+        }
+
+        /// A target that moved after the touch invalidates the approval.
+        ///
+        /// The operator approved *that* list. Recomputing the campaign around
+        /// a new target and reusing the assertion would apply a decision
+        /// nobody made.
+        #[test]
+        fn a_campaign_whose_targets_moved_is_refused() {
+            let domain = domain_with_two_credentials();
+            let approved = campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+            let challenge = approved.fingerprint();
+            let approval = approval(
+                &approved,
+                vec![answer(&domain.first, &domain.first_binding, &challenge)],
+            );
+
+            let widened = campaign(CampaignScope::FleetLeafs, vec![target(3), target(4)]);
+            assert!(matches!(
+                approval.verify(&widened, &domain.registry, RELYING_PARTY, ORIGIN, 1_100),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// The count comes from the campaign, never from the approval.
+        ///
+        /// A document that carried its own threshold would set it.
+        #[test]
+        fn an_approval_cannot_lower_the_count_its_campaign_demands() {
+            let domain = domain_with_two_credentials();
+            let campaign = campaign(CampaignScope::TrustAuthorities, vec![target(3)]);
+            let challenge = campaign.fingerprint();
+            let mut approval = approval(
+                &campaign,
+                vec![answer(&domain.first, &domain.first_binding, &challenge)],
+            );
+            approval.required_credentials = 1;
+
+            assert!(matches!(
+                approval.verify(&campaign, &domain.registry, RELYING_PARTY, ORIGIN, 1_100),
+                Err(CertificateError::InsufficientApprovals { .. })
+            ));
+        }
+
+        /// An assertion produced for another relying party is valid for
+        /// another domain, and must not verify here.
+        #[test]
+        fn an_assertion_for_another_relying_party_is_refused() {
+            let domain = domain_with_two_credentials();
+            let campaign = campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+            let challenge = campaign.fingerprint();
+            let approval = approval(
+                &campaign,
+                vec![answer(&domain.first, &domain.first_binding, &challenge)],
+            );
+
+            assert!(approval
+                .verify(
+                    &campaign,
+                    &domain.registry,
+                    "other.example",
+                    "https://other.example",
+                    1_100
+                )
+                .is_err());
+        }
+
+        /// A credential the registry does not carry approves nothing, however
+        /// well-formed its assertion is.
+        #[test]
+        fn a_credential_outside_the_registry_is_refused() {
+            let domain = domain_with_two_credentials();
+            let campaign = campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+            let challenge = campaign.fingerprint();
+            let stranger = Credential::generate();
+            let mut answer = answer(&domain.first, &domain.first_binding, &challenge);
+            answer.credential_id = b"credential-unknown".to_vec();
+            let _ = stranger;
+            let approval = approval(&campaign, vec![answer]);
+
+            assert!(matches!(
+                approval.verify(&campaign, &domain.registry, RELYING_PARTY, ORIGIN, 1_100),
+                Err(CertificateError::UnknownCredential)
+            ));
         }
     }
 }
