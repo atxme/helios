@@ -18,6 +18,8 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+use astra::registry::AstraRegistry;
+use astra::AuditEvent;
 
 fn astra(state_dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_astra"))
@@ -125,6 +127,55 @@ fn status_on_an_unbootstrapped_directory_fails() {
     let directory = tempfile::tempdir().expect("temp dir");
     let output = astra(directory.path(), &["status"]);
     assert!(!output.status.success());
+}
+
+/// A release that used to audit every read can leave status-only records after
+/// the operator witness. The compatibility check accepts exactly that suffix,
+/// while the normal exact-head check remains strict for every authority
+/// decision.
+#[test]
+fn status_accepts_only_a_legacy_status_suffix_after_the_witness() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+
+    let registry_path = directory.path().join("registry.json");
+    let mut registry = AstraRegistry::load(&registry_path, None).expect("registry");
+    let witness = registry.audit_head().to_hex();
+    registry
+        .record(
+            AuditEvent::StatusPublished {
+                target: "workstation".into(),
+                status_epoch: 1,
+            },
+            2,
+        )
+        .expect("legacy status record");
+    let current = registry.audit_head().to_hex();
+
+    let output = astra(
+        directory.path(),
+        &["status", "--expected-audit-head", witness.as_str()],
+    );
+    assert!(
+        output.status.success(),
+        "status-only suffix rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&current));
+
+    registry
+        .record(AuditEvent::IssuerInstalled { issuer_epoch: 2 }, 3)
+        .expect("decision record");
+    let output = astra(
+        directory.path(),
+        &["status", "--expected-audit-head", witness.as_str()],
+    );
+    assert!(
+        !output.status.success(),
+        "a decision suffix must remain a fork"
+    );
 }
 
 /// The delegation request is public, and it is the whole handover: an operator

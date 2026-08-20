@@ -129,7 +129,8 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8443")]
         bind: SocketAddr,
         /// Head of the audit chain recorded by the operator. Given, a restore
-        /// that forked away from it is refused instead of continued.
+        /// that forked away from it is refused instead of continued; a suffix
+        /// made only of legacy read-only status publications is tolerated.
         #[arg(long)]
         expected_audit_head: Option<String>,
         /// Address of the gateway's private lifecycle listener, on the veth.
@@ -169,7 +170,13 @@ enum Command {
         command: CampaignCommand,
     },
     /// Prints the authority's state and the head of its audit chain.
-    Status,
+    Status {
+        /// Previously recorded head. A suffix made only of legacy status
+        /// publications is accepted while all authority decisions remain
+        /// subject to the normal fork check.
+        #[arg(long)]
+        expected_audit_head: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -309,7 +316,9 @@ fn main() -> Result<()> {
                 window_secs,
             } => campaign_open(&cli.state_dir, scope, &reason, &requested_by, window_secs),
         },
-        Command::Status => status(&cli.state_dir),
+        Command::Status {
+            expected_audit_head,
+        } => status(&cli.state_dir, expected_audit_head.as_deref()),
     }
 }
 
@@ -493,8 +502,9 @@ fn run(
         .map(Fingerprint::parse_hex)
         .transpose()
         .context("reading the expected audit head")?;
-    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), expected.as_ref())
-        .context("loading the Astra registry")?;
+    let registry =
+        AstraRegistry::load_allowing_status_tail(&state_dir.join(REGISTRY_FILE), expected.as_ref())
+            .context("loading the Astra registry")?;
     let service_private_key = Zeroizing::new(
         std::fs::read(state_dir.join(SERVICE_KEY_FILE)).context("reading the Astra service key")?,
     );
@@ -1201,9 +1211,14 @@ fn issuer_install(state_dir: &Path, authorization: Option<&Path>) -> Result<()> 
     Ok(())
 }
 
-fn status(state_dir: &Path) -> Result<()> {
-    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
-        .context("loading the Astra registry")?;
+fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Result<()> {
+    let expected = expected_audit_head
+        .map(Fingerprint::parse_hex)
+        .transpose()
+        .context("reading the expected audit head")?;
+    let registry =
+        AstraRegistry::load_allowing_status_tail(&state_dir.join(REGISTRY_FILE), expected.as_ref())
+            .context("loading the Astra registry")?;
     let state = registry.state();
     println!("trust domain     : {}", state.trust_domain_id);
     println!("gateway          : {}", state.gateway_wg_public_key);

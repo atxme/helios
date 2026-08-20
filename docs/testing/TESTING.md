@@ -279,8 +279,11 @@ Valider avec accès console :
   Le conteneur lui-même : rootfs en lecture seule effectif (une écriture hors
   `/var/lib/astra` et `/tmp` doit échouer), aucune capacité, UID 10001, et le
   volume d'état seul montage. Restaurer une sauvegarde du volume dont la tête
-  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage** —
-  c'est la seule chose qui distingue une restauration d'un fork.
+  d'audit diffère de `--expected-audit-head` doit **refuser le démarrage**, sauf
+  l'extension composée exclusivement des anciennes entrées
+  `StatusPublished` produites par une lecture de statut — celles-ci sont une
+  compatibilité de migration et ne constituent pas une décision d'autorité.
+  Toute autre entrée après le témoin reste un fork et doit être refusée.
 
 - **uplinks multiples** (`wan_iface = "auto"`), sur une machine qui a les deux
   liens. C'est la bascule qu'il faut éprouver, pas le choix :

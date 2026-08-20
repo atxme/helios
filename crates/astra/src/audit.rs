@@ -158,6 +158,34 @@ impl AuditChain {
         Ok(())
     }
 
+    /// Verifies a recorded operator head, allowing only the legacy status
+    /// publications that were appended by read-only telemetry queries.
+    ///
+    /// Status publication used to advance the audit chain even though it did
+    /// not change an authority decision. A deployment witness captured at
+    /// bootstrap can therefore be an ancestor of the current head after an
+    /// otherwise harmless status read. This narrow compatibility path accepts
+    /// that suffix, but still refuses every renewal, admission, issuer,
+    /// campaign or revocation event after the witness.
+    pub fn verify_after_status_tail(&self, expected: &Fingerprint) -> Result<(), AuditError> {
+        self.verify(None)?;
+        let Some(index) = self
+            .records
+            .iter()
+            .position(|record| record.digest.matches(expected))
+        else {
+            return Err(AuditError::Forked);
+        };
+        if self.records[index + 1..]
+            .iter()
+            .all(|record| matches!(record.event, AuditEvent::StatusPublished { .. }))
+        {
+            Ok(())
+        } else {
+            Err(AuditError::Forked)
+        }
+    }
+
     fn digest(
         sequence: u64,
         recorded_at: u64,
@@ -237,6 +265,33 @@ mod tests {
         truncated.verify(None).expect("internally consistent");
         assert!(matches!(
             truncated.verify(Some(&head)),
+            Err(AuditError::Forked)
+        ));
+    }
+
+    #[test]
+    fn a_status_only_suffix_can_be_recovered_after_a_restart() {
+        let mut chain = chain();
+        let witness = chain.head();
+        chain.append(
+            AuditEvent::StatusPublished {
+                target: "workstation".into(),
+                status_epoch: 1,
+            },
+            1_300,
+        );
+        chain
+            .verify_after_status_tail(&witness)
+            .expect("read-only status suffix");
+    }
+
+    #[test]
+    fn a_decision_after_the_witness_is_still_a_fork() {
+        let mut chain = chain();
+        let witness = chain.head();
+        chain.append(AuditEvent::IssuerInstalled { issuer_epoch: 2 }, 1_300);
+        assert!(matches!(
+            chain.verify_after_status_tail(&witness),
             Err(AuditError::Forked)
         ));
     }

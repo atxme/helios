@@ -246,8 +246,8 @@ fi
 deployer_astra() {
     local compose etat wg_pub nom_serveur url rp domaine ancre sortie
     local cle_service tete_audit identite moteur compose_env statut_astra
-    local tete_attendue registre_gateway
-    local unite_build etat_build resultat_build code_build tentative
+    local tete_attendue registre_gateway statut_tete_ancienne tete_ancienne
+    local unite_build etat_build resultat_build code_build tentative astra_lire_frais
     local canal_present cert_astra cert_gateway
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
@@ -504,6 +504,12 @@ deployer_astra() {
 
     compose_astra="$compose_env $compose -f deploy/astra/compose.yaml \
         --env-file '$env_distant'"
+    # A compatibility check must use the freshly built image. The running
+    # container can still be the previous release until the final `up -d`, so
+    # `exec` would not know about the status-tail migration below. `--network
+    # none` keeps this disposable read from competing for Astra's static veth
+    # address.
+    astra_lire_frais="$compose_astra run --rm --no-deps -T --network none astra"
     if [ "$astra_en_marche" = oui ]; then
         # Le chemin absolu, et pas le sous-verbe seul : `exec` n'applique pas
         # l'`ENTRYPOINT` de l'image, il exécute l'argv tel quel. « status » y
@@ -666,10 +672,27 @@ deployer_astra() {
             return 1
         fi
         if [ "$tete_attendue" != "$tete_audit" ]; then
-            echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
-            echo "    attendue : $tete_attendue" >&2
-            echo "    présente : $tete_audit" >&2
-            return 1
+            # Releases before the status-read fix appended `StatusPublished`
+            # for every telemetry query. Ask the freshly built image whether
+            # the old witness is followed only by that harmless legacy suffix.
+            # A renewal, admission, issuer or revocation after the witness
+            # remains a hard fork and is never adopted automatically.
+            statut_tete_ancienne="$(helios_ssh_sudo_capture "$CIBLE" \
+                "cd '$racine' && $astra_lire_frais status \
+                    --expected-audit-head '$tete_attendue' 2>&1")" || statut_tete_ancienne=
+            tete_ancienne="$(printf '%s\n' "$statut_tete_ancienne" |
+                sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
+            if [ "$tete_ancienne" != "$tete_audit" ]; then
+                echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
+                echo "    attendue : $tete_attendue" >&2
+                echo "    présente : $tete_audit" >&2
+                [ -z "$statut_tete_ancienne" ] ||
+                    printf '%s\n' "$statut_tete_ancienne" | tail -20 >&2
+                return 1
+            fi
+            echo "    témoin avancé : l'écart ne contient que d'anciennes publications de statut"
+            mkdir -p "$(dirname "$RELAIS")"
+            printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
         fi
         helios_ssh_sudo "$CIBLE" \
             "printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' > '$env_distant'

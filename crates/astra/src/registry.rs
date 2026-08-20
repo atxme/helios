@@ -131,13 +131,35 @@ impl AstraRegistry {
     /// with an authority that has a history, a service key and a domain, and
     /// no way to read any of them.
     pub fn load(path: &Path, expected_head: Option<&Fingerprint>) -> Result<Self, RegistryError> {
+        Self::load_with(path, expected_head, false)
+    }
+
+    /// Loads a registry for a daemon restart, accepting only a suffix made of
+    /// legacy read-only status publications after the operator witness.
+    pub fn load_allowing_status_tail(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+    ) -> Result<Self, RegistryError> {
+        Self::load_with(path, expected_head, true)
+    }
+
+    fn load_with(
+        path: &Path,
+        expected_head: Option<&Fingerprint>,
+        allow_status_tail: bool,
+    ) -> Result<Self, RegistryError> {
         let raw = std::fs::read(path)?;
         let mut document: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
         let migrated = Self::migrate(&mut document)?;
         let state: AstraState = serde_json::from_value(document)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
-        state.audit.verify(expected_head)?;
+        match expected_head {
+            Some(expected) if allow_status_tail => {
+                state.audit.verify_after_status_tail(expected)?
+            }
+            _ => state.audit.verify(expected_head)?,
+        }
         let registry = Self {
             path: path.to_path_buf(),
             state,

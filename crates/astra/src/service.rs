@@ -467,15 +467,12 @@ async fn status_query(
     .sign(&service.service_private_key)
     .map_err(|_| ServiceError::Internal)?;
 
-    registry
-        .record(
-            crate::audit::AuditEvent::StatusPublished {
-                target: peer.name.clone(),
-                status_epoch,
-            },
-            now,
-        )
-        .map_err(|_| ServiceError::Internal)?;
+    // A status query is a read, not an authority decision. Older builds
+    // appended `StatusPublished` here, which made the operator's bootstrap
+    // witness stale after the first telemetry poll and blocked every restart.
+    // Keep the monotonic status epoch durable, but do not grow the fork
+    // witness for a read-only response.
+    registry.save().map_err(|_| ServiceError::Internal)?;
 
     Ok(Json(status))
 }

@@ -171,8 +171,11 @@ slot.
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
 témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
 dans `/var/lib/helios/astra-compose.env`. Sur une reprise, `deploy.sh` relit la
-tête du volume, la compare au témoin opérateur `~/.helios/astra/audit-head`, et
-refuse un écart au lieu d'adopter silencieusement une histoire restaurée.
+tête du volume et la compare au témoin opérateur `~/.helios/astra/audit-head`.
+Les anciennes versions ajoutaient une entrée `StatusPublished` à chaque lecture
+de télémétrie ; une extension composée uniquement de ces entrées est reprise et
+le témoin est avancé. Tout écart qui contient une admission, une émission, une
+rotation ou une révocation reste un fork et est refusé.
 
 Après une panne limitée à cette étape, la reprise ne relivre ni les binaires ni
 la configuration de la gateway :
