@@ -1,6 +1,7 @@
 // In dev, Vite proxies /api and /ws to heliosd. In production, the embedded
 // interface and the API are served by the same Axum process.
 import type {
+  CertificateDomain,
   CommandResponse,
   FinalizedRelease,
   FirewallRules,
@@ -69,6 +70,25 @@ export const fetchFirewallRules = () => json<FirewallRules>('/api/firewall/rules
 export const applyFirewallRules = (rules: string) => command('/api/firewall/rules', { rules })
 
 export const fetchUpdateStatus = () => json<UpdateStatus>('/api/update')
+
+/**
+ * The trust domain, or `null` when this gateway has none.
+ *
+ * `404` is a *state*, not a failure: a gateway that has never run
+ * `heliosd init-trust-domain` holds no registry, and an absent registry is not
+ * an empty one — the lifecycle routes stay closed. Folding it into the error
+ * path would put "le démon ne répond pas" on screen for a gateway answering
+ * perfectly, and send the operator looking at the network.
+ */
+export async function fetchCertificateDomain(): Promise<CertificateDomain | null> {
+  const response = await fetch('/api/certificates')
+  if (response.status === 404) return null
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`HTTP ${response.status}${detail ? ` — ${detail}` : ''}`)
+  }
+  return response.json() as Promise<CertificateDomain>
+}
 
 export async function stageUpdate(manifest: unknown): Promise<FinalizedRelease> {
   const response = await json<{ release: FinalizedRelease }>('/api/update/stage', {

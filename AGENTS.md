@@ -202,8 +202,18 @@ Restent ouverts :
   `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en
   dépend ; les trois autres actions du §12.2, sans pilote et refusées en le
   disant ; le lancement automatique du compagnon plutôt que sa ligne de
-  commande ; le discriminant de profil Orion et la bascule du §13 ; et la
-  surface *Certificats* de la console Helios.
+  commande ; et le discriminant de profil Orion avec la bascule du §13.
+  La **console Helios lit enfin le domaine** : `GET /api/certificates` rend en
+  une lecture sous un seul verrou les ancres, les époques, l'émetteur délégué
+  et chaque pair du registre — génération, échéance, barreau de l'échelle §4.3,
+  candidat sous bail, successeur committé et fragments non collectés. Le
+  barreau est calculé **côté gateway**, sur son horloge : un poste opérateur
+  décalé de quelques minutes placerait toutes les feuilles au mauvais barreau,
+  et c'est l'écran qu'on croirait. Rien de secret n'y passe — ni corps de
+  certificat, ni clé publique, seulement des empreintes et des dates — et
+  `aether::certificates::window::ValidityPhase` est désormais l'unique
+  définition des seuils 80/90/95 %, qu'Orion réexporte sous le nom
+  `CertificatePhase` qu'il exportait déjà.
   **Limite connue, et c'est celle qui reste entre l'installation et un
   renouvellement utilisable** : le port de négociation authentifie un client
   sous **une** CA TLS cliente et **une** CA PQ cliente, lues sur disque au

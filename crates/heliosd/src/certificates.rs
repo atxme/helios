@@ -643,6 +643,111 @@ pub fn enrolment_view(
     }
 }
 
+/// The whole domain, from one reading of the registry (spec §12.1).
+///
+/// A free function over the persisted state, like [`enrolment_view`]: the
+/// console's numbers are then exercised without a runtime, a lock or a signer,
+/// and the arithmetic that decides a renewal is due is the protocol's own
+/// rather than a second copy of it.
+///
+/// Nothing secret crosses: anchors, epochs, fingerprints, dates and counts.
+/// The certificate bodies stay here — an operator acts on an expiry, never on
+/// a DER blob — and so does every private key, which this process holds none
+/// of anyway.
+pub fn domain_view(
+    state: &helios_provisioning::certificates::RegistryState,
+    now_unix: u64,
+) -> helios_api::certificates::CertificateDomainView {
+    use aether::certificates::window::{ValidityPeriod, ValidityPhase};
+    use helios_api::certificates::{IssuerView, PeerCertificateView, PendingStageView};
+
+    let peers = state
+        .peers
+        .iter()
+        .map(|(key, peer)| {
+            let active = &peer.state.active;
+            // A period the issuer wrote inconsistently cannot be placed on the
+            // ladder. It is reported as expired rather than hidden: the leaf
+            // is unusable either way, and a peer missing from the list is a
+            // peer nobody investigates.
+            let phase = ValidityPeriod::new(active.not_before, active.not_after)
+                .map(|period| period.phase(now_unix))
+                .unwrap_or(ValidityPhase::Expired);
+            PeerCertificateView {
+                name: peer.name.clone(),
+                wg_public_key: key.clone(),
+                generation: active.generation,
+                not_before: active.not_before,
+                not_after: active.not_after,
+                phase,
+                revoked: peer.state.revoked,
+                pending: peer.state.pending.as_ref().map(|pending| PendingStageView {
+                    generation: pending.candidate.generation,
+                    state: pending.state,
+                    stage_expires_at: pending.stage_expires_at,
+                }),
+                next_generation: peer.state.next.as_ref().map(|next| next.generation),
+                activation_at: peer.state.activation_at,
+                distribution_chunks_pending: peer
+                    .distribution
+                    .as_ref()
+                    .map(|distribution| {
+                        let served = usize::from(distribution.cursor);
+                        u16::try_from(distribution.chunks.len().saturating_sub(served))
+                            .unwrap_or(u16::MAX)
+                    })
+                    .unwrap_or(0),
+            }
+        })
+        .collect();
+
+    helios_api::certificates::CertificateDomainView {
+        trust_domain_id: state.trust_domain_id.to_hex(),
+        server_name: state.gateway.server_name.clone(),
+        now_unix,
+        ca_epoch: state.gateway.ca_epoch,
+        ca_pq_fingerprint: state
+            .gateway
+            .current_ca_public_key
+            .authority_fingerprint()
+            .to_hex(),
+        ca_transition_pending: state.gateway.next_ca_public_key.is_some(),
+        ca_activation_at: state.gateway.ca_activation_at,
+        client_tls_ca_epoch: state.client_tls_ca.ca_tls_epoch,
+        client_tls_ca_transition_pending: state
+            .client_tls_ca
+            .next_client_tls_ca_certificate
+            .is_some(),
+        gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
+        gateway_tls_fingerprint: state.gateway.active_tls_fingerprint().to_hex(),
+        // An unreadable active leaf is the gateway's own identity failing to
+        // parse. Empty rather than a panic: this is a read, and the console
+        // showing a blank fingerprint beside populated epochs is a louder
+        // symptom than a `500` an operator reads as "the console is broken".
+        gateway_pq_fingerprint: state
+            .gateway
+            .active_pq_fingerprint()
+            .map(|fingerprint| fingerprint.to_hex())
+            .unwrap_or_default(),
+        gateway_transition_pending: state.gateway.next_gateway_certificate.is_some(),
+        gateway_activation_at: state.gateway.activation_at,
+        astra_authority_url: state.astra.authority_url.clone(),
+        astra_service_key_epoch: state.astra.astra_service_key_epoch,
+        astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),
+        webauthn_rp_id: state.astra.webauthn_rp_id.clone(),
+        credential_registry_epoch: state.astra.credential_registry_epoch,
+        credential_bindings: state.astra.credential_bindings.len(),
+        issuer: state.issuer.as_ref().map(|issuer| IssuerView {
+            issuer_epoch: issuer.issuer_epoch,
+            lifecycle: issuer.state,
+            not_before: issuer.authorization.not_before,
+            not_after: issuer.authorization.not_after,
+            usable: issuer.is_usable(now_unix),
+        }),
+        peers,
+    }
+}
+
 /// Refuses a candidate this gateway would not accept on the negotiation port.
 ///
 /// # Why staging has to ask this at all
@@ -772,6 +877,14 @@ impl TrustUpdateHandler for CertificateService {
             .peer(&peer_key)
             .ok_or(TrustUpdateRefusal::Rejected)?;
         Ok(enrolment_view(registry.state(), peer))
+    }
+
+    async fn domain(
+        &self,
+    ) -> Result<helios_api::certificates::CertificateDomainView, TrustUpdateRefusal> {
+        let now = now_unix();
+        let registry = self.registry.lock().await;
+        Ok(domain_view(registry.state(), now))
     }
 
     async fn trust_update(
@@ -1362,5 +1475,162 @@ mod tests {
         });
 
         assert!(!caller_is_current(&state, &peer, &current).expect("comparison"));
+    }
+
+    /// A queued transaction, at a chosen position, for the count below.
+    fn distribution(
+        cursor: u16,
+        chunk_count: u16,
+    ) -> helios_provisioning::certificates::PendingDistribution {
+        use aether::certificates::transport::{
+            ManifestAuthority, TrustUpdateChunk, TrustUpdateTransactionManifest,
+        };
+
+        let manifest = TrustUpdateTransactionManifest {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            transaction_id: Id16::new([9; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: key(9),
+            client_wg_public_key: key(2),
+            base_state_fingerprint: Fingerprint::of(b"base state"),
+            created_at: 0,
+            expires_at: 1_000,
+            minimum_activation_at: 1_000,
+            chunk_count,
+            objects: Vec::new(),
+            manifest_authority_kind: ManifestAuthority::CaPq,
+            manifest_authority_epoch: 1,
+            signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        };
+        let manifest_fingerprint = manifest.fingerprint();
+        helios_provisioning::certificates::PendingDistribution {
+            manifest,
+            chunks: (0..chunk_count)
+                .map(|index| TrustUpdateChunk {
+                    manifest_fingerprint,
+                    chunk_index: index,
+                    chunk_count,
+                    first_object_index: index,
+                    objects: Vec::new(),
+                })
+                .collect(),
+            cursor,
+            last_request_id: None,
+        }
+    }
+
+    /// The console draws the same rungs the protocol decides on.
+    ///
+    /// A screen with its own arithmetic is a screen that eventually says
+    /// *valide* about a leaf the planner has already scheduled a renewal for —
+    /// and the operator believes the screen.
+    #[test]
+    fn the_domain_view_places_a_leaf_on_the_protocol_ladder() {
+        use aether::certificates::window::ValidityPhase;
+
+        let mut state = state();
+        state.peers.insert(key(2).to_base64(), peer());
+
+        // The fixture generation runs from 0 to 1 000 000, so the thresholds
+        // of spec §4.3 fall on round numbers.
+        let phase_at = |now: u64| domain_view(&state, now).peers[0].phase;
+        assert_eq!(phase_at(0), ValidityPhase::Valid);
+        assert_eq!(phase_at(799_999), ValidityPhase::Valid);
+        assert_eq!(phase_at(800_000), ValidityPhase::RenewalDue);
+        assert_eq!(phase_at(900_000), ValidityPhase::Warning);
+        assert_eq!(phase_at(950_000), ValidityPhase::Critical);
+        assert_eq!(phase_at(1_000_000), ValidityPhase::Expired);
+    }
+
+    /// The count is what is **left**, not what was queued.
+    ///
+    /// A peer that has collected two of three fragments is still behind, and a
+    /// console showing the total would report the same number before and after
+    /// every poll — the one figure that says whether anything is moving.
+    #[test]
+    fn the_domain_view_counts_the_fragments_a_peer_has_not_collected() {
+        let pending_after = |cursor: u16| {
+            let mut state = state();
+            let mut queued = peer();
+            queued.distribution = Some(distribution(cursor, 3));
+            state.peers.insert(key(2).to_base64(), queued);
+            domain_view(&state, 0).peers[0].distribution_chunks_pending
+        };
+
+        assert_eq!(pending_after(1), 2);
+        assert_eq!(pending_after(3), 0);
+    }
+
+    /// The operator read carries no certificate body, and no key.
+    ///
+    /// It is served on the admin surface, so nothing here is secret — but a
+    /// view that grew a DER blob or a public key would be a view somebody
+    /// later fed to a parser, and the registry's own copies are the ones that
+    /// must decide. Fingerprints and dates are what an operator acts on.
+    #[test]
+    fn the_domain_view_carries_no_certificate_body() {
+        let mut state = state();
+        let peer = peer();
+        let leaf_key = peer.active_pq_certificate.ml_dsa_87_public_key.clone();
+        state.peers.insert(key(2).to_base64(), peer);
+
+        let json = serde_json::to_string(&domain_view(&state, 0)).expect("serialise");
+        assert!(
+            !json.contains(&leaf_key),
+            "the peer's public key must not travel"
+        );
+        assert!(
+            !json.contains(&state.gateway.current_ca_public_key.to_base64()),
+            "the anchor travels as a fingerprint, not as a key"
+        );
+        assert!(
+            !json.contains(&state.astra.active_astra_service_public_key.to_base64()),
+            "the Astra service key travels in the §19 block, not in this one"
+        );
+        // What it does carry: the values a screen shows.
+        assert!(json.contains("gateway.example"));
+        assert!(json.contains("\"generation\":4"));
+    }
+
+    /// An `active` delegation past its `not_after` signs nothing.
+    ///
+    /// The lifecycle field alone would let the console call it usable, and an
+    /// operator would look everywhere but at the clock when renewals stop.
+    #[test]
+    fn the_domain_view_reads_the_issuer_clock_and_not_only_its_lifecycle() {
+        let mut state = state();
+        let (_, issuer_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        state.issuer = Some(aether::certificates::state::AstraIssuerState {
+            issuer_epoch: 4,
+            authorization: aether::certificates::authority::AstraIssuerAuthorization {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: 1,
+                ca_tls_epoch: 2,
+                gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+                server_name: state.gateway.server_name.clone(),
+                issuer_epoch: 4,
+                pq_issuer_public_key: issuer_key,
+                tls_intermediate_certificate: DerCertificate::new(vec![3; 64]).expect("der"),
+                allowed_usage:
+                    aether::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: 1_000,
+                ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            },
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+
+        let inside = domain_view(&state, 999).issuer.expect("issuer");
+        assert!(inside.usable);
+        let outside = domain_view(&state, 1_000).issuer.expect("issuer");
+        assert_eq!(
+            outside.lifecycle,
+            aether::certificates::state::IssuerLifecycle::Active
+        );
+        assert!(!outside.usable, "expiry decides, not the lifecycle field");
     }
 }

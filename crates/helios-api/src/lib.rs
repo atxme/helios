@@ -337,6 +337,10 @@ pub fn router(state: AppState) -> Router {
             "/api/key-negotiation/trust-enrolment/:public_key",
             get(certificates::trust_enrolment),
         )
+        // The domain as the operator console reads it. On the admin surface
+        // rather than in the tunnel: it reports every admitted peer, which is
+        // exactly what no client may learn about its neighbours.
+        .route("/api/certificates", get(certificates::domain))
         .route("/api/firewall/rules", get(routes::firewall_rules_get))
         .merge(admin)
         .merge(authenticated_peer)
@@ -671,6 +675,12 @@ mod security_tests {
             &self,
             _peer_wg_public_key: &str,
         ) -> Result<certificates::TrustEnrolmentView, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn domain(
+            &self,
+        ) -> Result<certificates::CertificateDomainView, certificates::TrustUpdateRefusal> {
             Err(certificates::TrustUpdateRefusal::Rejected)
         }
 

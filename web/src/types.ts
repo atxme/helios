@@ -168,3 +168,90 @@ export interface UpdateStatus {
   channel: string
   target: string
 }
+
+/**
+ * Where a certificate sits on the renewal ladder of spec §4.3.
+ *
+ * The rungs are the protocol's own — 80 / 90 / 95 % of the lifetime — computed
+ * by the gateway from `aether::certificates::window`. The console never
+ * recomputes them: a screen with its own arithmetic eventually disagrees with
+ * the planner that actually schedules the renewal.
+ */
+export type CertificatePhase =
+  | 'not_yet_valid'
+  | 'valid'
+  | 'renewal_due'
+  | 'warning'
+  | 'critical'
+  | 'expired'
+
+/** How far a candidate generation has got between staging and commit. */
+export type PendingStageState = 'pending_grant' | 'pending_commit'
+
+export type IssuerLifecycle = 'active' | 'expiring' | 'revoked'
+
+export interface PendingStageView {
+  generation: number
+  state: PendingStageState
+  stage_expires_at: number
+}
+
+/** The bounded delegation ordinary renewals are issued under (spec §3.4). */
+export interface IssuerView {
+  issuer_epoch: number
+  lifecycle: IssuerLifecycle
+  not_before: number
+  not_after: number
+  /**
+   * Whether it may sign right now, which the lifecycle alone does not say: an
+   * `active` delegation past its `not_after` signs nothing.
+   */
+  usable: boolean
+}
+
+export interface PeerCertificateView {
+  name: string
+  wg_public_key: string
+  generation: number
+  not_before: number
+  not_after: number
+  phase: CertificatePhase
+  revoked: boolean
+  pending: PendingStageView | null
+  next_generation: number | null
+  activation_at: number | null
+  /** Fragments of a signed transaction this peer has not collected yet. */
+  distribution_chunks_pending: number
+}
+
+/**
+ * Contract of GET /api/certificates — the trust domain as an operator reads it.
+ *
+ * `now_unix` is the **gateway's** clock, and the whole view is drawn against
+ * it. A workstation minutes off would otherwise place every leaf on the wrong
+ * rung of the ladder, and the operator would trust the screen.
+ */
+export interface CertificateDomain {
+  trust_domain_id: string
+  server_name: string
+  now_unix: number
+  ca_epoch: number
+  ca_pq_fingerprint: string
+  ca_transition_pending: boolean
+  ca_activation_at: number | null
+  client_tls_ca_epoch: number
+  client_tls_ca_transition_pending: boolean
+  gateway_identity_epoch: number
+  gateway_tls_fingerprint: string
+  gateway_pq_fingerprint: string
+  gateway_transition_pending: boolean
+  gateway_activation_at: number | null
+  astra_authority_url: string
+  astra_service_key_epoch: number
+  astra_policy_fingerprint: string
+  webauthn_rp_id: string
+  credential_registry_epoch: number
+  credential_bindings: number
+  issuer: IssuerView | null
+  peers: PeerCertificateView[]
+}

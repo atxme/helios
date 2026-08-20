@@ -138,6 +138,131 @@ pub struct TrustEnrolmentView {
     pub astra_service_public_key: String,
 }
 
+/// The domain as an operator reads it — `GET /api/certificates`.
+///
+/// # Why the console gets its own read
+///
+/// Every other view of the registry answers a *client's* question, and is
+/// therefore shaped by what that client may learn: the §19 enrolment block
+/// covers one peer, and a trust update tells its caller about its own
+/// identity and nothing else. An operator's question is the opposite one —
+/// *what is the state of the whole domain* — and there is no client-facing
+/// route that could answer it without becoming an oracle on other peers.
+///
+/// Everything here is public: anchors, epochs, fingerprints and expiry dates.
+/// No private key, no PSK, no capability token, and no certificate body — a
+/// console shows what an operator acts on, and nobody acts on a DER blob.
+///
+/// # Why one read and not one per peer
+///
+/// The peers are rendered next to the epochs they were issued under. Reading
+/// them separately would let a screen pair a generation taken at one instant
+/// with an anchor taken at another, and the pairs that never existed together
+/// are exactly the ones an operator would investigate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateDomainView {
+    pub trust_domain_id: String,
+    pub server_name: String,
+    /// Unix instant this snapshot was taken, on the gateway's clock.
+    ///
+    /// Sent rather than assumed: the browser's clock is the operator's, and a
+    /// workstation minutes off would draw the renewal ladder at the wrong rung
+    /// for every leaf on the screen.
+    pub now_unix: u64,
+    pub ca_epoch: u64,
+    /// SHA-256 of the `CA-PQ` anchor's public key, lowercase hex.
+    pub ca_pq_fingerprint: String,
+    /// A successor anchor is installed and waiting for its activation.
+    pub ca_transition_pending: bool,
+    pub ca_activation_at: Option<u64>,
+    pub client_tls_ca_epoch: u64,
+    pub client_tls_ca_transition_pending: bool,
+    pub gateway_identity_epoch: u64,
+    pub gateway_tls_fingerprint: String,
+    pub gateway_pq_fingerprint: String,
+    pub gateway_transition_pending: bool,
+    pub gateway_activation_at: Option<u64>,
+    pub astra_authority_url: String,
+    pub astra_service_key_epoch: u64,
+    pub astra_policy_fingerprint: String,
+    pub webauthn_rp_id: String,
+    pub credential_registry_epoch: u64,
+    /// Operator credentials the domain holds. Two is the floor a vault opens
+    /// under, and an approval nobody can answer is what one leaves behind.
+    pub credential_bindings: usize,
+    /// The delegated issuer, absent until `astra issuer install` has run.
+    pub issuer: Option<IssuerView>,
+    pub peers: Vec<PeerCertificateView>,
+}
+
+/// The bounded delegation an ordinary renewal is issued under (spec §3.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerView {
+    pub issuer_epoch: u64,
+    pub lifecycle: aether::certificates::state::IssuerLifecycle,
+    pub not_before: u64,
+    pub not_after: u64,
+    /// Whether it may sign **now** — which the lifecycle alone does not say:
+    /// an `active` delegation past its `not_after` signs nothing.
+    pub usable: bool,
+}
+
+/// One admitted peer's identity, as the registry holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerCertificateView {
+    pub name: String,
+    pub wg_public_key: String,
+    pub generation: u64,
+    pub not_before: u64,
+    pub not_after: u64,
+    /// Where the active leaf sits on the 80 / 90 / 95 % ladder of spec §4.3.
+    pub phase: aether::certificates::window::ValidityPhase,
+    pub revoked: bool,
+    /// A candidate generation under lease, and how far it has got.
+    pub pending: Option<PendingStageView>,
+    /// A committed successor waiting for its activation instant.
+    pub next_generation: Option<u64>,
+    pub activation_at: Option<u64>,
+    /// Fragments of a signed transaction still queued for this peer.
+    ///
+    /// Non-zero means the peer is behind and has not finished collecting what
+    /// would bring it forward — the one state where `trust-update` is doing
+    /// something rather than answering "you are current".
+    pub distribution_chunks_pending: u16,
+}
+
+/// A candidate generation between staging and commit (spec §3.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingStageView {
+    pub generation: u64,
+    pub state: aether::certificates::state::PendingStageState,
+    pub stage_expires_at: u64,
+}
+
+/// `GET /api/certificates`, on the admin surface.
+///
+/// `404` when the gateway has no trust domain, for the same reason
+/// [`trust_enrolment`] answers `404`: an empty registry and an absent one are
+/// different facts, and a console handed an empty list would draw a domain
+/// with no clients rather than a gateway that was never initialised.
+pub async fn domain(State(s): State<AppState>) -> Response {
+    let Some(handler) = s.trust_update.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this gateway has no trust domain — run `heliosd init-trust-domain`",
+        )
+            .into_response();
+    };
+    match handler.domain().await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
 /// `GET /api/key-negotiation/trust-enrolment/:public_key`, on the admin
 /// surface.
 ///
@@ -184,6 +309,14 @@ pub trait TrustUpdateHandler: Send + Sync {
         &self,
         peer_wg_public_key: &str,
     ) -> Result<TrustEnrolmentView, TrustUpdateRefusal>;
+
+    /// The whole domain, for the operator console (`GET /api/certificates`).
+    ///
+    /// One reading of the registry under one lock, like [`Self::trust_enrolment`]
+    /// and for the same reason: a screen that paired a peer's generation with
+    /// an anchor epoch read a moment later would show a combination that never
+    /// existed, and it is precisely those that get investigated.
+    async fn domain(&self) -> Result<CertificateDomainView, TrustUpdateRefusal>;
 
     /// Records a freshly admitted peer's **first** generation (spec §13.1).
     ///
@@ -588,6 +721,10 @@ mod tests {
             &self,
             _peer_wg_public_key: &str,
         ) -> Result<TrustEnrolmentView, TrustUpdateRefusal> {
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn domain(&self) -> Result<CertificateDomainView, TrustUpdateRefusal> {
             Err(TrustUpdateRefusal::Rejected)
         }
 

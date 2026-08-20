@@ -8,6 +8,7 @@ import Typography from '@mui/material/Typography'
 import { Fingerprint, Globe, Lock, LockOpen, Network, Server, ShieldCheck, Terminal, Wifi } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { fetchTrust } from '../api'
+import { CertificateDomainPanel } from '../components/CertificateDomainPanel'
 import { DataRow } from '../components/DataRow'
 import { KnownLimit } from '../components/KnownLimit'
 import { SectionCard } from '../components/SectionCard'
@@ -252,6 +253,8 @@ export function SecurityView({ status, state }: { status: Status | null; state: 
           </Stack>
         )}
       </SectionCard>
+
+      <CertificateDomainPanel />
 
       <TrustPanel />
     </Stack>

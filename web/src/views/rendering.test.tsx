@@ -82,6 +82,12 @@ let fetchMock: ReturnType<typeof vi.fn>
 
 beforeEach(() => {
   fetchMock = vi.fn((input: string) => {
+    // Security mounts the lifecycle panel, which reads the trust domain. A
+    // gateway with none answers 404, and the panel says so — which is what
+    // this harness wants: the destination must mount without a registry.
+    if (input.includes('/api/certificates')) {
+      return Promise.resolve(new Response('{}', { status: 404 }))
+    }
     const body = input.includes('/trust')
       ? {
           required_algs: ['ed25519', 'ml-dsa-65'],

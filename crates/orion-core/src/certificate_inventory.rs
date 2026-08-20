@@ -45,23 +45,12 @@ use crate::KeyNegotiationSettings;
 
 /// Where a certificate stands on the renewal ladder of spec §4.3.
 ///
-/// The thresholds are the protocol's own — 80 %, 90 %, 95 % of the lifetime —
-/// read through [`ValidityPeriod`] rather than recomputed here. A panel that
-/// drew its own would eventually disagree with the planner that decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CertificatePhase {
-    /// Prepared for later: its validity has not started.
-    NotYetValid,
-    Valid,
-    /// Past 80 %: the renewal window is open.
-    RenewalDue,
-    /// Past 90 %.
-    Warning,
-    /// Past 95 %.
-    Critical,
-    Expired,
-}
+/// The ladder itself lives in [`aether::certificates::window`], with the
+/// protocol's own thresholds. Orion keeps the name it has always exported —
+/// the wire form is unchanged — but no longer keeps a second copy of the
+/// comparisons: the Helios console reports the same rungs, and two surfaces
+/// computing them apart is how one of them ends up a threshold behind.
+pub use aether::certificates::window::ValidityPhase as CertificatePhase;
 
 /// One certificate, as an interface needs to state it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,19 +80,7 @@ impl CertificateFacts {
         let renewal_at = period
             .renewal_at()
             .map_err(|_| "période de validité incohérente".to_string())?;
-        let phase = if now_unix < not_before {
-            CertificatePhase::NotYetValid
-        } else if now_unix >= not_after {
-            CertificatePhase::Expired
-        } else if now_unix >= period.critical_at().unwrap_or(not_after) {
-            CertificatePhase::Critical
-        } else if now_unix >= period.warning_at().unwrap_or(not_after) {
-            CertificatePhase::Warning
-        } else if now_unix >= renewal_at {
-            CertificatePhase::RenewalDue
-        } else {
-            CertificatePhase::Valid
-        };
+        let phase = period.phase(now_unix);
         Ok(Self {
             subject,
             issuer,
