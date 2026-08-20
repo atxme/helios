@@ -152,6 +152,9 @@ pub async fn provision(
 
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        // The provisioning endpoint is inside WireGuard. Never let an
+        // inherited desktop proxy move the signed request off the tunnel.
+        .no_proxy()
         .build()
         .map_err(|e| ProvisionError::Transport(e.to_string()))?;
 

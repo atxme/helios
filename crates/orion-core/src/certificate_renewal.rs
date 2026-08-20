@@ -723,6 +723,10 @@ impl RenewalSession {
             routes: RenewalRoutes::new(heliosd_url),
             http: reqwest::Client::builder()
                 .timeout(CALL_TIMEOUT)
+                // Every renewal route is inside WireGuard. A system proxy
+                // would send signed requests and capability tokens away from
+                // the gateway named by the profile.
+                .no_proxy()
                 // A renewal route never redirects. Following one would send a
                 // signed request, and the tokens in the answer, to whatever
                 // host a compromised gateway named.

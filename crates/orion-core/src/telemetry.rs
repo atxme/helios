@@ -44,7 +44,15 @@ async fn run_with_timing(
     poll_interval: Duration,
     request_timeout: Duration,
 ) {
-    let client = match reqwest::Client::builder().timeout(request_timeout).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(request_timeout)
+        // This URL is deliberately inside WireGuard. An inherited HTTP(S)
+        // proxy would move the request onto the physical network (or simply
+        // fail because a proxy cannot route the tunnel VIP), while the log
+        // would misleadingly say only "heliosd injoignable".
+        .no_proxy()
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             sink(ClientEvent::Error {
@@ -57,10 +65,21 @@ async fn run_with_timing(
     let mut last_reachable: Option<bool> = None;
 
     loop {
-        let reachable = matches!(
-            client.get(&status_url).send().await,
-            Ok(r) if r.status().is_success()
-        );
+        let failure = match client.get(&status_url).send().await {
+            Ok(response) if response.status().is_success() => None,
+            Ok(response) => Some(format!("réponse HTTP {}", response.status())),
+            Err(error) => {
+                let kind = if error.is_timeout() {
+                    "délai dépassé"
+                } else if error.is_connect() {
+                    "connexion TCP refusée ou injoignable"
+                } else {
+                    "erreur de transport HTTP"
+                };
+                Some(format!("{kind} : {error}"))
+            }
+        };
+        let reachable = failure.is_none();
         if last_reachable != Some(reachable) {
             last_reachable = Some(reachable);
             if reachable {
@@ -71,7 +90,10 @@ async fn run_with_timing(
             } else {
                 sink(ClientEvent::log(
                     "warn",
-                    "télémétrie : heliosd injoignable derrière le tunnel".to_string(),
+                    format!(
+                        "télémétrie : heliosd injoignable derrière le tunnel ({status_url}) — {}",
+                        failure.as_deref().unwrap_or("cause inconnue")
+                    ),
                 ));
             }
         }
@@ -157,6 +179,8 @@ mod tests {
             .collect();
         assert_eq!(messages.len(), 2, "the repeated success must stay silent");
         assert!(messages[0].contains("injoignable"));
+        assert!(messages[0].contains("HTTP 503"));
+        assert!(messages[0].contains("/api/status"));
         assert!(messages[1].contains("joignable"));
         assert!(
             paths

@@ -103,6 +103,10 @@ impl Tunnel {
             base,
             http: reqwest::blocking::Client::builder()
                 .timeout(CALL_TIMEOUT)
+                // The companion talks to the Helios API through the tunnel;
+                // an inherited proxy must not see capability tokens or route
+                // the request away from the profile's gateway VIP.
+                .no_proxy()
                 // A renewal route never redirects. Following one would carry
                 // the capability tokens, and later the operator's assertion,
                 // to whatever host the answer named.
