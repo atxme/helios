@@ -260,6 +260,27 @@ personne n'a observée — ni « volume vierge », qui enchaînerait sur un amor
 par-dessus une autorité existante. C'est la seule erreur irrattrapable de cette
 étape.
 
+### Le document de credentials
+
+Astra n'approuve rien sans liste d'autorisation. `astra-signer bindings` émet
+le document signé par `CA-PQ` — et le réémet tout seul à chaque geste qui
+déplace la table de key-slots. L'étape 7 le recopie dans le volume d'Astra,
+depuis `~/.helios/astra/astra-credentials.json`, à côté du coffre.
+
+Il ne porte rien de secret : ce sont les liaisons publiques des credentials,
+et c'est le **consommateur** qui les vérifie sous son ancre — Orion sous le
+`CA-PQ` de son profil, le compagnon sous celui de son coffre. Ni ce script, ni
+la gateway, ni Astra ne les authentifient.
+
+Il est lu **au démarrage**. Copié dans un conteneur déjà en marche, il n'aurait
+d'effet qu'au redémarrage suivant, et `up -d` ne recrée pas un service dont
+rien n'a changé : l'étape redémarre donc Astra explicitement, et seulement dans
+ce cas.
+
+Sans lui, Astra tourne, sert ses statuts et tient son canal — et refuse chaque
+renouvellement ordinaire en le disant. C'est ce à quoi une installation
+incomplète doit ressembler.
+
 ### À la main
 
 Chaque commande imprime la suivante. `astra bootstrap` imprime la ligne

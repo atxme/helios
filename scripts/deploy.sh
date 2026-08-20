@@ -526,13 +526,13 @@ deployer_astra() {
             echo "    Rien n'est su de son état, donc rien n'est amorcé." >&2
             return 1
         fi
-        astra_lire="$moteur run --rm --network none \
+        astra_lire="$moteur run --rm -i --network none \
             -v '$volume_astra':/var/lib/astra helios/astra:latest"
-        astra_lire_shell="$moteur run --rm --network none \
+        astra_lire_shell="$moteur run --rm -i --network none \
             -v '$volume_astra':/var/lib/astra --entrypoint /bin/sh helios/astra:latest -c"
     else
-        astra_lire="$compose_astra run --rm --no-deps astra"
-        astra_lire_shell="$compose_astra run --rm --no-deps --entrypoint /bin/sh astra -c"
+        astra_lire="$compose_astra run --rm --no-deps -T astra"
+        astra_lire_shell="$compose_astra run --rm --no-deps -T --entrypoint /bin/sh astra -c"
     fi
 
     # Ce que le runtime refuse n'est pas ce qu'Astra refuse.
@@ -786,6 +786,52 @@ deployer_astra() {
                     --unit=helios-channel-restart systemctl restart heliosd >/dev/null"
             fi
         fi
+    fi
+
+    # ── Le document de credentials opérateur ────────────────────────────────
+    # Sans lui, Astra n'a aucune liste d'autorisation : la demande d'approbation
+    # d'un renouvellement ordinaire n'a plus de credential à proposer, et chaque
+    # rotation est refusée en le disant. Il est signé par `CA-PQ` et ne porte
+    # rien de secret — c'est le consommateur qui le vérifie sous son ancre, pas
+    # ce script, pas la gateway et pas Astra.
+    #
+    # Il vit à côté du coffre, sur le poste opérateur, et `astra-signer` le
+    # réémet à chaque geste qui déplace la table de key-slots. Le recopier ici
+    # est donc idempotent, et l'oublier est la panne qu'on ne comprend qu'au
+    # premier renouvellement.
+    #
+    # En base64, pour la même raison que les deux certificats plus haut :
+    # `helios_ssh_sudo` compose lui-même l'entrée standard de la session, donc
+    # rien ne peut y être redirigé.
+    credentials_local="$(dirname "$RELAIS")/astra-credentials.json"
+    if [ -f "$credentials_local" ]; then
+        credentials_b64="$(base64 -w0 < "$credentials_local")"
+        if helios_ssh_sudo "$CIBLE" "cd '$racine' && \
+            printf '%s' '$credentials_b64' | base64 -d | \
+            $astra_lire_shell 'cat > /var/lib/astra/.credentials.tmp && \
+                mv /var/lib/astra/.credentials.tmp /var/lib/astra/astra-credentials.json'"; then
+            echo "    credentials opérateur copiés"
+            # Le document est lu **au démarrage**. Copié dans un conteneur qui
+            # tourne déjà, il ne prendrait effet qu'au prochain redémarrage —
+            # et `up -d` ne recrée pas un service dont rien n'a changé. Le
+            # redémarrage est donc explicite, et seulement dans ce cas.
+            if [ "$astra_en_marche" = oui ]; then
+                helios_ssh_sudo "$CIBLE" "cd '$racine' && \
+                    $compose_astra restart astra" >/dev/null || {
+                    echo "    Astra n'a pas redémarré : il sert encore la liste" >&2
+                    echo "    d'autorisation précédente." >&2
+                }
+            fi
+        else
+            echo "    les credentials opérateur n'ont pas pu être copiés :" >&2
+            echo "      $credentials_local" >&2
+            echo "    Astra tournera, mais refusera tout renouvellement ordinaire." >&2
+        fi
+    else
+        echo "    aucun document de credentials à côté du coffre :" >&2
+        echo "      $credentials_local" >&2
+        echo "    l'émettre par « astra-signer bindings », sinon aucun opérateur ne" >&2
+        echo "    peut approuver un renouvellement." >&2
     fi
 
     echo "    démarrage"
