@@ -9,7 +9,7 @@
 //! report reachable/unreachable transitions. The rich telemetry stream
 //! (WebSocket `/ws` → rates/SA) is a later refinement.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -20,6 +20,19 @@ use crate::events::ClientEvent;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Max delay of a status request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Keeps the terminal diagnostic useful when reqwest wraps the operating
+/// system error in several transport layers. The IHM receives only the short
+/// transition message below; this chain is for the operator at the terminal.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(" ← ")
+}
 
 /// Telemetry loop: polls `heliosd_url/api/status` until cancelled via
 /// `cancel`. Only emits a log on a **change** of reachability (anti-noise).
@@ -65,6 +78,7 @@ async fn run_with_timing(
     let mut last_reachable: Option<bool> = None;
 
     loop {
+        let started = Instant::now();
         let failure = match client.get(&status_url).send().await {
             Ok(response) if response.status().is_success() => None,
             Ok(response) => Some(format!("réponse HTTP {}", response.status())),
@@ -76,24 +90,38 @@ async fn run_with_timing(
                 } else {
                     "erreur de transport HTTP"
                 };
-                Some(format!("{kind} : {error}"))
+                Some(format!("{kind} : {}", error_chain(&error)))
             }
         };
         let reachable = failure.is_none();
+        let elapsed_ms = started.elapsed().as_millis();
+        if let Some(detail) = failure.as_deref() {
+            tracing::debug!(
+                target: "orion_core::telemetry",
+                url = %status_url,
+                elapsed_ms,
+                detail,
+                "heliosd API probe failed"
+            );
+        } else if last_reachable != Some(true) {
+            tracing::debug!(
+                target: "orion_core::telemetry",
+                url = %status_url,
+                elapsed_ms,
+                "heliosd API probe succeeded"
+            );
+        }
         if last_reachable != Some(reachable) {
             last_reachable = Some(reachable);
             if reachable {
                 sink(ClientEvent::log(
                     "info",
-                    format!("télémétrie : heliosd joignable ({heliosd_url})"),
+                    "télémétrie : heliosd joignable".to_string(),
                 ));
             } else {
                 sink(ClientEvent::log(
                     "warn",
-                    format!(
-                        "télémétrie : heliosd injoignable derrière le tunnel ({status_url}) — {}",
-                        failure.as_deref().unwrap_or("cause inconnue")
-                    ),
+                    "télémétrie : heliosd injoignable derrière le tunnel".to_string(),
                 ));
             }
         }
@@ -178,10 +206,11 @@ mod tests {
             })
             .collect();
         assert_eq!(messages.len(), 2, "the repeated success must stay silent");
-        assert!(messages[0].contains("injoignable"));
-        assert!(messages[0].contains("HTTP 503"));
-        assert!(messages[0].contains("/api/status"));
-        assert!(messages[1].contains("joignable"));
+        assert_eq!(
+            messages[0],
+            "télémétrie : heliosd injoignable derrière le tunnel"
+        );
+        assert_eq!(messages[1], "télémétrie : heliosd joignable");
         assert!(
             paths
                 .lock()
