@@ -11,10 +11,6 @@ name = "astra"
 path = "src/main.rs"
 
 [dependencies]
-# La frontière matérielle FIDO2 : `SlotSecret`, la longueur de sel et la
-# borne d'identifiant de credential y sont définies, parce qu'elles sont des
-# propriétés de la clé et non de ce format de fichier.
-helios-fido = { workspace = true }
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.

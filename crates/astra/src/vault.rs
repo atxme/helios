@@ -84,10 +84,13 @@ pub const AUTHORITY_VAULT_VERSION: u16 = 1;
 
 /// Length of the salt handed to `hmac-secret`, in bytes.
 ///
-/// Re-exported from the authenticator boundary that defines it: CTAP2 fixes
-/// it, so the value belongs where the key is spoken to rather than where the
-/// file is written. Kept visible here because every vault reader names it.
-pub use helios_fido::authenticator::SALT_LEN;
+/// Re-exported from the shared contracts: CTAP2 fixes it, so the value belongs
+/// where the key's own properties are stated rather than where the file is
+/// written. Kept visible here because every vault reader names it. Taken from
+/// `aether` and not from `helios-fido` on purpose — Astra reads this format
+/// but never speaks to a key, and linking the CTAP2 stack for a constant would
+/// drag `libudev` into a container that has no USB port to offer it.
+pub use aether::certificates::webauthn::SALT_LEN;
 
 /// Largest number of credentials a vault registers.
 ///
@@ -105,9 +108,10 @@ pub const MAX_SLOTS: usize = 8;
 /// hardware, kept elsewhere. Beyond two, more are welcome and none is special.
 pub const REQUIRED_SLOTS: usize = 2;
 
-/// Largest credential identifier accepted, in bytes. Also from the
-/// authenticator boundary: the bound is CTAP2's, not this file format's.
-pub use helios_fido::authenticator::MAX_CREDENTIAL_ID_BYTES;
+/// Largest credential identifier accepted, in bytes. Also from the shared
+/// contracts: the bound is CTAP2's, not this file format's, and it is the same
+/// one the lifecycle objects validate against.
+pub use aether::certificates::client::MAX_CREDENTIAL_ID_BYTES;
 
 /// Largest COSE credential public key accepted, in bytes.
 ///
@@ -163,10 +167,11 @@ type Result<T> = std::result::Result<T, VaultError>;
 
 /// Key material an authenticator released for one slot.
 ///
-/// Defined at the authenticator boundary — it is what a security key hands
-/// back, and this file merely derives from it. Re-exported so vault readers
-/// keep naming it here.
-pub use helios_fido::authenticator::SlotSecret;
+/// It is what a security key hands back, and this file merely derives from it.
+/// Re-exported so vault readers keep naming it here — and named from `aether`,
+/// so that reading a vault requires no HID stack. Astra transports this format
+/// and never opens it.
+pub use aether::certificates::webauthn::SlotSecret;
 
 /// What role a slot plays for the operator. Cryptographically identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

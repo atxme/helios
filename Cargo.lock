@@ -242,7 +242,6 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "helios-api",
- "helios-fido",
  "helios-vault",
  "rcgen",
  "reqwest 0.12.28",

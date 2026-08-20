@@ -7,6 +7,14 @@
 # `-p astra` et non `cargo build` : le second tirerait `astra-signer`, donc la
 # pile CTAP2 et `libudev`, dans une image qui n'a aucune clé de sécurité à
 # brancher. Le compagnon vit sur le poste opérateur, jamais ici.
+#
+# Le graphe d'`astra` lui-même en est libre, et cela se maintient : il ne lie
+# pas `helios-fido`. Les trois valeurs du coffre qu'il nomme — longueur de sel,
+# borne d'identifiant de credential, `SlotSecret` — sont des propriétés de la
+# clé, donc définies dans `aether`. Rajouter ici une dépendance vers
+# `helios-fido` rendrait `libudev-dev` obligatoire à la construction et
+# `libudev1` à l'exécution, pour un conteneur sans port USB. Astra transporte
+# et sauvegarde le coffre ; il ne l'ouvre pas.
 
 FROM rust:1.92-bookworm AS build
 

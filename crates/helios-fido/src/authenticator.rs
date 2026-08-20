@@ -60,47 +60,24 @@
 
 use aether::certificates::webauthn::{WebAuthnAssertion, MAX_CREDENTIAL_PUBLIC_KEY_BYTES};
 
-/// Length of the salt handed to `hmac-secret`, in bytes.
+/// Length of the salt handed to `hmac-secret`, in bytes, and the material a
+/// key releases for one slot.
 ///
-/// CTAP2 fixes it: the extension takes a 32-byte salt and returns a 32-byte
-/// output. It lives here rather than beside the vault format because it is a
-/// property of the key, not of the file.
-pub const SALT_LEN: usize = 32;
+/// Both are properties of the key rather than of this crate, and both are
+/// therefore defined in `aether` and merely re-exported here. That is not
+/// tidiness: `astra` names them to read a vault file, and it must be able to
+/// do so **without** linking the CTAP2 stack — the HID pile drags `libudev`,
+/// which has no business in a container where no security key is ever plugged
+/// in. Everything that actually speaks to a key stays below this line.
+pub use aether::certificates::webauthn::{SlotSecret, SALT_LEN};
 
 /// Largest credential identifier accepted, in bytes.
 ///
 /// CTAP2 credential IDs are typically 32–128 bytes; the ceiling refuses input
-/// that would drive an allocation before a single field is used.
-pub const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
-
-/// Key material an authenticator released for one slot.
-///
-/// On a real machine this is the CTAP2 `hmac-secret` output for a credential
-/// and a salt, obtained with user presence **and** user verification. The type
-/// exists so nothing above this boundary can confuse it with a key: it is
-/// input to a derivation, never a wrapping key itself.
-///
-/// Nothing in the approval path ever produces one — [`Authenticator::approve`]
-/// is handed no salt (spec §14.1), so a caller that holds only that method
-/// cannot obtain this type at all.
-pub struct SlotSecret(zeroize::Zeroizing<Vec<u8>>);
-
-impl SlotSecret {
-    pub fn new(material: Vec<u8>) -> Self {
-        Self(zeroize::Zeroizing::new(material))
-    }
-
-    /// The bytes, for the single derivation that consumes them.
-    pub fn expose(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SlotSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SlotSecret(<redacted>)")
-    }
-}
+/// that would drive an allocation before a single field is used. One value for
+/// the whole tree: the bound the lifecycle objects validate against is the
+/// bound a vault file is parsed with.
+pub use aether::certificates::client::MAX_CREDENTIAL_ID_BYTES;
 
 /// USB vendor identifiers of common security-key makers.
 ///
