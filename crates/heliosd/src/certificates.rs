@@ -108,6 +108,111 @@ impl CertificateService {
         Ok(Some(Arc::new(Self::new(registry, signer))))
     }
 
+    /// Records a peer's first generation, from the leaves admission carried.
+    ///
+    /// Shared by the two ways a peer is admitted — the API route, which runs
+    /// inside this process, and the console inbox drained by
+    /// [`Self::drain_admissions`]. One implementation, because a second one
+    /// would eventually date a generation differently and the divergence would
+    /// only show at a renewal.
+    async fn record_first_generation(
+        &self,
+        name: &str,
+        peer_wg_public_key: &str,
+        tls_certificate: aether::certificates::encoding::DerCertificate,
+        pq_certificate: aether::key_negotiation::PqCertificate,
+    ) -> Result<(), TrustUpdateRefusal> {
+        use aether::certificates::client::ClientCertificateGeneration;
+
+        let peer_key =
+            WireGuardKey::parse(peer_wg_public_key).map_err(|_| TrustUpdateRefusal::Protocol)?;
+        // The leaf must name the key it is being recorded against. Two halves
+        // of two identities, assembled here, would be a pair the domain never
+        // issued — §3.3 refuses exactly that at the other end.
+        if pq_certificate.wireguard_public_key.trim() != peer_key.to_base64() {
+            return Err(TrustUpdateRefusal::Rejected);
+        }
+        let facts = aether::certificates::x509::inspect(&tls_certificate)
+            .map_err(|_| TrustUpdateRefusal::Protocol)?;
+        // The narrower of the two windows, because the generation is only
+        // presentable while **both** halves are. Taking the PQ window alone
+        // would date a generation by a certificate the TLS layer has already
+        // stopped accepting.
+        let not_before = facts.not_before.max(pq_certificate.not_before_unix);
+        let not_after = facts.not_after.min(pq_certificate.not_after_unix);
+        if not_after <= not_before {
+            return Err(TrustUpdateRefusal::Rejected);
+        }
+
+        let mut registry = self.registry.lock().await;
+        let state = registry.state();
+        let generation = ClientCertificateGeneration {
+            generation: 1,
+            ca_tls_epoch: state.client_tls_ca.ca_tls_epoch,
+            tls_ca_certificate_fingerprint: state
+                .client_tls_ca
+                .active_client_tls_ca_certificate
+                .fingerprint(),
+            tls_certificate_fingerprint: tls_certificate.fingerprint(),
+            pq_certificate_fingerprint: aether::certificates::gateway::pq_certificate_fingerprint(
+                &pq_certificate,
+            )
+            .map_err(|_| TrustUpdateRefusal::Protocol)?,
+            not_before,
+            not_after,
+        };
+        // Idempotent for a peer already recorded at this exact generation: an
+        // admission that failed to persist `network.toml` is re-run by the
+        // operator, and refusing the second attempt would leave them with a
+        // registry row they cannot get rid of.
+        if let Some(existing) = registry.peer(&peer_key) {
+            if existing.name == name
+                && existing.state.active == generation
+                && !existing.state.revoked
+            {
+                return Ok(());
+            }
+        }
+        registry
+            .admit(name, &peer_key, generation, pq_certificate)
+            .map_err(|error| {
+                tracing::warn!(peer = %name, %error, "certificate registry refused an admission");
+                classify(error)
+            })?;
+        tracing::info!(peer = %name, "first certificate generation recorded");
+        Ok(())
+    }
+
+    /// Reads one queued admission and records it.
+    ///
+    /// The two certificates are decoded here rather than by the console: the
+    /// daemon is the end that will have to authenticate them, so it is the end
+    /// that decides whether they are readable at all.
+    async fn record_queued_admission(&self, path: &std::path::Path) -> Result<String> {
+        use base64::Engine as _;
+
+        let encoded = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let queued: QueuedAdmission =
+            serde_json::from_slice(&encoded).context("reading the queued admission")?;
+        let decoder = base64::engine::general_purpose::STANDARD;
+        let tls = aether::certificates::encoding::DerCertificate::new(
+            decoder
+                .decode(queued.tls_certificate.trim())
+                .context("the TLS certificate is not base64")?,
+        )
+        .map_err(|error| anyhow::anyhow!("the TLS certificate is refused: {error}"))?;
+        let pq: aether::key_negotiation::PqCertificate = serde_json::from_slice(
+            &decoder
+                .decode(queued.pq_certificate.trim())
+                .context("the PQ certificate is not base64")?,
+        )
+        .context("the PQ certificate is not a JSON document")?;
+        self.record_first_generation(&queued.name, &queued.client_wg_public_key, tls, pq)
+            .await
+            .map_err(|refusal| anyhow::anyhow!("the registry refused it: {refusal:?}"))?;
+        Ok(queued.name)
+    }
+
     /// Drops expired candidates and promotes due generations.
     ///
     /// Run on the same lock as everything else, so a purge never races the
@@ -140,6 +245,16 @@ impl AstraStageHandler for CertificateService {
         let caller = authorization.client_wg_public_key;
         let now = now_unix();
         let mut registry = self.registry.lock().await;
+        assert_candidate_is_presentable(registry.state(), &authorization).map_err(|reason| {
+            tracing::error!(
+                peer = %caller,
+                %reason,
+                "staging from Astra refused: this gateway could not authenticate the candidate \
+                 leaves once they became active, and staging them would lock the client out at \
+                 the end of the overlap"
+            );
+            TrustUpdateRefusal::Rejected
+        })?;
         let receipt = registry
             .stage(&caller, &authorization, now)
             .map_err(|error| {
@@ -251,6 +366,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
         Ok(helios_api::internal::PeerCertificateStateView {
             name: peer.name.clone(),
             state: peer.state.clone(),
+            active_pq_certificate: peer.active_pq_certificate.clone(),
         })
     }
 
@@ -308,6 +424,115 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
                 classify(error)
             })
     }
+}
+
+/// One admission, as the console leaves it for the daemon.
+///
+/// # Why an inbox and not a direct write
+///
+/// `heliosd peer add` runs in another process, and the daemon holds the
+/// registry **in memory**: a second writer would either be overwritten at the
+/// daemon's next persist, or would overwrite a staging in flight. So the
+/// console writes what it knows — the two public leaves — and the daemon, which
+/// is the single owner, performs the admission. It is the same shape as
+/// `network.toml` being watched rather than pushed, and for the same reason.
+///
+/// Everything here is public. A file left behind by a daemon that was not
+/// running is drained at its next start, which is what makes an offline
+/// `peer add` followed by a boot equivalent to an online one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedAdmission {
+    pub name: String,
+    pub client_wg_public_key: String,
+    /// The TLS leaf, DER in base64.
+    pub tls_certificate: String,
+    /// The PQ leaf, its JSON document in base64.
+    pub pq_certificate: String,
+}
+
+/// Where the console leaves admissions for the daemon.
+///
+/// Beside the registry rather than at a fixed path, so a test — and a
+/// `--dev` daemon — keeps both in the same disposable directory.
+pub fn admission_inbox(registry_path: &std::path::Path) -> PathBuf {
+    registry_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("admissions")
+}
+
+/// Leaves one admission for the daemon to record.
+///
+/// Named by the peer's WireGuard key, so a re-run of the same admission
+/// replaces its own file instead of queueing a second one.
+pub fn queue_admission(
+    registry_path: &std::path::Path,
+    admission: &QueuedAdmission,
+) -> Result<PathBuf> {
+    let directory = admission_inbox(registry_path);
+    aether::private_file::create_private_dir(&directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let name = format!(
+        "{}.json",
+        aether::certificates::encoding::Fingerprint::of(admission.client_wg_public_key.as_bytes())
+            .to_hex()
+    );
+    let path = directory.join(name);
+    let encoded = serde_json::to_vec_pretty(admission).context("encoding the admission")?;
+    aether::private_file::write_private_atomic(&path, &encoded)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// How often the daemon looks for admissions left by the console.
+///
+/// The same cadence as `network.toml` is watched at, and for the same reason:
+/// an operator admits a peer and then immediately asks for its trust block.
+/// Nothing is read unless a file is there, so the cost between two admissions
+/// is one `read_dir` on an empty directory.
+pub const ADMISSION_POLL_INTERVAL_SECS: u64 = 2;
+
+/// Records the admissions the console left, and forgets the ones it recorded.
+///
+/// A refusal deletes the file too, and says so loudly: a queued admission that
+/// this gateway will never accept — a leaf naming another peer, a window
+/// already closed — would otherwise be retried every two seconds for as long
+/// as the daemon runs, and the operator would read the same line for ever
+/// instead of re-admitting.
+pub fn spawn_admission_drain(service: Arc<CertificateService>, registry_path: PathBuf) {
+    tokio::spawn(async move {
+        let directory = admission_inbox(&registry_path);
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(ADMISSION_POLL_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                match service.record_queued_admission(&path).await {
+                    Ok(name) => {
+                        tracing::info!(peer = %name, "console admission recorded");
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            file = %path.display(),
+                            %error,
+                            "console admission refused: this peer has no certificate generation, \
+                             so it will connect but never renew. Re-admit it."
+                        );
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    });
 }
 
 /// How often the lifecycle sweeps leases and overlaps.
@@ -418,6 +643,88 @@ pub fn enrolment_view(
     }
 }
 
+/// Refuses a candidate this gateway would not accept on the negotiation port.
+///
+/// # Why staging has to ask this at all
+///
+/// A staged generation becomes the client's only identity at the end of its
+/// overlap. If the gateway cannot authenticate it then, the client is locked
+/// out of the tunnel that was its only way to ask for help — and the operator
+/// finds out days later, on a machine that no longer connects. So the question
+/// is asked **before** the candidate is written, where the answer still costs
+/// nothing.
+///
+/// # Limite connue — the two anchors are not the same one yet
+///
+/// The negotiation port authenticates a client under exactly one client TLS CA
+/// and one client PQ CA, both read from `/var/lib/helios` at start-up. A
+/// renewed leaf, however, is issued by Astra's delegated issuer: its TLS half
+/// chains to the intermediate the delegation names, and its PQ half is signed
+/// by the issuer's ML-DSA-87 key. Both are legitimate — every lifecycle object
+/// says so — and neither is something this gateway's negotiation currently
+/// verifies against.
+///
+/// Closing that is the next lot, and it is two things: the negotiation reading
+/// the certificate registry (`acceptable_pq_fingerprints`, `resolve_pair` and
+/// the delegated issuer's public key) instead of the frozen pins of
+/// `network.toml`, and the client TLS anchor of the domain becoming the one
+/// the authority actually issues under. Until both land, this check is what
+/// keeps an installed delegation from producing a certificate nobody can use.
+fn assert_candidate_is_presentable(
+    state: &helios_provisioning::certificates::RegistryState,
+    authorization: &aether::certificates::client::ClientCertificateStageAuthorization,
+) -> Result<(), String> {
+    use aether::certificates::x509;
+
+    // The TLS half: the leaf must chain to an anchor this gateway holds. When
+    // a delegation issued it, that means the intermediate itself has to be
+    // issued by one of the two client TLS CAs the registry names.
+    let anchors: Vec<_> = [
+        Some(&state.client_tls_ca.active_client_tls_ca_certificate),
+        state.client_tls_ca.next_client_tls_ca_certificate.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let direct = anchors
+        .iter()
+        .any(|anchor| x509::assert_issued_by(&authorization.next_tls_certificate, anchor).is_ok());
+    let delegated = authorization
+        .issuer_authorization
+        .as_ref()
+        .is_some_and(|delegation| {
+            x509::assert_issued_by(
+                &authorization.next_tls_certificate,
+                &delegation.tls_intermediate_certificate,
+            )
+            .is_ok()
+                && anchors.iter().any(|anchor| {
+                    x509::assert_issued_by(&delegation.tls_intermediate_certificate, anchor).is_ok()
+                })
+        });
+    if !direct && !delegated {
+        return Err("the candidate TLS leaf chains to no client CA this gateway holds".into());
+    }
+
+    // The PQ half: the negotiation verifies a client leaf under one key, read
+    // from disk. A candidate signed by anything else authenticates nowhere.
+    let client_pq_ca = std::fs::read(crate::key_negotiation::CLIENT_PQ_CA_PATH)
+        .map_err(|error| format!("the client PQ CA is unreadable: {error}"))?;
+    authorization
+        .next_pq_certificate
+        .verify(
+            &client_pq_ca,
+            aether::key_negotiation::PqCertificateRole::Client,
+            None,
+            &authorization.client_wg_public_key.to_base64(),
+            now_unix(),
+        )
+        .map_err(|error| {
+            format!("the candidate PQ leaf is not verifiable by the negotiation port: {error}")
+        })?;
+    Ok(())
+}
+
 /// Maps a registry refusal to the bounded class the API may report.
 ///
 /// The detail goes to the protected log. A peer learns only the class, exactly
@@ -443,6 +750,17 @@ impl TrustUpdateHandler for CertificateService {
     /// a profile that pins a pair which never existed together, and the
     /// mismatch would only surface at the first renewal — 80 % into a leaf's
     /// life, on a client with no fallback.
+    async fn admit_peer(
+        &self,
+        name: &str,
+        peer_wg_public_key: &str,
+        tls_certificate: aether::certificates::encoding::DerCertificate,
+        pq_certificate: Box<aether::key_negotiation::PqCertificate>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        self.record_first_generation(name, peer_wg_public_key, tls_certificate, *pq_certificate)
+            .await
+    }
+
     async fn trust_enrolment(
         &self,
         peer_wg_public_key: &str,
@@ -726,6 +1044,197 @@ mod tests {
             active_client_pq_certificate_fingerprint: peer.state.active.pq_certificate_fingerprint,
             client_pq_certificate_fingerprint: Fingerprint::of(b"presented"),
         }
+    }
+
+    /// A registry on a disposable path, and a signer that signs nothing.
+    ///
+    /// `admit_peer` never reaches the signer — it records a generation the
+    /// operator issued — so a stub that refuses is enough, and it makes the
+    /// test say out loud that admission borrows no gateway key.
+    struct RefusingSigner;
+
+    impl StageReceiptSigner for RefusingSigner {
+        fn sign_stage_receipt(
+            &self,
+            _receipt: GatewayCertificateStageReceipt,
+        ) -> Result<GatewayCertificateStageReceipt, CertificateError> {
+            Err(CertificateError::Signing)
+        }
+
+        fn served_pq_certificate(&self) -> PqCertificate {
+            gateway_leaf()
+        }
+    }
+
+    fn service(state: RegistryState) -> (CertificateService, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let registry =
+            CertificateRegistry::bootstrap(directory.path().join("certificates.json"), state)
+                .expect("registry");
+        (
+            CertificateService::new(registry, Arc::new(RefusingSigner)),
+            directory,
+        )
+    }
+
+    /// A client leaf issued to one exact WireGuard key, with a real signature.
+    fn client_leaf(wg_public_key: &WireGuardKey, not_after: u64) -> PqCertificate {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, subject_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [3; 16],
+                subject: "workstation".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: wg_public_key.to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 100,
+                not_after_unix: not_after,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_private,
+        )
+        .expect("issue")
+    }
+
+    /// Admission is where a peer enters the registry, and it enters whole:
+    /// both leaves, the anchor they chain to, and the window in which they may
+    /// be presented. Without this row there is no trust block, therefore a
+    /// profile that connects and can never renew — and nothing says so until
+    /// 80 % of a leaf's life.
+    #[tokio::test]
+    async fn admission_records_the_first_generation_from_the_two_leaves() {
+        let state = state();
+        let anchor = state
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint();
+        let (service, _directory) = service(state);
+        let peer_key = key(2);
+        let material = aether::certificates::test_x509::client_material("workstation");
+        let leaf = client_leaf(&peer_key, 500_000);
+
+        service
+            .admit_peer(
+                "workstation",
+                &peer_key.to_base64(),
+                material.leaf.clone(),
+                Box::new(leaf.clone()),
+            )
+            .await
+            .expect("admission");
+
+        let registry = service.registry.lock().await;
+        let recorded = registry.peer(&peer_key).expect("peer recorded");
+        assert_eq!(recorded.name, "workstation");
+        assert_eq!(recorded.state.active.generation, 1);
+        assert_eq!(
+            recorded.state.active.tls_certificate_fingerprint,
+            material.leaf.fingerprint()
+        );
+        assert_eq!(
+            recorded.state.active.pq_certificate_fingerprint,
+            aether::certificates::gateway::pq_certificate_fingerprint(&leaf).expect("fingerprint")
+        );
+        assert_eq!(
+            recorded.state.active.tls_ca_certificate_fingerprint, anchor,
+            "the generation names the anchor the registry actually holds"
+        );
+        // The narrower of the two windows: the PQ leaf expires first here, and
+        // a generation is only presentable while both halves are.
+        assert_eq!(recorded.state.active.not_after, 500_000);
+    }
+
+    /// An interrupted admission is re-run by the operator. The second attempt
+    /// has to finish it, not refuse it — otherwise the registry holds a row
+    /// they cannot get rid of and cannot complete.
+    #[tokio::test]
+    async fn re_admitting_an_unchanged_peer_is_a_no_op() {
+        let (service, _directory) = service(state());
+        let peer_key = key(2);
+        let material = aether::certificates::test_x509::client_material("workstation");
+        let leaf = client_leaf(&peer_key, 500_000);
+
+        for _ in 0..2 {
+            service
+                .admit_peer(
+                    "workstation",
+                    &peer_key.to_base64(),
+                    material.leaf.clone(),
+                    Box::new(leaf.clone()),
+                )
+                .await
+                .expect("admission");
+        }
+
+        assert_eq!(service.registry.lock().await.state().peers.len(), 1);
+    }
+
+    /// The PQ leaf names the WireGuard key it belongs to. Recording it against
+    /// another one assembles an identity the domain never issued — §3.3 refuses
+    /// exactly that pair at the other end, and it must not be creatable here.
+    #[tokio::test]
+    async fn a_leaf_naming_another_peer_is_refused() {
+        let (service, _directory) = service(state());
+        let material = aether::certificates::test_x509::client_material("workstation");
+        let leaf = client_leaf(&key(2), 500_000);
+
+        let refusal = service
+            .admit_peer(
+                "workstation",
+                &key(3).to_base64(),
+                material.leaf,
+                Box::new(leaf),
+            )
+            .await
+            .expect_err("a leaf naming another peer must be refused");
+        assert!(matches!(refusal, TrustUpdateRefusal::Rejected));
+    }
+
+    /// `heliosd peer add` runs in another process and may not write the
+    /// registry — the daemon holds it in memory, and a second writer would be
+    /// overwritten at the next persist. So the console queues, and the daemon
+    /// records: this is that hand-off, end to end.
+    #[tokio::test]
+    async fn a_queued_console_admission_becomes_a_generation() {
+        use base64::Engine as _;
+        let (service, directory) = service(state());
+        let registry_path = directory.path().join("certificates.json");
+        let peer_key = key(2);
+        let material = aether::certificates::test_x509::client_material("workstation");
+        let leaf = client_leaf(&peer_key, 500_000);
+        let encoder = base64::engine::general_purpose::STANDARD;
+
+        let path = queue_admission(
+            &registry_path,
+            &QueuedAdmission {
+                name: "workstation".into(),
+                client_wg_public_key: peer_key.to_base64(),
+                tls_certificate: encoder.encode(material.leaf.as_bytes()),
+                pq_certificate: encoder.encode(serde_json::to_vec(&leaf).expect("json")),
+            },
+        )
+        .expect("queued");
+
+        let name = service
+            .record_queued_admission(&path)
+            .await
+            .expect("recorded");
+
+        assert_eq!(name, "workstation");
+        let registry = service.registry.lock().await;
+        assert_eq!(
+            registry
+                .peer(&peer_key)
+                .expect("peer recorded")
+                .state
+                .active
+                .generation,
+            1
+        );
     }
 
     /// The block a profile carries is exactly what the registry holds, and it

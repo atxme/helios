@@ -104,6 +104,11 @@ pub enum RegistryError {
     Io(#[from] std::io::Error),
     #[error("registry is unreadable: {0}")]
     Corrupt(String),
+    #[error(
+        "this authority already holds the delegation of epoch {installed}: installing epoch \
+         {offered} would walk an issuer decision backwards"
+    )]
+    IssuerEpochNotAdvancing { installed: u64, offered: u64 },
 }
 
 /// The registry and its file.
@@ -235,18 +240,55 @@ impl AstraRegistry {
     }
 
     /// Records a peer's first generation.
+    ///
+    /// Astra does not decide admission — the gateway does — so this is a
+    /// **transcription**: the record is built from what the gateway answers on
+    /// the private channel, and it exists so a renewal can be checked against
+    /// the generation the domain actually holds rather than the one a request
+    /// claims. Re-transcribing an unchanged peer is a no-op, which is what
+    /// makes the lazy path of [`crate::renewal`] safe to retry.
     pub fn admit(&mut self, record: PeerRecord, now_unix: u64) -> Result<(), RegistryError> {
         let key = record.client_wg_public_key.to_base64();
+        if self.state.peers.get(&key) == Some(&record) {
+            return Ok(());
+        }
         let generation = record.active.generation;
         let name = record.name.clone();
         self.state.peers.insert(key, record);
         self.state.audit.append(
-            AuditEvent::ClientStageAuthorized {
+            AuditEvent::PeerAdmitted {
                 peer: name,
                 generation,
             },
             now_unix,
         );
+        self.save()
+    }
+
+    /// Installs the delegation the operator companion signed (spec §9.5).
+    ///
+    /// The epoch must move forward. A delegation reinstalled at an epoch
+    /// already used would let a withdrawn intermediate come back under a
+    /// signature that is still perfectly valid — the same walk-back the
+    /// credential document refuses, and for the same reason.
+    pub fn install_issuer(
+        &mut self,
+        issuer: AstraIssuerState,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        if let Some(installed) = &self.state.issuer {
+            if issuer.issuer_epoch <= installed.issuer_epoch {
+                return Err(RegistryError::IssuerEpochNotAdvancing {
+                    installed: installed.issuer_epoch,
+                    offered: issuer.issuer_epoch,
+                });
+            }
+        }
+        let issuer_epoch = issuer.issuer_epoch;
+        self.state.issuer = Some(issuer);
+        self.state
+            .audit
+            .append(AuditEvent::IssuerInstalled { issuer_epoch }, now_unix);
         self.save()
     }
 
@@ -578,6 +620,81 @@ mod tests {
             stage_expires_at: expires_at,
             granted: false,
         }
+    }
+
+    /// A delegation is installed by epoch, and the epoch only ever rises.
+    /// Reinstalling one already used would let a withdrawn intermediate come
+    /// back under a signature that is still perfectly valid.
+    #[test]
+    fn a_delegation_may_not_walk_its_epoch_backwards() {
+        use aether::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+        use aether::certificates::encoding::{DerCertificate, MlDsa87Signature};
+        use aether::certificates::state::{AstraIssuerState, IssuerLifecycle};
+
+        let (mut registry, _dir) = registry();
+        let (_, issuer_key) = generate_ml_dsa_87_keypair().expect("keygen");
+        let delegation = |epoch: u64| AstraIssuerState {
+            issuer_epoch: epoch,
+            authorization: AstraIssuerAuthorization {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                ca_epoch: 1,
+                ca_tls_epoch: 1,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                issuer_epoch: epoch,
+                pq_issuer_public_key: issuer_key.clone(),
+                tls_intermediate_certificate: DerCertificate::new(vec![9; 64]).expect("der"),
+                allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: 100_000,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            state: IssuerLifecycle::Active,
+        };
+
+        registry
+            .install_issuer(delegation(1), 1_000)
+            .expect("first");
+        assert!(matches!(
+            registry.install_issuer(delegation(1), 1_100),
+            Err(RegistryError::IssuerEpochNotAdvancing {
+                installed: 1,
+                offered: 1
+            })
+        ));
+        registry
+            .install_issuer(delegation(2), 1_200)
+            .expect("second");
+        assert_eq!(
+            registry
+                .state()
+                .issuer
+                .as_ref()
+                .expect("issuer")
+                .issuer_epoch,
+            2
+        );
+    }
+
+    /// The peer table is a transcription of the gateway's admission, and the
+    /// lazy path re-runs it on every renewal. Re-transcribing an unchanged
+    /// peer must not append an audit record — a chain that grew on every
+    /// renewal would make its head useless as a restore witness.
+    #[test]
+    fn re_transcribing_an_unchanged_peer_appends_nothing() {
+        let (mut registry, _dir) = registry();
+        let head = registry.audit_head();
+        let record = registry
+            .peer(&WireGuardKey::from_bytes([2; 32]))
+            .expect("peer")
+            .clone();
+
+        registry.admit(record, 2_000).expect("re-transcription");
+
+        assert_eq!(registry.audit_head(), head);
     }
 
     #[test]

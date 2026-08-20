@@ -9,6 +9,11 @@
 //! - `status` prints what the authority currently believes, including the head
 //!   of the audit chain — the value an operator records so a restore can be
 //!   told apart from a fork.
+//! - `issuer request` / `issuer install` prepare the delegated issuer and take
+//!   back the delegation the companion signed. Two commands and not one,
+//!   because the signature happens on another machine, at a security key: the
+//!   private halves are born here and never travel, and what crosses is a
+//!   public request one way and a `CA-PQ`-signed authorization the other.
 //!
 //! # Limite connue
 //!
@@ -37,8 +42,21 @@ use zeroize::Zeroizing;
 const DEFAULT_STATE_DIR: &str = "/var/lib/astra";
 const REGISTRY_FILE: &str = "registry.json";
 const SERVICE_KEY_FILE: &str = "service-key.bin";
-const ISSUER_PQ_KEY_FILE: &str = "issuer-pq-key.bin";
-const ISSUER_TLS_KEY_FILE: &str = "issuer-tls-key.der";
+/// Private material of one delegation, addressed by its epoch.
+///
+/// Epoch-addressed rather than fixed: `issuer request` writes the keys of the
+/// **next** delegation while the current one is still signing, and the
+/// registry names the epoch that is installed. An interrupted authorization
+/// therefore leaves an unreferenced pair of files and a working issuer, rather
+/// than a live delegation whose keys were overwritten by a candidate nobody
+/// signed.
+fn issuer_pq_key_path(state_dir: &Path, issuer_epoch: u64) -> PathBuf {
+    state_dir.join(format!("issuer-pq-key-{issuer_epoch}.bin"))
+}
+
+fn issuer_tls_key_path(state_dir: &Path, issuer_epoch: u64) -> PathBuf {
+    state_dir.join(format!("issuer-tls-key-{issuer_epoch}.der"))
+}
 const OPERATIONS_FILE: &str = "client-renewal-operations.json";
 /// The signed credential decisions of the domain, as the companion emits them.
 ///
@@ -128,12 +146,49 @@ enum Command {
         #[arg(long, env = "ASTRA_GATEWAY_CLIENT_CERTIFICATE")]
         gateway_client_certificate: Option<String>,
     },
+    /// Prepares the delegated issuer, and installs the delegation once signed.
+    Issuer {
+        #[command(subcommand)]
+        command: IssuerCommand,
+    },
     /// Prints the authority's state and the head of its audit chain.
     Status,
 }
 
+#[derive(Subcommand)]
+enum IssuerCommand {
+    /// Generates the next delegation's private material and prints its request.
+    ///
+    /// The request is public: an ML-DSA-87 public key and a PKCS#10 request
+    /// for the TLS intermediate. It goes to the operator's machine, where
+    /// `astra-signer authorize-issuer` signs it under `CA-PQ` at a security
+    /// key. Nothing here can sign anything until that authorization comes
+    /// back — the keys exist, and no object names them.
+    Request {
+        /// Where to write the request, in addition to standard output.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Installs the `AstraIssuerAuthorization` the companion signed.
+    ///
+    /// Verified under the anchor the registry pins, against the pinned
+    /// issuance policy, and against the private keys already on disk — three
+    /// checks that come from three different places, which is the only reason
+    /// installing is not simply believing a file.
+    Install {
+        /// The signed authorization, in JSON. Standard input when absent.
+        #[arg(long)]
+        authorization: Option<PathBuf>,
+    },
+}
+
 fn main() -> Result<()> {
+    // Logs on **stderr**, so standard output carries only what a command
+    // produces. `issuer request` is piped out of the container by the
+    // deployment, and a start-up banner interleaved with its JSON would make
+    // the handover depend on the log level.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -184,6 +239,12 @@ fn main() -> Result<()> {
             private_bind,
             gateway_client_certificate.as_deref(),
         ),
+        Command::Issuer { command } => match command {
+            IssuerCommand::Request { out } => issuer_request(&cli.state_dir, out.as_deref()),
+            IssuerCommand::Install { authorization } => {
+                issuer_install(&cli.state_dir, authorization.as_deref())
+            }
+        },
         Command::Status => status(&cli.state_dir),
     }
 }
@@ -591,8 +652,8 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
         );
         return Ok(None);
     };
-    let pq_key = state_dir.join(ISSUER_PQ_KEY_FILE);
-    let tls_key = state_dir.join(ISSUER_TLS_KEY_FILE);
+    let pq_key = issuer_pq_key_path(state_dir, installed.issuer_epoch);
+    let tls_key = issuer_tls_key_path(state_dir, installed.issuer_epoch);
     if !pq_key.exists() || !tls_key.exists() {
         tracing::error!(
             issuer_epoch = installed.issuer_epoch,
@@ -627,6 +688,166 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
         "delegated issuer loaded"
     );
     Ok(Some(issuer))
+}
+
+/// Draws the next delegation's private keys and prints its public request.
+///
+/// Nothing is installed and nothing is announced: the registry is only read,
+/// for the epoch to advance from. Until an authorization comes back, these two
+/// files are a key pair no signed object names — which is exactly the state an
+/// interrupted ceremony should leave behind.
+fn issuer_request(state_dir: &Path, out: Option<&Path>) -> Result<()> {
+    use base64::Engine as _;
+
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let state = registry.state();
+    let issuer_epoch = state
+        .issuer
+        .as_ref()
+        .map(|installed| installed.issuer_epoch)
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("issuer epoch overflow")?;
+
+    let (pq_private_key, pq_public_key) =
+        generate_ml_dsa_87_keypair().context("generating the delegated issuer ML-DSA-87 key")?;
+    let tls_key = rcgen::KeyPair::generate().context("generating the delegated issuer TLS key")?;
+
+    // Subject only. Validity, `basicConstraints` and key usage are the
+    // issuer's decision and are set by the companion when it signs — a PKCS#10
+    // request that carried them would be asking for what it is not entitled to
+    // choose.
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .context("building the intermediate request")?;
+    let mut name = rcgen::DistinguishedName::new();
+    name.push(
+        rcgen::DnType::CommonName,
+        format!("astra delegated issuer {issuer_epoch}"),
+    );
+    params.distinguished_name = name;
+    let csr = params
+        .serialize_request(&tls_key)
+        .context("serializing the intermediate request")?;
+
+    // The private halves first: a request whose keys were not written would
+    // name a public key nobody can ever sign with, and the operator would only
+    // discover it after a security-key ceremony.
+    aether::private_file::write_private_atomic(
+        &issuer_pq_key_path(state_dir, issuer_epoch),
+        &pq_private_key,
+    )
+    .context("sealing the delegated issuer ML-DSA-87 key")?;
+    aether::private_file::write_private_atomic(
+        &issuer_tls_key_path(state_dir, issuer_epoch),
+        &tls_key.serialize_der(),
+    )
+    .context("sealing the delegated issuer TLS key")?;
+
+    let request = astra::issuer::IssuerDelegationRequest {
+        trust_domain_id: state.trust_domain_id.to_hex(),
+        issuer_epoch,
+        pq_issuer_public_key: pq_public_key.to_base64(),
+        tls_intermediate_csr: base64::engine::general_purpose::STANDARD.encode(csr.der()),
+    };
+    let encoded = serde_json::to_vec_pretty(&request).context("encoding the delegation request")?;
+    if let Some(out) = out {
+        std::fs::write(out, &encoded).with_context(|| format!("writing {}", out.display()))?;
+        eprintln!("delegation request : {}", out.display());
+    }
+    eprintln!("issuer epoch       : {issuer_epoch}");
+    eprintln!(
+        "sign it with `astra-signer authorize-issuer --request <file> --out <file>`, then feed \
+         the result back to `astra issuer install`"
+    );
+    // On standard output, alone, so a deployment script can pipe it out of the
+    // container without a shared volume.
+    println!("{}", String::from_utf8_lossy(&encoded));
+    Ok(())
+}
+
+/// Installs a signed delegation, after checking it three ways.
+///
+/// The anchor the registry pins, the policy it computed at bootstrap, and the
+/// private keys already on disk. The three come from three different places on
+/// purpose: a file that satisfies all of them is one this authority can
+/// actually issue with, and the alternative is announcing a delegation whose
+/// first use fails at 80 % of a client's leaf.
+fn issuer_install(state_dir: &Path, authorization: Option<&Path>) -> Result<()> {
+    let encoded = match authorization {
+        Some(path) => std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        None => {
+            use std::io::Read as _;
+            let mut buffer = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buffer)
+                .context("reading the authorization from standard input")?;
+            buffer
+        }
+    };
+    let authorization: aether::certificates::authority::AstraIssuerAuthorization =
+        serde_json::from_slice(&encoded).context("reading the issuer authorization")?;
+
+    let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let now = now_unix();
+    {
+        let state = registry.state();
+        authorization
+            .verify(
+                &state.ca_public_key,
+                &state.trust_domain_id,
+                state.ca_epoch,
+                state.ca_tls_epoch,
+                &state.gateway_wg_public_key,
+                &state.server_name,
+                now,
+            )
+            .context("verifying the issuer authorization under this domain's anchor")?;
+        state
+            .astra_policy_fingerprint
+            .assert_authorizes(&authorization)
+            .context("the delegation does not match the pinned Astra issuance policy")?;
+    }
+
+    let issuer_epoch = authorization.issuer_epoch;
+    let pq_key = issuer_pq_key_path(state_dir, issuer_epoch);
+    let tls_key = issuer_tls_key_path(state_dir, issuer_epoch);
+    anyhow::ensure!(
+        pq_key.exists() && tls_key.exists(),
+        "no private material for issuer epoch {issuer_epoch} in {}: this authorization answers a \
+         request another state directory made, or `astra issuer request` was never run here",
+        state_dir.display()
+    );
+    let pq_private_key =
+        Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
+    let tls_private_key =
+        Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
+    // Possession, before anything is recorded: this is the check that refuses
+    // a delegation signed around somebody else's public key.
+    DelegatedIssuer::load(authorization.clone(), pq_private_key, tls_private_key)
+        .context("checking the delegation against the private material on disk")?;
+
+    let not_after = authorization.not_after;
+    registry
+        .install_issuer(
+            aether::certificates::state::AstraIssuerState {
+                issuer_epoch,
+                authorization,
+                state: aether::certificates::state::IssuerLifecycle::Active,
+            },
+            now,
+        )
+        .context("recording the delegation")?;
+
+    println!("issuer epoch     : {issuer_epoch}");
+    println!("delegation until : {not_after}");
+    println!("audit head       : {}", registry.audit_head());
+    println!(
+        "restart Astra to load it: the delegation is read at start-up, beside the private keys \
+         it names"
+    );
+    Ok(())
 }
 
 fn status(state_dir: &Path) -> Result<()> {

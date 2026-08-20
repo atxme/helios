@@ -106,23 +106,11 @@ pub const ANCHOR_ROTATION_CREDENTIALS: usize = 2;
 
 /// What Astra asks the companion to delegate to, for one issuer epoch.
 ///
-/// Astra generates and seals its own issuer keys locally (spec §9.5); what
-/// travels here is their public half and a PKCS#10 request for the TLS
-/// intermediate. The companion issues the intermediate under `CA-TLS` and
-/// binds both to one `AstraIssuerAuthorization` under `CA-PQ`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IssuerDelegationRequest {
-    /// Trust domain identifier, 32 hex characters. Compared with the vault's,
-    /// so a request meant for another authority is refused before it is
-    /// signed rather than after.
-    pub trust_domain_id: String,
-    pub issuer_epoch: u64,
-    /// ML-DSA-87 public key of the delegated issuer, base64.
-    pub pq_issuer_public_key: String,
-    /// PKCS#10 request for the TLS intermediate, DER base64.
-    pub tls_intermediate_csr: String,
-}
+/// Defined by `astra`, which is the end that **writes** it, and re-exported
+/// here rather than declared twice: the two ends are two programs on two
+/// machines, and a field that drifted would surface as a JSON refusal in the
+/// middle of a ceremony with a security key already plugged in.
+pub use astra::issuer::IssuerDelegationRequest;
 
 /// The bounds an operator sets on one delegation.
 #[derive(Debug, Clone, Copy)]

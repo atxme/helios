@@ -660,6 +660,127 @@ mod security_tests {
         r#""bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb""#
     );
 
+    /// A gateway holding a trust domain, for the two admission refusals below.
+    struct RecordingTrustHandler {
+        admitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl certificates::TrustUpdateHandler for RecordingTrustHandler {
+        async fn trust_enrolment(
+            &self,
+            _peer_wg_public_key: &str,
+        ) -> Result<certificates::TrustEnrolmentView, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn admit_peer(
+            &self,
+            _name: &str,
+            peer_wg_public_key: &str,
+            _tls_certificate: aether::certificates::encoding::DerCertificate,
+            _pq_certificate: Box<aether::key_negotiation::PqCertificate>,
+        ) -> Result<(), certificates::TrustUpdateRefusal> {
+            self.admitted
+                .lock()
+                .unwrap()
+                .push(peer_wg_public_key.to_string());
+            Ok(())
+        }
+
+        async fn trust_update(
+            &self,
+            _caller_wg_public_key: &str,
+            _request: aether::certificates::transport::AuthenticatedTrustUpdateRequest,
+        ) -> Result<certificates::TrustUpdateResponse, certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+
+        async fn stage_commit(
+            &self,
+            _caller_wg_public_key: &str,
+            _request: Box<certificates::StageCommitRequest>,
+        ) -> Result<(), certificates::TrustUpdateRefusal> {
+            Err(certificates::TrustUpdateRefusal::Rejected)
+        }
+    }
+
+    /// A gateway that holds a trust domain records the **leaves**, not their
+    /// digests. An admission that carries only the fingerprints would produce
+    /// a peer with no registry row: a client that connects and can never renew,
+    /// and nothing would say so until 80 % of its leaf's life.
+    #[tokio::test]
+    async fn admission_into_a_trust_domain_refuses_fingerprints_alone() {
+        let (_lock, _path) = isolated_config().await;
+        let (mut state, _cmd_rx) = state();
+        state.trust_update = Some(Arc::new(RecordingTrustHandler {
+            admitted: Default::default(),
+        }));
+
+        let response = router(state)
+            .oneshot(admin_request(
+                "/api/peers",
+                &format!(r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY}}}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("certificates"),
+            "the refusal names what is missing: {message}"
+        );
+    }
+
+    /// The peer table pins digests and the registry records objects. If the
+    /// two disagree, the gateway would hold two answers about which
+    /// certificate belongs to this peer — so the admission is refused rather
+    /// than resolved in favour of either.
+    #[tokio::test]
+    async fn admission_refuses_a_certificate_that_contradicts_its_pin() {
+        use base64::Engine as _;
+        let (_lock, _path) = isolated_config().await;
+        let (mut state, _cmd_rx) = state();
+        let handler = Arc::new(RecordingTrustHandler {
+            admitted: Default::default(),
+        });
+        state.trust_update = Some(handler.clone());
+
+        let encoder = base64::engine::general_purpose::STANDARD;
+        let certificate = encoder.encode(vec![9u8; 64]);
+        let pq = encoder.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "serial": vec![0u8; 16],
+                "subject": "laptop",
+                "issuer": "CA-PQ",
+                "role": "client",
+                "wireguard_public_key": NEW_KEY,
+                "ml_dsa_87_public_key": "cHVibGlj",
+                "not_before_unix": 0,
+                "not_after_unix": 1_000_000,
+                "ml_dsa_87_signature": "c2ln",
+            }))
+            .unwrap(),
+        );
+
+        let body = format!(
+            r#"{{"name":"laptop","public_key":"{NEW_KEY}",{ADMIT_IDENTITY},"key_negotiation_certificate":"{certificate}","key_negotiation_pq_certificate":"{pq}"}}"#
+        );
+        let response = router(state)
+            .oneshot(admin_request("/api/peers", &body))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            handler.admitted.lock().unwrap().is_empty(),
+            "nothing reaches the registry when the two halves disagree"
+        );
+    }
+
     #[tokio::test]
     async fn admission_allocates_a_vip_and_notifies_the_orchestrator() {
         let (_lock, _path) = isolated_config().await;

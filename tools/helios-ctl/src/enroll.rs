@@ -418,9 +418,18 @@ async fn admit(
     public_key: &str,
     material: &key_nego::ClientMaterial,
 ) -> Result<String> {
+    // The two leaves travel with the two fingerprints: the peer table pins the
+    // digests, the certificate registry records the objects. One admission,
+    // one pair of certificates — a peer whose registry row was written from
+    // another enrollment would hold a generation nobody can renew.
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let tls_certificate = encoder.encode(&material.certificate_der);
+    let pq_certificate = encoder.encode(&material.pq_certificate_json);
     let policy = peer::KeyNegotiationAdmission {
         tls_certificate_sha256: Some(&material.certificate_sha256),
         pq_certificate_sha256: Some(&material.pq_certificate_sha256),
+        tls_certificate: Some(&tls_certificate),
+        pq_certificate: Some(&pq_certificate),
         minimum_mode: options.mode,
     };
 

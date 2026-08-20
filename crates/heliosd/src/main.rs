@@ -9,6 +9,7 @@ mod static_psk;
 mod uplink;
 mod vip_routing;
 
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -267,6 +268,18 @@ enum PeerCommand {
         /// SHA-256 fingerprint of the client's ML-DSA-65 certificate.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
+        /// The client's TLS leaf itself, DER.
+        ///
+        /// A gateway holding a trust domain records the **leaves**, not their
+        /// digests: it verifies signatures made by them. Without the two
+        /// files, this peer would connect and never be able to renew, so the
+        /// admission is refused rather than left to be discovered at 80 % of a
+        /// leaf's life.
+        #[arg(long)]
+        certificate: Option<PathBuf>,
+        /// The client's ML-DSA-87 leaf, its JSON document.
+        #[arg(long)]
+        pq_certificate: Option<PathBuf>,
         /// Refuses future negotiations below this protection level.
         #[arg(long, value_enum)]
         minimum_mode: Option<NegotiationMode>,
@@ -919,8 +932,19 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             admin,
             key_negotiation_certificate_sha256,
             key_negotiation_pq_certificate_sha256,
+            certificate,
+            pq_certificate,
             minimum_mode,
         } => {
+            // Read and checked before `network.toml` moves: an admission whose
+            // certificates cannot be queued must not leave a peer admitted
+            // with no certificate generation.
+            let queued = queue_console_admission(
+                &name,
+                &public_key,
+                certificate.as_deref(),
+                pq_certificate.as_deref(),
+            )?;
             let minimum_mode = admission_floor(
                 minimum_mode,
                 key_negotiation_pq_certificate_sha256.is_some(),
@@ -938,6 +962,13 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             network
                 .save()
                 .context("writing the network configuration")?;
+            if let Some(queued) = queued {
+                certificates::queue_admission(
+                    &helios_provisioning::certificates::CertificateRegistry::path(),
+                    &queued,
+                )
+                .context("queueing the peer's first certificate generation")?;
+            }
             println!("{}\t{}", peer.name, peer.address);
             info!("peer admitted — a running heliosd applies it within seconds, without restart");
             Ok(())
@@ -978,6 +1009,47 @@ fn peer_command(mut network: NetworkConfig, command: PeerCommand) -> anyhow::Res
             Ok(())
         }
     }
+}
+
+/// Prepares the console's half of an admission into the certificate registry.
+///
+/// Returns `None` when this gateway has no trust domain: there is nothing to
+/// record, and admission keeps working exactly as it did before ADR-008.
+///
+/// When it does have one, both certificates are required. The registry needs
+/// the objects — it verifies signatures made by them — and a peer admitted
+/// without them holds no generation, therefore no trust block, therefore a
+/// profile that connects and can never renew. That is refused here rather than
+/// discovered months later.
+fn queue_console_admission(
+    name: &str,
+    public_key: &str,
+    certificate: Option<&Path>,
+    pq_certificate: Option<&Path>,
+) -> anyhow::Result<Option<certificates::QueuedAdmission>> {
+    use base64::Engine as _;
+
+    if !helios_provisioning::certificates::CertificateRegistry::path().exists() {
+        return Ok(None);
+    }
+    let (Some(certificate), Some(pq_certificate)) = (certificate, pq_certificate) else {
+        anyhow::bail!(
+            "this gateway holds a trust domain, so `peer add` also takes the client's two \
+             certificates: --certificate <orion-client-cert.der> --pq-certificate \
+             <orion-client-pq-cert.json>. Without them the peer connects but can never renew."
+        );
+    };
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let tls =
+        std::fs::read(certificate).with_context(|| format!("reading {}", certificate.display()))?;
+    let pq = std::fs::read(pq_certificate)
+        .with_context(|| format!("reading {}", pq_certificate.display()))?;
+    Ok(Some(certificates::QueuedAdmission {
+        name: name.to_string(),
+        client_wg_public_key: public_key.trim().to_string(),
+        tls_certificate: encoder.encode(tls),
+        pq_certificate: encoder.encode(pq),
+    }))
 }
 
 /// Derives the safe default without hiding an explicit operator floor.
@@ -1275,6 +1347,15 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             Ok(Some(service)) => {
                 info!("certificate lifecycle ready");
                 certificates::spawn_maintenance(Arc::clone(&service));
+                // Admissions made on the console, in another process: it may
+                // only leave the two public leaves in an inbox, because this
+                // task is the single owner of the registry. Drained here, and
+                // at every start — an admission made while the daemon was down
+                // is recorded when it comes back.
+                certificates::spawn_admission_drain(
+                    Arc::clone(&service),
+                    helios_provisioning::certificates::CertificateRegistry::path(),
+                );
                 // The private veth listener, on its own socket. Never a path
                 // on the administration API: two listeners make "Astra may
                 // not admit a peer" a fact about which socket the packet
@@ -1510,6 +1591,8 @@ mod tests {
                         name,
                         public_key,
                         admin,
+                        certificate: None,
+                        pq_certificate: None,
                         key_negotiation_certificate_sha256,
                         key_negotiation_pq_certificate_sha256,
                         minimum_mode,

@@ -267,6 +267,16 @@ enum PeerCmd {
         /// SHA-256 fingerprint of the client's ML-DSA-87 certificate.
         #[arg(long)]
         key_negotiation_pq_certificate_sha256: Option<String>,
+        /// The client's TLS leaf, DER — the file `key-nego issue-client` wrote.
+        ///
+        /// A gateway holding a trust domain records the leaves themselves, not
+        /// their digests, and refuses an admission without them: a peer with
+        /// no registry row is a client that connects and can never renew.
+        #[arg(long)]
+        certificate: Option<PathBuf>,
+        /// The client's ML-DSA-87 leaf, its JSON document.
+        #[arg(long)]
+        pq_certificate: Option<PathBuf>,
         /// Refuses every future network negotiation below this mode.
         #[arg(long, value_enum)]
         minimum_mode: Option<key_nego::Mode>,
@@ -826,6 +836,18 @@ fn ensure_command(response: CmdResp, action: &str) -> Result<()> {
 ///
 /// The normalized form is what gets written, so a document and the screen that
 /// displays it never disagree on spelling.
+/// Reads a file and encodes it base64, for the two certificates an admission
+/// carries.
+///
+/// A path rather than a value on the command line: `ps` shows every process's
+/// argv, and a certificate pasted there is one more place an operator can put
+/// the wrong bytes without noticing.
+fn read_base64(path: PathBuf) -> Result<String> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 fn check_allowed_ips(value: Option<String>) -> Result<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
@@ -887,8 +909,12 @@ async fn main() -> Result<()> {
                 admin,
                 key_negotiation_certificate_sha256,
                 key_negotiation_pq_certificate_sha256,
+                certificate,
+                pq_certificate,
                 minimum_mode,
             } => {
+                let certificate = certificate.map(read_base64).transpose()?;
+                let pq_certificate = pq_certificate.map(read_base64).transpose()?;
                 let minimum_mode = minimum_mode.map(Into::into).unwrap_or_else(|| {
                     if key_negotiation_pq_certificate_sha256.is_some() {
                         aether::key_negotiation::ProtectionMode::MlKem
@@ -905,6 +931,8 @@ async fn main() -> Result<()> {
                     peer::KeyNegotiationAdmission {
                         tls_certificate_sha256: key_negotiation_certificate_sha256.as_deref(),
                         pq_certificate_sha256: key_negotiation_pq_certificate_sha256.as_deref(),
+                        tls_certificate: certificate.as_deref(),
+                        pq_certificate: pq_certificate.as_deref(),
                         minimum_mode,
                     },
                 )
@@ -1103,6 +1131,8 @@ mod tests {
                     admin: true,
                     key_negotiation_certificate_sha256: Some(tls),
                     key_negotiation_pq_certificate_sha256: Some(pq),
+                    certificate: None,
+                    pq_certificate: None,
                     minimum_mode: Some(key_nego::Mode::MlKem),
                 }
             } if name == "operator" && public_key == "public" && tls == "tls" && pq == "pq"

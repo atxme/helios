@@ -496,6 +496,15 @@ case "$MODE" in
     *) echo "unsupported key-negotiation mode: $MODE" >&2; exit 1 ;;
 esac
 
+# Les deux feuilles du client partent aussi : une gateway qui porte un domaine
+# de confiance enregistre les certificats eux-mêmes, pas leurs empreintes — elle
+# vérifie des signatures faites par eux — et refuse une admission sans elles.
+# Sur une gateway sans domaine, `peer add` les ignore : rien à enregistrer.
+CERT_DISTANT="/tmp/helios-client-cert-$$.der"
+PQ_DISTANT="/tmp/helios-client-pq-cert-$$.json"
+scp -q "$SORTIE/client-pki/orion-client-cert.der" "$CIBLE:$CERT_DISTANT"
+scp -q "$SORTIE/client-pki/orion-client-pq-cert.json" "$CIBLE:$PQ_DISTANT"
+
 LOCAL_ADMISSION_SCRIPT="$SORTIE/admit-peer.sh"
 REMOTE_ADMISSION_SCRIPT="/tmp/helios-admit-peer.sh"
 cat > "$LOCAL_ADMISSION_SCRIPT" <<EOF
@@ -513,8 +522,10 @@ fi
     --public-key '$PUBLIC_KEY' \
     --key-negotiation-certificate-sha256 '$SHA_TLS' \
     --key-negotiation-pq-certificate-sha256 '$SHA_PQ' \
+    --certificate '$CERT_DISTANT' \
+    --pq-certificate '$PQ_DISTANT' \
     --minimum-mode '$MODE' $ARG_ADMIN
-rm -f '$BACKUP_GW'
+rm -f '$BACKUP_GW' '$CERT_DISTANT' '$PQ_DISTANT'
 trap - EXIT HUP INT TERM
 EOF
 scp -q "$LOCAL_ADMISSION_SCRIPT" "$CIBLE:$REMOTE_ADMISSION_SCRIPT"

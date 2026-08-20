@@ -210,9 +210,15 @@ impl IntoResponse for InternalRefusal {
 /// What the gateway tells the authority about one peer's certificate state.
 ///
 /// The whole answer, and nothing else: no WireGuard private key, no PSK, no
-/// TPM secret, no unredacted view of `network.toml` (spec §8.3). The peer's
-/// leaves are not here either — Astra issued them; it does not need them read
-/// back.
+/// TPM secret, no unredacted view of `network.toml` (spec §8.3).
+///
+/// The **active PQ leaf** is here, and it is not a leak: it is a certificate,
+/// public by construction, which this peer presents on every negotiation. It
+/// is here because Astra did not issue the first one — an operator did, at
+/// enrolment — and a renewal is checked against the public key of the
+/// generation the domain holds, never against one the request supplied. Astra
+/// therefore has to be able to learn it from the gateway rather than from the
+/// client asking to be renewed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerCertificateStateView {
@@ -220,6 +226,8 @@ pub struct PeerCertificateStateView {
     pub name: String,
     /// Bounded active/next/pending state, exactly as persisted.
     pub state: ClientCertificateState,
+    /// The leaf of the active generation, as the registry holds it.
+    pub active_pq_certificate: aether::key_negotiation::PqCertificate,
 }
 
 /// The gateway side of the private channel, implemented by the daemon.
@@ -1588,6 +1596,18 @@ mod tests {
                 not_before: 0,
                 not_after: 1_000_000,
             }),
+            active_pq_certificate: aether::key_negotiation::PqCertificate {
+                version: 2,
+                serial: [7; 16],
+                subject: "workstation".into(),
+                issuer: "operator".into(),
+                role: aether::key_negotiation::PqCertificateRole::Client,
+                wireguard_public_key: WireGuardKey::from_bytes([9; 32]).to_base64(),
+                ml_dsa_87_public_key: "cHVibGlj".into(),
+                not_before_unix: 0,
+                not_after_unix: 1_000_000,
+                ml_dsa_87_signature: "c2lnbmF0dXJl".into(),
+            },
         };
         let encoded = serde_json::to_string(&view)
             .expect("encode")

@@ -304,6 +304,15 @@ if [ "$REFAIRE_CA" = 1 ]; then
     scp -q "$CA_DIR/orion-client-pq-ca-public.bin" "$CIBLE:/tmp/orion-client-pq-ca-public.bin"
 fi
 
+# Les deux certificats du client, publics, vont aussi à la gateway : une
+# gateway qui porte un domaine de confiance enregistre les feuilles elles-mêmes
+# et pas leurs empreintes — elle vérifie des signatures faites par elles. Sans
+# elles, le pair se connecte et ne peut jamais renouveler, et rien ne le dit
+# avant 80 % de la vie de sa feuille.
+echo "==> Envoi des certificats du client à la gateway"
+scp -q "$PKI/orion-client-cert.der" "$CIBLE:/tmp/helios-client-cert-$$.der"
+scp -q "$PKI/orion-client-pq-cert.json" "$CIBLE:/tmp/helios-client-pq-cert-$$.json"
+
 # Garde-fou : ce heredoc n'est pas quote — il ne peut pas l'etre, les valeurs
 # locales doivent s'y substituer — donc tout backtick ou $(...) y serait execute
 # ICI, a la construction. Le piege s'est referme deux fois : un « scp » entre
@@ -363,8 +372,11 @@ echo "-- peer add"
     --public-key '$WG_PUBLIQUE' \
     --key-negotiation-certificate-sha256 '$FP_TLS' \
     --key-negotiation-pq-certificate-sha256 '$FP_PQ' \
+    --certificate /tmp/helios-client-cert-$$.der \
+    --pq-certificate /tmp/helios-client-pq-cert-$$.json \
     --minimum-mode '$MODE' \
     | awk -F'\t' -v n='$CLIENT' '\$1 == n { print \$2 }' > "\$DEPOT/peer.txt"
+rm -f /tmp/helios-client-cert-$$.der /tmp/helios-client-pq-cert-$$.json
 
 # Le port de negociation ne figure dans aucun certificat : hors API, il faut
 # aller le lire dans la configuration de la gateway, sans quoi « enroll » refuse
@@ -379,8 +391,20 @@ cp /var/lib/helios/key-negotiation-pq-cert.json "\$DEPOT/gw-pq-cert.json"
 # pas renouveler son certificat. Il se lit apres l'admission : il porte la
 # generation de CE pair. Une gateway sans domaine amorce n'en a pas — ce n'est
 # pas une erreur, le fichier reste absent et l'enrolement le dit.
-if ! "\$HELIOSD" show-trust-enrolment --public-key '$WG_PUBLIQUE' \
-        > "\$DEPOT/trust.json" 2>"\$DEPOT/trust.err"; then
+# L'admission est déposée pour le démon, qui est seul propriétaire du registre
+# et la relit toutes les deux secondes : le bloc n'existe donc pas à l'instant
+# où « peer add » rend la main. On attend, plutôt que de conclure à son absence.
+ESSAI=0
+while [ "\$ESSAI" -lt 15 ]; do
+    if "\$HELIOSD" show-trust-enrolment --public-key '$WG_PUBLIQUE' \
+            > "\$DEPOT/trust.json" 2>"\$DEPOT/trust.err"; then
+        break
+    fi
+    rm -f "\$DEPOT/trust.json"
+    ESSAI=\$((ESSAI + 1))
+    sleep 1
+done
+if [ ! -s "\$DEPOT/trust.json" ]; then
     rm -f "\$DEPOT/trust.json"
     echo "-- pas de bloc de confiance : \$(tail -1 "\$DEPOT/trust.err")"
 fi

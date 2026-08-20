@@ -21,19 +21,59 @@ const AUDIT_DOMAIN: &[u8] = b"helios-astra-audit-v5";
 #[serde(rename_all = "snake_case")]
 pub enum AuditEvent {
     DomainBootstrapped,
-    IssuerInstalled { issuer_epoch: u64 },
-    IssuerRevoked { issuer_epoch: u64 },
-    ClientRenewalRequested { peer: String, generation: u64 },
-    ClientStageAuthorized { peer: String, generation: u64 },
-    ClientGrantReleased { peer: String, generation: u64 },
-    ClientStagePurged { peer: String, generation: u64 },
-    ExpiredRecoveryApproved { peer: String, generation: u64 },
-    CampaignCreated { campaign: String, targets: usize },
-    CampaignApproved { campaign: String },
-    CampaignRefused { campaign: String, reason: String },
-    CertificateRevoked { target: String },
-    ServiceKeyRotated { epoch: u64 },
-    StatusPublished { target: String, status_epoch: u64 },
+    /// One peer transcribed from the gateway's admission, at its first
+    /// generation. Astra records who it was told about; it never decides it.
+    PeerAdmitted {
+        peer: String,
+        generation: u64,
+    },
+    IssuerInstalled {
+        issuer_epoch: u64,
+    },
+    IssuerRevoked {
+        issuer_epoch: u64,
+    },
+    ClientRenewalRequested {
+        peer: String,
+        generation: u64,
+    },
+    ClientStageAuthorized {
+        peer: String,
+        generation: u64,
+    },
+    ClientGrantReleased {
+        peer: String,
+        generation: u64,
+    },
+    ClientStagePurged {
+        peer: String,
+        generation: u64,
+    },
+    ExpiredRecoveryApproved {
+        peer: String,
+        generation: u64,
+    },
+    CampaignCreated {
+        campaign: String,
+        targets: usize,
+    },
+    CampaignApproved {
+        campaign: String,
+    },
+    CampaignRefused {
+        campaign: String,
+        reason: String,
+    },
+    CertificateRevoked {
+        target: String,
+    },
+    ServiceKeyRotated {
+        epoch: u64,
+    },
+    StatusPublished {
+        target: String,
+        status_epoch: u64,
+    },
 }
 
 /// One link of the chain.

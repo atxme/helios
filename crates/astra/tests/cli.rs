@@ -126,3 +126,99 @@ fn status_on_an_unbootstrapped_directory_fails() {
     let output = astra(directory.path(), &["status"]);
     assert!(!output.status.success());
 }
+
+/// The delegation request is public, and it is the whole handover: an operator
+/// pipes it out of the container and hands it to the companion. What must be
+/// true of it is that the private halves exist here **before** it is printed —
+/// a request naming a public key nobody holds would only be discovered after a
+/// ceremony with a security key already plugged in.
+#[test]
+fn an_issuer_request_names_keys_this_state_directory_holds() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+
+    let output = astra(directory.path(), &["issuer", "request"]);
+    assert!(
+        output.status.success(),
+        "issuer request failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the request is JSON on standard output");
+    assert_eq!(
+        request["issuer_epoch"], 1,
+        "the first delegation is epoch 1"
+    );
+    assert_eq!(
+        request["trust_domain_id"], "0102030405060708090a0b0c0d0e0f10",
+        "the request names the domain it is for"
+    );
+    assert!(!request["pq_issuer_public_key"]
+        .as_str()
+        .expect("key")
+        .is_empty());
+    assert!(!request["tls_intermediate_csr"]
+        .as_str()
+        .expect("csr")
+        .is_empty());
+    assert!(directory.path().join("issuer-pq-key-1.bin").exists());
+    assert!(directory.path().join("issuer-tls-key-1.der").exists());
+}
+
+/// Installing is not believing a file. An authorization that does not verify
+/// under this domain's anchor is refused before anything is recorded — and the
+/// authority keeps saying it has no issuer, which is the state that refuses
+/// renewals by name rather than issuing under a delegation nobody signed.
+#[test]
+fn an_unsigned_delegation_is_refused_and_records_nothing() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    assert!(astra(directory.path(), &["issuer", "request"])
+        .status
+        .success());
+
+    // Everything an authorization needs, except a signature anyone made.
+    let forged = serde_json::json!({
+        "format_version": 1,
+        "trust_domain_id": "0102030405060708090a0b0c0d0e0f10",
+        "ca_epoch": 1,
+        "ca_tls_epoch": 1,
+        "gateway_wg_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "server_name": "gateway.example",
+        "issuer_epoch": 1,
+        "pq_issuer_public_key": ca_public_key(),
+        "tls_intermediate_certificate": "AQID",
+        "allowed_usage": "admitted_client_leaf_renewal",
+        "maximum_leaf_lifetime_secs": 3600,
+        "policy_fingerprint": "00".repeat(32),
+        "not_before": 0,
+        "not_after": 4_000_000_000u64,
+        "ca_pq_signature": "",
+    });
+    let path = directory.path().join("forged.json");
+    std::fs::write(&path, serde_json::to_vec(&forged).expect("json")).expect("write");
+
+    let output = astra(
+        directory.path(),
+        &[
+            "issuer",
+            "install",
+            "--authorization",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "an unsigned delegation must not install"
+    );
+    let status = astra(directory.path(), &["status"]);
+    let printed = String::from_utf8(status.stdout).expect("utf-8");
+    assert!(
+        printed.contains("delegated issuer : absent"),
+        "nothing is recorded by a refused install: {printed}"
+    );
+}

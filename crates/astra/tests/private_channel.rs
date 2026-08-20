@@ -132,6 +132,7 @@ impl AstraChannelHandler for Recorder {
                 not_before: 0,
                 not_after: 1_000_000,
             }),
+            active_pq_certificate: served_leaf(),
         })
     }
 }

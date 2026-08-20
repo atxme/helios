@@ -43,12 +43,14 @@
 
 use aether::certificates::{
     client::{ClientCertificateRotationGrant, ClientCertificateStageCommit},
+    encoding::DerCertificate,
     status::AstraCertificateStatus,
     transport::{
         AuthenticatedTrustUpdateRequest, TrustUpdateChunk, TrustUpdateTransactionManifest,
         MAX_TRUST_UPDATE_REQUEST_BYTES,
     },
 };
+use aether::key_negotiation::PqCertificate;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -183,6 +185,25 @@ pub trait TrustUpdateHandler: Send + Sync {
         peer_wg_public_key: &str,
     ) -> Result<TrustEnrolmentView, TrustUpdateRefusal>;
 
+    /// Records a freshly admitted peer's **first** generation (spec §13.1).
+    ///
+    /// Admission is where this belongs, and nowhere else: the registry needs
+    /// the leaves themselves — it verifies signatures made by them rather than
+    /// merely comparing digests — and admission is the only moment the gateway
+    /// is handed them. A peer admitted without them is a peer with no trust
+    /// block, therefore a profile that cannot renew, and the gap only shows up
+    /// at 80 % of a leaf's life.
+    ///
+    /// Idempotent for an unchanged peer, so a re-run of an interrupted
+    /// admission finishes it instead of refusing it.
+    async fn admit_peer(
+        &self,
+        name: &str,
+        peer_wg_public_key: &str,
+        tls_certificate: DerCertificate,
+        pq_certificate: Box<PqCertificate>,
+    ) -> Result<(), TrustUpdateRefusal>;
+
     /// `caller_wg_public_key` is the identity `require_peer` resolved from the
     /// source address — the trusted one. The request's own copy is only ever
     /// compared against it.
@@ -274,11 +295,17 @@ pub async fn retired_in_tunnel_stage() -> StatusCode {
 
 impl TrustUpdateRefusal {
     fn status(self) -> StatusCode {
-        match self {
-            Self::Protocol => StatusCode::BAD_REQUEST,
-            Self::Rejected => StatusCode::FORBIDDEN,
-            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::from(self)
+    }
+}
+
+impl From<TrustUpdateRefusal> for StatusCode {
+    fn from(refusal: TrustUpdateRefusal) -> Self {
+        match refusal {
+            TrustUpdateRefusal::Protocol => StatusCode::BAD_REQUEST,
+            TrustUpdateRefusal::Rejected => StatusCode::FORBIDDEN,
+            TrustUpdateRefusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            TrustUpdateRefusal::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -562,6 +589,16 @@ mod tests {
             _peer_wg_public_key: &str,
         ) -> Result<TrustEnrolmentView, TrustUpdateRefusal> {
             Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn admit_peer(
+            &self,
+            _name: &str,
+            _peer_wg_public_key: &str,
+            _tls_certificate: DerCertificate,
+            _pq_certificate: Box<PqCertificate>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            Ok(())
         }
 
         async fn trust_update(

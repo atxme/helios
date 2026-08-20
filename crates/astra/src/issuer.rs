@@ -72,6 +72,29 @@ pub enum IssuerError {
     IssuerKeyMismatch(&'static str),
 }
 
+/// What Astra asks the companion to delegate to, for one issuer epoch.
+///
+/// Astra generates and seals its own issuer keys locally (spec §9.5); what
+/// travels here is their public half and a PKCS#10 request for the TLS
+/// intermediate. The companion issues the intermediate under `CA-TLS` and
+/// binds both to one [`AstraIssuerAuthorization`] under `CA-PQ`.
+///
+/// It carries nothing secret, which is what lets it cross to another machine
+/// by hand while the §8.2 transport is still unimplemented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuerDelegationRequest {
+    /// Trust domain identifier, 32 hex characters. Compared with the vault's,
+    /// so a request meant for another authority is refused before it is
+    /// signed rather than after.
+    pub trust_domain_id: String,
+    pub issuer_epoch: u64,
+    /// ML-DSA-87 public key of the delegated issuer, base64.
+    pub pq_issuer_public_key: String,
+    /// PKCS#10 request for the TLS intermediate, DER base64.
+    pub tls_intermediate_csr: String,
+}
+
 /// The issuer's private material, as Astra holds it.
 ///
 /// The private halves are `Zeroizing`: they are read once at startup and never

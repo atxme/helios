@@ -56,6 +56,10 @@ manque :
 - le **pilote client** du §7 dans `orion-core` : création des clés candidates,
   ouverture et suivi de l'opération, lancement du compagnon, vérification et
   persistance du grant, puis `stage-commit` ;
+- l'**alignement des ancres clientes** : la négociation authentifie sous les
+  CA de l'opérateur et sous les empreintes de `network.toml`, l'autorité émet
+  sous les siennes. Voir « Ce qui reste entre l'installation et un
+  renouvellement utilisable » plus bas ;
 - la **bascule de confiance** du §13 et les objets pré-signés de `trust-update`.
   L'alignement cryptographique du 16 août (ctx ML-DSA, HVLT, pin de politique,
   jetons de capacité et fournisseur d'aléa sans DRBG applicatif) est livré ; la
@@ -280,6 +284,70 @@ ce cas.
 Sans lui, Astra tourne, sert ses statuts et tient son canal — et refuse chaque
 renouvellement ordinaire en le disant. C'est ce à quoi une installation
 incomplète doit ressembler.
+
+### L'émetteur délégué
+
+Sans lui, Astra tourne et refuse chaque renouvellement ordinaire en le disant :
+il ne détient aucune clé autorisée à émettre. `CA-PQ` ne quitte jamais le
+coffre, donc la délégation se signe sur le poste opérateur, à la clé de
+sécurité, et fait un aller-retour.
+
+Trois commandes, dans cet ordre :
+
+```sh
+# 1. sur la gateway : les deux clés privées naissent dans le volume d'Astra,
+#    adressées par époque. Rien n'est installé, rien n'est annoncé.
+ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env exec -T astra \
+    /usr/local/bin/astra issuer request" > delegation-request.json
+
+# 2. sur le poste opérateur, clé branchée : CA-TLS d'abord si le domaine n'en
+#    a pas encore, puis la délégation elle-même.
+astra-signer issue-ca-tls
+astra-signer authorize-issuer --request delegation-request.json \
+    --out delegation.json --days 30 --leaf-days 90
+
+# 3. retour sur la gateway.
+ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env exec -T astra \
+    /usr/local/bin/astra issuer install" < delegation.json
+ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env restart astra"
+```
+
+La demande sort sur la **sortie standard** et les journaux d'Astra sur
+l'erreur standard, précisément pour que ce `>` fonctionne. `install` lit
+l'autorisation sur l'entrée standard quand `--authorization` est absent.
+
+`install` vérifie trois choses qui viennent de trois endroits différents :
+l'ancre que le registre épingle, la politique d'émission calculée à l'amorçage,
+et la possession — les clés privées de cette époque sont déjà sur le disque et
+doivent correspondre à ce que la délégation nomme. Une autorisation qui
+satisfait les trois est une délégation avec laquelle cette autorité peut
+réellement émettre ; l'alternative est d'annoncer une délégation dont le
+premier usage échoue à 80 % de la vie d'une feuille cliente.
+
+La délégation est lue **au démarrage**, d'où le redémarrage explicite.
+
+### Ce qui reste entre l'installation et un renouvellement utilisable
+
+Le port de négociation authentifie un client sous **une** CA TLS cliente et
+**une** CA PQ cliente, lues sur disque au démarrage, plus les empreintes figées
+de `network.toml`. Une feuille renouvelée est émise par l'émetteur délégué :
+elle ne chaîne pas vers la même ancre et n'est pas signée par la même clé PQ.
+
+La gateway refuse donc de mettre en attente un candidat qu'elle ne saurait pas
+authentifier une fois actif, et le journalise en nommant la raison. C'est
+délibéré : le refuser coûte un message, le poser enfermerait le client dehors à
+la fin du chevauchement, sur la machine dont le tunnel était le seul moyen de
+demander de l'aide.
+
+Lever cette limite, c'est deux choses, et elles vont ensemble : la négociation
+lisant le registre de certificats — `acceptable_pq_fingerprints`,
+`resolve_pair`, et la clé publique de l'émetteur délégué — au lieu des
+épinglages de `network.toml` ; et l'ancre TLS cliente du domaine devenant celle
+sous laquelle l'autorité émet réellement, ce qui est la migration de la CA
+opérateur vers le coffre que l'ADR-008 décrit et que rien n'a encore faite.
 
 ### À la main
 

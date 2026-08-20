@@ -43,7 +43,14 @@ const MAX_PSK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 
 const CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-cert.der";
 const CLIENT_CA_PATH: &str = "/var/lib/helios/key-negotiation-client-ca.der";
 const PQ_CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-pq-cert.json";
-const CLIENT_PQ_CA_PATH: &str = "/var/lib/helios/key-negotiation-client-pq-ca-public.bin";
+/// The one ML-DSA-87 authority a client leaf is authenticated under, on the
+/// public port.
+///
+/// `pub(crate)` because the certificate lifecycle has to ask the same question
+/// before it stages a candidate: see
+/// [`crate::certificates::assert_candidate_is_presentable`].
+pub(crate) const CLIENT_PQ_CA_PATH: &str =
+    "/var/lib/helios/key-negotiation-client-pq-ca-public.bin";
 const PRIVATE_KEYSTORE_PATH: &str = "/var/lib/helios/key-negotiation-key.sealed";
 const MAX_REPLAY_IDENTIFIERS: usize = 4096;
 

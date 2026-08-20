@@ -164,6 +164,59 @@ impl RenewalError {
     }
 }
 
+/// Learns a peer from the gateway, the first time it renews.
+///
+/// Astra does not admit anyone — the gateway does, and it is the end that was
+/// handed the leaves at enrolment. So the registry is filled here, from the
+/// private channel, rather than by a second admission an operator would have
+/// to perform twice and keep equal. §8.3 already publishes the state; this
+/// transcribes it.
+///
+/// Two checks before it is believed, even though the channel is mTLS and the
+/// peer is the gateway: the leaf must name this WireGuard key, and it must
+/// hash to the fingerprint of the active generation it comes with. They cost
+/// nothing and turn a disagreement between the two registries into a refusal
+/// instead of a renewal checked against the wrong public key.
+///
+/// Without a channel this is exactly the old behaviour — an unknown peer stays
+/// unknown, and the renewal is refused by name.
+async fn transcribe_peer(
+    service: &Arc<AstraService>,
+    caller: &WireGuardKey,
+    now_unix: u64,
+) -> Result<(), RenewalError> {
+    if service.registry.lock().await.peer(caller).is_some() {
+        return Ok(());
+    }
+    let Some(gateway) = service.gateway.as_ref() else {
+        return Err(RenewalError::UnknownPeer);
+    };
+    let view = gateway
+        .peer_state(caller)
+        .await
+        .map_err(|error| RenewalError::Gateway(error.to_string()))?;
+    if view.active_pq_certificate.wireguard_public_key.trim() != caller.to_base64() {
+        return Err(RenewalError::UnknownPeer);
+    }
+    let fingerprint =
+        aether::certificates::gateway::pq_certificate_fingerprint(&view.active_pq_certificate)
+            .map_err(RenewalError::Internal)?;
+    if !fingerprint.matches(&view.state.active.pq_certificate_fingerprint) {
+        return Err(RenewalError::UnknownPeer);
+    }
+    let record = crate::registry::PeerRecord {
+        name: view.name,
+        client_wg_public_key: *caller,
+        active: view.state.active,
+        active_pq_certificate: view.active_pq_certificate,
+        pending: None,
+        revoked: view.state.revoked,
+        revocation_epoch: view.state.revocation_epoch,
+    };
+    service.registry.lock().await.admit(record, now_unix)?;
+    Ok(())
+}
+
 /// Step 1: opens an operation for a request the gateway just relayed.
 ///
 /// Everything is verified before anything is stored: the caller owns the
@@ -182,6 +235,7 @@ pub async fn open(
     if request.client_wg_public_key != *caller {
         return Err(RenewalError::CallerMismatch);
     }
+    transcribe_peer(service, caller, now_unix).await?;
 
     let (peer, trust_domain_id, gateway_key, server_name, rp_id, service_epoch) = {
         let registry = service.registry.lock().await;

@@ -175,6 +175,28 @@ Restent ouverts :
   prise à un autre épinglerait un couple qui n'a jamais existé ensemble.
   **Un profil émis avant ce lot n'en porte pas** — il se connecte, mais Orion
   refuse le renouvellement en le disant ; il faut le réémettre.
+  **Le pair entre au registre à l'admission**, des deux côtés. La gateway
+  enregistre sa première génération depuis les feuilles elles-mêmes — pas leurs
+  empreintes : elle vérifie des signatures faites par elles. L'API la reçoit
+  dans la requête d'admission ; `heliosd peer add`, qui tourne dans un autre
+  processus, **dépose** l'admission dans une boîte que le démon draine toutes
+  les deux secondes, parce que lui seul possède le registre et le tient en
+  mémoire. Un pair admis sans ses deux certificats est refusé en le disant :
+  sans ligne au registre il n'y a pas de bloc de confiance, donc un profil qui
+  se connecte et ne renouvellera jamais. Astra, lui, ne décide d'aucune
+  admission : il **transcrit** le pair depuis le canal privé au premier
+  renouvellement (`peer_state` porte désormais la feuille PQ active), sous deux
+  contrôles — la feuille nomme cette clé WireGuard, et elle hache vers
+  l'empreinte de la génération qui l'accompagne.
+  L'**émetteur délégué s'installe** : `astra issuer request` fait naître ses
+  deux clés privées dans le volume, adressées par époque, et imprime la demande
+  publique sur la sortie standard ; `astra-signer authorize-issuer` la signe
+  sous `CA-PQ` à la clé de sécurité ; `astra issuer install` la vérifie trois
+  fois — l'ancre que le registre épingle, la politique calculée à l'amorçage,
+  et la possession des clés déjà sur disque — avant de l'enregistrer. L'époque
+  ne redescend jamais. Les journaux d'Astra passent sur **stderr** : la sortie
+  standard porte ce qu'une commande produit, et la demande de délégation se
+  pipe hors du conteneur.
   Restent ouverts : le **transport hors tunnel** du compagnon (routes §8.2 en
   `501`, donc copie de fichiers pour `authorize-issuer`, `approve-campaign`,
   `rotate-ca-pq` et le coffre) et la récupération d'une identité expirée qui en
@@ -182,6 +204,18 @@ Restent ouverts :
   disant ; le lancement automatique du compagnon plutôt que sa ligne de
   commande ; le discriminant de profil Orion et la bascule du §13 ; et la
   surface *Certificats* de la console Helios.
+  **Limite connue, et c'est celle qui reste entre l'installation et un
+  renouvellement utilisable** : le port de négociation authentifie un client
+  sous **une** CA TLS cliente et **une** CA PQ cliente, lues sur disque au
+  démarrage, et sous les empreintes figées de `network.toml`. Une feuille
+  renouvelée, elle, est émise par l'émetteur délégué. La gateway refuse donc le
+  staging d'un candidat qu'elle ne saurait pas authentifier une fois actif
+  (`heliosd::certificates::assert_candidate_is_presentable`) — le refuser coûte
+  un message, le poser enfermerait le client dehors à la fin du chevauchement.
+  Lever cette limite, c'est deux choses : la négociation lisant le registre
+  (`acceptable_pq_fingerprints`, `resolve_pair`, la clé de l'émetteur délégué)
+  au lieu des épinglages de `network.toml`, et l'ancre TLS cliente du domaine
+  devenant celle sous laquelle l'autorité émet réellement.
   La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
   lieu.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
