@@ -1046,6 +1046,11 @@ async fn handle_connection(
     };
 
     if let Err(error) = request.request.validate() {
+        tracing::warn!(
+            %remote,
+            %error,
+            "quic: key-negotiation request refused: malformed request"
+        );
         write_frame(
             &mut send,
             &ServerMessage::Error {
@@ -1053,10 +1058,21 @@ async fn handle_connection(
             },
         )
         .await?;
-        return Err(TransportError::Protocol(error.to_string()));
+        // The error frame is the public answer. Finish the stream and wait
+        // for the peer to take it before closing the connection; dropping it
+        // immediately makes Quinn report `connection lost` instead of the
+        // actual protocol refusal.
+        drain_then_close(&connection, &mut send, "malformed negotiation request").await;
+        return Ok(());
     }
     // The request may only speak for the peer mTLS already bound it to.
     if request.request.client_wg_public_key != admitted_peer {
+        tracing::warn!(
+            %remote,
+            requested_peer = %request.request.client_wg_public_key,
+            admitted_peer = %admitted_peer,
+            "quic: key-negotiation request refused: certificate and WireGuard identities differ"
+        );
         write_frame(
             &mut send,
             &ServerMessage::Error {
@@ -1064,10 +1080,13 @@ async fn handle_connection(
             },
         )
         .await?;
-        return Err(TransportError::Protocol(
-            "request names a WireGuard key other than the one this certificate is admitted for"
-                .into(),
-        ));
+        drain_then_close(
+            &connection,
+            &mut send,
+            "certificate and WireGuard identities differ",
+        )
+        .await;
+        return Ok(());
     }
 
     let transaction_id = request.request.transaction_id;
