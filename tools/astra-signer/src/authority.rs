@@ -112,7 +112,7 @@ pub const ANCHOR_ROTATION_CREDENTIALS: usize = 2;
 /// middle of a ceremony with a security key already plugged in.
 pub use astra::issuer::IssuerDelegationRequest;
 
-/// The bounds an operator sets on one delegation.
+/// n   The bounds an operator sets on one delegation.
 #[derive(Debug, Clone, Copy)]
 pub struct DelegationBounds {
     pub maximum_leaf_lifetime_secs: u64,
