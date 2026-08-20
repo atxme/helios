@@ -54,14 +54,11 @@
 //! — l'assertion, le binding, les quatre empreintes — est produit et
 //! **vérifié** ici, de sorte qu'Astra ne peut que signer un fait déjà établi.
 
-use aether::certificates::approval::{
-    AstraCredentialApprovalRequest, AstraCredentialBinding, AstraIssuancePolicy,
-    AstraRenewalApproval, CredentialState,
-};
+use aether::certificates::approval::{AstraCredentialBinding, CredentialState};
 use aether::certificates::authority::{AllowedUsage, AstraIssuerAuthorization, CaTransition};
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, MlDsa87PublicKey, MlDsa87Signature,
-    TrustDomainId, WireGuardKey,
+    TrustDomainId,
 };
 use aether::certificates::status::AstraRotationCampaign;
 use aether::certificates::webauthn::{
@@ -71,13 +68,13 @@ use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
 use astra::vault::{AuthoritySecrets, AuthorityVault};
 use base64::Engine as _;
+use helios_fido::authenticator::Authenticator;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::authenticator::Authenticator;
 use crate::credentials::CredentialRegistry;
 use crate::gestures::{GestureError, Result};
 
@@ -135,30 +132,12 @@ pub struct DelegationBounds {
     pub not_after: u64,
 }
 
-/// The public identity of the domain, as the hand-off records it.
+/// The domain, as every gesture here needs to know it.
 ///
-/// Every `CA-PQ`-signed object names the gateway and the domain; carrying them
-/// in one value keeps a caller from passing the domain of one and the gateway
-/// of another.
-#[derive(Debug, Clone)]
-pub struct DomainIdentity {
-    pub trust_domain_id: TrustDomainId,
-    pub gateway_wg_public_key: WireGuardKey,
-    pub server_name: String,
-    pub ca_epoch: u64,
-    pub ca_tls_epoch: u64,
-}
-
-impl DomainIdentity {
-    /// The pinned issuance policy of §2.4, computed rather than learned.
-    pub fn policy(&self) -> std::result::Result<AstraIssuancePolicy, CertificateError> {
-        Ok(AstraIssuancePolicy::standard(
-            self.trust_domain_id,
-            self.gateway_wg_public_key,
-            self.server_name.clone(),
-        ))
-    }
-}
+/// Defined at the approval boundary and re-exported: Orion needs the same five
+/// values to run the ceremony of §14.1, and two definitions of a domain are
+/// two things to keep equal.
+pub use helios_fido::DomainIdentity;
 
 /// One credential's answer to a challenge, and the binding it answered under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,132 +566,6 @@ fn sign_binding(
     .sign(ca_pq_private_key)?;
     binding.supersedes(recorded)?;
     Ok(binding)
-}
-
-/// Approves one exact client renewal at a security key (spec §2.4, §14.1).
-///
-/// **No vault, and no salt.** The parameters are the request, the bindings the
-/// domain already published, and a token — nothing here can open a key-slot,
-/// which is the property §14.1 asks for in as many words: «un renouvellement
-/// ordinaire n'obtient aucune sortie PRF et n'ouvre aucun key-slot».
-///
-/// The challenge is the SHA-256 of the canonical request, so the assertion is
-/// unmovable to another peer, generation or deadline. It is re-derived and the
-/// assertion re-verified here, under the credential's own public key, before
-/// anything is returned: a companion that handed back an assertion it had not
-/// checked would be asking Astra to discover the failure.
-///
-/// `active_generation` is the generation the operator states, when they know
-/// it. The companion holds no certificate state, so `None` means the request's
-/// own value is used and that one check is not performed here — Helios and
-/// Orion each re-run it against their persisted generation, which is where it
-/// actually decides anything.
-#[allow(clippy::too_many_arguments)]
-pub fn approve_renewal(
-    key: &dyn Authenticator,
-    request: &AstraCredentialApprovalRequest,
-    service_key: &MlDsa87PublicKey,
-    service_key_epoch: u64,
-    identity: &DomainIdentity,
-    ca_pq_public_key: &MlDsa87PublicKey,
-    bindings: &CredentialRegistry,
-    webauthn_rp_id: &str,
-    active_generation: Option<u64>,
-    pin: &str,
-    now_unix: u64,
-) -> Result<AstraRenewalApproval> {
-    // The service signature first: an operator must not be shown fields that
-    // nothing vouches for, and a token must not be asked to touch for them.
-    request.verify(
-        service_key,
-        service_key_epoch,
-        &identity.trust_domain_id,
-        &identity.gateway_wg_public_key,
-        &request.client_wg_public_key,
-        webauthn_rp_id,
-        active_generation.unwrap_or(request.active_generation),
-        now_unix,
-    )?;
-    bindings.verify(
-        ca_pq_public_key,
-        &identity.trust_domain_id,
-        &identity.gateway_wg_public_key,
-        identity.ca_epoch,
-        request.credential_registry_epoch,
-    )?;
-
-    // Only active credentials, and only those the request enumerated: the
-    // allow-list handed to the token is the intersection, so a token holding a
-    // credential the request did not name is a token that answers nothing.
-    let offered: Vec<&AstraCredentialBinding> = bindings
-        .approvable()
-        .into_iter()
-        .filter(|binding| {
-            request
-                .allowed_credential_ids
-                .contains(&binding.credential_id)
-        })
-        .collect();
-    if offered.is_empty() {
-        return Err(GestureError::Anchors(
-            "aucun credential actif de ce domaine n'est autorisé par cette demande".into(),
-        ));
-    }
-
-    let challenge = request.challenge();
-    let client_data_json = client_data(&challenge, &request.webauthn_origin);
-    let credential_ids: Vec<Vec<u8>> = offered
-        .iter()
-        .map(|binding| binding.credential_id.clone())
-        .collect();
-    let approval = key.approve(
-        &request.webauthn_rp_id,
-        &credential_ids,
-        &client_data_json,
-        pin,
-    )?;
-    let binding = offered
-        .into_iter()
-        .find(|binding| binding.credential_id == approval.credential_id)
-        .ok_or_else(|| {
-            GestureError::Anchors("la clé a répondu pour un credential non proposé".into())
-        })?;
-
-    // Checked here, with the same function the consumers run. Astra signs a
-    // fact rather than a claim.
-    verify_assertion(
-        &approval.assertion,
-        &binding.credential_public_key,
-        &AssertionExpectation {
-            relying_party_id: &request.webauthn_rp_id,
-            origin: &request.webauthn_origin,
-            challenge: &challenge,
-        },
-    )?;
-
-    // At most five minutes, and never past the request's own deadline
-    // (spec §2.4). Astra re-checks both under its clock.
-    let expires_at = request.expires_at.min(
-        now_unix
-            .checked_add(aether::certificates::approval::MAX_APPROVAL_LIFETIME_SECS)
-            .ok_or(CertificateError::ArithmeticOverflow)?,
-    );
-    Ok(AstraRenewalApproval {
-        format_version: CERTIFICATE_FORMAT_VERSION,
-        operation_id: request.operation_id,
-        request_fingerprint: request.request_fingerprint,
-        approval_request_fingerprint: request.fingerprint(),
-        credential_fingerprint: binding.fingerprint(),
-        credential_binding: binding.clone(),
-        assertion_fingerprint: approval.assertion.fingerprint(),
-        webauthn_assertion: approval.assertion,
-        approved_at: now_unix,
-        expires_at,
-        astra_service_key_epoch: service_key_epoch,
-        // Filled by Astra: the companion does not hold the service key, and
-        // must not — see the module header.
-        astra_signature: MlDsa87Signature::placeholder(),
-    })
 }
 
 /// Approves a manual campaign, at as many distinct credentials as its scope

@@ -242,6 +242,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "helios-api",
+ "helios-fido",
  "helios-vault",
  "rcgen",
  "reqwest 0.12.28",
@@ -268,7 +269,7 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
  "clap",
- "ctap-hid-fido2",
+ "helios-fido",
  "hex",
  "rcgen",
  "reqwest 0.12.28",
@@ -278,7 +279,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "time",
- "windows-sys 0.59.0",
  "x509-parser 0.16.0",
  "zeroize",
 ]
@@ -2327,6 +2327,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-fido"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "ctap-hid-fido2",
+ "thiserror 2.0.18",
+ "tracing",
+ "windows-sys 0.59.0",
+ "zeroize",
+]
+
+[[package]]
 name = "helios-firewall"
 version = "0.4.1"
 dependencies = [
@@ -3796,6 +3811,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "directories",
  "futures-util",
+ "helios-fido",
  "helios-key-negotiation",
  "helios-vault",
  "rcgen",

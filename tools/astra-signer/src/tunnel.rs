@@ -35,7 +35,9 @@
 
 use std::time::Duration;
 
-use aether::certificates::approval::{AstraCredentialApprovalRequest, AstraRenewalApproval};
+use aether::certificates::approval::{
+    AstraCredentialApprovalRequest, AstraRenewalApproval, CredentialRegistry,
+};
 use aether::certificates::encoding::Id16;
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
@@ -69,6 +71,12 @@ pub struct SignerRequest {
     pub operation_id: Id16,
     /// Signed by Astra's service key. Verified by the gesture, not here.
     pub approval_request: Box<AstraCredentialApprovalRequest>,
+    /// The `CA-PQ`-signed document the allow-list comes from.
+    ///
+    /// The companion holds its own copy beside the vault and uses that one:
+    /// this is carried for the consumer that has none — Orion. Reported here
+    /// so a caller can compare the two rather than choose between them.
+    pub credential_registry: Box<CredentialRegistry>,
     /// What the gateway says the authority origin is. Displayed for the
     /// operator, and compared against the hand-off — never substituted for it.
     pub authority_url: String,
@@ -198,6 +206,7 @@ impl Tunnel {
         Ok(SignerRequest {
             operation_id: *operation_id,
             approval_request: request.approval_request,
+            credential_registry: request.credential_registry,
             authority_url: request.authority_url,
             webauthn_rp_id: request.webauthn_rp_id,
             result_token,

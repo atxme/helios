@@ -59,7 +59,48 @@
 //! [`docs/testing/TESTING.md`]: ../../../docs/testing/TESTING.md
 
 use aether::certificates::webauthn::{WebAuthnAssertion, MAX_CREDENTIAL_PUBLIC_KEY_BYTES};
-use astra::vault::{SlotSecret, MAX_CREDENTIAL_ID_BYTES, SALT_LEN};
+
+/// Length of the salt handed to `hmac-secret`, in bytes.
+///
+/// CTAP2 fixes it: the extension takes a 32-byte salt and returns a 32-byte
+/// output. It lives here rather than beside the vault format because it is a
+/// property of the key, not of the file.
+pub const SALT_LEN: usize = 32;
+
+/// Largest credential identifier accepted, in bytes.
+///
+/// CTAP2 credential IDs are typically 32–128 bytes; the ceiling refuses input
+/// that would drive an allocation before a single field is used.
+pub const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
+
+/// Key material an authenticator released for one slot.
+///
+/// On a real machine this is the CTAP2 `hmac-secret` output for a credential
+/// and a salt, obtained with user presence **and** user verification. The type
+/// exists so nothing above this boundary can confuse it with a key: it is
+/// input to a derivation, never a wrapping key itself.
+///
+/// Nothing in the approval path ever produces one — [`Authenticator::approve`]
+/// is handed no salt (spec §14.1), so a caller that holds only that method
+/// cannot obtain this type at all.
+pub struct SlotSecret(zeroize::Zeroizing<Vec<u8>>);
+
+impl SlotSecret {
+    pub fn new(material: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(material))
+    }
+
+    /// The bytes, for the single derivation that consumes them.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SlotSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SlotSecret(<redacted>)")
+    }
+}
 
 /// USB vendor identifiers of common security-key makers.
 ///
@@ -488,12 +529,12 @@ pub fn connect(transport: Transport) -> Result<Box<dyn Authenticator>> {
 mod webauthn;
 
 mod ctap {
+    use super::SlotSecret;
     use super::{
         Approval, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
         HMAC_SECRET_LEN, SALT_LEN,
     };
     use aether::certificates::webauthn::WebAuthnAssertion;
-    use astra::vault::SlotSecret;
     use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::Extension as AssertionExt;
     use ctap_hid_fido2::fidokey::get_assertion::GetAssertionArgsBuilder;
     use ctap_hid_fido2::fidokey::get_info::InfoOption;

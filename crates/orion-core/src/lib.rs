@@ -23,6 +23,7 @@
 
 pub mod backend;
 pub mod certificate_actions;
+pub mod certificate_approval;
 pub mod certificate_inventory;
 pub mod certificate_renewal;
 pub mod certificates;

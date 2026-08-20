@@ -756,6 +756,13 @@ dernier effet exige la gateway réelle.
   la même machine avec la clé branchée. Le transport du compagnon, lui,
   s’éprouve hors matériel contre une gateway factice
   (`tools/astra-signer/tests/tunnel.rs`) ;
+- **la cérémonie d'approbation dans Orion ne s'exerce pas en WSL2** : aucun
+  passthrough USB, et le transport plateforme est propre à Windows. Ce qui est
+  éprouvé hors matériel est tout ce qui la précède — l'ordre de vérification,
+  les refus, et le fait qu'aucun chemin n'atteigne le coffre : `orion-core` lie
+  `helios-fido` et **jamais** `astra`, donc le format de coffre n'est pas
+  atteignable depuis ce processus. Un essai réel demande Orion sous Windows,
+  tunnel monté, et la clé d'approbation du domaine branchée ;
 - la récupération signée attend l’arbitrage du compteur monotone ;
 - **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
   n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse

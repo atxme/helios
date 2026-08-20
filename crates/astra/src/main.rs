@@ -383,7 +383,7 @@ fn run(
     );
 
     let issuer = load_issuer(state_dir, &registry)?;
-    let (approval_credential_ids, approval_credential_registry_epoch) =
+    let (approval_credential_ids, approval_credential_registry_epoch, approval_credential_registry) =
         load_approval_credentials(state_dir, &registry)?;
     let service_public_key = registry.state().astra_service_public_key.clone();
     let operations =
@@ -403,6 +403,7 @@ fn run(
         ),
         approval_credential_ids,
         approval_credential_registry_epoch,
+        approval_credential_registry,
         gateway,
     });
 
@@ -510,10 +511,22 @@ fn private_listener(
 /// A missing document is not fatal: the authority still serves statuses and
 /// still holds the channel. Every ordinary renewal is then refused by name,
 /// which is what an incomplete install should look like.
+/// What the credential document yields at start-up.
+///
+/// The identifiers, the epoch they came from, and the document itself — the
+/// last because whoever runs an approval verifies it under `CA-PQ`, and an
+/// allow-list this process merely asserted would be an allow-list a compromised
+/// Astra chooses.
+type ApprovalCredentials = (
+    Vec<Vec<u8>>,
+    u64,
+    Option<Box<aether::certificates::approval::CredentialRegistry>>,
+);
+
 fn load_approval_credentials(
     state_dir: &Path,
     registry: &AstraRegistry,
-) -> Result<(Vec<Vec<u8>>, u64)> {
+) -> Result<ApprovalCredentials> {
     let path = state_dir.join(CREDENTIALS_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::warn!(
@@ -521,7 +534,7 @@ fn load_approval_credentials(
             "no credential document: no operator credential can approve a renewal, so every \
              ordinary rotation will be refused until `astra-signer bindings` is copied here"
         );
-        return Ok((Vec::new(), registry.state().credential_registry_epoch));
+        return Ok((Vec::new(), registry.state().credential_registry_epoch, None));
     };
     if metadata.len() > MAX_CREDENTIALS_BYTES {
         anyhow::bail!(
@@ -557,7 +570,8 @@ fn load_approval_credentials(
         registry_epoch = document.credential_registry_epoch,
         "credential document loaded"
     );
-    Ok((approvable, document.credential_registry_epoch))
+    let epoch = document.credential_registry_epoch;
+    Ok((approvable, epoch, Some(Box::new(document))))
 }
 
 /// Builds the delegated issuer, when the domain has one **and** its private

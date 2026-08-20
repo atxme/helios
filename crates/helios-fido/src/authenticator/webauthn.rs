@@ -53,8 +53,8 @@ use super::{
     Approval, Authenticator, AuthenticatorError, CredentialSubject, Opened, Registration, Result,
     HMAC_SECRET_LEN,
 };
+use super::{SlotSecret, SALT_LEN};
 use aether::certificates::webauthn::WebAuthnAssertion;
-use astra::vault::{SlotSecret, SALT_LEN};
 
 /// Longest an operator is asked to look for their key before we give up.
 const TIMEOUT_MS: u32 = 120_000;

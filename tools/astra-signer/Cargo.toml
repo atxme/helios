@@ -21,6 +21,7 @@ path = "src/main.rs"
 # coffre et ne peut rien en faire.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 astra.workspace = true
+helios-fido = { workspace = true }
 anyhow.workspace = true
 aws-lc-rs.workspace = true
 base64.workspace = true
@@ -38,13 +39,6 @@ thiserror.workspace = true
 # Les périodes de validité X.509 que `rcgen` attend.
 time.workspace = true
 zeroize.workspace = true
-# Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
-# compagnon qui ne parle à aucune clé n'ouvre aucun coffre, et la spécification
-# refuse tout autre déverrouillage — le bâtir sans serait indiscernable d'une
-# panne. Elle tire `hidapi`, donc `libudev` sous Linux (scripts/setup-dev.sh).
-# `aws-lc-rs` plutôt que `ring` : c'est le backend cryptographique du dépôt, et
-# deux piles dans un même binaire sont deux surfaces à suivre.
-ctap-hid-fido2 = { version = "3.5", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,13 +48,3 @@ tempfile = "3"
 # avoir posé. Même version que celle qu'`aether` vérifie déjà.
 x509-parser = { version = "0.16", features = ["verify"] }
 
-# API WebAuthn de Windows, générée depuis les métadonnées Microsoft : aucune
-# déclaration FFI écrite à la main. C'est le chemin qui n'exige pas
-# d'élévation — et celui où le PIN est collecté par le système, donc n'entre
-# jamais dans ce processus.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Networking_WindowsWebServices",
-    "Win32_System_Console",
-] }

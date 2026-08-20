@@ -11,6 +11,7 @@ members = [
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
     "crates/helios-vault",
+    "crates/helios-fido",
     "crates/orion-core",
     "crates/heliosd",
     "tools/astra-signer",
@@ -38,6 +39,7 @@ default-members = [
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
     "crates/helios-vault",
+    "crates/helios-fido",
     "crates/orion-core",
     "crates/heliosd",
     "tools/astra-signer",
@@ -151,6 +153,7 @@ helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }
 helios-vault = { path = "crates/helios-vault" }
+helios-fido = { path = "crates/helios-fido" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }

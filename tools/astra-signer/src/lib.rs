@@ -23,7 +23,13 @@
 /// touched are ever committed.
 pub const WORK_STACK_BYTES: usize = 32 * 1024 * 1024;
 
-pub mod authenticator;
+/// The hardware boundary, and the one ceremony that opens no vault.
+///
+/// Both live in `helios-fido` since Orion runs the approval itself: the
+/// gesture receives no salt, so no `hmac-secret` output exists for it and no
+/// key-slot can be unwrapped (§14.1). Keeping it here as well would be a
+/// second copy of a security boundary.
+pub use helios_fido::authenticator;
 pub mod authority;
 pub mod credentials;
 pub mod documents;

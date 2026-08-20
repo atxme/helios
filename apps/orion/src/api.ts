@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   About,
+  ApprovalManifest,
   CertificateAction,
   CertificateActionState,
   RenewalProgress,
@@ -116,6 +117,34 @@ export const certificateOverview = () =>
  */
 export const runCertificateAction = (name: string, action: CertificateAction) =>
   invoke<RenewalProgress>('run_certificate_action', { name, action })
+
+/**
+ * Reads the approval request the open renewal is waiting on.
+ *
+ * Verified on the Rust side before it comes back. Nothing touches a security
+ * key here — the manifest exists so the user decides before the ceremony.
+ */
+export const certificateApprovalManifest = (name: string) =>
+  invoke<ApprovalManifest>('certificate_approval_manifest', { name })
+
+/**
+ * Whether this machine's key collects its own PIN.
+ *
+ * Asked rather than assumed: under Windows the platform dialog collects it and
+ * it never enters Orion, so prompting would be asking for a secret Orion has
+ * no use for.
+ */
+export const certificateApprovalNeedsPin = (name: string) =>
+  invoke<boolean>('certificate_approval_needs_pin', { name })
+
+/**
+ * Runs the ceremony and posts the assertion.
+ *
+ * Resolves with where the renewal reached. The manifest must have been read
+ * first: what is signed is what was shown.
+ */
+export const approveCertificateRenewal = (name: string, pin?: string) =>
+  invoke<RenewalProgress>('approve_certificate_renewal', { name, pin })
 
 /** The last certificate action that failed on this profile, if any. */
 export const lastCertificateError = (name: string) =>

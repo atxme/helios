@@ -8,6 +8,9 @@ import type { ProfileCertificates } from '../types'
 const api = vi.hoisted(() => ({
   certificateOverview: vi.fn(),
   runCertificateAction: vi.fn(),
+  certificateApprovalManifest: vi.fn(),
+  certificateApprovalNeedsPin: vi.fn(),
+  approveCertificateRenewal: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -43,6 +46,21 @@ const entry = (overrides: Partial<ProfileCertificates> = {}): ProfileCertificate
   ],
   last_error: null,
   ...overrides,
+})
+
+/** The one action with a driver, unblocked. */
+const renewNow = () => ({
+  action: 'renew_now' as const,
+  label: 'Renouveler maintenant',
+  blocked_by: null,
+  message: null,
+})
+
+/** A renewal parked where every renewal legitimately parks. */
+const awaiting = () => ({
+  step: 'awaiting_operator' as const,
+  operation_id: 'f'.repeat(32),
+  companion_command: 'astra-signer approve --operation-id ' + 'f'.repeat(32),
 })
 
 /** A certificate whose validity is long past, whatever «now» happens to be. */
@@ -176,37 +194,67 @@ describe('CertificatesView', () => {
   })
 
   /**
-   * `awaiting_operator` is where every renewal legitimately waits. What the
-   * user needs there is not an explanation but the command that ends the wait.
+   * `awaiting_operator` is where every renewal legitimately waits. What ends
+   * the wait is a security key, and Orion now asks for it itself — there is no
+   * second binary to launch.
    */
-  it('shows the operation and the command that approves it', async () => {
-    const command =
-      'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
-    api.certificateOverview.mockResolvedValue([
-      entry({
-        actions: [
-          {
-            action: 'renew_now',
-            label: 'Renouveler maintenant',
-            blocked_by: null,
-            message: null,
-          },
-        ],
-      }),
-    ])
-    api.runCertificateAction.mockResolvedValue({
-      step: 'awaiting_operator',
-      operation_id: 'f'.repeat(32),
-      companion_command: command,
-    })
+  it('offers the ceremony in place of a command to run', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(awaiting())
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
 
+    await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
+    expect(await screen.findByRole('button', { name: 'Lire la demande' })).toBeTruthy()
+    expect(screen.queryByText(/astra-signer/)).toBeNull()
+  })
+
+  /**
+   * The manifest is shown, and only then is the key asked for: what is signed
+   * has to be what the user saw.
+   */
+  it('shows the request before asking for a touch', async () => {
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue(awaiting())
+    api.certificateApprovalManifest.mockResolvedValue({
+      operation_id: 'f'.repeat(32),
+      client_wg_public_key: 'AAAA',
+      active_generation: 4,
+      requested_generation: 5,
+      request_fingerprint: 'a'.repeat(64),
+      expires_at: 1_700_000_300,
+      eligible_credentials: 2,
+    })
+    api.certificateApprovalNeedsPin.mockResolvedValue(false)
+    api.approveCertificateRenewal.mockResolvedValue({ step: 'issuing', operation_id: 'f'.repeat(32) })
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande' }))
+
+    await waitFor(() => expect(api.approveCertificateRenewal).toHaveBeenCalledWith('portable', undefined))
+    expect(api.certificateApprovalManifest).toHaveBeenCalledWith('portable')
+  })
+
+  /**
+   * When the ceremony cannot run — no platform dialog, a key that needs an
+   * elevated process — the companion is the answer, and that is the one place
+   * its command line belongs.
+   */
+  it('falls back to the companion command only after a failed ceremony', async () => {
+    const command =
+      'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValue({ ...awaiting(), companion_command: command })
+    api.certificateApprovalManifest.mockRejectedValue('aucune clé de sécurité n’a répondu')
+    render(<CertificatesView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    expect(screen.queryByText(command)).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande' }))
     await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
-    expect(screen.getByText('f'.repeat(32))).toBeTruthy()
-    // The command is meant to be carried out of Orion, like every other value
-    // on this screen: selecting truncated monospace text is where that fails.
     expect(screen.getByRole('button', { name: 'Copier approbation' })).toBeTruthy()
   })
 
@@ -239,32 +287,16 @@ describe('CertificatesView', () => {
    * the new error would show one renewal as progressing and refused at once.
    */
   it('drops the previous step when a later press is refused', async () => {
-    const command = 'astra-signer approve --operation-id ' + 'f'.repeat(32)
-    api.certificateOverview.mockResolvedValue([
-      entry({
-        actions: [
-          {
-            action: 'renew_now',
-            label: 'Renouveler maintenant',
-            blocked_by: null,
-            message: null,
-          },
-        ],
-      }),
-    ])
-    api.runCertificateAction.mockResolvedValueOnce({
-      step: 'awaiting_operator',
-      operation_id: 'f'.repeat(32),
-      companion_command: command,
-    })
+    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
+    api.runCertificateAction.mockResolvedValueOnce(awaiting())
     render(<CertificatesView />)
 
     const button = await screen.findByRole('button', { name: 'Renouveler maintenant' })
     fireEvent.click(button)
-    await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
 
     api.runCertificateAction.mockRejectedValue('la gateway a refusé')
     fireEvent.click(screen.getByRole('button', { name: 'Renouveler maintenant' }))
-    await waitFor(() => expect(screen.queryByText(command)).toBeNull())
+    await waitFor(() => expect(screen.queryByText('f'.repeat(32))).toBeNull())
   })
 })

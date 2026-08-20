@@ -72,7 +72,9 @@ use aether::certificates::gateway::pq_certificate_fingerprint;
 use aether::certificates::state::{
     AstraProfile, ClientCertificateState, ClientTlsCaState, GatewayCertificateState, TrustLedger,
 };
-use aether::certificates::transport::{ClientRenewalOperationState, ClientRenewalOperationView};
+use aether::certificates::transport::{
+    ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
+};
 use aether::certificates::x509::{client_rotation_csr, ClientRotationCsr};
 use aether::certificates::{
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
@@ -147,6 +149,13 @@ pub enum RenewalError {
     GrantMissing,
     #[error("the local clock is before the Unix epoch")]
     Clock,
+    #[error("approbation : {0}")]
+    Approval(#[from] crate::certificate_approval::ApprovalError),
+    #[error(
+        "la fenêtre de capacité de cette opération est passée : elle vaut cinq minutes. Relancer \
+         le renouvellement."
+    )]
+    CapabilityWindowClosed,
     #[error(
         "ce profil ne porte pas le matériel de confiance qu'un renouvellement exige — domaine, \
          autorité Astra épinglée et CA TLS cliente. Demander à l'opérateur un document réémis."
@@ -492,6 +501,22 @@ impl RenewalRoutes {
         )
     }
 
+    fn signer_request(&self, operation_id: &Id16) -> String {
+        format!(
+            "{}/api/key-negotiation/certificate-renewal/signer-requests/{}",
+            self.base,
+            operation_id.to_hex()
+        )
+    }
+
+    fn signer_result(&self, operation_id: &Id16) -> String {
+        format!(
+            "{}/api/key-negotiation/certificate-renewal/signer-results/{}",
+            self.base,
+            operation_id.to_hex()
+        )
+    }
+
     fn stage_commit(&self) -> String {
         format!(
             "{}/api/key-negotiation/certificate-renewal/stage-commit",
@@ -632,6 +657,19 @@ pub struct RenewalSession {
     keys: CandidateKeys,
     request: ClientCertificateRotationRequest,
     operation_id: Option<Id16>,
+    /// Capability tokens from the last read of the operation (spec §8.2).
+    ///
+    /// Minted per read and alive five minutes at most, so they are kept only
+    /// until the ceremony that uses them. They confer nothing outside that
+    /// operation, that manifest and that scope — which is why holding them in
+    /// memory beside the session is exactly as much as they are worth.
+    tokens: Option<CapabilityTokens>,
+}
+
+/// The two short-lived tokens one read of an operation hands over.
+struct CapabilityTokens {
+    read: String,
+    submit: String,
 }
 
 impl RenewalSession {
@@ -694,6 +732,7 @@ impl RenewalSession {
             keys,
             request,
             operation_id: None,
+            tokens: None,
         })
     }
 
@@ -762,6 +801,62 @@ impl RenewalSession {
         let body = serde_json::to_vec(&self.request)
             .map_err(|error| RenewalError::Malformed(error.to_string()))?;
         let view = self.post(&self.routes.request(), body).await?;
+        self.adopt(view)
+    }
+
+    /// Fetches the approval request this operation is waiting on (step 4a).
+    ///
+    /// Verified before it is returned, against what this profile pins: an
+    /// operator must not be shown a generation or a peer that nothing vouches
+    /// for, and a ceremony spent to reach a refusal is the one cost that
+    /// cannot be retried casually.
+    ///
+    /// The tokens come from the last read of the operation, so the caller polls
+    /// first. That is not an ordering quirk: they live five minutes, and taking
+    /// them any earlier would spend the window on the user finding their key.
+    pub async fn fetch_approval(
+        &mut self,
+        store: &TrustStore,
+        now_unix: u64,
+    ) -> Result<crate::certificate_approval::VerifiedApproval, RenewalError> {
+        let operation_id = self
+            .operation_id
+            .ok_or_else(|| RenewalError::Malformed("no operation to approve".into()))?;
+        let token = self
+            .tokens
+            .as_ref()
+            .ok_or(RenewalError::CapabilityWindowClosed)?
+            .read
+            .clone();
+        let served: ClientRenewalSignerRequest = self
+            .get_with_token(&self.routes.signer_request(&operation_id), Some(&token))
+            .await?;
+        crate::certificate_approval::VerifiedApproval::verify(served, store.state(), now_unix)
+            .map_err(RenewalError::Approval)
+    }
+
+    /// Posts the assertion the ceremony produced (step 4b).
+    ///
+    /// The answer is the operation Astra reached with it, so a caller that
+    /// submits does not have to poll again to learn whether it landed.
+    pub async fn submit_approval(
+        &mut self,
+        approval: &aether::certificates::approval::AstraRenewalApproval,
+    ) -> Result<RenewalStep, RenewalError> {
+        let operation_id = self
+            .operation_id
+            .ok_or_else(|| RenewalError::Malformed("no operation to approve".into()))?;
+        let token = self
+            .tokens
+            .as_ref()
+            .ok_or(RenewalError::CapabilityWindowClosed)?
+            .submit
+            .clone();
+        let body = serde_json::to_vec(approval)
+            .map_err(|error| RenewalError::Malformed(error.to_string()))?;
+        let view = self
+            .post_with_token(&self.routes.signer_result(&operation_id), body, &token)
+            .await?;
         self.adopt(view)
     }
 
@@ -920,6 +1015,13 @@ impl RenewalSession {
         self.check_identity(&view)?;
         let operation_id = view.operation_id;
         self.operation_id = Some(operation_id);
+        // Kept only while both are there: an operation that has stopped
+        // minting one of them no longer accepts a result, and a half-set would
+        // let a ceremony run for an assertion nowhere to put.
+        self.tokens = match (view.signer_request_token, view.signer_result_token) {
+            (Some(read), Some(submit)) => Some(CapabilityTokens { read, submit }),
+            _ => None,
+        };
         match view.state {
             ClientRenewalOperationState::AwaitingOperator => {
                 Ok(RenewalStep::AwaitingOperator { operation_id })
@@ -995,6 +1097,41 @@ impl RenewalSession {
         Ok(())
     }
 
+    /// A read that carries a capability token, for a typed answer.
+    async fn get_with_token<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<T, RenewalError> {
+        let mut request = self.http.get(url);
+        if let Some(token) = token {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| RenewalError::Transport(error.to_string()))?;
+        Self::decode_typed(response).await
+    }
+
+    async fn post_with_token(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+        token: &str,
+    ) -> Result<ClientRenewalOperationView, RenewalError> {
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| RenewalError::Transport(error.to_string()))?;
+        Self::decode_typed(response).await
+    }
+
     async fn get(&self, url: &str) -> Result<ClientRenewalOperationView, RenewalError> {
         let response = self
             .http
@@ -1008,6 +1145,12 @@ impl RenewalSession {
     async fn decode(
         response: reqwest::Response,
     ) -> Result<ClientRenewalOperationView, RenewalError> {
+        Self::decode_typed(response).await
+    }
+
+    async fn decode_typed<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, RenewalError> {
         Self::refuse_status(&response)?;
         if response
             .content_length()

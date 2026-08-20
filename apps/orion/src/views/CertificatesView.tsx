@@ -5,13 +5,14 @@ import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
 import Paper from '@mui/material/Paper'
 import Typography from '@mui/material/Typography'
-import { RefreshCw } from 'lucide-react'
+import { KeyRound, RefreshCw } from 'lucide-react'
 
 import * as api from '../api'
 import { CertificatePanel, PhasePill, isAlarming, worstPhase } from '../components/CertificatePanel'
 import { CopyButton } from '../components/CopyButton'
 import { GUTTER, RULE } from '../theme'
 import type {
+  ApprovalManifest,
   CertificateAction,
   CertificatePhase,
   ProfileCertificates,
@@ -56,10 +57,19 @@ export function CertificatesView() {
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
+  // A ceremony's refusal comes back from the rejection, not from the overview:
+  // the shell records the *action*'s reason, and a key that was not plugged in
+  // is not an action that was refused.
+  const [failure, setFailure] = useState<Record<string, string>>({})
   // Where each profile's renewal stopped, from the press that opened it.
   // Not persisted and not refreshed: it describes one attempt made here, and a
   // step surviving a reload would outlive the operation it names.
   const [progress, setProgress] = useState<Record<string, RenewalProgress>>({})
+  // The approval request, once read and verified. Held so that what the user
+  // approves is what they were shown: re-fetching between the display and the
+  // touch would ask for a touch on something nobody saw.
+  const [manifest, setManifest] = useState<Record<string, ApprovalManifest>>({})
+  const [ceremony, setCeremony] = useState<string | null>(null)
   const [reloading, setReloading] = useState(false)
 
   const refresh = useCallback(async () => {
@@ -100,6 +110,31 @@ export function CertificatesView() {
       })
     } finally {
       setBusy(false)
+      await refresh()
+    }
+  }
+
+  /// Reads the approval request, then runs the ceremony on the same object.
+  const approve = async (name: string) => {
+    setCeremony(name)
+    try {
+      const request = manifest[name] ?? (await api.certificateApprovalManifest(name))
+      setManifest((current) => ({ ...current, [name]: request }))
+      const pin = (await api.certificateApprovalNeedsPin(name))
+        ? // Only the HID transport asks. Under Windows the system collects it
+          // in its own dialog and it never enters Orion.
+          (window.prompt('PIN de la clé de sécurité') ?? '')
+        : undefined
+      const step = await api.approveCertificateRenewal(name, pin)
+      setProgress((current) => ({ ...current, [name]: step }))
+      setManifest((current) => {
+        const { [name]: _done, ...rest } = current
+        return rest
+      })
+    } catch (cause) {
+      setFailure((current) => ({ ...current, [name]: String(cause) }))
+    } finally {
+      setCeremony(null)
       await refresh()
     }
   }
@@ -179,7 +214,13 @@ export function CertificatesView() {
               lastError={profile.last_error}
               onRun={busy ? undefined : (action) => void run(profile.name, action)}
             />
-            <RenewalStep step={progress[profile.name]} />
+            <RenewalStep
+              step={progress[profile.name]}
+              manifest={manifest[profile.name]}
+              failure={failure[profile.name]}
+              busy={ceremony === profile.name}
+              onApprove={ceremony ? undefined : () => void approve(profile.name)}
+            />
           </Paper>
         ))}
       </Box>
@@ -204,16 +245,63 @@ export function CertificatesView() {
  * The command is copyable for the same reason every other value here is:
  * selecting truncated monospace text with the mouse is where it goes wrong.
  */
-function RenewalStep({ step }: { step: RenewalProgress | undefined }) {
-  if (!step) return null
+function RenewalStep({
+  step,
+  manifest,
+  failure,
+  busy,
+  onApprove,
+}: {
+  step: RenewalProgress | undefined
+  manifest: ApprovalManifest | undefined
+  failure: string | undefined
+  busy: boolean
+  onApprove?: () => void
+}) {
+  if (!step && !failure) return null
   return (
     <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
-      {step.step === 'committed' ? (
+      {step?.step === 'committed' && (
         <Row label="génération suivante" value={String(step.generation)} />
-      ) : (
+      )}
+      {step && step.step !== 'committed' && (
+        <Row label="opération" value={step.operation_id} copyable />
+      )}
+      {manifest && (
         <>
-          <Row label="opération" value={step.operation_id} copyable />
-          {step.step === 'awaiting_operator' && (
+          <Row
+            label="générations"
+            value={`${manifest.active_generation} → ${manifest.requested_generation}`}
+          />
+          <Row label="demande" value={manifest.request_fingerprint} copyable />
+          <Row label="clés éligibles" value={String(manifest.eligible_credentials)} />
+        </>
+      )}
+      {step?.step === 'awaiting_operator' && (
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={busy || !onApprove}
+          startIcon={
+            busy ? <CircularProgress size={13} color="inherit" /> : <KeyRound size={14} aria-hidden />
+          }
+          onClick={onApprove}
+          sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+        >
+          {manifest ? 'Approuver avec la clé' : 'Lire la demande'}
+        </Button>
+      )}
+      {failure && (
+        <>
+          <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+            {failure}
+          </Alert>
+          {/* The command line is the escape hatch, and only here: a machine
+              where the platform key dialog cannot run is exactly where an
+              operator needs the companion, and nowhere else does showing it
+              add anything. */}
+          {step?.step === 'awaiting_operator' && (
             <Row label="approbation" value={step.companion_command} copyable />
           )}
         </>

@@ -113,6 +113,12 @@ pub enum RenewalError {
     Approval(aether::certificates::CertificateError),
     #[error("the capability token is refused: {0}")]
     Capability(aether::certificates::CertificateError),
+    #[error(
+        "this authority holds no credential document: no operator credential can approve a \
+         renewal, so the ceremony has no allow-list to run against. Copy the one \
+         `astra-signer bindings` emits."
+    )]
+    NoOperatorCredential,
     #[error("operation: {0}")]
     Operation(#[from] OperationError),
     #[error("registry: {0}")]
@@ -339,9 +345,18 @@ pub async fn signer_request(
         let state = registry.state();
         (state.authority_url.clone(), state.webauthn_rp_id.clone())
     };
+    // The allow-list travels with the document that authorizes it. Whoever
+    // runs the ceremony verifies that document under `CA-PQ` themselves: an
+    // allow-list this service merely asserted would let a compromised Astra
+    // name a credential nobody ever enrolled.
+    let credential_registry = service
+        .approval_credential_registry
+        .clone()
+        .ok_or(RenewalError::NoOperatorCredential)?;
     Ok(ClientRenewalSignerRequest {
         operation_id: *operation_id,
         approval_request: operation.approval_request.clone(),
+        credential_registry,
         authority_url,
         webauthn_rp_id,
     })

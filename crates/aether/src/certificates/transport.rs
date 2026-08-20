@@ -1116,6 +1116,14 @@ pub struct ClientRenewalOperationView {
 pub struct ClientRenewalSignerRequest {
     pub operation_id: Id16,
     pub approval_request: Box<super::approval::AstraCredentialApprovalRequest>,
+    /// The `CA-PQ`-signed credential registry the allow-list comes from.
+    ///
+    /// Carried rather than assumed, because whoever runs the ceremony has to
+    /// verify it under an anchor **it already holds**. The operator companion
+    /// keeps its own copy beside the vault; Orion has none, and asking it to
+    /// trust an allow-list on the authority's word would let a compromised
+    /// authority name a credential of its choosing. Under `CA-PQ` it cannot.
+    pub credential_registry: Box<super::approval::CredentialRegistry>,
     pub authority_url: String,
     pub webauthn_rp_id: String,
 }

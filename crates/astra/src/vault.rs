@@ -84,9 +84,10 @@ pub const AUTHORITY_VAULT_VERSION: u16 = 1;
 
 /// Length of the salt handed to `hmac-secret`, in bytes.
 ///
-/// CTAP2 fixes it: the extension takes a 32-byte salt and returns a 32-byte
-/// output.
-pub const SALT_LEN: usize = 32;
+/// Re-exported from the authenticator boundary that defines it: CTAP2 fixes
+/// it, so the value belongs where the key is spoken to rather than where the
+/// file is written. Kept visible here because every vault reader names it.
+pub use helios_fido::authenticator::SALT_LEN;
 
 /// Largest number of credentials a vault registers.
 ///
@@ -104,11 +105,9 @@ pub const MAX_SLOTS: usize = 8;
 /// hardware, kept elsewhere. Beyond two, more are welcome and none is special.
 pub const REQUIRED_SLOTS: usize = 2;
 
-/// Largest credential identifier accepted, in bytes.
-///
-/// CTAP2 credential IDs are typically 32–128 bytes; the ceiling refuses a
-/// file that would drive an allocation.
-pub const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
+/// Largest credential identifier accepted, in bytes. Also from the
+/// authenticator boundary: the bound is CTAP2's, not this file format's.
+pub use helios_fido::authenticator::MAX_CREDENTIAL_ID_BYTES;
 
 /// Largest COSE credential public key accepted, in bytes.
 ///
@@ -164,23 +163,10 @@ type Result<T> = std::result::Result<T, VaultError>;
 
 /// Key material an authenticator released for one slot.
 ///
-/// On a real machine this is the CTAP2 `hmac-secret` output for the slot's
-/// credential and the vault's salt, obtained with user presence **and** user
-/// verification. The type exists so nothing above this boundary can confuse it
-/// with a key: it is input to a derivation, never a wrapping key itself.
-pub struct SlotSecret(Zeroizing<Vec<u8>>);
-
-impl SlotSecret {
-    pub fn new(material: Vec<u8>) -> Self {
-        Self(Zeroizing::new(material))
-    }
-}
-
-impl std::fmt::Debug for SlotSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SlotSecret(<redacted>)")
-    }
-}
+/// Defined at the authenticator boundary — it is what a security key hands
+/// back, and this file merely derives from it. Re-exported so vault readers
+/// keep naming it here.
+pub use helios_fido::authenticator::SlotSecret;
 
 /// What role a slot plays for the operator. Cryptographically identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,7 +401,7 @@ fn wrap_master(
         SLOT_DOMAIN,
         &slot_context(vault_id, slot_id),
         &Unlock::Derived {
-            ikm: &secret.0,
+            ikm: secret.expose(),
             info: SLOT_INFO,
         },
         master,
@@ -555,7 +541,7 @@ impl AuthorityVault {
             SLOT_DOMAIN,
             &slot_context(&self.vault_id, slot_id),
             &Unlock::Derived {
-                ikm: &secret.0,
+                ikm: secret.expose(),
                 info: SLOT_INFO,
             },
             &blob,

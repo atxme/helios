@@ -339,7 +339,7 @@ fn an_ordinary_renewal_approves_without_opening_the_vault() {
     let (service_private, service_public) = service_key();
     let request = approval_request(&registry, &service_private);
 
-    let approval = authority::approve_renewal(
+    let approval = helios_fido::approve_renewal(
         &first,
         &request,
         &service_public,
@@ -379,7 +379,7 @@ fn an_ordinary_renewal_approves_without_opening_the_vault() {
     // A token nobody enrolled holds no credential this request names, so it
     // answers nothing — the allow-list is the intersection, not the union.
     let stranger = FakeKey::new(9);
-    assert!(authority::approve_renewal(
+    assert!(helios_fido::approve_renewal(
         &stranger,
         &request,
         &service_public,
@@ -411,7 +411,7 @@ fn an_approval_does_not_travel_to_a_second_request() {
     other.requested_generation = 5;
     let other = other.sign(&service_private).expect("signs");
 
-    let approval = authority::approve_renewal(
+    let approval = helios_fido::approve_renewal(
         &first,
         &request,
         &service_public,
@@ -615,7 +615,7 @@ fn the_signing_gestures_fit_the_stack_the_binary_reserves() {
             let registry = bindings(&vault, &opening);
             let (service_private, service_public) = service_key();
             let request = approval_request(&registry, &service_private);
-            authority::approve_renewal(
+            helios_fido::approve_renewal(
                 &first,
                 &request,
                 &service_public,

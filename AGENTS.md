@@ -139,9 +139,14 @@ Restent ouverts :
   pair par sa VIP, pas par un jeton porteur. Le transport ne décide de rien :
   la demande reste vérifiée sous la clé de service épinglée, et le RP ID
   annoncé par la gateway est **comparé** à celui du coffre, jamais adopté.
-  **Le bouton existe** : l'écran *Certificats* d'Orion ouvre l'opération,
-  affiche la ligne exacte qui l'approuve, la reprend au clic suivant et
-  committe le grant. Le magasin de confiance s'amorce tout seul depuis le
+  **Le bouton existe, et il va jusqu'au bout** : l'écran *Certificats* d'Orion
+  ouvre l'opération, lit la demande d'approbation, la vérifie sous ce que le
+  profil épingle, **demande la clé de sécurité lui-même** puis committe le
+  grant. Aucun second binaire à lancer : `orion-core::certificate_approval`
+  porte la cérémonie du §14.1 par `helios-fido`, transport plateforme sous
+  Windows — pas d'élévation, et le PIN reste collecté par le système. La ligne
+  de commande du compagnon n'apparaît plus que là où elle est la réponse :
+  après une cérémonie qui n'a pas pu s'exécuter. Le magasin de confiance s'amorce tout seul depuis le
   profil et l'identité scellée (`open_or_seed`) ; une fois écrit, c'est lui qui
   fait foi, et un magasin décrivant un autre domaine est refusé plutôt
   qu'écrasé. Le candidat est scellé sous `<identité>-next` **avant** le commit,
@@ -699,6 +704,14 @@ c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
   format du coffre d'autorité — key-slots FIDO2, corps scellé lié à la table de
   slots. Astra le transporte et le sauvegarde ; il ne l'ouvre pas, et rien dans
   le conteneur ne le peut.
+- `helios-fido` : la frontière matérielle FIDO2, et la **seule** cérémonie qui
+  n'ouvre aucun coffre — l'approbation ordinaire du §14.1. Extraite parce
+  qu'Orion la fait lui-même : elle ne reçoit aucun sel, donc aucune sortie PRF
+  n'existe pour elle et aucun key-slot ne peut être déverrouillé. La frontière
+  est un type et non une convention — `approve_renewal` ne prend pas de coffre,
+  `Authenticator::approve` ne reçoit pas de sel — et `orion-core` lie cette
+  caisse sans jamais lier `astra` : le format de coffre n'est pas atteignable
+  depuis le client.
 - `astra-signer` : compagnon du **poste opérateur** (ADR-008 §4), le seul
   programme du dépôt qui détienne `CA-PQ` en clair, et seulement le temps d'une
   opération. Il parle à CTAP2 directement — jamais un navigateur, jamais Orion,

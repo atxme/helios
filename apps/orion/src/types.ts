@@ -137,6 +137,25 @@ export type RenewalProgress =
   | { step: 'issuing'; operation_id: string }
   | { step: 'committed'; generation: number }
 
+/**
+ * What the operator is shown **before** being asked to touch their key.
+ *
+ * Every field comes from a request verified against what the profile pins, not
+ * from the answer's own claims: showing a generation or a peer that nothing
+ * vouches for is how a ceremony gets spent on a lie.
+ */
+export interface ApprovalManifest {
+  operation_id: string
+  client_wg_public_key: string
+  active_generation: number
+  requested_generation: number
+  /** SHA-256 of the rotation request this approval is bound to. */
+  request_fingerprint: string
+  expires_at: number
+  /** How many of the domain's credentials may answer this request. */
+  eligible_credentials: number
+}
+
 /** Everything the Certificates screen shows for one profile. */
 export interface ProfileCertificates {
   name: string

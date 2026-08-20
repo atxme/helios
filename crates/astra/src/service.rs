@@ -235,6 +235,15 @@ pub struct AstraService {
     /// epoch N-1 would make the verifier and the authenticator describe two
     /// different allow-lists.
     pub approval_credential_registry_epoch: u64,
+    /// The signed document those identifiers came from, whole.
+    ///
+    /// Whoever runs the approval verifies it under `CA-PQ` themselves, so it
+    /// has to travel — an allow-list this service merely asserts would let a
+    /// compromised Astra name a credential nobody enrolled. `None` when no
+    /// credential document has been copied here, which is also when
+    /// `approval_credential_ids` is empty.
+    pub approval_credential_registry:
+        Option<Box<aether::certificates::approval::CredentialRegistry>>,
     /// The private veth link to `heliosd`, when the deployment has one.
     ///
     /// It lives here because this is where staging will be driven from: an

@@ -156,6 +156,13 @@ struct InFlightRenewal {
     session: orion_core::certificate_renewal::RenewalSession,
     store: orion_core::certificates::TrustStore,
     settings: orion_core::KeyNegotiationSettings,
+    /// The approval request, once read and verified.
+    ///
+    /// Held between the read and the ceremony so that what is signed is what
+    /// was shown: a screen that displayed one manifest and then re-fetched
+    /// before touching the key would be asking for a touch on something the
+    /// user never saw.
+    approval: Option<orion_core::certificate_approval::VerifiedApproval>,
 }
 
 /// A WireGuard key pair held between its creation and its save.
@@ -667,6 +674,7 @@ async fn drive_renewal(
                 session,
                 store,
                 settings,
+                approval: None,
             },
         );
     }
@@ -684,6 +692,98 @@ async fn record_certificate_error(
         .await
         .insert(name.to_string(), message.clone());
     message
+}
+
+/// Reads the approval request the open renewal is waiting on (§8.1.2 step 4a).
+///
+/// Verified before it comes back, against what the profile pins — so what the
+/// screen shows is attested rather than announced. Nothing touches a security
+/// key here: the manifest exists precisely so the user decides *before* the
+/// ceremony, not during it.
+#[tauri::command]
+async fn certificate_approval_manifest(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<orion_core::certificate_approval::ApprovalManifest, String> {
+    let mut renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get_mut(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let verified = in_flight
+        .session
+        .fetch_approval(&in_flight.store, now_unix())
+        .await
+        .map_err(|error| error.to_string())?;
+    let manifest = verified.manifest();
+    in_flight.approval = Some(verified);
+    Ok(manifest)
+}
+
+/// Runs the ceremony and posts the assertion (§8.1.2 step 4b).
+///
+/// The blocking call lives on a blocking thread: talking to a security key
+/// puts a modal on screen and waits for a human, and holding the async runtime
+/// for that would stop every other task in Orion — the tunnel's telemetry
+/// included.
+///
+/// The verified request is **consumed**. A second run would ask for a touch
+/// against a window the authority has since closed, and the user would be
+/// standing at a prompt for nothing.
+#[tauri::command]
+async fn approve_certificate_renewal(
+    state: State<'_, AppState>,
+    name: String,
+    pin: Option<String>,
+) -> Result<RenewalProgress, String> {
+    let verified = {
+        let mut renewals = state.renewals.lock().await;
+        let in_flight = renewals
+            .get_mut(&name)
+            .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+        in_flight.approval.take().ok_or_else(|| {
+            "lire d'abord la demande d'approbation : c'est elle qui est vérifiée, et ce qui est              signé est ce qui a été montré"
+                .to_string()
+        })?
+    };
+
+    let pin = pin.unwrap_or_default();
+    let approval = tokio::task::spawn_blocking(move || verified.run(&pin, now_unix()))
+        .await
+        .map_err(|error| format!("la cérémonie n'a pas pu être lancée : {error}"))?
+        .map_err(|error| error.to_string())?;
+
+    let mut renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get_mut(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let step = in_flight
+        .session
+        .submit_approval(&approval)
+        .await
+        .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of(&step, &in_flight.session);
+    Ok(progress)
+}
+
+/// Whether this machine's key collects its own PIN.
+///
+/// Asked rather than assumed: under Windows the platform API puts up its own
+/// dialog and the PIN never enters this process, so prompting for one would be
+/// asking the user for a secret Orion has no use for.
+#[tauri::command]
+async fn certificate_approval_needs_pin(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<bool, String> {
+    let renewals = state.renewals.lock().await;
+    let in_flight = renewals
+        .get(&name)
+        .ok_or_else(|| "aucun renouvellement ouvert pour ce profil".to_string())?;
+    let approval = in_flight
+        .approval
+        .as_ref()
+        .ok_or_else(|| "lire d'abord la demande d'approbation".to_string())?;
+    approval.needs_pin().map_err(|error| error.to_string())
 }
 
 /// The last certificate action that failed on this profile, if any.
@@ -2223,6 +2323,9 @@ fn main() {
             key_negotiation_support,
             certificate_inventory,
             certificate_actions,
+            certificate_approval_manifest,
+            certificate_approval_needs_pin,
+            approve_certificate_renewal,
             certificate_overview,
             run_certificate_action,
             last_certificate_error,

@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
-use aether::certificates::approval::AstraCredentialApprovalRequest;
+use aether::certificates::approval::{AstraCredentialApprovalRequest, CredentialRegistry};
 use aether::certificates::encoding::{
     Fingerprint, Id16, MlDsa87Signature, TrustDomainId, WireGuardKey,
 };
@@ -64,6 +64,29 @@ fn view(
         signer_request_token: Some("read-token".into()),
         signer_result_token: Some("result-token".into()),
         grant: None,
+    }
+}
+
+/// What the gateway serves the companion, with the allow-list's own document.
+///
+/// The registry is never verified in these tests — `approve_renewal` is what
+/// checks it under `CA-PQ`, and this module is the wire.
+fn signer_request(
+    operation_id: Id16,
+    request: &AstraCredentialApprovalRequest,
+) -> ClientRenewalSignerRequest {
+    ClientRenewalSignerRequest {
+        operation_id,
+        approval_request: Box::new(request.clone()),
+        credential_registry: Box::new(CredentialRegistry {
+            trust_domain_id: request.trust_domain_id,
+            gateway_wg_public_key: request.gateway_wg_public_key,
+            ca_epoch: 1,
+            credential_registry_epoch: request.credential_registry_epoch,
+            bindings: Vec::new(),
+        }),
+        authority_url: "https://astra.helios.test".into(),
+        webauthn_rp_id: RP_ID.into(),
     }
 }
 
@@ -173,12 +196,7 @@ fn serve(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<Seen
 fn the_companion_reads_the_operation_then_the_request_it_is_bound_to() {
     let operation_id = operation();
     let request = approval_request(operation_id);
-    let signer = ClientRenewalSignerRequest {
-        operation_id,
-        approval_request: Box::new(request.clone()),
-        authority_url: "https://astra.helios.test".into(),
-        webauthn_rp_id: RP_ID.into(),
-    };
+    let signer = signer_request(operation_id, &request);
     let stub = Stub::serving(vec![
         (
             200,
@@ -229,12 +247,7 @@ fn a_request_that_is_not_the_bound_manifest_is_refused() {
     let request = approval_request(operation_id);
     let mut bound = view(operation_id, &request);
     bound.operation_manifest_fingerprint = Fingerprint::of(b"another manifest");
-    let signer = ClientRenewalSignerRequest {
-        operation_id,
-        approval_request: Box::new(request),
-        authority_url: "https://astra.helios.test".into(),
-        webauthn_rp_id: RP_ID.into(),
-    };
+    let signer = signer_request(operation_id, &request);
     let stub = Stub::serving(vec![
         (200, serde_json::to_string(&bound).unwrap()),
         (200, serde_json::to_string(&signer).unwrap()),

@@ -1095,7 +1095,7 @@ fn approve(
     wait_for_operator()?;
     let key = authenticator::connect(transport)?;
     let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
-    let approval = authority::approve_renewal(
+    let approval = helios_fido::approve_renewal(
         key.as_ref(),
         &request,
         &service_key,
