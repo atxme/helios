@@ -73,14 +73,29 @@ pub fn suggested_window(
     Ok((validity.renewal_at()?, validity.not_after))
 }
 
+/// What the caller knows about a renewal the registry cannot see.
+///
+/// §8.2 separates two states deliberately: `awaiting_operator` describes the
+/// **active** leaf while a renewal is open and no candidate exists yet, and
+/// `pending_grant` describes the candidate once there is one. The registry
+/// only learns of a rotation at staging, so it can never tell them apart on
+/// its own — whoever holds the operation store passes what it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenewalInFlight {
+    /// An operation is open for this peer and has not produced a candidate.
+    pub awaiting_operator: bool,
+}
+
 /// Builds the signed status of one peer's active identity (spec §8.2).
 ///
 /// `status_epoch` comes from the registry's monotonic counter, and the key
 /// epoch is stamped alongside it: the pair is compared lexicographically by
 /// the client, which is what keeps a compromised key from freezing a target.
+#[allow(clippy::too_many_arguments)]
 pub fn client_status(
     trust_domain_id: TrustDomainId,
     peer: &PeerRecord,
+    in_flight: RenewalInFlight,
     status_epoch: u64,
     astra_service_key_epoch: u64,
     now_unix: u64,
@@ -90,11 +105,16 @@ pub fn client_status(
     let status = if peer.revoked {
         CertificateStatus::Revoked
     } else if let Some(rotation) = &peer.pending {
+        // A candidate exists, so the operation is past the operator: the
+        // registry's own record decides, and the caller's view of the
+        // operation cannot contradict it.
         if rotation.granted {
             CertificateStatus::PendingCommit
         } else {
             CertificateStatus::PendingGrant
         }
+    } else if in_flight.awaiting_operator {
+        CertificateStatus::AwaitingOperator
     } else {
         match urgency(&peer.active, now_unix)? {
             RenewalUrgency::Expired => CertificateStatus::Expired,
@@ -195,8 +215,16 @@ mod tests {
     fn a_revoked_peer_is_reported_revoked_whatever_its_dates_say() {
         let mut peer = peer();
         peer.revoked = true;
-        let status = client_status(TrustDomainId::new([1; 16]).unwrap(), &peer, 1, 1, 100, 200)
-            .expect("status");
+        let status = client_status(
+            TrustDomainId::new([1; 16]).unwrap(),
+            &peer,
+            idle(),
+            1,
+            1,
+            100,
+            200,
+        )
+        .expect("status");
         assert_eq!(status.status, CertificateStatus::Revoked);
         assert!(status.status.is_terminal());
     }
@@ -213,12 +241,49 @@ mod tests {
             granted: false,
         });
         let domain = TrustDomainId::new([1; 16]).unwrap();
-        let pending = client_status(domain, &peer, 1, 1, 100, 200).expect("status");
+        let pending = client_status(domain, &peer, idle(), 1, 1, 100, 200).expect("status");
         assert_eq!(pending.status, CertificateStatus::PendingGrant);
 
         peer.pending.as_mut().unwrap().granted = true;
-        let granted = client_status(domain, &peer, 2, 1, 100, 200).expect("status");
+        let granted = client_status(domain, &peer, idle(), 2, 1, 100, 200).expect("status");
         assert_eq!(granted.status, CertificateStatus::PendingCommit);
+    }
+
+    /// No operation open for this peer.
+    fn idle() -> RenewalInFlight {
+        RenewalInFlight {
+            awaiting_operator: false,
+        }
+    }
+
+    /// `awaiting_operator` and `pending_grant` describe two different things,
+    /// and only the operation store can tell them apart.
+    ///
+    /// Before a candidate exists the status is about the **active** leaf and a
+    /// renewal nobody has answered yet; once the registry records a rotation,
+    /// the registry decides — a caller's view of the operation cannot
+    /// contradict a candidate that is already on disk.
+    #[test]
+    fn an_open_operation_without_a_candidate_is_awaiting_the_operator() {
+        let domain = TrustDomainId::new([1; 16]).unwrap();
+        let open = RenewalInFlight {
+            awaiting_operator: true,
+        };
+
+        let status = client_status(domain, &peer(), open, 1, 1, 100, 200).expect("status");
+        assert_eq!(status.status, CertificateStatus::AwaitingOperator);
+
+        let mut staged = peer();
+        staged.pending = Some(PendingRotation {
+            stage_id: Id16::new([4; 16]).unwrap(),
+            request_fingerprint: Fingerprint::of(b"request"),
+            candidate: generation(),
+            window: TransitionWindow::new(1, 2, 3).unwrap(),
+            stage_expires_at: 5_000,
+            granted: false,
+        });
+        let status = client_status(domain, &staged, open, 2, 1, 100, 200).expect("status");
+        assert_eq!(status.status, CertificateStatus::PendingGrant);
     }
 
     /// An expired leaf is reported expired, and no status makes it usable
@@ -228,6 +293,7 @@ mod tests {
         let status = client_status(
             TrustDomainId::new([1; 16]).unwrap(),
             &peer(),
+            idle(),
             1,
             1,
             2_000,

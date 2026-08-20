@@ -455,9 +455,19 @@ async fn status_query(
     let status_epoch = registry.next_status_epoch(&peer.active.pq_certificate_fingerprint);
     let service_key_epoch = registry.state().astra_service_key_epoch;
     let trust_domain_id = registry.state().trust_domain_id;
+    // Whether a renewal is open for this peer and has not yet produced a
+    // candidate. The registry cannot answer it — it only learns of a rotation
+    // at staging — so the operation store is asked, and §8.2's distinction
+    // between `awaiting_operator` and `pending_grant` survives.
+    let awaiting_operator = service
+        .operations
+        .lock()
+        .await
+        .awaits_operator(&query.client_wg_public_key, now);
     let status = planner::client_status(
         trust_domain_id,
         &peer,
+        planner::RenewalInFlight { awaiting_operator },
         status_epoch,
         service_key_epoch,
         now,

@@ -289,9 +289,24 @@ Restent ouverts :
   `AuthenticatedTrustUpdateRequest` sont intentionnelles — snapshot TLS/PQ de
   l'active, puis leaf PQ effectivement présentée — et les statuts sont validés
   par famille. La révocation de l'active domine depuis toute phase ; celle de
-  la seule suivante retire le candidat sans révoquer l'active. Le code n'est
-  pas encore aligné sur tous ces écarts filaires : voir §12.3 de la
-  spécification avant de poursuivre le développement.
+  la seule suivante retire le candidat sans révoquer l'active.
+  **Ces écarts filaires sont désormais alignés.** Trois l'étaient déjà — le
+  reçu qui laisse Helios en `pending_grant`, `retire_active_at =
+  transition.not_after`, et la révocation qui distingue l'active de la seule
+  suivante ; le quatrième ne l'était pas : `CertificateStatus` était un enum
+  plat de dix états, là où le §8.2 en nomme douze et exige que **le décodeur
+  refuse** toute combinaison absente de sa table par famille. `awaiting_operator`
+  et `promoted` manquaient, et rien ne liait un état à une famille — un statut
+  signé pouvait dire `astra_issuer: pending_commit`, phrase sans signification
+  que chaque consommateur aurait dû interpréter. `permitted_for` porte la table
+  et `AstraCertificateStatus::verify` refuse avant la signature. Les octets de
+  transcription des dix états d'origine ne bougent pas : les renuméroter
+  changerait silencieusement ce que tout statut déjà signé disait.
+  `awaiting_operator` a un producteur — l'état est un fait sur l'**opération**,
+  que le registre ne voit pas, donc `client_status` le reçoit de qui détient le
+  magasin d'opérations. `promoted` est accepté mais **jamais émis** : l'affirmer
+  demanderait un journal de mutations par cible, et Astra tient un compteur
+  monotone qui dit qu'un changement a eu lieu, pas lequel.
   La fermeture cryptographique du même jour ajoute six invariants. Les deux
   optionnels de `GatewayIdentityTransition` portent chacun un octet de présence
   `0|1` avant leur empreinte — le code le faisait déjà, la transcription ne le

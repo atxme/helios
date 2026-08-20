@@ -1707,10 +1707,17 @@ impl TrustLedger {
                 .u8(scope_byte(revocation.scope))
                 .u64(revocation.revocation_epoch)
                 .u64(revocation.effective_at)
-                .optional_fingerprint(revocation.revoked_tls_fingerprint.as_ref())
-                .optional_u64(revocation.revoked_tls_not_after)
-                .optional_fingerprint(revocation.revoked_pq_fingerprint.as_ref())
-                .optional_u64(revocation.revoked_pq_not_after)
+                // The same one-flag-per-pair rule as the signed revocation
+                // (spec §0.5): the base-state fingerprint must not be able to
+                // describe a half-filled pair either.
+                .optional_revoked_leaf(
+                    revocation.revoked_tls_fingerprint.as_ref(),
+                    revocation.revoked_tls_not_after,
+                )
+                .optional_revoked_leaf(
+                    revocation.revoked_pq_fingerprint.as_ref(),
+                    revocation.revoked_pq_not_after,
+                )
                 .optional_fingerprint(revocation.revocation_fingerprint.as_ref());
         }
         bytes.u16(self.revoked.len() as u16);

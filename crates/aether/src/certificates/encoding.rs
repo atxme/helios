@@ -507,17 +507,31 @@ impl CanonicalBytes {
         }
     }
 
-    /// An optional integer: a presence byte, then the value if present.
+    /// A revoked leaf and its cryptographic expiry, behind **one** presence
+    /// byte (spec §0.5).
     ///
-    /// Using zero as an absence sentinel would make `None` and `Some(0)` share
-    /// one signed transcript even though they have different semantics.
-    pub(crate) fn optional_u64(&mut self, value: Option<u64>) -> &mut Self {
-        match value {
-            Some(value) => {
+    /// The two halves are one decision: a fingerprint without its `not_after`
+    /// is a revocation that never expires, and an expiry without a fingerprint
+    /// names nothing. Encoding them under two independent flags lets the
+    /// canonical bytes express a pair the validator forbids — and a verifier
+    /// that skipped the validator would accept it, because the bytes are still
+    /// well-formed. One flag makes the impossible state unrepresentable in the
+    /// transcript itself.
+    pub(crate) fn optional_revoked_leaf(
+        &mut self,
+        fingerprint: Option<&Fingerprint>,
+        not_after: Option<u64>,
+    ) -> &mut Self {
+        match (fingerprint, not_after) {
+            (Some(fingerprint), Some(not_after)) => {
                 self.u8(1);
-                self.u64(value)
+                self.fingerprint(fingerprint);
+                self.u64(not_after)
             }
-            None => self.u8(0),
+            // A half-filled pair encodes as absent rather than as itself: the
+            // object is refused by `validate` either way, and a transcript
+            // that could carry it would be a transcript worth forging.
+            _ => self.u8(0),
         }
     }
 
@@ -707,13 +721,40 @@ mod tests {
         assert_ne!(absent.finish(), zero.finish());
     }
 
+    /// One presence byte covers a revoked leaf **and** its expiry (spec §0.5).
+    ///
+    /// Three properties, and each one is a way the old two-flag encoding could
+    /// be wrong: an absent pair does not encode like a present all-zero one; a
+    /// half-filled pair encodes as absent rather than as itself, so the
+    /// transcript cannot describe a state the object refuses; and two
+    /// different expiries under one fingerprint stay distinguishable.
     #[test]
-    fn an_absent_optional_integer_does_not_encode_like_zero() {
+    fn a_revoked_leaf_and_its_expiry_share_one_presence_byte() {
+        let leaf = Fingerprint::from_bytes([0; FINGERPRINT_LEN]);
+
         let mut absent = CanonicalBytes::new(b"domain");
-        absent.optional_u64(None);
+        absent.optional_revoked_leaf(None, None);
         let mut zero = CanonicalBytes::new(b"domain");
-        zero.optional_u64(Some(0));
+        zero.optional_revoked_leaf(Some(&leaf), Some(0));
         assert_ne!(absent.finish(), zero.finish());
+
+        // A fingerprint with no expiry is a revocation that never ends, and an
+        // expiry with no fingerprint names nothing. Neither is expressible.
+        let mut half = CanonicalBytes::new(b"domain");
+        half.optional_revoked_leaf(Some(&leaf), None);
+        let mut other_half = CanonicalBytes::new(b"domain");
+        other_half.optional_revoked_leaf(None, Some(10_000));
+        let mut nothing = CanonicalBytes::new(b"domain");
+        nothing.optional_revoked_leaf(None, None);
+        let nothing = nothing.finish();
+        assert_eq!(half.finish(), nothing);
+        assert_eq!(other_half.finish(), nothing);
+
+        let mut early = CanonicalBytes::new(b"domain");
+        early.optional_revoked_leaf(Some(&leaf), Some(1));
+        let mut late = CanonicalBytes::new(b"domain");
+        late.optional_revoked_leaf(Some(&leaf), Some(2));
+        assert_ne!(early.finish(), late.finish());
     }
 
     /// Two adjacent variable-length fields must not be re-splittable.
