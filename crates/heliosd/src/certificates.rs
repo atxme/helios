@@ -76,36 +76,45 @@ pub trait StageReceiptSigner: Send + Sync {
     fn served_pq_certificate(&self) -> aether::key_negotiation::PqCertificate;
 }
 
+/// Opens the registry once, for both the lifecycle and the negotiation.
+///
+/// Called before the negotiation starts, because the negotiation needs to read
+/// it and the lifecycle service is built afterwards — it signs its receipts
+/// through the negotiation handler. Loading it twice would put two writers on
+/// one file.
+///
+/// A missing file is `None`, and that is not an empty domain: without `CA-PQ`
+/// there is no anchor to verify anything against, so the lifecycle routes stay
+/// closed rather than accepting the first object that arrives, and the
+/// negotiation keeps to the pins of `network.toml`.
+pub fn open_registry(path: &std::path::Path) -> Result<Option<SharedRegistry>> {
+    let Some(registry) = CertificateRegistry::load(path)
+        .with_context(|| format!("reading the certificate registry {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(Mutex::new(registry))))
+}
+
+/// A registry behind its one lock, shared by its owner and its readers.
+///
+/// The **writer** is [`CertificateService`], and there is only ever one. The
+/// key negotiation holds the same handle to *read* it: a caller resolved by
+/// the fingerprint mTLS proved has to be looked up in the thing that recorded
+/// the last rotation, not in a file written once at admission. One lock, one
+/// registry — a second `CertificateRegistry` over the same path would be two
+/// writers of one slot, which is the arrangement this module exists to avoid.
+pub type SharedRegistry = Arc<Mutex<CertificateRegistry>>;
+
 /// Owner of the registry, and the only writer of its file.
 pub struct CertificateService {
-    registry: Mutex<CertificateRegistry>,
+    registry: SharedRegistry,
     signer: Arc<dyn StageReceiptSigner>,
 }
 
 impl CertificateService {
-    pub fn new(registry: CertificateRegistry, signer: Arc<dyn StageReceiptSigner>) -> Self {
-        Self {
-            registry: Mutex::new(registry),
-            signer,
-        }
-    }
-
-    /// Loads the registry, or reports that this gateway has no trust domain.
-    ///
-    /// A missing file is not an empty domain: without `CA-PQ` there is no
-    /// anchor to verify anything against, and the routes stay closed rather
-    /// than accepting the first object that arrives.
-    ///
-    /// A gateway that runs no negotiation service has no served leaf to sign
-    /// receipts with either, so the lifecycle needs the signer to exist — the
-    /// two are not independently deployable.
-    pub fn load(path: PathBuf, signer: Arc<dyn StageReceiptSigner>) -> Result<Option<Arc<Self>>> {
-        let Some(registry) = CertificateRegistry::load(&path)
-            .with_context(|| format!("reading the certificate registry {}", path.display()))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(Self::new(registry, signer))))
+    pub fn new(registry: SharedRegistry, signer: Arc<dyn StageReceiptSigner>) -> Self {
+        Self { registry, signer }
     }
 
     /// Records a peer's first generation, from the leaves admission carried.
@@ -245,16 +254,31 @@ impl AstraStageHandler for CertificateService {
         let caller = authorization.client_wg_public_key;
         let now = now_unix();
         let mut registry = self.registry.lock().await;
-        assert_candidate_is_presentable(registry.state(), &authorization).map_err(|reason| {
-            tracing::error!(
-                peer = %caller,
-                %reason,
-                "staging from Astra refused: this gateway could not authenticate the candidate \
-                 leaves once they became active, and staging them would lock the client out at \
-                 the end of the overlap"
-            );
-            TrustUpdateRefusal::Rejected
-        })?;
+        // Read here rather than inside the check, so the check is a pure
+        // question about a state and a candidate — and can therefore be
+        // exercised without a `/var/lib/helios` on the machine running it.
+        let client_pq_ca =
+            std::fs::read(crate::key_negotiation::CLIENT_PQ_CA_PATH).map_err(|error| {
+                tracing::error!(
+                    peer = %caller,
+                    %error,
+                    "staging from Astra refused: the client PQ CA the negotiation port \
+                     authenticates under is unreadable"
+                );
+                TrustUpdateRefusal::Internal
+            })?;
+        assert_candidate_is_presentable(registry.state(), &client_pq_ca, &authorization).map_err(
+            |reason| {
+                tracing::error!(
+                    peer = %caller,
+                    %reason,
+                    "staging from Astra refused: this gateway could not authenticate the candidate \
+                     leaves once they became active, and staging them would lock the client out at \
+                     the end of the overlap"
+                );
+                TrustUpdateRefusal::Rejected
+            },
+        )?;
         let receipt = registry
             .stage(&caller, &authorization, now)
             .map_err(|error| {
@@ -759,24 +783,31 @@ pub fn domain_view(
 /// is asked **before** the candidate is written, where the answer still costs
 /// nothing.
 ///
-/// # Limite connue — the two anchors are not the same one yet
+/// # Why this asks the negotiation's own question
 ///
-/// The negotiation port authenticates a client under exactly one client TLS CA
-/// and one client PQ CA, both read from `/var/lib/helios` at start-up. A
-/// renewed leaf, however, is issued by Astra's delegated issuer: its TLS half
-/// chains to the intermediate the delegation names, and its PQ half is signed
-/// by the issuer's ML-DSA-87 key. Both are legitimate — every lifecycle object
-/// says so — and neither is something this gateway's negotiation currently
-/// verifies against.
+/// The negotiation now resolves callers from the registry and admits every
+/// issuer the domain names — the anchor, its successor, the delegated issuer,
+/// and the operator CA the first generation was signed by. This check builds
+/// **the same set, the same way**. Two slightly different answers to "would
+/// this leaf authenticate" is the failure that has no good outcome: the
+/// narrower one refuses candidates that would have worked, and the wider one
+/// stages a leaf whose owner is locked out at the end of the overlap, on a
+/// machine whose only channel for saying so was the tunnel.
 ///
-/// Closing that is the next lot, and it is two things: the negotiation reading
-/// the certificate registry (`acceptable_pq_fingerprints`, `resolve_pair` and
-/// the delegated issuer's public key) instead of the frozen pins of
-/// `network.toml`, and the client TLS anchor of the domain becoming the one
-/// the authority actually issues under. Until both land, this check is what
-/// keeps an installed delegation from producing a certificate nobody can use.
+/// # Limite connue — the TLS root set is still read once, from disk
+///
+/// The QUIC endpoint's client trust anchors are loaded at start-up from
+/// `/var/lib/helios/key-negotiation-client-ca.der`. `heliosd
+/// init-trust-domain` seeds the registry from that same file, so today the two
+/// agree and a delegated leaf validates as long as the client presents the
+/// delegation's TLS intermediate in its chain. What is not wired is a **client
+/// TLS CA rotation**: the registry's `next_client_tls_ca_certificate` is not
+/// offered as a second root, and a new anchor would in any case need a
+/// restart, since rebuilding the endpoint under live sessions would drop the
+/// PSK slots they hold. Nothing performs that rotation yet.
 fn assert_candidate_is_presentable(
     state: &helios_provisioning::certificates::RegistryState,
+    client_pq_ca: &[u8],
     authorization: &aether::certificates::client::ClientCertificateStageAuthorization,
 ) -> Result<(), String> {
     use aether::certificates::x509;
@@ -811,22 +842,41 @@ fn assert_candidate_is_presentable(
         return Err("the candidate TLS leaf chains to no client CA this gateway holds".into());
     }
 
-    // The PQ half: the negotiation verifies a client leaf under one key, read
-    // from disk. A candidate signed by anything else authenticates nowhere.
-    let client_pq_ca = std::fs::read(crate::key_negotiation::CLIENT_PQ_CA_PATH)
-        .map_err(|error| format!("the client PQ CA is unreadable: {error}"))?;
-    authorization
-        .next_pq_certificate
-        .verify(
-            &client_pq_ca,
+    // The PQ half, asked as **exactly** the question the negotiation port will
+    // answer: the same issuer set, in the same order. Asking a narrower one
+    // here refuses candidates that would in fact authenticate; asking a wider
+    // one stages a leaf that locks its owner out at the end of the overlap.
+    // Either way the two must not drift, which is why both build the set from
+    // the registry plus the key on disk.
+    let now = now_unix();
+    let mut issuers = vec![client_pq_ca.to_vec()];
+    for key in state.client_leaf_issuers(now) {
+        let bytes = key.as_bytes().to_vec();
+        if !issuers.contains(&bytes) {
+            issuers.push(bytes);
+        }
+    }
+    let mut refusal = String::from("no issuer offered");
+    let presentable = issuers.iter().any(|issuer| {
+        match authorization.next_pq_certificate.verify(
+            issuer,
             aether::key_negotiation::PqCertificateRole::Client,
             None,
             &authorization.client_wg_public_key.to_base64(),
-            now_unix(),
-        )
-        .map_err(|error| {
-            format!("the candidate PQ leaf is not verifiable by the negotiation port: {error}")
-        })?;
+            now,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                refusal = error.to_string();
+                false
+            }
+        }
+    });
+    if !presentable {
+        return Err(format!(
+            "the candidate PQ leaf is not verifiable by the negotiation port: {refusal}"
+        ));
+    }
     Ok(())
 }
 
@@ -1185,7 +1235,7 @@ mod tests {
             CertificateRegistry::bootstrap(directory.path().join("certificates.json"), state)
                 .expect("registry");
         (
-            CertificateService::new(registry, Arc::new(RefusingSigner)),
+            CertificateService::new(Arc::new(Mutex::new(registry)), Arc::new(RefusingSigner)),
             directory,
         )
     }
@@ -1632,5 +1682,129 @@ mod tests {
             aether::certificates::state::IssuerLifecycle::Active
         );
         assert!(!outside.usable, "expiry decides, not the lifecycle field");
+    }
+
+    /// A leaf signed by a chosen key, for one exact WireGuard identity.
+    fn leaf_from(
+        issuer_private: &[u8],
+        wg_public_key: &WireGuardKey,
+        serial: u8,
+    ) -> (
+        PqCertificate,
+        aether::certificates::encoding::MlDsa87PublicKey,
+    ) {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let (_, subject_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let certificate = issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [serial; 16],
+                subject: "workstation".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: wg_public_key.to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 0,
+                not_after_unix: u64::MAX / 2,
+                ml_dsa_87_signature: String::new(),
+            },
+            issuer_private,
+        )
+        .expect("issue");
+        (certificate, subject_public)
+    }
+
+    /// The staging check must accept exactly what the negotiation port will.
+    ///
+    /// An ordinary renewal is issued by the **delegated issuer**, not by the
+    /// operator CA the first generation chained to. A gateway offering only
+    /// the key on disk refuses to stage the one candidate the whole lifecycle
+    /// exists to produce — and it refuses it silently enough that the operator
+    /// looks at the authority rather than at the pinning.
+    #[test]
+    fn a_candidate_signed_by_the_delegated_issuer_is_presentable() {
+        use aether::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+        use aether::certificates::client::{ClientCertificateStageAuthorization, IssuerKind};
+        use aether::certificates::encoding::MlDsa87Signature;
+        use aether::certificates::window::TransitionWindow;
+
+        let material = aether::certificates::test_x509::client_material("workstation");
+        let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (candidate, _) = leaf_from(&issuer_private, &key(2), 7);
+        // The key the negotiation port reads from disk. Deliberately unrelated
+        // to the delegation: that is the whole situation being tested.
+        let (_, on_disk_ca) = generate_ml_dsa_87_keypair().expect("keygen");
+
+        let authorization = ClientCertificateStageAuthorization {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            ca_tls_epoch: 2,
+            issuer_kind: IssuerKind::Astra,
+            issuer_epoch: 4,
+            issuer_authorization_fingerprint: Fingerprint::of(b"delegation"),
+            issuer_authorization: None,
+            stage_id: Id16::new([5; 16]).expect("stage"),
+            request_fingerprint: Fingerprint::of(b"request"),
+            operator_approval_fingerprint: Fingerprint::of(b"approval"),
+            renewal_approval: None,
+            gateway_wg_public_key: key(9),
+            server_name: "gateway.example".into(),
+            client_wg_public_key: key(2),
+            active_generation: 4,
+            next_generation: 5,
+            active_tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+            active_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+            next_tls_ca_certificate_fingerprint: material.authority.fingerprint(),
+            next_tls_certificate: material.leaf.clone(),
+            next_pq_certificate: candidate,
+            issued_at: 1_000,
+            stage_expires_at: 50_000,
+            window: TransitionWindow::new(1_000, 50_000, 60_000).expect("window"),
+            reason: aether::certificates::authority::RotationReason::Scheduled,
+            signature: MlDsa87Signature::placeholder(),
+        };
+
+        // Without the delegation the gateway knows only the key on disk, and
+        // refuses — which is the behaviour that used to be permanent.
+        let mut state = state();
+        // One authority for both halves: `client_material` mints a fresh CA
+        // per call, and a leaf checked against a different one would fail on
+        // the TLS half before the PQ half — the half under test — is reached.
+        state.client_tls_ca.active_client_tls_ca_certificate = material.authority.clone();
+        let refusal =
+            assert_candidate_is_presentable(&state, on_disk_ca.as_bytes(), &authorization)
+                .expect_err("no issuer offered can verify this leaf");
+        assert!(
+            refusal.contains("not verifiable by the negotiation port"),
+            "{refusal}"
+        );
+
+        // Installed, it is accepted — and the negotiation port admits the same
+        // set, so what is staged here is what will authenticate later.
+        state.issuer = Some(aether::certificates::state::AstraIssuerState {
+            issuer_epoch: 4,
+            authorization: AstraIssuerAuthorization {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: 1,
+                ca_tls_epoch: 2,
+                gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+                server_name: state.gateway.server_name.clone(),
+                issuer_epoch: 4,
+                pq_issuer_public_key: issuer_public,
+                tls_intermediate_certificate: DerCertificate::new(vec![3; 64]).expect("der"),
+                allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: u64::MAX / 2,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+        assert_candidate_is_presentable(&state, on_disk_ca.as_bytes(), &authorization)
+            .expect("the delegated issuer is one the negotiation admits");
     }
 }

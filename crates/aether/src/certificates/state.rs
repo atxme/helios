@@ -950,6 +950,34 @@ impl ClientCertificateState {
         }
     }
 
+    /// The PQ fingerprint belonging to the **same generation** as `tls`.
+    ///
+    /// The negotiation resolves a caller by the fingerprint mTLS proved, then
+    /// has to know which PQ leaf that caller may present. Returning the union
+    /// of both generations would accept the mixed pair of spec §3.3 — the TLS
+    /// of the outgoing identity beside the PQ of the incoming one, an identity
+    /// the domain never issued. So the answer is one fingerprint: the partner
+    /// of the half already proved.
+    pub fn pq_paired_with_tls(&self, tls: &Fingerprint, now_unix: u64) -> Option<Fingerprint> {
+        if self.revoked {
+            return None;
+        }
+        if self.active.tls_certificate_fingerprint.matches(tls) && self.active.is_valid_at(now_unix)
+        {
+            return Some(self.active.pq_certificate_fingerprint);
+        }
+        match (&self.next, self.activation_at) {
+            (Some(next), Some(activation_at))
+                if now_unix >= activation_at
+                    && next.tls_certificate_fingerprint.matches(tls)
+                    && next.is_valid_at(now_unix) =>
+            {
+                Some(next.pq_certificate_fingerprint)
+            }
+            _ => None,
+        }
+    }
+
     /// PQ fingerprints acceptable at `now_unix`, for the trust-update route.
     pub fn acceptable_pq_fingerprints(&self, now_unix: u64) -> Vec<Fingerprint> {
         if self.revoked {
@@ -1852,6 +1880,88 @@ mod tests {
             window: TransitionWindow::new(1_000, 10_000, 20_000).expect("window"),
         });
         state
+    }
+
+    /// The negotiation resolves a caller by the TLS half mTLS proved, and
+    /// must then know which PQ leaf that caller may present.
+    ///
+    /// The answer is the partner of that exact half, never the union of both
+    /// generations: the union accepts the mixed pair of §3.3 — the TLS of the
+    /// outgoing identity beside the PQ of the incoming one — which is an
+    /// identity the domain never issued.
+    #[test]
+    fn the_pq_half_returned_belongs_to_the_generation_the_tls_half_named() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            Some(active.pq_certificate_fingerprint)
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 2_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+        // Never the other one's, from either side.
+        assert_ne!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+    }
+
+    /// Before its activation instant the successor is not an identity yet.
+    #[test]
+    fn a_successor_resolves_nothing_until_its_activation() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 999),
+            None
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 1_000),
+            Some(next.pq_certificate_fingerprint)
+        );
+    }
+
+    /// Revocation dominates: neither half of either generation resolves.
+    #[test]
+    fn a_revoked_peer_resolves_no_pq_half_at_all() {
+        let active = generation(4, 1);
+        let next = generation(5, 2);
+        let mut state = ClientCertificateState::new(active.clone());
+        state.next = Some(next.clone());
+        state.activation_at = Some(1_000);
+        state.revoke(7);
+
+        assert_eq!(
+            state.pq_paired_with_tls(&active.tls_certificate_fingerprint, 2_000),
+            None
+        );
+        assert_eq!(
+            state.pq_paired_with_tls(&next.tls_certificate_fingerprint, 2_000),
+            None
+        );
+    }
+
+    /// A candidate under lease is not presentable, so it resolves nothing —
+    /// the same rule `accepts_pair` applies, stated for the half the
+    /// negotiation actually looks up.
+    #[test]
+    fn a_candidate_under_lease_resolves_no_pq_half() {
+        let state = staged_state();
+        let candidate = generation(5, 2);
+        assert_eq!(
+            state.pq_paired_with_tls(&candidate.tls_certificate_fingerprint, 2_000),
+            None
+        );
     }
 
     /// The commit is the moment a candidate becomes usable, and not before.

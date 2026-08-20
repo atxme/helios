@@ -209,6 +209,19 @@ pub struct GatewayHandler {
     handshake_tx: mpsc::Sender<aether::ObserveHandshakeRequest>,
     gateway_public_key: String,
     client_pq_ca_public_key: Vec<u8>,
+    /// The certificate registry, when this gateway has a trust domain.
+    ///
+    /// Read-only here, and read for one reason: a client that has renewed
+    /// presents a leaf `network.toml` has never heard of. That file is written
+    /// once, at admission, and nothing updates it afterwards — so a gateway
+    /// resolving callers only from it refuses every peer it has itself just
+    /// renewed, at the end of the overlap, on a machine whose only channel for
+    /// asking about it was the tunnel it can no longer open.
+    ///
+    /// `None` is the ordinary state of a gateway with no trust domain, and
+    /// there the behaviour is exactly what it was: the pins of `network.toml`
+    /// and the single client PQ CA on disk.
+    registry: Option<crate::certificates::SharedRegistry>,
     gateway_pq_certificate: PqCertificate,
     /// Fingerprint of the certificate this daemon actually serves.
     ///
@@ -244,6 +257,80 @@ fn elevate_security_floor(
 }
 
 impl GatewayHandler {
+    /// The identity behind the fingerprint mTLS proved, from the registry.
+    ///
+    /// `None` when this gateway holds no registry, or when the registry knows
+    /// nothing about that fingerprint — the caller then falls back to the pins
+    /// of `network.toml`, which is what an un-bootstrapped gateway has always
+    /// used and what a peer admitted before the trust domain existed still
+    /// answers to.
+    ///
+    /// The PQ half that comes back is the **partner** of the TLS half, not the
+    /// union of what the peer may hold: accepting the union would accept the
+    /// mixed pair of spec §3.3, where each half is valid under a different
+    /// generation and the assembled identity was never issued.
+    async fn registered_identity(
+        &self,
+        certificate_sha256: &str,
+        now_unix: u64,
+    ) -> Option<helios_provisioning::certificates::NegotiationIdentity> {
+        let registry = self.registry.as_ref()?;
+        let fingerprint =
+            aether::certificates::encoding::Fingerprint::parse_hex(certificate_sha256).ok()?;
+        registry
+            .lock()
+            .await
+            .state()
+            .resolve_negotiation_identity(&fingerprint, now_unix)
+    }
+
+    /// PQ leaves an already-authenticated peer may present, from the registry.
+    ///
+    /// Keyed by the WireGuard identity rather than by a fingerprint, because
+    /// this serves the in-tunnel routes: there the tunnel is the proof and
+    /// `require_peer` has already resolved the caller from its source VIP.
+    /// Empty when the gateway holds no registry, or knows nothing about this
+    /// peer — the caller then falls back to the pin of `network.toml`.
+    async fn registered_pq_fingerprints(&self, wg_public_key: &str, now_unix: u64) -> Vec<String> {
+        let Some(registry) = self.registry.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(key) = aether::certificates::encoding::WireGuardKey::parse(wg_public_key) else {
+            return Vec::new();
+        };
+        registry
+            .lock()
+            .await
+            .acceptable_pq_fingerprints(&key, now_unix)
+            .into_iter()
+            .map(|fingerprint| fingerprint.to_hex())
+            .collect()
+    }
+
+    /// Every ML-DSA-87 key that may legitimately have signed a client leaf.
+    ///
+    /// The one on disk is always in the set, and that is not belt and braces:
+    /// a peer's **first** generation was issued by the operator CA that
+    /// `init-key-negotiation` installed, and the registry does not necessarily
+    /// hold that key at all — `init-trust-domain` receives the domain anchor
+    /// from Astra, which is a different key. Dropping it would refuse every
+    /// client that has never renewed, which is all of them on a fresh domain.
+    ///
+    /// The registry adds the anchor, its successor during a CA overlap, and
+    /// the delegated issuer an ordinary renewal is actually issued under.
+    async fn client_leaf_issuers(&self, now_unix: u64) -> Vec<Vec<u8>> {
+        let mut issuers = vec![self.client_pq_ca_public_key.clone()];
+        if let Some(registry) = self.registry.as_ref() {
+            for key in registry.lock().await.state().client_leaf_issuers(now_unix) {
+                let bytes = key.as_bytes().to_vec();
+                if !issuers.contains(&bytes) {
+                    issuers.push(bytes);
+                }
+            }
+        }
+        issuers
+    }
+
     async fn install(
         &self,
         public_key: String,
@@ -617,6 +704,14 @@ impl NegotiationHandler for GatewayHandler {
     }
 
     async fn resolve_admitted_peer(&self, certificate_sha256: &str) -> Option<String> {
+        // The registry first: it is the only place that knows about a leaf
+        // issued after admission. The pins are the answer for a gateway with
+        // no trust domain, and for a peer that has never renewed.
+        if let Ok(now) = unix_time_now() {
+            if let Some(identity) = self.registered_identity(certificate_sha256, now).await {
+                return Some(identity.wg_public_key);
+            }
+        }
         self.network
             .read()
             .await
@@ -666,6 +761,12 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 PublicError::Rejected
             })?;
+        let now = unix_time_now().map_err(|_| PublicError::Protocol)?;
+        // The registry knows about leaves issued after admission; the pins in
+        // `network.toml` only ever describe the generation a peer was admitted
+        // with. Consulting the registry first is what keeps a renewed client
+        // able to negotiate at all.
+        let registered = self.registered_identity(&certificate_sha256, now).await;
         let (address, previous_psk, pq_fingerprint, minimum_mode) = {
             let network = self.network.read().await;
             // Found by the **TLS fingerprint**, never by the key the request
@@ -674,22 +775,32 @@ impl NegotiationHandler for GatewayHandler {
             // makes a client-chosen value the index into the peer table; a
             // single missing comparison anywhere downstream would then let an
             // admitted identity aim a negotiation at another peer.
-            let peer = network
-                .peers
-                .iter()
-                .find(|peer| {
+            //
+            // The registry path obeys the same rule: the WireGuard key it
+            // returns is *gateway state* derived from the fingerprint mTLS
+            // proved, and the request's own field is still only ever compared
+            // against it below. What §7.3 forbids is indexing the table with a
+            // value the caller chose, and nothing here does.
+            let peer = match &registered {
+                Some(identity) => network
+                    .peers
+                    .iter()
+                    .find(|peer| peer.public_key == identity.wg_public_key),
+                None => network.peers.iter().find(|peer| {
                     peer.key_negotiation_certificate_sha256.as_deref()
                         == Some(certificate_sha256.as_str())
-                })
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        %transaction,
-                        peer = %peer_key,
-                        presented = %certificate_sha256,
-                        "key negotiation refused: this client certificate is not admitted"
-                    );
-                    PublicError::Rejected
-                })?;
+                }),
+            }
+            .ok_or_else(|| {
+                tracing::warn!(
+                    %transaction,
+                    peer = %peer_key,
+                    presented = %certificate_sha256,
+                    registered = registered.is_some(),
+                    "key negotiation refused: this client certificate is not admitted"
+                );
+                PublicError::Rejected
+            })?;
             if peer.public_key != request.client_wg_public_key {
                 tracing::warn!(
                     %transaction,
@@ -701,12 +812,17 @@ impl NegotiationHandler for GatewayHandler {
                 );
                 return Err(PublicError::Rejected);
             }
+            let pq_fingerprint = match &registered {
+                Some(identity) => identity.pq_certificate_fingerprint.to_hex(),
+                None => peer
+                    .key_negotiation_pq_certificate_sha256
+                    .clone()
+                    .ok_or(PublicError::Rejected)?,
+            };
             (
                 peer.address.clone(),
                 peer.preshared_key.clone(),
-                peer.key_negotiation_pq_certificate_sha256
-                    .clone()
-                    .ok_or(PublicError::Rejected)?,
+                pq_fingerprint,
                 peer.minimum_key_negotiation_mode,
             )
         };
@@ -723,12 +839,14 @@ impl NegotiationHandler for GatewayHandler {
             // port by trying one mode after another.
             return Err(PublicError::Rejected);
         }
+        // Every issuer the domain admits, and exactly one acceptable
+        // fingerprint — the partner of the TLS half already proved. The
+        // fingerprint decides before any signature is verified, so a caller
+        // presenting a leaf this gateway never issued costs a hash.
+        let issuers = self.client_leaf_issuers(now).await;
+        let issuer_refs: Vec<&[u8]> = issuers.iter().map(Vec::as_slice).collect();
         authenticated
-            .verify(
-                &self.client_pq_ca_public_key,
-                &pq_fingerprint,
-                unix_time_now().map_err(|_| PublicError::Protocol)?,
-            )
+            .verify_against(&issuer_refs, &[pq_fingerprint.as_str()], now)
             .map_err(|error| {
                 tracing::warn!(
                     %transaction,
@@ -1167,23 +1285,39 @@ impl helios_api::key_negotiation::PskReleaseHandler for GatewayHandler {
             );
             return Err(PskReleaseRefusal::Rejected);
         }
-        let pq_fingerprint = {
+        let now = unix_time_now().map_err(|_| PskReleaseRefusal::Internal)?;
+        // Same reason as the negotiation port: `network.toml` describes the
+        // generation a peer was admitted with, and a renewed client presents
+        // something else. A refusal here is not fatal — the 300 s reclaim is
+        // the net — but it turns an explicit, immediate teardown into five
+        // minutes of a PSK nobody holds, and the log would name an
+        // authentication failure rather than a stale pin.
+        //
+        // Unlike the negotiation this is the **union** of the acceptable
+        // generations, and correctly so: no TLS half was presented here, so
+        // there is no pair to mix. The proof of identity is the tunnel itself,
+        // which `require_peer` resolved from the source VIP.
+        let mut fingerprints = self
+            .registered_pq_fingerprints(caller_wg_public_key, now)
+            .await;
+        if fingerprints.is_empty() {
             let network = self.network.read().await;
             let peer = network
                 .peers
                 .iter()
                 .find(|peer| peer.public_key == caller_wg_public_key)
                 .ok_or(PskReleaseRefusal::Rejected)?;
-            peer.key_negotiation_pq_certificate_sha256
-                .clone()
-                .ok_or(PskReleaseRefusal::Rejected)?
-        };
+            fingerprints.push(
+                peer.key_negotiation_pq_certificate_sha256
+                    .clone()
+                    .ok_or(PskReleaseRefusal::Rejected)?,
+            );
+        }
+        let issuers = self.client_leaf_issuers(now).await;
+        let issuer_refs: Vec<&[u8]> = issuers.iter().map(Vec::as_slice).collect();
+        let acceptable: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
         authenticated
-            .verify(
-                &self.client_pq_ca_public_key,
-                &pq_fingerprint,
-                unix_time_now().map_err(|_| PskReleaseRefusal::Internal)?,
-            )
+            .verify_against(&issuer_refs, &acceptable, now)
             .map_err(|error| {
                 tracing::warn!(
                     peer = %caller_wg_public_key,
@@ -1241,6 +1375,12 @@ pub async fn start(
     psk_tx: mpsc::Sender<InstallPskRequest>,
     handshake_tx: mpsc::Sender<aether::ObserveHandshakeRequest>,
     peer_runtime: Arc<RwLock<Vec<helios_wireguard::PeerStatus>>>,
+    // The certificate registry, already opened, or `None` on a gateway with no
+    // trust domain. Opened by the caller and shared rather than loaded here,
+    // because the lifecycle service that *writes* it is built from this
+    // handler — it signs its receipts through the served leaf — and a second
+    // `CertificateRegistry` over the same path would be a second writer.
+    registry: Option<crate::certificates::SharedRegistry>,
     boot: &BootDecision,
     dry_run: bool,
 ) -> Result<Option<Arc<GatewayHandler>>> {
@@ -1318,6 +1458,7 @@ pub async fn start(
         gateway_public_key,
         client_pq_ca_public_key: std::fs::read(CLIENT_PQ_CA_PATH)
             .context("reading key-negotiation client PQ CA public key")?,
+        registry,
         served_certificate_fingerprint: identity
             .pq_certificate
             .fingerprint()
@@ -2166,6 +2307,7 @@ mod tests {
             handshake_tx,
             gateway_public_key: GATEWAY_KEY.into(),
             client_pq_ca_public_key: fixture.client_ca_public_key.clone(),
+            registry: None,
             gateway_pq_certificate: fixture.gateway_certificate.clone(),
             served_certificate_fingerprint: fixture.gateway_certificate.fingerprint().unwrap(),
             gateway_pq_private_key: Zeroizing::new(fixture.gateway_private_key.clone()),
@@ -2833,6 +2975,7 @@ mod tests {
             handshake_tx,
             gateway_public_key: gateway_wg.public_key.clone(),
             client_pq_ca_public_key: ca_public,
+            registry: None,
             gateway_pq_certificate: gateway_pq_certificate.clone(),
             served_certificate_fingerprint: gateway_pq_certificate.fingerprint().unwrap(),
             gateway_pq_private_key: Zeroizing::new(gateway_pq_private.to_vec()),

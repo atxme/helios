@@ -341,19 +341,79 @@ impl AuthenticatedKeyNegotiationRequest {
         expected_certificate_fingerprint: &str,
         now_unix: u64,
     ) -> Result<(), KeyNegotiationError> {
+        self.verify_against(
+            &[issuer_public_key],
+            &[expected_certificate_fingerprint],
+            now_unix,
+        )
+    }
+
+    /// The same verification, against every identity the gateway currently
+    /// admits for this peer.
+    ///
+    /// # Why a set and not one value
+    ///
+    /// A client that renews is, for the length of its overlap, two identities:
+    /// the outgoing generation and the incoming one. And once the delegated
+    /// issuer of ADR-008 §3.4 is installed, the incoming leaf is signed by
+    /// that issuer rather than by the anchor the outgoing one chains to. A
+    /// gateway holding a single fingerprint and a single issuer therefore
+    /// locks out every client it has just renewed — at the end of the overlap,
+    /// on a machine whose only way to ask for help was the tunnel it can no
+    /// longer open.
+    ///
+    /// # Why the fingerprint decides first
+    ///
+    /// The digest is a hash; each issuer trial is an ML-DSA-87 verification.
+    /// Matching the fingerprint first pins **which** generation is being
+    /// claimed before any signature work is spent, so a caller presenting a
+    /// certificate this gateway never issued buys a hash and nothing more.
+    /// It also keeps the pair unmixed: the accepted fingerprint names one
+    /// generation, and the issuers are the domain's, not that generation's
+    /// claim about itself.
+    ///
+    /// Both sets are the gateway's own state. Neither is ever taken from the
+    /// message being checked, and an empty set refuses everything — an
+    /// unknown peer must not be an unauthenticated one.
+    pub fn verify_against(
+        &self,
+        issuer_public_keys: &[&[u8]],
+        acceptable_certificate_fingerprints: &[&str],
+        now_unix: u64,
+    ) -> Result<(), KeyNegotiationError> {
         self.request.validate()?;
         // Freshness first: it costs a subtraction, while everything below is
         // an ML-DSA verification. A stale request must not buy that work.
         self.request.assert_fresh(now_unix)?;
-        self.certificate.verify(
-            issuer_public_key,
-            PqCertificateRole::Client,
-            None,
-            &self.request.client_wg_public_key,
-            now_unix,
-        )?;
-        if self.certificate.fingerprint()? != expected_certificate_fingerprint {
+        let presented = self.certificate.fingerprint()?;
+        if !acceptable_certificate_fingerprints
+            .iter()
+            .any(|acceptable| *acceptable == presented)
+        {
             return Err(KeyNegotiationError::PqCertificateFingerprintMismatch);
+        }
+        let mut refusal = KeyNegotiationError::InvalidPqCertificate;
+        let accepted = issuer_public_keys.iter().any(|issuer| {
+            match self.certificate.verify(
+                issuer,
+                PqCertificateRole::Client,
+                None,
+                &self.request.client_wg_public_key,
+                now_unix,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    // The last refusal is kept rather than the first: a
+                    // signature that failed under the real issuer is a more
+                    // useful diagnosis than a malformed-key complaint from an
+                    // anchor this leaf was never meant to chain to.
+                    refusal = error;
+                    false
+                }
+            }
+        });
+        if !accepted {
+            return Err(refusal);
         }
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
@@ -785,6 +845,27 @@ impl AuthenticatedPskRelease {
         expected_certificate_fingerprint: &str,
         now_unix: u64,
     ) -> Result<(), KeyNegotiationError> {
+        self.verify_against(
+            &[issuer_public_key],
+            &[expected_certificate_fingerprint],
+            now_unix,
+        )
+    }
+
+    /// The same verification, against every identity the gateway admits for
+    /// this peer — see
+    /// [`AuthenticatedKeyNegotiationRequest::verify_against`].
+    ///
+    /// The acceptable set here is the **union** of the peer's live
+    /// generations, and that is correct rather than lax: no TLS half is
+    /// presented on this route, because the tunnel is the proof and the caller
+    /// was resolved from its source VIP. There is no pair to mix.
+    pub fn verify_against(
+        &self,
+        issuer_public_keys: &[&[u8]],
+        acceptable_certificate_fingerprints: &[&str],
+        now_unix: u64,
+    ) -> Result<(), KeyNegotiationError> {
         if self.release.protocol_version != KEY_NEGOTIATION_VERSION {
             return Err(KeyNegotiationError::VersionMismatch {
                 received: self.release.protocol_version,
@@ -803,15 +884,31 @@ impl AuthenticatedPskRelease {
             .map_err(|_| KeyNegotiationError::InvalidWireGuardKey)?;
         crate::wg::validate_key(&self.release.gateway_wg_public_key)
             .map_err(|_| KeyNegotiationError::InvalidWireGuardKey)?;
-        self.certificate.verify(
-            issuer_public_key,
-            PqCertificateRole::Client,
-            None,
-            &self.release.client_wg_public_key,
-            now_unix,
-        )?;
-        if self.certificate.fingerprint()? != expected_certificate_fingerprint {
+        let presented = self.certificate.fingerprint()?;
+        if !acceptable_certificate_fingerprints
+            .iter()
+            .any(|acceptable| *acceptable == presented)
+        {
             return Err(KeyNegotiationError::PqCertificateFingerprintMismatch);
+        }
+        let mut refusal = KeyNegotiationError::InvalidPqCertificate;
+        let accepted = issuer_public_keys.iter().any(|issuer| {
+            match self.certificate.verify(
+                issuer,
+                PqCertificateRole::Client,
+                None,
+                &self.release.client_wg_public_key,
+                now_unix,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    refusal = error;
+                    false
+                }
+            }
+        });
+        if !accepted {
+            return Err(refusal);
         }
         verify_protocol_signature(
             &self.certificate.ml_dsa_87_public_key,
@@ -1979,6 +2076,108 @@ mod tests {
             authenticated.verify(&ca_public, &fingerprint, test_now()),
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
         );
+    }
+
+    /// A renewed leaf is signed by the delegated issuer, not by the anchor
+    /// the first generation chained to.
+    ///
+    /// A gateway holding one issuer would refuse every client it has itself
+    /// renewed — at the end of the overlap, on a machine whose only way to ask
+    /// about it was the tunnel it can no longer open.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_leaf_signed_by_the_second_issuer_is_accepted() {
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (delegated_private, delegated_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            delegated_private.as_slice(),
+        );
+        let fingerprint = certificate.fingerprint().unwrap();
+        let authenticated = authenticate_request(
+            request(ProtectionMode::StaticPsk),
+            certificate,
+            client_private.as_slice(),
+        )
+        .unwrap();
+
+        // The anchor alone refuses it, which is the whole reason the set
+        // exists.
+        assert!(authenticated
+            .verify(&anchor_public, &fingerprint, test_now())
+            .is_err());
+        authenticated
+            .verify_against(
+                &[&anchor_public, &delegated_public],
+                &[&fingerprint],
+                test_now(),
+            )
+            .unwrap();
+        let _ = anchor_private;
+    }
+
+    /// The fingerprint decides before any signature is verified.
+    ///
+    /// Each issuer trial is an ML-DSA-87 verification; the digest is a hash.
+    /// A caller presenting a leaf this gateway never issued must buy the hash
+    /// and nothing more, however many issuers the domain admits.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_fingerprint_that_is_not_admitted_is_refused_before_any_issuer_is_tried() {
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let authenticated = authenticate_request(
+            request(ProtectionMode::StaticPsk),
+            certificate,
+            client_private.as_slice(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authenticated.verify_against(&[&ca_public], &["00".repeat(32).as_str()], test_now()),
+            Err(KeyNegotiationError::PqCertificateFingerprintMismatch)
+        );
+    }
+
+    /// An unknown peer must not be an unauthenticated one: empty sets refuse.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn empty_issuer_and_fingerprint_sets_refuse_everything() {
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Client,
+            "orion",
+            CLIENT_WG_KEY,
+            &client_public,
+            ca_private.as_slice(),
+        );
+        let fingerprint = certificate.fingerprint().unwrap();
+        let authenticated = authenticate_request(
+            request(ProtectionMode::StaticPsk),
+            certificate,
+            client_private.as_slice(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authenticated.verify_against(&[&ca_public], &[], test_now()),
+            Err(KeyNegotiationError::PqCertificateFingerprintMismatch)
+        );
+        assert!(authenticated
+            .verify_against(&[], &[&fingerprint], test_now())
+            .is_err());
     }
 
     /// La liaison à la gateway est **signée** : la retoucher pour viser une

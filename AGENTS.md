@@ -214,20 +214,37 @@ Restent ouverts :
   `aether::certificates::window::ValidityPhase` est désormais l'unique
   définition des seuils 80/90/95 %, qu'Orion réexporte sous le nom
   `CertificatePhase` qu'il exportait déjà.
-  **Limite connue, et c'est celle qui reste entre l'installation et un
-  renouvellement utilisable** : le port de négociation authentifie un client
-  sous **une** CA TLS cliente et **une** CA PQ cliente, lues sur disque au
-  démarrage, et sous les empreintes figées de `network.toml`. Une feuille
-  renouvelée, elle, est émise par l'émetteur délégué. La gateway refuse donc le
-  staging d'un candidat qu'elle ne saurait pas authentifier une fois actif
-  (`heliosd::certificates::assert_candidate_is_presentable`) — le refuser coûte
-  un message, le poser enfermerait le client dehors à la fin du chevauchement.
-  Lever cette limite, c'est deux choses : la négociation lisant le registre
-  (`acceptable_pq_fingerprints`, `resolve_pair`, la clé de l'émetteur délégué)
-  au lieu des épinglages de `network.toml`, et l'ancre TLS cliente du domaine
-  devenant celle sous laquelle l'autorité émet réellement.
-  La leaf PQ gateway servie reste auto-signée tant que cette bascule n'a pas eu
-  lieu.
+  **La négociation lit désormais le registre**, et c'est ce qui rendait un
+  renouvellement inutilisable : `network.toml` n'est écrit qu'à l'admission et
+  rien ne le remet à jour, donc un client renouvelé y présentait une empreinte
+  inconnue et se faisait enfermer dehors à la fin du chevauchement — sur une
+  machine dont le seul canal pour le dire était le tunnel qu'elle ne pouvait
+  plus ouvrir. Le registre, lui, est ce qui a **enregistré** la rotation. La
+  résolution passe donc par `RegistryState::resolve_negotiation_identity`, et
+  la vérification par `AuthenticatedKeyNegotiationRequest::verify_against` :
+  un ensemble d'émetteurs — l'ancre, son successeur pendant un chevauchement,
+  l'émetteur délégué, et la CA opérateur sur disque sous laquelle la
+  **première** génération a été émise, que le registre ne détient pas — et
+  **une seule** empreinte acceptable, celle appariée à la moitié TLS que mTLS
+  vient de prouver. Jamais l'union des deux générations : ce serait accepter la
+  paire mixte du §3.3. L'empreinte tranche avant toute signature, donc une
+  feuille que cette gateway n'a jamais émise coûte un hachage.
+  `assert_candidate_is_presentable` construit **le même ensemble, de la même
+  façon** — deux réponses différentes à « cette feuille s'authentifierait-elle »
+  n'ont aucune issue correcte.
+  Sans registre, le comportement est exactement l'ancien : les épinglages de
+  `network.toml` et la CA sur disque. Le registre est ouvert une fois et
+  partagé (`certificates::open_registry`, `SharedRegistry`) : la négociation le
+  lit, le service de cycle de vie l'écrit, un seul verrou.
+  **Limite connue** : le jeu d'ancres TLS clientes du point d'écoute QUIC est
+  toujours lu une fois sur disque au démarrage. `init-trust-domain` amorce le
+  registre depuis ce même fichier, donc les deux concordent et une feuille
+  déléguée valide tant que le client présente l'intermédiaire de la délégation
+  dans sa chaîne. Ce qui n'est pas câblé, c'est une **rotation de CA TLS
+  cliente** : `next_client_tls_ca_certificate` n'est pas offert en seconde
+  racine, et une nouvelle ancre exigerait de toute façon un redémarrage.
+  Rien n'effectue cette rotation aujourd'hui.
+  La leaf PQ gateway servie reste auto-signée.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
   restant : un Orion dont le tunnel fonctionne ne contacte jamais Astra
   directement. Il appelle des routes typées de `helios-api` dans WireGuard ;
@@ -463,7 +480,19 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   mêmes messages, mais fait d’une valeur choisie par le client l’index de la
   table — une comparaison manquante en aval laisserait alors une identité
   admise viser un autre pair. Le budget par identité ne se débite qu’après
-  cette résolution.
+  cette résolution. La résolution passe par le **registre de certificats**
+  quand il existe (`RegistryState::resolve_negotiation_identity`), et par les
+  épinglages de `network.toml` sinon : le fichier n’est écrit qu’à l’admission,
+  donc lui seul enfermerait dehors tout client renouvelé. La règle ci-dessus ne
+  change pas — la clé WireGuard que rend le registre est un **état de la
+  gateway** dérivé de l’empreinte que mTLS vient de prouver, jamais un champ du
+  message, et celui du client lui est toujours seulement comparé. L’empreinte
+  PQ acceptée est **celle appariée** à cette moitié TLS, jamais l’union des
+  générations vivantes : l’union accepterait la paire mixte du §3.3, moitié
+  d’une génération et moitié d’une autre, identité que le domaine n’a jamais
+  émise. Dans le tunnel — `release`, `trust-update` — c’est bien l’union, et
+  correctement : aucune moitié TLS n’y est présentée, la preuve est le tunnel
+  lui-même.
 - Un PSK négocié n’est retiré que par un `release` signé, un remplacement
   atomique, une révocation d’admission, le vieillissement du handshake ou
   l’échéance. Jamais par un silence réseau sur un canal de contrôle.

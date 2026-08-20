@@ -1326,11 +1326,30 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     // readers disagreeing on whether a peer is still there — and the whole
     // point of v5's liveness is that there is one answer, read where the
     // traffic is.
+    // Opened once, and shared. The negotiation *reads* it — a caller resolved
+    // by the fingerprint mTLS proved has to be looked up in the thing that
+    // recorded the last rotation, not in a file written at admission — while
+    // the lifecycle service below is its single writer. Two `CertificateRegistry`
+    // values over one path would be two writers of one slot.
+    let registry = match certificates::open_registry(
+        &helios_provisioning::certificates::CertificateRegistry::path(),
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            error!(
+                %error,
+                "certificate registry unusable — the in-tunnel lifecycle routes stay closed and \
+                 the negotiation falls back to the pins of network.toml"
+            );
+            None
+        }
+    };
     if let Some(handler) = key_negotiation::start(
         Arc::clone(&shared_network),
         psk_tx.clone(),
         handshake_tx,
         Arc::clone(&state.peer_runtime),
+        registry.clone(),
         &boot,
         dry_run,
     )
@@ -1340,11 +1359,13 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // signs its receipts through the negotiation handler — the same leaf
         // the client already pins, unsealed once — and it is the single owner
         // of the registry: a second one would give one slot two writers.
-        match certificates::CertificateService::load(
-            helios_provisioning::certificates::CertificateRegistry::path(),
-            Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
-        ) {
-            Ok(Some(service)) => {
+        match registry.map(|registry| {
+            Arc::new(certificates::CertificateService::new(
+                registry,
+                Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
+            ))
+        }) {
+            Some(service) => {
                 info!("certificate lifecycle ready");
                 certificates::spawn_maintenance(Arc::clone(&service));
                 // Admissions made on the console, in another process: it may
@@ -1374,13 +1395,9 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
                 }
                 state = state.with_trust_update(service);
             }
-            Ok(None) => info!(
+            None => info!(
                 "no certificate registry: the trust domain is not bootstrapped, and the \
                  in-tunnel lifecycle routes stay closed"
-            ),
-            Err(error) => error!(
-                %error,
-                "certificate registry unusable — the in-tunnel lifecycle routes stay closed"
             ),
         }
         // The in-tunnel `release` (spec §7.5) reaches the same state machine

@@ -53,7 +53,8 @@ use aether::certificates::{
         GatewayCertificateStageReceipt, IssuerKind,
     },
     encoding::{
-        Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId,
+        WireGuardKey,
     },
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
@@ -213,6 +214,77 @@ pub struct RegistryState {
     /// authorization. A readmission under a fresh identity is legitimate; the
     /// **same** leaf coming back is what §10.2 forbids.
     pub ledger: TrustLedger,
+}
+
+/// One admitted identity, as the key negotiation needs to see it.
+///
+/// Deliberately a value and not a borrow: the negotiation reads this under the
+/// registry lock and then does ML-DSA work with it, and holding the lock
+/// across that would serialise every concurrent handshake behind one
+/// signature verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiationIdentity {
+    /// Base64 WireGuard public key — the peer's identity, and the only value
+    /// the gateway ever resolves a caller to.
+    pub wg_public_key: String,
+    pub name: String,
+    /// The PQ leaf this exact caller may present, and no other.
+    pub pq_certificate_fingerprint: Fingerprint,
+}
+
+impl RegistryState {
+    /// Resolves the fingerprint mTLS proved to the identity that owns it.
+    ///
+    /// This is what lets a renewed client keep negotiating. The pins in
+    /// `network.toml` are written once, at admission, and nothing updates them
+    /// afterwards: a peer whose leaf has rotated presents a fingerprint that
+    /// file has never heard of, and the gateway refuses it at the end of the
+    /// overlap — locking the machine out of the only channel it had to ask for
+    /// help. The registry, by contrast, is the thing that recorded the
+    /// rotation.
+    ///
+    /// The PQ half returned is the **partner** of the TLS half, never the
+    /// union of what the peer may hold: see
+    /// [`ClientCertificateState::pq_paired_with_tls`].
+    pub fn resolve_negotiation_identity(
+        &self,
+        tls: &Fingerprint,
+        now_unix: u64,
+    ) -> Option<NegotiationIdentity> {
+        self.peers.iter().find_map(|(wg_public_key, peer)| {
+            peer.state
+                .pq_paired_with_tls(tls, now_unix)
+                .map(|pq_certificate_fingerprint| NegotiationIdentity {
+                    wg_public_key: wg_public_key.clone(),
+                    name: peer.name.clone(),
+                    pq_certificate_fingerprint,
+                })
+        })
+    }
+
+    /// Every ML-DSA-87 key that may have signed an admitted client's leaf.
+    ///
+    /// The domain anchor, its successor during a CA overlap, and the delegated
+    /// issuer — which is what an *ordinary renewal* is issued under, and
+    /// therefore the one a gateway pinning only the anchor would reject.
+    ///
+    /// A set, not a choice: which of them signed a given leaf is not knowable
+    /// before the signature is checked, and asking the leaf would be asking
+    /// the message to name its own authority.
+    pub fn client_leaf_issuers(&self, now_unix: u64) -> Vec<&MlDsa87PublicKey> {
+        let mut issuers = self.gateway.acceptable_anchors(now_unix);
+        if let Some(issuer) = &self.issuer {
+            if issuer.is_usable(now_unix) {
+                issuers.push(&issuer.authorization.pq_issuer_public_key);
+            }
+        }
+        issuers
+    }
+
+    /// The client TLS anchors this domain issues under, active first.
+    pub fn client_tls_anchors(&self, now_unix: u64) -> Vec<&DerCertificate> {
+        self.client_tls_ca.acceptable_anchors(now_unix)
+    }
 }
 
 /// The registry, with its file.
@@ -2160,5 +2232,98 @@ mod tests {
             .expect("reload")
             .expect("registry");
         assert_eq!(reloaded.state(), migrated.state());
+    }
+
+    /// The fingerprint mTLS proved resolves to the peer that owns it.
+    ///
+    /// This is the lookup that replaces the pins of `network.toml`, which
+    /// describe only the generation a peer was admitted with and are never
+    /// updated afterwards.
+    #[test]
+    fn the_proved_tls_half_resolves_to_its_peer_and_its_own_pq_half() {
+        let fixture = fixture();
+        let expected = fixture
+            .registry
+            .peer(&client_key(2))
+            .expect("admitted")
+            .state
+            .active
+            .clone();
+
+        let resolved = fixture
+            .registry
+            .state()
+            .resolve_negotiation_identity(&expected.tls_certificate_fingerprint, 0)
+            .expect("resolved");
+        assert_eq!(resolved.wg_public_key, client_key(2).to_base64());
+        assert_eq!(resolved.name, "workstation");
+        assert_eq!(
+            resolved.pq_certificate_fingerprint,
+            expected.pq_certificate_fingerprint
+        );
+
+        // A fingerprint the domain never issued resolves to nobody — an
+        // unknown caller must not become an anonymous one.
+        assert!(fixture
+            .registry
+            .state()
+            .resolve_negotiation_identity(&Fingerprint::of(b"never issued"), 0)
+            .is_none());
+    }
+
+    /// An ordinary renewal is issued by the delegated issuer, not by the
+    /// anchor the first generation chained to.
+    ///
+    /// A gateway offering only the anchor would refuse every leaf it has
+    /// itself just renewed, which is the whole reason this returns a set.
+    #[test]
+    fn the_issuer_set_carries_the_delegation_an_ordinary_renewal_uses() {
+        let fixture = fixture();
+        let anchor = fixture
+            .registry
+            .state()
+            .gateway
+            .current_ca_public_key
+            .clone();
+        assert_eq!(
+            fixture.registry.state().client_leaf_issuers(0),
+            vec![&anchor],
+            "with no delegation installed there is exactly the anchor"
+        );
+
+        let issuer = keys();
+        let mut state = fixture.registry.state().clone();
+        state.issuer = Some(AstraIssuerState {
+            issuer_epoch: 1,
+            authorization: aether::certificates::authority::AstraIssuerAuthorization {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: domain(),
+                ca_epoch: 1,
+                ca_tls_epoch: 1,
+                gateway_wg_public_key: gateway_key(),
+                server_name: SERVER_NAME.into(),
+                issuer_epoch: 1,
+                pq_issuer_public_key: issuer.public.clone(),
+                tls_intermediate_certificate: DerCertificate::new(vec![3; 64]).expect("der"),
+                allowed_usage:
+                    aether::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+                maximum_leaf_lifetime_secs: 100,
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                not_before: 0,
+                not_after: 1_000,
+                ca_pq_signature: MlDsa87Signature::placeholder(),
+            },
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+        let registry =
+            CertificateRegistry::new(fixture._directory.path().join("with-issuer.json"), state);
+
+        assert_eq!(
+            registry.state().client_leaf_issuers(0),
+            vec![&anchor, &issuer.public]
+        );
+        // Past its own expiry the delegation signs nothing, whatever its
+        // lifecycle field says.
+        assert_eq!(registry.state().client_leaf_issuers(1_000), vec![&anchor]);
     }
 }
