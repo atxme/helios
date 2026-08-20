@@ -56,6 +56,7 @@ MODE="ml-kem"
 ENDPOINT=""
 SERVER_NAME=""
 TRAFIC=""
+LEAF_VALIDITY_SECS=""
 
 usage() {
     cat >&2 <<'EOF'
@@ -72,6 +73,10 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
                        chaque poste évite qu'un parc finisse avec autant de
                        tables de routage que d'utilisateurs.
                          --trafic "100.64.0.0/10, 192.168.1.0/24"
+  --leaf-validity-secs N
+                       Validité des feuilles clientes en secondes, pour un
+                       profil de test du renouvellement (minimum 600 ;
+                       défaut 825 jours).
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
@@ -90,6 +95,7 @@ while [ $# -gt 0 ]; do
         --server-name) SERVER_NAME="${2:-}"; shift 2 ;;
         --mode) MODE="${2:-}"; shift 2 ;;
         --trafic|--allowed-ips) TRAFIC="${2:-}"; shift 2 ;;
+        --leaf-validity-secs) LEAF_VALIDITY_SECS="${2:-}"; shift 2 ;;
         --remplacer) REMPLACER=1; shift ;;
         --refaire-ca) REFAIRE_CA=1; shift ;;
         --sortie) SORTIE="${2:-}"; shift 2 ;;
@@ -182,6 +188,20 @@ CTL=(cargo run --quiet -p helios-ctl --)
 
 ARG_TRAFIC=()
 [ -n "$TRAFIC" ] && ARG_TRAFIC=(--allowed-ips "$TRAFIC")
+ARG_LEAF_VALIDITY=()
+if [ -n "$LEAF_VALIDITY_SECS" ]; then
+    case "$LEAF_VALIDITY_SECS" in
+        ''|*[!0-9]*)
+            echo "--leaf-validity-secs doit être un entier positif." >&2
+            exit 1
+            ;;
+    esac
+    if [ "$LEAF_VALIDITY_SECS" -lt 600 ]; then
+        echo "--leaf-validity-secs doit valoir au moins 600 secondes." >&2
+        exit 1
+    fi
+    ARG_LEAF_VALIDITY=(--validity-secs "$LEAF_VALIDITY_SECS")
+fi
 
 # Décidé ici, avant que quoi que ce soit ne bouge sur la gateway.
 #
@@ -204,6 +224,7 @@ echo "==> Gateway    $CIBLE   (SSH)"
 echo "==> Public     $ENDPOINT   (nom authentifié : $SERVER_NAME, mode $MODE)"
 echo "==> CA         $CA_DIR"
 echo "==> Trafic     ${TRAFIC:-0.0.0.0/0 (tunnel complet)}"
+echo "==> Validité   ${LEAF_VALIDITY_SECS:-825 jours (production)}"
 echo "==> Profil     $PROFIL"
 if [ -e "$PROFIL" ]; then
     echo "               un profil de ce nom existe : il sera remplacé, et il"
@@ -274,7 +295,7 @@ EMPREINTES="$("${CTL[@]}" key-nego issue-client \
     --ca-private-key "$CA_DIR/orion-client-ca-key.der" \
     --ca-pq-private-key "$CA_DIR/orion-client-pq-ca-private.bin" \
     --wireguard-public-key "$WG_PUBLIQUE" \
-    --output-dir "$PKI")"
+    --output-dir "$PKI" "${ARG_LEAF_VALIDITY[@]}")"
 FP_TLS="$(printf '%s\n' "$EMPREINTES" | sed -n 's/^sha256: //p')"
 FP_PQ="$(printf '%s\n' "$EMPREINTES" | sed -n 's/^PQ certificate sha256: //p')"
 if [ -z "$FP_TLS" ] || [ -z "$FP_PQ" ]; then

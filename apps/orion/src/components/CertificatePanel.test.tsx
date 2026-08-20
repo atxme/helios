@@ -208,6 +208,38 @@ describe('CertificatePanel', () => {
   })
 
   /**
+   * A fresh certificate is not broken when Astra answers 403: its policy is
+   * saying that the 80% renewal window has not opened. The UI must make that
+   * distinction without receiving Astra's protected reason over WireGuard.
+   */
+  it('presents a 403 before the renewal window as information', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('valid') })}
+        identityName="orion-poste"
+        lastError="la gateway a refusé le renouvellement (403)."
+      />,
+    )
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toMatch(/Renouvellement non nécessaire pour le moment/)
+    expect(alert.className).toContain('MuiAlert-colorInfo')
+  })
+
+  /** A 403 during an active renewal window still needs operator attention. */
+  it('keeps a 403 during the renewal window as an error', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({ client_pq: facts('renewal_due') })}
+        identityName="orion-poste"
+        lastError="la gateway a refusé le renouvellement (403)."
+      />,
+    )
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toMatch(/la gateway a refusé/)
+    expect(alert.className).toContain('MuiAlert-colorError')
+  })
+
+  /**
    * Nothing to say, nothing shown. A profile with no negotiation block pins
    * no certificate, and four «absent» rows would be noise on every classic
    * profile in the list.

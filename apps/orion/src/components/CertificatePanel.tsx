@@ -186,7 +186,7 @@ export function CertificatePanel({
   identityName: string
   /** The four actions of spec §12.2 and their state, decided in Rust. */
   actions?: CertificateActionState[]
-  /** Last action that failed on this profile — §12.2 asks for it. */
+  /** Last action result on this profile — §12.2 asks for it. */
   lastError?: string | null
   onRun?: (action: CertificateAction) => void
 }) {
@@ -280,12 +280,12 @@ export function CertificatePanel({
         <Fault key={fault}>{fault}</Fault>
       ))}
 
-      {/* The last attempt that failed. Shown once, above the buttons that
-          produced it, rather than repeated inside each of their tooltips. */}
+      {/* The last attempt's result. A 403 while the active PQ leaf is still
+          valid is a policy answer («not due»), not a broken renewal. Keep
+          that distinction visible without asking the gateway to disclose the
+          protected Astra reason over the tunnel. */}
       {lastError && (
-        <Alert severity="error" variant="outlined" sx={{ py: 0, fontSize: 11 }}>
-          {lastError}
-        </Alert>
+        <RenewalResult message={lastError} inventory={inventory} />
       )}
 
       {actions.length > 0 && (
@@ -296,6 +296,32 @@ export function CertificatePanel({
         </Box>
       )}
     </Box>
+  )
+}
+
+/**
+ * Presents the bounded refusal the gateway is allowed to return.
+ *
+ * Astra deliberately collapses its protected reasons to HTTP 403. Orion can
+ * still make the one safe distinction it owns: a current client PQ leaf means
+ * the ordinary renewal window has not opened yet. This is deliberately
+ * conservative; every other 403 remains an error instead of being guessed at
+ * as `not_due`.
+ */
+function RenewalResult({
+  message,
+  inventory,
+}: {
+  message: string
+  inventory: CertificateInventory
+}) {
+  const notDue = /\b403\b/.test(message) && inventory.client_pq?.phase === 'valid'
+  return (
+    <Alert severity={notDue ? 'info' : 'error'} variant="outlined" sx={{ py: 0, fontSize: 11 }}>
+      {notDue
+        ? 'Renouvellement non nécessaire pour le moment : le certificat client est encore valide et la protection de la gateway bloque la rotation avant sa fenêtre.'
+        : message}
+    </Alert>
   )
 }
 

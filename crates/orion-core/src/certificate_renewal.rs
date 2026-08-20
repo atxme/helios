@@ -66,7 +66,7 @@ use aether::certificates::client::{
 };
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
-    MlDsa87Signature, WireGuardKey,
+    MlDsa87Signature, TrustDomainId, WireGuardKey,
 };
 use aether::certificates::gateway::pq_certificate_fingerprint;
 use aether::certificates::state::{
@@ -179,25 +179,82 @@ pub enum RenewalError {
     ActiveExpired { not_after: u64 },
 }
 
-/// Where the trust store lives, beside the profile file.
+/// Where one identity's trust store lives, beside the profile file.
 ///
-/// One store per machine and not per profile: the bounded state it holds —
-/// anchors, generations, revocation ledger — belongs to the trust *domain*,
-/// and a second copy per profile would let two profiles of the same domain
-/// disagree about which anchor is current.
+/// The state is indexed by both the trust domain and the client's WireGuard
+/// public key. The first keeps two authorities apart; the second keeps the
+/// client generations, pending candidate and revocation ledger apart inside
+/// one domain. Profile names are deliberately absent: they are presentation
+/// labels and may change without changing the admitted identity.
 ///
-/// **Limite connue** : cette version suppose donc **un seul domaine de
-/// confiance par poste**. Un poste admis dans deux domaines écrirait deux états
-/// dans le même fichier ; [`open_or_seed`] le refuse en nommant le domaine
-/// trouvé plutôt qu'en écrasant. Ce qui débloque : un fichier par
-/// `trust_domain_id`, dès qu'un cas réel l'exige.
-pub fn trust_store_path() -> Result<PathBuf, RenewalError> {
+/// The key is hashed before entering the filename. Besides avoiding base64
+/// separators, this leaves a fixed lowercase alphabet that cannot escape the
+/// configuration directory.
+pub fn trust_store_path(
+    trust_domain_id: &TrustDomainId,
+    client_wg_public_key: &WireGuardKey,
+) -> Result<PathBuf, RenewalError> {
     let config = crate::config::ClientConfig::path()
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    Ok(config
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("trust.json"))
+    Ok(identity_trust_store_path(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        trust_domain_id,
+        client_wg_public_key,
+    ))
+}
+
+fn identity_trust_store_path(
+    directory: &Path,
+    trust_domain_id: &TrustDomainId,
+    client_wg_public_key: &WireGuardKey,
+) -> PathBuf {
+    let key_fingerprint = Fingerprint::of(client_wg_public_key.as_bytes()).to_hex();
+    directory.join(format!(
+        "trust-{}-{key_fingerprint}.json",
+        trust_domain_id.to_hex()
+    ))
+}
+
+/// Opens the identity-scoped store and imports the legacy machine-wide store
+/// when — and only when — it describes this exact identity.
+///
+/// Import is a copy, not a move. `trust.json` stays as a recoverable snapshot;
+/// it is never overwritten by a second profile. A legacy store belonging to a
+/// different domain or WireGuard key is likewise left untouched and cannot
+/// prevent this identity from obtaining its own store.
+fn open_identity_store(
+    directory: &Path,
+    settings: &KeyNegotiationSettings,
+    bundle: &ClientIdentityBundle,
+    now_unix: u64,
+) -> Result<TrustStore, RenewalError> {
+    let trust = settings
+        .trust
+        .as_ref()
+        .ok_or(RenewalError::TrustMaterialMissing)?;
+    let trust_domain_id = trust
+        .trust_domain()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let client_wg_public_key = client_key_of(bundle)?;
+    let path = identity_trust_store_path(directory, &trust_domain_id, &client_wg_public_key);
+
+    if TrustStore::load(&path)?.is_some() {
+        return open_or_seed(&path, settings, bundle, now_unix);
+    }
+
+    let legacy_path = directory.join("trust.json");
+    if let Some(legacy) = TrustStore::load(&legacy_path)? {
+        let state = legacy.state();
+        if state.trust_domain_id == trust_domain_id
+            && state.client_wg_public_key == client_wg_public_key
+        {
+            let migrated = TrustStore::new(path, state.clone());
+            migrated.save()?;
+            return Ok(migrated);
+        }
+    }
+
+    open_or_seed(&path, settings, bundle, now_unix)
 }
 
 /// Opens the trust store, or seeds it from the profile and the sealed identity.
@@ -1229,7 +1286,14 @@ pub async fn begin(
         .load(identity)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
 
-    let mut store = open_or_seed(&trust_store_path()?, settings, &bundle, now_unix)?;
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let mut store = open_identity_store(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        settings,
+        &bundle,
+        now_unix,
+    )?;
     // Anything already due is applied before a new generation is asked for: a
     // renewal computed against a state that has not caught up would name the
     // generation it is replacing.
@@ -1539,6 +1603,18 @@ mod tests {
             pq_certificate: STANDARD
                 .encode(serde_json::to_vec(&domain.active_client_leaf).expect("client leaf")),
             pq_private_key: STANDARD.encode(domain.active_client_private.as_slice()),
+        }
+    }
+
+    fn bundle_for_client_key(domain: &Domain, client: WireGuardKey) -> ClientIdentityBundle {
+        let mut leaf = domain.active_client_leaf.clone();
+        leaf.wireguard_public_key = client.to_base64();
+        leaf.ml_dsa_87_signature.clear();
+        let leaf = issue_pq_certificate(leaf, &domain.ca_pq_private).expect("client leaf");
+        ClientIdentityBundle {
+            pq_certificate: STANDARD
+                .encode(serde_json::to_vec(&leaf).expect("client leaf encoding")),
+            ..bundle(domain)
         }
     }
 
@@ -1971,6 +2047,81 @@ mod tests {
             4,
             "the store is the record, not the document"
         );
+    }
+
+    /// A machine can hold several Orion identities, including several peers
+    /// admitted in the same trust domain. Their pending generations and
+    /// revocation ledgers must never share a file.
+    #[test]
+    fn trust_store_paths_are_scoped_by_domain_and_client_key() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let first = identity_trust_store_path(directory.path(), &domain_id(), &client_key());
+        let second = identity_trust_store_path(
+            directory.path(),
+            &domain_id(),
+            &WireGuardKey::from_bytes([3; 32]),
+        );
+
+        assert_ne!(first, second);
+        let filename = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 filename");
+        assert!(filename.starts_with(&format!("trust-{}-", domain_id().to_hex())));
+        assert!(filename.ends_with(".json"));
+        assert!(filename
+            .trim_end_matches(".json")
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+    }
+
+    /// Upgrade keeps every decision already recorded in the machine-wide
+    /// store. It copies that state under the identity-scoped name and retains
+    /// the old file as a recoverable snapshot.
+    #[test]
+    fn a_matching_legacy_store_is_copied_without_being_deleted() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let legacy_path = directory.path().join("trust.json");
+        let legacy = store(directory.path(), &domain);
+        legacy.save().expect("legacy saved");
+
+        let migrated = open_identity_store(directory.path(), &settings, &bundle, NOW)
+            .expect("legacy imported");
+        let scoped_path = identity_trust_store_path(directory.path(), &domain_id(), &client_key());
+
+        assert!(
+            legacy_path.exists(),
+            "migration retains the legacy snapshot"
+        );
+        assert!(scoped_path.exists(), "migration writes the scoped store");
+        assert_eq!(migrated.state(), legacy.state());
+    }
+
+    /// A legacy store for another peer is not an error and is not overwritten:
+    /// the newly loaded profile receives an independent state file.
+    #[test]
+    fn another_clients_legacy_store_does_not_block_a_new_profile() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let legacy = store(directory.path(), &domain);
+        legacy.save().expect("legacy saved");
+        let other_key = WireGuardKey::from_bytes([3; 32]);
+        let other_bundle = bundle_for_client_key(&domain, other_key);
+
+        let opened = open_identity_store(directory.path(), &settings, &other_bundle, NOW)
+            .expect("independent store seeded");
+        let scoped_path = identity_trust_store_path(directory.path(), &domain_id(), &other_key);
+
+        assert_eq!(opened.state().client_wg_public_key, other_key);
+        assert!(scoped_path.exists());
+        let preserved = TrustStore::load(&directory.path().join("trust.json"))
+            .expect("legacy readable")
+            .expect("legacy retained");
+        assert_eq!(preserved.state().client_wg_public_key, client_key());
     }
 
     /// A store belonging to another domain is refused, never replaced: it

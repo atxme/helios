@@ -19,6 +19,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import {
   AlertTriangle,
+  Check,
   ChevronRight,
   KeyRound,
   FileCode2,
@@ -627,6 +628,26 @@ export function ProfilesView({
     }
   }
 
+  /**
+   * Makes one saved profile the profile Orion loads and connects with.
+   *
+   * Selection is persisted by the Rust shell before the editor follows it.
+   * If persistence fails, keeping the previous draft avoids showing a profile
+   * as loaded while the backend will still connect another one.
+   */
+  const selectProfile = async (profile: ClientProfile) => {
+    if (profile.name === draft.name && profile.name === config.selected) return
+    try {
+      await onSelect(profile.name)
+      loadDraft(profile)
+      setDirty(false)
+      setNotice(null)
+    } catch {
+      // The global error surface owns the backend failure. Most importantly,
+      // do not make the editor claim the rejected selection was adopted.
+    }
+  }
+
   const importFile = async (file: File | undefined) => {
     if (!file) return
     setNotice(null)
@@ -792,25 +813,28 @@ export function ProfilesView({
             color="text.disabled"
             sx={{ px: GUTTER, pb: 0.5 }}
           >
-            Profils
+            Profils à charger
           </Typography>
 
-          <Box component="ul" sx={{ m: 0, p: 0, listStyle: 'none', overflow: 'hidden' }}>
+          <Box
+            component="ul"
+            aria-label="Choisir le profil chargé"
+            sx={{ m: 0, p: 0, listStyle: 'none', overflow: 'hidden' }}
+          >
             {config.profiles.map((profile) => {
               const active = profile.name === draft.name
               return (
                 <Box component="li" key={profile.name}>
                   <ButtonBase
-                    onClick={() => {
-                      loadDraft(profile)
-                      setDirty(false)
-                      setNotice(null)
-                      void onSelect(profile.name).catch(() => {})
-                    }}
+                    onClick={() => void selectProfile(profile)}
+                    aria-label={profile.name}
                     aria-current={active ? 'true' : undefined}
                     sx={{
                       position: 'relative',
-                      display: 'block',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 0.75,
                       width: '100%',
                       px: GUTTER,
                       py: 1,
@@ -839,10 +863,27 @@ export function ProfilesView({
                         fontSize: 12.5,
                         fontWeight: active ? 650 : 500,
                         color: active ? 'primary.main' : 'text.primary',
+                        minWidth: 0,
+                        flex: 1,
                       }}
                     >
                       {profile.name}
                     </Typography>
+                    {active && (
+                      <Box
+                        aria-hidden
+                        sx={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 0.35,
+                          color: 'primary.main',
+                          flexShrink: 0,
+                        }}
+                      >
+                        <Check size={12} />
+                        <Typography sx={{ fontSize: 9.5, fontWeight: 700 }}>chargé</Typography>
+                      </Box>
+                    )}
                   </ButtonBase>
                 </Box>
               )

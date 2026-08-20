@@ -505,9 +505,17 @@ describe('ProfilesView interactions', () => {
       />,
     )
 
+    expect(screen.getByRole('list', { name: 'Choisir le profil chargé' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'portable' }).getAttribute('aria-current')).toBe(
+      'true',
+    )
+
     fireEvent.click(screen.getByRole('button', { name: 'backup' }))
-    expect(handlers.onSelect).toHaveBeenCalledWith('backup')
-    expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('backup')
+    await waitFor(() => expect(handlers.onSelect).toHaveBeenCalledWith('backup'))
+    await waitFor(() =>
+      expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('backup'),
+    )
+    expect(screen.getByRole('button', { name: 'backup' }).getAttribute('aria-current')).toBe('true')
 
     fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
     expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('nouveau')
@@ -518,6 +526,28 @@ describe('ProfilesView interactions', () => {
     const dialog = screen.getByRole('dialog', { name: 'Supprimer « portable » ?' })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Supprimer' }))
     await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledWith('portable'))
+  })
+
+  it('keeps the loaded profile when selecting another profile is refused', async () => {
+    const handlers = callbacks()
+    handlers.onSelect.mockRejectedValueOnce(new Error('configuration non écrite'))
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile(), profile({ name: 'backup', endpoint: 'backup.example:51820' })],
+          selected: 'portable',
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'backup' }))
+    await waitFor(() => expect(handlers.onSelect).toHaveBeenCalledWith('backup'))
+    expect((screen.getByLabelText('Nom') as HTMLInputElement).value).toBe('portable')
+    expect(screen.getByRole('button', { name: 'portable' }).getAttribute('aria-current')).toBe(
+      'true',
+    )
   })
 
   /**
