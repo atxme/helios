@@ -526,6 +526,29 @@ impl ClientProfile {
         Ok(())
     }
 
+    /// Refuses changing the security variant of an existing stable profile.
+    ///
+    /// A classic and a Helios profile may target the same endpoint, but they
+    /// must have distinct stable identifiers (spec §14, §19). Reusing the
+    /// existing profile would erase the fact that it has carried Helios trust
+    /// material; after that, losing the negotiation block would once again
+    /// look exactly like an intentional classic profile.
+    pub fn check_replacement_of(&self, known: &Self) -> Result<()> {
+        self.check_kind()?;
+        known.check_kind()?;
+        if self.kind() != known.kind() {
+            anyhow::bail!(
+                "le type du profil « {} » est immuable : il est enregistré comme « {} » mais \
+                 le remplacement propose « {} ». Créer un nouveau profil sous un autre nom \
+                 pour obtenir un identifiant distinct.",
+                known.name,
+                known.kind().as_str(),
+                self.kind().as_str(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.check_kind()?;
         if self.endpoint.trim().is_empty() {
@@ -729,33 +752,32 @@ impl ClientConfig {
     /// refuses to lower a peer's floor when a redacted view is reposted
     /// (ADR-001, amendment of 24 July 2026). A screen that forgot the block,
     /// or a draft opened before a raise and saved after it, must not silently
-    /// reopen a weaker negotiation. Lowering the floor stays possible, but
-    /// only by editing `profiles.toml` by hand — a deliberate local act, never
-    /// a side effect of saving a form.
-    pub fn upsert(&mut self, mut profile: ClientProfile) {
+    /// reopen a weaker negotiation. The profile variant is an even stronger
+    /// boundary: changing it under the same stable profile is refused. A
+    /// classic peer and a Helios peer use two distinct profile identifiers.
+    pub fn upsert(&mut self, mut profile: ClientProfile) -> Result<()> {
+        profile.check_kind()?;
         match self.profiles.iter_mut().find(|p| p.name == profile.name) {
             Some(slot) => {
+                profile.check_replacement_of(slot)?;
                 Self::keep_strongest_floor(&mut profile, slot);
                 *slot = profile;
             }
             None => self.profiles.push(profile),
         }
+        Ok(())
     }
 
     /// Carries the known floor over to the profile about to replace it.
     ///
-    /// Dropping the block entirely is a downgrade too: a profile that
-    /// negotiated in ML-KEM and comes back without any block would fall back
-    /// to the legacy path, whose first handshake is unprotected. The known
-    /// block is therefore preserved rather than erased.
+    /// The caller has already proved both profiles are Helios. Dropping the
+    /// block is refused before this function; only the monotone floor remains
+    /// to reconcile here.
     fn keep_strongest_floor(incoming: &mut ClientProfile, known: &ClientProfile) {
         let Some(previous) = known.key_negotiation.as_ref() else {
             return;
         };
         let Some(next) = incoming.key_negotiation.as_mut() else {
-            if previous.minimum_mode != ProtectionMode::Classic {
-                incoming.key_negotiation = Some(previous.clone());
-            }
             return;
         };
         if !next.minimum_mode.satisfies(previous.minimum_mode) {
@@ -855,11 +877,13 @@ mod tests {
         cfg.upsert(ClientProfile {
             name: "a".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.upsert(ClientProfile {
             name: "b".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.selected = Some("b".into());
         assert_eq!(cfg.profiles.len(), 2);
 
@@ -868,7 +892,8 @@ mod tests {
             name: "a".into(),
             endpoint: "203.0.113.1:51820".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         assert_eq!(cfg.profiles.len(), 2);
         assert_eq!(cfg.find("a").unwrap().endpoint, "203.0.113.1:51820");
 
@@ -903,11 +928,13 @@ mod tests {
     #[test]
     fn saving_a_profile_never_lowers_the_key_negotiation_floor() {
         let mut cfg = ClientConfig::default();
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem))
+            .unwrap();
         cfg.upsert(negotiating(
             ProtectionMode::Classic,
             ProtectionMode::Classic,
-        ));
+        ))
+        .unwrap();
 
         let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
         assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
@@ -919,26 +946,29 @@ mod tests {
     /// Dropping the block is a downgrade too: the legacy path leaves the
     /// first handshake unprotected.
     #[test]
-    fn saving_a_profile_without_its_block_keeps_the_known_one() {
+    fn saving_a_profile_without_its_block_is_refused() {
         let mut cfg = ClientConfig::default();
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
-        cfg.upsert(ClientProfile {
-            name: "poste".into(),
-            ..ClientProfile::default()
-        });
+        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem))
+            .unwrap();
+        let error = cfg
+            .upsert(ClientProfile {
+                name: "poste".into(),
+                profile_type: Some(ProfileKind::Classic),
+                ..ClientProfile::default()
+            })
+            .unwrap_err();
 
-        let saved = cfg.find("poste").unwrap().key_negotiation.as_ref().unwrap();
-        assert_eq!(saved.minimum_mode, ProtectionMode::MlKem);
+        assert!(error.to_string().contains("type du profil"));
+        assert_eq!(
+            cfg.find("poste").unwrap().kind(),
+            ProfileKind::HeliosKeyNegotiation
+        );
     }
 
-    /// Adding negotiation to a profile that had none must survive the save
-    /// **and** the round-trip through `profiles.toml`.
+    /// A separately identified Helios profile survives the save and reload.
     ///
-    /// This is the upgrade path a user actually walks: a profile enrolled long
-    /// ago, re-enrolled with a negotiation block. If the block were dropped by
-    /// the ratchet, by serialization, or by a default, the Profiles screen
-    /// would keep saying "this profile does not negotiate" with no way to tell
-    /// whether the import or the display was at fault.
+    /// A classic profile cannot be converted in place: the new Helios profile
+    /// receives another stable identifier, represented here by another name.
     ///
     /// Serialized in place rather than through `save`/`load`: those go through
     /// `ORION_CONFIG`, a process-wide variable that parallel tests would fight
@@ -952,16 +982,19 @@ mod tests {
             endpoint: "vpn.example.net:51820".into(),
             private_key: "cHJpdmF0ZQ==".into(),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
 
-        // Re-enrolled: same name, now carrying negotiation.
-        cfg.upsert(negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem));
+        // Re-enrolled under a distinct name, now carrying negotiation.
+        let mut enrolled = negotiating(ProtectionMode::MlKem, ProtectionMode::MlKem);
+        enrolled.name = "poste-helios".into();
+        cfg.upsert(enrolled).unwrap();
 
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let reloaded: ClientConfig = toml::from_str(&encoded).unwrap();
         let settings = reloaded
-            .find("poste")
+            .find("poste-helios")
             .expect("profile kept")
             .key_negotiation
             .as_ref()
@@ -970,20 +1003,25 @@ mod tests {
         assert_eq!(settings.identity, "orion-poste");
     }
 
-    /// A floor still at `classic` carries no promise: nothing to preserve.
+    /// Even a legacy `classic` floor does not permit changing profile kind.
     #[test]
-    fn a_classic_floor_does_not_pin_the_block() {
+    fn a_classic_floor_does_not_allow_reclassifying_the_profile() {
         let mut cfg = ClientConfig::default();
         cfg.upsert(negotiating(
             ProtectionMode::Classic,
             ProtectionMode::Classic,
-        ));
-        cfg.upsert(ClientProfile {
-            name: "poste".into(),
-            ..ClientProfile::default()
-        });
+        ))
+        .unwrap();
+        let error = cfg
+            .upsert(ClientProfile {
+                name: "poste".into(),
+                profile_type: Some(ProfileKind::Classic),
+                ..ClientProfile::default()
+            })
+            .unwrap_err();
 
-        assert!(cfg.find("poste").unwrap().key_negotiation.is_none());
+        assert!(error.to_string().contains("type du profil"));
+        assert!(cfg.find("poste").unwrap().key_negotiation.is_some());
     }
 
     #[test]
@@ -1002,7 +1040,8 @@ mod tests {
             preshared_key: Some("cHNr".into()),
             address: Some("100.64.1.2/32".into()),
             ..ClientProfile::default()
-        });
+        })
+        .unwrap();
         cfg.selected = Some("site-a".into());
         cfg.save().unwrap();
 

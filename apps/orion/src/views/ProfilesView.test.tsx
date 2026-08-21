@@ -30,22 +30,27 @@ vi.mock('../profileDocument', () => ({ readProfileDocument: documents.readProfil
 
 import { ProfilesView } from './ProfilesView'
 
-const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
-  name: 'portable',
-  endpoint: '203.0.113.10:51820',
-  peer_public_key: 'gateway-public',
-  profile_type: 'classic',
-  public_key: 'client-public',
-  has_private_key: true,
-  has_static_psk: false,
-  address: '100.64.1.2/32',
-  allowed_ips: '0.0.0.0/0',
-  persistent_keepalive: 25,
-  heliosd_url: 'http://100.64.0.1:8080',
-  ssh_target: null,
-  key_negotiation: null,
-  ...overrides,
-})
+const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
+  const profile_type =
+    overrides.profile_type ??
+    (overrides.key_negotiation ? 'helios_key_negotiation' : 'classic')
+  return {
+    name: 'portable',
+    endpoint: '203.0.113.10:51820',
+    peer_public_key: 'gateway-public',
+    profile_type,
+    public_key: 'client-public',
+    has_private_key: true,
+    has_static_psk: false,
+    address: '100.64.1.2/32',
+    allowed_ips: '0.0.0.0/0',
+    persistent_keepalive: 25,
+    heliosd_url: 'http://100.64.0.1:8080',
+    ssh_target: null,
+    key_negotiation: null,
+    ...overrides,
+  }
+}
 
 /**
  * What the shell reports for a profile whose identity is not on this machine.
@@ -367,13 +372,14 @@ describe('ProfilesView interactions', () => {
    * (`ClassicNotNegotiable`), so offering it here would only build profiles
    * that fail before the first handshake.
    */
-  it('offers only the two negotiable modes, and reaches classic by removing the block', async () => {
+  it('offers only the two negotiable modes and keeps an existing profile Helios', async () => {
     const handlers = callbacks()
     render(
       <ProfilesView
         config={{
           profiles: [
             profile({
+              profile_type: 'helios_key_negotiation',
               key_negotiation: {
                 mode: 'ml_kem',
                 minimum_mode: 'classic',
@@ -402,12 +408,8 @@ describe('ProfilesView interactions', () => {
     // has climbed past is the point.
     expect(within(screen.getByLabelText('Plancher')).getAllByRole('button')).toHaveLength(3)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Retirer' }))
-    await waitFor(() => expect(screen.getByText('aucune')).toBeTruthy())
-    // And the PSK comes back to the WireGuard settings, where it is plain
-    // WireGuard again.
-    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
-    expect(screen.getByRole('button', { name: 'Définir un PSK statique' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retirer' })).toBeNull()
+    expect(screen.getByText(/type d’un profil enregistré est immuable/i)).toBeTruthy()
   })
 
   /** Certificates have their own destination: none of it leaks back here. */

@@ -439,9 +439,10 @@ garder, c’est choisir un niveau de protection à la place de l’opérateur. L
 chemin de connexion lit `ClientProfile::negotiates()`, jamais la présence du
 bloc. L’inférence historique survit à un seul endroit — un manifeste scellé
 avant la v5 ou un document écrit avant §19 —, s’applique **une fois** à la
-lecture, et le prochain scellement écrit la réponse. L’éditeur, lui, a le droit
-de changer le type : ajouter un bloc à un profil classique est un geste
-légitime, et c’est le seul chemin qui le fait.
+lecture, et le prochain scellement écrit la réponse. Une fois le profil scellé,
+son type est immuable sous son identifiant stable : passer de `classic` à
+`helios_key_negotiation`, ou l’inverse, exige un nouveau profil sous un autre
+nom. Le modèle, le coffre et l’écran refusent tous la reclassification en place.
 
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
@@ -533,7 +534,10 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   boucle bornée de la négociation, et le budget n’est rendu que par un
   handshake réussi — jamais par le fait d’avoir essayé. Un reçu n’existe que
   pour `ml_kem` : un `static_psk` est la configuration de l’opérateur, relue à
-  chaque démarrage, donc toujours là.
+  chaque démarrage, donc toujours là. Le reçu précédent n’est remplacé qu’au
+  commit du suivant : un échec de renégociation ne doit ni perdre la capacité
+  de libérer l’ancien slot, ni empêcher un handshake ancien revenu de remettre
+  le tunnel à `Up`.
 - Tout cela suppose un keep-alive persistant, et la gateway le **pose
   elle-même** (`WgPeer::persistent_keepalive_secs`, 25 s) plutôt que de faire
   confiance à celui du client, qu’elle ne peut pas inspecter. L’admission
@@ -584,6 +588,9 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   monté dès le début de la connexion — pas au commit : une négociation dure
   plusieurs secondes, et un profil retiré pendant celle-ci doit être reconnu. Il
   est tenu à part du reçu de commit, qu’un tunnel classique n’a pas.
+  Si `down()` échoue, la suppression est refusée : le nom reste attaché à
+  l’adaptateur encore monté afin qu’un nouvel essai puisse le démonter avant de
+  détruire le profil.
 - Un `release` ne retire qu’un état `committed` dont il nomme exactement le
   propriétaire. Pendant `preparing` c’est un **no-op** : le candidat appartient
   à la connexion qui le prépare, et sa garde de rollback est la seule sortie,

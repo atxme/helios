@@ -425,12 +425,24 @@ impl ProfileStore {
     /// raises the generation and clears the migration flag, which is precisely
     /// how a profile that came from a plaintext file becomes connectable again.
     pub fn save_profile(&self, profile: &ClientProfile) -> Result<(), VaultError> {
+        profile
+            .check_kind()
+            .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
         let root = self.root()?;
         let mut registry = self.load_registry(&root)?;
         let client_public_key = aether::wg::public_from_private(&profile.private_key)
             .map_err(|_| VaultError::ContextDisagrees)?;
 
         let previous = registry.find_by_name(&profile.name).cloned();
+        if let Some(entry) = previous.as_ref() {
+            let known = self.load_manifest(&root, entry)?;
+            if known.kind() != profile.kind() {
+                return Err(VaultError::ProfileKindChanged {
+                    known: known.kind().as_str(),
+                    offered: profile.kind().as_str(),
+                });
+            }
+        }
         let id = previous.as_ref().map(|entry| entry.id);
         let id = match id {
             Some(id) => id,
@@ -847,6 +859,31 @@ mod tests {
         assert_eq!(loaded.profiles.len(), 1);
         assert_eq!(loaded.profiles[0].private_key, original.private_key);
         assert_eq!(loaded.selected.as_deref(), Some("poste"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The vault is the durable enforcement point for the profile variant.
+    ///
+    /// The shell normally refuses this before I/O, but imports and future
+    /// callers must not be able to bypass the rule by writing directly. The
+    /// original blob must remain readable after the refusal.
+    #[test]
+    fn a_sealed_profile_cannot_change_security_kind_in_place() {
+        use crate::config::ProfileKind;
+
+        let (dir, store) = store("immutable-kind");
+        let classic = profile("poste");
+        store.save_profile(&classic).unwrap();
+
+        let mut helios = classic.clone();
+        helios.profile_type = Some(ProfileKind::HeliosKeyNegotiation);
+        helios.key_negotiation = Some(negotiation());
+        let error = store.save_profile(&helios).unwrap_err();
+        assert!(matches!(error, VaultError::ProfileKindChanged { .. }));
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.find("poste").unwrap().kind(), ProfileKind::Classic);
+        assert!(loaded.find("poste").unwrap().key_negotiation.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

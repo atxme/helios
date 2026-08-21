@@ -1699,7 +1699,9 @@ tentative est bornée à deux secondes et son échec ne retarde jamais davantage
 la déconnexion. La désinstallation d'un profil fait de même si le tunnel, le
 reçu de commit et une identité utilisable sont encore disponibles : la
 suppression déconnecte d'abord, puis retire, parce que le `release` voyage dans
-ce tunnel et est signé par l'identité de ce profil. En
+ce tunnel et est signé par l'identité de ce profil. Si le démontage de
+l'adaptateur échoue, la suppression est refusée : le profil reste associé à
+l'adaptateur encore monté et permet de réessayer. En
 `static_psk`, Orion démonte seulement son adaptateur et libère sa copie mémoire ;
 la source configurée reste protégée dans son stockage.
 
@@ -1979,6 +1981,11 @@ la configuration de l'opérateur : `network.toml` le contient, la gateway le
 relit à chaque démarrage, donc il est toujours là et un handshake vieilli y
 signifie autre chose. Un tunnel `classic` n'a pas de slot du tout et WireGuard
 réessaie seul.
+
+Le reçu précédent reste détenu jusqu'au commit de son remplaçant. Une
+renégociation qui échoue avant ce commit ne prouve pas que l'ancien slot a
+disparu : si son handshake revient, Orion repasse à `Up`, et une déconnexion
+peut encore nommer exactement cette transaction dans son `release` signé.
 
 ## 13. Déroulement nominal
 

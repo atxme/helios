@@ -2119,11 +2119,13 @@ mod tests {
         assert!(imported.profile.private_key.is_empty());
 
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            name: "portable".into(),
-            private_key: CLIENT_PRIVATE.into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                name: "portable".into(),
+                private_key: CLIENT_PRIVATE.into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let completed = complete_profile_import(imported.profile, &config, None, Vec::new())
             .unwrap()
@@ -2164,12 +2166,14 @@ mod tests {
         assert_eq!(imported.admitted_public_key().as_deref(), Some(&*admitted));
 
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            // Same client, other name: the situation the name rule refused.
-            name: "poste-de-christophe".into(),
-            private_key: CLIENT_PRIVATE.into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                // Same client, other name: the situation the name rule refused.
+                name: "poste-de-christophe".into(),
+                private_key: CLIENT_PRIVATE.into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let admitted_key = imported.admitted_public_key();
         let completed = complete_profile_import(
@@ -2194,10 +2198,12 @@ mod tests {
             ..complete_profile()
         };
         let mut config = ClientConfig::default();
-        config.upsert(ClientProfile {
-            private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
-            ..complete_profile()
-        });
+        config
+            .upsert(ClientProfile {
+                private_key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into(),
+                ..complete_profile()
+            })
+            .unwrap();
 
         let completed = complete_profile_import(
             invitation,

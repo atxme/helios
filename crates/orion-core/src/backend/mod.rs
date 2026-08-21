@@ -407,11 +407,20 @@ impl VpnController {
     /// clear-text leak.
     pub async fn connect(&self, profile: ClientProfile, user_sink: EventSink) {
         self.abort_task().await;
-        // No link to hang up any more. A previous PSK is not released here:
-        // the negotiation about to run replaces it atomically on both ends,
-        // and releasing first would open a window in which the gateway holds
-        // nothing for a peer that is about to reconnect.
-        self.installed.lock().await.take();
+        // No link to hang up any more. A receipt for this same Helios profile
+        // stays valid until a replacement actually commits. Dropping it merely
+        // because a renegotiation started lost the only signed handle able to
+        // release the old slot when the new dial failed before preparation.
+        // A different profile cannot use that receipt and must not inherit it.
+        let mut installed = self.installed.lock().await;
+        let keep_previous_receipt = profile.negotiates()
+            && installed
+                .as_ref()
+                .is_some_and(|receipt| receipt.profile.name == profile.name);
+        if !keep_previous_receipt {
+            installed.take();
+        }
+        drop(installed);
         self.link_lost.store(false, Ordering::SeqCst);
         *self.mounted_profile.lock().await = Some(profile.name.clone());
         let sink = self.wrap_sink(user_sink);
@@ -516,12 +525,10 @@ impl VpnController {
     }
 
     /// Unmounts the tunnel — **the only path allowed to remove the adapter**.
-    pub async fn disconnect(&self, user_sink: EventSink) {
+    pub async fn disconnect(&self, user_sink: EventSink) -> anyhow::Result<()> {
         self.abort_task().await;
         let installed = self.installed.lock().await.take();
         self.link_lost.store(false, Ordering::SeqCst);
-        self.mounted_profile.lock().await.take();
-        self.stale_renegotiations.store(0, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
         // Say it explicitly, before unmounting. This is the message that
         // replaces v4's closing link, and it is best-effort by construction:
@@ -533,15 +540,23 @@ impl VpnController {
         if let Some(installed) = installed {
             self.release_installed_psk(installed, &sink).await;
         }
-        if let Err(e) = self.backend.down(&sink).await {
+        if let Err(error) = self.backend.down(&sink).await {
+            // The profile still names a mounted adapter. Keep that ownership
+            // visible so a deletion retries the disconnection instead of
+            // destroying the only local material able to clean it up.
+            sink(ClientEvent::state(TunnelState::Failed));
             sink(ClientEvent::Error {
-                message: format!("échec de déconnexion: {e}"),
+                message: format!("échec de déconnexion: {error}"),
             });
+            return Err(error);
         }
+        self.mounted_profile.lock().await.take();
+        self.stale_renegotiations.store(0, Ordering::SeqCst);
         // Guarantees a return to Down even if the backend emitted nothing.
         if self.state() != TunnelState::Down {
             sink(ClientEvent::state(TunnelState::Down));
         }
+        Ok(())
     }
 
     /// Re-evaluates state from the age of the last handshake (WireGuard is
@@ -584,11 +599,20 @@ impl VpnController {
             self.stale_renegotiations.store(0, Ordering::SeqCst);
         }
         let current = self.state();
+        let retained_receipt = self.installed.lock().await.is_some();
         let raw_sink = Arc::clone(&user_sink);
         let sink = self.wrap_sink(user_sink);
 
         match (current, fresh) {
             (TunnelState::Connecting, true) => {
+                sink(ClientEvent::state(TunnelState::Up));
+            }
+            // A same-profile renegotiation may fail before replacing the old
+            // slot. If that slot was merely unreachable and its handshake
+            // returns, the retained receipt proves which negotiated tunnel is
+            // carrying traffic; keeping `Failed` would contradict the data
+            // plane and would also strand a releasable gateway slot.
+            (TunnelState::Failed, true) if retained_receipt => {
                 sink(ClientEvent::state(TunnelState::Up));
             }
             // The closure has just been announced by the link watcher, with the
@@ -1027,6 +1051,31 @@ mod tests {
         }
     }
 
+    struct RefusingDownBackend;
+
+    #[async_trait::async_trait]
+    impl VpnBackend for RefusingDownBackend {
+        async fn up(&self, _profile: &ClientProfile, _sink: &EventSink) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn down(&self, _sink: &EventSink) -> anyhow::Result<()> {
+            anyhow::bail!("adapter is still mounted")
+        }
+
+        async fn last_handshake_age(&self) -> Option<Duration> {
+            None
+        }
+
+        fn adapter_is_up(&self) -> bool {
+            true
+        }
+
+        fn kind(&self) -> &'static str {
+            "refusing-down"
+        }
+    }
+
     /// A connection announces itself before it does anything long.
     ///
     /// The bug this guards against was silent on this side and fatal on the
@@ -1111,12 +1160,102 @@ mod tests {
             "a connection under way already owns the profile — a negotiation              takes seconds, and a profile removed during it must be recognised"
         );
 
-        ctrl.disconnect(sink()).await;
+        ctrl.disconnect(sink()).await.unwrap();
         assert_eq!(
             ctrl.mounted_profile().await,
             None,
             "the tunnel is down: no profile is mounted any more"
         );
+    }
+
+    /// A failed unmount must leave the profile associated with its adapter.
+    ///
+    /// The shell uses this fact to refuse deleting the profile: destroying its
+    /// identity while the adapter still exists would violate the normative
+    /// "disconnect first, then remove" order.
+    #[tokio::test]
+    async fn a_failed_disconnection_keeps_the_mounted_profile_owned() {
+        let ctrl = VpnController::new(Arc::new(RefusingDownBackend));
+        *ctrl.mounted_profile.lock().await = Some("test".into());
+        *ctrl.state.write().unwrap() = TunnelState::Up;
+
+        assert!(ctrl.disconnect(sink()).await.is_err());
+        assert_eq!(ctrl.mounted_profile().await.as_deref(), Some("test"));
+        assert_eq!(ctrl.state(), TunnelState::Failed);
+        assert!(ctrl.adapter_is_up());
+    }
+
+    /// A failed same-profile renegotiation must not erase the old receipt.
+    ///
+    /// Network loss can stale a handshake while the gateway still owns the
+    /// previous slot. Until the replacement commits, that transaction remains
+    /// the only value a signed release can name.
+    #[tokio::test]
+    async fn starting_a_same_profile_renegotiation_keeps_the_previous_receipt() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend);
+        let mut helios = profile();
+        helios.profile_type = Some(crate::config::ProfileKind::HeliosKeyNegotiation);
+        helios.key_negotiation = Some(crate::config::KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "203.0.113.10:51821".into(),
+            server_name: "gateway.example".into(),
+            gateway_ca_der: "Q0E=".into(),
+            gateway_pq_certificate: "Q0VSVA==".into(),
+            identity: "test".into(),
+            trust: None,
+        });
+        *ctrl.installed.lock().await = Some(InstalledNegotiation {
+            transaction_id: [9; 16],
+            profile: helios.clone(),
+        });
+
+        // No identity provider: the spawned negotiation fails, but only after
+        // `connect` has made its receipt-retention decision.
+        ctrl.connect(helios, sink()).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            ctrl.installed
+                .lock()
+                .await
+                .as_ref()
+                .map(|receipt| receipt.transaction_id),
+            Some([9; 16])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_returning_old_handshake_recovers_a_failed_renegotiation() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        *ctrl.installed.lock().await = Some(InstalledNegotiation {
+            transaction_id: [9; 16],
+            profile: profile(),
+        });
+        *ctrl.state.write().unwrap() = TunnelState::Failed;
+        backend.set_handshake_age(Some(Duration::from_secs(1)));
+
+        ctrl.poll_handshake(sink()).await;
+
+        assert_eq!(ctrl.state(), TunnelState::Up);
+    }
+
+    #[tokio::test]
+    async fn connecting_another_profile_drops_an_unrelated_receipt() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend);
+        *ctrl.installed.lock().await = Some(InstalledNegotiation {
+            transaction_id: [9; 16],
+            profile: profile(),
+        });
+        let mut other = profile();
+        other.name = "other".into();
+
+        ctrl.connect(other, sink()).await;
+
+        assert!(ctrl.installed.lock().await.is_none());
     }
 
     /// Records every log line, so a test can assert on what the user reads.
@@ -1242,7 +1381,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(ctrl.adapter_is_up());
 
-        ctrl.disconnect(sink()).await;
+        ctrl.disconnect(sink()).await.unwrap();
         assert!(!ctrl.adapter_is_up(), "disconnect must unmount the adapter");
         assert_eq!(ctrl.state(), TunnelState::Down);
     }

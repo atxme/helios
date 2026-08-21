@@ -125,6 +125,16 @@ pub struct ProfileManifest {
 }
 
 impl ProfileManifest {
+    /// Declared kind, or the one-time historical inference for a pre-v5 blob.
+    pub fn kind(&self) -> ProfileKind {
+        self.profile_type
+            .unwrap_or(if self.key_negotiation.is_some() {
+                ProfileKind::HeliosKeyNegotiation
+            } else {
+                ProfileKind::Classic
+            })
+    }
+
     /// Builds a manifest from the profile shape the UI edits.
     pub fn from_profile(profile: &ClientProfile, generation: SecurityGeneration) -> Self {
         Self {

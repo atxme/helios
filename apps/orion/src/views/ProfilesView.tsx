@@ -713,11 +713,16 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
+  const storedKind = config.profiles.find((profile) => profile.name === draft.name)?.profile_type
+  const draftKind: ClientProfile['profile_type'] = draft.key_negotiation
+    ? 'helios_key_negotiation'
+    : 'classic'
+  const kindChanged = storedKind !== undefined && storedKind !== draftKind
   // A PSK entered during this edit counts as present: it is what the save is
   // about to store, and showing "aucun" next to a value the user just typed
   // would read as the entry having been refused.
   const staticPsk = (draft.has_static_psk && !clearPsk) || stagedPsk
-  const invalid = Object.values(issues).some(Boolean)
+  const invalid = kindChanged || Object.values(issues).some(Boolean)
   // The "Advanced" collapse must flag what it hides: otherwise a faulty field
   // would stay invisible until someone thinks to open it. A narrowed range is
   // *not* one of those: split tunnelling is a decision, not a defect.
@@ -1169,15 +1174,28 @@ export function ProfilesView({
               color="text.secondary"
               sx={{ fontFamily: 'monospace', fontSize: 11 }}
             >
-              {draft.key_negotiation ? 'helios_key_negotiation' : 'classic'}
+              {draftKind}
             </Typography>
           </Box>
+
+          {exists && (
+            <Alert
+              severity={kindChanged ? 'error' : 'info'}
+              role={kindChanged ? 'alert' : 'note'}
+              sx={{ mb: 1.5 }}
+            >
+              {kindChanged
+                ? `Le type enregistré « ${storedKind} » ne peut pas devenir « ${draftKind} » sous le même identifiant. Rétablissez le type initial ou choisissez un nouveau nom.`
+                : 'Le type d’un profil enregistré est immuable. Pour utiliser l’autre type, créez un nouveau profil sous un autre nom afin qu’il reçoive un identifiant distinct.'}
+            </Alert>
+          )}
 
           <KeyNegotiation
             settings={draft.key_negotiation}
             floorBaseline={floorBaseline}
             issue={issues.key_negotiation}
             support={support}
+            kindLocked={exists}
             pskField={pskField}
             onChange={setNegotiation}
             onRaiseFloor={raiseFloor}
@@ -1279,6 +1297,7 @@ function KeyNegotiation({
   floorBaseline,
   issue,
   support,
+  kindLocked,
   pskField,
   onChange,
   onRaiseFloor,
@@ -1289,6 +1308,8 @@ function KeyNegotiation({
   floorBaseline: ProtectionMode | null
   issue?: string | null
   support: KeyNegotiationSupport | null
+  /** An existing stable profile cannot change security variant. */
+  kindLocked: boolean
   /** The static PSK row, shown here when `static_psk` is the chosen mode. */
   pskField: React.ReactNode
   onChange: <Key extends keyof KeyNegotiationSettings>(
@@ -1319,15 +1340,18 @@ function KeyNegotiation({
           describeChild
           title="Sans négociation, le tunnel monte avant toute authentification post-quantique : le premier handshake n’est pas protégé."
         >
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<ShieldPlus size={14} aria-hidden />}
-            onClick={() => onToggle(true)}
-            sx={{ ml: 'auto', flexShrink: 0 }}
-          >
-            Ajouter
-          </Button>
+          <span style={{ marginLeft: 'auto' }}>
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<ShieldPlus size={14} aria-hidden />}
+              onClick={() => onToggle(true)}
+              disabled={kindLocked}
+              sx={{ flexShrink: 0 }}
+            >
+              Ajouter
+            </Button>
+          </span>
         </Tooltip>
       </Box>
     )
@@ -1337,7 +1361,7 @@ function KeyNegotiation({
   // Removing the block is a downgrade. It stays possible while nothing has
   // been negotiated — a block just added by hand, typically — and the floor
   // is what closes the door as soon as something has.
-  const removable = !floorBaseline || modeLevel(floorBaseline) === 0
+  const removable = !kindLocked && (!floorBaseline || modeLevel(floorBaseline) === 0)
   // A block loaded with `classic` cannot negotiate at all: the gateway
   // refuses that mode by name. It is not offered above, so it can only come
   // from a document written before the rule — and it has to be said, because

@@ -1098,6 +1098,7 @@ impl ProfileDraft {
         staged: Option<&StagedKey>,
         staged_psk: Option<&StagedPsk>,
     ) -> Result<ClientProfile, String> {
+        let stored_kind = stored.map(ClientProfile::kind);
         let mut profile = match stored {
             Some(profile) => profile.clone(),
             None => ClientProfile {
@@ -1147,19 +1148,19 @@ impl ProfileDraft {
         profile.heliosd_url = self.heliosd_url;
         profile.ssh_target = self.ssh_target;
         profile.key_negotiation = self.key_negotiation;
-        // The editor is the one place allowed to **change** the kind: adding a
-        // negotiation block to a classic profile is a legitimate gesture, and
-        // so is the reverse while nothing has been negotiated. The discriminant
-        // therefore follows what was saved, and is recorded rather than
-        // re-derived on every later read — which is the whole difference. A
-        // profile whose block goes missing afterwards has a recorded kind that
-        // no longer matches, and `check_kind` refuses it instead of quietly
-        // mounting a classic tunnel.
-        profile.profile_type = Some(if profile.key_negotiation.is_some() {
-            orion_core::ProfileKind::HeliosKeyNegotiation
-        } else {
-            orion_core::ProfileKind::Classic
-        });
+        // An existing stable profile keeps its declared variant. Switching
+        // between classic and Helios requires another profile identifier (spec
+        // §14, §19); deriving the kind from the edited block here made deleting
+        // that block a persistent downgrade. A new draft has no history and is
+        // stamped from the shape the user chose before its first save.
+        profile.profile_type = Some(stored_kind.unwrap_or_else(|| {
+            if profile.key_negotiation.is_some() {
+                orion_core::ProfileKind::HeliosKeyNegotiation
+            } else {
+                orion_core::ProfileKind::Classic
+            }
+        }));
+        profile.check_kind().map_err(|error| error.to_string())?;
         // A stored profile never carries a negotiated PSK: that one only ever
         // exists in the ephemeral copy the backend mounts.
         profile.preshared_key_is_negotiated = false;
@@ -1616,18 +1617,24 @@ async fn save_profile(
     // its WireGuard key is the old one. Ordinary edits never have a pending
     // import, so they still use the stored profile and preserve its secrets.
     let pending = state.pending_imports.lock().await.remove(&draft.name);
-    let stored = profile_edit_base(pending.as_ref(), cfg.find(&draft.name));
+    let known = cfg.find(&draft.name);
+    let stored = profile_edit_base(pending.as_ref(), known);
     // Taken, not peeked: the key is now the profile's, and leaving a copy in
     // the slot would let the next profile saved adopt it too.
     let staged = state.staged_key.lock().await.take();
     let staged_psk = state.staged_psk.lock().await.take();
     let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    if let Some(known) = known {
+        profile
+            .check_replacement_of(known)
+            .map_err(|error| error.to_string())?;
+    }
     let selected = profile.name.clone();
     state
         .store
         .save_profile(&profile)
         .map_err(|e| e.to_string())?;
-    cfg.upsert(profile);
+    cfg.upsert(profile).map_err(|error| error.to_string())?;
     cfg.selected = Some(selected.clone());
     state.store.select(&selected).map_err(|e| e.to_string())?;
     let view = ConfigView::from(&*cfg);
@@ -1657,7 +1664,7 @@ async fn delete_profile(
     // — but holding a lock across it would stall every other command for the
     // two seconds the release is allowed.
     if state.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
-        stop_connection(&app).await;
+        stop_connection(&app).await?;
     }
     let mut cfg = state.config.lock().await;
     state
@@ -1916,14 +1923,13 @@ fn raise_key_negotiation_floor(
 
 #[tauri::command]
 async fn disconnect(app: AppHandle) -> Result<(), String> {
-    stop_connection(&app).await;
-    Ok(())
+    stop_connection(&app).await
 }
 
 /// Unmounts the tunnel. Shared by the `disconnect` command and the tray menu,
 /// for the same reason as [`start_connection`]: two paths that differ by one
 /// step end up differing by more.
-async fn stop_connection(app: &AppHandle) {
+async fn stop_connection(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     state.telemetry.stop();
     // The inference stops before the state moves, not after: a poll that read
@@ -1933,7 +1939,11 @@ async fn stop_connection(app: &AppHandle) {
     if let Some(poll) = poll {
         poll.abort();
     }
-    state.controller.disconnect(emit_sink(app.clone())).await;
+    state
+        .controller
+        .disconnect(emit_sink(app.clone()))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Reports the faulty fields of a profile being edited.
@@ -1957,12 +1967,18 @@ async fn validate_profile(
     // to the old WireGuard key, then `save_profile` would persist that split.
     // Peeked, not removed: validation runs on every keystroke.
     let pending = state.pending_imports.lock().await.get(&draft.name).cloned();
-    let stored = profile_edit_base(pending.as_ref(), cfg.find(&draft.name));
+    let known = cfg.find(&draft.name);
+    let stored = profile_edit_base(pending.as_ref(), known);
     // Validation runs on every keystroke: the staged secrets are read, never
     // taken.
     let staged = state.staged_key.lock().await;
     let staged_psk = state.staged_psk.lock().await;
     let profile = draft.merge(stored, staged.as_ref(), staged_psk.as_ref())?;
+    if let Some(known) = known {
+        profile
+            .check_replacement_of(known)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(inspect_profile(&profile))
 }
 
@@ -2659,6 +2675,26 @@ mod security_tests {
         assert_eq!(merged.private_key, key, "la clé stockée a été perdue");
         assert_eq!(merged.preshared_key, psk, "le PSK stocké a été perdu");
         assert_eq!(merged.endpoint, "198.51.100.7:51820");
+    }
+
+    /// Removing the block cannot rewrite an existing Helios profile as classic.
+    #[test]
+    fn editing_cannot_change_an_existing_profile_kind() {
+        let mut stored = profile("poste");
+        stored.profile_type = Some(orion_core::ProfileKind::HeliosKeyNegotiation);
+        stored.key_negotiation = Some(orion_core::KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "203.0.113.10:51821".into(),
+            server_name: "gateway.example".into(),
+            gateway_ca_der: "Q0E=".into(),
+            gateway_pq_certificate: "Q0VSVA==".into(),
+            identity: "poste".into(),
+            trust: None,
+        });
+
+        let error = draft("poste").merge(Some(&stored), None, None).unwrap_err();
+        assert!(error.contains("helios_key_negotiation"), "{error}");
     }
 
     /// The staged key is what a save adopts, and only when asked.

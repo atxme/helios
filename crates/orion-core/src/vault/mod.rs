@@ -233,6 +233,16 @@ pub enum VaultError {
          autre poste ou d'un autre pair"
     )]
     ContextDisagrees,
+    #[error("profil contradictoire : {0}")]
+    InvalidProfileKind(String),
+    #[error(
+        "le type d'un profil scellé est immuable : « {known} » ne peut pas être remplacé par \
+         « {offered} » sous le même identifiant. Créer un nouveau profil sous un autre nom"
+    )]
+    ProfileKindChanged {
+        known: &'static str,
+        offered: &'static str,
+    },
     #[error("scellement DPAPI refusé par le système : {0}")]
     Dpapi(String),
     #[error("TPM : {0}")]

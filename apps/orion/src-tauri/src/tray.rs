@@ -409,7 +409,9 @@ mod windows {
                 model.is_engaged(&name)
             };
             if engaged {
-                crate::stop_connection(&app).await;
+                if let Err(error) = crate::stop_connection(&app).await {
+                    tracing::warn!(%error, "unable to disconnect from the notification area");
+                }
             } else if let Err(error) = crate::select_and_connect(&app, &name).await {
                 // The window is probably hidden — this is the one path where a
                 // refusal has no screen to land on. It is shown as an error the
