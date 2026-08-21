@@ -2317,6 +2317,232 @@ mod tests {
 
     /// The approved operation is bound to the exact request, its challenge and
     /// its deadline: none of the three can be moved afterwards.
+    /// Builds a recovery request whose expired leaf is genuinely expired.
+    ///
+    /// `ca` is the authority that issued it, `expired` the identity being
+    /// recovered, `fresh` the one asking to be certified.
+    fn recovery_request(
+        ca: &Keys,
+        expired: &Keys,
+        fresh: &Keys,
+        last_known: &ClientCertificateGeneration,
+        challenge: [u8; 32],
+    ) -> ExpiredCertificateRecoveryRequest {
+        ExpiredCertificateRecoveryRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            astra_challenge: challenge,
+            request_id: Id16::new([9; 16]).expect("request id"),
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            client_wg_public_key: client_key(),
+            expired_generation: last_known.generation,
+            requested_generation: last_known.generation + 1,
+            expired_tls_certificate: tls_material().leaf,
+            expired_pq_certificate: client_leaf(ca, expired, 4),
+            tls_csr: tls_material().csr,
+            new_ml_dsa_87_public_key: fresh.public.clone(),
+            credential_id: vec![1, 2, 3],
+            created_at: 500_000,
+            expires_at: 500_120,
+            expired_pq_signature: MlDsa87Signature::placeholder(),
+            new_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&expired.private, &fresh.private)
+        .expect("sign")
+    }
+
+    /// The generation the registry still records for a peer whose leaf died.
+    fn expired_generation_of(
+        request: &ExpiredCertificateRecoveryRequest,
+    ) -> ClientCertificateGeneration {
+        ClientCertificateGeneration {
+            generation: 4,
+            ca_tls_epoch: 1,
+            tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
+            tls_certificate_fingerprint: request.expired_tls_certificate.fingerprint(),
+            pq_certificate_fingerprint: pq_certificate_fingerprint(&request.expired_pq_certificate)
+                .expect("fingerprint"),
+            not_before: 0,
+            not_after: 100_000,
+        }
+    }
+
+    /// The period, and **only** the period, is waived (spec §7.5).
+    ///
+    /// This is the validator's whole reason to exist as a separate type: an
+    /// expired leaf is refused by mTLS, by QUIC and by every ordinary
+    /// validator, and here it is a historical proof rather than a credential.
+    /// Waiving one check is safe only while every other one still runs.
+    #[test]
+    fn a_leaf_long_past_its_expiry_still_proves_continuity() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut last_known = active_generation();
+        let request = recovery_request(&ca, &expired, &fresh, &last_known, challenge);
+        last_known = expired_generation_of(&request);
+
+        // Four hundred thousand seconds past the leaf's `not_after`.
+        request
+            .verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            )
+            .expect("an expired leaf is exactly what this validator is given");
+    }
+
+    /// Waiving the period does not waive the issuer.
+    #[test]
+    fn a_leaf_no_authority_of_this_domain_signed_is_refused() {
+        let ca = keys();
+        let stranger = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&stranger.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::UnauthorizedIssuer)
+        ));
+    }
+
+    /// Only the **newest** recorded leaf proves continuity.
+    ///
+    /// An attacker holding *some* old certificate of the peer is stopped here:
+    /// accepting any leaf the domain ever issued would make every superseded
+    /// generation a permanent key to the identity.
+    #[test]
+    fn an_older_leaf_of_the_same_peer_is_refused() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        let mut last_known = expired_generation_of(&request);
+        // The registry has since recorded a different leaf under the same
+        // generation number.
+        last_known.pq_certificate_fingerprint = Fingerprint::of(b"a newer leaf");
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::FingerprintMismatch("expired PQ leaf"))
+        ));
+    }
+
+    /// The challenge is Astra's, single-use, and not the requester's to pick.
+    #[test]
+    fn a_request_answering_another_challenge_is_refused() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let request = recovery_request(&ca, &expired, &fresh, &active_generation(), [7u8; 32]);
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &[8u8; 32],
+                500_050,
+            ),
+            Err(CertificateError::InvalidChallenge)
+        ));
+    }
+
+    /// Continuity is a signature by the expired identity, not its certificate.
+    ///
+    /// Holding the old leaf is public knowledge — it travelled in every
+    /// handshake. Only its private half proves the recovery is asked for by
+    /// the machine that owned the identity.
+    #[test]
+    fn holding_the_expired_leaf_without_its_private_key_proves_nothing() {
+        let ca = keys();
+        let expired = keys();
+        let thief = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        // The leaf stays the peer's; the continuity signature is the thief's.
+        request = request.sign(&thief.private, &fresh.private).expect("sign");
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::MissingProof("expired client"))
+        ));
+    }
+
+    /// A recovery is the **next** generation, never a jump or a rollback.
+    #[test]
+    fn a_recovery_may_not_skip_a_generation() {
+        let ca = keys();
+        let expired = keys();
+        let fresh = keys();
+        let challenge = [7u8; 32];
+        let mut request = recovery_request(&ca, &expired, &fresh, &active_generation(), challenge);
+        request.requested_generation = 9;
+        let request = request
+            .sign(&expired.private, &fresh.private)
+            .expect("sign");
+        let last_known = expired_generation_of(&request);
+
+        assert!(matches!(
+            request.verify_historical(
+                &[&ca.public],
+                &domain(),
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &last_known,
+                &challenge,
+                500_050,
+            ),
+            Err(CertificateError::GenerationSkipped { .. })
+        ));
+    }
+
     #[test]
     fn the_recovery_approval_challenge_binds_request_challenge_and_deadline() {
         let request = Fingerprint::of(b"request");

@@ -2697,8 +2697,17 @@ contournés :
   tous les compteurs et toutes les empreintes actives, gateway comme client :
   une omission y répondrait « rien à récupérer » à un client en retard, et
   c'est le seul refus dont il ne se relève pas ;
-- la **récupération d'une identité expirée** de bout en bout, qui dépend des
-  deux points précédents ;
+- la **récupération d'une identité expirée** de bout en bout. L'objet et son
+  **validateur historique** sont livrés et éprouvés (`aether::certificates::client`) :
+  `ExpiredCertificateRecoveryRequest`, sa transcription, ses deux signatures,
+  le challenge d'approbation, et un `verify_historical` qui écarte la période
+  **et rien d'autre** — l'émetteur, le rôle, la liaison WireGuard, l'égalité
+  avec la dernière génération enregistrée et les deux preuves restent
+  contrôlés. Ce qui manque est chacun de ses consommateurs : la route publique
+  d'Astra, la cérémonie du compagnon qui ouvre le coffre et signe
+  l'autorisation de staging sous `CA-PQ`, le relais par le veth et le commit
+  côté gateway. Le tout dépend de l'application d'une opération opérateur
+  approuvée, qui n'existe pour aucun chemin ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le
