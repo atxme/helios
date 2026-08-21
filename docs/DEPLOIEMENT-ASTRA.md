@@ -35,41 +35,36 @@ coffre d'autorité ouvert par clé de sécurité, un Astra qui tourne et tient s
 registre et sa chaîne d'audit, une gateway dont les routes de cycle de vie
 in-tunnel sont ouvertes.
 
-Vous n'avez **pas** encore de renouvellement de certificats fonctionnel. Il
-manque :
+Le **renouvellement client ordinaire se boucle** : Orion ouvre l'opération par
+les routes in-tunnel, lit la demande d'approbation, la vérifie sous ce que son
+profil épingle, **demande la clé de sécurité lui-même** — pas de second binaire
+à lancer — puis committe le grant qu'il a vérifié avant toute écriture. La
+gateway enregistre le pair au registre dès l'admission, l'émetteur délégué
+s'installe (`astra issuer request` / `issuer install`), et le client présente
+l'intermédiaire de la délégation dans sa chaîne. Voir « Ce qui fait qu'une
+feuille renouvelée se connecte encore » plus bas.
 
-- le **dépôt** des demandes et des résultats d'`astra-signer`. Les commandes
-  existent — `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
-  `approve-campaign`, `rotate-ca-pq` — mais elles lisent une demande sur disque
-  et écrivent leur résultat à côté. Le backend privé sait vérifier un résultat
-  relayé, mais le compagnon ne sait pas encore utiliser `heliosd_url` : les
-  routes publiques du §8.2 répondent `501` et Orion ne lance pas encore le
-  compagnon. La copie de fichiers reste donc un geste d'outillage, pas un
-  renouvellement Orion fonctionnel ;
-- la **distribution des objets de transition** : le relais typé
-  WireGuard–veth du §2 est livré dans ses deux sens — Orion appelle Helios dans
-  WireGuard, Helios relaie sur le veth privé mTLS, et l'autorisation de stage
-  comme le reçu circulent uniquement entre Astra et Helios — mais la gateway ne
-  détient encore aucun objet pré-signé à distribuer par `trust-update`.
-  L'ancienne route `stage` Orion ne doit
-  pas être ouverte et sera retirée lors de cet alignement ;
-- le **pilote client** du §7 dans `orion-core` : création des clés candidates,
-  ouverture et suivi de l'opération, lancement du compagnon, vérification et
-  persistance du grant, puis `stage-commit` ;
-- l'**alignement des ancres clientes** : la négociation authentifie sous les
-  CA de l'opérateur et sous les empreintes de `network.toml`, l'autorité émet
-  sous les siennes. Voir « Ce qui reste entre l'installation et un
-  renouvellement utilisable » plus bas ;
-- la **bascule de confiance** du §13 et les objets pré-signés de `trust-update`.
-  L'alignement cryptographique du 16 août (ctx ML-DSA, HVLT, pin de politique,
-  jetons de capacité et fournisseur d'aléa sans DRBG applicatif) est livré ; la
-  validation CAVP/ACVP n'est pas exigée par cette version de la spécification.
+Ce qui **manque** encore :
 
-Ce qui est donc réellement éprouvé ici : la construction de l'image, le
-démarrage du conteneur, les volumes, la sauvegarde, le durcissement, la
-cohérence des deux moitiés du domaine et le relais applicatif serveur sur une
-paire TLS de test. Le veth noyau réel et le parcours Orion complet ne le sont
-pas encore.
+- la **récupération d'une identité expirée**, et les trois autres actions du
+  §12.2 : sans pilote, refusées en le disant ;
+- `authorize-issuer` et `rotate-ca-pq` ne portent **aucune campagne**, donc pas
+  d'opération à laquelle se rattacher : ces deux gestes passent par des
+  fichiers, comme décrit ici. `approve` et `approve-campaign`, eux, ont leur
+  transport ;
+- la **distribution** des objets de transition : la gateway les met en file et
+  `trust-update` en rend un fragment par requête, mais rien ne **dépose**
+  encore de transaction faute de constructeur de manifeste côté Astra. Un
+  client en retard reçoit `503`, jamais un « à jour » qui l'arrêterait ;
+- la **bascule de confiance** du §13, la rotation de CA TLS cliente, et le
+  discriminant de type de profil Orion (§19, §22).
+
+Ce qui est réellement éprouvé ici : la construction de l'image, le démarrage du
+conteneur, les volumes, la sauvegarde, le durcissement, la cohérence des deux
+moitiés du domaine, et toute la séquence au-dessus du matériel. Ce qui ne l'est
+pas en WSL2 : le veth noyau réel, la clé de sécurité (aucun passthrough USB) et
+DPAPI — donc un renouvellement complet s'exerce sur Windows, contre une vraie
+gateway. Voir [TESTING.md](testing/TESTING.md).
 
 ## Le choix qu'on ne refait pas
 
@@ -363,25 +358,39 @@ premier usage échoue à 80 % de la vie d'une feuille cliente.
 
 La délégation est lue **au démarrage**, d'où le redémarrage explicite.
 
-### Ce qui reste entre l'installation et un renouvellement utilisable
+### Ce qui fait qu'une feuille renouvelée se connecte encore
 
-Le port de négociation authentifie un client sous **une** CA TLS cliente et
-**une** CA PQ cliente, lues sur disque au démarrage, plus les empreintes figées
-de `network.toml`. Une feuille renouvelée est émise par l'émetteur délégué :
-elle ne chaîne pas vers la même ancre et n'est pas signée par la même clé PQ.
+Trois choses, et il a fallu les trois. Elles se lisent ensemble parce qu'une
+seule qui manque produit la même panne : un client qui a renouvelé, qui bascule
+à la fin du chevauchement, et qui ne rouvre plus le tunnel — donc plus aucun
+canal pour le dire.
 
-La gateway refuse donc de mettre en attente un candidat qu'elle ne saurait pas
-authentifier une fois actif, et le journalise en nommant la raison. C'est
-délibéré : le refuser coûte un message, le poser enfermerait le client dehors à
-la fin du chevauchement, sur la machine dont le tunnel était le seul moyen de
-demander de l'aide.
+1. **La négociation résout dans le registre**, pas dans `network.toml`.
+   Ce fichier n'est écrit qu'à l'admission et rien ne le remet à jour ; le
+   registre, lui, est ce qui a enregistré la rotation. L'empreinte TLS que mTLS
+   vient de prouver désigne le pair, et l'empreinte PQ acceptable est **celle
+   appariée** à cette moitié-là — jamais l'union des générations vivantes, qui
+   accepterait la paire mixte du §3.3.
+2. **L'ensemble d'émetteurs contient l'émetteur délégué.** Une feuille PQ
+   renouvelée n'est pas signée par la CA opérateur mais par la délégation, et
+   la gateway l'admet parce que le registre la nomme.
+   `assert_candidate_is_presentable` construit le **même** ensemble avant de
+   mettre un candidat en attente : deux réponses différentes à « cette feuille
+   s'authentifierait-elle » n'ont aucune issue correcte.
+3. **Le client présente la chaîne.** La feuille TLS déléguée est signée par
+   l'intermédiaire de la délégation, et le point d'écoute QUIC ne détient que
+   l'ancre : il construit le chemin depuis ce que le client montre. Orion scelle
+   donc `[feuille, intermédiaire]`, et seulement quand cet intermédiaire est
+   celui qui a signé cette feuille.
 
-Lever cette limite, c'est deux choses, et elles vont ensemble : la négociation
-lisant le registre de certificats — `acceptable_pq_fingerprints`,
-`resolve_pair`, et la clé publique de l'émetteur délégué — au lieu des
-épinglages de `network.toml` ; et l'ancre TLS cliente du domaine devenant celle
-sous laquelle l'autorité émet réellement, ce qui est la migration de la CA
-opérateur vers le coffre que l'ADR-008 décrit et que rien n'a encore faite.
+**Limite connue** : le jeu d'ancres TLS clientes est lu une fois sur disque au
+démarrage, et `heliosd init-trust-domain` amorce le registre depuis ce même
+fichier — les deux concordent donc, et l'intermédiaire de la délégation chaîne
+vers cette ancre. Ce qui n'est pas câblé, c'est une **rotation de CA TLS
+cliente** : `next_client_tls_ca_certificate` n'est pas offert en seconde racine,
+et une nouvelle ancre exigerait de toute façon un redémarrage — reconstruire le
+point d'écoute sous des sessions vivantes ferait tomber les slots PSK qu'elles
+tiennent. Rien n'effectue cette rotation aujourd'hui.
 
 ### À la main
 

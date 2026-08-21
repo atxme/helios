@@ -258,13 +258,22 @@ Restent ouverts :
   `network.toml` et la CA sur disque. Le registre est ouvert une fois et
   partagé (`certificates::open_registry`, `SharedRegistry`) : la négociation le
   lit, le service de cycle de vie l'écrit, un seul verrou.
+  **Et le client présente désormais la chaîne**, ce qui fermait la dernière
+  marche : une feuille déléguée est signée par l'intermédiaire de la
+  délégation, et le point d'écoute QUIC ne détient que l'ancre — il construit
+  le chemin depuis ce que le client montre. `candidate_bundle` scelle donc
+  `[feuille, intermédiaire]` dès que l'intermédiaire est **celui qui a signé
+  cette feuille**, pas dès que le grant en porte un : ajouter un intermédiaire
+  étranger ferait échouer un chemin qui se serait construit sans lui. Une
+  chaîne d'un seul certificat laissait la feuille attachée à rien de connu, et
+  le handshake échouait à la fin du chevauchement — sur la machine dont le seul
+  canal pour le dire était ce tunnel.
   **Limite connue** : le jeu d'ancres TLS clientes du point d'écoute QUIC est
   toujours lu une fois sur disque au démarrage. `init-trust-domain` amorce le
-  registre depuis ce même fichier, donc les deux concordent et une feuille
-  déléguée valide tant que le client présente l'intermédiaire de la délégation
-  dans sa chaîne. Ce qui n'est pas câblé, c'est une **rotation de CA TLS
-  cliente** : `next_client_tls_ca_certificate` n'est pas offert en seconde
-  racine, et une nouvelle ancre exigerait de toute façon un redémarrage.
+  registre depuis ce même fichier, donc les deux concordent. Ce qui n'est pas
+  câblé, c'est une **rotation de CA TLS cliente** :
+  `next_client_tls_ca_certificate` n'est pas offert en seconde racine, et une
+  nouvelle ancre exigerait de toute façon un redémarrage.
   Rien n'effectue cette rotation aujourd'hui.
   La leaf PQ gateway servie reste auto-signée.
   L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin

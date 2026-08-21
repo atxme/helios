@@ -758,7 +758,13 @@ dernier effet exige la gateway réelle.
   déployé, et `astra-signer approve --heliosd-url … --operation-id …` lancé sur
   la même machine avec la clé branchée. Le transport du compagnon, lui,
   s’éprouve hors matériel contre une gateway factice
-  (`tools/astra-signer/tests/tunnel.rs`) ;
+  (`tools/astra-signer/tests/tunnel.rs`). **Ce que cette recette doit vérifier
+  en dernier**, et qui est l’acceptation réelle du renouvellement : que le
+  client **rouvre le tunnel après l’activation**. Tout le reste peut réussir et
+  laisser un poste enfermé dehors à la fin du chevauchement — c’est précisément
+  ce que la chaîne `[feuille, intermédiaire]` scellée par `candidate_bundle` et
+  l’ensemble d’émetteurs lu dans le registre existent pour éviter, et hors
+  matériel on n’en prouve que la logique ;
 - **la cérémonie d'approbation dans Orion ne s'exerce pas en WSL2** : aucun
   passthrough USB, et le transport plateforme est propre à Windows. Ce qui est
   éprouvé hors matériel est tout ce qui la précède — l'ordre de vérification,
