@@ -1525,12 +1525,27 @@ async fn save_profile(
     Ok(view)
 }
 
+/// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
+///
+/// The order is the whole point (spec §12.2). The signed `release` that frees
+/// the gateway's PSK slot travels **inside** the tunnel and is signed by the
+/// profile's own identity, so it has to leave before either disappears.
+/// Deleting first left the slot held until the gateway reclaimed it on
+/// handshake silence, five minutes later — and left the adapter mounted for a
+/// profile that no longer existed.
 #[tauri::command]
 async fn delete_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
+    // Before the configuration lock, not after: the disconnection is a network
+    // round trip, and `stop_connection` rebuilds nothing that needs the config
+    // — but holding a lock across it would stall every other command for the
+    // two seconds the release is allowed.
+    if state.controller.mounted_profile().await.as_deref() == Some(name.as_str()) {
+        stop_connection(&app).await;
+    }
     let mut cfg = state.config.lock().await;
     state
         .store

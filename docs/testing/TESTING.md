@@ -197,6 +197,20 @@ Valider avec accès console :
   trois modes, un certificat client non lié, un ciphertext altéré, la fermeture
   avant confirmation, le timeout, puis un handshake réussi avec le PSK négocié
   et l’ACK de commit ;
+- réparation sur redémarrage de gateway (§12.5) : tunnel `ml_kem` monté,
+  `systemctl restart heliosd`, puis **ne rien faire**. Le journal client doit
+  annoncer « renégociation 1/3 » en nommant le handshake vieilli, et le tunnel
+  doit reporter du trafic en moins de trois minutes sans geste de
+  l'utilisateur. Le contre-essai compte autant : gateway éteinte pour de bon,
+  trois renégociations puis un tunnel en erreur — pas une boucle. Et le même
+  redémarrage sur un profil `static_psk` ne doit déclencher **aucune**
+  renégociation : ce slot est relu depuis `network.toml` ;
+- désinstallation d'un profil monté (§12.2) : supprimer le profil dont le
+  tunnel est up. La gateway doit journaliser le `release` **avant** que
+  l'adaptateur tombe, et `wg show` doit y montrer le slot vidé tout de suite —
+  pas cinq minutes plus tard par la récupération. L'ordre est ce qui est
+  éprouvé : le message voyage dans le tunnel et est signé par l'identité du
+  profil, donc supprimer d'abord ne libère rien ;
 - identité key-negotiation : `heliosd init-key-negotiation` scelle réellement la
   clé serveur, refuse l’écrasement sans `--rotate` et redémarre avec le même
   certificat et la même clé descellée ;

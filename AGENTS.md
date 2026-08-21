@@ -68,16 +68,8 @@ Restent ouverts :
 - le **renouvellement de PSK en place** (§12.3), suspendu à l’essai bloquant du
   §20.0 qui doit d’abord établir sur un vrai plan de données qu’une session
   WireGuard réinitialisée handshake dans les délais ;
-- la **renégociation d’Orion sur vieillissement de handshake** (§12.5) : la
-  gateway récupère bien son slot, mais un client dont le PSK a été retiré ne
-  s’en aperçoit qu’à la déconnexion ;
 - l’**enrôlement sans clé privée avec signature opérateur** (§15), qui reste au
   modèle v4 décrit plus bas ;
-- la **libération à la désinstallation d’un profil** (§12.2) : le `release` du
-  §7.5 part bien à la déconnexion, mais retirer un profil dont le tunnel est
-  monté n’en envoie aucun — le slot tient jusqu’à la récupération à 300 s. Seul
-  le contrôleur détient le reçu de commit, et le chemin de suppression ne l’a
-  pas ;
 - l'**exploitation** du cycle de vie des certificats
   ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) §12.3,
   [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)). Le chemin
@@ -512,6 +504,18 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   d’un PSK même sur un tunnel sain. Les deux premiers encadrent les 180 s au
   bout desquelles WireGuard abandonne lui-même une session : à 300 s la
   gateway ne détruit jamais quelque chose qui marchait encore.
+  **Orion répare de lui-même** (§12.5) : le même seuil de 150 s qui fait
+  tomber le tunnel déclenche une renégociation quand le client détient un reçu
+  `ml_kem`. Un PSK négocié n’est jamais persisté, donc un redémarrage de
+  `heliosd` vide tous les slots — le client garde alors un PSK que la gateway
+  n’a plus, continue sur ses clés de transport en cours, et échoue en silence à
+  son rekey suivant, jusqu’à deux minutes plus tard, sans aucun canal qui le
+  lui dise. Retomber en `Connecting` décrivait ce tunnel sans le réparer.
+  La réparation est **bornée** à trois renégociations, chacune étant déjà la
+  boucle bornée de la négociation, et le budget n’est rendu que par un
+  handshake réussi — jamais par le fait d’avoir essayé. Un reçu n’existe que
+  pour `ml_kem` : un `static_psk` est la configuration de l’opérateur, relue à
+  chaque démarrage, donc toujours là.
 - Tout cela suppose un keep-alive persistant, et la gateway le **pose
   elle-même** (`WgPeer::persistent_keepalive_secs`, 25 s) plutôt que de faire
   confiance à celui du client, qu’elle ne peut pas inspecter. L’admission
@@ -555,6 +559,13 @@ lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM rée
   commande ancienne inoffensive, et WireGuard refuse déjà les paquets rejoués.
   L’opération est best-effort, bornée à deux secondes côté Orion, et son échec
   ne retarde pas la déconnexion — la récupération à 300 s est le filet.
+  **Désinstaller un profil monté envoie ce `release`** (§12.2) : la suppression
+  déconnecte d’abord, puis retire. L’ordre est tout : le `release` voyage dans
+  le tunnel et est signé par l’identité du profil, donc il doit partir avant que
+  l’un ou l’autre disparaisse. `VpnController::mounted_profile` nomme le profil
+  monté dès le début de la connexion — pas au commit : une négociation dure
+  plusieurs secondes, et un profil retiré pendant celle-ci doit être reconnu. Il
+  est tenu à part du reçu de commit, qu’un tunnel classique n’a pas.
 - Un `release` ne retire qu’un état `committed` dont il nomme exactement le
   propriétaire. Pendant `preparing` c’est un **no-op** : le candidat appartient
   à la connexion qui le prépare, et sa garde de rollback est la seule sortie,

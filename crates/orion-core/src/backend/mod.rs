@@ -25,7 +25,7 @@
 //! real WireGuard backend (BoringTun + Wintun via `defguard_wireguard_rs`) is
 //! target-only, just like the `netlink` feature on the heliosd side.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -291,6 +291,22 @@ pub struct VpnController {
     /// already condemned. Inferring the state from freshness alone left the
     /// UI showing a healthy connection the client knew was over.
     link_lost: Arc<AtomicBool>,
+    /// Name of the profile the current tunnel was mounted for.
+    ///
+    /// Separate from `installed`, which only exists once a negotiation has
+    /// committed: a classic tunnel has no receipt, and the shell still has to
+    /// be able to ask "is this the profile that is up?". Set as soon as a
+    /// connection starts, so a profile removed while its negotiation is still
+    /// running is recognised too.
+    mounted_profile: Arc<Mutex<Option<String>>>,
+    /// Renegotiations already triggered by a stale handshake, since the last
+    /// one that succeeded.
+    ///
+    /// Bounds the repair of spec §12.5. A gateway that is durably gone must
+    /// not produce an aggressive negotiation loop, and the counter is reset by
+    /// the only fact that proves the repair worked — a fresh handshake — never
+    /// by having attempted one.
+    stale_renegotiations: Arc<AtomicU32>,
     key_negotiation_identities: Option<Arc<dyn crate::key_negotiation::IdentityProvider>>,
 }
 
@@ -317,6 +333,8 @@ impl VpnController {
             task: Mutex::new(None),
             installed: Arc::new(Mutex::new(None)),
             link_lost: Arc::new(AtomicBool::new(false)),
+            mounted_profile: Arc::new(Mutex::new(None)),
+            stale_renegotiations: Arc::new(AtomicU32::new(0)),
             key_negotiation_identities: None,
         }
     }
@@ -356,6 +374,17 @@ impl VpnController {
         self.backend.adapter_is_up()
     }
 
+    /// The profile this tunnel was mounted for, while it is mounted.
+    ///
+    /// The shell asks this before removing a profile: uninstalling the one
+    /// that is up has to release its slot **through the tunnel that is still
+    /// up** (spec §12.2), and afterwards there is no profile left to sign the
+    /// release with. Answering `None` means no connection is in progress, not
+    /// that the tunnel is down — the two differ during a negotiation.
+    pub async fn mounted_profile(&self) -> Option<String> {
+        self.mounted_profile.lock().await.clone()
+    }
+
     /// Builds a sink that synchronizes internal state **before** relaying
     /// the event to `user_sink`. Guarantees that `state()` always reflects
     /// the last transition seen by the UI.
@@ -384,6 +413,7 @@ impl VpnController {
         // nothing for a peer that is about to reconnect.
         self.installed.lock().await.take();
         self.link_lost.store(false, Ordering::SeqCst);
+        *self.mounted_profile.lock().await = Some(profile.name.clone());
         let sink = self.wrap_sink(user_sink);
         // Says a connection has begun, before anything long happens.
         //
@@ -485,6 +515,8 @@ impl VpnController {
         self.abort_task().await;
         let installed = self.installed.lock().await.take();
         self.link_lost.store(false, Ordering::SeqCst);
+        self.mounted_profile.lock().await.take();
+        self.stale_renegotiations.store(0, Ordering::SeqCst);
         let sink = self.wrap_sink(user_sink);
         // Say it explicitly, before unmounting. This is the message that
         // replaces v4's closing link, and it is best-effort by construction:
@@ -540,7 +572,14 @@ impl VpnController {
                 self.backend.last_handshake_age().await,
                 Some(age) if age < HANDSHAKE_STALE_AFTER
             );
+        if fresh {
+            // The repair worked — or none was ever needed. Either way the
+            // budget of §12.5 is restored by the handshake itself, never by
+            // the mere fact of having attempted a renegotiation.
+            self.stale_renegotiations.store(0, Ordering::SeqCst);
+        }
         let current = self.state();
+        let raw_sink = Arc::clone(&user_sink);
         let sink = self.wrap_sink(user_sink);
 
         match (current, fresh) {
@@ -562,10 +601,66 @@ impl VpnController {
                         HANDSHAKE_STALE_AFTER.as_secs()
                     ),
                 ));
+                if self.renegotiate_on_stale_handshake(&sink, raw_sink).await {
+                    // `connect` has already announced its own transition.
+                    return;
+                }
                 sink(ClientEvent::state(TunnelState::Connecting));
             }
             _ => {}
         }
+    }
+
+    /// Repairs a negotiated tunnel whose gateway slot is gone (spec §12.5).
+    ///
+    /// # The failure this exists for
+    ///
+    /// A negotiated PSK is never persisted, so a `heliosd` restart empties
+    /// every slot — and the 300-second reclamation empties one. The client
+    /// keeps a PSK the gateway no longer has, keeps working on the transport
+    /// keys already derived, then fails silently at its next rekey up to two
+    /// minutes later. Nothing tells it: there is no control link any more, by
+    /// design. Without this, the user sees a tunnel displayed as up that
+    /// simply stops carrying traffic, two minutes after the cause.
+    ///
+    /// # Why only a negotiated slot
+    ///
+    /// A receipt exists only for `ml_kem`. A `static_psk` slot is the
+    /// operator's configuration: it is read back from `network.toml` at every
+    /// restart, so it is still there and a stale handshake means something
+    /// else entirely — renegotiating would repair nothing and cost a round of
+    /// ML-DSA-87. A classic tunnel has no slot at all, and WireGuard retries
+    /// on its own.
+    ///
+    /// Returns whether a renegotiation was started, so the caller does not
+    /// also announce a transition `connect` has just made.
+    async fn renegotiate_on_stale_handshake(&self, sink: &EventSink, raw_sink: EventSink) -> bool {
+        let Some(installed) = self.installed.lock().await.clone() else {
+            return false;
+        };
+        let attempt = self.stale_renegotiations.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt > STALE_RENEGOTIATIONS_ALLOWED {
+            sink(ClientEvent::log(
+                "error",
+                format!(
+                    "{STALE_RENEGOTIATIONS_ALLOWED} renégociations n'ont pas ramené de \
+                     handshake : la gateway est durablement injoignable. Se reconnecter \
+                     quand elle répond de nouveau."
+                ),
+            ));
+            sink(ClientEvent::state(TunnelState::Failed));
+            return true;
+        }
+        sink(ClientEvent::log(
+            "info",
+            format!(
+                "renégociation {attempt}/{STALE_RENEGOTIATIONS_ALLOWED} : le PSK négocié a \
+                 disparu côté gateway — redémarrage ou récupération du slot. Cause : \
+                 handshake vieilli, pas échec de négociation."
+            ),
+        ));
+        self.connect(installed.profile, raw_sink).await;
+        true
     }
 
     async fn abort_task(&self) {
@@ -574,6 +669,16 @@ impl VpnController {
         }
     }
 }
+
+/// Renegotiations a stale handshake may trigger before the tunnel gives up.
+///
+/// Three, and the bound matters as much as the repair: a gateway that is
+/// durably absent must not be met with a permanent negotiation loop. Each
+/// attempt is itself the bounded loop of [`KEY_NEGOTIATION_ATTEMPTS`], so the
+/// spacing the specification asks for is already there — and wider than the
+/// two seconds it names, because §4.5 arms ten seconds of rest after a
+/// rollback and a retry inside that window is rejected by construction.
+const STALE_RENEGOTIATIONS_ALLOWED: u32 = 3;
 
 /// Negotiations attempted before giving up.
 ///
@@ -977,6 +1082,149 @@ mod tests {
              the default route falls back to the physical interface and traffic \
              exits in clear (ADR-001 §3 bis)"
         );
+    }
+
+    /// The shell has to be able to name the profile that is up.
+    ///
+    /// Uninstalling a profile whose tunnel is mounted must release the
+    /// gateway's slot first (spec §12.2), and the release travels inside that
+    /// tunnel signed by that profile. Both disappear at deletion, so the
+    /// question "is this the one that is up?" has to be answerable **before**
+    /// anything is removed — and it has to be answerable for a classic profile
+    /// too, which owns no negotiation receipt at all.
+    #[tokio::test]
+    async fn the_mounted_profile_is_named_from_the_start_and_forgotten_at_disconnection() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+
+        assert_eq!(ctrl.mounted_profile().await, None, "nothing is mounted yet");
+
+        ctrl.connect(profile(), sink()).await;
+        assert_eq!(
+            ctrl.mounted_profile().await.as_deref(),
+            Some("test"),
+            "a connection under way already owns the profile — a negotiation              takes seconds, and a profile removed during it must be recognised"
+        );
+
+        ctrl.disconnect(sink()).await;
+        assert_eq!(
+            ctrl.mounted_profile().await,
+            None,
+            "the tunnel is down: no profile is mounted any more"
+        );
+    }
+
+    /// Records every log line, so a test can assert on what the user reads.
+    fn logging_sink() -> (EventSink, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = Arc::clone(&lines);
+        (
+            Arc::new(move |ev: ClientEvent| {
+                if let ClientEvent::Log { message, .. } = ev {
+                    recorder.lock().unwrap().push(message);
+                }
+            }),
+            lines,
+        )
+    }
+
+    /// Puts the controller in the exact state §12.5 is about: a tunnel that
+    /// reads as up, holding a negotiated receipt, with no handshake in sight.
+    async fn stalled_with_receipt(ctrl: &VpnController, backend: &Arc<DryRunBackend>) {
+        *ctrl.installed.lock().await = Some(InstalledNegotiation {
+            transaction_id: [7; 16],
+            profile: profile(),
+        });
+        *ctrl.state.write().unwrap() = TunnelState::Up;
+        backend.set_handshake_age(Some(Duration::from_secs(300)));
+    }
+
+    /// A gateway restart empties every negotiated slot, and says nothing.
+    ///
+    /// The client keeps a PSK the gateway no longer has, keeps working on the
+    /// transport keys already derived, then fails at its next rekey up to two
+    /// minutes later. Falling back to `Connecting` and waiting described that
+    /// tunnel truthfully but repaired nothing: only a new negotiation installs
+    /// another PSK.
+    #[tokio::test]
+    async fn a_stale_handshake_on_a_negotiated_tunnel_renegotiates_by_itself() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        stalled_with_receipt(&ctrl, &backend).await;
+        let (sink, lines) = logging_sink();
+
+        ctrl.poll_handshake(sink).await;
+
+        assert_eq!(
+            ctrl.stale_renegotiations.load(Ordering::SeqCst),
+            1,
+            "the repair must be counted, or its bound cannot hold"
+        );
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| line.contains("renégociation 1/3")),
+            "the log must name the cause as a stale handshake, not a failed \
+             negotiation: {lines:?}"
+        );
+    }
+
+    /// A `static_psk` slot is the operator's configuration, not a negotiation.
+    ///
+    /// It is read back from `network.toml` at every restart, so it is still
+    /// there — a stale handshake means something else, and renegotiating would
+    /// repair nothing while costing a round of ML-DSA-87. No receipt, no
+    /// repair: that is the whole test.
+    #[tokio::test]
+    async fn a_tunnel_without_a_receipt_only_falls_back() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        *ctrl.state.write().unwrap() = TunnelState::Up;
+        backend.set_handshake_age(Some(Duration::from_secs(300)));
+
+        ctrl.poll_handshake(sink()).await;
+
+        assert_eq!(ctrl.state(), TunnelState::Connecting);
+        assert_eq!(ctrl.stale_renegotiations.load(Ordering::SeqCst), 0);
+    }
+
+    /// A gateway that is durably gone must not be met with a permanent loop.
+    #[tokio::test]
+    async fn the_repair_gives_up_after_its_budget_instead_of_looping() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        stalled_with_receipt(&ctrl, &backend).await;
+        ctrl.stale_renegotiations
+            .store(STALE_RENEGOTIATIONS_ALLOWED, Ordering::SeqCst);
+        let (sink, lines) = logging_sink();
+
+        ctrl.poll_handshake(sink).await;
+
+        assert_eq!(
+            ctrl.state(),
+            TunnelState::Failed,
+            "past the budget the tunnel must say it is over, not keep trying"
+        );
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("durablement injoignable")),
+            "giving up must name why: {lines:?}"
+        );
+    }
+
+    /// Only a handshake restores the budget — never having attempted a repair.
+    #[tokio::test]
+    async fn a_successful_handshake_restores_the_repair_budget() {
+        let backend = Arc::new(DryRunBackend::default());
+        let ctrl = VpnController::new(backend.clone());
+        ctrl.stale_renegotiations.store(2, Ordering::SeqCst);
+        *ctrl.state.write().unwrap() = TunnelState::Up;
+        backend.set_handshake_age(Some(Duration::from_secs(5)));
+
+        ctrl.poll_handshake(sink()).await;
+
+        assert_eq!(ctrl.stale_renegotiations.load(Ordering::SeqCst), 0);
     }
 
     /// Only explicit disconnection may remove the adapter.

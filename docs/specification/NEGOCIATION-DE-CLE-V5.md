@@ -113,20 +113,9 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   découvrir un défaut de conception à travers une implémentation qui le
 >   masque. Conséquence : un PSK vit jusqu'à son échéance de 24 h, puis la
 >   gateway le retire ;
-> - la **renégociation d'Orion sur vieillissement du handshake**
->   ([§12.5](#125-redémarrage-de-la-gateway)). La gateway récupère bien son
->   slot à 300 s, mais rien ne prévient le client : après un redémarrage de
->   `heliosd`, le tunnel meurt au rekey suivant sans se réparer seul ;
 > - l'**enrôlement sans clé privée et sa signature opérateur**
 >   ([§15](#15-enrôlement)). `helios-ctl enroll` distribue encore l'identité
 >   cliente comme en v4, avec le document `.orion` secret que cela implique ;
-> - la **libération à la désinstallation d'un profil**
->   ([§12.2](#122-cycle-de-vie-du-psk)). Le `release` du
->   [§7.5](#75-libération-signée-dans-le-tunnel) est bien envoyé dans le tunnel
->   à la déconnexion, mais retirer un profil pendant que son tunnel est monté
->   ne l'envoie pas : le slot reste posé jusqu'à la récupération à 300 s. Ce
->   qui débloquerait : donner au chemin de suppression de profil l'accès au
->   contrôleur, qui seul détient le reçu de commit ;
 > - tout le **cycle de vie des certificats**
 >   ([ROTATION-CERTIFICATS](ROTATION-CERTIFICATS.md)) : la leaf PQ gateway
 >   est encore auto-signée, il n'y a ni slot actif/suivant, ni génération
@@ -1702,7 +1691,9 @@ Une déconnexion VPN explicite en mode `ml_kem` déclenche un `release` sur l'AP
 interne **avant** le démontage de l'adaptateur, puis la zéroïsation locale. La
 tentative est bornée à deux secondes et son échec ne retarde jamais davantage
 la déconnexion. La désinstallation d'un profil fait de même si le tunnel, le
-reçu de commit et une identité utilisable sont encore disponibles. En
+reçu de commit et une identité utilisable sont encore disponibles : la
+suppression déconnecte d'abord, puis retire, parce que le `release` voyage dans
+ce tunnel et est signé par l'identité de ce profil. En
 `static_psk`, Orion démonte seulement son adaptateur et libère sa copie mémoire ;
 la source configurée reste protégée dans son stockage.
 
@@ -1966,11 +1957,22 @@ redémarrage de gateway est donc réparé en moins de trois minutes, sans geste 
 l'utilisateur, et le journal client nomme la cause — handshake vieilli, pas
 échec de négociation.
 
-Cette renégociation reste **bornée** : trois tentatives, deux secondes entre
-elles, puis le tunnel passe en erreur avec un message qui invite à se
-reconnecter. Une gateway durablement absente ne doit pas produire une boucle de
-négociation agressive ; c'est la même réserve que la v4 opposait à la
-reconnexion automatique.
+Cette renégociation reste **bornée** : trois tentatives, puis le tunnel passe
+en erreur avec un message qui invite à se reconnecter. Une gateway durablement
+absente ne doit pas produire une boucle de négociation agressive ; c'est la
+même réserve que la v4 opposait à la reconnexion automatique. L'espacement
+n'est pas celui de deux secondes que cette section nommait à l'origine : chaque
+tentative est elle-même la boucle bornée de la négociation, dont le délai entre
+essais est de onze secondes parce que [§4.5](#45-délais-et-limites) arme dix
+secondes de repos après un rollback — une reprise à l'intérieur de cette
+fenêtre est refusée par construction. Le budget n'est rendu que par un
+handshake réussi, jamais par le fait d'avoir tenté une réparation.
+
+Le déclencheur exige un **reçu de commit `ml_kem`**. Un slot `static_psk` est
+la configuration de l'opérateur : `network.toml` le contient, la gateway le
+relit à chaque démarrage, donc il est toujours là et un handshake vieilli y
+signifie autre chose. Un tunnel `classic` n'a pas de slot du tout et WireGuard
+réessaie seul.
 
 ## 13. Déroulement nominal
 
@@ -2906,4 +2908,4 @@ courant détaillé en tête de note.
 | [`helios-ctl::enroll`](../../tools/helios-ctl/src/enroll.rs) | invitation et registre à usage unique, preuve WireGuard, émission, liaison et signature JCS du document |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts
-encore ouverts, dont la libération manquante à la désinstallation d'un profil.
+encore ouverts.
