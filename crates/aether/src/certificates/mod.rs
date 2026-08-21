@@ -304,6 +304,14 @@ pub enum CertificateError {
     PolicyNotPinned,
     #[error("operator credential binding refused: {0}")]
     InvalidCredentialBinding(&'static str),
+    #[error(
+        "a {kind:?} certificate cannot be in state {status:?}: the specification selects the state \
+         type by family, and this combination is not in the table"
+    )]
+    UnsupportedStatus {
+        kind: crate::certificates::status::CertificateKind,
+        status: crate::certificates::status::CertificateStatus,
+    },
     #[error("the approving credential is not one this operation admits")]
     UnknownCredential,
     #[error(

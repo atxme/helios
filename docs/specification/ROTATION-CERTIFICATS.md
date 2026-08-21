@@ -2588,16 +2588,30 @@ libellé ambigu « Renouveler ».
 **Non livré.** Ces points sont refusés explicitement à l'exécution, jamais
 contournés :
 
-- l'**alignement filaire du 16 août** : portage exclusif de
-  `ClientCertificateStageAuthorization` et du reçu sur le veth, retrait de la
-  route `stage` Orion, liaison de `operator_approval_fingerprint` dans le reçu,
-  versions dans les octets signés de la récupération, sous-ensembles de statut
-  par famille avec `awaiting_operator`/`promoted`, cérémonie combinée de
-  récupération et encodage de chaque couple révoqué
-  empreinte/`not_after` derrière un seul drapeau de présence. Les invariants
-  déjà présents — trois empreintes de la requête
-  de confiance, `pending_grant` jusqu'au commit, révocation de l'active depuis
-  toute phase et égalité de `retire_active_at` — restent la base à conserver ;
+- l'**alignement filaire du 16 août**, désormais livré sauf pour ce qui dépend
+  de la récupération. Sont en place : le portage exclusif de
+  `ClientCertificateStageAuthorization` et du reçu sur le veth, le retrait de
+  la route `stage` Orion — un `404` explicite, pour que le repli SPA ne
+  réponde pas une page en `200` —, la liaison de
+  `operator_approval_fingerprint` dans le reçu, que
+  `GatewayCertificateStageReceipt::verify` compare à l'autorisation avant tout
+  grant, les sous-ensembles de statut par famille avec `awaiting_operator` et
+  `promoted`, et l'encodage de chaque couple révoqué empreinte/`not_after`
+  derrière un seul drapeau de présence.
+  Ce dernier point mérite d'être dit : deux drapeaux indépendants laissaient la
+  forme canonique décrire une paire à moitié remplie — une empreinte sans
+  échéance, donc une révocation sans fin — que `validate` refuse mais qu'un
+  vérificateur l'ayant omis aurait acceptée, puisque les octets restent bien
+  formés. Un seul drapeau rend l'état impossible inexprimable dans la
+  transcription elle-même.
+  `promoted` est accepté et jamais émis : l'affirmer demande un journal de
+  mutations par cible, et Astra tient un compteur monotone qui dit qu'un
+  changement a eu lieu, pas lequel.
+  Restent liés à la récupération, non livrée : les versions dans ses octets
+  signés et sa cérémonie combinée. Les invariants déjà présents — trois
+  empreintes de la requête de confiance, `pending_grant` jusqu'au commit,
+  révocation de l'active depuis toute phase et égalité de `retire_active_at` —
+  restent la base à conserver ;
 
 - l'**alignement cryptographique du 16 août**, partiellement livré. Ce qui est
   fait : toute signature ML-DSA-87 du cycle passe par `aether::ml_dsa`, un

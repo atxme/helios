@@ -685,6 +685,23 @@ impl OperationStore {
         Ok(operation)
     }
 
+    /// Whether this peer has a live renewal that no operator has answered.
+    ///
+    /// It answers the one question the registry cannot: §8.2 separates
+    /// `awaiting_operator` — an operation is open and no candidate exists —
+    /// from `pending_grant`, which describes a candidate the registry already
+    /// records. Only the operation store knows the first.
+    ///
+    /// `AwaitingOperator` and nothing else: past that state the operation has
+    /// produced a staging, and the registry's own record is what decides.
+    pub fn awaits_operator(&self, peer: &WireGuardKey, now_unix: u64) -> bool {
+        self.operations.values().any(|operation| {
+            operation.client_wg_public_key == *peer
+                && !operation.is_expired(now_unix)
+                && operation.state == ClientRenewalOperationState::AwaitingOperator
+        })
+    }
+
     /// Drops every operation past its deadline, and returns their peers.
     pub fn purge_expired(&mut self, now_unix: u64) -> Vec<WireGuardKey> {
         let mut purged = Vec::new();

@@ -106,9 +106,39 @@ pub enum CertificateStatus {
     Overlap,
     Expired,
     Revoked,
+    /// A client renewal is open and waiting for an operator's key, before any
+    /// candidate certificate exists (spec §8.2).
+    ///
+    /// It describes the **active** leaf, not a candidate: at this point there
+    /// is none. `pending_grant` and `pending_commit` describe the candidate,
+    /// once there is one.
+    AwaitingOperator,
+    /// The mutation that has just made this generation the active one.
+    ///
+    /// A later status with no new mutation describes it as `active` again, so
+    /// this is an event and not a resting state.
+    ///
+    /// # Limite connue : accepté, jamais émis
+    ///
+    /// Nothing in this repository produces it. Saying "this generation was
+    /// promoted **just now**" needs a per-target record of the last mutation,
+    /// and Astra keeps a monotonic status counter rather than a mutation
+    /// journal — the counter says a change happened, not which one or when.
+    /// It stays in the enum because a decoder must accept every state the
+    /// specification's family table names: refusing one the authority is
+    /// entitled to send would be refusing a legitimate answer. Emitting it
+    /// needs Astra to record the promotion it observes at admission
+    /// synchronisation.
+    Promoted,
 }
 
 impl CertificateStatus {
+    /// Byte in the signed transcript.
+    ///
+    /// The two states added after the first ten are **appended** rather than
+    /// slotted into the specification's reading order. The number is what the
+    /// ML-DSA-87 signature covers, so renumbering an existing state would
+    /// silently change what every already-signed status said.
     const fn domain_byte(self) -> u8 {
         match self {
             Self::Active => 0,
@@ -121,12 +151,77 @@ impl CertificateStatus {
             Self::Overlap => 7,
             Self::Expired => 8,
             Self::Revoked => 9,
+            Self::AwaitingOperator => 10,
+            Self::Promoted => 11,
         }
     }
 
     /// Whether this state forbids every rotation, recovery and rollback.
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Revoked)
+    }
+
+    /// Whether a family may be in this state at all (spec §8.2).
+    ///
+    /// # Why this is a refusal and not a display rule
+    ///
+    /// The specification is explicit: «il n'existe pas un enum libre commun à
+    /// toutes les familles», and «le décodeur **doit** refuser une combinaison
+    /// absente de ce tableau». A flat enum lets a signed status say
+    /// `astra_issuer: pending_commit` — a sentence with no meaning, which
+    /// every consumer would then have to interpret. Interpreting it is how two
+    /// interfaces end up disagreeing about what the authority said.
+    ///
+    /// The subsets follow the shape of each lifecycle. Only a client leaf has
+    /// an operator-approved renewal, so only it may be `awaiting_operator`,
+    /// `pending_grant` or `pending_commit`. Only the gateway identity has a
+    /// staged transition that can be published or aborted. The anchors stage
+    /// and overlap but are never published or aborted, because nothing
+    /// announces them separately. The delegated issuer has no overlap at all:
+    /// it is replaced, not rotated through one.
+    pub const fn permitted_for(self, kind: CertificateKind) -> bool {
+        match kind {
+            CertificateKind::ClientTls | CertificateKind::ClientPq => matches!(
+                self,
+                Self::Active
+                    | Self::RenewalDue
+                    | Self::AwaitingOperator
+                    | Self::PendingGrant
+                    | Self::PendingCommit
+                    | Self::Overlap
+                    | Self::Promoted
+                    | Self::Expired
+                    | Self::Revoked
+            ),
+            CertificateKind::GatewayTls | CertificateKind::GatewayPq => matches!(
+                self,
+                Self::Active
+                    | Self::RenewalDue
+                    | Self::Staged
+                    | Self::Published
+                    | Self::Aborted
+                    | Self::Overlap
+                    | Self::Promoted
+                    | Self::Expired
+                    | Self::Revoked
+            ),
+            CertificateKind::CaPq | CertificateKind::CaTls | CertificateKind::AstraServiceKey => {
+                matches!(
+                    self,
+                    Self::Active
+                        | Self::RenewalDue
+                        | Self::Staged
+                        | Self::Overlap
+                        | Self::Promoted
+                        | Self::Expired
+                        | Self::Revoked
+                )
+            }
+            CertificateKind::AstraIssuer => matches!(
+                self,
+                Self::Active | Self::RenewalDue | Self::Expired | Self::Revoked
+            ),
+        }
     }
 }
 
@@ -194,6 +289,16 @@ impl AstraCertificateStatus {
         }
         if self.trust_domain_id != *trust_domain_id {
             return Err(CertificateError::TrustDomainMismatch);
+        }
+        // Before the signature, because it costs a match and the signature
+        // costs an ML-DSA-87 verification — and because a combination the
+        // table does not hold is a sentence with no meaning, whoever signed
+        // it. §8.2 makes this a decoder obligation, not a display rule.
+        if !self.status.permitted_for(self.certificate_kind) {
+            return Err(CertificateError::UnsupportedStatus {
+                kind: self.certificate_kind,
+                status: self.status,
+            });
         }
         if self.astra_service_key_epoch != service_key_epoch {
             return Err(CertificateError::UnauthorizedIssuer);
@@ -731,6 +836,23 @@ mod signing {
 mod tests {
     use super::*;
 
+    /// Every state the specification names, so a new one cannot be added to
+    /// the enum and quietly left out of the family table.
+    const EVERY_STATUS: [CertificateStatus; 12] = [
+        CertificateStatus::Active,
+        CertificateStatus::RenewalDue,
+        CertificateStatus::AwaitingOperator,
+        CertificateStatus::PendingGrant,
+        CertificateStatus::PendingCommit,
+        CertificateStatus::Staged,
+        CertificateStatus::Published,
+        CertificateStatus::Aborted,
+        CertificateStatus::Overlap,
+        CertificateStatus::Promoted,
+        CertificateStatus::Expired,
+        CertificateStatus::Revoked,
+    ];
+
     fn domain() -> TrustDomainId {
         TrustDomainId::new([1; 16]).expect("domain")
     }
@@ -891,6 +1013,149 @@ mod tests {
         ] {
             assert!(!status.is_terminal(), "{status:?}");
         }
+    }
+
+    /// The refusal happens in the **verifier**, not only in a display.
+    ///
+    /// And before the signature: the family check is a match, the signature is
+    /// an ML-DSA-87 verification, and a combination the table does not hold is
+    /// meaningless whoever signed it.
+    #[test]
+    fn a_status_outside_its_family_is_refused_before_its_signature() {
+        let (_, service_key) =
+            crate::certificates::encoding::generate_ml_dsa_87_keypair().expect("keygen");
+        let fingerprint = Fingerprint::of(b"delegation");
+        let status = AstraCertificateStatus {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            certificate_fingerprint: fingerprint,
+            // A delegated issuer is replaced, never staged through a client
+            // renewal: this pair is not in the table.
+            certificate_kind: CertificateKind::AstraIssuer,
+            generation: 3,
+            status: CertificateStatus::PendingCommit,
+            suggested_window_start: 9_000,
+            suggested_window_end: 20_000,
+            produced_at: 1_000,
+            next_update: 2_000,
+            status_epoch: 5,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        };
+
+        assert!(matches!(
+            status.verify(&service_key, 1, &domain(), &fingerprint, None),
+            Err(CertificateError::UnsupportedStatus {
+                kind: CertificateKind::AstraIssuer,
+                status: CertificateStatus::PendingCommit,
+            })
+        ));
+
+        // The same object in a state its family does hold gets as far as the
+        // signature — which a placeholder fails. That is what says the refusal
+        // above was about the family and not about the signature.
+        let allowed = AstraCertificateStatus {
+            status: CertificateStatus::RenewalDue,
+            ..status
+        };
+        assert!(!matches!(
+            allowed.verify(&service_key, 1, &domain(), &fingerprint, None),
+            Err(CertificateError::UnsupportedStatus { .. })
+        ));
+    }
+
+    /// §8.2 selects the state type by family, and the decoder **must** refuse a
+    /// combination absent from its table.
+    ///
+    /// A flat enum lets a signed status say `astra_issuer: pending_commit` — a
+    /// sentence with no meaning that every consumer would then have to
+    /// interpret, and interpreting it is how two interfaces end up disagreeing
+    /// about what the authority said.
+    #[test]
+    fn each_family_admits_only_the_states_the_table_gives_it() {
+        use CertificateKind::*;
+        use CertificateStatus::*;
+
+        // The table of §8.2, transcribed. Anything outside a row is refused.
+        let client: &[CertificateStatus] = &[
+            Active,
+            RenewalDue,
+            AwaitingOperator,
+            PendingGrant,
+            PendingCommit,
+            Overlap,
+            Promoted,
+            Expired,
+            Revoked,
+        ];
+        let gateway: &[CertificateStatus] = &[
+            Active, RenewalDue, Staged, Published, Aborted, Overlap, Promoted, Expired, Revoked,
+        ];
+        let anchors: &[CertificateStatus] = &[
+            Active, RenewalDue, Staged, Overlap, Promoted, Expired, Revoked,
+        ];
+        let issuer: &[CertificateStatus] = &[Active, RenewalDue, Expired, Revoked];
+        let table: [(CertificateKind, &[CertificateStatus]); 8] = [
+            (ClientTls, client),
+            (ClientPq, client),
+            (GatewayTls, gateway),
+            (GatewayPq, gateway),
+            (CaPq, anchors),
+            (CaTls, anchors),
+            (AstraServiceKey, anchors),
+            (AstraIssuer, issuer),
+        ];
+
+        for (kind, admitted) in table {
+            for status in EVERY_STATUS {
+                assert_eq!(
+                    status.permitted_for(kind),
+                    admitted.contains(&status),
+                    "{kind:?} / {status:?}"
+                );
+            }
+        }
+    }
+
+    /// A state no family may hold is a state nothing can express.
+    #[test]
+    fn no_state_is_orphaned_by_the_table() {
+        use CertificateKind::*;
+
+        let families = [
+            GatewayTls,
+            GatewayPq,
+            ClientTls,
+            ClientPq,
+            CaPq,
+            CaTls,
+            AstraIssuer,
+            AstraServiceKey,
+        ];
+        for status in EVERY_STATUS {
+            assert!(
+                families.iter().any(|kind| status.permitted_for(*kind)),
+                "{status:?} belongs to no family"
+            );
+        }
+    }
+
+    /// Two states cannot share a transcript byte: that byte is what the
+    /// signature covers, so a collision makes two statements identical.
+    #[test]
+    fn every_state_has_its_own_transcript_byte() {
+        let mut bytes: Vec<u8> = EVERY_STATUS
+            .into_iter()
+            .map(CertificateStatus::domain_byte)
+            .collect();
+        let total = bytes.len();
+        bytes.sort_unstable();
+        bytes.dedup();
+        assert_eq!(bytes.len(), total, "two states share a byte");
+        // The ten original states keep the numbers they were signed under:
+        // renumbering one would silently change what every signed status said.
+        assert_eq!(CertificateStatus::Active.domain_byte(), 0);
+        assert_eq!(CertificateStatus::Revoked.domain_byte(), 9);
     }
 
     mod campaign_approval {
