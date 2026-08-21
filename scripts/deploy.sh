@@ -504,12 +504,30 @@ deployer_astra() {
 
     compose_astra="$compose_env $compose -f deploy/astra/compose.yaml \
         --env-file '$env_distant'"
+    # Le contrôle de reprise doit exécuter le binaire de l'image fraîche sans
+    # toucher au réseau Compose. `docker compose run --network none` n'est pas
+    # disponible avec toutes les versions de Compose et son échec était
+    # auparavant masqué par le message générique de fork. Récupérer le volume
+    # même lorsque le conteneur tourne permet ensuite un `docker run` direct,
+    # sans adresse statique ni conflit avec le veth Astra.
+    if [ -z "${volume_astra:-}" ] && [ -n "$conteneur_astra" ]; then
+        volume_astra="$(helios_ssh_sudo_capture "$CIBLE" "$moteur inspect \
+            -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/astra\"}}{{.Name}}{{end}}{{end}}' \
+            '$conteneur_astra' 2>/dev/null" | tr -d '\r' | tail -1)"
+    fi
     # A compatibility check must use the freshly built image. The running
     # container can still be the previous release until the final `up -d`, so
-    # `exec` would not know about the status-tail migration below. `--network
-    # none` keeps this disposable read from competing for Astra's static veth
-    # address.
-    astra_lire_frais="$compose_astra run --rm --no-deps -T --network none astra"
+    # `exec` would not know about the status-tail migration below. A direct
+    # runtime invocation with `--network none` keeps this disposable read from
+    # competing for Astra's static veth address.
+    if [ -n "${volume_astra:-}" ]; then
+        astra_lire_frais="$moteur run --rm --network none \
+            -v '$volume_astra':/var/lib/astra helios/astra:latest"
+    else
+        # No existing container means no reserved static address; Compose is
+        # safe for the initial read and is retained for that one case.
+        astra_lire_frais="$compose_astra run --rm --no-deps -T astra"
+    fi
     if [ "$astra_en_marche" = oui ]; then
         # Le chemin absolu, et pas le sous-verbe seul : `exec` n'applique pas
         # l'`ENTRYPOINT` de l'image, il exécute l'argv tel quel. « status » y
