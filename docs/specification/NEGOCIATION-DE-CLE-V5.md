@@ -93,17 +93,23 @@ un **contrat à finir d'implémenter**, pas une description du système.
 >   **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
 >   émis avant ce changement cesse de vérifier. Un parc existant se ré-émet
 >   (`scripts/provision-client.sh`, `heliosd init-key-negotiation --rotate`) ;
-> - le **discriminant de type de profil Orion**
->   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)).
->   `classic` est bien refusé à la validation d'une requête v5 et à la
->   préparation — serde le décode, `validate()` le rejette, et aucun message v5
->   ne peut donc le sélectionner. Mais la variante subsiste dans
->   `ProtectionMode`, et un profil Orion reste un bloc `key_negotiation`
->   **facultatif** au lieu de l'union explicite `ClassicWireGuard` /
->   `HeliosKeyNegotiation`. L'absence du bloc peut donc encore signifier
->   implicitement « profil classique ». La retirer entièrement est une migration
->   de format : `network.toml` (`minimum_key_negotiation_mode = "classic"`), le
->   document `.orion`, le manifeste de coffre (`mode_id = 0`) et les deux IHM.
+> - la variante `classic` de `ProtectionMode`
+>   ([§19](#19-fin-des-chemins-hérités), [§22](#22-correspondance-avec-le-code)),
+>   qui subsiste dans le type. Elle est bien refusée à la validation d'une
+>   requête v5 et à la préparation — serde la décode, `validate()` la rejette,
+>   et aucun message v5 ne peut donc la sélectionner — et elle doit subsister
+>   pour relire un `network.toml` existant. La retirer entièrement reste une
+>   migration de `network.toml` (`minimum_key_negotiation_mode = "classic"`) et
+>   de l'octet `mode_id = 0` du manifeste de coffre.
+>
+>   Le **discriminant de type de profil Orion**, lui, est livré : un profil
+>   déclare `type = "classic"` ou `type = "helios_key_negotiation"`, le document
+>   `.orion` le porte, le manifeste de coffre le scelle en v5, l'écran *Profils*
+>   le montre, et le chemin de connexion lit le type déclaré au lieu de la
+>   présence du bloc. Les deux formes sont exclusives et la contradiction est
+>   refusée. L'inférence historique ne survit qu'à la lecture d'un manifeste
+>   antérieur à la v5 ou d'un document antérieur à §19, s'applique une fois, et
+>   le prochain scellement écrit la réponse.
 >   Ce qui débloquerait : écrire cette migration et son chemin de relecture des
 >   documents déjà émis ;
 > - le **renouvellement de PSK en place** ([§12.3](#123-politique-de-renouvellement)),

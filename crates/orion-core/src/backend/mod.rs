@@ -434,7 +434,12 @@ impl VpnController {
         let installed = Arc::clone(&self.installed);
         let link_lost = Arc::clone(&self.link_lost);
         let handle = tokio::spawn(async move {
-            if profile.key_negotiation.is_some() {
+            // The discriminant, not the presence of the block. A Helios
+            // profile that lost its block is refused by `validate()` inside
+            // the negotiation path; reading the block here would instead have
+            // sent it down the classic path, mounting a tunnel with no
+            // pre-WireGuard authentication and reporting nothing wrong.
+            if profile.negotiates() {
                 if let Err(error) = connect_with_key_negotiation(
                     &backend,
                     &profile,
@@ -481,7 +486,7 @@ impl VpnController {
         let Some(identities) = self.key_negotiation_identities.clone() else {
             return;
         };
-        if installed.profile.key_negotiation.is_none() {
+        if !installed.profile.negotiates() {
             return;
         }
         match crate::key_negotiation::release_for_profile(

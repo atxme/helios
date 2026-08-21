@@ -2699,8 +2699,15 @@ contournés :
   c'est le seul refus dont il ne se relève pas ;
 - la **récupération d'une identité expirée** de bout en bout, qui dépend des
   deux points précédents ;
-- le **discriminant de profil Orion** `helios_key_negotiation` et la bascule
-  coordonnée du §13. Le **bloc de confiance**, lui, est livré : la gateway le
+- la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
+  `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
+  est livré : le document `.orion` porte `type`, le manifeste de coffre le
+  scelle en v5, l'écran *Profils* le montre, et le chemin de connexion lit le
+  type déclaré plutôt que la présence du bloc — une leaf perdue ne dégrade donc
+  plus un profil Helios en profil classique sans le dire. Ce qui reste de cette
+  ligne est la variante `classic` de `ProtectionMode`, qui survit pour relire un
+  `network.toml` existant, et l'octet `mode_id = 0` du manifeste.
+  Le **bloc de confiance** est livré aussi : la gateway le
   sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
   `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose dans le document
   — en ligne depuis l'API, hors ligne depuis `--trust-material` —, et

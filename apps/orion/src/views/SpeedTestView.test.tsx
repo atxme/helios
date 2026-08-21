@@ -22,6 +22,7 @@ const profile: ClientProfile = {
   name: 'portable',
   endpoint: '203.0.113.10:51820',
   peer_public_key: 'gateway',
+  profile_type: 'classic',
   public_key: 'client',
   has_private_key: true,
   has_static_psk: false,

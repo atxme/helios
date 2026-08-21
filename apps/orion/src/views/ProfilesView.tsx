@@ -122,6 +122,7 @@ function blankProfile(): ClientProfile {
     public_key: null,
     has_private_key: false,
     has_static_psk: false,
+    profile_type: 'classic',
     address: null,
     allowed_ips: '0.0.0.0/0',
     persistent_keepalive: 25,
@@ -1159,6 +1160,18 @@ export function ProfilesView({
           </Box>
 
           <Divider sx={{ my: 1.75 }} />
+
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 1.5 }}>
+            <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
+              Type de profil
+            </Typography>
+            <Typography
+              color="text.secondary"
+              sx={{ fontFamily: 'monospace', fontSize: 11 }}
+            >
+              {draft.key_negotiation ? 'helios_key_negotiation' : 'classic'}
+            </Typography>
+          </Box>
 
           <KeyNegotiation
             settings={draft.key_negotiation}

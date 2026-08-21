@@ -53,13 +53,13 @@ génération n’était pas réservée avant la pose du candidat, et l’échéa
 absolue de connexion détruisait la tâche sans rollback. Les deux sont corrigés.
 Restent ouverts :
 
-- le **discriminant de type de profil Orion** (§19, §22). `classic` est refusé
-  à la validation d’une requête v5 et à la préparation — serde le décode, puis
-  `validate()` le rejette, donc aucun message v5 ne peut le sélectionner — mais
-  la variante subsiste dans `ProtectionMode` et un profil Orion reste un bloc
-  `key_negotiation` facultatif, dont l’absence signifie encore implicitement
-  « classique ». La retirer est une migration de format : `network.toml`,
-  document `.orion`, manifeste de coffre (`mode_id = 0`) et les deux IHM ;
+- la variante `classic` de **`ProtectionMode`** (§19, §22), qui survit dans le
+  type. Elle est refusée à la validation d’une requête v5 et à la préparation —
+  serde la décode, puis `validate()` la rejette, donc aucun message v5 ne peut
+  la sélectionner — et elle doit survivre pour relire un `network.toml`
+  existant. La retirer reste une migration de `network.toml` et de l’octet
+  `mode_id = 0` du manifeste de coffre. **Le discriminant de profil Orion, lui,
+  est livré** (voir plus bas) : c’était l’autre moitié, et la dangereuse ;
 - l’état **`revoked`** du §11.1 : une révocation se lit à l’absence du pair
   dans `network.peers`, pas à un marqueur terminal dans le slot. Hors
   concurrence le pair ne négocie plus, mais l’absence de transition atomique
@@ -425,6 +425,24 @@ Restent ouverts :
   contre `x86_64-pc-windows-msvc` dans une caisse isolée, `aws-lc-sys` empêchant
   le cross-check du workspace entier. La séquence au-dessus du matériel, elle,
   est éprouvée par `tools/astra-signer/tests/enrolment.rs`.
+**Un profil Orion déclare ce qu’il est** (§19, §22) : `type = "classic"` ou
+`type = "helios_key_negotiation"`, porté par le document `.orion`, par le
+manifeste de coffre (v5) et par l’écran *Profils*. Il ne s’infère plus à chaque
+lecture de la présence du bloc `key_negotiation` — l’inférence lit une
+**présence** comme une **intention**, et les deux se séparent dans le sens qui
+compte : un profil Helios dont le bloc a été perdu par une édition, une
+conversion ou un import partiel arrivait avec l’apparence exacte d’un profil
+classique délibéré, et Orion montait un tunnel sans aucune authentification
+avant WireGuard sans que rien ne le dise. Les deux formes sont **exclusives** et
+la contradiction est refusée, jamais réparée : deviner laquelle des deux moitiés
+garder, c’est choisir un niveau de protection à la place de l’opérateur. Le
+chemin de connexion lit `ClientProfile::negotiates()`, jamais la présence du
+bloc. L’inférence historique survit à un seul endroit — un manifeste scellé
+avant la v5 ou un document écrit avant §19 —, s’applique **une fois** à la
+lecture, et le prochain scellement écrit la réponse. L’éditeur, lui, a le droit
+de changer le type : ajouter un bloc à un profil classique est un geste
+légitime, et c’est le seul chemin qui le fait.
+
 L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
 enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
 identité en un document) en lisant le matériel public de la gateway par

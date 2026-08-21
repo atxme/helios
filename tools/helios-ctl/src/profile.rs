@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use aether::key_negotiation::ProtectionMode;
 use anyhow::{bail, Context, Result};
+use orion_core::ProfileKind;
 use reqwest::Client;
 use serde::Serialize;
 
@@ -56,7 +57,22 @@ pub struct EmitOptions {
 struct Document<'a> {
     format: &'a str,
     version: u16,
-    profile: Profile<'a>,
+    profile: TaggedProfile<'a>,
+}
+
+/// The profile, plus the §19 discriminant [`render`] derives for it.
+///
+/// Kept out of [`Profile`] on purpose: the kind is not something a caller
+/// chooses beside the negotiation block, it is what the presence of that block
+/// *means*. Deriving it at the single point that renders a document makes the
+/// two impossible to contradict — which is the failure the field exists to
+/// stop, and it would be a poor joke to reintroduce it in the emitter.
+#[derive(Serialize)]
+struct TaggedProfile<'a> {
+    #[serde(rename = "type")]
+    profile_type: ProfileKind,
+    #[serde(flatten)]
+    inner: Profile<'a>,
 }
 
 /// The `private_key` field is omitted in invitation mode: `orion-core` treats
@@ -120,10 +136,18 @@ pub struct KeyNegotiation {
 /// is to have the actual consumer accept the actual bytes. A document that
 /// Orion would refuse must never reach a user's machine.
 pub fn render(profile: Profile<'_>) -> Result<String> {
+    let profile_type = if profile.key_negotiation.is_some() {
+        ProfileKind::HeliosKeyNegotiation
+    } else {
+        ProfileKind::Classic
+    };
     let json = serde_json::to_string_pretty(&Document {
         format: FORMAT,
         version: VERSION,
-        profile,
+        profile: TaggedProfile {
+            profile_type,
+            inner: profile,
+        },
     })
     .context("serializing the profile")?;
 
@@ -468,6 +492,17 @@ mod tests {
                 private_key.is_none()
             );
             assert!(imported.identity.is_none(), "emit ships no secret");
+            assert_eq!(
+                imported.profile.profile_type,
+                Some(ProfileKind::Classic),
+                "a document with no negotiation block says so, rather than \
+                 leaving the reader to infer it"
+            );
+            let document: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                document["profile"]["type"], "classic",
+                "the field is spelled `type`, as the specification writes it"
+            );
         }
     }
 

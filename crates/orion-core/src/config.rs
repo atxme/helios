@@ -297,6 +297,43 @@ fn mode_label(mode: ProtectionMode) -> &'static str {
     }
 }
 
+/// What kind of profile this is (spec §19, §22).
+///
+/// # Why an explicit discriminant, when the block already says it
+///
+/// It used to be inferred: a `key_negotiation` block meant a Helios profile,
+/// its absence meant classic. Inference reads a **presence** as an
+/// **intention**, and the two come apart in the direction that matters — a
+/// profile whose negotiation block was dropped by an edit, a conversion or a
+/// partial import arrives looking exactly like a deliberate classic profile.
+/// Orion would then mount a tunnel with no pre-WireGuard authentication and
+/// report nothing, because from its side nothing was wrong. A silent downgrade
+/// of the protection level is the one outcome this client may not produce.
+///
+/// So the profile says which it is, and the two shapes are **exclusive**: a
+/// `helios_key_negotiation` profile without a block, or a `classic` profile
+/// carrying one, is refused rather than cleaned up. Guessing which half of a
+/// contradiction to keep is choosing a protection level in the operator's
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    /// A plain WireGuard peer. No negotiation block, and none expected.
+    Classic,
+    /// A Helios profile: the negotiation block is mandatory.
+    HeliosKeyNegotiation,
+}
+
+impl ProfileKind {
+    /// Name of the kind as it is written in a document and read on screen.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::HeliosKeyNegotiation => "helios_key_negotiation",
+        }
+    }
+}
+
 /// A complete VPN profile, as edited by the user in the UI.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientProfile {
@@ -370,6 +407,16 @@ pub struct ClientProfile {
     /// have a natural home.
     #[serde(default)]
     pub ssh_target: Option<String>,
+    /// Which of the two profile shapes this is (spec §19, §22).
+    ///
+    /// `None` only for a profile that predates the discriminant — a sealed
+    /// manifest below v5, or a document written before §19. Every path that
+    /// **produces** a profile stamps it, so the absent case is a migration
+    /// state and not a third kind. Read it through [`ClientProfile::kind`],
+    /// never directly: that is where the legacy inference lives, once, with
+    /// its reason.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub profile_type: Option<ProfileKind>,
     /// Authenticated public negotiation performed before WireGuard is mounted.
     #[serde(default)]
     pub key_negotiation: Option<KeyNegotiationSettings>,
@@ -411,6 +458,7 @@ impl fmt::Debug for ClientProfile {
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
             .field("ssh_target", &self.ssh_target)
+            .field("profile_type", &self.profile_type)
             .field("key_negotiation", &self.key_negotiation)
             .finish()
     }
@@ -422,7 +470,64 @@ impl ClientProfile {
     /// An incomplete profile must not be presented as connectable: we fail
     /// **before** touching the network rather than mounting an adapter that
     /// will never handshake.
+    /// The kind this profile is, declared or — for a legacy profile — inferred.
+    ///
+    /// The inference is the historical rule, kept in exactly one place instead
+    /// of at every call site: a profile sealed before manifest v5 carries no
+    /// discriminant, and the presence of the block is the only thing left to
+    /// go on. It is resolved once, and [`crate::vault::store::ProfileStore`]
+    /// writes the answer back at the next save — so the guess is made about a
+    /// file, never about a decision.
+    pub fn kind(&self) -> ProfileKind {
+        self.profile_type.unwrap_or({
+            if self.key_negotiation.is_some() {
+                ProfileKind::HeliosKeyNegotiation
+            } else {
+                ProfileKind::Classic
+            }
+        })
+    }
+
+    /// Does this profile negotiate before WireGuard?
+    ///
+    /// The single question the connection path asks. It reads the
+    /// discriminant, not the presence of the block: a Helios profile that lost
+    /// its block must fail loudly at [`Self::validate`], never quietly mount a
+    /// classic tunnel.
+    pub fn negotiates(&self) -> bool {
+        self.kind() == ProfileKind::HeliosKeyNegotiation
+    }
+
+    /// Checks the two shapes of spec §19 against each other.
+    ///
+    /// Separate from [`Self::validate`] because it answers a different
+    /// question, at a different moment. `validate` asks whether a profile can
+    /// mount a tunnel, and a half-filled draft legitimately cannot. This asks
+    /// whether the profile **contradicts itself**, which a draft never has the
+    /// right to do — so it can be applied when a profile is stored, long
+    /// before it is complete.
+    pub fn check_kind(&self) -> Result<()> {
+        // The contradiction is refused rather than resolved. Either half could
+        // be the true one, and the wrong guess mounts a tunnel with no
+        // pre-WireGuard authentication while the screen still says «Helios».
+        match (self.profile_type, self.key_negotiation.is_some()) {
+            (Some(ProfileKind::HeliosKeyNegotiation), false) => anyhow::bail!(
+                "ce profil se déclare « helios_key_negotiation » mais ne porte pas de bloc de \
+                 négociation : il monterait un tunnel sans authentification avant WireGuard. \
+                 Réimporter le document d'enrôlement."
+            ),
+            (Some(ProfileKind::Classic), true) => anyhow::bail!(
+                "ce profil se déclare « classic » mais porte un bloc de négociation : l'un des \
+                 deux est faux, et deviner lequel reviendrait à choisir un niveau de protection \
+                 à la place de l'opérateur"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.check_kind()?;
         if self.endpoint.trim().is_empty() {
             anyhow::bail!("l'endpoint de la gateway (IP/FQDN:port) est requis");
         }
@@ -536,6 +641,12 @@ impl Default for ClientProfile {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
+            // Left undeclared while the user is still filling the form: a new
+            // profile that started as classic and receives a negotiation block
+            // must not have to fight its own discriminant. It is stamped when
+            // the profile is persisted, which is the moment it becomes a fact
+            // rather than a draft.
+            profile_type: None,
             ssh_target: None,
             key_negotiation: None,
             preshared_key_is_negotiated: false,
@@ -667,6 +778,76 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure the discriminant exists for.
+    ///
+    /// A Helios profile whose negotiation block is lost — a bad edit, a
+    /// partial import, a conversion — used to arrive looking exactly like a
+    /// deliberate classic profile. Orion mounted a tunnel with no
+    /// pre-WireGuard authentication and reported nothing, because from its
+    /// side nothing was wrong. That is a silent downgrade of the protection
+    /// level, which is the one outcome this client may not produce.
+    #[test]
+    fn a_helios_profile_that_lost_its_block_is_refused_not_downgraded() {
+        let mut profile = ClientProfile {
+            name: "poste".into(),
+            endpoint: "203.0.113.10:51820".into(),
+            private_key: "cHJpdmF0ZQ==".into(),
+            peer_public_key: "cHVibGlj".into(),
+            profile_type: Some(ProfileKind::HeliosKeyNegotiation),
+            ..ClientProfile::default()
+        };
+        profile.key_negotiation = None;
+
+        let error = profile
+            .validate()
+            .expect_err("the contradiction is refused");
+        assert!(
+            format!("{error}").contains("sans authentification avant WireGuard"),
+            "the message must name the consequence, not the field: {error}"
+        );
+        assert!(
+            profile.negotiates(),
+            "the declared kind still governs: a lost block never turns a Helios \
+             profile into a classic one"
+        );
+    }
+
+    /// The other half of the exclusivity, refused for the same reason.
+    #[test]
+    fn a_classic_profile_carrying_a_negotiation_block_is_refused() {
+        let profile = ClientProfile {
+            name: "poste".into(),
+            endpoint: "203.0.113.10:51820".into(),
+            private_key: "cHJpdmF0ZQ==".into(),
+            peer_public_key: "cHVibGlj".into(),
+            profile_type: Some(ProfileKind::Classic),
+            key_negotiation: Some(KeyNegotiationSettings {
+                mode: ProtectionMode::MlKem,
+                minimum_mode: ProtectionMode::MlKem,
+                endpoint: "203.0.113.10:51821".into(),
+                server_name: "gw.example".into(),
+                gateway_ca_der: "MIIB".into(),
+                gateway_pq_certificate: "e30=".into(),
+                identity: "orion-poste".into(),
+                trust: None,
+            }),
+            ..ClientProfile::default()
+        };
+
+        assert!(profile.validate().is_err());
+    }
+
+    /// A profile that predates the field keeps behaving exactly as before.
+    #[test]
+    fn an_undeclared_profile_falls_back_to_the_historical_inference() {
+        let classic = ClientProfile {
+            profile_type: None,
+            ..ClientProfile::default()
+        };
+        assert_eq!(classic.kind(), ProfileKind::Classic);
+        assert!(!classic.negotiates());
+    }
 
     #[test]
     fn upsert_and_remove() {

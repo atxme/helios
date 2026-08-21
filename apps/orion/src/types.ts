@@ -247,8 +247,18 @@ export interface About {
 //
 // What the screen actually needs is the **public** half — the one value meant
 // to leave the machine — plus a boolean saying whether each secret is present.
+export type ProfileKind = 'classic' | 'helios_key_negotiation'
+
 export interface ClientProfile {
   name: string
+  /**
+   * Which of the two profile shapes this is (spec §19).
+   *
+   * Resolved by the core, never absent: a profile stored before the
+   * discriminant existed still has a kind, and the screen shows what the
+   * connection path acts on rather than what the file happens to record.
+   */
+  profile_type: ProfileKind
   /** Gateway's UDP endpoint: `IP:port` or `FQDN:port`. */
   endpoint: string
   /** Gateway's Curve25519 public key (base64). */

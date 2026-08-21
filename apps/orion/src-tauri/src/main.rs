@@ -888,6 +888,12 @@ struct ProfileView {
     heliosd_url: Option<String>,
     ssh_target: Option<String>,
     key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+    /// Which of the two shapes of spec §19 this profile is.
+    ///
+    /// Resolved, never `null`: a profile sealed before the discriminant
+    /// existed still has a kind, and the screen shows what the connection
+    /// path will act on rather than what the file happens to record.
+    profile_type: &'static str,
     /// Public half of the profile's WireGuard key. The one value of the pair
     /// that is *meant* to leave the machine — it is what the operator admits.
     public_key: Option<String>,
@@ -909,6 +915,7 @@ impl From<&ClientProfile> for ProfileView {
             heliosd_url: profile.heliosd_url.clone(),
             ssh_target: profile.ssh_target.clone(),
             key_negotiation: profile.key_negotiation.clone(),
+            profile_type: profile.kind().as_str(),
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.trim().is_empty(),
             has_static_psk: profile.has_static_psk(),
@@ -1047,6 +1054,19 @@ impl ProfileDraft {
         profile.heliosd_url = self.heliosd_url;
         profile.ssh_target = self.ssh_target;
         profile.key_negotiation = self.key_negotiation;
+        // The editor is the one place allowed to **change** the kind: adding a
+        // negotiation block to a classic profile is a legitimate gesture, and
+        // so is the reverse while nothing has been negotiated. The discriminant
+        // therefore follows what was saved, and is recorded rather than
+        // re-derived on every later read — which is the whole difference. A
+        // profile whose block goes missing afterwards has a recorded kind that
+        // no longer matches, and `check_kind` refuses it instead of quietly
+        // mounting a classic tunnel.
+        profile.profile_type = Some(if profile.key_negotiation.is_some() {
+            orion_core::ProfileKind::HeliosKeyNegotiation
+        } else {
+            orion_core::ProfileKind::Classic
+        });
         // A stored profile never carries a negotiated PSK: that one only ever
         // exists in the ephemeral copy the backend mounts.
         profile.preshared_key_is_negotiated = false;
@@ -1670,7 +1690,7 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     let telemetry = Arc::clone(&state.telemetry);
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
-    let negotiating = profile.key_negotiation.is_some();
+    let negotiating = profile.negotiates();
     let negotiated_profile = profile.name.clone();
     let config = Arc::clone(&state.config);
     let store = Arc::clone(&state.store);

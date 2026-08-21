@@ -205,6 +205,13 @@ Valider avec accès console :
   trois renégociations puis un tunnel en erreur — pas une boucle. Et le même
   redémarrage sur un profil `static_psk` ne doit déclencher **aucune**
   renégociation : ce slot est relu depuis `network.toml` ;
+- migration du manifeste de coffre v4 → v5 : installer par-dessus un Orion qui
+  détient déjà des profils scellés, sans en réimporter aucun. Chaque profil doit
+  s'ouvrir, afficher son type — `helios_key_negotiation` pour ceux qui portent un
+  bloc — et se connecter comme avant. Puis enregistrer une modification anodine
+  et vérifier au redémarrage suivant que le type est **toujours** le même : c'est
+  le scellement en v5 qui écrit l'inférence, et une réponse qui changerait entre
+  deux lectures serait exactement la panne que le discriminant supprime ;
 - désinstallation d'un profil monté (§12.2) : supprimer le profil dont le
   tunnel est up. La gateway doit journaliser le `release` **avant** que
   l'adaptateur tombe, et `wg show` doit y montrer le slot vidé tout de suite —
