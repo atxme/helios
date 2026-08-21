@@ -9,6 +9,7 @@ import type {
   ApprovalManifest,
   CertificateAction,
   CertificateActionState,
+  ActionOutcome,
   RenewalProgress,
   CertificateInventory,
   ClientConfig,
@@ -114,9 +115,12 @@ export const certificateOverview = () =>
  * Resolves with where the renewal stopped rather than with nothing: a renewal
  * waits on a human, so «lancé» is not an outcome the screen can show. Pressing
  * again on an operation already open resumes it — it never opens a second one.
+ *
+ * Keyed by profile: `renew_every_profile` advances all of them by one step,
+ * and each has its own place to wait.
  */
 export const runCertificateAction = (name: string, action: CertificateAction) =>
-  invoke<RenewalProgress>('run_certificate_action', { name, action })
+  invoke<ActionOutcome>('run_certificate_action', { name, action })
 
 /**
  * Reads the approval request the open renewal is waiting on.

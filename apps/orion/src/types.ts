@@ -138,6 +138,20 @@ export type RenewalProgress =
   | { step: 'committed'; generation: number }
 
 /**
+ * What one press produced, per profile.
+ *
+ * A map and not a single step, because one of the four actions is
+ * device-wide: returning the progress of the profile the press started from
+ * would attribute every other renewal to it, and hide the approval each of
+ * them is waiting for. `refused` is only ever filled by that action — a
+ * single-profile press rejects instead.
+ */
+export interface ActionOutcome {
+  progress: Record<string, RenewalProgress>
+  refused: Record<string, string>
+}
+
+/**
  * What the operator is shown **before** being asked to touch their key.
  *
  * Every field comes from a request verified against what the profile pins, not

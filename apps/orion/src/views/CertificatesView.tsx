@@ -94,8 +94,17 @@ export function CertificatesView() {
   const run = async (name: string, action: CertificateAction) => {
     setBusy(true)
     try {
-      const step = await api.runCertificateAction(name, action)
-      setProgress((current) => ({ ...current, [name]: step }))
+      // Merged, not assigned: `renew_every_profile` advances every profile by
+      // one step, and each has its own place to wait for an approval.
+      const outcome = await api.runCertificateAction(name, action)
+      setProgress((current) => {
+        const merged = { ...current, ...outcome.progress }
+        // A profile that could not be advanced has no step any more. Leaving
+        // the previous one beside its refusal would show a renewal as
+        // progressing and refused at once.
+        for (const refused of Object.keys(outcome.refused)) delete merged[refused]
+        return merged
+      })
     } catch {
       // The refusal is recorded on the Rust side and comes back with the
       // refreshed overview: showing it from the rejection as well would print

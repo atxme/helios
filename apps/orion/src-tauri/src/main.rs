@@ -535,10 +535,27 @@ async fn run_certificate_action(
     state: State<'_, AppState>,
     name: String,
     action: orion_core::CertificateAction,
+) -> Result<ActionOutcome, String> {
+    match action {
+        orion_core::CertificateAction::RenewEveryProfile => renew_every_profile(&state).await,
+        // The other three each concern one profile — including the two that
+        // have no driver, refused by `admits` before anything is generated.
+        _ => {
+            let step = run_for_one(&state, &name, action).await?;
+            Ok(ActionOutcome::of(&name, step))
+        }
+    }
+}
+
+/// One action, one profile.
+async fn run_for_one(
+    state: &State<'_, AppState>,
+    name: &str,
+    action: orion_core::CertificateAction,
 ) -> Result<RenewalProgress, String> {
     let (settings, heliosd_url) = {
         let cfg = state.config.lock().await;
-        let profile = cfg.find(&name);
+        let profile = cfg.find(name);
         (
             profile.and_then(|profile| profile.key_negotiation.clone()),
             profile.and_then(|profile| profile.heliosd_url.clone()),
@@ -551,18 +568,20 @@ async fn run_certificate_action(
         &inventory,
         state.controller.key_negotiation_ready(),
     ) {
-        return Err(record_certificate_error(&state, &name, block.message()).await);
+        return Err(record_certificate_error(state, name, block.message()).await);
     }
 
-    // The two renewals are the ones that have a driver. The other two are
-    // refused above, each for its own reason, and reaching this point with one
-    // of them would mean `action_states` and this match had drifted apart.
+    // `RenewNow` is the only per-profile action with a driver. The other two
+    // are refused above, each for its own reason, and reaching this point with
+    // one of them would mean `action_states` and this match had drifted apart.
     let outcome = match action {
         orion_core::CertificateAction::RenewNow => {
-            drive_renewal(&state, &name, settings, heliosd_url).await
+            drive_renewal(state, name, settings, heliosd_url).await
         }
-        orion_core::CertificateAction::RenewEveryProfile
-        | orion_core::CertificateAction::RecoverExpired
+        orion_core::CertificateAction::RenewEveryProfile => {
+            unreachable!("the fleet action is dispatched before this point")
+        }
+        orion_core::CertificateAction::RecoverExpired
         | orion_core::CertificateAction::RollbackToPrevious => Err(
             "cette action n'a pas encore de pilote : seul « Renouveler maintenant » en a un."
                 .to_string(),
@@ -570,10 +589,84 @@ async fn run_certificate_action(
     };
     match outcome {
         Ok(progress) => {
-            state.last_certificate_error.lock().await.remove(&name);
+            state.last_certificate_error.lock().await.remove(name);
             Ok(progress)
         }
-        Err(message) => Err(record_certificate_error(&state, &name, message).await),
+        Err(message) => Err(record_certificate_error(state, name, message).await),
+    }
+}
+
+/// Advances **every** Helios profile of this device by one step (§12.2).
+///
+/// # Why one step and not «until finished»
+///
+/// A renewal is not a call, it is a sequence that waits on a human: the
+/// authority opens an operation, a security key answers its challenge, and
+/// only then is anything issued. Driving one profile to completion before
+/// starting the next would leave the other five untouched behind a touch that
+/// may never come. Each press therefore advances all of them by one step,
+/// exactly as a press on a single profile does — which also makes this action
+/// the same shape as the one beside it, and resumable for the same reason.
+///
+/// # Why one profile's failure does not end the run
+///
+/// The profiles are independent: a gateway that is down, a block that is too
+/// old to renew, a missing tunnel address — each concerns its own profile, and
+/// stopping at the first would make the outcome depend on the order of a list.
+/// Every refusal is recorded against **its** profile, where the screen already
+/// shows it.
+async fn renew_every_profile(state: &State<'_, AppState>) -> Result<ActionOutcome, String> {
+    let profiles: Vec<String> = {
+        let cfg = state.config.lock().await;
+        cfg.profiles
+            .iter()
+            .filter(|profile| profile.negotiates())
+            .map(|profile| profile.name.clone())
+            .collect()
+    };
+    if profiles.is_empty() {
+        return Err("aucun profil Helios sur cet appareil".to_string());
+    }
+
+    let mut outcome = ActionOutcome::default();
+    for name in profiles {
+        match run_for_one(state, &name, orion_core::CertificateAction::RenewNow).await {
+            Ok(step) => {
+                outcome.progress.insert(name, step);
+            }
+            // Already recorded against this profile by `run_for_one`; carried
+            // here too so the press that caused it reports it without waiting
+            // for the overview to be read again.
+            Err(message) => {
+                outcome.refused.insert(name, message);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// What one press produced, per profile.
+///
+/// A map and not a single step, because one of the four actions is
+/// device-wide: returning the progress of the profile the press happened to
+/// start from would have attributed five other renewals to it, and hidden the
+/// approval each of them is waiting for.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+struct ActionOutcome {
+    progress: std::collections::BTreeMap<String, RenewalProgress>,
+    /// Profiles that could not be advanced, and why.
+    ///
+    /// Only ever populated by the fleet action: a single-profile press reports
+    /// its refusal as an error, exactly as before.
+    refused: std::collections::BTreeMap<String, String>,
+}
+
+impl ActionOutcome {
+    fn of(name: &str, step: RenewalProgress) -> Self {
+        Self {
+            progress: [(name.to_string(), step)].into_iter().collect(),
+            refused: std::collections::BTreeMap::new(),
+        }
     }
 }
 

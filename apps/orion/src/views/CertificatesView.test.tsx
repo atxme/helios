@@ -56,11 +56,25 @@ const renewNow = () => ({
   message: null,
 })
 
+/** The device-wide action, unblocked. */
+const renewEvery = () => ({
+  action: 'renew_every_profile' as const,
+  label: 'Renouveler tous les profils Helios de cet appareil',
+  blocked_by: null,
+  message: null,
+})
+
 /** A renewal parked where every renewal legitimately parks. */
 const awaiting = () => ({
   step: 'awaiting_operator' as const,
   operation_id: 'f'.repeat(32),
   companion_command: 'astra-signer approve --operation-id ' + 'f'.repeat(32),
+})
+
+/** One press's result, keyed by profile as the command returns it. */
+const outcome = (step: unknown, name = 'portable') => ({
+  progress: { [name]: step },
+  refused: {},
 })
 
 /** A certificate whose validity is long past, whatever «now» happens to be. */
@@ -76,11 +90,13 @@ const expiredFacts = () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
-  api.runCertificateAction.mockResolvedValue({
-    step: 'awaiting_operator',
-    operation_id: 'f'.repeat(32),
-    companion_command: 'astra-signer approve --heliosd-url http://100.64.0.1:8080',
-  })
+  api.runCertificateAction.mockResolvedValue(
+    outcome({
+      step: 'awaiting_operator',
+      operation_id: 'f'.repeat(32),
+      companion_command: 'astra-signer approve --heliosd-url http://100.64.0.1:8080',
+    }),
+  )
 })
 
 afterEach(cleanup)
@@ -200,7 +216,7 @@ describe('CertificatesView', () => {
    */
   it('offers the ceremony in place of a command to run', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValue(awaiting())
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
@@ -216,7 +232,7 @@ describe('CertificatesView', () => {
    */
   it('shows the request before asking for a touch', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValue(awaiting())
+    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     api.certificateApprovalManifest.mockResolvedValue({
       operation_id: 'f'.repeat(32),
       client_wg_public_key: 'AAAA',
@@ -246,7 +262,9 @@ describe('CertificatesView', () => {
     const command =
       'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValue({ ...awaiting(), companion_command: command })
+    api.runCertificateAction.mockResolvedValue(
+      outcome({ ...awaiting(), companion_command: command }),
+    )
     api.certificateApprovalManifest.mockRejectedValue('aucune clé de sécurité n’a répondu')
     render(<CertificatesView />)
 
@@ -272,7 +290,7 @@ describe('CertificatesView', () => {
         ],
       }),
     ])
-    api.runCertificateAction.mockResolvedValue({ step: 'committed', generation: 5 })
+    api.runCertificateAction.mockResolvedValue(outcome({ step: 'committed', generation: 5 }))
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
@@ -286,9 +304,44 @@ describe('CertificatesView', () => {
    * A refused press drops the step it followed. Leaving it on screen beside
    * the new error would show one renewal as progressing and refused at once.
    */
+  /**
+   * The device-wide action advances every profile, and each waits on its own.
+   *
+   * Attributing the whole run to the profile the press started from was the
+   * defect: five other renewals would have been opened with nothing on screen
+   * saying so, and the approval each of them waits for would never have been
+   * offered.
+   */
+  it('gives every profile its own place to wait after a fleet renewal', async () => {
+    api.certificateOverview.mockResolvedValue([
+      entry({ actions: [renewNow(), renewEvery()] }),
+      entry({ name: 'bureau', actions: [renewNow(), renewEvery()] }),
+    ])
+    api.runCertificateAction.mockResolvedValue({
+      progress: {
+        portable: awaiting(),
+        bureau: { ...awaiting(), operation_id: 'e'.repeat(32) },
+      },
+      refused: {},
+    })
+    render(<CertificatesView />)
+
+    fireEvent.click(
+      (
+        await screen.findAllByRole('button', {
+          name: 'Renouveler tous les profils Helios de cet appareil',
+        })
+      )[0],
+    )
+
+    await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
+    expect(screen.getByText('e'.repeat(32))).toBeTruthy()
+    expect(screen.getAllByRole('button', { name: 'Lire la demande' })).toHaveLength(2)
+  })
+
   it('drops the previous step when a later press is refused', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValueOnce(awaiting())
+    api.runCertificateAction.mockResolvedValueOnce(outcome(awaiting()))
     render(<CertificatesView />)
 
     const button = await screen.findByRole('button', { name: 'Renouveler maintenant' })

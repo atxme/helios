@@ -2723,11 +2723,16 @@ contournés :
   de chaque refus, la dernière erreur, et — depuis ce lot — l'étape où le
   renouvellement s'est arrêté, avec la ligne exacte qui l'approuve. Le bouton
   « Renouveler maintenant » **agit** : il ouvre l'opération, la reprend au
-  clic suivant et committe le grant. Manquent encore : les trois autres
-  actions, qui n'ont pas de pilote (`RenewEveryProfile`, `RecoverExpired`,
-  `RollbackToPrevious` sont refusées en le disant), le lancement automatique
-  du compagnon plutôt que sa ligne de commande, et l'affichage des credentials
-  opérateur enregistrés. Côté console Helios, rien n'existe encore ;
+  clic suivant et committe le grant. `RenewEveryProfile` **agit** aussi : il
+  avance tous les profils Helios de l'appareil d'un pas, chacun gardant sa
+  propre place d'attente — une réponse par profil, parce qu'attribuer toute la
+  campagne au profil d'où part le clic aurait ouvert cinq renouvellements sans
+  rien montrer, et masqué l'approbation que chacun attend. Le refus d'un profil
+  n'arrête pas les autres : ils sont indépendants, et s'arrêter au premier
+  ferait dépendre le résultat de l'ordre d'une liste. Manquent encore :
+  `RecoverExpired` et `RollbackToPrevious`, refusées en le disant, le lancement
+  automatique du compagnon plutôt que sa ligne de commande, et l'affichage des
+  credentials opérateur enregistrés. Côté console Helios, rien n'existe encore ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné
