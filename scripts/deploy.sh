@@ -695,15 +695,21 @@ deployer_astra() {
             # the old witness is followed only by that harmless legacy suffix.
             # A renewal, admission, issuer or revocation after the witness
             # remains a hard fork and is never adopted automatically.
+            # Conserver la sortie même en cas d'échec : elle nomme l'option
+            # de runtime ou le volume qui empêcherait la sonde de s'exécuter,
+            # au lieu de transformer cette panne en faux « fork » silencieux.
             statut_tete_ancienne="$(helios_ssh_sudo_capture "$CIBLE" \
                 "cd '$racine' && $astra_lire_frais status \
-                    --expected-audit-head '$tete_attendue' 2>&1")" || statut_tete_ancienne=
+                    --expected-audit-head '$tete_attendue' 2>&1")" || true
             tete_ancienne="$(printf '%s\n' "$statut_tete_ancienne" |
                 sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
             if [ "$tete_ancienne" != "$tete_audit" ]; then
                 echo "    refus de reprendre une histoire Astra différente du témoin opérateur" >&2
                 echo "    attendue : $tete_attendue" >&2
                 echo "    présente : $tete_audit" >&2
+                if [ -n "$statut_tete_ancienne" ] && [ -z "$tete_ancienne" ]; then
+                    echo "    sonde de compatibilité Astra :" >&2
+                fi
                 [ -z "$statut_tete_ancienne" ] ||
                     printf '%s\n' "$statut_tete_ancienne" | tail -20 >&2
                 return 1
