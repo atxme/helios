@@ -2727,15 +2727,28 @@ contournés :
   l'autorisation de staging sous `CA-PQ`, le relais par le veth et le commit
   côté gateway. Le tout dépend de l'application d'une opération opérateur
   approuvée, qui n'existe pour aucun chemin ;
-- l'**exécution d'une campagne approuvée**. Tout ce qui est *sous* elle est
-  désormais livré : la famille d'approbation, la signature `manual_global` par
-  l'émetteur délégué et sa vérification par la gateway. Ce qui manque est
-  l'opération : `astra::renewal` ouvre un renouvellement par pair autour d'une
-  approbation ordinaire recueillie auprès du compagnon, et une campagne est la
-  forme inverse — une approbation, plusieurs pairs, dont aucun n'a encore écrit
-  de demande de rotation. L'exécuter veut dire une opération qui tire son
-  autorisation de `astra::signing` pour chaque cible, au fur et à mesure qu'elle
-  revient. `RenewalError::ReasonNotDelegable` le refuse en le disant ;
+- l'**exécution d'une campagne d'autorité**. Une campagne sur les **leafs
+  clientes** s'exécute désormais : quand un pair couvert envoie sa demande de
+  rotation, `astra::renewal::open` retrouve l'opération approuvée par
+  `SigningOperationStore::approved_for_client`, ouvre une opération **déjà
+  approuvée** — elle ne passe jamais par `awaiting_operator`, puisque personne
+  n'a rien à répondre — et émet dans le même appel. La campagne est aussi la
+  seule chose qui surcharge légitimement le seuil de 80 % : renouveler *avant*
+  est ce à quoi sert une action manuelle. Elle ne surcharge pas l'expiration —
+  une rotation ordinaire prouve la possession par une feuille qu'aucun
+  validateur n'accepte, et §7.5 est le seul retour.
+  **Limite connue** : une leaf cliente ne tourne pas sans son client, qui
+  détient la clé privée et écrit le CSR. Une campagne autorise donc des
+  rotations, et c'est la demande de chaque pair qui dépense cette autorisation,
+  dans la fenêtre de campagne — 300 s au plus (§7.6). Un pair hors ligne
+  pendant ces cinq minutes n'est pas renouvelé, et l'opérateur rouvre une
+  campagne : atteindre un parc absent voudrait dire une autorisation qui
+  survit au texte que son opérateur a lu.
+  Ce qui reste ouvert est la moitié **autorité** : `trust_authorities` et la
+  part ancre de `full_certificate_chain` font signer `CA-PQ` ou `CA-TLS`, ce qui
+  n'arrive que dans le compagnon. Rien ne transforme encore une telle
+  approbation en objets signés, et `covers_client` refuse de lire une campagne
+  d'autorité comme une autorisation par client plutôt que d'en approximer une ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le

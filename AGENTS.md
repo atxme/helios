@@ -229,12 +229,24 @@ Restent ouverts :
   les quatre raisons interdites à l'émetteur délégué ne sont plus exprimables.
   Staging et commit côté gateway choisissent le contrôle sur la **raison
   signée**, jamais sur le champ rempli, et exigent l'absence de l'autre famille.
-  Ce qui manque au-dessus est l'**exécuteur** : `astra::renewal` ouvre un
-  renouvellement par pair autour d'une approbation ordinaire, et une campagne est
-  la forme inverse — une approbation, plusieurs pairs. `ReasonNotDelegable` le
-  refuse en le disant.
-  Restent ouverts : l'exécution d'une campagne approuvée ; la récupération d'une
-  identité expirée ;
+  **Une campagne sur les leafs clientes s'exécute** : quand un pair couvert
+  envoie sa demande de rotation, `renewal::open` retrouve l'opération approuvée
+  par `approved_for_client`, ouvre une opération **déjà approuvée** — jamais
+  `awaiting_operator`, puisque personne n'a rien à répondre — et émet dans le
+  même appel. C'est aussi la seule chose qui surcharge légitimement le seuil de
+  80 % : renouveler avant est ce à quoi sert une action manuelle. Pas
+  l'expiration, en revanche : §7.5 reste le seul retour.
+  **Limite connue** : une leaf cliente ne tourne pas sans son client, qui
+  détient la clé privée et écrit le CSR. Une campagne autorise donc des
+  rotations, et la demande de chaque pair dépense cette autorisation dans la
+  fenêtre de campagne — 300 s au plus. Un pair hors ligne pendant ces cinq
+  minutes n'est pas renouvelé ; l'opérateur rouvre une campagne. Atteindre un
+  parc absent voudrait dire une autorisation qui survit au texte que son
+  opérateur a lu.
+  Restent ouverts : l'exécution d'une campagne d'**autorité** —
+  `trust_authorities` et la part ancre de `full_certificate_chain` font signer
+  `CA-PQ` ou `CA-TLS`, ce qui n'arrive que dans le compagnon ; la récupération
+  d'une identité expirée ;
   `authorize-issuer` et `rotate-ca-pq`, qui ne portent aucune campagne et n'ont
   donc pas d'opération à laquelle se rattacher ; les trois autres actions du
   §12.2, sans pilote et refusées en le disant ; le lancement automatique du

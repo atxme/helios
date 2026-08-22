@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use aether::certificates::{
     approval::CredentialRegistry,
-    encoding::{Fingerprint, Id16},
+    encoding::{Fingerprint, Id16, WireGuardKey},
     status::{AstraRotationCampaign, AstraSignerRequest, CampaignScope},
     CertificateError,
 };
@@ -105,25 +105,34 @@ pub enum SigningOperationState {
     AwaitingOperator,
     /// The assertions arrived and verified.
     ///
-    /// # Limite connue : rien n'applique encore une campagne approuvée
+    /// # What an approval authorizes, and what still does not act on one
     ///
-    /// The approval is recorded, and that is where it stops.
+    /// A campaign covering **client leaves** is applied: when a covered peer
+    /// sends its rotation request, [`crate::renewal::open`] finds this
+    /// operation through [`SigningOperationStore::approved_for_client`], opens
+    /// an operation already approved, and issues without asking anyone a
+    /// second time. It also overrides the 80 % threshold, which is what a
+    /// manual campaign is for.
     ///
-    /// What now exists is everything **below** it: a campaign approval is a
-    /// full approval family on the wire
-    /// ([`aether::certificates::approval::AstraCampaignApprovalEvidence`]), the
-    /// delegated issuer signs a `manual_global` staging under it, and the
-    /// gateway verifies whichever family the signed reason names — so an
-    /// applied campaign would be checked end to end today.
+    /// # Limite connue : une campagne n'atteint que les clients qui reviennent
     ///
-    /// What is missing is the *executor*: [`crate::renewal`] opens one
-    /// operation per peer around one ordinary approval collected from the
-    /// companion, and a campaign is the opposite shape — one approval, many
-    /// peers, none of whom has written a rotation request yet. Turning this
-    /// state into rotations means an operation that draws its authorization
-    /// from this store instead, for each target, as that target comes back.
-    /// Every surface that can reach this state says so out loud rather than
-    /// letting an operator spend a ceremony and watch nothing happen.
+    /// A client leaf cannot be rotated without the client: it holds the private
+    /// key and writes the CSR. So a campaign authorizes rotations, and each
+    /// peer's own request is what spends that authorization — inside the
+    /// campaign window, which `astra campaign open` caps at 300 seconds (§7.6).
+    /// A peer that is offline for those five minutes is simply not renewed, and
+    /// the operator opens another campaign. Reaching an absent fleet would mean
+    /// an authorization that outlives the text its operator read, which is the
+    /// property §7.6 exists to hold.
+    ///
+    /// # Limite connue : rien n'applique une campagne d'autorité
+    ///
+    /// [`CampaignScope::TrustAuthorities`] and the anchor half of
+    /// [`CampaignScope::FullCertificateChain`] make `CA-PQ` or `CA-TLS` sign,
+    /// which happens in the companion and nowhere else. Nothing here turns such
+    /// an approval into signed objects yet, and
+    /// [`AstraRotationCampaign::covers_client`] refuses to read an authority
+    /// campaign as a per-client authorization rather than approximating one.
     Approved,
 }
 
@@ -231,6 +240,19 @@ impl SigningOperation {
             Some(_) => Err(SigningError::Conflict),
             None => Ok(false),
         }
+    }
+
+    /// Marks the operation approved without a ceremony.
+    ///
+    /// Test-only, and deliberately not a shortcut anything else can take: the
+    /// real path is [`SigningOperationStore::submit`], which re-derives the
+    /// challenge and resolves every credential against the `CA-PQ`-signed
+    /// registry. Verifying an assertion here would need a WebAuthn credential
+    /// fixture that lives inside `aether`.
+    #[cfg(test)]
+    pub(crate) fn approve_without_ceremony(&mut self) {
+        self.accepted = Some(Fingerprint::of(b"test approval"));
+        self.state = SigningOperationState::Approved;
     }
 
     /// Records a verified approval, once.
@@ -359,6 +381,42 @@ impl SigningOperationStore {
             .collect()
     }
 
+    /// The approved campaign that authorizes rotating one client's generation.
+    ///
+    /// # Why this is a lookup and not a flag on the peer
+    ///
+    /// A campaign authorizes *the rotation it described*: §7.6 freezes the
+    /// targets and their current fingerprints at approval, so the row only
+    /// covers the identity in the exact state the operator read. Marking the
+    /// peer instead would survive the generation it was approved for, and one
+    /// touch would then renew that peer once per generation, indefinitely.
+    /// [`AstraRotationCampaign::covers_client`] is the whole test, and it is
+    /// the same one the gateway re-runs on the staging it receives.
+    ///
+    /// Bounded by [`MAX_LIVE_SIGNING_OPERATIONS`], and in practice one.
+    pub fn approved_for_client(
+        &self,
+        client_wg_public_key: &WireGuardKey,
+        active_generation: u64,
+        active_tls_certificate_fingerprint: &Fingerprint,
+        active_pq_certificate_fingerprint: &Fingerprint,
+        now_unix: u64,
+    ) -> Option<&SigningOperation> {
+        self.operations.values().find(|operation| {
+            operation.state == SigningOperationState::Approved
+                && !operation.is_expired(now_unix)
+                && operation
+                    .campaign
+                    .covers_client(
+                        client_wg_public_key,
+                        active_generation,
+                        active_tls_certificate_fingerprint,
+                        active_pq_certificate_fingerprint,
+                    )
+                    .is_ok()
+        })
+    }
+
     /// Delivers the operator's result, verified against what Astra holds.
     ///
     /// Nothing in the submitted document decides anything: the challenge is
@@ -483,6 +541,118 @@ mod tests {
             astra_service_key_epoch: 1,
             astra_signature: MlDsa87Signature::placeholder(),
         })
+    }
+
+    fn client_key() -> WireGuardKey {
+        WireGuardKey::from_bytes([3; 32])
+    }
+
+    fn approved_store(scope: CampaignScope) -> SigningOperationStore {
+        let campaign = campaign(scope);
+        let request = request(&campaign, Fingerprint::of(b"vault"));
+        let mut operation = SigningOperation::new(campaign, request, 1_050).expect("open");
+        operation.approve_without_ceremony();
+        let mut store = SigningOperationStore::new();
+        store.open(operation, 1_050).expect("store");
+        store
+    }
+
+    /// The lookup the delegated renewal path runs before asking anyone for a
+    /// touch: an approved campaign covering this identity, in this state.
+    #[test]
+    fn an_approved_campaign_is_found_for_the_target_it_named() {
+        let store = approved_store(CampaignScope::FleetLeafs);
+        assert!(store
+            .approved_for_client(
+                &client_key(),
+                3,
+                &Fingerprint::of(b"tls"),
+                &Fingerprint::of(b"pq"),
+                1_100,
+            )
+            .is_some());
+    }
+
+    /// A campaign nobody has approved yet authorizes nothing. Without this the
+    /// mere act of opening a campaign would renew the fleet.
+    #[test]
+    fn a_campaign_still_awaiting_its_operator_authorizes_nothing() {
+        let campaign = campaign(CampaignScope::FleetLeafs);
+        let request = request(&campaign, Fingerprint::of(b"vault"));
+        let operation = SigningOperation::new(campaign, request, 1_050).expect("open");
+        let mut store = SigningOperationStore::new();
+        store.open(operation, 1_050).expect("store");
+
+        assert!(store
+            .approved_for_client(
+                &client_key(),
+                3,
+                &Fingerprint::of(b"tls"),
+                &Fingerprint::of(b"pq"),
+                1_100,
+            )
+            .is_none());
+    }
+
+    /// The approval covers the generation the operator read, and stops there.
+    /// A peer that rotated in the meantime is a different rotation.
+    #[test]
+    fn an_approved_campaign_does_not_follow_its_target_to_the_next_generation() {
+        let store = approved_store(CampaignScope::FleetLeafs);
+        for (generation, tls, pq) in [
+            (4, Fingerprint::of(b"tls"), Fingerprint::of(b"pq")),
+            (3, Fingerprint::of(b"other"), Fingerprint::of(b"pq")),
+            (3, Fingerprint::of(b"tls"), Fingerprint::of(b"other")),
+        ] {
+            assert!(
+                store
+                    .approved_for_client(&client_key(), generation, &tls, &pq, 1_100)
+                    .is_none(),
+                "generation {generation} was covered by an approval that never described it"
+            );
+        }
+        // And an identity the campaign never named at all.
+        assert!(store
+            .approved_for_client(
+                &WireGuardKey::from_bytes([9; 32]),
+                3,
+                &Fingerprint::of(b"tls"),
+                &Fingerprint::of(b"pq"),
+                1_100,
+            )
+            .is_none());
+    }
+
+    /// The window is the approval's, and it ends. An expired operation is not
+    /// an authorization the next request may still spend.
+    #[test]
+    fn an_expired_approval_authorizes_nothing() {
+        let store = approved_store(CampaignScope::FleetLeafs);
+        assert!(store
+            .approved_for_client(
+                &client_key(),
+                3,
+                &Fingerprint::of(b"tls"),
+                &Fingerprint::of(b"pq"),
+                1_300,
+            )
+            .is_none());
+    }
+
+    /// Two credentials approved a decision about `CA-PQ`; spending it on a
+    /// client leaf would apply a text the operator was never shown.
+    #[test]
+    fn an_authority_campaign_is_never_found_for_a_client() {
+        let store = approved_store(CampaignScope::TrustAuthorities);
+        assert!(store
+            .approved_for_client(
+                &client_key(),
+                3,
+                &Fingerprint::of(b"tls"),
+                &Fingerprint::of(b"pq"),
+                1_100,
+            )
+            .is_none());
     }
 
     /// The request the companion verifies must name the campaign it will be

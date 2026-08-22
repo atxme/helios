@@ -47,7 +47,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
-    approval::{AstraCredentialApprovalRequest, AstraRenewalApprovalEvidence},
+    approval::{
+        AstraCampaignApprovalEvidence, AstraCredentialApprovalRequest,
+        AstraRenewalApprovalEvidence, DelegatedApproval,
+    },
     client::{
         ClientCertificateRotationGrant, ClientCertificateRotationRequest,
         ClientCertificateStageAuthorization, GatewayCertificateStageReceipt,
@@ -144,6 +147,17 @@ pub struct Operation {
     /// Fully verified and Astra-countersigned evidence. Persisted before any
     /// certificate is issued so a restart never asks for a second touch.
     approval_evidence: Option<Box<AstraRenewalApprovalEvidence>>,
+    /// The other approval family of §7.2, when a manual campaign authorized
+    /// this rotation instead of a per-peer ceremony.
+    ///
+    /// Additive and defaulted rather than folded into `approval_evidence` as
+    /// an enum: this journal is on disk, a version bump refuses the whole file,
+    /// and refusing it would abandon every renewal already past its operator
+    /// touch. At most one of the two is ever set — `validate_persisted`
+    /// refuses a record carrying both, and [`Operation::approval`] is the only
+    /// way the rest of the code reads either.
+    #[serde(default)]
+    campaign_evidence: Option<Box<AstraCampaignApprovalEvidence>>,
     /// Identifier of the staging sent to the gateway, once one was.
     stage_id: Option<Id16>,
     /// Exact authorization replayed after a cut; random leaf material is never
@@ -176,6 +190,7 @@ impl Operation {
             expires_at,
             approved_with: None,
             approval_evidence: None,
+            campaign_evidence: None,
             stage_id: None,
             stage_authorization: None,
             receipt: None,
@@ -208,6 +223,11 @@ impl Operation {
         {
             return Err(OperationError::Corrupt("identity or request binding"));
         }
+        // One approval, one rotation. A record carrying both families would
+        // leave "which one authorized this" to whoever read it first.
+        if self.approval_evidence.is_some() && self.campaign_evidence.is_some() {
+            return Err(OperationError::Corrupt("two approval families"));
+        }
         if let Some(evidence) = &self.approval_evidence {
             if evidence.approval_request != *self.approval_request
                 || evidence.approval.operation_id != self.operation_id
@@ -219,6 +239,23 @@ impl Operation {
                 return Err(OperationError::Corrupt("approval evidence binding"));
             }
         }
+        if let Some(evidence) = &self.campaign_evidence {
+            // The campaign binds to the target's state, not to this request,
+            // so what has to hold on reload is that it still covers the peer
+            // and generation this operation is about.
+            if evidence
+                .campaign
+                .covers_client(
+                    &self.client_wg_public_key,
+                    self.request.active_generation,
+                    &self.request.active_tls_certificate_fingerprint,
+                    &self.request.active_pq_certificate_fingerprint,
+                )
+                .is_err()
+            {
+                return Err(OperationError::Corrupt("campaign evidence binding"));
+            }
+        }
         if let Some(authorization) = &self.stage_authorization {
             if self.stage_id != Some(authorization.stage_id)
                 || authorization.client_wg_public_key != self.client_wg_public_key
@@ -226,6 +263,7 @@ impl Operation {
                     .request_fingerprint
                     .matches(&self.request_fingerprint)
                 || authorization.renewal_approval.as_ref() != self.approval_evidence.as_deref()
+                || authorization.campaign_approval.as_deref() != self.campaign_evidence.as_deref()
             {
                 return Err(OperationError::Corrupt("stage authorization binding"));
             }
@@ -275,6 +313,7 @@ impl Operation {
                 || grant.next_generation != authorization.next_generation
                 || grant.stage_expires_at != authorization.stage_expires_at
                 || grant.renewal_approval.as_ref() != self.approval_evidence.as_deref()
+                || grant.campaign_approval.as_deref() != self.campaign_evidence.as_deref()
             {
                 return Err(OperationError::Corrupt("grant binding"));
             }
@@ -389,6 +428,63 @@ impl Operation {
 
     pub fn approval_evidence(&self) -> Option<&AstraRenewalApprovalEvidence> {
         self.approval_evidence.as_deref()
+    }
+
+    /// The operator authorization this rotation stands on, whichever family.
+    ///
+    /// The single reader of the two fields. Returning
+    /// [`DelegatedApproval`] rather than either half is what keeps the reason
+    /// derived from the evidence all the way to the issuer: nothing between
+    /// here and `authorize_stage` gets to name a reason of its own.
+    pub fn approval(&self) -> Option<DelegatedApproval> {
+        match (&self.approval_evidence, &self.campaign_evidence) {
+            (Some(renewal), None) => Some(DelegatedApproval::Renewal(renewal.clone())),
+            (None, Some(campaign)) => Some(DelegatedApproval::Campaign(campaign.clone())),
+            // Both, or neither. `validate_persisted` refuses the first on
+            // reload and `consume_*` never creates it; treating it as "no
+            // approval" here is the refusal that costs nothing.
+            _ => None,
+        }
+    }
+
+    /// Records a campaign that already authorized this target (spec §7.6).
+    ///
+    /// No operator is asked anything: the touch happened once, for a set of
+    /// targets, before this request existed. The operation therefore skips
+    /// `awaiting_operator` — the state exists to hold a request while a human
+    /// is asked, and here nobody is.
+    ///
+    /// The campaign is still required to cover *this* peer at *this* state,
+    /// here as well as at the gateway: this is the point where a lookup could
+    /// hand over a campaign that has drifted from the request it is about to
+    /// authorize.
+    pub fn consume_campaign_approval(
+        &mut self,
+        approval_fingerprint: Fingerprint,
+        evidence: Box<AstraCampaignApprovalEvidence>,
+    ) -> Result<(), OperationError> {
+        if self.state != ClientRenewalOperationState::AwaitingOperator {
+            return Err(OperationError::NotAwaitingOperator);
+        }
+        if self.approved_with.is_some() {
+            return Err(OperationError::ApprovalAlreadySpent);
+        }
+        if evidence
+            .campaign
+            .covers_client(
+                &self.client_wg_public_key,
+                self.request.active_generation,
+                &self.request.active_tls_certificate_fingerprint,
+                &self.request.active_pq_certificate_fingerprint,
+            )
+            .is_err()
+        {
+            return Err(OperationError::Corrupt("campaign evidence binding"));
+        }
+        self.approved_with = Some(approval_fingerprint);
+        self.campaign_evidence = Some(evidence);
+        self.state = ClientRenewalOperationState::PendingGrant;
+        Ok(())
     }
 
     /// Whether this is the result that already completed the operation.
@@ -792,6 +888,57 @@ mod tests {
         Operation::awaiting_operator(operation_id, client, request, approval_request, 1_000)
     }
 
+    fn campaign_evidence(
+        client: WireGuardKey,
+        generation: u64,
+    ) -> Box<AstraCampaignApprovalEvidence> {
+        use aether::certificates::approval::CredentialRegistry;
+        use aether::certificates::status::{
+            AstraRotationCampaign, CampaignApproval, CampaignScope, CampaignTarget, CertificateKind,
+        };
+        let campaign = AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([7; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: key(9),
+            server_name: "gateway.example".into(),
+            created_at: 1_000,
+            expires_at: 1_300,
+            scope: CampaignScope::FleetLeafs,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: client,
+                epoch: 1,
+                generation,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"tls"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"pq"),
+            }],
+            reason: "rotation".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: 1,
+        };
+        let approval = CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: 1,
+            approved_at: 1_050,
+            approvals: Vec::new(),
+        };
+        Box::new(AstraCampaignApprovalEvidence {
+            campaign,
+            approval,
+            credential_registry: CredentialRegistry {
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: key(9),
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            },
+            webauthn_origin: "https://astra.example".into(),
+        })
+    }
+
     fn evidence(operation: &Operation) -> Box<AstraRenewalApprovalEvidence> {
         let request = operation.approval_request.clone();
         let binding = AstraCredentialBinding {
@@ -1151,5 +1298,89 @@ mod tests {
         assert_eq!(view.state, ClientRenewalOperationState::Failed);
         assert!(view.grant.is_none());
         assert!(view.signer_request_token.is_none());
+    }
+
+    /// A campaign approved before this request existed: nobody is asked
+    /// anything, so the operation never rests in `awaiting_operator`.
+    #[test]
+    fn a_covering_campaign_opens_an_operation_that_asks_no_one() {
+        let client = key(1);
+        let mut operation = operation(2, client);
+        let evidence = campaign_evidence(client, 4);
+        operation
+            .consume_campaign_approval(Fingerprint::of(b"campaign"), evidence)
+            .expect("covered");
+
+        assert_eq!(operation.state, ClientRenewalOperationState::PendingGrant);
+        assert!(matches!(
+            operation.approval(),
+            Some(DelegatedApproval::Campaign(_))
+        ));
+        // The reason travels with the family, all the way to the issuer.
+        assert_eq!(
+            operation.approval().expect("approval").reason(),
+            aether::certificates::authority::RotationReason::ManualGlobal
+        );
+    }
+
+    /// The lookup is not the last word: the campaign has to cover the request
+    /// this operation actually carries.
+    #[test]
+    fn a_campaign_describing_another_generation_authorizes_nothing_here() {
+        let client = key(1);
+        let mut operation = operation(2, client);
+        // The request is generation 4 -> 5; this campaign was approved for 3.
+        let evidence = campaign_evidence(client, 3);
+        assert!(matches!(
+            operation.consume_campaign_approval(Fingerprint::of(b"campaign"), evidence),
+            Err(OperationError::Corrupt("campaign evidence binding"))
+        ));
+        assert_eq!(
+            operation.state,
+            ClientRenewalOperationState::AwaitingOperator
+        );
+    }
+
+    /// One approval, one issuance — whichever family it came from.
+    #[test]
+    fn a_campaign_approval_is_spent_once() {
+        let client = key(1);
+        let mut operation = operation(2, client);
+        operation
+            .consume_campaign_approval(Fingerprint::of(b"campaign"), campaign_evidence(client, 4))
+            .expect("covered");
+        assert!(matches!(
+            operation.consume_campaign_approval(
+                Fingerprint::of(b"campaign"),
+                campaign_evidence(client, 4)
+            ),
+            Err(OperationError::NotAwaitingOperator)
+        ));
+        // And the ordinary ceremony cannot approve it a second time either.
+        let ordinary = evidence(&operation);
+        assert!(matches!(
+            operation.consume_approval(Fingerprint::of(b"other"), ordinary),
+            Err(OperationError::NotAwaitingOperator)
+        ));
+    }
+
+    /// A record carrying both families leaves «which one authorized this» to
+    /// whoever reads it first. It is refused on reload, and read as nothing.
+    #[test]
+    fn a_record_carrying_two_approval_families_is_refused() {
+        let client = key(1);
+        let mut operation = operation(2, client);
+        operation
+            .consume_campaign_approval(Fingerprint::of(b"campaign"), campaign_evidence(client, 4))
+            .expect("covered");
+        // Only a corrupted journal can reach this shape; construct it here so
+        // the refusal is exercised rather than assumed.
+        operation.approval_evidence = Some(evidence(&operation));
+
+        assert!(operation.approval().is_none());
+        assert!(matches!(
+            operation.validate_persisted(),
+            Err(OperationError::Corrupt("two approval families"))
+        ));
     }
 }

@@ -36,26 +36,28 @@
 //! replays the same authorization. The gateway treats that stage idempotently
 //! and its signed lease bounds any reservation that cannot be completed.
 //!
-//! # Limite connue : ce chemin n'ouvre que des renouvellements planifiés
+//! # Two approval families reach this module, and only two
 //!
-//! `RotationReason::Scheduled` only. Everything a `manual_global` rotation
-//! needs on the wire now exists — `aether` carries the campaign approval
-//! family, [`crate::issuer::DelegatedIssuer::authorize_stage`] signs an
-//! authorization under it, and the gateway verifies whichever family the
-//! signed reason names. What is still missing is the *operation*: this store
-//! holds one ordinary approval per renewal, and a campaign is one approval for
-//! many peers, so opening a rotation from an approved campaign means an
-//! operation whose authorization is looked up in
-//! [`crate::signing::SigningOperationStore`] rather than collected from the
-//! companion per peer. Until that exists, a request that would need it is
-//! refused by [`RenewalError::ReasonNotDelegable`] rather than approximated.
+//! An ordinary renewal is approved for *this* request, by a companion ceremony
+//! this module drives itself: [`open`] creates `awaiting_operator`, [`submit`]
+//! consumes the assertion. A manual campaign (§7.6) is approved once, for a set
+//! of targets, **before** any of their requests exist — so nothing is asked of
+//! anyone when the request finally arrives. [`open`] looks the campaign up in
+//! [`crate::signing::SigningOperationStore`], and if one covers this peer at
+//! this exact state, the operation is born already approved and goes straight
+//! to issuance.
+//!
+//! A campaign is also the one thing that legitimately overrides the 80 %
+//! threshold: renewing ahead of it is what a manual action is *for*. It does
+//! not override expiry — an ordinary rotation proves possession with a leaf no
+//! validator accepts, and §7.5 is the only way back from there.
 
 use std::sync::Arc;
 
 use aether::certificates::{
     approval::{
-        AstraCredentialApprovalRequest, AstraRenewalApproval, AstraRenewalApprovalEvidence,
-        DelegatedApproval, MAX_APPROVAL_LIFETIME_SECS, ORDINARY_APPROVAL_CREDENTIALS,
+        AstraCampaignApprovalEvidence, AstraCredentialApprovalRequest, AstraRenewalApproval,
+        AstraRenewalApprovalEvidence, MAX_APPROVAL_LIFETIME_SECS, ORDINARY_APPROVAL_CREDENTIALS,
     },
     capability::{CapabilityGrant, CapabilityRequirement, CapabilityScope},
     client::{ClientCertificateRotationRequest, IssuerKind},
@@ -142,11 +144,6 @@ pub enum RenewalError {
     NoGatewayChannel,
     #[error("the gateway refused or could not be reached: {0}")]
     Gateway(String),
-    #[error(
-        "only a scheduled renewal is opened here; a campaign rotation is signed and verified \
-         end to end, but no operation yet draws its authorization from an approved campaign"
-    )]
-    ReasonNotDelegable,
     #[error("the authority could not build this object: {0}")]
     Internal(aether::certificates::CertificateError),
 }
@@ -262,12 +259,43 @@ pub async fn open(
         return Err(RenewalError::Revoked);
     }
 
+    // An approved manual campaign covering this identity, in the exact state
+    // the operator read (§7.6). Looked up before the threshold, because it is
+    // the one thing that legitimately overrides it: a campaign exists to renew
+    // ahead of 80 %, and refusing it there would make the manual action mean
+    // «renew the peers that were going to renew anyway».
+    let campaign = {
+        let signing = service.signing.lock().await;
+        signing
+            .approved_for_client(
+                caller,
+                peer.active.generation,
+                &peer.active.tls_certificate_fingerprint,
+                &peer.active.pq_certificate_fingerprint,
+                now_unix,
+            )
+            .map(|operation| {
+                (
+                    operation.campaign.clone(),
+                    operation
+                        .approval()
+                        .cloned()
+                        .expect("an approved operation holds its approval"),
+                )
+            })
+    };
+
     // The threshold, and the only thing it decides: whether the request is
-    // admissible at all. Past it, an operator still has to answer.
+    // admissible at all. Past it, an operator still has to answer — unless one
+    // already has, for this exact target.
     match urgency(&peer.active, now_unix).map_err(RenewalError::Internal)? {
-        RenewalUrgency::Idle => return Err(RenewalError::NotDue),
+        RenewalUrgency::Idle if campaign.is_none() => return Err(RenewalError::NotDue),
+        // Expired is never lifted here, campaign or not: an ordinary rotation
+        // proves possession with a leaf no validator accepts, and §7.5 is the
+        // only way back. A campaign that could revive one would be a campaign
+        // that re-admits.
         RenewalUrgency::Expired => return Err(RenewalError::ExpiredIdentity),
-        RenewalUrgency::Due | RenewalUrgency::Warning | RenewalUrgency::Critical => {}
+        _ => {}
     }
 
     let active_pq_key = MlDsa87PublicKey::parse(&peer.active_pq_certificate.ml_dsa_87_public_key)
@@ -298,13 +326,25 @@ pub async fn open(
         now_unix,
     )?;
 
-    let operation = Operation::awaiting_operator(
+    let mut operation = Operation::awaiting_operator(
         operation_id,
         *caller,
         request,
         Box::new(approval_request),
         now_unix,
     );
+    // A covering campaign is spent here, in the same durable write that opens
+    // the operation: an operation persisted as `awaiting_operator` and only
+    // then moved would ask an operator, on a restart between the two, for a
+    // touch that has already happened.
+    let campaign_authorized = if let Some((campaign, approval)) = campaign {
+        let evidence = campaign_evidence(service, *campaign, approval).await?;
+        let fingerprint = evidence.fingerprint().map_err(RenewalError::Internal)?;
+        operation.consume_campaign_approval(fingerprint, Box::new(evidence))?;
+        true
+    } else {
+        false
+    };
     let mut operations = service.operations.lock().await;
     operations.open(operation, now_unix)?;
     operations.persist()?;
@@ -329,16 +369,57 @@ pub async fn open(
         operations.persist()?;
         return Err(RenewalError::Registry(error));
     }
-    tracing::info!(
-        peer = %peer.name,
-        operation = %operation_id,
-        generation = requested_generation,
-        "renewal prepared and awaiting an operator credential"
-    );
+    if campaign_authorized {
+        tracing::info!(
+            peer = %peer.name,
+            operation = %operation_id,
+            generation = requested_generation,
+            "renewal authorized by an approved campaign; no per-peer credential is asked"
+        );
+    } else {
+        tracing::info!(
+            peer = %peer.name,
+            operation = %operation_id,
+            generation = requested_generation,
+            "renewal prepared and awaiting an operator credential"
+        );
+    }
     drop(registry);
+    if campaign_authorized {
+        // The touch already happened, so there is nothing to poll for: issue,
+        // stage and grant in this same call. A failure here leaves
+        // `pending_grant`, which the next poll resumes — the campaign is not
+        // spent twice.
+        resume_stage(service, caller, &operation_id, now_unix).await?;
+    }
     let operations = service.operations.lock().await;
     let operation = operations.get(&operation_id, caller, now_unix)?;
     mint_view(service, operation, now_unix).await
+}
+
+/// Assembles the campaign evidence a delegated staging will carry (§7.2).
+///
+/// The credential registry and the WebAuthn origin come from **this** service,
+/// not from the campaign: they are what the gateway re-derives the assertions
+/// against, and a campaign that supplied them would be a campaign that chose
+/// the allow-list it is checked under.
+async fn campaign_evidence(
+    service: &Arc<AstraService>,
+    campaign: aether::certificates::status::AstraRotationCampaign,
+    approval: aether::certificates::status::CampaignApproval,
+) -> Result<AstraCampaignApprovalEvidence, RenewalError> {
+    let registry = service
+        .approval_credential_registry
+        .as_deref()
+        .cloned()
+        .ok_or(RenewalError::NoOperatorCredential)?;
+    let rp_id = service.registry.lock().await.state().webauthn_rp_id.clone();
+    Ok(AstraCampaignApprovalEvidence {
+        campaign,
+        approval,
+        credential_registry: registry,
+        webauthn_origin: format!("https://{rp_id}"),
+    })
 }
 
 /// Steps 3 and 7: reads one operation on behalf of the peer that owns it.
@@ -574,7 +655,7 @@ async fn resume_stage(
         .gateway
         .as_ref()
         .ok_or(RenewalError::NoGatewayChannel)?;
-    let (request, evidence, stored_authorization, stored_receipt) = {
+    let (request, approval, stored_authorization, stored_receipt) = {
         let operations = service.operations.lock().await;
         let operation = operations.get(operation_id, caller, now_unix)?;
         if operation.state != helios_api::internal::ClientRenewalOperationState::PendingGrant {
@@ -583,8 +664,7 @@ async fn resume_stage(
         (
             operation.request.clone(),
             operation
-                .approval_evidence()
-                .cloned()
+                .approval()
                 .ok_or(OperationError::Corrupt("approval evidence missing"))?,
             operation.stage_authorization().cloned(),
             operation.receipt().cloned(),
@@ -612,7 +692,6 @@ async fn resume_stage(
             )?;
             // The family, and therefore the reason, decided once: the leaves
             // are issued under the same reason the authorization will carry.
-            let approval = DelegatedApproval::Renewal(Box::new(evidence));
             let (tls_leaf, pq_leaf) = issuer.issue_generation(
                 &request,
                 &peer.name,
