@@ -353,6 +353,20 @@ enum Command {
         /// Recouvrement pendant lequel les deux ancres vérifient, en jours.
         #[arg(long, default_value_t = 30)]
         overlap_days: u64,
+        /// Origine publique d'Astra, pour rattacher la rotation à une campagne.
+        ///
+        /// Avec `--operation-id`, la rotation est l'exécution d'une campagne
+        /// `trust_authorities` : l'approbation et l'objet signé partent dans
+        /// le même dépôt, et Astra distribue la transition aux pairs. Sans
+        /// elle, la rotation reste un fichier que personne ne consomme.
+        #[arg(long)]
+        authority_url: Option<String>,
+        /// Identifiant imprimé par `astra campaign open --scope trust-authorities`.
+        #[arg(long)]
+        operation_id: Option<String>,
+        /// Origine WebAuthn, si elle diffère de `https://<rp_id>`.
+        #[arg(long)]
+        origin: Option<String>,
     },
     /// Renames a slot. Needs no security key.
     Rename {
@@ -455,7 +469,19 @@ fn run() -> Result<()> {
             out,
             prepare_days,
             overlap_days,
-        } => rotate_ca_pq(&path, &out, prepare_days, overlap_days, transport),
+            authority_url,
+            operation_id,
+            origin,
+        } => rotate_ca_pq(
+            &path,
+            &out,
+            prepare_days,
+            overlap_days,
+            authority_url.as_deref(),
+            operation_id.as_deref(),
+            origin.as_deref(),
+            transport,
+        ),
     }
 }
 
@@ -1238,41 +1264,7 @@ fn approve_campaign(
 
     let campaign = match &online {
         Some((_, request)) => {
-            // Signed by Astra's service key, verified under the key this
-            // companion already pins. A request that carried the key it is
-            // checked against would authenticate nothing.
-            //
-            // The URL is checked **inside** the signature rather than against
-            // a local copy: Astra signs the origin it serves itself, so an
-            // operator pointed at another host gets a request whose
-            // `authority_url` does not match what they dialled — and no
-            // signature under the pinned service key can be produced for one
-            // that does. That is why the hand-off records the key and not the
-            // address.
-            let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
-                     `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
-                )
-            })?;
-            let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {
-                anyhow::anyhow!("ce relais de domaine ne porte pas l'époque de la clé de service")
-            })?;
-            request.signer_request.verify(
-                &MlDsa87PublicKey::parse(service_key)?,
-                service_key_epoch,
-                authority_url.unwrap_or_default(),
-                now_unix(),
-            )?;
-            if request.webauthn_rp_id != vault.rp_id {
-                bail!(
-                    "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} ». Rien \
-                     n'est signé : une assertion produite sous un autre RP ID vaudrait pour un \
-                     autre domaine.",
-                    request.webauthn_rp_id,
-                    vault.rp_id
-                );
-            }
+            verify_campaign_request(&handoff, &vault, request, authority_url.unwrap_or_default())?;
             request.campaign.as_ref().clone()
         }
         None => {
@@ -1293,6 +1285,18 @@ fn approve_campaign(
         Some(origin) => origin.to_string(),
         None => format!("https://{}", vault.rp_id),
     };
+
+    if campaign.scope.rotates_authority() {
+        // An anchor campaign is not approved and then applied: the approval
+        // and the objects `CA-PQ` signs travel in one deposit (§0.6). Taking
+        // the touch here would spend the operator's window on a result that
+        // carries nothing.
+        bail!(
+            "cette campagne fait tourner une ancre : elle s'exécute par `astra-signer rotate-ca-pq \
+             --authority-url … --operation-id …`, qui ouvre le coffre et rend les objets signés \
+             dans le même dépôt. Rien n'a été signé."
+        );
+    }
 
     let required = usize::from(campaign.required_credentials);
     println!("campagne         : {}", campaign.campaign_id.to_hex());
@@ -1333,12 +1337,13 @@ fn approve_campaign(
 
     match (&online, out) {
         (Some((client, request)), _) => {
-            let state = client.submit(&request.operation_id, &request.result_token, &approval)?;
+            let result = campaign_result(&approval, Vec::new(), None);
+            let state = client.submit(&request.operation_id, &request.result_token, &result)?;
             println!("opération        : {}", request.operation_id.to_hex());
             println!("état             : {state:?}");
             println!(
-                "limite connue    : l'autorité a enregistré l'approbation, et rien ne l'applique \
-                 encore. Aucun certificat n'a été émis, aucune transition déposée."
+                "cette approbation est dépensée par la demande de chaque pair couvert, dans la \
+                 fenêtre de la campagne. Un pair hors ligne pendant celle-ci n'est pas renouvelé."
             );
         }
         (None, Some(out)) => {
@@ -1363,6 +1368,26 @@ fn approve_campaign(
 /// Split out so the borrow of the client and the request it produced do not
 /// have to be created in the same expression — and so the failure to fetch is
 /// reported before an operator is asked to plug anything in.
+/// Wraps what a ceremony produced into the one document §8.2 accepts.
+///
+/// Built here rather than by each gesture so the two cases stay visibly the
+/// same shape: an ordinary campaign carries an approval and nothing else, an
+/// anchor campaign carries the same approval plus what `CA-PQ` signed under
+/// it. A second document for the second case would be a second thing to keep
+/// equal on the wire.
+fn campaign_result(
+    approval: &aether::certificates::status::CampaignApproval,
+    objects: Vec<aether::certificates::transport::TrustUpdateObject>,
+    credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+) -> aether::certificates::status::AstraSignerResult {
+    aether::certificates::status::AstraSignerResult {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(approval.clone()),
+        objects,
+        credential_registry,
+    }
+}
+
 fn origin_client_fetch(
     client: &astra_signer::origin::Origin,
     operation_id: &Id16,
@@ -1370,11 +1395,29 @@ fn origin_client_fetch(
     client.fetch(operation_id)
 }
 
+/// Rotates `CA-PQ`, alone or as the execution of an authority campaign.
+///
+/// # Why the deposit happens before the vault moves
+///
+/// Astra learns of the successor first, and the local vault adopts it second.
+/// The other order has a failed deposit leave an operator whose vault holds an
+/// anchor the authority has never heard of: the next campaign would resolve
+/// its target from the registry's old anchor, the companion would refuse the
+/// mismatch, and there would be no gesture left that reconciles the two. A
+/// deposit that fails before anything moves is simply a ceremony to redo.
+///
+/// The local half is still crash-safe on its own: the journal is written after
+/// the deposit and replayed until every file has landed, so a resume needs no
+/// network and no second touch.
+#[allow(clippy::too_many_arguments)]
 fn rotate_ca_pq(
     path: &Path,
     out: &Path,
     prepare_days: u64,
     overlap_days: u64,
+    authority_url: Option<&str>,
+    operation_id: Option<&str>,
+    origin: Option<&str>,
     transport: Transport,
 ) -> Result<()> {
     let output_path = absolute_path(out)?;
@@ -1421,23 +1464,68 @@ fn rotate_ca_pq(
             .context("délai hors bornes")?,
     )?;
 
+    let online = match (authority_url, operation_id) {
+        (Some(url), Some(id)) => {
+            let operation =
+                Id16::parse_hex(id).map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+            let client = astra_signer::origin::Origin::new(url)?;
+            let request = origin_client_fetch(&client, &operation)?;
+            verify_campaign_request(&handoff, &vault, &request, url)?;
+            let campaign = request.campaign.as_ref().clone();
+            if !campaign.scope.rotates_authority() {
+                bail!(
+                    "cette campagne ne fait tourner aucune ancre : elle s'approuve par \
+                     `astra-signer approve-campaign`. Rien n'a été signé."
+                );
+            }
+            // The campaign was resolved from Astra's registry. If it names
+            // another anchor than the one this vault holds, the two halves of
+            // the domain disagree about what is current — and a rotation is
+            // the last thing that should reconcile them.
+            campaign
+                .covers_authority_object(&anchor_probe(&identity, &current_ca_public_key, window)?)
+                .context(
+                    "la campagne ne nomme pas l'ancre que ce coffre détient : l'autorité et le \
+                     compagnon ne décrivent pas le même domaine",
+                )?;
+            Some((client, request, campaign))
+        }
+        (None, None) => None,
+        _ => bail!("--authority-url et --operation-id vont ensemble"),
+    };
+
     println!(
         "rotation de CA-PQ : l'ancre du domaine change. Tout objet signé sous l'ancienne cesse \
          de vérifier au bout du recouvrement."
     );
     println!("préparation      : {prepare_days} jour(s)");
     println!("recouvrement     : {overlap_days} jour(s)");
+    if let Some((_, _, campaign)) = &online {
+        println!("campagne         : {}", campaign.campaign_id.to_hex());
+        println!("empreinte        : {}", campaign.fingerprint());
+        println!("motif            : {}", campaign.reason);
+        println!("demandée par     : {}", campaign.requested_by);
+    } else {
+        println!(
+            "hors campagne    : la transition sera écrite dans un fichier, et aucune autorité ne \
+             la distribuera"
+        );
+    }
 
     // Two distinct keys, plugged one after the other. Both are proven to open
     // the vault before anything is generated: an operator whose second key
     // does not work should find out now, and not after the anchor has moved.
-    let first = open_vault(
+    //
+    // Each key stays connected for both of its jobs — the campaign assertion
+    // and the key-slot opening. Asking for four plug cycles where two suffice
+    // is how a ceremony gets abandoned halfway.
+    let first = connect_authorized_key(
         &vault,
         transport,
         "Brancher la PREMIÈRE clé autorisée, puis appuyer sur Entrée.",
     )?;
     eprintln!();
-    let second = open_vault(
+    let second = connect_authorized_key(
         &vault,
         transport,
         "Débrancher celle-ci, brancher la SECONDE clé autorisée, puis Entrée.",
@@ -1445,9 +1533,39 @@ fn rotate_ca_pq(
 
     let registry_path = credentials::path_beside(path);
     let previous = credentials::load(&registry_path)?;
+
+    // The approval is taken **before** the anchor moves, under the credential
+    // document the outgoing anchor signed — which is also the one Astra holds.
+    let approval = match &online {
+        Some((_, _, campaign)) => {
+            let registry = previous.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "aucun document de credentials : l'émettre par `astra-signer bindings` avant \
+                     d'exécuter une campagne d'autorité"
+                )
+            })?;
+            let origin = match origin {
+                Some(origin) => origin.to_string(),
+                None => format!("https://{}", vault.rp_id),
+            };
+            Some(authority::approve_campaign(
+                &[first.key.as_ref(), second.key.as_ref()],
+                campaign,
+                &registry,
+                &identity,
+                &current_ca_public_key,
+                &vault.rp_id,
+                &origin,
+                &[first.pin.as_str(), second.pin.as_str()],
+                now,
+            )?)
+        }
+        None => None,
+    };
+
     let rotated = authority::rotate_ca_pq(
         &mut vault,
-        &[&first, &second],
+        &[&first.opened, &second.opened],
         &identity,
         previous.as_ref(),
         window,
@@ -1466,6 +1584,22 @@ fn rotate_ca_pq(
         handoff: next_handoff,
     };
     validate_ca_pq_rotation_journal(&journal)?;
+
+    if let (Some((client, request, _)), Some(approval)) = (&online, &approval) {
+        let result = campaign_result(
+            approval,
+            vec![
+                aether::certificates::transport::TrustUpdateObject::CaTransition(Box::new(
+                    journal.transition.clone(),
+                )),
+            ],
+            Some(Box::new(journal.bindings.clone())),
+        );
+        let state = client.submit(&request.operation_id, &request.result_token, &result)?;
+        println!("opération        : {}", request.operation_id.to_hex());
+        println!("état             : {state:?}");
+    }
+
     documents::write(&journal_path, &journal)
         .context("préparation durable de la rotation CA-PQ")?;
     apply_ca_pq_rotation(path, &journal)?;
@@ -1474,6 +1608,110 @@ fn rotate_ca_pq(
 
     print_ca_pq_rotation(&journal);
     println!("les key-slots n'ont pas bougé : chaque clé qui ouvrait le coffre l'ouvre encore");
+    if online.is_some() {
+        println!(
+            "l'autorité distribue la transition aux pairs qui reviennent avant l'activation ; \
+             au-delà, un pair en retard se répare par l'opérateur"
+        );
+    }
+    Ok(())
+}
+
+/// The object a campaign target is compared against, before anything signs.
+///
+/// A placeholder transition carrying the outgoing epoch and fingerprint: what
+/// [`AstraRotationCampaign::covers_authority_object`] reads is exactly those
+/// two values, so comparing here costs no signature and answers the only
+/// question that matters before a key is touched — does the authority name the
+/// anchor this vault holds.
+fn anchor_probe(
+    identity: &authority::DomainIdentity,
+    current: &MlDsa87PublicKey,
+    window: TransitionWindow,
+) -> Result<aether::certificates::transport::TrustUpdateObject> {
+    use aether::certificates::authority::CaTransition;
+
+    Ok(
+        aether::certificates::transport::TrustUpdateObject::CaTransition(Box::new(CaTransition {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: identity.trust_domain_id,
+            current_ca_epoch: identity.ca_epoch,
+            next_ca_epoch: identity.ca_epoch + 1,
+            current_ca_fingerprint: current.authority_fingerprint(),
+            next_ca_public_key: current.clone(),
+            next_ca_fingerprint: current.authority_fingerprint(),
+            window,
+            current_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            next_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        })),
+    )
+}
+
+/// One security key, connected once and used for everything it owes.
+struct ConnectedKey {
+    key: Box<dyn astra_signer::authenticator::Authenticator>,
+    /// Zeroized on drop, like every other PIN this program holds.
+    pin: zeroize::Zeroizing<String>,
+    opened: Opened,
+}
+
+fn connect_authorized_key(
+    vault: &AuthorityVault,
+    transport: Transport,
+    prompt: &str,
+) -> Result<ConnectedKey> {
+    eprintln!("{prompt}");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+    let opened = gestures::open_with_authorized_key(key.as_ref(), vault, &pin)?;
+    let slot = vault.slot_for_credential(&opened.credential_id)?;
+    eprintln!("Clé reconnue : « {} » ({}).", slot.label, slot.role);
+    Ok(ConnectedKey { key, pin, opened })
+}
+
+/// Checks what the authority served, before an operator is asked for anything.
+///
+/// The request is signed by Astra's service key and verified under the key
+/// this companion already pins; the campaign is bound to that signature; and
+/// the relying party the authority announces is **compared** to the vault's,
+/// never adopted.
+///
+/// The URL is checked **inside** the signature rather than against a local
+/// copy: Astra signs the origin it serves itself, so an operator pointed at
+/// another host gets a request whose `authority_url` does not match what they
+/// dialled — and no signature under the pinned service key can be produced for
+/// one that does. That is why the hand-off records the key and not the
+/// address.
+fn verify_campaign_request(
+    handoff: &handoff::DomainHandoff,
+    vault: &AuthorityVault,
+    request: &astra_signer::origin::CampaignRequest,
+    authority_url: &str,
+) -> Result<()> {
+    let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
+             `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
+        )
+    })?;
+    let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {
+        anyhow::anyhow!("ce relais de domaine ne porte pas l'époque de la clé de service")
+    })?;
+    request.signer_request.verify(
+        &MlDsa87PublicKey::parse(service_key)?,
+        service_key_epoch,
+        authority_url,
+        now_unix(),
+    )?;
+    if request.webauthn_rp_id != vault.rp_id {
+        bail!(
+            "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} ». Rien n'est \
+             signé : une assertion produite sous un autre RP ID vaudrait pour un autre domaine.",
+            request.webauthn_rp_id,
+            vault.rp_id
+        );
+    }
     Ok(())
 }
 

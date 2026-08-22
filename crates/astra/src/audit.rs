@@ -60,6 +60,14 @@ pub enum AuditEvent {
     CampaignApproved {
         campaign: String,
     },
+    /// Anchor transitions an approved campaign produced, now held for
+    /// delivery. Recorded by count and campaign: the objects themselves are
+    /// in the registry, and duplicating them here would make the chain the
+    /// second place a transition is stored.
+    AnchorTransitionsAccepted {
+        campaign: String,
+        objects: usize,
+    },
     CampaignRefused {
         campaign: String,
         reason: String,

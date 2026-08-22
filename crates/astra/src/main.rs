@@ -183,6 +183,8 @@ enum Command {
 enum CampaignScopeArg {
     /// The fleet's client leaves. Rotates no authority.
     FleetLeafs,
+    /// The `CA-PQ` anchor. Two operator credentials, and the companion signs.
+    TrustAuthorities,
 }
 
 #[derive(Subcommand)]
@@ -380,6 +382,7 @@ fn bootstrap(
         astra_service_key_epoch: 1,
         astra_service_public_key: service_public_key.clone(),
         issuer: None,
+        transitions: Vec::new(),
         peers: Default::default(),
         status_epochs: Default::default(),
         audit: Default::default(),
@@ -610,6 +613,26 @@ fn spawn_campaign_drain(service: Arc<AstraService>, state_dir: PathBuf) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // Anchor transitions that can no longer authorize anything, on the
+            // same tick. A bounded store that only ever grows refuses the next
+            // rotation, and it would refuse it during a ceremony.
+            match service
+                .registry
+                .lock()
+                .await
+                .forget_expired_transitions(now_unix())
+            {
+                Ok(0) => {}
+                Ok(dropped) => tracing::info!(
+                    dropped,
+                    "anchor transitions past their window forgotten: a peer that never collected \
+                     one is repaired by an operator, not by a late delivery"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    "could not sweep the expired anchor transitions"
+                ),
+            }
             let Ok(entries) = std::fs::read_dir(&directory) else {
                 continue;
             };
@@ -938,24 +961,51 @@ fn campaign_open(
     let state = registry.state();
     let scope = match scope {
         CampaignScopeArg::FleetLeafs => CampaignScope::FleetLeafs,
+        CampaignScopeArg::TrustAuthorities => CampaignScope::TrustAuthorities,
     };
 
-    let targets: Vec<CampaignTarget> = state
-        .peers
-        .values()
-        .filter(|peer| !peer.revoked)
-        .map(|peer| CampaignTarget {
-            certificate_kind: CertificateKind::ClientPq,
-            identity_key: peer.client_wg_public_key,
-            epoch: state.ca_epoch,
-            generation: peer.active.generation,
-            active_tls_certificate_fingerprint: peer.active.tls_certificate_fingerprint,
-            active_pq_certificate_fingerprint: peer.active.pq_certificate_fingerprint,
-        })
-        .collect();
+    let targets: Vec<CampaignTarget> = match scope {
+        // One target, and it is the anchor as this registry holds it right
+        // now. The companion compares it to the anchor its own vault holds:
+        // two authorities that disagree about which `CA-PQ` is current must
+        // not be reconciled by a rotation, they must stop.
+        CampaignScope::TrustAuthorities => {
+            let anchor = state.ca_public_key.authority_fingerprint();
+            vec![CampaignTarget {
+                certificate_kind: CertificateKind::CaPq,
+                identity_key: state.gateway_wg_public_key,
+                epoch: state.ca_epoch,
+                generation: state.ca_epoch,
+                active_tls_certificate_fingerprint: anchor,
+                active_pq_certificate_fingerprint: anchor,
+            }]
+        }
+        _ => state
+            .peers
+            .values()
+            .filter(|peer| !peer.revoked)
+            .map(|peer| CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: peer.client_wg_public_key,
+                epoch: state.ca_epoch,
+                generation: peer.active.generation,
+                active_tls_certificate_fingerprint: peer.active.tls_certificate_fingerprint,
+                active_pq_certificate_fingerprint: peer.active.pq_certificate_fingerprint,
+            })
+            .collect(),
+    };
     if targets.is_empty() {
         anyhow::bail!(
             "no admitted peer in this registry: there is nothing for an operator to approve"
+        );
+    }
+    if scope.rotates_authority() && load_encrypted_vault(state_dir)?.is_none() {
+        // The companion needs the vault to open `CA-PQ`, and it fetches it
+        // from here. Opening the campaign anyway would spend an operator's
+        // window on a ceremony that cannot reach a private key.
+        anyhow::bail!(
+            "this state volume holds no encrypted vault: an authority campaign has nothing for \
+             the companion to open, and `CA-PQ` would never sign"
         );
     }
     if targets.len() > MAX_CAMPAIGN_TARGETS {

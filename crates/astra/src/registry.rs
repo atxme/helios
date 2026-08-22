@@ -62,6 +62,44 @@ pub struct PendingRotation {
     pub granted: bool,
 }
 
+/// One anchor transition the operator companion signed, held for delivery.
+///
+/// # Why the authority stores an object it cannot produce
+///
+/// §0.6 splits the two halves of a trust mutation. `CA-PQ` signs the object,
+/// once, in the companion — the only program that ever holds it in the clear.
+/// This authority's service key then signs as many per-client manifests as
+/// there are peers to reach. Storing the object is therefore storing something
+/// the storer could never forge, which is exactly what makes an online copy of
+/// it harmless: a compromised service key can delay, omit or reorder delivery,
+/// and cannot invent a single transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredTransition {
+    /// The campaign whose approval produced it. Audited, and the reason a
+    /// stored object can always be traced back to a text an operator read.
+    pub campaign_id: Id16,
+    pub accepted_at: u64,
+    pub object: aether::certificates::transport::TrustUpdateObject,
+    /// Operator credential rows re-signed under the anchor this object
+    /// installs, when it installs one.
+    ///
+    /// Carried with the transition rather than beside it: a successor anchor
+    /// and a credential document only its predecessor can verify would leave
+    /// the domain unable to approve anything again — on the one path that
+    /// repairs a domain.
+    #[serde(default)]
+    pub credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+}
+
+/// Largest number of anchor transitions the registry keeps at once.
+///
+/// An anchor rotates on a human timescale and its overlap is measured in
+/// weeks, so more than a handful alive means something is re-depositing. The
+/// ceiling is a refusal, never an eviction: dropping the oldest would drop the
+/// one a lagging peer is still missing.
+pub const MAX_STORED_TRANSITIONS: usize = 8;
+
 /// Everything Astra persists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +120,13 @@ pub struct AstraState {
     pub astra_service_public_key: MlDsa87PublicKey,
 
     pub issuer: Option<AstraIssuerState>,
+    /// Anchor transitions accepted from an approved authority campaign.
+    ///
+    /// Additive and defaulted: the file is on disk, and a registry written
+    /// before this field existed must still load. A version bump would refuse
+    /// the whole domain to add a list that starts empty.
+    #[serde(default)]
+    pub transitions: Vec<StoredTransition>,
     pub peers: BTreeMap<String, PeerRecord>,
     /// Monotonic status counter per certificate fingerprint (spec §4.2).
     pub status_epochs: BTreeMap<String, u64>,
@@ -109,6 +154,14 @@ pub enum RegistryError {
          {offered} would walk an issuer decision backwards"
     )]
     IssuerEpochNotAdvancing { installed: u64, offered: u64 },
+    #[error(
+        "this authority already holds {held} anchor transitions, the ceiling of \
+         {MAX_STORED_TRANSITIONS}: a peer that is still missing one must not have it dropped to \
+         make room"
+    )]
+    TransitionStoreFull { held: usize },
+    #[error("the transition this campaign produced is refused: {0}")]
+    Transition(#[from] aether::certificates::CertificateError),
 }
 
 /// The registry and its file.
@@ -312,6 +365,114 @@ impl AstraRegistry {
             .audit
             .append(AuditEvent::IssuerInstalled { issuer_epoch }, now_unix);
         self.save()
+    }
+
+    /// Records the anchor transitions an approved campaign produced (§0.6).
+    ///
+    /// Every object is verified **here**, under the anchor and the epoch this
+    /// registry already holds, before a byte is written. That is the whole
+    /// reason the online authority may hold them at all: it re-derives the
+    /// `CA-PQ` proof rather than trusting the channel that delivered it, and a
+    /// forged object fails against a key no online process possesses.
+    ///
+    /// Depositing the same object twice is a **no-op**, not a second entry: a
+    /// companion that retries after a lost response must not make the peer
+    /// collect the same transition under two fingerprints.
+    pub fn accept_transitions(
+        &mut self,
+        campaign_id: Id16,
+        objects: &[aether::certificates::transport::TrustUpdateObject],
+        credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
+        now_unix: u64,
+    ) -> Result<usize, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        let mut fresh = Vec::new();
+        for object in objects {
+            match object {
+                TrustUpdateObject::CaTransition(transition) => transition.verify(
+                    &self.state.ca_public_key,
+                    &self.state.trust_domain_id,
+                    self.state.ca_epoch,
+                )?,
+                // Limite connue : la rotation de `CA-TLS` n'est pas stockée
+                // ici. `ClientTlsCaTransition::verify` compares the outgoing
+                // TLS anchor to a fingerprint the verifier must already pin,
+                // and this registry pins the epoch of `CA-TLS` without pinning
+                // the anchor itself. Verifying it against a value taken from
+                // the object would be verifying nothing, so it is refused in
+                // the open rather than stored on a check that always passes.
+                // Pinning `ca_tls_fingerprint` at `init-trust-domain` is what
+                // unblocks it.
+                _ => {
+                    return Err(RegistryError::Transition(
+                        aether::certificates::CertificateError::IssuerScopeViolation(
+                            "this authority stores only a CA-PQ transition",
+                        ),
+                    ))
+                }
+            }
+            let fingerprint = object.fingerprint()?;
+            let held = self.state.transitions.iter().try_fold(
+                false,
+                |found, stored| -> Result<bool, RegistryError> {
+                    Ok(found || stored.object.fingerprint()?.matches(&fingerprint))
+                },
+            )?;
+            if !held {
+                fresh.push(object.clone());
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(0);
+        }
+        let held = self.state.transitions.len();
+        if held + fresh.len() > MAX_STORED_TRANSITIONS {
+            return Err(RegistryError::TransitionStoreFull { held });
+        }
+
+        let accepted = fresh.len();
+        for object in fresh {
+            self.state.transitions.push(StoredTransition {
+                campaign_id,
+                accepted_at: now_unix,
+                object,
+                credential_registry: credential_registry.clone(),
+            });
+        }
+        self.state.audit.append(
+            AuditEvent::AnchorTransitionsAccepted {
+                campaign: campaign_id.to_hex(),
+                objects: accepted,
+            },
+            now_unix,
+        );
+        self.save()?;
+        Ok(accepted)
+    }
+
+    /// Drops the transitions no peer can still be told about (spec §4.1).
+    ///
+    /// A transition past its `not_after` authorizes nothing: a client that
+    /// received it would refuse it, and one that did not has to be repaired by
+    /// an operator rather than by a delivery that arrives after the window it
+    /// was signed for. Forgetting it is what keeps the bounded store from
+    /// filling with objects that can no longer do anything.
+    pub fn forget_expired_transitions(&mut self, now_unix: u64) -> Result<usize, RegistryError> {
+        let before = self.state.transitions.len();
+        self.state
+            .transitions
+            .retain(|stored| match transition_window(&stored.object) {
+                Some(window) => now_unix < window.not_after,
+                // Something with no window is something this store does not
+                // hold; keeping it would be keeping an object nothing prunes.
+                None => false,
+            });
+        let dropped = before - self.state.transitions.len();
+        if dropped > 0 {
+            self.save()?;
+        }
+        Ok(dropped)
     }
 
     /// Opens a rotation, refusing a second one for the same peer.
@@ -559,6 +720,22 @@ impl ChallengeStore {
     }
 }
 
+/// The window an anchor transition is in force for, when it carries one.
+///
+/// Read from the object rather than recorded beside it: two copies of a
+/// deadline drift, and the one that decides must be the one the signature
+/// covers.
+fn transition_window(
+    object: &aether::certificates::transport::TrustUpdateObject,
+) -> Option<&TransitionWindow> {
+    use aether::certificates::transport::TrustUpdateObject;
+    match object {
+        TrustUpdateObject::CaTransition(transition) => Some(&transition.window),
+        TrustUpdateObject::ClientTlsCaTransition(transition) => Some(&transition.window),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +769,193 @@ mod tests {
         }
     }
 
+    /// The anchor-transition half of §0.6, with the private key that signs.
+    ///
+    /// A separate module because every test here needs the outgoing `CA-PQ`
+    /// in hand: what is being asserted is that this registry re-derives the
+    /// proof itself rather than trusting whatever reached it.
+    mod anchor_transitions {
+        use super::*;
+        use aether::certificates::authority::CaTransition;
+        use aether::certificates::transport::TrustUpdateObject;
+        use aether::certificates::window::TransitionWindow;
+        use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+        struct Anchored {
+            registry: AstraRegistry,
+            ca_private: zeroize::Zeroizing<Vec<u8>>,
+            ca_public: MlDsa87PublicKey,
+            _directory: tempfile::TempDir,
+        }
+
+        fn anchored() -> Anchored {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+            let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+            let state = AstraState {
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                authority_url: "https://astra.example".into(),
+                webauthn_rp_id: "astra.example".into(),
+                astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                    .expect("policy pin"),
+                credential_registry_epoch: 1,
+                ca_epoch: 1,
+                ca_public_key: ca_public.clone(),
+                ca_tls_epoch: 1,
+                astra_service_key_epoch: 1,
+                astra_service_public_key: service,
+                issuer: None,
+                transitions: Vec::new(),
+                peers: BTreeMap::new(),
+                status_epochs: BTreeMap::new(),
+                audit: AuditChain::default(),
+            };
+            Anchored {
+                registry: AstraRegistry::new(directory.path().join("astra.json"), state),
+                ca_private,
+                ca_public,
+                _directory: directory,
+            }
+        }
+
+        fn transition(anchored: &Anchored, current_epoch: u64) -> TrustUpdateObject {
+            let (next_private, next_public) = generate_ml_dsa_87_keypair().expect("keygen");
+            let transition = CaTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                current_ca_epoch: current_epoch,
+                next_ca_epoch: current_epoch + 1,
+                current_ca_fingerprint: anchored.ca_public.authority_fingerprint(),
+                next_ca_fingerprint: next_public.authority_fingerprint(),
+                next_ca_public_key: next_public,
+                window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+                current_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(
+                ),
+                next_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private, &next_private)
+            .expect("signing");
+            TrustUpdateObject::CaTransition(Box::new(transition))
+        }
+
+        fn campaign_id() -> Id16 {
+            Id16::new([7; 16]).expect("id")
+        }
+
+        /// The one property that lets an online authority hold `CA-PQ` output
+        /// at all: it re-derives the proof under the anchor it already pins.
+        #[test]
+        fn a_transition_is_verified_under_the_anchor_this_registry_pins() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// A transition leaving another epoch, or signed by another anchor, is
+        /// refused — the check is the object's own `verify`, run here.
+        #[test]
+        fn a_transition_this_domain_did_not_authorize_is_refused() {
+            let mut anchored = anchored();
+            let wrong_epoch = transition(&anchored, 2);
+            assert!(anchored
+                .registry
+                .accept_transitions(campaign_id(), &[wrong_epoch], None, 2_000)
+                .is_err());
+
+            let other_domain = super::anchor_transitions::anchored();
+            let foreign = transition(&other_domain, 1);
+            assert!(anchored
+                .registry
+                .accept_transitions(campaign_id(), &[foreign], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// A companion that retries after a lost response must not make a peer
+        /// collect the same transition under two fingerprints.
+        #[test]
+        fn depositing_the_same_transition_twice_stores_it_once() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), std::slice::from_ref(&object), None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), &[object], None, 2_100)
+                    .expect("replayed"),
+                0
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// The ceiling refuses rather than evicting: dropping the oldest would
+        /// drop the one a lagging peer is still missing.
+        #[test]
+        fn the_store_refuses_rather_than_dropping_what_a_peer_still_needs() {
+            let mut anchored = anchored();
+            for index in 0..MAX_STORED_TRANSITIONS {
+                let object = transition(&anchored, 1);
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), &[object], None, 2_000 + index as u64)
+                    .expect("accepted");
+            }
+            let overflow = transition(&anchored, 1);
+            assert!(matches!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), &[overflow], None, 3_000),
+                Err(RegistryError::TransitionStoreFull { .. })
+            ));
+            assert_eq!(
+                anchored.registry.state().transitions.len(),
+                MAX_STORED_TRANSITIONS
+            );
+        }
+
+        /// Past its `not_after` a transition authorizes nothing, and keeping
+        /// it would fill a bounded store with objects that can no longer act.
+        #[test]
+        fn an_expired_transition_is_forgotten() {
+            let mut anchored = anchored();
+            let object = transition(&anchored, 1);
+            anchored
+                .registry
+                .accept_transitions(campaign_id(), &[object], None, 2_000)
+                .expect("accepted");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(199_999)
+                    .expect("swept"),
+                0
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(200_000)
+                    .expect("swept"),
+                1
+            );
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+    }
+
     fn registry() -> (AstraRegistry, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("temp dir");
         let (_, ca) = generate_ml_dsa_87_keypair().expect("keygen");
@@ -611,6 +975,7 @@ mod tests {
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,
+            transitions: Vec::new(),
             peers: BTreeMap::new(),
             status_epochs: BTreeMap::new(),
             audit: AuditChain::default(),

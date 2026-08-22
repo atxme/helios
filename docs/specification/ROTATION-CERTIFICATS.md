@@ -2773,9 +2773,11 @@ contournés :
   s'appliquent par IPv4 ou préfixe IPv6 `/64`, credential, pair et domaine » —
   n'est décrite nulle part pour ce cas, et l'inventer serait construire le
   trou. La résolution se fait donc localement.
-  `authorize-issuer` et `rotate-ca-pq` lisent encore une demande sur disque :
-  elles ne portent aucune campagne, donc rien ne les rattache à une opération,
-  et les jetons du §8.2 sont liés à une opération et à un manifeste ;
+  `rotate-ca-pq` porte désormais une campagne (`--authority-url`,
+  `--operation-id`) et emprunte les quatre routes du §8.2 comme
+  `approve-campaign`. `authorize-issuer` lit encore une demande sur disque :
+  elle ne porte aucune campagne, donc rien ne la rattache à une opération, et
+  les jetons du §8.2 sont liés à une opération et à un manifeste ;
 - la **production** des transactions de transition, pour les objets qu'aucune
   cérémonie hors ligne ne signe. Le chemin complet du §0.6 est livré :
   `aether::certificates::transport::signing::build_transaction` construit et
@@ -2795,13 +2797,35 @@ contournés :
   empreinte de base comprise, collecte les fragments et n'applique rien avant
   le dernier — un manifeste qui change en cours de collecte est un conflit, pas
   une reprise.
-  **Limite connue** : le seul objet de transition que cette autorité **stocke**
-  est la délégation `AstraIssuerAuthorization`. Les transitions de CA, d'identité
-  gateway et les révocations sont signées par `CA-PQ` dans le compagnon, et
-  §0.6 leur donne un chemin — le compagnon les rend **une fois**, liées à la
-  campagne, et Astra les persiste — mais rien n'écrit encore ce magasin. Un pair
-  en retard uniquement sur une ancre reçoit donc toujours `503`, et jamais un
-  « à jour » qui l'arrêterait pour de bon.
+  **Le magasin d'objets de transition existe** : `astra-signer rotate-ca-pq
+  --authority-url --operation-id` exécute une campagne `trust_authorities`,
+  rend la `CaTransition` signée par `CA-PQ` **dans le même dépôt** que
+  l'approbation, et `AstraRegistry::accept_transitions` la vérifie sous l'ancre
+  et l'époque que ce registre épingle déjà avant d'écrire un octet. C'est
+  précisément ce qui rend inoffensive une copie en ligne d'un objet `CA-PQ` :
+  l'autorité ne peut pas en fabriquer un, elle re-dérive la preuve. Un pair en
+  retard sur l'ancre reçoit donc sa transition, et `select_objects` la lui
+  propose tant qu'elle n'est pas entrée en vigueur.
+  **Limite connue** : une transition n'atteint un pair que pendant
+  `[not_before, activation_at)`. §8.1.1 refuse une transaction passé sa
+  première activation — installer comme à venir ce qui devrait déjà être en
+  vigueur est exactement ce que cette règle interdit — donc le délai de
+  préparation choisi par `rotate-ca-pq --prepare-days` est la fenêtre dont
+  chaque pair dispose pour revenir. Au-delà, il se répare par l'opérateur, pas
+  par une livraison tardive.
+  **Limite connue** : deux familles d'objets seulement. La délégation et la
+  transition `CA-PQ`. Une transition de `CA-TLS` est refusée au registre plutôt
+  que stockée — il épingle l'époque de cette ancre sans épingler l'ancre
+  elle-même, donc il ne pourrait la contrôler que contre une valeur portée par
+  l'objet, ce qui ne contrôle rien ; épingler `ca_tls_fingerprint` à
+  `init-trust-domain` est ce qui la débloque. Les transitions d'identité
+  gateway et les révocations n'ont aucun producteur.
+  **Limite connue** : le domaine n'**adopte** pas de lui-même une ancre
+  distribuée. Les clients l'appliquent ; le registre Astra et l'épinglage de la
+  gateway restent sur l'ancre sortante jusqu'à ce que l'opérateur les avance.
+  Une adoption qui ne toucherait qu'une moitié du domaine serait pire qu'une
+  limite nommée : elle laisserait Astra et la gateway en désaccord sur ce qui
+  est courant.
   La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
   statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
   ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche
@@ -2836,11 +2860,26 @@ contournés :
   pendant ces cinq minutes n'est pas renouvelé, et l'opérateur rouvre une
   campagne : atteindre un parc absent voudrait dire une autorisation qui
   survit au texte que son opérateur a lu.
-  Ce qui reste ouvert est la moitié **autorité** : `trust_authorities` et la
-  part ancre de `full_certificate_chain` font signer `CA-PQ` ou `CA-TLS`, ce qui
-  n'arrive que dans le compagnon. Rien ne transforme encore une telle
-  approbation en objets signés, et `covers_client` refuse de lire une campagne
-  d'autorité comme une autorisation par client plutôt que d'en approximer une ;
+  La moitié **autorité** s'exécute désormais aussi, et par une seule
+  cérémonie : `astra campaign open --scope trust-authorities` résout la
+  campagne sur l'ancre que le registre détient, `astra-signer rotate-ca-pq
+  --authority-url --operation-id` la vérifie contre l'ancre de son propre
+  coffre — deux moitiés du domaine qui se contredisent sur ce qui est courant
+  s'arrêtent, elles ne se réconcilient pas par une rotation —, prend les deux
+  confirmations, et dépose l'approbation **et** la `CaTransition` signée dans
+  le même document. `AstraSignerResult::validate` lie chaque objet à une cible
+  que l'opérateur a lue, refuse un objet nommé deux fois, refuse un objet dans
+  une campagne qui ne fait tourner aucune ancre, et exige qu'une transition de
+  `CA-PQ` porte le document de credentials ré-signé sous son successeur — une
+  ancre neuve laissée avec un registre que seule l'ancienne vérifie
+  n'approuverait plus jamais rien. Le dépôt précède la mutation du coffre :
+  l'autorité apprend le successeur d'abord, et un dépôt qui échoue est une
+  cérémonie à refaire plutôt qu'un opérateur dont le coffre porte une ancre que
+  personne ne connaît. `covers_client` refuse toujours de lire une campagne
+  d'autorité comme une autorisation par client, et `covers_authority_object`
+  refuse la réciproque.
+  **Reste ouvert** : `authorize-issuer`, qui ne porte encore aucune campagne, et
+  la part ancre de `full_certificate_chain` ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le

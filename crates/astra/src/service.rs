@@ -778,16 +778,30 @@ async fn encrypted_vault(
 
 /// `POST /v1/signer-results/<operation_id>`, scope `signer_result_submit`.
 ///
-/// The approval is verified against **this operation's own** campaign, which
+/// The result is verified against **this operation's own** campaign, which
 /// Astra holds — never against one the same message supplied. An identical
 /// replay is idempotent; different bytes under the same identifier are a
 /// conflict, not a second success.
+///
+/// # Why the objects land before the approval is spent
+///
+/// An authority campaign carries `CA-PQ`-signed transition objects (§0.6).
+/// They are persisted into the registry **first**, and only then is the
+/// approval recorded. The other order has a failed write leave an approval
+/// that is already idempotent: the companion's retry would be told «already
+/// approved» while the objects it produced were never stored, and `CA-PQ`
+/// would have to sign them a second time — which means another ceremony, on a
+/// campaign whose window has passed.
+///
+/// The two locks are taken one after the other, never nested. Every other
+/// path in this crate scopes them the same way, and a single nested pair is
+/// all a deadlock needs.
 async fn signer_result(
     State(service): State<Arc<AstraService>>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
     Path(raw): Path<String>,
     headers: HeaderMap,
-    Json(approval): Json<Box<aether::certificates::status::CampaignApproval>>,
+    Json(result): Json<Box<aether::certificates::status::AstraSignerResult>>,
 ) -> Result<Json<crate::signing::SigningOperationView>, ServiceError> {
     use aether::certificates::capability::CapabilityScope;
 
@@ -801,8 +815,8 @@ async fn signer_result(
         .clone()
         .ok_or(ServiceError::Refused)?;
 
-    let mut operations = service.signing.lock().await;
-    {
+    let verified = {
+        let operations = service.signing.lock().await;
         let operation = operations
             .get(&operation_id, now)
             .map_err(|_| ServiceError::Refused)?;
@@ -815,16 +829,50 @@ async fn signer_result(
             now,
         )
         .await?;
+        operations
+            .verify_result(
+                &operation_id,
+                &result,
+                &registry,
+                &webauthn_rp_id,
+                &webauthn_origin,
+                now,
+            )
+            .map_err(|error| {
+                tracing::warn!(%operation_id, %error, "operator result refused");
+                ServiceError::Refused
+            })?
+    };
+
+    if !verified.objects.is_empty() {
+        let mut domain = service.registry.lock().await;
+        let accepted = domain
+            .accept_transitions(
+                verified.campaign_id,
+                &verified.objects,
+                verified.credential_registry.clone(),
+                now,
+            )
+            .map_err(|error| {
+                tracing::error!(
+                    %operation_id,
+                    %error,
+                    "the transitions this campaign produced were refused: the approval is not \
+                     spent, and an identical deposit may be retried"
+                );
+                ServiceError::Refused
+            })?;
+        tracing::info!(
+            %operation_id,
+            accepted,
+            offered = verified.objects.len(),
+            "anchor transitions stored; the service key will build one manifest per peer"
+        );
     }
+
+    let mut operations = service.signing.lock().await;
     let operation = operations
-        .submit(
-            &operation_id,
-            approval,
-            &registry,
-            &webauthn_rp_id,
-            &webauthn_origin,
-            now,
-        )
+        .accept_result(&operation_id, *result, &verified, now)
         .map_err(|error| {
             tracing::warn!(%operation_id, %error, "operator result refused");
             ServiceError::Refused

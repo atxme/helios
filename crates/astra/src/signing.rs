@@ -37,7 +37,8 @@ use std::collections::BTreeMap;
 use aether::certificates::{
     approval::CredentialRegistry,
     encoding::{Fingerprint, Id16, WireGuardKey},
-    status::{AstraRotationCampaign, AstraSignerRequest, CampaignScope},
+    status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignScope},
+    transport::TrustUpdateObject,
     CertificateError,
 };
 use serde::{Deserialize, Serialize};
@@ -125,14 +126,15 @@ pub enum SigningOperationState {
     /// an authorization that outlives the text its operator read, which is the
     /// property §7.6 exists to hold.
     ///
-    /// # Limite connue : rien n'applique une campagne d'autorité
+    /// # What an authority campaign produces instead
     ///
-    /// [`CampaignScope::TrustAuthorities`] and the anchor half of
-    /// [`CampaignScope::FullCertificateChain`] make `CA-PQ` or `CA-TLS` sign,
-    /// which happens in the companion and nowhere else. Nothing here turns such
-    /// an approval into signed objects yet, and
-    /// [`AstraRotationCampaign::covers_client`] refuses to read an authority
-    /// campaign as a per-client authorization rather than approximating one.
+    /// [`CampaignScope::TrustAuthorities`] makes `CA-PQ` sign, which happens
+    /// in the companion and nowhere else. Such a campaign is therefore
+    /// approved **and** answered in one deposit: the result carries the signed
+    /// transition objects, and the registry stores them before this state is
+    /// reached (§0.6). Nothing here reads it as a per-client authorization —
+    /// [`AstraRotationCampaign::covers_client`] refuses an authority campaign
+    /// outright rather than approximating one.
     Approved,
 }
 
@@ -417,20 +419,81 @@ impl SigningOperationStore {
         })
     }
 
-    /// Delivers the operator's result, verified against what Astra holds.
+    /// Checks an operator result, and decides nothing.
     ///
     /// Nothing in the submitted document decides anything: the challenge is
     /// recomputed from **this operation's** campaign, each credential's public
     /// key comes from the registry `CA-PQ` signed, and the relying party and
-    /// origin come from the domain. An identical replay is a no-op; different
-    /// bytes under the same identifier are a conflict.
-    pub fn submit(
-        &mut self,
+    /// origin come from the domain.
+    ///
+    /// # Why checking and recording are two calls
+    ///
+    /// An authority campaign carries transition objects that have to reach the
+    /// **registry**, behind another lock, before the approval that authorized
+    /// them is marked spent. Recording first would let a failed persistence
+    /// leave an approval that is already idempotent — the companion's retry
+    /// would return «already approved» and the objects would be gone with no
+    /// second chance to deliver them. So this call verifies, the caller
+    /// persists, and [`Self::accept_result`] records.
+    pub fn verify_result(
+        &self,
         operation_id: &Id16,
-        approval: Box<aether::certificates::status::CampaignApproval>,
+        result: &AstraSignerResult,
         registry: &CredentialRegistry,
         webauthn_rp_id: &str,
         webauthn_origin: &str,
+        now_unix: u64,
+    ) -> Result<VerifiedResult, SigningError> {
+        let operation = self
+            .operations
+            .get(operation_id.as_bytes())
+            .ok_or(SigningError::Unknown)?;
+        if operation.is_expired(now_unix) {
+            return Err(SigningError::Expired);
+        }
+        let submitted = result.fingerprint()?;
+        if operation.is_idempotent(&submitted)? {
+            return Ok(VerifiedResult {
+                fingerprint: submitted,
+                campaign_id: operation.campaign.campaign_id,
+                objects: Vec::new(),
+                credential_registry: None,
+                already_accepted: true,
+            });
+        }
+        if operation.state == SigningOperationState::Approved {
+            return Err(SigningError::AlreadyApproved);
+        }
+        // Shape first, signatures second. `validate` is what ties each object
+        // to a target the operator was shown; without it a valid `CA-PQ`
+        // signature over an object nobody read would pass every later check.
+        result.validate(&operation.campaign)?;
+        result.approval.verify(
+            &operation.campaign,
+            registry,
+            webauthn_rp_id,
+            webauthn_origin,
+            now_unix,
+        )?;
+        Ok(VerifiedResult {
+            fingerprint: submitted,
+            campaign_id: operation.campaign.campaign_id,
+            objects: result.objects.clone(),
+            credential_registry: result.credential_registry.clone(),
+            already_accepted: false,
+        })
+    }
+
+    /// Records a result [`Self::verify_result`] accepted, once.
+    ///
+    /// Takes the same `now_unix` as the verification that preceded it, so an
+    /// operation cannot expire between the two and leave the caller having
+    /// persisted objects for an approval that was then refused.
+    pub fn accept_result(
+        &mut self,
+        operation_id: &Id16,
+        result: AstraSignerResult,
+        verified: &VerifiedResult,
         now_unix: u64,
     ) -> Result<&SigningOperation, SigningError> {
         let operation = self
@@ -440,23 +503,31 @@ impl SigningOperationStore {
         if operation.is_expired(now_unix) {
             return Err(SigningError::Expired);
         }
-        let submitted = approval.fingerprint()?;
-        if operation.is_idempotent(&submitted)? {
+        if operation.is_idempotent(&verified.fingerprint)? {
             return Ok(operation);
         }
         if operation.state == SigningOperationState::Approved {
             return Err(SigningError::AlreadyApproved);
         }
-        approval.verify(
-            &operation.campaign,
-            registry,
-            webauthn_rp_id,
-            webauthn_origin,
-            now_unix,
-        )?;
-        operation.accept(submitted, approval);
+        operation.accept(verified.fingerprint, result.approval);
         Ok(operation)
     }
+}
+
+/// What an operator result was found to contain, before anything records it.
+#[derive(Debug, Clone)]
+pub struct VerifiedResult {
+    /// The exact bytes accepted, for the idempotency rule of §8.2.
+    pub fingerprint: Fingerprint,
+    pub campaign_id: Id16,
+    /// Anchor transitions to persist before the approval is marked spent.
+    ///
+    /// Empty on an idempotent replay: the objects were persisted the first
+    /// time, and `accept_transitions` would deduplicate them anyway.
+    pub objects: Vec<TrustUpdateObject>,
+    pub credential_registry: Option<Box<CredentialRegistry>>,
+    /// `true` when these exact bytes were already accepted.
+    pub already_accepted: bool,
 }
 
 /// Drains the campaign inbox into the running service's store.
@@ -713,6 +784,75 @@ mod tests {
         assert_eq!(operation.manifest_fingerprint(), expected);
     }
 
+    /// The shape of a result is decided before its assertions are, so an
+    /// object nobody was shown is refused without a signature being checked —
+    /// and without the operator's approval being marked spent.
+    #[test]
+    fn an_object_the_campaign_never_named_is_refused_before_any_assertion() {
+        use aether::certificates::authority::CaTransition;
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87PublicKey};
+        use aether::certificates::transport::TrustUpdateObject;
+        use aether::certificates::window::TransitionWindow;
+
+        let campaign = campaign(CampaignScope::FleetLeafs);
+        let request = request(&campaign, Fingerprint::of(b"vault"));
+        let campaign_fingerprint = campaign.fingerprint();
+        let campaign_id = campaign.campaign_id;
+        let trust_domain_id = campaign.trust_domain_id;
+        let operation = SigningOperation::new(campaign, request, 1_050).expect("open");
+        let operation_id = operation.operation_id;
+        let mut store = SigningOperationStore::new();
+        store.open(operation, 1_050).expect("opened");
+
+        let (_, next) = generate_ml_dsa_87_keypair().expect("keygen");
+        let smuggled = TrustUpdateObject::CaTransition(Box::new(CaTransition {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id,
+            current_ca_epoch: 1,
+            next_ca_epoch: 2,
+            current_ca_fingerprint: Fingerprint::of(b"anchor"),
+            next_ca_fingerprint: next.authority_fingerprint(),
+            next_ca_public_key: MlDsa87PublicKey::clone(&next),
+            window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            current_ca_signature: MlDsa87Signature::placeholder(),
+            next_ca_signature: MlDsa87Signature::placeholder(),
+        }));
+        let result = AstraSignerResult {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(aether::certificates::status::CampaignApproval {
+                campaign_id,
+                campaign_fingerprint,
+                required_credentials: 1,
+                approved_at: 1_100,
+                approvals: Vec::new(),
+            }),
+            objects: vec![smuggled],
+            credential_registry: None,
+        };
+        let registry = CredentialRegistry {
+            trust_domain_id,
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings: Vec::new(),
+        };
+        assert!(store
+            .verify_result(
+                &operation_id,
+                &result,
+                &registry,
+                "astra.example",
+                "https://astra.example",
+                1_100,
+            )
+            .is_err());
+        assert_eq!(
+            store.get(&operation_id, 1_100).expect("still open").state,
+            SigningOperationState::AwaitingOperator,
+            "a refused result must not spend the approval"
+        );
+    }
+
     /// A store that never dropped an abandoned ceremony would let a burst of
     /// them deny every honest one afterwards.
     #[test]
@@ -790,10 +930,16 @@ mod tests {
             }],
         };
 
+        let result = AstraSignerResult {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(nonsense),
+            objects: Vec::new(),
+            credential_registry: None,
+        };
         assert!(store
-            .submit(
+            .verify_result(
                 &operation_id,
-                Box::new(nonsense),
+                &result,
                 &registry,
                 "astra.example",
                 "https://astra.example",

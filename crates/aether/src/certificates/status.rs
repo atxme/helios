@@ -63,6 +63,14 @@ const SERVICE_ROLLBACK_DOMAIN: &[u8] = b"helios-certificate-service-rollback-aut
 /// Largest campaign Astra will resolve, sign or apply (spec §8.2).
 pub const MAX_CAMPAIGN_TARGETS: usize = 256;
 
+/// Largest number of transition objects one campaign result may carry.
+///
+/// [`CampaignScope::TrustAuthorities`] names two anchors, so two is the whole
+/// domain of the honest case. The ceiling is four to leave room for a scope
+/// that later names more, and low enough that a result cannot be a delivery
+/// vehicle for an object set nobody read.
+pub const MAX_CAMPAIGN_OBJECTS: usize = 4;
+
 /// Which family a certified target belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -567,6 +575,68 @@ impl AstraRotationCampaign {
         }
     }
 
+    /// Whether this campaign authorized one anchor transition (spec §0.6).
+    ///
+    /// The mirror of [`Self::covers_client`], and its opposite in both
+    /// directions: only a scope that rotates an anchor may produce one of
+    /// these, and the two object kinds accepted are exactly the two anchors
+    /// [`CampaignScope::TrustAuthorities`] names — `CA-PQ` and `CA-TLS`.
+    /// Anything else is refused rather than stored: an object nobody was shown
+    /// would be an object the operator's touch did not approve.
+    ///
+    /// What is compared is the **outgoing** state, target by target, exactly
+    /// as `covers_client` compares a client's. A transition leaving another
+    /// epoch, or another anchor, is not the one the campaign named — even when
+    /// its own signatures verify, because a valid object produced for a
+    /// different starting point walks the domain somewhere nobody approved.
+    pub fn covers_authority_object(
+        &self,
+        object: &super::transport::TrustUpdateObject,
+    ) -> Result<(), CertificateError> {
+        use super::transport::TrustUpdateObject;
+
+        if !self.scope.rotates_authority() {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only an authority campaign produces a transition object",
+            ));
+        }
+        let (kind, trust_domain_id, epoch, current_fingerprint) = match object {
+            TrustUpdateObject::CaTransition(transition) => (
+                CertificateKind::CaPq,
+                transition.trust_domain_id,
+                transition.current_ca_epoch,
+                transition.current_ca_fingerprint,
+            ),
+            TrustUpdateObject::ClientTlsCaTransition(transition) => (
+                CertificateKind::CaTls,
+                transition.trust_domain_id,
+                transition.current_ca_tls_epoch,
+                transition.active_client_tls_ca_fingerprint,
+            ),
+            _ => {
+                return Err(CertificateError::IssuerScopeViolation(
+                    "this object is not an anchor transition",
+                ))
+            }
+        };
+        if trust_domain_id != self.trust_domain_id {
+            return Err(CertificateError::TrustDomainMismatch);
+        }
+        let covered = self.targets.iter().any(|target| {
+            target.certificate_kind == kind
+                && target.identity_key == self.gateway_wg_public_key
+                && target.epoch == epoch
+                && target
+                    .active_pq_certificate_fingerprint
+                    .matches(&current_fingerprint)
+        });
+        if covered {
+            Ok(())
+        } else {
+            Err(CertificateError::CampaignMismatch)
+        }
+    }
+
     /// Refuses a campaign whose targets moved after approval (spec §7.6).
     pub fn assert_unchanged(
         &self,
@@ -705,6 +775,116 @@ impl CampaignApproval {
             )?;
         }
         Ok(())
+    }
+}
+
+/// What the companion deposits once a campaign has been approved (spec §0.6).
+///
+/// # Why the objects travel with the approval and not after it
+///
+/// §0.6 has the companion open the vault and return the transition objects
+/// **once**, bound to the campaign. Delivering them in a second call would
+/// leave a window in which Astra holds an approval that authorizes objects it
+/// does not have — and no way to tell that state apart from a campaign whose
+/// operator walked away. One deposit, one decision: either the whole result
+/// verifies, or the campaign is still awaiting its operator.
+///
+/// # What is *not* here
+///
+/// No private key, no PRF output, no vault. The objects carry their own
+/// `CA-PQ` signatures, produced inside the companion and never reproducible by
+/// the online authority — which is precisely why Astra may persist and
+/// redistribute them without ever being able to forge one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AstraSignerResult {
+    pub format_version: u16,
+    pub approval: Box<CampaignApproval>,
+    /// The transition objects this campaign authorized, signed by `CA-PQ`.
+    ///
+    /// Empty for a campaign that rotates no anchor: a fleet campaign is an
+    /// authorization to renew leaves, and the leaves are issued online by the
+    /// delegated issuer as each client comes back.
+    #[serde(default)]
+    pub objects: Vec<super::transport::TrustUpdateObject>,
+    /// Credential bindings re-signed under the anchor being installed.
+    ///
+    /// Present exactly when an object replaces `CA-PQ`. Leaving it out would
+    /// hand the domain a successor anchor and a registry of operator
+    /// credentials that only the anchor it replaces can verify — every future
+    /// approval would then fail, on the one path that repairs anything.
+    #[serde(default)]
+    pub credential_registry: Option<Box<super::approval::CredentialRegistry>>,
+}
+
+impl AstraSignerResult {
+    /// Everything this document is, as bytes, for the idempotency rule of §8.2.
+    pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| CertificateError::InvalidAssertion("encoding"))?;
+        Ok(Fingerprint::of(&encoded))
+    }
+
+    /// Checks the shape of the result against the campaign it answers.
+    ///
+    /// Shape only: every signature inside is verified by its own object's
+    /// `verify`, against anchors the reader holds. What this decides is
+    /// narrower and cannot be decided there — that each object belongs to this
+    /// campaign, that no object arrives twice, and that a result carrying a
+    /// successor anchor carries the credential registry that survives it.
+    pub fn validate(&self, campaign: &AstraRotationCampaign) -> Result<(), CertificateError> {
+        use super::transport::TrustUpdateObject;
+
+        if self.format_version != CERTIFICATE_FORMAT_VERSION {
+            return Err(CertificateError::UnsupportedFormatVersion {
+                received: self.format_version,
+                supported: CERTIFICATE_FORMAT_VERSION,
+            });
+        }
+        self.approval
+            .campaign_fingerprint
+            .matches(&campaign.fingerprint())
+            .then_some(())
+            .ok_or(CertificateError::CampaignMismatch)?;
+        if self.objects.len() > MAX_CAMPAIGN_OBJECTS {
+            return Err(CertificateError::CampaignMismatch);
+        }
+        if !campaign.scope.rotates_authority() {
+            // A scope that rotates no anchor has nothing for the companion to
+            // sign. Accepting objects here would let a one-credential campaign
+            // deliver an anchor transition.
+            return if self.objects.is_empty() && self.credential_registry.is_none() {
+                Ok(())
+            } else {
+                Err(CertificateError::IssuerScopeViolation(
+                    "this campaign rotates no anchor and authorizes no transition object",
+                ))
+            };
+        }
+        if self.objects.is_empty() {
+            return Err(CertificateError::EmptyTransition);
+        }
+
+        let mut seen: Vec<Fingerprint> = Vec::with_capacity(self.objects.len());
+        let mut replaces_ca_pq = false;
+        for object in &self.objects {
+            campaign.covers_authority_object(object)?;
+            let fingerprint = object.fingerprint()?;
+            if seen.iter().any(|earlier| earlier.matches(&fingerprint)) {
+                return Err(CertificateError::DuplicateFingerprint);
+            }
+            seen.push(fingerprint);
+            replaces_ca_pq |= matches!(object, TrustUpdateObject::CaTransition(_));
+        }
+        match (replaces_ca_pq, self.credential_registry.is_some()) {
+            (true, true) | (false, false) => Ok(()),
+            (true, false) => Err(CertificateError::InvalidCredentialBinding(
+                "a CA-PQ transition must carry the registry re-signed under its successor",
+            )),
+            (false, true) => Err(CertificateError::InvalidCredentialBinding(
+                "no object replaces CA-PQ, so nothing re-signs the registry",
+            )),
+        }
     }
 }
 
@@ -945,6 +1125,232 @@ mod tests {
             requested_by: "operator".into(),
             policy_fingerprint: Fingerprint::of(b"policy"),
             required_credentials: scope.required_credentials(),
+        }
+    }
+
+    /// The §0.6 half: what a campaign that touches an anchor may produce.
+    ///
+    /// Gated on the signing feature only because a valid ML-DSA-87 public key
+    /// has to be generated to build a transition at all; everything asserted
+    /// below is pure decision logic that a verifier-only build also runs.
+    #[cfg(feature = "key-negotiation-signing")]
+    mod authority_objects {
+        use super::*;
+        use crate::certificates::encoding::generate_ml_dsa_87_keypair;
+
+        /// The anchor as a campaign names it: the gateway key, the outgoing epoch
+        /// and the outgoing fingerprint, exactly as `astra campaign open` resolves
+        /// them.
+        fn anchor_target(
+            kind: CertificateKind,
+            epoch: u64,
+            current: Fingerprint,
+        ) -> CampaignTarget {
+            CampaignTarget {
+                certificate_kind: kind,
+                identity_key: WireGuardKey::from_bytes([2; 32]),
+                epoch,
+                generation: epoch,
+                active_tls_certificate_fingerprint: current,
+                active_pq_certificate_fingerprint: current,
+            }
+        }
+
+        fn ca_transition(
+            current_epoch: u64,
+            current: Fingerprint,
+        ) -> crate::certificates::transport::TrustUpdateObject {
+            use crate::certificates::authority::CaTransition;
+            use crate::certificates::window::TransitionWindow;
+
+            crate::certificates::transport::TrustUpdateObject::CaTransition(Box::new(
+                CaTransition {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    trust_domain_id: domain(),
+                    current_ca_epoch: current_epoch,
+                    next_ca_epoch: current_epoch + 1,
+                    current_ca_fingerprint: current,
+                    next_ca_public_key: generate_ml_dsa_87_keypair().expect("keygen").1,
+                    next_ca_fingerprint: Fingerprint::of(b"next anchor"),
+                    window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+                    current_ca_signature: MlDsa87Signature::placeholder(),
+                    next_ca_signature: MlDsa87Signature::placeholder(),
+                },
+            ))
+        }
+
+        fn registry() -> Box<crate::certificates::approval::CredentialRegistry> {
+            Box::new(crate::certificates::approval::CredentialRegistry {
+                trust_domain_id: domain(),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                ca_epoch: 2,
+                credential_registry_epoch: 2,
+                bindings: Vec::new(),
+            })
+        }
+
+        fn signer_result(
+            campaign: &AstraRotationCampaign,
+            objects: Vec<crate::certificates::transport::TrustUpdateObject>,
+            credential_registry: Option<Box<crate::certificates::approval::CredentialRegistry>>,
+        ) -> AstraSignerResult {
+            AstraSignerResult {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                approval: Box::new(CampaignApproval {
+                    campaign_id: campaign.campaign_id,
+                    campaign_fingerprint: campaign.fingerprint(),
+                    required_credentials: campaign.required_credentials,
+                    approved_at: 1_100,
+                    approvals: Vec::new(),
+                }),
+                objects,
+                credential_registry,
+            }
+        }
+
+        /// The whole point of §0.6: an object the operator's campaign named, and
+        /// nothing else, is what the companion may deposit.
+        #[test]
+        fn an_authority_campaign_covers_the_anchor_state_its_operator_read() {
+            let current = Fingerprint::of(b"anchor of epoch 1");
+            let campaign = campaign(
+                CampaignScope::TrustAuthorities,
+                vec![anchor_target(CertificateKind::CaPq, 1, current)],
+            );
+            assert!(campaign
+                .covers_authority_object(&ca_transition(1, current))
+                .is_ok());
+
+            // A transition that leaves another epoch verifies under its own
+            // anchor and still walks the domain somewhere nobody approved.
+            assert!(matches!(
+                campaign.covers_authority_object(&ca_transition(2, current)),
+                Err(CertificateError::CampaignMismatch)
+            ));
+            // Same epoch, another outgoing anchor: not the object that was read.
+            assert!(matches!(
+                campaign.covers_authority_object(&ca_transition(1, Fingerprint::of(b"elsewhere"))),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// A one-credential campaign must never be a delivery vehicle for an
+        /// anchor transition — that is the whole difference between the two
+        /// families of §7.2.
+        #[test]
+        fn a_fleet_campaign_produces_no_transition_object() {
+            let campaign = campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+            assert!(matches!(
+                campaign.covers_authority_object(&ca_transition(1, Fingerprint::of(b"anchor"))),
+                Err(CertificateError::IssuerScopeViolation(_))
+            ));
+
+            let result = signer_result(&campaign, Vec::new(), None);
+            assert!(result.validate(&campaign).is_ok());
+
+            let smuggled = signer_result(
+                &campaign,
+                vec![ca_transition(1, Fingerprint::of(b"anchor"))],
+                None,
+            );
+            assert!(matches!(
+                smuggled.validate(&campaign),
+                Err(CertificateError::IssuerScopeViolation(_))
+            ));
+        }
+
+        /// A successor anchor and a credential registry only the anchor it
+        /// replaces can verify would leave the domain unable to approve anything
+        /// again — on the one path that repairs a domain.
+        #[test]
+        fn a_ca_pq_transition_carries_the_registry_that_survives_it() {
+            let current = Fingerprint::of(b"anchor of epoch 1");
+            let campaign = campaign(
+                CampaignScope::TrustAuthorities,
+                vec![anchor_target(CertificateKind::CaPq, 1, current)],
+            );
+
+            let complete =
+                signer_result(&campaign, vec![ca_transition(1, current)], Some(registry()));
+            assert!(complete.validate(&campaign).is_ok());
+
+            let orphaned = signer_result(&campaign, vec![ca_transition(1, current)], None);
+            assert!(matches!(
+                orphaned.validate(&campaign),
+                Err(CertificateError::InvalidCredentialBinding(_))
+            ));
+        }
+
+        /// An empty authority result is not «nothing to do»: the operator touched
+        /// their key for a text that named an anchor, and no object came back.
+        #[test]
+        fn an_authority_campaign_with_no_object_is_refused() {
+            let current = Fingerprint::of(b"anchor of epoch 1");
+            let campaign = campaign(
+                CampaignScope::TrustAuthorities,
+                vec![anchor_target(CertificateKind::CaPq, 1, current)],
+            );
+            assert!(matches!(
+                signer_result(&campaign, Vec::new(), None).validate(&campaign),
+                Err(CertificateError::EmptyTransition)
+            ));
+        }
+
+        /// Two rows naming one object would make «what did the operator approve»
+        /// a question of iteration order, and the ceiling stops a result from
+        /// being a bulk channel.
+        #[test]
+        fn a_result_names_each_object_once_and_stays_under_the_ceiling() {
+            let current = Fingerprint::of(b"anchor of epoch 1");
+            let campaign = campaign(
+                CampaignScope::TrustAuthorities,
+                vec![anchor_target(CertificateKind::CaPq, 1, current)],
+            );
+            // The same object twice, not two objects that merely look alike:
+            // each call draws a fresh successor key, and two successors are
+            // two decisions rather than one repeated.
+            let object = ca_transition(1, current);
+            let twice = signer_result(
+                &campaign,
+                vec![object.clone(), object.clone()],
+                Some(registry()),
+            );
+            assert!(matches!(
+                twice.validate(&campaign),
+                Err(CertificateError::DuplicateFingerprint)
+            ));
+
+            let flood = signer_result(
+                &campaign,
+                (0..=MAX_CAMPAIGN_OBJECTS).map(|_| object.clone()).collect(),
+                Some(registry()),
+            );
+            assert!(matches!(
+                flood.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// The result answers the campaign it was fetched for, and Astra compares
+        /// that before reading a single object.
+        #[test]
+        fn a_result_answering_another_campaign_is_refused() {
+            let current = Fingerprint::of(b"anchor of epoch 1");
+            let campaign = campaign(
+                CampaignScope::TrustAuthorities,
+                vec![anchor_target(CertificateKind::CaPq, 1, current)],
+            );
+            let mut elsewhere = campaign.clone();
+            elsewhere.reason = "un autre texte".into();
+            let result = signer_result(
+                &elsewhere,
+                vec![ca_transition(1, current)],
+                Some(registry()),
+            );
+            assert!(matches!(
+                result.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
         }
     }
 

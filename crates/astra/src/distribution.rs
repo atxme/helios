@@ -31,15 +31,26 @@
 //! is «nothing to distribute» — never an invented object, never a transaction
 //! that would fail at the receiver after a full fragment cycle.
 //!
-//! # Limite connue : le seul objet distribuable aujourd'hui est la délégation
+//! # A transition reaches a peer only before it comes into force
 //!
-//! [`AstraIssuerAuthorization`] is the only transition object this authority
-//! stores. CA transitions, gateway identity transitions and revocations are
-//! signed by `CA-PQ` in the operator companion, and §0.6 gives them a home —
-//! the companion returns them **once**, bound to a campaign, and Astra
-//! persists them — but nothing writes that store yet. Until it does, a peer
-//! behind only on an anchor still receives nothing, and the gateway still says
-//! so out loud instead of answering «up to date».
+//! §8.1.1 refuses a transaction past its earliest activation, so an anchor
+//! transition is distributable during `[not_before, activation_at)` and not
+//! one second later — installing something that should already be in force as
+//! if it were still ahead is exactly what that rule exists to stop. The
+//! preparation delay of the rotation is therefore the window every peer has to
+//! come back in, and `astra-signer rotate-ca-pq --prepare-days` is where it is
+//! chosen. A peer that stays away longer is repaired by an operator, not by a
+//! late delivery.
+//!
+//! # Limite connue : deux familles d'objets seulement
+//!
+//! [`AstraIssuerAuthorization`] and the `CA-PQ` transition of §9.1 are what
+//! this authority holds. `CA-TLS` transitions are refused at the registry
+//! rather than stored — it pins the epoch of that anchor without pinning the
+//! anchor itself, so it could only check such an object against a value the
+//! object carried. Gateway identity transitions and revocations have no
+//! producer at all. Pinning `ca_tls_fingerprint` at `init-trust-domain` is
+//! what unblocks the first; the other two need a gesture that signs them.
 
 use std::sync::Arc;
 
@@ -228,6 +239,18 @@ fn select_objects(
     now_unix: u64,
 ) -> Vec<TrustUpdateObject> {
     let mut objects = Vec::new();
+    // Anchor transitions first, and by the receiver's own epoch. An operator
+    // campaign produced them; this authority only decides who is behind, and
+    // «behind» is a comparison the client itself signed.
+    for stored in &state.transitions {
+        if let TrustUpdateObject::CaTransition(transition) = &stored.object {
+            let in_force_later = now_unix < transition.window.activation_at;
+            let names_the_peers_anchor = request.request.ca_epoch == transition.current_ca_epoch;
+            if in_force_later && names_the_peers_anchor {
+                objects.push(stored.object.clone());
+            }
+        }
+    }
     // The delegation. A client whose `issuer_epoch` is behind cannot build the
     // chain of a delegated leaf at all: it holds the anchor and sees a leaf
     // signed by an intermediate it has never been told about.
@@ -265,5 +288,139 @@ fn activation_of(object: &TrustUpdateObject) -> Option<u64> {
             Some(grant.window.activation_at)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::authority::CaTransition;
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, Fingerprint, Id16, MlDsa87Signature, TrustDomainId,
+        WireGuardKey,
+    };
+    use aether::certificates::transport::TrustUpdateRequest;
+    use aether::certificates::window::TransitionWindow;
+    use aether::certificates::{
+        approval::AstraPolicyPin, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
+    };
+    use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
+
+    /// A state holding one signed anchor transition, and nothing else.
+    ///
+    /// The signatures are real: `select_objects` never checks one — the
+    /// registry did that when it accepted the object — but building the
+    /// fixture the honest way is what keeps this test from passing on an
+    /// object the real path would have refused.
+    fn state_with_transition(current_ca_epoch: u64) -> crate::registry::AstraState {
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (next_private, next_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+        let trust_domain_id = TrustDomainId::new([1; 16]).expect("domain");
+        let transition = CaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id,
+            current_ca_epoch,
+            next_ca_epoch: current_ca_epoch + 1,
+            current_ca_fingerprint: ca_public.authority_fingerprint(),
+            next_ca_fingerprint: next_public.authority_fingerprint(),
+            next_ca_public_key: next_public,
+            window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            current_ca_signature: MlDsa87Signature::placeholder(),
+            next_ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_private, &next_private)
+        .expect("signing");
+
+        crate::registry::AstraState {
+            trust_domain_id,
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            server_name: "gateway.example".into(),
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(Fingerprint::of(b"policy"))
+                .expect("policy pin"),
+            credential_registry_epoch: 1,
+            ca_epoch: current_ca_epoch,
+            ca_public_key: ca_public,
+            ca_tls_epoch: 1,
+            astra_service_key_epoch: 1,
+            astra_service_public_key: service,
+            issuer: None,
+            transitions: vec![crate::registry::StoredTransition {
+                campaign_id: Id16::new([7; 16]).expect("id"),
+                accepted_at: 2_000,
+                object: TrustUpdateObject::CaTransition(Box::new(transition)),
+                credential_registry: None,
+            }],
+            peers: Default::default(),
+            status_epochs: Default::default(),
+            audit: Default::default(),
+        }
+    }
+
+    fn request(ca_epoch: u64) -> AuthenticatedTrustUpdateRequest {
+        AuthenticatedTrustUpdateRequest {
+            request: TrustUpdateRequest {
+                protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+                request_id: Id16::new([3; 16]).expect("id"),
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                ca_epoch,
+                ca_tls_epoch: 1,
+                astra_service_key_epoch: 1,
+                issuer_epoch: 0,
+                active_gateway_identity_epoch: 1,
+                gateway_decision_epoch: 1,
+                client_identity_generation: 4,
+                active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"gateway tls"),
+                active_gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq"),
+                active_client_tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+                active_client_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+                client_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+                base_state_fingerprint: Fingerprint::of(b"local state"),
+            },
+            certificate: PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [1; 16],
+                subject: "orion".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: WireGuardKey::from_bytes([2; 32]).to_base64(),
+                ml_dsa_87_public_key: String::new(),
+                not_before_unix: 0,
+                not_after_unix: 100_000,
+                ml_dsa_87_signature: String::new(),
+            },
+            ml_dsa_87_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    /// A peer still on the outgoing anchor is exactly who a transition is for.
+    #[test]
+    fn a_peer_behind_on_the_anchor_is_offered_the_transition() {
+        let state = state_with_transition(1);
+        let selected = select_objects(&state, &request(1), 2_000);
+        assert_eq!(selected.len(), 1);
+        assert!(matches!(selected[0], TrustUpdateObject::CaTransition(_)));
+    }
+
+    /// A peer that already moved must not be sent a transition it applied: it
+    /// would be a transaction refused after a whole fragment cycle.
+    #[test]
+    fn a_peer_already_on_the_successor_is_offered_nothing() {
+        let state = state_with_transition(1);
+        assert!(select_objects(&state, &request(2), 2_000).is_empty());
+    }
+
+    /// §8.1.1 refuses a transaction past its earliest activation, so offering
+    /// one then would be building something the receiver must reject. The
+    /// preparation delay is the window every peer has to come back in.
+    #[test]
+    fn past_the_activation_the_transition_is_no_longer_offered() {
+        let state = state_with_transition(1);
+        assert_eq!(select_objects(&state, &request(1), 89_999).len(), 1);
+        assert!(select_objects(&state, &request(1), 90_000).is_empty());
     }
 }

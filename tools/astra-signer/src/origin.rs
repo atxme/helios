@@ -31,7 +31,7 @@
 use std::time::Duration;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
-use aether::certificates::status::{AstraRotationCampaign, AstraSignerRequest, CampaignApproval};
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult};
 use anyhow::{bail, Context, Result};
 
 /// Per-call timeout.
@@ -226,9 +226,9 @@ impl Origin {
         &self,
         operation_id: &Id16,
         result_token: &str,
-        approval: &CampaignApproval,
+        result: &AstraSignerResult,
     ) -> Result<astra::signing::SigningOperationState> {
-        let body = serde_json::to_vec(approval).context("encodage de l'approbation")?;
+        let body = serde_json::to_vec(result).context("encodage du résultat de campagne")?;
         let response = self
             .http
             .post(format!(

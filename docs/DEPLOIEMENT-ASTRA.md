@@ -48,16 +48,18 @@ Ce qui **manque** encore :
 
 - la **récupération d'une identité expirée**, et les trois autres actions du
   §12.2 : sans pilote, refusées en le disant ;
-- `authorize-issuer` et `rotate-ca-pq` ne portent **aucune campagne**, donc pas
-  d'opération à laquelle se rattacher : ces deux gestes passent par des
-  fichiers, comme décrit ici. `approve` et `approve-campaign`, eux, ont leur
-  transport ;
-- la **distribution** des objets de transition : la gateway les met en file et
-  `trust-update` en rend un fragment par requête, mais rien ne **dépose**
-  encore de transaction faute de constructeur de manifeste côté Astra. Un
-  client en retard reçoit `503`, jamais un « à jour » qui l'arrêterait ;
-- la **bascule de confiance** du §13, la rotation de CA TLS cliente, et le
-  discriminant de type de profil Orion (§19, §22).
+- `authorize-issuer` ne porte **aucune campagne**, donc pas d'opération à
+  laquelle se rattacher : ce geste passe par des fichiers, comme décrit ici.
+  `approve`, `approve-campaign` et `rotate-ca-pq` ont leur transport ;
+- l'**adoption** d'une ancre distribuée. Les clients l'appliquent ; le registre
+  Astra et l'épinglage de la gateway restent sur l'ancre sortante jusqu'à ce
+  que l'opérateur les avance. Une adoption qui ne toucherait qu'une moitié du
+  domaine laisserait les deux en désaccord sur ce qui est courant ;
+- une transition de **CA TLS cliente**, qu'aucun geste ne signe et que le
+  registre refuserait faute d'épingler cette ancre ; les transitions
+  d'identité gateway et les révocations, sans producteur ;
+- la **bascule de confiance** du §13, et le discriminant de type de profil
+  Orion (§19, §22).
 
 Ce qui est réellement éprouvé ici : la construction de l'image, le démarrage du
 conteneur, les volumes, la sauvegarde, le durcissement, la cohérence des deux
@@ -65,6 +67,39 @@ moitiés du domaine, et toute la séquence au-dessus du matériel. Ce qui ne l'e
 pas en WSL2 : le veth noyau réel, la clé de sécurité (aucun passthrough USB) et
 DPAPI — donc un renouvellement complet s'exerce sur Windows, contre une vraie
 gateway. Voir [TESTING.md](testing/TESTING.md).
+
+## Faire tourner l'ancre `CA-PQ`
+
+Deux commandes, sur deux machines, et rien à recopier entre elles.
+
+```sh
+# sur la gateway, dans le conteneur Astra
+astra campaign open --scope trust-authorities \
+  --reason "rotation annuelle" --requested-by "prénom.nom"
+# → imprime un identifiant d'opération
+
+# sur le poste opérateur
+astra-signer rotate-ca-pq --out ca-pq-transition.json \
+  --authority-url https://astra.exemple --operation-id <identifiant>
+```
+
+La campagne est résolue **sur l'ancre que le registre détient**, et le
+compagnon la compare à celle de son propre coffre : deux moitiés du domaine qui
+se contredisent sur ce qui est courant s'arrêtent, elles ne se réconcilient pas
+par une rotation. Les deux clés autorisées restent branchées le temps de leurs
+deux gestes — l'assertion de campagne et l'ouverture du key-slot — plutôt que
+d'imposer quatre cycles de branchement.
+
+Le dépôt précède la mutation du coffre. Astra apprend le successeur d'abord, le
+coffre l'adopte ensuite, et le journal local rejoue la seconde moitié sans
+réseau ni seconde touche. Un dépôt qui échoue est une cérémonie à refaire, pas
+un opérateur dont le coffre porte une ancre que personne ne connaît.
+
+`--prepare-days` (1 par défaut) est **la fenêtre dont chaque pair dispose pour
+revenir** : §8.1.1 refuse une transaction passé sa première activation, donc un
+client qui se connecte après ce délai ne recevra plus la transition et se
+répare par l'opérateur. Le choisir plus long qu'un jour est raisonnable pour un
+parc dont une part n'est pas allumée tous les jours.
 
 ## Le choix qu'on ne refait pas
 
