@@ -1111,7 +1111,7 @@ fn now_unix() -> u64 {
 }
 
 /// A non-zero 16-byte identifier from the approved DRBG (spec §2.3.2).
-fn fresh_id() -> Result<Id16, aether::certificates::CertificateError> {
+pub(crate) fn fresh_id() -> Result<Id16, aether::certificates::CertificateError> {
     let bytes = aether::random::public_bytes::<16>()
         .map_err(|_| aether::certificates::CertificateError::RandomnessUnavailable)?;
     Id16::new(bytes)
@@ -1247,9 +1247,11 @@ pub mod router {
         Json, Router,
     };
     use helios_api::internal::{
-        InternalRefusal, RelayedOperationQuery, RelayedRotationRequest, ASTRA_INTERNAL_PREFIX,
-        ROTATION_OPERATION_ROUTE, ROTATION_REQUEST_PATH, ROTATION_SIGNER_REQUEST_ROUTE,
-        ROTATION_SIGNER_RESULT_ROUTE,
+        InternalRefusal, PreparedTrustUpdate, PreparedTrustUpdateTransaction,
+        RelayedOperationQuery, RelayedRotationRequest, RelayedTrustUpdatePreparation,
+        ASTRA_INTERNAL_PREFIX, ASTRA_TRUST_UPDATE_PREFIX, ROTATION_OPERATION_ROUTE,
+        ROTATION_REQUEST_PATH, ROTATION_SIGNER_REQUEST_ROUTE, ROTATION_SIGNER_RESULT_ROUTE,
+        TRUST_UPDATE_PREPARE_PATH,
     };
 
     use super::{now_unix, RenewalError};
@@ -1259,7 +1261,10 @@ pub mod router {
     ///
     /// A rotation request carries two certificate requests and three ML-DSA-87
     /// signatures; sixty-four kilobytes is well above that and far below what
-    /// an allocation driven by a caller would be.
+    /// an allocation driven by a caller would be. A relayed preparation adds a
+    /// peer snapshot and one PQ leaf to a request already bounded by
+    /// [`aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES`],
+    /// which stays inside the same ceiling.
     pub const MAX_PRIVATE_BODY_BYTES: usize = 64 * 1024;
 
     /// Builds the private router.
@@ -1269,9 +1274,41 @@ pub mod router {
             .route(ROTATION_OPERATION_ROUTE, post(operation))
             .route(ROTATION_SIGNER_REQUEST_ROUTE, post(signer_request))
             .route(ROTATION_SIGNER_RESULT_ROUTE, post(signer_result))
+            .route(TRUST_UPDATE_PREPARE_PATH, post(prepare_trust_update))
             .fallback(refuse_unknown_route)
             .layer(DefaultBodyLimit::max(MAX_PRIVATE_BODY_BYTES))
             .with_state(service)
+    }
+
+    /// `POST /internal/v1/trust-update/prepare` (spec §0.6).
+    ///
+    /// The answer carries a transaction or nothing, and «nothing» is not an
+    /// error: the gateway's comparison and this authority's registry answer
+    /// two different questions, and where they disagree the honest reply is
+    /// that there is nothing to hand over.
+    async fn prepare_trust_update(
+        State(service): State<Arc<AstraService>>,
+        Json(relayed): Json<RelayedTrustUpdatePreparation>,
+    ) -> Response {
+        let now = now_unix();
+        match crate::distribution::prepare(&service, &relayed, now).await {
+            Ok(Some((manifest, chunks))) => (
+                StatusCode::OK,
+                Json(PreparedTrustUpdate {
+                    transaction: Some(PreparedTrustUpdateTransaction { manifest, chunks }),
+                }),
+            )
+                .into_response(),
+            Ok(None) => (
+                StatusCode::OK,
+                Json(PreparedTrustUpdate { transaction: None }),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::warn!(route = TRUST_UPDATE_PREPARE_PATH, %error, "preparation refused");
+                InternalRefusal::from(error.refusal()).into_response()
+            }
+        }
     }
 
     /// One refusal, logged with its real reason and answered with its class.
@@ -1391,7 +1428,8 @@ pub mod router {
     async fn refuse_unknown_route(uri: Uri) -> StatusCode {
         tracing::warn!(
             path = %uri.path(),
-            "private renewal listener: route refused; it serves only {ASTRA_INTERNAL_PREFIX}*"
+            "private renewal listener: route refused; it serves only \
+             {ASTRA_INTERNAL_PREFIX}* and {ASTRA_TRUST_UPDATE_PREFIX}*"
         );
         StatusCode::NOT_FOUND
     }

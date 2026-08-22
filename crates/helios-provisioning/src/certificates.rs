@@ -977,6 +977,7 @@ impl CertificateRegistry {
         &mut self,
         wg_public_key: &WireGuardKey,
         request_id: &Id16,
+        base_state_fingerprint: &Fingerprint,
         now_unix: u64,
     ) -> Result<Option<(TrustUpdateTransactionManifest, TrustUpdateChunk)>, RegistryError> {
         let mut state = self.state.clone();
@@ -991,6 +992,19 @@ impl CertificateRegistry {
         // `expires_at` the receiver refuses it, and handing it over would burn
         // a poll cycle to reach that refusal.
         if now_unix >= distribution.manifest.expires_at {
+            peer.distribution = None;
+            self.persist(state)?;
+            return Ok(None);
+        }
+        // A transaction is a compare-and-swap decision for the exact local
+        // state the client signed. Serving one built for an older snapshot
+        // would spend a complete chunk cycle only to be refused at commit.
+        // Drop it so the preparation relay can replace it from this request.
+        if !distribution
+            .manifest
+            .base_state_fingerprint
+            .matches(base_state_fingerprint)
+        {
             peer.distribution = None;
             self.persist(state)?;
             return Ok(None);
@@ -1436,7 +1450,8 @@ mod tests {
             minimum_activation_at: expires_at,
             chunk_count,
             objects: Vec::new(),
-            manifest_authority_kind: aether::certificates::transport::ManifestAuthority::CaPq,
+            manifest_authority_kind:
+                aether::certificates::transport::ManifestAuthority::AstraServiceKey,
             manifest_authority_epoch: 1,
             signature: MlDsa87Signature::placeholder(),
         };
@@ -1468,7 +1483,12 @@ mod tests {
             let request = Id16::new([index as u8 + 1; 16]).expect("request id");
             let (manifest, chunk) = fixture
                 .registry
-                .take_distribution_chunk(&client_key(2), &request, 0)
+                .take_distribution_chunk(
+                    &client_key(2),
+                    &request,
+                    &Fingerprint::of(b"base state"),
+                    0,
+                )
                 .expect("readable")
                 .expect("a fragment is owed");
             assert_eq!(chunk.chunk_index, index);
@@ -1483,7 +1503,7 @@ mod tests {
         let last = Id16::new([99; 16]).expect("request id");
         assert!(fixture
             .registry
-            .take_distribution_chunk(&client_key(2), &last, 0)
+            .take_distribution_chunk(&client_key(2), &last, &Fingerprint::of(b"base state"), 0,)
             .expect("readable")
             .is_none());
     }
@@ -1503,13 +1523,13 @@ mod tests {
         let request = Id16::new([7; 16]).expect("request id");
         let first = fixture
             .registry
-            .take_distribution_chunk(&client_key(2), &request, 0)
+            .take_distribution_chunk(&client_key(2), &request, &Fingerprint::of(b"base state"), 0)
             .expect("readable")
             .expect("owed")
             .1;
         let replayed = fixture
             .registry
-            .take_distribution_chunk(&client_key(2), &request, 0)
+            .take_distribution_chunk(&client_key(2), &request, &Fingerprint::of(b"base state"), 0)
             .expect("readable")
             .expect("owed")
             .1;
@@ -1531,7 +1551,12 @@ mod tests {
         let request = Id16::new([7; 16]).expect("request id");
         assert!(fixture
             .registry
-            .take_distribution_chunk(&client_key(2), &request, 1_000)
+            .take_distribution_chunk(
+                &client_key(2),
+                &request,
+                &Fingerprint::of(b"base state"),
+                1_000,
+            )
             .expect("readable")
             .is_none());
         assert!(
@@ -1543,6 +1568,36 @@ mod tests {
                 .is_none(),
             "an expired transaction does not stay in the queue"
         );
+    }
+
+    /// The queue is only transport: it must not hand a client a decision
+    /// computed for a state other than the one this request signed.
+    #[test]
+    fn a_transaction_for_another_base_state_is_dropped() {
+        let mut fixture = fixture();
+        let (manifest, chunks) = distribution(&client_key(2), 1, 10_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, chunks, 0)
+            .expect("queued");
+
+        let request = Id16::new([7; 16]).expect("request id");
+        assert!(fixture
+            .registry
+            .take_distribution_chunk(
+                &client_key(2),
+                &request,
+                &Fingerprint::of(b"new local state"),
+                0,
+            )
+            .expect("readable")
+            .is_none());
+        assert!(fixture
+            .registry
+            .peer(&client_key(2))
+            .expect("peer")
+            .distribution
+            .is_none());
     }
 
     /// A transaction addressed elsewhere is refused. The manifest names its
@@ -1604,7 +1659,7 @@ mod tests {
         let request = Id16::new([7; 16]).expect("request id");
         let (manifest, chunk) = fixture
             .registry
-            .take_distribution_chunk(&client_key(2), &request, 0)
+            .take_distribution_chunk(&client_key(2), &request, &Fingerprint::of(b"base state"), 0)
             .expect("readable")
             .expect("owed");
         assert_eq!(manifest.fingerprint(), expected);

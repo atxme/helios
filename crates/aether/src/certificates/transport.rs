@@ -23,10 +23,11 @@
 //! # Why the in-tunnel request carries no challenge and no timestamp
 //!
 //! The transport already refuses replayed packets, and the request is signed
-//! over the generations and fingerprints the client currently holds. Replaying
-//! it can only ever ask for the same state again. Adding a challenge would buy
-//! nothing and would cost a round trip on the one path that must work while a
-//! client is racing an expiry.
+//! over the generations and fingerprints the client currently holds, plus the
+//! opaque fingerprint of its complete local trust state. Replaying it can only
+//! ever ask for the same compare-and-swap decision again. Adding a challenge
+//! would buy nothing and would cost a round trip on the one path that must work
+//! while a client is racing an expiry.
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,13 @@ pub struct TrustUpdateRequest {
     pub active_client_pq_certificate_fingerprint: Fingerprint,
     /// Fingerprint of the PQ certificate carried alongside this request.
     pub client_pq_certificate_fingerprint: Fingerprint,
+    /// SHA-256 of the sender's complete live trust state.
+    ///
+    /// The authority treats this as an opaque compare-and-swap token: it
+    /// copies it into the transaction manifest, and the receiver recomputes it
+    /// before commit. The authority never needs the local tombstones, pending
+    /// slots or status counters that formed its preimage (spec §8.1.1).
+    pub base_state_fingerprint: Fingerprint,
 }
 
 impl TrustUpdateRequest {
@@ -107,7 +115,8 @@ impl TrustUpdateRequest {
             .fingerprint(&self.active_gateway_certificate_fingerprint)
             .fingerprint(&self.active_client_tls_certificate_fingerprint)
             .fingerprint(&self.active_client_pq_certificate_fingerprint)
-            .fingerprint(&self.client_pq_certificate_fingerprint);
+            .fingerprint(&self.client_pq_certificate_fingerprint)
+            .fingerprint(&self.base_state_fingerprint);
         bytes.finish_signed()
     }
 }
@@ -251,9 +260,17 @@ impl TrustUpdateObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestAuthority {
-    /// Any transaction touching a CA, the service key or the gateway identity.
+    /// Reserved wire value. Online manifests carrying it are refused.
+    ///
+    /// `CA-PQ` authorizes the transition objects themselves; making it also
+    /// sign one personalized envelope per client would require the offline
+    /// companion for every recipient without granting any additional trust.
     CaPq,
-    /// A transaction limited to an ordinary client renewal.
+    /// The online coordinator of every in-tunnel manifest.
+    ///
+    /// This signature binds target, base state, ordering and atomic grouping.
+    /// Every contained object still verifies under its own normative
+    /// authority, including `CA-PQ` where required.
     AstraServiceKey,
 }
 
@@ -265,15 +282,11 @@ impl ManifestAuthority {
         }
     }
 
-    /// Whether this authority may sign a manifest containing `objects`.
-    ///
-    /// The service key covers client-scoped objects only. A manifest that
-    /// moves an anchor while being authorized by the online key would hand a
-    /// compromised Astra the fleet.
-    fn covers(self, objects: &[TrustUpdateObjectRef]) -> bool {
+    /// Whether this authority may sign an online manifest.
+    fn covers(self, _objects: &[TrustUpdateObjectRef]) -> bool {
         match self {
-            Self::CaPq => true,
-            Self::AstraServiceKey => objects.iter().all(|object| object.apply_order >= 4),
+            Self::CaPq => false,
+            Self::AstraServiceKey => true,
         }
     }
 }
@@ -678,8 +691,11 @@ impl OrionTrustUpdateDocument {
 }
 
 /// Signing side of the transport objects (see `authority::signing`).
+///
+/// Public, unlike its siblings: besides the inherent `sign` methods, it holds
+/// the transaction **builder**, which the authority calls by name.
 #[cfg(feature = "key-negotiation-signing")]
-mod signing {
+pub mod signing {
     use super::*;
     use crate::certificates::encoding::sign_ml_dsa_87;
     use crate::key_negotiation::PqCertificate;
@@ -704,6 +720,146 @@ mod signing {
         pub fn sign(mut self, authority_private_key: &[u8]) -> Result<Self, CertificateError> {
             self.signature = sign_ml_dsa_87(authority_private_key, &self.signing_bytes())?;
             Ok(self)
+        }
+    }
+
+    /// What one transaction is addressed to and bounded by.
+    ///
+    /// A struct rather than nine positional arguments: every field here is a
+    /// `u64` or a fingerprint, and a builder that took them in a row would let
+    /// two of them be swapped without the compiler noticing — on the one
+    /// object whose whole job is to say *which* peer and *which* base state.
+    pub struct TransactionPlan<'a> {
+        pub transaction_id: Id16,
+        pub trust_domain_id: TrustDomainId,
+        pub gateway_wg_public_key: WireGuardKey,
+        pub client_wg_public_key: WireGuardKey,
+        /// The opaque compare-and-swap token the client signed (§0.6).
+        pub base_state_fingerprint: Fingerprint,
+        pub created_at: u64,
+        pub expires_at: u64,
+        pub minimum_activation_at: u64,
+        pub authority_epoch: u64,
+        pub authority_private_key: &'a [u8],
+    }
+
+    /// Builds and signs one chunked transaction from an ordered object set.
+    ///
+    /// # Why this lives beside the verifier
+    ///
+    /// Every rule the receiver enforces is a rule the producer has to satisfy:
+    /// the apply order, the object index each chunk starts at, the chunk count
+    /// as a *signed statement about the split*, and the fingerprint each entry
+    /// pins. Written on the other side of the wire they would be two readings
+    /// of one contract, and the drift would only appear as a client refusing a
+    /// transaction nobody could explain.
+    ///
+    /// The objects are sorted by apply order, stably: §8.1 orders the phases,
+    /// and within a phase the caller's order is a decision this must not
+    /// silently change.
+    ///
+    /// Chunks are cut by serialized size against `chunk_budget_bytes`, because
+    /// what bounds a fragment is the response it has to fit in, not a count of
+    /// objects — one gateway identity transition is worth many revocations.
+    /// An object that does not fit alone is refused rather than split: a
+    /// fragment carries whole objects, and there is no reassembly below that
+    /// level.
+    pub fn build_transaction(
+        mut objects: Vec<TrustUpdateObject>,
+        plan: &TransactionPlan<'_>,
+        chunk_budget_bytes: usize,
+    ) -> Result<(TrustUpdateTransactionManifest, Vec<TrustUpdateChunk>), CertificateError> {
+        if objects.is_empty() {
+            return Err(CertificateError::InvalidTransaction("empty transaction"));
+        }
+        if objects.len() > MAX_TRUST_UPDATE_OBJECTS {
+            return Err(CertificateError::TooManyObjects);
+        }
+        objects.sort_by_key(TrustUpdateObject::apply_order);
+
+        // The ranges first: the chunk count is signed, so it has to be known
+        // before the manifest exists — and the manifest fingerprint has to
+        // exist before any chunk can name it.
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        let mut start = 0usize;
+        let mut used = 0usize;
+        for (index, object) in objects.iter().enumerate() {
+            let size = serde_json::to_vec(object)
+                .map_err(|_| CertificateError::InvalidTransaction("object encoding"))?
+                .len();
+            if size > chunk_budget_bytes {
+                return Err(CertificateError::InvalidTransaction("object too large"));
+            }
+            if index > start && used + size > chunk_budget_bytes {
+                ranges.push((start as u16, (index - start) as u16));
+                start = index;
+                used = 0;
+            }
+            used += size;
+        }
+        ranges.push((start as u16, (objects.len() - start) as u16));
+        let chunk_count = u16::try_from(ranges.len())
+            .map_err(|_| CertificateError::InvalidTransaction("chunk count"))?;
+
+        let mut refs = Vec::with_capacity(objects.len());
+        for object in &objects {
+            refs.push(TrustUpdateObjectRef {
+                apply_order: object.apply_order(),
+                object_fingerprint: object.fingerprint()?,
+                // Every earlier index, which is exactly what the apply order
+                // means once the set is sorted: an object depends on
+                // everything the receiver must already have installed.
+                prerequisite_bitmap: prerequisites(refs.len()),
+            });
+        }
+
+        let manifest = TrustUpdateTransactionManifest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            transaction_id: plan.transaction_id,
+            trust_domain_id: plan.trust_domain_id,
+            gateway_wg_public_key: plan.gateway_wg_public_key,
+            client_wg_public_key: plan.client_wg_public_key,
+            base_state_fingerprint: plan.base_state_fingerprint,
+            created_at: plan.created_at,
+            expires_at: plan.expires_at,
+            minimum_activation_at: plan.minimum_activation_at,
+            chunk_count,
+            objects: refs,
+            // §0.6: every online manifest is coordinated by the service key.
+            // The objects keep their own normative signatures.
+            manifest_authority_kind: ManifestAuthority::AstraServiceKey,
+            manifest_authority_epoch: plan.authority_epoch,
+            signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(plan.authority_private_key)?;
+
+        let manifest_fingerprint = manifest.fingerprint();
+        let chunks = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(index, (first, len))| TrustUpdateChunk {
+                manifest_fingerprint,
+                chunk_index: index as u16,
+                chunk_count,
+                first_object_index: first,
+                objects: objects[usize::from(first)..usize::from(first) + usize::from(len)]
+                    .to_vec(),
+            })
+            .collect();
+        Ok((manifest, chunks))
+    }
+
+    /// Every index strictly below `index`, as a bitmap.
+    ///
+    /// Saturating at 64 rather than wrapping: the object ceiling is
+    /// [`MAX_TRUST_UPDATE_OBJECTS`], so the shift never overflows in practice,
+    /// and a silent wrap would claim an object depends on nothing.
+    const fn prerequisites(index: usize) -> u64 {
+        if index >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << index) - 1
         }
     }
 
@@ -788,7 +944,7 @@ mod tests {
             minimum_activation_at: 9_000,
             chunk_count,
             objects: refs,
-            manifest_authority_kind: ManifestAuthority::CaPq,
+            manifest_authority_kind: ManifestAuthority::AstraServiceKey,
             manifest_authority_epoch: 1,
             signature: MlDsa87Signature::new(vec![0; 4627]).unwrap(),
         };
@@ -810,6 +966,154 @@ mod tests {
             &Fingerprint::of(b"base state"),
             now,
         )
+    }
+
+    /// The builder and the verifier are one contract: what it emits has to
+    /// pass every check the receiver runs, reassemble in order, and land on
+    /// the exact base state the client signed.
+    #[test]
+    fn a_built_transaction_verifies_and_reassembles_whole() {
+        use super::signing::{build_transaction, TransactionPlan};
+
+        let authority = keys();
+        let base = Fingerprint::of(b"orion local state");
+        let objects = vec![ca_object(1), ca_object(2), ca_object(3)];
+        let plan = TransactionPlan {
+            transaction_id: Id16::new([5; 16]).expect("id"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            base_state_fingerprint: base,
+            created_at: 1_000,
+            expires_at: 8_000,
+            minimum_activation_at: 9_000,
+            authority_epoch: 1,
+            authority_private_key: &authority.private,
+        };
+        // A budget under two objects, so the split is exercised rather than
+        // assumed: a single-chunk transaction proves nothing about ranges.
+        let one_object = serde_json::to_vec(&objects[0]).expect("encode").len();
+        let (manifest, chunks) =
+            build_transaction(objects.clone(), &plan, one_object + 1).expect("built");
+
+        assert!(chunks.len() > 1, "the budget must have split this set");
+        assert_eq!(manifest.chunk_count as usize, chunks.len());
+        manifest
+            .verify(
+                &authority.public,
+                1,
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &base,
+                1_100,
+            )
+            .expect("the receiver accepts what the builder emitted");
+
+        let mut pending = PendingTrustTransaction::new(manifest);
+        for chunk in &chunks {
+            pending.accept(chunk).expect("fragment");
+        }
+        assert!(pending.is_complete());
+        assert_eq!(pending.complete().expect("complete"), objects);
+    }
+
+    /// The base state is the compare-and-swap token. A transaction built for
+    /// one snapshot must not apply to another, even one object for object.
+    #[test]
+    fn a_built_transaction_is_refused_against_another_base_state() {
+        use super::signing::{build_transaction, TransactionPlan};
+
+        let authority = keys();
+        let plan = TransactionPlan {
+            transaction_id: Id16::new([5; 16]).expect("id"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            base_state_fingerprint: Fingerprint::of(b"the state it was built for"),
+            created_at: 1_000,
+            expires_at: 8_000,
+            minimum_activation_at: 9_000,
+            authority_epoch: 1,
+            authority_private_key: &authority.private,
+        };
+        let (manifest, _) = build_transaction(vec![ca_object(1)], &plan, 64 * 1024).expect("built");
+        assert!(matches!(
+            manifest.verify(
+                &authority.public,
+                1,
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &Fingerprint::of(b"the state it moved to"),
+                1_100,
+            ),
+            Err(CertificateError::InvalidTransaction("base state moved"))
+        ));
+    }
+
+    /// A fragment carries whole objects. One that fits in no fragment is
+    /// refused here rather than emitted as a transaction nobody can read.
+    #[test]
+    fn an_object_that_fits_in_no_fragment_is_refused() {
+        use super::signing::{build_transaction, TransactionPlan};
+
+        let authority = keys();
+        let plan = TransactionPlan {
+            transaction_id: Id16::new([5; 16]).expect("id"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            base_state_fingerprint: Fingerprint::of(b"base"),
+            created_at: 1_000,
+            expires_at: 8_000,
+            minimum_activation_at: 9_000,
+            authority_epoch: 1,
+            authority_private_key: &authority.private,
+        };
+        assert!(matches!(
+            build_transaction(vec![ca_object(1)], &plan, 16),
+            Err(CertificateError::InvalidTransaction("object too large"))
+        ));
+        assert!(matches!(
+            build_transaction(Vec::new(), &plan, 64 * 1024),
+            Err(CertificateError::InvalidTransaction("empty transaction"))
+        ));
+    }
+
+    /// The opaque CAS token is part of the client's signature. A gateway may
+    /// relay it, but cannot retarget the future manifest to another local
+    /// state without invalidating the request first.
+    #[test]
+    fn the_base_state_fingerprint_is_bound_into_the_client_request() {
+        let signer = keys();
+        let mut request = TrustUpdateRequest {
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            request_id: Id16::new([3; 16]).expect("request"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            ca_epoch: 1,
+            ca_tls_epoch: 2,
+            astra_service_key_epoch: 3,
+            issuer_epoch: 4,
+            active_gateway_identity_epoch: 5,
+            gateway_decision_epoch: 6,
+            client_identity_generation: 7,
+            active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"gateway tls"),
+            active_gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq"),
+            active_client_tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+            active_client_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+            client_pq_certificate_fingerprint: Fingerprint::of(b"presented pq"),
+            base_state_fingerprint: Fingerprint::of(b"local state"),
+        };
+        let signature =
+            sign_ml_dsa_87(&signer.private, &request.signing_bytes()).expect("signature");
+        verify_ml_dsa_87(&signer.public, &request.signing_bytes(), &signature)
+            .expect("original request");
+
+        request.base_state_fingerprint = Fingerprint::of(b"another local state");
+        assert!(verify_ml_dsa_87(&signer.public, &request.signing_bytes(), &signature).is_err());
     }
 
     /// Nothing is visible until every chunk has landed — the property the
@@ -966,13 +1270,22 @@ mod tests {
         ));
     }
 
-    /// The online service key may not authorize a manifest that moves an
-    /// anchor: that is exactly the power the delegation exists to withhold.
+    /// The service key coordinates an anchor object but does not authorize it:
+    /// the object's own `CA-PQ` signatures remain independently mandatory.
     #[test]
-    fn the_astra_service_key_cannot_sign_an_anchor_moving_manifest() {
+    fn the_astra_service_key_can_coordinate_an_anchor_object() {
+        let authority = keys();
+        let manifest = manifest(&authority, &[ca_object(1)], 1);
+        assert!(verify_manifest(&manifest, &authority, 1_100).is_ok());
+    }
+
+    /// `CA-PQ` signs transition objects and offline documents, never a
+    /// personalized online envelope.
+    #[test]
+    fn the_ca_pq_manifest_authority_is_reserved_online() {
         let authority = keys();
         let mut manifest = manifest(&authority, &[ca_object(1)], 1);
-        manifest.manifest_authority_kind = ManifestAuthority::AstraServiceKey;
+        manifest.manifest_authority_kind = ManifestAuthority::CaPq;
         manifest.signature = sign_ml_dsa_87(&authority.private, &manifest.signing_bytes()).unwrap();
         assert!(matches!(
             verify_manifest(&manifest, &authority, 1_100),

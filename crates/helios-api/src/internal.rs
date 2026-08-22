@@ -1043,6 +1043,17 @@ pub const ROTATION_SIGNER_REQUEST_ROUTE: &str =
 pub const ROTATION_SIGNER_RESULT_ROUTE: &str =
     "/internal/v1/client-rotation/signer-results/:operation";
 
+/// The second prefix Astra's private listener serves (spec §0.6).
+///
+/// Its own prefix rather than a fifth route under the rotation one: a renewal
+/// is about a peer asking to be re-certified, a preparation is about a peer
+/// being behind on the domain's trust. They share a link, not a subject, and
+/// naming them together would make the refusal log unable to say which surface
+/// was probed.
+pub const ASTRA_TRUST_UPDATE_PREFIX: &str = "/internal/v1/trust-update/";
+
+pub const TRUST_UPDATE_PREPARE_PATH: &str = "/internal/v1/trust-update/prepare";
+
 /// The name the gateway puts in SNI when it dials Astra.
 ///
 /// A second constant rather than a reuse of [`INTERNAL_SERVER_NAME`]: the two
@@ -1072,6 +1083,53 @@ pub struct RelayedRotationRequest {
     pub request: Box<aether::certificates::client::ClientCertificateRotationRequest>,
 }
 
+/// What the gateway relays when a peer is behind and its queue holds nothing
+/// built for the state that peer signed (spec §0.6).
+///
+/// Three things, and deliberately not a fourth: the client's own authenticated
+/// request, the gateway's resolution of who is asking, and the peer snapshot
+/// the registry already holds. No method, no path, no header of the client's —
+/// the gateway builds a canonical object and relays that, so a request the
+/// authority acts on is never a request a client shaped.
+///
+/// The peer snapshot travels because the authority does not hold the gateway's
+/// admission state: it is the same view `GET /internal/v1/certificates/state`
+/// already publishes, and it is what lets the authority check the request's
+/// signature against the generation the **domain** holds rather than one the
+/// request supplied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedTrustUpdatePreparation {
+    pub caller_wg_public_key: WireGuardKey,
+    pub request: Box<aether::certificates::transport::AuthenticatedTrustUpdateRequest>,
+    pub peer: Box<PeerCertificateStateView>,
+}
+
+/// What the authority answers a preparation with.
+///
+/// `None` is a legitimate answer and not an error: the gateway's comparison
+/// and the authority's registry can disagree about what «behind» means — the
+/// gateway compares its own counters, the authority holds the objects — and a
+/// disagreement resolves as «nothing to distribute», never as a fabricated
+/// transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedTrustUpdate {
+    pub transaction: Option<PreparedTrustUpdateTransaction>,
+}
+
+/// One manifest and every fragment of it, ready to be queued.
+///
+/// The whole set in one answer: the gateway's queue holds a complete
+/// transaction or none, so streaming the fragments over several calls would
+/// only create a half-queued state neither end could describe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedTrustUpdateTransaction {
+    pub manifest: aether::certificates::transport::TrustUpdateTransactionManifest,
+    pub chunks: Vec<aether::certificates::transport::TrustUpdateChunk>,
+}
+
 /// A read of one operation, on behalf of one caller.
 ///
 /// The caller travels with every read for the same reason it travels with the
@@ -1093,6 +1151,23 @@ pub struct RelayedOperationQuery {
 pub struct ClientRenewalSignerResult {
     pub caller_wg_public_key: WireGuardKey,
     pub approval: Box<aether::certificates::approval::AstraRenewalApproval>,
+}
+
+/// The gateway's door to the authority's transaction producer (spec §0.6).
+///
+/// A trait rather than the concrete client, for the same reason
+/// [`AstraChannelHandler`] is one: the certificate service owns a registry
+/// lock and no transport, and giving it a `reqwest`-shaped dependency would
+/// make every one of its tests need a listener. It is also what lets a gateway
+/// deployed **without** an authority hold `None` and answer exactly as it does
+/// today.
+#[async_trait]
+pub trait TrustUpdatePreparer: Send + Sync {
+    /// Asks the authority for the transaction this peer is missing.
+    async fn prepare(
+        &self,
+        relayed: &RelayedTrustUpdatePreparation,
+    ) -> Result<PreparedTrustUpdate, TrustUpdateRefusal>;
 }
 
 /// The gateway's typed client for Astra's private routes.
@@ -1122,6 +1197,14 @@ impl AstraLifecycleClient {
         relayed: &RelayedRotationRequest,
     ) -> Result<ClientRenewalOperationView, ChannelError> {
         self.post(ROTATION_REQUEST_PATH, relayed, None).await
+    }
+
+    /// Asks the authority to build the transaction this peer is missing.
+    pub async fn prepare_trust_update(
+        &self,
+        relayed: &RelayedTrustUpdatePreparation,
+    ) -> Result<PreparedTrustUpdate, ChannelError> {
+        self.post(TRUST_UPDATE_PREPARE_PATH, relayed, None).await
     }
 
     /// Reads one operation on behalf of the peer that owns it.

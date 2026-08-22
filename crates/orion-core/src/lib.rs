@@ -37,6 +37,7 @@ pub mod profile_import;
 pub mod provisioning;
 pub mod speedtest;
 pub mod telemetry;
+pub mod trust_update;
 pub mod vault;
 
 pub use backend::{default_backend, EventSink, VpnBackend, VpnController, HANDSHAKE_STALE_AFTER};

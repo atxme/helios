@@ -810,6 +810,7 @@ mod tests {
                 active_client_tls_certificate_fingerprint: Fingerprint::of(b"c"),
                 active_client_pq_certificate_fingerprint: Fingerprint::of(b"d"),
                 client_pq_certificate_fingerprint: Fingerprint::of(b"e"),
+                base_state_fingerprint: Fingerprint::of(b"base state"),
             },
             certificate: PqCertificate {
                 version: PQ_CERTIFICATE_VERSION,

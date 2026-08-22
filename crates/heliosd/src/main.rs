@@ -1359,11 +1359,21 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // signs its receipts through the negotiation handler — the same leaf
         // the client already pins, unsealed once — and it is the single owner
         // of the registry: a second one would give one slot two writers.
+        // Built before the service, and shared with it: the same veth client
+        // serves the four renewal routes and the trust-update producer, and a
+        // second one would open a second connection to say the same thing.
+        let authority = astra_channel::relay().map(Arc::new);
         match registry.map(|registry| {
-            Arc::new(certificates::CertificateService::new(
+            let service = certificates::CertificateService::new(
                 registry,
                 Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
-            ))
+            );
+            Arc::new(match &authority {
+                Some(relay) => service.with_authority(
+                    Arc::clone(relay) as Arc<dyn helios_api::internal::TrustUpdatePreparer>
+                ),
+                None => service,
+            })
         }) {
             Some(service) => {
                 info!("certificate lifecycle ready");
@@ -1390,8 +1400,8 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
                 // no way to dial the authority, and in that state the
                 // trust-update route must keep working while the renewal
                 // routes report the authority unreachable.
-                if let Some(relay) = astra_channel::relay() {
-                    state = state.with_client_renewal(Arc::new(relay));
+                if let Some(relay) = authority {
+                    state = state.with_client_renewal(relay);
                 }
                 state = state.with_trust_update(service);
             }

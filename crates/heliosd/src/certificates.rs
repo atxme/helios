@@ -110,11 +110,95 @@ pub type SharedRegistry = Arc<Mutex<CertificateRegistry>>;
 pub struct CertificateService {
     registry: SharedRegistry,
     signer: Arc<dyn StageReceiptSigner>,
+    /// The authority's transaction producer, when this gateway has one.
+    ///
+    /// `None` on a gateway deployed without Astra, and that is a supported
+    /// shape, not a degraded one: such a domain distributes nothing, so a
+    /// lagging client is told the authority has queued nothing — the same
+    /// answer, reached without a call that could not succeed.
+    authority: Option<Arc<dyn helios_api::internal::TrustUpdatePreparer>>,
 }
 
 impl CertificateService {
     pub fn new(registry: SharedRegistry, signer: Arc<dyn StageReceiptSigner>) -> Self {
-        Self { registry, signer }
+        Self {
+            registry,
+            signer,
+            authority: None,
+        }
+    }
+
+    /// The same service, able to ask the authority to build a transaction.
+    pub fn with_authority(
+        mut self,
+        authority: Arc<dyn helios_api::internal::TrustUpdatePreparer>,
+    ) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// Asks the authority to build what this lagging peer is missing, and
+    /// queues it (spec §0.6).
+    ///
+    /// Every failure is swallowed into a log line rather than returned: the
+    /// caller's next act is to read the queue again, and an empty queue is
+    /// already the answer this path produces when nothing can be prepared. A
+    /// distinct error here would only turn "the authority is down" into a
+    /// second refusal class the client cannot act on differently.
+    ///
+    /// What is relayed is a **canonical object this gateway builds**: the
+    /// client's authenticated request, the caller resolved from the source
+    /// VIP, and the peer snapshot the registry holds. Never the client's
+    /// method, path or headers.
+    async fn prepare_from_authority(
+        &self,
+        caller: &WireGuardKey,
+        request: &aether::certificates::transport::AuthenticatedTrustUpdateRequest,
+        now: u64,
+    ) -> Result<(), TrustUpdateRefusal> {
+        let Some(authority) = &self.authority else {
+            return Ok(());
+        };
+        let peer = {
+            let registry = self.registry.lock().await;
+            let peer = registry.peer(caller).ok_or(TrustUpdateRefusal::Rejected)?;
+            helios_api::internal::PeerCertificateStateView {
+                name: peer.name.clone(),
+                state: peer.state.clone(),
+                active_pq_certificate: peer.active_pq_certificate.clone(),
+            }
+        };
+        let relayed = helios_api::internal::RelayedTrustUpdatePreparation {
+            caller_wg_public_key: *caller,
+            request: Box::new(request.clone()),
+            peer: Box::new(peer),
+        };
+        let prepared = match authority.prepare(&relayed).await {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                tracing::warn!(
+                    peer = %caller, ?refusal,
+                    "the authority refused to prepare a transaction for this peer"
+                );
+                return Ok(());
+            }
+        };
+        let Some(transaction) = prepared.transaction else {
+            return Ok(());
+        };
+        let mut registry = self.registry.lock().await;
+        if let Err(error) =
+            registry.stage_distribution(caller, transaction.manifest, transaction.chunks, now)
+        {
+            // The authority built something this gateway will not queue. That
+            // is a disagreement worth naming: the two ends hold the same
+            // registry contract, and a refusal here means one of them moved.
+            tracing::error!(
+                peer = %caller, %error,
+                "the authority prepared a transaction this gateway refused to queue"
+            );
+        }
+        Ok(())
     }
 
     /// Records a peer's first generation, from the leaves admission carried.
@@ -991,11 +1075,43 @@ impl TrustUpdateHandler for CertificateService {
         drop(registry);
         let mut registry = self.registry.lock().await;
         let served = registry
-            .take_distribution_chunk(&caller, &request_id, now)
+            .take_distribution_chunk(
+                &caller,
+                &request_id,
+                &request.request.base_state_fingerprint,
+                now,
+            )
             .map_err(|error| {
                 tracing::warn!(peer = %caller_wg_public_key, %error, "trust distribution unreadable");
                 classify(error)
             })?;
+        let served = match served {
+            Some(served) => Some(served),
+            // Nothing queued for this exact base state — either nothing was
+            // ever queued, or what was queued described a state this client
+            // has since left and the read above dropped it. Both mean the same
+            // thing: ask the authority to build one for the state this request
+            // signed (§0.6).
+            None => {
+                drop(registry);
+                self.prepare_from_authority(&caller, &request, now).await?;
+                let mut registry = self.registry.lock().await;
+                registry
+                    .take_distribution_chunk(
+                        &caller,
+                        &request_id,
+                        &request.request.base_state_fingerprint,
+                        now,
+                    )
+                    .map_err(|error| {
+                        tracing::warn!(
+                            peer = %caller_wg_public_key, %error,
+                            "trust distribution unreadable after preparation"
+                        );
+                        classify(error)
+                    })?
+            }
+        };
         match served {
             Some((manifest, chunk)) => Ok(TrustUpdateResponse {
                 // Never a status: one is signed by Astra's service key, which
@@ -1007,14 +1123,13 @@ impl TrustUpdateHandler for CertificateService {
                 chunk: Some(chunk),
             }),
             None => {
-                // Behind, and the authority has left nothing here. Saying so
+                // Behind, and the authority has nothing for it. Saying so
                 // beats claiming the client is up to date: an empty update is
                 // the one answer a client does not recover from, because it
                 // stops asking.
                 tracing::warn!(
                     peer = %caller_wg_public_key,
-                    "trust update: the caller is behind and the authority has queued nothing \
-                     for it"
+                    "trust update: the caller is behind and the authority has nothing for it"
                 );
                 Err(TrustUpdateRefusal::Unavailable)
             }
@@ -1206,6 +1321,50 @@ mod tests {
                 .tls_certificate_fingerprint,
             active_client_pq_certificate_fingerprint: peer.state.active.pq_certificate_fingerprint,
             client_pq_certificate_fingerprint: Fingerprint::of(b"presented"),
+            base_state_fingerprint: Fingerprint::of(b"base state"),
+        }
+    }
+
+    /// A relayed request, whose signature this side never checks.
+    ///
+    /// `prepare_from_authority` relays and does not verify: the gateway
+    /// already verified the request before deciding the caller was behind, and
+    /// the authority verifies it again under the peer snapshot it is handed.
+    /// A fixture that had to produce a real signature would be testing those
+    /// two, not this one.
+    fn authenticated_request(
+        peer_key: &WireGuardKey,
+    ) -> aether::certificates::transport::AuthenticatedTrustUpdateRequest {
+        let mut state = state();
+        state.peers.insert(peer_key.to_base64(), peer());
+        let peer = state
+            .peers
+            .get(&peer_key.to_base64())
+            .expect("peer")
+            .clone();
+        aether::certificates::transport::AuthenticatedTrustUpdateRequest {
+            request: request(&state, &peer),
+            certificate: peer.active_pq_certificate.clone(),
+            ml_dsa_87_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        }
+    }
+
+    /// An authority that hands back exactly what it was built with.
+    ///
+    /// The gateway is not supposed to inspect a prepared transaction — the
+    /// registry's own `stage_distribution` is the check — so the stub answers
+    /// unconditionally and the test asserts on what the queue then holds.
+    struct StubAuthority {
+        prepared: helios_api::internal::PreparedTrustUpdate,
+    }
+
+    #[async_trait::async_trait]
+    impl helios_api::internal::TrustUpdatePreparer for StubAuthority {
+        async fn prepare(
+            &self,
+            _relayed: &helios_api::internal::RelayedTrustUpdatePreparation,
+        ) -> Result<helios_api::internal::PreparedTrustUpdate, TrustUpdateRefusal> {
+            Ok(self.prepared.clone())
         }
     }
 
@@ -1549,7 +1708,7 @@ mod tests {
             minimum_activation_at: 1_000,
             chunk_count,
             objects: Vec::new(),
-            manifest_authority_kind: ManifestAuthority::CaPq,
+            manifest_authority_kind: ManifestAuthority::AstraServiceKey,
             manifest_authority_epoch: 1,
             signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
         };
@@ -1568,6 +1727,68 @@ mod tests {
             cursor,
             last_request_id: None,
         }
+    }
+
+    /// The gateway asks the authority when its queue holds nothing, and queues
+    /// what comes back. This is the whole of the 503 fix on this side.
+    #[tokio::test]
+    async fn an_empty_queue_makes_the_gateway_ask_the_authority() {
+        let mut state = state();
+        state.peers.insert(key(2).to_base64(), peer());
+        let (service, _directory) = service(state);
+        let prepared = distribution(0, 1);
+        let service = service.with_authority(Arc::new(StubAuthority {
+            prepared: helios_api::internal::PreparedTrustUpdate {
+                transaction: Some(helios_api::internal::PreparedTrustUpdateTransaction {
+                    manifest: prepared.manifest.clone(),
+                    chunks: prepared.chunks.clone(),
+                }),
+            },
+        }));
+
+        let request = authenticated_request(&key(2));
+        service
+            .prepare_from_authority(&key(2), &request, 0)
+            .await
+            .expect("preparation");
+
+        let mut registry = service.registry.lock().await;
+        let served = registry
+            .take_distribution_chunk(
+                &key(2),
+                &Id16::new([4; 16]).expect("request id"),
+                &Fingerprint::of(b"base state"),
+                0,
+            )
+            .expect("readable")
+            .expect("the prepared transaction is queued");
+        assert_eq!(served.0.fingerprint(), prepared.manifest.fingerprint());
+    }
+
+    /// A gateway with no authority behaves exactly as before: it asks nobody
+    /// and queues nothing. A domain without Astra is a supported shape.
+    #[tokio::test]
+    async fn a_gateway_without_an_authority_asks_no_one() {
+        let mut state = state();
+        state.peers.insert(key(2).to_base64(), peer());
+        let (service, _directory) = service(state);
+
+        let request = authenticated_request(&key(2));
+        service
+            .prepare_from_authority(&key(2), &request, 0)
+            .await
+            .expect("no authority is not a failure");
+
+        let mut registry = service.registry.lock().await;
+        assert!(registry
+            .take_distribution_chunk(
+                &key(2),
+                &Id16::new([4; 16]).expect("request id"),
+                &Fingerprint::of(b"base state"),
+                0,
+            )
+            .expect("readable")
+            .is_none());
     }
 
     /// The console draws the same rungs the protocol decides on.

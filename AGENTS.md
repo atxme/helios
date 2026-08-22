@@ -155,9 +155,41 @@ Restent ouverts :
   détient ni `CA-PQ` ni la clé de service, donc tout contrôle qu'elle écrirait
   nommerait une autorité qu'elle possède, ce que la vérification du
   destinataire existe précisément pour refuser. Elle est une file, pas un
-  auteur. Reste que rien ne **dépose** encore de transaction, faute des routes
-  §8.2 et d'un constructeur de manifeste côté Astra : un client en retard
-  reçoit donc toujours `503`, jamais un « à jour » qui l'arrêterait pour de bon.
+  auteur. **Son producteur existe désormais**, et le chemin va d'un bout à
+  l'autre. L'amendement du 22 août 2026 ferme les deux questions de conception
+  qui le bloquaient. `base_state_fingerprint` reste
+  l'empreinte exhaustive du magasin local, mais Orion la porte comme jeton CAS
+  opaque dans sa requête signée ; Astra la recopie sans reconstruire les
+  tombstones, compteurs ou slots pending. Tout manifeste en ligne est signé
+  par la clé de service Astra : il décide attribution, base, ordre et atomicité,
+  jamais l'autorité d'une mutation. Les objets qui touchent une ancre, la clé
+  de service, la gateway, une révocation ou une récupération gardent leur
+  propre signature `CA-PQ`, produite une fois par `astra-signer` puis assemblée
+  dans les manifestes par client. Le type filaire porte le hash sous la
+  signature cliente, Orion refuse `ca_pq` comme autorité d'un manifeste en
+  ligne et la file gateway jette une transaction visant une autre base.
+  Le chemin livré : `aether::…::transport::signing::build_transaction` construit
+  et signe le manifeste sous la clé de service, découpe par taille sérialisée et
+  y recopie le jeton opaque ; `astra::distribution::prepare` choisit dans le
+  registre ce que les compteurs du pair disent lui manquer, après avoir vérifié
+  la signature de la requête sous la feuille PQ active que **la gateway**
+  détient — jamais sous une clé que la requête porte ;
+  `POST /internal/v1/trust-update/prepare` la sert sur le canal privé
+  Helios → Astra, sous son propre préfixe ; et la gateway, quand sa file ne
+  contient rien pour l'empreinte de base que ce client vient de signer, relaie
+  un objet **canonique qu'elle construit** — requête authentifiée, pair résolu
+  depuis la VIP source, instantané du registre —, met en file ce qui revient et
+  sert le premier fragment dans le même appel. Côté client,
+  `orion-core::trust_update` écrit la requête depuis son propre magasin,
+  empreinte de base comprise, collecte les fragments et n'applique rien avant le
+  dernier ; un manifeste qui change en cours de collecte est un conflit, pas une
+  reprise. Une gateway sans autorité garde exactement l'ancien comportement.
+  **Limite connue** : le seul objet de transition qu'Astra **stocke** est la
+  délégation `AstraIssuerAuthorization`. Les transitions de CA, d'identité
+  gateway et les révocations sont signées par `CA-PQ` dans le compagnon — §0.6
+  leur donne un chemin, le compagnon les rend une fois, liées à la campagne, et
+  Astra les persiste —, mais rien n'écrit encore ce magasin. Un pair en retard
+  uniquement sur une ancre reçoit donc toujours `503`.
   Le **bloc de confiance du §19 est enfin porté par le document** : la gateway
   le sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
   `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose — en ligne depuis

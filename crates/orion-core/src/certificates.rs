@@ -218,10 +218,13 @@ impl TrustStore {
         // manifest: a transaction that named the key which verifies it would
         // authorize itself.
         let (authority_key, authority_epoch) = match manifest.manifest_authority_kind {
-            aether::certificates::transport::ManifestAuthority::CaPq => (
-                &self.state.gateway.current_ca_public_key,
-                self.state.gateway.ca_epoch,
-            ),
+            // `CA-PQ` authorizes objects and the offline document, never an
+            // online per-client envelope (spec §0.6, §8.1.1).
+            aether::certificates::transport::ManifestAuthority::CaPq => {
+                return Err(TrustError::Certificate(
+                    CertificateError::UnauthorizedIssuer,
+                ))
+            }
             aether::certificates::transport::ManifestAuthority::AstraServiceKey => (
                 &self.state.astra.active_astra_service_public_key,
                 self.state.astra.astra_service_key_epoch,
@@ -1018,6 +1021,94 @@ mod tests {
             before,
             store.base_state_fingerprint().expect("fingerprint"),
             "the counter moved, so the state a manifest was built against did too"
+        );
+    }
+
+    /// The producer and the client meet: what `aether`'s builder emits — the
+    /// exact call Astra makes — is collected, verified and applied by the real
+    /// client, with nothing between them but the wire types.
+    ///
+    /// This is the test the 503 existed for. Every half was covered on its own
+    /// long before either could talk to the other.
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn a_transaction_built_by_the_authority_is_applied_by_the_client() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+        use aether::certificates::transport::signing::{build_transaction, TransactionPlan};
+
+        let directory = tempfile::tempdir().expect("temp");
+        let (anchor_private, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = generation(4);
+
+        let revocation = EmergencyCertificateRevocation {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: key(2),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+            revoked_tls_not_after: Some(active.not_after),
+            revoked_pq_fingerprint: None,
+            revoked_pq_not_after: None,
+            effective_at: 9_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&anchor_private)
+        .expect("sign");
+
+        // The token the client would have signed into its request, read off
+        // the very store the transaction is about to be applied to.
+        let base = store.base_state_fingerprint().expect("base state");
+        let plan = TransactionPlan {
+            transaction_id: Id16::new([5; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: key(9),
+            client_wg_public_key: key(2),
+            base_state_fingerprint: base,
+            created_at: 1_000,
+            expires_at: 5_000,
+            minimum_activation_at: 9_000,
+            authority_epoch: 1,
+            // The **service** key, not `CA-PQ`: §0.6 makes the online manifest
+            // a coordination signature. The revocation inside it still carries
+            // its own `CA-PQ` proof, which is what actually authorizes it.
+            authority_private_key: &service_private,
+        };
+        let (manifest, chunks) = build_transaction(
+            vec![TrustUpdateObject::CertificateRevocation(Box::new(
+                revocation,
+            ))],
+            &plan,
+            32 * 1024,
+        )
+        .expect("built");
+
+        let applied = store
+            .verify_and_apply_transaction(&manifest, &chunks, 1_100)
+            .expect("the client applies what the authority built");
+        assert_eq!(applied, 1);
+        assert_eq!(store.state().ledger.scheduled_revocations.len(), 1);
+
+        // And the store has moved, so the same transaction no longer applies:
+        // the compare-and-swap token is the whole point.
+        assert!(
+            store
+                .verify_and_apply_transaction(&manifest, &chunks, 1_100)
+                .is_err(),
+            "a transaction bound to a state the store has left was applied twice"
         );
     }
 

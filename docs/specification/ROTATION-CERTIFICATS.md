@@ -1,7 +1,7 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
 **Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
-(revu le 2026-08-09, amendé les 2026-08-15 et 2026-08-16). Le protocole de
+(revu le 2026-08-09, amendé les 2026-08-15, 2026-08-16 et 2026-08-22). Le protocole de
 négociation servi est déjà la v5. Le §12.3 nomme précisément ce qui est livré
 et ce qui ne l'est pas ; ne pas lire le reste de la note comme une capacité
 disponible.
@@ -69,7 +69,7 @@ de rotation de parc défini ci-dessous.
 | rotation de `CA-TLS` cliente | deux ancres au plus, transition autorisée par `CA-PQ` avant toute nouvelle leaf mTLS |
 | clé de service Astra | slot actif/suivant et transition signée par `CA-PQ`, avec preuve de la nouvelle clé et époque séquentielle |
 | statut Astra | jamais accessible par empreinte seule ; requête authentifiée dans WireGuard ou challenge public signé par la clé PQ cliente |
-| réponses fractionnées | chunks d'une même transaction signée, invisibles aux slots actifs/suivants jusqu'au commit atomique local |
+| réponses fractionnées | chunks d'une même transaction signée par la clé de service Astra, liés à l'empreinte exhaustive que le client a déclarée dans sa requête signée, invisibles aux slots actifs/suivants jusqu'au commit atomique local ; chaque objet conserve sa propre autorité normative |
 | compromission | révocation sans grâce ; si `CA-PQ` est compromise, réinitialisation hors bande |
 | commandes manuelles | Orion renouvelle un profil ou tous ses profils locaux ; Helios renouvelle les leafs du parc ou toute la chaîne ; chaque demande ou campagne porte les empreintes immuables approuvées par YubiKey |
 
@@ -144,6 +144,58 @@ type signé possède un `ctx` ML-DSA-87 non vide et exhaustivement fixé, HVLT v
 fixe AEAD, KDF, sels et AAD, la politique Astra est épinglée hors bande, les
 capacités du compagnon ont un format HKDF/HMAC exact et tout aléa provient d'un
 DRBG SP 800-90A certifié à 256 bits, semé par la plateforme en mode fail-closed.
+
+### 0.6 Amendement de production des transactions du 22 août 2026
+
+Deux exigences de §8.1.1 rendaient la production des transactions impossible,
+alors que leur transport était déjà défini : Astra ne peut pas reconstruire
+l'état local complet d'Orion, et sa partie en ligne ne détient jamais
+`CA-PQ`. Elles sont tranchées sans réduire l'anti-rollback ni déplacer une clé
+maîtresse vers la gateway.
+
+- `base_state_fingerprint` reste le SHA-256 de l'état de confiance **local
+  complet** d'Orion. Il n'est ni remplacé par les seuls compteurs du registre,
+  ni recalculé par Astra. Orion le place dans
+  `AuthenticatedTrustUpdateRequest`, donc sous la signature de sa leaf PQ
+  présentée. Astra le traite comme un jeton opaque de comparaison-et-échange,
+  le recopie dans le manifeste et n'a besoin d'en connaître aucun préimage.
+  Au commit, Orion le recalcule sur son état vivant ; toute mutation intervenue
+  depuis la requête invalide la transaction entière et provoque une nouvelle
+  demande avec une nouvelle empreinte ;
+- quand Helios constate que le client est en retard et ne détient aucune
+  transaction correspondant à cette empreinte, il relaie une demande de
+  préparation **typée** vers Astra sur le canal privé Helios → Astra. Le relais
+  contient la requête cliente authentifiée et le snapshot de pair que le
+  registre gateway possède déjà ; il ne relaie ni méthode, ni chemin, ni
+  en-tête du client. Astra sélectionne les objets depuis ses registres, lie la
+  réponse à l'empreinte opaque et rend une transaction que Helios place dans
+  la file existante. Un même `request_id` et les mêmes octets rendent la même
+  décision ; le même identifiant avec d'autres octets est un conflit ;
+- tout `TrustUpdateTransactionManifest` servi **en ligne** est signé par la
+  clé de service Astra active. Le manifeste autorise l'attribution à un pair,
+  le snapshot de base, l'ordre, les dépendances et l'atomicité ; il n'autorise
+  aucune mutation de confiance. Chaque objet conserve sa signature normative :
+  une transition de CA ou de clé de service, une identité gateway, une
+  révocation ou une récupération porte toujours la preuve `CA-PQ` exigée par
+  sa propre machine d'état. La valeur `ca_pq` de `manifest_authority_kind` est
+  réservée et refusée pour ce canal ; le document hors ligne de §8.4 conserve
+  sa signature globale `CA-PQ` ;
+- pour une campagne qui touche une ancre, `astra-signer` ouvre le coffre et
+  rend les **objets de transition signés une fois**, liés à la campagne. Astra
+  les vérifie et les persiste, puis sa clé de service construit autant de
+  manifestes par client que nécessaire. Le compagnon ne signe donc jamais un
+  manifeste par destinataire, et Astra ne reçoit jamais une clé privée de CA.
+
+La compromission de la clé de service peut toujours retarder, omettre ou
+réordonner la livraison — disponibilité déjà dans son périmètre — mais elle ne
+peut fabriquer aucun objet de transition. Les compteurs, fenêtres, portées et
+signatures propres des objets continuent de décider ce qu'Orion peut publier.
+
+**Migration filaire** : le champ ajouté appartient à la transcription signée
+v5 et le décodeur strict refuse une requête qui ne le porte pas. Aucun client
+ne produisait encore cette requête en exploitation au moment de l'amendement ;
+il n'existe donc pas de transaction distribuée à préserver ni de forme
+historique à négocier.
 
 ## 1. Périmètre
 
@@ -1546,9 +1598,13 @@ d'une génération admissible à l'instant courant et une signature ML-DSA-87.
 La requête contient un `request_id` de 16 octets produit selon §2.3.2 — la
 valeur nulle est refusée à la réception sans tenir lieu de contrôle du DRBG —,
 les identités WireGuard, les générations connues et les empreintes actives.
-Elle ne contient ni challenge public, ni horodatage : l'anti-rejeu du transport
-WireGuard protège le paquet, et les générations ainsi que les empreintes
-signées empêchent tout rollback de l'état applicatif. La signature couvre :
+Elle contient aussi `base_state_fingerprint`, empreinte de l'état local complet
+calculée par Orion selon la forme canonique ci-dessous. Astra la traite comme
+un jeton opaque : sa présence sous la signature du client suffit à lier la
+décision au magasin qui la recevra. Elle ne contient ni challenge public, ni
+horodatage : l'anti-rejeu du transport WireGuard protège le paquet, et les
+générations ainsi que les empreintes signées empêchent tout rollback de l'état
+applicatif. La signature couvre :
 
 ```text
 AuthenticatedTrustUpdateRequest {
@@ -1578,6 +1634,7 @@ signature :
 || active_client_tls_certificate_fingerprint:32
 || active_client_pq_certificate_fingerprint:32
 || client_pq_certificate_fingerprint:32
+|| base_state_fingerprint:32
 ```
 
 Les trois empreintes clientes ont des rôles distincts. Les champs
@@ -1592,6 +1649,14 @@ elle peut être celle de `next`, mais seulement à partir de `activation_at`,
 tandis que les deux champs `active_*` continuent de décrire l'ancien slot
 jusqu'à sa promotion atomique.
 
+`base_state_fingerprint` n'est pas une seconde description de ces champs. Les
+compteurs et empreintes explicites permettent à Helios et Astra de déterminer
+les objets manquants ; l'empreinte exhaustive protège la comparaison finale
+contre tout état local non transporté — tombstones, statuts déjà vus,
+révocations différées, slots pending et fenêtres. Un client ne peut mentir sur
+cette valeur qu'à lui-même : le manifeste ainsi produit ne committera que sur
+le magasin qui hache vers cette valeur.
+
 La gateway exige que le pair WireGuard résolu, le certificat PQ présenté, sa
 génération retrouvée par son empreinte et le snapshot TLS/PQ désignent cet
 unique état autorisé. Elle refuse un snapshot actif mélangé, une leaf présentée
@@ -1602,27 +1667,46 @@ borne opérationnelle et non la défense anti-rejeu principale. Les objets de
 réponse restent rejouables sans rollback grâce à leurs générations et
 signatures.
 
-La réponse `200 OK` contient le statut Astra signé de l'identité cliente et,
-facultativement, un `TrustUpdateChunk`; l'absence de chunk signifie que la
-confiance est à jour. Tous les objets sont pré-signés par Astra ou l'autorité
-maîtresse ; la gateway n'appelle jamais une clé CA et ne réalise aucune
-signature de CA à la demande. Les erreurs HTTP sont volontairement grossières :
+La réponse `200 OK` contient facultativement un manifeste et son
+`TrustUpdateChunk`; leur absence signifie que la confiance est à jour. Elle ne
+contient pas de statut Astra signé : la gateway ne détient pas la clé de
+service et ne fabrique aucune fraîcheur. Tous les objets sont pré-signés par
+Astra ou l'autorité maîtresse ; la gateway n'appelle jamais une clé CA et ne
+réalise aucune signature de CA à la demande. Si le client est en retard et
+qu'aucune transaction liée à son `base_state_fingerprint` n'est en file,
+Helios remet la requête authentifiée et son propre snapshot de pair à la route
+privée typée de préparation :
+
+```text
+POST https://<adresse-veth-Astra>:8445/internal/v1/trust-update/prepare
+```
+
+Le corps est un `RelayedTrustUpdatePreparation` construit par Helios : clé du
+pair résolue depuis la VIP, `AuthenticatedTrustUpdateRequest` exacte et
+`PeerCertificateStateView` lu sous le même verrou que la décision « en
+retard ». Astra compare les trois copies de l'identité et refuse tout écart.
+La réponse est soit une `TrustDistribution` complète que Helios place dans sa
+file, soit un refus grossier ; elle n'est jamais un proxy HTTP. Une
+indisponibilité d'Astra ou l'absence d'un objet d'autorité déjà signé rend
+`503`, jamais un faux « à jour ». Les erreurs HTTP sont volontairement
+grossières :
 `400` pour le JSON ou la version, `401` si la source n'est pas un pair admis,
 `403` pour une identité, un certificat ou une signature refusés, `413` au-delà
 de 32 Kio, `415` hors JSON et `500` après une erreur interne. Le motif détaillé
 reste dans le journal protégé de la gateway.
 
 Une suite qui ne tient pas dans 64 Kio reste **une seule transaction logique**.
-Son `TrustUpdateTransactionManifest` contient un `transaction_id`, la cible et
-son snapshot complet de compteurs et d'empreintes, `created_at`, `expires_at`,
+Son `TrustUpdateTransactionManifest` contient un `transaction_id`, la cible,
+le `base_state_fingerprint` déclaré par cette cible, `created_at`, `expires_at`,
 `chunk_count`, la liste ordonnée des empreintes d'objets, leurs dépendances,
-l'instant d'activation minimal et l'autorité du manifeste. Une transaction qui
-touche CA, clé de service ou identité gateway est signée par `CA-PQ`; une
-transaction limitée à un renouvellement client ordinaire peut être signée par
-la clé de service Astra active. La signature couvre le manifeste canonique
-complet. Chaque chunk répète son empreinte, porte son index et contient des
-objets complets contigus ; un objet individuel encodé au-delà de 60 Kio est
-refusé à l'émission et n'est jamais fragmenté.
+l'instant d'activation minimal et l'autorité du manifeste. Sur le canal en
+ligne, cette autorité est toujours la clé de service Astra active. Sa signature
+couvre le manifeste canonique complet, mais ne remplace jamais les signatures
+propres des objets : toucher une CA, la clé de service ou l'identité gateway
+continue d'exiger l'objet `CA-PQ` correspondant, produit par le compagnon si le
+coffre est nécessaire. Chaque chunk répète son empreinte, porte son index et
+contient des objets complets contigus ; un objet individuel encodé au-delà de
+60 Kio est refusé à l'émission et n'est jamais fragmenté.
 
 ```text
 "helios-trust-update-transaction-manifest-v5"
@@ -1644,11 +1728,15 @@ refusé à l'émission et n'est jamais fragmenté.
 ```
 
 `base_state_canonical` contient tous les compteurs et empreintes actives,
-suivantes, pending et tombstones connus de la cible. `prerequisite_bitmap`
-référence uniquement des objets d'indice inférieur, `object_count` est borné à
-64 et les bits hors de cette borne sont refusés. Le manifeste et chaque objet
-ont leur signature propre ; le chunk est lié par les empreintes du manifeste
-et des objets.
+suivantes, pending et tombstones connus **localement par Orion**. Seul son hash
+voyage ; Astra ne reconstruit ni n'adopte ce préimage. Pour une transaction en
+ligne, `manifest_authority_kind` vaut obligatoirement `astra_service_key` et
+son époque est celle que le client déclare encore active. La valeur `ca_pq` est
+réservée et refusée dans ce type de réponse. `prerequisite_bitmap` référence
+uniquement des objets d'indice inférieur, `object_count` est borné à 64 et les
+bits hors de cette borne sont refusés. Le manifeste et chaque objet ont leur
+signature propre ; le chunk est lié par les empreintes du manifeste et des
+objets.
 
 Orion vérifie le manifeste sous une autorité déjà fiable, puis stocke les
 chunks dans un espace `pending_transaction` invisible aux slots actifs et
@@ -2688,28 +2776,32 @@ contournés :
   `authorize-issuer` et `rotate-ca-pq` lisent encore une demande sur disque :
   elles ne portent aucune campagne, donc rien ne les rattache à une opération,
   et les jetons du §8.2 sont liés à une opération et à un manifeste ;
-- la **production** des transactions de transition. Leur distribution, elle,
-  est livrée : `POST /internal/v1/certificates/distribution` sur le veth prend
-  une transaction signée adressée à un pair, la gateway la met en file dans son
-  registre, et `trust-update` en rend un fragment par requête fraîche — le
-  manifeste accompagnant **chaque** fragment, pour qu'un client qui a perdu sa
-  copie puisse encore les attribuer. Un `request_id` rejoué reçoit le même
-  fragment : avancer sur une retransmission ferait sauter un chunk sur un lien
-  qui perd, et le client interrogerait indéfiniment une transaction qu'il ne
-  peut plus compléter. La gateway ne vérifie **aucune** signature ici, et c'est
-  la conception : elle ne détient ni `CA-PQ` ni la clé de service, donc tout
-  contrôle qu'elle écrirait devrait nommer une autorité qu'elle possède —
-  exactement la substitution que la vérification du destinataire existe pour
-  refuser. Elle vérifie l'adressage, la cohérence du jeu de fragments et
-  l'échéance ; Orion vérifie les signatures sous ses propres ancres.
-  Ce qui manque en amont : rien ne **dépose** encore de transaction. Une
-  campagne s'ouvre et s'approuve désormais de bout en bout — `astra campaign
-  open`, puis les routes du §8.2 —, mais l'approbation obtenue n'est pas encore
-  transformée en objets : il faut qu'Astra bâtisse par client un manifeste
-  signé, ce que seule la clé de service (objets clients uniquement) ou le
-  compagnon (tout le reste) peut faire. Tant que rien n'est déposé, un client
-  en retard reçoit toujours `503`, et jamais un « à jour » qui l'arrêterait
-  pour de bon.
+- la **production** des transactions de transition, pour les objets qu'aucune
+  cérémonie hors ligne ne signe. Le chemin complet du §0.6 est livré :
+  `aether::certificates::transport::signing::build_transaction` construit et
+  signe un manifeste sous la clé de service, découpe les objets en fragments
+  par taille sérialisée et y recopie le jeton opaque du client ;
+  `astra::distribution::prepare` sélectionne dans le registre ce que les
+  compteurs du pair disent lui manquer, après avoir vérifié la signature de la
+  requête sous la feuille PQ active que **la gateway** détient — jamais sous
+  une clé que la requête porte ; `POST /internal/v1/trust-update/prepare` sert
+  cette préparation sur le canal privé Helios → Astra, sous son propre préfixe ;
+  et la gateway, quand sa file ne contient rien pour l'empreinte de base que ce
+  client vient de signer, relaie un objet **canonique qu'elle construit** — la
+  requête authentifiée, le pair qu'elle a résolu depuis la VIP source, et
+  l'instantané que son registre possède déjà —, met en file ce qui revient et
+  sert le premier fragment dans le même appel. Côté client,
+  `orion_core::trust_update` écrit la requête depuis son propre magasin,
+  empreinte de base comprise, collecte les fragments et n'applique rien avant
+  le dernier — un manifeste qui change en cours de collecte est un conflit, pas
+  une reprise.
+  **Limite connue** : le seul objet de transition que cette autorité **stocke**
+  est la délégation `AstraIssuerAuthorization`. Les transitions de CA, d'identité
+  gateway et les révocations sont signées par `CA-PQ` dans le compagnon, et
+  §0.6 leur donne un chemin — le compagnon les rend **une fois**, liées à la
+  campagne, et Astra les persiste — mais rien n'écrit encore ce magasin. Un pair
+  en retard uniquement sur une ancre reçoit donc toujours `503`, et jamais un
+  « à jour » qui l'arrêterait pour de bon.
   La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
   statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
   ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche

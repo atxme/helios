@@ -558,6 +558,27 @@ impl AstraRenewalRelay {
 }
 
 #[async_trait::async_trait]
+impl helios_api::internal::TrustUpdatePreparer for AstraRenewalRelay {
+    /// Relays one preparation and hands back whatever the authority built.
+    ///
+    /// The same coarse-class mapping as every other relayed call: this end
+    /// decides nothing, and a finer reason on a route a peer can reach would
+    /// be an oracle about the domain's state.
+    async fn prepare(
+        &self,
+        relayed: &helios_api::internal::RelayedTrustUpdatePreparation,
+    ) -> Result<
+        helios_api::internal::PreparedTrustUpdate,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .prepare_trust_update(relayed)
+            .await
+            .map_err(|error| Self::refuse(helios_api::internal::TRUST_UPDATE_PREPARE_PATH, error))
+    }
+}
+
+#[async_trait::async_trait]
 impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
     async fn open(
         &self,
