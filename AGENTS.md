@@ -211,7 +211,30 @@ Restent ouverts :
   part. `astra campaign open` fait la résolution localement.
   `client-rotation/recovery` reste en `501` pour sa propre raison : le
   validateur historique du §7.5.
-  Restent ouverts : la récupération d'une identité expirée ;
+  **Les deux familles d'approbation du §7.2 existent maintenant, et un objet ne
+  peut plus les mélanger.** Une rotation ordinaire est approuvée pour *une*
+  demande qui existe déjà ; une campagne l'est pour un jeu de cibles avant
+  qu'aucune n'ait écrit de demande — donc pas les mêmes documents, et pas la
+  même liaison : `AstraRenewalApprovalEvidence` lie une empreinte de demande,
+  `AstraCampaignApprovalEvidence` lie **l'état courant de la cible**.
+  `covers_client` exige la clé WireGuard, la génération et les deux empreintes
+  actives exactes : une approbation ne se rejoue donc pas d'une génération sur
+  la suivante — sans quoi une seule touche renouvellerait un pair indéfiniment,
+  une fois par génération —, et une campagne `trust_authorities` n'autorise
+  aucune rotation cliente. Le registre de credentials voyage avec l'évidence et
+  est vérifié sous le `CA-PQ` déjà épinglé ; l'origine WebAuthn voyage aussi, et
+  n'est admise que si elle appartient au relying party épinglé. `authorize_stage`
+  ne reçoit plus une raison **et** une évidence mais `DelegatedApproval`, dont la
+  raison est *dérivée* de la famille : les deux ne peuvent plus se contredire, et
+  les quatre raisons interdites à l'émetteur délégué ne sont plus exprimables.
+  Staging et commit côté gateway choisissent le contrôle sur la **raison
+  signée**, jamais sur le champ rempli, et exigent l'absence de l'autre famille.
+  Ce qui manque au-dessus est l'**exécuteur** : `astra::renewal` ouvre un
+  renouvellement par pair autour d'une approbation ordinaire, et une campagne est
+  la forme inverse — une approbation, plusieurs pairs. `ReasonNotDelegable` le
+  refuse en le disant.
+  Restent ouverts : l'exécution d'une campagne approuvée ; la récupération d'une
+  identité expirée ;
   `authorize-issuer` et `rotate-ca-pq`, qui ne portent aucune campagne et n'ont
   donc pas d'opération à laquelle se rattacher ; les trois autres actions du
   §12.2, sans pilote et refusées en le disant ; le lancement automatique du

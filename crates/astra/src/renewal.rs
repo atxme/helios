@@ -36,22 +36,27 @@
 //! replays the same authorization. The gateway treats that stage idempotently
 //! and its signed lease bounds any reservation that cannot be completed.
 //!
-//! # Limite connue
+//! # Limite connue : ce chemin n'ouvre que des renouvellements planifiés
 //!
-//! `RotationReason::Scheduled` only. `manual_global` — the campaign case §7.2
-//! allows the delegated issuer to sign — needs the approved campaign to be
-//! wired into this operation path. The companion command exists, but its
-//! transport and campaign executor do not. It is refused by
-//! [`RenewalError::ReasonNotDelegable`] rather than approximated.
+//! `RotationReason::Scheduled` only. Everything a `manual_global` rotation
+//! needs on the wire now exists — `aether` carries the campaign approval
+//! family, [`crate::issuer::DelegatedIssuer::authorize_stage`] signs an
+//! authorization under it, and the gateway verifies whichever family the
+//! signed reason names. What is still missing is the *operation*: this store
+//! holds one ordinary approval per renewal, and a campaign is one approval for
+//! many peers, so opening a rotation from an approved campaign means an
+//! operation whose authorization is looked up in
+//! [`crate::signing::SigningOperationStore`] rather than collected from the
+//! companion per peer. Until that exists, a request that would need it is
+//! refused by [`RenewalError::ReasonNotDelegable`] rather than approximated.
 
 use std::sync::Arc;
 
 use aether::certificates::{
     approval::{
         AstraCredentialApprovalRequest, AstraRenewalApproval, AstraRenewalApprovalEvidence,
-        MAX_APPROVAL_LIFETIME_SECS, ORDINARY_APPROVAL_CREDENTIALS,
+        DelegatedApproval, MAX_APPROVAL_LIFETIME_SECS, ORDINARY_APPROVAL_CREDENTIALS,
     },
-    authority::RotationReason,
     capability::{CapabilityGrant, CapabilityRequirement, CapabilityScope},
     client::{ClientCertificateRotationRequest, IssuerKind},
     encoding::{Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, WireGuardKey},
@@ -138,8 +143,8 @@ pub enum RenewalError {
     #[error("the gateway refused or could not be reached: {0}")]
     Gateway(String),
     #[error(
-        "only a scheduled renewal is delegable here; a campaign needs an approved campaign \
-         object, which needs the operator companion's signing commands"
+        "only a scheduled renewal is opened here; a campaign rotation is signed and verified \
+         end to end, but no operation yet draws its authorization from an approved campaign"
     )]
     ReasonNotDelegable,
     #[error("the authority could not build this object: {0}")]
@@ -569,9 +574,6 @@ async fn resume_stage(
         .gateway
         .as_ref()
         .ok_or(RenewalError::NoGatewayChannel)?;
-    if !RotationReason::Scheduled.is_delegable() {
-        return Err(RenewalError::ReasonNotDelegable);
-    }
     let (request, evidence, stored_authorization, stored_receipt) = {
         let operations = service.operations.lock().await;
         let operation = operations.get(operation_id, caller, now_unix)?;
@@ -608,12 +610,16 @@ async fn resume_stage(
                 issuer.authorization.maximum_leaf_lifetime_secs,
                 now_unix,
             )?;
+            // The family, and therefore the reason, decided once: the leaves
+            // are issued under the same reason the authorization will carry.
+            let approval = DelegatedApproval::Renewal(Box::new(evidence));
             let (tls_leaf, pq_leaf) = issuer.issue_generation(
                 &request,
                 &peer.name,
                 &plan.window,
                 (plan.leaf_not_before, plan.leaf_not_after),
                 fresh_serial().map_err(RenewalError::Internal)?,
+                approval.reason(),
             )?;
             let stage_id = fresh_id().map_err(RenewalError::Internal)?;
             let authorization = issuer.authorize_stage(
@@ -627,8 +633,7 @@ async fn resume_stage(
                 plan.window,
                 now_unix,
                 plan.stage_expires_at,
-                RotationReason::Scheduled,
-                evidence,
+                approval,
             )?;
             // Persist all random issuance material before reserving or sending
             // it. A restart replays these exact bytes and never creates a
@@ -1049,6 +1054,7 @@ pub const RELAYED_ISSUER_KIND: IssuerKind = IssuerKind::Astra;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::certificates::authority::RotationReason;
     use aether::certificates::client::ClientCertificateGeneration;
 
     fn generation(not_before: u64, not_after: u64) -> ClientCertificateGeneration {

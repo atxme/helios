@@ -870,6 +870,7 @@ mod tests {
             request_fingerprint: Fingerprint::of(b"request"),
             operator_approval_fingerprint: Fingerprint::of(b"approval"),
             renewal_approval: None,
+            campaign_approval: None,
             stage_receipt_fingerprint: receipt().fingerprint(),
             stage_receipt: *receipt(),
             gateway_wg_public_key: key(9),

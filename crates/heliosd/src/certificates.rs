@@ -1749,6 +1749,7 @@ mod tests {
             request_fingerprint: Fingerprint::of(b"request"),
             operator_approval_fingerprint: Fingerprint::of(b"approval"),
             renewal_approval: None,
+            campaign_approval: None,
             gateway_wg_public_key: key(9),
             server_name: "gateway.example".into(),
             client_wg_public_key: key(2),

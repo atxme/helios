@@ -26,7 +26,7 @@
 //! degraded path.
 
 use aether::certificates::{
-    approval::AstraRenewalApprovalEvidence,
+    approval::DelegatedApproval,
     authority::{AstraIssuerAuthorization, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
@@ -171,6 +171,7 @@ impl DelegatedIssuer {
         window: &TransitionWindow,
         validity: (u64, u64),
         serial: [u8; 16],
+        reason: RotationReason,
     ) -> Result<(DerCertificate, PqCertificate), IssuerError> {
         let lifetime = validity
             .1
@@ -182,7 +183,7 @@ impl DelegatedIssuer {
             request.active_generation,
             request.requested_generation,
             lifetime,
-            RotationReason::Scheduled,
+            reason,
         )?;
         let _ = window;
 
@@ -242,12 +243,19 @@ impl DelegatedIssuer {
         window: TransitionWindow,
         issued_at: u64,
         stage_expires_at: u64,
-        reason: RotationReason,
-        renewal_approval: AstraRenewalApprovalEvidence,
+        approval: DelegatedApproval,
     ) -> Result<ClientCertificateStageAuthorization, IssuerError> {
+        // The reason is read off the evidence rather than supplied beside it:
+        // the two cannot then name different things (see `DelegatedApproval`).
+        let reason = approval.reason();
         if !reason.is_delegable() {
             return Err(IssuerError::MasterAuthorityRequired);
         }
+        let operator_approval_fingerprint = approval.fingerprint()?;
+        let (renewal_approval, campaign_approval) = match approval {
+            DelegatedApproval::Renewal(evidence) => (Some(*evidence), None),
+            DelegatedApproval::Campaign(evidence) => (None, Some(evidence)),
+        };
         let authorization = ClientCertificateStageAuthorization {
             format_version: CERTIFICATE_FORMAT_VERSION,
             protocol_version: CERTIFICATE_PROTOCOL_VERSION,
@@ -260,8 +268,9 @@ impl DelegatedIssuer {
             issuer_authorization: Some(self.authorization.clone()),
             stage_id,
             request_fingerprint: request.fingerprint(),
-            operator_approval_fingerprint: renewal_approval.fingerprint(),
-            renewal_approval: Some(renewal_approval),
+            operator_approval_fingerprint,
+            renewal_approval,
+            campaign_approval,
             gateway_wg_public_key: self.authorization.gateway_wg_public_key,
             server_name: self.authorization.server_name.clone(),
             client_wg_public_key: request.client_wg_public_key,
@@ -315,6 +324,7 @@ impl DelegatedIssuer {
             request_fingerprint: authorization.request_fingerprint,
             operator_approval_fingerprint: authorization.operator_approval_fingerprint,
             renewal_approval: authorization.renewal_approval.clone(),
+            campaign_approval: authorization.campaign_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
             stage_receipt: receipt.clone(),
             gateway_wg_public_key: authorization.gateway_wg_public_key,
@@ -356,6 +366,7 @@ impl DelegatedIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::certificates::approval::AstraRenewalApprovalEvidence;
     use aether::certificates::encoding::{
         generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
     };
@@ -591,7 +602,14 @@ mod tests {
         let window = TransitionWindow::new(1_000, 50_000, 60_000).expect("window");
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
 
         let authorization = fixture
@@ -606,8 +624,7 @@ mod tests {
                 window,
                 1_000,
                 1_000 + 3_600,
-                RotationReason::Scheduled,
-                approval_evidence(&request),
+                DelegatedApproval::Renewal(Box::new(approval_evidence(&request))),
             )
             .expect("authorization");
 
@@ -686,7 +703,8 @@ mod tests {
                 "workstation",
                 &window,
                 (0, 100_000),
-                [9; 16]
+                [9; 16],
+                RotationReason::Scheduled,
             ),
             Err(IssuerError::Certificate(
                 CertificateError::IssuerScopeViolation("generation")
@@ -696,31 +714,131 @@ mod tests {
         let request = request(&fixture, csr_der, &new_public, &new_private, 5);
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
+        let _ = (tls_leaf, pq_leaf);
+        // The four reasons this issuer may not sign for are no longer
+        // *expressible* here: `authorize_stage` reads the reason off the
+        // approval family, and neither family names one of them. The guard
+        // inside it stays as the belt to that suspenders, and this asserts the
+        // property the type now carries.
         for forbidden in [
             RotationReason::ExpiredRecovery,
             RotationReason::Readmission,
             RotationReason::EmergencyReplacement,
             RotationReason::KeyRecovery,
         ] {
-            assert!(matches!(
-                fixture.issuer.authorize_stage(
-                    &request,
-                    &active(),
-                    Id16::new([4; 16]).expect("stage"),
-                    fixture.tls_anchor.fingerprint(),
-                    tls_leaf.clone(),
-                    pq_leaf.clone(),
-                    window,
-                    1_000,
-                    1_000 + 3_600,
-                    forbidden,
-                    approval_evidence(&request),
-                ),
-                Err(IssuerError::MasterAuthorityRequired)
-            ));
+            assert!(!forbidden.is_delegable());
         }
+    }
+
+    /// The two families produce two different authorizations, and never a
+    /// hybrid: `authorize_stage` reads the reason off the evidence, so the
+    /// field that is filled and the reason that is signed always agree.
+    #[test]
+    fn each_approval_family_names_its_own_reason_and_fills_its_own_field() {
+        use aether::certificates::approval::AstraCampaignApprovalEvidence;
+        use aether::certificates::status::{
+            AstraRotationCampaign, CampaignApproval, CampaignScope, CampaignTarget, CertificateKind,
+        };
+
+        let fixture = fixture();
+        let (csr_der, _csr_key) = csr();
+        let (new_private, new_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let window = TransitionWindow {
+            not_before: 0,
+            activation_at: 1_000,
+            not_after: 100_000,
+        };
+        let request = request(&fixture, csr_der, &new_public, &new_private, 5);
+
+        let campaign = AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([7; 16]).expect("id"),
+            trust_domain_id: fixture.issuer.authorization.trust_domain_id,
+            gateway_wg_public_key: fixture.issuer.authorization.gateway_wg_public_key,
+            server_name: fixture.issuer.authorization.server_name.clone(),
+            created_at: 900,
+            expires_at: 1_200,
+            scope: CampaignScope::FleetLeafs,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: request.client_wg_public_key,
+                epoch: 1,
+                generation: active().generation,
+                active_tls_certificate_fingerprint: active().tls_certificate_fingerprint,
+                active_pq_certificate_fingerprint: active().pq_certificate_fingerprint,
+            }],
+            reason: "campagne trimestrielle".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: CampaignScope::FleetLeafs.required_credentials(),
+        };
+        let approval = CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: campaign.required_credentials,
+            approved_at: 1_000,
+            approvals: Vec::new(),
+        };
+        let evidence = AstraCampaignApprovalEvidence {
+            campaign,
+            approval,
+            credential_registry: aether::certificates::approval::CredentialRegistry {
+                trust_domain_id: fixture.issuer.authorization.trust_domain_id,
+                gateway_wg_public_key: fixture.issuer.authorization.gateway_wg_public_key,
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            },
+            webauthn_origin: "https://astra.example".into(),
+        };
+        let campaign_approval = DelegatedApproval::Campaign(Box::new(evidence));
+        assert_eq!(campaign_approval.reason(), RotationReason::ManualGlobal);
+
+        let (tls_leaf, pq_leaf) = fixture
+            .issuer
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                campaign_approval.reason(),
+            )
+            .expect("a campaign is delegable");
+        let expected = campaign_approval.fingerprint().expect("fingerprint");
+        let authorization = fixture
+            .issuer
+            .authorize_stage(
+                &request,
+                &active(),
+                Id16::new([4; 16]).expect("stage"),
+                fixture.tls_anchor.fingerprint(),
+                tls_leaf,
+                pq_leaf,
+                window,
+                1_000,
+                1_000 + 3_600,
+                campaign_approval,
+            )
+            .expect("authorization");
+
+        assert_eq!(authorization.reason, RotationReason::ManualGlobal);
+        assert!(authorization.campaign_approval.is_some());
+        // The other family must be absent, not merely unused: an object
+        // carrying both would leave "which one was checked" to its reader.
+        assert!(authorization.renewal_approval.is_none());
+        assert!(authorization
+            .operator_approval_fingerprint
+            .matches(&expected));
     }
 
     /// A lifetime beyond the delegation's ceiling is refused before issuance.
@@ -738,7 +856,8 @@ mod tests {
                 "workstation",
                 &window,
                 (0, 300_000),
-                [9; 16]
+                [9; 16],
+                RotationReason::Scheduled,
             ),
             Err(IssuerError::Certificate(
                 CertificateError::IssuerScopeViolation("leaf lifetime")
@@ -757,7 +876,14 @@ mod tests {
         let window = TransitionWindow::new(1_000, 50_000, 60_000).expect("window");
         let (tls_leaf, pq_leaf) = fixture
             .issuer
-            .issue_generation(&request, "workstation", &window, (0, 100_000), [9; 16])
+            .issue_generation(
+                &request,
+                "workstation",
+                &window,
+                (0, 100_000),
+                [9; 16],
+                RotationReason::Scheduled,
+            )
             .expect("issuance");
         let authorization = fixture
             .issuer
@@ -771,8 +897,7 @@ mod tests {
                 window,
                 1_000,
                 1_000 + 3_600,
-                RotationReason::Scheduled,
-                approval_evidence(&request),
+                DelegatedApproval::Renewal(Box::new(approval_evidence(&request))),
             )
             .expect("authorization");
 

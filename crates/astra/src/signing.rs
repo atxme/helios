@@ -107,11 +107,23 @@ pub enum SigningOperationState {
     ///
     /// # Limite connue : rien n'applique encore une campagne approuvée
     ///
-    /// The approval is recorded, and that is where it stops. Turning it into
-    /// signed objects means Astra building a per-client manifest and depositing
-    /// it on the veth, which is the lot after this one. Every surface that can
-    /// reach this state says so out loud rather than letting an operator spend
-    /// a ceremony and watch nothing happen.
+    /// The approval is recorded, and that is where it stops.
+    ///
+    /// What now exists is everything **below** it: a campaign approval is a
+    /// full approval family on the wire
+    /// ([`aether::certificates::approval::AstraCampaignApprovalEvidence`]), the
+    /// delegated issuer signs a `manual_global` staging under it, and the
+    /// gateway verifies whichever family the signed reason names — so an
+    /// applied campaign would be checked end to end today.
+    ///
+    /// What is missing is the *executor*: [`crate::renewal`] opens one
+    /// operation per peer around one ordinary approval collected from the
+    /// companion, and a campaign is the opposite shape — one approval, many
+    /// peers, none of whom has written a rotation request yet. Turning this
+    /// state into rotations means an operation that draws its authorization
+    /// from this store instead, for each target, as that target comes back.
+    /// Every surface that can reach this state says so out loud rather than
+    /// letting an operator spend a ceremony and watch nothing happen.
     Approved,
 }
 

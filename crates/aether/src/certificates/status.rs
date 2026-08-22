@@ -502,7 +502,69 @@ impl AstraRotationCampaign {
                 provided: self.required_credentials,
             });
         }
+        // One decision per object. Two rows naming the same certificate would
+        // make «what did the operator approve for this identity» a question of
+        // iteration order, and `covers_client` below answers it by finding a
+        // row — the first one it meets would silently win over a second that
+        // pins other fingerprints.
+        for (index, target) in self.targets.iter().enumerate() {
+            if self.targets[..index].iter().any(|earlier| {
+                earlier.certificate_kind == target.certificate_kind
+                    && earlier.identity_key == target.identity_key
+            }) {
+                return Err(CertificateError::DuplicateFingerprint);
+            }
+        }
         Ok(())
+    }
+
+    /// The row that authorizes rotating one admitted client's generation.
+    ///
+    /// # Why the whole current state, and not just the key
+    ///
+    /// A campaign is frozen at approval: §7.6 makes the operator approve the
+    /// targets *and their current fingerprints*. So a row only authorizes the
+    /// rotation it described — the same identity one generation later is a
+    /// different rotation, and re-using the approval for it would let one
+    /// touch renew a peer indefinitely, once per generation, for as long as
+    /// nobody noticed.
+    ///
+    /// A client generation is a TLS leaf and a PQ leaf that rotate together,
+    /// so either kind names it and both fingerprints are pinned in both rows.
+    /// A scope that rotates an anchor is refused outright: `trust_authorities`
+    /// is a two-credential decision about `CA-PQ`, and reading it as a
+    /// per-client authorization would spend it on something the operator was
+    /// not shown.
+    pub fn covers_client(
+        &self,
+        client_wg_public_key: &WireGuardKey,
+        active_generation: u64,
+        active_tls_certificate_fingerprint: &Fingerprint,
+        active_pq_certificate_fingerprint: &Fingerprint,
+    ) -> Result<(), CertificateError> {
+        if self.scope.rotates_authority() {
+            return Err(CertificateError::IssuerScopeViolation(
+                "an authority campaign does not authorize a client rotation",
+            ));
+        }
+        let covered = self.targets.iter().any(|target| {
+            matches!(
+                target.certificate_kind,
+                CertificateKind::ClientTls | CertificateKind::ClientPq
+            ) && target.identity_key == *client_wg_public_key
+                && target.generation == active_generation
+                && target
+                    .active_tls_certificate_fingerprint
+                    .matches(active_tls_certificate_fingerprint)
+                && target
+                    .active_pq_certificate_fingerprint
+                    .matches(active_pq_certificate_fingerprint)
+        });
+        if covered {
+            Ok(())
+        } else {
+            Err(CertificateError::CampaignMismatch)
+        }
     }
 
     /// Refuses a campaign whose targets moved after approval (spec §7.6).
@@ -913,6 +975,107 @@ mod tests {
         ));
     }
 
+    /// Two rows for the same object make «what was approved» an iteration
+    /// order, and `covers_client` would answer with whichever it met first.
+    #[test]
+    fn a_campaign_naming_the_same_object_twice_is_refused() {
+        let twice = campaign(CampaignScope::FleetLeafs, vec![target(1), target(1)]);
+        assert!(matches!(
+            twice.validate(1_100),
+            Err(CertificateError::DuplicateFingerprint)
+        ));
+
+        // Same identity, other family: two different objects, both allowed.
+        let mut tls = target(1);
+        tls.certificate_kind = CertificateKind::ClientTls;
+        let pair = campaign(CampaignScope::FleetLeafs, vec![target(1), tls]);
+        pair.validate(1_100).expect("two families of one identity");
+    }
+
+    /// The row authorizes the rotation it described, and no later one.
+    #[test]
+    fn a_campaign_covers_the_state_its_operator_read_and_no_other() {
+        let campaign = campaign(CampaignScope::FleetLeafs, vec![target(1), target(2)]);
+        let key = WireGuardKey::from_bytes([1; 32]);
+        let tls = Fingerprint::of(&[1, 1]);
+        let pq = Fingerprint::of(&[1, 2]);
+        campaign
+            .covers_client(&key, 3, &tls, &pq)
+            .expect("the approved target");
+
+        // The same identity, one generation on: a different rotation, and the
+        // touch that approved the first must not authorize it. Without this a
+        // single approval renews a peer for as long as nobody looks.
+        assert!(matches!(
+            campaign.covers_client(&key, 4, &tls, &pq),
+            Err(CertificateError::CampaignMismatch)
+        ));
+        // A leaf that moved under the operator between reading and approving.
+        assert!(matches!(
+            campaign.covers_client(&key, 3, &Fingerprint::of(b"other"), &pq),
+            Err(CertificateError::CampaignMismatch)
+        ));
+        assert!(matches!(
+            campaign.covers_client(&key, 3, &tls, &Fingerprint::of(b"other")),
+            Err(CertificateError::CampaignMismatch)
+        ));
+        // An identity the campaign never named.
+        assert!(matches!(
+            campaign.covers_client(&WireGuardKey::from_bytes([9; 32]), 3, &tls, &pq),
+            Err(CertificateError::CampaignMismatch)
+        ));
+    }
+
+    /// A generation is a TLS leaf and a PQ leaf together, so either row names
+    /// it — both pin both fingerprints.
+    #[test]
+    fn either_client_family_names_the_generation() {
+        let mut tls = target(1);
+        tls.certificate_kind = CertificateKind::ClientTls;
+        let campaign = campaign(CampaignScope::FleetLeafs, vec![tls]);
+        campaign
+            .covers_client(
+                &WireGuardKey::from_bytes([1; 32]),
+                3,
+                &Fingerprint::of(&[1, 1]),
+                &Fingerprint::of(&[1, 2]),
+            )
+            .expect("a TLS row names the same generation");
+    }
+
+    /// A gateway row is not a client row, whatever its fingerprints say.
+    #[test]
+    fn a_gateway_target_does_not_authorize_a_client_rotation() {
+        let mut gateway = target(1);
+        gateway.certificate_kind = CertificateKind::GatewayPq;
+        let campaign = campaign(CampaignScope::FleetLeafs, vec![gateway]);
+        assert!(matches!(
+            campaign.covers_client(
+                &WireGuardKey::from_bytes([1; 32]),
+                3,
+                &Fingerprint::of(&[1, 1]),
+                &Fingerprint::of(&[1, 2]),
+            ),
+            Err(CertificateError::CampaignMismatch)
+        ));
+    }
+
+    /// Two credentials approved a decision about `CA-PQ`. Spending it on a
+    /// client leaf would apply a text the operator was never shown.
+    #[test]
+    fn an_authority_campaign_never_authorizes_a_client_rotation() {
+        let campaign = campaign(CampaignScope::TrustAuthorities, vec![target(1)]);
+        assert!(matches!(
+            campaign.covers_client(
+                &WireGuardKey::from_bytes([1; 32]),
+                3,
+                &Fingerprint::of(&[1, 1]),
+                &Fingerprint::of(&[1, 2]),
+            ),
+            Err(CertificateError::IssuerScopeViolation(_))
+        ));
+    }
+
     /// Adding, removing or reordering a target after approval must be visible.
     #[test]
     fn any_change_to_the_target_list_invalidates_the_approval() {
@@ -1231,6 +1394,7 @@ mod tests {
         }
 
         struct Domain {
+            ca_public: MlDsa87PublicKey,
             registry: CredentialRegistry,
             first: Credential,
             second: Credential,
@@ -1239,12 +1403,13 @@ mod tests {
         }
 
         fn domain_with_two_credentials() -> Domain {
-            let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+            let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
             let first = Credential::generate();
             let second = Credential::generate();
             let first_binding = binding(&ca_private, &first, b"credential-one");
             let second_binding = binding(&ca_private, &second, b"credential-two");
             Domain {
+                ca_public,
                 registry: CredentialRegistry {
                     trust_domain_id: domain(),
                     gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
@@ -1269,6 +1434,154 @@ mod tests {
                 required_credentials: campaign.required_credentials,
                 approved_at: 1_100,
                 approvals: answers,
+            }
+        }
+
+        /// The evidence a delegated `manual_global` staging carries (§7.2).
+        mod evidence {
+            use super::*;
+            use crate::certificates::approval::AstraCampaignApprovalEvidence;
+
+            const POLICY: &[u8] = b"policy";
+
+            fn client_key() -> WireGuardKey {
+                WireGuardKey::from_bytes([1; 32])
+            }
+
+            fn evidence(
+                domain: &Domain,
+                campaign: AstraRotationCampaign,
+            ) -> AstraCampaignApprovalEvidence {
+                let challenge = campaign.fingerprint();
+                let approval = approval(
+                    &campaign,
+                    vec![answer(&domain.first, &domain.first_binding, &challenge)],
+                );
+                AstraCampaignApprovalEvidence {
+                    campaign,
+                    approval,
+                    credential_registry: domain.registry.clone(),
+                    webauthn_origin: ORIGIN.into(),
+                }
+            }
+
+            fn check(
+                domain: &Domain,
+                evidence: &AstraCampaignApprovalEvidence,
+                policy: &Fingerprint,
+            ) -> Result<(), CertificateError> {
+                evidence.verify(
+                    &domain.ca_public,
+                    &super::super::domain(),
+                    &WireGuardKey::from_bytes([2; 32]),
+                    &client_key(),
+                    3,
+                    &Fingerprint::of(&[1, 1]),
+                    &Fingerprint::of(&[1, 2]),
+                    RELYING_PARTY,
+                    policy,
+                    1,
+                    4,
+                    1_100,
+                )
+            }
+
+            #[test]
+            fn a_campaign_approval_authorizes_the_target_it_named() {
+                let domain = domain_with_two_credentials();
+                let evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(1), target(2)]),
+                );
+                check(&domain, &evidence, &Fingerprint::of(POLICY)).expect("covered target");
+            }
+
+            /// The fingerprint is what the staging authorization signs. An
+            /// evidence blob that did not hash to it would be a second
+            /// document beside the one the signature commits to.
+            #[test]
+            fn the_carried_fingerprint_is_the_approval_itself() {
+                let domain = domain_with_two_credentials();
+                let evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(1)]),
+                );
+                assert!(evidence
+                    .fingerprint()
+                    .expect("fingerprint")
+                    .matches(&evidence.approval.fingerprint().expect("approval")));
+            }
+
+            /// §2.4: the policy pin is confirmed out of band, and a campaign
+            /// resolved under another set of rules is not this domain's.
+            #[test]
+            fn a_campaign_naming_another_policy_is_refused() {
+                let domain = domain_with_two_credentials();
+                let evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(1)]),
+                );
+                assert!(matches!(
+                    check(&domain, &evidence, &Fingerprint::of(b"another policy")),
+                    Err(CertificateError::PolicyNotPinned)
+                ));
+            }
+
+            /// The origin is supplied, so it is checked against the relying
+            /// party the consumer pins — otherwise supplying it would be
+            /// supplying the answer.
+            #[test]
+            fn an_origin_outside_the_pinned_relying_party_is_refused() {
+                let domain = domain_with_two_credentials();
+                let mut evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(1)]),
+                );
+                evidence.webauthn_origin = "https://attacker.example".into();
+                assert!(check(&domain, &evidence, &Fingerprint::of(POLICY)).is_err());
+            }
+
+            /// The registry travels along and is verified under the `CA-PQ`
+            /// the consumer already holds, never believed for being present.
+            #[test]
+            fn a_registry_no_ca_pq_of_this_domain_signed_is_refused() {
+                let domain = domain_with_two_credentials();
+                let stranger = domain_with_two_credentials();
+                let mut evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(1)]),
+                );
+                evidence.credential_registry = stranger.registry.clone();
+                assert!(check(&domain, &evidence, &Fingerprint::of(POLICY)).is_err());
+            }
+
+            /// A campaign for another gateway resolves credentials that verify
+            /// nowhere; it is refused before any of them is looked at.
+            #[test]
+            fn a_campaign_for_another_gateway_is_refused() {
+                let domain = domain_with_two_credentials();
+                let mut wrong = campaign(CampaignScope::FleetLeafs, vec![target(1)]);
+                wrong.gateway_wg_public_key = WireGuardKey::from_bytes([9; 32]);
+                let evidence = evidence(&domain, wrong);
+                assert!(matches!(
+                    check(&domain, &evidence, &Fingerprint::of(POLICY)),
+                    Err(CertificateError::GatewayIdentityMismatch)
+                ));
+            }
+
+            /// The whole point of the family: a perfectly approved campaign
+            /// that does not name this peer authorizes nothing for it.
+            #[test]
+            fn a_valid_approval_for_other_targets_authorizes_nothing_here() {
+                let domain = domain_with_two_credentials();
+                let evidence = evidence(
+                    &domain,
+                    campaign(CampaignScope::FleetLeafs, vec![target(2), target(3)]),
+                );
+                assert!(matches!(
+                    check(&domain, &evidence, &Fingerprint::of(POLICY)),
+                    Err(CertificateError::CampaignMismatch)
+                ));
             }
         }
 

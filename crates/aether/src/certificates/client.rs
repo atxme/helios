@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::key_negotiation::{PqCertificate, PqCertificateRole};
 
 use super::{
-    approval::{AstraPolicyPin, AstraRenewalApprovalEvidence},
+    approval::{AstraCampaignApprovalEvidence, AstraPolicyPin, AstraRenewalApprovalEvidence},
     authority::{AstraIssuerAuthorization, RotationReason},
     encoding::{
         validate_server_name, verify_ml_dsa_87, CanonicalBytes, DerCertificate, Fingerprint, Id16,
@@ -318,6 +318,13 @@ pub struct ClientCertificateStageAuthorization {
     /// approval family and therefore leave this absent; their caller must
     /// verify that family before invoking this leaf-level verifier.
     pub renewal_approval: Option<AstraRenewalApprovalEvidence>,
+    /// The other approval family of §7.2: the campaign that authorized this
+    /// rotation, present exactly when `reason` is [`RotationReason::ManualGlobal`].
+    ///
+    /// Boxed because a campaign carries up to 256 targets and a credential
+    /// registry, and every consumer of this authorization would otherwise
+    /// carry that weight on the ordinary path where the field is empty.
+    pub campaign_approval: Option<Box<AstraCampaignApprovalEvidence>>,
     pub gateway_wg_public_key: WireGuardKey,
     pub server_name: String,
     pub client_wg_public_key: WireGuardKey,
@@ -804,6 +811,9 @@ pub struct ClientCertificateRotationGrant {
     pub request_fingerprint: Fingerprint,
     pub operator_approval_fingerprint: Fingerprint,
     pub renewal_approval: Option<AstraRenewalApprovalEvidence>,
+    /// Carried onward from the authorization, so the client checks the same
+    /// family the gateway did rather than trusting that it happened.
+    pub campaign_approval: Option<Box<AstraCampaignApprovalEvidence>>,
     pub stage_receipt_fingerprint: Fingerprint,
     pub stage_receipt: GatewayCertificateStageReceipt,
     pub gateway_wg_public_key: WireGuardKey,
@@ -1953,6 +1963,7 @@ mod tests {
             request_fingerprint,
             operator_approval_fingerprint: Fingerprint::of(b"operator approval"),
             renewal_approval: None,
+            campaign_approval: None,
             gateway_wg_public_key: gateway_key(),
             server_name: SERVER_NAME.into(),
             client_wg_public_key: client_key(),

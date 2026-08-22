@@ -2511,6 +2511,25 @@ libellé ambigu « Renouveler ».
   dominante, unicité globale des empreintes. Toute mutation est calculée sur
   une copie, écrite, puis adoptée : un échec d'écriture laisse le registre
   décrivant ce que le disque contient.
+- **les deux familles d'approbation du §7.2**, et le fait qu'un objet ne puisse
+  pas les mélanger. Une rotation ordinaire est approuvée pour *une* demande qui
+  existe déjà ; une campagne est approuvée pour un jeu de cibles avant qu'aucune
+  d'elles n'ait écrit de demande. Ce ne sont donc pas les mêmes documents, et
+  ils ne lient pas la même chose : `AstraRenewalApprovalEvidence` lie une
+  empreinte de demande, `AstraCampaignApprovalEvidence` lie **l'état courant de
+  la cible** — `covers_client` exige la clé WireGuard, la génération et les deux
+  empreintes actives exactes, donc une approbation ne se rejoue pas d'une
+  génération sur la suivante, et une campagne `trust_authorities` n'autorise
+  aucune rotation cliente. Le registre de credentials voyage avec l'évidence et
+  est vérifié sous le `CA-PQ` que le consommateur épingle déjà ; l'origine
+  WebAuthn voyage aussi, et n'est admise que si elle appartient au relying party
+  épinglé. Côté émetteur, `authorize_stage` ne reçoit plus une raison **et** une
+  évidence : il reçoit `DelegatedApproval`, dont la raison est *dérivée* de la
+  famille — les deux ne peuvent donc plus se contredire, et les quatre raisons
+  interdites à l'émetteur délégué ne sont plus exprimables. Côté gateway,
+  staging et commit choisissent le contrôle sur la **raison signée**, jamais sur
+  le champ qui se trouve rempli, et exigent l'absence de l'autre famille : un
+  objet portant les deux laisserait « laquelle a été vérifiée » au lecteur.
 - `helios-api` : `trust-update`, `stage` et `stage-commit` dans le tunnel,
   derrière la résolution de source. La route `stage` décrit ici l'état du code
   antérieur à §0.5 : elle doit disparaître du canal Orion et ne doit pas être
@@ -2708,6 +2727,15 @@ contournés :
   l'autorisation de staging sous `CA-PQ`, le relais par le veth et le commit
   côté gateway. Le tout dépend de l'application d'une opération opérateur
   approuvée, qui n'existe pour aucun chemin ;
+- l'**exécution d'une campagne approuvée**. Tout ce qui est *sous* elle est
+  désormais livré : la famille d'approbation, la signature `manual_global` par
+  l'émetteur délégué et sa vérification par la gateway. Ce qui manque est
+  l'opération : `astra::renewal` ouvre un renouvellement par pair autour d'une
+  approbation ordinaire recueillie auprès du compagnon, et une campagne est la
+  forme inverse — une approbation, plusieurs pairs, dont aucun n'a encore écrit
+  de demande de rotation. L'exécuter veut dire une opération qui tire son
+  autorisation de `astra::signing` pour chaque cible, au fur et à mesure qu'elle
+  revient. `RenewalError::ReasonNotDelegable` le refuse en le disant ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le

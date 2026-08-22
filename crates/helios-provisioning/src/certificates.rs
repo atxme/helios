@@ -46,7 +46,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aether::certificates::{
-    approval::AstraIssuancePolicy,
+    approval::{AstraCredentialBinding, AstraIssuancePolicy},
+    authority::RotationReason,
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
@@ -496,38 +497,111 @@ impl CertificateRegistry {
             now_unix,
         )?;
 
+        // Which approval family has to be present is decided by the signed
+        // `reason`, never by which field happens to be filled: reading the
+        // presence would let an authorization choose the check it is put
+        // through, and the two families do not prove the same thing. The one
+        // the reason does not name must be absent — carrying both would leave
+        // "which one was checked" to the reader.
         if authorization.issuer_kind == IssuerKind::Astra {
-            let evidence = authorization.renewal_approval.as_ref().ok_or(
-                CertificateError::ApprovalMismatch("delegated renewal approval"),
-            )?;
-            let service_epoch = evidence.approval_request.astra_service_key_epoch;
-            let service_key = state
-                .astra
-                .service_key_for(service_epoch, now_unix)
-                .ok_or(CertificateError::UnauthorizedIssuer)?;
-            evidence.verify(
-                &authorization.request_fingerprint,
-                &state.gateway.current_ca_public_key,
-                service_key,
-                service_epoch,
-                &state.trust_domain_id,
-                &state.gateway.gateway_wg_public_key,
-                caller_wg_public_key,
-                &state.astra.webauthn_rp_id,
-                peer.state.active.generation,
-                state.gateway.ca_epoch,
-                state.astra.credential_registry_epoch,
-                // The approval is a five-minute authorization to *issue*, not
-                // a five-minute lifetime for the staged certificate. Prove it
-                // was live when Astra signed this authorization; the stage's
-                // own lease governs replay afterwards.
-                authorization.issued_at,
-            )?;
-            state
-                .astra
-                .accept_credential_binding(&evidence.approval.credential_binding)?;
+            match authorization.reason {
+                RotationReason::Scheduled => {
+                    if authorization.campaign_approval.is_some() {
+                        return Err(CertificateError::ApprovalMismatch(
+                            "a scheduled renewal carries no campaign approval",
+                        )
+                        .into());
+                    }
+                    let evidence = authorization.renewal_approval.as_ref().ok_or(
+                        CertificateError::ApprovalMismatch("delegated renewal approval"),
+                    )?;
+                    let service_epoch = evidence.approval_request.astra_service_key_epoch;
+                    let service_key = state
+                        .astra
+                        .service_key_for(service_epoch, now_unix)
+                        .ok_or(CertificateError::UnauthorizedIssuer)?;
+                    evidence.verify(
+                        &authorization.request_fingerprint,
+                        &state.gateway.current_ca_public_key,
+                        service_key,
+                        service_epoch,
+                        &state.trust_domain_id,
+                        &state.gateway.gateway_wg_public_key,
+                        caller_wg_public_key,
+                        &state.astra.webauthn_rp_id,
+                        peer.state.active.generation,
+                        state.gateway.ca_epoch,
+                        state.astra.credential_registry_epoch,
+                        // The approval is a five-minute authorization to
+                        // *issue*, not a five-minute lifetime for the staged
+                        // certificate. Prove it was live when Astra signed
+                        // this authorization; the stage's own lease governs
+                        // replay afterwards.
+                        authorization.issued_at,
+                    )?;
+                    let binding = evidence.approval.credential_binding.clone();
+                    state.astra.accept_credential_binding(&binding)?;
+                }
+                RotationReason::ManualGlobal => {
+                    if authorization.renewal_approval.is_some() {
+                        return Err(CertificateError::ApprovalMismatch(
+                            "a campaign rotation carries no ordinary renewal approval",
+                        )
+                        .into());
+                    }
+                    let evidence = authorization.campaign_approval.as_deref().ok_or(
+                        CertificateError::ApprovalMismatch("delegated campaign approval"),
+                    )?;
+                    if !evidence
+                        .fingerprint()?
+                        .matches(&authorization.operator_approval_fingerprint)
+                    {
+                        return Err(CertificateError::ApprovalMismatch(
+                            "campaign approval fingerprint",
+                        )
+                        .into());
+                    }
+                    evidence.verify(
+                        &state.gateway.current_ca_public_key,
+                        &state.trust_domain_id,
+                        &state.gateway.gateway_wg_public_key,
+                        caller_wg_public_key,
+                        peer.state.active.generation,
+                        &peer.state.active.tls_certificate_fingerprint,
+                        &peer.state.active.pq_certificate_fingerprint,
+                        &state.astra.webauthn_rp_id,
+                        state.astra.astra_policy_fingerprint.fingerprint(),
+                        state.gateway.ca_epoch,
+                        state.astra.credential_registry_epoch,
+                        // Same instant as the ordinary family, for the same
+                        // reason: the campaign's five-minute window bounds the
+                        // *approval*, the stage lease bounds the replay.
+                        authorization.issued_at,
+                    )?;
+                    // Only the rows that actually answered. A whole snapshot
+                    // applied here would let a campaign advance decisions
+                    // about credentials it never used.
+                    let bindings: Vec<_> = evidence
+                        .approval
+                        .approvals
+                        .iter()
+                        .map(|answer| {
+                            evidence
+                                .credential_registry
+                                .binding(&answer.credential_id)
+                                .cloned()
+                                .ok_or(CertificateError::UnknownCredential)
+                        })
+                        .collect::<Result<_, _>>()?;
+                    for binding in &bindings {
+                        state.astra.accept_credential_binding(binding)?;
+                    }
+                }
+                _ => {
+                    return Err(CertificateError::IssuerScopeViolation("reason").into());
+                }
+            }
         }
-
         let candidate = authorization.candidate()?;
         assert_fingerprints_free(
             &state,
@@ -682,42 +756,99 @@ impl CertificateRegistry {
             ));
         }
 
-        let accepted_credential_binding = if grant.issuer_kind == IssuerKind::Astra {
-            let evidence =
-                grant
-                    .renewal_approval
-                    .as_ref()
-                    .ok_or(CertificateError::ApprovalMismatch(
-                        "delegated renewal approval",
-                    ))?;
-            let service_epoch = evidence.approval_request.astra_service_key_epoch;
-            let service_key = self
-                .state
-                .astra
-                .service_key_for(service_epoch, now_unix)
-                .ok_or(CertificateError::UnauthorizedIssuer)?;
-            evidence.verify(
-                &grant.request_fingerprint,
-                &self.state.gateway.current_ca_public_key,
-                service_key,
-                service_epoch,
-                &self.state.trust_domain_id,
-                &self.state.gateway.gateway_wg_public_key,
-                caller_wg_public_key,
-                &self.state.astra.webauthn_rp_id,
-                peer.state.active.generation,
-                self.state.gateway.ca_epoch,
-                self.state.astra.credential_registry_epoch,
-                // Helios already verified the approval at stage issuance.
-                // Re-check its signatures at commit without turning the
-                // five-minute operator ceremony into a five-minute commit
-                // deadline; `stage_expires_at` is that deadline.
-                evidence.approval.approved_at,
-            )?;
-            Some(evidence.approval.credential_binding.clone())
-        } else {
-            None
-        };
+        // Same family rule as the staging, and for the same reason: the
+        // signed `reason` chooses the check, never which field is filled.
+        let accepted_credential_bindings: Vec<AstraCredentialBinding> =
+            if grant.issuer_kind == IssuerKind::Astra {
+                match grant.reason {
+                    RotationReason::Scheduled => {
+                        if grant.campaign_approval.is_some() {
+                            return Err(CertificateError::ApprovalMismatch(
+                                "a scheduled renewal carries no campaign approval",
+                            )
+                            .into());
+                        }
+                        let evidence = grant.renewal_approval.as_ref().ok_or(
+                            CertificateError::ApprovalMismatch("delegated renewal approval"),
+                        )?;
+                        let service_epoch = evidence.approval_request.astra_service_key_epoch;
+                        let service_key = self
+                            .state
+                            .astra
+                            .service_key_for(service_epoch, now_unix)
+                            .ok_or(CertificateError::UnauthorizedIssuer)?;
+                        evidence.verify(
+                            &grant.request_fingerprint,
+                            &self.state.gateway.current_ca_public_key,
+                            service_key,
+                            service_epoch,
+                            &self.state.trust_domain_id,
+                            &self.state.gateway.gateway_wg_public_key,
+                            caller_wg_public_key,
+                            &self.state.astra.webauthn_rp_id,
+                            peer.state.active.generation,
+                            self.state.gateway.ca_epoch,
+                            self.state.astra.credential_registry_epoch,
+                            // Helios already verified the approval at stage
+                            // issuance. Re-check its signatures at commit
+                            // without turning the five-minute operator
+                            // ceremony into a five-minute commit deadline;
+                            // `stage_expires_at` is that deadline.
+                            evidence.approval.approved_at,
+                        )?;
+                        vec![evidence.approval.credential_binding.clone()]
+                    }
+                    RotationReason::ManualGlobal => {
+                        if grant.renewal_approval.is_some() {
+                            return Err(CertificateError::ApprovalMismatch(
+                                "a campaign rotation carries no ordinary renewal approval",
+                            )
+                            .into());
+                        }
+                        let evidence = grant.campaign_approval.as_deref().ok_or(
+                            CertificateError::ApprovalMismatch("delegated campaign approval"),
+                        )?;
+                        if !evidence
+                            .fingerprint()?
+                            .matches(&grant.operator_approval_fingerprint)
+                        {
+                            return Err(CertificateError::ApprovalMismatch(
+                                "campaign approval fingerprint",
+                            )
+                            .into());
+                        }
+                        evidence.verify(
+                            &self.state.gateway.current_ca_public_key,
+                            &self.state.trust_domain_id,
+                            &self.state.gateway.gateway_wg_public_key,
+                            caller_wg_public_key,
+                            peer.state.active.generation,
+                            &peer.state.active.tls_certificate_fingerprint,
+                            &peer.state.active.pq_certificate_fingerprint,
+                            &self.state.astra.webauthn_rp_id,
+                            self.state.astra.astra_policy_fingerprint.fingerprint(),
+                            self.state.gateway.ca_epoch,
+                            self.state.astra.credential_registry_epoch,
+                            evidence.approval.approved_at,
+                        )?;
+                        evidence
+                            .approval
+                            .approvals
+                            .iter()
+                            .map(|answer| {
+                                evidence
+                                    .credential_registry
+                                    .binding(&answer.credential_id)
+                                    .cloned()
+                                    .ok_or(CertificateError::UnknownCredential)
+                            })
+                            .collect::<Result<_, _>>()?
+                    }
+                    _ => return Err(CertificateError::IssuerScopeViolation("reason").into()),
+                }
+            } else {
+                Vec::new()
+            };
 
         // Reading the clock once, here, is what makes the race with the purge
         // deterministic: a commit at the deadline is late, not lucky.
@@ -736,7 +867,7 @@ impl CertificateRegistry {
 
         let stage_id = pending.stage_id;
         let mut state = self.state.clone();
-        if let Some(binding) = &accepted_credential_binding {
+        for binding in &accepted_credential_bindings {
             state.astra.accept_credential_binding(binding)?;
         }
         let peer = state
@@ -1500,6 +1631,7 @@ mod tests {
             request_fingerprint: Fingerprint::of(b"request"),
             operator_approval_fingerprint: Fingerprint::of(b"operator approval"),
             renewal_approval: None,
+            campaign_approval: None,
             gateway_wg_public_key: gateway_key(),
             server_name: SERVER_NAME.into(),
             client_wg_public_key: client_key(2),
@@ -1545,6 +1677,7 @@ mod tests {
             request_fingerprint: authorization.request_fingerprint,
             operator_approval_fingerprint: authorization.operator_approval_fingerprint,
             renewal_approval: authorization.renewal_approval.clone(),
+            campaign_approval: authorization.campaign_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
             stage_receipt: receipt,
             gateway_wg_public_key: authorization.gateway_wg_public_key,
