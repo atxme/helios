@@ -184,7 +184,42 @@ astra-signer bindings --active <key-slot>   # la remettre en service
 Le document réémis est à copier dans le volume d'état d'Astra : c'est lui qui
 décide quelles rangées peuvent répondre à une approbation.
 
-## 7. Ce qui n'a pas encore de commande
+## 7. Préparer le renouvellement de l'identité gateway (§5)
+
+La gateway génère et scelle sa propre clé suivante, puis exporte une demande.
+Aucune clé privée gateway ne quitte jamais la machine qui l'a créée : ce qui
+part est une clé publique et deux preuves.
+
+**Sur la gateway** :
+
+```sh
+heliosd prepare-gateway-certificate
+# ajouter --rotate-tls pour remplacer aussi la feuille TLS auto-signée
+# → imprime le chemin, l'époque, l'identifiant et l'empreinte de la demande
+```
+
+La clé candidate est scellée **à côté** de l'identité en service, jamais
+par-dessus : la feuille active continue de monter les tunnels pendant toute la
+cérémonie, puis pendant le recouvrement du §4.1.
+
+**Relancer la commande est une reprise, pas une seconde tentative.** Une
+demande encore valide pour la même époque est rendue telle quelle — l'opérateur
+tient déjà une empreinte, et en produire une seconde ne se distingue pas d'une
+substitution. Une demande qui a dépassé les 24 heures du §5 est **re-signée sur
+la même clé scellée** : la cérémonie n'est pas tenue par cette horloge.
+`--new-key` est le seul geste qui remplace la clé candidate elle-même.
+
+`--key-recovery` construit la demande sans signature de continuité, et
+seulement après une procédure locale explicite établissant que la clé active a
+disparu. Le champ est alors **absent** plutôt que non vérifié, et la transition
+qui répond doit porter le motif `key_recovery`.
+
+**Limite connue** : la demande s'arrête là. Rien ne la transforme encore en
+feuille ni en `GatewayIdentityTransition` signée — c'est l'étape 4 du §11.1, une
+cérémonie `CA-PQ` dont le compagnon n'a pas encore la sous-commande. La demande
+est produite, vérifiée et exportée ; elle attend.
+
+## 8. Ce qui n'a pas encore de commande
 
 Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'un
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
@@ -198,7 +233,10 @@ fait.
   signée que les clients appliqueraient.
 - **`CA-TLS` cliente** (§9.4) : aucun geste ne la fait tourner, et le registre
   la refuserait — il épingle l'époque de cette ancre sans épingler l'ancre.
-- **L'identité gateway** (§6) : aucun producteur de transition.
+- **L'identité gateway** (§6) : la demande du §5 se prépare désormais
+  (`heliosd prepare-gateway-certificate`), mais rien ne la signe. Aucun
+  producteur de `GatewayIdentityTransition`, donc ni renouvellement gateway, ni
+  avortement avant publication, ni rollback pendant le recouvrement.
 - **Le retour à l'identité précédente** : rien ne la conserve, le magasin
   protégé ne garde qu'un lot par nom.
 - **L'adoption d'une ancre distribuée** par Astra et par la gateway.

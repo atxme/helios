@@ -52,6 +52,18 @@ const PQ_CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-pq-cert.json"
 pub(crate) const CLIENT_PQ_CA_PATH: &str =
     "/var/lib/helios/key-negotiation-client-pq-ca-public.bin";
 const PRIVATE_KEYSTORE_PATH: &str = "/var/lib/helios/key-negotiation-key.sealed";
+/// The candidate identity of a renewal in flight (spec §6.3, `staged`).
+///
+/// Sealed **beside** the active one and never over it. The operator ceremony
+/// that turns a request into a signed transition happens off this machine and
+/// may take days; the active leaf keeps mounting tunnels for the whole of it,
+/// and again through the overlap of §4.1. A candidate written over the active
+/// slot would take the gateway identity out of service at the moment the
+/// ceremony has not even started.
+const NEXT_PRIVATE_KEYSTORE_PATH: &str = "/var/lib/helios/key-negotiation-key-next.sealed";
+/// Self-signed TLS leaf of the candidate, present only when the renewal
+/// replaces the TLS half too (spec §6.1: each leaf is optional).
+const NEXT_CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-cert-next.der";
 const MAX_REPLAY_IDENTIFIERS: usize = 4096;
 
 pub struct InitializedIdentity {
@@ -1856,6 +1868,223 @@ pub fn initialize(
         pq_certificate_sha256: pq_certificate.fingerprint()?,
         pq_certificate_path,
     })
+}
+
+/// Public half of the candidate identity a renewal has sealed.
+///
+/// The private halves stay in the vault this module owns; what comes back is
+/// only what the request and the transition have to carry.
+pub(crate) struct SealedCandidate {
+    pub(crate) pq_public_key: aether::certificates::encoding::MlDsa87PublicKey,
+    /// Present exactly when the renewal replaces the TLS leaf too.
+    pub(crate) tls_certificate: Option<aether::certificates::encoding::DerCertificate>,
+}
+
+/// Which proof of continuity a gateway certificate request carries (spec §5).
+pub(crate) enum RequestContinuity {
+    /// Ordinary renewal: the leaf in service signs alongside the new key.
+    FromActiveLeaf,
+    /// The active private key is gone. §5 allows the operator to accept a
+    /// request without it after an explicit local procedure, and the field is
+    /// then **absent** — a signature nobody could check would read, in an
+    /// audit, as one that proved continuity.
+    KeyRecovery,
+}
+
+/// Sealing context of the candidate slot.
+///
+/// Bound to the epoch as well as to the peer, so a candidate prepared for one
+/// decision cannot be unsealed as the candidate of another. This is the
+/// freshness binding ADR-006 §2 asks for and that the active slot still
+/// cannot express: the active identity carries no epoch of its own, the
+/// candidate is created by a decision that has one.
+fn candidate_identity_context(
+    gateway_wg_public_key: &str,
+    gateway_identity_epoch: u64,
+) -> helio_tpm::Context {
+    helio_tpm::Context::new()
+        .field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
+        .field(
+            "gateway_identity_epoch",
+            &gateway_identity_epoch.to_be_bytes(),
+        )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCandidateIdentity {
+    pq_private_key: String,
+    /// Present exactly when the renewal replaces the TLS leaf. `None` is not
+    /// "empty": a renewal that keeps its TLS leaf must carry no candidate TLS
+    /// key at all, or promotion would have two keys and no rule saying which
+    /// one the next handshake is served under.
+    tls_private_key: Option<String>,
+}
+
+/// Generates and seals the next gateway private material (spec §11.1 step 1).
+///
+/// The keys are created **here** and never leave: what the ceremony receives
+/// is a public key and a self-signed leaf. No path in the lifecycle moves a
+/// gateway private key off the machine that created it.
+pub(crate) fn seal_candidate_identity(
+    boot: &BootDecision,
+    gateway_wg_public_key: &str,
+    server_name: &str,
+    gateway_identity_epoch: u64,
+    rotate_tls: bool,
+) -> Result<SealedCandidate> {
+    use aether::certificates::encoding::{DerCertificate, MlDsa87PublicKey};
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+
+    let secret = boot
+        .secret()
+        .context("TPM secret unavailable: cannot seal the candidate gateway identity")?;
+    let (pq_private_key, pq_public_key) =
+        generate_ml_dsa_87_keypair().context("generating the candidate gateway PQ identity")?;
+
+    let tls = if rotate_tls {
+        // Self-issued, self-signed and pinned, exactly like the active leaf:
+        // §15 keeps this asymmetry deliberate, and `GatewayIdentityTransition`
+        // refuses a leaf that chains to the client CA-TLS instead.
+        let mut params = CertificateParams::new(vec![server_name.trim().to_string()])
+            .context("server name is not valid for an X.509 certificate")?;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(825);
+        let key_pair = KeyPair::generate().context("generating the candidate gateway TLS key")?;
+        let certificate = params
+            .self_signed(&key_pair)
+            .context("creating the candidate gateway TLS certificate")?;
+        let der = DerCertificate::new(certificate.der().as_ref().to_vec())
+            .context("encoding the candidate gateway TLS certificate")?;
+        Some((Zeroizing::new(key_pair.serialize_der()), der))
+    } else {
+        None
+    };
+
+    let stored = Zeroizing::new(
+        serde_json::to_vec(&StoredCandidateIdentity {
+            pq_private_key: base64::engine::general_purpose::STANDARD
+                .encode(pq_private_key.as_slice()),
+            tls_private_key: tls
+                .as_ref()
+                .map(|(key, _)| base64::engine::general_purpose::STANDARD.encode(key.as_slice())),
+        })
+        .context("encoding the candidate gateway identity")?,
+    );
+    SealedKeystore::new(
+        NEXT_PRIVATE_KEYSTORE_PATH,
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    )
+    .store(
+        secret,
+        &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
+        stored.as_slice(),
+    )
+    .context("sealing the candidate gateway keys")?;
+
+    // The public leaf is written only once its private half is sealed. The
+    // reverse order would leave a certificate on disk whose key the gateway
+    // cannot prove it holds — and an operator reading the directory would see
+    // a candidate that does not exist.
+    let tls_certificate = match tls {
+        Some((_, der)) => {
+            write_public_atomic(Path::new(NEXT_CERTIFICATE_PATH), der.as_bytes())
+                .context("installing the candidate gateway TLS certificate")?;
+            Some(der)
+        }
+        None => {
+            // A previous attempt may have rotated TLS where this one does not.
+            remove_if_present(Path::new(NEXT_CERTIFICATE_PATH))?;
+            None
+        }
+    };
+
+    Ok(SealedCandidate {
+        pq_public_key: MlDsa87PublicKey::new(pq_public_key.to_vec())
+            .context("encoding the candidate gateway PQ public key")?,
+        tls_certificate,
+    })
+}
+
+/// Signs a gateway certificate request under the keys this module holds
+/// (spec §5).
+///
+/// Both unsealings happen inside this call and neither key leaves it. The
+/// caller builds the request from the registry and never sees a private half.
+pub(crate) fn sign_certificate_request(
+    request: aether::certificates::gateway::GatewayCertificateRequest,
+    boot: &BootDecision,
+    dry_run: bool,
+    gateway_wg_public_key: &str,
+    gateway_identity_epoch: u64,
+    continuity: RequestContinuity,
+) -> Result<aether::certificates::gateway::GatewayCertificateRequest> {
+    let secret = boot
+        .secret()
+        .context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
+    let sealed = SealedKeystore::new(
+        NEXT_PRIVATE_KEYSTORE_PATH,
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    )
+    .load(
+        secret,
+        &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
+    )
+    .context("unsealing the candidate gateway identity")?;
+    let stored: StoredCandidateIdentity =
+        serde_json::from_slice(&sealed).context("decoding the candidate gateway identity")?;
+    let candidate_pq = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(&stored.pq_private_key)
+            .context("decoding the candidate gateway PQ private key")?,
+    );
+
+    let signed = match continuity {
+        RequestContinuity::FromActiveLeaf => {
+            let active = load_identity(boot, dry_run, gateway_wg_public_key)
+                .context("opening the gateway identity in service")?;
+            request
+                .sign(
+                    candidate_pq.as_slice(),
+                    Some(active.pq_private_key.as_slice()),
+                )
+                .context("signing the gateway certificate request")?
+        }
+        RequestContinuity::KeyRecovery => request
+            .sign(candidate_pq.as_slice(), None)
+            .context("signing the gateway certificate request")?,
+    };
+    Ok(signed)
+}
+
+/// The candidate's self-signed TLS leaf, when this renewal replaces it.
+///
+/// Public by construction, and read without opening the vault: the file is
+/// either there — the renewal rotates TLS — or it is not.
+pub(crate) fn candidate_tls_certificate(
+) -> Result<Option<aether::certificates::encoding::DerCertificate>> {
+    use aether::certificates::encoding::DerCertificate;
+
+    match std::fs::read(NEXT_CERTIFICATE_PATH) {
+        Ok(der) => {
+            Ok(Some(DerCertificate::new(der).with_context(|| {
+                format!("reading {NEXT_CERTIFICATE_PATH}")
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {NEXT_CERTIFICATE_PATH}")),
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 fn write_public_atomic(path: &Path, contents: &[u8]) -> Result<()> {

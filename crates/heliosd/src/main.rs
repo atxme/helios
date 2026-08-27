@@ -3,6 +3,7 @@
 mod astra_channel;
 mod certificates;
 mod gateway_key;
+mod gateway_rotation;
 mod key_negotiation;
 mod orchestrator;
 mod static_psk;
@@ -130,6 +131,45 @@ enum Command {
         /// `astra-signer init --rp-id` and to `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
+    },
+    /// Prepares this gateway's next identity and exports its request (§5).
+    ///
+    /// Step 1 and 2 of §11.1, and the only two that happen on the gateway
+    /// before an operator ceremony: the next ML-DSA-87 key is generated and
+    /// sealed **beside** the identity in service — never over it, which keeps
+    /// serving tunnels throughout — and a `GatewayCertificateRequest` carrying
+    /// only public halves is written out.
+    ///
+    /// The request proves possession of the new key and, on an ordinary
+    /// renewal, continuity from the leaf in service. It authorises nothing:
+    /// only `CA-PQ` issues, from a vault this machine must never hold. Carry
+    /// the file to the operator companion and bring back a signed
+    /// `GatewayIdentityTransition`.
+    ///
+    /// Re-running is a resumption, not a second attempt: an unexpired request
+    /// for the same epoch is returned unchanged, and one that has outlived the
+    /// 24 hours of §5 is re-signed over the **same** sealed key.
+    PrepareGatewayCertificate {
+        /// Also replace the TLS leaf, self-signed and pinned like the active
+        /// one. Left out, the renewal moves the PQ half alone — §6.1 makes
+        /// each leaf independently optional.
+        #[arg(long)]
+        rotate_tls: bool,
+        /// Discard the sealed candidate and generate a fresh key.
+        ///
+        /// Not needed to refresh an expired request. Use it when the candidate
+        /// itself must be replaced — the previous one is destroyed, and the
+        /// epoch it was prepared for stays available.
+        #[arg(long)]
+        new_key: bool,
+        /// Build the request without a continuity signature (§5 recovery).
+        ///
+        /// Only after an explicit local procedure establishing that the active
+        /// private key is gone. The field is then absent rather than
+        /// unverified, and the transition that answers must carry the
+        /// `key_recovery` reason.
+        #[arg(long)]
+        key_recovery: bool,
     },
     /// Prints the trust block a client's profile must carry (spec §19).
     ///
@@ -380,6 +420,11 @@ async fn main() -> anyhow::Result<()> {
             init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
         }
         Command::ShowTrustEnrolment { public_key } => show_trust_enrolment(&public_key),
+        Command::PrepareGatewayCertificate {
+            rotate_tls,
+            new_key,
+            key_recovery,
+        } => prepare_gateway_certificate(rotate_tls, new_key, key_recovery),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -551,6 +596,47 @@ fn init_key_negotiation(
     println!("PQ certificate: {}", result.pq_certificate_path.display());
     println!("PQ sha256: {}", result.pq_certificate_sha256);
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
+    Ok(())
+}
+
+/// Prepares the next gateway identity and prints where its request landed.
+fn prepare_gateway_certificate(
+    rotate_tls: bool,
+    new_key: bool,
+    key_recovery: bool,
+) -> anyhow::Result<()> {
+    let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
+        .context("unlocking the TPM vault to seal the candidate gateway identity")?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?
+        .as_secs();
+    let prepared = gateway_rotation::prepare_request(
+        &boot,
+        false,
+        rotate_tls,
+        new_key,
+        key_recovery,
+        now_unix,
+    )?;
+
+    println!("request: {}", prepared.path.display());
+    println!("epoch: {}", prepared.request.gateway_identity_epoch);
+    println!("request id: {}", prepared.request.request_id.to_hex());
+    println!("fingerprint: {}", prepared.request.fingerprint().to_hex());
+    println!("expires at: {}", prepared.request.expires_at);
+    match &prepared.tls_certificate {
+        Some(certificate) => println!("candidate TLS leaf: {}", certificate.fingerprint().to_hex()),
+        None => println!("candidate TLS leaf: unchanged"),
+    }
+    if prepared.reused {
+        info!("the request already prepared for this epoch is still valid and was reused");
+    } else if key_recovery {
+        warn!(
+            "request built without a continuity signature: the transition answering it must \
+             carry the key_recovery reason"
+        );
+    }
     Ok(())
 }
 
