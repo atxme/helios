@@ -48,18 +48,19 @@ Ce qui **manque** encore :
 
 - le **retour à l'identité précédente** du §12.2 : rien ne la conserve, refusé
   en le disant ;
-- la **révocation** d'une identité : l'objet et la route privée existent, aucun
-  geste ne les produit ni ne les dépose ;
+- la **révocation de la gateway** : la révocation cliente est produite,
+  déposée et relayée ; celle de la gateway reste refusée faute de feuilles
+  gateway dans le registre Astra ;
 - `authorize-issuer` ne porte **aucune campagne**, donc pas d'opération à
   laquelle se rattacher : ce geste passe par des fichiers, comme décrit ici.
-  `approve`, `approve-campaign` et `rotate-ca-pq` ont leur transport ;
+  `approve`, `approve-campaign`, `revoke` et `rotate-ca-pq` ont leur transport ;
 - l'**adoption** d'une ancre distribuée. Les clients l'appliquent ; le registre
   Astra et l'épinglage de la gateway restent sur l'ancre sortante jusqu'à ce
   que l'opérateur les avance. Une adoption qui ne toucherait qu'une moitié du
   domaine laisserait les deux en désaccord sur ce qui est courant ;
 - une transition de **CA TLS cliente**, qu'aucun geste ne signe et que le
   registre refuserait faute d'épingler cette ancre ; les transitions
-  d'identité gateway et les révocations, sans producteur ;
+  d'identité gateway, sans producteur ;
 - la **bascule de confiance** du §13, et le discriminant de type de profil
   Orion (§19, §22).
 

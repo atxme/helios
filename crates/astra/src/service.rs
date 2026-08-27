@@ -896,6 +896,39 @@ async fn signer_result(
             offered = verified.objects.len(),
             "anchor transitions stored; the service key will build one manifest per peer"
         );
+        drop(domain);
+
+        // The signed decision is durable before it reaches the data plane.
+        // An identical companion retry replays this relay without creating a
+        // second registry entry, which repairs a transient private-channel
+        // failure without asking `CA-PQ` to sign again.
+        for object in &verified.objects {
+            let aether::certificates::transport::TrustUpdateObject::CertificateRevocation(
+                revocation,
+            ) = object
+            else {
+                continue;
+            };
+            let Some(gateway) = service.gateway.as_ref() else {
+                tracing::error!(
+                    %operation_id,
+                    "revocation recorded but no private gateway channel is configured; the \
+                     signed decision remains distributable and the data-plane withdrawal must be retried"
+                );
+                return Err(ServiceError::Internal);
+            };
+            match gateway.revoke(revocation).await {
+                Ok(()) => tracing::info!(%operation_id, "revocation applied on the gateway"),
+                Err(error) => {
+                    tracing::error!(
+                        %operation_id,
+                        %error,
+                        "revocation recorded but not applied on the gateway; retry the identical signer result"
+                    );
+                    return Err(ServiceError::Internal);
+                }
+            }
+        }
     }
 
     let mut operations = service.signing.lock().await;

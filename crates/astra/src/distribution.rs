@@ -42,15 +42,14 @@
 //! chosen. A peer that stays away longer is repaired by an operator, not by a
 //! late delivery.
 //!
-//! # Limite connue : deux familles d'objets seulement
+//! # Limite connue : certaines transitions restent sans producteur
 //!
-//! [`AstraIssuerAuthorization`] and the `CA-PQ` transition of §9.1 are what
-//! this authority holds. `CA-TLS` transitions are refused at the registry
+//! [`AstraIssuerAuthorization`], the `CA-PQ` transition of §9.1 and emergency
+//! revocations are what this authority holds. `CA-TLS` transitions are refused at the registry
 //! rather than stored — it pins the epoch of that anchor without pinning the
 //! anchor itself, so it could only check such an object against a value the
-//! object carried. Gateway identity transitions and revocations have no
-//! producer at all. Pinning `ca_tls_fingerprint` at `init-trust-domain` is
-//! what unblocks the first; the other two need a gesture that signs them.
+//! object carried. Gateway identity transitions have no producer. Pinning
+//! `ca_tls_fingerprint` at `init-trust-domain` is what unblocks the first.
 
 use std::sync::Arc;
 
@@ -251,6 +250,23 @@ fn select_objects(
             }
         }
     }
+    // Revocation counters are independent from certificate generations and
+    // are not carried by `TrustUpdateRequest`. While a revocation's own
+    // signed validity remains, offer it unconditionally; receivers deduplicate
+    // its tombstone, while a client that missed it gets another chance to
+    // learn the decision.
+    for stored in &state.transitions {
+        if let TrustUpdateObject::CertificateRevocation(revocation) = &stored.object {
+            let still_relevant = revocation
+                .revoked_tls_not_after
+                .into_iter()
+                .chain(revocation.revoked_pq_not_after)
+                .any(|not_after| now_unix < not_after);
+            if still_relevant {
+                objects.push(stored.object.clone());
+            }
+        }
+    }
     // The delegation. A client whose `issuer_epoch` is behind cannot build the
     // chain of a delegated leaf at all: it holds the anchor and sees a leaf
     // signed by an intermediate it has never been told about.
@@ -397,6 +413,42 @@ mod tests {
         }
     }
 
+    fn state_with_revocation() -> crate::registry::AstraState {
+        use aether::certificates::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        let mut state = state_with_transition(1);
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let revocation = EmergencyCertificateRevocation {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: state.trust_domain_id,
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key: WireGuardKey::from_bytes([9; 32]),
+            server_name: None,
+            revocation_epoch: 1,
+            revoked_tls_fingerprint: Some(Fingerprint::of(b"withdrawn tls")),
+            revoked_tls_not_after: Some(50_000),
+            revoked_pq_fingerprint: Some(Fingerprint::of(b"withdrawn pq")),
+            revoked_pq_not_after: Some(60_000),
+            effective_at: 2_000,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_private)
+        .expect("signing");
+        state.ca_public_key = ca_public;
+        state.transitions = vec![crate::registry::StoredTransition {
+            campaign_id: Id16::new([8; 16]).expect("id"),
+            accepted_at: 2_000,
+            object: TrustUpdateObject::CertificateRevocation(Box::new(revocation)),
+            credential_registry: None,
+        }];
+        state
+    }
+
     /// A peer still on the outgoing anchor is exactly who a transition is for.
     #[test]
     fn a_peer_behind_on_the_anchor_is_offered_the_transition() {
@@ -422,5 +474,17 @@ mod tests {
         let state = state_with_transition(1);
         assert_eq!(select_objects(&state, &request(1), 89_999).len(), 1);
         assert!(select_objects(&state, &request(1), 90_000).is_empty());
+    }
+
+    #[test]
+    fn a_revocation_is_offered_until_its_last_signed_expiry() {
+        let state = state_with_revocation();
+        let selected = select_objects(&state, &request(1), 59_999);
+        assert_eq!(selected.len(), 1);
+        assert!(matches!(
+            selected[0],
+            TrustUpdateObject::CertificateRevocation(_)
+        ));
+        assert!(select_objects(&state, &request(1), 60_000).is_empty());
     }
 }

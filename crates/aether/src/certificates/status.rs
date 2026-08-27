@@ -386,6 +386,8 @@ pub enum CampaignScope {
     FullCertificateChain,
     /// `CA-PQ` and `CA-TLS`. Two operator credentials.
     TrustAuthorities,
+    /// Emergency withdrawal of one identity's active leaves (spec §10).
+    EmergencyRevocation,
 }
 
 impl CampaignScope {
@@ -396,6 +398,7 @@ impl CampaignScope {
             Self::FleetLeafs => 2,
             Self::FullCertificateChain => 3,
             Self::TrustAuthorities => 4,
+            Self::EmergencyRevocation => 5,
         }
     }
 
@@ -410,6 +413,24 @@ impl CampaignScope {
     /// Whether the scope rotates an anchor of the domain.
     pub const fn rotates_authority(self) -> bool {
         matches!(self, Self::TrustAuthorities)
+    }
+
+    /// Whether this scope authorizes renewing a client leaf.
+    pub const fn authorizes_client_rotation(self) -> bool {
+        matches!(
+            self,
+            Self::OrionProfile | Self::OrionDevice | Self::FleetLeafs | Self::FullCertificateChain
+        )
+    }
+
+    /// Whether the companion must open the master vault for this scope.
+    pub const fn opens_vault(self) -> bool {
+        matches!(self, Self::TrustAuthorities | Self::EmergencyRevocation)
+    }
+
+    /// Whether this scope withdraws leaves instead of renewing them.
+    pub const fn revokes(self) -> bool {
+        matches!(self, Self::EmergencyRevocation)
     }
 }
 
@@ -498,6 +519,9 @@ impl AstraRotationCampaign {
         if self.targets.len() > MAX_CAMPAIGN_TARGETS {
             return Err(CertificateError::TooManyObjects);
         }
+        if self.scope.revokes() && self.targets.len() != 1 {
+            return Err(CertificateError::CampaignMismatch);
+        }
         if self.expires_at <= self.created_at || now_unix >= self.expires_at {
             return Err(CertificateError::InvalidLease);
         }
@@ -550,9 +574,9 @@ impl AstraRotationCampaign {
         active_tls_certificate_fingerprint: &Fingerprint,
         active_pq_certificate_fingerprint: &Fingerprint,
     ) -> Result<(), CertificateError> {
-        if self.scope.rotates_authority() {
+        if !self.scope.authorizes_client_rotation() {
             return Err(CertificateError::IssuerScopeViolation(
-                "an authority campaign does not authorize a client rotation",
+                "this campaign does not authorize a client rotation",
             ));
         }
         let covered = self.targets.iter().any(|target| {
@@ -629,6 +653,53 @@ impl AstraRotationCampaign {
                 && target
                     .active_pq_certificate_fingerprint
                     .matches(&current_fingerprint)
+        });
+        if covered {
+            Ok(())
+        } else {
+            Err(CertificateError::CampaignMismatch)
+        }
+    }
+
+    /// Verifies that an emergency revocation names the exact identity state
+    /// frozen into this campaign.
+    pub fn covers_revocation(
+        &self,
+        revocation: &super::revocation::EmergencyCertificateRevocation,
+    ) -> Result<(), CertificateError> {
+        use super::revocation::RevocationScope;
+
+        if !self.scope.revokes() {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only a revocation campaign produces a revocation",
+            ));
+        }
+        if revocation.trust_domain_id != self.trust_domain_id {
+            return Err(CertificateError::TrustDomainMismatch);
+        }
+        let (tls_kind, pq_kind) = match revocation.scope {
+            RevocationScope::Gateway => (CertificateKind::GatewayTls, CertificateKind::GatewayPq),
+            RevocationScope::Client => (CertificateKind::ClientTls, CertificateKind::ClientPq),
+        };
+        let covered = self.targets.iter().any(|target| {
+            (target.certificate_kind == tls_kind || target.certificate_kind == pq_kind)
+                && target.identity_key == revocation.identity_key
+                && target
+                    .epoch
+                    .checked_add(1)
+                    .is_some_and(|next| next == revocation.revocation_epoch)
+                && revocation
+                    .revoked_tls_fingerprint
+                    .is_none_or(|fingerprint| {
+                        target
+                            .active_tls_certificate_fingerprint
+                            .matches(&fingerprint)
+                    })
+                && revocation.revoked_pq_fingerprint.is_none_or(|fingerprint| {
+                    target
+                        .active_pq_certificate_fingerprint
+                        .matches(&fingerprint)
+                })
         });
         if covered {
             Ok(())
@@ -849,15 +920,18 @@ impl AstraSignerResult {
         if self.objects.len() > MAX_CAMPAIGN_OBJECTS {
             return Err(CertificateError::CampaignMismatch);
         }
-        if !campaign.scope.rotates_authority() {
-            // A scope that rotates no anchor has nothing for the companion to
-            // sign. Accepting objects here would let a one-credential campaign
-            // deliver an anchor transition.
+        if campaign.scope.revokes() && self.objects.len() != 1 {
+            return Err(CertificateError::CampaignMismatch);
+        }
+        if !campaign.scope.rotates_authority() && !campaign.scope.revokes() {
+            // An ordinary leaf campaign has nothing for the companion to
+            // sign. Accepting objects here would let it deliver a trust
+            // mutation that the operator was never shown.
             return if self.objects.is_empty() && self.credential_registry.is_none() {
                 Ok(())
             } else {
                 Err(CertificateError::IssuerScopeViolation(
-                    "this campaign rotates no anchor and authorizes no transition object",
+                    "this campaign authorizes no trust-update object",
                 ))
             };
         }
@@ -868,7 +942,17 @@ impl AstraSignerResult {
         let mut seen: Vec<Fingerprint> = Vec::with_capacity(self.objects.len());
         let mut replaces_ca_pq = false;
         for object in &self.objects {
-            campaign.covers_authority_object(object)?;
+            match (campaign.scope.revokes(), object) {
+                (true, TrustUpdateObject::CertificateRevocation(revocation)) => {
+                    campaign.covers_revocation(revocation)?
+                }
+                (true, _) | (false, TrustUpdateObject::CertificateRevocation(_)) => {
+                    return Err(CertificateError::IssuerScopeViolation(
+                        "this object does not belong to the family its campaign approved",
+                    ))
+                }
+                (false, _) => campaign.covers_authority_object(object)?,
+            }
             let fingerprint = object.fingerprint()?;
             if seen.iter().any(|earlier| earlier.matches(&fingerprint)) {
                 return Err(CertificateError::DuplicateFingerprint);
@@ -1352,6 +1436,124 @@ mod tests {
                 Err(CertificateError::CampaignMismatch)
             ));
         }
+    }
+
+    fn revocation(
+        identity_key: WireGuardKey,
+        tls: Option<Fingerprint>,
+        pq: Option<Fingerprint>,
+    ) -> super::super::revocation::EmergencyCertificateRevocation {
+        use super::super::revocation::{
+            EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+        };
+
+        EmergencyCertificateRevocation {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            scope: RevocationScope::Client,
+            identity_key,
+            server_name: None,
+            revocation_epoch: 2,
+            revoked_tls_fingerprint: tls,
+            revoked_tls_not_after: tls.map(|_| 9_000),
+            revoked_pq_fingerprint: pq,
+            revoked_pq_not_after: pq.map(|_| 9_000),
+            effective_at: 1_100,
+            reason: RevocationReason::KeyCompromise,
+            replacement_transition_fingerprint: None,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    #[test]
+    fn a_revocation_campaign_covers_only_the_identity_state_shown_to_the_operator() {
+        let target = target(1);
+        let campaign = campaign(CampaignScope::EmergencyRevocation, vec![target.clone()]);
+        let decision = revocation(
+            target.identity_key,
+            Some(target.active_tls_certificate_fingerprint),
+            Some(target.active_pq_certificate_fingerprint),
+        );
+        campaign
+            .covers_revocation(&decision)
+            .expect("the exact frozen identity");
+
+        let substituted = revocation(
+            target.identity_key,
+            None,
+            Some(Fingerprint::of(b"a leaf the operator was not shown")),
+        );
+        assert!(matches!(
+            campaign.covers_revocation(&substituted),
+            Err(CertificateError::CampaignMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_revocation_campaign_neither_renews_a_client_nor_carries_an_anchor() {
+        let target = target(1);
+        let campaign = campaign(CampaignScope::EmergencyRevocation, vec![target.clone()]);
+        assert!(campaign
+            .covers_client(
+                &target.identity_key,
+                target.generation,
+                &target.active_tls_certificate_fingerprint,
+                &target.active_pq_certificate_fingerprint,
+            )
+            .is_err());
+        assert!(campaign
+            .covers_authority_object(
+                &crate::certificates::transport::TrustUpdateObject::CertificateRevocation(
+                    Box::new(revocation(
+                        target.identity_key,
+                        None,
+                        Some(target.active_pq_certificate_fingerprint),
+                    )),
+                )
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_revocation_result_carries_exactly_one_revocation_and_no_registry() {
+        let target = target(1);
+        let campaign = campaign(CampaignScope::EmergencyRevocation, vec![target.clone()]);
+        let object = crate::certificates::transport::TrustUpdateObject::CertificateRevocation(
+            Box::new(revocation(
+                target.identity_key,
+                Some(target.active_tls_certificate_fingerprint),
+                Some(target.active_pq_certificate_fingerprint),
+            )),
+        );
+        let result = AstraSignerResult {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            approval: Box::new(CampaignApproval {
+                campaign_id: campaign.campaign_id,
+                campaign_fingerprint: campaign.fingerprint(),
+                required_credentials: 1,
+                approved_at: 1_100,
+                approvals: Vec::new(),
+            }),
+            objects: vec![object.clone()],
+            credential_registry: None,
+        };
+        result.validate(&campaign).expect("one signed decision");
+
+        let mut twice = result.clone();
+        twice.objects.push(object);
+        assert!(twice.validate(&campaign).is_err());
+        let mut with_registry = result;
+        with_registry.credential_registry = Some(Box::new(
+            crate::certificates::approval::CredentialRegistry {
+                trust_domain_id: domain(),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            },
+        ));
+        assert!(with_registry.validate(&campaign).is_err());
     }
 
     /// Rotating the authorities is the one scope that needs two credentials,

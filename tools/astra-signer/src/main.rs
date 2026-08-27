@@ -186,6 +186,32 @@ impl From<RoleArg> for SlotRole {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RevokedHalvesArg {
+    Both,
+    Tls,
+    Pq,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RevocationReasonArg {
+    KeyCompromise,
+    SuspectedCompromise,
+    Cessation,
+    Superseded,
+}
+
+impl From<RevocationReasonArg> for aether::certificates::revocation::RevocationReason {
+    fn from(value: RevocationReasonArg) -> Self {
+        match value {
+            RevocationReasonArg::KeyCompromise => Self::KeyCompromise,
+            RevocationReasonArg::SuspectedCompromise => Self::SuspectedCompromise,
+            RevocationReasonArg::Cessation => Self::Cessation,
+            RevocationReasonArg::Superseded => Self::Superseded,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Creates the vault around fresh anchors and registers the first key.
@@ -368,6 +394,22 @@ enum Command {
         #[arg(long)]
         origin: Option<String>,
     },
+    /// Signs and deposits an emergency client revocation (spec §10).
+    Revoke {
+        #[arg(long)]
+        authority_url: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        origin: Option<String>,
+        #[arg(long, value_enum, default_value = "both")]
+        halves: RevokedHalvesArg,
+        /// Signed cryptographic expiry printed by `astra revocation open`.
+        #[arg(long)]
+        not_after: u64,
+        #[arg(long, value_enum, default_value = "key-compromise")]
+        reason: RevocationReasonArg,
+    },
     /// Approuve la récupération d'une identité expirée (§7.5).
     ///
     /// Une seule commande, une seule clé branchée : elle lit la demande,
@@ -523,6 +565,23 @@ fn run() -> Result<()> {
             authority_url.as_deref(),
             operation_id.as_deref(),
             origin.as_deref(),
+            transport,
+        ),
+        Command::Revoke {
+            authority_url,
+            operation_id,
+            origin,
+            halves,
+            not_after,
+            reason,
+        } => revoke(
+            &path,
+            &authority_url,
+            &operation_id,
+            origin.as_deref(),
+            halves,
+            not_after,
+            reason.into(),
             transport,
         ),
     }
@@ -1329,6 +1388,13 @@ fn approve_campaign(
         None => format!("https://{}", vault.rp_id),
     };
 
+    if campaign.scope.revokes() {
+        bail!(
+            "cette campagne retire une identité : l'exécuter par `astra-signer revoke \
+             --authority-url … --operation-id …`, qui ouvre le coffre et dépose la décision \
+             signée dans le même geste. Rien n'a été signé."
+        );
+    }
     if campaign.scope.rotates_authority() {
         // An anchor campaign is not approved and then applied: the approval
         // and the objects `CA-PQ` signs travel in one deposit (§0.6). Taking
@@ -1429,6 +1495,137 @@ fn campaign_result(
         objects,
         credential_registry,
     }
+}
+
+/// Signs and deposits the client revocation frozen into an Astra campaign.
+#[allow(clippy::too_many_arguments)]
+fn revoke(
+    path: &Path,
+    authority_url: &str,
+    operation_id: &str,
+    origin: Option<&str>,
+    halves: RevokedHalvesArg,
+    not_after: u64,
+    reason: aether::certificates::revocation::RevocationReason,
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::revocation::RevocationScope;
+
+    let operation = Id16::parse_hex(operation_id)
+        .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let request = origin_client_fetch(&client, &operation)?;
+    verify_campaign_request(&handoff, &vault, &request, authority_url)?;
+    let campaign = request.campaign.as_ref().clone();
+    if !campaign.scope.revokes() {
+        bail!("cette opération n'est pas une révocation. Rien n'a été signé.");
+    }
+    if campaign.targets.len() != 1 {
+        bail!(
+            "une révocation doit nommer exactement une identité, {} présentes. Rien n'a été signé.",
+            campaign.targets.len()
+        );
+    }
+    let target = campaign
+        .targets
+        .first()
+        .context("la campagne ne nomme aucune identité")?;
+    let revocation_epoch = target
+        .epoch
+        .checked_add(1)
+        .context("revocation counter overflow")?;
+    let (revoke_tls, revoke_pq) = match halves {
+        RevokedHalvesArg::Both => (true, true),
+        RevokedHalvesArg::Tls => (true, false),
+        RevokedHalvesArg::Pq => (false, true),
+    };
+    let now = now_unix();
+
+    println!("révocation       : {}", operation.to_hex());
+    println!("identité         : {}", target.identity_key.to_base64());
+    println!("gateway          : {}", campaign.server_name);
+    println!("génération       : {}", target.generation);
+    println!("compteur         : {} → {revocation_epoch}", target.epoch);
+    println!(
+        "feuilles         : {}",
+        match (revoke_tls, revoke_pq) {
+            (true, true) => "TLS et PQ",
+            (true, false) => "TLS",
+            (false, true) => "PQ",
+            (false, false) => unreachable!("the command always selects a half"),
+        }
+    );
+    println!("échéance signée  : {not_after}");
+    println!("effet            : immédiat ({now})");
+    println!("catégorie        : {reason:?}");
+    println!("motif            : {}", campaign.reason);
+    println!("demandée par     : {}", campaign.requested_by);
+    println!("empreinte        : {}", campaign.fingerprint());
+    println!("terminal         : cette identité devra être réadmise");
+
+    let origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+
+    let approval = authority::approve_campaign(
+        &[key.as_ref()],
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        &[pin.as_str()],
+        now,
+    )?;
+    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+    let decision = authority::RevocationDecision {
+        scope: RevocationScope::Client,
+        identity_key: target.identity_key,
+        server_name: None,
+        revocation_epoch,
+        revoked_tls: revoke_tls.then_some((target.active_tls_certificate_fingerprint, not_after)),
+        revoked_pq: revoke_pq.then_some((target.active_pq_certificate_fingerprint, not_after)),
+        effective_at: now,
+        reason,
+    };
+    let revocation = authority::sign_revocation(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key,
+        &decision,
+        target.epoch,
+    )?;
+    campaign
+        .covers_revocation(&revocation)
+        .context("la décision signée ne correspond pas à la campagne approuvée")?;
+
+    let result = campaign_result(
+        &approval,
+        vec![
+            aether::certificates::transport::TrustUpdateObject::CertificateRevocation(Box::new(
+                revocation,
+            )),
+        ],
+        None,
+    );
+    let state = client.submit(&request.operation_id, &request.result_token, &result)?;
+    println!("état             : {state:?}");
+    println!("décision déposée : Astra la relaie à la gateway et la distribue aux clients");
+    Ok(())
 }
 
 fn origin_client_fetch(

@@ -169,6 +169,11 @@ enum Command {
         #[command(subcommand)]
         command: CampaignCommand,
     },
+    /// Opens an emergency identity revocation for the companion to sign.
+    Revocation {
+        #[command(subcommand)]
+        command: RevocationCommand,
+    },
     /// Prints the authority's state and the head of its audit chain.
     Status {
         /// Previously recorded head. A suffix made only of legacy status
@@ -215,6 +220,33 @@ enum CampaignCommand {
         #[arg(long)]
         requested_by: String,
         /// How long the operator has, in seconds.
+        #[arg(long, default_value_t = 300)]
+        window_secs: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RevocationScopeArg {
+    /// This gateway's own leaves.
+    Gateway,
+    /// One admitted client's leaves.
+    Client,
+}
+
+#[derive(Subcommand)]
+enum RevocationCommand {
+    /// Resolves one active identity into a short-lived signing campaign.
+    Open {
+        #[arg(long, value_enum)]
+        scope: RevocationScopeArg,
+        /// Client WireGuard public key. Required for `client`, refused for
+        /// `gateway`.
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
     },
@@ -317,6 +349,22 @@ fn main() -> Result<()> {
                 requested_by,
                 window_secs,
             } => campaign_open(&cli.state_dir, scope, &reason, &requested_by, window_secs),
+        },
+        Command::Revocation { command } => match command {
+            RevocationCommand::Open {
+                scope,
+                peer,
+                reason,
+                requested_by,
+                window_secs,
+            } => revocation_open(
+                &cli.state_dir,
+                scope,
+                peer.as_deref(),
+                &reason,
+                &requested_by,
+                window_secs,
+            ),
         },
         Command::Status {
             expected_audit_head,
@@ -772,16 +820,16 @@ type ApprovalCredentials = (
 /// `AstraSignerRequest` names, so a wrong file is refused by the companion —
 /// not by this read.
 ///
-/// Absent is a supported state, and the ordinary one: only a campaign that
-/// rotates an anchor needs it. Saying so at start-up beats discovering it in
-/// the middle of a ceremony.
+/// Absent is a supported state, and the ordinary one: only a ceremony that
+/// makes a master key sign needs it. Saying so at start-up beats discovering
+/// it in the middle of a ceremony.
 fn load_encrypted_vault(state_dir: &Path) -> Result<Option<Vec<u8>>> {
     let path = state_dir.join(VAULT_FILE);
     let Ok(metadata) = std::fs::metadata(&path) else {
         tracing::info!(
             path = %path.display(),
-            "no encrypted vault in the state volume: campaigns that rotate an anchor are refused \
-             by name; every other scope is unaffected"
+            "no encrypted vault in the state volume: anchor rotations and revocations are \
+             refused by name; every other scope is unaffected"
         );
         return Ok(None);
     };
@@ -923,6 +971,161 @@ fn fresh_id() -> Result<aether::certificates::encoding::Id16> {
         .map_err(|error| anyhow::anyhow!("drawing an identifier: {error}"))
 }
 
+/// Writes a resolved campaign and its service-signed companion request into
+/// the inbox consumed by the running Astra service.
+fn deposit_campaign(
+    state_dir: &Path,
+    state: &astra::registry::AstraState,
+    campaign: aether::certificates::status::AstraRotationCampaign,
+    now: u64,
+    expires_at: u64,
+) -> Result<astra::signing::CampaignDeposit> {
+    use aether::certificates::status::AstraSignerRequest;
+
+    let service_private_key = Zeroizing::new(
+        std::fs::read(state_dir.join(SERVICE_KEY_FILE)).context("reading the Astra service key")?,
+    );
+    let vault_fingerprint = load_encrypted_vault(state_dir)?
+        .map(|bytes| Fingerprint::of(&bytes))
+        .unwrap_or_else(|| Fingerprint::of(b"no encrypted vault in this state volume"));
+    let signer_request = AstraSignerRequest {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        operation_id: fresh_id()?,
+        campaign_fingerprint: campaign.fingerprint(),
+        authority_url: state.authority_url.clone(),
+        encrypted_vault_fingerprint: vault_fingerprint,
+        required_credentials: campaign.required_credentials,
+        created_at: now,
+        expires_at,
+        astra_service_key_epoch: state.astra_service_key_epoch,
+        astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(&service_private_key)
+    .map_err(|error| anyhow::anyhow!("signing the companion request: {error}"))?;
+
+    let operation_id = signer_request.operation_id;
+    let deposit = astra::signing::CampaignDeposit {
+        campaign: Box::new(campaign),
+        signer_request: Box::new(signer_request),
+    };
+    let directory = state_dir.join(astra::signing::CAMPAIGN_INBOX_DIR);
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("creating {}", directory.display()))?;
+    let path = directory.join(format!("{}.json", operation_id.to_hex()));
+    let temporary = directory.join(format!("{}.tmp", operation_id.to_hex()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&deposit).context("encoding the campaign")?,
+    )
+    .with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path).with_context(|| format!("publishing {}", path.display()))?;
+    Ok(deposit)
+}
+
+/// Resolves one admitted client into an emergency revocation campaign.
+fn revocation_open(
+    state_dir: &Path,
+    scope: RevocationScopeArg,
+    peer: Option<&str>,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+) -> Result<()> {
+    use aether::certificates::status::{
+        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
+    };
+
+    if reason.trim().is_empty() || requested_by.trim().is_empty() {
+        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
+    }
+    if window_secs == 0 || window_secs > 300 {
+        anyhow::bail!("--window-secs must be between 1 and 300");
+    }
+    if scope == RevocationScopeArg::Gateway {
+        if peer.is_some() {
+            anyhow::bail!("--peer is refused for --scope gateway");
+        }
+        anyhow::bail!(
+            "known limitation: Astra does not hold the gateway leaf certificates, so it cannot \
+             bind their exact fingerprints and signed expiries into a revocation"
+        );
+    }
+    let peer = peer.context("--peer is required for --scope client")?;
+    let client_wg_public_key =
+        WireGuardKey::parse(peer).context("reading the client's WireGuard public key")?;
+
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let state = registry.state();
+    let record = state
+        .peers
+        .get(&client_wg_public_key.to_base64())
+        .context("this registry has no admitted identity for --peer")?;
+    if record.revoked {
+        anyhow::bail!(
+            "{} is already revoked at epoch {}; revoked is terminal",
+            record.name,
+            record.revocation_epoch
+        );
+    }
+    if load_encrypted_vault(state_dir)?.is_none() {
+        anyhow::bail!("this state volume has no encrypted vault for the companion to open");
+    }
+
+    let target = CampaignTarget {
+        certificate_kind: CertificateKind::ClientPq,
+        identity_key: record.client_wg_public_key,
+        epoch: record.revocation_epoch,
+        generation: record.active.generation,
+        active_tls_certificate_fingerprint: record.active.tls_certificate_fingerprint,
+        active_pq_certificate_fingerprint: record.active.pq_certificate_fingerprint,
+    };
+    let now = now_unix();
+    let expires_at = now
+        .checked_add(window_secs)
+        .context("revocation campaign window overflow")?;
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: fresh_id()?,
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway_wg_public_key,
+        server_name: state.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope: CampaignScope::EmergencyRevocation,
+        targets: vec![target],
+        reason: reason.trim().to_string(),
+        requested_by: requested_by.trim().to_string(),
+        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+        required_credentials: CampaignScope::EmergencyRevocation.required_credentials(),
+    };
+    campaign.validate(now).map_err(|error| {
+        anyhow::anyhow!("the resolved revocation cannot be shown to an operator: {error}")
+    })?;
+
+    let peer_name = record.name.clone();
+    let generation = record.active.generation;
+    let not_after = record.active.not_after;
+    let next_epoch = record
+        .revocation_epoch
+        .checked_add(1)
+        .context("revocation counter overflow")?;
+    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
+    let operation_id = deposit.signer_request.operation_id;
+    println!("{}", operation_id.to_hex());
+    eprintln!(
+        "révocation déposée : {peer_name}, génération {generation}, compteur {next_epoch}, fenêtre de {window_secs} s"
+    );
+    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    eprintln!(
+        "signer depuis le poste opérateur :\n  astra-signer revoke --authority-url {} \
+         --operation-id {} --not-after {not_after}",
+        deposit.signer_request.authority_url,
+        operation_id.to_hex()
+    );
+    Ok(())
+}
+
 /// Resolves a campaign over the fleet as it stands, and deposits it (§7.6).
 ///
 /// Every target is pinned to the generation and the **exact** fingerprints the
@@ -943,8 +1146,7 @@ fn campaign_open(
     window_secs: u64,
 ) -> Result<()> {
     use aether::certificates::status::{
-        AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, CertificateKind,
-        MAX_CAMPAIGN_TARGETS,
+        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind, MAX_CAMPAIGN_TARGETS,
     };
 
     if reason.trim().is_empty() || requested_by.trim().is_empty() {
@@ -1000,7 +1202,7 @@ fn campaign_open(
             "no admitted peer in this registry: there is nothing for an operator to approve"
         );
     }
-    if scope.rotates_authority() && load_encrypted_vault(state_dir)?.is_none() {
+    if scope.opens_vault() && load_encrypted_vault(state_dir)?.is_none() {
         // The companion needs the vault to open `CA-PQ`, and it fetches it
         // from here. Opening the campaign anyway would spend an operator's
         // window on a ceremony that cannot reach a private key.
@@ -1042,50 +1244,8 @@ fn campaign_open(
         anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
     })?;
 
-    let service_private_key = Zeroizing::new(
-        std::fs::read(state_dir.join(SERVICE_KEY_FILE)).context("reading the Astra service key")?,
-    );
-    // The vault fingerprint is part of the signed request, so a scope that
-    // needs no vault still names one. All-zero would be a value the companion
-    // could be pointed at; the vault actually held is the honest answer, and
-    // `SigningOperation::vault_fingerprint` is what decides whether a token is
-    // ever minted for it.
-    let vault_fingerprint = load_encrypted_vault(state_dir)?
-        .map(|bytes| Fingerprint::of(&bytes))
-        .unwrap_or_else(|| Fingerprint::of(b"no encrypted vault in this state volume"));
-    let signer_request = AstraSignerRequest {
-        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
-        operation_id: fresh_id()?,
-        campaign_fingerprint: campaign.fingerprint(),
-        authority_url: state.authority_url.clone(),
-        encrypted_vault_fingerprint: vault_fingerprint,
-        required_credentials: campaign.required_credentials,
-        created_at: now,
-        expires_at,
-        astra_service_key_epoch: state.astra_service_key_epoch,
-        astra_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
-    }
-    .sign(&service_private_key)
-    .map_err(|error| anyhow::anyhow!("signing the companion request: {error}"))?;
-
-    let operation_id = signer_request.operation_id;
-    let deposit = astra::signing::CampaignDeposit {
-        campaign: Box::new(campaign),
-        signer_request: Box::new(signer_request),
-    };
-    let directory = state_dir.join(astra::signing::CAMPAIGN_INBOX_DIR);
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("creating {}", directory.display()))?;
-    let path = directory.join(format!("{}.json", operation_id.to_hex()));
-    let temporary = directory.join(format!("{}.tmp", operation_id.to_hex()));
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec(&deposit).context("encoding the campaign")?,
-    )
-    .with_context(|| format!("writing {}", temporary.display()))?;
-    // Renamed into place, so the drain never reads a half-written campaign and
-    // refuses a deposit that was merely still being made.
-    std::fs::rename(&temporary, &path).with_context(|| format!("publishing {}", path.display()))?;
+    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
+    let operation_id = deposit.signer_request.operation_id;
 
     println!("{}", operation_id.to_hex());
     eprintln!(

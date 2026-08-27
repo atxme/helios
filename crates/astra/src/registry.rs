@@ -99,6 +99,11 @@ pub struct StoredTransition {
 /// ceiling is a refusal, never an eviction: dropping the oldest would drop the
 /// one a lagging peer is still missing.
 pub const MAX_STORED_TRANSITIONS: usize = 8;
+/// Revocations retained for redistribution while their signed leaves live.
+///
+/// Aligned with the holder-side tombstone ledger: accepting more here than a
+/// recipient can remember would only defer a deterministic refusal.
+pub const MAX_STORED_REVOCATIONS: usize = aether::certificates::state::MAX_REVOCATION_TOMBSTONES;
 
 /// Everything Astra persists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +165,11 @@ pub enum RegistryError {
          make room"
     )]
     TransitionStoreFull { held: usize },
+    #[error(
+        "this authority already holds {held} live revocations, the ceiling of \
+         {MAX_STORED_REVOCATIONS}; no live decision is evicted to make room"
+    )]
+    RevocationStoreFull { held: usize },
     #[error("the transition this campaign produced is refused: {0}")]
     Transition(#[from] aether::certificates::CertificateError),
 }
@@ -388,13 +398,81 @@ impl AstraRegistry {
         use aether::certificates::transport::TrustUpdateObject;
 
         let mut fresh = Vec::new();
+        let mut withdrawn = Vec::new();
         for object in objects {
+            let fingerprint = object.fingerprint()?;
+            let held = self.state.transitions.iter().try_fold(
+                false,
+                |found, stored| -> Result<bool, RegistryError> {
+                    Ok(found || stored.object.fingerprint()?.matches(&fingerprint))
+                },
+            )?;
+            let repeated_in_batch = fresh.iter().try_fold(
+                false,
+                |found, pending: &TrustUpdateObject| -> Result<bool, RegistryError> {
+                    Ok(found || pending.fingerprint()?.matches(&fingerprint))
+                },
+            )?;
+            // An identical retry names an object this registry has already
+            // verified and applied. In particular, checking its old counter
+            // against the now-advanced revocation counter would turn the
+            // idempotent retry into a rollback error.
+            if held || repeated_in_batch {
+                continue;
+            }
             match object {
                 TrustUpdateObject::CaTransition(transition) => transition.verify(
                     &self.state.ca_public_key,
                     &self.state.trust_domain_id,
                     self.state.ca_epoch,
                 )?,
+                TrustUpdateObject::CertificateRevocation(revocation) => {
+                    use aether::certificates::revocation::RevocationScope;
+
+                    if revocation.scope != RevocationScope::Client
+                        || revocation.effective_at > now_unix
+                    {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IssuerScopeViolation(
+                                "this authority accepts only immediately effective client revocations",
+                            ),
+                        ));
+                    }
+                    let key = revocation.identity_key.to_base64();
+                    let peer = self
+                        .state
+                        .peers
+                        .get(&key)
+                        .ok_or(RegistryError::UnknownPeer)?;
+                    revocation.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        peer.revocation_epoch,
+                    )?;
+                    let tls_matches = revocation
+                        .revoked_tls_fingerprint
+                        .zip(revocation.revoked_tls_not_after)
+                        .is_none_or(|(fingerprint, not_after)| {
+                            peer.active
+                                .tls_certificate_fingerprint
+                                .matches(&fingerprint)
+                                && peer.active.not_after == not_after
+                        });
+                    let pq_matches = revocation
+                        .revoked_pq_fingerprint
+                        .zip(revocation.revoked_pq_not_after)
+                        .is_none_or(|(fingerprint, not_after)| {
+                            peer.active.pq_certificate_fingerprint.matches(&fingerprint)
+                                && peer.active.not_after == not_after
+                        });
+                    if !tls_matches || !pq_matches {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::CampaignMismatch,
+                        ));
+                    }
+                    withdrawn.push((key, revocation.revocation_epoch));
+                }
                 // Limite connue : la rotation de `CA-TLS` n'est pas stockée
                 // ici. `ClientTlsCaTransition::verify` compares the outgoing
                 // TLS anchor to a fingerprint the verifier must already pin,
@@ -407,30 +485,56 @@ impl AstraRegistry {
                 _ => {
                     return Err(RegistryError::Transition(
                         aether::certificates::CertificateError::IssuerScopeViolation(
-                            "this authority stores only a CA-PQ transition",
+                            "this authority stores only a CA-PQ transition or a client revocation",
                         ),
                     ))
                 }
             }
-            let fingerprint = object.fingerprint()?;
-            let held = self.state.transitions.iter().try_fold(
-                false,
-                |found, stored| -> Result<bool, RegistryError> {
-                    Ok(found || stored.object.fingerprint()?.matches(&fingerprint))
-                },
-            )?;
-            if !held {
-                fresh.push(object.clone());
-            }
+            fresh.push(object.clone());
         }
         if fresh.is_empty() {
             return Ok(0);
         }
-        let held = self.state.transitions.len();
-        if held + fresh.len() > MAX_STORED_TRANSITIONS {
-            return Err(RegistryError::TransitionStoreFull { held });
+        let held_revocations = self
+            .state
+            .transitions
+            .iter()
+            .filter(|stored| {
+                matches!(stored.object, TrustUpdateObject::CertificateRevocation(_))
+                    && retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+            })
+            .count();
+        let fresh_revocations = fresh
+            .iter()
+            .filter(|object| matches!(object, TrustUpdateObject::CertificateRevocation(_)))
+            .count();
+        if held_revocations + fresh_revocations > MAX_STORED_REVOCATIONS {
+            return Err(RegistryError::RevocationStoreFull {
+                held: held_revocations,
+            });
+        }
+        let held_transitions = self
+            .state
+            .transitions
+            .iter()
+            .filter(|stored| {
+                !matches!(stored.object, TrustUpdateObject::CertificateRevocation(_))
+                    && retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+            })
+            .count();
+        let fresh_transitions = fresh.len() - fresh_revocations;
+        if held_transitions + fresh_transitions > MAX_STORED_TRANSITIONS {
+            return Err(RegistryError::TransitionStoreFull {
+                held: held_transitions,
+            });
         }
 
+        // Capacity has been proven without mutation. Only now remove expired
+        // objects and commit the fresh batch, so a refused deposit leaves the
+        // in-memory state exactly as it was.
+        self.state.transitions.retain(|stored| {
+            retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
+        });
         let accepted = fresh.len();
         for object in fresh {
             self.state.transitions.push(StoredTransition {
@@ -440,13 +544,31 @@ impl AstraRegistry {
                 credential_registry: credential_registry.clone(),
             });
         }
-        self.state.audit.append(
-            AuditEvent::AnchorTransitionsAccepted {
-                campaign: campaign_id.to_hex(),
-                objects: accepted,
-            },
-            now_unix,
-        );
+        // The authority stops issuing for the identity as part of accepting
+        // the signed decision. Delivery to other clients may follow later;
+        // it must never be a prerequisite for the local withdrawal.
+        for (key, revocation_epoch) in withdrawn {
+            if let Some(peer) = self.state.peers.get_mut(&key) {
+                peer.revoked = true;
+                peer.revocation_epoch = revocation_epoch;
+                peer.pending = None;
+                self.state.audit.append(
+                    AuditEvent::CertificateRevoked {
+                        target: peer.name.clone(),
+                    },
+                    now_unix,
+                );
+            }
+        }
+        if fresh_transitions > 0 {
+            self.state.audit.append(
+                AuditEvent::AnchorTransitionsAccepted {
+                    campaign: campaign_id.to_hex(),
+                    objects: fresh_transitions,
+                },
+                now_unix,
+            );
+        }
         self.save()?;
         Ok(accepted)
     }
@@ -462,8 +584,8 @@ impl AstraRegistry {
         let before = self.state.transitions.len();
         self.state
             .transitions
-            .retain(|stored| match transition_window(&stored.object) {
-                Some(window) => now_unix < window.not_after,
+            .retain(|stored| match retained_until(&stored.object) {
+                Some(not_after) => now_unix < not_after,
                 // Something with no window is something this store does not
                 // hold; keeping it would be keeping an object nothing prunes.
                 None => false,
@@ -736,6 +858,20 @@ fn transition_window(
     }
 }
 
+/// Last instant at which a stored object can still affect a recipient.
+fn retained_until(object: &aether::certificates::transport::TrustUpdateObject) -> Option<u64> {
+    use aether::certificates::transport::TrustUpdateObject;
+
+    if let TrustUpdateObject::CertificateRevocation(revocation) = object {
+        return revocation
+            .revoked_tls_not_after
+            .into_iter()
+            .chain(revocation.revoked_pq_not_after)
+            .max();
+    }
+    transition_window(object).map(|window| window.not_after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +980,63 @@ mod tests {
             Id16::new([7; 16]).expect("id")
         }
 
+        fn admitted(anchored: &mut Anchored) -> WireGuardKey {
+            let client = WireGuardKey::from_bytes([5; 32]);
+            anchored.registry.state.peers.insert(
+                client.to_base64(),
+                PeerRecord {
+                    name: "compromised workstation".into(),
+                    client_wg_public_key: client,
+                    active: generation(3),
+                    active_pq_certificate: certificate(),
+                    pending: Some(PendingRotation {
+                        stage_id: Id16::new([4; 16]).expect("stage"),
+                        request_fingerprint: Fingerprint::of(b"request"),
+                        candidate: generation(4),
+                        window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+                        stage_expires_at: 3_000,
+                        granted: false,
+                    }),
+                    revoked: false,
+                    revocation_epoch: 0,
+                },
+            );
+            client
+        }
+
+        fn revocation(
+            anchored: &Anchored,
+            client: WireGuardKey,
+            effective_at: u64,
+            not_after: u64,
+        ) -> TrustUpdateObject {
+            use aether::certificates::revocation::{
+                EmergencyCertificateRevocation, RevocationReason, RevocationScope,
+            };
+
+            let active = generation(3);
+            let object = EmergencyCertificateRevocation {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                scope: RevocationScope::Client,
+                identity_key: client,
+                server_name: None,
+                revocation_epoch: 1,
+                revoked_tls_fingerprint: Some(active.tls_certificate_fingerprint),
+                revoked_tls_not_after: Some(not_after),
+                revoked_pq_fingerprint: Some(active.pq_certificate_fingerprint),
+                revoked_pq_not_after: Some(not_after),
+                effective_at,
+                reason: RevocationReason::KeyCompromise,
+                replacement_transition_fingerprint: None,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::CertificateRevocation(Box::new(object))
+        }
+
         /// The one property that lets an online authority hold `CA-PQ` output
         /// at all: it re-derives the proof under the anchor it already pins.
         #[test]
@@ -901,6 +1094,77 @@ mod tests {
                 0
             );
             assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        #[test]
+        fn an_accepted_revocation_is_terminal_and_cancels_staging() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let object = revocation(&anchored, client, 2_000, generation(3).not_after);
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), std::slice::from_ref(&object), None, 2_000,)
+                    .expect("accepted"),
+                1
+            );
+            let peer = &anchored.registry.state().peers[&client.to_base64()];
+            assert!(peer.revoked);
+            assert_eq!(peer.revocation_epoch, 1);
+            assert!(peer.pending.is_none());
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(campaign_id(), &[object], None, 2_100)
+                    .expect("identical retry"),
+                0
+            );
+        }
+
+        #[test]
+        fn a_revocation_with_a_retyped_expiry_or_future_effect_is_refused_atomically() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let wrong_expiry = revocation(&anchored, client, 2_000, 99_999);
+            assert!(anchored
+                .registry
+                .accept_transitions(campaign_id(), &[wrong_expiry], None, 2_000)
+                .is_err());
+            let future = revocation(&anchored, client, 2_001, generation(3).not_after);
+            assert!(anchored
+                .registry
+                .accept_transitions(campaign_id(), &[future], None, 2_000)
+                .is_err());
+            let peer = &anchored.registry.state().peers[&client.to_base64()];
+            assert!(!peer.revoked);
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        #[test]
+        fn a_revocation_is_retained_until_its_signed_expiry() {
+            let mut anchored = anchored();
+            let client = admitted(&mut anchored);
+            let expiry = generation(3).not_after;
+            let object = revocation(&anchored, client, 2_000, expiry);
+            anchored
+                .registry
+                .accept_transitions(campaign_id(), &[object], None, 2_000)
+                .expect("accepted");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(expiry - 1)
+                    .expect("sweep"),
+                0
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(expiry)
+                    .expect("sweep"),
+                1
+            );
         }
 
         /// The ceiling refuses rather than evicting: dropping the oldest would

@@ -1529,7 +1529,7 @@ Une action manuelle crée un `AstraRotationCampaign` qui contient :
 
 - `campaign_id`, `trust_domain_id`, la gateway et la période de cinq minutes ;
 - `scope` : `orion_profile`, `orion_device`, `fleet_leafs`,
-  `full_certificate_chain` ou `trust_authorities` ;
+  `full_certificate_chain`, `trust_authorities` ou `emergency_revocation` ;
 - pour chaque cible, type, clé WireGuard, époque, génération et empreintes
   actives exactes ;
 - `reason`, `requested_by` et le pin exact `astra_policy_fingerprint` de
@@ -1542,6 +1542,9 @@ ajoutée, retirée ou modifiée après cette approbation. `orion_device` ne vise
 les profils Helios présents sur cet appareil ; `fleet_leafs` ne tourne aucune
 CA ; `full_certificate_chain` ordonne émetteur, CA TLS, gateway puis clients ;
 `trust_authorities` tourne aussi `CA-PQ` et exige deux credentials opérateur.
+`emergency_revocation` ne renouvelle rien : il fige exactement une identité,
+ses empreintes actives et son compteur courant pour produire l'objet du §10 ;
+il n'autorise ni une rotation cliente ni une transition d'ancre.
 
 Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, Orion
 ouvre le compagnon avec `heliosd_url` et `operation_id`; la requête et le
@@ -2820,13 +2823,13 @@ contournés :
   préparation choisi par `rotate-ca-pq --prepare-days` est la fenêtre dont
   chaque pair dispose pour revenir. Au-delà, il se répare par l'opérateur, pas
   par une livraison tardive.
-  **Limite connue** : deux familles d'objets seulement. La délégation et la
-  transition `CA-PQ`. Une transition de `CA-TLS` est refusée au registre plutôt
+  **Trois familles d'objets sont produites** : la délégation, la transition
+  `CA-PQ` et la révocation cliente. Une transition de `CA-TLS` est refusée au registre plutôt
   que stockée — il épingle l'époque de cette ancre sans épingler l'ancre
   elle-même, donc il ne pourrait la contrôler que contre une valeur portée par
   l'objet, ce qui ne contrôle rien ; épingler `ca_tls_fingerprint` à
   `init-trust-domain` est ce qui la débloque. Les transitions d'identité
-  gateway et les révocations n'ont aucun producteur.
+  gateway et les révocations de gateway n'ont aucun producteur.
   **Limite connue** : le domaine n'**adopte** pas de lui-même une ancre
   distribuée. Les clients l'appliquent ; le registre Astra et l'épinglage de la
   gateway restent sur l'ancre sortante jusqu'à ce que l'opérateur les avance.

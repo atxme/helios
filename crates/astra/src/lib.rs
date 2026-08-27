@@ -35,7 +35,8 @@
 //!   *resolve* a campaign over the fleet's current targets — on an
 //!   unauthenticated public route, that answers every caller with the domain's
 //!   inventory, and the authentication it would need is not settled anywhere.
-//!   `astra campaign open` does the resolution locally instead. Recovery of an
+//!   `astra campaign open` and `astra revocation open` do the resolution
+//!   locally instead. Recovery of an
 //!   expired identity answers `501` for its own reason: it needs the
 //!   historical validator of §7.5;
 //! - the **objects that would travel on the private veth channel**. The

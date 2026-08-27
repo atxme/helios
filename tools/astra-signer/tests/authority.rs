@@ -20,6 +20,7 @@ use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
     MlDsa87Signature, TrustDomainId, WireGuardKey,
 };
+use aether::certificates::revocation::{RevocationReason, RevocationScope};
 use aether::certificates::status::{
     AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
 };
@@ -138,6 +139,37 @@ fn the_self_signed_ca_tls_certifies_under_the_vaults_own_key() {
         NOW + MAX_CA_TLS_LIFETIME_SECS + 1,
     )
     .is_err());
+}
+
+#[test]
+fn an_emergency_revocation_is_signed_by_the_master_anchor() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let decision = authority::RevocationDecision {
+        scope: RevocationScope::Client,
+        identity_key: WireGuardKey::from_bytes([7; 32]),
+        server_name: None,
+        revocation_epoch: 1,
+        revoked_tls: Some((Fingerprint::of(b"tls leaf"), NOW + 86_400)),
+        revoked_pq: Some((Fingerprint::of(b"pq leaf"), NOW + 86_400)),
+        effective_at: NOW,
+        reason: RevocationReason::KeyCompromise,
+    };
+
+    let revocation = authority::sign_revocation(
+        &vault,
+        &opening,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        &decision,
+        0,
+    )
+    .expect("revocation signs");
+    revocation
+        .verify(&ca_pq_public_key(&vault), &domain(), 1, 0)
+        .expect("and verifies under the pinned anchor");
 }
 
 /// A delegation binds the issuer's two halves under `CA-PQ`, and verifies

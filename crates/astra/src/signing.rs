@@ -216,14 +216,14 @@ impl SigningOperation {
 
     /// The encrypted vault this operation may read, if its scope needs one.
     ///
-    /// Only a scope that rotates an anchor makes `CA-PQ` or `CA-TLS` sign, and
-    /// only then does the companion have to open the vault at all. Returning
+    /// Only a scope that makes a master key sign — an anchor rotation or an
+    /// emergency revocation — has the companion open the vault. Returning
     /// `None` otherwise is what stops an ordinary campaign's token from being
     /// a vault-download token.
     pub fn vault_fingerprint(&self) -> Option<Fingerprint> {
         self.campaign
             .scope
-            .rotates_authority()
+            .opens_vault()
             .then_some(self.signer_request.encrypted_vault_fingerprint)
     }
 
@@ -456,8 +456,12 @@ impl SigningOperationStore {
             return Ok(VerifiedResult {
                 fingerprint: submitted,
                 campaign_id: operation.campaign.campaign_id,
-                objects: Vec::new(),
-                credential_registry: None,
+                // Exact bytes were accepted before, so replaying their
+                // objects is safe. The registry deduplicates persistence and
+                // the service may need the object again to retry an external
+                // side effect such as the private-channel revocation relay.
+                objects: result.objects.clone(),
+                credential_registry: result.credential_registry.clone(),
                 already_accepted: true,
             });
         }
@@ -522,8 +526,8 @@ pub struct VerifiedResult {
     pub campaign_id: Id16,
     /// Anchor transitions to persist before the approval is marked spent.
     ///
-    /// Empty on an idempotent replay: the objects were persisted the first
-    /// time, and `accept_transitions` would deduplicate them anyway.
+    /// Repeated on an idempotent replay. Registry persistence deduplicates
+    /// them, while external relays may need another attempt.
     pub objects: Vec<TrustUpdateObject>,
     pub credential_registry: Option<Box<CredentialRegistry>>,
     /// `true` when these exact bytes were already accepted.
@@ -742,13 +746,13 @@ mod tests {
         ));
     }
 
-    /// A token is minted for a vault only when the scope makes an anchor sign.
+    /// A token is minted for a vault only when the scope makes a master key sign.
     ///
     /// Otherwise an ordinary campaign's grant would carry a vault fingerprint,
     /// and a vault-download token would exist for a ceremony that opens
     /// nothing.
     #[test]
-    fn only_an_authority_scope_names_a_vault() {
+    fn only_a_master_key_scope_names_a_vault() {
         let vault = Fingerprint::of(b"vault");
         let ordinary = campaign(CampaignScope::FleetLeafs);
         let ordinary_request = request(&ordinary, vault);
@@ -758,6 +762,11 @@ mod tests {
         let authorities = campaign(CampaignScope::TrustAuthorities);
         let authority_request = request(&authorities, vault);
         let operation = SigningOperation::new(authorities, authority_request, 1_050).expect("open");
+        assert_eq!(operation.vault_fingerprint(), Some(vault));
+
+        let revocation = campaign(CampaignScope::EmergencyRevocation);
+        let revocation_request = request(&revocation, vault);
+        let operation = SigningOperation::new(revocation, revocation_request, 1_050).expect("open");
         assert_eq!(operation.vault_fingerprint(), Some(vault));
     }
 

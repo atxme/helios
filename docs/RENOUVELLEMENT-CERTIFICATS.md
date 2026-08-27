@@ -184,7 +184,58 @@ astra-signer bindings --active <key-slot>   # la remettre en service
 Le document réémis est à copier dans le volume d'état d'Astra : c'est lui qui
 décide quelles rangées peuvent répondre à une approbation.
 
-## 7. Préparer le renouvellement de l'identité gateway (§5)
+## 7. Révoquer une identité compromise (§10)
+
+Une révocation n'est pas un renouvellement. Elle retire les feuilles actives
+immédiatement, annule tout staging concurrent et laisse l'identité dans l'état
+terminal `revoked` : le poste devra être réadmis, pas rétabli.
+
+**Sur la gateway**, dans le conteneur Astra :
+
+```sh
+astra revocation open --scope client --peer <clé-wg-base64> \
+  --reason "poste volé" --requested-by "prénom.nom"
+# → imprime l'identifiant et la commande complète à coller
+```
+
+Astra résout la cible contre son registre. La campagne courte fige l'identité,
+la génération, les deux empreintes actives et le prochain compteur de
+révocation. Une autorité en ligne compromise ne peut donc pas substituer une
+autre leaf sous le toucher de l'opérateur.
+
+**Sur le poste de l'opérateur**, exécuter la ligne imprimée :
+
+```sh
+astra-signer revoke --authority-url https://astra.exemple \
+  --operation-id <identifiant> --not-after <échéance>
+# --halves tls|pq|both (défaut : both)
+# --reason key-compromise|suspected-compromise|cessation|superseded
+```
+
+Le compagnon vérifie la demande sous la clé de service épinglée, affiche
+l'identité, les feuilles et le compteur avant le toucher, ouvre le coffre puis
+signe la décision sous `CA-PQ`. Le dépôt est unique : l'approbation WebAuthn et
+la révocation signée partent ensemble.
+
+À l'arrivée, Astra revalide la signature, le compteur, les empreintes et
+l'échéance contre l'état qu'elle détient déjà. Elle marque alors le pair
+`revoked`, refuse ses renouvellements suivants, relaie la décision à la
+gateway sur le canal privé et la distribue aux clients qui reviennent jusqu'à
+la dernière échéance signée. Un dépôt identique est idempotent et peut rejouer
+le relais après une panne transitoire du canal privé.
+
+`--not-after` est recopié depuis la commande produite par Astra parce que le
+format partagé `CampaignTarget` ne porte pas l'échéance. Une valeur altérée ne
+révoque pas la mauvaise chose : Astra refuse le dépôt entier en la comparant à
+la génération active.
+
+**Limite connue** : `--scope gateway` est refusé. Le registre Astra connaît la
+clé WireGuard et le nom de service de la gateway, mais pas ses feuilles
+actives ; il ne peut donc pas lier leurs empreintes et échéances exactes à la
+décision. Cette limitation est explicite plutôt que remplacée par des valeurs
+retapées.
+
+## 8. Préparer le renouvellement de l'identité gateway (§5)
 
 La gateway génère et scelle sa propre clé suivante, puis exporte une demande.
 Aucune clé privée gateway ne quitte jamais la machine qui l'a créée : ce qui
@@ -214,29 +265,60 @@ seulement après une procédure locale explicite établissant que la clé active
 disparu. Le champ est alors **absent** plutôt que non vérifié, et la transition
 qui répond doit porter le motif `key_recovery`.
 
-**Limite connue** : la demande s'arrête là. Rien ne la transforme encore en
-feuille ni en `GatewayIdentityTransition` signée — c'est l'étape 4 du §11.1, une
-cérémonie `CA-PQ` dont le compagnon n'a pas encore la sous-commande. La demande
-est produite, vérifiée et exportée ; elle attend.
+**Installer ce qui revient de la cérémonie** (§11.1 étape 5) :
 
-## 8. Ce qui n'a pas encore de commande
+```sh
+heliosd install-gateway-transition /chemin/transition.json
+```
+
+La transition est vérifiée sous les ancres que cette gateway épingle déjà, et
+refusée si la moitié privée d'une des feuilles qu'elle installe n'est pas
+scellée ici. C'est le contrôle qu'aucune signature ne fait : `CA-PQ` atteste
+qu'une feuille est authentique, jamais que sa clé privée est sur cette machine.
+Sans lui, tout paraîtrait correct jusqu'à `activation_at`, puis tous les
+tunnels tomberaient d'un coup, l'ancienne identité déjà retirée.
+
+**L'identité servie ne change pas.** Le basculement appartient à
+`activation_at` et demande le redémarrage de l'étape 7 du §11.1 ; jusque-là la
+feuille active continue de monter les tunnels.
+
+**Annuler avant publication** (§6.3) :
+
+```sh
+heliosd abort-gateway-transition /chemin/avortement.json
+```
+
+Accepté seulement tant que la transition est `staged`, qu'aucun octet n'est
+parti et qu'`activation_at` est encore devant — sur l'horloge locale autant que
+dans le document, donc antidater n'ouvre rien. L'identité candidate est
+détruite et **l'époque reste consommée** : un parc ne doit jamais avoir à
+choisir entre deux décisions portant le même numéro.
+
+**Limite connue** : rien ne signe encore la transition ni l'avortement. C'est
+l'étape 4 du §11.1, une cérémonie `CA-PQ` dont le compagnon n'a pas la
+sous-commande. La gateway sait produire la demande et appliquer la réponse ;
+c'est la signature entre les deux qui manque.
+
+**Limite connue** : le marqueur `published` du §6.3 est une écriture d'Astra,
+et aucune route ne le relaie jusqu'ici. Cette gateway juge donc un avortement
+sur son seul état local, où `published` reste faux tant que rien ne l'écrit :
+c'est l'ordre des étapes du §11.1, pas ce contrôle, qui garantit aujourd'hui
+qu'aucun avortement ne suit une distribution.
+
+## 9. Ce qui n'a pas encore de commande
 
 Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'un
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
 fait.
 
-- **Révoquer une identité** (§10). L'objet et la route privée existent —
-  `EmergencyCertificateRevocation`, `POST /internal/v1/certificates/revoke` —
-  mais rien ne le signe ni ne le dépose : ni `astra-signer` ni `astra` n'ont de
-  sous-commande de révocation. En attendant, un pair se retire par sa
-  configuration WireGuard, ce qui coupe l'accès sans produire la décision
-  signée que les clients appliqueraient.
+- **Révoquer la gateway** (§10). Le chemin client est livré en section 7 ; la
+  gateway reste refusée faute de feuilles gateway dans le registre Astra.
 - **`CA-TLS` cliente** (§9.4) : aucun geste ne la fait tourner, et le registre
   la refuserait — il épingle l'époque de cette ancre sans épingler l'ancre.
-- **L'identité gateway** (§6) : la demande du §5 se prépare désormais
-  (`heliosd prepare-gateway-certificate`), mais rien ne la signe. Aucun
-  producteur de `GatewayIdentityTransition`, donc ni renouvellement gateway, ni
-  avortement avant publication, ni rollback pendant le recouvrement.
+- **Signer l'identité gateway** (§6) : la gateway prépare sa demande et sait
+  appliquer la transition comme l'avortement (section 8), mais aucun compagnon
+  ne les signe. Sans producteur de `GatewayIdentityTransition`, ni
+  renouvellement gateway, ni rollback pendant le recouvrement.
 - **Le retour à l'identité précédente** : rien ne la conserve, le magasin
   protégé ne garde qu'un lot par nom.
 - **L'adoption d'une ancre distribuée** par Astra et par la gateway.
