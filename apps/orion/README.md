@@ -59,11 +59,14 @@ les trois cas, et `build.rs` s’en charge.
   tourne pas, et toute modification de `src/` est visible au rechargement. Les
   ressources Windows absentes ne sont pas exigées par la seule compilation :
   un checkout frais peut donc compiler le shell dry-run sans télécharger
-  WireGuardNT. La CLI Tauri les prépare toujours avant de créer un bundle.
+  WireGuardNT. `build.rs` vérifie toutefois l’arbre npm et exécute `npm ci` si
+  une dépendance manque, afin que `cargo run` puisse démarrer immédiatement.
+  La CLI Tauri prépare les ressources Windows avant de créer un bundle.
 - **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
   Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
   quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
-  qui se lance, s’affiche, et ment. Prérequis : `npm ci --prefix apps/orion`.
+  qui se lance, s’affiche, et ment. Prérequis : Node.js et npm ; `build.rs`
+  vérifie et installe automatiquement les dépendances du lockfile.
 ## Journal
 
 Orion écrit **à la fois** sur la sortie standard et dans un fichier :

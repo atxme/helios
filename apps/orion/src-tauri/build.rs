@@ -26,6 +26,7 @@ fn main() {
     let orion = frontend_root();
     watch_frontend(&orion);
     watch_icons();
+    ensure_npm_dependencies(&orion);
 
     // Debug charge `devUrl` : Vite sert les sources, et
     // `ensure_frontend_dev_server` le démarre au besoin. Rien à construire, et
@@ -83,11 +84,16 @@ fn watch_frontend(orion: &Path) {
     for entry in [
         "index.html",
         "package.json",
+        "package-lock.json",
         "vite.config.ts",
         "tsconfig.json",
     ] {
         println!("cargo:rerun-if-changed={}", orion.join(entry).display());
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        orion.join("node_modules/vite/bin/vite.js").display()
+    );
     watch_tree(&orion.join("src"));
 }
 
@@ -132,14 +138,6 @@ fn ensure_frontend_built(orion: &Path) {
     }
     println!("cargo:warning=frontend Orion périmé — `npm run build` en cours");
 
-    if !orion.join("node_modules").is_dir() {
-        panic!(
-            "les dépendances npm d'Orion sont absentes : lancer `npm ci --prefix apps/orion` \
-             avant une compilation release. Le frontend ne peut pas être construit sans elles, \
-             et embarquer un `dist` périmé produirait une interface qui n'est plus celle du code."
-        );
-    }
-
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     match std::process::Command::new(npm)
         .args(["run", "build"])
@@ -155,6 +153,49 @@ fn ensure_frontend_built(orion: &Path) {
             "impossible de lancer `{npm} run build` ({error}). Node.js est requis pour une \
              compilation release d'Orion ; en debug, l'interface est servie par Vite et cette \
              étape n'a pas lieu."
+        ),
+    }
+}
+
+/// Ensures that the frontend toolchain is present before Cargo finishes.
+///
+/// `cargo run` starts Vite from the compiled shell in debug, so merely having
+/// Rust dependencies compiled is not enough to launch Orion. `npm ls` checks
+/// the installed direct dependency graph; the Vite entrypoint check catches a
+/// missing package directory. For a fresh, partial or damaged installation,
+/// `npm ci` restores the lockfile's exact dependency graph.
+fn ensure_npm_dependencies(orion: &Path) {
+    let vite = orion.join("node_modules/vite/bin/vite.js");
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let dependencies_are_healthy = vite.is_file()
+        && std::process::Command::new(npm)
+            .args(["ls", "--depth=0", "--silent"])
+            .current_dir(orion)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    if dependencies_are_healthy {
+        return;
+    }
+
+    println!("cargo:warning=Orion npm dependencies missing — `npm ci` in progress");
+    match std::process::Command::new(npm)
+        .args(["ci"])
+        .current_dir(orion)
+        .status()
+    {
+        Ok(status) if status.success() && vite.is_file() => {}
+        Ok(status) if !status.success() => panic!(
+            "`{npm} ci` failed ({status}); Orion's frontend dependencies could not be installed"
+        ),
+        Ok(_) => panic!(
+            "`{npm} ci` completed but Vite is still missing at {}; \
+             check package-lock.json and the Node.js installation",
+            vite.display()
+        ),
+        Err(error) => panic!(
+            "unable to run `{npm} ci` ({error}); Node.js and npm are required to build Orion"
         ),
     }
 }
