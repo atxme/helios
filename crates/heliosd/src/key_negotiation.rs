@@ -2079,6 +2079,18 @@ pub(crate) fn candidate_tls_certificate(
     }
 }
 
+/// Destroys the candidate identity, private half first (spec §6.3, `aborted`).
+///
+/// The sealed key goes before the leaf that names it: the reverse order would
+/// leave, on a failure between the two removals, private material on disk with
+/// nothing left to say which decision it belonged to. Called only once the
+/// registry has persisted the abort — a candidate destroyed ahead of that
+/// write would be destroyed for a cancellation that was refused.
+pub(crate) fn discard_candidate_identity() -> Result<()> {
+    remove_if_present(Path::new(NEXT_PRIVATE_KEYSTORE_PATH))?;
+    remove_if_present(Path::new(NEXT_CERTIFICATE_PATH))
+}
+
 fn remove_if_present(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),

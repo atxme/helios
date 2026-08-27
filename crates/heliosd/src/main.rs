@@ -171,6 +171,32 @@ enum Command {
         #[arg(long)]
         key_recovery: bool,
     },
+    /// Installs the signed transition that answers the request (§11.1 5).
+    ///
+    /// Step 5, and the first thing the gateway does with what comes back from
+    /// the ceremony. The transition is verified against the anchors this
+    /// gateway already pins — `CA-PQ`, its epoch, the stable WireGuard
+    /// identity, the server name and the two leaves in service — and refused
+    /// unless the private half of every leaf it installs is sealed here.
+    ///
+    /// **The identity served does not change.** Staging is a decision about
+    /// `activation_at`; until then the active leaf keeps mounting tunnels, and
+    /// the switch needs the restart of §11.1 step 7.
+    InstallGatewayTransition {
+        /// Signed `GatewayIdentityTransition`, as JSON.
+        transition: PathBuf,
+    },
+    /// Cancels a staged, unpublished transition (§6.3).
+    ///
+    /// Accepted only while the transition is staged, has distributed no byte
+    /// and `activation_at` is still ahead — on the local clock as well as in
+    /// the document, so backdating the abort reopens nothing. The candidate
+    /// identity is destroyed and the epoch stays consumed: a fleet must never
+    /// have to choose between two decisions numbered the same.
+    AbortGatewayTransition {
+        /// Signed `GatewayTransitionAbort`, as JSON.
+        abort: PathBuf,
+    },
     /// Prints the trust block a client's profile must carry (spec §19).
     ///
     /// Read from the certificate registry in one pass, and printed as the
@@ -425,6 +451,8 @@ async fn main() -> anyhow::Result<()> {
             new_key,
             key_recovery,
         } => prepare_gateway_certificate(rotate_tls, new_key, key_recovery),
+        Command::InstallGatewayTransition { transition } => install_gateway_transition(&transition),
+        Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -607,10 +635,7 @@ fn prepare_gateway_certificate(
 ) -> anyhow::Result<()> {
     let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
         .context("unlocking the TPM vault to seal the candidate gateway identity")?;
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock predates the Unix epoch")?
-        .as_secs();
+    let now_unix = now_unix()?;
     let prepared = gateway_rotation::prepare_request(
         &boot,
         false,
@@ -638,6 +663,72 @@ fn prepare_gateway_certificate(
         );
     }
     Ok(())
+}
+
+fn install_gateway_transition(source: &Path) -> anyhow::Result<()> {
+    let now_unix = now_unix()?;
+    let staged = gateway_rotation::install_transition(source, now_unix)?;
+    let transition = &staged.transition;
+
+    println!("epoch: {}", transition.gateway_identity_epoch);
+    println!("fingerprint: {}", transition.fingerprint()?.to_hex());
+    println!("reason: {:?}", transition.reason);
+    println!("not before: {}", transition.window.not_before);
+    println!("activation at: {}", transition.window.activation_at);
+    println!("not after: {}", transition.window.not_after);
+    match &transition.next_gateway_certificate {
+        Some(certificate) => println!(
+            "next PQ leaf: {}",
+            aether::certificates::gateway::pq_certificate_fingerprint(certificate)?.to_hex()
+        ),
+        None => println!("next PQ leaf: unchanged"),
+    }
+    match &transition.next_gateway_tls_certificate {
+        Some(certificate) => println!("next TLS leaf: {}", certificate.fingerprint().to_hex()),
+        None => println!("next TLS leaf: unchanged"),
+    }
+    println!("document: {}", staged.path.display());
+
+    if staged.already_present {
+        info!("this transition was already staged; nothing moved");
+    } else {
+        info!(
+            "transition staged: the identity in service is unchanged until activation_at, and \
+             heliosd must be restarted at that instant to serve the next one"
+        );
+    }
+    Ok(())
+}
+
+fn abort_gateway_transition(source: &Path) -> anyhow::Result<()> {
+    let now_unix = now_unix()?;
+    let aborted = gateway_rotation::abort_transition(source, now_unix)?;
+
+    println!("epoch: {}", aborted.abort.gateway_identity_epoch);
+    println!("aborted at: {}", aborted.abort.aborted_at);
+    println!("reason: {:?}", aborted.abort.reason);
+    println!(
+        "cancelled transition: {}",
+        aborted.abort.gateway_transition_fingerprint.to_hex()
+    );
+
+    if aborted.already_present {
+        info!("this abort had already been applied; nothing moved");
+    } else {
+        warn!(
+            "transition cancelled and the candidate identity destroyed: epoch {} stays consumed, \
+             the next attempt starts one decision higher",
+            aborted.abort.gateway_identity_epoch
+        );
+    }
+    Ok(())
+}
+
+fn now_unix() -> anyhow::Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?
+        .as_secs())
 }
 
 /// Resolves `wan_iface = "auto"` against the kernel, once.

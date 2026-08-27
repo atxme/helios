@@ -57,6 +57,7 @@ use aether::certificates::{
         DerCertificate, Fingerprint, Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId,
         WireGuardKey,
     },
+    gateway::{GatewayIdentityTransition, GatewayTransitionAbort},
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
         GatewayCertificateState, InstallOutcome, PendingStageState, RevocationTombstone,
@@ -1052,6 +1053,60 @@ impl CertificateRegistry {
         Ok(promoted)
     }
 
+    /// Stages a signed transition of the gateway's own identity (spec §6.3).
+    ///
+    /// The verification belongs to the state machine, against the anchors
+    /// this registry already pins: `CA-PQ` and its epoch, the stable WireGuard
+    /// identity, the server name and the two leaves in service. Nothing is
+    /// re-derived here, and a transition a caller verified somewhere else is
+    /// not accepted on that caller's word — the same rule the client side
+    /// follows for the objects it receives.
+    ///
+    /// Persisted only when the state actually moved. Carrying the same signed
+    /// document in twice is `AlreadyPresent` and writes nothing: an epoch is
+    /// consumed by a decision, never by a repeated delivery of one.
+    pub fn install_gateway_transition(
+        &mut self,
+        transition: &GatewayIdentityTransition,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, RegistryError> {
+        let mut state = self.state.clone();
+        // The ledger is read while the gateway slot is written, and both live
+        // in this one value. One copy on a ceremony that happens once per
+        // identity buys the revocation check the ledger this registry holds,
+        // rather than one the caller passed in.
+        let ledger = state.ledger.clone();
+        let outcome = state
+            .gateway
+            .install_transition(transition, &ledger, now_unix)?;
+        if matches!(outcome, InstallOutcome::Installed) {
+            self.persist(state)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Cancels a staged, unpublished gateway transition (spec §6.3).
+    ///
+    /// The abort names the exact document it cancels, and the state machine
+    /// refuses it once `published` is set or once the local clock has reached
+    /// `activation_at` — backdating the object does not reopen a window the
+    /// clients may already have acted on. The epoch stays consumed: the slot
+    /// disappears, the tombstone takes its place, and the next attempt starts
+    /// one decision higher.
+    pub fn abort_gateway_transition(
+        &mut self,
+        abort: &GatewayTransitionAbort,
+        transition: &GatewayIdentityTransition,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, RegistryError> {
+        let mut state = self.state.clone();
+        let outcome = state.gateway.apply_abort(abort, transition, now_unix)?;
+        if matches!(outcome, InstallOutcome::Installed) {
+            self.persist(state)?;
+        }
+        Ok(outcome)
+    }
+
     /// Terminal revocation of a peer's certificate state.
     ///
     /// Called by the same path that removes the admission, under the same
@@ -1246,6 +1301,7 @@ mod tests {
     use aether::certificates::client::IssuerKind;
     use aether::certificates::encoding::Id16;
     use aether::certificates::encoding::{generate_ml_dsa_87_keypair, DerCertificate};
+    use aether::certificates::gateway::AbortReason;
     use aether::certificates::window::TransitionWindow;
     use aether::key_negotiation::{
         issue_pq_certificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
@@ -2513,5 +2569,230 @@ mod tests {
         // Past its own expiry the delegation signs nothing, whatever its
         // lifecycle field says.
         assert_eq!(registry.state().client_leaf_issuers(1_000), vec![&anchor]);
+    }
+
+    fn window() -> TransitionWindow {
+        TransitionWindow {
+            not_before: 1_000,
+            activation_at: 2_000,
+            not_after: 3_000,
+        }
+    }
+
+    fn gateway_transition(
+        fixture: &Fixture,
+        next: &Keys,
+        epoch: u64,
+        window: TransitionWindow,
+    ) -> GatewayIdentityTransition {
+        let gateway = &fixture.registry.state().gateway;
+        GatewayIdentityTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            gateway_identity_epoch: epoch,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            active_gateway_tls_certificate_fingerprint: gateway.active_tls_fingerprint(),
+            next_gateway_tls_certificate: None,
+            active_gateway_certificate_fingerprint: gateway
+                .active_pq_fingerprint()
+                .expect("active fingerprint"),
+            next_gateway_certificate: Some(leaf(
+                &fixture.ca,
+                next,
+                PqCertificateRole::Gateway,
+                &gateway_key(),
+                9,
+            )),
+            window,
+            reason: RotationReason::Scheduled,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&fixture.ca.private)
+        .expect("sign the transition")
+    }
+
+    fn gateway_abort(
+        fixture: &Fixture,
+        transition: &GatewayIdentityTransition,
+        aborted_at: u64,
+    ) -> GatewayTransitionAbort {
+        GatewayTransitionAbort {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            gateway_identity_epoch: transition.gateway_identity_epoch,
+            gateway_transition_fingerprint: transition.fingerprint().expect("fingerprint"),
+            aborted_at,
+            reason: AbortReason::OperatorCancelled,
+            campaign_fingerprint: Fingerprint::of(b"campaign"),
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&fixture.ca.private)
+        .expect("sign the abort")
+    }
+
+    #[test]
+    fn a_staged_transition_leaves_the_identity_in_service_untouched() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+
+        let outcome = fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let gateway = &fixture.registry.state().gateway;
+        assert_eq!(gateway.next_gateway_identity_epoch, Some(2));
+        assert_eq!(gateway.activation_at, Some(2_000));
+        assert_eq!(gateway.retire_active_at, Some(3_000));
+        // The switch belongs to `activation_at`, not to the installation: a
+        // staging that changed the served leaf would take the identity out of
+        // service the moment the operator came back from the ceremony.
+        assert_eq!(gateway.active_gateway_identity_epoch, 1);
+        assert!(!gateway.published);
+
+        // And it survives the process: the ceremony is measured in days.
+        let reloaded = CertificateRegistry::load(
+            fixture
+                ._directory
+                .path()
+                .join("certificates.json")
+                .as_path(),
+        )
+        .expect("reload")
+        .expect("registry");
+        assert_eq!(
+            reloaded.state().gateway.next_gateway_identity_epoch,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_same_transition_carried_in_twice_consumes_one_epoch() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+
+        let outcome = fixture
+            .registry
+            .install_gateway_transition(&transition, 1_600)
+            .expect("replay");
+
+        assert_eq!(outcome, InstallOutcome::AlreadyPresent);
+        assert_eq!(fixture.registry.state().gateway.gateway_decision_epoch, 2);
+    }
+
+    #[test]
+    fn a_second_transition_is_refused_while_one_is_staged() {
+        let mut fixture = fixture();
+        let first = keys();
+        let second = keys();
+        let transition = gateway_transition(&fixture, &first, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+
+        let refusal = fixture
+            .registry
+            .install_gateway_transition(&gateway_transition(&fixture, &second, 3, window()), 1_500)
+            .expect_err("a second candidate at once");
+
+        assert!(matches!(
+            refusal,
+            RegistryError::Certificate(CertificateError::IllegalStateTransition(_))
+        ));
+    }
+
+    #[test]
+    fn an_abort_clears_the_slot_and_leaves_the_epoch_consumed() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        let abort = gateway_abort(&fixture, &transition, 1_600);
+
+        let outcome = fixture
+            .registry
+            .abort_gateway_transition(&abort, &transition, 1_700)
+            .expect("abort");
+
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let gateway = &fixture.registry.state().gateway;
+        assert_eq!(gateway.next_gateway_identity_epoch, None);
+        assert!(gateway.next_gateway_certificate.is_none());
+        // The number stays spent. A client holding the tombstone refuses a
+        // second decision at the same epoch, and it is right to.
+        assert_eq!(gateway.gateway_decision_epoch, 2);
+        assert!(gateway.last_aborted_transition.is_some());
+    }
+
+    #[test]
+    fn an_abort_is_refused_once_the_transition_has_been_published() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        // What §6.3 makes irreversible: past this marker a client may already
+        // hold the decision, go offline and promote on its own at `not_after`.
+        let mut published = fixture.registry.state().clone();
+        published.gateway.published = true;
+        let mut registry =
+            CertificateRegistry::new(fixture._directory.path().join("published.json"), published);
+        let abort = gateway_abort(&fixture, &transition, 1_600);
+
+        let refusal = registry
+            .abort_gateway_transition(&abort, &transition, 1_700)
+            .expect_err("an abort after publication");
+
+        assert!(matches!(refusal, RegistryError::Certificate(_)));
+        assert_eq!(
+            registry.state().gateway.next_gateway_identity_epoch,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn an_abort_is_refused_once_the_local_clock_reaches_activation() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        // Backdated inside the document, read against a clock that has moved
+        // past `activation_at`: the overlap has begun and cancelling it here
+        // would leave two truths in the fleet.
+        let abort = gateway_abort(&fixture, &transition, 1_600);
+
+        let refusal = fixture
+            .registry
+            .abort_gateway_transition(&abort, &transition, 2_400)
+            .expect_err("an abort during the overlap");
+
+        assert!(matches!(refusal, RegistryError::Certificate(_)));
+        assert_eq!(
+            fixture.registry.state().gateway.next_gateway_identity_epoch,
+            Some(2)
+        );
     }
 }
