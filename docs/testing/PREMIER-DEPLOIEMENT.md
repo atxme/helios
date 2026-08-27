@@ -28,6 +28,27 @@ Deux protections, à mettre en place **avant** le premier démarrage :
    quand il n'y a plus d'adresse à joindre. Soit figer l'adresse, soit poser
    `allow_dhcp_on_wan = true`.
 
+4. **La voie de secours NordVPN Meshnet**, si la gateway en dispose. Helios
+   peut conserver un accès SSH d'administration via l'interface `nordlynx`,
+   indépendant de l'adresse LAN/WAN et du tunnel Helios. Cette voie n'est
+   ouverte qu'aux pairs Meshnet déclarés dans `nordvpn_meshnet.peer_cidrs` et
+   pour le port TCP 22. Relever l'adresse Meshnet de la gateway avec :
+
+   ```sh
+   ip -4 addr show nordlynx
+   ```
+
+   En cas de perte de l'accès principal, utiliser cette adresse pour joindre
+   la gateway :
+
+   ```sh
+   ssh <utilisateur>@<adresse-nordlynx-de-la-gateway>
+   ```
+
+   Ce n'est pas `100.64.0.1`, qui est l'adresse du tunnel WireGuard Helios.
+   Vérifier également que l'adresse Meshnet du poste apparaît dans
+   `wg show nordlynx` et dans `peer_cidrs` de la configuration active.
+
 S'assurer d'avoir un moyen de redémarrer la machine — bouton, console, panneau
 d'hébergeur — avant de commencer.
 

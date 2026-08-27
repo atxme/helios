@@ -1,1067 +1,180 @@
 # AGENTS.md
 
-Instructions pour les agents de code travaillant dans ce dépôt.
+Repository-wide instructions for coding agents working on Helios.
 
-## État courant
+## Purpose
 
-Helios est une gateway WireGuard Linux ; Orion est son client Tauri ; `aether`
-porte les types et contrats communs. La rupture avec IKEv2 est terminée dans le
-code. [ADR-001](docs/adr/ADR-001-WIREGUARD.md) conserve le raisonnement de migration
-et [ADR-002](docs/adr/ADR-002-SIGNATURES-PQ.md) fixe la signature hybride des
-artefacts éditeur. [ADR-004](docs/adr/ADR-004-CHAINE-DE-LIVRAISON.md) fixe le
-cycle de vie des secrets et la chaîne de livraison. En cas de doute, le code et
-les ADR acceptés font foi.
+Helios is a Linux WireGuard gateway; Orion is its Tauri desktop client; `aether` owns shared contracts. This file is a **map and guardrail**, not an architecture manual or project journal.
 
-Le provisioning ML-KEM, l’IPAM et les backends WireGuard existent. Le PSK
-post-quantique est négocié et posé de bout en bout : la gateway l’installe sur
-le plan de données **avant** de l’annoncer au client, et refuse la demande si
-la pose échoue. Trois limites restent explicites : la VIP dérivée par l’IPAM
-n’est pas réconciliée avec l’adresse déclarée en config (chaque bout garde la
-sienne, l’écart est journalisé) ; le fichier de récupération signé est bloqué
-jusqu’au choix du compteur anti-rejeu fichier ou NV TPM ; le **DNS d’un client
-n’est pas tunnelé**, même `allow_client_internet` actif — ses requêtes sortent
-hors du tunnel (voir le doc-comment de `helios-firewall::ruleset`).
+## Keep this file lean
 
-L’outillage d’exploitation existe (ADR-004, lot 1) : `heliosd init-identity`
-crée l’identité WireGuard scellée sans jamais l’écrire en clair, `heliosd peer`
-et `helios-ctl peer` admettent les clients par le **même** code
-(`helios-provisioning::admission`), `helios-ctl profile emit` produit le
-document `orion-profile` que l’import Orion consomme, et `helios-ctl escrow`
-expose enfin le séquestre.
+This file is hot context for coding agents. Keep it short, current, and actionable.
 
-La négociation de clé pré-WireGuard existe de bout en bout, en **protocole v5**
-([ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md), amendements des 6 et 8 août 2026 ;
-spécification [NEGOCIATION-DE-CLE-V5.md](docs/specification/NEGOCIATION-DE-CLE-V5.md)) : port
-UDP dédié, phase de challenge anti-rejeu, authentification **ML-DSA-87**, deux
-modes négociables — `static_psk` et `ml_kem` — et plancher anti-downgrade qui
-monte seul et ne redescend pas. La v4 est décrite par
-[NEGOCIATION-DE-CLE-V4.md](docs/specification/NEGOCIATION-DE-CLE-V4.md), conservée
-comme trace de ce qui tournait avant la bascule — le code ne la sert plus, et
-les deux versions ne négocient pas ensemble (ALPN, domaines de signature et
-format de certificat distincts). Les deux IHM exposent la négociation —
-plancher par pair côté gateway ; côté Orion l’écran *Profils* édite tout le
-bloc, certificats compris, avec empreinte PQ dérivée en Rust et état de
-l’identité. Seul le plancher n’y est pas librement modifiable : il ne descend
-jamais sous la valeur avec laquelle le profil a été chargé.
+When modifying `AGENTS.md`:
 
-**La v5 est partiellement implémentée**, et la spécification nomme ce qui
-manque. Ne pas la présenter comme terminée : la mention « implémentée à trois
-exceptions » portée ici jusqu’au 6 août 2026 était fausse, et une revue a dû
-l’établir. Une seconde revue, le 7 août 2026, a montré que la machine d’état
-générationnelle posée en réponse à la première était elle-même incomplète — la
-génération n’était pas réservée avant la pose du candidat, et l’échéance
-absolue de connexion détruisait la tâche sans rollback. Les deux sont corrigés.
-Restent ouverts :
+* Preserve the structure and concise style already used here.
+* Prefer replacing or tightening an existing rule over appending another paragraph.
+* Add only repository-wide facts an agent needs in most sessions.
+* Do not add implementation history, incident narratives, review chronology, temporary status dumps, or long rationale.
+* Put architecture rationale and protocol details in `docs/` and link them from here.
+* Put subsystem-only instructions in a nested `AGENTS.md` close to that subtree instead of growing the root file.
+* Delete or update obsolete instructions when behavior changes.
+* Avoid duplicating information already obvious from code, `Cargo.toml`, package scripts, or an ADR.
+* Aim to keep this root file below roughly 200 lines.
 
-- la variante `classic` de **`ProtectionMode`** (§19, §22), qui survit dans le
-  type. Elle est refusée à la validation d’une requête v5 et à la préparation —
-  serde la décode, puis `validate()` la rejette, donc aucun message v5 ne peut
-  la sélectionner — et elle doit survivre pour relire un `network.toml`
-  existant. La retirer reste une migration de `network.toml` et de l’octet
-  `mode_id = 0` du manifeste de coffre. **Le discriminant de profil Orion, lui,
-  est livré** (voir plus bas) : c’était l’autre moitié, et la dangereuse ;
-- l’état **`revoked`** du §11.1 : une révocation se lit à l’absence du pair
-  dans `network.peers`, pas à un marqueur terminal dans le slot. Hors
-  concurrence le pair ne négocie plus, mais l’absence de transition atomique
-  entre admission, génération et plan de données ne fournit pas encore la
-  priorité normative de `revoked` ;
-- le **renouvellement de PSK en place** (§12.3), suspendu à l’essai bloquant du
-  §20.0 qui doit d’abord établir sur un vrai plan de données qu’une session
-  WireGuard réinitialisée handshake dans les délais ;
-- l’**enrôlement sans clé privée avec signature opérateur** (§15), qui reste au
-  modèle v4 décrit plus bas ;
-- l'**exploitation** du cycle de vie des certificats
-  ([ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) §12.3,
-  [ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)). Le chemin
-  « demande → autorisation → persistance gateway → reçu → grant → commit » est
-  livré et branché : `aether::certificates` porte les objets signés, les états
-  bornés et les contrôles X.509 ; `helios-provisioning::certificates` exige le
-  grant au commit ; `heliosd::certificates` est le propriétaire unique du
-  registre et signe les reçus par la leaf servie ; le binaire **`astra`** porte
-  registre, audit chaîné et émetteur délégué borné ;
-  `orion-core::certificates` vérifie une transaction chunkée entière avant de
-  l'appliquer par une seule écriture. Le **coffre d'autorité** existe aussi :
-  `astra::vault` enveloppe `CA-PQ` et `CA-TLS` sous un key-slot par credential
-  FIDO2, et le compagnon **`astra-signer`** crée le coffre, y enrôle des clés,
-  les éprouve et en retire — `init`, `enrol`, `verify`, `list`, `remove`,
-  `rename`. Ses **commandes de signature** sont livrées : `issue-ca-tls`
-  auto-signe la CA TLS cliente, `authorize-issuer` signe une
-  `AstraIssuerAuthorization` bornée, `bindings` réémet le document de
-  credentials depuis la table de key-slots — automatiquement à chaque geste qui
-  la déplace —, `approve` approuve un renouvellement client **sans ouvrir le
-  coffre** (§14.1 : la méthode d'approbation ne reçoit aucun sel, donc aucune
-  sortie PRF n'existe pour elle), `approve-campaign` approuve une campagne à
-  autant de clés distinctes que sa portée l'exige, et `rotate-ca-pq` fait
-  tourner l'ancre sous deux clés. Aucune valeur ne se retape : `domain`
-  enregistre gateway, nom de service et clé de service Astra dans le relais
-  public, et chaque commande y lit. Reste ouvert du côté compagnon : le
-  transport, qui passe encore par des fichiers — les routes publiques à jeton
-  de capacité du §8.2 répondent `501`, et le binaire ne sait pas encore
-  utiliser les routes privées relayées par `heliosd_url`. Le backend Astra
-  vérifie et consomme déjà une approbation relayée avant toute émission, et
-  Orion pilote l'opération de bout en bout — ce qu'il ne sait pas faire, c'est
-  lancer le compagnon. Le veth privé est
-  livré **dans ses deux sens**, confiné par le ruleset (`astra0`, adresses et
-  ports exacts) : Astra → Helios en 8444 porte le staging, le reçu et la leaf
-  servie que la gateway relit sur demande ; Helios → Astra en 8445 porte le
-  renouvellement relayé du §8.1.2. Deux identités de transport par bout, jamais
-  une seule en double rôle — un certificat portant `clientAuth` et `serverAuth`
-  laisserait rejouer chaque bout dans le rôle de l'autre. Un Orion dont le
-  tunnel marche appelle donc quatre routes typées de `helios-api` dans
-  WireGuard ; `heliosd` résout le pair par sa VIP source et relaie un objet
-  **canonique qu'il construit lui-même** — jamais la méthode, le chemin ni les
-  en-têtes du client. Côté Astra, le seuil de 80 % ouvre une opération
-  `awaiting_operator` qui ne détient aucun certificat, et rien n'est émis avant
-  qu'une assertion réponde au challenge exact de cette opération.
-  Le **client de renouvellement Orion** existe aussi : `orion-core::certificate_renewal`
-  fait naître les deux clés candidates dans le processus, signe la requête de
-  rotation deux fois — continuité par la génération sortante, possession par
-  celle qui demande à être certifiée —, pilote l'opération et, au retour du
-  grant, le vérifie **avant toute écriture** contre ce que le magasin épingle
-  déjà. Orion étant le bout qui ne voit jamais l'autorisation de staging, il
-  pose son candidat depuis le grant (`stage_from_grant`), directement en
-  `pending_commit` : sur ce bout il n'existe aucun instant antérieur. Le slot
-  ne devient `next` qu'après confirmation de la gateway, donc une interruption
-  ne laisse ni identité à demi scellée, ni clé orpheline, ni slot nommant un
-  certificat sans clé privée.
-  **Le renouvellement client ordinaire se boucle donc de bout en bout** :
-  `astra-signer approve --heliosd-url --operation-id` récupère sa demande et
-  dépose son assertion par les mêmes routes in-tunnel, ce qui tient parce que
-  le compagnon tourne sur la machine du client — ces routes authentifient le
-  pair par sa VIP, pas par un jeton porteur. Le transport ne décide de rien :
-  la demande reste vérifiée sous la clé de service épinglée, et le RP ID
-  annoncé par la gateway est **comparé** à celui du coffre, jamais adopté.
-  **Le bouton existe, et il va jusqu'au bout** : l'écran *Certificats* d'Orion
-  ouvre l'opération, lit la demande d'approbation, la vérifie sous ce que le
-  profil épingle, **demande la clé de sécurité lui-même** puis committe le
-  grant. Aucun second binaire à lancer : `orion-core::certificate_approval`
-  porte la cérémonie du §14.1 par `helios-fido`, transport plateforme sous
-  Windows — pas d'élévation, et le PIN reste collecté par le système. La ligne
-  de commande du compagnon n'apparaît plus que là où elle est la réponse :
-  après une cérémonie qui n'a pas pu s'exécuter. Le magasin de confiance s'amorce tout seul depuis le
-  profil et l'identité scellée (`open_or_seed`) ; une fois écrit, c'est lui qui
-  fait foi, et un magasin décrivant un autre domaine est refusé plutôt
-  qu'écrasé. Le candidat est scellé sous `<identité>-next` **avant** le commit,
-  jamais par-dessus l'actif — qui monte le tunnel pendant tout le
-  chevauchement — et `promote_due` remet les deux en place à l'activation, clés
-  d'abord, état ensuite. **Limite connue** : ces deux écritures passent par
-  DPAPI, donc un renouvellement complet ne s'exerce pas en WSL2 ; tout le reste
-  du chemin y est éprouvé (voir [TESTING.md](docs/testing/TESTING.md)).
-  La **distribution** des transitions est livrée côté gateway : le veth prend
-  une transaction signée adressée à un pair (`/internal/v1/certificates/distribution`),
-  le registre la met en file, et `trust-update` en rend un fragment par requête
-  fraîche — manifeste compris à chaque fois, et même fragment pour un
-  `request_id` rejoué. La gateway ne vérifie aucune signature là : elle ne
-  détient ni `CA-PQ` ni la clé de service, donc tout contrôle qu'elle écrirait
-  nommerait une autorité qu'elle possède, ce que la vérification du
-  destinataire existe précisément pour refuser. Elle est une file, pas un
-  auteur. **Son producteur existe désormais**, et le chemin va d'un bout à
-  l'autre. L'amendement du 22 août 2026 ferme les deux questions de conception
-  qui le bloquaient. `base_state_fingerprint` reste
-  l'empreinte exhaustive du magasin local, mais Orion la porte comme jeton CAS
-  opaque dans sa requête signée ; Astra la recopie sans reconstruire les
-  tombstones, compteurs ou slots pending. Tout manifeste en ligne est signé
-  par la clé de service Astra : il décide attribution, base, ordre et atomicité,
-  jamais l'autorité d'une mutation. Les objets qui touchent une ancre, la clé
-  de service, la gateway, une révocation ou une récupération gardent leur
-  propre signature `CA-PQ`, produite une fois par `astra-signer` puis assemblée
-  dans les manifestes par client. Le type filaire porte le hash sous la
-  signature cliente, Orion refuse `ca_pq` comme autorité d'un manifeste en
-  ligne et la file gateway jette une transaction visant une autre base.
-  Le chemin livré : `aether::…::transport::signing::build_transaction` construit
-  et signe le manifeste sous la clé de service, découpe par taille sérialisée et
-  y recopie le jeton opaque ; `astra::distribution::prepare` choisit dans le
-  registre ce que les compteurs du pair disent lui manquer, après avoir vérifié
-  la signature de la requête sous la feuille PQ active que **la gateway**
-  détient — jamais sous une clé que la requête porte ;
-  `POST /internal/v1/trust-update/prepare` la sert sur le canal privé
-  Helios → Astra, sous son propre préfixe ; et la gateway, quand sa file ne
-  contient rien pour l'empreinte de base que ce client vient de signer, relaie
-  un objet **canonique qu'elle construit** — requête authentifiée, pair résolu
-  depuis la VIP source, instantané du registre —, met en file ce qui revient et
-  sert le premier fragment dans le même appel. Côté client,
-  `orion-core::trust_update` écrit la requête depuis son propre magasin,
-  empreinte de base comprise, collecte les fragments et n'applique rien avant le
-  dernier ; un manifeste qui change en cours de collecte est un conflit, pas une
-  reprise. Une gateway sans autorité garde exactement l'ancien comportement.
-  **Limite connue** : le seul objet de transition qu'Astra **stocke** est la
-  délégation `AstraIssuerAuthorization`. Les transitions de CA, d'identité
-  gateway et les révocations sont signées par `CA-PQ` dans le compagnon — §0.6
-  leur donne un chemin, le compagnon les rend une fois, liées à la campagne, et
-  Astra les persiste —, mais rien n'écrit encore ce magasin. Un pair en retard
-  uniquement sur une ancre reçoit donc toujours `503`.
-  Le **bloc de confiance du §19 est enfin porté par le document** : la gateway
-  le sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
-  `heliosd show-trust-enrolment`, `helios-ctl enroll` le pose — en ligne depuis
-  l'API, hors ligne depuis `--trust-material` —, et `provision-client.sh` le
-  rapatrie à côté des deux certificats qu'il copie déjà. Onze valeurs publiques
-  lues sous un seul verrou : une époque prise à un instant à côté d'une ancre
-  prise à un autre épinglerait un couple qui n'a jamais existé ensemble.
-  **Un profil émis avant ce lot n'en porte pas** — il se connecte, mais Orion
-  refuse le renouvellement en le disant ; il faut le réémettre.
-  **Le pair entre au registre à l'admission**, des deux côtés. La gateway
-  enregistre sa première génération depuis les feuilles elles-mêmes — pas leurs
-  empreintes : elle vérifie des signatures faites par elles. L'API la reçoit
-  dans la requête d'admission ; `heliosd peer add`, qui tourne dans un autre
-  processus, **dépose** l'admission dans une boîte que le démon draine toutes
-  les deux secondes, parce que lui seul possède le registre et le tient en
-  mémoire. Un pair admis sans ses deux certificats est refusé en le disant :
-  sans ligne au registre il n'y a pas de bloc de confiance, donc un profil qui
-  se connecte et ne renouvellera jamais. Astra, lui, ne décide d'aucune
-  admission : il **transcrit** le pair depuis le canal privé au premier
-  renouvellement (`peer_state` porte désormais la feuille PQ active), sous deux
-  contrôles — la feuille nomme cette clé WireGuard, et elle hache vers
-  l'empreinte de la génération qui l'accompagne.
-  L'**émetteur délégué s'installe** : `astra issuer request` fait naître ses
-  deux clés privées dans le volume, adressées par époque, et imprime la demande
-  publique sur la sortie standard ; `astra-signer authorize-issuer` la signe
-  sous `CA-PQ` à la clé de sécurité ; `astra issuer install` la vérifie trois
-  fois — l'ancre que le registre épingle, la politique calculée à l'amorçage,
-  et la possession des clés déjà sur disque — avant de l'enregistrer. L'époque
-  ne redescend jamais. Les journaux d'Astra passent sur **stderr** : la sortie
-  standard porte ce qu'une commande produit, et la demande de délégation se
-  pipe hors du conteneur.
-  Le **transport hors tunnel du compagnon est livré** : `astra campaign open`
-  résout une campagne sur les cibles courantes et la dépose ; le service
-  l'adopte, et les quatre routes du §8.2 — lecture d'opération, demande de
-  signature, coffre chiffré, dépôt du résultat — la servent. Trois jetons de
-  capacité, un par scope, liés à l'opération, à l'empreinte de campagne qui est
-  aussi le challenge de l'opérateur, et à cinq minutes ; le jeton de coffre
-  n'est émis que pour une portée qui fait signer une ancre. `astra-signer
-  approve-campaign --authority-url --operation-id` boucle l'ensemble.
-  Deux **magasins séparés**, pas une énumération : les routes publiques ne
-  regardent que les opérations opérateur, donc un identifiant de renouvellement
-  ordinaire y est **absent** plutôt qu'écarté par une comparaison qu'on peut
-  oublier d'écrire — c'est la règle du §8.2, portée par la structure.
-  Le coffre est servi **chiffré**, et il n'y a pas d'autre forme : ce processus
-  ne détient aucun secret de key-slot. Ses octets sont comparés à l'empreinte
-  que la demande **signée** nomme, des deux côtés.
-  Reste `POST /v1/campaigns` en `501`, et c'est délibéré : le §11.6 fait
-  *résoudre* la campagne par Astra sur les cibles courantes, ce qui sur une
-  route publique non authentifiée répondrait l'inventaire du domaine à
-  n'importe qui — et l'authentification qu'il faudrait n'est tranchée nulle
-  part. `astra campaign open` fait la résolution localement.
-  `client-rotation/recovery` reste en `501` pour sa propre raison : le
-  validateur historique du §7.5.
-  **Les deux familles d'approbation du §7.2 existent maintenant, et un objet ne
-  peut plus les mélanger.** Une rotation ordinaire est approuvée pour *une*
-  demande qui existe déjà ; une campagne l'est pour un jeu de cibles avant
-  qu'aucune n'ait écrit de demande — donc pas les mêmes documents, et pas la
-  même liaison : `AstraRenewalApprovalEvidence` lie une empreinte de demande,
-  `AstraCampaignApprovalEvidence` lie **l'état courant de la cible**.
-  `covers_client` exige la clé WireGuard, la génération et les deux empreintes
-  actives exactes : une approbation ne se rejoue donc pas d'une génération sur
-  la suivante — sans quoi une seule touche renouvellerait un pair indéfiniment,
-  une fois par génération —, et une campagne `trust_authorities` n'autorise
-  aucune rotation cliente. Le registre de credentials voyage avec l'évidence et
-  est vérifié sous le `CA-PQ` déjà épinglé ; l'origine WebAuthn voyage aussi, et
-  n'est admise que si elle appartient au relying party épinglé. `authorize_stage`
-  ne reçoit plus une raison **et** une évidence mais `DelegatedApproval`, dont la
-  raison est *dérivée* de la famille : les deux ne peuvent plus se contredire, et
-  les quatre raisons interdites à l'émetteur délégué ne sont plus exprimables.
-  Staging et commit côté gateway choisissent le contrôle sur la **raison
-  signée**, jamais sur le champ rempli, et exigent l'absence de l'autre famille.
-  **Une campagne sur les leafs clientes s'exécute** : quand un pair couvert
-  envoie sa demande de rotation, `renewal::open` retrouve l'opération approuvée
-  par `approved_for_client`, ouvre une opération **déjà approuvée** — jamais
-  `awaiting_operator`, puisque personne n'a rien à répondre — et émet dans le
-  même appel. C'est aussi la seule chose qui surcharge légitimement le seuil de
-  80 % : renouveler avant est ce à quoi sert une action manuelle. Pas
-  l'expiration, en revanche : §7.5 reste le seul retour.
-  **Limite connue** : une leaf cliente ne tourne pas sans son client, qui
-  détient la clé privée et écrit le CSR. Une campagne autorise donc des
-  rotations, et la demande de chaque pair dépense cette autorisation dans la
-  fenêtre de campagne — 300 s au plus. Un pair hors ligne pendant ces cinq
-  minutes n'est pas renouvelé ; l'opérateur rouvre une campagne. Atteindre un
-  parc absent voudrait dire une autorisation qui survit au texte que son
-  opérateur a lu.
-  Restent ouverts : l'exécution d'une campagne d'**autorité** —
-  `trust_authorities` et la part ancre de `full_certificate_chain` font signer
-  `CA-PQ` ou `CA-TLS`, ce qui n'arrive que dans le compagnon ; la récupération
-  d'une identité expirée ;
-  `authorize-issuer` et `rotate-ca-pq`, qui ne portent aucune campagne et n'ont
-  donc pas d'opération à laquelle se rattacher ; les trois autres actions du
-  §12.2, sans pilote et refusées en le disant ; le lancement automatique du
-  compagnon plutôt que sa ligne de commande ; et le discriminant de profil
-  Orion avec la bascule du §13.
-  La **console Helios lit enfin le domaine** : `GET /api/certificates` rend en
-  une lecture sous un seul verrou les ancres, les époques, l'émetteur délégué
-  et chaque pair du registre — génération, échéance, barreau de l'échelle §4.3,
-  candidat sous bail, successeur committé et fragments non collectés. Le
-  barreau est calculé **côté gateway**, sur son horloge : un poste opérateur
-  décalé de quelques minutes placerait toutes les feuilles au mauvais barreau,
-  et c'est l'écran qu'on croirait. Rien de secret n'y passe — ni corps de
-  certificat, ni clé publique, seulement des empreintes et des dates — et
-  `aether::certificates::window::ValidityPhase` est désormais l'unique
-  définition des seuils 80/90/95 %, qu'Orion réexporte sous le nom
-  `CertificatePhase` qu'il exportait déjà.
-  **La négociation lit désormais le registre**, et c'est ce qui rendait un
-  renouvellement inutilisable : `network.toml` n'est écrit qu'à l'admission et
-  rien ne le remet à jour, donc un client renouvelé y présentait une empreinte
-  inconnue et se faisait enfermer dehors à la fin du chevauchement — sur une
-  machine dont le seul canal pour le dire était le tunnel qu'elle ne pouvait
-  plus ouvrir. Le registre, lui, est ce qui a **enregistré** la rotation. La
-  résolution passe donc par `RegistryState::resolve_negotiation_identity`, et
-  la vérification par `AuthenticatedKeyNegotiationRequest::verify_against` :
-  un ensemble d'émetteurs — l'ancre, son successeur pendant un chevauchement,
-  l'émetteur délégué, et la CA opérateur sur disque sous laquelle la
-  **première** génération a été émise, que le registre ne détient pas — et
-  **une seule** empreinte acceptable, celle appariée à la moitié TLS que mTLS
-  vient de prouver. Jamais l'union des deux générations : ce serait accepter la
-  paire mixte du §3.3. L'empreinte tranche avant toute signature, donc une
-  feuille que cette gateway n'a jamais émise coûte un hachage.
-  `assert_candidate_is_presentable` construit **le même ensemble, de la même
-  façon** — deux réponses différentes à « cette feuille s'authentifierait-elle »
-  n'ont aucune issue correcte.
-  Sans registre, le comportement est exactement l'ancien : les épinglages de
-  `network.toml` et la CA sur disque. Le registre est ouvert une fois et
-  partagé (`certificates::open_registry`, `SharedRegistry`) : la négociation le
-  lit, le service de cycle de vie l'écrit, un seul verrou.
-  **Et le client présente désormais la chaîne**, ce qui fermait la dernière
-  marche : une feuille déléguée est signée par l'intermédiaire de la
-  délégation, et le point d'écoute QUIC ne détient que l'ancre — il construit
-  le chemin depuis ce que le client montre. `candidate_bundle` scelle donc
-  `[feuille, intermédiaire]` dès que l'intermédiaire est **celui qui a signé
-  cette feuille**, pas dès que le grant en porte un : ajouter un intermédiaire
-  étranger ferait échouer un chemin qui se serait construit sans lui. Une
-  chaîne d'un seul certificat laissait la feuille attachée à rien de connu, et
-  le handshake échouait à la fin du chevauchement — sur la machine dont le seul
-  canal pour le dire était ce tunnel.
-  **Limite connue** : le jeu d'ancres TLS clientes du point d'écoute QUIC est
-  toujours lu une fois sur disque au démarrage. `init-trust-domain` amorce le
-  registre depuis ce même fichier, donc les deux concordent. Ce qui n'est pas
-  câblé, c'est une **rotation de CA TLS cliente** :
-  `next_client_tls_ca_certificate` n'est pas offert en seconde racine, et une
-  nouvelle ancre exigerait de toute façon un redémarrage.
-  Rien n'effectue cette rotation aujourd'hui.
-  La leaf PQ gateway servie reste auto-signée.
-  L'amendement du 15 août 2026 tranche le transport et l'approbation du chemin
-  restant : un Orion dont le tunnel fonctionne ne contacte jamais Astra
-  directement. Il appelle des routes typées de `helios-api` dans WireGuard ;
-  `heliosd` authentifie la VIP du pair puis relaie les objets canoniques vers
-  l'IP privée d'Astra sur le veth mTLS. Le canal HTTPS public est réservé à la
-  récupération sans tunnel et aux opérations opérateur hors tunnel. Chaque
-  renouvellement client, planifié ou manuel, attend une approbation YubiKey
-  liée au hash exact de la demande. Le grant transporte l'assertion WebAuthn et
-  le binding public du credential signé par `CA-PQ`, afin qu'Helios et Orion ne
-  fassent pas confiance à la seule affirmation d'Astra. Cette assertion
-  autorise l'émetteur délégué, n'ouvre pas le coffre maître et ne produit aucune
-  signature ML-DSA.
-  Le seuil de 80 % prépare donc une opération `awaiting_operator`; il ne peut
-  plus achever silencieusement la rotation.
-  L'amendement du 16 août 2026 ferme les contradictions relevées dans le document :
-  `ClientCertificateStageAuthorization` voyage toujours d'Astra vers Helios
-  sur le veth et le reçu revient à Astra sur ce même lien ; Orion ne transporte
-  aucun des deux. Helios reste en `pending_grant` après le reçu et ne crée
-  `next_committed` qu'au commit. Les trois empreintes clientes de
-  `AuthenticatedTrustUpdateRequest` sont intentionnelles — snapshot TLS/PQ de
-  l'active, puis leaf PQ effectivement présentée — et les statuts sont validés
-  par famille. La révocation de l'active domine depuis toute phase ; celle de
-  la seule suivante retire le candidat sans révoquer l'active.
-  **Ces écarts filaires sont désormais alignés.** Trois l'étaient déjà — le
-  reçu qui laisse Helios en `pending_grant`, `retire_active_at =
-  transition.not_after`, et la révocation qui distingue l'active de la seule
-  suivante ; le quatrième ne l'était pas : `CertificateStatus` était un enum
-  plat de dix états, là où le §8.2 en nomme douze et exige que **le décodeur
-  refuse** toute combinaison absente de sa table par famille. `awaiting_operator`
-  et `promoted` manquaient, et rien ne liait un état à une famille — un statut
-  signé pouvait dire `astra_issuer: pending_commit`, phrase sans signification
-  que chaque consommateur aurait dû interpréter. `permitted_for` porte la table
-  et `AstraCertificateStatus::verify` refuse avant la signature. Les octets de
-  transcription des dix états d'origine ne bougent pas : les renuméroter
-  changerait silencieusement ce que tout statut déjà signé disait.
-  `awaiting_operator` a un producteur — l'état est un fait sur l'**opération**,
-  que le registre ne voit pas, donc `client_status` le reçoit de qui détient le
-  magasin d'opérations. `promoted` est accepté mais **jamais émis** : l'affirmer
-  demanderait un journal de mutations par cible, et Astra tient un compteur
-  monotone qui dit qu'un changement a eu lieu, pas lequel.
-  La fermeture cryptographique du même jour ajoute six invariants. Les deux
-  optionnels de `GatewayIdentityTransition` portent chacun un octet de présence
-  `0|1` avant leur empreinte — le code le faisait déjà, la transcription ne le
-  disait pas. Toute signature ML-DSA-87 de la négociation v5 et du cycle de vie
-  emploie l'algorithme pur avec un `ctx` FIPS 204 non vide égal au domaine
-  ASCII du type ; HashML-DSA et `ctx = ""` sont refusés, y compris sous
-  `CA-PQ`. Le coffre Astra est exactement les deux
-  couches HVLT v1 AES-256-GCM/HKDF-SHA-256 décrites au §2.4.1 : sel WebAuthn
-  par coffre, mais sel HKDF frais dans chaque enveloppe de slot. La politique
-  Astra possède une empreinte confirmée hors bande et épinglée dans le profil ;
-  une signature `CA-PQ` ne peut la remplacer. Les capacités du compagnon sont
-  des jetons HKDF-SHA-256 + HMAC-SHA-256, bornés à cinq minutes, une opération,
-  un manifeste, un coffre et un scope. Enfin tout aléa du protocole vient du
-  DRBG SP 800-90A à 256 bits de la bibliothèque cryptographique —
-  HMAC-DRBG-SHA-512 ou CTR-DRBG-AES-256 —, semé par la source
-  plateforme en mode fail-closed, reseed au plus tard toutes les `2^20`
-  générations et après fork ; un échec ne rend aucun octet. Aucun DRBG
-  applicatif n'est écrit dans Helios, et la validation CAVP/ACVP du fournisseur
-  n'est pas exigée par cette version.
-  **Le socle de cet alignement est livré.** `aether::ml_dsa` est le point
-  d'entrée unique des signatures ML-DSA-87 : il exige le `ctx` du type, refuse
-  contexte vide, contexte d'un autre type, NUL et octet non imprimable, et
-  refuse un message qui ne s'ouvre pas sur son domaine — le contexte n'est plus
-  un paramètre libre, `CanonicalBytes::finish_signed` rend un
-  `SignedTranscript` qui porte le sien. HashML-DSA n'est appelé nulle part et
-  ne vérifie pas. `aether::random` porte l'autre moitié et **ne réimplémente
-  aucun DRBG** : interface vers le fournisseur, refus ferme, faux fournisseur
-  déterministe sous `cfg(test)` seulement, bannière de démarrage nommant
-  fournisseur, version, mécanisme, `use_df` et intervalle de reseed.
-  Plus aucun appel direct au CSPRNG système ne subsiste hors de ce module —
-  négociation, cycle de vie, HVLT, coffres Orion, séquestre TPM et outils
-  compris.
-  La source est **`aws_lc_rs::rand::SystemRandom`**, c'est-à-dire le
-  `RAND_bytes` d'AWS-LC déjà utilisé pour AES-GCM, HKDF et HMAC. Le lot a été
-  audité contre la source vendorée plutôt que contre la réputation de la
-  bibliothèque : CTR-DRBG-AES-256, état par thread, seed issu d'un arbre DRBG
-  enraciné dans le jitter CPU et personnalisation par l'OS — les deux rôles
-  s'échangeant sous hyperviseur —, reseed toutes les 4096 générations
-  (`kCtrDrbgReseedInterval`, 256 fois sous le plafond de `2^20`), et
-  réinstanciation avant toute sortie après fork ou reprise d'instantané de VM
-  (`crypto/ube`, bâti sur `MADV_WIPEONFORK`). C'est précisément pourquoi
-  `aether::random` n'a **pas** de détection de fork à lui : le fournisseur la
-  fait, et mieux qu'une comparaison de PID — et quand cette détection est
-  indisponible, elle échoue fermée et impose un reseed avant *chaque*
-  génération. Un échec d'entropie n'est pas une erreur rendue : AWS-LC
-  `abort()`, et `RAND_bytes` retourne 1 inconditionnellement, donc le refus est
-  plus strict que ce que la spécification demande.
-  Le fournisseur n'emploie **pas** de fonction de dérivation :
-  `CTR_DRBG_init` consomme un seedlen de pleine entropie conformément à
-  SP 800-90Ar1 §10.2.1.3.1, cas désormais admis par les deux spécifications ;
-  la bannière annonce `use_df=false`. La résistance à la prédiction des
-  tirages secrets appelle directement
-  `RAND_bytes_with_user_prediction_resistance`, alimenté par le DRBG public
-  séparé d'AWS-LC, sans état applicatif. Le canal privé rustls emploie également
-  le fournisseur AWS-LC. Le **matériel de session TLS** des autres chemins
-  `rustls`/`quinn` reste sur le CSPRNG de `ring` : `reqwest`
-  0.12 n'offre que le fournisseur `ring`, et sa variante `-no-provider` exige un
-  `CryptoProvider::install_default` dans chaque binaire. En revanche les **clés
-  privées X.509** produites par `rcgen` sont passées sur AWS-LC (feature
-  `aws_lc_rs` épinglée au manifeste), et ML-KEM comme ML-DSA tirent déjà du même
-  `RAND_bytes`.
-  La **validation FIPS est hors périmètre** et assumée comme telle : la
-  construction `aws-lc-fips-sys` porte les certificats CAVP/CMVP mais exige les
-  chaînes CMake et Go qu'ADR-001 §2 tient hors du build, pour le même mécanisme.
-  Rien dans le code ne revendique de validation.
-  **Migration** : le `ctx` entre dans la vérification, donc tout certificat PQ
-  émis avant ce lot cesse de vérifier et le parc se ré-émet.
-  Les **deux moitiés du domaine s'amorcent** : `astra bootstrap` d'un côté,
-  `heliosd init-trust-domain` de l'autre. La seconde n'ouvre aucun coffre et ne
-  génère aucune clé — elle relit les leaves servies sur disque et reçoit les
-  ancres de l'opérateur, donc elle tourne TPM indisponible. Sans elle le
-  registre est absent, et un registre absent n'est **pas** un registre vide :
-  les routes de cycle de vie in-tunnel restent fermées et le démarrage le dit.
-  Le tout se déploie en **deux commandes** — `astra-signer init`, puis
-  `./scripts/deploy.sh` — et aucune valeur ne se recopie : `init` écrit un
-  relais public à côté du coffre, `deploy.sh` le lit, interroge la gateway par
-  `heliosd show-identity`, amorce Astra, capture clé de service et tête d'audit
-  dans sa sortie, et enchaîne sur `init-trust-domain`. Voir
-  [DEPLOIEMENT-ASTRA](docs/DEPLOIEMENT-ASTRA.md).
-  **Aucune clé de sécurité ne signe quoi que ce soit** : une YubiKey 5 ne
-  produit pas d'ML-DSA, et tout champ de signature du cycle de vie est un
-  `MlDsa87Signature`. Le jeton authentifie et dérive — `hmac-secret` ouvre un
-  key-slot, rien d'autre. Le coffre exige deux credentials (`REQUIRED_SLOTS`)
-  et en accepte huit ; enrôler la troisième est le **même** geste que la
-  seconde. Le corps est scellé sous une empreinte de la table de slots, donc un
-  slot retiré puis recollé depuis une sauvegarde n'ouvre plus le fichier
-  courant — une sauvegarde antérieure, elle, reste ouvrable par la clé retirée.
-  CTAP n'est **pas** une feature de compilation, pas plus que la négociation de
-  clé : tout binaire `astra-signer` porte la pile, et aucun chemin n'ouvre le
-  coffre sans clé. **Deux transports**, choisis explicitement et jamais déduits
-  (`--transport`) : `platform` sous Windows passe par `webauthn.dll` — aucune
-  élévation, et le PIN est saisi par le système donc n'entre jamais dans le
-  processus ; `hid` parle CTAP2 directement, partout, mais sous Windows exige
-  un processus administrateur — pour un programme qui tient `CA-PQ` en clair,
-  c'est le privilège qu'on ne veut pas. Un credential appartient à la clé, pas
-  à l'API : un coffre créé par un transport s'ouvre par l'autre à RP ID égal —
-  mais seulement parce que le chemin HID applique **lui aussi** la conversion
-  PRF de WebAuthn, `SHA-256("WebAuthn PRF" || 0x00 || sel)`. Windows l'applique
-  par défaut dans `pHmacSecretSaltValues` ; le code laisse volontairement
-  `WEBAUTHN_AUTHENTICATOR_HMAC_SECRET_VALUES_FLAG` désactivé, car demander les
-  sels CTAP bruts ferait dériver deux secrets différents selon le transport.
-  L'API WebAuthn 4 sait fournir ces sels avec `GetAssertion` v6, mais ne sait
-  créer qu'avec
-  `MakeCredential` v5 : ce chemin demande l'extension historique
-  `hmac-secret`. À partir de l'API 6 seulement, `MakeCredential` v6 et
-  `bEnablePrf` la remplacent. Annoncer v5 tout en remplissant `bEnablePrf`
-  laisse Windows ignorer silencieusement le champ et crée un credential qui ne
-  déverrouille rien.
-  Le prix du transport HID est `libudev` en dépendance de compilation, posée par
-  `scripts/setup-dev.sh` — sans elle le workspace ne se bâtit plus ; celui du
-  transport plateforme est `WEBAUTHN_API_VERSION_4`, exigé par les sels
-  `hmac-secret` et refusé en nommant la version trouvée.
-  **Limite connue** : le matériel ne s'exerce pas en WSL2 (aucun passthrough
-  USB), et le module `webauthn` ne s'y compile même pas — il est type-vérifié
-  contre `x86_64-pc-windows-msvc` dans une caisse isolée, `aws-lc-sys` empêchant
-  le cross-check du workspace entier. La séquence au-dessus du matériel, elle,
-  est éprouvée par `tools/astra-signer/tests/enrolment.rs`.
-**Un profil Orion déclare ce qu’il est** (§19, §22) : `type = "classic"` ou
-`type = "helios_key_negotiation"`, porté par le document `.orion`, par le
-manifeste de coffre (v5) et par l’écran *Profils*. Il ne s’infère plus à chaque
-lecture de la présence du bloc `key_negotiation` — l’inférence lit une
-**présence** comme une **intention**, et les deux se séparent dans le sens qui
-compte : un profil Helios dont le bloc a été perdu par une édition, une
-conversion ou un import partiel arrivait avec l’apparence exacte d’un profil
-classique délibéré, et Orion montait un tunnel sans aucune authentification
-avant WireGuard sans que rien ne le dise. Les deux formes sont **exclusives** et
-la contradiction est refusée, jamais réparée : deviner laquelle des deux moitiés
-garder, c’est choisir un niveau de protection à la place de l’opérateur. Le
-chemin de connexion lit `ClientProfile::negotiates()`, jamais la présence du
-bloc. L’inférence historique survit à un seul endroit — un manifeste scellé
-avant la v5 ou un document écrit avant §19 —, s’applique **une fois** à la
-lecture, et le prochain scellement écrit la réponse. Une fois le profil scellé,
-son type est immuable sous son identifiant stable : passer de `classic` à
-`helios_key_negotiation`, ou l’inverse, exige un nouveau profil sous un autre
-nom. Le modèle, le coffre et l’écran refusent tous la reclassification en place.
+The same rule applies to `CLAUDE.md`: it must remain a thin adapter to this file, not a second copy.
 
-L’identité cliente est scellée par DPAPI au compte Windows ; `helios-ctl
-enroll` fait l’enrôlement d’un trait (clés, certificats, admission, profil et
-identité en un document) en lisant le matériel public de la gateway par
-`GET /api/key-negotiation`.
-**Limite connue** : DPAPI ne se compile ni ne s’exerce en WSL2 — hors Windows le
-scellement échoue explicitement plutôt que d’écrire ces clés en clair.
+## Source of truth
 
-Une invitation (`enroll --public-key`) ne porte pas de clé privée : l’import la
-reprend du profil local qui détient la **clé admise**, quel que soit son nom —
-la correspondance se fait sur la clé, jamais sur le nom. À défaut, le brouillon
-s’affiche quand même et le message nomme la clé attendue, celle qu’imprime
-`helios-ctl profile check`.
+Use these sources deliberately:
 
-Les profils portent l’extension **`.orion`** (`.orionprofile` jusqu’en août
-2026 : encore lue à l’import, plus écrite ni enregistrée auprès de Windows), et
-une icône de document qui leur est propre — posée par un fragment WiX, le
-gabarit de Tauri n’écrivant qu’un ProgID sans icône. Sous Windows, la zone de
-notification est une surface à part entière : état du tunnel, liste de profils
-que l’on coche pour connecter, import, journal et « À propos ». Elle vit dans
-`apps/orion/src-tauri/src/tray.rs`, dont seul le câblage est propre à Windows ;
-le modèle et les libellés se compilent et se testent partout.
+1. Accepted ADRs: architectural intent and security decisions.
+2. Current code/tests: implementation that actually exists.
+3. Specifications: protocol/wire behavior and tracked incomplete work.
+4. `docs/testing/TESTING.md`: what each environment proves.
+5. `README.md`: overview only.
 
-La gateway se livre en binaires (ADR-004, lot 2) : `cargo xtask bundle` assemble,
-`helios-publisher bundle` signe hors ligne, `cargo xtask pack` archive, et
-`helios-installer bootstrap` vérifie tout avant d’écrire. `setup-target.sh` ne
-compile plus rien. L’installateur Orion se bâtit par `cargo xtask orion-msi`,
-sur Windows uniquement — WiX n’a pas d’équivalent croisé.
+If code and an accepted ADR disagree, do not silently choose one. Identify the discrepancy, preserve fail-closed behavior, and resolve it explicitly. Do not infer current status from historical docs or this file.
 
-La mise à jour de l’OS de la gateway ne perd plus l’identité scellée
-([ADR-007](docs/adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)) : `heliosd tpm
-prepare-update --reboot` porte le **même** secret à travers un redémarrage
-planifié, dans un slot NV lisible sous PCR 0/7 par le seul `TPM2_NV_Read`, puis
-écrasé après rescellement durable. Les coffres survivent donc, et aucun client n’est
-ré-enrôlé. Le billet de rescellement reste le chemin du changement de PCR
-**subi**. Trois limites explicites : pendant qu’une fenêtre est ouverte, un
-attaquant ayant l’accès physique qui démarre un autre OS signé descelle le
-secret (`TPM2_PolicyCounterTimer` n’est pas exposé par `tss-esapi` 7.7) ; une
-mise à jour de firmware ou de base Secure Boot déplace PCR 0/7 et sort du
-périmètre ; et l’identité de négociation reste **sans séquestre**, donc un
-changement de PCR subi impose encore une rotation et le ré-enrôlement du parc.
+## Read before changing
 
-Le câblage PSK est validé en dry-run seulement. Aucun essai noyau n’a encore eu
-lieu, et la fenêtre de mise à jour n’a jamais été exercée sur un TPM réel — voir
-[docs/testing/TESTING.md](docs/testing/TESTING.md).
+Read only the documents relevant to the touched area:
 
-## Invariants de sécurité
+| Area                            | Required context                                                                               |
+| ------------------------------- | ---------------------------------------------------------------------------------------------- |
+| WireGuard, routing, firewall    | `docs/adr/ADR-001-WIREGUARD.md`, `docs/ARCHITECTURE.md`                                        |
+| Publisher signatures / recovery | `docs/adr/ADR-002-SIGNATURES-PQ.md`                                                            |
+| Application updates             | `docs/adr/ADR-003-MISES-A-JOUR-APPLICATIVES.md`                                                |
+| Delivery, admission, secrets    | `docs/adr/ADR-004-CHAINE-DE-LIVRAISON.md`                                                      |
+| Pre-WireGuard key negotiation   | `docs/adr/ADR-005-NEGOCIATION-DE-CLE.md`, `docs/specification/NEGOCIATION-DE-CLE-V5.md`        |
+| Secrets at rest                 | `docs/adr/ADR-006-SECRETS-AU-REPOS.md`                                                         |
+| TPM update window               | `docs/adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md`                                                   |
+| Astra / certificate lifecycle   | `docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md`, `docs/specification/ROTATION-CERTIFICATS.md` |
+| Testing / target limitations    | `docs/testing/TESTING.md`                                                                      |
 
-- Gateway : seul `TunnelState::Up` autorise le trafic. Engager le kill-switch
-  avant tout réseau et le laisser engagé à l’arrêt.
-- Hors `--dev`, un backend noyau absent est une erreur de démarrage ; aucun
-  repli implicite vers un backend simulé.
-- Netlink : traduire tout le ruleset puis envoyer une transaction atomique ; ne
-  jamais appliquer règle par règle. Le NAT entre dans la **même** transaction
-  que le filtrage : un masquerade qui survivrait au kill-switch laisserait
-  sortir en clair ce qu’il vient de couper.
-- Orion : lire le doc-comment de `orion-core/src/backend/mod.rs` avant toute
-  modification. L’adaptateur reste monté sur échec et `down()` n’est appelé que
-  sur déconnexion explicite.
-- Un Orion compilé avec `wireguard` refuse de démarrer si le backend réel est
-  indisponible ; aucun repli implicite vers le dry-run. Réciproquement, un
-  Orion **pour Windows** bâti sans cette feature ne compile pas : le repli
-  vers le backend simulé y produirait un client qui n’ouvre aucun tunnel tout
-  en affichant un profil et un mode négocié.
-- La session QUIC de négociation **est fermée après le commit** : elle porte
-  une transaction, puis disparaît. Sa fermeture ne dit **rien** du tunnel et ne
-  retire aucun PSK. C’est l’inverse de la v4, où elle était un lien de
-  vivacité — et où toute coupure réseau de plus de 35 s tuait un tunnel sain.
-  Ne réintroduire ni keep-alive QUIC, ni délai d’inactivité qui servirait à
-  déduire qu’un pair est encore là. Le seul délai restant
-  (`TRANSACTION_IDLE_TIMEOUT`, 60 s) borne la transaction et couvre l’attente
-  de confirmation, rien d’autre.
-- La vivacité se lit sur le **plan de données**, jamais sur un canal de
-  contrôle. Trois seuils, trois questions distinctes :
-  `HANDSHAKE_STALE_AFTER_SECS` (150 s) décide de l’état du tunnel et donc du
-  kill-switch ; `PSK_RECLAIM_AFTER_STALE_SECS` (300 s) décide que la gateway
-  détruit le secret d’un pair disparu ; `MAX_PSK_LIFETIME` (24 h) borne l’âge
-  d’un PSK même sur un tunnel sain. Les deux premiers encadrent les 180 s au
-  bout desquelles WireGuard abandonne lui-même une session : à 300 s la
-  gateway ne détruit jamais quelque chose qui marchait encore.
-  **Orion répare de lui-même** (§12.5) : le même seuil de 150 s qui fait
-  tomber le tunnel déclenche une renégociation quand le client détient un reçu
-  `ml_kem`. Un PSK négocié n’est jamais persisté, donc un redémarrage de
-  `heliosd` vide tous les slots — le client garde alors un PSK que la gateway
-  n’a plus, continue sur ses clés de transport en cours, et échoue en silence à
-  son rekey suivant, jusqu’à deux minutes plus tard, sans aucun canal qui le
-  lui dise. Retomber en `Connecting` décrivait ce tunnel sans le réparer.
-  La réparation est **bornée** à trois renégociations, chacune étant déjà la
-  boucle bornée de la négociation, et le budget n’est rendu que par un
-  handshake réussi — jamais par le fait d’avoir essayé. Un reçu n’existe que
-  pour `ml_kem` : un `static_psk` est la configuration de l’opérateur, relue à
-  chaque démarrage, donc toujours là. Le reçu précédent n’est remplacé qu’au
-  commit du suivant : un échec de renégociation ne doit ni perdre la capacité
-  de libérer l’ancien slot, ni empêcher un handshake ancien revenu de remettre
-  le tunnel à `Up`.
-- Tout cela suppose un keep-alive persistant, et la gateway le **pose
-  elle-même** (`WgPeer::persistent_keepalive_secs`, 25 s) plutôt que de faire
-  confiance à celui du client, qu’elle ne peut pas inspecter. L’admission
-  refuse un `0` explicite et le chargement de `network.toml` échoue en nommant
-  le pair : sans keep-alive, un tunnel inactif ne produit aucun handshake et
-  les deux seuils ci-dessus liraient un horodatage ancien sur un pair
-  parfaitement sain.
-- L’empreinte TLS est résolue vers **son** unique pair admis dès la fin du
-  mTLS, avant qu’un challenge soit émis. La clé WireGuard d’une requête est
-  ensuite comparée à ce pair ; elle n’est jamais la clé de recherche dans la
-  table. Chercher par le champ du client puis comparer l’empreinte refuse les
-  mêmes messages, mais fait d’une valeur choisie par le client l’index de la
-  table — une comparaison manquante en aval laisserait alors une identité
-  admise viser un autre pair. Le budget par identité ne se débite qu’après
-  cette résolution. La résolution passe par le **registre de certificats**
-  quand il existe (`RegistryState::resolve_negotiation_identity`), et par les
-  épinglages de `network.toml` sinon : le fichier n’est écrit qu’à l’admission,
-  donc lui seul enfermerait dehors tout client renouvelé. La règle ci-dessus ne
-  change pas — la clé WireGuard que rend le registre est un **état de la
-  gateway** dérivé de l’empreinte que mTLS vient de prouver, jamais un champ du
-  message, et celui du client lui est toujours seulement comparé. L’empreinte
-  PQ acceptée est **celle appariée** à cette moitié TLS, jamais l’union des
-  générations vivantes : l’union accepterait la paire mixte du §3.3, moitié
-  d’une génération et moitié d’une autre, identité que le domaine n’a jamais
-  émise. Dans le tunnel — `release`, `trust-update` — c’est bien l’union, et
-  correctement : aucune moitié TLS n’y est présentée, la preuve est le tunnel
-  lui-même.
-- Un PSK négocié n’est retiré que par un `release` signé, un remplacement
-  atomique, une révocation d’admission, le vieillissement du handshake ou
-  l’échéance. Jamais par un silence réseau sur un canal de contrôle.
-- Le `release` vit **dans le tunnel WireGuard**, sur `POST
-  /api/key-negotiation/release`, et nulle part ailleurs : le port QUIC public
-  ne porte plus que challenge, requête, confirmation et commit, et le tag
-  hérité `release` n’y décode plus. Négocier doit précéder WireGuard, se
-  déconnecter le suit — rouvrir le port public pour annoncer un arrêt
-  réauthentifiait par mTLS, challenge et ML-DSA une machine qui tenait déjà un
-  canal chiffré et authentifié vers la gateway. `require_peer` résout la VIP
-  source vers l’unique pair admis ; la clé du corps n’est que **comparée** à
-  celle-là, jamais la clé de recherche. Pas de challenge, pas d’horodatage,
-  pas de repli QUIC : l’identifiant de transaction suffit à rendre une
-  commande ancienne inoffensive, et WireGuard refuse déjà les paquets rejoués.
-  L’opération est best-effort, bornée à deux secondes côté Orion, et son échec
-  ne retarde pas la déconnexion — la récupération à 300 s est le filet.
-  **Désinstaller un profil monté envoie ce `release`** (§12.2) : la suppression
-  déconnecte d’abord, puis retire. L’ordre est tout : le `release` voyage dans
-  le tunnel et est signé par l’identité du profil, donc il doit partir avant que
-  l’un ou l’autre disparaisse. `VpnController::mounted_profile` nomme le profil
-  monté dès le début de la connexion — pas au commit : une négociation dure
-  plusieurs secondes, et un profil retiré pendant celle-ci doit être reconnu. Il
-  est tenu à part du reçu de commit, qu’un tunnel classique n’a pas.
-  Si `down()` échoue, la suppression est refusée : le nom reste attaché à
-  l’adaptateur encore monté afin qu’un nouvel essai puisse le démonter avant de
-  détruire le profil.
-- Un `release` ne retire qu’un état `committed` dont il nomme exactement le
-  propriétaire. Pendant `preparing` c’est un **no-op** : le candidat appartient
-  à la connexion qui le prépare, et sa garde de rollback est la seule sortie,
-  y compris quand la tâche est détruite. Lui laisser annuler un candidat
-  donnait deux écrivains sans ordre à un même slot.
-- Le commit signé est le **point de non-retour**. `take_for_rollback` ne
-  cherche que dans les transactions `active` : après la signature il ne trouve
-  rien, et c’est structurel. La v4 restaurait le slot quand le commit
-  n’arrivait pas à destination, ce qui laissait un client détenir un commit
-  valide et vérifiable face à une gateway ayant tout défait.
-- Le commit exige une **preuve de handshake WireGuard** lue sur le plan de
-  données : une observation strictement postérieure à celle mémorisée juste
-  avant la pose du candidat. C’est la seule preuve de l’échange qui engage la
-  clé privée **WireGuard** du pair — TLS et ML-DSA-87 en attestent deux autres.
-  Sans elle, une identité de négociation volée fait committer la gateway sur un
-  PSK arbitraire et coupe le vrai client. La lecture passe par
-  `ObserveHandshakeRequest`, pas par l’instantané `peer_runtime` : celui-ci
-  retarde de 10 s et refuserait des confirmations légitimes.
-- Chaque slot porte une **génération par pair**, et tout acteur tardif doit
-  présenter celle qu’il a observée — rollback, `release` retardé, récupération
-  décidée sur un instantané. Une génération périmée est un no-op, jamais une
-  écriture. Sans cela, chacun des trois efface le PSK d’une transaction plus
-  récente et coupe un tunnel qui marchait.
-- La génération se **réserve**, elle ne s’observe pas. `prepare` l’incrémente
-  et pose l’état `preparing` sous le **même** verrou qui réserve le pair, avant
-  de lire le plan de données et avant d’installer le candidat. La lire sans la
-  prendre laissait le slot décrire le PSK *déplacé* pendant que le fil portait
-  déjà le nouveau : un `release` visant l’ancienne transaction correspondait
-  encore, et la récupération aussi. La confirmation revérifie l’appartenance du
-  slot — même génération, `preparing` à son nom — **avant** de persister le
-  plancher et de signer, sinon la gateway signe un commit pour un PSK qu’elle
-  ne détient plus.
-- La vérification de propriété, la pose backend du candidat et l’insertion de
-  la transaction active forment une **seule section sérialisée**. De même, un
-  `release` classe et applique son action sous ce sérialiseur : si le commit a
-  gagné il retire le PSK committé ; s’il arrive avant, le slot n’est pas encore
-  `committed` et rien n’est touché. Découpler l’observation de l’écriture
-  permet à une préparation annulée de poser son candidat en retard, ou à un
-  `release` d’accuser un retrait sans effet.
-- Un rollback doit survivre à la **destruction de la tâche**. Détruire une
-  future n’exécute aucun chemin de sortie : l’échéance absolue de 90 s le
-  faisait, et laissait candidat posé, pair réservé et transaction active — un
-  pair admis s’enfermait dehors avec une seule connexion inachevée. Chaque
-  phase est bornée par ce qui reste de l’échéance, et une garde de destruction
-  couvre le reste. Le défaire s’appuie sur l’identifiant que le slot porte
-  lui-même, jamais sur l’enregistrement de transaction : un `prepare`
-  interrompu peut ne pas encore en avoir écrit. La garde ne se désarme donc
-  qu’après le **retour** du rollback : le désarmer avant l’`await` rouvre le
-  trou qu’elle bouche, et
-  tout ce qui se déduisait de la présence de l’enregistrement — le repos
-  compris — doit se lire sur le slot.
-- Un rollback survenu **après** la pose d’un candidat met le pair au repos dix
-  secondes. Une identité de négociation volée sans la clé WireGuard du pair ne
-  peut jamais committer — la preuve de handshake l’arrête — mais rien ne
-  l’empêchait de faire osciller un slot qui marchait, aussi vite que le
-  round-trip le permet.
-- Ordre d’un retrait : **vider le plan de données d’abord**, n’oublier l’état
-  qu’après succès, le verrou tenu à travers l’écriture. L’inverse laisse un PSK
-  orphelin quand l’écriture échoue — plus rien ne le désigne, un `release`
-  rejoué devient un no-op sans rien retirer, et la récupération ignore que le
-  slot existe.
-- Un PSK **statique** n’entre pas dans le cycle transactionnel. Il n’a pas de
-  propriétaire, n’expire pas, n’est pas retiré par `release` ni par la
-  récupération : c’est la configuration de l’opérateur, présente avant la
-  transaction et après elle. Le commit le laisse en `configured_static`, et
-  Orion n’enregistre pas de reçu pour lui. L’effacer serait détruire une valeur
-  qu’aucune renégociation ne restaure.
-- `classic` n’est **pas** un mode négociable v5 : refusé par `validate()`
-  (`ClassicNotNegotiable`) et à la préparation. Le décodeur serde l’accepte
-  encore, puisque la variante doit survivre pour relire un `network.toml` ;
-  c’est la validation qui refuse, et il faut le dire ainsi. Un tunnel sans PSK est un profil
-  WireGuard générique, pas un résultat de négociation — sinon le plancher du
-  protocole se satisfait de l’absence de protection. La variante survit dans le
-  type pour qu’un `network.toml` existant se relise encore ; voir la limite
-  ci-dessus.
-- Anti-rejeu : un `server_challenge` de 32 octets par connexion, à usage
-  unique, et **une seule** demande de challenge par connexion. Il vit dans la
-  pile de la tâche de connexion — `Option::take` **est** la consommation
-  atomique — et n’est délibérément **pas signé** par la gateway : le signer
-  offrirait une opération ML-DSA-87 gratuite à un client non authentifié. Le
-  cache de 4096 identifiants subsiste en défense en profondeur ; ne plus le
-  présenter comme la défense anti-rejeu.
-- Bornes DoS du port public, toutes nécessaires ensemble : Retry avant tout
-  état, budget par IPv4 ou par **préfixe IPv6 `/64`** (compter par adresse
-  exacte rend la limite décorative sur IPv6), budget par identité admise une
-  fois mTLS passé, durée de vie absolue de 90 s par connexion (l’idle timeout
-  ne borne pas une connexion occupée, et le permis de concurrence ne revient
-  jamais), reprise TLS et 0-RTT désactivés des deux côtés, zéro flux
-  unidirectionnel et fenêtres de réception bornées. Les limites de flux et de
-  fenêtre s’annoncent des **deux** côtés : une borne que seule la gateway
-  déclare ne borne que la gateway. L’échéance absolue borne chaque phase, elle
-  n’enveloppe pas la connexion : détruire la tâche à l’échéance n’exécute
-  aucun rollback.
-- Deux longueurs ML-DSA, deux modules : `aether::key_negotiation::ML_DSA_87_*`
-  pour la PKI de négociation, `aether::sig::ML_DSA_65_*` pour les artefacts
-  éditeur. Valider du matériel de négociation avec la constante de `sig`
-  compile, se lit bien, et refuse toute vraie clé ML-DSA-87.
-- Sur le port QUIC public, trois codes d’erreur seulement : `protocol`,
-  `rejected`, `internal`.
-  Tout refus avant installation du slot est `rejected`, quelle qu’en soit la
-  cause. Les sept codes de la v4 laissaient énumérer les pairs admis et lire
-  leur plancher depuis un port public. Le motif réel va au journal protégé.
-- Deux jeux de paramètres ML-DSA coexistent et **ne se remplacent pas** :
-  `ml-dsa-65` porte les signatures d’artefacts éditeur (ADR-002,
-  `aether::sig`, `REQUIRED_ALGS`), `ml-dsa-87` porte la PKI de négociation
-  (ADR-005 v5). Remplacer le premier par le second invaliderait la
-  vérification de toutes les releases déjà signées.
-- Négociation de clé : datagrammes QUIC **épinglés à 1200 octets**, découverte
-  de MTU désactivée des deux côtés. Le matériel PQ pèse plusieurs kilooctets et
-  quinn sonde jusqu’à 1452 par défaut — une taille qui passe en labo puis
-  échoue chez le client dès que l’interface WireGuard capte la route avec un
-  MTU plus petit (`WSAEMSGSIZE`). 1200 est le plancher que RFC 9000 §14 impose
-  à tout chemin QUIC.
-- Un PSK négocié n’est pas un PSK statique, bien qu’ils occupent le même slot.
-  Le profil éphémère passé au backend porte `preshared_key_is_negotiated` ;
-  sans lui, `validate()` refuse le tunnel que la négociation vient de préparer.
-  Toute copie qui installe un PSK à l’exécution doit poser ce drapeau.
-- La négociation de clé n’est **pas** une feature de compilation, ni côté
-  Orion ni côté `heliosd` : tout binaire la porte. Un client d’apparence
-  normale qui importe un profil épinglé puis échoue avant WireGuard est
-  indiscernable, côté utilisateur, d’une gateway en panne ; et une gateway qui
-  accepte `key_negotiation_port` sans le servir l’est tout autant. Seul
-  `key_negotiation_port` décide de l’ouverture du service — absent, il reste
-  fermé, sans erreur. Côté Orion, seul le stockage protégé d’identité reste
-  conditionnel : il est propre à la machine, pas à la compilation.
-- **Plage CGNAT partagée** : Helios n'est pas seul à tirer ses adresses de
-  `100.64.0.0/10`. NordLynx, Tailscale et la plupart des clients VPN grand
-  public y puisent aussi, et surtout ils posent des **règles de routage** qui
-  consultent leur table avant la principale — NordVPN en 32765 vers une table
-  contenant `100.64.0.0/10 dev nordlynx`. À partir de là, tout paquet que la
-  gateway envoie à **ses propres** clients part dans l'autre tunnel : rien
-  n'est jeté, rien n'est journalisé, `ip route get` répond simplement une
-  autre interface. `heliosd::vip_routing` pose donc une table à lui, une
-  **route `/32` par pair admis** et une seule règle en 32000. Jamais la plage
-  entière : elle contient aussi les pairs de l'autre VPN, et la reprendre en
-  bloc réparerait Helios en cassant son voisin. Une destination absente de la
-  table retombe sur la règle suivante, exactement comme avant. La pose est
-  **inconditionnelle** : l'autre VPN peut se connecter longtemps après
-  `heliosd` et réinstalle ses règles à chaque fois, donc un test au démarrage
-  passerait sur une machine qui casse dix minutes plus tard. Un échec de pose
-  n'est pas fatal — sur une gateway qui a la plage pour elle seule, cela ne
-  change rien — mais il est journalisé en nommant la conséquence.
-- **Uplink multiple** : `wan_iface` est un **ensemble**, pas un choix — une
-  chaîne ou une liste (`"auto"`, `"eth0"`, `["enp3s0", "wlo1"]`), la clé TOML
-  restant `wan_iface`. Chaque règle qui nomme le WAN est émise **une fois par
-  interface**, et le masquerade aussi : une gateway avec câble et radio survit
-  au débranchement sans redémarrage ni rechargement, parce que les règles de
-  l'autre lien sont déjà posées. Le pare-feu ne doit jamais être ce qui casse
-  une bascule. La préférence, elle, n'est pas ici : c'est le routage qui décide
-  par où un paquet sort, et elle s'exprime en **métrique de route**. `auto`
-  énumère toute interface physique ayant une porteuse — mieux routée en tête,
-  filaire départageant à égalité — et l'ordre ne sert qu'aux mesures qui
-  regardent un seul lien (sonde MTU, télémétrie). Un lien sans route est
-  **permis quand même** : le refuser ferait jeter l'échange DHCP qui lui
-  donnerait justement sa route. Le type ARPHRD ne distingue pas le Wi-Fi (il
-  vaut 1 comme Ethernet) : c'est `phy80211`, et `wireless/` pour les pilotes
-  antérieurs ; l'absence de lien `device` écarte les interfaces virtuelles,
-  sans quoi `docker0` serait candidat. L'ensemble est établi **une fois** — un
-  nom d'interface ne change pas sous un plan de données en marche — et
-  `adopt_runtime_secrets_from` reporte la liste résolue à chaque relecture :
-  laisser passer le marqueur reconstruirait le ruleset autour d'une interface
-  nommée `auto`. `heliosd show-uplink` montre les candidats, l'ordre et les
-  désaccords.
-- `network.toml` est relu à chaud : le démon le surveille et réapplique la
-  table de pairs sans redémarrer (`orchestrator::spawn_network_config_watcher`).
-  Toute relecture doit passer par `NetworkConfig::adopt_runtime_secrets_from` —
-  le fichier ne contient ni la clé privée scellée ni les PSK négociés, et les
-  appliquer tels quels retirerait son identité à la gateway et casserait tous
-  les handshakes. **Limite connue** : ce qui ne peut pas changer sous le plan
-  de données en marche — nom d’interface, port d’écoute, adresse d’API — exige
-  toujours un redémarrage.
-- L’identité de négociation, elle, n’est **pas** relue : elle est lue une fois
-  au démarrage et servie jusqu’à l’arrêt. `init-key-negotiation --rotate` sous
-  un démon en marche change donc les fichiers sans changer ce qui est présenté,
-  et les profils émis après la rotation épinglent un certificat que la gateway
-  ne sert pas encore : le client refuse le handshake QUIC sur `invalid peer
-  certificate: BadSignature`, qui nomme une signature et pas l’écart derrière
-  elle. Une rotation s’applique par `systemctl restart heliosd`. Le démarrage
-  journalise l’empreinte servie et la date d’écriture du fichier : un
-  certificat plus récent que le démon est le diagnostic complet.
-- Dans le code actuel, la CA opérateur vit dans
-  `~/.helios/certs/internal-ca`, et à **un seul** endroit : la gateway n'en
-  épingle qu'une. Un script qui la cherche ailleurs ne la trouve pas, en
-  fabrique une neuve, fait tourner l'identité de la gateway pour l'y installer
-  — et coupe tous les clients déjà admis. La cible ADR-008 migre ce registre
-  vers Astra : coffre maître chiffré co-implanté mais déverrouillé et signé
-  côté opérateur par YubiKey, plus émetteur Astra délégué et borné sur la
-  gateway. Tant que cette migration atomique n'est pas livrée, aucun chemin ne
-  mélange les deux emplacements et aucune seconde CA n'est créée.
-- L’API vit derrière `admin_iface` (`helios0`). Elle ne monte jamais le tunnel
-  initial. Toutes les mutations exigent du JSON, aucun CORS permissif, et les
-  lectures ne doivent jamais sérialiser clé privée ou PSK.
-- PSK post-quantique : toujours posé sur le plan de données **avant** d’être
-  annoncé au client, et jamais persisté sur disque. Un slot PSK renseigné d’un
-  seul côté fait échouer tous les handshakes, sans canal de rattrapage.
-- Billets TPM : Ed25519 **et** ML-DSA-65 obligatoires, `key_epoch` signé,
-  trousseau compilé, v1 refusé. Compteur strictement croissant ; PCR facultatif.
-- Fenêtre de mise à jour (ADR-007) : elle **transporte** un verdict d'intégrité
-  à travers un redémarrage planifié, elle n'en fabrique pas. L'armement exige un
-  descellement nominal du démarrage courant — jamais depuis `Bypassed`,
-  `Resealed` ou `Provisioned`. Au démarrage, le descellement nominal PCR 0/4/7
-  passe **toujours en premier**, et son succès révoque une fenêtre restée armée.
-  Le marqueur non secret est synchronisé avant l'écriture NV ; une erreur
-  d'armement déclenche un écrasement compensatoire et le marqueur reste présent
-  tant que cet écrasement n'est pas confirmé.
-  À la consommation, le payload NV n'est écrasé qu'**après** que le blob
-  rescellé est sur disque et synchronisé : révoquer plus tôt laisserait un état
-  sans issue. Une erreur après ce point ne retombe jamais sur le billet. Le
-  scellement nominal, lui, n'est pas modifiable par ce chemin.
-- Identité de la gateway : elle naît **sur** la gateway (`heliosd
-  init-identity`), scellée au TPM. `wg_private_key` en clair dans
-  `network.toml` est un repli hérité, pas un chemin d’installation.
-- Admission : jamais de *read-modify-write* de `network.toml` depuis la vue
-  expurgée de l’API — les PSK des autres pairs y seraient effacés. Passer par
-  `helios_provisioning::admission`, et persister sans clé privée ni PSK.
-- Clé privée de séquestre : sur le poste opérateur, jamais sur la gateway
-  qu’elle secourt.
-- Une release exige `HELIOS_PUBLISHER_KEYRING_PATH`. Les secrets éditeur ne
-  doivent jamais entrer dans une gateway ni dans le dépôt.
+`docs/README.md` is the documentation index.
 
-## Interdiction des TODO
+## Workspace map
 
-Aucun marqueur `TODO`, `FIXME`, `XXX`, `HACK`, `TBD`, `todo!()` ni
-`unimplemented!()` ne doit être introduit dans ce dépôt. Un marqueur est une
-dette invisible : il ne compile aucun test, ne bloque aucune release et sort du
-champ de vision dès la revue suivante.
+* `aether`: shared canonical config/state/protocol/crypto contracts.
+* `astra`: certificate-authority coordinator and trust-domain state.
+* `helios-firewall` / `helios-wireguard`: nftables and WireGuard data plane.
+* `helios-provisioning` / `helios-key-negotiation`: admission, IPAM, ML-KEM orchestration and authenticated QUIC transport.
+* `helios-api`: Axum REST/WebSocket API and embedded-web integration.
+* `helios-update` / `helios-vault` / `helio-tpm`: signed updates, encrypted secrets and TPM support.
+* `orion-core` / `apps/orion`: portable client logic and Tauri/React desktop shell.
+* `heliosd`: gateway CLI and orchestration.
+* `web`: React/MUI gateway administration console.
+* `astra-signer`, `helios-ctl`, `helios-publisher`, `helios-installer`, `xtask`: operator, publisher, installer and build tooling.
 
-Face à une fonctionnalité incomplète, trois issues seulement :
+Do not duplicate logic already owned by one of these components.
 
-1. **La développer** — c’est le défaut. Si la tâche est faisable, la faire
-   plutôt que de la baliser.
-2. **La refuser explicitement dans le type** — variante d’erreur nommée et
-   documentée (modèle : `helio_tpm::TpmError::NotImplemented`), testée, qui
-   échoue franchement à l’exécution. Jamais un chemin silencieux ou dégradé.
-3. **La documenter comme limite connue** — section « Limite connue » dans le
-   doc-comment du module, plus une ligne dans l’ADR concerné si elle engage
-   l’architecture. Le texte doit dire *pourquoi* c’est hors périmètre et *ce
-   qui débloquerait*, pas seulement que ça manque.
+## Change discipline
 
-Un blocage qui attend un arbitrage humain (ADR-002 amendement 2) relève du
-point 3, pas d’un `TODO`. Une limite matérielle non vérifiable en WSL2 relève
-du point 3 et de [docs/testing/TESTING.md](docs/testing/TESTING.md).
+Before writing code, inspect the nearest analogous implementation, follow its naming/layering/error/state/test patterns, search for the canonical type/function, and read the relevant ADR/spec for security/protocol/persistence/trust changes.
 
-Si une limite documentée est visible par l’utilisateur, l’IHM doit la dire —
-c’est déjà la pratique dans `web/src/views/Firewall.tsx` et
-`apps/orion/src/views/ProfilesView.tsx`.
+While implementing:
 
-## Workspace
+* Prefer the smallest coherent change that fully solves the requested problem.
+* Extend existing patterns instead of introducing parallel architecture.
+* Do not add a dependency, framework, state store, crypto primitive or serialization format when an existing project mechanism fits.
+* Do not perform unrelated refactors or formatting churn.
+* Preserve backward compatibility only where the repository explicitly requires it; never silently weaken validation to make old data pass.
+* Keep behavior explicit and fail closed at security boundaries.
+* Make invalid states unrepresentable when practical; prefer typed validation over comments and conventions.
+* Do not hide errors, silently downgrade behavior, or convert a required backend into a best-effort path.
+* Add or update tests at the same abstraction level as the behavior being changed.
+* Update the relevant ADR/spec/user-facing documentation when the contract changes.
 
-- `aether` : états, config, politique, ML-KEM, protocole et signatures hybrides.
-  `aether::certificates` y ajoute le cycle de vie des certificats : objets
-  signés, encodage canonique, générations et états bornés à deux slots.
-  `aether::ml_dsa` est le **seul** point d'entrée ML-DSA-87 de la négociation
-  v5 et du cycle de vie — pur, `ctx` non vide par type, HashML-DSA refusé —,
-  et `aether::random` la **seule** porte vers l'aléa : une interface vers
-  `aws_lc_rs::rand::SystemRandom`, jamais un DRBG écrit ici. Aucun autre module
-  du dépôt n'appelle `SystemRandom`, `aws_lc_rs::rand::fill` ni `getrandom`.
-- `astra` : coordinateur d'autorité (ADR-008), binaire co-implanté dans un
-  conteneur séparé. Registre du domaine, journal d'audit chaîné dont la tête
-  distingue une restauration d'un fork, émetteur délégué borné et endpoint
-  public. `astra::signing` tient les campagnes manuelles qu'un opérateur
-  **sans tunnel** approuve par l'origine publique — un magasin séparé de celui
-  des renouvellements clients, ce qui porte par la structure la règle du §8.2
-  selon laquelle un identifiant de renouvellement ordinaire n'existe pas sur ce
-  canal. `astra::operations` tient les renouvellements qui attendent un
-  opérateur — en mémoire, parce qu'une opération ne détient aucun certificat et
-  qu'en persister une survivrait au challenge de cinq minutes qu'elle porte —,
-  et `astra::renewal` enchaîne demande, approbation, émission, staging sur le
-  veth, reçu et grant. Il ne détient **jamais** `CA-PQ` en clair. `astra::vault` y ajoute le
-  format du coffre d'autorité — key-slots FIDO2, corps scellé lié à la table de
-  slots. Astra le transporte et le sauvegarde ; il ne l'ouvre pas, et rien dans
-  le conteneur ne le peut.
-- `helios-fido` : la frontière matérielle FIDO2, et la **seule** cérémonie qui
-  n'ouvre aucun coffre — l'approbation ordinaire du §14.1. Extraite parce
-  qu'Orion la fait lui-même : elle ne reçoit aucun sel, donc aucune sortie PRF
-  n'existe pour elle et aucun key-slot ne peut être déverrouillé. La frontière
-  est un type et non une convention — `approve_renewal` ne prend pas de coffre,
-  `Authenticator::approve` ne reçoit pas de sel — et `orion-core` lie cette
-  caisse sans jamais lier `astra` : le format de coffre n'est pas atteignable
-  depuis le client.
-- `astra-signer` : compagnon du **poste opérateur** (ADR-008 §4), le seul
-  programme du dépôt qui détienne `CA-PQ` en clair, et seulement le temps d'une
-  opération. Il parle à CTAP2 directement — jamais un navigateur, jamais Orion,
-  jamais la console. Quatre modules : `authenticator` (la seule frontière avec
-  le matériel), `gestures` (les séquences, éprouvées hors terminal), `store`
-  (le fichier) et `tunnel` (le transport in-tunnel du §8.1.2 : il récupère la
-  demande d'approbation et dépose l'assertion par les routes de `helios-api`,
-  et ne décide de rien — la demande reste vérifiée sous la clé de service
-  épinglée, le RP ID annoncé est comparé à celui du coffre).
-- `helios-firewall` : ruleset structuré, dry-run, backend Netlink.
-- `helios-wireguard` : interface gateway et table de pairs.
-- `helios-provisioning` : IPAM CGNAT et rotation/protocole ML-KEM.
-- `helios-api` : Axum REST/WS, provisioning et IHM embarquée.
-- `web` : console d’administration de la gateway, embarquée dans `heliosd` par
-  la feature `embed-ui`. React et **MUI seul** — pas de Tailwind, pas de moteur
-  3D : ce bundle part dans le binaire, et les polices y sont **auto-hébergées**
-  (`@fontsource-variable`, 62 Ko) parce qu’une gateway ne joint aucun CDN.
-  Quatre destinations : Aperçu, Clients, Sécurité, Système
-  (`web/src/navigation.ts`) — la console montre un **état et des actions**, les
-  explications d’architecture restent en infobulle et dans les ADR.
-  `web/src/theme.ts` tient les pigments et `web/src/state.ts` le **sens** des
-  états du tunnel ; les deux ne se mélangent pas, et trois familles de couleur
-  ne s’empruntent rien : action (indigo), post-quantique (violet), état.
-  `web/src/theme.test.ts` vérifie qu’aucun token ne manque dans l’un des deux
-  schémas — l’oubli est invisible autrement, il rend transparent.
-  Attention aux unités `sx` : `borderRadius: 3` vaut 3 × 12 px et `width: 1`
-  vaut **100 %**, pas 1 px.
-- `helio-tpm` : scellement PCR, séquestre et billets de rescellement.
-- `helios-update` : mises à jour applicatives signées (ADR-003).
-- `heliosd` : orchestration gateway.
-- `orion-core` / `apps/orion` : cœur client et shell Tauri React.
-  `orion-core::certificate_renewal` y tient la moitié cliente du §8.1.2 :
-  génération des clés candidates, requête de rotation signée deux fois,
-  pilotage de l'opération, vérification du grant **avant** toute écriture, pose
-  du candidat depuis ce grant — jamais depuis l'autorisation de staging, qu'un
-  client ne voit pas — et commit. Rien n'est écrit tant que le grant n'a pas
-  vérifié, donc une interruption ne laisse aucun état à recoller.
-- `xtask` : fabrique de bundles d’installation (poste de build, jamais la
-  gateway) — `cargo xtask bundle`, `cargo xtask pack`, et
-  `cargo xtask orion-msi` pour l’installateur Windows (même commande que la CI
-  de release : les features y sont tenues en un seul endroit).
-- `helios-ctl` : outil du **poste opérateur** — diagnostic, campagnes de bout en
-  bout (`campaign`, agit en vrai client via `orion-core`), admission (`peer`),
-  profils clients (`profile`) et séquestre (`escrow`). Il est aussi livré **sur
-  la gateway**, où `helios-ctl update` fait la mise à jour de l’OS en une
-  commande : listes, classement des paquets par PCR touché, `apt upgrade`,
-  armement de la fenêtre et redémarrage — qui la tue. Le résultat se lit au
-  journal du démarrage suivant, pas en retour de commande ;
-  `helios-publisher` : outil du **poste éditeur**, hors gateway.
+For UI changes, matching the existing product is a requirement:
 
-## Développement et validation
+* Reuse adjacent components, spacing, typography, layout, interactions and wording before inventing new patterns.
+* Gateway UI is React + MUI; no Tailwind/second UI framework and no CDN assets.
+* Reuse theme tokens and semantic state helpers; avoid one-off styling.
+* New screens/controls must look and behave like the surrounding Helios/Orion UI, not a standalone redesign.
+
+## Security invariants
+
+Detailed rationale belongs in the ADRs/specs.
+
+### Gateway and data plane
+
+* Gateway traffic is allowed only for `TunnelState::Up`.
+* Engage the kill-switch before networking and keep it engaged on shutdown/failure.
+* Outside explicit development mode, an unavailable real kernel/WireGuard backend is a startup error. Never fall back silently to simulation/dry-run.
+* Build the complete nftables ruleset first, then apply filtering and NAT atomically. Never apply rules incrementally.
+* Negotiated PSKs are installed on the data plane before they are announced and are never persisted to disk.
+* Removal clears the data plane before forgetting state; do not leave orphaned PSKs.
+* A static PSK is operator configuration and must not be treated as a negotiated transactional PSK.
+* `network.toml` hot reload must preserve runtime-only secrets/state through the existing adoption path. Do not reconstruct runtime state from the persisted file alone.
+
+### Key negotiation
+
+* The served Helios negotiation protocol is v5. The v4 document is historical; do not reintroduce v4 behavior.
+* `classic` is not a negotiable v5 protection mode.
+* QUIC carries one negotiation transaction and is closed after commit. It is not a tunnel-liveness channel.
+* Tunnel liveness comes from WireGuard data-plane handshake state, never from silence/activity on the control channel.
+* Commit requires proof of a WireGuard handshake observed after candidate installation.
+* Per-peer generations are ownership tokens: stale generations must not mutate newer state.
+* Reserve generation + `preparing` atomically before candidate installation; preserve existing serialization of ownership/install/state transitions.
+* Rollback must survive task/future cancellation; normal async return paths are insufficient cleanup.
+* Post-commit `release` belongs inside the WireGuard tunnel, not on the public negotiation endpoint.
+* Public negotiation errors must not expose admission state or policy details.
+
+### Identity, trust and crypto
+
+* Resolve authenticated peer identity from trusted gateway state established by mTLS; never use a client-controlled WireGuard key as the lookup authority.
+* Where TLS/PQ generations are paired, verify the paired generation required by the protocol; do not accept a union that permits mixed generations.
+* `aether::ml_dsa` is the single application entry point for ML-DSA-87 behavior owned there.
+* `aether::random` is the single application entry point for protocol randomness owned there. Do not add direct RNG calls elsewhere without changing that architecture explicitly.
+* ML-DSA-65 release signatures and ML-DSA-87 negotiation/PKI signatures are separate domains and are not interchangeable.
+* Never log, serialize through read APIs, or expose private keys, PSKs, vault plaintext, publisher secrets or equivalent secret material.
+* Publisher private material must never enter the repository or gateway.
+* Gateway WireGuard identity is created on the gateway and sealed through the established TPM path; plaintext config keys are legacy compatibility, not the installation path.
+* Escrow private-key material belongs on the operator side, not on the gateway it is intended to recover.
+
+### API, admission and routing
+
+* Administrative API mutations stay authenticated through the established tunnel/interface boundary and use the existing typed API paths.
+* Never rebuild and persist `network.toml` from an API view that intentionally omits secrets.
+* Admission must go through the shared provisioning/admission implementation.
+* Do not claim the whole `100.64.0.0/10` CGNAT range for Helios routing; preserve the existing per-peer routing design.
+* Treat `wan_iface` as the existing multi-uplink set semantics; firewall/NAT behavior must continue to work per resolved uplink.
+
+## Incomplete work: no TODO markers
+
+Do not introduce `TODO`, `FIXME`, `XXX`, `HACK`, `TBD`, `todo!()` or `unimplemented!()`.
+
+For incomplete behavior: implement it; reject it explicitly with a named/typed/tested error; or document a known limitation in the owning module and relevant ADR/spec. Known limitations must state why and what unblocks them; user-visible ones must appear in UI/CLI.
+
+## Code conventions
+
+* Rust edition 2021; workspace MSRV is Rust 1.82.
+* Code identifiers, comments, doc-comments, logs and test names are in English.
+* Documentation under `docs/` is in French.
+* Follow existing `thiserror`/`anyhow` boundaries instead of inventing a new error convention.
+* Do not use panics or `unwrap`/`expect` as routine runtime error handling. Existing test/build-time uses are not a pattern for fallible production paths.
+* Keep protocol/domain validation close to canonical types.
+* Keep ownership of secrets and state explicit; do not duplicate caches/stores across layers without an architectural reason.
+
+## Validation
+
+Run the narrowest relevant checks while iterating, then broaden according to impact:
 
 ```sh
-bash scripts/regression.sh
-bash scripts/campaign.sh          # campagnes PQ, mise à jour signée et bundle
-bash scripts/lab.sh --keep        # banc complet : gateway + client admis + profil
-./scripts/deploy.sh               # construit, signe, copie et installe sur la gateway
-./scripts/provision-client.sh nom # CA, négociation, admission et profil client
-cargo test --workspace --all-features
-cargo run -p heliosd -- run --dev
-npm run dev --prefix web
+cargo fmt --check
+cargo test -p <crate>
+cargo clippy -p <crate> --all-targets --all-features -- -D warnings
+npm run test:unit --prefix web
+npm run test:unit --prefix apps/orion
 ```
 
-`scripts/regression.sh` est la référence : fmt, Clippy/tests toutes features,
-audits Cargo/npm, Vitest et builds frontend.
+For cross-crate, security/protocol, release-tooling changes, or before claiming repository-wide regression safety, run `bash scripts/regression.sh`. It is the canonical full check.
 
-**Langue.** Tout ce qui est du code est en **anglais** : noms de fonctions, de
-types, de champs et de variables (`render`, `assign_vip`, `verify_manifest`),
-mais aussi les commentaires, les doc-comments, les messages de journal et les
-noms de tests. Seule la documentation sous `docs/` (ADR, guides, `TESTING.md`)
-reste en **français**.
+Do not claim hardware validation from WSL2 or dry-run tests. Kernel networking, TPM, WireGuard-NT and installation behavior require the target environments described in `docs/testing/TESTING.md`.
 
-`scripts/provision-client.sh` enchaîne les sept gestes d'une admission — créer
-la CA opérateur, en pousser la moitié publique, initialiser la négociation de
-la gateway, admettre le pair, rapatrier ses deux certificats, enrôler hors API,
-écrire le `.orion`. Quatre copies de fichiers dans les deux sens, dont
-chacune est un endroit où coller la mauvaise valeur ; et la panne ne se voit
-qu'à la fin, en négociation refusée sans motif. La CA n'est jamais remplacée
-sans `--refaire-ca` : la gateway l'épingle, en changer coupe tous les clients
-déjà admis.
+If an expected check cannot run, report exactly what was not run and why. Do not silently treat an environment limitation as a passing test.
 
-`scripts/deploy.sh` porte aussi Astra, en étape 7. Le conteneur n'entre **pas**
-dans le bundle signé de l'ADR-004 — il est séparé, sans capacité, rootfs en
-lecture seule, UID propre, un seul volume — mais le déployer par un second
-script obligeait à recopier six valeurs entre trois commandes, ce qui est
-exactement là où un déploiement casse. L'étape ne se déclenche que si un relais
-de domaine existe ; sinon elle est sautée en une ligne, et une gateway sans
-autorité reste une gateway qui marche. `--sans-astra` la saute explicitement.
+## Finish work cleanly
 
-`scripts/deploy.sh` enchaîne ce que l'ADR-004 sépare en trois outils — construire,
-signer hors ligne, archiver — puis copie et installe. La séparation garde son
-sens pour une release publique ; pour un opérateur qui détient les trois rôles,
-la retaper à chaque fois n'apporte rien. La séquence de release est un
-horodatage : l'anti-rollback exige une valeur strictement croissante, et un
-compteur local se désynchronise dès qu'on déploie depuis une autre machine.
-
-`scripts/lab.sh` monte un banc jetable avec les **mêmes outils qu'en
-production** — `helios-ctl peer add`, `helios-ctl profile emit` — et non un
-chemin de test parallèle : il éprouve donc l'outillage d'exploitation en même
-temps qu'il sert au développement. Il produit un profil directement importable
-dans Orion. Il ne fait pas partie de la régression : celle-ci vérifie des
-invariants, elle ne lance pas d'environnements.
-
-WSL2 compile les features `netlink`, `wireguard` et `tpm` si leurs dépendances
-sont installées, mais ne prouve pas leurs effets réels. Les essais noyau, TPM,
-WireGuard-NT et l'installation d'une release sont target-only ; suivre
-[docs/testing/TESTING.md](docs/testing/TESTING.md).
-
-Features matérielles :
-
-```sh
-cargo build -p heliosd --features netlink,wireguard,tpm,embed-ui
-cargo build -p orion --features wireguard
-```
-
-Une release gateway se construit seulement après le frontend et avec le
-trousseau public éditeur :
-
-```sh
-npm run build --prefix web
-HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \
-  cargo build --release -p heliosd --features netlink,wireguard,tpm,embed-ui
-```
-
-Ne pas « compléter » le lot récupération de l’ADR-002 tant que l’amendement 2
-n’a pas été arbitré. Ne jamais présenter une compilation WSL2 comme une
-validation matérielle.
+Before finishing: review the diff for scope creep/duplication/secret leakage; confirm existing architectural and visual patterns were followed; ensure tests cover behavior + failure paths; update docs/specs when contracts changed; state checks run and target-only validation still required.
