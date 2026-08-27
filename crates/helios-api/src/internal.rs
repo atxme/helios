@@ -340,6 +340,14 @@ pub struct GatewayIdentityView {
     /// leaf in service — a campaign freezes the identity by its two
     /// fingerprints (spec §11.1 step 3) — never to re-serve it.
     pub tls_certificate_fingerprint: Fingerprint,
+    /// Its signed expiry, read from the DER this gateway actually serves.
+    ///
+    /// §10.1 makes a revocation carry the exact `not_after` of each leaf it
+    /// withdraws, and the authority holds neither leaf. Reading it here is the
+    /// difference between a revocation that applies and one every recipient
+    /// refuses — during the incident that motivated it. The PQ half needs no
+    /// field of its own: its certificate travels whole.
+    pub tls_certificate_not_after: u64,
     pub active_gateway_identity_epoch: u64,
     pub gateway_decision_epoch: u64,
 }

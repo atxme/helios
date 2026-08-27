@@ -232,11 +232,30 @@ format partagé `CampaignTarget` ne porte pas l'échéance. Une valeur altérée
 révoque pas la mauvaise chose : Astra refuse le dépôt entier en la comparant à
 la génération active.
 
-**Limite connue** : `--scope gateway` est refusé. Le registre Astra connaît la
-clé WireGuard et le nom de service de la gateway, mais pas ses feuilles
-actives ; il ne peut donc pas lier leurs empreintes et échéances exactes à la
-décision. Cette limitation est explicite plutôt que remplacée par des valeurs
-retapées.
+**Révoquer la gateway elle-même** — même cérémonie, une résolution en plus :
+
+```sh
+astra revocation open --scope gateway \
+  --reason "clé de service compromise" --requested-by "prénom.nom"
+# → imprime les deux empreintes, leurs deux échéances, et la ligne à coller
+astra-signer revoke --scope gateway --authority-url https://astra.exemple \
+  --operation-id <identifiant> --pq-not-after <…> --tls-not-after <…>
+```
+
+Le registre Astra n'a jamais détenu les feuilles de la gateway — il transcrit
+des admissions, il ne tient pas l'identité que tous les clients épinglent.
+Elles sont donc lues **en direct** sur le canal privé, auprès du démon qui les
+sert, avec leurs échéances signées : §10.1 les exige exactes, et une valeur
+retapée produirait un objet refusé par tous ses destinataires pendant
+l'incident.
+
+Les deux feuilles gateway n'expirent pas ensemble, contrairement à une
+génération cliente : leurs échéances se nomment séparément, et une moitié sans
+la sienne est refusée plutôt que complétée d'office.
+
+**C'est terminal.** Une gateway révoquée n'offre plus de feuille acceptable :
+les clients refusent la négociation au lieu de traiter avec une identité que
+l'autorité a retirée. Aucune clé de sécurité ne relève cet état.
 
 ## 8. Préparer le renouvellement de l'identité gateway (§5)
 
@@ -387,8 +406,6 @@ Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'u
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
 fait.
 
-- **Révoquer la gateway** (§10). Le chemin client est livré en section 7 ; la
-  gateway reste refusée faute de feuilles gateway dans le registre Astra.
 - **`CA-TLS` cliente** (§9.4) : aucun geste ne la fait tourner, et le registre
   la refuserait — il épingle l'époque de cette ancre sans épingler l'ancre.
 - **Le retour à l'identité précédente** : l'ancien slot reste scellé pendant

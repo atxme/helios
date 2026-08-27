@@ -316,6 +316,63 @@ impl CertificateService {
         Ok(queued.name)
     }
 
+    /// Withdraws this gateway's own identity (spec §10.1, §6.3 `revoked`).
+    ///
+    /// Terminal, and nothing local repairs it: a revoked gateway offers no
+    /// acceptable leaf, so a client refuses the handshake rather than
+    /// negotiating with an identity the authority has withdrawn. The counter
+    /// is the gateway's own axis (§4.2) and is read from the state this
+    /// process holds, never from the object being checked.
+    async fn revoke_gateway_identity(
+        &self,
+        revocation: &aether::certificates::revocation::EmergencyCertificateRevocation,
+    ) -> Result<(), TrustUpdateRefusal> {
+        let mut registry = self.registry.lock().await;
+        let state = registry.state();
+        if revocation.identity_key != state.gateway.gateway_wg_public_key {
+            tracing::warn!(
+                identity = %revocation.identity_key,
+                "gateway revocation refused: it names another gateway"
+            );
+            return Err(TrustUpdateRefusal::Rejected);
+        }
+        revocation
+            .verify(
+                &state.gateway.current_ca_public_key,
+                &state.trust_domain_id,
+                state.gateway.ca_epoch,
+                state.gateway.revocation_epoch,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "gateway revocation refused");
+                classify(RegistryError::Certificate(error))
+            })?;
+
+        let hit = registry
+            .revoke_gateway(
+                revocation.revoked_tls_fingerprint.as_ref(),
+                revocation.revoked_pq_fingerprint.as_ref(),
+                revocation.revocation_epoch,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "gateway revocation could not be applied");
+                classify(error)
+            })?;
+        if hit {
+            tracing::error!(
+                revocation_epoch = revocation.revocation_epoch,
+                "gateway certificate identity revoked: no client will negotiate with it again"
+            );
+        } else {
+            tracing::warn!(
+                revocation_epoch = revocation.revocation_epoch,
+                "gateway revocation recorded for a leaf this gateway does not hold; its counter \
+                 is consumed and the leaf can no longer arrive through a transition"
+            );
+        }
+        Ok(())
+    }
+
     /// Drops expired candidates and promotes due generations.
     ///
     /// Run on the same lock as everything else, so a purge never races the
@@ -525,14 +582,8 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
         let mut registry = self.registry.lock().await;
         let state = registry.state();
 
-        if revocation.scope != RevocationScope::Client {
-            tracing::warn!(
-                identity = %revocation.identity_key,
-                "revocation refused: only a client scope is applied on the private channel; a \
-                 gateway identity is withdrawn by the §6 transition, which this build does not \
-                 implement"
-            );
-            return Err(TrustUpdateRefusal::Rejected);
+        if revocation.scope == RevocationScope::Gateway {
+            return self.revoke_gateway_identity(&revocation).await;
         }
         // The peer is resolved **before** the signature is checked, because the
         // counter the signature is checked against belongs to that peer: two
@@ -620,6 +671,14 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
             pq_certificate_fingerprint,
             pq_certificate,
             tls_certificate_fingerprint: state.gateway.active_tls_fingerprint(),
+            tls_certificate_not_after: aether::certificates::x509::inspect(
+                &state.gateway.active_gateway_tls_certificate,
+            )
+            .map_err(|error| {
+                tracing::error!(%error, "the served gateway TLS leaf is unreadable");
+                TrustUpdateRefusal::Internal
+            })?
+            .not_after,
             active_gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
             gateway_decision_epoch: state.gateway.gateway_decision_epoch,
         })

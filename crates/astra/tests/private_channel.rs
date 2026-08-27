@@ -136,6 +136,7 @@ impl AstraChannelHandler for Recorder {
             tls_certificate_fingerprint: aether::certificates::encoding::Fingerprint::of(
                 b"gateway tls in service",
             ),
+            tls_certificate_not_after: 100_000,
             active_gateway_identity_epoch: 3,
             gateway_decision_epoch: 7,
         })

@@ -1178,6 +1178,29 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
+    /// Withdraws the gateway's own identity (spec §10.1).
+    ///
+    /// Returns whether a leaf this gateway actually holds was named. A
+    /// revocation that names none is **not** an error: an offline document may
+    /// carry decisions about leaves this state never saw, and its counter is
+    /// consumed all the same — which is what stops the named leaf from
+    /// arriving later through a transition.
+    pub fn revoke_gateway(
+        &mut self,
+        revoked_tls_fingerprint: Option<&Fingerprint>,
+        revoked_pq_fingerprint: Option<&Fingerprint>,
+        revocation_epoch: u64,
+    ) -> Result<bool, RegistryError> {
+        let mut state = self.state.clone();
+        let hit = state.gateway.apply_revocation(
+            revoked_tls_fingerprint,
+            revoked_pq_fingerprint,
+            revocation_epoch,
+        )?;
+        self.persist(state)?;
+        Ok(hit)
+    }
+
     /// Terminal revocation of a peer's certificate state.
     ///
     /// Called by the same path that removes the admission, under the same
@@ -2899,6 +2922,79 @@ mod tests {
         // second decision at the same epoch, and it is right to.
         assert_eq!(gateway.gateway_decision_epoch, 2);
         assert!(gateway.last_aborted_transition.is_some());
+    }
+
+    /// §6.3: `revoked` dominates every phase and every date, and nothing
+    /// local repairs it.
+    #[test]
+    fn revoking_the_served_leaf_is_terminal_for_the_gateway() {
+        let mut fixture = fixture();
+        let active_pq = fixture
+            .registry
+            .state()
+            .gateway
+            .active_pq_fingerprint()
+            .expect("active fingerprint");
+
+        let hit = fixture
+            .registry
+            .revoke_gateway(None, Some(&active_pq), 1)
+            .expect("revoked");
+
+        assert!(hit);
+        let gateway = &fixture.registry.state().gateway;
+        assert!(gateway.revoked);
+        assert_eq!(gateway.revocation_epoch, 1);
+    }
+
+    /// A decision about a leaf this gateway never held is not an error — an
+    /// offline document carries the fleet's decisions — but its counter is
+    /// consumed, which is what stops that leaf arriving later by transition.
+    #[test]
+    fn revoking_a_leaf_this_gateway_never_held_consumes_the_counter() {
+        let mut fixture = fixture();
+        let stranger = Fingerprint::of(b"a leaf from elsewhere");
+
+        let hit = fixture
+            .registry
+            .revoke_gateway(Some(&stranger), None, 4)
+            .expect("recorded");
+
+        assert!(!hit);
+        let gateway = &fixture.registry.state().gateway;
+        assert!(!gateway.revoked, "the identity in service is untouched");
+        assert_eq!(gateway.revocation_epoch, 4);
+    }
+
+    /// A revocation reaching only the staged generation withdraws it and
+    /// leaves the identity in service `active` (§6.3).
+    #[test]
+    fn revoking_the_staged_candidate_leaves_the_served_identity_active() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        let staged = aether::certificates::gateway::pq_certificate_fingerprint(
+            transition
+                .next_gateway_certificate
+                .as_ref()
+                .expect("staged leaf"),
+        )
+        .expect("fingerprint");
+
+        let hit = fixture
+            .registry
+            .revoke_gateway(None, Some(&staged), 2)
+            .expect("revoked");
+
+        assert!(hit);
+        let gateway = &fixture.registry.state().gateway;
+        assert!(!gateway.revoked);
+        assert_eq!(gateway.next_gateway_identity_epoch, None);
+        assert_eq!(gateway.revocation_epoch, 2);
     }
 
     #[test]

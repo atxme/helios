@@ -194,6 +194,23 @@ enum RevokedHalvesArg {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RevocationScopeArg {
+    /// One admitted client's leaves.
+    Client,
+    /// The gateway's own leaves. Terminal for the whole domain's data plane.
+    Gateway,
+}
+
+impl From<RevocationScopeArg> for aether::certificates::revocation::RevocationScope {
+    fn from(value: RevocationScopeArg) -> Self {
+        match value {
+            RevocationScopeArg::Client => Self::Client,
+            RevocationScopeArg::Gateway => Self::Gateway,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AbortReasonArg {
     /// L'opérateur renonce à la transition qu'il a fait signer.
     OperatorCancelled,
@@ -419,11 +436,22 @@ enum Command {
         operation_id: String,
         #[arg(long)]
         origin: Option<String>,
+        #[arg(long, value_enum, default_value = "client")]
+        scope: RevocationScopeArg,
         #[arg(long, value_enum, default_value = "both")]
         halves: RevokedHalvesArg,
         /// Signed cryptographic expiry printed by `astra revocation open`.
+        ///
+        /// A client generation retires both its leaves at once, so one value
+        /// covers them. A gateway's two leaves are issued separately and do
+        /// not share an expiry: name them with `--tls-not-after` and
+        /// `--pq-not-after`, which override this one when given.
         #[arg(long)]
-        not_after: u64,
+        not_after: Option<u64>,
+        #[arg(long)]
+        tls_not_after: Option<u64>,
+        #[arg(long)]
+        pq_not_after: Option<u64>,
         #[arg(long, value_enum, default_value = "key-compromise")]
         reason: RevocationReasonArg,
     },
@@ -655,17 +683,24 @@ fn run() -> Result<()> {
             authority_url,
             operation_id,
             origin,
+            scope,
             halves,
             not_after,
+            tls_not_after,
+            pq_not_after,
             reason,
         } => revoke(
             &path,
             &authority_url,
             &operation_id,
             origin.as_deref(),
-            halves,
-            not_after,
-            reason.into(),
+            RevocationInputs {
+                scope: scope.into(),
+                halves,
+                tls_not_after: tls_not_after.or(not_after),
+                pq_not_after: pq_not_after.or(not_after),
+                reason: reason.into(),
+            },
             transport,
         ),
         Command::SignGatewayTransition {
@@ -1627,20 +1662,34 @@ fn campaign_result(
     }
 }
 
-/// Signs and deposits the client revocation frozen into an Astra campaign.
-#[allow(clippy::too_many_arguments)]
+/// What the operator decides about a revocation, and the authority does not.
+struct RevocationInputs {
+    scope: aether::certificates::revocation::RevocationScope,
+    halves: RevokedHalvesArg,
+    /// Signed expiry of each half. Absent means that half is not named.
+    tls_not_after: Option<u64>,
+    pq_not_after: Option<u64>,
+    reason: aether::certificates::revocation::RevocationReason,
+}
+
+/// Signs and deposits the revocation frozen into an Astra campaign (§10).
 fn revoke(
     path: &Path,
     authority_url: &str,
     operation_id: &str,
     origin: Option<&str>,
-    halves: RevokedHalvesArg,
-    not_after: u64,
-    reason: aether::certificates::revocation::RevocationReason,
+    inputs: RevocationInputs,
     transport: Transport,
 ) -> Result<()> {
     use aether::certificates::revocation::RevocationScope;
 
+    let RevocationInputs {
+        scope,
+        halves,
+        tls_not_after,
+        pq_not_after,
+        reason,
+    } = inputs;
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
@@ -1677,9 +1726,19 @@ fn revoke(
         RevokedHalvesArg::Tls => (true, false),
         RevokedHalvesArg::Pq => (false, true),
     };
+    // Each named half carries its own signed expiry (§10.1). A missing one is
+    // refused rather than defaulted: an expiry chosen here would be an expiry
+    // no leaf actually carries, and every recipient would refuse the object.
+    if revoke_tls && tls_not_after.is_none() {
+        bail!("--tls-not-after (or --not-after) is required to withdraw the TLS leaf");
+    }
+    if revoke_pq && pq_not_after.is_none() {
+        bail!("--pq-not-after (or --not-after) is required to withdraw the PQ leaf");
+    }
     let now = now_unix();
 
     println!("révocation       : {}", operation.to_hex());
+    println!("portée           : {scope:?}");
     println!("identité         : {}", target.identity_key.to_base64());
     println!("gateway          : {}", campaign.server_name);
     println!("génération       : {}", target.generation);
@@ -1693,13 +1752,24 @@ fn revoke(
             (false, false) => unreachable!("the command always selects a half"),
         }
     );
-    println!("échéance signée  : {not_after}");
+    println!(
+        "échéances signées: TLS {} · PQ {}",
+        tls_not_after.map_or("—".to_string(), |value| value.to_string()),
+        pq_not_after.map_or("—".to_string(), |value| value.to_string())
+    );
     println!("effet            : immédiat ({now})");
     println!("catégorie        : {reason:?}");
     println!("motif            : {}", campaign.reason);
     println!("demandée par     : {}", campaign.requested_by);
     println!("empreinte        : {}", campaign.fingerprint());
-    println!("terminal         : cette identité devra être réadmise");
+    println!(
+        "terminal         : {}",
+        match scope {
+            RevocationScope::Client => "cette identité devra être réadmise",
+            RevocationScope::Gateway =>
+                "la gateway ne négociera plus ; aucune clé de sécurité ne relève cet état",
+        }
+    );
 
     let origin = origin
         .map(str::to_string)
@@ -1722,12 +1792,22 @@ fn revoke(
     )?;
     let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
     let decision = authority::RevocationDecision {
-        scope: RevocationScope::Client,
+        scope,
         identity_key: target.identity_key,
-        server_name: None,
+        // §10.1 names the service only for a gateway: a client leaf is
+        // identified by its WireGuard key, and a name there would be a second
+        // identifier nobody verifies.
+        server_name: match scope {
+            RevocationScope::Client => None,
+            RevocationScope::Gateway => Some(campaign.server_name.clone()),
+        },
         revocation_epoch,
-        revoked_tls: revoke_tls.then_some((target.active_tls_certificate_fingerprint, not_after)),
-        revoked_pq: revoke_pq.then_some((target.active_pq_certificate_fingerprint, not_after)),
+        revoked_tls: revoke_tls
+            .then(|| tls_not_after.map(|at| (target.active_tls_certificate_fingerprint, at)))
+            .flatten(),
+        revoked_pq: revoke_pq
+            .then(|| pq_not_after.map(|at| (target.active_pq_certificate_fingerprint, at)))
+            .flatten(),
         effective_at: now,
         reason,
     };

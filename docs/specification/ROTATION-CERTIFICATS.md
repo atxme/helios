@@ -2879,10 +2879,13 @@ contournés :
   elle-même, donc il ne pourrait la contrôler que contre une valeur portée par
   l'objet, ce qui ne contrôle rien ; épingler `ca_tls_fingerprint` à
   `init-trust-domain` est ce qui la débloque. La révocation d'une **gateway**
-  n'a toujours aucun producteur : ce registre ne détient pas les feuilles de la
-  gateway, donc il ne peut figer ni leurs empreintes ni les échéances signées
-  qu'exige §10.1, et `astra revocation open --scope gateway` le refuse en le
-  disant.
+  s'exécute désormais : `astra revocation open --scope gateway` lit les deux
+  feuilles et leurs échéances signées **en direct** sur le canal privé, auprès
+  du démon qui les sert, parce que ce registre ne les a jamais détenues ;
+  `astra-signer revoke --scope gateway` nomme chaque moitié avec sa propre
+  échéance — les deux feuilles gateway n'expirent pas ensemble, contrairement à
+  une génération cliente — et la gateway applique la décision sur son propre
+  axe de compteur, terminale.
   **Limite connue** : le domaine n'**adopte** pas de lui-même une ancre
   distribuée. Les clients l'appliquent ; le registre Astra et l'épinglage de la
   gateway restent sur l'ancre sortante jusqu'à ce que l'opérateur les avance.
@@ -3005,10 +3008,10 @@ contournés :
   substituée est refusée à l'installation.
   **Limite connue** : `sign-gateway-transition` n'émet que `scheduled` et
   `key_recovery`. Le motif `emergency_replacement` de §6.1 — sans chevauchement,
-  identité sortante retirée — n'a pas de commande, et il est solidaire de la
-  révocation gateway, qui n'en a pas non plus. `verify` accepte les trois
-  motifs et refuse les trois autres de `RotationReason`, qui décrivent une
-  décision cliente.
+  identité sortante retirée — n'a pas de commande : la révocation gateway
+  existe et retire l'identité, mais rien n'enchaîne dans le même geste sur la
+  transition qui la remplace. `verify` accepte les trois motifs et refuse les
+  trois autres de `RotationReason`, qui décrivent une décision cliente.
   **Limite connue** : le rollback de service de §11.1 étape 8 n'a pas de
   commande. L'ancien slot reste scellé pendant tout le chevauchement, donc
   l'état nécessaire existe, mais rien ne demande à `heliosd` de le resservir
