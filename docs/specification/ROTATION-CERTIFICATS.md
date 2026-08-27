@@ -1536,7 +1536,8 @@ Une action manuelle crée un `AstraRotationCampaign` qui contient :
 
 - `campaign_id`, `trust_domain_id`, la gateway et la période de cinq minutes ;
 - `scope` : `orion_profile`, `orion_device`, `fleet_leafs`,
-  `full_certificate_chain`, `trust_authorities` ou `emergency_revocation` ;
+  `full_certificate_chain`, `trust_authorities`, `emergency_revocation` ou
+  `gateway_identity` ;
 - pour chaque cible, type, clé WireGuard, époque, génération et empreintes
   actives exactes ;
 - `reason`, `requested_by` et le pin exact `astra_policy_fingerprint` de
@@ -1552,6 +1553,20 @@ CA ; `full_certificate_chain` ordonne émetteur, CA TLS, gateway puis clients ;
 `emergency_revocation` ne renouvelle rien : il fige exactement une identité,
 ses empreintes actives et son compteur courant pour produire l'objet du §10 ;
 il n'autorise ni une rotation cliente ni une transition d'ancre.
+`gateway_identity` fige l'identité gateway en service — ses deux empreintes
+actives et l'époque de décision courante — pour produire soit la
+`GatewayIdentityTransition` de §6.1, soit le `GatewayTransitionAbort` de §6.3.
+Il ne tourne aucune ancre et n'autorise aucune rotation cliente. La relation
+d'époque diffère entre les deux objets : une transition porte
+`decision_epoch + 1`, un avortement porte l'époque déjà mise en attente, parce
+que sa campagne s'ouvre après le staging. Accepter les deux relations pour un
+même objet laisserait une ligne approuvée autoriser deux décisions
+différentes.
+
+Ces portées forment quatre familles d'objets, et une campagne n'en produit
+qu'une : aucun objet signé, pour les portées clientes ; une transition d'ancre ;
+une décision d'identité gateway ; une révocation. Un objet déposé sous une
+campagne d'une autre famille est refusé, dans les deux sens.
 
 Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, Orion
 ouvre le compagnon avec `heliosd_url` et `operation_id`; la requête et le
@@ -2005,20 +2020,45 @@ POST /internal/v1/certificates/stage
 POST /internal/v1/certificates/stage-commit   # récupération seulement
 POST /internal/v1/certificates/revoke
 GET  /internal/v1/certificates/state/<identity>
-POST /internal/v1/campaigns/apply
+GET  /internal/v1/certificates/gateway-identity
+POST /internal/v1/certificates/gateway-transition/published
+POST /internal/v1/certificates/distribution
 ```
 
-L'API Astra appelée par Helios porte le relais ordinaire et la synchronisation
-du registre :
+`gateway-identity` rend la leaf que le démon **sert**, jamais celle qu'un
+registre a enregistrée : un reçu se vérifie sous la clé qui l'a signé, et une
+campagne d'identité gateway se fige sur l'état réellement en service.
+`gateway-transition/published` porte le marqueur de §6.3 ; il nomme la
+transition exacte, parce qu'un opérateur peut en avoir installé une à la main
+pendant que l'autorité en publiait une autre. `distribution` met en file une
+transaction déjà signée pour le pair que son manifeste nomme.
+
+`POST /internal/v1/campaigns/apply`, nommé dans une version antérieure de ce
+document, n'est **pas** routé : une campagne s'applique sous une approbation
+opérateur que ce chemin ne porte pas, et la route publique `/v1/campaigns`
+répond `501` pour la même raison. Il est refusé par le repli comme tout chemin
+inconnu, plutôt que réservé par un gestionnaire vide.
+
+L'API Astra appelée par Helios porte le relais ordinaire et la préparation des
+transactions de confiance :
 
 ```text
 POST /internal/v1/client-rotation/request
 GET  /internal/v1/client-rotation/operations/<operation_id>
 GET  /internal/v1/client-rotation/signer-requests/<operation_id>
 POST /internal/v1/client-rotation/signer-results/<operation_id>
-POST /internal/v1/client-rotation/stage-receipt
-POST /internal/v1/admissions/synchronize
+POST /internal/v1/trust-update/prepare
 ```
+
+Deux routes nommées dans une version antérieure de ce document n'existent pas
+et ne sont pas attendues. `POST /internal/v1/client-rotation/stage-receipt` a
+été remplacée par l'amendement du 16 août : le reçu revient dans la **réponse**
+au staging, sur le même appel, ce qui supprime la fenêtre où une autorisation
+est posée sans que son reçu soit revenu. `POST /internal/v1/admissions/synchronize`
+supposait une poussée de la gateway vers l'autorité ; la transcription du
+registre se fait dans l'autre sens, par tirage d'Astra sur
+`GET /internal/v1/certificates/state/<identity>`. Astra enregistre ainsi ce
+que la gateway lui répond, et ne décide jamais une admission.
 
 Le pare-feu limite chaque adresse à l'API opposée et à ces chemins. Aucun des
 deux services n'accepte un chemin arbitraire à relayer depuis Orion.
@@ -2558,7 +2598,7 @@ libellé montre avant approbation le nombre de cibles, les générations et si u
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
 
-### 12.3 État de l'implémentation au 16 août 2026
+### 12.3 État de l'implémentation au 27 août 2026
 
 **Livré et testé.**
 
@@ -2677,7 +2717,9 @@ libellé ambigu « Renouveler ».
 - `astra::vault` et `astra-signer` : coffre maître HVLT, key-slots FIDO2
   `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove`,
   `rename`, `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
-  `approve-campaign` et `rotate-ca-pq`. Le coffre exige deux credentials avant
+  `approve-campaign`, `rotate-ca-pq`, `recover`, `revoke`,
+  `sign-gateway-transition` et `abort-gateway-transition`.
+  Le coffre exige deux credentials avant
   d'être tenu pour amorcé et en accepte huit. L'approbation ordinaire ne reçoit
   aucun secret de slot et produit une assertion WebAuthn vérifiable ; les deux
   couches AES-256-GCM, HKDF-SHA-256, sels, contextes et AAD sont celles figées
@@ -2830,13 +2872,17 @@ contournés :
   préparation choisi par `rotate-ca-pq --prepare-days` est la fenêtre dont
   chaque pair dispose pour revenir. Au-delà, il se répare par l'opérateur, pas
   par une livraison tardive.
-  **Trois familles d'objets sont produites** : la délégation, la transition
-  `CA-PQ` et la révocation cliente. Une transition de `CA-TLS` est refusée au registre plutôt
+  **Cinq familles d'objets sont produites** : la délégation, la transition
+  `CA-PQ`, la révocation cliente, la transition d'identité gateway et son
+  avortement. Une transition de `CA-TLS` est refusée au registre plutôt
   que stockée — il épingle l'époque de cette ancre sans épingler l'ancre
   elle-même, donc il ne pourrait la contrôler que contre une valeur portée par
   l'objet, ce qui ne contrôle rien ; épingler `ca_tls_fingerprint` à
-  `init-trust-domain` est ce qui la débloque. Les transitions d'identité
-  gateway et les révocations de gateway n'ont aucun producteur.
+  `init-trust-domain` est ce qui la débloque. La révocation d'une **gateway**
+  n'a toujours aucun producteur : ce registre ne détient pas les feuilles de la
+  gateway, donc il ne peut figer ni leurs empreintes ni les échéances signées
+  qu'exige §10.1, et `astra revocation open --scope gateway` le refuse en le
+  disant.
   **Limite connue** : le domaine n'**adopte** pas de lui-même une ancre
   distribuée. Les clients l'appliquent ; le registre Astra et l'épinglage de la
   gateway restent sur l'ancre sortante jusqu'à ce que l'opérateur les avance.
@@ -2907,8 +2953,9 @@ contournés :
   s'arrêtent, elles ne se réconcilient pas par une rotation —, prend les deux
   confirmations, et dépose l'approbation **et** la `CaTransition` signée dans
   le même document. `AstraSignerResult::validate` lie chaque objet à une cible
-  que l'opérateur a lue, refuse un objet nommé deux fois, refuse un objet dans
-  une campagne qui ne fait tourner aucune ancre, et exige qu'une transition de
+  que l'opérateur a lue, refuse un objet nommé deux fois, répartit chaque objet
+  sur la **famille** de sa portée — les quatre du §7.6, chacune refusant les
+  trois autres dans les deux sens —, et exige qu'une transition de
   `CA-PQ` porte le document de credentials ré-signé sous son successeur — une
   ancre neuve laissée avec un registre que seule l'ancienne vérifie
   n'approuverait plus jamais rien. Le dépôt précède la mutation du coffre :
@@ -2917,8 +2964,55 @@ contournés :
   personne ne connaît. `covers_client` refuse toujours de lire une campagne
   d'autorité comme une autorisation par client, et `covers_authority_object`
   refuse la réciproque.
+  La famille **identité gateway** s'exécute aussi ; elle a sa propre ligne
+  ci-dessous.
   **Reste ouvert** : `authorize-issuer`, qui ne porte encore aucune campagne, et
-  la part ancre de `full_certificate_chain` ;
+  `full_certificate_chain`, dont aucune portée n'ordonne encore émetteur, CA
+  TLS, gateway puis clients en une seule campagne ;
+- le **cycle complet de l'identité gateway**, §5, §6 et les neuf étapes de
+  §11.1, est livré. La gateway génère et scelle sa clé suivante **à côté** de
+  celle en service et exporte une `GatewayCertificateRequest`
+  (`heliosd prepare-gateway-certificate`) ; relancer la commande est une
+  reprise, jamais une seconde demande — une demande encore valide pour la même
+  époque est rendue telle quelle, parce que l'opérateur en tient déjà
+  l'empreinte et qu'une seconde ne se distinguerait pas d'une substitution.
+  `astra gateway-identity open` fige l'identité **lue en direct** sur le veth :
+  ce registre n'a jamais détenu les feuilles de la gateway, et une valeur
+  retapée produirait une campagne que le compagnon signe et que la gateway
+  refuse. `astra-signer sign-gateway-transition` émet la leaf sous `CA-PQ` et
+  signe la transition dans le **même geste**, parce que la signature lie la
+  leaf exacte. `heliosd install-gateway-transition` la vérifie sous les ancres
+  que ce registre épingle déjà et refuse toute leaf dont la moitié privée n'est
+  pas scellée ici — le seul contrôle qu'aucune signature ne fait, et sans lui
+  tout paraîtrait correct jusqu'à `activation_at`. `astra gateway-identity
+  publish` persiste `published` puis le relaie, dans cet ordre : écrit après le
+  relais, il laisserait la gateway fermer sa fenêtre d'avortement pendant que
+  l'autorité croit encore la décision annulable. Un redémarrage après
+  `activation_at` sert la candidate, et seulement si `published` est durable ;
+  à `not_after`, la maintenance persiste le registre promu, remplace
+  atomiquement le coffre actif, puis détruit l'ancienne clé scellée. Un
+  marqueur nommant la transition exacte couvre la fenêtre de coupure entre ces
+  écritures. L'avortement de §6.3 est produit par
+  `astra-signer abort-gateway-transition` et appliqué par
+  `heliosd abort-gateway-transition` ; il consomme l'époque.
+  **Limite connue** : un client qui n'a jamais reçu la transition reste à
+  l'époque précédente et refuse correctement le saut vers la suivante, sans
+  pouvoir récupérer ce tombstone par la distribution — lui servir un avortement
+  qu'il ne peut pas appliquer ferait échouer toute la transaction plutôt qu'une
+  partie.
+  **Limite connue** : la leaf TLS candidate voyage à part. La demande de §5 ne
+  porte pas de champ TLS, donc son DER se copie depuis la gateway ; une leaf
+  substituée est refusée à l'installation.
+  **Limite connue** : `sign-gateway-transition` n'émet que `scheduled` et
+  `key_recovery`. Le motif `emergency_replacement` de §6.1 — sans chevauchement,
+  identité sortante retirée — n'a pas de commande, et il est solidaire de la
+  révocation gateway, qui n'en a pas non plus. `verify` accepte les trois
+  motifs et refuse les trois autres de `RotationReason`, qui décrivent une
+  décision cliente.
+  **Limite connue** : le rollback de service de §11.1 étape 8 n'a pas de
+  commande. L'ancien slot reste scellé pendant tout le chevauchement, donc
+  l'état nécessaire existe, mais rien ne demande à `heliosd` de le resservir
+  temporairement ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le
@@ -2956,10 +3050,15 @@ contournés :
   suivant jusqu'au commit relayé. Elle n'est proposée que si une feuille
   **cliente** est expirée : un certificat gateway périmé est le côté opérateur
   du domaine, qu'aucun credential client ne déplace.
-  Manquent encore : `RollbackToPrevious`, refusée en le disant — rien ne
-  conserve l'identité précédente —, le lancement automatique du compagnon
-  plutôt que sa ligne de commande, et l'affichage des credentials opérateur
-  enregistrés. Côté console Helios, rien n'existe encore ;
+  Manquent encore : `RollbackToPrevious`, refusée en le disant — côté client
+  rien ne conserve l'identité précédente —, le lancement automatique du
+  compagnon plutôt que sa ligne de commande, et l'affichage des credentials
+  opérateur enregistrés. Côté console Helios, `CertificateDomainPanel` **montre**
+  le domaine — gateway, CA, émetteur délégué, synthèse du parc — et n'expose
+  **aucune action** : les six boutons du §12.2, dont « Annuler la transition
+  préparée » et le rollback gateway pendant chevauchement, n'existent pas.
+  Chaque geste qu'ils devraient déclencher a désormais sa commande, ce qui rend
+  cette surface entièrement additive ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné

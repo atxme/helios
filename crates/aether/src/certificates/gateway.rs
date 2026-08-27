@@ -315,6 +315,22 @@ impl GatewayIdentityTransition {
         }
         validate_server_name(&self.server_name)?;
         require_next_generation(gateway_decision_epoch, self.gateway_identity_epoch)?;
+        // §6.1 admits three reasons here, and `RotationReason` carries six:
+        // the other three describe a **client** decision. Nothing downstream
+        // branches on this field, which is exactly why it has to be checked —
+        // an unread value is one nobody would notice being wrong, and it is
+        // signed, so it would be wrong in a document an operator approved.
+        if !matches!(
+            self.reason,
+            RotationReason::Scheduled
+                | RotationReason::KeyRecovery
+                | RotationReason::EmergencyReplacement
+        ) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "a gateway identity transition carries scheduled, key_recovery or \
+                 emergency_replacement",
+            ));
+        }
         if self.next_gateway_tls_certificate.is_none() && self.next_gateway_certificate.is_none() {
             return Err(CertificateError::EmptyTransition);
         }
@@ -626,6 +642,50 @@ mod tests {
             reason: RotationReason::Scheduled,
             ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
         };
+        let transcript = transition.signing_bytes().expect("transcript");
+        transition.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
+        transition
+    }
+
+    /// §6.1 admits three reasons; `RotationReason` carries six, and the other
+    /// three describe a client decision. Nothing downstream reads this field,
+    /// which is why an unchecked value would be a signed lie nobody notices.
+    #[test]
+    fn a_transition_carries_only_the_three_reasons_of_the_gateway() {
+        let ca = keys();
+        let subject = keys();
+        let leaf = gateway_leaf(&ca, &subject);
+
+        for reason in [
+            RotationReason::Scheduled,
+            RotationReason::KeyRecovery,
+            RotationReason::EmergencyReplacement,
+        ] {
+            let mut accepted = transition(&ca, Some(leaf.clone()));
+            accepted.reason = reason;
+            let signed = resign(accepted, &ca);
+            verify(&signed, &ca, 1).unwrap_or_else(|error| panic!("{reason:?}: {error}"));
+        }
+
+        for reason in [
+            RotationReason::ManualGlobal,
+            RotationReason::ExpiredRecovery,
+            RotationReason::Readmission,
+        ] {
+            let mut refused = transition(&ca, Some(leaf.clone()));
+            refused.reason = reason;
+            let signed = resign(refused, &ca);
+            assert!(
+                matches!(
+                    verify(&signed, &ca, 1),
+                    Err(CertificateError::IssuerScopeViolation(_))
+                ),
+                "{reason:?} was accepted on a gateway transition"
+            );
+        }
+    }
+
+    fn resign(mut transition: GatewayIdentityTransition, ca: &Keys) -> GatewayIdentityTransition {
         let transcript = transition.signing_bytes().expect("transcript");
         transition.ca_signature = sign_ml_dsa_87(&ca.private, &transcript).expect("sign");
         transition
