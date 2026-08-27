@@ -41,6 +41,12 @@ use zeroize::Zeroizing;
 
 const DEFAULT_STATE_DIR: &str = "/var/lib/astra";
 const REGISTRY_FILE: &str = "registry.json";
+/// The gateway leaf in service, exported for the operator companion.
+///
+/// Public by construction, and rewritten on every campaign: the companion has
+/// to verify the §5 request's continuity signature under the key that is
+/// actually serving, and it holds no copy of it.
+const GATEWAY_ACTIVE_CERTIFICATE_FILE: &str = "gateway-active-certificate.json";
 const SERVICE_KEY_FILE: &str = "service-key.bin";
 /// Private material of one delegation, addressed by its epoch.
 ///
@@ -174,6 +180,11 @@ enum Command {
         #[command(subcommand)]
         command: RevocationCommand,
     },
+    /// Opens a campaign about the gateway's own identity (spec §6, §11.1).
+    GatewayIdentity {
+        #[command(subcommand)]
+        command: GatewayIdentityCommand,
+    },
     /// Prints the authority's state and the head of its audit chain.
     Status {
         /// Previously recorded head. A suffix made only of legacy status
@@ -249,6 +260,43 @@ enum RevocationCommand {
         requested_by: String,
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum GatewayIdentityCommand {
+    /// Freezes the gateway identity in service into a signing campaign.
+    ///
+    /// # Why the state is read from the gateway and not from here
+    ///
+    /// Astra records which generation each **client** is at; it has never held
+    /// the gateway's own leaves, and §11.1 step 3 needs their exact
+    /// fingerprints. They are therefore read live over the private channel,
+    /// from the daemon that serves them. A value retyped by an operator would
+    /// produce a campaign the companion signs and the gateway then refuses —
+    /// at the one moment a renewal is already under way.
+    ///
+    /// # Why one command for a renewal and for an abort
+    ///
+    /// Both decide the same identity at the same decision epoch, so both
+    /// freeze the same row. Which decision is being taken is not a property of
+    /// the campaign but of the object signed under it, and the companion
+    /// displays that in full before the touch. A second scope would give the
+    /// gateway identity two families that each accept the other's objects.
+    Open {
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        requested_by: String,
+        #[arg(long, default_value_t = 300)]
+        window_secs: u64,
+        /// Address of the gateway's private lifecycle listener, on the veth.
+        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
+        gateway_channel: SocketAddr,
+        /// The gateway's transport certificate, DER base64 — the same value
+        /// `astra run` is given.
+        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
+        gateway_certificate: String,
     },
 }
 
@@ -364,6 +412,22 @@ fn main() -> Result<()> {
                 &reason,
                 &requested_by,
                 window_secs,
+            ),
+        },
+        Command::GatewayIdentity { command } => match command {
+            GatewayIdentityCommand::Open {
+                reason,
+                requested_by,
+                window_secs,
+                gateway_channel,
+                gateway_certificate,
+            } => gateway_identity_open(
+                &cli.state_dir,
+                &reason,
+                &requested_by,
+                window_secs,
+                gateway_channel,
+                &gateway_certificate,
             ),
         },
         Command::Status {
@@ -973,6 +1037,125 @@ fn fresh_id() -> Result<aether::certificates::encoding::Id16> {
 
 /// Writes a resolved campaign and its service-signed companion request into
 /// the inbox consumed by the running Astra service.
+/// Freezes the gateway identity in service into a signing campaign (§11.1 3).
+fn gateway_identity_open(
+    state_dir: &Path,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+    gateway_channel: SocketAddr,
+    gateway_certificate: &str,
+) -> Result<()> {
+    use aether::certificates::status::{
+        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
+    };
+
+    if reason.trim().is_empty() || requested_by.trim().is_empty() {
+        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
+    }
+    if window_secs == 0 || window_secs > 300 {
+        anyhow::bail!("--window-secs must be between 1 and 300");
+    }
+    if load_encrypted_vault(state_dir)?.is_none() {
+        anyhow::bail!("this state volume has no encrypted vault for the companion to open");
+    }
+
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let state = registry.state();
+
+    let pinned = aether::certificates::encoding::DerCertificate::parse(gateway_certificate)
+        .map_err(|error| anyhow::anyhow!("--gateway-certificate: {error}"))?;
+    let channel = astra::gateway::GatewayChannel::open(state_dir, gateway_channel, &pinned)
+        .map_err(|error| anyhow::anyhow!("opening the private gateway channel: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting a runtime for the private channel")?;
+    let identity = runtime
+        .block_on(channel.gateway_identity())
+        .context("reading the identity the gateway serves")?;
+
+    // The daemon answers with the leaf it actually presents. A campaign built
+    // from anything else would freeze a state no client has ever pinned.
+    let target = CampaignTarget {
+        certificate_kind: CertificateKind::GatewayPq,
+        identity_key: state.gateway_wg_public_key,
+        epoch: identity.gateway_decision_epoch,
+        generation: identity.active_gateway_identity_epoch,
+        active_tls_certificate_fingerprint: identity.tls_certificate_fingerprint,
+        active_pq_certificate_fingerprint: identity.pq_certificate_fingerprint,
+    };
+    let now = now_unix();
+    let expires_at = now
+        .checked_add(window_secs)
+        .context("gateway campaign window overflow")?;
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: fresh_id()?,
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway_wg_public_key,
+        server_name: state.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope: CampaignScope::GatewayIdentity,
+        targets: vec![target],
+        reason: reason.trim().to_string(),
+        requested_by: requested_by.trim().to_string(),
+        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+        required_credentials: CampaignScope::GatewayIdentity.required_credentials(),
+    };
+    campaign.validate(now).map_err(|error| {
+        anyhow::anyhow!("the resolved campaign cannot be shown to an operator: {error}")
+    })?;
+
+    // Exported because the companion cannot verify the §5 request's
+    // continuity signature without the leaf in service, and it holds no copy
+    // of it. Public material: the same leaf every admitted client pins.
+    let served_path = state_dir.join(GATEWAY_ACTIVE_CERTIFICATE_FILE);
+    std::fs::write(
+        &served_path,
+        serde_json::to_vec_pretty(&identity.pq_certificate)
+            .context("encoding the gateway leaf in service")?,
+    )
+    .with_context(|| format!("writing {}", served_path.display()))?;
+
+    let decision_epoch = identity.gateway_decision_epoch;
+    let next_epoch = decision_epoch
+        .checked_add(1)
+        .context("gateway decision epoch overflow")?;
+    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
+    let operation_id = deposit.signer_request.operation_id;
+    println!("{}", operation_id.to_hex());
+    eprintln!("campagne gateway déposée : décision {decision_epoch}, fenêtre de {window_secs} s");
+    eprintln!(
+        "feuille PQ en service : {}",
+        identity.pq_certificate_fingerprint
+    );
+    eprintln!(
+        "feuille TLS en service : {}",
+        identity.tls_certificate_fingerprint
+    );
+    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    eprintln!("feuille en service exportée : {}", served_path.display());
+    eprintln!(
+        "renouveler depuis le poste opérateur (époque {next_epoch}) :\n  astra-signer \
+         sign-gateway-transition --authority-url {} --operation-id {} --request <demande.json> \
+         --active-certificate <{}> --out <transition.json>",
+        deposit.signer_request.authority_url,
+        operation_id.to_hex(),
+        GATEWAY_ACTIVE_CERTIFICATE_FILE
+    );
+    eprintln!(
+        "ou annuler la transition déjà en attente :\n  astra-signer abort-gateway-transition \
+         --authority-url {} --operation-id {} --transition <transition.json> \
+         --out <avortement.json>",
+        deposit.signer_request.authority_url,
+        operation_id.to_hex()
+    );
+    Ok(())
+}
+
 fn deposit_campaign(
     state_dir: &Path,
     state: &astra::registry::AstraState,

@@ -456,6 +456,7 @@ impl SigningOperationStore {
             return Ok(VerifiedResult {
                 fingerprint: submitted,
                 campaign_id: operation.campaign.campaign_id,
+                campaign: Box::new(operation.campaign.as_ref().clone()),
                 // Exact bytes were accepted before, so replaying their
                 // objects is safe. The registry deduplicates persistence and
                 // the service may need the object again to retry an external
@@ -482,6 +483,7 @@ impl SigningOperationStore {
         Ok(VerifiedResult {
             fingerprint: submitted,
             campaign_id: operation.campaign.campaign_id,
+            campaign: Box::new(operation.campaign.as_ref().clone()),
             objects: result.objects.clone(),
             credential_registry: result.credential_registry.clone(),
             already_accepted: false,
@@ -524,6 +526,14 @@ pub struct VerifiedResult {
     /// The exact bytes accepted, for the idempotency rule of §8.2.
     pub fingerprint: Fingerprint,
     pub campaign_id: Id16,
+    /// The exact text the operator approved.
+    ///
+    /// Carried rather than looked up again: it is the only place the state a
+    /// decision was taken against is pinned — for the gateway identity, whose
+    /// leaves this authority does not hold, it is the *only* place. A second
+    /// lookup would be a second value that can disagree with the one the
+    /// approval was checked against.
+    pub campaign: Box<AstraRotationCampaign>,
     /// Anchor transitions to persist before the approval is marked spent.
     ///
     /// Repeated on an idempotent replay. Registry persistence deduplicates

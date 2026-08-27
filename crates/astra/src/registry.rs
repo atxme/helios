@@ -390,12 +390,14 @@ impl AstraRegistry {
     /// collect the same transition under two fingerprints.
     pub fn accept_transitions(
         &mut self,
-        campaign_id: Id16,
+        campaign: &aether::certificates::status::AstraRotationCampaign,
         objects: &[aether::certificates::transport::TrustUpdateObject],
         credential_registry: Option<Box<aether::certificates::approval::CredentialRegistry>>,
         now_unix: u64,
     ) -> Result<usize, RegistryError> {
         use aether::certificates::transport::TrustUpdateObject;
+
+        let campaign_id = campaign.campaign_id;
 
         let mut fresh = Vec::new();
         let mut withdrawn = Vec::new();
@@ -473,6 +475,60 @@ impl AstraRegistry {
                     }
                     withdrawn.push((key, revocation.revocation_epoch));
                 }
+                TrustUpdateObject::GatewayIdentityTransition(transition) => {
+                    // The campaign first, and it is not a formality here: this
+                    // authority holds no gateway leaf, so the approved text is
+                    // the only place the state this decision was taken against
+                    // is pinned. Verifying the object against fingerprints it
+                    // carries itself would be verifying nothing — it is
+                    // `covers_gateway_transition` that ties them to what an
+                    // operator read at a security key.
+                    campaign.covers_gateway_transition(transition)?;
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        transition.gateway_identity_epoch.checked_sub(1).ok_or(
+                            RegistryError::Transition(
+                                aether::certificates::CertificateError::CampaignMismatch,
+                            ),
+                        )?,
+                        &self.state.gateway_wg_public_key,
+                        &self.state.server_name,
+                        &transition.active_gateway_tls_certificate_fingerprint,
+                        &transition.active_gateway_certificate_fingerprint,
+                    )?;
+                }
+                TrustUpdateObject::GatewayTransitionAbort(abort) => {
+                    campaign.covers_gateway_abort(abort)?;
+                    // An abort is verified against the exact document it
+                    // cancels, so that document must already be here. It is
+                    // the same rule the gateway applies, and it is why an
+                    // abort deposited before its transition is refused rather
+                    // than stored for a transition that may never arrive.
+                    let cancelled = self
+                        .state
+                        .transitions
+                        .iter()
+                        .filter_map(|stored| match &stored.object {
+                            TrustUpdateObject::GatewayIdentityTransition(held) => Some(held),
+                            _ => None,
+                        })
+                        .find(|held| {
+                            held.fingerprint().is_ok_and(|held_fingerprint| {
+                                held_fingerprint.matches(&abort.gateway_transition_fingerprint)
+                            })
+                        })
+                        .ok_or(RegistryError::Transition(
+                            aether::certificates::CertificateError::CampaignMismatch,
+                        ))?;
+                    // Limite connue : `published` est faux ici parce que cette
+                    // autorité ne distribue encore aucune transition gateway.
+                    // Le marqueur du §6.3 doit être persisté ici avant le
+                    // premier octet émis, et c'est ce qui rendra cet argument
+                    // autre chose qu'une constante.
+                    abort.verify(&self.state.ca_public_key, cancelled, false, now_unix)?;
+                }
                 // Limite connue : la rotation de `CA-TLS` n'est pas stockée
                 // ici. `ClientTlsCaTransition::verify` compares the outgoing
                 // TLS anchor to a fingerprint the verifier must already pin,
@@ -485,7 +541,8 @@ impl AstraRegistry {
                 _ => {
                     return Err(RegistryError::Transition(
                         aether::certificates::CertificateError::IssuerScopeViolation(
-                            "this authority stores only a CA-PQ transition or a client revocation",
+                            "this authority stores only a CA-PQ transition, a gateway identity \
+                             decision or a client revocation",
                         ),
                     ))
                 }
@@ -854,6 +911,7 @@ fn transition_window(
     match object {
         TrustUpdateObject::CaTransition(transition) => Some(&transition.window),
         TrustUpdateObject::ClientTlsCaTransition(transition) => Some(&transition.window),
+        TrustUpdateObject::GatewayIdentityTransition(transition) => Some(&transition.window),
         _ => None,
     }
 }
@@ -980,6 +1038,40 @@ mod tests {
             Id16::new([7; 16]).expect("id")
         }
 
+        /// The approved text an acceptance is checked against.
+        ///
+        /// Only the gateway-identity arms read its rows; every other object
+        /// carries the state it is verified against, or is verified against an
+        /// anchor this registry pins. Which is exactly the asymmetry: the
+        /// gateway's own leaves live nowhere here.
+        fn campaign(
+            scope: aether::certificates::status::CampaignScope,
+            targets: Vec<aether::certificates::status::CampaignTarget>,
+        ) -> aether::certificates::status::AstraRotationCampaign {
+            aether::certificates::status::AstraRotationCampaign {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                campaign_id: campaign_id(),
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                created_at: 1_000,
+                expires_at: 1_300,
+                scope,
+                targets,
+                reason: "rotation".into(),
+                requested_by: "operator".into(),
+                policy_fingerprint: Fingerprint::of(b"policy"),
+                required_credentials: scope.required_credentials(),
+            }
+        }
+
+        fn anchor_campaign() -> aether::certificates::status::AstraRotationCampaign {
+            campaign(
+                aether::certificates::status::CampaignScope::TrustAuthorities,
+                Vec::new(),
+            )
+        }
+
         fn admitted(anchored: &mut Anchored) -> WireGuardKey {
             let client = WireGuardKey::from_bytes([5; 32]);
             anchored.registry.state.peers.insert(
@@ -1037,6 +1129,186 @@ mod tests {
             TrustUpdateObject::CertificateRevocation(Box::new(object))
         }
 
+        fn gateway_campaign(
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> aether::certificates::status::AstraRotationCampaign {
+            campaign(
+                aether::certificates::status::CampaignScope::GatewayIdentity,
+                vec![aether::certificates::status::CampaignTarget {
+                    certificate_kind: aether::certificates::status::CertificateKind::GatewayPq,
+                    identity_key: WireGuardKey::from_bytes([1; 32]),
+                    epoch,
+                    generation: epoch,
+                    active_tls_certificate_fingerprint: tls,
+                    active_pq_certificate_fingerprint: pq,
+                }],
+            )
+        }
+
+        /// The leaf a transition installs. A decision that installs neither
+        /// half is refused as empty, and rightly: it would consume an epoch
+        /// and move nothing.
+        fn gateway_leaf(anchored: &Anchored, epoch: u64) -> PqCertificate {
+            use base64::Engine as _;
+
+            let (_, subject) = generate_ml_dsa_87_keypair().expect("keygen");
+            aether::key_negotiation::issue_pq_certificate(
+                PqCertificate {
+                    version: PQ_CERTIFICATE_VERSION,
+                    serial: [epoch as u8; 16],
+                    subject: "gateway.example".into(),
+                    issuer: "helios-ca-pq".into(),
+                    role: PqCertificateRole::Gateway,
+                    wireguard_public_key: WireGuardKey::from_bytes([1; 32]).to_base64(),
+                    ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                        .encode(subject.as_bytes()),
+                    not_before_unix: 0,
+                    not_after_unix: 100_000,
+                    ml_dsa_87_signature: String::new(),
+                },
+                &anchored.ca_private,
+            )
+            .expect("issue")
+        }
+
+        fn gateway_transition(
+            anchored: &Anchored,
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> TrustUpdateObject {
+            use aether::certificates::authority::RotationReason;
+            use aether::certificates::gateway::GatewayIdentityTransition;
+
+            let object = GatewayIdentityTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                gateway_identity_epoch: epoch,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                active_gateway_tls_certificate_fingerprint: tls,
+                next_gateway_tls_certificate: None,
+                active_gateway_certificate_fingerprint: pq,
+                next_gateway_certificate: Some(gateway_leaf(anchored, epoch)),
+                window: TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+                reason: RotationReason::Scheduled,
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::GatewayIdentityTransition(Box::new(object))
+        }
+
+        fn gateway_abort(
+            anchored: &Anchored,
+            transition: &TrustUpdateObject,
+            aborted_at: u64,
+        ) -> TrustUpdateObject {
+            use aether::certificates::gateway::{AbortReason, GatewayTransitionAbort};
+
+            let TrustUpdateObject::GatewayIdentityTransition(cancelled) = transition else {
+                panic!("not a gateway transition");
+            };
+            let object = GatewayTransitionAbort {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+                server_name: "gateway.example".into(),
+                gateway_identity_epoch: cancelled.gateway_identity_epoch,
+                gateway_transition_fingerprint: cancelled.fingerprint().expect("fingerprint"),
+                aborted_at,
+                reason: AbortReason::OperatorCancelled,
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            TrustUpdateObject::GatewayTransitionAbort(Box::new(object))
+        }
+
+        /// This authority holds no gateway leaf, so the approved text is the
+        /// only place the state a decision was taken against is pinned.
+        #[test]
+        fn a_gateway_transition_is_stored_against_the_campaign_that_froze_it() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let object = gateway_transition(&anchored, 5, tls, pq);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&gateway_campaign(4, tls, pq), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        /// A leaf the operator never read, under a signature that verifies.
+        #[test]
+        fn a_gateway_transition_over_another_leaf_in_service_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let elsewhere = gateway_transition(&anchored, 5, tls, Fingerprint::of(b"another leaf"));
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(4, tls, pq), &[elsewhere], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// An abort is verified against the exact document it cancels, so that
+        /// document has to be here — not promised for later.
+        #[test]
+        fn an_abort_without_its_transition_is_refused() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .is_err());
+        }
+
+        #[test]
+        fn an_abort_cancels_the_transition_already_stored() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                    .expect("cancelled"),
+                1
+            );
+            assert_eq!(anchored.registry.state().transitions.len(), 2);
+        }
+
         /// The one property that lets an online authority hold `CA-PQ` output
         /// at all: it re-derives the proof under the anchor it already pins.
         #[test]
@@ -1046,7 +1318,7 @@ mod tests {
             assert_eq!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), &[object], None, 2_000)
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
                     .expect("accepted"),
                 1
             );
@@ -1061,14 +1333,14 @@ mod tests {
             let wrong_epoch = transition(&anchored, 2);
             assert!(anchored
                 .registry
-                .accept_transitions(campaign_id(), &[wrong_epoch], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[wrong_epoch], None, 2_000)
                 .is_err());
 
             let other_domain = super::anchor_transitions::anchored();
             let foreign = transition(&other_domain, 1);
             assert!(anchored
                 .registry
-                .accept_transitions(campaign_id(), &[foreign], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[foreign], None, 2_000)
                 .is_err());
             assert!(anchored.registry.state().transitions.is_empty());
         }
@@ -1082,14 +1354,19 @@ mod tests {
             assert_eq!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), std::slice::from_ref(&object), None, 2_000)
+                    .accept_transitions(
+                        &anchor_campaign(),
+                        std::slice::from_ref(&object),
+                        None,
+                        2_000
+                    )
                     .expect("accepted"),
                 1
             );
             assert_eq!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), &[object], None, 2_100)
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_100)
                     .expect("replayed"),
                 0
             );
@@ -1104,7 +1381,12 @@ mod tests {
             assert_eq!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), std::slice::from_ref(&object), None, 2_000,)
+                    .accept_transitions(
+                        &anchor_campaign(),
+                        std::slice::from_ref(&object),
+                        None,
+                        2_000,
+                    )
                     .expect("accepted"),
                 1
             );
@@ -1116,7 +1398,7 @@ mod tests {
             assert_eq!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), &[object], None, 2_100)
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_100)
                     .expect("identical retry"),
                 0
             );
@@ -1129,12 +1411,12 @@ mod tests {
             let wrong_expiry = revocation(&anchored, client, 2_000, 99_999);
             assert!(anchored
                 .registry
-                .accept_transitions(campaign_id(), &[wrong_expiry], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[wrong_expiry], None, 2_000)
                 .is_err());
             let future = revocation(&anchored, client, 2_001, generation(3).not_after);
             assert!(anchored
                 .registry
-                .accept_transitions(campaign_id(), &[future], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[future], None, 2_000)
                 .is_err());
             let peer = &anchored.registry.state().peers[&client.to_base64()];
             assert!(!peer.revoked);
@@ -1149,7 +1431,7 @@ mod tests {
             let object = revocation(&anchored, client, 2_000, expiry);
             anchored
                 .registry
-                .accept_transitions(campaign_id(), &[object], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
                 .expect("accepted");
             assert_eq!(
                 anchored
@@ -1176,14 +1458,14 @@ mod tests {
                 let object = transition(&anchored, 1);
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), &[object], None, 2_000 + index as u64)
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000 + index as u64)
                     .expect("accepted");
             }
             let overflow = transition(&anchored, 1);
             assert!(matches!(
                 anchored
                     .registry
-                    .accept_transitions(campaign_id(), &[overflow], None, 3_000),
+                    .accept_transitions(&anchor_campaign(), &[overflow], None, 3_000),
                 Err(RegistryError::TransitionStoreFull { .. })
             ));
             assert_eq!(
@@ -1200,7 +1482,7 @@ mod tests {
             let object = transition(&anchored, 1);
             anchored
                 .registry
-                .accept_transitions(campaign_id(), &[object], None, 2_000)
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
                 .expect("accepted");
             assert_eq!(
                 anchored

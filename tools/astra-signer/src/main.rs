@@ -194,6 +194,23 @@ enum RevokedHalvesArg {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AbortReasonArg {
+    /// L'opérateur renonce à la transition qu'il a fait signer.
+    OperatorCancelled,
+    /// Une décision plus récente la remplace avant son activation.
+    SupersededBeforeActivation,
+}
+
+impl From<AbortReasonArg> for aether::certificates::gateway::AbortReason {
+    fn from(value: AbortReasonArg) -> Self {
+        match value {
+            AbortReasonArg::OperatorCancelled => Self::OperatorCancelled,
+            AbortReasonArg::SupersededBeforeActivation => Self::SupersededBeforeActivation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RevocationReasonArg {
     KeyCompromise,
     SuspectedCompromise,
@@ -410,6 +427,73 @@ enum Command {
         #[arg(long, value_enum, default_value = "key-compromise")]
         reason: RevocationReasonArg,
     },
+    /// Émet la feuille gateway suivante et signe sa transition (§11.1 étape 4).
+    ///
+    /// La gateway a scellé sa clé et exporté une demande ; cette commande
+    /// l'émet sous `CA-PQ` et signe la décision qui l'installe. Elle ne change
+    /// rien à l'identité servie : la transition porte sa propre fenêtre, et
+    /// c'est `activation_at` qui bascule.
+    ///
+    /// Le fichier produit se rapporte sur la gateway, à
+    /// `heliosd install-gateway-transition`.
+    SignGatewayTransition {
+        #[arg(long)]
+        authority_url: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        origin: Option<String>,
+        /// La demande exportée par `heliosd prepare-gateway-certificate`.
+        #[arg(long)]
+        request: PathBuf,
+        /// La feuille PQ en service, exportée par `astra gateway-identity open`.
+        ///
+        /// Elle vérifie la signature de continuité du §5 — la preuve que la
+        /// demande vient bien de l'identité en place. Absente, la continuité
+        /// n'est pas vérifiée et `--key-recovery` doit être explicite.
+        #[arg(long)]
+        active_certificate: Option<PathBuf>,
+        /// La feuille TLS candidate de la gateway, en DER.
+        #[arg(long)]
+        tls_certificate: Option<PathBuf>,
+        /// Où écrire la transition signée.
+        #[arg(long)]
+        out: PathBuf,
+        /// Durée de vie de la nouvelle feuille, en jours.
+        #[arg(long, default_value_t = 365)]
+        validity_days: u64,
+        /// Délai avant `activation_at`, en jours : le temps laissé au parc
+        /// pour recevoir la décision avant qu'elle prenne effet.
+        #[arg(long, default_value_t = 7)]
+        prepare_days: u64,
+        /// Recouvrement entre `activation_at` et le retrait, en jours.
+        #[arg(long, default_value_t = 7)]
+        overlap_days: u64,
+        /// La demande n'a pas de signature de continuité (§5, clé perdue).
+        #[arg(long)]
+        key_recovery: bool,
+    },
+    /// Signe l'annulation d'une transition gateway en attente (§6.3).
+    ///
+    /// Refusée une fois la transition distribuée ou `activation_at` atteint :
+    /// un client peut déjà l'avoir persistée, repartir hors ligne et
+    /// promouvoir seul. L'époque reste consommée.
+    AbortGatewayTransition {
+        #[arg(long)]
+        authority_url: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        origin: Option<String>,
+        /// La transition à annuler, telle qu'elle a été signée.
+        #[arg(long)]
+        transition: PathBuf,
+        /// Où écrire l'avortement signé.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_enum, default_value = "operator-cancelled")]
+        reason: AbortReasonArg,
+    },
     /// Approuve la récupération d'une identité expirée (§7.5).
     ///
     /// Une seule commande, une seule clé branchée : elle lit la demande,
@@ -581,6 +665,52 @@ fn run() -> Result<()> {
             origin.as_deref(),
             halves,
             not_after,
+            reason.into(),
+            transport,
+        ),
+        Command::SignGatewayTransition {
+            authority_url,
+            operation_id,
+            origin,
+            request,
+            active_certificate,
+            tls_certificate,
+            out,
+            validity_days,
+            prepare_days,
+            overlap_days,
+            key_recovery,
+        } => sign_gateway_transition(
+            &path,
+            &authority_url,
+            &operation_id,
+            origin.as_deref(),
+            GatewayTransitionInputs {
+                request: &request,
+                active_certificate: active_certificate.as_deref(),
+                tls_certificate: tls_certificate.as_deref(),
+                out: &out,
+                validity_days,
+                prepare_days,
+                overlap_days,
+                key_recovery,
+            },
+            transport,
+        ),
+        Command::AbortGatewayTransition {
+            authority_url,
+            operation_id,
+            origin,
+            transition,
+            out,
+            reason,
+        } => abort_gateway_transition(
+            &path,
+            &authority_url,
+            &operation_id,
+            origin.as_deref(),
+            &transition,
+            &out,
             reason.into(),
             transport,
         ),
@@ -1626,6 +1756,384 @@ fn revoke(
     println!("état             : {state:?}");
     println!("décision déposée : Astra la relaie à la gateway et la distribue aux clients");
     Ok(())
+}
+
+/// Everything the gateway ceremony reads from the operator's command line.
+struct GatewayTransitionInputs<'a> {
+    request: &'a Path,
+    active_certificate: Option<&'a Path>,
+    tls_certificate: Option<&'a Path>,
+    out: &'a Path,
+    validity_days: u64,
+    prepare_days: u64,
+    overlap_days: u64,
+    key_recovery: bool,
+}
+
+/// Issues the next gateway leaf and signs its transition (spec §11.1 step 4).
+fn sign_gateway_transition(
+    path: &Path,
+    authority_url: &str,
+    operation_id: &str,
+    origin: Option<&str>,
+    inputs: GatewayTransitionInputs<'_>,
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::gateway::{Continuity, GatewayCertificateRequest};
+    use aether::certificates::status::CampaignFamily;
+
+    let operation = Id16::parse_hex(operation_id)
+        .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let request_document = origin_client_fetch(&client, &operation)?;
+    verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+    let campaign = request_document.campaign.as_ref().clone();
+    if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
+        bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
+    }
+    let target = match campaign.targets.as_slice() {
+        [only] => only,
+        targets => bail!(
+            "une décision gateway nomme exactement une identité, {} présentes. Rien n'a été signé.",
+            targets.len()
+        ),
+    };
+
+    let request: GatewayCertificateRequest = read_json(inputs.request, "la demande gateway")?;
+    let epoch = target
+        .epoch
+        .checked_add(1)
+        .context("époque de décision hors bornes")?;
+    if request.gateway_identity_epoch != epoch {
+        bail!(
+            "la demande porte l'époque {} et cette campagne autorise la {epoch}. Rien n'a été \
+             signé.",
+            request.gateway_identity_epoch
+        );
+    }
+    let now = now_unix();
+
+    // The continuity signature proves the request comes from the identity in
+    // place. It cannot be checked without that identity's public key, which
+    // this companion does not hold — `astra gateway-identity open` exports it
+    // from the daemon that serves it.
+    let continuity_key = match inputs.active_certificate {
+        Some(source) => {
+            let served: aether::key_negotiation::PqCertificate =
+                read_json(source, "la feuille en service")?;
+            let fingerprint = aether::certificates::gateway::pq_certificate_fingerprint(&served)?;
+            if !target
+                .active_pq_certificate_fingerprint
+                .matches(&fingerprint)
+            {
+                bail!(
+                    "la feuille fournie n'est pas celle que la campagne épingle. Rien n'a été \
+                     signé."
+                );
+            }
+            Some(MlDsa87PublicKey::parse(&served.ml_dsa_87_public_key)?)
+        }
+        None if inputs.key_recovery => None,
+        None => bail!(
+            "--active-certificate est requis : sans la feuille en service, la continuité du §5 \
+             n'est pas vérifiable. Une demande sans continuité exige --key-recovery."
+        ),
+    };
+    request.verify(
+        match continuity_key.as_ref() {
+            Some(key) => Continuity::Required(key),
+            None => Continuity::WaivedForKeyRecovery,
+        },
+        &identity.trust_domain_id,
+        target.epoch,
+        &campaign.gateway_wg_public_key,
+        &campaign.server_name,
+        now,
+    )?;
+
+    let next_tls = inputs
+        .tls_certificate
+        .map(|source| -> Result<DerCertificate> {
+            let der = std::fs::read(source)
+                .with_context(|| format!("lecture de {}", source.display()))?;
+            Ok(DerCertificate::new(der)?)
+        })
+        .transpose()?;
+
+    let day =
+        |days: u64| -> Result<u64> { days.checked_mul(DAY_SECS).context("durée hors bornes") };
+    let activation_at = now
+        .checked_add(day(inputs.prepare_days)?)
+        .context("durée hors bornes")?;
+    let window = TransitionWindow::new(
+        now,
+        activation_at,
+        activation_at
+            .checked_add(day(inputs.overlap_days)?)
+            .context("durée hors bornes")?,
+    )?;
+    let leaf_validity = (
+        now,
+        now.checked_add(day(inputs.validity_days)?)
+            .context("durée hors bornes")?,
+    );
+
+    println!("opération        : {}", operation.to_hex());
+    println!("gateway          : {}", campaign.server_name);
+    println!(
+        "identité         : {}",
+        campaign.gateway_wg_public_key.to_base64()
+    );
+    println!("époque           : {} → {epoch}", target.epoch);
+    println!(
+        "feuille PQ       : {}",
+        target.active_pq_certificate_fingerprint
+    );
+    println!(
+        "feuille TLS      : {}",
+        target.active_tls_certificate_fingerprint
+    );
+    println!(
+        "TLS remplacée    : {}",
+        match &next_tls {
+            Some(certificate) => certificate.fingerprint().to_hex(),
+            None => "inchangée".to_string(),
+        }
+    );
+    println!(
+        "continuité       : {}",
+        if continuity_key.is_some() {
+            "vérifiée"
+        } else {
+            "levée (récupération de clé)"
+        }
+    );
+    println!("activation       : {activation_at}");
+    println!("retrait          : {}", window.not_after);
+    println!("motif            : {}", campaign.reason);
+    println!("demandée par     : {}", campaign.requested_by);
+    println!("empreinte        : {}", campaign.fingerprint());
+    println!("effet            : aucun avant activation_at ; heliosd redémarre à cet instant");
+
+    let origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+
+    let approval = authority::approve_campaign(
+        &[key.as_ref()],
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        &[pin.as_str()],
+        now,
+    )?;
+    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+    let decision = authority::GatewayTransitionDecision {
+        gateway_identity_epoch: epoch,
+        gateway_wg_public_key: campaign.gateway_wg_public_key,
+        server_name: campaign.server_name.clone(),
+        active_tls_fingerprint: target.active_tls_certificate_fingerprint,
+        active_pq_fingerprint: target.active_pq_certificate_fingerprint,
+        next_pq_public_key: request.new_ml_dsa_87_public_key.clone(),
+        next_tls_certificate: next_tls,
+        window,
+        leaf_validity,
+        reason: if inputs.key_recovery {
+            aether::certificates::authority::RotationReason::KeyRecovery
+        } else {
+            aether::certificates::authority::RotationReason::Scheduled
+        },
+        serial: random_id()?,
+    };
+    let transition = authority::sign_gateway_transition(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key,
+        &decision,
+    )?;
+    campaign
+        .covers_gateway_transition(&transition)
+        .context("la décision signée ne correspond pas à la campagne approuvée")?;
+
+    deposit_gateway_decision(
+        &client,
+        &request_document,
+        &approval,
+        aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(Box::new(
+            transition,
+        )),
+        inputs.out,
+        "transition",
+    )
+}
+
+/// Signs the cancellation of a staged gateway transition (spec §6.3).
+#[allow(clippy::too_many_arguments)]
+fn abort_gateway_transition(
+    path: &Path,
+    authority_url: &str,
+    operation_id: &str,
+    origin: Option<&str>,
+    transition_path: &Path,
+    out: &Path,
+    reason: aether::certificates::gateway::AbortReason,
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::gateway::GatewayIdentityTransition;
+    use aether::certificates::status::CampaignFamily;
+
+    let operation = Id16::parse_hex(operation_id)
+        .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let request_document = origin_client_fetch(&client, &operation)?;
+    verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+    let campaign = request_document.campaign.as_ref().clone();
+    if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
+        bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
+    }
+    let target = match campaign.targets.as_slice() {
+        [only] => only,
+        targets => bail!(
+            "une décision gateway nomme exactement une identité, {} présentes. Rien n'a été signé.",
+            targets.len()
+        ),
+    };
+
+    let transition: GatewayIdentityTransition =
+        read_json(transition_path, "la transition à annuler")?;
+    if transition.gateway_identity_epoch != target.epoch {
+        bail!(
+            "cette campagne porte la décision {} et la transition fournie la {}. Rien n'a été \
+             signé.",
+            target.epoch,
+            transition.gateway_identity_epoch
+        );
+    }
+    let now = now_unix();
+    if now >= transition.window.activation_at {
+        bail!(
+            "activation_at est atteint : la transition est en recouvrement et ne s'annule plus \
+             (§6.3). Promouvoir, puis préparer une nouvelle transition."
+        );
+    }
+
+    println!("opération        : {}", operation.to_hex());
+    println!("gateway          : {}", campaign.server_name);
+    println!("époque annulée   : {}", transition.gateway_identity_epoch);
+    println!("transition       : {}", transition.fingerprint()?);
+    println!("activation prévue: {}", transition.window.activation_at);
+    println!("motif            : {reason:?}");
+    println!("demandé par      : {}", campaign.requested_by);
+    println!("empreinte        : {}", campaign.fingerprint());
+    println!(
+        "effet            : l'époque reste consommée ; la suivante repart une décision plus haut"
+    );
+
+    let origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+
+    let approval = authority::approve_campaign(
+        &[key.as_ref()],
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        &[pin.as_str()],
+        now,
+    )?;
+    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+    let abort = authority::sign_gateway_abort(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key,
+        &authority::GatewayAbortDecision {
+            transition: &transition,
+            reason,
+            campaign_fingerprint: campaign.fingerprint(),
+            aborted_at: now,
+        },
+    )?;
+    campaign
+        .covers_gateway_abort(&abort)
+        .context("l'avortement signé ne correspond pas à la campagne approuvée")?;
+
+    deposit_gateway_decision(
+        &client,
+        &request_document,
+        &approval,
+        aether::certificates::transport::TrustUpdateObject::GatewayTransitionAbort(Box::new(abort)),
+        out,
+        "avortement",
+    )
+}
+
+/// Writes the signed decision out, then deposits it.
+///
+/// The file first. The operator carries it to the gateway, and a deposit that
+/// fails after `CA-PQ` has signed must not also lose the object — the
+/// alternative is a second ceremony for a decision that already exists.
+fn deposit_gateway_decision(
+    client: &astra_signer::origin::Origin,
+    request: &astra_signer::origin::CampaignRequest,
+    approval: &aether::certificates::status::CampaignApproval,
+    object: aether::certificates::transport::TrustUpdateObject,
+    out: &Path,
+    what: &str,
+) -> Result<()> {
+    let encoded = serde_json::to_vec_pretty(&object).context("encodage de la décision signée")?;
+    std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
+    println!("{what} écrit : {}", out.display());
+
+    let result = campaign_result(approval, vec![object], None);
+    let state = client.submit(&request.operation_id, &request.result_token, &result)?;
+    println!("état             : {state:?}");
+    println!(
+        "à reporter sur la gateway : heliosd {} {}",
+        if what == "transition" {
+            "install-gateway-transition"
+        } else {
+            "abort-gateway-transition"
+        },
+        out.display()
+    );
+    Ok(())
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<T> {
+    let raw = std::fs::read(path).with_context(|| format!("lecture de {}", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("décodage de {what} : {}", path.display()))
 }
 
 fn origin_client_fetch(

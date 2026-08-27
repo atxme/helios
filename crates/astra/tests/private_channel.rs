@@ -122,6 +122,9 @@ impl AstraChannelHandler for Recorder {
             pq_certificate_fingerprint: pq_certificate_fingerprint(&pq_certificate)
                 .expect("fingerprint"),
             pq_certificate,
+            tls_certificate_fingerprint: aether::certificates::encoding::Fingerprint::of(
+                b"gateway tls in service",
+            ),
             active_gateway_identity_epoch: 3,
             gateway_decision_epoch: 7,
         })

@@ -321,6 +321,12 @@ pub struct GatewayIdentityView {
     /// Its fingerprint, recomputed by the reader anyway — carried so a
     /// mismatch is caught as a disagreement rather than as a bad signature.
     pub pq_certificate_fingerprint: Fingerprint,
+    /// The active gateway TLS leaf, by fingerprint.
+    ///
+    /// The certificate itself stays here: the authority needs to *name* the
+    /// leaf in service — a campaign freezes the identity by its two
+    /// fingerprints (spec §11.1 step 3) — never to re-serve it.
+    pub tls_certificate_fingerprint: Fingerprint,
     pub active_gateway_identity_epoch: u64,
     pub gateway_decision_epoch: u64,
 }

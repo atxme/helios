@@ -501,6 +501,7 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
         Ok(helios_api::internal::GatewayIdentityView {
             pq_certificate_fingerprint,
             pq_certificate,
+            tls_certificate_fingerprint: state.gateway.active_tls_fingerprint(),
             active_gateway_identity_epoch: state.gateway.active_gateway_identity_epoch,
             gateway_decision_epoch: state.gateway.gateway_decision_epoch,
         })

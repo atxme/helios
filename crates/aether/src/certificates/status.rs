@@ -388,6 +388,30 @@ pub enum CampaignScope {
     TrustAuthorities,
     /// Emergency withdrawal of one identity's active leaves (spec §10).
     EmergencyRevocation,
+    /// The gateway's own identity: one transition, or its abort (spec §6).
+    GatewayIdentity,
+}
+
+/// Which family of signed objects a scope may produce.
+///
+/// # Why a family and not a set of booleans
+///
+/// Every predicate below reads as «may this scope do X». Asked one at a time,
+/// they answer independently, and a scope added later inherits whatever the
+/// negative form of a question happens to allow — the exact shape that once
+/// let a revocation scope through a guard written as «not an authority». A
+/// family is total: a new scope cannot be written without naming which
+/// objects it authorizes, and every other family refuses it by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CampaignFamily {
+    /// Client leaves. The companion signs no trust-update object at all.
+    ClientLeaves,
+    /// Anchor transitions: `CA-PQ` and the client TLS CA.
+    Authorities,
+    /// The gateway's own identity, and the abort that cancels it (spec §6).
+    GatewayIdentity,
+    /// Emergency withdrawal of active leaves (spec §10).
+    Revocation,
 }
 
 impl CampaignScope {
@@ -399,6 +423,20 @@ impl CampaignScope {
             Self::FullCertificateChain => 3,
             Self::TrustAuthorities => 4,
             Self::EmergencyRevocation => 5,
+            Self::GatewayIdentity => 6,
+        }
+    }
+
+    /// The one family of objects this scope authorizes.
+    pub const fn family(self) -> CampaignFamily {
+        match self {
+            Self::OrionProfile
+            | Self::OrionDevice
+            | Self::FleetLeafs
+            | Self::FullCertificateChain => CampaignFamily::ClientLeaves,
+            Self::TrustAuthorities => CampaignFamily::Authorities,
+            Self::EmergencyRevocation => CampaignFamily::Revocation,
+            Self::GatewayIdentity => CampaignFamily::GatewayIdentity,
         }
     }
 
@@ -424,8 +462,13 @@ impl CampaignScope {
     }
 
     /// Whether the companion must open the master vault for this scope.
+    ///
+    /// Not the same question as «does it replace an anchor». A revocation and
+    /// a gateway transition are both signed **by** `CA-PQ` without replacing
+    /// it, and a single predicate for the two questions would refuse the vault
+    /// to a ceremony that cannot proceed without it.
     pub const fn opens_vault(self) -> bool {
-        matches!(self, Self::TrustAuthorities | Self::EmergencyRevocation)
+        !matches!(self.family(), CampaignFamily::ClientLeaves)
     }
 
     /// Whether this scope withdraws leaves instead of renewing them.
@@ -708,6 +751,106 @@ impl AstraRotationCampaign {
         }
     }
 
+    /// Verifies that a gateway transition moves the identity this campaign
+    /// froze, one decision forward (spec §6.1, §11.1 step 3).
+    ///
+    /// The row pins the two leaves in service, so the transition is bound to
+    /// the state the operator was shown. What the campaign deliberately does
+    /// **not** pin is the leaf being installed: it does not exist when the
+    /// campaign is opened, and `CA-PQ` is what certifies it. A substituted
+    /// next leaf is refused at the gateway instead, which alone knows whether
+    /// it holds the matching private half.
+    pub fn covers_gateway_transition(
+        &self,
+        transition: &super::gateway::GatewayIdentityTransition,
+    ) -> Result<(), CertificateError> {
+        let row = self.gateway_row(
+            transition.trust_domain_id,
+            &transition.gateway_wg_public_key,
+            &transition.server_name,
+            // One decision forward: the row names the last decision this
+            // domain took, and a transition is the next one.
+            transition
+                .gateway_identity_epoch
+                .checked_sub(1)
+                .ok_or(CertificateError::CampaignMismatch)?,
+        )?;
+        let matches_state = row
+            .active_tls_certificate_fingerprint
+            .matches(&transition.active_gateway_tls_certificate_fingerprint)
+            && row
+                .active_pq_certificate_fingerprint
+                .matches(&transition.active_gateway_certificate_fingerprint);
+        if matches_state {
+            Ok(())
+        } else {
+            Err(CertificateError::CampaignMismatch)
+        }
+    }
+
+    /// Verifies that an abort cancels a transition of the identity this
+    /// campaign froze (spec §6.3).
+    ///
+    /// # Why the epoch relation is not the transition's
+    ///
+    /// An abort campaign is opened **after** the transition was staged, when
+    /// the decision epoch already *is* the epoch being cancelled. Reusing the
+    /// «one forward» rule here would refuse every abort, and accepting either
+    /// relation would let one approved row authorise two different decisions.
+    ///
+    /// # Why the leaves in service are not compared
+    ///
+    /// An abort names no leaf. It names the exact document it cancels, by
+    /// fingerprint, under `CA-PQ` — which is narrower than the pair of active
+    /// leaves would be, since a transition is unique where a leaf pair is
+    /// shared by every decision taken while it is in service. The fingerprints
+    /// on the row are still what the operator reads before the touch.
+    pub fn covers_gateway_abort(
+        &self,
+        abort: &super::gateway::GatewayTransitionAbort,
+    ) -> Result<(), CertificateError> {
+        self.gateway_row(
+            abort.trust_domain_id,
+            &abort.gateway_wg_public_key,
+            &abort.server_name,
+            abort.gateway_identity_epoch,
+        )
+        .map(|_| ())
+    }
+
+    /// The row authorizing a decision about the gateway's own identity.
+    fn gateway_row(
+        &self,
+        trust_domain_id: TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        decision_epoch: u64,
+    ) -> Result<&CampaignTarget, CertificateError> {
+        if !matches!(self.scope.family(), CampaignFamily::GatewayIdentity) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only a gateway-identity campaign decides the gateway identity",
+            ));
+        }
+        if trust_domain_id != self.trust_domain_id {
+            return Err(CertificateError::TrustDomainMismatch);
+        }
+        // Named twice, because a client pins both: an object for another
+        // gateway carried under this approval would be a decision the operator
+        // never read.
+        if gateway_wg_public_key != &self.gateway_wg_public_key || server_name != self.server_name {
+            return Err(CertificateError::GatewayIdentityMismatch);
+        }
+        self.targets
+            .iter()
+            .find(|target| {
+                (target.certificate_kind == CertificateKind::GatewayPq
+                    || target.certificate_kind == CertificateKind::GatewayTls)
+                    && target.identity_key == self.gateway_wg_public_key
+                    && target.epoch == decision_epoch
+            })
+            .ok_or(CertificateError::CampaignMismatch)
+    }
+
     /// Refuses a campaign whose targets moved after approval (spec §7.6).
     pub fn assert_unchanged(
         &self,
@@ -920,10 +1063,17 @@ impl AstraSignerResult {
         if self.objects.len() > MAX_CAMPAIGN_OBJECTS {
             return Err(CertificateError::CampaignMismatch);
         }
-        if campaign.scope.revokes() && self.objects.len() != 1 {
+        // One decision per ceremony for the two families that decide about a
+        // single identity. A batch would make «which of these did the operator
+        // approve» a question about ordering.
+        if matches!(
+            campaign.scope.family(),
+            CampaignFamily::Revocation | CampaignFamily::GatewayIdentity
+        ) && self.objects.len() != 1
+        {
             return Err(CertificateError::CampaignMismatch);
         }
-        if !campaign.scope.rotates_authority() && !campaign.scope.revokes() {
+        if matches!(campaign.scope.family(), CampaignFamily::ClientLeaves) {
             // An ordinary leaf campaign has nothing for the companion to
             // sign. Accepting objects here would let it deliver a trust
             // mutation that the operator was never shown.
@@ -942,16 +1092,32 @@ impl AstraSignerResult {
         let mut seen: Vec<Fingerprint> = Vec::with_capacity(self.objects.len());
         let mut replaces_ca_pq = false;
         for object in &self.objects {
-            match (campaign.scope.revokes(), object) {
-                (true, TrustUpdateObject::CertificateRevocation(revocation)) => {
-                    campaign.covers_revocation(revocation)?
-                }
-                (true, _) | (false, TrustUpdateObject::CertificateRevocation(_)) => {
+            // Total in both directions: every family names the objects it
+            // authorizes, and everything else falls into one refusal. A family
+            // added later cannot inherit another's authorization by omission.
+            match (campaign.scope.family(), object) {
+                (
+                    CampaignFamily::Revocation,
+                    TrustUpdateObject::CertificateRevocation(revocation),
+                ) => campaign.covers_revocation(revocation)?,
+                (
+                    CampaignFamily::Authorities,
+                    TrustUpdateObject::CaTransition(_)
+                    | TrustUpdateObject::ClientTlsCaTransition(_),
+                ) => campaign.covers_authority_object(object)?,
+                (
+                    CampaignFamily::GatewayIdentity,
+                    TrustUpdateObject::GatewayIdentityTransition(transition),
+                ) => campaign.covers_gateway_transition(transition)?,
+                (
+                    CampaignFamily::GatewayIdentity,
+                    TrustUpdateObject::GatewayTransitionAbort(abort),
+                ) => campaign.covers_gateway_abort(abort)?,
+                _ => {
                     return Err(CertificateError::IssuerScopeViolation(
                         "this object does not belong to the family its campaign approved",
                     ))
                 }
-                (false, _) => campaign.covers_authority_object(object)?,
             }
             let fingerprint = object.fingerprint()?;
             if seen.iter().any(|earlier| earlier.matches(&fingerprint)) {
@@ -1435,6 +1601,198 @@ mod tests {
                 result.validate(&campaign),
                 Err(CertificateError::CampaignMismatch)
             ));
+        }
+
+        fn gateway_target(epoch: u64, tls: Fingerprint, pq: Fingerprint) -> CampaignTarget {
+            CampaignTarget {
+                certificate_kind: CertificateKind::GatewayPq,
+                identity_key: WireGuardKey::from_bytes([2; 32]),
+                epoch,
+                generation: epoch,
+                active_tls_certificate_fingerprint: tls,
+                active_pq_certificate_fingerprint: pq,
+            }
+        }
+
+        fn gateway_transition(
+            epoch: u64,
+            tls: Fingerprint,
+            pq: Fingerprint,
+        ) -> crate::certificates::transport::TrustUpdateObject {
+            use crate::certificates::authority::RotationReason;
+            use crate::certificates::gateway::GatewayIdentityTransition;
+            use crate::certificates::window::TransitionWindow;
+
+            crate::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(Box::new(
+                GatewayIdentityTransition {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    protocol_version: crate::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                    trust_domain_id: domain(),
+                    ca_epoch: 1,
+                    gateway_identity_epoch: epoch,
+                    gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                    server_name: "gateway.example".into(),
+                    active_gateway_tls_certificate_fingerprint: tls,
+                    next_gateway_tls_certificate: None,
+                    active_gateway_certificate_fingerprint: pq,
+                    next_gateway_certificate: None,
+                    window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+                    reason: RotationReason::Scheduled,
+                    ca_signature: MlDsa87Signature::placeholder(),
+                },
+            ))
+        }
+
+        fn gateway_abort(epoch: u64) -> crate::certificates::transport::TrustUpdateObject {
+            use crate::certificates::gateway::{AbortReason, GatewayTransitionAbort};
+
+            crate::certificates::transport::TrustUpdateObject::GatewayTransitionAbort(Box::new(
+                GatewayTransitionAbort {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    protocol_version: crate::certificates::CERTIFICATE_PROTOCOL_VERSION,
+                    trust_domain_id: domain(),
+                    ca_epoch: 1,
+                    gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                    server_name: "gateway.example".into(),
+                    gateway_identity_epoch: epoch,
+                    gateway_transition_fingerprint: Fingerprint::of(b"the staged transition"),
+                    aborted_at: 1_500,
+                    reason: AbortReason::OperatorCancelled,
+                    campaign_fingerprint: Fingerprint::of(b"campaign"),
+                    ca_signature: MlDsa87Signature::placeholder(),
+                },
+            ))
+        }
+
+        /// §11.1 step 3: the campaign freezes the identity in service, and the
+        /// transition it authorizes is the next decision on that exact state.
+        #[test]
+        fn a_gateway_campaign_covers_the_identity_state_its_operator_read() {
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let campaign = campaign(
+                CampaignScope::GatewayIdentity,
+                vec![gateway_target(4, tls, pq)],
+            );
+
+            let result = signer_result(&campaign, vec![gateway_transition(5, tls, pq)], None);
+            result.validate(&campaign).expect("the approved decision");
+
+            // Two decisions forward: an epoch nobody was shown.
+            let skipped = signer_result(&campaign, vec![gateway_transition(6, tls, pq)], None);
+            assert!(matches!(
+                skipped.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+            // The same epoch over another leaf in service: a decision taken
+            // against a state the operator never read.
+            let elsewhere = signer_result(
+                &campaign,
+                vec![gateway_transition(5, tls, Fingerprint::of(b"another leaf"))],
+                None,
+            );
+            assert!(matches!(
+                elsewhere.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// The asymmetry that would silently refuse every abort: a transition
+        /// is one decision forward, an abort is *at* the decision it cancels.
+        #[test]
+        fn an_abort_is_covered_at_the_epoch_it_cancels() {
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let campaign = campaign(
+                CampaignScope::GatewayIdentity,
+                vec![gateway_target(5, tls, pq)],
+            );
+
+            let result = signer_result(&campaign, vec![gateway_abort(5)], None);
+            result.validate(&campaign).expect("the staged epoch");
+
+            let forward = signer_result(&campaign, vec![gateway_abort(6)], None);
+            assert!(matches!(
+                forward.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// Four families, and each refuses the other three.
+        #[test]
+        fn a_gateway_decision_belongs_to_no_other_family() {
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(5, tls, pq);
+
+            for scope in [
+                CampaignScope::TrustAuthorities,
+                CampaignScope::EmergencyRevocation,
+                CampaignScope::FleetLeafs,
+            ] {
+                let campaign = campaign(scope, vec![gateway_target(4, tls, pq)]);
+                let smuggled = signer_result(&campaign, vec![transition.clone()], None);
+                assert!(
+                    matches!(
+                        smuggled.validate(&campaign),
+                        Err(CertificateError::IssuerScopeViolation(_))
+                    ),
+                    "{scope:?} accepted a gateway transition"
+                );
+            }
+
+            // And the reverse: a gateway campaign is not a delivery vehicle
+            // for an anchor rotation.
+            let campaign = campaign(
+                CampaignScope::GatewayIdentity,
+                vec![gateway_target(4, tls, pq)],
+            );
+            let anchor = signer_result(&campaign, vec![ca_transition(1, tls)], Some(registry()));
+            assert!(matches!(
+                anchor.validate(&campaign),
+                Err(CertificateError::IssuerScopeViolation(_))
+            ));
+        }
+
+        /// One touch, one decision about the identity every client pins.
+        #[test]
+        fn a_gateway_campaign_carries_exactly_one_decision() {
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let campaign = campaign(
+                CampaignScope::GatewayIdentity,
+                vec![gateway_target(4, tls, pq)],
+            );
+
+            let twice = signer_result(
+                &campaign,
+                vec![
+                    gateway_transition(5, tls, pq),
+                    gateway_transition(5, tls, pq),
+                ],
+                None,
+            );
+            assert!(matches!(
+                twice.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+
+            let empty = signer_result(&campaign, Vec::new(), None);
+            assert!(matches!(
+                empty.validate(&campaign),
+                Err(CertificateError::CampaignMismatch)
+            ));
+        }
+
+        /// A gateway renewal is signed by `CA-PQ` without replacing it, so it
+        /// opens the vault while rotating no authority at all.
+        #[test]
+        fn a_gateway_campaign_opens_the_vault_without_rotating_an_anchor() {
+            assert!(CampaignScope::GatewayIdentity.opens_vault());
+            assert!(!CampaignScope::GatewayIdentity.rotates_authority());
+            assert!(!CampaignScope::GatewayIdentity.revokes());
+            assert!(!CampaignScope::GatewayIdentity.authorizes_client_rotation());
+            assert_eq!(CampaignScope::GatewayIdentity.required_credentials(), 1);
         }
     }
 

@@ -876,7 +876,7 @@ async fn signer_result(
         let mut domain = service.registry.lock().await;
         let accepted = domain
             .accept_transitions(
-                verified.campaign_id,
+                &verified.campaign,
                 &verified.objects,
                 verified.credential_registry.clone(),
                 now,
