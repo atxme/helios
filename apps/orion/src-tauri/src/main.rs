@@ -2295,7 +2295,7 @@ fn prepare_wireguard_nt_working_directory() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Orion workspace root not found"))?;
         if !workspace.join(DLL).is_file() {
             anyhow::bail!(
-                "WireGuardNT is missing ({DLL}); run `cargo xtask orion-deps` before Orion"
+                "WireGuardNT is missing ({DLL}); rebuild Orion so its Windows dependencies are prepared"
             );
         }
         workspace.to_path_buf()
@@ -2652,10 +2652,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");
 }
-
-#[cfg(test)]
-#[path = "../build_support.rs"]
-mod build_support_tests;
 
 #[cfg(test)]
 mod security_tests {

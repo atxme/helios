@@ -13,7 +13,8 @@ certificat X.509.
 courant. Sur ARM64 il ouvre `wireguard-arm64.dll`. Ces noms viennent de sa
 source ; ils ne sont pas une convention inventée par le bundle Orion.
 
-Préparer les ressources avant un build Windows :
+Le build Windows prépare automatiquement les ressources avant de compiler
+Orion. Pour préparer les DLL sans compiler le client, utiliser :
 
 ```sh
 cargo xtask orion-deps

@@ -56,12 +56,10 @@ nécessaire pour tester**. Le nom, l’icône et l’interface sont ceux du code
 les trois cas, et `build.rs` s’en charge.
 
 - **En debug**, l’IHM est servie par Vite : Orion le démarre lui-même s’il ne
-  tourne pas, et toute modification de `src/` est visible au rechargement. Les
-  ressources Windows absentes ne sont pas exigées par la seule compilation :
-  un checkout frais peut donc compiler le shell dry-run sans télécharger
-  WireGuardNT. `build.rs` vérifie toutefois l’arbre npm et exécute `npm ci` si
-  une dépendance manque, afin que `cargo run` puisse démarrer immédiatement.
-  La CLI Tauri prépare les ressources Windows avant de créer un bundle.
+  tourne pas, et toute modification de `src/` est visible au rechargement.
+  `build.rs` vérifie l’arbre npm et exécute `npm ci` si une dépendance manque,
+  puis prépare automatiquement les ressources WireGuardNT sous Windows afin
+  que `cargo run` puisse démarrer immédiatement.
 - **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
   Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
   quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
@@ -237,7 +235,8 @@ handshake tout en testant le même cycle de vie. Le backend réel est fourni par
 `defguard_wireguard_rs` derrière la feature `wireguard` :
 
 ```sh
-# Requis sur Windows : télécharge WireGuardNT et vérifie son empreinte épinglée.
+# Sous Windows, `cargo build` télécharge et vérifie automatiquement WireGuardNT.
+# La commande explicite reste utile pour préparer les ressources sans compiler.
 cargo xtask orion-deps
 
 # Compilation Rust du shell avec le backend réel
