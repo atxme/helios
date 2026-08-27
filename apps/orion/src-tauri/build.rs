@@ -24,14 +24,15 @@ fn main() {
     let orion = frontend_root();
     watch_frontend(&orion);
     watch_icons();
-    ensure_npm_dependencies(&orion);
+    let npm = ensure_npm_available();
+    ensure_npm_dependencies(&orion, &npm);
     ensure_windows_dependencies();
 
     // Debug charge `devUrl` : Vite sert les sources, et
     // `ensure_frontend_dev_server` le démarre au besoin. Rien à construire, et
     // le construire coûterait une minute à chaque `cargo run`.
     if std::env::var("PROFILE").as_deref() == Ok("release") {
-        ensure_frontend_built(&orion);
+        ensure_frontend_built(&orion, &npm);
     }
 
     let windows = tauri_build::WindowsAttributes::new()
@@ -119,13 +120,12 @@ fn watch_tree(directory: &Path) {
 /// produit un exécutable qui se lance, s'affiche, et ment. C'est exactement la
 /// panne qui fait chercher un défaut dans le code Rust pendant une demi-heure
 /// avant de comprendre que l'écran affiché date d'avant la correction.
-fn ensure_frontend_built(orion: &Path) {
+fn ensure_frontend_built(orion: &Path, npm: &Path) {
     if !stale(&orion.join("dist"), orion) {
         return;
     }
     println!("cargo:warning=frontend Orion périmé — `npm run build` en cours");
 
-    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     match std::process::Command::new(npm)
         .args(["run", "build"])
         .current_dir(orion)
@@ -137,7 +137,7 @@ fn ensure_frontend_built(orion: &Path) {
              corriger le frontend plutôt que livrer un écran périmé."
         ),
         Err(error) => panic!(
-            "impossible de lancer `{npm} run build` ({error}). Node.js est requis pour une \
+            "impossible de lancer `npm run build` ({error}). Node.js est requis pour une \
              compilation release d'Orion ; en debug, l'interface est servie par Vite et cette \
              étape n'a pas lieu."
         ),
@@ -151,9 +151,8 @@ fn ensure_frontend_built(orion: &Path) {
 /// the installed direct dependency graph; the Vite entrypoint check catches a
 /// missing package directory. For a fresh, partial or damaged installation,
 /// `npm ci` restores the lockfile's exact dependency graph.
-fn ensure_npm_dependencies(orion: &Path) {
+fn ensure_npm_dependencies(orion: &Path, npm: &Path) {
     let vite = orion.join("node_modules/vite/bin/vite.js");
-    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     let dependencies_are_healthy = vite.is_file()
         && std::process::Command::new(npm)
             .args(["ls", "--depth=0", "--silent"])
@@ -174,17 +173,95 @@ fn ensure_npm_dependencies(orion: &Path) {
     {
         Ok(status) if status.success() && vite.is_file() => {}
         Ok(status) if !status.success() => panic!(
-            "`{npm} ci` failed ({status}); Orion's frontend dependencies could not be installed"
+            "`npm ci` failed ({status}); Orion's frontend dependencies could not be installed"
         ),
         Ok(_) => panic!(
-            "`{npm} ci` completed but Vite is still missing at {}; \
+            "`npm ci` completed but Vite is still missing at {}; \
              check package-lock.json and the Node.js installation",
             vite.display()
         ),
+        Err(error) => {
+            panic!("unable to run `npm ci` ({error}); Node.js and npm are required to build Orion")
+        }
+    }
+}
+
+/// Finds npm, installing Node.js LTS on Windows when the toolchain is absent.
+///
+/// Cargo invokes this build script before Orion can start its Vite development
+/// server. A fresh Windows workstation therefore cannot rely on `npm ci`: the
+/// command itself is unavailable until Node.js is installed. `winget` provides
+/// the signed official OpenJS package without requiring a repository checkout
+/// to carry a second installer.
+fn ensure_npm_available() -> std::path::PathBuf {
+    let default = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    if command_succeeds(default) {
+        return std::path::PathBuf::from(default);
+    }
+
+    if !cfg!(windows) {
+        panic!(
+            "Node.js and npm are required to build Orion; install them with the platform package manager"
+        );
+    }
+
+    println!("cargo:warning=Node.js/npm not found — installing OpenJS Node.js LTS with winget");
+    let status = std::process::Command::new("winget")
+        .args([
+            "install",
+            "--id",
+            "OpenJS.NodeJS.LTS",
+            "--exact",
+            "--silent",
+            "--accept-source-agreements",
+            "--accept-package-agreements",
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!(
+            "winget could not install OpenJS Node.js LTS ({status}); install Node.js manually and retry"
+        ),
         Err(error) => panic!(
-            "unable to run `{npm} ci` ({error}); Node.js and npm are required to build Orion"
+            "Node.js/npm are missing and winget could not be started ({error}); \
+             install Node.js LTS manually and retry"
         ),
     }
+
+    for candidate in windows_npm_candidates() {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if command_succeeds("npm.cmd") {
+        return std::path::PathBuf::from("npm.cmd");
+    }
+    panic!(
+        "Node.js was installed but npm.cmd is still unavailable; restart the terminal so PATH changes apply, then retry"
+    );
+}
+
+fn command_succeeds(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn windows_npm_candidates() -> Vec<std::path::PathBuf> {
+    [
+        "ProgramFiles",
+        "LOCALAPPDATA",
+        "ProgramW6432",
+        "ProgramFiles(x86)",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .map(std::path::PathBuf::from)
+    .map(|root| root.join("nodejs").join("npm.cmd"))
+    .collect()
 }
 
 /// `dist` est-il plus vieux que la source la plus récemment modifiée ?

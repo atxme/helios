@@ -63,8 +63,9 @@ les trois cas, et `build.rs` s’en charge.
 - **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
   Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
   quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,
-  qui se lance, s’affiche, et ment. Prérequis : Node.js et npm ; `build.rs`
-  vérifie et installe automatiquement les dépendances du lockfile.
+  qui se lance, s’affiche, et ment. Sous Windows, `build.rs` installe Node.js
+  LTS via `winget` s’il manque, puis vérifie et installe automatiquement les
+  dépendances du lockfile.
 ## Journal
 
 Orion écrit **à la fois** sur la sortie standard et dans un fichier :
