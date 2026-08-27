@@ -8,7 +8,7 @@ ne décide rien, il ordonne des gestes.
 
 ## Ce qui n'a besoin d'aucune commande
 
-Trois choses tournent sans qu'un opérateur intervienne, et c'est voulu :
+Quatre choses tournent sans qu'un opérateur intervienne, et c'est voulu :
 
 - **la feuille cliente d'un poste allumé.** À 80 % de sa vie, Orion propose
   « Renouveler maintenant » ; l'utilisateur clique, un opérateur approuve, le
@@ -17,6 +17,9 @@ Trois choses tournent sans qu'un opérateur intervienne, et c'est voulu :
   demande une fois à la gateway s'il lui manque quelque chose. Ce qui revient
   est signé, ordonné, et n'est appliqué qu'entier ;
 - **la purge** des étapes de staging qu'aucun client n'a committées.
+- **la promotion d'une identité gateway publiée.** Un redémarrage dans le
+  recouvrement charge la candidate ; à `not_after`, la maintenance synchronise
+  la génération active puis détruit définitivement l'ancienne clé scellée.
 
 Tout le reste ci-dessous est une action délibérée.
 
@@ -278,9 +281,13 @@ qu'une feuille est authentique, jamais que sa clé privée est sur cette machine
 Sans lui, tout paraîtrait correct jusqu'à `activation_at`, puis tous les
 tunnels tomberaient d'un coup, l'ancienne identité déjà retirée.
 
-**L'identité servie ne change pas.** Le basculement appartient à
-`activation_at` et demande le redémarrage de l'étape 7 du §11.1 ; jusque-là la
-feuille active continue de monter les tunnels.
+**L'installation ne change pas l'identité servie.** Le basculement appartient
+à `activation_at` et demande le redémarrage de l'étape 7 du §11.1. Avant cette
+date, `heliosd` charge encore l'active ; à partir de cette date, il charge la
+candidate seulement si Astra a déjà persisté `published`. À `not_after`, la
+maintenance promeut d'abord le registre, remplace ensuite atomiquement le
+coffre actif et détruit l'ancien slot. Une coupure entre ces écritures reprend
+la même transition au démarrage suivant.
 
 **Annuler avant publication** (§6.3) :
 
@@ -294,16 +301,73 @@ dans le document, donc antidater n'ouvre rien. L'identité candidate est
 détruite et **l'époque reste consommée** : un parc ne doit jamais avoir à
 choisir entre deux décisions portant le même numéro.
 
-**Limite connue** : rien ne signe encore la transition ni l'avortement. C'est
-l'étape 4 du §11.1, une cérémonie `CA-PQ` dont le compagnon n'a pas la
-sous-commande. La gateway sait produire la demande et appliquer la réponse ;
-c'est la signature entre les deux qui manque.
+### La cérémonie qui répond (§11.1 étapes 3 à 6)
 
-**Limite connue** : le marqueur `published` du §6.3 est une écriture d'Astra,
-et aucune route ne le relaie jusqu'ici. Cette gateway juge donc un avortement
-sur son seul état local, où `published` reste faux tant que rien ne l'écrit :
-c'est l'ordre des étapes du §11.1, pas ce contrôle, qui garantit aujourd'hui
-qu'aucun avortement ne suit une distribution.
+**Sur la gateway**, dans le conteneur Astra :
+
+```sh
+astra gateway-identity open --reason "rotation annuelle" --requested-by "prénom.nom"
+# → imprime l'identifiant, les deux empreintes en service, et les deux
+#   lignes de commande à coller
+```
+
+La campagne lit l'identité **en direct sur le canal privé**, auprès du démon
+qui la sert. Astra enregistre la génération de chaque client ; elle n'a jamais
+détenu les feuilles de la gateway, et le §11.1 étape 3 en exige les empreintes
+exactes. Une valeur retapée produirait une campagne que le compagnon signe et
+que la gateway refuse — au moment précis où un renouvellement est en cours.
+
+La commande exporte aussi la feuille en service : le compagnon ne peut pas
+vérifier la signature de continuité du §5 sans la clé qui signe réellement.
+
+**Sur le poste de l'opérateur** :
+
+```sh
+astra-signer sign-gateway-transition --authority-url https://astra.exemple \
+  --operation-id <identifiant> --request demande.json \
+  --active-certificate gateway-active-certificate.json --out transition.json
+# --tls-certificate <der> si la feuille TLS change aussi
+# --prepare-days 7 --overlap-days 7 --validity-days 365
+```
+
+Le compagnon émet la feuille sous `CA-PQ` **et** signe la transition dans le
+même geste : la signature lie la feuille exacte, et une transition signée
+autour d'une feuille émise à part lierait celle qui traînait sur le disque.
+
+Le fichier produit se rapporte sur la gateway (`heliosd
+install-gateway-transition`), et la décision est aussi déposée chez Astra.
+
+**Puis, une fois l'installation faite** :
+
+```sh
+astra gateway-identity publish --epoch <n>
+```
+
+C'est l'étape 6, et le dernier instant où un avortement est encore légitime
+est **avant** cette commande. Après, un client peut détenir la décision,
+repartir hors ligne et promouvoir seul à `not_after` : annuler sur la seule
+gateway laisserait deux vérités dans le parc. La marque est persistée avant
+d'être relayée, et la commande est rejouable — une seconde exécution termine
+un relais que la première n'a pas pu confirmer.
+
+Pour annuler, tant que rien n'est publié : rouvrir une campagne
+(`astra gateway-identity open`), puis
+
+```sh
+astra-signer abort-gateway-transition --authority-url https://astra.exemple \
+  --operation-id <identifiant> --transition transition.json --out avortement.json
+```
+
+**Limite connue** : un client qui n'a jamais reçu la transition reste à
+l'époque précédente et refusera correctement le saut vers la suivante (§6.3),
+sans pouvoir récupérer ce tombstone par la distribution. Lui servir un
+avortement qu'il ne peut pas appliquer ferait échouer toute la transaction
+plutôt qu'une partie.
+
+**Limite connue** : `--tls-certificate` voyage à part. La demande du §5 ne
+porte pas de champ TLS, donc la feuille candidate se copie depuis la gateway.
+Une feuille substituée est refusée à l'installation — la gateway seule sait
+laquelle elle a scellée.
 
 ## 9. Ce qui n'a pas encore de commande
 
@@ -315,12 +379,9 @@ fait.
   gateway reste refusée faute de feuilles gateway dans le registre Astra.
 - **`CA-TLS` cliente** (§9.4) : aucun geste ne la fait tourner, et le registre
   la refuserait — il épingle l'époque de cette ancre sans épingler l'ancre.
-- **Signer l'identité gateway** (§6) : la gateway prépare sa demande et sait
-  appliquer la transition comme l'avortement (section 8), mais aucun compagnon
-  ne les signe. Sans producteur de `GatewayIdentityTransition`, ni
-  renouvellement gateway, ni rollback pendant le recouvrement.
-- **Le retour à l'identité précédente** : rien ne la conserve, le magasin
-  protégé ne garde qu'un lot par nom.
+- **Le retour à l'identité précédente** : l'ancien slot reste scellé pendant
+  le recouvrement, mais aucune commande ne demande encore à `heliosd` de le
+  resservir temporairement.
 - **L'adoption d'une ancre distribuée** par Astra et par la gateway.
 
 ## Vérifier où en est le domaine

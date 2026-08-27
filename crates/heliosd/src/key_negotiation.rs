@@ -19,7 +19,7 @@ use aether::{
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use helio_tpm::{BootDecision, SealedKeystore};
+use helio_tpm::{BootDecision, SealedKeystore, SecretKey};
 use helios_api::key_negotiation::PskReleaseRefusal;
 use helios_key_negotiation::{
     prepare_key_material, server_endpoint, GatewayIdentity, NegotiationHandler,
@@ -64,6 +64,21 @@ const NEXT_PRIVATE_KEYSTORE_PATH: &str = "/var/lib/helios/key-negotiation-key-ne
 /// Self-signed TLS leaf of the candidate, present only when the renewal
 /// replaces the TLS half too (spec §6.1: each leaf is optional).
 const NEXT_CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-cert-next.der";
+
+/// The candidate's sealed private material. `HELIOS_KEY_NEGO_NEXT_KEY`
+/// isolates a test run exactly as `HELIOS_GATEWAY_TRANSITION` does for the
+/// transition document.
+fn next_private_keystore_path() -> std::path::PathBuf {
+    std::env::var_os("HELIOS_KEY_NEGO_NEXT_KEY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(NEXT_PRIVATE_KEYSTORE_PATH))
+}
+
+fn next_certificate_path() -> std::path::PathBuf {
+    std::env::var_os("HELIOS_KEY_NEGO_NEXT_CERT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(NEXT_CERTIFICATE_PATH))
+}
 const MAX_REPLAY_IDENTIFIERS: usize = 4096;
 
 pub struct InitializedIdentity {
@@ -1424,38 +1439,34 @@ pub async fn start(
     };
     let gateway_public_key = aether::wg::public_from_private(&gateway_private_key)
         .context("gateway WireGuard identity is unavailable for key negotiation")?;
-    let identity = load_identity(boot, dry_run, &gateway_public_key)?;
+    let gateway_certificates = match &registry {
+        Some(registry) => Some(registry.lock().await.state().gateway.clone()),
+        None => None,
+    };
+    let now_unix = unix_time_now()?;
+    let identity = load_served_identity(
+        boot,
+        dry_run,
+        &gateway_public_key,
+        gateway_certificates.as_ref(),
+        now_unix,
+    )?;
     let client_ca =
         std::fs::read(CLIENT_CA_PATH).context("reading key-negotiation client CA certificate")?;
     // The identity is read **once**, here, and served for the lifetime of the
     // process — unlike `network.toml`, which is watched and re-read.
     //
-    // # Limite connue
-    //
-    // `heliosd init-key-negotiation --rotate` on a running daemon therefore
-    // changes the files without changing what is served: the daemon keeps
-    // presenting the previous certificate while every profile issued after the
-    // rotation pins the new one. Clients then fail the QUIC handshake with
-    // `invalid peer certificate: BadSignature`, which names a signature and
-    // not the mismatch behind it. Restarting the daemon is what applies a
-    // rotation. Reloading it under a live data plane would mean rebuilding the
-    // QUIC endpoint while sessions hold PSK slots on it, and the closure of
-    // those sessions is what releases the slots — so the rebuild would drop
-    // every tunnel it was meant to spare.
-    //
-    // Until then this line is the diagnosis: the fingerprint served, next to
-    // the age of the file it was read from. A certificate written after the
-    // daemon started is the whole answer.
+    // Reloading an identity under a live data plane would rebuild the QUIC
+    // endpoint while negotiations own PSK slots on it. The scheduled switch
+    // therefore remains a restart: this selection is stable for the process,
+    // and a restart inside the overlap selects the published candidate.
     tracing::info!(
         certificate_sha256 = %helios_key_negotiation::certificate_fingerprint_der(
-            &std::fs::read(CERTIFICATE_PATH).unwrap_or_default()
+            identity.tls.certificate_chain.first().map_or(&[], Vec::as_slice)
         ),
-        certificate_written = ?std::fs::metadata(CERTIFICATE_PATH)
-            .and_then(|meta| meta.modified())
-            .ok(),
         client_ca_sha256 = %helios_key_negotiation::certificate_fingerprint_der(&client_ca),
-        "key-negotiation identity read from disk — served until this daemon restarts; \
-         a rotation performed later takes effect only on restart"
+        gateway_identity_slot = ?served_identity_slot(gateway_certificates.as_ref(), now_unix)?,
+        "key-negotiation identity selected at startup and served until this daemon restarts"
     );
     let endpoint = server_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
@@ -1602,7 +1613,7 @@ pub fn public_material() -> Result<Option<helios_api::KeyNegotiationMaterial>> {
     }))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct StoredPrivateIdentity {
     tls_private_key: String,
@@ -1613,6 +1624,67 @@ struct LoadedIdentity {
     tls: TlsIdentity,
     pq_certificate: PqCertificate,
     pq_private_key: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServedIdentitySlot {
+    Active,
+    Candidate { epoch: u64 },
+}
+
+/// Selects the private slot a fresh daemon may serve.
+///
+/// A staged leaf is never selected merely because the wall clock moved: Astra
+/// must first have persisted `published`. At `not_after` the overlap is over,
+/// so startup refuses an unpromoted state rather than reviving either side of
+/// a decision whose finalization should already be durable.
+fn served_identity_slot(
+    gateway: Option<&aether::certificates::state::GatewayCertificateState>,
+    now_unix: u64,
+) -> Result<ServedIdentitySlot> {
+    let Some(gateway) = gateway else {
+        return Ok(ServedIdentitySlot::Active);
+    };
+    select_served_identity_slot(
+        gateway.revoked,
+        gateway.next_gateway_identity_epoch,
+        gateway.activation_at,
+        gateway.retire_active_at,
+        gateway.published,
+        now_unix,
+    )
+}
+
+fn select_served_identity_slot(
+    revoked: bool,
+    next_epoch: Option<u64>,
+    activation_at: Option<u64>,
+    retire_active_at: Option<u64>,
+    published: bool,
+    now_unix: u64,
+) -> Result<ServedIdentitySlot> {
+    anyhow::ensure!(
+        !revoked,
+        "the gateway certificate identity is revoked; the negotiation listener stays closed"
+    );
+    let Some(epoch) = next_epoch else {
+        return Ok(ServedIdentitySlot::Active);
+    };
+    let activation_at = activation_at.context("a staged gateway identity has no activation_at")?;
+    let retire_active_at =
+        retire_active_at.context("a staged gateway identity has no retire_active_at")?;
+    anyhow::ensure!(
+        now_unix < retire_active_at,
+        "gateway identity epoch {epoch} reached not_after without being promoted"
+    );
+    if now_unix < activation_at {
+        return Ok(ServedIdentitySlot::Active);
+    }
+    anyhow::ensure!(
+        published,
+        "gateway identity epoch {epoch} reached activation_at before publication"
+    );
+    Ok(ServedIdentitySlot::Candidate { epoch })
 }
 
 /// The gateway signs staging receipts with the leaf it already serves.
@@ -1647,21 +1719,84 @@ fn negotiation_identity_context(gateway_wg_public_key: &str) -> helio_tpm::Conte
     helio_tpm::Context::new().field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
 }
 
-fn load_identity(
+fn load_served_identity(
     boot: &BootDecision,
     dry_run: bool,
     gateway_wg_public_key: &str,
+    gateway: Option<&aether::certificates::state::GatewayCertificateState>,
+    now_unix: u64,
 ) -> Result<LoadedIdentity> {
-    let certificate =
-        std::fs::read(CERTIFICATE_PATH).context("reading key-negotiation certificate")?;
-    let private_identity = match boot.secret() {
-        Some(secret) => SealedKeystore::new(
-            PRIVATE_KEYSTORE_PATH,
-            helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
-        )
-        .load(secret, &negotiation_identity_context(gateway_wg_public_key))
-        .context("unsealing key-negotiation private key")?
-        .to_vec(),
+    match served_identity_slot(gateway, now_unix)? {
+        ServedIdentitySlot::Active => {
+            load_active_identity(boot, dry_run, gateway_wg_public_key, gateway)
+        }
+        ServedIdentitySlot::Candidate { epoch } => {
+            let gateway = gateway.context("candidate selection requires a certificate registry")?;
+            let active = load_active_private_identity(boot, dry_run, gateway_wg_public_key)?;
+            let candidate = load_candidate_private_identity(
+                boot.secret().context(
+                    "TPM secret unavailable: the scheduled gateway identity stays sealed",
+                )?,
+                gateway_wg_public_key,
+                epoch,
+            )?;
+            let stored = compose_private_identity(
+                active,
+                candidate,
+                gateway.next_gateway_tls_certificate.is_some(),
+                gateway.next_gateway_certificate.is_some(),
+            )?;
+            let tls_certificate = gateway
+                .next_gateway_tls_certificate
+                .as_ref()
+                .unwrap_or(&gateway.active_gateway_tls_certificate)
+                .as_bytes()
+                .to_vec();
+            let pq_certificate = gateway
+                .next_gateway_certificate
+                .as_ref()
+                .unwrap_or(&gateway.active_gateway_certificate)
+                .clone();
+            decode_loaded_identity(stored, tls_certificate, pq_certificate, false)
+        }
+    }
+}
+
+fn load_active_identity(
+    boot: &BootDecision,
+    dry_run: bool,
+    gateway_wg_public_key: &str,
+    gateway: Option<&aether::certificates::state::GatewayCertificateState>,
+) -> Result<LoadedIdentity> {
+    let stored = load_active_private_identity(boot, dry_run, gateway_wg_public_key)?;
+    let (tls_certificate, pq_certificate, verify_self_signed) = match gateway {
+        Some(gateway) => (
+            gateway.active_gateway_tls_certificate.as_bytes().to_vec(),
+            gateway.active_gateway_certificate.clone(),
+            false,
+        ),
+        None => (
+            std::fs::read(CERTIFICATE_PATH).context("reading key-negotiation certificate")?,
+            serde_json::from_slice(
+                &std::fs::read(PQ_CERTIFICATE_PATH)
+                    .context("reading key-negotiation PQ certificate")?,
+            )
+            .context("decoding the key-negotiation PQ certificate")?,
+            true,
+        ),
+    };
+    decode_loaded_identity(stored, tls_certificate, pq_certificate, verify_self_signed)
+}
+
+fn load_active_private_identity(
+    boot: &BootDecision,
+    dry_run: bool,
+    gateway_wg_public_key: &str,
+) -> Result<StoredPrivateIdentity> {
+    let encoded = match boot.secret() {
+        Some(secret) => {
+            return load_active_private_identity_with_secret(secret, gateway_wg_public_key)
+        }
         None if dry_run => {
             let path = std::env::var("HELIOS_KEY_NEGO_DEV_KEY_DER")
                 .context("HELIOS_KEY_NEGO_DEV_KEY_DER is required in dev mode")?;
@@ -1670,31 +1805,90 @@ fn load_identity(
         }
         None => anyhow::bail!("TPM secret unavailable: key-negotiation identity stays sealed"),
     };
-    let private_identity: StoredPrivateIdentity = serde_json::from_slice(&private_identity)
-        .context("decoding the sealed key-negotiation identity")?;
+    serde_json::from_slice(&encoded).context("decoding the sealed key-negotiation identity")
+}
+
+fn load_active_private_identity_with_secret(
+    secret: &SecretKey,
+    gateway_wg_public_key: &str,
+) -> Result<StoredPrivateIdentity> {
+    let encoded = SealedKeystore::new(
+        PRIVATE_KEYSTORE_PATH,
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    )
+    .load(secret, &negotiation_identity_context(gateway_wg_public_key))
+    .context("unsealing key-negotiation private key")?;
+    serde_json::from_slice(&encoded).context("decoding the sealed key-negotiation identity")
+}
+
+fn load_candidate_private_identity(
+    secret: &SecretKey,
+    gateway_wg_public_key: &str,
+    gateway_identity_epoch: u64,
+) -> Result<StoredCandidateIdentity> {
+    let encoded = SealedKeystore::new(
+        next_private_keystore_path(),
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    )
+    .load(
+        secret,
+        &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
+    )
+    .context("unsealing the candidate gateway identity")?;
+    serde_json::from_slice(&encoded).context("decoding the candidate gateway identity")
+}
+
+fn compose_private_identity(
+    active: StoredPrivateIdentity,
+    candidate: StoredCandidateIdentity,
+    rotate_tls: bool,
+    rotate_pq: bool,
+) -> Result<StoredPrivateIdentity> {
+    let tls_private_key = if rotate_tls {
+        candidate.tls_private_key.as_ref().cloned().context(
+            "the transition rotates TLS, but the sealed candidate has no TLS private key",
+        )?
+    } else {
+        active.tls_private_key.clone()
+    };
+    let pq_private_key = if rotate_pq {
+        candidate.pq_private_key.clone()
+    } else {
+        active.pq_private_key.clone()
+    };
+    Ok(StoredPrivateIdentity {
+        tls_private_key,
+        pq_private_key,
+    })
+}
+
+fn decode_loaded_identity(
+    private_identity: StoredPrivateIdentity,
+    tls_certificate: Vec<u8>,
+    pq_certificate: PqCertificate,
+    verify_self_signed: bool,
+) -> Result<LoadedIdentity> {
     let tls_private_key = base64::engine::general_purpose::STANDARD
-        .decode(private_identity.tls_private_key)
+        .decode(&private_identity.tls_private_key)
         .context("decoding the sealed TLS private key")?;
     let pq_private_key = Zeroizing::new(
         base64::engine::general_purpose::STANDARD
-            .decode(private_identity.pq_private_key)
+            .decode(&private_identity.pq_private_key)
             .context("decoding the sealed PQ private key")?,
     );
-    let pq_certificate: PqCertificate = serde_json::from_slice(
-        &std::fs::read(PQ_CERTIFICATE_PATH).context("reading key-negotiation PQ certificate")?,
-    )
-    .context("decoding the key-negotiation PQ certificate")?;
-    pq_certificate
-        .verify_self_signed(
-            PqCertificateRole::Gateway,
-            None,
-            &pq_certificate.wireguard_public_key,
-            unix_time_now()?,
-        )
-        .context("verifying the gateway PQ certificate")?;
+    if verify_self_signed {
+        pq_certificate
+            .verify_self_signed(
+                PqCertificateRole::Gateway,
+                None,
+                &pq_certificate.wireguard_public_key,
+                unix_time_now()?,
+            )
+            .context("verifying the gateway PQ certificate")?;
+    }
     Ok(LoadedIdentity {
         tls: TlsIdentity {
-            certificate_chain: vec![certificate],
+            certificate_chain: vec![tls_certificate],
             private_key: tls_private_key,
         },
         pq_certificate,
@@ -1910,7 +2104,7 @@ fn candidate_identity_context(
         )
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 struct StoredCandidateIdentity {
     pq_private_key: String,
@@ -1975,7 +2169,7 @@ pub(crate) fn seal_candidate_identity(
         .context("encoding the candidate gateway identity")?,
     );
     SealedKeystore::new(
-        NEXT_PRIVATE_KEYSTORE_PATH,
+        next_private_keystore_path(),
         helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .store(
@@ -1991,13 +2185,13 @@ pub(crate) fn seal_candidate_identity(
     // a candidate that does not exist.
     let tls_certificate = match tls {
         Some((_, der)) => {
-            write_public_atomic(Path::new(NEXT_CERTIFICATE_PATH), der.as_bytes())
+            write_public_atomic(&next_certificate_path(), der.as_bytes())
                 .context("installing the candidate gateway TLS certificate")?;
             Some(der)
         }
         None => {
             // A previous attempt may have rotated TLS where this one does not.
-            remove_if_present(Path::new(NEXT_CERTIFICATE_PATH))?;
+            remove_if_present(&next_certificate_path())?;
             None
         }
     };
@@ -2026,7 +2220,7 @@ pub(crate) fn sign_certificate_request(
         .secret()
         .context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
     let sealed = SealedKeystore::new(
-        NEXT_PRIVATE_KEYSTORE_PATH,
+        next_private_keystore_path(),
         helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .load(
@@ -2044,13 +2238,15 @@ pub(crate) fn sign_certificate_request(
 
     let signed = match continuity {
         RequestContinuity::FromActiveLeaf => {
-            let active = load_identity(boot, dry_run, gateway_wg_public_key)
+            let active = load_active_private_identity(boot, dry_run, gateway_wg_public_key)
                 .context("opening the gateway identity in service")?;
+            let active_pq = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&active.pq_private_key)
+                    .context("decoding the active gateway PQ private key")?,
+            );
             request
-                .sign(
-                    candidate_pq.as_slice(),
-                    Some(active.pq_private_key.as_slice()),
-                )
+                .sign(candidate_pq.as_slice(), Some(active_pq.as_slice()))
                 .context("signing the gateway certificate request")?
         }
         RequestContinuity::KeyRecovery => request
@@ -2068,15 +2264,124 @@ pub(crate) fn candidate_tls_certificate(
 ) -> Result<Option<aether::certificates::encoding::DerCertificate>> {
     use aether::certificates::encoding::DerCertificate;
 
-    match std::fs::read(NEXT_CERTIFICATE_PATH) {
-        Ok(der) => {
-            Ok(Some(DerCertificate::new(der).with_context(|| {
-                format!("reading {NEXT_CERTIFICATE_PATH}")
-            })?))
-        }
+    match std::fs::read(next_certificate_path()) {
+        Ok(der) => Ok(Some(DerCertificate::new(der).with_context(|| {
+            format!("reading {}", next_certificate_path().display())
+        })?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("reading {NEXT_CERTIFICATE_PATH}")),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading {}", next_certificate_path().display()))
+        }
     }
+}
+
+/// Opens both sealed slots and proves they can form the transition's result.
+///
+/// Called before the registry promotion is persisted. A missing or malformed
+/// candidate therefore leaves the old generation authoritative instead of
+/// committing state that this machine cannot turn into a usable identity.
+pub(crate) fn assert_candidate_identity_promotable(
+    secret: &SecretKey,
+    gateway_wg_public_key: &str,
+    transition: &aether::certificates::gateway::GatewayIdentityTransition,
+) -> Result<()> {
+    let active = load_active_private_identity_with_secret(secret, gateway_wg_public_key)?;
+    let candidate = load_candidate_private_identity(
+        secret,
+        gateway_wg_public_key,
+        transition.gateway_identity_epoch,
+    )?;
+    compose_private_identity(
+        active,
+        candidate,
+        transition.next_gateway_tls_certificate.is_some(),
+        transition.next_gateway_certificate.is_some(),
+    )?;
+    Ok(())
+}
+
+/// Makes a durably promoted registry generation the active sealed slot.
+///
+/// The caller persists the registry first. Replacing the active vault is then
+/// atomic, so a power cut leaves either the outgoing vault or the composed new
+/// one intact; the candidate vault and transition document remain available
+/// for a retry until every active public file has followed successfully.
+pub(crate) fn promote_candidate_identity(
+    secret: &SecretKey,
+    gateway: &aether::certificates::state::GatewayCertificateState,
+    transition: &aether::certificates::gateway::GatewayIdentityTransition,
+) -> Result<()> {
+    use aether::certificates::gateway::pq_certificate_fingerprint;
+
+    anyhow::ensure!(
+        gateway.active_gateway_identity_epoch == transition.gateway_identity_epoch,
+        "the promoted registry is at gateway epoch {}, but the retained transition is for epoch {}",
+        gateway.active_gateway_identity_epoch,
+        transition.gateway_identity_epoch
+    );
+    anyhow::ensure!(
+        gateway.gateway_wg_public_key == transition.gateway_wg_public_key,
+        "the retained transition belongs to another gateway identity"
+    );
+
+    let expected_tls = transition.next_gateway_tls_certificate.as_ref().map_or(
+        transition.active_gateway_tls_certificate_fingerprint,
+        |certificate| certificate.fingerprint(),
+    );
+    anyhow::ensure!(
+        gateway.active_tls_fingerprint().matches(&expected_tls),
+        "the promoted TLS leaf does not match the retained transition"
+    );
+    let expected_pq = match &transition.next_gateway_certificate {
+        Some(certificate) => pq_certificate_fingerprint(certificate)
+            .context("fingerprinting the retained candidate PQ leaf")?,
+        None => transition.active_gateway_certificate_fingerprint,
+    };
+    anyhow::ensure!(
+        gateway.active_pq_fingerprint()?.matches(&expected_pq),
+        "the promoted PQ leaf does not match the retained transition"
+    );
+
+    let gateway_wg_public_key = gateway.gateway_wg_public_key.to_base64();
+    let active = load_active_private_identity_with_secret(secret, &gateway_wg_public_key)?;
+    let candidate = load_candidate_private_identity(
+        secret,
+        &gateway_wg_public_key,
+        transition.gateway_identity_epoch,
+    )?;
+    let promoted = compose_private_identity(
+        active,
+        candidate,
+        transition.next_gateway_tls_certificate.is_some(),
+        transition.next_gateway_certificate.is_some(),
+    )?;
+    let encoded = Zeroizing::new(
+        serde_json::to_vec(&promoted).context("encoding the promoted gateway identity")?,
+    );
+
+    // The registry is already promoted. Only now may this atomic replacement
+    // destroy the outgoing private slot (§11.1 step 9).
+    SealedKeystore::new(
+        PRIVATE_KEYSTORE_PATH,
+        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    )
+    .store(
+        secret,
+        &negotiation_identity_context(&gateway_wg_public_key),
+        encoded.as_slice(),
+    )
+    .context("installing the promoted gateway private identity")?;
+    write_public_atomic(
+        Path::new(CERTIFICATE_PATH),
+        gateway.active_gateway_tls_certificate.as_bytes(),
+    )
+    .context("installing the promoted gateway TLS certificate")?;
+    write_public_atomic(
+        Path::new(PQ_CERTIFICATE_PATH),
+        &serde_json::to_vec_pretty(&gateway.active_gateway_certificate)
+            .context("encoding the promoted gateway PQ certificate")?,
+    )
+    .context("installing the promoted gateway PQ certificate")
 }
 
 /// Destroys the candidate identity, private half first (spec §6.3, `aborted`).
@@ -2087,8 +2392,8 @@ pub(crate) fn candidate_tls_certificate(
 /// registry has persisted the abort — a candidate destroyed ahead of that
 /// write would be destroyed for a cancellation that was refused.
 pub(crate) fn discard_candidate_identity() -> Result<()> {
-    remove_if_present(Path::new(NEXT_PRIVATE_KEYSTORE_PATH))?;
-    remove_if_present(Path::new(NEXT_CERTIFICATE_PATH))
+    remove_if_present(&next_private_keystore_path())?;
+    remove_if_present(&next_certificate_path())
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -2134,6 +2439,55 @@ mod tests {
     const GATEWAY_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const CERTIFICATE_FINGERPRINT: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn a_restart_selects_only_a_published_candidate_inside_the_overlap() {
+        assert_eq!(
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 199)
+                .expect("before activation"),
+            ServedIdentitySlot::Active
+        );
+        assert_eq!(
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 200)
+                .expect("published overlap"),
+            ServedIdentitySlot::Candidate { epoch: 2 }
+        );
+        assert!(
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), false, 200,).is_err()
+        );
+        assert!(
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 300,).is_err()
+        );
+    }
+
+    #[test]
+    fn promotion_composes_only_the_halves_named_by_the_transition() {
+        let active = StoredPrivateIdentity {
+            tls_private_key: "active-tls".into(),
+            pq_private_key: "active-pq".into(),
+        };
+        let candidate = StoredCandidateIdentity {
+            tls_private_key: Some("candidate-tls".into()),
+            pq_private_key: "candidate-pq".into(),
+        };
+        let promoted =
+            compose_private_identity(active, candidate, true, false).expect("TLS-only rotation");
+        assert_eq!(promoted.tls_private_key, "candidate-tls");
+        assert_eq!(promoted.pq_private_key, "active-pq");
+
+        let active = StoredPrivateIdentity {
+            tls_private_key: "active-tls".into(),
+            pq_private_key: "active-pq".into(),
+        };
+        let candidate = StoredCandidateIdentity {
+            tls_private_key: None,
+            pq_private_key: "candidate-pq".into(),
+        };
+        let promoted =
+            compose_private_identity(active, candidate, false, true).expect("PQ-only rotation");
+        assert_eq!(promoted.tls_private_key, "active-tls");
+        assert_eq!(promoted.pq_private_key, "candidate-pq");
+    }
 
     struct PqFixture {
         client_ca_public_key: Vec<u8>,

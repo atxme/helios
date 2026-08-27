@@ -1521,6 +1521,18 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
             None
         }
     };
+    if let Some(registry) = &registry {
+        let mut registry = registry.lock().await;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock predates the Unix epoch")?
+            .as_secs();
+        if gateway_rotation::maintain_gateway_identity(&mut registry, boot.secret(), now_unix)
+            .context("reconciling the scheduled gateway identity before startup")?
+        {
+            info!("gateway identity promoted and sealed slots synchronized");
+        }
+    }
     if let Some(handler) = key_negotiation::start(
         Arc::clone(&shared_network),
         psk_tx.clone(),
@@ -1540,11 +1552,13 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
         // serves the four renewal routes and the trust-update producer, and a
         // second one would open a second connection to say the same thing.
         let authority = astra_channel::relay().map(Arc::new);
+        let gateway_identity_secret = boot.secret().cloned();
         match registry.map(|registry| {
             let service = certificates::CertificateService::new(
                 registry,
                 Arc::clone(&handler) as Arc<dyn certificates::StageReceiptSigner>,
-            );
+            )
+            .with_gateway_identity_secret(gateway_identity_secret);
             Arc::new(match &authority {
                 Some(relay) => service.with_authority(
                     Arc::clone(relay) as Arc<dyn helios_api::internal::TrustUpdatePreparer>

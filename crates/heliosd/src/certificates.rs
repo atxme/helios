@@ -110,6 +110,9 @@ pub type SharedRegistry = Arc<Mutex<CertificateRegistry>>;
 pub struct CertificateService {
     registry: SharedRegistry,
     signer: Arc<dyn StageReceiptSigner>,
+    /// TPM-derived unlock material retained only so step 9 can atomically
+    /// replace the sealed active gateway identity at `not_after`.
+    gateway_identity_secret: Option<helio_tpm::SecretKey>,
     /// The authority's transaction producer, when this gateway has one.
     ///
     /// `None` on a gateway deployed without Astra, and that is a supported
@@ -124,8 +127,14 @@ impl CertificateService {
         Self {
             registry,
             signer,
+            gateway_identity_secret: None,
             authority: None,
         }
+    }
+
+    pub fn with_gateway_identity_secret(mut self, secret: Option<helio_tpm::SecretKey>) -> Self {
+        self.gateway_identity_secret = secret;
+        self
     }
 
     /// The same service, able to ask the authority to build a transaction.
@@ -310,7 +319,7 @@ impl CertificateService {
     ///
     /// Run on the same lock as everything else, so a purge never races the
     /// commit it competes with.
-    pub async fn maintain(&self, now_unix: u64) -> Result<(), RegistryError> {
+    pub async fn maintain(&self, now_unix: u64) -> Result<()> {
         let mut registry = self.registry.lock().await;
         let purged = registry.purge_expired(now_unix)?;
         for peer in &purged {
@@ -319,6 +328,17 @@ impl CertificateService {
         let promoted = registry.promote_due(now_unix)?;
         for peer in &promoted {
             tracing::info!(peer = %peer, "certificate generation promoted at the end of its overlap");
+        }
+        if crate::gateway_rotation::maintain_gateway_identity(
+            &mut registry,
+            self.gateway_identity_secret.as_ref(),
+            now_unix,
+        )
+        .context("maintaining the gateway certificate identity")?
+        {
+            tracing::info!(
+                "gateway certificate identity promoted; the outgoing sealed key was destroyed"
+            );
         }
         Ok(())
     }

@@ -1218,6 +1218,13 @@ l'objet de transition avant de les annoncer. Elle continue de servir
 l'ancienne identité jusqu'à `activation_at`. Le passage à la clé suivante
 nécessite toujours un redémarrage de `heliosd`, puisque l'identité est chargée
 une fois ; Astra planifie ce redémarrage sans en changer l'ordre de sûreté.
+Au démarrage, `heliosd` ne sélectionne le slot suivant qu'après
+`activation_at` et si `published` est durable. À `not_after`, sa maintenance
+persiste d'abord `promoted`, compose le nouveau slot actif avec les seules
+moitiés nommées par la transition, puis remplace atomiquement le coffre actif
+et supprime l'ancien. Le slot candidat et un marqueur de promotion restent
+jusqu'à la fin de cette séquence afin qu'une coupure puisse la rejouer sans
+réactiver l'ancienne génération.
 
 ## 7. Rotation de l'identité cliente
 

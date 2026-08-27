@@ -1085,6 +1085,39 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
+    /// Promotes the gateway identity once its published overlap has ended.
+    ///
+    /// The registry is persisted before this method reports success. The
+    /// caller may therefore replace the sealed active slot only after `true`:
+    /// a crash can leave the old key beside a registry that already names the
+    /// new generation, but can never destroy the old key ahead of that durable
+    /// decision. Retrying the private-slot synchronization then completes the
+    /// operation without moving the epoch a second time.
+    pub fn promote_gateway_if_due(&mut self, now_unix: u64) -> Result<bool, RegistryError> {
+        let gateway = &self.state.gateway;
+        let due = gateway
+            .retire_active_at
+            .is_some_and(|retire_at| now_unix >= retire_at)
+            && gateway.next_gateway_identity_epoch.is_some();
+        if !due {
+            return Ok(false);
+        }
+        if !gateway.published {
+            return Err(RegistryError::Certificate(
+                CertificateError::IllegalStateTransition(
+                    "an unpublished gateway transition cannot be promoted",
+                ),
+            ));
+        }
+
+        let mut state = self.state.clone();
+        let promoted = state.gateway.promote_if_due(now_unix)?;
+        if promoted {
+            self.persist(state)?;
+        }
+        Ok(promoted)
+    }
+
     /// Records that the authority has let a staged transition leave (§6.3).
     ///
     /// Irreversible, and that is the point: past this marker a client may hold
@@ -2730,6 +2763,94 @@ mod tests {
 
         assert_eq!(outcome, InstallOutcome::AlreadyPresent);
         assert_eq!(fixture.registry.state().gateway.gateway_decision_epoch, 2);
+    }
+
+    #[test]
+    fn a_published_gateway_transition_is_promoted_durably_at_not_after() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        fixture
+            .registry
+            .state
+            .gateway
+            .mark_published()
+            .expect("publish");
+
+        assert!(!fixture
+            .registry
+            .promote_gateway_if_due(2_999)
+            .expect("not due"));
+        assert!(fixture
+            .registry
+            .promote_gateway_if_due(3_000)
+            .expect("promote"));
+        assert_eq!(
+            fixture
+                .registry
+                .state()
+                .gateway
+                .active_gateway_identity_epoch,
+            2
+        );
+        assert!(fixture
+            .registry
+            .state()
+            .gateway
+            .next_gateway_certificate
+            .is_none());
+
+        let reloaded = CertificateRegistry::load(
+            fixture
+                ._directory
+                .path()
+                .join("certificates.json")
+                .as_path(),
+        )
+        .expect("reload")
+        .expect("registry");
+        assert_eq!(reloaded.state().gateway.active_gateway_identity_epoch, 2);
+        assert!(!fixture
+            .registry
+            .promote_gateway_if_due(u64::MAX)
+            .expect("idempotent"));
+    }
+
+    #[test]
+    fn an_unpublished_gateway_transition_never_reaches_the_active_slot() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+
+        let refusal = fixture
+            .registry
+            .promote_gateway_if_due(3_000)
+            .expect_err("unpublished transition");
+
+        assert!(matches!(
+            refusal,
+            RegistryError::Certificate(CertificateError::IllegalStateTransition(_))
+        ));
+        assert_eq!(
+            fixture
+                .registry
+                .state()
+                .gateway
+                .active_gateway_identity_epoch,
+            1
+        );
+        assert_eq!(
+            fixture.registry.state().gateway.next_gateway_identity_epoch,
+            Some(2)
+        );
     }
 
     #[test]
