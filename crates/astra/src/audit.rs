@@ -78,6 +78,10 @@ pub enum AuditEvent {
     ServiceKeyRotated {
         epoch: u64,
     },
+    /// The client `CA-TLS` in service was recorded, once (spec §9.4).
+    ClientTlsCaPinned {
+        ca_tls_epoch: u64,
+    },
     /// A staged gateway transition may now leave (spec §6.3). Recorded
     /// because the moment is irreversible: after it, no abort is legitimate,
     /// and an audit that could not date it could not tell a late abort from

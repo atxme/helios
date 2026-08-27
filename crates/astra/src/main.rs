@@ -118,6 +118,26 @@ enum Command {
         authority_url: String,
         #[arg(long)]
         webauthn_rp_id: String,
+        /// SHA-256 of the client `CA-TLS` in service, hex — printed by
+        /// `astra-signer issue-ca-tls` and by `heliosd show-trust-enrolment`.
+        ///
+        /// Optional, and named rather than inferred: without it this authority
+        /// pins the epoch of that anchor without pinning the anchor, and a
+        /// `CA-TLS` transition can only be checked against a value the object
+        /// itself carries — which checks nothing. Absent, the rotation of §9.4
+        /// is refused by name until `astra pin-ca-tls` records it.
+        #[arg(long)]
+        ca_tls_fingerprint: Option<String>,
+    },
+    /// Records the client `CA-TLS` this domain serves, once (§9.4).
+    ///
+    /// For a domain bootstrapped before that anchor was pinned. It refuses to
+    /// overwrite one already recorded: replacing a pinned anchor is a
+    /// rotation, and a rotation is signed.
+    PinCaTls {
+        /// SHA-256 of the certificate in service, hex. Confirmed out of band.
+        #[arg(long)]
+        fingerprint: String,
     },
     /// Creates Astra's transport identity for the private veth channel (§8.3).
     ///
@@ -386,6 +406,7 @@ fn main() -> Result<()> {
             server_name,
             authority_url,
             webauthn_rp_id,
+            ca_tls_fingerprint,
         } => bootstrap(
             &cli.state_dir,
             &ca_public_key,
@@ -394,7 +415,9 @@ fn main() -> Result<()> {
             &server_name,
             &authority_url,
             &webauthn_rp_id,
+            ca_tls_fingerprint.as_deref(),
         ),
+        Command::PinCaTls { fingerprint } => pin_ca_tls(&cli.state_dir, &fingerprint),
         Command::InitChannel { rotate } => init_channel(&cli.state_dir, rotate),
         Command::Run {
             bind,
@@ -478,6 +501,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bootstrap(
     state_dir: &Path,
     ca_public_key: &str,
@@ -486,7 +510,12 @@ fn bootstrap(
     server_name: &str,
     authority_url: &str,
     webauthn_rp_id: &str,
+    ca_tls_fingerprint: Option<&str>,
 ) -> Result<()> {
+    let ca_tls_fingerprint = ca_tls_fingerprint
+        .map(parse_fingerprint)
+        .transpose()
+        .context("--ca-tls-fingerprint")?;
     let registry_path = state_dir.join(REGISTRY_FILE);
     anyhow::ensure!(
         !registry_path.exists(),
@@ -533,6 +562,7 @@ fn bootstrap(
         ca_epoch: 1,
         ca_public_key,
         ca_tls_epoch: 1,
+        ca_tls_fingerprint,
         astra_service_key_epoch: 1,
         astra_service_public_key: service_public_key.clone(),
         issuer: None,
@@ -577,6 +607,35 @@ fn bootstrap(
 /// One value per line, `clé=valeur`, because the consumer is `deploy.sh` over
 /// SSH: a script that has to parse JSON parses it with `sed`, and a `sed`
 /// pattern over a certificate is a defect waiting for a field to move.
+/// Records the client `CA-TLS` in service, once (spec §9.4).
+fn pin_ca_tls(state_dir: &Path, fingerprint: &str) -> Result<()> {
+    let fingerprint = parse_fingerprint(fingerprint).context("--fingerprint")?;
+    let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+
+    if let Some(held) = registry.state().ca_tls_fingerprint {
+        if held.matches(&fingerprint) {
+            eprintln!("cette ancre CA-TLS est déjà épinglée ; rien n'a changé");
+            return Ok(());
+        }
+        anyhow::bail!(
+            "another CA-TLS anchor is already pinned here. Replacing a pinned anchor is a \
+             rotation, and a rotation is signed: `astra campaign open --scope trust-authorities` \
+             then `astra-signer rotate-ca-tls`"
+        );
+    }
+    registry.pin_client_tls_ca(fingerprint, now_unix())?;
+    println!("{fingerprint}");
+    eprintln!("ancre CA-TLS épinglée : la rotation du §9.4 est désormais vérifiable ici");
+    Ok(())
+}
+
+/// Reads a SHA-256 an operator confirmed out of band.
+fn parse_fingerprint(value: &str) -> Result<aether::certificates::encoding::Fingerprint> {
+    aether::certificates::encoding::Fingerprint::parse_hex(value.trim())
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 fn init_channel(state_dir: &Path, rotate: bool) -> Result<()> {
     let identities = astra::gateway::initialize_pair(state_dir, rotate)
         .context("creating the Astra transport identities")?;
@@ -1561,14 +1620,30 @@ fn campaign_open(
         // not be reconciled by a rotation, they must stop.
         CampaignScope::TrustAuthorities => {
             let anchor = state.ca_public_key.authority_fingerprint();
-            vec![CampaignTarget {
+            let mut targets = vec![CampaignTarget {
                 certificate_kind: CertificateKind::CaPq,
                 identity_key: state.gateway_wg_public_key,
                 epoch: state.ca_epoch,
                 generation: state.ca_epoch,
                 active_tls_certificate_fingerprint: anchor,
                 active_pq_certificate_fingerprint: anchor,
-            }]
+            }];
+            // The client TLS anchor is a second row, not a second campaign:
+            // §7.6 puts both under `trust_authorities`, and the companion
+            // signs whichever the ceremony is for. A domain that never pinned
+            // that anchor simply offers no row for it — the rotation is then
+            // refused where the pin is missing, not here.
+            if let Some(client_tls_ca) = state.ca_tls_fingerprint {
+                targets.push(CampaignTarget {
+                    certificate_kind: CertificateKind::CaTls,
+                    identity_key: state.gateway_wg_public_key,
+                    epoch: state.ca_tls_epoch,
+                    generation: state.ca_tls_epoch,
+                    active_tls_certificate_fingerprint: client_tls_ca,
+                    active_pq_certificate_fingerprint: client_tls_ca,
+                });
+            }
+            targets
         }
         _ => state
             .peers

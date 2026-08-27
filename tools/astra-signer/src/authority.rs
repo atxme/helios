@@ -59,7 +59,7 @@ use aether::certificates::approval::{
     ExpiredRecoveryApprovalEvidence,
 };
 use aether::certificates::authority::{
-    AllowedUsage, AstraIssuerAuthorization, CaTransition, RotationReason,
+    AllowedUsage, AstraIssuerAuthorization, CaTransition, ClientTlsCaTransition, RotationReason,
 };
 use aether::certificates::client::{
     ClientCertificateRotationGrant, ClientCertificateStageAuthorization,
@@ -1014,6 +1014,127 @@ pub fn rotate_ca_pq(
         transition,
         next_ca_public_key: next_public_key,
         bindings,
+    })
+}
+
+/// A `CA-TLS` rotation, and everything its two consumers need (spec §9.4).
+pub struct RotatedClientTlsCa {
+    pub transition: ClientTlsCaTransition,
+    /// The incoming anchor, for the operator to read and for the gateway to
+    /// pin. Its private half stayed in the vault.
+    pub next_certificate: DerCertificate,
+}
+
+/// Rotates the client `CA-TLS`, under `CA-PQ` (spec §9.4).
+///
+/// # Why one credential and not two
+///
+/// §9.1 asks for two because it replaces the operator anchor — the key that
+/// authorises everything else, including its own successor. `CA-TLS`
+/// authenticates a transport, and the object that installs it is authorised by
+/// `CA-PQ`, which does not move here. Requiring two would be borrowing the
+/// weight of a different ceremony; the campaign scope is what carries it.
+///
+/// # Why the outgoing key is not kept
+///
+/// The overlap lives in the **certificates**: both anchors are acceptable
+/// until `not_after`, and each verifies chains issued under it with its own
+/// public half. Nothing signs under the outgoing key once the successor
+/// exists — the delegated issuer's intermediate is re-issued under the new
+/// anchor by §9.5 — so keeping its private half would be keeping a key whose
+/// only remaining use is to forge a chain the fleet still accepts.
+pub fn rotate_ca_tls(
+    vault: &mut AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    identity: &DomainIdentity,
+    active_certificate: &DerCertificate,
+    window: TransitionWindow,
+    validity: (u64, u64),
+) -> Result<RotatedClientTlsCa> {
+    if validity.1 <= validity.0 || validity.1 - validity.0 > MAX_CA_TLS_LIFETIME_SECS {
+        return Err(GestureError::Anchors(format!(
+            "période de validité hors bornes : au plus {MAX_CA_TLS_LIFETIME_SECS} secondes"
+        )));
+    }
+    window.validate()?;
+    // The incoming anchor must outlive the window it opens: an anchor expiring
+    // inside its own overlap would retire the chains it authorises while the
+    // outgoing one is already scheduled for removal (§4.1).
+    if validity.0 > window.not_before || validity.1 <= window.not_after {
+        return Err(GestureError::Anchors(
+            "la validité de la CA-TLS entrante ne couvre pas la fenêtre de transition".into(),
+        ));
+    }
+    let next_ca_tls_epoch = identity
+        .ca_tls_epoch
+        .checked_add(1)
+        .ok_or(CertificateError::ArithmeticOverflow)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+
+    let key = KeyPair::generate()
+        .map_err(|error| GestureError::Anchors(format!("clé CA-TLS suivante : {error}")))?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(
+        DnType::CommonName,
+        format!(
+            "Helios client CA-TLS {} epoch {next_ca_tls_epoch}",
+            identity.trust_domain_id
+        ),
+    );
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|error| GestureError::Anchors(error.to_string()))?;
+    params.distinguished_name = distinguished_name;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.not_before = to_offset_date_time(validity.0)?;
+    params.not_after = to_offset_date_time(validity.1)?;
+    let next_certificate = params
+        .self_signed(&key)
+        .map_err(|error| GestureError::Anchors(format!("auto-signature CA-TLS : {error}")))?;
+    let next_certificate = DerCertificate::new(next_certificate.der().to_vec())?;
+    // Proved rather than intended, exactly as at issuance.
+    aether::certificates::x509::assert_certificate_authority(&next_certificate)?;
+
+    let (transition, next_secrets) = with_anchors(vault, opening, |secrets| {
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
+        let transition = ClientTlsCaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: identity.trust_domain_id,
+            ca_epoch: identity.ca_epoch,
+            current_ca_tls_epoch: identity.ca_tls_epoch,
+            next_ca_tls_epoch,
+            active_client_tls_ca_fingerprint: active_certificate.fingerprint(),
+            next_client_tls_ca_certificate: next_certificate.clone(),
+            window,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_pq_private_key)?;
+        transition.verify(
+            &ca_pq_public_key,
+            &identity.trust_domain_id,
+            identity.ca_epoch,
+            identity.ca_tls_epoch,
+            &active_certificate.fingerprint(),
+        )?;
+        Ok((
+            transition,
+            AuthoritySecrets {
+                ca_pq_private_key: secrets.ca_pq_private_key.clone(),
+                ca_pq_public_key: secrets.ca_pq_public_key.clone(),
+                ca_tls_private_key: encode(&key.serialize_der()),
+            },
+        ))
+    })?;
+
+    // The object is signed and verified before the vault moves. A vault that
+    // held a successor no transition names would leave the operator unable to
+    // rotate again — the next ceremony would resolve its target from an anchor
+    // the domain has never heard of.
+    vault.replace_anchors(&opening.credential_id, &opening.secret, &next_secrets)?;
+
+    Ok(RotatedClientTlsCa {
+        transition,
+        next_certificate,
     })
 }
 

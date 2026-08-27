@@ -267,6 +267,20 @@ fn select_objects(
             }
         }
     }
+    // The client TLS anchor, on the receiver's own epoch. Before
+    // `activation_at` only: §8.1.1 refuses a transaction past its first
+    // activation, and installing as future what should already be in force is
+    // exactly what that rule forbids.
+    for stored in &state.transitions {
+        if let TrustUpdateObject::ClientTlsCaTransition(transition) = &stored.object {
+            let in_force_later = now_unix < transition.window.activation_at;
+            let names_the_peers_anchor =
+                request.request.ca_tls_epoch == transition.current_ca_tls_epoch;
+            if in_force_later && names_the_peers_anchor {
+                objects.push(stored.object.clone());
+            }
+        }
+    }
     // The gateway identity, and only once §11.1 step 6 has let it leave. A
     // client is offered the decision that moves it from the state it signed:
     // its own decision epoch, and the leaf it says it is pinning. A client on
@@ -404,6 +418,7 @@ mod tests {
             ca_epoch: current_ca_epoch,
             ca_public_key: ca_public,
             ca_tls_epoch: 1,
+            ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,
@@ -589,6 +604,58 @@ mod tests {
         assert!(!select_objects(&state, &elsewhere, 2_000)
             .iter()
             .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
+    }
+
+    fn state_with_client_tls_ca_rotation() -> crate::registry::AstraState {
+        use aether::certificates::authority::ClientTlsCaTransition;
+
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut state = state_with_transition(1);
+        state.ca_public_key = ca_public;
+        let active = Fingerprint::of(b"client tls ca");
+        let transition = ClientTlsCaTransition {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            current_ca_tls_epoch: 1,
+            next_ca_tls_epoch: 2,
+            active_client_tls_ca_fingerprint: active,
+            next_client_tls_ca_certificate: aether::certificates::test_x509::client_material(
+                "successor",
+            )
+            .authority,
+            window: aether::certificates::window::TransitionWindow::new(1_000, 90_000, 150_000)
+                .expect("window"),
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_private)
+        .expect("sign");
+        state.transitions = vec![crate::registry::StoredTransition {
+            campaign_id: Id16::new([6; 16]).expect("id"),
+            accepted_at: 2_000,
+            object: TrustUpdateObject::ClientTlsCaTransition(Box::new(transition)),
+            published: true,
+            credential_registry: None,
+        }];
+        state
+    }
+
+    /// The client anchor follows the receiver's own epoch, like the `CA-PQ`
+    /// one, and stops being offered once it is in force.
+    #[test]
+    fn a_peer_behind_on_the_client_tls_anchor_is_offered_its_rotation() {
+        let state = state_with_client_tls_ca_rotation();
+        let selected = select_objects(&state, &request(1), 2_000);
+        assert!(selected
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::ClientTlsCaTransition(_))));
+
+        // Already on the successor: nothing to hand over.
+        let mut ahead = request(1);
+        ahead.request.ca_tls_epoch = 2;
+        assert!(select_objects(&state, &ahead, 2_000).is_empty());
+        // Past the activation, §8.1.1 refuses the transaction anyway.
+        assert!(select_objects(&state, &request(1), 90_000).is_empty());
     }
 
     #[test]

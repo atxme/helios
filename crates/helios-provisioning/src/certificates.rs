@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::{
     approval::{AstraCredentialBinding, AstraIssuancePolicy},
-    authority::RotationReason,
+    authority::{ClientTlsCaTransition, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
@@ -1036,9 +1036,14 @@ impl CertificateRegistry {
     }
 
     /// Promotes every generation whose overlap has ended.
+    ///
+    /// The client TLS anchor moves here too, and on the same write: it is the
+    /// same clock boundary, and a sweep that promoted the peers while leaving
+    /// the anchor behind would keep accepting a chain the domain has retired.
     pub fn promote_due(&mut self, now_unix: u64) -> Result<Vec<String>, RegistryError> {
         let mut state = self.state.clone();
         let mut promoted = Vec::new();
+        let anchor_moved = state.client_tls_ca.promote_if_due(now_unix);
         for (key, peer) in state.peers.iter_mut() {
             if peer.state.promote_if_due(now_unix) {
                 if let Some(certificate) = peer.staged_pq_certificate.take() {
@@ -1047,7 +1052,7 @@ impl CertificateRegistry {
                 promoted.push(key.clone());
             }
         }
-        if !promoted.is_empty() {
+        if !promoted.is_empty() || anchor_moved {
             self.persist(state)?;
         }
         Ok(promoted)
@@ -1116,6 +1121,35 @@ impl CertificateRegistry {
             self.persist(state)?;
         }
         Ok(promoted)
+    }
+
+    /// Installs a rotation of the client `CA-TLS` (spec §9.4).
+    ///
+    /// Verified by the state machine against the anchor this registry already
+    /// serves. Persisted only when the state moved: an operator carrying the
+    /// same document twice must not consume a second epoch.
+    pub fn install_client_tls_ca_transition(
+        &mut self,
+        transition: &ClientTlsCaTransition,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, RegistryError> {
+        let mut state = self.state.clone();
+        let ledger = state.ledger.clone();
+        let ca_pq = state.gateway.current_ca_public_key.clone();
+        let trust_domain_id = state.trust_domain_id;
+        let ca_epoch = state.gateway.ca_epoch;
+        let outcome = state.client_tls_ca.apply_transition(
+            transition,
+            &ca_pq,
+            &trust_domain_id,
+            ca_epoch,
+            &ledger,
+            now_unix,
+        )?;
+        if matches!(outcome, InstallOutcome::Installed) {
+            self.persist(state)?;
+        }
+        Ok(outcome)
     }
 
     /// Records that the authority has let a staged transition leave (§6.3).
@@ -2995,6 +3029,122 @@ mod tests {
         assert!(!gateway.revoked);
         assert_eq!(gateway.next_gateway_identity_epoch, None);
         assert_eq!(gateway.revocation_epoch, 2);
+    }
+
+    fn client_tls_ca_transition(
+        fixture: &Fixture,
+        current_epoch: u64,
+        active: Fingerprint,
+        window: TransitionWindow,
+    ) -> aether::certificates::authority::ClientTlsCaTransition {
+        use aether::certificates::authority::ClientTlsCaTransition;
+
+        ClientTlsCaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            current_ca_tls_epoch: current_epoch,
+            next_ca_tls_epoch: current_epoch + 1,
+            active_client_tls_ca_fingerprint: active,
+            next_client_tls_ca_certificate: aether::certificates::test_x509::client_material(
+                "successor",
+            )
+            .authority,
+            window,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&fixture.ca.private)
+        .expect("sign the rotation")
+    }
+
+    /// §9.4: both chains are acceptable during the overlap, and only then.
+    #[test]
+    fn a_client_tls_ca_rotation_is_accepted_from_its_activation() {
+        let mut fixture = fixture();
+        let active = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint();
+        let transition = client_tls_ca_transition(&fixture, 1, active, window());
+
+        fixture
+            .registry
+            .install_client_tls_ca_transition(&transition, 1_500)
+            .expect("install");
+
+        let anchors = fixture.registry.state().client_tls_anchors(1_999);
+        assert_eq!(
+            anchors.len(),
+            1,
+            "before activation only the anchor in service"
+        );
+        assert_eq!(fixture.registry.state().client_tls_anchors(2_000).len(), 2);
+    }
+
+    /// At `not_after` the outgoing anchor is gone, on the same write that
+    /// promotes the peers: a sweep that moved one without the other would keep
+    /// accepting a chain the domain retired.
+    #[test]
+    fn the_outgoing_client_tls_anchor_retires_with_the_generations() {
+        let mut fixture = fixture();
+        let active = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint();
+        let transition = client_tls_ca_transition(&fixture, 1, active, window());
+        fixture
+            .registry
+            .install_client_tls_ca_transition(&transition, 1_500)
+            .expect("install");
+
+        fixture.registry.promote_due(3_000).expect("promote");
+
+        let state = fixture.registry.state();
+        assert_eq!(state.client_tls_ca.ca_tls_epoch, 2);
+        assert!(state.client_tls_ca.next_client_tls_ca_certificate.is_none());
+        assert_eq!(fixture.registry.state().client_tls_anchors(3_000).len(), 1);
+        assert!(
+            !fixture
+                .registry
+                .state()
+                .client_tls_ca
+                .active_client_tls_ca_certificate
+                .fingerprint()
+                .matches(&active),
+            "the successor is the one in service"
+        );
+    }
+
+    /// One rotation in flight at a time: a second would leave two successors
+    /// and no rule saying which the next handshake is verified under.
+    #[test]
+    fn a_second_client_tls_ca_rotation_is_refused_while_one_is_in_flight() {
+        let mut fixture = fixture();
+        let active = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint();
+        fixture
+            .registry
+            .install_client_tls_ca_transition(
+                &client_tls_ca_transition(&fixture, 1, active, window()),
+                1_500,
+            )
+            .expect("install");
+
+        assert!(fixture
+            .registry
+            .install_client_tls_ca_transition(
+                &client_tls_ca_transition(&fixture, 1, active, window()),
+                1_500,
+            )
+            .is_err());
     }
 
     #[test]

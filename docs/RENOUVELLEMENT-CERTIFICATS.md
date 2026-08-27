@@ -400,14 +400,64 @@ porte pas de champ TLS, donc la feuille candidate se copie depuis la gateway.
 Une feuille substituée est refusée à l'installation — la gateway seule sait
 laquelle elle a scellée.
 
-## 9. Ce qui n'a pas encore de commande
+## 9. Faire tourner la CA TLS cliente (§9.4)
+
+`CA-TLS` authentifie le transport mTLS **avant** qu'aucune signature PQ soit
+vérifiée. Sa rotation se prépare donc sur la gateway avant qu'une feuille
+cliente soit émise sous la nouvelle ancre.
+
+**Une fois, si le domaine est antérieur à cet épinglage** — dans le conteneur
+Astra :
+
+```sh
+astra pin-ca-tls --fingerprint <sha256-hex>
+```
+
+Sans cette valeur, l'autorité épingle l'*époque* de cette ancre sans épingler
+l'ancre : elle ne pourrait vérifier une transition que contre une empreinte
+portée par l'objet lui-même, ce qui ne vérifie rien. La commande refuse de
+remplacer une ancre déjà épinglée — remplacer une ancre est une rotation, et
+une rotation se signe. Les domaines neufs la reçoivent par
+`astra bootstrap --ca-tls-fingerprint`.
+
+**La rotation** :
+
+```sh
+astra campaign open --scope trust-authorities --reason … --requested-by …
+astra-signer rotate-ca-tls --authority-url https://astra.exemple \
+  --operation-id <identifiant> --out ca-tls-transition.json
+# --prepare-days 7 --overlap-days 30 --validity-days 1825
+heliosd install-client-tls-ca ca-tls-transition.json
+```
+
+L'ancre entrante est créée au compagnon, auto-signée pour prouver qu'elle
+détient sa clé — cette auto-signature ne remplace jamais la signature `CA-PQ`
+comme autorisation —, et le coffre adopte la nouvelle clé privée TLS dans la
+même écriture. `CA-PQ`, elle, ne bouge pas.
+
+**Pendant le chevauchement, les deux chaînes sont acceptées.** C'est tout
+l'objet de la fenêtre : les feuilles clientes émises sous l'ancienne ancre
+continuent de monter des tunnels le temps que le parc soit ré-émis. À
+`not_after`, l'ancienne est retirée dans la même écriture que les promotions
+de générations — une purge qui déplacerait l'une sans l'autre laisserait
+accepter une chaîne que le domaine a retirée.
+
+**Limite connue** : la rotation ne ré-émet pas les feuilles clientes. Elles
+restent valides sous l'ancienne ancre jusqu'à `not_after`, et c'est une
+campagne `fleet_leafs` — ou le renouvellement ordinaire à 80 % — qui les fait
+passer sous la nouvelle. Un chevauchement plus court que ce que le parc met à
+revenir couperait les retardataires.
+
+**Limite connue** : l'intermédiaire de l'émetteur délégué est signé par
+l'ancre sortante. Le faire ré-émettre sous la nouvelle est la rotation du
+§9.5, qui reste un geste distinct.
+
+## 10. Ce qui n'a pas encore de commande
 
 Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'un
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
 fait.
 
-- **`CA-TLS` cliente** (§9.4) : aucun geste ne la fait tourner, et le registre
-  la refuserait — il épingle l'époque de cette ancre sans épingler l'ancre.
 - **Le retour à l'identité précédente** : l'ancien slot reste scellé pendant
   le recouvrement, mais aucune commande ne demande encore à `heliosd` de le
   resservir temporairement.

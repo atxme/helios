@@ -501,6 +501,32 @@ enum Command {
         #[arg(long)]
         key_recovery: bool,
     },
+    /// Fait tourner la CA TLS cliente sous `CA-PQ` (§9.4).
+    ///
+    /// L'ancre entrante est créée ici, auto-signée pour prouver qu'elle
+    /// détient sa clé, et la transition qui l'installe est signée par `CA-PQ`
+    /// — laquelle ne bouge pas. Le coffre adopte la nouvelle clé privée
+    /// TLS dans la même écriture ; l'ancienne ne signe plus rien.
+    RotateCaTls {
+        #[arg(long)]
+        authority_url: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        origin: Option<String>,
+        /// Où écrire la transition signée, pour la porter sur la gateway.
+        #[arg(long)]
+        out: PathBuf,
+        /// Délai avant `activation_at`, en jours.
+        #[arg(long, default_value_t = 7)]
+        prepare_days: u64,
+        /// Recouvrement pendant lequel les deux ancres sont acceptées.
+        #[arg(long, default_value_t = 30)]
+        overlap_days: u64,
+        /// Durée de vie de l'ancre entrante, en jours.
+        #[arg(long, default_value_t = 1825)]
+        validity_days: u64,
+    },
     /// Signe l'annulation d'une transition gateway en attente (§6.3).
     ///
     /// Refusée une fois la transition distribuée ou `activation_at` atteint :
@@ -730,6 +756,23 @@ fn run() -> Result<()> {
                 overlap_days,
                 key_recovery,
             },
+            transport,
+        ),
+        Command::RotateCaTls {
+            authority_url,
+            operation_id,
+            origin,
+            out,
+            prepare_days,
+            overlap_days,
+            validity_days,
+        } => rotate_ca_tls(
+            &path,
+            &authority_url,
+            &operation_id,
+            origin.as_deref(),
+            &out,
+            (prepare_days, overlap_days, validity_days),
             transport,
         ),
         Command::AbortGatewayTransition {
@@ -1835,6 +1878,157 @@ fn revoke(
     let state = client.submit(&request.operation_id, &request.result_token, &result)?;
     println!("état             : {state:?}");
     println!("décision déposée : Astra la relaie à la gateway et la distribue aux clients");
+    Ok(())
+}
+
+/// Rotates the client `CA-TLS` under an approved authority campaign (§9.4).
+///
+/// # Why this one has no offline form
+///
+/// `rotate-ca-pq` can run without an authority because the operator's vault
+/// **is** the `CA-PQ` authority: it holds the outgoing key and can vouch for
+/// its successor alone. The client TLS anchor is different — the object that
+/// installs it is authorised by `CA-PQ`, and what says *which* anchor is
+/// current is the domain's registry, not this vault. A rotation resolved from
+/// the vault alone could name an anchor the fleet retired months ago.
+fn rotate_ca_tls(
+    path: &Path,
+    authority_url: &str,
+    operation_id: &str,
+    origin: Option<&str>,
+    out: &Path,
+    (prepare_days, overlap_days, validity_days): (u64, u64, u64),
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::transport::TrustUpdateObject;
+
+    let operation = Id16::parse_hex(operation_id)
+        .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+    let mut vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let active_certificate = DerCertificate::parse(handoff.require(
+        handoff.ca_tls_certificate.as_ref(),
+        "le certificat CA-TLS en service",
+        "--ca-tls-certificate",
+    )?)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let request = origin_client_fetch(&client, &operation)?;
+    verify_campaign_request(&handoff, &vault, &request, authority_url)?;
+    let campaign = request.campaign.as_ref().clone();
+    if !campaign.scope.rotates_authority() {
+        bail!("cette campagne ne fait tourner aucune ancre. Rien n'a été signé.");
+    }
+
+    let now = now_unix();
+    let day =
+        |days: u64| -> Result<u64> { days.checked_mul(DAY_SECS).context("durée hors bornes") };
+    let activation_at = now
+        .checked_add(day(prepare_days)?)
+        .context("délai hors bornes")?;
+    let window = TransitionWindow::new(
+        now,
+        activation_at,
+        activation_at
+            .checked_add(day(overlap_days)?)
+            .context("délai hors bornes")?,
+    )?;
+    let validity = (
+        now,
+        now.checked_add(day(validity_days)?)
+            .context("durée hors bornes")?,
+    );
+
+    println!("rotation de CA-TLS: l'ancre du transport mTLS client change.");
+    println!("opération        : {}", operation.to_hex());
+    println!(
+        "époque           : {} → {}",
+        identity.ca_tls_epoch,
+        identity.ca_tls_epoch + 1
+    );
+    println!("ancre sortante   : {}", active_certificate.fingerprint());
+    println!("activation       : {activation_at}");
+    println!("retrait          : {}", window.not_after);
+    println!("motif            : {}", campaign.reason);
+    println!("demandée par     : {}", campaign.requested_by);
+    println!("empreinte        : {}", campaign.fingerprint());
+    println!(
+        "effet            : pendant le recouvrement les deux chaînes sont acceptées ; après \
+         not_after, une leaf émise sous l'ancienne ne monte plus de tunnel"
+    );
+
+    // Two keys, because §7.6 makes `trust_authorities` a two-credential
+    // decision. The vault opens at the first: the second confirms the text,
+    // not the key-slot — that is what the campaign approval is.
+    let first = connect_authorized_key(
+        &vault,
+        transport,
+        "Brancher la PREMIÈRE clé autorisée, puis appuyer sur Entrée.",
+    )?;
+    eprintln!();
+    let second = connect_authorized_key(
+        &vault,
+        transport,
+        "Débrancher celle-ci, brancher la SECONDE clé autorisée, puis Entrée.",
+    )?;
+    let origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    let approval = authority::approve_campaign(
+        &[first.key.as_ref(), second.key.as_ref()],
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        &[first.pin.as_str(), second.pin.as_str()],
+        now,
+    )?;
+    let opening = gestures::open_with_authorized_key(first.key.as_ref(), &vault, &first.pin)?;
+
+    let rotated = authority::rotate_ca_tls(
+        &mut vault,
+        &opening,
+        &identity,
+        &active_certificate,
+        window,
+        validity,
+    )?;
+    let object = TrustUpdateObject::ClientTlsCaTransition(Box::new(rotated.transition));
+    campaign
+        .covers_authority_object(&object)
+        .context("la transition signée ne correspond pas à la campagne approuvée")?;
+
+    // The vault already holds the successor. Writing the object before the
+    // deposit keeps a failed deposit a ceremony to redo rather than a domain
+    // whose operator holds a key nobody has heard of.
+    let encoded = serde_json::to_vec_pretty(&object).context("encodage de la transition")?;
+    std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
+    println!("transition écrite: {}", out.display());
+    println!(
+        "ancre entrante   : {}",
+        rotated.next_certificate.fingerprint()
+    );
+
+    store::save(path, &vault)?;
+    let mut handoff = handoff;
+    handoff.ca_tls_epoch = Some(identity.ca_tls_epoch + 1);
+    handoff.ca_tls_certificate = Some(rotated.next_certificate.to_base64());
+    handoff::save(&handoff::path_beside(path), &handoff)?;
+
+    let result = campaign_result(&approval, vec![object], None);
+    let state = client.submit(&request.operation_id, &request.result_token, &result)?;
+    println!("état             : {state:?}");
+    println!(
+        "à reporter sur la gateway : heliosd install-client-tls-ca {}",
+        out.display()
+    );
     Ok(())
 }
 

@@ -209,6 +209,18 @@ enum Command {
         /// Signed `GatewayTransitionAbort`, as JSON.
         abort: PathBuf,
     },
+    /// Installs a signed rotation of the client `CA-TLS` (§9.4).
+    ///
+    /// The anchor that authenticates the mTLS transport before any PQ
+    /// signature is checked. Both chains are accepted during the overlap, and
+    /// the outgoing one retires at `not_after` — a rotation without that
+    /// overlap would cut every client that has not yet been re-issued.
+    ///
+    /// **For a stopped daemon**, like the gateway identity commands.
+    InstallClientTlsCa {
+        /// Signed `ClientTlsCaTransition`, as JSON.
+        transition: PathBuf,
+    },
     /// Prints the trust block a client's profile must carry (spec §19).
     ///
     /// Read from the certificate registry in one pass, and printed as the
@@ -465,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
         } => prepare_gateway_certificate(rotate_tls, new_key, key_recovery),
         Command::InstallGatewayTransition { transition } => install_gateway_transition(&transition),
         Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
+        Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -738,6 +751,40 @@ fn abort_gateway_transition(source: &Path) -> anyhow::Result<()> {
              the next attempt starts one decision higher",
             aborted.abort.gateway_identity_epoch
         );
+    }
+    Ok(())
+}
+
+fn install_client_tls_ca(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::state::InstallOutcome;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition: aether::certificates::authority::ClientTlsCaTransition =
+        gateway_rotation::read_signed_document(source, "client TLS CA transition")?;
+    let outcome = registry
+        .install_client_tls_ca_transition(&transition, now_unix)
+        .context("installing the client TLS CA rotation")?;
+
+    println!(
+        "epoch: {} → {}",
+        transition.current_ca_tls_epoch, transition.next_ca_tls_epoch
+    );
+    println!(
+        "next anchor: {}",
+        transition
+            .next_client_tls_ca_certificate
+            .fingerprint()
+            .to_hex()
+    );
+    println!("activation at: {}", transition.window.activation_at);
+    println!("not after: {}", transition.window.not_after);
+    match outcome {
+        InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
+        InstallOutcome::Installed => info!(
+            "client TLS CA rotation staged: both chains are accepted from activation_at, and the \
+             outgoing anchor retires at not_after"
+        ),
     }
     Ok(())
 }

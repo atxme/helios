@@ -225,7 +225,10 @@ slot.
    refuse la compilation `--release` de l'image. La construction tourne dans
    une unité systemd transitoire : une coupure SSH n'annule pas BuildKit, et le
    script se reconnecte pour lire son résultat et son journal ;
-5. si le domaine n'est pas amorcé : `astra bootstrap`, capture de la clé de
+5. si le domaine n'est pas amorcé : `astra bootstrap`
+   — avec `--ca-tls-fingerprint`, l'empreinte de la CA TLS cliente en service,
+   sans laquelle la rotation du §9.4 reste invérifiable ici et se refuse par
+   son nom —, capture de la clé de
    service et de la tête d'audit, écriture du `.env` distant, puis
    `heliosd init-trust-domain` et `systemctl restart heliosd` ;
 6. `compose up -d`.

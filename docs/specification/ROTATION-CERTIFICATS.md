@@ -2872,13 +2872,20 @@ contournés :
   préparation choisi par `rotate-ca-pq --prepare-days` est la fenêtre dont
   chaque pair dispose pour revenir. Au-delà, il se répare par l'opérateur, pas
   par une livraison tardive.
-  **Cinq familles d'objets sont produites** : la délégation, la transition
-  `CA-PQ`, la révocation cliente, la transition d'identité gateway et son
-  avortement. Une transition de `CA-TLS` est refusée au registre plutôt
-  que stockée — il épingle l'époque de cette ancre sans épingler l'ancre
-  elle-même, donc il ne pourrait la contrôler que contre une valeur portée par
-  l'objet, ce qui ne contrôle rien ; épingler `ca_tls_fingerprint` à
-  `init-trust-domain` est ce qui la débloque. La révocation d'une **gateway**
+  **Sept familles d'objets sont produites** : la délégation, la transition
+  `CA-PQ`, la transition `CA-TLS`, la révocation cliente, la révocation
+  gateway, la transition d'identité gateway et son avortement.
+  Le blocage de `CA-TLS` est levé : le registre épingle désormais
+  `ca_tls_fingerprint`, reçu à `astra bootstrap --ca-tls-fingerprint` ou
+  enregistré une fois par `astra pin-ca-tls`, et refuse de le remplacer par
+  commande — remplacer une ancre est une rotation, et une rotation se signe.
+  Un domaine antérieur à ce champ est refusé **par son nom** plutôt que
+  contrôlé contre un défaut qui accepterait tout. `astra-signer rotate-ca-tls`
+  crée l'ancre entrante, la fait auto-signer, signe la transition sous `CA-PQ`
+  et fait adopter la nouvelle clé privée TLS par le coffre dans la même
+  écriture ; `heliosd install-client-tls-ca` la met en attente, les deux
+  chaînes sont acceptées pendant le chevauchement, et l'ancienne est retirée
+  par la même passe qui promeut les générations. La révocation d'une **gateway**
   s'exécute désormais : `astra revocation open --scope gateway` lit les deux
   feuilles et leurs échéances signées **en direct** sur le canal privé, auprès
   du démon qui les sert, parce que ce registre ne les a jamais détenues ;

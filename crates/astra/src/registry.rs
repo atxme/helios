@@ -130,6 +130,16 @@ pub struct AstraState {
     pub ca_epoch: u64,
     pub ca_public_key: MlDsa87PublicKey,
     pub ca_tls_epoch: u64,
+    /// SHA-256 of the client `CA-TLS` in service, confirmed out of band.
+    ///
+    /// `None` on a domain bootstrapped before this field existed. It is not
+    /// defaulted to a placeholder, because a placeholder would be a value
+    /// `ClientTlsCaTransition::verify` compares against and always accepts —
+    /// pinning an epoch without pinning the anchor is what made a `CA-TLS`
+    /// rotation impossible to check at all. Absent, the rotation is refused by
+    /// name; `astra pin-ca-tls` records it once.
+    #[serde(default)]
+    pub ca_tls_fingerprint: Option<Fingerprint>,
 
     pub astra_service_key_epoch: u64,
     pub astra_service_public_key: MlDsa87PublicKey,
@@ -566,15 +576,29 @@ impl AstraRegistry {
                         now_unix,
                     )?;
                 }
-                // Limite connue : la rotation de `CA-TLS` n'est pas stockée
-                // ici. `ClientTlsCaTransition::verify` compares the outgoing
-                // TLS anchor to a fingerprint the verifier must already pin,
-                // and this registry pins the epoch of `CA-TLS` without pinning
-                // the anchor itself. Verifying it against a value taken from
-                // the object would be verifying nothing, so it is refused in
-                // the open rather than stored on a check that always passes.
-                // Pinning `ca_tls_fingerprint` at `init-trust-domain` is what
-                // unblocks it.
+                TrustUpdateObject::ClientTlsCaTransition(transition) => {
+                    // The anchor this registry pins, never one taken from the
+                    // object: comparing a transition to the fingerprint it
+                    // carries itself would be comparing a value to itself.
+                    // A domain bootstrapped before that pin existed is refused
+                    // by name rather than checked against nothing.
+                    let active = self
+                        .state
+                        .ca_tls_fingerprint
+                        .ok_or(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "no client CA-TLS anchor is pinned here: record it with \
+                             `astra pin-ca-tls` before a rotation can be verified",
+                            ),
+                        ))?;
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                        self.state.ca_tls_epoch,
+                        &active,
+                    )?;
+                }
                 _ => {
                     return Err(RegistryError::Transition(
                         aether::certificates::CertificateError::IssuerScopeViolation(
@@ -955,6 +979,38 @@ impl AstraRegistry {
         Ok(*transition)
     }
 
+    /// Records the client `CA-TLS` this domain serves, once (spec §9.4).
+    ///
+    /// Refuses to replace one already pinned: an anchor that a command can
+    /// overwrite is an anchor an operator error can move, and §9.4 makes that
+    /// move a signed transition instead.
+    pub fn pin_client_tls_ca(
+        &mut self,
+        fingerprint: Fingerprint,
+        now_unix: u64,
+    ) -> Result<(), RegistryError> {
+        if let Some(held) = self.state.ca_tls_fingerprint {
+            if !held.matches(&fingerprint) {
+                return Err(RegistryError::Transition(
+                    aether::certificates::CertificateError::IllegalStateTransition(
+                        "a client CA-TLS anchor is already pinned; replacing it is a rotation",
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        state.ca_tls_fingerprint = Some(fingerprint);
+        state.audit.append(
+            AuditEvent::ClientTlsCaPinned {
+                ca_tls_epoch: state.ca_tls_epoch,
+            },
+            now_unix,
+        );
+        self.state = state;
+        self.save()
+    }
+
     pub fn record(&mut self, event: AuditEvent, now_unix: u64) -> Result<(), RegistryError> {
         self.state.audit.append(event, now_unix);
         self.save()
@@ -1108,6 +1164,7 @@ mod tests {
                 ca_epoch: 1,
                 ca_public_key: ca_public.clone(),
                 ca_tls_epoch: 1,
+                ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
                 astra_service_key_epoch: 1,
                 astra_service_public_key: service,
                 issuer: None,
@@ -1629,6 +1686,115 @@ mod tests {
             assert_eq!(anchored.registry.state().transitions.len(), 2);
         }
 
+        fn client_tls_ca_transition(
+            anchored: &Anchored,
+            current_epoch: u64,
+            active: Fingerprint,
+        ) -> (
+            TrustUpdateObject,
+            aether::certificates::encoding::DerCertificate,
+        ) {
+            use aether::certificates::authority::ClientTlsCaTransition;
+
+            let next = aether::certificates::test_x509::client_material("successor").authority;
+            let object = ClientTlsCaTransition {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: anchored.registry.state().trust_domain_id,
+                ca_epoch: 1,
+                current_ca_tls_epoch: current_epoch,
+                next_ca_tls_epoch: current_epoch + 1,
+                active_client_tls_ca_fingerprint: active,
+                next_client_tls_ca_certificate: next.clone(),
+                window: TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+                ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+            }
+            .sign(&anchored.ca_private)
+            .expect("signing");
+            (
+                TrustUpdateObject::ClientTlsCaTransition(Box::new(object)),
+                next,
+            )
+        }
+
+        /// §9.4 was unverifiable while this registry pinned the epoch of that
+        /// anchor without pinning the anchor: the only value to compare
+        /// against came from the object itself.
+        #[test]
+        fn a_client_tls_ca_rotation_is_verified_against_the_pinned_anchor() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned by the fixture");
+            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+        }
+
+        #[test]
+        fn a_client_tls_ca_rotation_over_another_anchor_is_refused() {
+            let mut anchored = anchored();
+            let (object, _) =
+                client_tls_ca_transition(&anchored, 1, Fingerprint::of(b"another anchor"));
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .is_err());
+            assert!(anchored.registry.state().transitions.is_empty());
+        }
+
+        /// A domain bootstrapped before the pin existed is refused by name,
+        /// not checked against a placeholder that would always match.
+        #[test]
+        fn a_client_tls_ca_rotation_without_a_pinned_anchor_is_refused() {
+            let anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+            let mut unpinned = anchored.registry.state().clone();
+            unpinned.ca_tls_fingerprint = None;
+            let mut registry =
+                AstraRegistry::new(anchored._directory.path().join("unpinned.json"), unpinned);
+
+            let refusal = registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect_err("no anchor to verify against");
+            assert!(format!("{refusal}").contains("pin-ca-tls"));
+        }
+
+        /// An anchor a command can overwrite is an anchor an operator error
+        /// can move; §9.4 makes that move a signed transition.
+        #[test]
+        fn a_pinned_client_tls_ca_is_not_replaced_by_a_command() {
+            let mut anchored = anchored();
+            let held = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+
+            anchored
+                .registry
+                .pin_client_tls_ca(held, 2_000)
+                .expect("idempotent");
+            assert!(anchored
+                .registry
+                .pin_client_tls_ca(Fingerprint::of(b"elsewhere"), 2_000)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(held));
+        }
+
         /// The one property that lets an online authority hold `CA-PQ` output
         /// at all: it re-derives the proof under the anchor it already pins.
         #[test]
@@ -1838,6 +2004,7 @@ mod tests {
             ca_epoch: 1,
             ca_public_key: ca,
             ca_tls_epoch: 1,
+            ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,
