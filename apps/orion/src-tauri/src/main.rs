@@ -2654,6 +2654,10 @@ fn main() {
 }
 
 #[cfg(test)]
+#[path = "../build_support.rs"]
+mod build_support_tests;
+
+#[cfg(test)]
 mod security_tests {
     use super::{
         associated_profile_paths, sanitize_stem, window_size_for, ClientProfile, ConfigView, Path,

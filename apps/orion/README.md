@@ -56,7 +56,10 @@ nécessaire pour tester**. Le nom, l’icône et l’interface sont ceux du code
 les trois cas, et `build.rs` s’en charge.
 
 - **En debug**, l’IHM est servie par Vite : Orion le démarre lui-même s’il ne
-  tourne pas, et toute modification de `src/` est visible au rechargement.
+  tourne pas, et toute modification de `src/` est visible au rechargement. Les
+  ressources Windows absentes ne sont pas exigées par la seule compilation :
+  un checkout frais peut donc compiler le shell dry-run sans télécharger
+  WireGuardNT. La CLI Tauri les prépare toujours avant de créer un bundle.
 - **En release**, `cargo` ne connaît pas le `beforeBuildCommand` de la CLI
   Tauri. `build.rs` compare donc `dist/` aux sources et relance `npm run build`
   quand il est périmé — sans quoi le binaire embarquerait l’interface d’avant,

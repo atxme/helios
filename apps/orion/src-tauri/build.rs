@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod build_support;
+
 fn main() {
     let orion = frontend_root();
     watch_frontend(&orion);
@@ -30,12 +32,43 @@ fn main() {
     // le construire coûterait une minute à chaque `cargo run`.
     if std::env::var("PROFILE").as_deref() == Ok("release") {
         ensure_frontend_built(&orion);
+    } else if windows_bundle_resources_are_missing() {
+        disable_bundle_resources();
     }
 
     let windows = tauri_build::WindowsAttributes::new()
         .app_manifest(include_str!("windows/orion-manifest.xml"));
     let attributes = tauri_build::Attributes::new().windows_attributes(windows);
     tauri_build::try_build(attributes).expect("construction des ressources Tauri Orion");
+}
+
+/// Reports whether a Windows debug build has no resources to stage.
+///
+/// A Tauri build runs `orion-deps` first, so its debug bundles still receive
+/// the DLLs. A plain Cargo build from a fresh checkout does not run that hook;
+/// it is the only case in which the resource mapping must be disabled.
+fn windows_bundle_resources_are_missing() -> bool {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return false;
+    }
+    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../resources-windows");
+    println!("cargo:rerun-if-changed={}", resources.display());
+    !resources.is_dir()
+}
+
+/// Keeps a debug Cargo build independent from missing installer resources.
+///
+/// Tauri copies `bundle.resources` from its platform configuration during the
+/// Rust build itself, including in debug. WireGuardNT deliberately lives
+/// outside Git and is fetched before packaging; requiring it merely to compile
+/// the dry-run shell makes a fresh Windows checkout fail before Rust starts.
+/// A real backend still checks for its DLL at startup. Release builds and Tauri
+/// debug bundles keep the copy that makes the binary and installer complete.
+fn disable_bundle_resources() {
+    let existing = std::env::var("TAURI_CONFIG").ok();
+    let config = build_support::without_bundle_resources(existing.as_deref())
+        .expect("overriding the Tauri configuration for an Orion debug build");
+    std::env::set_var("TAURI_CONFIG", config);
 }
 
 fn frontend_root() -> PathBuf {
