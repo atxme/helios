@@ -957,6 +957,109 @@ impl ClientCertificateRotationGrant {
         verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
     }
 
+    /// Verifies the grant of a §7.5 recovery, as the client does.
+    ///
+    /// The same checks as [`Self::verify`], read off the recovery request
+    /// instead of the rotation one — and two extra refusals that only make
+    /// sense here: the grant must be `CA-PQ`'s own
+    /// ([`IssuerKind::Master`]) and its reason must be
+    /// [`RotationReason::ExpiredRecovery`].
+    ///
+    /// # Why this is a separate method and not a generic one
+    ///
+    /// A recovery installs a certificate for an identity every ordinary
+    /// validator refuses. Sharing one entry point with the ordinary path would
+    /// mean one `if` away from letting a delegated issuer's grant install a
+    /// generation that reaches past a validity period. Two methods make the
+    /// two paths impossible to confuse at the call site, which is where the
+    /// confusion would matter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_for_recovery(
+        &self,
+        ca_pq: &MlDsa87PublicKey,
+        gateway_pq_public_key: &MlDsa87PublicKey,
+        gateway_certificate_fingerprint: &Fingerprint,
+        trust_domain_id: &TrustDomainId,
+        ca_epoch: u64,
+        ca_tls_epoch: u64,
+        gateway_wg_public_key: &WireGuardKey,
+        server_name: &str,
+        client_wg_public_key: &WireGuardKey,
+        request: &ExpiredCertificateRecoveryRequest,
+        tls_anchors: &[&DerCertificate],
+        policy_pin: Option<&AstraPolicyPin>,
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        if self.issuer_kind != IssuerKind::Master {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only CA-PQ grants the recovery of an expired identity",
+            ));
+        }
+        if self.reason != RotationReason::ExpiredRecovery {
+            return Err(CertificateError::IssuerScopeViolation(
+                "this grant was issued for another reason",
+            ));
+        }
+        let issuer_key = self.verify_common(
+            ca_pq,
+            gateway_pq_public_key,
+            gateway_certificate_fingerprint,
+            trust_domain_id,
+            ca_epoch,
+            ca_tls_epoch,
+            gateway_wg_public_key,
+            server_name,
+            client_wg_public_key,
+            tls_anchors,
+            policy_pin,
+            now_unix,
+        )?;
+
+        crate::certificates::x509::assert_csr_matches(
+            &request.tls_csr,
+            &self.next_tls_certificate,
+        )?;
+        if !self.request_fingerprint.matches(&request.fingerprint()) {
+            return Err(CertificateError::FingerprintMismatch("recovery request"));
+        }
+        if self.active_generation != request.expired_generation
+            || self.next_generation != request.requested_generation
+        {
+            return Err(CertificateError::GenerationConflict {
+                generation: self.next_generation,
+            });
+        }
+        if self.next_pq_certificate.ml_dsa_87_public_key
+            != request.new_ml_dsa_87_public_key.to_base64()
+        {
+            return Err(CertificateError::MissingProof("new client"));
+        }
+
+        verify_ml_dsa_87(issuer_key, &self.signing_bytes()?, &self.signature)
+    }
+
+    /// Checks the issuer's signature over this grant, and nothing else.
+    ///
+    /// # What this is for, and what it is not
+    ///
+    /// A **relay** needs to know that the authority whose key it pins produced
+    /// these bytes, before it stores or forwards them. It is not a substitute
+    /// for [`Self::verify`] or [`Self::verify_for_gateway`]: neither the
+    /// receipt, the leaves, the window, the anchors nor the generation are
+    /// examined here, and a consumer that installs anything on the strength of
+    /// this call alone would be installing an unverified certificate.
+    ///
+    /// Named so that no caller can mistake it for the whole check: the two
+    /// full verifications say what they verify *for*, this one says only that
+    /// it verifies a signature.
+    pub fn verify_signed_by(
+        &self,
+        issuer_public_key: &MlDsa87PublicKey,
+    ) -> Result<(), CertificateError> {
+        let transcript = self.signing_bytes()?;
+        verify_ml_dsa_87(issuer_public_key, &transcript, &self.signature)
+    }
+
     /// Verifies the grant as **Helios** does, on a commit arriving in the
     /// tunnel (spec §7.3).
     ///

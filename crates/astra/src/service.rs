@@ -33,9 +33,13 @@
 //! built. Campaigns are opened by `astra campaign open`, on the machine that
 //! already runs Astra, and deposited for this process to adopt.
 //!
-//! `POST /v1/client-rotation/recovery` likewise stays `501`: recovering an
-//! expired identity needs the historical validator of §7.5, which is its own
-//! lot.
+//! # The one route reachable without any live certificate
+//!
+//! `POST /v1/client-rotation/recovery` and the four that follow it serve §7.5.
+//! They are the only public surface a client with an **expired** identity can
+//! use, and they must be: the tunnel it would otherwise renew through is
+//! exactly what expired. They carry no bearer credential and need none — every
+//! proof is inside the objects, and the material they return is public.
 //!
 //! Physical ceremonies cannot be exercised in WSL2 — see
 //! [`docs/testing/TESTING.md`](../../../../docs/testing/TESTING.md).
@@ -274,6 +278,13 @@ pub struct AstraService {
     /// companion routes look only here, so an ordinary renewal identifier is
     /// absent rather than filtered out by a comparison somebody could forget.
     pub signing: Mutex<crate::signing::SigningOperationStore>,
+    /// Recoveries of expired identities in flight (spec §7.5).
+    ///
+    /// A third store, and separate for the same reason the other two are: a
+    /// recovery reaches past a validity period, and an identifier from it must
+    /// never resolve on a route that authorizes an ordinary renewal. Absence
+    /// carries that rule; a comparison would only describe it.
+    pub recoveries: Mutex<crate::recovery::RecoveryStore>,
     /// The encrypted authority vault, byte for byte as the companion wrote it.
     ///
     /// Astra transports and backs it up; it cannot open it, and nothing in
@@ -322,9 +333,26 @@ pub fn router(service: Arc<AstraService>) -> Router {
         // here is how a hole gets built. Campaigns are opened locally, by
         // `astra campaign open`, on the machine that already runs Astra.
         .route("/v1/campaigns", post(operator_credential_required))
+        // The recovery of an expired identity (§7.5). Reachable without a
+        // tunnel by construction — the tunnel is what expired — and therefore
+        // without a bearer credential: every proof is inside the objects.
+        .route("/v1/client-rotation/challenge", post(status_challenge))
+        .route("/v1/client-rotation/recovery", post(open_recovery))
         .route(
-            "/v1/client-rotation/recovery",
-            post(operator_credential_required),
+            "/v1/client-rotation/recovery/:operation",
+            get(read_recovery),
+        )
+        .route(
+            "/v1/client-rotation/recovery/:operation/authorization",
+            post(authorize_recovery),
+        )
+        .route(
+            "/v1/client-rotation/recovery/:operation/grant",
+            post(grant_recovery),
+        )
+        .route(
+            "/v1/client-rotation/recovery/:operation/commit",
+            post(commit_recovery),
         )
         // The companion's three capability-bound exchanges, plus the read an
         // interface follows progress with. They serve **only** the operator
@@ -879,6 +907,117 @@ async fn signer_result(
         })?;
     let view = mint_view(&service, operation, now).await;
     Ok(Json(view))
+}
+
+/// `POST /v1/client-rotation/recovery` (spec §7.5).
+///
+/// The one route a client with no valid certificate may reach. It is
+/// unauthenticated in the transport sense and authenticated in every sense
+/// that matters: the request carries a signature by the expired generation's
+/// private key, answers a challenge this authority issued and consumes, and is
+/// checked by the historical validator against the peer the registry already
+/// records.
+async fn open_recovery(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Json(request): Json<Box<aether::certificates::client::ExpiredCertificateRecoveryRequest>>,
+) -> Result<Json<aether::certificates::transport::ExpiredRecoveryOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    crate::recovery::open(&service, request, now)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "recovery refused");
+            crate::recovery::refusal(&error)
+        })
+}
+
+/// `GET /v1/client-rotation/recovery/<operation_id>`.
+///
+/// Everything it returns is public material: two expired leaves, a CSR, a
+/// public key, a receipt and a grant. Knowing the identifier confers no
+/// ability — the grant installs nothing without the private keys that only the
+/// client holds, and the commit needs both of them.
+async fn read_recovery(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+) -> Result<Json<aether::certificates::transport::ExpiredRecoveryOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    let recoveries = service.recoveries.lock().await;
+    recoveries
+        .get(&operation_id, now)
+        .map(|operation| Json(operation.view()))
+        .map_err(|error| {
+            tracing::debug!(%operation_id, %error, "recovery read refused");
+            crate::recovery::refusal(&error)
+        })
+}
+
+/// `POST /v1/client-rotation/recovery/<operation_id>/authorization` (§7.5).
+async fn authorize_recovery(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    Json(deposit): Json<aether::certificates::transport::ExpiredRecoveryAuthorizationDeposit>,
+) -> Result<Json<aether::certificates::transport::ExpiredRecoveryOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    crate::recovery::authorize(
+        &service,
+        &operation_id,
+        deposit.authorization,
+        deposit.evidence,
+        now,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%operation_id, %error, "recovery authorization refused");
+        crate::recovery::refusal(&error)
+    })
+}
+
+/// `POST /v1/client-rotation/recovery/<operation_id>/grant` (§7.5).
+async fn grant_recovery(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    Json(deposit): Json<aether::certificates::transport::ExpiredRecoveryGrantDeposit>,
+) -> Result<Json<aether::certificates::transport::ExpiredRecoveryOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    crate::recovery::grant(&service, &operation_id, deposit.grant, now)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%operation_id, %error, "recovery grant refused");
+            crate::recovery::refusal(&error)
+        })
+}
+
+/// `POST /v1/client-rotation/recovery/<operation_id>/commit` (§7.3, §7.5).
+async fn commit_recovery(
+    State(service): State<Arc<AstraService>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Path(raw): Path<String>,
+    Json(deposit): Json<aether::certificates::transport::ExpiredRecoveryCommitDeposit>,
+) -> Result<Json<aether::certificates::transport::ExpiredRecoveryOperationView>, ServiceError> {
+    let now = now_unix();
+    service.charge(source.ip(), now).await?;
+    let operation_id = path_id(&raw)?;
+    crate::recovery::commit(&service, &operation_id, deposit.commit, now)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%operation_id, %error, "recovery commit refused");
+            crate::recovery::refusal(&error)
+        })
 }
 
 /// A public challenge, from the approved DRBG of the specification §2.3.2.

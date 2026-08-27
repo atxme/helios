@@ -61,6 +61,7 @@ pub mod gateway;
 pub mod issuer;
 pub mod operations;
 pub mod planner;
+pub mod recovery;
 pub mod registry;
 pub mod renewal;
 pub mod service;

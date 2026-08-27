@@ -112,6 +112,18 @@ impl GatewayChannel {
         self.client.stage(authorization).await
     }
 
+    /// Relays a recovery commit for a client that has no tunnel (§7.3, §7.5).
+    ///
+    /// Only a recovery reaches this route, and the gateway is what decides
+    /// that: it refuses anything whose pending stage was not opened by the
+    /// `CA-PQ` authorization presented alongside. This end never claims it.
+    pub async fn commit_recovery(
+        &self,
+        relayed: &helios_api::internal::RelayedStageCommit,
+    ) -> Result<(), ChannelError> {
+        self.client.commit_recovery(relayed).await
+    }
+
     /// Applies a signed revocation on the gateway.
     pub async fn revoke(
         &self,

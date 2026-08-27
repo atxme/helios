@@ -237,17 +237,47 @@ fn renewal_block(
     None
 }
 
-/// Whether anything this profile depends on has already expired.
-fn anything_expired(inventory: &CertificateInventory) -> bool {
-    [
-        inventory.gateway_pq.as_ref(),
-        inventory.gateway_ca_tls.as_ref(),
-        inventory.client_tls.as_ref(),
-        inventory.client_pq.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|facts| facts.phase == CertificatePhase::Expired)
+/// What stands between this profile and a §7.5 recovery.
+///
+/// The same three prerequisites a renewal has — a protected store, the sealed
+/// identity, the trust material — plus the one that makes a recovery a
+/// recovery: a **client** leaf whose validity has passed. Recovery is not
+/// offered as a repair for a gateway certificate that aged out; that is the
+/// operator's side of the domain and no client credential moves it.
+///
+/// The sealed bundle is what makes this possible at all, and the reason the
+/// identity check is not merely inherited from the renewal: the expired
+/// private key signs the request. If the protected store lost it, no
+/// historical proof exists and the answer is a re-admission, which
+/// `certificate_recovery` says in its own words when it is reached.
+fn recovery_block(
+    settings: &KeyNegotiationSettings,
+    inventory: &CertificateInventory,
+    identity_store: bool,
+) -> Option<CertificateActionBlock> {
+    if !identity_store {
+        return Some(CertificateActionBlock::NoIdentityStore);
+    }
+    if !inventory.identity_sealed {
+        return Some(CertificateActionBlock::IdentityMissing {
+            identity: settings.identity.clone(),
+        });
+    }
+    if settings.trust.is_none() {
+        return Some(CertificateActionBlock::TrustMaterialMissing);
+    }
+    let client_expired = [inventory.client_tls.as_ref(), inventory.client_pq.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|facts| facts.phase == CertificatePhase::Expired);
+    if !client_expired {
+        return Some(CertificateActionBlock::NothingExpired);
+    }
+    // Nothing blocks it any more. `certificate_recovery` signs the historical
+    // request against Astra's public origin, `astra-signer recover` opens the
+    // vault once, and the commit comes back through the private channel — the
+    // client has no tunnel, which is the whole premise.
+    None
 }
 
 /// The state of all four actions for one profile.
@@ -281,18 +311,20 @@ pub fn action_states(
                     },
                 }
             }
-            // Recovery is about an expired identity, and only about that. On a
-            // profile whose certificates are healthy the honest answer is
-            // "rien à récupérer", not the operator credential the user cannot
-            // produce either way.
+            // Recovery is about an expired **client** identity, and only about
+            // that. On a profile whose client leaves are healthy the honest
+            // answer is "rien à récupérer" — even when a gateway certificate
+            // has aged out, because §7.5 restores a client identity and
+            // nothing else.
             CertificateAction::RecoverExpired => {
-                if anything_expired(inventory) {
-                    CertificateActionState::blocked(
+                match recovery_block(settings, inventory, identity_store) {
+                    Some(block) => CertificateActionState::blocked(action, block),
+                    None => CertificateActionState {
                         action,
-                        CertificateActionBlock::OperatorCredentialRequired,
-                    )
-                } else {
-                    CertificateActionState::blocked(action, CertificateActionBlock::NothingExpired)
+                        label: action.label().to_string(),
+                        blocked_by: None,
+                        message: None,
+                    },
                 }
             }
             // A rollback needs a previous identity held locally. Nothing keeps
@@ -443,13 +475,15 @@ mod tests {
             .is_some_and(|message| message.contains("domaine de confiance")));
     }
 
-    /// A profile enrolled since §19 carries the material, and the whole chain
-    /// exists behind it. Blocking here would send the operator re-issuing a
-    /// document that is already correct, for a path that already works.
-    #[test]
-    fn a_profile_carrying_its_trust_material_may_renew() {
+    /// A profile enrolled since §19, with everything §7 and §7.5 need.
+    fn settings_with_trust() -> KeyNegotiationSettings {
         let mut settings = settings();
-        settings.trust = Some(crate::config::TrustMaterial {
+        settings.trust = Some(trust_material());
+        settings
+    }
+
+    fn trust_material() -> crate::config::TrustMaterial {
+        crate::config::TrustMaterial {
             trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
             ca_epoch: 1,
             ca_pq_public_key: String::new(),
@@ -462,7 +496,15 @@ mod tests {
             credential_registry_epoch: 1,
             astra_service_key_epoch: 1,
             astra_service_public_key: String::new(),
-        });
+        }
+    }
+
+    /// A profile enrolled since §19 carries the material, and the whole chain
+    /// exists behind it. Blocking here would send the operator re-issuing a
+    /// document that is already correct, for a path that already works.
+    #[test]
+    fn a_profile_carrying_its_trust_material_may_renew() {
+        let settings = settings_with_trust();
         let inventory = CertificateInventory {
             identity_sealed: true,
             ..CertificateInventory::default()
@@ -482,8 +524,8 @@ mod tests {
     /// certificates that they need a YubiKey answers a question they did not
     /// ask.
     #[test]
-    fn recovery_reports_the_expiry_before_the_credential() {
-        let settings = settings();
+    fn recovery_reports_the_expiry_before_anything_else() {
+        let settings = settings_with_trust();
         let healthy = CertificateInventory {
             identity_sealed: true,
             client_pq: Some(facts(CertificatePhase::Valid)),
@@ -497,7 +539,35 @@ mod tests {
             .blocked_by,
             Some(CertificateActionBlock::NothingExpired)
         );
+    }
 
+    /// A gateway certificate that aged out is the operator's side of the
+    /// domain: no client credential moves it, and offering a recovery for it
+    /// would send the user through a ceremony that repairs nothing they hold.
+    #[test]
+    fn recovery_is_about_the_client_identity_and_not_the_gateways() {
+        let settings = settings_with_trust();
+        let inventory = CertificateInventory {
+            identity_sealed: true,
+            client_pq: Some(facts(CertificatePhase::Valid)),
+            gateway_pq: Some(facts(CertificatePhase::Expired)),
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &inventory, true),
+                CertificateAction::RecoverExpired
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::NothingExpired)
+        );
+    }
+
+    /// The §7.5 chain closes: an expired client identity, a sealed bundle and
+    /// the trust material are all a recovery needs from this side.
+    #[test]
+    fn an_expired_client_identity_may_be_recovered() {
+        let settings = settings_with_trust();
         let expired = CertificateInventory {
             identity_sealed: true,
             client_pq: Some(facts(CertificatePhase::Expired)),
@@ -509,7 +579,20 @@ mod tests {
                 CertificateAction::RecoverExpired
             )
             .blocked_by,
-            Some(CertificateActionBlock::OperatorCredentialRequired)
+            None
+        );
+
+        // Without the §19 material there is no authority to ask, and that is
+        // the reason to give — not the security key the user cannot use yet.
+        let mut bare = settings.clone();
+        bare.trust = None;
+        assert_eq!(
+            state_of(
+                &action_states(Some(&bare), &expired, true),
+                CertificateAction::RecoverExpired
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::TrustMaterialMissing)
         );
     }
 

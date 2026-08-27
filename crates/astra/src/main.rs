@@ -544,6 +544,7 @@ fn run(
         approval_credential_registry_epoch,
         approval_credential_registry,
         signing: Mutex::new(astra::signing::SigningOperationStore::new()),
+        recoveries: Mutex::new(astra::recovery::RecoveryStore::new()),
         encrypted_vault,
         gateway,
     });

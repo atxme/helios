@@ -1418,6 +1418,93 @@ pub struct ClientRenewalOperationView {
     pub grant: Option<Box<super::client::ClientCertificateRotationGrant>>,
 }
 
+/// Where a §7.5 recovery stands.
+///
+/// Four states and no more. A recovery has no approval to wait for *and* a
+/// staging to wait for: the same ceremony that approves it signs the staging,
+/// because both need `CA-PQ` and `CA-PQ` is opened once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiredRecoveryState {
+    /// The request verified. Nothing exists yet but the operator's decision.
+    AwaitingOperator,
+    /// The gateway persisted the candidate and signed a receipt.
+    Staged,
+    /// The grant is available; the client may install and commit.
+    Granted,
+    /// The client's commit reached the gateway. Terminal.
+    Committed,
+}
+
+/// What the authority answers about one recovery.
+///
+/// # Why there is no capability token here
+///
+/// Everything this view carries is public: two expired leaves, a CSR, a public
+/// key, a receipt and a grant. The private halves never leave the client, and
+/// the one secret in the whole exchange — `CA-PQ` — never leaves the vault.
+/// A token would be protecting material that is already published by the
+/// objects it appears in, while adding a second thing to keep alive across a
+/// ceremony that already has a five-minute window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpiredRecoveryOperationView {
+    pub operation_id: Id16,
+    pub state: ExpiredRecoveryState,
+    pub client_wg_public_key: WireGuardKey,
+    pub request_fingerprint: Fingerprint,
+    pub created_at: u64,
+    pub expires_at: u64,
+    /// The request itself, for the companion that has to display it.
+    pub request: Option<Box<super::client::ExpiredCertificateRecoveryRequest>>,
+    /// Present from [`ExpiredRecoveryState::Staged`]: what the companion signs
+    /// the grant against.
+    pub receipt: Option<Box<super::client::GatewayCertificateStageReceipt>>,
+    /// The leaf the gateway **serves**, read back over the private channel.
+    ///
+    /// A receipt is signed by what the daemon actually presents, and the
+    /// companion has no way to reach the gateway itself. It is not asked to
+    /// believe this copy: the leaf names a WireGuard key, and the companion
+    /// compares it to the gateway its own domain hand-off pins before it
+    /// verifies anything under it.
+    pub gateway_pq_certificate: Option<Box<crate::key_negotiation::PqCertificate>>,
+    /// Present from [`ExpiredRecoveryState::Granted`]: what the client installs.
+    pub grant: Option<Box<super::client::ClientCertificateRotationGrant>>,
+}
+
+/// What the companion deposits after the one ceremony (spec §7.5).
+///
+/// The authorization and the approval travel together because one touch
+/// produced both: the assertion answers the recovery challenge, and the PRF
+/// output of that same assertion opens the key-slot that signs the
+/// authorization. Splitting them would let a caller present an authorization
+/// with no operator answer, or an answer with nothing it authorized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpiredRecoveryAuthorizationDeposit {
+    pub authorization: Box<super::client::ClientCertificateStageAuthorization>,
+    pub evidence: Box<super::approval::ExpiredRecoveryApprovalEvidence>,
+}
+
+/// The grant the companion signs once the gateway's receipt exists.
+///
+/// A recovery staging is `IssuerKind::Master`, so its grant is signed by
+/// `CA-PQ` too — the delegated issuer may not vouch for an operation it was
+/// never allowed to authorize. That is why the vault stays open across one
+/// veth round trip, and why it is one command rather than two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpiredRecoveryGrantDeposit {
+    pub grant: Box<super::client::ClientCertificateRotationGrant>,
+}
+
+/// The client's commit, relayed because it has no tunnel to send it through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpiredRecoveryCommitDeposit {
+    pub commit: Box<super::client::ClientCertificateStageCommit>,
+}
+
 /// What the companion fetches, and everything it needs in order to answer.
 ///
 /// No private material: the approval request is signed by the Astra service

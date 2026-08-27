@@ -46,8 +46,10 @@ feuille renouvelée se connecte encore » plus bas.
 
 Ce qui **manque** encore :
 
-- la **récupération d'une identité expirée**, et les trois autres actions du
-  §12.2 : sans pilote, refusées en le disant ;
+- le **retour à l'identité précédente** du §12.2 : rien ne la conserve, refusé
+  en le disant ;
+- la **révocation** d'une identité : l'objet et la route privée existent, aucun
+  geste ne les produit ni ne les dépose ;
 - `authorize-issuer` ne porte **aucune campagne**, donc pas d'opération à
   laquelle se rattacher : ce geste passe par des fichiers, comme décrit ici.
   `approve`, `approve-campaign` et `rotate-ca-pq` ont leur transport ;
@@ -67,6 +69,35 @@ moitiés du domaine, et toute la séquence au-dessus du matériel. Ce qui ne l'e
 pas en WSL2 : le veth noyau réel, la clé de sécurité (aucun passthrough USB) et
 DPAPI — donc un renouvellement complet s'exerce sur Windows, contre une vraie
 gateway. Voir [TESTING.md](testing/TESTING.md).
+
+## Récupérer une identité expirée
+
+Un poste resté éteint trop longtemps n'a plus de tunnel : sa feuille est
+refusée par mTLS, par QUIC et par tous les validateurs ordinaires. C'est le
+seul cas où le client parle à l'**origine publique** d'Astra plutôt qu'à la
+gateway.
+
+Dans Orion : « Récupérer le certificat expiré ». Puis, sur le poste de
+l'opérateur :
+
+```sh
+astra-signer recover --authority-url https://astra.exemple \
+  --operation-id <identifiant> --validity-days 365
+```
+
+Une seule clé suffit, et §7.5 dit pourquoi : elle n'est pas la seule preuve —
+la clé privée de la dernière génération admise signe aussi la demande, et une
+récupération ne peut changer ni le pair ni le domaine. Une réadmission, elle,
+peut créer une continuité neuve, et exige donc deux clés.
+
+Le commit du client repart par le canal privé, parce qu'il n'a toujours pas de
+tunnel au moment où il committe. La gateway refuse sur ce lien tout ce dont
+l'étape en attente n'a pas été ouverte par l'autorisation `CA-PQ` présentée à
+côté : relayer ne donne donc à l'autorité rien qu'elle n'avait déjà.
+
+**La clé privée expirée doit encore exister.** Si elle est partie avec le
+stockage protégé qui la tenait, Orion le dit et s'arrête : il reste une
+réadmission opérateur à deux clés.
 
 ## Faire tourner l'ancre `CA-PQ`
 

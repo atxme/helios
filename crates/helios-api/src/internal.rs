@@ -55,14 +55,6 @@
 //!
 //! # Limites connues
 //!
-//! - `POST /internal/v1/certificates/stage-commit` is routed and answers `501`
-//!   through [`InternalRefusal::RecoveryUnavailable`]. Spec §7.3 accepts a
-//!   commit on this link **only** for the recovery of an expired identity, and
-//!   only alongside the signed recovery authorization — an object produced by
-//!   an operator YubiKey ceremony that no build implements (§12.3). Taking the
-//!   commit without it would turn the veth into a second path for an ordinary
-//!   commit, which must travel in WireGuard where the source proves the peer.
-//!   Delivering `astra-signer`'s signing commands is what unblocks it.
 //! - `POST /internal/v1/campaigns/apply` of §8.3 is deliberately **not**
 //!   routed: a campaign is applied under an operator approval that does not
 //!   exist, and Astra's public `/v1/campaigns` already answers `501` for the
@@ -171,9 +163,6 @@ pub enum InternalRefusal {
     Rejected,
     /// Known identity, nothing to answer with.
     Unavailable,
-    /// The operation needs the signed recovery authorization of spec §7.3,
-    /// which needs the operator credential layer that no build implements.
-    RecoveryUnavailable,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -184,7 +173,6 @@ impl InternalRefusal {
             Self::Protocol => StatusCode::BAD_REQUEST,
             Self::Rejected => StatusCode::FORBIDDEN,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::RecoveryUnavailable => StatusCode::NOT_IMPLEMENTED,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -268,6 +256,42 @@ pub trait AstraChannelHandler: AstraStageHandler {
         &self,
         distribution: Box<TrustDistribution>,
     ) -> Result<(), TrustUpdateRefusal>;
+
+    /// Commits a recovery staging on behalf of a client that has no tunnel.
+    ///
+    /// The only commit this link accepts, and the implementation is what
+    /// enforces that: the peer comes from the **signed** commit, never from
+    /// the caller, and the stage must be one a `CA-PQ` recovery authorization
+    /// created.
+    async fn commit_recovery(
+        &self,
+        relayed: Box<RelayedStageCommit>,
+    ) -> Result<(), TrustUpdateRefusal>;
+}
+
+/// A commit relayed on the private link, for a recovery only (spec §7.3).
+///
+/// # Why the authorization travels with the commit
+///
+/// This link is the one place a commit does **not** arrive from the client's
+/// own tunnel, and it is legitimate for exactly one operation: the recovery of
+/// an identity whose leaf has expired, where by definition no tunnel exists.
+/// The gateway must therefore be able to tell a recovery from an ordinary
+/// renewal, and «which kind of stage is this» is a fact about the *signed
+/// authorization* — not about the caller, and not about anything the registry
+/// keeps.
+///
+/// So the authorization comes along. The gateway compares its fingerprint to
+/// the one the pending stage already recorded, which makes the copy provably
+/// the exact document it verified at staging time, and then reads the reason
+/// off it. Carrying a flag instead would be asking the relay what kind of
+/// operation it is relaying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedStageCommit {
+    pub authorization: Box<aether::certificates::client::ClientCertificateStageAuthorization>,
+    pub commit: Box<aether::certificates::client::ClientCertificateStageCommit>,
+    pub grant: Box<aether::certificates::client::ClientCertificateRotationGrant>,
 }
 
 /// One signed transaction, addressed to one peer.
@@ -351,19 +375,31 @@ async fn distribute(State(handler): State<Arc<dyn AstraChannelHandler>>, body: B
     }
 }
 
-/// `POST /internal/v1/certificates/stage-commit`.
+/// `POST /internal/v1/certificates/stage-commit` (spec §7.3, §7.5).
 ///
-/// Routed and refused — see the module's known limitations. On this link a
-/// commit is legitimate only for the recovery of an expired identity, and only
-/// alongside the signed recovery authorization of spec §7.3, which needs the
-/// operator credential layer. A named refusal rather than a silent accept.
-async fn stage_commit(uri: Uri) -> Response {
-    tracing::warn!(
-        path = %uri.path(),
-        "private channel: a stage commit here needs the signed recovery authorization of §7.3, \
-         which this build does not implement; an ordinary commit belongs in the tunnel"
-    );
-    InternalRefusal::RecoveryUnavailable.into_response()
+/// The recovery commit, and nothing else. A client whose leaf has expired has
+/// no tunnel to commit through, so the authority relays the commit it received
+/// on its public origin. Every proof still belongs to the client: the commit
+/// carries both its signatures, and the peer is read off the signed document
+/// rather than off the caller.
+async fn stage_commit(
+    State(handler): State<Arc<dyn AstraChannelHandler>>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_INTERNAL_BODY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let relayed: RelayedStageCommit = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "private channel: unreadable relayed commit");
+            return InternalRefusal::Protocol.into_response();
+        }
+    };
+    match handler.commit_recovery(Box::new(relayed)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(refusal) => InternalRefusal::from(refusal).into_response(),
+    }
 }
 
 /// `POST /internal/v1/certificates/revoke` (spec §10).
@@ -866,6 +902,16 @@ impl GatewayLifecycleClient {
             .request("POST", STAGE_PATH, Some(body), None)
             .await?;
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+    }
+
+    /// Relays a recovery commit for a client that has no tunnel (spec §7.3).
+    pub async fn commit_recovery(&self, relayed: &RelayedStageCommit) -> Result<(), ChannelError> {
+        let body =
+            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
+        self.http
+            .request("POST", STAGE_COMMIT_PATH, Some(body), None)
+            .await?;
+        Ok(())
     }
 
     /// Applies a signed revocation.
@@ -1371,6 +1417,14 @@ mod tests {
             Err(TrustUpdateRefusal::Rejected)
         }
 
+        async fn commit_recovery(
+            &self,
+            _relayed: Box<RelayedStageCommit>,
+        ) -> Result<(), TrustUpdateRefusal> {
+            self.seen.lock().unwrap().push("commit_recovery");
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
         async fn peer_state(
             &self,
             _identity: &WireGuardKey,
@@ -1475,17 +1529,21 @@ mod tests {
         assert_eq!(handler.seen.lock().unwrap().as_slice(), ["peer_state"]);
     }
 
-    /// A commit on this link needs the signed recovery authorization of §7.3.
-    /// It is refused by name — never accepted as an ordinary commit, which must
-    /// travel in the tunnel where the source proves the peer.
+    /// A commit on this link carries a whole relayed document, and a body that
+    /// is not one never reaches the registry: an empty POST is a protocol
+    /// error, not an ordinary commit that happened to arrive here.
     #[tokio::test]
-    async fn a_commit_is_refused_by_name_rather_than_accepted() {
+    async fn a_commit_without_its_authorization_never_reaches_the_registry() {
         let handler = spy();
         assert_eq!(
             status_of(Arc::clone(&handler), "POST", STAGE_COMMIT_PATH).await,
-            StatusCode::NOT_IMPLEMENTED
+            StatusCode::BAD_REQUEST
         );
-        assert!(handler.seen.lock().unwrap().is_empty());
+        assert!(
+            handler.seen.lock().unwrap().is_empty(),
+            "the handler decides which stagings are recoveries; it must not be asked about \
+             something that is not even a commit"
+        );
     }
 
     #[test]
@@ -1496,10 +1554,6 @@ mod tests {
             (
                 InternalRefusal::Unavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                InternalRefusal::RecoveryUnavailable,
-                StatusCode::NOT_IMPLEMENTED,
             ),
             (InternalRefusal::Internal, StatusCode::INTERNAL_SERVER_ERROR),
         ] {

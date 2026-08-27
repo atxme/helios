@@ -149,6 +149,19 @@ struct AppState {
     /// touched. The cost is that a restart reopens rather than resumes — the
     /// cheap failure, since nothing was committed.
     renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    /// Recoveries of expired identities in progress (§7.5).
+    ///
+    /// A separate map, for the same reason Astra keeps a separate store: a
+    /// recovery reaches past a validity period, and an identifier from one
+    /// must never resolve where an ordinary renewal is resumed. Absence
+    /// carries the rule; a comparison would only describe it.
+    recoveries: Arc<Mutex<std::collections::HashMap<String, InFlightRecovery>>>,
+}
+
+/// One recovery in progress: the session that drives it, and its profile.
+struct InFlightRecovery {
+    session: orion_core::certificate_recovery::RecoverySession,
+    settings: orion_core::KeyNegotiationSettings,
 }
 
 /// One renewal in progress: what drives it, and the state it writes into.
@@ -547,6 +560,53 @@ async fn run_certificate_action(
     }
 }
 
+/// Asks the gateway, once per connection, whether this profile is behind.
+///
+/// # Why it is spawned and never awaited
+///
+/// It runs from the event sink, which the tunnel's own state machine drives. A
+/// trust update that blocked there would make a gateway that accepts the
+/// connection and then stalls hold up the client's notion of being connected —
+/// the update is a convenience, the tunnel is the product.
+///
+/// Every outcome is said in the log the user actually reads, including the
+/// refusals: a client that silently never catches up on a revocation is the
+/// one failure this whole path exists to prevent, and «nothing happened» is
+/// indistinguishable from «nothing was owed» unless one of them is written
+/// down.
+fn spawn_trust_refresh(
+    settings: orion_core::KeyNegotiationSettings,
+    heliosd_url: String,
+    sink: EventSink,
+) {
+    tauri::async_runtime::spawn(async move {
+        match orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await {
+            Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
+                tracing::debug!("mise à jour de confiance : rien à récupérer");
+            }
+            Ok(orion_core::trust_update::TrustUpdateOutcome::Applied { objects }) => {
+                let message = format!(
+                    "confiance mise à jour : {objects} objet(s) signé(s) appliqué(s) depuis la \
+                     gateway"
+                );
+                tracing::info!(objects, "mise à jour de confiance appliquée");
+                sink(ClientEvent::log("info", message));
+            }
+            Err(error) => {
+                // Not fatal, and deliberately not silent. The tunnel works;
+                // what may not is a future renewal, and that is worth a line
+                // now rather than a refusal nobody can explain later.
+                let message = format!(
+                    "mise à jour de confiance impossible : {error}. Le tunnel n'est pas \
+                             affecté."
+                );
+                tracing::warn!(%error, "mise à jour de confiance refusée");
+                sink(ClientEvent::log("warn", message));
+            }
+        }
+    });
+}
+
 /// One action, one profile.
 async fn run_for_one(
     state: &State<'_, AppState>,
@@ -581,9 +641,12 @@ async fn run_for_one(
         orion_core::CertificateAction::RenewEveryProfile => {
             unreachable!("the fleet action is dispatched before this point")
         }
-        orion_core::CertificateAction::RecoverExpired
-        | orion_core::CertificateAction::RollbackToPrevious => Err(
-            "cette action n'a pas encore de pilote : seul « Renouveler maintenant » en a un."
+        orion_core::CertificateAction::RecoverExpired => {
+            drive_recovery(state, name, settings).await
+        }
+        orion_core::CertificateAction::RollbackToPrevious => Err(
+            "cette action n'a pas encore de pilote : rien ne conserve l'identité précédente, le \
+             magasin protégé ne garde qu'un lot par nom."
                 .to_string(),
         ),
     };
@@ -688,6 +751,34 @@ enum RenewalProgress {
     Committed {
         generation: u64,
     },
+    /// A §7.5 recovery, waiting on an operator who is not on this machine.
+    ///
+    /// It carries no companion command line: the operator runs `astra-signer`
+    /// on **their** workstation, against Astra's public origin, and the only
+    /// thing that has to travel between the two people is the identifier.
+    RecoveryAwaitingOperator {
+        operation_id: String,
+    },
+    Recovered {
+        generation: u64,
+    },
+}
+
+impl RenewalProgress {
+    fn of_recovery(step: &orion_core::certificate_recovery::RecoveryStep) -> Self {
+        use orion_core::certificate_recovery::RecoveryStep;
+        match step {
+            RecoveryStep::AwaitingOperator { operation_id } => Self::RecoveryAwaitingOperator {
+                operation_id: operation_id.to_hex(),
+            },
+            RecoveryStep::Issuing { operation_id } => Self::Issuing {
+                operation_id: operation_id.to_hex(),
+            },
+            RecoveryStep::Recovered { generation } => Self::Recovered {
+                generation: *generation,
+            },
+        }
+    }
 }
 
 impl RenewalProgress {
@@ -770,6 +861,55 @@ async fn drive_renewal(
                 approval: None,
             },
         );
+    }
+    Ok(progress)
+}
+
+/// Opens a §7.5 recovery, or takes one more step on the one already open.
+///
+/// # Why resuming matters even more here than for a renewal
+///
+/// A recovery burns the one historical proof this machine has: the expired
+/// private key signs a request naming a specific generation, and Astra
+/// consumes the challenge it answered. Starting a second one while the first
+/// still waits would leave an operator holding an identifier that no longer
+/// matches what the client will present — and the operator is on another
+/// machine, with no way to see that.
+async fn drive_recovery(
+    state: &State<'_, AppState>,
+    name: &str,
+    settings: Option<orion_core::KeyNegotiationSettings>,
+) -> Result<RenewalProgress, String> {
+    let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+
+    let mut recoveries = state.recoveries.lock().await;
+    if let Some(in_flight) = recoveries.get(name) {
+        let step = orion_core::certificate_recovery::resume(
+            &in_flight.session,
+            &in_flight.settings,
+            now_unix(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let progress = RenewalProgress::of_recovery(&step);
+        if matches!(
+            step,
+            orion_core::certificate_recovery::RecoveryStep::Recovered { .. }
+        ) {
+            recoveries.remove(name);
+        }
+        return Ok(progress);
+    }
+
+    let (session, step) = orion_core::certificate_recovery::begin(&settings, now_unix())
+        .await
+        .map_err(|error| error.to_string())?;
+    let progress = RenewalProgress::of_recovery(&step);
+    if !matches!(
+        step,
+        orion_core::certificate_recovery::RecoveryStep::Recovered { .. }
+    ) {
+        recoveries.insert(name.to_string(), InFlightRecovery { session, settings });
     }
     Ok(progress)
 }
@@ -1791,6 +1931,17 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     let heliosd_url = profile.heliosd_url.clone();
     let app_for_tel = app.clone();
     let negotiating = profile.negotiates();
+    // The trust update of §8.1.1 lives inside the tunnel, so the moment it
+    // becomes reachable is the moment it is worth asking. Captured here rather
+    // than read later: by the time the tunnel is up, the configuration may
+    // already describe a different profile.
+    let trust_settings = profile.key_negotiation.clone();
+    let trust_url = profile.heliosd_url.clone();
+    // Once per connection. `Up` is re-emitted whenever the inference loop sees
+    // a fresh handshake after a stall, and each of those is the same tunnel —
+    // asking again on every one would poll the gateway for the life of the
+    // session.
+    let trust_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let negotiated_profile = profile.name.clone();
     let config = Arc::clone(&state.config);
     let store = Arc::clone(&state.store);
@@ -1815,6 +1966,13 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
                 TunnelState::Up => {
                     if let Some(url) = heliosd_url.clone() {
                         telemetry.start(url, emit_sink(app_for_tel.clone()));
+                    }
+                    if let (Some(settings), Some(url), false) = (
+                        trust_settings.clone(),
+                        trust_url.clone(),
+                        trust_asked.swap(true, std::sync::atomic::Ordering::SeqCst),
+                    ) {
+                        spawn_trust_refresh(settings, url, emit_sink(app_for_tel.clone()));
                     }
                 }
                 TunnelState::Down | TunnelState::Failed => telemetry.stop(),
@@ -2443,6 +2601,7 @@ fn main() {
             log_path,
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
             renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {
             #[cfg(target_os = "windows")]

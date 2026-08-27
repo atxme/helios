@@ -3,6 +3,15 @@
 Point d'entrée de la documentation. Le code et les ADR acceptés font foi en
 cas de doute (voir [AGENTS.md](../AGENTS.md)).
 
+## Exploitation
+
+- [RENOUVELLEMENT-CERTIFICATS.md](RENOUVELLEMENT-CERTIFICATS.md) — toutes les
+  commandes de renouvellement et de rotation, objet par objet : feuille
+  cliente, parc entier, ancre `CA-PQ`, délégation Astra, identité expirée,
+  révocation.
+- [DEPLOIEMENT-ASTRA.md](DEPLOIEMENT-ASTRA.md) — déploiement de l'autorité et
+  état réellement éprouvé.
+
 ## Architecture
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — vue opérationnelle courante du système

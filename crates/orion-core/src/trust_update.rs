@@ -282,3 +282,69 @@ struct TrustUpdateAnswer {
     #[serde(default)]
     chunk: Option<aether::certificates::transport::TrustUpdateChunk>,
 }
+
+/// Asks the gateway once whether this profile is behind, and catches it up.
+///
+/// # Why this opens the identity store itself
+///
+/// The request is signed by the **active** PQ leaf, and every counter in it is
+/// read from the store. A caller that assembled those parts would be a second
+/// place where «what this client currently holds» is decided, and the two
+/// would drift silently — the symptom being a transaction refused at commit,
+/// after a whole fragment cycle, for a state mismatch nobody can see from the
+/// screen that triggered it.
+///
+/// Anything already due is promoted first, for the same reason
+/// [`crate::certificate_renewal::begin`] does it: a request computed against a
+/// state that has not caught up describes a generation this client is leaving.
+///
+/// It is safe to call on every connection. `UpToDate` is the ordinary answer
+/// and costs one round trip inside the tunnel.
+pub async fn refresh(
+    settings: &crate::KeyNegotiationSettings,
+    heliosd_url: &str,
+    now_unix: u64,
+) -> Result<TrustUpdateOutcome, TrustUpdateError> {
+    use crate::certificate_renewal::{client_pq_leaf, open_identity_store, promote_due};
+    use crate::identity_store::ProtectedIdentityStore;
+    use std::path::Path;
+
+    let identity = settings.identity.trim();
+    if identity.is_empty() {
+        return Err(TrustUpdateError::Transport(
+            "ce profil ne nomme aucune identité protégée".into(),
+        ));
+    }
+    let identities = ProtectedIdentityStore::for_current_user()
+        .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+    let bundle = identities
+        .load(identity)
+        .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+    let mut store = open_identity_store(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        settings,
+        &bundle,
+        now_unix,
+    )
+    .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+    promote_due(&mut store, &identities, identity, now_unix)
+        .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+
+    let certificate =
+        client_pq_leaf(&bundle).map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
+    let private_key = Zeroizing::new(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            bundle.pq_private_key.trim(),
+        )
+        .map_err(|_| {
+            TrustUpdateError::Transport("clé privée PQ cliente : base64 illisible".into())
+        })?,
+    );
+
+    let session = TrustUpdateSession::prepare(&store, heliosd_url, certificate, &private_key)?;
+    session.run(&mut store, now_unix).await
+}

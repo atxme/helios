@@ -248,6 +248,84 @@ impl Origin {
         Ok(view.state)
     }
 
+    /// Reads one §7.5 recovery.
+    ///
+    /// No token: everything it returns is public material — two expired
+    /// leaves, a CSR, a public key, a receipt. The private halves are the
+    /// client's and the anchor is in the vault; knowing the identifier confers
+    /// nothing.
+    pub fn recovery(
+        &self,
+        operation_id: &Id16,
+    ) -> Result<aether::certificates::transport::ExpiredRecoveryOperationView> {
+        let view: aether::certificates::transport::ExpiredRecoveryOperationView = self
+            .get(
+                &format!(
+                    "{}/v1/client-rotation/recovery/{}",
+                    self.base,
+                    operation_id.to_hex()
+                ),
+                None,
+            )
+            .context("lecture de la récupération")?;
+        if view.operation_id != *operation_id {
+            bail!(
+                "l'autorité a répondu au sujet de l'opération {} et non de {}",
+                view.operation_id.to_hex(),
+                operation_id.to_hex()
+            );
+        }
+        Ok(view)
+    }
+
+    /// Deposits the approval and the `CA-PQ` staging one ceremony produced.
+    pub fn deposit_recovery_authorization(
+        &self,
+        operation_id: &Id16,
+        deposit: &aether::certificates::transport::ExpiredRecoveryAuthorizationDeposit,
+    ) -> Result<aether::certificates::transport::ExpiredRecoveryOperationView> {
+        self.post(
+            &format!(
+                "{}/v1/client-rotation/recovery/{}/authorization",
+                self.base,
+                operation_id.to_hex()
+            ),
+            deposit,
+        )
+    }
+
+    /// Deposits the grant signed against the gateway's receipt.
+    pub fn deposit_recovery_grant(
+        &self,
+        operation_id: &Id16,
+        deposit: &aether::certificates::transport::ExpiredRecoveryGrantDeposit,
+    ) -> Result<aether::certificates::transport::ExpiredRecoveryOperationView> {
+        self.post(
+            &format!(
+                "{}/v1/client-rotation/recovery/{}/grant",
+                self.base,
+                operation_id.to_hex()
+            ),
+            deposit,
+        )
+    }
+
+    fn post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
+        let encoded = serde_json::to_vec(body).context("encodage de la requête")?;
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded)
+            .send()
+            .context("appel de l'autorité")?;
+        Self::decode(response)
+    }
+
     fn get<T: serde::de::DeserializeOwned>(&self, url: &str, token: Option<&str>) -> Result<T> {
         let mut request = self.http.get(url);
         if let Some(token) = token {

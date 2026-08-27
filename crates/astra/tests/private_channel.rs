@@ -104,6 +104,17 @@ impl AstraChannelHandler for Recorder {
         Err(TrustUpdateRefusal::Rejected)
     }
 
+    async fn commit_recovery(
+        &self,
+        relayed: Box<helios_api::internal::RelayedStageCommit>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        self.seen.lock().unwrap().push(format!(
+            "commit_recovery {}",
+            relayed.commit.client_wg_public_key
+        ));
+        Err(TrustUpdateRefusal::Rejected)
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("identity".into());
         let pq_certificate = served_leaf();

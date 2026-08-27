@@ -2796,7 +2796,14 @@ contournés :
   `orion_core::trust_update` écrit la requête depuis son propre magasin,
   empreinte de base comprise, collecte les fragments et n'applique rien avant
   le dernier — un manifeste qui change en cours de collecte est un conflit, pas
-  une reprise.
+  une reprise. Orion l'**appelle** : le tunnel passe à `Up`, la route devient
+  joignable, et une seule demande part par connexion — `Up` est réémis à chaque
+  reprise de handshake après une pause, et redemander à chacune ferait sonder
+  la gateway pendant toute la session. Le résultat est écrit dans le journal
+  que l'utilisateur lit, refus compris : un client qui ne rattrape jamais une
+  révocation en silence est le seul échec que tout ce chemin existe pour
+  éviter, et « rien ne s'est passé » ne se distingue de « rien n'était dû » que
+  si l'un des deux est écrit.
   **Le magasin d'objets de transition existe** : `astra-signer rotate-ca-pq
   --authority-url --operation-id` exécute une campagne `trust_authorities`,
   rend la `CaTransition` signée par `CA-PQ` **dans le même dépôt** que
@@ -2832,17 +2839,39 @@ contournés :
   tous les compteurs et toutes les empreintes actives, gateway comme client :
   une omission y répondrait « rien à récupérer » à un client en retard, et
   c'est le seul refus dont il ne se relève pas ;
-- la **récupération d'une identité expirée** de bout en bout. L'objet et son
-  **validateur historique** sont livrés et éprouvés (`aether::certificates::client`) :
-  `ExpiredCertificateRecoveryRequest`, sa transcription, ses deux signatures,
-  le challenge d'approbation, et un `verify_historical` qui écarte la période
-  **et rien d'autre** — l'émetteur, le rôle, la liaison WireGuard, l'égalité
-  avec la dernière génération enregistrée et les deux preuves restent
-  contrôlés. Ce qui manque est chacun de ses consommateurs : la route publique
-  d'Astra, la cérémonie du compagnon qui ouvre le coffre et signe
-  l'autorisation de staging sous `CA-PQ`, le relais par le veth et le commit
-  côté gateway. Le tout dépend de l'application d'une opération opérateur
-  approuvée, qui n'existe pour aucun chemin ;
+- la **récupération d'une identité expirée** est livrée de bout en bout. Le
+  validateur historique était déjà éprouvé ; ses consommateurs le sont
+  désormais aussi. Orion (`orion_core::certificate_recovery`) demande un
+  challenge à l'origine publique, signe la demande avec la clé privée
+  **expirée** et la clé neuve, et la dépose ;
+  `POST /v1/client-rotation/recovery` la passe au validateur historique contre
+  le pair que le registre enregistre déjà, consomme le challenge, et ouvre une
+  opération de récupération dans un **troisième** magasin — un identifiant de
+  récupération ne doit jamais se résoudre là où un renouvellement ordinaire
+  s'autorise. `astra-signer recover --authority-url … --operation-id …` lit la
+  demande, l'affiche, prend l'assertion de l'opérateur, la **vérifie avant**
+  d'employer la sortie PRF de la même session pour ouvrir le coffre, émet les
+  deux feuilles sous `CA-TLS` et `CA-PQ`, signe l'autorisation de staging sous
+  `IssuerKind::Master`, la dépose ; Astra la relaie par le veth, récupère le
+  reçu, et le compagnon signe le grant sous `CA-PQ` contre ce reçu exact.
+  Enfin le commit du client repart par
+  `POST /internal/v1/certificates/stage-commit` : la gateway refuse sur ce lien
+  tout ce dont l'étape en attente n'a pas été ouverte par l'autorisation
+  `CA-PQ` présentée à côté, ce qui empêche ce chemin d'être une seconde voie
+  pour un renouvellement ordinaire.
+  **Limite connue** : la clé privée expirée doit encore exister. Si elle est
+  partie avec le stockage DPAPI ou TPM qui la tenait, aucune preuve historique
+  n'est produisible et `RecoveryError::NoHistoricalProof` le dit — il reste la
+  réadmission opérateur à deux credentials, qui crée une continuité neuve au
+  lieu d'en prolonger une.
+  **Limite connue** : deux touchers plutôt qu'un. §7.5 demande une **seule**
+  cérémonie `GetAssertion` portant le challenge et le sel PRF ; `Authenticator`
+  sépare délibérément `approve` (sans sel, ce qui fait tenir §14.1 par
+  construction) et `derive`. Le compagnon interroge donc la même clé, dans la
+  même session, deux fois. Les propriétés que §7.5 nomme tiennent — même
+  credential, même connexion, assertion vérifiée avant emploi du secret ; ce
+  qui manque est le confort d'un seul appui, et le débloquer demande un appel
+  combiné dans `helios-fido` et dans **les deux** transports ;
 - l'**exécution d'une campagne d'autorité**. Une campagne sur les **leafs
   clientes** s'exécute désormais : quand un pair couvert envoie sa demande de
   rotation, `astra::renewal::open` retrouve l'opération approuvée par
@@ -2910,10 +2939,17 @@ contournés :
   campagne au profil d'où part le clic aurait ouvert cinq renouvellements sans
   rien montrer, et masqué l'approbation que chacun attend. Le refus d'un profil
   n'arrête pas les autres : ils sont indépendants, et s'arrêter au premier
-  ferait dépendre le résultat de l'ordre d'une liste. Manquent encore :
-  `RecoverExpired` et `RollbackToPrevious`, refusées en le disant, le lancement
-  automatique du compagnon plutôt que sa ligne de commande, et l'affichage des
-  credentials opérateur enregistrés. Côté console Helios, rien n'existe encore ;
+  ferait dépendre le résultat de l'ordre d'une liste.
+  `RecoverExpired` **agit** aussi désormais : elle ouvre la récupération du
+  §7.5, rend l'identifiant que l'utilisateur lit à voix haute à qui détient une
+  clé de sécurité — il n'existe plus aucun autre canal — puis reprend au clic
+  suivant jusqu'au commit relayé. Elle n'est proposée que si une feuille
+  **cliente** est expirée : un certificat gateway périmé est le côté opérateur
+  du domaine, qu'aucun credential client ne déplace.
+  Manquent encore : `RollbackToPrevious`, refusée en le disant — rien ne
+  conserve l'identité précédente —, le lancement automatique du compagnon
+  plutôt que sa ligne de commande, et l'affichage des credentials opérateur
+  enregistrés. Côté console Helios, rien n'existe encore ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné

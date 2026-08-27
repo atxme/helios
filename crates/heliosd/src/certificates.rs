@@ -532,6 +532,81 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
                 classify(error)
             })
     }
+
+    /// The recovery commit of §7.3, and only a recovery.
+    ///
+    /// # What makes this safe on a link the client is not on
+    ///
+    /// Three things, and all three are needed. The peer is read off the
+    /// **signed** commit, which carries the signatures of both the expired
+    /// generation and the candidate — so the relay names nobody. The stage
+    /// being closed must be the one this presented authorization opened,
+    /// compared by the fingerprint the registry already recorded — so the
+    /// relay describes nothing. And that authorization must be a `CA-PQ`
+    /// recovery, which is a decision an operator made at a security key, in
+    /// the companion, and which no online process can produce.
+    ///
+    /// Without the last check this route would be a way for the authority to
+    /// commit an ordinary renewal in a client's place — the one operation the
+    /// tunnel exists to keep the client's own.
+    async fn commit_recovery(
+        &self,
+        relayed: Box<helios_api::internal::RelayedStageCommit>,
+    ) -> Result<(), TrustUpdateRefusal> {
+        use aether::certificates::authority::RotationReason;
+        use aether::certificates::client::IssuerKind;
+
+        let helios_api::internal::RelayedStageCommit {
+            authorization,
+            commit,
+            grant,
+        } = *relayed;
+        let peer = commit.client_wg_public_key;
+        if authorization.issuer_kind != IssuerKind::Master
+            || authorization.reason != RotationReason::ExpiredRecovery
+        {
+            tracing::warn!(
+                %peer,
+                "relayed commit refused: this link carries the recovery of an expired identity \
+                 and nothing else; an ordinary renewal is committed by the client, in its tunnel"
+            );
+            return Err(TrustUpdateRefusal::Rejected);
+        }
+
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        // The presented authorization must be the exact document that opened
+        // the stage being closed. Matching it here is what turns «the relay
+        // says this is a recovery» into «the registry already verified this
+        // recovery», which is a different sentence.
+        let recorded = registry
+            .peer(&peer)
+            .and_then(|peer| peer.state.pending.as_ref())
+            .map(|pending| pending.authorization_fingerprint);
+        let expected = authorization.fingerprint().map_err(|error| {
+            tracing::warn!(%peer, %error, "relayed commit refused: unreadable authorization");
+            TrustUpdateRefusal::Rejected
+        })?;
+        match recorded {
+            Some(recorded) if recorded.matches(&expected) => {}
+            _ => {
+                tracing::warn!(
+                    %peer,
+                    "relayed commit refused: no pending stage of this peer was opened by the \
+                     recovery authorization presented"
+                );
+                return Err(TrustUpdateRefusal::Rejected);
+            }
+        }
+
+        registry
+            .commit(&peer, &commit, &grant, now)
+            .map(|_| ())
+            .map_err(|error| {
+                tracing::warn!(%peer, %error, "relayed recovery commit refused");
+                classify(error)
+            })
+    }
 }
 
 /// One admission, as the console leaves it for the daemon.
@@ -1295,6 +1370,127 @@ mod tests {
         }
     }
 
+    /// A relayed recovery commit whose shape is right and whose stage is not.
+    ///
+    /// The signatures are placeholders on purpose: every assertion that uses
+    /// this refuses **before** any signature is read, and building real ones
+    /// would hide which check actually fired.
+    fn relayed_commit() -> helios_api::internal::RelayedStageCommit {
+        use aether::certificates::authority::RotationReason;
+        use aether::certificates::client::{
+            ClientCertificateStageAuthorization, ClientCertificateStageCommit,
+        };
+        use aether::certificates::encoding::MlDsa87Signature;
+        use aether::certificates::window::TransitionWindow;
+
+        let stage_id = Id16::new([4; 16]).expect("id");
+        let authorization = ClientCertificateStageAuthorization {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            ca_tls_epoch: 2,
+            issuer_kind: aether::certificates::client::IssuerKind::Master,
+            issuer_epoch: 1,
+            issuer_authorization_fingerprint: Fingerprint::from_bytes([0; 32]),
+            issuer_authorization: None,
+            stage_id,
+            request_fingerprint: Fingerprint::of(b"recovery request"),
+            operator_approval_fingerprint: Fingerprint::of(b"approval"),
+            renewal_approval: None,
+            campaign_approval: None,
+            gateway_wg_public_key: key(9),
+            server_name: "gateway.example".into(),
+            client_wg_public_key: key(2),
+            active_generation: 4,
+            next_generation: 5,
+            active_tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+            active_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+            next_tls_ca_certificate_fingerprint: Fingerprint::of(b"tls ca"),
+            next_tls_certificate: DerCertificate::new(vec![2; 64]).expect("der"),
+            next_pq_certificate: signed_leaf(PqCertificateRole::Client, "workstation", 5),
+            issued_at: 1_000,
+            stage_expires_at: 4_000,
+            window: TransitionWindow::new(1_000, 2_000, 9_000).expect("window"),
+            reason: RotationReason::ExpiredRecovery,
+            signature: MlDsa87Signature::placeholder(),
+        };
+        let commit = ClientCertificateStageCommit {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: authorization.trust_domain_id,
+            stage_id,
+            grant_fingerprint: Fingerprint::of(b"grant"),
+            stage_receipt_fingerprint: Fingerprint::of(b"receipt"),
+            gateway_wg_public_key: authorization.gateway_wg_public_key,
+            client_wg_public_key: authorization.client_wg_public_key,
+            active_generation: 4,
+            staged_generation: 5,
+            staged_tls_certificate_fingerprint: Fingerprint::of(b"staged tls"),
+            staged_pq_certificate_fingerprint: Fingerprint::of(b"staged pq"),
+            stage_expires_at: 4_000,
+            committed_at: 1_100,
+            active_pq_signature: MlDsa87Signature::placeholder(),
+            staged_pq_signature: MlDsa87Signature::placeholder(),
+        };
+        let grant = aether::certificates::client::ClientCertificateRotationGrant {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: authorization.trust_domain_id,
+            ca_epoch: 1,
+            ca_tls_epoch: 2,
+            issuer_kind: authorization.issuer_kind,
+            issuer_epoch: 1,
+            issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
+            issuer_authorization: None,
+            request_fingerprint: authorization.request_fingerprint,
+            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_approval: None,
+            campaign_approval: None,
+            stage_receipt_fingerprint: Fingerprint::of(b"receipt"),
+            stage_receipt: aether::certificates::client::GatewayCertificateStageReceipt {
+                format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+                trust_domain_id: authorization.trust_domain_id,
+                stage_id,
+                stage_authorization_fingerprint: Fingerprint::of(b"authorization"),
+                request_fingerprint: authorization.request_fingerprint,
+                operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+                gateway_wg_public_key: authorization.gateway_wg_public_key,
+                client_wg_public_key: authorization.client_wg_public_key,
+                active_generation: 4,
+                staged_generation: 5,
+                staged_tls_certificate_fingerprint: Fingerprint::of(b"staged tls"),
+                staged_pq_certificate_fingerprint: Fingerprint::of(b"staged pq"),
+                persisted_at: 1_050,
+                stage_expires_at: 4_000,
+                active_gateway_identity_epoch: 3,
+                gateway_decision_epoch: 3,
+                gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq"),
+                gateway_signature: MlDsa87Signature::placeholder(),
+            },
+            gateway_wg_public_key: authorization.gateway_wg_public_key,
+            server_name: authorization.server_name.clone(),
+            client_wg_public_key: authorization.client_wg_public_key,
+            active_generation: 4,
+            next_generation: 5,
+            active_tls_certificate_fingerprint: authorization.active_tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: authorization.active_pq_certificate_fingerprint,
+            next_tls_ca_certificate_fingerprint: authorization.next_tls_ca_certificate_fingerprint,
+            next_tls_certificate: authorization.next_tls_certificate.clone(),
+            next_pq_certificate: authorization.next_pq_certificate.clone(),
+            stage_expires_at: 4_000,
+            window: authorization.window,
+            reason: authorization.reason,
+            signature: MlDsa87Signature::placeholder(),
+        };
+        helios_api::internal::RelayedStageCommit {
+            authorization: Box::new(authorization),
+            commit: Box::new(commit),
+            grant: Box::new(grant),
+        }
+    }
+
     /// A request that declares exactly what the gateway serves.
     fn request(state: &RegistryState, peer: &PeerCertificates) -> TrustUpdateRequest {
         TrustUpdateRequest {
@@ -1731,6 +1927,55 @@ mod tests {
 
     /// The gateway asks the authority when its queue holds nothing, and queues
     /// what comes back. This is the whole of the 503 fix on this side.
+    /// The private link carries the recovery of §7.5 and nothing else.
+    ///
+    /// The refusal happens before the registry is even locked, and that is the
+    /// point: an ordinary renewal is committed by its client, inside its
+    /// tunnel, where the source address proves the peer. A veth that also
+    /// accepted one would be a second path to the same write, reachable by a
+    /// party that is not the client.
+    #[tokio::test]
+    async fn an_ordinary_renewal_is_never_committed_on_the_private_link() {
+        use aether::certificates::authority::RotationReason;
+        use aether::certificates::client::IssuerKind;
+        use helios_api::internal::AstraChannelHandler;
+
+        let mut state = state();
+        state.peers.insert(key(2).to_base64(), peer());
+        let (service, _directory) = service(state);
+
+        let mut relayed = relayed_commit();
+        relayed.authorization.issuer_kind = IssuerKind::Astra;
+        assert!(
+            service.commit_recovery(Box::new(relayed)).await.is_err(),
+            "a delegated staging is not a recovery, whatever its reason says"
+        );
+
+        let mut relayed = relayed_commit();
+        relayed.authorization.reason = RotationReason::Scheduled;
+        assert!(
+            service.commit_recovery(Box::new(relayed)).await.is_err(),
+            "CA-PQ signing an ordinary renewal is still an ordinary renewal"
+        );
+    }
+
+    /// A recovery whose authorization is not the one that opened the pending
+    /// stage is refused: the relay may carry a decision, never describe one.
+    #[tokio::test]
+    async fn a_recovery_commit_must_name_the_staging_the_registry_recorded() {
+        use helios_api::internal::AstraChannelHandler;
+
+        let mut state = state();
+        state.peers.insert(key(2).to_base64(), peer());
+        let (service, _directory) = service(state);
+        // `peer()` holds no pending stage at all, so there is nothing this
+        // authorization could be the one that opened.
+        assert!(service
+            .commit_recovery(Box::new(relayed_commit()))
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn an_empty_queue_makes_the_gateway_ask_the_authority() {
         let mut state = state();

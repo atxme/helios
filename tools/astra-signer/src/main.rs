@@ -368,6 +368,34 @@ enum Command {
         #[arg(long)]
         origin: Option<String>,
     },
+    /// Approuve la récupération d'une identité expirée (§7.5).
+    ///
+    /// Une seule commande, une seule clé branchée : elle lit la demande,
+    /// l'affiche, prend l'assertion de l'opérateur, ouvre le coffre, émet les
+    /// deux feuilles sous `CA-PQ` et `CA-TLS`, dépose l'autorisation, attend le
+    /// reçu de la gateway et signe le grant. Le client, lui, n'a aucun tunnel :
+    /// c'est ce que cette procédure répare.
+    Recover {
+        /// Origine publique d'Astra.
+        #[arg(long)]
+        authority_url: String,
+        /// Identifiant imprimé par le client au moment où il a demandé.
+        #[arg(long)]
+        operation_id: String,
+        /// Origine WebAuthn, si elle diffère de `https://<rp_id>`.
+        #[arg(long)]
+        origin: Option<String>,
+        /// Durée de vie de la nouvelle génération, en jours.
+        #[arg(long, default_value_t = 365)]
+        validity_days: u64,
+        /// Recouvrement avant que l'ancienne génération soit retirée, en jours.
+        ///
+        /// Court par défaut : l'ancienne a déjà expiré, elle n'ouvre plus rien,
+        /// et le recouvrement n'existe ici que pour laisser la gateway et le
+        /// client se croiser.
+        #[arg(long, default_value_t = 1)]
+        overlap_days: u64,
+    },
     /// Renames a slot. Needs no security key.
     Rename {
         #[arg(long)]
@@ -463,6 +491,21 @@ fn run() -> Result<()> {
             authority_url.as_deref(),
             operation_id.as_deref(),
             origin.as_deref(),
+            transport,
+        ),
+        Command::Recover {
+            authority_url,
+            operation_id,
+            origin,
+            validity_days,
+            overlap_days,
+        } => recover(
+            &path,
+            &authority_url,
+            &operation_id,
+            origin.as_deref(),
+            validity_days,
+            overlap_days,
             transport,
         ),
         Command::RotateCaPq {
@@ -1409,6 +1452,184 @@ fn origin_client_fetch(
 /// The local half is still crash-safe on its own: the journal is written after
 /// the deposit and replayed until every file has landed, so a resume needs no
 /// network and no second touch.
+#[allow(clippy::too_many_arguments)]
+/// Recovers an identity whose leaf has expired (spec §7.5).
+///
+/// # Why one command and one connection
+///
+/// A recovery needs `CA-PQ` twice: once to authorize the staging, and once
+/// again to sign the grant — which cannot exist until the gateway has
+/// persisted the candidate and signed a receipt. Splitting that into two
+/// commands would mean two ceremonies for one decision, and a second
+/// ceremony's operator has no way to tell it is finishing the first. So the
+/// key stays plugged and the vault stays open across one round trip through
+/// the authority, which is what «the length of one operation» means here.
+///
+/// If anything fails before the grant is deposited, nothing has been installed
+/// anywhere: the gateway holds a candidate under a lease it will purge, and the
+/// operator reruns the command against a fresh request.
+fn recover(
+    path: &Path,
+    authority_url: &str,
+    operation_id: &str,
+    origin: Option<&str>,
+    validity_days: u64,
+    overlap_days: u64,
+    transport: Transport,
+) -> Result<()> {
+    let operation = Id16::parse_hex(operation_id)
+        .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+    let ca_tls_certificate = handoff.ca_tls_certificate.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ce relais de domaine ne porte pas la CA-TLS cliente : l'émettre par `astra-signer \
+             issue-ca-tls`, sinon la feuille TLS de la génération récupérée ne chaîne à rien"
+        )
+    })?;
+    let ca_tls_certificate = DerCertificate::new(
+        <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::decode(
+            &base64::engine::general_purpose::STANDARD,
+            ca_tls_certificate.trim(),
+        )
+        .context("CA-TLS cliente : base64 illisible")?,
+    )?;
+
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let view = client.recovery(&operation)?;
+    let request = view
+        .request
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("l'autorité ne rend pas la demande de cette opération"))?;
+
+    let origin = match origin {
+        Some(origin) => origin.to_string(),
+        None => format!("https://{}", vault.rp_id),
+    };
+    let now = now_unix();
+
+    // Everything the operator has to weigh, before a key is asked for
+    // anything. A recovery reaches past a validity period: the one fact that
+    // must not be buried is *which* identity, and how long it has been dead.
+    println!("récupération     : {}", operation.to_hex());
+    println!("pair             : {}", request.client_wg_public_key);
+    println!("gateway          : {}", request.server_name);
+    println!(
+        "génération       : {} → {}",
+        request.expired_generation, request.requested_generation
+    );
+    println!(
+        "expirée depuis   : {} s",
+        now.saturating_sub(request.expired_pq_certificate.not_after_unix)
+    );
+    println!("empreinte        : {}", request.fingerprint());
+
+    let validity = (
+        now,
+        now.checked_add(
+            validity_days
+                .checked_mul(DAY_SECS)
+                .context("durée hors bornes")?,
+        )
+        .context("durée hors bornes")?,
+    );
+    // The new generation activates immediately: the old one expired, so there
+    // is nothing to overlap *with*. The window exists only so the gateway and
+    // the client have a common instant to change over on.
+    let window = TransitionWindow::new(
+        now,
+        now,
+        now.checked_add(
+            overlap_days
+                .checked_mul(DAY_SECS)
+                .context("durée hors bornes")?,
+        )
+        .context("durée hors bornes")?,
+    )?;
+    let stage_expires_at = request.expires_at;
+
+    eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+
+    let produced = authority::recover_expired_identity(
+        &vault,
+        key.as_ref(),
+        &pin,
+        &identity,
+        &registry,
+        &ca_tls_certificate,
+        &request,
+        &request.client_wg_public_key.to_base64(),
+        window,
+        validity,
+        Id16::new(random_id()?)?,
+        random_id()?,
+        &origin,
+        stage_expires_at,
+        now,
+    )?;
+    let authorization = produced.authorization;
+
+    let staged = client.deposit_recovery_authorization(
+        &operation,
+        &aether::certificates::transport::ExpiredRecoveryAuthorizationDeposit {
+            authorization: Box::new(authorization.clone()),
+            evidence: Box::new(produced.evidence),
+        },
+    )?;
+    println!("stade            : {:?}", staged.state);
+
+    let receipt = staged
+        .receipt
+        .ok_or_else(|| anyhow::anyhow!("l'autorité n'a pas rendu le reçu de la gateway"))?;
+    let gateway_leaf = staged.gateway_pq_certificate.ok_or_else(|| {
+        anyhow::anyhow!("l'autorité n'a pas rendu la feuille que la gateway sert")
+    })?;
+    // The leaf is compared to the gateway this vault's own hand-off names,
+    // before anything is verified under it. Astra reads that leaf on the veth;
+    // this end must not adopt an identity because the relay reported it.
+    if gateway_leaf.wireguard_public_key != identity.gateway_wg_public_key.to_base64() {
+        bail!(
+            "la feuille que l'autorité annonce appartient à une autre gateway que celle que ce \
+             coffre épingle. Rien n'est signé."
+        );
+    }
+    let gateway_pq_public_key = MlDsa87PublicKey::parse(&gateway_leaf.ml_dsa_87_public_key)?;
+    let gateway_fingerprint =
+        aether::certificates::gateway::pq_certificate_fingerprint(&gateway_leaf)?;
+
+    // The vault opens a second time for the grant. Same key, same session:
+    // the operator is not asked to decide anything again, only to let the
+    // second signature happen.
+    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+    let grant = authority::grant_recovered_identity(
+        &vault,
+        &opening,
+        &authorization,
+        &receipt,
+        &gateway_pq_public_key,
+        &gateway_fingerprint,
+    )?;
+    let granted = client.deposit_recovery_grant(
+        &operation,
+        &aether::certificates::transport::ExpiredRecoveryGrantDeposit {
+            grant: Box::new(grant),
+        },
+    )?;
+    println!("stade            : {:?}", granted.state);
+    println!(
+        "le client peut installer sa nouvelle génération et committer ; la gateway relaiera son \
+         commit par le canal privé"
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rotate_ca_pq(
     path: &Path,

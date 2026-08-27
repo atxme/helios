@@ -222,7 +222,7 @@ fn identity_trust_store_path(
 /// it is never overwritten by a second profile. A legacy store belonging to a
 /// different domain or WireGuard key is likewise left untouched and cannot
 /// prevent this identity from obtaining its own store.
-fn open_identity_store(
+pub(crate) fn open_identity_store(
     directory: &Path,
     settings: &KeyNegotiationSettings,
     bundle: &ClientIdentityBundle,
@@ -333,7 +333,7 @@ fn client_key_of(bundle: &ClientIdentityBundle) -> Result<WireGuardKey, RenewalE
     WireGuardKey::parse(&leaf.wireguard_public_key).map_err(RenewalError::Certificate)
 }
 
-fn client_pq_leaf(bundle: &ClientIdentityBundle) -> Result<PqCertificate, RenewalError> {
+pub(crate) fn client_pq_leaf(bundle: &ClientIdentityBundle) -> Result<PqCertificate, RenewalError> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(bundle.pq_certificate.trim())
         .map_err(|_| RenewalError::Identity("certificat PQ client : base64 illisible".into()))?;
