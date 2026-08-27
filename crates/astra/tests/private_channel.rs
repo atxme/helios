@@ -115,6 +115,17 @@ impl AstraChannelHandler for Recorder {
         Err(TrustUpdateRefusal::Rejected)
     }
 
+    async fn gateway_transition_published(
+        &self,
+        published: helios_api::internal::GatewayTransitionPublished,
+    ) -> Result<(), TrustUpdateRefusal> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(format!("published:{}", published.gateway_identity_epoch));
+        Ok(())
+    }
+
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal> {
         self.seen.lock().unwrap().push("identity".into());
         let pq_certificate = served_leaf();

@@ -149,6 +149,14 @@ impl GatewayChannel {
     pub async fn gateway_identity(&self) -> Result<GatewayIdentityView, ChannelError> {
         self.client.gateway_identity().await
     }
+
+    /// Tells the gateway a staged transition has left the authority (§6.3).
+    pub async fn gateway_transition_published(
+        &self,
+        published: &helios_api::internal::GatewayTransitionPublished,
+    ) -> Result<(), ChannelError> {
+        self.client.gateway_transition_published(published).await
+    }
 }
 
 /// Creates Astra's transport identity in its state volume, or reads back the

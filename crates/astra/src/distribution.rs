@@ -267,6 +267,50 @@ fn select_objects(
             }
         }
     }
+    // The gateway identity, and only once §11.1 step 6 has let it leave. A
+    // client is offered the decision that moves it from the state it signed:
+    // its own decision epoch, and the leaf it says it is pinning. A client on
+    // another state would be handed a transition its own `install_transition`
+    // refuses, costing it a full poll cycle to discover.
+    for stored in &state.transitions {
+        if !stored.published {
+            continue;
+        }
+        match &stored.object {
+            TrustUpdateObject::GatewayIdentityTransition(transition) => {
+                let follows_the_clients_decision = request
+                    .request
+                    .gateway_decision_epoch
+                    .checked_add(1)
+                    .is_some_and(|next| next == transition.gateway_identity_epoch);
+                let names_the_clients_leaf = request
+                    .request
+                    .active_gateway_certificate_fingerprint
+                    .matches(&transition.active_gateway_certificate_fingerprint);
+                if follows_the_clients_decision
+                    && names_the_clients_leaf
+                    && now_unix < transition.window.not_after
+                {
+                    objects.push(stored.object.clone());
+                }
+            }
+            // The tombstone goes to the clients that hold the transition it
+            // cancels — they are the ones whose decision epoch already *is*
+            // that epoch, and the only ones whose `apply_abort` can act on it.
+            //
+            // Limite connue : un client qui n'a jamais reçu la transition
+            // reste à l'époque précédente et refusera correctement le saut
+            // vers la suivante (§6.3), sans pouvoir récupérer ce tombstone
+            // ici. Lui servir un avortement qu'il ne peut pas appliquer ferait
+            // échouer toute la transaction plutôt qu'une partie.
+            TrustUpdateObject::GatewayTransitionAbort(abort) => {
+                if request.request.gateway_decision_epoch == abort.gateway_identity_epoch {
+                    objects.push(stored.object.clone());
+                }
+            }
+            _ => {}
+        }
+    }
     // The delegation. A client whose `issuer_epoch` is behind cannot build the
     // chain of a delegated leaf at all: it holds the anchor and sees a leaf
     // signed by an intermediate it has never been told about.
@@ -367,6 +411,7 @@ mod tests {
                 campaign_id: Id16::new([7; 16]).expect("id"),
                 accepted_at: 2_000,
                 object: TrustUpdateObject::CaTransition(Box::new(transition)),
+                published: true,
                 credential_registry: None,
             }],
             peers: Default::default(),
@@ -444,6 +489,7 @@ mod tests {
             campaign_id: Id16::new([8; 16]).expect("id"),
             accepted_at: 2_000,
             object: TrustUpdateObject::CertificateRevocation(Box::new(revocation)),
+            published: true,
             credential_registry: None,
         }];
         state
@@ -474,6 +520,75 @@ mod tests {
         let state = state_with_transition(1);
         assert_eq!(select_objects(&state, &request(1), 89_999).len(), 1);
         assert!(select_objects(&state, &request(1), 90_000).is_empty());
+    }
+
+    /// The gateway decision the client's own request says it is behind on.
+    fn state_with_gateway_transition(published: bool) -> crate::registry::AstraState {
+        use aether::certificates::authority::RotationReason;
+        use aether::certificates::gateway::GatewayIdentityTransition;
+
+        let mut state = state_with_transition(1);
+        let transition = GatewayIdentityTransition {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            gateway_identity_epoch: 2,
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            server_name: "gateway.example".into(),
+            active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"gateway tls"),
+            next_gateway_tls_certificate: None,
+            active_gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq"),
+            next_gateway_certificate: None,
+            window: aether::certificates::window::TransitionWindow::new(1_000, 90_000, 150_000)
+                .expect("window"),
+            reason: RotationReason::Scheduled,
+            ca_signature: MlDsa87Signature::placeholder(),
+        };
+        state.transitions = vec![crate::registry::StoredTransition {
+            campaign_id: Id16::new([9; 16]).expect("id"),
+            accepted_at: 2_000,
+            object: TrustUpdateObject::GatewayIdentityTransition(Box::new(transition)),
+            published,
+            credential_registry: None,
+        }];
+        state
+    }
+
+    /// §6.3 orders it: nothing leaves before the authority has persisted the
+    /// publication, and until then an abort is still legitimate.
+    #[test]
+    fn an_unpublished_gateway_transition_is_offered_to_nobody() {
+        let state = state_with_gateway_transition(false);
+        assert!(select_objects(&state, &request(1), 2_000).is_empty());
+    }
+
+    #[test]
+    fn a_published_gateway_transition_reaches_the_client_it_moves() {
+        let state = state_with_gateway_transition(true);
+        let selected = select_objects(&state, &request(1), 2_000);
+        assert!(selected
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
+
+        // Past `not_after` the decision is spent: the successor is active and
+        // the outgoing leaf is gone.
+        assert!(!select_objects(&state, &request(1), 150_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
+    }
+
+    /// A client pinning another gateway leaf would refuse this decision after
+    /// collecting every fragment of it.
+    #[test]
+    fn a_client_on_another_gateway_leaf_is_offered_no_transition() {
+        let state = state_with_gateway_transition(true);
+        let mut elsewhere = request(1);
+        elsewhere.request.active_gateway_certificate_fingerprint =
+            Fingerprint::of(b"another gateway leaf");
+        assert!(!select_objects(&state, &elsewhere, 2_000)
+            .iter()
+            .any(|object| matches!(object, TrustUpdateObject::GatewayIdentityTransition(_))));
     }
 
     #[test]

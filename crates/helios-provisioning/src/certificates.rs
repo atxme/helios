@@ -1085,6 +1085,44 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
+    /// Records that the authority has let a staged transition leave (§6.3).
+    ///
+    /// Irreversible, and that is the point: past this marker a client may hold
+    /// the decision, go offline and promote on its own at `not_after`.
+    /// Cancelling on the gateway alone would leave two truths in one fleet.
+    ///
+    /// The publication names the exact document. An operator may have
+    /// installed one transition by hand while the authority published
+    /// another, and «publish whatever is staged» would then close the abort
+    /// window on a decision nobody distributed.
+    pub fn publish_gateway_transition(
+        &mut self,
+        gateway_identity_epoch: u64,
+        transition_fingerprint: &Fingerprint,
+    ) -> Result<(), RegistryError> {
+        let gateway = &self.state.gateway;
+        let names_the_staged_document = gateway.next_gateway_identity_epoch
+            == Some(gateway_identity_epoch)
+            && gateway
+                .next_transition_fingerprint
+                .is_some_and(|staged| staged.matches(transition_fingerprint));
+        if !names_the_staged_document {
+            return Err(RegistryError::Certificate(
+                CertificateError::IllegalStateTransition(
+                    "no staged transition matches this publication",
+                ),
+            ));
+        }
+        // A repeated report is the authority retrying a relay it could not
+        // confirm, not a second decision.
+        if gateway.published {
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        state.gateway.mark_published()?;
+        self.persist(state)
+    }
+
     /// Cancels a staged, unpublished gateway transition (spec §6.3).
     ///
     /// The abort names the exact document it cancels, and the state machine
@@ -2740,6 +2778,44 @@ mod tests {
         // second decision at the same epoch, and it is right to.
         assert_eq!(gateway.gateway_decision_epoch, 2);
         assert!(gateway.last_aborted_transition.is_some());
+    }
+
+    #[test]
+    fn a_publication_names_the_document_it_lets_go() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        let fingerprint = transition.fingerprint().expect("fingerprint");
+
+        // Another document at the same epoch: an operator may have installed
+        // one transition by hand while the authority published another.
+        let other = gateway_transition(&fixture, &keys(), 2, window());
+        assert!(fixture
+            .registry
+            .publish_gateway_transition(2, &other.fingerprint().expect("fingerprint"))
+            .is_err());
+        // The right document at the wrong epoch is no better.
+        assert!(fixture
+            .registry
+            .publish_gateway_transition(3, &fingerprint)
+            .is_err());
+        assert!(!fixture.registry.state().gateway.published);
+
+        fixture
+            .registry
+            .publish_gateway_transition(2, &fingerprint)
+            .expect("published");
+        assert!(fixture.registry.state().gateway.published);
+        // A retry of a relay the authority could not confirm is not a second
+        // decision.
+        fixture
+            .registry
+            .publish_gateway_transition(2, &fingerprint)
+            .expect("idempotent");
     }
 
     #[test]

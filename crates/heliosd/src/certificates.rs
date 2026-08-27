@@ -507,6 +507,32 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
         })
     }
 
+    async fn gateway_transition_published(
+        &self,
+        published: helios_api::internal::GatewayTransitionPublished,
+    ) -> Result<(), TrustUpdateRefusal> {
+        let mut registry = self.registry.lock().await;
+        registry
+            .publish_gateway_transition(
+                published.gateway_identity_epoch,
+                &published.transition_fingerprint,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    epoch = published.gateway_identity_epoch,
+                    %error,
+                    "publication marker refused"
+                );
+                classify(error)
+            })?;
+        tracing::warn!(
+            epoch = published.gateway_identity_epoch,
+            "gateway transition published: it can no longer be aborted, and the identity switches \
+             at activation_at"
+        );
+        Ok(())
+    }
+
     /// Queues a pre-signed transaction for the peer its manifest names.
     ///
     /// Nothing here verifies a signature, and that is the design rather than

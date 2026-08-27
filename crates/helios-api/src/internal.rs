@@ -139,6 +139,9 @@ pub const DISTRIBUTION_PATH: &str = "/internal/v1/certificates/distribution";
 /// the class of deployment error `deploy.sh` exists to remove. Nothing secret
 /// crosses: the leaf is the public object every client already pins.
 pub const GATEWAY_IDENTITY_PATH: &str = "/internal/v1/certificates/gateway-identity";
+/// Where the authority reports that a staged transition may no longer be
+/// aborted (spec §6.3, §11.1 step 6).
+pub const GATEWAY_PUBLISHED_PATH: &str = "/internal/v1/certificates/gateway-transition/published";
 
 /// The name the client puts in SNI.
 ///
@@ -251,6 +254,16 @@ pub trait AstraChannelHandler: AstraStageHandler {
     /// under the key that signed it rather than under a copy it was handed.
     async fn gateway_identity(&self) -> Result<GatewayIdentityView, TrustUpdateRefusal>;
 
+    /// Records that a staged gateway transition has left the authority.
+    ///
+    /// Irreversible on purpose (spec §6.3): a client may already hold the
+    /// decision, go offline and promote on its own at `not_after`. Cancelling
+    /// on the gateway alone would then create two truths.
+    async fn gateway_transition_published(
+        &self,
+        published: GatewayTransitionPublished,
+    ) -> Result<(), TrustUpdateRefusal>;
+
     /// Queues a pre-signed transaction for the peer its manifest names.
     async fn distribute(
         &self,
@@ -331,7 +344,20 @@ pub struct GatewayIdentityView {
     pub gateway_decision_epoch: u64,
 }
 
-/// Builds the private router — the six routes, and a refusal for the rest.
+/// One staged transition, named exactly (spec §6.3).
+///
+/// The document is named rather than «whatever is staged»: an operator may
+/// have installed one transition by hand while the authority published
+/// another, and publishing the wrong decision would make the gateway refuse
+/// an abort it is entitled to — or accept one it is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayTransitionPublished {
+    pub gateway_identity_epoch: u64,
+    pub transition_fingerprint: Fingerprint,
+}
+
+/// Builds the private router — the seven routes, and a refusal for the rest.
 pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
     Router::new()
         .route(STAGE_PATH, post(stage))
@@ -339,6 +365,7 @@ pub fn router(handler: Arc<dyn AstraChannelHandler>) -> Router {
         .route(REVOKE_PATH, post(revoke))
         .route(STATE_ROUTE, get(peer_state))
         .route(GATEWAY_IDENTITY_PATH, get(gateway_identity))
+        .route(GATEWAY_PUBLISHED_PATH, post(gateway_transition_published))
         .route(DISTRIBUTION_PATH, post(distribute))
         .fallback(refuse_unknown_route)
         .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY_BYTES))
@@ -421,6 +448,27 @@ async fn revoke(State(handler): State<Arc<dyn AstraChannelHandler>>, body: Bytes
         }
     };
     match handler.revoke(Box::new(revocation)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(refusal) => InternalRefusal::from(refusal).into_response(),
+    }
+}
+
+/// `POST /internal/v1/certificates/gateway-transition/published` (spec §6.3).
+async fn gateway_transition_published(
+    State(handler): State<Arc<dyn AstraChannelHandler>>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_INTERNAL_BODY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let published: GatewayTransitionPublished = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "private channel: unreadable publication marker");
+            return InternalRefusal::Protocol.into_response();
+        }
+    };
+    match handler.gateway_transition_published(published).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(refusal) => InternalRefusal::from(refusal).into_response(),
     }
@@ -972,6 +1020,18 @@ impl GatewayLifecycleClient {
             .await?;
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
+
+    pub async fn gateway_transition_published(
+        &self,
+        published: &GatewayTransitionPublished,
+    ) -> Result<(), ChannelError> {
+        let body =
+            serde_json::to_vec(published).map_err(|error| ChannelError::Body(error.to_string()))?;
+        self.http
+            .request("POST", GATEWAY_PUBLISHED_PATH, Some(body), None)
+            .await?;
+        Ok(())
+    }
 }
 
 /// One pinned mTLS connection, opened per call, on either direction of the
@@ -1412,6 +1472,17 @@ mod tests {
             _revocation: Box<EmergencyCertificateRevocation>,
         ) -> Result<(), TrustUpdateRefusal> {
             self.seen.lock().unwrap().push("revoke");
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn gateway_transition_published(
+            &self,
+            _published: GatewayTransitionPublished,
+        ) -> Result<(), TrustUpdateRefusal> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push("gateway_transition_published");
             Err(TrustUpdateRefusal::Rejected)
         }
 

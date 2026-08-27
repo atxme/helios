@@ -298,6 +298,24 @@ enum GatewayIdentityCommand {
         #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
         gateway_certificate: String,
     },
+    /// Laisse partir la transition déjà signée (§11.1 étape 6).
+    ///
+    /// Le dernier instant où un avortement est encore légitime est *avant*
+    /// cette commande. Après, un client peut détenir la décision, repartir
+    /// hors ligne et promouvoir seul à `not_after` : annuler sur la seule
+    /// gateway laisserait deux vérités dans le parc.
+    ///
+    /// Rejouable : la marque est persistée avant le relais, et une seconde
+    /// exécution termine un relais que la première n'a pas pu confirmer.
+    Publish {
+        /// L'époque de la transition à publier.
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
+        gateway_channel: SocketAddr,
+        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
+        gateway_certificate: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -426,6 +444,16 @@ fn main() -> Result<()> {
                 &reason,
                 &requested_by,
                 window_secs,
+                gateway_channel,
+                &gateway_certificate,
+            ),
+            GatewayIdentityCommand::Publish {
+                epoch,
+                gateway_channel,
+                gateway_certificate,
+            } => gateway_identity_publish(
+                &cli.state_dir,
+                epoch,
                 gateway_channel,
                 &gateway_certificate,
             ),
@@ -1153,6 +1181,56 @@ fn gateway_identity_open(
         deposit.signer_request.authority_url,
         operation_id.to_hex()
     );
+    Ok(())
+}
+
+/// Lets a signed transition leave the authority (spec §11.1 step 6).
+fn gateway_identity_publish(
+    state_dir: &Path,
+    epoch: u64,
+    gateway_channel: SocketAddr,
+    gateway_certificate: &str,
+) -> Result<()> {
+    let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let pinned = aether::certificates::encoding::DerCertificate::parse(gateway_certificate)
+        .map_err(|error| anyhow::anyhow!("--gateway-certificate: {error}"))?;
+    let channel = astra::gateway::GatewayChannel::open(state_dir, gateway_channel, &pinned)
+        .map_err(|error| anyhow::anyhow!("opening the private gateway channel: {error}"))?;
+
+    // Persisted first, and irreversibly. A marker written after the relay
+    // would leave a gateway that has closed its abort window while this
+    // authority still believes the decision cancellable — and §6.3 makes the
+    // gateway's belief the one clients act on.
+    let transition = registry
+        .publish_gateway_transition(epoch, now_unix())
+        .context("no unaborted gateway transition is stored at this epoch")?;
+    let fingerprint = transition
+        .fingerprint()
+        .context("fingerprinting the published transition")?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting a runtime for the private channel")?;
+    runtime
+        .block_on(channel.gateway_transition_published(
+            &helios_api::internal::GatewayTransitionPublished {
+                gateway_identity_epoch: epoch,
+                transition_fingerprint: fingerprint,
+            },
+        ))
+        .context(
+            "the publication is recorded here but the gateway did not confirm it; re-run this \
+             command",
+        )?;
+
+    println!("{}", fingerprint);
+    eprintln!(
+        "transition publiée : époque {epoch}, activation {}",
+        transition.window.activation_at
+    );
+    eprintln!("l'avortement n'est plus légitime ; la distribution aux clients est ouverte");
     Ok(())
 }
 

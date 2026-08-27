@@ -80,6 +80,16 @@ pub struct StoredTransition {
     /// stored object can always be traced back to a text an operator read.
     pub campaign_id: Id16,
     pub accepted_at: u64,
+    /// Whether this object may leave the authority (spec §6.3).
+    ///
+    /// Only a gateway transition is held back: a `CA-PQ` transition and a
+    /// revocation are distributable the moment they are accepted, while §11.1
+    /// makes publication a step of its own — the last instant at which an
+    /// operator may still cancel. Defaulted, so a registry written before this
+    /// field existed still loads; the objects it holds are not gateway
+    /// transitions, which could not be stored at all back then.
+    #[serde(default)]
+    pub published: bool,
     pub object: aether::certificates::transport::TrustUpdateObject,
     /// Operator credential rows re-signed under the anchor this object
     /// installs, when it installs one.
@@ -511,10 +521,12 @@ impl AstraRegistry {
                         .transitions
                         .iter()
                         .filter_map(|stored| match &stored.object {
-                            TrustUpdateObject::GatewayIdentityTransition(held) => Some(held),
+                            TrustUpdateObject::GatewayIdentityTransition(held) => {
+                                Some((held, stored.published))
+                            }
                             _ => None,
                         })
-                        .find(|held| {
+                        .find(|(held, _)| {
                             held.fingerprint().is_ok_and(|held_fingerprint| {
                                 held_fingerprint.matches(&abort.gateway_transition_fingerprint)
                             })
@@ -522,12 +534,16 @@ impl AstraRegistry {
                         .ok_or(RegistryError::Transition(
                             aether::certificates::CertificateError::CampaignMismatch,
                         ))?;
-                    // Limite connue : `published` est faux ici parce que cette
-                    // autorité ne distribue encore aucune transition gateway.
-                    // Le marqueur du §6.3 doit être persisté ici avant le
-                    // premier octet émis, et c'est ce qui rendra cet argument
-                    // autre chose qu'une constante.
-                    abort.verify(&self.state.ca_public_key, cancelled, false, now_unix)?;
+                    // The publication marker this authority persisted, not a
+                    // constant: past it a client may already hold the decision,
+                    // and refusing the abort here is what keeps one fleet from
+                    // holding two truths (spec §6.3).
+                    abort.verify(
+                        &self.state.ca_public_key,
+                        cancelled.0,
+                        cancelled.1,
+                        now_unix,
+                    )?;
                 }
                 // Limite connue : la rotation de `CA-TLS` n'est pas stockée
                 // ici. `ClientTlsCaTransition::verify` compares the outgoing
@@ -594,10 +610,18 @@ impl AstraRegistry {
         });
         let accepted = fresh.len();
         for object in fresh {
+            // A gateway transition is held back until §11.1 step 6; every
+            // other object is distributable the moment it is accepted.
+            let published = !matches!(
+                object,
+                TrustUpdateObject::GatewayIdentityTransition(_)
+                    | TrustUpdateObject::GatewayTransitionAbort(_)
+            );
             self.state.transitions.push(StoredTransition {
                 campaign_id,
                 accepted_at: now_unix,
                 object,
+                published,
                 credential_registry: credential_registry.clone(),
             });
         }
@@ -843,6 +867,71 @@ impl AstraRegistry {
             .or_insert(0);
         *entry += 1;
         *entry
+    }
+
+    /// Lets a stored gateway decision leave the authority (spec §11.1 step 6).
+    ///
+    /// Persisted **before** the first byte, and irreversible. A gateway
+    /// transition that has been distributed can no longer be aborted: a client
+    /// may hold it, go offline, and promote on its own at `not_after`.
+    ///
+    /// Idempotent, because the relay to the gateway that follows may fail
+    /// after this write. Re-running the step must be able to finish the relay
+    /// without asking `CA-PQ` to sign anything again.
+    pub fn publish_gateway_transition(
+        &mut self,
+        gateway_identity_epoch: u64,
+        now_unix: u64,
+    ) -> Result<aether::certificates::gateway::GatewayIdentityTransition, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        let position = self
+            .state
+            .transitions
+            .iter()
+            .position(|stored| match &stored.object {
+                TrustUpdateObject::GatewayIdentityTransition(transition) => {
+                    transition.gateway_identity_epoch == gateway_identity_epoch
+                }
+                _ => false,
+            })
+            .ok_or(RegistryError::UnknownPeer)?;
+        let TrustUpdateObject::GatewayIdentityTransition(transition) =
+            self.state.transitions[position].object.clone()
+        else {
+            return Err(RegistryError::UnknownPeer);
+        };
+        if self.state.transitions[position].published {
+            return Ok(*transition);
+        }
+        // An aborted decision never becomes publishable: the tombstone that
+        // cancelled it is itself a stored object at the same epoch.
+        let cancelled = self
+            .state
+            .transitions
+            .iter()
+            .any(|stored| match &stored.object {
+                TrustUpdateObject::GatewayTransitionAbort(abort) => {
+                    abort.gateway_identity_epoch == gateway_identity_epoch
+                }
+                _ => false,
+            });
+        if cancelled {
+            return Err(RegistryError::Transition(
+                aether::certificates::CertificateError::IllegalStateTransition(
+                    "this transition was aborted; the epoch stays consumed",
+                ),
+            ));
+        }
+        self.state.transitions[position].published = true;
+        self.state.audit.append(
+            AuditEvent::GatewayTransitionPublished {
+                gateway_identity_epoch,
+            },
+            now_unix,
+        );
+        self.save()?;
+        Ok(*transition)
     }
 
     pub fn record(&mut self, event: AuditEvent, now_unix: u64) -> Result<(), RegistryError> {
@@ -1279,6 +1368,63 @@ mod tests {
             assert!(anchored
                 .registry
                 .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .is_err());
+        }
+
+        /// §6.3, at the authority: past the publication no abort is
+        /// legitimate, because a client may already hold the decision.
+        #[test]
+        fn an_abort_is_refused_once_the_transition_has_been_published() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            anchored
+                .registry
+                .publish_gateway_transition(5, 2_050)
+                .expect("published");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .is_err());
+        }
+
+        /// A cancelled decision never becomes publishable again.
+        #[test]
+        fn an_aborted_transition_is_not_published_afterwards() {
+            let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
+            let transition = gateway_transition(&anchored, 5, tls, pq);
+            anchored
+                .registry
+                .accept_transitions(
+                    &gateway_campaign(4, tls, pq),
+                    std::slice::from_ref(&transition),
+                    None,
+                    2_000,
+                )
+                .expect("staged");
+            let abort = gateway_abort(&anchored, &transition, 2_100);
+            anchored
+                .registry
+                .accept_transitions(&gateway_campaign(5, tls, pq), &[abort], None, 2_200)
+                .expect("cancelled");
+
+            assert!(anchored
+                .registry
+                .publish_gateway_transition(5, 2_300)
                 .is_err());
         }
 
