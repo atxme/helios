@@ -3053,12 +3053,27 @@ contournés :
   Manquent encore : `RollbackToPrevious`, refusée en le disant — côté client
   rien ne conserve l'identité précédente —, le lancement automatique du
   compagnon plutôt que sa ligne de commande, et l'affichage des credentials
-  opérateur enregistrés. Côté console Helios, `CertificateDomainPanel` **montre**
-  le domaine — gateway, CA, émetteur délégué, synthèse du parc — et n'expose
-  **aucune action** : les six boutons du §12.2, dont « Annuler la transition
-  préparée » et le rollback gateway pendant chevauchement, n'existent pas.
-  Chaque geste qu'ils devraient déclencher a désormais sa commande, ce qui rend
-  cette surface entièrement additive ;
+  opérateur enregistrés. Côté console Helios, `CertificateDomainPanel` montre le
+  domaine — gateway, CA, émetteur délégué, synthèse du parc — et
+  `GatewayIdentityActions` **agit** sur les gestes que cette gateway possède :
+  « Renouveler la gateway », l'installation d'une transition signée et
+  « Annuler la transition préparée », par
+  `POST /api/certificates/gateway-renewal` et
+  `POST /api/certificates/gateway-transition[/abort]` sur la surface admin.
+  Ces routes passent par le processus qui **détient** le registre ; les
+  commandes équivalentes de `heliosd` restent celles d'un démon arrêté, deux
+  écrivains sur un fichier étant exactement ce que ce module évite par
+  ailleurs. Une décision signée se colle telle quelle : le compagnon la produit
+  dans un coffre que cette machine ne détient pas, donc la console applique,
+  elle ne signe pas. Ses refus portent leur raison — la surface est
+  authentifiée comme le pare-feu, et l'inverse enverrait un opérateur dans les
+  journaux du démon au pire moment.
+  **Reste ouvert** : « Renouveler les leafs du parc », « Renouveler toute la
+  chaîne » et « Tourner les autorités » ouvrent une campagne **Astra**, dont
+  §11.6 garde la résolution locale parce qu'une campagne est l'inventaire du
+  domaine ; la console les nomme avec leur commande plutôt que d'inventer la
+  surface qui les porterait. Le rollback gateway pendant chevauchement n'a de
+  commande nulle part ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné

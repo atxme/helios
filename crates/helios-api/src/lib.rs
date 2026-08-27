@@ -88,6 +88,11 @@ pub struct AppState {
     /// owns the per-peer serializer, and learns nothing back beyond a refusal
     /// class.
     pub psk_release: Option<Arc<dyn key_negotiation::PskReleaseHandler>>,
+    /// The gateway's own certificate identity, driven from the console
+    /// (spec §12.2). `None` on a daemon that holds no TPM unlock material:
+    /// the screen then reads the domain and offers no gesture, rather than
+    /// offering one that fails at its last step.
+    pub gateway_identity: Option<Arc<dyn certificates::GatewayIdentityHandler>>,
     /// Gateway side of the certificate lifecycle, `None` when the trust
     /// domain is not bootstrapped. Absent, the in-tunnel trust-update route
     /// answers `404` — the same answer an older gateway gives, so Orion has a
@@ -150,6 +155,7 @@ impl AppState {
             api_ready: Arc::new(AtomicBool::new(false)),
             key_negotiation: None,
             psk_release: None,
+            gateway_identity: None,
             trust_update: None,
             client_renewal: None,
             tpm: None,
@@ -198,6 +204,15 @@ impl AppState {
         self
     }
 
+    /// Wires the gateway's own identity, once the daemon can open its vault.
+    pub fn with_gateway_identity(
+        mut self,
+        handler: Arc<dyn certificates::GatewayIdentityHandler>,
+    ) -> Self {
+        self.gateway_identity = Some(handler);
+        self
+    }
+
     /// Wires the relayed client renewal, once the gateway can reach Astra.
     ///
     /// Separate from [`Self::with_trust_update`] on purpose: a gateway may hold
@@ -233,6 +248,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/update/chunk", post(update::chunk))
         .route("/api/update/finalize", post(update::finalize))
         .route("/api/update/activate", post(update::activate))
+        .route(
+            "/api/certificates/gateway-renewal",
+            post(certificates::gateway_renewal),
+        )
+        .route(
+            "/api/certificates/gateway-transition",
+            post(certificates::gateway_transition_install),
+        )
+        .route(
+            "/api/certificates/gateway-transition/abort",
+            post(certificates::gateway_transition_abort),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

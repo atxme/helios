@@ -149,6 +149,12 @@ enum Command {
     /// Re-running is a resumption, not a second attempt: an unexpired request
     /// for the same epoch is returned unchanged, and one that has outlived the
     /// 24 hours of §5 is re-signed over the **same** sealed key.
+    ///
+    /// **For a stopped daemon.** A running `heliosd` owns the certificate
+    /// registry in memory and persists it on its own mutations, so a write
+    /// made here can be overwritten by the next one it makes. With the daemon
+    /// up, the console's *Certificats* screen drives the same gesture through
+    /// the process that holds the lock.
     PrepareGatewayCertificate {
         /// Also replace the TLS leaf, self-signed and pinned like the active
         /// one. Left out, the renewal moves the PQ half alone — §6.1 makes
@@ -182,6 +188,10 @@ enum Command {
     /// **The identity served does not change.** Staging is a decision about
     /// `activation_at`; until then the active leaf keeps mounting tunnels, and
     /// the switch needs the restart of §11.1 step 7.
+    ///
+    /// **For a stopped daemon**, like `prepare-gateway-certificate`. The
+    /// console applies the same document through the process that owns the
+    /// registry.
     InstallGatewayTransition {
         /// Signed `GatewayIdentityTransition`, as JSON.
         transition: PathBuf,
@@ -193,6 +203,8 @@ enum Command {
     /// the document, so backdating the abort reopens nothing. The candidate
     /// identity is destroyed and the epoch stays consumed: a fleet must never
     /// have to choose between two decisions numbered the same.
+    ///
+    /// **For a stopped daemon**, like the two commands above.
     AbortGatewayTransition {
         /// Signed `GatewayTransitionAbort`, as JSON.
         abort: PathBuf,
@@ -636,8 +648,10 @@ fn prepare_gateway_certificate(
     let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
         .context("unlocking the TPM vault to seal the candidate gateway identity")?;
     let now_unix = now_unix()?;
+    let registry = gateway_rotation::open_registry_for_command()?;
     let prepared = gateway_rotation::prepare_request(
-        &boot,
+        &registry,
+        boot.secret(),
         false,
         rotate_tls,
         new_key,
@@ -667,7 +681,9 @@ fn prepare_gateway_certificate(
 
 fn install_gateway_transition(source: &Path) -> anyhow::Result<()> {
     let now_unix = now_unix()?;
-    let staged = gateway_rotation::install_transition(source, now_unix)?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition = gateway_rotation::read_signed_document(source, "transition")?;
+    let staged = gateway_rotation::install_transition(&mut registry, transition, now_unix)?;
     let transition = &staged.transition;
 
     println!("epoch: {}", transition.gateway_identity_epoch);
@@ -702,7 +718,9 @@ fn install_gateway_transition(source: &Path) -> anyhow::Result<()> {
 
 fn abort_gateway_transition(source: &Path) -> anyhow::Result<()> {
     let now_unix = now_unix()?;
-    let aborted = gateway_rotation::abort_transition(source, now_unix)?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let abort = gateway_rotation::read_signed_document(source, "abort")?;
+    let aborted = gateway_rotation::abort_transition(&mut registry, abort, now_unix)?;
 
     println!("epoch: {}", aborted.abort.gateway_identity_epoch);
     println!("aborted at: {}", aborted.abort.aborted_at);
@@ -1594,6 +1612,12 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
                 if let Some(relay) = authority {
                     state = state.with_client_renewal(relay);
                 }
+                // The same service, on two surfaces: the lifecycle screen
+                // reads through `trust_update`, and its four gestures go
+                // through `gateway_identity`. One instance, because both
+                // mutate the registry this task owns.
+                state = state.with_gateway_identity(Arc::clone(&service)
+                    as Arc<dyn helios_api::certificates::GatewayIdentityHandler>);
                 state = state.with_trust_update(service);
             }
             None => info!(

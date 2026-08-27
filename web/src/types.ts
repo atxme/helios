@@ -255,3 +255,30 @@ export interface CertificateDomain {
   issuer: IssuerView | null
   peers: PeerCertificateView[]
 }
+
+/** What the console asks of a gateway renewal (spec §12.2, §11.1 steps 1-2). */
+export interface GatewayRenewalRequest {
+  rotate_tls: boolean
+  new_key: boolean
+  key_recovery: boolean
+}
+
+/** The exported request, as the operator reads it before carrying it away. */
+export interface GatewayRenewalView {
+  gateway_identity_epoch: number
+  request_id: string
+  request_fingerprint: string
+  expires_at: number
+  candidate_tls_fingerprint: string | null
+  reused: boolean
+  key_recovery: boolean
+}
+
+/** A staged or cancelled decision, as the console displays it back. */
+export interface GatewayDecisionView {
+  gateway_identity_epoch: number
+  fingerprint: string
+  already_present: boolean
+  activation_at: number | null
+  not_after: number | null
+}

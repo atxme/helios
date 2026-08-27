@@ -47,6 +47,7 @@ use aether::certificates::client::GatewayCertificateStageReceipt;
 use aether::certificates::{encoding::WireGuardKey, CertificateError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use helios_api::certificates::GatewayActionRefusal;
 use helios_api::certificates::{
     AstraStageHandler, StageCommitRequest, TrustUpdateHandler, TrustUpdateRefusal,
     TrustUpdateResponse,
@@ -341,6 +342,103 @@ impl CertificateService {
             );
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
+    /// §11.1 steps 1 and 2, driven from the console instead of a terminal.
+    ///
+    /// The registry is the daemon's own, held under the same lock as every
+    /// other mutation. The offline command loads a second copy from disk,
+    /// which is only safe while this process is stopped — one file with two
+    /// writers is the failure the whole module is built to avoid.
+    async fn prepare_renewal(
+        &self,
+        request: helios_api::certificates::GatewayRenewalRequest,
+    ) -> Result<helios_api::certificates::GatewayRenewalView, GatewayActionRefusal> {
+        let now = now_unix();
+        let registry = self.registry.lock().await;
+        let prepared = crate::gateway_rotation::prepare_request(
+            &registry,
+            self.gateway_identity_secret.as_ref(),
+            // Never the development key on this route: a console that sealed
+            // a candidate under a file key would hand an operator a request
+            // for an identity no TPM can ever serve.
+            false,
+            request.rotate_tls,
+            request.new_key,
+            request.key_recovery,
+            now,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, "gateway renewal refused");
+            GatewayActionRefusal::new(format!("{error:#}"))
+        })?;
+
+        Ok(helios_api::certificates::GatewayRenewalView {
+            gateway_identity_epoch: prepared.request.gateway_identity_epoch,
+            request_id: prepared.request.request_id.to_hex(),
+            request_fingerprint: prepared.request.fingerprint().to_hex(),
+            expires_at: prepared.request.expires_at,
+            candidate_tls_fingerprint: prepared
+                .tls_certificate
+                .as_ref()
+                .map(|certificate| certificate.fingerprint().to_hex()),
+            reused: prepared.reused,
+            key_recovery: request.key_recovery,
+        })
+    }
+
+    async fn install_transition(
+        &self,
+        transition: Box<aether::certificates::gateway::GatewayIdentityTransition>,
+    ) -> Result<helios_api::certificates::GatewayDecisionView, GatewayActionRefusal> {
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let staged = crate::gateway_rotation::install_transition(&mut registry, *transition, now)
+            .map_err(|error| {
+            tracing::warn!(%error, "gateway transition refused");
+            GatewayActionRefusal::new(format!("{error:#}"))
+        })?;
+        let fingerprint = staged.transition.fingerprint().map_err(|error| {
+            GatewayActionRefusal::new(format!("fingerprinting the staged transition: {error}"))
+        })?;
+        tracing::warn!(
+            epoch = staged.transition.gateway_identity_epoch,
+            "gateway transition staged from the console; the identity in service is unchanged"
+        );
+        Ok(helios_api::certificates::GatewayDecisionView {
+            gateway_identity_epoch: staged.transition.gateway_identity_epoch,
+            fingerprint: fingerprint.to_hex(),
+            already_present: staged.already_present,
+            activation_at: Some(staged.transition.window.activation_at),
+            not_after: Some(staged.transition.window.not_after),
+        })
+    }
+
+    async fn abort_transition(
+        &self,
+        abort: Box<aether::certificates::gateway::GatewayTransitionAbort>,
+    ) -> Result<helios_api::certificates::GatewayDecisionView, GatewayActionRefusal> {
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let aborted = crate::gateway_rotation::abort_transition(&mut registry, *abort, now)
+            .map_err(|error| {
+                tracing::warn!(%error, "gateway transition abort refused");
+                GatewayActionRefusal::new(format!("{error:#}"))
+            })?;
+        tracing::warn!(
+            epoch = aborted.abort.gateway_identity_epoch,
+            "gateway transition cancelled from the console; the epoch stays consumed"
+        );
+        Ok(helios_api::certificates::GatewayDecisionView {
+            gateway_identity_epoch: aborted.abort.gateway_identity_epoch,
+            fingerprint: aborted.abort.fingerprint().to_hex(),
+            already_present: aborted.already_present,
+            activation_at: None,
+            not_after: None,
+        })
     }
 }
 

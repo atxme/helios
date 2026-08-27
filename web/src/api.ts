@@ -2,6 +2,9 @@
 // interface and the API are served by the same Axum process.
 import type {
   CertificateDomain,
+  GatewayDecisionView,
+  GatewayRenewalRequest,
+  GatewayRenewalView,
   CommandResponse,
   FinalizedRelease,
   FirewallRules,
@@ -149,3 +152,43 @@ export function createWebSocket(): WebSocket {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return new WebSocket(`${protocol}//${window.location.host}/ws`)
 }
+
+/**
+ * The gateway's own identity, driven from the console (spec §12.2).
+ *
+ * These three refuse with `409` and a reason in the body, and the reason is
+ * the point: unlike the public negotiation surface — where a precise refusal
+ * would be an oracle — this one is behind the admin authentication, and an
+ * operator sent to the daemon logs during a renewal is sent there at the worst
+ * possible moment.
+ */
+async function gatewayAction<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (response.ok) return response.json() as Promise<T>
+  const detail = await response.text()
+  throw new Error(refusalMessage(detail) ?? `HTTP ${response.status}`)
+}
+
+/** The refusal reason, whether the daemon answered JSON or plain text. */
+function refusalMessage(detail: string): string | null {
+  if (!detail) return null
+  try {
+    const parsed = JSON.parse(detail) as { message?: unknown }
+    return typeof parsed.message === 'string' ? parsed.message : detail
+  } catch {
+    return detail
+  }
+}
+
+export const prepareGatewayRenewal = (request: GatewayRenewalRequest) =>
+  gatewayAction<GatewayRenewalView>('/api/certificates/gateway-renewal', request)
+
+export const installGatewayTransition = (transition: unknown) =>
+  gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition', transition)
+
+export const abortGatewayTransition = (abort: unknown) =>
+  gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition/abort', abort)

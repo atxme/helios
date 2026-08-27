@@ -45,7 +45,6 @@ use aether::certificates::gateway::{
 };
 use aether::certificates::state::InstallOutcome;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
-use helio_tpm::BootDecision;
 use helios_provisioning::certificates::CertificateRegistry;
 
 use crate::key_negotiation::RequestContinuity;
@@ -146,23 +145,14 @@ fn plan(
 
 /// Prepares the next gateway identity and exports its request (§11.1 1-2).
 pub(crate) fn prepare_request(
-    boot: &BootDecision,
+    registry: &CertificateRegistry,
+    secret: Option<&helio_tpm::SecretKey>,
     dry_run: bool,
     rotate_tls: bool,
     new_key: bool,
     key_recovery: bool,
     now_unix: u64,
 ) -> Result<PreparedRequest> {
-    let registry_path = CertificateRegistry::path();
-    let registry = CertificateRegistry::load(&registry_path)
-        .context("opening the certificate registry")?
-        .with_context(|| {
-            format!(
-                "this gateway has no trust domain: run `heliosd init-trust-domain` first. The \
-                 request is built from the registry — {} does not exist",
-                registry_path.display()
-            )
-        })?;
     let gateway = &registry.state().gateway;
     let path = pending_request_path();
 
@@ -191,7 +181,9 @@ pub(crate) fn prepare_request(
         Plan::Seal { epoch } => (
             epoch,
             crate::key_negotiation::seal_candidate_identity(
-                boot,
+                secret.context(
+                    "TPM secret unavailable: cannot seal the candidate gateway identity",
+                )?,
                 &gateway.gateway_wg_public_key.to_base64(),
                 &gateway.server_name,
                 epoch,
@@ -220,7 +212,7 @@ pub(crate) fn prepare_request(
     };
     let request = crate::key_negotiation::sign_certificate_request(
         request,
-        boot,
+        secret,
         dry_run,
         &gateway.gateway_wg_public_key.to_base64(),
         epoch,
@@ -369,21 +361,10 @@ fn candidate_is_held(
 /// here. Until then — and only until the first byte is distributed — the
 /// operator can still cancel with a signed abort.
 pub(crate) fn install_transition(
-    source: &std::path::Path,
+    registry: &mut CertificateRegistry,
+    transition: GatewayIdentityTransition,
     now_unix: u64,
 ) -> Result<StagedTransition> {
-    let transition: GatewayIdentityTransition = read_document(source, "transition")?;
-    let registry_path = CertificateRegistry::path();
-    let mut registry = CertificateRegistry::load(&registry_path)
-        .context("opening the certificate registry")?
-        .with_context(|| {
-            format!(
-                "this gateway has no trust domain: run `heliosd init-trust-domain` first — {} \
-                 does not exist",
-                registry_path.display()
-            )
-        })?;
-
     candidate_is_held(
         &transition,
         read_pending(&pending_request_path())?.as_ref(),
@@ -413,6 +394,33 @@ pub(crate) fn install_transition(
         path,
         already_present: matches!(outcome, InstallOutcome::AlreadyPresent),
     })
+}
+
+/// Opens the registry for an **offline** operator command (spec §12.2).
+///
+/// The console route goes through the running daemon, which already owns the
+/// registry under its lock. This one exists for a gateway whose daemon is
+/// stopped: two writers on one file is the failure this module is otherwise
+/// built to avoid, and the console route is what removes the need for it.
+pub(crate) fn open_registry_for_command() -> Result<CertificateRegistry> {
+    let registry_path = CertificateRegistry::path();
+    CertificateRegistry::load(&registry_path)
+        .context("opening the certificate registry")?
+        .with_context(|| {
+            format!(
+                "this gateway has no trust domain: run `heliosd init-trust-domain` first — {} \
+                 does not exist",
+                registry_path.display()
+            )
+        })
+}
+
+/// Reads a signed decision an operator carried back from the ceremony.
+pub(crate) fn read_signed_document<T: serde::de::DeserializeOwned>(
+    source: &std::path::Path,
+    what: &str,
+) -> Result<T> {
+    read_document(source, what)
 }
 
 /// The three local documents a gateway renewal moves through.
@@ -580,10 +588,10 @@ fn maintain_gateway_identity_in(
 /// same, and reusing the number would be the gateway asking a fleet to choose
 /// between two documents at one epoch.
 pub(crate) fn abort_transition(
-    source: &std::path::Path,
+    registry: &mut CertificateRegistry,
+    abort: GatewayTransitionAbort,
     now_unix: u64,
 ) -> Result<AbortedTransition> {
-    let abort: GatewayTransitionAbort = read_document(source, "abort")?;
     let staged_path = staged_transition_path();
     let transition: GatewayIdentityTransition = read_document(&staged_path, "transition")
         .with_context(|| {
@@ -594,15 +602,6 @@ pub(crate) fn abort_transition(
             )
         })?;
 
-    let registry_path = CertificateRegistry::path();
-    let mut registry = CertificateRegistry::load(&registry_path)
-        .context("opening the certificate registry")?
-        .with_context(|| {
-            format!(
-                "this gateway has no trust domain: {} does not exist",
-                registry_path.display()
-            )
-        })?;
     let outcome = registry
         .abort_gateway_transition(&abort, &transition, now_unix)
         .context("cancelling the staged transition in the certificate registry")?;

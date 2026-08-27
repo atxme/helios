@@ -1445,7 +1445,7 @@ pub async fn start(
     };
     let now_unix = unix_time_now()?;
     let identity = load_served_identity(
-        boot,
+        boot.secret(),
         dry_run,
         &gateway_public_key,
         gateway_certificates.as_ref(),
@@ -1720,7 +1720,7 @@ fn negotiation_identity_context(gateway_wg_public_key: &str) -> helio_tpm::Conte
 }
 
 fn load_served_identity(
-    boot: &BootDecision,
+    secret: Option<&SecretKey>,
     dry_run: bool,
     gateway_wg_public_key: &str,
     gateway: Option<&aether::certificates::state::GatewayCertificateState>,
@@ -1728,13 +1728,13 @@ fn load_served_identity(
 ) -> Result<LoadedIdentity> {
     match served_identity_slot(gateway, now_unix)? {
         ServedIdentitySlot::Active => {
-            load_active_identity(boot, dry_run, gateway_wg_public_key, gateway)
+            load_active_identity(secret, dry_run, gateway_wg_public_key, gateway)
         }
         ServedIdentitySlot::Candidate { epoch } => {
             let gateway = gateway.context("candidate selection requires a certificate registry")?;
-            let active = load_active_private_identity(boot, dry_run, gateway_wg_public_key)?;
+            let active = load_active_private_identity(secret, dry_run, gateway_wg_public_key)?;
             let candidate = load_candidate_private_identity(
-                boot.secret().context(
+                secret.context(
                     "TPM secret unavailable: the scheduled gateway identity stays sealed",
                 )?,
                 gateway_wg_public_key,
@@ -1763,12 +1763,12 @@ fn load_served_identity(
 }
 
 fn load_active_identity(
-    boot: &BootDecision,
+    secret: Option<&SecretKey>,
     dry_run: bool,
     gateway_wg_public_key: &str,
     gateway: Option<&aether::certificates::state::GatewayCertificateState>,
 ) -> Result<LoadedIdentity> {
-    let stored = load_active_private_identity(boot, dry_run, gateway_wg_public_key)?;
+    let stored = load_active_private_identity(secret, dry_run, gateway_wg_public_key)?;
     let (tls_certificate, pq_certificate, verify_self_signed) = match gateway {
         Some(gateway) => (
             gateway.active_gateway_tls_certificate.as_bytes().to_vec(),
@@ -1789,11 +1789,11 @@ fn load_active_identity(
 }
 
 fn load_active_private_identity(
-    boot: &BootDecision,
+    secret: Option<&SecretKey>,
     dry_run: bool,
     gateway_wg_public_key: &str,
 ) -> Result<StoredPrivateIdentity> {
-    let encoded = match boot.secret() {
+    let encoded = match secret {
         Some(secret) => {
             return load_active_private_identity_with_secret(secret, gateway_wg_public_key)
         }
@@ -2121,7 +2121,7 @@ struct StoredCandidateIdentity {
 /// is a public key and a self-signed leaf. No path in the lifecycle moves a
 /// gateway private key off the machine that created it.
 pub(crate) fn seal_candidate_identity(
-    boot: &BootDecision,
+    secret: &SecretKey,
     gateway_wg_public_key: &str,
     server_name: &str,
     gateway_identity_epoch: u64,
@@ -2130,9 +2130,6 @@ pub(crate) fn seal_candidate_identity(
     use aether::certificates::encoding::{DerCertificate, MlDsa87PublicKey};
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
-    let secret = boot
-        .secret()
-        .context("TPM secret unavailable: cannot seal the candidate gateway identity")?;
     let (pq_private_key, pq_public_key) =
         generate_ml_dsa_87_keypair().context("generating the candidate gateway PQ identity")?;
 
@@ -2210,21 +2207,20 @@ pub(crate) fn seal_candidate_identity(
 /// caller builds the request from the registry and never sees a private half.
 pub(crate) fn sign_certificate_request(
     request: aether::certificates::gateway::GatewayCertificateRequest,
-    boot: &BootDecision,
+    secret: Option<&SecretKey>,
     dry_run: bool,
     gateway_wg_public_key: &str,
     gateway_identity_epoch: u64,
     continuity: RequestContinuity,
 ) -> Result<aether::certificates::gateway::GatewayCertificateRequest> {
-    let secret = boot
-        .secret()
-        .context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
+    let unsealing =
+        secret.context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
     let sealed = SealedKeystore::new(
         next_private_keystore_path(),
         helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .load(
-        secret,
+        unsealing,
         &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
     )
     .context("unsealing the candidate gateway identity")?;
@@ -2238,7 +2234,7 @@ pub(crate) fn sign_certificate_request(
 
     let signed = match continuity {
         RequestContinuity::FromActiveLeaf => {
-            let active = load_active_private_identity(boot, dry_run, gateway_wg_public_key)
+            let active = load_active_private_identity(secret, dry_run, gateway_wg_public_key)
                 .context("opening the gateway identity in service")?;
             let active_pq = Zeroizing::new(
                 base64::engine::general_purpose::STANDARD

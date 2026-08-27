@@ -244,13 +244,22 @@ La gateway génère et scelle sa propre clé suivante, puis exporte une demande.
 Aucune clé privée gateway ne quitte jamais la machine qui l'a créée : ce qui
 part est une clé publique et deux preuves.
 
-**Sur la gateway** :
+**Sur la gateway**, depuis la console — *Sécurité → Certificats* — avec
+« Préparer la demande ». C'est le chemin normal : la console passe par le
+démon, qui **détient** le registre.
+
+En ligne de commande, pour un démon arrêté :
 
 ```sh
 heliosd prepare-gateway-certificate
 # ajouter --rotate-tls pour remplacer aussi la feuille TLS auto-signée
 # → imprime le chemin, l'époque, l'identifiant et l'empreinte de la demande
 ```
+
+**Ces trois commandes sont celles d'un démon arrêté.** Un `heliosd` en marche
+tient le registre en mémoire et le réécrit à chacune de ses propres mutations :
+une écriture faite à côté peut être recouverte par la suivante. Deux écrivains
+sur un fichier est précisément ce que ce module évite partout ailleurs.
 
 La clé candidate est scellée **à côté** de l'identité en service, jamais
 par-dessus : la feuille active continue de monter les tunnels pendant toute la
@@ -269,6 +278,9 @@ disparu. Le champ est alors **absent** plutôt que non vérifié, et la transiti
 qui répond doit porter le motif `key_recovery`.
 
 **Installer ce qui revient de la cérémonie** (§11.1 étape 5) :
+
+Depuis la console, coller la décision signée dans « Appliquer une décision
+signée ». En ligne de commande, démon arrêté :
 
 ```sh
 heliosd install-gateway-transition /chemin/transition.json
@@ -382,6 +394,11 @@ fait.
 - **Le retour à l'identité précédente** : l'ancien slot reste scellé pendant
   le recouvrement, mais aucune commande ne demande encore à `heliosd` de le
   resservir temporairement.
+- **Les campagnes depuis la console** : « Renouveler les leafs du parc »,
+  « toute la chaîne » et « Tourner les autorités » ouvrent une campagne Astra,
+  et §11.6 garde cette résolution locale — une campagne est l'inventaire du
+  domaine. La console les nomme avec leur commande ; elles se lancent dans le
+  conteneur Astra.
 - **L'adoption d'une ancre distribuée** par Astra et par la gateway.
 
 ## Vérifier où en est le domaine

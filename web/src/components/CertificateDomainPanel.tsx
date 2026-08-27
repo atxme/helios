@@ -10,6 +10,7 @@ import { fetchCertificateDomain } from '../api'
 import { shortKey } from '../format'
 import type { CertificateDomain, CertificatePhase, PeerCertificateView } from '../types'
 import { DataRow } from './DataRow'
+import { GatewayIdentityActions } from './GatewayIdentityActions'
 import { KnownLimit } from './KnownLimit'
 import { SectionCard } from './SectionCard'
 
@@ -356,6 +357,8 @@ export function CertificateDomainPanel() {
           </Box>
         </SectionCard>
       </Box>
+
+      <GatewayIdentityActions domain={domain} />
 
       <SectionCard
         title="Identités clientes"
