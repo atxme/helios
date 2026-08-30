@@ -7,15 +7,17 @@ import Stack from '@mui/material/Stack'
 import Switch from '@mui/material/Switch'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { History, KeyRound, ShieldCheck, Undo2 } from 'lucide-react'
+import { Anchor, History, KeyRound, ShieldCheck, Undo2 } from 'lucide-react'
 import { useState } from 'react'
 import {
   abortGatewayTransition,
+  installCaTransition,
   installGatewayRollback,
   installGatewayTransition,
   prepareGatewayRenewal,
 } from '../api'
 import type {
+  AnchorDecisionView,
   CertificateDomain,
   GatewayDecisionView,
   GatewayRenewalView,
@@ -58,11 +60,14 @@ function formatInstant(unix: number): string {
 }
 
 export function GatewayIdentityActions({ domain }: Props) {
-  const [busy, setBusy] = useState<null | 'renewal' | 'install' | 'abort' | 'rollback'>(null)
+  const [busy, setBusy] = useState<
+    null | 'renewal' | 'install' | 'abort' | 'rollback' | 'anchor'
+  >(null)
   const [error, setError] = useState<string | null>(null)
   const [renewal, setRenewal] = useState<GatewayRenewalView | null>(null)
   const [decision, setDecision] = useState<GatewayDecisionView | null>(null)
   const [rollback, setRollback] = useState<GatewayRollbackView | null>(null)
+  const [anchor, setAnchor] = useState<AnchorDecisionView | null>(null)
   const [rotateTls, setRotateTls] = useState(false)
   const [newKey, setNewKey] = useState(false)
   const [document, setDocument] = useState('')
@@ -80,7 +85,7 @@ export function GatewayIdentityActions({ domain }: Props) {
     domain.now_unix < domain.gateway_retire_active_at
 
   const run = async <T,>(
-    kind: 'renewal' | 'install' | 'abort' | 'rollback',
+    kind: 'renewal' | 'install' | 'abort' | 'rollback' | 'anchor',
     action: () => Promise<T>,
   ) => {
     setBusy(kind)
@@ -105,6 +110,23 @@ export function GatewayIdentityActions({ domain }: Props) {
     }
   }
 
+  const onAnchor = async () => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(document)
+    } catch {
+      setError('Ce n’est pas un document JSON. Coller la transition signée telle quelle.')
+      return
+    }
+    const answer = await run('anchor', () => installCaTransition(parsed))
+    if (answer) {
+      setAnchor(answer)
+      setDecision(null)
+      setRollback(null)
+      setDocument('')
+    }
+  }
+
   const onRollback = async () => {
     let parsed: unknown
     try {
@@ -117,6 +139,7 @@ export function GatewayIdentityActions({ domain }: Props) {
     if (answer) {
       setRollback(answer)
       setDecision(null)
+      setAnchor(null)
       setDocument('')
     }
   }
@@ -135,6 +158,7 @@ export function GatewayIdentityActions({ domain }: Props) {
     if (answer) {
       setDecision(answer)
       setRollback(null)
+      setAnchor(null)
       setDocument('')
     }
   }
@@ -238,7 +262,7 @@ export function GatewayIdentityActions({ domain }: Props) {
 
       <SectionCard
         title="Appliquer une décision signée"
-        subtitle="Ce qui revient de la cérémonie CA-PQ : la transition du §6.1, ou l’avortement du §6.3."
+        subtitle="Ce qui revient de la cérémonie : la transition du §6.1, son avortement du §6.3, ou la rotation d’ancre du §9.1."
         icon={ShieldCheck}
         accent="tertiary.main"
       >
@@ -247,6 +271,14 @@ export function GatewayIdentityActions({ domain }: Props) {
             L’installation <strong>ne change pas l’identité servie</strong> : le basculement
             appartient à <code>activation_at</code> et demande un redémarrage. L’avortement n’est
             accepté que tant que rien n’a été distribué, et il consomme l’époque.
+          </Typography>
+
+          <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+            Une rotation d’ancre <strong>ne déplace pas non plus l’époque</strong> : les deux{' '}
+            <code>CA-PQ</code> vérifient à partir de <code>activation_at</code>, et la sortante est
+            retirée à <code>not_after</code> — par la même passe qui promeut les générations
+            clientes. Comparer l’empreinte entrante avec celle qu’affiche le compagnon&nbsp;: au
+            §9.1, c’est la comparaison qui fait foi, pas la signature seule.
           </Typography>
 
           <TextField
@@ -286,7 +318,44 @@ export function GatewayIdentityActions({ domain }: Props) {
             >
               Annuler la transition préparée
             </Button>
+            <Button
+              variant="outlined"
+              color="inherit"
+              disabled={busy !== null || document.trim() === ''}
+              onClick={() => void onAnchor()}
+              startIcon={
+                busy === 'anchor' ? (
+                  <CircularProgress size={16} color="inherit" />
+                ) : (
+                  <Anchor size={18} />
+                )
+              }
+            >
+              Installer la rotation CA-PQ
+            </Button>
           </Stack>
+
+          {anchor && (
+            <Box>
+              <DataRow
+                label="Époque CA-PQ"
+                value={`${anchor.ca_epoch} → ${anchor.next_ca_epoch} à not_after`}
+              />
+              <DataRow
+                label="Ancre entrante"
+                value={anchor.next_ca_fingerprint}
+                hint="À comparer avec l’empreinte affichée par le compagnon. Deux valeurs différentes, c’est une substitution."
+                wrap
+              />
+              <DataRow label="Activation" value={formatInstant(anchor.activation_at)} />
+              <DataRow label="Retrait" value={formatInstant(anchor.not_after)} />
+              {anchor.already_present && (
+                <Typography variant="body2" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Cette rotation était déjà installée. Rien n’a bougé.
+                </Typography>
+              )}
+            </Box>
+          )}
 
           {decision && (
             <Box>

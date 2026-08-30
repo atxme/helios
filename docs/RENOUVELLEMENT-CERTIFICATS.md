@@ -109,9 +109,31 @@ connecte après ce délai ne recevra plus la transition et se répare par
 l'opérateur. Sept jours est un défaut raisonnable pour un parc dont une part
 n'est pas allumée tous les jours ; un jour ne l'est pas.
 
-**Limite connue** : le domaine n'adopte pas de lui-même l'ancre distribuée. Les
-clients l'appliquent ; le registre Astra et l'épinglage de la gateway restent
-sur l'ancre sortante jusqu'à ce que l'opérateur les avance.
+**Puis sur la gateway**, avec la transition rapportée — écran *Certificats*,
+ou `POST /api/certificates/ca-transition` :
+
+```sh
+# ou, démon arrêté :
+heliosd install-ca-transition ca-pq-transition.json
+```
+
+L'ancre ne bouge pas là. Les deux `CA-PQ` vérifient à partir de
+`activation_at`, et la sortante est retirée à `not_after` — par la même passe
+d'entretien qui promeut les générations clientes et la CA TLS, dans la même
+écriture. Un redémarrage qui trouverait une ancre avancée et l'autre non
+accepterait une chaîne que le domaine a retirée, ou refuserait une chaîne sous
+laquelle il émet encore ; laquelle des deux dépendrait de l'endroit où la
+panne est tombée.
+
+**Comparer l'empreinte entrante** avec celle qu'affiche le compagnon. Le §9.1
+en fait le contrôle : la double signature prouve la continuité, pas que
+l'ancre affichée est celle que l'opérateur a créée. La console la montre à
+côté de l'époque.
+
+**Limite connue** : le registre Astra reste sur l'ancre sortante jusqu'à ce
+qu'un opérateur l'avance. Les clients l'appliquent, la gateway aussi
+désormais ; l'autorité, non — sa campagne suivante repartirait donc de l'ancre
+retirée.
 
 ## 4. Renouveler la délégation d'émission Astra (§9.5)
 
@@ -577,8 +599,8 @@ fait.
   et §11.6 garde cette résolution locale — une campagne est l'inventaire du
   domaine. La console les nomme avec leur commande ; elles se lancent dans le
   conteneur Astra.
-- **L'adoption de l'ancre `CA-PQ` distribuée** par Astra et par la gateway.
-  `CA-TLS` est adoptée automatiquement à `not_after` des deux côtés.
+- **L'adoption de l'ancre `CA-PQ` distribuée par Astra.** La gateway et les
+  clients l'appliquent ; `CA-TLS` est adoptée à `not_after` des deux côtés.
 
 ## Vérifier où en est le domaine
 

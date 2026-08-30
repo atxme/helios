@@ -264,6 +264,10 @@ pub fn router(state: AppState) -> Router {
             "/api/certificates/gateway-transition/rollback",
             post(certificates::gateway_transition_rollback),
         )
+        .route(
+            "/api/certificates/ca-transition",
+            post(certificates::ca_transition_install),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

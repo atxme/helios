@@ -1,6 +1,7 @@
 // In dev, Vite proxies /api and /ws to heliosd. In production, the embedded
 // interface and the API are served by the same Axum process.
 import type {
+  AnchorDecisionView,
   CertificateDomain,
   GatewayDecisionView,
   GatewayRenewalRequest,
@@ -193,6 +194,9 @@ export const installGatewayTransition = (transition: unknown) =>
 
 export const abortGatewayTransition = (abort: unknown) =>
   gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition/abort', abort)
+
+export const installCaTransition = (transition: unknown) =>
+  gatewayAction<AnchorDecisionView>('/api/certificates/ca-transition', transition)
 
 export const installGatewayRollback = (authorization: unknown) =>
   gatewayAction<GatewayRollbackView>(

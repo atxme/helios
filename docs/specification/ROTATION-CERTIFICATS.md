@@ -2910,10 +2910,15 @@ contournés :
   échéance — les deux feuilles gateway n'expirent pas ensemble, contrairement à
   une génération cliente — et la gateway applique la décision sur son propre
   axe de compteur, terminale.
-  **Limite connue** : l'adoption automatique de l'ancre `CA-PQ` distribuée
-  reste absente d'Astra et de la gateway. `CA-TLS`, elle, est adoptée à
-  `not_after` par Astra et par la gateway ; les deux avancent donc sur la même
-  époque que le compagnon une fois sa promotion opérateur exécutée.
+  La gateway adopte désormais l'ancre `CA-PQ` distribuée :
+  `heliosd install-ca-transition` — ou la route console équivalente, qui écrit
+  par le processus détenant le registre — étage la rotation, les deux ancres
+  vérifient à partir de `activation_at`, et la sortante est retirée à
+  `not_after` par la passe d'entretien, dans la même écriture que les
+  promotions clientes et celle de la CA TLS. **Limite connue** : le registre
+  Astra, lui, reste sur l'ancre sortante jusqu'à ce qu'un opérateur l'avance,
+  si bien que la campagne suivante repartirait de l'ancre retirée. `CA-TLS`
+  est adoptée à `not_after` par Astra comme par la gateway.
   La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
   statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
   ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche

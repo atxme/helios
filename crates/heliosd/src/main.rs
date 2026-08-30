@@ -209,6 +209,20 @@ enum Command {
         /// Signed `GatewayTransitionAbort`, as JSON.
         abort: PathBuf,
     },
+    /// Installs a signed rotation of the domain anchor `CA-PQ` (§9.1).
+    ///
+    /// The anchor everything else hangs from. The outgoing `CA-PQ` authorises
+    /// its successor and the successor proves its own key — one signature
+    /// would not be enough — and both verify from `activation_at` until the
+    /// outgoing one is retired at `not_after`. The epoch moves only then.
+    ///
+    /// **For a stopped daemon.** A running one takes the same document on the
+    /// Certificates screen, which writes through the process that holds the
+    /// registry.
+    InstallCaTransition {
+        /// Signed `CaTransition`, as JSON.
+        transition: PathBuf,
+    },
     /// Installs a signed rotation of the client `CA-TLS` (§9.4).
     ///
     /// The anchor that authenticates the mTLS transport before any PQ
@@ -477,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
         } => prepare_gateway_certificate(rotate_tls, new_key, key_recovery),
         Command::InstallGatewayTransition { transition } => install_gateway_transition(&transition),
         Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
+        Command::InstallCaTransition { transition } => install_ca_transition(&transition),
         Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
         Command::InitTrustDomain {
             trust_domain_id,
@@ -751,6 +766,33 @@ fn abort_gateway_transition(source: &Path) -> anyhow::Result<()> {
              the next attempt starts one decision higher",
             aborted.abort.gateway_identity_epoch
         );
+    }
+    Ok(())
+}
+
+fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::state::InstallOutcome;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let transition: aether::certificates::authority::CaTransition =
+        gateway_rotation::read_signed_document(source, "CA-PQ transition")?;
+    let outcome = registry
+        .install_ca_transition(&transition, now_unix)
+        .context("installing the CA-PQ rotation")?;
+
+    println!(
+        "epoch: {} → {}",
+        transition.current_ca_epoch, transition.next_ca_epoch
+    );
+    println!("next anchor: {}", transition.next_ca_fingerprint.to_hex());
+    println!("activation at: {}", transition.window.activation_at);
+    println!("not after: {}", transition.window.not_after);
+    match outcome {
+        InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
+        InstallOutcome::Installed => warn!(
+            "CA-PQ rotation staged: both anchors verify from activation_at, and the outgoing one              is retired at not_after. Every client must have received this transition before that              date — one that has not is repaired by an operator, not by a late delivery"
+        ),
     }
     Ok(())
 }

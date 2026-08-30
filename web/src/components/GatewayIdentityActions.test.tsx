@@ -24,6 +24,8 @@ const DOMAIN: CertificateDomain = {
   ca_pq_fingerprint: 'cd'.repeat(32),
   ca_transition_pending: false,
   ca_activation_at: null,
+  ca_retire_active_at: null,
+  next_ca_fingerprint: null,
   client_tls_ca_epoch: 2,
   client_tls_ca_transition_pending: false,
   gateway_identity_epoch: 3,
@@ -153,6 +155,53 @@ describe('GatewayIdentityActions', () => {
   it('names the campaign actions it cannot open itself', () => {
     mount()
     expect(screen.getByText(/astra campaign open --scope fleet-leafs/)).toBeTruthy()
+  })
+
+  /** §9.1: the anchor rotation is staged, and the epoch stays where it was. */
+  it('hands back the incoming anchor and says when the epoch moves', async () => {
+    const answer = {
+      ca_epoch: 1,
+      next_ca_epoch: 2,
+      next_ca_fingerprint: 'bb'.repeat(32),
+      activation_at: 60_000,
+      not_after: 90_000,
+      already_present: false,
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response(JSON.stringify(answer), { status: 200 }))),
+    )
+    mount()
+
+    const textarea = screen.getByPlaceholderText(/Coller ici la transition/)
+    fireEvent.change(textarea, { target: { value: '{"format_version":1}' } })
+    fireEvent.click(screen.getByText('Installer la rotation CA-PQ'))
+
+    expect(await screen.findByText('bb'.repeat(32))).toBeTruthy()
+    expect(screen.getByText('1 → 2 à not_after')).toBeTruthy()
+  })
+
+  /** A second rotation while one is in flight is refused, with its reason. */
+  it('shows why an anchor rotation was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ message: 'a CA rotation is already in flight' }), {
+            status: 409,
+          }),
+        ),
+      ),
+    )
+    mount()
+
+    const textarea = screen.getByPlaceholderText(/Coller ici la transition/)
+    fireEvent.change(textarea, { target: { value: '{"format_version":1}' } })
+    fireEvent.click(screen.getByText('Installer la rotation CA-PQ'))
+
+    await waitFor(() =>
+      expect(screen.getByText('a CA rotation is already in flight')).toBeTruthy(),
+    )
   })
 
   /**

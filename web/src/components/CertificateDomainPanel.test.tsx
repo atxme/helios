@@ -39,6 +39,8 @@ const DOMAIN: CertificateDomain = {
   ca_pq_fingerprint: 'cd'.repeat(32),
   ca_transition_pending: false,
   ca_activation_at: null,
+  ca_retire_active_at: null,
+  next_ca_fingerprint: null,
   client_tls_ca_epoch: 2,
   client_tls_ca_transition_pending: false,
   gateway_identity_epoch: 3,

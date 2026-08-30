@@ -239,6 +239,8 @@ export interface CertificateDomain {
   ca_pq_fingerprint: string
   ca_transition_pending: boolean
   ca_activation_at: number | null
+  ca_retire_active_at: number | null
+  next_ca_fingerprint: string | null
   client_tls_ca_epoch: number
   client_tls_ca_transition_pending: boolean
   gateway_identity_epoch: number
@@ -291,5 +293,15 @@ export interface GatewayRollbackView {
   gateway_identity_epoch: number
   selected_certificate_fingerprint: string
   expires_at: number
+  already_present: boolean
+}
+
+/** A staged anchor rotation, as the console displays it back (§9.1). */
+export interface AnchorDecisionView {
+  ca_epoch: number
+  next_ca_epoch: number
+  next_ca_fingerprint: string
+  activation_at: number
+  not_after: number
   already_present: boolean
 }

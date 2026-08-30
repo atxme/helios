@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use aether::certificates::{
     approval::{AstraCredentialBinding, AstraIssuancePolicy},
-    authority::{ClientTlsCaTransition, RotationReason},
+    authority::{CaTransition, ClientTlsCaTransition, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
         ClientCertificateStageAuthorization, ClientCertificateStageCommit,
@@ -1044,7 +1044,12 @@ impl CertificateRegistry {
     pub fn promote_due(&mut self, now_unix: u64) -> Result<Vec<String>, RegistryError> {
         let mut state = self.state.clone();
         let mut promoted = Vec::new();
-        let anchor_moved = state.client_tls_ca.promote_if_due(now_unix);
+        // Both anchors on the same pass and the same write. A restart that
+        // found one moved and the other not would either accept a chain the
+        // domain has retired or refuse one it still issues under, and which of
+        // the two it got would depend on where the crash landed.
+        let mut anchors_moved = state.client_tls_ca.promote_if_due(now_unix);
+        anchors_moved |= state.gateway.promote_ca_if_due(now_unix);
         for (key, peer) in state.peers.iter_mut() {
             if peer.state.promote_if_due(now_unix) {
                 if let Some(certificate) = peer.staged_pq_certificate.take() {
@@ -1053,10 +1058,37 @@ impl CertificateRegistry {
                 promoted.push(key.clone());
             }
         }
-        if !promoted.is_empty() || anchor_moved {
+        if !promoted.is_empty() || anchors_moved {
             self.persist(state)?;
         }
         Ok(promoted)
+    }
+
+    /// Stages a rotation of the domain anchor `CA-PQ` (spec §9.1).
+    ///
+    /// The state machine verifies it against the anchor this registry already
+    /// pins — the outgoing `CA-PQ` authorises its successor, and the successor
+    /// proves its own key — and refuses a second rotation while one is in
+    /// flight, or one whose activation is already in the past.
+    ///
+    /// The anchor does **not** move here. Both are acceptable from
+    /// `activation_at`, which is what [`TrustState::client_leaf_issuers`]
+    /// already reads, and `promote_due` retires the outgoing one at
+    /// `not_after`. Persisted only when the state moved.
+    pub fn install_ca_transition(
+        &mut self,
+        transition: &CaTransition,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, RegistryError> {
+        let mut state = self.state.clone();
+        let ledger = state.ledger.clone();
+        let outcome = state
+            .gateway
+            .apply_ca_transition(transition, &ledger, now_unix)?;
+        if matches!(outcome, InstallOutcome::Installed) {
+            self.persist(state)?;
+        }
+        Ok(outcome)
     }
 
     /// Stages a signed transition of the gateway's own identity (spec §6.3).
@@ -2907,6 +2939,151 @@ mod tests {
             .registry
             .promote_gateway_if_due(u64::MAX)
             .expect("idempotent"));
+    }
+
+    /// A `CA-PQ` rotation signed by the fixture's anchor and by its successor.
+    fn ca_transition(
+        fixture: &Fixture,
+        next: &Keys,
+        window: TransitionWindow,
+    ) -> aether::certificates::authority::CaTransition {
+        let transition = aether::certificates::authority::CaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            current_ca_epoch: 1,
+            next_ca_epoch: 2,
+            current_ca_fingerprint: fixture.ca.public.authority_fingerprint(),
+            next_ca_public_key: next.public.clone(),
+            next_ca_fingerprint: next.public.authority_fingerprint(),
+            window,
+            current_ca_signature: MlDsa87Signature::placeholder(),
+            next_ca_signature: MlDsa87Signature::placeholder(),
+        };
+        transition
+            .sign(&fixture.ca.private, &next.private)
+            .expect("sign")
+    }
+
+    /// §9.1 on the gateway: the anchor is staged, both verify during the
+    /// overlap, and the epoch moves only at `not_after`.
+    #[test]
+    fn a_ca_rotation_keeps_both_anchors_until_the_end_of_its_overlap() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = ca_transition(&fixture, &next, window());
+
+        assert!(matches!(
+            fixture
+                .registry
+                .install_ca_transition(&transition, 1_500)
+                .expect("install"),
+            InstallOutcome::Installed
+        ));
+        assert_eq!(fixture.registry.state().gateway.ca_epoch, 1);
+        assert_eq!(
+            fixture.registry.state().client_leaf_issuers(1_999).len(),
+            1,
+            "prepared, not yet acceptable"
+        );
+        assert_eq!(
+            fixture.registry.state().client_leaf_issuers(2_000).len(),
+            2,
+            "both anchors verify from activation_at"
+        );
+
+        // A repeat of the same signed document consumes nothing.
+        assert!(matches!(
+            fixture
+                .registry
+                .install_ca_transition(&transition, 1_600)
+                .expect("replay"),
+            InstallOutcome::AlreadyPresent
+        ));
+
+        fixture.registry.promote_due(2_999).expect("not due");
+        assert_eq!(fixture.registry.state().gateway.ca_epoch, 1);
+
+        fixture.registry.promote_due(3_000).expect("promotion");
+        assert_eq!(fixture.registry.state().gateway.ca_epoch, 2);
+        assert_eq!(
+            fixture
+                .registry
+                .state()
+                .gateway
+                .current_ca_public_key
+                .authority_fingerprint()
+                .to_hex(),
+            next.public.authority_fingerprint().to_hex()
+        );
+        assert_eq!(
+            fixture.registry.state().client_leaf_issuers(3_000).len(),
+            1,
+            "the outgoing anchor is gone, not merely unpreferred"
+        );
+    }
+
+    /// The promotion is persisted, not merely computed: a restart must find
+    /// the same anchor the pass moved to.
+    #[test]
+    fn the_promoted_anchor_survives_a_reopen() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = ca_transition(&fixture, &next, window());
+        fixture
+            .registry
+            .install_ca_transition(&transition, 1_500)
+            .expect("install");
+        fixture.registry.promote_due(3_000).expect("promotion");
+
+        let reopened = CertificateRegistry::load(&fixture.registry.path)
+            .expect("load")
+            .expect("registry on disk");
+        assert_eq!(reopened.state().gateway.ca_epoch, 2);
+        assert!(reopened.state().gateway.next_ca_public_key.is_none());
+    }
+
+    /// Two anchors at most: a second, different rotation while one is in
+    /// flight would leave three, of which the domain names two.
+    #[test]
+    fn a_second_ca_rotation_is_refused_while_one_is_in_flight() {
+        let mut fixture = fixture();
+        let first = keys();
+        let second = keys();
+        fixture
+            .registry
+            .install_ca_transition(&ca_transition(&fixture, &first, window()), 1_500)
+            .expect("install");
+
+        let refusal = fixture
+            .registry
+            .install_ca_transition(&ca_transition(&fixture, &second, window()), 1_500)
+            .expect_err("second rotation");
+        assert!(matches!(
+            refusal,
+            RegistryError::Certificate(CertificateError::IllegalStateTransition(_))
+        ));
+    }
+
+    /// A rotation whose activation has already passed installs nothing: it
+    /// would take effect the instant it landed, on a fleet that never saw it.
+    #[test]
+    fn a_ca_rotation_activating_in_the_past_is_refused() {
+        let mut fixture = fixture();
+        let next = keys();
+        let refusal = fixture
+            .registry
+            .install_ca_transition(&ca_transition(&fixture, &next, window()), 2_500)
+            .expect_err("late");
+        assert!(matches!(
+            refusal,
+            RegistryError::Certificate(CertificateError::IllegalStateTransition(_))
+        ));
+        assert!(fixture
+            .registry
+            .state()
+            .gateway
+            .next_ca_public_key
+            .is_none());
     }
 
     /// A rollback authorization signed by the fixture's `CA-PQ` for its own

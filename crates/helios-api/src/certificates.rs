@@ -176,6 +176,11 @@ pub struct CertificateDomainView {
     /// A successor anchor is installed and waiting for its activation.
     pub ca_transition_pending: bool,
     pub ca_activation_at: Option<u64>,
+    /// When the outgoing anchor is retired and `ca_epoch` finally moves.
+    pub ca_retire_active_at: Option<u64>,
+    /// The incoming anchor, for the operator to compare with the companion —
+    /// §9.1 makes that comparison the check, not the signature alone.
+    pub next_ca_fingerprint: Option<String>,
     pub client_tls_ca_epoch: u64,
     pub client_tls_ca_transition_pending: bool,
     pub gateway_identity_epoch: u64,
@@ -315,13 +320,36 @@ pub struct GatewayRollbackView {
     pub already_present: bool,
 }
 
-/// The gateway's own identity, driven from the console (spec §12.2).
+/// A staged anchor rotation, as the console displays it back (spec §9.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorDecisionView {
+    /// The generation in service. It does not move here.
+    pub ca_epoch: u64,
+    pub next_ca_epoch: u64,
+    /// The incoming anchor, for the operator to compare with the companion.
+    pub next_ca_fingerprint: String,
+    /// From this instant both anchors verify.
+    pub activation_at: u64,
+    /// When the outgoing anchor is retired and the epoch finally moves.
+    pub not_after: u64,
+    /// `true` when this exact document was already applied.
+    pub already_present: bool,
+}
+
+/// The lifecycle gestures the console drives on this daemon's own registry
+/// (spec §12.2).
 ///
-/// Separate from [`TrustUpdateHandler`] because it needs something that
-/// handler never touches: the TPM unlock material. A gateway that reads its
-/// registry can answer every question of the lifecycle screen; only one that
-/// can open its own vault can prepare a key, and wiring the two together
+/// Separate from [`TrustUpdateHandler`] because one of them needs something
+/// that handler never touches: the TPM unlock material. A gateway that reads
+/// its registry can answer every question of the lifecycle screen; only one
+/// that can open its own vault can prepare a key, and wiring the two together
 /// would close the screen on a daemon that merely cannot seal.
+///
+/// The anchor rotation of §9.1 sits here rather than beside the trust updates
+/// for the plainer reason: it is a write to the same registry, under the same
+/// lock, and a second door onto that file is the failure this module exists to
+/// avoid.
 #[async_trait]
 pub trait GatewayIdentityHandler: Send + Sync {
     /// Generates and seals the next identity, and exports its request.
@@ -347,6 +375,12 @@ pub trait GatewayIdentityHandler: Send + Sync {
         &self,
         authorization: Box<aether::certificates::status::CertificateServiceRollbackAuthorization>,
     ) -> Result<GatewayRollbackView, GatewayActionRefusal>;
+
+    /// Stages a rotation of the domain anchor `CA-PQ` (spec §9.1).
+    async fn install_ca_transition(
+        &self,
+        transition: Box<aether::certificates::authority::CaTransition>,
+    ) -> Result<AnchorDecisionView, GatewayActionRefusal>;
 }
 
 /// Why a gateway identity gesture was refused, in words the operator reads.
@@ -432,6 +466,20 @@ pub async fn gateway_transition_rollback(
         return gateway_identity_absent();
     };
     match handler.install_rollback(Box::new(authorization)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `POST /api/certificates/ca-transition`, on the admin surface.
+pub async fn ca_transition_install(
+    State(s): State<AppState>,
+    Json(transition): Json<aether::certificates::authority::CaTransition>,
+) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler.install_ca_transition(Box::new(transition)).await {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(refusal) => refusal.into_response(),
     }

@@ -529,6 +529,42 @@ impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
             already_present: installed.already_present,
         })
     }
+
+    /// §9.1, applied to the anchor this gateway pins.
+    ///
+    /// The registry is the daemon's own, under the same lock as every other
+    /// mutation. The anchor does not move here: both verify from
+    /// `activation_at`, and the outgoing one is retired by the maintenance
+    /// pass at `not_after` — the same pass that promotes the client
+    /// generations, and in the same write.
+    async fn install_ca_transition(
+        &self,
+        transition: Box<aether::certificates::authority::CaTransition>,
+    ) -> Result<helios_api::certificates::AnchorDecisionView, GatewayActionRefusal> {
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let outcome = registry
+            .install_ca_transition(&transition, now)
+            .map_err(|error| {
+                tracing::warn!(%error, "CA-PQ rotation refused");
+                GatewayActionRefusal::new(format!("{error:#}"))
+            })?;
+        tracing::warn!(
+            next_ca_epoch = transition.next_ca_epoch,
+            "CA-PQ rotation staged from the console; both anchors verify from activation_at"
+        );
+        Ok(helios_api::certificates::AnchorDecisionView {
+            ca_epoch: transition.current_ca_epoch,
+            next_ca_epoch: transition.next_ca_epoch,
+            next_ca_fingerprint: transition.next_ca_fingerprint.to_hex(),
+            activation_at: transition.window.activation_at,
+            not_after: transition.window.not_after,
+            already_present: matches!(
+                outcome,
+                aether::certificates::state::InstallOutcome::AlreadyPresent
+            ),
+        })
+    }
 }
 
 #[async_trait]
@@ -1132,6 +1168,12 @@ pub fn domain_view(
             .to_hex(),
         ca_transition_pending: state.gateway.next_ca_public_key.is_some(),
         ca_activation_at: state.gateway.ca_activation_at,
+        ca_retire_active_at: state.gateway.ca_retire_active_at,
+        next_ca_fingerprint: state
+            .gateway
+            .next_ca_public_key
+            .as_ref()
+            .map(|key| key.authority_fingerprint().to_hex()),
         client_tls_ca_epoch: state.client_tls_ca.ca_tls_epoch,
         client_tls_ca_transition_pending: state
             .client_tls_ca
