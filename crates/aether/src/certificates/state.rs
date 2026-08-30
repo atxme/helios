@@ -41,7 +41,7 @@ use super::{
     approval::{AstraCredentialBinding, AstraPolicyPin},
     authority::{
         AstraIssuerAuthorization, AstraServiceKeyTransition, CaTransition, ClientTlsCaTransition,
-        EmergencyAstraServiceKeyReplacement,
+        EmergencyAstraServiceKeyReplacement, RotationReason,
     },
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
@@ -135,6 +135,18 @@ pub struct GatewayCertificateState {
     /// Absent outside a rollback, which is the resting state (spec §4.4).
     #[serde(default)]
     pub service_rollback: Option<GatewayServiceRollback>,
+    /// The one transition a revoked identity will still accept (spec §10.1).
+    ///
+    /// Set from `replacement_transition_fingerprint` when a revocation
+    /// withdraws the served identity and names what replaces it. Without it a
+    /// revoked gateway has no way back at all: every transition is refused,
+    /// and the domain has to be rebuilt to bring the service up again.
+    ///
+    /// It names **one exact signed document**, so it is not a re-opening of
+    /// the state — nothing else installs, and the revoked leaves stay in the
+    /// ledger where `install_transition` already refuses them.
+    #[serde(default)]
+    pub awaited_replacement: Option<Fingerprint>,
 }
 
 /// A bounded, manual selection of the outgoing identity (spec §4.4).
@@ -209,9 +221,6 @@ impl GatewayCertificateState {
         ledger: &TrustLedger,
         now_unix: u64,
     ) -> Result<InstallOutcome, CertificateError> {
-        if self.revoked {
-            return Err(CertificateError::Revoked);
-        }
         // A revoked leaf never comes back, whatever signs the document that
         // carries it (spec §10.2).
         ledger.assert_not_revoked(&transition.installed_fingerprints()?)?;
@@ -220,13 +229,28 @@ impl GatewayCertificateState {
         // "Identical" is the whole signed document: the same leaves under a
         // different window are a different decision.
         let fingerprint = transition.fingerprint()?;
+        let replaces_revoked = self.awaits_replacement(&fingerprint);
+        if self.revoked && !replaces_revoked {
+            return Err(CertificateError::Revoked);
+        }
+        // The reason is not decoration: an emergency replacement is the one
+        // transition that installs straight into the served slot, so it is
+        // accepted **only** where that is what §10 asks for. Offered on a
+        // healthy identity it would be an immediate, unscheduled swap that no
+        // client has been told about.
+        if (transition.reason == RotationReason::EmergencyReplacement) != replaces_revoked {
+            return Err(CertificateError::IllegalStateTransition(
+                "emergency_replacement belongs to a revoked identity awaiting exactly this \
+                 document, and nothing else does",
+            ));
+        }
         if self
             .next_transition_fingerprint
             .is_some_and(|staged| staged.matches(&fingerprint))
         {
             return Ok(InstallOutcome::AlreadyPresent);
         }
-        if self.next_gateway_identity_epoch.is_some() {
+        if !replaces_revoked && self.next_gateway_identity_epoch.is_some() {
             return Err(CertificateError::IllegalStateTransition(
                 "a transition is already staged",
             ));
@@ -241,6 +265,9 @@ impl GatewayCertificateState {
             &self.active_tls_fingerprint(),
             &self.active_pq_fingerprint()?,
         )?;
+        if replaces_revoked {
+            return self.replace_revoked_identity(transition);
+        }
         if now_unix >= transition.window.activation_at {
             return Err(CertificateError::IllegalStateTransition(
                 "transition activates in the past",
@@ -259,6 +286,59 @@ impl GatewayCertificateState {
         self.activation_at = Some(transition.window.activation_at);
         self.retire_active_at = Some(transition.window.not_after);
         self.published = false;
+        Ok(InstallOutcome::Installed)
+    }
+
+    /// Whether this exact document is the replacement a revocation named.
+    fn awaits_replacement(&self, fingerprint: &Fingerprint) -> bool {
+        self.revoked
+            && self
+                .awaited_replacement
+                .is_some_and(|awaited| awaited.matches(fingerprint))
+    }
+
+    /// Installs the replacement of a revoked identity (spec §6.1, §10.2).
+    ///
+    /// # Why it does not go through the window
+    ///
+    /// §4.1 schedules an **ordinary** transition: prepared, then served, with
+    /// the outgoing identity accepted throughout. Here the outgoing identity
+    /// has been withdrawn — §10.2 makes the revocation dominate `staged`,
+    /// `overlap` and any rollback — so there is nothing to overlap with.
+    /// Staging this one would leave the gateway serving nothing at all until
+    /// `activation_at`, on an incident where the service is already down.
+    ///
+    /// So it lands in the served slot directly, and the decision counter moves
+    /// with it. What keeps that from being a way back into a revoked identity
+    /// is upstream: the ledger refuses the retired fingerprints, and this path
+    /// is only reachable for the one document the revocation itself named.
+    fn replace_revoked_identity(
+        &mut self,
+        transition: &GatewayIdentityTransition,
+    ) -> Result<InstallOutcome, CertificateError> {
+        if let Some(certificate) = &transition.next_gateway_tls_certificate {
+            self.active_gateway_tls_certificate = certificate.clone();
+        }
+        if let Some(certificate) = &transition.next_gateway_certificate {
+            self.active_gateway_certificate = certificate.clone();
+        }
+        self.active_gateway_identity_epoch = transition.gateway_identity_epoch;
+        self.gateway_decision_epoch = transition.gateway_identity_epoch;
+        // Nothing staged, nothing to promote, nothing to roll back to: the
+        // identity this replaces is gone rather than outgoing.
+        self.next_gateway_identity_epoch = None;
+        self.next_transition_fingerprint = None;
+        self.next_gateway_tls_certificate = None;
+        self.next_gateway_certificate = None;
+        self.activation_at = None;
+        self.retire_active_at = None;
+        self.published = false;
+        self.service_rollback = None;
+        self.awaited_replacement = None;
+        // The revocation counter keeps its value. It is a separate axis
+        // (§4.2), and lowering it would make an already-consumed decision
+        // deliverable a second time.
+        self.revoked = false;
         Ok(InstallOutcome::Installed)
     }
 
@@ -452,6 +532,7 @@ impl GatewayCertificateState {
         revoked_tls_fingerprint: Option<&Fingerprint>,
         revoked_pq_fingerprint: Option<&Fingerprint>,
         revocation_epoch: u64,
+        replacement_transition_fingerprint: Option<&Fingerprint>,
     ) -> Result<bool, CertificateError> {
         let named = |candidate: &Fingerprint| {
             [revoked_tls_fingerprint, revoked_pq_fingerprint]
@@ -471,6 +552,10 @@ impl GatewayCertificateState {
             self.retire_active_at = None;
             self.published = false;
             self.service_rollback = None;
+            // The one document that will still install here. Without it a
+            // revoked gateway has no way back: every transition is refused,
+            // and the service stays down until the domain is rebuilt.
+            self.awaited_replacement = replacement_transition_fingerprint.copied();
             return Ok(true);
         }
 
@@ -1496,6 +1581,10 @@ pub struct ScheduledRevocation {
     pub revoked_pq_not_after: Option<u64>,
     /// Fingerprint of the signed revocation, carried through to the tombstone.
     pub revocation_fingerprint: Option<Fingerprint>,
+    /// The replacement the revocation named, carried to the state it will
+    /// have to accept it from (spec §10.1).
+    #[serde(default)]
+    pub replacement_transition_fingerprint: Option<Fingerprint>,
 }
 
 impl ScheduledRevocation {
@@ -1638,6 +1727,7 @@ impl TrustLedger {
             revoked_pq_fingerprint: revocation.revoked_pq_fingerprint,
             revoked_pq_not_after: revocation.revoked_pq_not_after,
             revocation_fingerprint: Some(revocation.fingerprint()),
+            replacement_transition_fingerprint: revocation.replacement_transition_fingerprint,
         });
         Ok(())
     }
@@ -1703,10 +1793,15 @@ impl TrustLedger {
                     }
                 }
                 RevocationScope::Gateway => {
+                    // The client records the awaited replacement for the same
+                    // reason the gateway does: without it, a client that
+                    // received the revocation would refuse the transition
+                    // that repairs the service, and stay refusing forever.
                     gateway.apply_revocation(
                         revocation.revoked_tls_fingerprint.as_ref(),
                         revocation.revoked_pq_fingerprint.as_ref(),
                         revocation.revocation_epoch,
+                        revocation.replacement_transition_fingerprint.as_ref(),
                     )?;
                 }
             }
@@ -2434,6 +2529,7 @@ mod tests {
                 revoked: false,
                 revocation_epoch: 0,
                 service_rollback: None,
+                awaited_replacement: None,
             }
         }
 
@@ -2521,6 +2617,168 @@ mod tests {
                 ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
             };
             authorization.sign(&ca.private).expect("sign")
+        }
+
+        /// A transition with the emergency reason, for a state that has been
+        /// revoked and told what replaces it.
+        fn replacement(
+            ca: &Keys,
+            state: &GatewayCertificateState,
+            epoch: u64,
+            next: PqCertificate,
+        ) -> GatewayIdentityTransition {
+            let mut transition = transition(ca, state, epoch, next);
+            transition.reason = RotationReason::EmergencyReplacement;
+            transition.sign(&ca.private).expect("sign")
+        }
+
+        /// §10.2 followed by §6.1: the revocation names what replaces the
+        /// identity it withdraws, and that one document still installs.
+        #[test]
+        fn a_revoked_identity_accepts_the_replacement_its_revocation_named() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            let replacement = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            let named = replacement.fingerprint().expect("fingerprint");
+
+            assert!(state
+                .apply_revocation(None, Some(&revoked_pq), 3, Some(&named))
+                .expect("revocation"));
+            assert!(state.revoked);
+            assert!(
+                state.acceptable_pq_fingerprints(1_500).unwrap().is_empty(),
+                "a revoked gateway offers nothing while it waits"
+            );
+
+            assert_eq!(
+                state
+                    .install_transition(&replacement, &TrustLedger::default(), 1_500)
+                    .expect("replacement"),
+                InstallOutcome::Installed
+            );
+            // Served immediately: there is no outgoing identity to overlap
+            // with, and staging would leave the service down until
+            // activation_at.
+            assert!(!state.revoked);
+            assert_eq!(state.active_gateway_identity_epoch, 2);
+            assert_eq!(state.gateway_decision_epoch, 2);
+            assert!(state.next_gateway_identity_epoch.is_none());
+            assert!(state.activation_at.is_none());
+            assert_eq!(state.acceptable_pq_fingerprints(1_500).unwrap().len(), 1);
+            assert_eq!(
+                state.revocation_epoch, 3,
+                "the revocation counter is a separate axis and never comes back down"
+            );
+            assert!(state.awaited_replacement.is_none());
+        }
+
+        /// Any other document, however well signed, stays refused.
+        #[test]
+        fn a_revoked_identity_refuses_every_transition_but_the_one_named() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            let named = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2))
+                .fingerprint()
+                .expect("fingerprint");
+            state
+                .apply_revocation(None, Some(&revoked_pq), 3, Some(&named))
+                .expect("revocation");
+
+            let other = keys();
+            let elsewhere = replacement(&ca, &state, 2, leaf(&ca, &other, 3));
+            assert!(matches!(
+                state.install_transition(&elsewhere, &TrustLedger::default(), 1_500),
+                Err(CertificateError::Revoked)
+            ));
+            assert!(state.revoked);
+        }
+
+        /// A revocation that names nothing leaves the identity terminal, which
+        /// is what it was before this path existed.
+        #[test]
+        fn a_revocation_naming_no_replacement_stays_terminal() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked_pq = state.active_pq_fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(None, Some(&revoked_pq), 3, None)
+                .expect("revocation");
+            assert!(state.awaited_replacement.is_none());
+
+            let refused = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            assert!(matches!(
+                state.install_transition(&refused, &TrustLedger::default(), 1_500),
+                Err(CertificateError::Revoked)
+            ));
+        }
+
+        /// The revoked leaves never come back, whatever names them: the ledger
+        /// refuses them before the awaited fingerprint is even consulted.
+        #[test]
+        fn the_replacement_may_not_reinstall_the_leaf_that_was_revoked() {
+            let (ca, active) = (keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let revoked = leaf(&ca, &active, 7);
+            let revoked_fingerprint = pq_certificate_fingerprint(&revoked).expect("fingerprint");
+            let reinstalls = replacement(&ca, &state, 2, revoked);
+            let named = reinstalls.fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(
+                    None,
+                    Some(&state.active_pq_fingerprint().expect("fingerprint")),
+                    3,
+                    Some(&named),
+                )
+                .expect("revocation");
+
+            let ledger = TrustLedger {
+                revoked: vec![RevocationTombstone {
+                    scope: RevocationScope::Gateway,
+                    family: RevokedFamily::Pq,
+                    fingerprint: revoked_fingerprint,
+                    revocation_epoch: 3,
+                    expires_at: 100_000,
+                    revocation_fingerprint: None,
+                }],
+                ..TrustLedger::default()
+            };
+
+            assert!(state
+                .install_transition(&reinstalls, &ledger, 1_500)
+                .is_err());
+            assert!(state.revoked, "and the identity stays withdrawn");
+        }
+
+        /// The reason and the situation must agree in both directions: an
+        /// emergency replacement offered to a healthy identity would be an
+        /// immediate swap nobody scheduled.
+        #[test]
+        fn the_emergency_reason_belongs_only_to_a_revoked_identity() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let emergency = replacement(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            assert!(matches!(
+                state.install_transition(&emergency, &TrustLedger::default(), 1_500),
+                Err(CertificateError::IllegalStateTransition(_))
+            ));
+
+            // And the converse: the awaited document must carry the reason.
+            let ordinary = transition(&ca, &state, 2, leaf(&ca, &candidate, 3));
+            let named = ordinary.fingerprint().expect("fingerprint");
+            state
+                .apply_revocation(
+                    None,
+                    Some(&state.active_pq_fingerprint().expect("fingerprint")),
+                    3,
+                    Some(&named),
+                )
+                .expect("revocation");
+            assert!(matches!(
+                state.install_transition(&ordinary, &TrustLedger::default(), 1_500),
+                Err(CertificateError::IllegalStateTransition(_))
+            ));
         }
 
         /// The window a rollback lives in is exactly the window in which the
@@ -2715,7 +2973,7 @@ mod tests {
                 .apply_service_rollback(&authorization, 2_100)
                 .expect("rollback");
             assert!(state
-                .apply_revocation(Some(&outgoing), None, 1)
+                .apply_revocation(Some(&outgoing), None, 1, None)
                 .expect("revocation"));
             assert!(state.service_rollback.is_none());
             assert!(!state.in_overlap(2_200));

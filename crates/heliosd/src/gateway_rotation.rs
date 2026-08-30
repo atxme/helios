@@ -99,15 +99,23 @@ fn plan(
     gateway: &aether::certificates::state::GatewayCertificateState,
     pending: Option<GatewayCertificateRequest>,
     new_key: bool,
+    key_recovery: bool,
     now_unix: u64,
 ) -> Result<Plan> {
-    // §6.3: `revoked` is terminal and dominates every phase and every date.
-    // Nothing local repairs it, and a renewal request would be this gateway
-    // asking to continue an identity the authority has withdrawn.
+    // A revoked identity may not vouch for its successor. §5's continuity
+    // signature is the revoked key signing for the next one, which is exactly
+    // what a withdrawal removes the right to do — so the only request this
+    // state produces is a `key_recovery` one, and the authority then has
+    // nothing but its own out-of-band judgement to go on.
+    //
+    // Refusing outright would be simpler and was what this did, but §10.1 has
+    // a revocation name the transition that replaces the identity it
+    // withdraws: a gateway that could not prepare the key for it would make
+    // that field unusable, and every withdrawal terminal in practice.
     anyhow::ensure!(
-        !gateway.revoked,
-        "this gateway identity is revoked at epoch {}; a revocation is not repaired by a \
-         renewal, and no new leaf may continue it",
+        !gateway.revoked || key_recovery,
+        "this gateway identity is revoked at epoch {}; a revoked identity may not sign for its \
+         successor, so the replacement of §10.1 is prepared with --key-recovery or not at all",
         gateway.revocation_epoch
     );
     // One candidate at a time (§6.3). Past `staged` the next epoch belongs to
@@ -160,7 +168,13 @@ pub(crate) fn prepare_request(
     // The epoch comes back from the plan and is not recomputed here: the
     // sealing context binds it, and a second derivation is a second value that
     // can disagree with the one the candidate was sealed under.
-    let (epoch, candidate) = match plan(gateway, read_pending(&path)?, new_key, now_unix)? {
+    let (epoch, candidate) = match plan(
+        gateway,
+        read_pending(&path)?,
+        new_key,
+        key_recovery,
+        now_unix,
+    )? {
         Plan::Reuse(held) => {
             return Ok(PreparedRequest {
                 request: *held,
@@ -773,6 +787,7 @@ mod tests {
             revoked: false,
             revocation_epoch: 0,
             service_rollback: None,
+            awaited_replacement: None,
         }
     }
 
@@ -797,7 +812,7 @@ mod tests {
     #[test]
     fn a_first_preparation_seals_the_epoch_after_the_last_decision() {
         assert_eq!(
-            plan(&gateway(), None, false, NOW).expect("plan"),
+            plan(&gateway(), None, false, false, NOW).expect("plan"),
             Plan::Seal { epoch: 4 }
         );
     }
@@ -806,7 +821,8 @@ mod tests {
     #[test]
     fn a_valid_request_for_the_same_epoch_is_returned_unchanged() {
         let held = request(4, NOW + 3600);
-        let Plan::Reuse(reused) = plan(&gateway(), Some(held.clone()), false, NOW).expect("plan")
+        let Plan::Reuse(reused) =
+            plan(&gateway(), Some(held.clone()), false, false, NOW).expect("plan")
         else {
             panic!("a valid request must be reused");
         };
@@ -819,7 +835,7 @@ mod tests {
         let held = request(4, NOW - 1);
         let expected = held.new_ml_dsa_87_public_key.clone();
         assert_eq!(
-            plan(&gateway(), Some(held), false, NOW).expect("plan"),
+            plan(&gateway(), Some(held), false, false, NOW).expect("plan"),
             Plan::Resign {
                 epoch: 4,
                 pq_public_key: expected,
@@ -830,7 +846,7 @@ mod tests {
     #[test]
     fn new_key_replaces_the_candidate_even_while_its_request_is_valid() {
         assert_eq!(
-            plan(&gateway(), Some(request(4, NOW + 3600)), true, NOW).expect("plan"),
+            plan(&gateway(), Some(request(4, NOW + 3600)), true, false, NOW).expect("plan"),
             Plan::Seal { epoch: 4 }
         );
     }
@@ -840,7 +856,7 @@ mod tests {
     #[test]
     fn a_request_from_an_earlier_epoch_is_not_a_resumption() {
         assert_eq!(
-            plan(&gateway(), Some(request(3, NOW + 3600)), false, NOW).expect("plan"),
+            plan(&gateway(), Some(request(3, NOW + 3600)), false, false, NOW).expect("plan"),
             Plan::Seal { epoch: 4 }
         );
     }
@@ -852,23 +868,42 @@ mod tests {
         let mut gateway = gateway();
         gateway.gateway_decision_epoch = 4;
         gateway.next_gateway_identity_epoch = Some(4);
-        let error = plan(&gateway, None, false, NOW).expect_err("a staged transition must refuse");
+        let error =
+            plan(&gateway, None, false, false, NOW).expect_err("a staged transition must refuse");
         assert!(
             error.to_string().contains("already staged"),
             "unexpected refusal: {error}"
         );
     }
 
-    /// §6.3: `revoked` is terminal, and a renewal is not what repairs it.
+    /// A revoked identity may not sign for its successor: §5's continuity
+    /// signature is exactly the right a withdrawal removes.
     #[test]
-    fn a_revoked_gateway_prepares_nothing() {
+    fn a_revoked_gateway_prepares_nothing_that_claims_continuity() {
         let mut gateway = gateway();
         gateway.revoked = true;
         gateway.revocation_epoch = 2;
-        let error = plan(&gateway, None, false, NOW).expect_err("a revoked identity must refuse");
+        let error =
+            plan(&gateway, None, false, false, NOW).expect_err("a revoked identity must refuse");
         assert!(
             error.to_string().contains("revoked"),
             "unexpected refusal: {error}"
+        );
+    }
+
+    /// But it prepares the §10.1 replacement, without continuity. Refusing
+    /// that too would make `replacement_transition_fingerprint` unusable and
+    /// every withdrawal terminal in practice.
+    #[test]
+    fn a_revoked_gateway_prepares_its_replacement_under_key_recovery() {
+        let mut gateway = gateway();
+        gateway.revoked = true;
+        gateway.revocation_epoch = 2;
+        assert_eq!(
+            plan(&gateway, None, false, true, NOW).expect("replacement"),
+            Plan::Seal {
+                epoch: gateway.gateway_decision_epoch + 1
+            }
         );
     }
 

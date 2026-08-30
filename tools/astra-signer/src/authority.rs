@@ -249,6 +249,12 @@ pub struct RevocationDecision {
     pub revoked_pq: Option<(Fingerprint, u64)>,
     pub effective_at: u64,
     pub reason: RevocationReason,
+    /// The one transition a revoked identity will still accept (spec §10.1).
+    ///
+    /// Naming it here is what makes the withdrawal recoverable: without it the
+    /// state is terminal on every holder, and the service stays down until the
+    /// trust domain is rebuilt.
+    pub replacement_transition_fingerprint: Option<Fingerprint>,
 }
 
 /// Signs an emergency revocation with the master `CA-PQ` key.
@@ -285,7 +291,7 @@ pub fn sign_revocation(
             revoked_pq_not_after: decision.revoked_pq.map(|value| value.1),
             effective_at: decision.effective_at,
             reason: decision.reason,
-            replacement_transition_fingerprint: None,
+            replacement_transition_fingerprint: decision.replacement_transition_fingerprint,
             ca_signature: MlDsa87Signature::placeholder(),
         }
         .sign(&ca_pq_private_key)?;

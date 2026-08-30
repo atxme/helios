@@ -3033,12 +3033,27 @@ contournés :
   **Limite connue** : la leaf TLS candidate voyage à part. La demande de §5 ne
   porte pas de champ TLS, donc son DER se copie depuis la gateway ; une leaf
   substituée est refusée à l'installation.
-  **Limite connue** : `sign-gateway-transition` n'émet que `scheduled` et
-  `key_recovery`. Le motif `emergency_replacement` de §6.1 — sans chevauchement,
-  identité sortante retirée — n'a pas de commande : la révocation gateway
-  existe et retire l'identité, mais rien n'enchaîne dans le même geste sur la
-  transition qui la remplace. `verify` accepte les trois motifs et refuse les
+  Le motif `emergency_replacement` de §6.1 est livré, et avec lui la sortie
+  d'une révocation gateway — qui était jusque-là une panne de service
+  définitive, aucun détenteur n'acceptant plus la moindre transition.
+  `astra-signer sign-gateway-transition --emergency-replacement` signe le
+  remplacement, `astra-signer revoke --replacement-transition <fichier>` le
+  nomme dans le champ `replacement_transition_fingerprint` du §10.1 — le
+  fichier est lu, jamais l'empreinte saisie —, et l'état n'accepte ensuite que
+  ce document exact. Il est **servi immédiatement** : il n'y a plus d'identité
+  sortante avec laquelle se recouvrir, et l'étager laisserait le service à
+  terre jusqu'à `activation_at`. Le compteur de révocation garde sa valeur, et
+  les feuilles retirées restent refusées par le registre des tombstones. La
+  réciproque tient aussi : le motif est refusé sur une identité saine, où il
+  serait une bascule immédiate que personne n'a planifiée. `heliosd
+  prepare-gateway-certificate` accepte une identité révoquée **sous
+  `--key-recovery` seulement** : une identité retirée ne signe pas la
+  continuité de sa suivante. `verify` accepte les trois motifs et refuse les
   trois autres de `RotationReason`, qui décrivent une décision cliente.
+  **Limite connue** : préparer la clé de remplacement sur la machine qui vient
+  d'être révoquée ne vaut que si l'hôte est sain ; après une compromission de
+  clé, c'est le geste à ne pas faire, et rien ici ne prend cette décision à la
+  place de l'opérateur.
   Le **rollback de service** de §11.1 étape 8 est livré :
   `astra-signer sign-gateway-rollback` résout la campagne localement depuis la
   transition signée — un rollback ne distribue rien, et le garde d'Astra

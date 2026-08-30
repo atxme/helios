@@ -156,6 +156,7 @@ fn an_emergency_revocation_is_signed_by_the_master_anchor() {
         revoked_pq: Some((Fingerprint::of(b"pq leaf"), NOW + 86_400)),
         effective_at: NOW,
         reason: RevocationReason::KeyCompromise,
+        replacement_transition_fingerprint: None,
     };
 
     let revocation = authority::sign_revocation(

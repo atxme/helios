@@ -1287,12 +1287,14 @@ impl CertificateRegistry {
         revoked_tls_fingerprint: Option<&Fingerprint>,
         revoked_pq_fingerprint: Option<&Fingerprint>,
         revocation_epoch: u64,
+        replacement_transition_fingerprint: Option<&Fingerprint>,
     ) -> Result<bool, RegistryError> {
         let mut state = self.state.clone();
         let hit = state.gateway.apply_revocation(
             revoked_tls_fingerprint,
             revoked_pq_fingerprint,
             revocation_epoch,
+            replacement_transition_fingerprint,
         )?;
         self.persist(state)?;
         Ok(hit)
@@ -1624,6 +1626,7 @@ mod tests {
                 revoked: false,
                 revocation_epoch: 0,
                 service_rollback: None,
+                awaited_replacement: None,
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 1,
@@ -3276,13 +3279,61 @@ mod tests {
 
         let hit = fixture
             .registry
-            .revoke_gateway(None, Some(&active_pq), 1)
+            .revoke_gateway(None, Some(&active_pq), 1, None)
             .expect("revoked");
 
         assert!(hit);
         let gateway = &fixture.registry.state().gateway;
         assert!(gateway.revoked);
         assert_eq!(gateway.revocation_epoch, 1);
+    }
+
+    /// §10.1 followed by §6.1, on the registry: a withdrawal that names its
+    /// replacement is recoverable, and the replacement is served at once —
+    /// there is no outgoing identity left to overlap with.
+    #[test]
+    fn a_revocation_naming_a_replacement_lets_the_gateway_come_back() {
+        let mut fixture = fixture();
+        let next = keys();
+        let mut replacement = gateway_transition(&fixture, &next, 2, window());
+        replacement.reason = RotationReason::EmergencyReplacement;
+        let replacement = replacement.sign(&fixture.ca.private).expect("sign");
+        let named = replacement.fingerprint().expect("fingerprint");
+        let active_pq = fixture
+            .registry
+            .state()
+            .gateway
+            .active_pq_fingerprint()
+            .expect("active fingerprint");
+
+        assert!(fixture
+            .registry
+            .revoke_gateway(None, Some(&active_pq), 1, Some(&named))
+            .expect("revoked"));
+        assert!(fixture.registry.state().gateway.revoked);
+
+        assert!(matches!(
+            fixture
+                .registry
+                .install_gateway_transition(&replacement, 1_500)
+                .expect("replacement"),
+            InstallOutcome::Installed
+        ));
+        let gateway = &fixture.registry.state().gateway;
+        assert!(!gateway.revoked);
+        assert_eq!(gateway.active_gateway_identity_epoch, 2);
+        assert!(gateway.next_gateway_identity_epoch.is_none());
+        assert_eq!(
+            gateway.revocation_epoch, 1,
+            "the revocation counter never comes back down"
+        );
+
+        // And it survives a reopen: the decision is on disk, not in a clone.
+        let reopened = CertificateRegistry::load(&fixture.registry.path)
+            .expect("load")
+            .expect("registry on disk");
+        assert!(!reopened.state().gateway.revoked);
+        assert_eq!(reopened.state().gateway.active_gateway_identity_epoch, 2);
     }
 
     /// A decision about a leaf this gateway never held is not an error — an
@@ -3295,7 +3346,7 @@ mod tests {
 
         let hit = fixture
             .registry
-            .revoke_gateway(Some(&stranger), None, 4)
+            .revoke_gateway(Some(&stranger), None, 4, None)
             .expect("recorded");
 
         assert!(!hit);
@@ -3325,7 +3376,7 @@ mod tests {
 
         let hit = fixture
             .registry
-            .revoke_gateway(None, Some(&staged), 2)
+            .revoke_gateway(None, Some(&staged), 2, None)
             .expect("revoked");
 
         assert!(hit);

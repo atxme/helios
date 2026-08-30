@@ -454,6 +454,17 @@ enum Command {
         pq_not_after: Option<u64>,
         #[arg(long, value_enum, default_value = "key-compromise")]
         reason: RevocationReasonArg,
+        /// La transition `emergency_replacement` que cette révocation autorise
+        /// (§10.1), telle qu'elle a été signée.
+        ///
+        /// Sans elle, une gateway révoquée est terminale : plus aucune
+        /// transition ne s'installe, sur aucun détenteur, et le service reste
+        /// à terre jusqu'à ce que le domaine soit reconstruit. Le fichier est
+        /// lu, pas l'empreinte saisie : une valeur retapée de travers laisse
+        /// une gateway qui attend un document que plus personne ne peut
+        /// produire.
+        #[arg(long)]
+        replacement_transition: Option<PathBuf>,
     },
     /// Émet la feuille gateway suivante et signe sa transition (§11.1 étape 4).
     ///
@@ -500,6 +511,16 @@ enum Command {
         /// La demande n'a pas de signature de continuité (§5, clé perdue).
         #[arg(long)]
         key_recovery: bool,
+        /// Remplace une identité **révoquée** (§6.1, motif
+        /// `emergency_replacement`).
+        ///
+        /// La transition produite n'est acceptée que par une gateway révoquée
+        /// dont la révocation nomme ce document exact, et elle est alors
+        /// servie immédiatement : il n'y a plus d'identité sortante avec
+        /// laquelle se recouvrir. La signer avant la révocation, qui la
+        /// nommera par `astra-signer revoke --replacement-transition`.
+        #[arg(long)]
+        emergency_replacement: bool,
     },
     /// Fait tourner la CA TLS cliente sous `CA-PQ` (§9.4).
     ///
@@ -766,6 +787,7 @@ fn run() -> Result<()> {
             tls_not_after,
             pq_not_after,
             reason,
+            replacement_transition,
         } => revoke(
             &path,
             &authority_url,
@@ -777,6 +799,7 @@ fn run() -> Result<()> {
                 tls_not_after: tls_not_after.or(not_after),
                 pq_not_after: pq_not_after.or(not_after),
                 reason: reason.into(),
+                replacement: replacement_transition,
             },
             transport,
         ),
@@ -792,6 +815,7 @@ fn run() -> Result<()> {
             prepare_days,
             overlap_days,
             key_recovery,
+            emergency_replacement,
         } => sign_gateway_transition(
             &path,
             &authority_url,
@@ -806,6 +830,7 @@ fn run() -> Result<()> {
                 prepare_days,
                 overlap_days,
                 key_recovery,
+                emergency_replacement,
             },
             transport,
         ),
@@ -1783,6 +1808,8 @@ struct RevocationInputs {
     tls_not_after: Option<u64>,
     pq_not_after: Option<u64>,
     reason: aether::certificates::revocation::RevocationReason,
+    /// The signed replacement transition this revocation names, if any.
+    replacement: Option<std::path::PathBuf>,
 }
 
 /// Signs and deposits the revocation frozen into an Astra campaign (§10).
@@ -1802,6 +1829,7 @@ fn revoke(
         tls_not_after,
         pq_not_after,
         reason,
+        replacement,
     } = inputs;
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
@@ -1850,6 +1878,41 @@ fn revoke(
     }
     let now = now_unix();
 
+    // Read from the signed document rather than typed on a command line: a
+    // fingerprint an operator retypes is a fingerprint that can be retyped
+    // wrong, and the failure would be a revoked gateway waiting forever for a
+    // transition nobody can produce.
+    let replacement_transition_fingerprint = match &replacement {
+        None => None,
+        Some(source) => {
+            if scope != RevocationScope::Gateway {
+                bail!(
+                    "--replacement-transition ne vaut que pour --scope gateway : une identité \
+                     cliente révoquée est réadmise, elle n'est pas remplacée par une transition."
+                );
+            }
+            let transition: aether::certificates::gateway::GatewayIdentityTransition =
+                read_json(source, "la transition de remplacement")?;
+            if transition.reason
+                != aether::certificates::authority::RotationReason::EmergencyReplacement
+            {
+                bail!(
+                    "cette transition ne porte pas le motif emergency_replacement : une gateway \
+                     révoquée n'accepte que celui-là (§6.1). Rien n'a été signé."
+                );
+            }
+            if transition.gateway_wg_public_key != target.identity_key
+                || transition.server_name != campaign.server_name
+            {
+                bail!(
+                    "la transition de remplacement vise une autre gateway que celle que cette \
+                     révocation retire. Rien n'a été signé."
+                );
+            }
+            Some(transition.fingerprint()?)
+        }
+    };
+
     println!("révocation       : {}", operation.to_hex());
     println!("portée           : {scope:?}");
     println!("identité         : {}", target.identity_key.to_base64());
@@ -1877,10 +1940,15 @@ fn revoke(
     println!("empreinte        : {}", campaign.fingerprint());
     println!(
         "terminal         : {}",
-        match scope {
-            RevocationScope::Client => "cette identité devra être réadmise",
-            RevocationScope::Gateway =>
-                "la gateway ne négociera plus ; aucune clé de sécurité ne relève cet état",
+        match (scope, replacement_transition_fingerprint) {
+            (RevocationScope::Client, _) => "cette identité devra être réadmise".to_string(),
+            (RevocationScope::Gateway, None) => "la gateway ne négociera plus ; aucune transition \
+                                                 ne sera acceptée ensuite"
+                .to_string(),
+            (RevocationScope::Gateway, Some(fingerprint)) => format!(
+                "la gateway ne négociera plus, sauf par la transition {fingerprint} — le seul \
+                 document qu'elle acceptera ensuite"
+            ),
         }
     );
 
@@ -1923,6 +1991,7 @@ fn revoke(
             .flatten(),
         effective_at: now,
         reason,
+        replacement_transition_fingerprint,
     };
     let revocation = authority::sign_revocation(
         &vault,
@@ -2265,6 +2334,7 @@ struct GatewayTransitionInputs<'a> {
     prepare_days: u64,
     overlap_days: u64,
     key_recovery: bool,
+    emergency_replacement: bool,
 }
 
 /// Issues the next gateway leaf and signs its transition (spec §11.1 step 4).
@@ -2450,10 +2520,10 @@ fn sign_gateway_transition(
         next_tls_certificate: next_tls,
         window,
         leaf_validity,
-        reason: if inputs.key_recovery {
-            aether::certificates::authority::RotationReason::KeyRecovery
-        } else {
-            aether::certificates::authority::RotationReason::Scheduled
+        reason: match (inputs.emergency_replacement, inputs.key_recovery) {
+            (true, _) => aether::certificates::authority::RotationReason::EmergencyReplacement,
+            (false, true) => aether::certificates::authority::RotationReason::KeyRecovery,
+            (false, false) => aether::certificates::authority::RotationReason::Scheduled,
         },
         serial: random_id()?,
     };

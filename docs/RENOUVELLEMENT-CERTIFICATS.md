@@ -275,9 +275,75 @@ Les deux feuilles gateway n'expirent pas ensemble, contrairement à une
 génération cliente : leurs échéances se nomment séparément, et une moitié sans
 la sienne est refusée plutôt que complétée d'office.
 
-**C'est terminal.** Une gateway révoquée n'offre plus de feuille acceptable :
-les clients refusent la négociation au lieu de traiter avec une identité que
-l'autorité a retirée. Aucune clé de sécurité ne relève cet état.
+**C'est terminal, sauf pour un document exact.** Une gateway révoquée n'offre
+plus de feuille acceptable : les clients refusent la négociation au lieu de
+traiter avec une identité que l'autorité a retirée. Aucune clé de sécurité ne
+relève cet état — seule la transition que la révocation elle-même a nommée
+s'installe ensuite.
+
+### 7.1 Remplacer l'identité retirée (§6.1, motif `emergency_replacement`)
+
+Sans cette suite, une révocation gateway est une panne de service définitive :
+plus aucune transition ne s'installe, sur aucun détenteur, et il faut
+reconstruire le domaine. Le champ `replacement_transition_fingerprint` du
+§10.1 existe pour ça.
+
+L'ordre est imposé, et par la machine à états plutôt que par la consigne.
+
+**1. Préparer la clé suivante, sur la gateway** — avant ou après la
+révocation, mais toujours en récupération de clé :
+
+```sh
+heliosd prepare-gateway-certificate --key-recovery
+```
+
+Une identité révoquée ne signe pas pour sa suivante : la signature de
+continuité du §5 est exactement le droit qu'un retrait supprime. Sans
+`--key-recovery`, la commande refuse et le dit.
+
+**2. Signer la transition de remplacement** — campagne `gateway-identity` :
+
+```sh
+astra-signer sign-gateway-transition --emergency-replacement \
+  --authority-url https://astra.exemple --operation-id <identifiant> \
+  --request gateway-certificate-request.json --out remplacement.json \
+  --key-recovery
+```
+
+**3. Signer la révocation, en la nommant** — campagne `emergency-revocation` :
+
+```sh
+astra-signer revoke --scope gateway --authority-url https://astra.exemple \
+  --operation-id <identifiant> --pq-not-after <…> --tls-not-after <…> \
+  --replacement-transition remplacement.json
+```
+
+Le fichier est lu, pas l'empreinte saisie. Une valeur retapée de travers
+laisserait une gateway qui attend un document que plus personne ne peut
+produire.
+
+**4. Appliquer, dans cet ordre** : la révocation d'abord — c'est elle qui
+inscrit ce que l'état acceptera —, la transition ensuite.
+
+La transition de remplacement est **servie immédiatement**, sans fenêtre : il
+n'y a plus d'identité sortante avec laquelle se recouvrir, et l'étager
+laisserait le service à terre jusqu'à `activation_at` alors qu'il l'est déjà.
+Le compteur de révocation, lui, garde sa valeur — c'est un axe distinct
+(§4.2), et le faire redescendre rendrait une décision déjà consommée
+livrable une seconde fois. Les feuilles retirées ne reviennent jamais : le
+registre des tombstones les refuse avant même que le document nommé soit
+consulté.
+
+Le motif `emergency_replacement` n'est accepté **que** là. Proposé à une
+identité saine, il serait une bascule immédiate et non planifiée dont aucun
+client n'a été prévenu ; il est refusé, et la réciproque aussi — une gateway
+révoquée n'accepte pas un document ordinaire à la place de celui qu'on lui a
+nommé.
+
+**Limite connue** : préparer la clé de remplacement sur la machine qui vient
+d'être révoquée n'a de sens que si l'hôte est sain. Après une compromission de
+clé, c'est précisément ce qu'il ne faut pas faire — la décision reste celle de
+l'opérateur, et rien ici ne peut la prendre à sa place.
 
 ## 8. Préparer le renouvellement de l'identité gateway (§5)
 
