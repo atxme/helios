@@ -2367,6 +2367,78 @@ mod tests {
             );
         }
 
+        /// Three offline CA transitions in a row, and never three anchors
+        /// (spec §14.1).
+        ///
+        /// The bound is what makes an offline rotation safe to repeat: between
+        /// two of them the registry holds one anchor, and during one it holds
+        /// the outgoing key and its single successor. A third would mean a
+        /// document signed by a key nobody can still place.
+        #[test]
+        fn three_successive_ca_pq_transitions_never_hold_three_anchors() {
+            let mut anchored = anchored();
+            let mut private = anchored.ca_private.clone();
+            let mut public = anchored.ca_public.clone();
+            let mut retired = vec![public.clone()];
+
+            for round in 0..3u64 {
+                let epoch = round + 1;
+                let base = 10_000 * (round + 1);
+                let window =
+                    TransitionWindow::new(base, base + 1_000, base + 2_000).expect("window");
+                let (object, next_private, next_public) =
+                    transition_from(&anchored.registry, &private, &public, epoch, window);
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, base + 500)
+                    .expect("successive rotation accepted");
+
+                // Staged: the outgoing anchor and exactly one successor.
+                let state = anchored.registry.state();
+                assert_eq!(state.ca_epoch, epoch);
+                assert_eq!(state.ca_public_key, public);
+                let rotation = state.ca_rotation.clone().expect("a rotation is in flight");
+                assert_eq!(rotation.next_ca_epoch, epoch + 1);
+                assert_eq!(rotation.next_ca_public_key, next_public);
+                assert_eq!(
+                    state.transitions.len(),
+                    1,
+                    "one decision in flight, never two"
+                );
+                assert!(
+                    !retired.contains(&rotation.next_ca_public_key),
+                    "a rotation must not reinstate an anchor already retired"
+                );
+
+                // Promoted at retirement: the predecessor goes in the same
+                // write that installs the successor.
+                assert_eq!(
+                    anchored
+                        .registry
+                        .forget_expired_transitions(base + 2_000)
+                        .expect("promotion at retirement"),
+                    1
+                );
+                let state = anchored.registry.state();
+                assert_eq!(state.ca_epoch, epoch + 1);
+                assert_eq!(state.ca_public_key, next_public);
+                assert!(state.ca_rotation.is_none(), "no successor is kept around");
+                assert!(state.transitions.is_empty());
+
+                retired.push(public);
+                private = next_private;
+                public = next_public;
+            }
+
+            assert_eq!(anchored.registry.state().ca_epoch, 4);
+            assert_eq!(
+                retired.len(),
+                4,
+                "three predecessors and the anchor of \
+                                          the fixture, none of them still held"
+            );
+        }
+
         #[test]
         fn a_registry_recovers_a_stored_ca_pq_window_from_the_legacy_format() {
             let mut anchored = anchored();

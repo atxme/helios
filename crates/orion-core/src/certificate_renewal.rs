@@ -2034,6 +2034,77 @@ mod tests {
         ));
     }
 
+    /// A store belonging to another admitted peer of the **same** domain is
+    /// refused too. The domain check alone would let one machine's second
+    /// profile adopt the first one's generations, and the renewal would then
+    /// prove continuity for an identity it does not hold the key of.
+    #[test]
+    fn a_store_describing_another_client_key_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let path = directory.path().join("trust.json");
+        open_or_seed(&path, &settings, &bundle(&domain), NOW).expect("seeded");
+
+        let stranger = bundle_for_client_key(&domain, WireGuardKey::from_bytes([3; 32]));
+        assert!(matches!(
+            open_or_seed(&path, &settings, &stranger, NOW),
+            Err(RenewalError::ForeignTrustStore { .. })
+        ));
+    }
+
+    /// Conversion into a numbered generation is a triple correspondence
+    /// (spec §14.1): the chain, the fingerprints and the local keys. Each of
+    /// the three is read from the material the machine already holds — the
+    /// sealed bundle and the operator's trust block — and never from the
+    /// document alone, which is why they are asserted together here.
+    #[test]
+    fn the_seeded_generation_matches_the_chain_the_fingerprints_and_the_local_key() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+
+        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        let state = store.state();
+        let active = &state.certificates.active;
+        let trust = settings.trust.as_ref().expect("trust");
+
+        // The chain: the leaf the bundle carries, not a fingerprint the
+        // profile asserts about it.
+        let chain_leaf = DerCertificate::new(
+            STANDARD
+                .decode(bundle.certificate_chain.first().expect("chain").trim())
+                .expect("chain leaf base64"),
+        )
+        .expect("chain leaf der");
+        assert_eq!(active.tls_certificate_fingerprint, chain_leaf.fingerprint());
+
+        // The fingerprints: the anchor the operator pinned, and the PQ leaf
+        // the protected store holds.
+        assert_eq!(
+            active.tls_ca_certificate_fingerprint,
+            domain.tls_ca_der.fingerprint()
+        );
+        assert_eq!(
+            active.pq_certificate_fingerprint,
+            aether::certificates::gateway::pq_certificate_fingerprint(&domain.active_client_leaf)
+                .expect("pq fingerprint")
+        );
+        assert_eq!(active.generation, trust.client_generation);
+        assert_eq!(active.ca_tls_epoch, trust.ca_tls_epoch);
+        assert_eq!(active.not_before, domain.active_client_leaf.not_before_unix);
+        assert_eq!(active.not_after, domain.active_client_leaf.not_after_unix);
+
+        // The local key: read off the certificate the gateway admitted, so a
+        // profile naming another key cannot seed a state around it.
+        assert_eq!(
+            state.client_wg_public_key,
+            WireGuardKey::parse(&domain.active_client_leaf.wireguard_public_key).expect("key")
+        );
+    }
+
     /// An expired leaf cannot sign the continuity proof a rotation needs, so
     /// the refusal names the recovery rather than letting the authority refuse
     /// without saying which side is wrong.

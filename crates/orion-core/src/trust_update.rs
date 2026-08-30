@@ -664,6 +664,179 @@ mod tests {
             .is_some_and(|pending| !pending.is_complete()));
     }
 
+    /// The request describes the **active** generation and nothing else.
+    ///
+    /// A snapshot mixing the TLS half of one generation with the PQ half of
+    /// another, or presenting a next leaf before its `activation_at`, is
+    /// refused by the authority (spec §14.1). It is refused here too, by
+    /// construction: every field is read from `certificates.active`, and a
+    /// staged `next` — however far along — contributes nothing.
+    #[test]
+    fn the_request_names_the_active_snapshot_alone_even_with_a_staged_next() {
+        use crate::test_domain::{domain, NOW};
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut state = crate::test_domain::store(directory.path(), &domain)
+            .state()
+            .clone();
+        let active = state.certificates.active.clone();
+
+        // A committed candidate, still short of its activation.
+        let next = aether::certificates::client::ClientCertificateGeneration {
+            generation: active.generation + 1,
+            tls_certificate_fingerprint: Fingerprint::of(b"next client tls"),
+            pq_certificate_fingerprint: Fingerprint::of(b"next client pq"),
+            ..active.clone()
+        };
+        state.certificates.next = Some(next.clone());
+        state.certificates.activation_at = Some(NOW + 3_600);
+        let store = TrustStore::new(directory.path().join("trust.json"), state);
+
+        let session = TrustUpdateSession::prepare(
+            &store,
+            "http://gateway.invalid",
+            domain.active_client_leaf.clone(),
+            &domain.active_client_private,
+        )
+        .expect("prepare");
+        let request = &session.request.request;
+
+        assert_eq!(request.client_identity_generation, active.generation);
+        assert_eq!(
+            request.active_client_tls_certificate_fingerprint,
+            active.tls_certificate_fingerprint
+        );
+        assert_eq!(
+            request.active_client_pq_certificate_fingerprint,
+            active.pq_certificate_fingerprint
+        );
+        assert_ne!(
+            request.active_client_tls_certificate_fingerprint, next.tls_certificate_fingerprint,
+            "the premature candidate is never presented"
+        );
+        assert_ne!(
+            request.active_client_pq_certificate_fingerprint, next.pq_certificate_fingerprint,
+            "the premature candidate is never presented"
+        );
+        // And the identity it signs with is the one it says it holds: the two
+        // halves come from the same generation or the request is a mixture.
+        assert_eq!(
+            request.client_pq_certificate_fingerprint,
+            active.pq_certificate_fingerprint
+        );
+    }
+
+    /// Reads one whole HTTP request off the socket, and returns its start line.
+    ///
+    /// The body carries a PQ certificate and an ML-DSA-87 signature — some ten
+    /// kilobytes — so answering before it has all arrived would make the
+    /// client see a broken pipe instead of the status under test.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(head) = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            else {
+                continue;
+            };
+            let length: usize = String::from_utf8_lossy(&buffer[..head])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            if buffer.len() >= head + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buffer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A gateway that does not serve the route answers `404`, and that is the
+    /// end of it (spec §14.1).
+    ///
+    /// There is no second channel to try: not QUIC, not the public Astra
+    /// channel, not a weaker mode. A fallback would be the one path where a
+    /// client accepts trust from somewhere its profile never pinned — so the
+    /// refusal has to surface as a refusal, with the store untouched.
+    #[tokio::test]
+    async fn a_relay_error_ends_the_collection_instead_of_reaching_for_another_channel() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = crate::test_domain::domain();
+        let mut store = crate::test_domain::store(directory.path(), &domain);
+        let before = store.state().clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let line = read_request(&mut stream).await;
+                recorded.lock().expect("lock").push(line);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let session = TrustUpdateSession::prepare(
+            &store,
+            &format!("http://{address}"),
+            domain.active_client_leaf.clone(),
+            &domain.active_client_private,
+        )
+        .expect("prepare");
+        let outcome = session.run(&mut store, crate::test_domain::NOW).await;
+
+        assert!(
+            matches!(outcome, Err(TrustUpdateError::Status { status: 404 })),
+            "expected the gateway's refusal to be the outcome, got {outcome:?}"
+        );
+        assert_eq!(
+            store.state(),
+            &before,
+            "a refused poll applies nothing at all"
+        );
+        server.abort();
+        let seen = seen.lock().expect("lock");
+        assert_eq!(
+            seen.len(),
+            1,
+            "the collection stopped at the refusal instead of polling on"
+        );
+        assert!(
+            seen[0].starts_with("POST /api/key-negotiation/trust-update "),
+            "the only route this client calls is the in-tunnel one, got {:?}",
+            seen[0]
+        );
+    }
+
     /// Every object slot filled is not the same as every fragment received:
     /// the chunk count is part of the signed manifest, so a transaction
     /// completed on one fragment is one the sender never emitted.

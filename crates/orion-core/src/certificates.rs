@@ -861,6 +861,83 @@ mod tests {
         assert!(renewal_is_due(&generation, &key(1), instant).expect("due"));
     }
 
+    /// Astra sends a suggested window with every status. It may bring a
+    /// renewal **forward** — an incident campaign — and can never push one
+    /// back: a gateway able to delay renewals could manufacture the very
+    /// expiry the planner exists to prevent (spec §4.3, §14.1).
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn an_astra_window_never_delays_the_local_renewal_instant() {
+        use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+        use aether::certificates::status::{
+            AstraCertificateStatus, CertificateKind, CertificateStatus,
+        };
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, anchor_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let mut store = store(
+            directory.path().join("trust.json"),
+            anchor_public,
+            service_public,
+        );
+        let active = store.state().certificates.active.clone();
+        let client = store.state().client_wg_public_key;
+        let validity = active.validity().expect("validity");
+        let local_renewal_at = validity.renewal_at().expect("renewal");
+        let before = renewal_instant(&active, &client).expect("instant");
+
+        // A status that would have this client wait until the last thousand
+        // seconds of the leaf's life.
+        let late = AstraCertificateStatus {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            certificate_fingerprint: active.pq_certificate_fingerprint,
+            certificate_kind: CertificateKind::ClientPq,
+            generation: active.generation,
+            status: CertificateStatus::Active,
+            suggested_window_start: validity.not_after - 1_000,
+            suggested_window_end: validity.not_after + 10_000,
+            produced_at: 1_000,
+            next_update: 4_600,
+            status_epoch: 1,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&service_private)
+        .expect("sign");
+
+        store
+            .apply(
+                &[TrustUpdateObject::CertificateStatus(Box::new(late.clone()))],
+                1_000,
+            )
+            .expect("a correctly signed status about a slot this store holds");
+
+        // The status landed — and moved nothing but its own counter.
+        assert_eq!(
+            store
+                .state()
+                .ledger
+                .last_status_for(&active.pq_certificate_fingerprint),
+            Some((1, 1))
+        );
+        assert_eq!(
+            renewal_instant(&store.state().certificates.active, &client).expect("instant"),
+            before,
+            "the local instant is derived from the certificate, never from a status"
+        );
+        assert!(
+            renewal_is_due(&store.state().certificates.active, &client, before).expect("due"),
+            "the client renews at its own instant, whatever Astra suggested"
+        );
+        assert_eq!(
+            late.clamped_window(local_renewal_at, validity.not_after),
+            (local_renewal_at, validity.not_after),
+            "both bounds are clamped back to what this client computed"
+        );
+    }
+
     /// A signed gateway leaf: a PQ certificate's fingerprint covers its own
     /// signature, so an unsigned placeholder has no fingerprint at all.
     #[cfg(feature = "certificate-signing")]

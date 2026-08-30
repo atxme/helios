@@ -105,4 +105,18 @@ mod tests {
         std::fs::write(&path, br#"{"value":"x","extra":1}"#).expect("write");
         assert!(read::<Document>(&path).is_err());
     }
+
+    /// A duplicated member is refused rather than resolved by "the last one
+    /// wins" (spec §14.1).
+    ///
+    /// Two values under one name is a document with two readings: an operator
+    /// approving what a viewer shows them, and a verifier signing what the
+    /// parser kept, would not be looking at the same object.
+    #[test]
+    fn a_duplicated_member_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("document.json");
+        std::fs::write(&path, br#"{"value":"first","value":"second"}"#).expect("write");
+        assert!(read::<Document>(&path).is_err());
+    }
 }

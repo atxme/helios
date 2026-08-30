@@ -1682,6 +1682,87 @@ mod tests {
         );
     }
 
+    /// Runs one complete handshake between two in-memory connections.
+    ///
+    /// No socket: what is under test is the key schedule the two
+    /// configurations agree on, and a listener would only add a port to it.
+    fn handshake(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) -> Vec<u8> {
+        for _ in 0..16 {
+            let mut to_server = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut to_server).expect("client writes");
+            }
+            if !to_server.is_empty() {
+                server
+                    .read_tls(&mut to_server.as_slice())
+                    .expect("server reads");
+                server.process_new_packets().expect("server processes");
+            }
+
+            let mut to_client = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut to_client).expect("server writes");
+            }
+            if !to_client.is_empty() {
+                client
+                    .read_tls(&mut to_client.as_slice())
+                    .expect("client reads");
+                client.process_new_packets().expect("client processes");
+            }
+
+            if !client.is_handshaking() && !server.is_handshaking() {
+                let exported = client
+                    .export_keying_material(vec![0u8; 32], b"helios veth session probe", None)
+                    .expect("exporter");
+                assert_eq!(
+                    exported,
+                    server
+                        .export_keying_material(vec![0u8; 32], b"helios veth session probe", None)
+                        .expect("exporter"),
+                    "the two ends must agree on the session they just derived"
+                );
+                return exported;
+            }
+        }
+        panic!("the handshake never completed");
+    }
+
+    /// Every reconnection derives its own session keys (spec §14.1).
+    ///
+    /// It follows from the bounds the configurations declare — no ticket, no
+    /// resumption, no 0-RTT — but it is the property the specification names,
+    /// and the one an operator cares about: a captured veth session gives
+    /// nothing about the next one.
+    #[test]
+    fn each_veth_reconnection_derives_its_own_session_keys() {
+        let gateway = disposable(INTERNAL_SERVER_NAME, PinnedRole::Server);
+        let astra = disposable("astra.internal", PinnedRole::Client);
+        let server_config =
+            Arc::new(server_config(&gateway.identity, &astra.certificate).expect("server"));
+        let client_config =
+            Arc::new(client_config(&astra.identity, &gateway.certificate).expect("client"));
+        let name = rustls::pki_types::ServerName::try_from(INTERNAL_SERVER_NAME).expect("name");
+
+        let mut keys = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let mut client =
+                rustls::ClientConnection::new(Arc::clone(&client_config), name.clone())
+                    .expect("client connection");
+            let mut server =
+                rustls::ServerConnection::new(Arc::clone(&server_config)).expect("connection");
+            keys.insert(handshake(&mut client, &mut server));
+        }
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "two reconnections landed on the same session keys"
+        );
+    }
+
     /// A pin has to be usable for the role it is pinned in, and it has to be
     /// alive. Both are checked when the configuration is built, so a bad
     /// install fails at startup rather than on the first rotation.
