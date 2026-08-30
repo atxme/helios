@@ -8,6 +8,22 @@ Avant tout paquet WireGuard, Orion négocie avec la gateway sur un port UDP déd
 **premier** handshake utilisera — protocole v5,
 [ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md).
 
+## Fonctionnalités principales
+
+- passerelle WireGuard Linux avec routage, IPAM CGNAT, multi-uplink et règles
+  nftables atomiques ;
+- kill-switch fail-closed et suivi réel de l'état des tunnels par handshake ;
+- négociation de clé v5 avant WireGuard, via QUIC/mTLS, avec ML-KEM-1024 et
+  signatures ML-DSA-87 ;
+- PKI Astra avec coffre chiffré, clés opérateur YubiKey, registre de confiance,
+  renouvellement et rotation des certificats ;
+- client Orion pour Windows et Linux : profils, coffre sécurisé, tunnel
+  WireGuard, certificats, renouvellement et récupération d'identité ;
+- console web d'administration avec gestion des pairs, réseau, certificats,
+  télémétrie et tests de débit ;
+- mises à jour signées avec anti-rollback, TPM et outils de déploiement ;
+- support NordVPN Meshnet comme chemin d'accès réseau de secours.
+
 ```text
 Orion ── QUIC/mTLS ──► heliosd   négociation de clé (avant le tunnel)
 Orion ── WireGuard ──► heliosd   trafic + API d'administration
@@ -40,6 +56,7 @@ déconnexion explicite le démonte.
 | `helios-wireguard` | Plan de données gateway et table de pairs |
 | `helios-provisioning` | IPAM CGNAT, admission, session ML-KEM |
 | `helios-key-negotiation` | Transport QUIC authentifié (ni CA, ni backend WireGuard) |
+| `astra` | Coordinateur PKI, registre de confiance et renouvellement des certificats |
 | `helios-api` | API Axum, WebSocket, IHM embarquée |
 | `helios-update` | Manifeste hybride, staging, anti-rollback |
 | `helio-tpm` | Scellement PCR, séquestre, fenêtre de mise à jour |
@@ -118,13 +135,17 @@ Livraison : `cargo xtask bundle`, `helios-publisher bundle`, `cargo xtask pack`,
 
 ## État et limites
 
-La négociation v5 est **partiellement implémentée** ; la
-[spécification](docs/specification/NEGOCIATION-DE-CLE-V5.md) nomme les lots
-ouverts. Le **cycle de vie des certificats n'est pas implémenté** : la leaf PQ de
-la gateway est encore auto-signée, sans slot actif/suivant ni génération
-anti-rollback (cible :
-[ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md) et
-[ADR-008](docs/adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md)).
+La négociation v5 est opérationnelle pour l'établissement initial d'un tunnel :
+challenge, authentification, dérivation du PSK ML-KEM, preuve WireGuard et
+rollback sont en place. Restent notamment le renouvellement de PSK en place,
+l'enrôlement sans transport de clé privée et certaines validations sur matériel
+réel ; le détail est dans la
+[spécification v5](docs/specification/NEGOCIATION-DE-CLE-V5.md).
+
+Le cycle de vie des certificats est un chantier distinct, déjà partiellement
+livré avec Astra, le registre de confiance, le renouvellement client, la
+récupération d'une identité expirée et plusieurs rotations. Les lots ouverts
+sont listés dans [ROTATION-CERTIFICATS](docs/specification/ROTATION-CERTIFICATS.md).
 
 Par ailleurs :
 
