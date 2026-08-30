@@ -253,6 +253,7 @@ deployer_astra() {
     local tete_attendue registre_gateway statut_tete_ancienne tete_ancienne
     local unite_build etat_build resultat_build code_build tentative astra_lire_frais
     local canal_present cert_astra cert_gateway demande_gateway certificat_distant
+    local ca_tls_der empreinte_ca_tls
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -293,6 +294,28 @@ deployer_astra() {
     url="${ASTRA_AUTHORITY_URL:-https://$rp}"
     echo "    domaine $domaine"
     echo "    RP ID   $rp"
+
+    # L'ancre TLS cliente en service, épinglée par son empreinte et non par son
+    # époque. Sans elle, `astra` retient le numéro de l'ancre sans retenir
+    # l'ancre : une transition du §9.4 ne pourrait être comparée qu'à la valeur
+    # que l'objet transporte lui-même — c'est-à-dire à rien — et le binaire la
+    # refuse par son nom jusqu'à un `pin-ca-tls`.
+    #
+    # Elle se calcule ici plutôt que de se retaper : le relais porte déjà le
+    # certificat public (`ca_tls_certificate`, DER en base64) dès qu'`astra-signer
+    # issue-ca-tls` a tourné, et l'empreinte en est le SHA-256 en hexadécimal
+    # minuscule — exactement ce que `Fingerprint::of` calcule sur ces octets.
+    ca_tls_der="$(sed -n \
+        's/.*"ca_tls_certificate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
+    if [ -n "$ca_tls_der" ]; then
+        empreinte_ca_tls="$(printf '%s' "$ca_tls_der" | base64 -d | sha256sum | cut -d' ' -f1)"
+        echo "    CA-TLS  $empreinte_ca_tls"
+    else
+        empreinte_ca_tls=""
+        echo "    aucune CA TLS cliente dans le relais : la rotation du §9.4 restera" >&2
+        echo "    refusée ici. L'émettre par « astra-signer issue-ca-tls », puis" >&2
+        echo "    relancer ./scripts/deploy.sh --astra." >&2
+    fi
 
     # Le nom de serveur et la clé WireGuard sortent de la leaf PQ que la
     # gateway sert, lue par `heliosd` lui-même — donc sous privilège, comme
@@ -670,7 +693,8 @@ deployer_astra() {
             $astra_lire bootstrap \
             --ca-public-key '$ancre' --trust-domain-id '$domaine' \
             --gateway-wireguard-public-key '$wg_pub' --server-name '$nom_serveur' \
-            --authority-url '$url' --webauthn-rp-id '$rp'")" || {
+            --authority-url '$url' --webauthn-rp-id '$rp' \
+            ${empreinte_ca_tls:+--ca-tls-fingerprint '$empreinte_ca_tls'}")" || {
             echo "    l'amorçage d'Astra a échoué :" >&2
             printf '%s\n' "$sortie" >&2
             return 1
@@ -747,6 +771,48 @@ deployer_astra() {
             mkdir -p "$(dirname "$RELAIS")"
             printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
         fi
+        # Un domaine amorcé avant que cette ancre soit épinglée — ou avant que
+        # ce script la calcule — n'en retient que l'époque. `pin-ca-tls`
+        # l'enregistre une fois et refuse d'en remplacer une : il est donc
+        # idempotent, et une seconde exécution ne dit rien de plus que « rien
+        # n'a changé ».
+        #
+        # Un refus, lui, n'est pas un détail d'exploitation : il signifie que
+        # le relais de l'opérateur et le registre d'Astra ne nomment pas la
+        # même CA TLS cliente. Deux moitiés du domaine qui se contredisent
+        # s'arrêtent, exactement comme pour la tête d'audit — et c'est bien
+        # **après** le contrôle du témoin que l'épinglage a lieu, pour ne
+        # jamais prolonger une histoire dont le fork n'a pas encore été écarté.
+        #
+        # L'épinglage ajoute `ClientTlsCaPinned` à la chaîne : la tête bouge, et
+        # les deux témoins qui la portent — le `.env` de compose et le fichier
+        # opérateur — sont donc réécrits ensuite, jamais avant. Les figer avant
+        # ferait refuser `astra run --expected-audit-head` au démarrage suivant.
+        if [ -n "$empreinte_ca_tls" ]; then
+            sortie="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+                $astra_lire pin-ca-tls --fingerprint '$empreinte_ca_tls' 2>&1")" || {
+                echo "    l'ancre CA-TLS du relais n'a pas pu être épinglée :" >&2
+                echo "    attendue : $empreinte_ca_tls" >&2
+                printf '%s\n' "$sortie" | tail -10 >&2
+                return 1
+            }
+            statut_astra="$(helios_ssh_sudo_capture "$CIBLE" "cd '$racine' && \
+                $astra_lire status 2>&1")" || {
+                echo "    état Astra illisible après l'épinglage de l'ancre CA-TLS :" >&2
+                printf '%s\n' "$statut_astra" | tail -10 >&2
+                return 1
+            }
+            tete_audit="$(printf '%s\n' "$statut_astra" |
+                sed -n 's/^audit head[[:space:]]*:[[:space:]]*//p' | head -1)"
+            if [ -z "$tete_audit" ]; then
+                echo "    tête d'audit illisible après l'épinglage de l'ancre CA-TLS :" >&2
+                printf '%s\n' "$statut_astra" | tail -10 >&2
+                return 1
+            fi
+            mkdir -p "$(dirname "$RELAIS")"
+            printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
+        fi
+
         helios_ssh_sudo "$CIBLE" \
             "printf 'ASTRA_EXPECTED_AUDIT_HEAD=%s\n' '$tete_audit' > '$env_distant'
              chmod 600 '$env_distant'" || {

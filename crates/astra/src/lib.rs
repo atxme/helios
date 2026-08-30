@@ -25,33 +25,26 @@
 //!
 //! # Limites connues
 //!
-//! Three integration parts of ADR-008 are not implemented, and are refused
-//! explicitly rather than approximated:
+//! One route of ADR-008 is not implemented, and is refused explicitly rather
+//! than approximated: **opening a campaign from the public origin**. The
+//! approval itself is live in both directions — in the tunnel through
+//! [`renewal`], and out of it through [`signing`] and the three
+//! capability-bound routes of §8.2. What stays `501` is `POST /v1/campaigns`,
+//! because §11.6 has that route *resolve* a campaign over the fleet's current
+//! targets: on an unauthenticated public route, that answers every caller with
+//! the domain's inventory, and the authentication it would need is not settled
+//! anywhere. `astra campaign open` and `astra revocation open` do the
+//! resolution locally instead.
 //!
-//! - **opening a campaign from the public origin**. The approval itself is
-//!   live in both directions: in the tunnel through [`renewal`], and out of it
-//!   through [`signing`] and the three capability-bound routes of §8.2. What
-//!   stays `501` is `POST /v1/campaigns`, because §11.6 has that route
-//!   *resolve* a campaign over the fleet's current targets — on an
-//!   unauthenticated public route, that answers every caller with the domain's
-//!   inventory, and the authentication it would need is not settled anywhere.
-//!   `astra campaign open` and `astra revocation open` do the resolution
-//!   locally instead. Recovery of an
-//!   expired identity answers `501` for its own reason: it needs the
-//!   historical validator of §7.5;
-//! - the **objects that would travel on the private veth channel**. The
-//!   channel itself exists: [`gateway`] dials `heliosd`'s
-//!   `/internal/v1/certificates/*` listener under mutually authenticated TLS
-//!   1.3 with pinned identities, no resumption and no 0-RTT, and `astra run`
-//!   opens it — and checks its pin — at startup. What is missing is what would
-//!   be sent: issuing a staging authorization needs the operator approval
-//!   above. The reverse relay of the 15 August 2026 amendment, in which
-//!   `heliosd` forwards an active Orion's canonical request to Astra, has no
-//!   Astra-side route in §8.3 and is a specification change rather than an
-//!   implementation gap;
-//! - the **end-to-end orchestration** which joins approval, delegated issuance,
-//!   gateway staging, receipt, grant and commit without exposing a direct Astra
-//!   route to an Orion whose tunnel still works.
+//! Both directions of the private veth channel are served. [`gateway`] dials
+//! `heliosd`'s `/internal/v1/certificates/*` listener under mutually
+//! authenticated TLS 1.3 with pinned identities, no resumption and no 0-RTT,
+//! and `astra run` opens it — and checks its pin — at startup; the reverse
+//! relay of the 15 August 2026 amendment, in which `heliosd` forwards an
+//! active Orion's canonical request, is [`renewal::router`] on
+//! `ASTRA_PRIVATE_BIND`. Its absence is a degraded authority, not a dead one:
+//! the public endpoint comes up either way and the gateway answers `503` to
+//! every client renewal.
 //!
 //! See [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md) for what
 //! a WSL2 build does and does not prove.

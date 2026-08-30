@@ -15,23 +15,35 @@ astra-signer enrol --label "YubiKey de récupération"
 astra-signer issue-gateway-bootstrap \
   --request ~/.helios/astra/gateway-bootstrap-request.json \
   --out ~/.helios/astra/gateway-bootstrap-certificate.json
+# L'ancre TLS cliente, dans la foulée : elle se dépose dans le même relais et
+# c'est là que le déploiement va chercher l'empreinte qu'il épingle.
+astra-signer issue-ca-tls
 ./scripts/deploy.sh --astra
 ```
 
-C'est tout. Les deux gestes `astra-signer` exigent les clés de sécurité et ne
-peuvent pas être automatisés — c'est le but des objets physiques. Le premier
+C'est tout. Chaque geste `astra-signer` exige les clés de sécurité et ne peut
+pas être automatisé — c'est le but des objets physiques. Le premier
 passage du déploiement installe la gateway, puis rapatrie la demande publique
 créée et signée par sa clé ML-DSA-87 scellée. Il s'arrête **avant** de créer un
 registre Astra. La cérémonie hors ligne émet la leaf sous `CA-PQ` ; la reprise
 la reporte sur la gateway, amorce Astra et le registre gateway, puis redémarre.
 
+`issue-ca-tls` vient **après** `issue-gateway-bootstrap` et non avant : l'ancre
+TLS cliente est émise sous la politique d'émission du domaine, qui nomme la
+gateway. La cérémonie d'amorçage est ce qui apprend cette identité, depuis une
+demande que la gateway a signée, et l'inscrit dans le relais — un domaine sert
+une gateway et une seule, donc une demande qui en nommerait une autre arrête la
+cérémonie au lieu de l'adopter.
+
 Aucune valeur n'est recopiée à la main. `init` écrit un **relais** public à côté
 du coffre (`~/.helios/astra/astra-domain.json`, `%APPDATA%\astra\` sous Windows) :
-domaine, RP ID, ancre `CA-PQ`.
+domaine, RP ID, ancre `CA-PQ`. Les cérémonies suivantes y ajoutent ce qu'elles
+apprennent — identité de la gateway, ancre `CA-TLS` et son époque.
 `deploy.sh` le lit, demande à la gateway son identité servie
 (`heliosd show-identity` lit la demande tant que la leaf n'existe pas), amorce
-Astra, **capture** dans sa sortie la clé de service et la tête de chaîne
-d'audit, les reporte dans le `.env` distant et enchaîne sur `heliosd
+Astra — en lui épinglant au passage l'empreinte de la `CA-TLS` qu'il calcule
+depuis ce relais —, **capture** dans sa sortie la clé de service et la tête de
+chaîne d'audit, les reporte dans le `.env` distant et enchaîne sur `heliosd
 init-trust-domain --gateway-certificate ...`.
 
 Sans relais, `deploy.sh` saute cette partie en une ligne et déploie la gateway
@@ -73,7 +85,14 @@ Ce qui **manque** encore :
   d'empreinte hors bande, et non une rotation `N -> N+1` ;
 - la **cérémonie FIDO2 unique** du §7.5 : le compagnon interroge la même clé
   deux fois dans la même session, `approve` puis `derive`. Les propriétés de
-  sécurité tiennent ; ce qui manque est le confort d'un seul appui.
+  sécurité tiennent ; ce qui manque est le confort d'un seul appui ;
+- le **terminateur TLS devant l'origine publique**. `astra run` sert du HTTP
+  clair sur la boucle locale et ADR-008 §2 met un reverse proxy devant lui ; ce
+  déploiement n'en pose aucun, et le pare-feu n'ouvre pas le port sur le WAN.
+  Tant qu'il manque, tout ce qui passe par l'origine publique — récupération
+  d'une identité expirée, statut authentifié hors tunnel, routes compagnon du
+  §8.2 — n'est joignable que depuis la gateway elle-même. Le renouvellement
+  ordinaire, qui passe par le tunnel puis le veth, n'en dépend pas.
 
 Ce qui est réellement éprouvé ici : la construction de l'image, le démarrage du
 conteneur, les volumes, la sauvegarde, le durcissement, la cohérence des deux
@@ -244,15 +263,23 @@ slot.
    script se reconnecte pour lire son résultat et son journal ;
 5. à la reprise, la leaf publique issue de
    `astra-signer issue-gateway-bootstrap` est copiée sur la gateway ; si le
-   domaine n'est pas amorcé : `astra bootstrap`
-   — avec `--ca-tls-fingerprint`, l'empreinte de la CA TLS cliente en service,
-   sans laquelle la rotation du §9.4 reste invérifiable ici et se refuse par
-   son nom —, capture de la clé de
-   service et de la tête d'audit, écriture du `.env` distant, puis
+   domaine n'est pas amorcé : `astra bootstrap`, capture de la clé de service
+   et de la tête d'audit, écriture du `.env` distant, puis
    `heliosd init-trust-domain --gateway-certificate ...` — qui vérifie la
    signature `CA-PQ` et refuse une auto-signature — puis `systemctl restart
    heliosd` ;
-6. `compose up -d`.
+6. l'ancre TLS cliente est épinglée par son empreinte, sans laquelle la
+   rotation du §9.4 reste invérifiable ici et se refuse par son nom. Elle ne
+   se retape pas : le relais porte déjà le certificat public
+   (`ca_tls_certificate`) dès qu'`astra-signer issue-ca-tls` a tourné, et le
+   script en calcule le SHA-256. Sur un domaine neuf, l'empreinte est passée à
+   `astra bootstrap` ; sur un domaine déjà amorcé, elle passe par
+   `astra pin-ca-tls`, qui l'enregistre une fois et refuse d'en remplacer une.
+   Cet épinglage étend la chaîne d'audit, donc les deux témoins qui en portent
+   la tête — le `.env` de compose et `~/.helios/astra/audit-head` — sont
+   réécrits après lui, jamais avant. Un relais sans CA TLS ne bloque rien :
+   l'étape le dit et continue ;
+7. `compose up -d`.
 
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
 témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
@@ -274,8 +301,22 @@ L'URL d'autorité vaut `https://<rp_id>` par défaut ; `ASTRA_AUTHORITY_URL` la
 remplace. Elle sert à la récupération et au statut authentifié quand WireGuard
 ne peut plus être monté, ainsi qu'aux opérations opérateur hors tunnel, pas au
 renouvellement ordinaire. Le veth utilise deux adresses IP statiques locales à
-la gateway, absentes du DNS et des profils Orion. Sa moitié Astra → Helios est
-livrée ; le client Helios vers l'API Astra opposée reste le lot suivant.
+la gateway, absentes du DNS et des profils Orion. Ses **deux** sens sont
+livrés : Astra appelle `10.88.7.1:8444` pour poser un candidat et relire un
+reçu, la gateway appelle `10.88.7.2:8445` pour relayer le renouvellement d'un
+client (§8.1.2). Chaque moitié est indépendante — absente, elle est journalisée
+et l'autre continue ; sans la seconde, la gateway répond `503` à chaque
+renouvellement client.
+
+**L'origine publique, elle, n'est pas montée par ce déploiement.** `astra run`
+sert du HTTP clair sur `127.0.0.1:8443` et attend un terminateur TLS devant lui
+(ADR-008 §2) : ni `compose.yaml`, ni le ruleset atomique de `helios-firewall`
+n'en installent un, et aucune règle `input` n'ouvre le port sur le WAN. Tant
+que ce terminateur n'est pas posé — reverse proxy sur TCP 443 devant le
+conteneur, avec le nom DNS qui sert aussi de RP ID —, la récupération d'une
+identité expirée (§7.5), le statut authentifié hors tunnel et les trois routes
+compagnon du §8.2 restent injoignables depuis une autre machine. Le
+renouvellement ordinaire, qui passe par le tunnel et le veth, n'en dépend pas.
 
 ### Pourquoi la construction emprunte le réseau de l'hôte
 
@@ -388,13 +429,18 @@ sur la gateway est une décision d'exploitation : elle donne une sauvegarde hors
 du poste opérateur, et elle met le fichier là où tourne le service. Les deux
 sont défendables ; aucune n'est un défaut à choisir dans un script.
 
-Copier :
+Copier. Le contexte de compose est celui que `deploy.sh` dépose, et son
+`.env` est le témoin durable — les mêmes que toutes les autres commandes de
+cette page :
 
 ```sh
 scp ~/.helios/astra/authority-vault.json cible:/tmp/vault.json
-ssh cible 'sudo docker compose -f /opt/helios/astra/docker-compose.yml     cp /tmp/vault.json astra:/var/lib/astra/authority-vault.json'
-ssh cible 'sudo docker compose -f /opt/helios/astra/docker-compose.yml restart astra'
-rm ~/…/tmp/vault.json
+ssh cible "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env \
+    cp /tmp/vault.json astra:/var/lib/astra/authority-vault.json"
+ssh cible "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
+    --env-file /var/lib/helios/astra-compose.env restart astra"
+ssh cible 'rm -f /tmp/vault.json'
 ```
 
 Il est lu au démarrage, comme le document de credentials, et pour la même

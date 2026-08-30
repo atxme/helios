@@ -2535,11 +2535,49 @@ fn issue_gateway_bootstrap(
     use aether::certificates::status::CampaignScope;
 
     let vault = store::load(path)?;
-    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let mut handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let request: GatewayBootstrapRequest =
         read_json(request_path, "la demande d'amorçage gateway")?;
     request.verify()?;
+    // The gateway this domain serves, recorded once rather than retyped.
+    //
+    // This ceremony is the first thing that learns it, from a request the
+    // gateway signed with its own sealed key, and every later command needs
+    // it: `issue-ca-tls` pins the issuance policy over exactly these two
+    // values. Leaving them out of the hand-off is what forces an operator to
+    // pass `astra-signer domain --gateway-wg-public-key ...` by hand between
+    // two steps that both already hold the value.
+    //
+    // Recorded, never replaced: ADR-008 binds a trust domain to one gateway,
+    // so a request naming another one is a mistake to stop on, not a second
+    // identity to adopt.
+    let gateway_key = request.gateway_wg_public_key.to_base64();
+    for (held, found, what) in [
+        (
+            handoff.gateway_wg_public_key.as_deref(),
+            gateway_key.as_str(),
+            "la clé publique WireGuard",
+        ),
+        (
+            handoff.server_name.as_deref(),
+            request.server_name.as_str(),
+            "le nom de service",
+        ),
+    ] {
+        if let Some(held) = held {
+            if held != found {
+                bail!(
+                    "ce relais nomme déjà une autre gateway : {what} y vaut « {held} », la \
+                     demande porte « {found} ». Un domaine de confiance sert une gateway et une \
+                     seule."
+                );
+            }
+        }
+    }
+    handoff.gateway_wg_public_key = Some(gateway_key);
+    handoff.server_name = Some(request.server_name.clone());
+    handoff::save(&handoff::path_beside(path), &handoff)?;
     let now = now_unix();
     let validity = validity_days
         .checked_mul(DAY_SECS)

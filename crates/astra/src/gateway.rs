@@ -24,9 +24,10 @@
 //! already been passed.
 //!
 //! The ordinary relayed renewal calls [`GatewayChannel::stage`] after Astra
-//! has verified and durably consumed the operator approval. The public/offline
-//! companion routes of §8.2 still answer `501`; they are a separate transport
-//! and are not a fallback for an Orion whose tunnel works. See
+//! has verified and durably consumed the operator approval. The public
+//! companion routes of §8.2 are a separate transport and are not a fallback
+//! for an Orion whose tunnel works: they carry the offline ceremony, never a
+//! relayed renewal. See
 //! [`docs/testing/TESTING.md`](../../../docs/testing/TESTING.md) for what a
 //! WSL2 build does and does not prove about the veth itself.
 
