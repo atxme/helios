@@ -188,6 +188,11 @@ enum Command {
         #[command(subcommand)]
         command: CampaignCommand,
     },
+    /// Drives the full certificate chain, one campaign at a time (§7.6).
+    Chain {
+        #[command(subcommand)]
+        command: ChainCommand,
+    },
     /// Opens an emergency identity revocation for the companion to sign.
     Revocation {
         #[command(subcommand)]
@@ -247,6 +252,69 @@ enum CampaignCommand {
         #[arg(long, default_value_t = 300)]
         window_secs: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum ChainCommand {
+    /// Resolves the chain and deposits its first campaign.
+    ///
+    /// # Why four campaigns and not one
+    ///
+    /// `full_certificate_chain` covers the issuer, the client TLS anchor, the
+    /// gateway identity and the fleet's leaves — four **families** of signed
+    /// object. `CampaignFamily` is total on purpose: every family refuses the
+    /// other three in both directions, so no scope added later inherits an
+    /// authorization by omission. A campaign carrying a *set* of families
+    /// would turn each of those guards into a subset check, which is the shape
+    /// that model exists to remove. So the chain is a plan of four ordinary
+    /// campaigns, each with its own family and its own operator touch, and not
+    /// a single wider one.
+    ///
+    /// §7.6 also bounds a campaign window at five minutes, so the later steps
+    /// could not be resolved up front in any case: each is resolved against
+    /// the registry as it stands when its turn comes.
+    Open {
+        /// Free text shown to the operator before every touch of this chain.
+        #[arg(long)]
+        reason: String,
+        /// Who asked for it. Shown to the operator, and audited.
+        #[arg(long)]
+        requested_by: String,
+        /// How long the operator has for each step, in seconds.
+        #[arg(long, default_value_t = 300)]
+        window_secs: u64,
+        /// Where to write the delegation request of the first step.
+        #[arg(long)]
+        issuer_request_out: Option<PathBuf>,
+    },
+    /// Deposits the next campaign, once the previous one has taken effect.
+    ///
+    /// «Taken effect» is read from this registry, not from an approval: the
+    /// plan lives in the state volume and the operations live in the running
+    /// service's memory. Observing the effect is also the stronger question —
+    /// a step whose approval was taken but whose object never landed has not
+    /// moved the domain, and resolving the next campaign against it would
+    /// freeze a state nobody reached.
+    Next {
+        /// Address of the gateway's private lifecycle listener, on the veth.
+        ///
+        /// Required only when the chain reaches its gateway-identity step:
+        /// that campaign is resolved from the leaves the daemon actually
+        /// serves, which this registry has never held.
+        #[arg(long, env = "ASTRA_GATEWAY_CHANNEL")]
+        gateway_channel: Option<SocketAddr>,
+        /// The gateway's transport certificate, DER base64 — the same value
+        /// `astra run` is given.
+        #[arg(long, env = "ASTRA_GATEWAY_CERTIFICATE")]
+        gateway_certificate: Option<String>,
+        /// Where to write the delegation request, on the issuer step.
+        #[arg(long)]
+        issuer_request_out: Option<PathBuf>,
+    },
+    /// Prints where the chain stands.
+    Status,
+    /// Drops the plan. Campaigns already approved keep their effect.
+    Abandon,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -460,7 +528,8 @@ fn main() -> Result<()> {
                 out.as_deref(),
                 reason.as_deref().zip(requested_by.as_deref()),
                 window_secs,
-            ),
+            )
+            .map(|_| ()),
             IssuerCommand::Install { authorization } => {
                 issuer_install(&cli.state_dir, authorization.as_deref())
             }
@@ -472,6 +541,32 @@ fn main() -> Result<()> {
                 requested_by,
                 window_secs,
             } => campaign_open(&cli.state_dir, scope, &reason, &requested_by, window_secs),
+        },
+        Command::Chain { command } => match command {
+            ChainCommand::Open {
+                reason,
+                requested_by,
+                window_secs,
+                issuer_request_out,
+            } => chain_open(
+                &cli.state_dir,
+                &reason,
+                &requested_by,
+                window_secs,
+                issuer_request_out.as_deref(),
+            ),
+            ChainCommand::Next {
+                gateway_channel,
+                gateway_certificate,
+                issuer_request_out,
+            } => chain_next(
+                &cli.state_dir,
+                gateway_channel,
+                gateway_certificate.as_deref(),
+                issuer_request_out.as_deref(),
+            ),
+            ChainCommand::Status => chain_status(&cli.state_dir),
+            ChainCommand::Abandon => chain_abandon(&cli.state_dir),
         },
         Command::Revocation { command } => match command {
             RevocationCommand::Open {
@@ -507,7 +602,8 @@ fn main() -> Result<()> {
                 window_secs,
                 gateway_channel,
                 &gateway_certificate,
-            ),
+            )
+            .map(|_| ()),
             GatewayIdentityCommand::Publish {
                 epoch,
                 gateway_channel,
@@ -1287,20 +1383,8 @@ fn gateway_identity_open(
     window_secs: u64,
     gateway_channel: SocketAddr,
     gateway_certificate: &str,
-) -> Result<()> {
-    use aether::certificates::status::{
-        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
-    };
-
-    if reason.trim().is_empty() || requested_by.trim().is_empty() {
-        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
-    }
-    if window_secs == 0 || window_secs > 300 {
-        anyhow::bail!("--window-secs must be between 1 and 300");
-    }
-    if load_encrypted_vault(state_dir)?.is_none() {
-        anyhow::bail!("this state volume has no encrypted vault for the companion to open");
-    }
+) -> Result<DepositedCampaign> {
+    use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
 
     let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
         .context("loading the Astra registry")?;
@@ -1318,28 +1402,6 @@ fn gateway_identity_open(
         active_tls_certificate_fingerprint: identity.tls_certificate_fingerprint,
         active_pq_certificate_fingerprint: identity.pq_certificate_fingerprint,
     };
-    let now = now_unix();
-    let expires_at = now
-        .checked_add(window_secs)
-        .context("gateway campaign window overflow")?;
-    let campaign = AstraRotationCampaign {
-        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
-        campaign_id: fresh_id()?,
-        trust_domain_id: state.trust_domain_id,
-        gateway_wg_public_key: state.gateway_wg_public_key,
-        server_name: state.server_name.clone(),
-        created_at: now,
-        expires_at,
-        scope: CampaignScope::GatewayIdentity,
-        targets: vec![target],
-        reason: reason.trim().to_string(),
-        requested_by: requested_by.trim().to_string(),
-        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
-        required_credentials: CampaignScope::GatewayIdentity.required_credentials(),
-    };
-    campaign.validate(now).map_err(|error| {
-        anyhow::anyhow!("the resolved campaign cannot be shown to an operator: {error}")
-    })?;
 
     // Exported because the companion cannot verify the §5 request's
     // continuity signature without the leaf in service, and it holds no copy
@@ -1356,8 +1418,16 @@ fn gateway_identity_open(
     let next_epoch = decision_epoch
         .checked_add(1)
         .context("gateway decision epoch overflow")?;
-    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
-    let operation_id = deposit.signer_request.operation_id;
+    let deposited = open_campaign(
+        state_dir,
+        state,
+        CampaignScope::GatewayIdentity,
+        vec![target],
+        reason,
+        requested_by,
+        window_secs,
+    )?;
+    let operation_id = deposited.operation_id;
     println!("{}", operation_id.to_hex());
     eprintln!("campagne gateway déposée : décision {decision_epoch}, fenêtre de {window_secs} s");
     eprintln!(
@@ -1368,13 +1438,13 @@ fn gateway_identity_open(
         "feuille TLS en service : {}",
         identity.tls_certificate_fingerprint
     );
-    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    eprintln!("empreinte de campagne : {}", deposited.fingerprint);
     eprintln!("feuille en service exportée : {}", served_path.display());
     eprintln!(
         "renouveler depuis le poste opérateur (époque {next_epoch}) :\n  astra-signer \
          sign-gateway-transition --authority-url {} --operation-id {} --request <demande.json> \
          --active-certificate <{}> --out <transition.json>",
-        deposit.signer_request.authority_url,
+        state.authority_url,
         operation_id.to_hex(),
         GATEWAY_ACTIVE_CERTIFICATE_FILE
     );
@@ -1382,10 +1452,10 @@ fn gateway_identity_open(
         "ou annuler la transition déjà en attente :\n  astra-signer abort-gateway-transition \
          --authority-url {} --operation-id {} --transition <transition.json> \
          --out <avortement.json>",
-        deposit.signer_request.authority_url,
+        state.authority_url,
         operation_id.to_hex()
     );
-    Ok(())
+    Ok(deposited)
 }
 
 /// Lets a signed transition leave the authority (spec §11.1 step 6).
@@ -1618,19 +1688,7 @@ fn campaign_open(
     requested_by: &str,
     window_secs: u64,
 ) -> Result<()> {
-    use aether::certificates::status::{
-        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind, MAX_CAMPAIGN_TARGETS,
-    };
-
-    if reason.trim().is_empty() || requested_by.trim().is_empty() {
-        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
-    }
-    // The specification bounds the campaign window at five minutes: the
-    // approval is a challenge, and a challenge with a long life is a challenge
-    // worth capturing.
-    if window_secs == 0 || window_secs > 300 {
-        anyhow::bail!("--window-secs must be between 1 and 300");
-    }
+    use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
 
     let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
         .context("loading the Astra registry")?;
@@ -1660,101 +1718,92 @@ fn campaign_open(
             // signs whichever the ceremony is for. A domain that never pinned
             // that anchor simply offers no row for it — the rotation is then
             // refused where the pin is missing, not here.
-            if let Some(client_tls_ca) = state.ca_tls_fingerprint {
-                targets.push(CampaignTarget {
-                    certificate_kind: CertificateKind::CaTls,
-                    identity_key: state.gateway_wg_public_key,
-                    epoch: state.ca_tls_epoch,
-                    generation: state.ca_tls_epoch,
-                    active_tls_certificate_fingerprint: client_tls_ca,
-                    active_pq_certificate_fingerprint: client_tls_ca,
-                });
+            if let Some(row) = client_tls_ca_row(state) {
+                targets.push(row);
             }
             targets
         }
-        _ => state
-            .peers
-            .values()
-            .filter(|peer| !peer.revoked)
-            .map(|peer| CampaignTarget {
-                certificate_kind: CertificateKind::ClientPq,
-                identity_key: peer.client_wg_public_key,
-                epoch: state.ca_epoch,
-                generation: peer.active.generation,
-                active_tls_certificate_fingerprint: peer.active.tls_certificate_fingerprint,
-                active_pq_certificate_fingerprint: peer.active.pq_certificate_fingerprint,
-            })
-            .collect(),
+        _ => fleet_leaf_rows(state),
     };
     if targets.is_empty() {
         anyhow::bail!(
             "no admitted peer in this registry: there is nothing for an operator to approve"
         );
     }
-    if scope.opens_vault() && load_encrypted_vault(state_dir)?.is_none() {
-        // The companion needs the vault to open `CA-PQ`, and it fetches it
-        // from here. Opening the campaign anyway would spend an operator's
-        // window on a ceremony that cannot reach a private key.
-        anyhow::bail!(
-            "this state volume holds no encrypted vault: an authority campaign has nothing for \
-             the companion to open, and `CA-PQ` would never sign"
-        );
-    }
-    if targets.len() > MAX_CAMPAIGN_TARGETS {
-        anyhow::bail!(
-            "{} targets, over the {MAX_CAMPAIGN_TARGETS} ceiling of §8.2",
-            targets.len()
-        );
-    }
 
-    let now = now_unix();
-    let expires_at = now
-        .checked_add(window_secs)
-        .context("campaign window overflow")?;
-    let campaign = AstraRotationCampaign {
-        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
-        campaign_id: fresh_id()?,
-        trust_domain_id: state.trust_domain_id,
-        gateway_wg_public_key: state.gateway_wg_public_key,
-        server_name: state.server_name.clone(),
-        created_at: now,
-        expires_at,
+    let deposited = open_campaign(
+        state_dir,
+        state,
         scope,
         targets,
-        reason: reason.trim().to_string(),
-        requested_by: requested_by.trim().to_string(),
-        // The pin the domain was bootstrapped with, not one computed here: a
-        // campaign carrying a policy it derived itself would be a campaign
-        // that chose the policy it is checked against (§2.4).
-        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
-        required_credentials: scope.required_credentials(),
-    };
-    campaign.validate(now).map_err(|error| {
-        anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
-    })?;
+        reason,
+        requested_by,
+        window_secs,
+    )?;
 
-    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
-    let operation_id = deposit.signer_request.operation_id;
-
-    println!("{}", operation_id.to_hex());
+    println!("{}", deposited.operation_id.to_hex());
     eprintln!(
-        "campagne déposée : {} cible(s), {} credential(s), fenêtre de {window_secs} s",
-        deposit.campaign.targets.len(),
-        deposit.campaign.required_credentials
+        "campagne déposée : {} credential(s), fenêtre de {window_secs} s",
+        scope.required_credentials()
     );
-    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    eprintln!("empreinte de campagne : {}", deposited.fingerprint);
     eprintln!(
         "approuver depuis le poste opérateur :\n  astra-signer approve-campaign \\\n    \
          --authority-url {} \\\n    --operation-id {}",
-        deposit.signer_request.authority_url,
-        operation_id.to_hex()
-    );
-    eprintln!(
-        "limite connue : l'approbation sera enregistrée, et rien ne l'applique encore. Produire \
-         les objets signés et les déposer sur le veth est le lot suivant — cette commande sert à \
-         éprouver la cérémonie, pas à faire tourner un parc."
+        state.authority_url,
+        deposited.operation_id.to_hex()
     );
     Ok(())
+}
+
+/// The client `CA-TLS` row, when this domain pins that anchor at all.
+///
+/// Shared between `campaign open --scope trust-authorities`, which offers it
+/// beside `CA-PQ`, and the chain of §7.6, which offers it **alone** — the
+/// chain covers «émetteur, CA TLS, gateway et leafs clientes, mais pas
+/// `CA-PQ`», and leaving the anchor row out is what carries that exclusion:
+/// `covers_authority_object` matches on the certificate kind, so a campaign
+/// with no `CA-PQ` row refuses a `CA-PQ` transition by construction rather
+/// than by a check somebody has to remember.
+fn client_tls_ca_row(
+    state: &astra::registry::AstraState,
+) -> Option<aether::certificates::status::CampaignTarget> {
+    use aether::certificates::status::{CampaignTarget, CertificateKind};
+    state
+        .ca_tls_fingerprint
+        .map(|client_tls_ca| CampaignTarget {
+            certificate_kind: CertificateKind::CaTls,
+            identity_key: state.gateway_wg_public_key,
+            epoch: state.ca_tls_epoch,
+            generation: state.ca_tls_epoch,
+            active_tls_certificate_fingerprint: client_tls_ca,
+            active_pq_certificate_fingerprint: client_tls_ca,
+        })
+}
+
+/// One row per admitted peer, pinned to the generation it is actually at.
+///
+/// A revoked peer is not a target. `revoked` is terminal — no credential lifts
+/// it — so including one would put an object in the campaign that every
+/// downstream step must then refuse, and would make the count the operator
+/// reads on their screen wrong.
+fn fleet_leaf_rows(
+    state: &astra::registry::AstraState,
+) -> Vec<aether::certificates::status::CampaignTarget> {
+    use aether::certificates::status::{CampaignTarget, CertificateKind};
+    state
+        .peers
+        .values()
+        .filter(|peer| !peer.revoked)
+        .map(|peer| CampaignTarget {
+            certificate_kind: CertificateKind::ClientPq,
+            identity_key: peer.client_wg_public_key,
+            epoch: state.ca_epoch,
+            generation: peer.active.generation,
+            active_tls_certificate_fingerprint: peer.active.tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: peer.active.pq_certificate_fingerprint,
+        })
+        .collect()
 }
 
 fn issuer_request(
@@ -1762,7 +1811,7 @@ fn issuer_request(
     out: Option<&Path>,
     campaign: Option<(&str, &str)>,
     window_secs: u64,
-) -> Result<()> {
+) -> Result<Option<DepositedCampaign>> {
     use base64::Engine as _;
 
     if campaign.is_some() && (window_secs == 0 || window_secs > 300) {
@@ -1827,9 +1876,9 @@ fn issuer_request(
     }
     eprintln!("issuer epoch       : {issuer_epoch}");
 
-    match campaign {
+    let deposited = match campaign {
         Some((reason, requested_by)) => {
-            let operation_id = deposit_issuer_campaign(
+            let deposited = deposit_issuer_campaign(
                 state_dir,
                 state,
                 &request,
@@ -1841,23 +1890,381 @@ fn issuer_request(
                 "sign it from the operator machine:\n  astra-signer authorize-issuer \\\n    \
                  --authority-url {} \\\n    --operation-id {}",
                 state.authority_url,
-                operation_id.to_hex()
+                deposited.operation_id.to_hex()
             );
             eprintln!(
                 "the delegation is recorded here as soon as the companion deposits it; restart \
                  Astra to issue under it"
             );
+            Some(deposited)
         }
-        None => eprintln!(
+        None => {
+            eprintln!(
             "hors campagne      : `astra-signer authorize-issuer --request <file> --out <file>`, \
              puis `astra issuer install`. Rien ne rattache alors cette demande à cette autorité : \
              l'opérateur signe le fichier qu'on lui présente. Passer --reason et --requested-by \
              pour la cérémonie du §8.2."
-        ),
-    }
+            );
+            None
+        }
+    };
     // On standard output, alone, so a deployment script can pipe it out of the
     // container without a shared volume.
     println!("{}", String::from_utf8_lossy(&encoded));
+    Ok(deposited)
+}
+
+/// What a resolved campaign left for the running service to adopt.
+#[derive(Debug, Clone, Copy)]
+struct DepositedCampaign {
+    operation_id: aether::certificates::encoding::Id16,
+    campaign_id: aether::certificates::encoding::Id16,
+    fingerprint: Fingerprint,
+}
+
+/// Builds one campaign over targets a caller resolved, and deposits it.
+///
+/// The targets are the caller's business, because each scope reads a different
+/// source: the fleet from this registry, the gateway from the daemon that
+/// serves it, the delegation from the request that was just produced. What is
+/// the same for all of them — the window bound of §7.6, the vault the
+/// companion must be able to open, the policy pin, the structural validation
+/// and the deposit itself — lives here, so that a scope added later cannot
+/// acquire its own version of any of it.
+fn open_campaign(
+    state_dir: &Path,
+    state: &astra::registry::AstraState,
+    scope: aether::certificates::status::CampaignScope,
+    targets: Vec<aether::certificates::status::CampaignTarget>,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+) -> Result<DepositedCampaign> {
+    use aether::certificates::status::{AstraRotationCampaign, MAX_CAMPAIGN_TARGETS};
+
+    if reason.trim().is_empty() || requested_by.trim().is_empty() {
+        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
+    }
+    // The specification bounds the campaign window at five minutes: the
+    // approval is a challenge, and a challenge with a long life is a challenge
+    // worth capturing.
+    if window_secs == 0 || window_secs > 300 {
+        anyhow::bail!("--window-secs must be between 1 and 300");
+    }
+    if targets.is_empty() {
+        anyhow::bail!(
+            "this campaign resolves to no target: there is nothing for an operator to approve"
+        );
+    }
+    if targets.len() > MAX_CAMPAIGN_TARGETS {
+        anyhow::bail!(
+            "{} targets, over the {MAX_CAMPAIGN_TARGETS} ceiling of §8.2",
+            targets.len()
+        );
+    }
+    if scope.opens_vault() && load_encrypted_vault(state_dir)?.is_none() {
+        // The companion needs the vault to open `CA-PQ`, and it fetches it
+        // from here. Opening the campaign anyway would spend an operator's
+        // window on a ceremony that cannot reach a private key.
+        anyhow::bail!(
+            "this state volume holds no encrypted vault: this campaign has nothing for the \
+             companion to open, and `CA-PQ` would never sign"
+        );
+    }
+
+    let now = now_unix();
+    let expires_at = now
+        .checked_add(window_secs)
+        .context("campaign window overflow")?;
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: fresh_id()?,
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway_wg_public_key,
+        server_name: state.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope,
+        targets,
+        reason: reason.trim().to_string(),
+        requested_by: requested_by.trim().to_string(),
+        // The pin the domain was bootstrapped with, not one computed here: a
+        // campaign carrying a policy it derived itself would be a campaign
+        // that chose the policy it is checked against (§2.4).
+        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+        required_credentials: scope.required_credentials(),
+    };
+    campaign.validate(now).map_err(|error| {
+        anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
+    })?;
+
+    let campaign_id = campaign.campaign_id;
+    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
+    Ok(DepositedCampaign {
+        operation_id: deposit.signer_request.operation_id,
+        campaign_id,
+        fingerprint: deposit.campaign.fingerprint(),
+    })
+}
+
+fn chain_plan_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(astra::chain::CHAIN_PLAN_FILE)
+}
+
+fn load_chain_plan(state_dir: &Path) -> Result<astra::chain::ChainPlan> {
+    let path = chain_plan_path(state_dir);
+    let raw = std::fs::read(&path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "no certificate chain is open in {}: `astra chain open` starts one",
+            state_dir.display()
+        ),
+        _ => anyhow::Error::new(error).context(format!("reading {}", path.display())),
+    })?;
+    let plan: astra::chain::ChainPlan =
+        serde_json::from_slice(&raw).with_context(|| format!("decoding {}", path.display()))?;
+    plan.validate()?;
+    Ok(plan)
+}
+
+/// Writes the plan where a crash leaves either the old one or the new one.
+///
+/// The plan is what keeps the four campaigns in order, so a half-written file
+/// would leave the chain unable to say which step it is on — and the next
+/// command would resolve a campaign against a domain it cannot describe.
+fn save_chain_plan(state_dir: &Path, plan: &astra::chain::ChainPlan) -> Result<()> {
+    let path = chain_plan_path(state_dir);
+    let temporary = path.with_extension("tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(plan).context("encoding the certificate chain plan")?,
+    )
+    .with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path).with_context(|| format!("publishing {}", path.display()))
+}
+
+/// Deposits the campaign of the step the plan currently points at.
+fn chain_deposit_current(
+    state_dir: &Path,
+    plan: &mut astra::chain::ChainPlan,
+    gateway_channel: Option<SocketAddr>,
+    gateway_certificate: Option<&str>,
+    issuer_request_out: Option<&Path>,
+) -> Result<()> {
+    use aether::certificates::status::CampaignScope;
+
+    let Some(step) = plan.pending() else {
+        return Err(astra::chain::ChainError::Finished.into());
+    };
+    let scope = step.scope;
+    let (reason, requested_by, window_secs) = (
+        plan.reason.clone(),
+        plan.requested_by.clone(),
+        plan.window_secs,
+    );
+
+    let deposited = match scope {
+        // The delegation's target does not exist until this call creates it:
+        // the epoch, the ML-DSA-87 key and the PKCS#10 request are produced
+        // here, beside the private halves they name.
+        CampaignScope::IssuerDelegation => issuer_request(
+            state_dir,
+            issuer_request_out,
+            Some((reason.as_str(), requested_by.as_str())),
+            window_secs,
+        )?
+        .context("the issuer step deposited no campaign")?,
+        // Read live from the daemon that serves the leaves: this registry has
+        // never held them, and a retyped value would produce a campaign the
+        // companion signs and the gateway then refuses.
+        CampaignScope::GatewayIdentity => {
+            let channel = gateway_channel.context(
+                "--gateway-channel is required for the gateway identity step: the campaign is \
+                 resolved from the leaves the daemon actually serves",
+            )?;
+            let certificate = gateway_certificate
+                .context("--gateway-certificate is required for the gateway identity step")?;
+            gateway_identity_open(
+                state_dir,
+                &reason,
+                &requested_by,
+                window_secs,
+                channel,
+                certificate,
+            )?
+        }
+        scope => {
+            let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+                .context("loading the Astra registry")?;
+            let state = registry.state();
+            let targets = match scope {
+                // The chain covers the client TLS anchor and **not** `CA-PQ`
+                // (§7.6). Leaving the `CA-PQ` row out is what carries that
+                // exclusion: `covers_authority_object` matches on the
+                // certificate kind, so this campaign refuses a `CA-PQ`
+                // transition by construction.
+                CampaignScope::TrustAuthorities => {
+                    client_tls_ca_row(state).map(|row| vec![row]).context(
+                        "this domain pins no client TLS anchor: `astra pin-ca-tls` records it \
+                         once, and a rotation cannot be checked without it",
+                    )?
+                }
+                _ => fleet_leaf_rows(state),
+            };
+            if targets.is_empty() {
+                anyhow::bail!(
+                    "no admitted peer in this registry: the fleet step has nothing for an \
+                     operator to approve"
+                );
+            }
+            let deposited = open_campaign(
+                state_dir,
+                state,
+                scope,
+                targets,
+                &reason,
+                &requested_by,
+                window_secs,
+            )?;
+            println!("{}", deposited.operation_id.to_hex());
+            eprintln!("empreinte de campagne : {}", deposited.fingerprint);
+            eprintln!(
+                "approuver depuis le poste opérateur :\n  astra-signer approve-campaign \\\n    \
+                 --authority-url {} \\\n    --operation-id {}",
+                state.authority_url,
+                deposited.operation_id.to_hex()
+            );
+            deposited
+        }
+    };
+
+    plan.record_deposit(
+        deposited.operation_id,
+        deposited.campaign_id,
+        deposited.fingerprint,
+        now_unix(),
+    )?;
+    save_chain_plan(state_dir, plan)
+}
+
+fn print_chain_plan(plan: &astra::chain::ChainPlan) {
+    eprintln!("chaîne           : {}", plan.chain_id.to_hex());
+    eprintln!("motif            : {}", plan.reason);
+    eprintln!("demandée par     : {}", plan.requested_by);
+    for (index, step) in plan.steps.iter().enumerate() {
+        let mark = match index.cmp(&plan.current) {
+            std::cmp::Ordering::Less => "fait",
+            std::cmp::Ordering::Equal => "en cours",
+            std::cmp::Ordering::Greater => "à venir",
+        };
+        eprintln!(
+            "  {}. {:<26} {:<9} {} credential(s){}",
+            index + 1,
+            step.label(),
+            mark,
+            step.scope.required_credentials(),
+            match step.operation_id {
+                Some(id) => format!(" — opération {}", id.to_hex()),
+                None => String::new(),
+            }
+        );
+    }
+}
+
+fn chain_open(
+    state_dir: &Path,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+    issuer_request_out: Option<&Path>,
+) -> Result<()> {
+    let path = chain_plan_path(state_dir);
+    if path.exists() {
+        let existing = load_chain_plan(state_dir)?;
+        anyhow::bail!(
+            "a certificate chain is already open in {} with {} step(s) left: finish it with \
+             `astra chain next`, or drop it with `astra chain abandon`",
+            state_dir.display(),
+            existing.remaining()
+        );
+    }
+
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    let mut plan = astra::chain::ChainPlan::resolve(
+        fresh_id()?,
+        registry.state(),
+        reason.trim().to_string(),
+        requested_by.trim().to_string(),
+        window_secs,
+        now_unix(),
+    );
+    drop(registry);
+
+    chain_deposit_current(state_dir, &mut plan, None, None, issuer_request_out)?;
+    eprintln!(
+        "chaîne ouverte : quatre campagnes, quatre touchers. `astra chain next` dépose la \
+         suivante une fois celle-ci prise en compte."
+    );
+    print_chain_plan(&plan);
+    Ok(())
+}
+
+fn chain_next(
+    state_dir: &Path,
+    gateway_channel: Option<SocketAddr>,
+    gateway_certificate: Option<&str>,
+    issuer_request_out: Option<&Path>,
+) -> Result<()> {
+    let mut plan = load_chain_plan(state_dir)?;
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    plan.assert_current_landed(registry.state())?;
+    drop(registry);
+
+    plan.advance();
+    if plan.pending().is_none() {
+        std::fs::remove_file(chain_plan_path(state_dir))
+            .with_context(|| format!("removing {}", chain_plan_path(state_dir).display()))?;
+        eprintln!(
+            "chaîne terminée. La dernière étape autorise des rotations clientes : chaque pair la \
+             dépense en revenant, dans la fenêtre de campagne, et l'autorité ne l'observe pas."
+        );
+        return Ok(());
+    }
+    save_chain_plan(state_dir, &plan)?;
+    chain_deposit_current(
+        state_dir,
+        &mut plan,
+        gateway_channel,
+        gateway_certificate,
+        issuer_request_out,
+    )?;
+    print_chain_plan(&plan);
+    Ok(())
+}
+
+fn chain_status(state_dir: &Path) -> Result<()> {
+    let plan = load_chain_plan(state_dir)?;
+    let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
+        .context("loading the Astra registry")?;
+    print_chain_plan(&plan);
+    match plan.assert_current_landed(registry.state()) {
+        Ok(()) => eprintln!("étape en cours   : prête pour `astra chain next`"),
+        Err(error) => eprintln!("étape en cours   : {error}"),
+    }
+    Ok(())
+}
+
+fn chain_abandon(state_dir: &Path) -> Result<()> {
+    let plan = load_chain_plan(state_dir)?;
+    std::fs::remove_file(chain_plan_path(state_dir))
+        .with_context(|| format!("removing {}", chain_plan_path(state_dir).display()))?;
+    eprintln!(
+        "chaîne {} abandonnée après {} étape(s). Ce qui a déjà été approuvé garde son effet : \
+         une campagne dépensée ne se reprend pas.",
+        plan.chain_id.to_hex(),
+        plan.current
+    );
     Ok(())
 }
 
@@ -1875,24 +2282,9 @@ fn deposit_issuer_campaign(
     reason: &str,
     requested_by: &str,
     window_secs: u64,
-) -> Result<aether::certificates::encoding::Id16> {
-    use aether::certificates::status::{
-        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
-    };
+) -> Result<DepositedCampaign> {
+    use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
     use base64::Engine as _;
-
-    if reason.trim().is_empty() || requested_by.trim().is_empty() {
-        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
-    }
-    if load_encrypted_vault(state_dir)?.is_none() {
-        // The companion issues the intermediate under `CA-TLS` and signs the
-        // delegation under `CA-PQ`; both live in the vault it fetches from
-        // here. Opening the campaign anyway would spend an operator's window
-        // on a ceremony that cannot reach a private key.
-        anyhow::bail!(
-            "this state volume holds no encrypted vault: the companion would have no `CA-PQ` to              sign the delegation with"
-        );
-    }
 
     let csr = aether::certificates::encoding::DerCertificate::new(
         base64::engine::general_purpose::STANDARD
@@ -1908,21 +2300,11 @@ fn deposit_issuer_campaign(
     )
     .context("reading the delegated issuer's ML-DSA-87 key")?;
 
-    let now = now_unix();
-    let expires_at = now
-        .checked_add(window_secs)
-        .context("campaign window overflow")?;
-    let scope = CampaignScope::IssuerDelegation;
-    let campaign = AstraRotationCampaign {
-        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
-        campaign_id: fresh_id()?,
-        trust_domain_id: state.trust_domain_id,
-        gateway_wg_public_key: state.gateway_wg_public_key,
-        server_name: state.server_name.clone(),
-        created_at: now,
-        expires_at,
-        scope,
-        targets: vec![CampaignTarget {
+    let deposited = open_campaign(
+        state_dir,
+        state,
+        CampaignScope::IssuerDelegation,
+        vec![CampaignTarget {
             certificate_kind: CertificateKind::AstraIssuer,
             identity_key: state.gateway_wg_public_key,
             epoch: request.issuer_epoch,
@@ -1930,24 +2312,17 @@ fn deposit_issuer_campaign(
             active_tls_certificate_fingerprint: Fingerprint::of(&public_key_info),
             active_pq_certificate_fingerprint: Fingerprint::of(pq_issuer_public_key.as_bytes()),
         }],
-        reason: reason.trim().to_string(),
-        requested_by: requested_by.trim().to_string(),
-        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
-        required_credentials: scope.required_credentials(),
-    };
-    campaign.validate(now).map_err(|error| {
-        anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
-    })?;
-
-    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
-    let operation_id = deposit.signer_request.operation_id;
+        reason,
+        requested_by,
+        window_secs,
+    )?;
     // Standard error, unlike `campaign open`: on this command standard output
     // already belongs to the delegation request, which a deployment script
     // pipes out of the container. Two things there would give the script
     // neither.
-    eprintln!("operation         : {}", operation_id.to_hex());
-    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
-    Ok(operation_id)
+    eprintln!("operation         : {}", deposited.operation_id.to_hex());
+    eprintln!("empreinte de campagne : {}", deposited.fingerprint);
+    Ok(deposited)
 }
 
 /// Installs a signed delegation, after checking it three ways.

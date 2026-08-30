@@ -388,6 +388,15 @@ impl CertificateService {
         for peer in &promoted {
             tracing::info!(peer = %peer, "certificate generation promoted at the end of its overlap");
         }
+        if let Some(reason) =
+            crate::key_negotiation::restart_due(Some(&registry.state().gateway), now_unix)
+        {
+            // Loud, and repeated every sweep: the gateway is presenting a leaf
+            // the domain has moved past, and nothing in this process will fix
+            // it. Silence here is what turned an expired rollback into a
+            // gateway that quietly kept serving the outgoing identity.
+            tracing::warn!(%reason, "the key-negotiation identity in service is out of date");
+        }
         if crate::gateway_rotation::maintain_gateway_identity(
             &mut registry,
             self.gateway_identity_secret.as_ref(),
@@ -1199,6 +1208,7 @@ pub fn domain_view(
             .gateway
             .active_service_rollback(now_unix)
             .map(|rollback| rollback.expires_at),
+        gateway_restart_due: crate::key_negotiation::restart_due(Some(&state.gateway), now_unix),
         astra_authority_url: state.astra.authority_url.clone(),
         astra_service_key_epoch: state.astra.astra_service_key_epoch,
         astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),

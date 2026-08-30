@@ -676,7 +676,66 @@ et `resume-rotation` la rappelle. Ce qui la lèverait est un ordonnanceur côté
 opérateur, qui n'existe pas : le compagnon est une machine hors ligne qu'on
 branche.
 
-## 10. Ce qui n'a pas encore de commande
+## 10. Renouveler toute la chaîne (§7.6)
+
+« Toute la chaîne » couvre l'émetteur délégué, la CA TLS cliente, l'identité
+gateway et les feuilles du parc — **pas `CA-PQ`**, qui a sa propre cérémonie
+(§3 de cette note).
+
+Ce n'est pas une campagne, c'est un **plan de quatre campagnes ordonnées**. Ces
+quatre choses appartiennent à quatre familles d'objets signés, et une famille
+refuse les trois autres dans les deux sens : c'est ce qui empêche une campagne
+d'autoriser quelque chose que l'opérateur n'a pas lu. Une campagne unique
+portant les quatre transformerait chacune de ces gardes en un contrôle de
+sous-ensemble.
+
+```sh
+astra chain open --reason "renouvellement annuel" --requested-by "prénom.nom" \
+  --issuer-request-out issuer-request.json
+```
+
+La première étape est déposée. Ensuite, pour chacune des suivantes :
+
+```sh
+# depuis le poste opérateur : approuver l'étape en cours, avec sa commande
+# propre (astra-signer authorize-issuer, rotate-ca-tls,
+# sign-gateway-transition, approve-campaign).
+
+# puis, sur la gateway :
+astra chain next \
+  --gateway-channel <adresse-veth> --gateway-certificate <certificat>
+```
+
+`astra chain next` **refuse d'avancer** tant que l'effet de l'étape en cours
+n'apparaît pas dans le registre : l'époque de l'émetteur a bougé, l'ancre TLS a
+un successeur, la décision gateway a été stockée. Ce n'est pas « l'opérateur a
+approuvé » — une approbation dont l'objet n'a jamais atterri n'a pas déplacé le
+domaine, et résoudre la campagne suivante contre cet état figerait une
+situation que personne n'a atteinte.
+
+`--gateway-channel` et `--gateway-certificate` ne servent qu'à l'étape
+d'identité gateway : cette campagne est résolue sur les feuilles que le démon
+sert réellement, qu'Astra n'a jamais détenues.
+
+```sh
+astra chain status     # où en est le plan
+astra chain abandon    # l'abandonner ; ce qui est approuvé garde son effet
+```
+
+**L'ordre n'est pas une préférence.** L'émetteur signe les feuilles clientes,
+l'ancre TLS est ce à quoi elles se chaînent, l'identité gateway est ce que
+chaque client épingle. Commencer par les feuilles les émettrait sous un
+émetteur et une ancre sur le point d'être remplacés, et chaque pair reviendrait
+une seconde fois.
+
+**Limite connue** : la dernière étape n'a aucun effet observable. Une campagne
+de parc autorise des rotations, et chaque pair dépense cette autorisation en
+revenant, dans la fenêtre de cinq minutes du §7.6. Le plan le dit au lieu de
+rapporter une réussite qu'il n'a pas vue. **Quatre touchers**, aussi : c'est le
+prix de l'ordonnancement, puisque la fenêtre de campagne interdit de résoudre
+les étapes suivantes d'avance.
+
+## 11. Ce qui n'a pas encore de commande
 
 Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'un
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
@@ -685,10 +744,20 @@ fait.
 - **Les campagnes depuis la console** : « Renouveler les leafs du parc »,
   « toute la chaîne » et « Tourner les autorités » ouvrent une campagne Astra,
   et §11.6 garde cette résolution locale — une campagne est l'inventaire du
-  domaine. La console les nomme avec leur commande ; elles se lancent dans le
-  conteneur Astra.
-- **L'adoption de l'ancre `CA-PQ` distribuée par Astra.** La gateway et les
-  clients l'appliquent ; `CA-TLS` est adoptée à `not_after` des deux côtés.
+  domaine, et une route publique non authentifiée qui la résoudrait la
+  répondrait à n'importe quel appelant. La console les nomme avec leur
+  commande ; elles se lancent dans le conteneur Astra.
+- **Le redémarrage après une bascule.** L'identité servie est descellée une
+  seule fois et tenue pour la vie du processus : la recharger reconstruirait le
+  point d'accès QUIC pendant que des négociations y détiennent des PSK. Toute
+  bascule est donc un redémarrage — `activation_at`, `not_after`, et
+  l'expiration d'un rollback de service. Le démon le **dit** désormais, dans
+  son journal et sur l'écran *Certificats*, mais rien ne le redémarre à la
+  place de l'opérateur.
+- **La bascule de confiance du §13.2**, pour un parc v5 déjà déployé : la
+  première installation de `CA-PQ` est un amorçage, pas une rotation, et elle
+  exige une confirmation d'empreinte hors bande. C'est une procédure
+  opérateur, et aucune commande ne peut la remplacer.
 
 ## Vérifier où en est le domaine
 

@@ -53,20 +53,17 @@ restauration de fichier ne les rend pas de nouveau sélectionnables.
 
 Ce qui **manque** encore :
 
-- la **révocation de la gateway** : la révocation cliente est produite,
-  déposée et relayée ; celle de la gateway reste refusée faute de feuilles
-  gateway dans le registre Astra ;
-- `full_certificate_chain` : aucune portée n'ordonne encore émetteur, CA TLS,
-  gateway puis clients. Les campagnes s'ouvrent une par une ;
-- l'**adoption** d'une ancre distribuée. Les clients l'appliquent ; le registre
-  Astra et l'épinglage de la gateway restent sur l'ancre sortante jusqu'à ce
-  que l'opérateur les avance. Une adoption qui ne toucherait qu'une moitié du
-  domaine laisserait les deux en désaccord sur ce qui est courant ;
-- une transition de **CA TLS cliente**, qu'aucun geste ne signe et que le
-  registre refuserait faute d'épingler cette ancre ; les transitions
-  d'identité gateway, sans producteur ;
-- la **bascule de confiance** du §13, et le discriminant de type de profil
-  Orion (§19, §22).
+- l'**ouverture d'une campagne depuis l'origine publique** (`POST
+  /v1/campaigns`) : cette route *résout* une campagne sur les cibles courantes,
+  donc sur un canal public non authentifié elle répondrait l'inventaire du
+  domaine à n'importe quel appelant, et l'authentification qu'elle exigerait
+  n'est décrite nulle part. La résolution reste locale, dans ce conteneur ;
+- la **bascule de confiance du §13.2** pour un parc v5 déjà déployé : la
+  première installation de `CA-PQ` est un amorçage, avec confirmation
+  d'empreinte hors bande, et non une rotation `N -> N+1` ;
+- la **cérémonie FIDO2 unique** du §7.5 : le compagnon interroge la même clé
+  deux fois dans la même session, `approve` puis `derive`. Les propriétés de
+  sécurité tiennent ; ce qui manque est le confort d'un seul appui.
 
 Ce qui est réellement éprouvé ici : la construction de l'image, le démarrage du
 conteneur, les volumes, la sauvegarde, le durcissement, la cohérence des deux

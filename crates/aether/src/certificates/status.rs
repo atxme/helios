@@ -569,6 +569,20 @@ impl AstraRotationCampaign {
                 supported: CERTIFICATE_FORMAT_VERSION,
             });
         }
+        // The chain is a **plan**, never one campaign (spec §7.6, §12.2). It
+        // covers the issuer, the client TLS anchor, the gateway identity and
+        // the fleet's leaves — four families — and `CampaignFamily` is total
+        // so that no scope inherits another's authorization by omission. A
+        // single campaign bearing this scope would have to claim one of the
+        // four, and whichever it claimed would be an authorization for three
+        // things the operator was never shown. It is refused here rather than
+        // merely left unproduced: «nothing builds one» is a fact about today's
+        // callers, and this is a rule about the document.
+        if matches!(self.scope, CampaignScope::FullCertificateChain) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "the full certificate chain is an ordered plan of campaigns, not one campaign",
+            ));
+        }
         if self.targets.is_empty() {
             return Err(CertificateError::EmptyTransition);
         }
@@ -1488,6 +1502,27 @@ mod tests {
             requested_by: "operator".into(),
             policy_fingerprint: Fingerprint::of(b"policy"),
             required_credentials: scope.required_credentials(),
+        }
+    }
+
+    /// The chain is a plan of campaigns, and never one campaign (§7.6).
+    #[test]
+    fn the_full_certificate_chain_is_not_a_campaign() {
+        let chain = campaign(CampaignScope::FullCertificateChain, vec![target(3)]);
+        assert!(matches!(
+            chain.validate(1_100),
+            Err(CertificateError::IssuerScopeViolation(_))
+        ));
+        // Its three siblings under the same family still resolve: the refusal
+        // is about this scope, not about client leaves.
+        for scope in [
+            CampaignScope::FleetLeafs,
+            CampaignScope::OrionDevice,
+            CampaignScope::OrionProfile,
+        ] {
+            campaign(scope, vec![target(3)])
+                .validate(1_100)
+                .expect("an ordinary client-leaf campaign");
         }
     }
 

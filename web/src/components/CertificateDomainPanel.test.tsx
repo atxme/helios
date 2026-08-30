@@ -51,6 +51,7 @@ const DOMAIN: CertificateDomain = {
   gateway_retire_active_at: null,
   gateway_transition_published: false,
   gateway_rollback_expires_at: null,
+  gateway_restart_due: null,
   astra_authority_url: 'https://astra.example',
   astra_service_key_epoch: 5,
   astra_policy_fingerprint: '34'.repeat(32),
@@ -88,6 +89,28 @@ afterEach(() => {
 })
 
 describe('CertificateDomainPanel', () => {
+  it('dit qu’un redémarrage est dû quand la feuille servie n’est plus la bonne', async () => {
+    answer({
+      ...DOMAIN,
+      gateway_restart_due:
+        'gateway identity epoch 4 is due and this process is serving the outgoing leaf; restart to present it',
+    })
+    mount()
+
+    expect(await screen.findByText('La feuille en service n’est plus la bonne')).toBeTruthy()
+    expect(screen.getByText(/gateway identity epoch 4 is due/)).toBeTruthy()
+    // Le geste est nommé : l’identité servie ne se recharge pas à chaud.
+    expect(screen.getByText('systemctl restart heliosd')).toBeTruthy()
+  })
+
+  it('ne dit rien tant que la feuille servie est la bonne', async () => {
+    answer(DOMAIN)
+    mount()
+
+    expect(await screen.findByText('gateway.example')).toBeTruthy()
+    expect(screen.queryByText('La feuille en service n’est plus la bonne')).toBeNull()
+  })
+
   it('names the client, its generation and where its leaf stands', async () => {
     answer(DOMAIN)
     mount()

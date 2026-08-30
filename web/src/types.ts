@@ -251,6 +251,7 @@ export interface CertificateDomain {
   gateway_retire_active_at: number | null
   gateway_transition_published: boolean
   gateway_rollback_expires_at: number | null
+  gateway_restart_due: string | null
   astra_authority_url: string
   astra_service_key_epoch: number
   astra_policy_fingerprint: string

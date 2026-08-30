@@ -3023,8 +3023,38 @@ contournés :
   détenteur ne le reçoit, l'autorité émet dessous et tous les autres le
   vérifient sous l'ancre qu'ils épinglent déjà. La replier dans l'une des trois
   autres aurait laissé une campagne de celles-ci le livrer, ou l'inverse.
-  **Reste ouvert** : `full_certificate_chain`, dont aucune portée n'ordonne
-  encore émetteur, CA TLS, gateway puis clients ;
+  La **chaîne complète** s'exécute enfin, et pas comme une campagne :
+  `astra chain open`, puis `astra chain next` entre chaque étape, déposent
+  quatre campagnes ordinaires dans l'ordre du §12.2 — émetteur, CA TLS,
+  identité gateway, leafs du parc —, chacune avec sa propre famille, ses
+  propres cibles et son propre toucher. `CampaignFamily` est totale, chaque
+  famille refusant les trois autres dans les deux sens ; une campagne portant
+  un *ensemble* de familles transformerait chacune de ces gardes en un contrôle
+  de sous-ensemble, c'est-à-dire exactement la forme que ce modèle supprime.
+  `AstraRotationCampaign::validate` **refuse** donc désormais la portée
+  `full_certificate_chain` par son nom : « rien ne la fabrique » est un constat
+  sur les appelants du jour, ce refus est une règle sur le document.
+  L'ordre n'est pas une préférence : l'émetteur signe les feuilles clientes,
+  l'ancre TLS est ce à quoi elles se chaînent, et l'identité gateway est ce que
+  chaque client épingle — commencer par les feuilles les émettrait sous un
+  émetteur et une ancre sur le point d'être remplacés, et chaque pair
+  reviendrait deux fois. La campagne CA TLS de la chaîne ne porte **pas** de
+  ligne `CA-PQ`, et c'est cette absence qui porte l'exclusion du §7.6 :
+  `covers_authority_object` compare le type de certificat, donc une campagne
+  sans ligne d'ancre refuse une transition `CA-PQ` par construction.
+  « Franchie » ne veut pas dire « approuvée » : `astra chain next` lit l'**effet**
+  dans le registre — l'époque d'émetteur a bougé, l'ancre TLS a un successeur,
+  la décision gateway a été stockée — parce que le plan vit dans le volume
+  d'état et les opérations dans la mémoire du service, et parce que c'est la
+  question la plus forte des deux. Une étape approuvée dont l'objet n'a jamais
+  atterri n'a pas déplacé le domaine.
+  **Limite connue** : la dernière étape, les feuilles du parc, n'a aucun effet
+  observable ici — une campagne autorise des rotations et chaque pair dépense
+  cette autorisation en revenant (§7.6). Le plan le nomme au lieu de rapporter
+  une réussite qu'il n'a pas vue. **Le prix est quatre touchers** au lieu d'un,
+  et c'est le prix honnête de l'ordonnancement : le §7.6 borne une fenêtre de
+  campagne à cinq minutes, donc les étapes suivantes ne pouvaient de toute
+  façon pas être résolues d'avance ;
 - le **cycle complet de l'identité gateway**, §5, §6 et les neuf étapes de
   §11.1, est livré. La gateway génère et scelle sa clé suivante **à côté** de
   celle en service et exporte une `GatewayCertificateRequest`
@@ -3089,10 +3119,21 @@ contournés :
   contre l'ancre, la transition et la feuille qu'elle détient déjà, la refuse
   hors chevauchement, et la sélection expire par l'horloge, au plus tard avec
   le recouvrement. Rien d'autre ne bouge : aucun compteur, aucun slot, et la
-  promotion a toujours lieu à `not_after`. **Limite connue** : la sélection est
-  lue au démarrage, parce que la feuille en service est descellée une fois et
-  tenue pour la vie du processus — l'installer enregistre la décision, un
-  redémarrage l'applique, et rien ne redémarre le démon quand elle expire ;
+  promotion a toujours lieu à `not_after`. La sélection est lue au démarrage,
+  parce que la feuille en service est descellée une fois et tenue pour la vie
+  du processus : la recharger reconstruirait le point d'accès QUIC pendant que
+  des négociations y détiennent des slots de PSK. Toute bascule programmée est
+  donc un redémarrage — `activation_at`, `not_after`, et l'expiration d'un
+  rollback borné pareillement. Ce qui manquait n'était pas la bascule, c'était
+  **de le dire** : la passe d'entretien compare maintenant, à chaque tour, le
+  slot que ce processus a choisi à celui qu'un démarrage neuf choisirait, et
+  quand ils diffèrent elle porte la raison dans le journal et dans la vue que
+  la console affiche. Un démarrage qui *refuserait* — identité révoquée,
+  chevauchement passé `not_after` sans promotion — transmet son erreur plutôt
+  qu'un verdict : redémarrer à l'aveugle est précisément ce qu'il ne faut pas
+  faire là. **Limite connue** : rien ne redémarre le démon à la place de
+  l'opérateur, et rien ne doit le faire tant que la feuille servie est
+  descellée une seule fois ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le
@@ -3170,12 +3211,15 @@ contournés :
   elle ne signe pas. Ses refus portent leur raison — la surface est
   authentifiée comme le pare-feu, et l'inverse enverrait un opérateur dans les
   journaux du démon au pire moment.
+  La console dit aussi quand la feuille **en service** n'est plus celle qu'un
+  démarrage neuf choisirait, et nomme le geste — l'identité servie ne se
+  recharge pas à chaud, et un écran qui tairait cela laisserait une gateway
+  présenter l'ancienne identité sans trace du pourquoi.
   **Reste ouvert** : « Renouveler les leafs du parc », « Renouveler toute la
   chaîne » et « Tourner les autorités » ouvrent une campagne **Astra**, dont
   §11.6 garde la résolution locale parce qu'une campagne est l'inventaire du
-  domaine ; la console les nomme avec leur commande plutôt que d'inventer la
-  surface qui les porterait. Le rollback gateway pendant chevauchement n'a de
-  commande nulle part ;
+  domaine ; la console les nomme avec leur commande — `astra campaign open`,
+  `astra chain open` — plutôt que d'inventer la surface qui les porterait ;
 - les **essais d'intégration** du §14.2, qui supposent un vrai plan de données ;
 - toute **migration de format** des états persistés. `TrustState` et
   `RegistryState` portent `deny_unknown_fields`, et la forme de leur état borné

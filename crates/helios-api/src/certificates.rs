@@ -196,6 +196,14 @@ pub struct CertificateDomainView {
     pub gateway_transition_published: bool,
     /// End of a service rollback in force, absent when none is (spec §4.4).
     pub gateway_rollback_expires_at: Option<u64>,
+    /// Why the daemon must be restarted, when the registry has moved past the
+    /// leaf this process serves.
+    ///
+    /// The served identity is unsealed once and held for the life of the
+    /// process, so every scheduled switch is a restart — including the expiry
+    /// of a bounded rollback, which no clock in this daemon acts on. Absent
+    /// means the leaf in service is still the one a fresh start would choose.
+    pub gateway_restart_due: Option<String>,
     pub astra_authority_url: String,
     pub astra_service_key_epoch: u64,
     pub astra_policy_fingerprint: String,

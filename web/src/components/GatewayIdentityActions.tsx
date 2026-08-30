@@ -464,8 +464,11 @@ export function GatewayIdentityActions({ domain }: Props) {
         autorités » ouvrent une campagne <strong>Astra</strong>, qui la résout sur les cibles et
         générations qu’elle détient — §11.6 garde cette résolution locale, parce qu’une campagne
         est l’inventaire du domaine. Les ouvrir depuis ici demanderait une surface qui n’existe
-        pas&nbsp;: <code>astra campaign open --scope fleet-leafs</code> ou{' '}
-        <code>--scope trust-authorities</code>, dans le conteneur Astra.
+        pas&nbsp;: dans le conteneur Astra,{' '}
+        <code>astra campaign open --scope fleet-leafs</code>,{' '}
+        <code>--scope trust-authorities</code>, ou <code>astra chain open</code> pour toute la
+        chaîne — quatre campagnes ordonnées, quatre touchers, <code>astra chain next</code> entre
+        chacune.
       </KnownLimit>
     </Stack>
   )

@@ -279,6 +279,15 @@ export function CertificateDomainPanel() {
         </KnownLimit>
       )}
 
+      {domain.gateway_restart_due !== null && (
+        <KnownLimit register="danger" title="La feuille en service n’est plus la bonne">
+          {domain.gateway_restart_due}. L’identité servie est descellée une seule fois et tenue
+          pour la vie du processus — recharger la remplacerait sous des négociations qui
+          détiennent déjà des PSK. Chaque bascule est donc un redémarrage&nbsp;:{' '}
+          <code>systemctl restart heliosd</code>.
+        </KnownLimit>
+      )}
+
       <Box sx={{ display: 'grid', gap: 2.5, gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' } }}>
         <SectionCard title="Domaine de confiance" icon={Fingerprint} accent="tertiary.main">
           <Box>

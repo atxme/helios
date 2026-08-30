@@ -57,6 +57,7 @@
 //! a WSL2 build does and does not prove.
 
 pub mod audit;
+pub mod chain;
 pub mod distribution;
 pub mod gateway;
 pub mod issuer;

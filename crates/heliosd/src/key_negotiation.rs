@@ -1444,6 +1444,7 @@ pub async fn start(
         None => None,
     };
     let now_unix = unix_time_now()?;
+    let slot = served_identity_slot(gateway_certificates.as_ref(), now_unix)?;
     let identity = load_served_identity(
         boot.secret(),
         dry_run,
@@ -1465,9 +1466,13 @@ pub async fn start(
             identity.tls.certificate_chain.first().map_or(&[], Vec::as_slice)
         ),
         client_ca_sha256 = %helios_key_negotiation::certificate_fingerprint_der(&client_ca),
-        gateway_identity_slot = ?served_identity_slot(gateway_certificates.as_ref(), now_unix)?,
+        gateway_identity_slot = ?slot,
         "key-negotiation identity selected at startup and served until this daemon restarts"
     );
+    // Recorded so the lifecycle sweep can tell when the registry has moved
+    // past it. Set once: a second listener in one process would be two
+    // identities, which nothing here builds.
+    let _ = SERVED_SLOT.set(slot);
     let endpoint = server_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
         &identity.tls,
@@ -1630,6 +1635,61 @@ struct LoadedIdentity {
 enum ServedIdentitySlot {
     Active,
     Candidate { epoch: u64 },
+}
+
+/// The slot this process selected at start-up.
+///
+/// Set once, when the negotiation listener is built, and read by the lifecycle
+/// sweep to answer one question the daemon could not answer before: has the
+/// registry moved past what this process is serving? See [`restart_due`].
+static SERVED_SLOT: std::sync::OnceLock<ServedIdentitySlot> = std::sync::OnceLock::new();
+
+/// Why a restart is due, or `None` while the served leaf is still the right one.
+///
+/// # Why a signal and not a hot swap
+///
+/// The served identity is unsealed once and held for the life of the process,
+/// deliberately: reloading it would rebuild the QUIC endpoint while
+/// negotiations own PSK slots on it. Every scheduled switch is therefore a
+/// restart — `activation_at`, `not_after`, and the expiry of a bounded service
+/// rollback alike.
+///
+/// What was missing is not the swap, it is the **notice**. A rollback expires
+/// by the clock (§4.4) and nothing restarts the daemon when it does, so the
+/// gateway went on presenting the outgoing leaf with no trace of why. This
+/// compares, on every sweep, the slot this process chose against the one a
+/// fresh start would choose, and says so in the log and on the console.
+pub fn restart_due(
+    gateway: Option<&aether::certificates::state::GatewayCertificateState>,
+    now_unix: u64,
+) -> Option<String> {
+    let selected = SERVED_SLOT.get()?;
+    restart_reason(*selected, served_identity_slot(gateway, now_unix))
+}
+
+/// The comparison [`restart_due`] makes, without the process-wide selection.
+fn restart_reason(
+    selected: ServedIdentitySlot,
+    fresh: Result<ServedIdentitySlot>,
+) -> Option<String> {
+    match fresh {
+        Ok(fresh) if fresh == selected => None,
+        Ok(ServedIdentitySlot::Active) => Some(
+            "a service rollback is in force and this process is serving the staged \
+             identity; restart to present the outgoing leaf"
+                .to_string(),
+        ),
+        Ok(ServedIdentitySlot::Candidate { epoch }) => Some(format!(
+            "gateway identity epoch {epoch} is due and this process is serving the \
+             outgoing leaf; restart to present it"
+        )),
+        // A fresh start would refuse outright — the identity is revoked, or an
+        // overlap ran past `not_after` unpromoted. Restarting is exactly what
+        // must not be done blind, so the reason travels rather than the verdict.
+        Err(error) => Some(format!(
+            "a restart would refuse to serve this identity: {error}"
+        )),
+    }
 }
 
 /// Selects the private slot a fresh daemon may serve.
@@ -2504,6 +2564,49 @@ mod tests {
                 .is_err(),
             "a revoked identity serves nothing, rolled back or not"
         );
+    }
+
+    /// The bounded rollback of §4.4 ends by the clock, and nothing in this
+    /// daemon restarts it when it does. The served leaf is unsealed once and
+    /// held for the life of the process, deliberately — so what was missing
+    /// was never the swap, it was saying that the swap is due.
+    #[test]
+    fn an_expired_rollback_says_a_restart_is_due_rather_than_going_quiet() {
+        // Serving the outgoing leaf under a rollback that has since expired:
+        // a fresh start would present the staged identity.
+        assert!(restart_reason(
+            ServedIdentitySlot::Active,
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, false, 250),
+        )
+        .expect("a restart is due")
+        .contains("epoch 2 is due"));
+
+        // The other direction: a rollback installed after this process chose
+        // the candidate. Installing it records the decision; a restart applies
+        // it.
+        assert!(restart_reason(
+            ServedIdentitySlot::Candidate { epoch: 2 },
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, true, 250),
+        )
+        .expect("a restart is due")
+        .contains("service rollback"));
+
+        // Unchanged is silent: a warning on every sweep of a healthy gateway
+        // is a warning nobody reads when it matters.
+        assert!(restart_reason(
+            ServedIdentitySlot::Candidate { epoch: 2 },
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, false, 250),
+        )
+        .is_none());
+
+        // A start that would refuse carries its reason rather than a verdict:
+        // restarting blind is exactly what must not happen here.
+        assert!(restart_reason(
+            ServedIdentitySlot::Active,
+            select_served_identity_slot(true, Some(2), Some(200), Some(300), true, false, 250),
+        )
+        .expect("a restart would refuse")
+        .contains("would refuse"));
     }
 
     #[test]
