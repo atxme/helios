@@ -3603,6 +3603,23 @@ qu'il sert.
 - fuzzing de tous les objets signés, de leurs certificats embarqués et de la
   machine d'état temporelle.
 
+Les harnais de fuzzing sont livrés. Ils vivent dans `aether::fuzzing`, que la
+compilation stable vérifie et que la suite ordinaire exécute sur ses graines ;
+`fuzz/`, hors espace de travail, ne porte que quatre enveloppes libFuzzer de
+trois lignes. Du code que seule une chaîne *nightly* compile est du code que
+personne n'exécute sur la branche qui part en production, et un harnais devenu
+inerte parce qu'un type a été renommé doit échouer avec le reste, pas au
+prochain `cargo fuzz`. Quatre cibles : les objets signés, la transaction
+chunkée, les certificats embarqués, et la machine d'état temporelle — cette
+dernière étant la seule à **asserter** plutôt qu'à seulement survivre, sur les
+invariants du §4 : un compteur de révocation ne redescend jamais, `revoked`
+est terminal, un rollback de service ne déplace aucun compteur et ne survit
+pas au chevauchement qui le porte.
+
+**Limites connues** : aucune cible ne vérifie une signature valide — un fuzzer
+n'en produit pas —, il n'existe pas de corpus de graines versionné, et aucune
+exécution `cargo fuzz` n'a encore eu lieu. `fuzz/README.md` le dit aussi.
+
 ### 14.2 Essais d'intégration
 
 - client resté hors ligne avant activation, pendant le chevauchement et après

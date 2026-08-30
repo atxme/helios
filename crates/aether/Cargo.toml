@@ -12,6 +12,9 @@ default = []
 publisher-signing = ["fips204/default-rng"]
 # Runtime ML-DSA signing for authenticated key negotiation.
 key-negotiation-signing = ["fips204/default-rng", "dep:rcgen"]
+# Point d'entrée des cibles de fuzzing du §14.1. Compilé par les tests de toute
+# façon ; la feature n'existe que pour le crate `fuzz/`, hors espace de travail.
+fuzzing = []
 
 [dependencies]
 serde.workspace = true
