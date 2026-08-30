@@ -37,7 +37,13 @@ fn main() {
 
     let windows = tauri_build::WindowsAttributes::new()
         .app_manifest(include_str!("windows/orion-manifest.xml"));
-    let attributes = tauri_build::Attributes::new().windows_attributes(windows);
+    // The WebView may ask for exactly one process-related action. Model it as
+    // an inlined plugin so Tauri's ACL applies to that command without turning
+    // every application command into an all-or-nothing app manifest.
+    let companion = tauri_build::InlinedPlugin::new().commands(&["launch_certificate_companion"]);
+    let attributes = tauri_build::Attributes::new()
+        .windows_attributes(windows)
+        .plugin("companion", companion);
     tauri_build::try_build(attributes).expect("construction des ressources Tauri Orion");
 }
 

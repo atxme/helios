@@ -37,10 +37,10 @@
 //! chain over the same tunnel (`astra-signer approve --heliosd-url`), so the
 //! ordinary renewal has no missing link left and is no longer blocked here.
 //!
-//! What the interface still owes the user is the **launch** of that companion.
-//! That is a surface concern and not a refusal:
-//! `RenewalSession::companion_invocation` hands it the exact command, which is
-//! a value to render rather than a caveat to write.
+//! `RenewalSession::companion_invocation` hands the shell the exact companion
+//! invocation. Launch remains a surface concern and not an action refusal: a
+//! machine whose policy blocks process creation still has a valid operation
+//! and the copyable command as its explicit fallback.
 //!
 //! Either way the refusal happens **before** a key pair is generated or an
 //! authority is asked to certify anything: a button that produced a key and
@@ -234,10 +234,9 @@ fn renewal_block(
     // approve --heliosd-url` fetches its own request through the same tunnel
     // and posts the operator's assertion back. The chain closes.
     //
-    // What the interface still owes the user is the **launch** of the
-    // companion, and that is a surface concern rather than a refusal:
-    // `RenewalSession::companion_invocation` hands it the exact command, which
-    // is a value to render, not a caveat to write.
+    // Launching the companion is a surface concern rather than a refusal:
+    // `RenewalSession::companion_invocation` hands the shell the exact value,
+    // and a launch failure still leaves the copyable fallback usable.
     None
 }
 

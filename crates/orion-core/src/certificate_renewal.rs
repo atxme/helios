@@ -740,9 +740,10 @@ pub enum RenewalStep {
 /// will need are minted on the read it makes, never carried here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompanionInvocation {
-    /// `astra-signer`, unqualified: which binary answers is the operator's
-    /// `PATH` to decide, and a path baked in here would be wrong on the one
-    /// machine that matters.
+    /// `astra-signer`, unqualified and fixed: installation chooses its location
+    /// through `PATH`, while neither a profile field nor a network response can
+    /// select another executable. A platform-specific absolute path would make
+    /// development and packaged layouts disagree.
     pub program: &'static str,
     pub arguments: Vec<String>,
 }

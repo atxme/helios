@@ -33,6 +33,7 @@ const inventory = (overrides: Partial<CertificateInventory> = {}): CertificateIn
   faults: [],
   identity_sealed: false,
   previous_identity: null,
+  operator_credentials: null,
   ...overrides,
 })
 

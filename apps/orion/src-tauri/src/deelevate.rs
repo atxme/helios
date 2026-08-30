@@ -85,29 +85,82 @@ impl Drop for Token {
 /// [`orion_core::profile_import::validate_ssh_target`]: it is placed on a
 /// command line, and the allow-list grammar is what makes that inert.
 pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
-    let token = standard_user_token()?;
+    spawn_with_standard_token(
+        format!("powershell.exe -NoExit -Command ssh {target}"),
+        "ouverture du terminal",
+    )?;
+    tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
+    Ok(())
+}
 
-    // The last gate, and the one that counts. Everything above can be wrong
-    // in a way that still returns a handle; only Windows can say what that
-    // handle actually confers.
-    if is_elevated(&token)? {
-        return Err(
-            "refus : le jeton obtenu est toujours élevé, le terminal ne sera pas ouvert".into(),
-        );
+/// Runs the fixed Astra companion as the standard user, in its own console.
+///
+/// The arguments come from `orion-core::CompanionInvocation`; the program does
+/// not. Keeping the executable literal at this boundary prevents a WebView or
+/// profile value from turning this into a general process launcher.
+pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
+    let command = windows_command_line("astra-signer", arguments);
+    spawn_with_standard_token(command, "lancement du compagnon")
+}
+
+/// Quotes one argument according to the Windows command-line grammar consumed
+/// by `CommandLineToArgvW` and Rust/clap. No shell interprets the result.
+fn quote_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return argument.to_string();
     }
 
-    let mut command: Vec<u16> =
-        OsStr::new(&format!("powershell.exe -NoExit -Command ssh {target}"))
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            quoted.push(character);
+        }
+        backslashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
 
+fn windows_command_line(program: &str, arguments: &[String]) -> String {
+    std::iter::once(program)
+        .chain(arguments.iter().map(String::as_str))
+        .map(quote_argument)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn spawn_with_standard_token(command: String, action: &str) -> Result<(), String> {
+    let token = standard_user_token()?;
+    if is_elevated(&token)? {
+        return Err(format!(
+            "refus : le jeton obtenu est toujours élevé, {action} annulé"
+        ));
+    }
+
+    let mut command: Vec<u16> = OsStr::new(&command)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // SAFETY: `command` is NUL-terminated and stays alive for the call;
-    // `startup` and `process` are correctly sized zeroed structures.
+    // SAFETY: `command` is NUL-terminated and remains alive for the call;
+    // `startup` and `process` are correctly sized initialized structures.
     let created = unsafe {
         CreateProcessWithTokenW(
             token.0,
@@ -115,10 +168,8 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
             std::ptr::null(),
             command.as_mut_ptr(),
             CREATE_NEW_CONSOLE,
-            // NULL rather than our own block: with a null environment,
-            // `CreateProcessWithTokenW` builds one from the profile of the
-            // user the token designates — which is the standard user, not the
-            // elevated context this process runs in.
+            // NULL rather than Orion's environment: Windows builds one from
+            // the standard user's profile selected by `token`.
             std::ptr::null(),
             std::ptr::null(),
             &startup,
@@ -127,16 +178,16 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
     };
     if created == 0 {
         return Err(format!(
-            "ouverture du terminal impossible : CreateProcessWithTokenW a échoué ({})",
+            "{action} impossible : CreateProcessWithTokenW a échoué ({})",
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: both handles were produced by the successful call above.
+    // SAFETY: both handles were returned by the successful call above.
     unsafe {
         CloseHandle(process.hProcess);
         CloseHandle(process.hThread);
     }
-    tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
+    tracing::info!(%action, "processus ouvert sous le compte standard");
     Ok(())
 }
 

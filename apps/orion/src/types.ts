@@ -197,6 +197,11 @@ export interface CertificateInventory {
     phase: 'not_yet_available' | 'available' | 'expired'
     selected: boolean
   } | null
+  /** Authenticated epoch held locally; Orion does not persist registry rows. */
+  operator_credentials: {
+    registry_epoch: number
+    detail: 'epoch_only'
+  } | null
 }
 
 /**

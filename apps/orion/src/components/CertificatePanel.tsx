@@ -220,6 +220,7 @@ export function CertificatePanel({
     !inventory.client_pq &&
     identityName.trim() !== '' &&
     !inventory.identity_sealed
+  const recovery = actions.find((state) => state.action === 'recover_expired')
 
   // Counted **with** the missing identity, and that is the point: a profile
   // that pins nothing readable and names an unsealed identity is exactly the
@@ -229,6 +230,7 @@ export function CertificatePanel({
     groups.some((group) => group.rows.some((row) => row.facts)) ||
     inventory.faults.length > 0 ||
     clientMissing ||
+    inventory.operator_credentials !== null ||
     actions.length > 0
   if (!anything) return null
 
@@ -282,6 +284,50 @@ export function CertificatePanel({
           <Typography noWrap color="text.disabled" sx={{ minWidth: 0, fontSize: 11 }}>
             jusqu’au {instant(inventory.previous_identity.available_until)}
           </Typography>
+        </Box>
+      )}
+
+      {(inventory.operator_credentials || recovery) && (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.4 }}>
+          <Typography variant="overline" color="text.disabled">
+            Opérateur
+          </Typography>
+          {inventory.operator_credentials && (
+            <>
+              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+                <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+                  credentials
+                </Typography>
+                <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
+                  registre époque {inventory.operator_credentials.registry_epoch}
+                </Typography>
+              </Box>
+              <Typography color="text.disabled" sx={{ pl: '118px', fontSize: 11, lineHeight: 1.45 }}>
+                Détail non conservé sur ce poste : Orion n’affiche aucune clé sans registre vérifié
+                sous CA-PQ.
+              </Typography>
+            </>
+          )}
+          {recovery && (
+            <>
+              <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+                <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+                  récupération
+                </Typography>
+                <Typography
+                  color={recovery.blocked_by ? 'text.disabled' : 'text.primary'}
+                  sx={{ fontSize: 11.5, fontWeight: 600 }}
+                >
+                  {recovery.blocked_by ? 'indisponible' : 'disponible'}
+                </Typography>
+              </Box>
+              {recovery.message && (
+                <Typography color="text.disabled" sx={{ pl: '118px', fontSize: 11, lineHeight: 1.45 }}>
+                  {recovery.message}
+                </Typography>
+              )}
+            </>
+          )}
         </Box>
       )}
 

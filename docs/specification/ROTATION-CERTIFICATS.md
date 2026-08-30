@@ -3139,9 +3139,23 @@ contournés :
   déjà été autorisées par le grant approuvé et la gateway les accepte pendant
   le chevauchement ; contrairement au rollback gateway, aucune clé privée de
   service détenue par un autre composant n'est dégradée et aucun nouvel objet
-  `CA-PQ` n'ajouterait d'autorité. Manquent encore : le lancement automatique
-  du compagnon plutôt que sa ligne de commande, et l'affichage des credentials
-  opérateur enregistrés. Côté console Helios, `CertificateDomainPanel` montre le
+  `CA-PQ` n'ajouterait d'autorité.
+  Orion lance désormais automatiquement `astra-signer` quand l'opération
+  atteint `awaiting_operator`. Le frontend ne transmet que le nom du profil à
+  une permission Tauri dédiée ; la session Rust fournit le binaire fixe et les
+  arguments, et la ligne exacte reste visible et copiable si `PATH`, l'OS ou
+  la politique du poste refuse le lancement. Sous Windows, le compagnon ouvre
+  une console avec le jeton de l'utilisateur standard, jamais avec le jeton
+  Administrateur dont Orion a besoin pour WireGuard-NT.
+  La section opérateur affiche aussi l'époque du registre de credentials portée
+  par le profil et la disponibilité de la récupération, avec le motif canonique
+  de son indisponibilité. **Limite connue** : Orion ne persiste encore aucun
+  registre `CredentialRegistry` vérifié ; il dit donc que le détail n'est pas
+  détenu au lieu d'inventer une liste ou de la récupérer au rendu. Lever cette
+  limite exige de conserver le registre seulement après vérification sous le
+  `CA-PQ` épinglé, avec une taille bornée et un refus de toute régression
+  d'époque.
+  Côté console Helios, `CertificateDomainPanel` montre le
   domaine — gateway, CA, émetteur délégué, synthèse du parc — et
   `GatewayIdentityActions` **agit** sur les gestes que cette gateway possède :
   « Renouveler la gateway », l'installation d'une transition signée et

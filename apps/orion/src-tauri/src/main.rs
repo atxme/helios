@@ -56,6 +56,11 @@ use tokio::sync::{watch, Mutex};
 #[cfg(target_os = "windows")]
 mod deelevate;
 
+/// Process launch is isolated behind a one-command Tauri plugin and a fixed
+/// executable. Keeping it out of the application invoke handler makes the ACL
+/// visible and prevents this shell from acquiring a generic process right.
+mod companion;
+
 /// Notification-area menu. Its model and labels are portable and tested
 /// everywhere; only the wiring inside is Windows-only.
 mod tray;
@@ -736,9 +741,9 @@ impl ActionOutcome {
 
 /// Where a renewal stands, as the Certificates surface states it.
 ///
-/// `companion_command` is a **value**, not advice: it is the exact line that
-/// approves this operation, and the screen shows it because the operator has
-/// to run it. It is present only while an operator is awaited.
+/// `companion_command` is a **value**, not advice: it is the exact fallback for
+/// the invocation Orion launches automatically. It remains visible while an
+/// operator is awaited, including after a successful launch.
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "step")]
 enum RenewalProgress {
@@ -767,6 +772,35 @@ enum RenewalProgress {
         generation: u64,
         available_until: u64,
     },
+}
+
+/// Launches the companion for the operation held by one renewal session.
+///
+/// Only the profile name crosses IPC. The executable and every argument come
+/// from the session owned by `orion-core`, so the WebView cannot turn this
+/// permission into a shell or retarget an approval to another operation.
+#[tauri::command]
+async fn launch_certificate_companion(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    let invocation = {
+        let renewals = state.renewals.lock().await;
+        let renewal = renewals
+            .get(&name)
+            .ok_or_else(|| format!("aucun renouvellement en attente pour le profil « {name} »"))?;
+        renewal
+            .session
+            .companion_invocation()
+            .ok_or_else(|| format!("le profil « {name} » n'attend aucune approbation opérateur"))?
+    };
+    companion::launch(&invocation)
+}
+
+fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("companion")
+        .invoke_handler(tauri::generate_handler![launch_certificate_companion])
+        .build()
 }
 
 impl RenewalProgress {
@@ -2591,6 +2625,7 @@ fn main() {
                 tracing::warn!(%error, "unable to reveal Orion from the secondary instance");
             }
         }))
+        .plugin(companion_plugin())
         .manage(AppState {
             controller,
             store,
@@ -3150,7 +3185,10 @@ mod security_tests {
         assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
         assert_eq!(
             capabilities["permissions"],
-            serde_json::json!(["core:default"])
+            serde_json::json!([
+                "core:default",
+                "companion:allow-launch-certificate-companion"
+            ])
         );
     }
 

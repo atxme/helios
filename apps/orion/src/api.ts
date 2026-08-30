@@ -123,6 +123,16 @@ export const runCertificateAction = (name: string, action: CertificateAction) =>
   invoke<ActionOutcome>('run_certificate_action', { name, action })
 
 /**
+ * Launches the operator companion for this profile's in-memory operation.
+ *
+ * The inlined Tauri plugin accepts only the profile name. Rust resolves the
+ * session and its core-built invocation; no executable or argument crosses
+ * from the WebView.
+ */
+export const launchCertificateCompanion = (name: string) =>
+  invoke<void>('plugin:companion|launch_certificate_companion', { name })
+
+/**
  * Reads the approval request the open renewal is waiting on.
  *
  * Verified on the Rust side before it comes back. Nothing touches a security

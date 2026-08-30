@@ -4,27 +4,31 @@
 //!
 //! [`crate::certificates::TrustStore`] is the *decision* half of the
 //! certificate lifecycle: bounded slots, generations, transitions applied in
-//! one write. Nothing populates it yet — the Orion profile format has no
-//! `helios_key_negotiation` discriminant, so there is no document that could
-//! carry a trust domain, an Astra profile and a client generation into one
-//! (spec §19, §22, listed as *non livré*).
+//! one write. It is populated from the profile's trust material and advanced
+//! by the renewal driver; exposing that state directly would couple a display
+//! to the transaction store and its private candidate lifecycle.
 //!
-//! This module is the *observation* half, and it needs none of that. Four
+//! This module is the *observation* half. Four
 //! certificates already exist on any enrolled machine — the two the profile
 //! pins for the gateway, and the two the protected store holds for this
-//! client — and every question a user asks about the lifecycle can be
-//! answered from them: what is pinned, until when, and when the renewal
-//! window opens. The answers are computed with the lifecycle's own arithmetic
-//! (`ValidityPeriod` at 80 / 90 / 95 %), so the panel and the protocol agree
-//! by construction rather than by resemblance.
+//! client — and they answer what is pinned, until when, and when the renewal
+//! window opens. Those answers are computed with the lifecycle's own
+//! arithmetic (`ValidityPeriod` at 80 / 90 / 95 %), so the panel and the
+//! protocol agree by construction rather than by resemblance.
 //!
-//! # Limite connue
+//! # Operator credentials
 //!
-//! Nothing here *acts*. It reads four certificates and reports their dates: it
-//! does not renew, does not stage, does not apply a trust update. A leaf that
-//! reaches its renewal window is reported, and the renewal itself is still the
-//! operator re-issuing and the user re-importing. Wiring the automatic path
-//! needs the trust store above, which needs the profile discriminant.
+//! The profile holds the highest `credential_registry_epoch` it accepted, but
+//! Orion does not persist the corresponding CA-PQ-signed registry. The
+//! inventory therefore reports that epoch and states that the rows are not
+//! held locally. It never fetches a registry just to draw a screen: listing
+//! operator keys would otherwise turn an authenticated trust decision into a
+//! claim made by whichever network endpoint answered last.
+//!
+//! Showing the rows later requires the trust store to retain a registry only
+//! after verifying it under the pinned CA-PQ, with the same bounded size and
+//! monotonic epoch checks as every other consumer. Until that persistence
+//! exists, an epoch-only inventory is the complete and honest local fact.
 //!
 //! # What a fault is, and what an absence is
 //!
@@ -64,6 +68,24 @@ pub struct CertificateFacts {
     /// Instant the renewal window opens — 80 % of the lifetime.
     pub renewal_at: u64,
     pub phase: CertificatePhase,
+}
+
+/// What this profile locally knows about the domain's operator credentials.
+///
+/// `EpochOnly` is a positive statement, not an empty list: the profile has
+/// accepted a registry generation, but this client has never retained its
+/// verified rows. Keeping that distinction in the value prevents a surface
+/// from rendering “zero registered keys”, which would be false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCredentialInventory {
+    pub registry_epoch: u64,
+    pub detail: OperatorCredentialDetail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCredentialDetail {
+    EpochOnly,
 }
 
 impl CertificateFacts {
@@ -110,6 +132,8 @@ pub struct CertificateInventory {
     pub identity_sealed: bool,
     /// Outgoing identity retained for a bounded service rollback.
     pub previous_identity: Option<PreviousIdentityStatus>,
+    /// Highest authenticated credential-registry epoch carried by the profile.
+    pub operator_credentials: Option<OperatorCredentialInventory>,
 }
 
 /// Reads a PQ certificate as the negotiation format carries it.
@@ -252,6 +276,14 @@ pub fn inventory(settings: Option<&KeyNegotiationSettings>, now_unix: u64) -> Ce
     let Some(settings) = settings else {
         return inventory;
     };
+    inventory.operator_credentials =
+        settings
+            .trust
+            .as_ref()
+            .map(|trust| OperatorCredentialInventory {
+                registry_epoch: trust.credential_registry_epoch,
+                detail: OperatorCredentialDetail::EpochOnly,
+            });
     gateway_inventory(settings, now_unix, &mut inventory);
     client_inventory(settings, now_unix, &mut inventory);
     inventory
@@ -323,6 +355,46 @@ mod tests {
         let found = inventory(None, 1_000);
         assert_eq!(found, CertificateInventory::default());
         assert!(found.faults.is_empty());
+    }
+
+    /// Orion must not turn a pinned epoch into an invented list. Until it
+    /// persists a CA-PQ-verified registry, the inventory says exactly what the
+    /// profile holds and distinguishes that from an empty registry.
+    #[test]
+    fn a_trust_profile_reports_the_registry_epoch_without_inventing_rows() {
+        let mut settings = KeyNegotiationSettings {
+            mode: aether::key_negotiation::ProtectionMode::MlKem,
+            minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+            endpoint: "gateway:51821".into(),
+            server_name: "gateway.example".into(),
+            gateway_ca_der: "pas du base64 !".into(),
+            gateway_pq_certificate: "pas du base64 !".into(),
+            identity: String::new(),
+            trust: None,
+        };
+        settings.trust = Some(crate::config::TrustMaterial {
+            trust_domain_id: "01".repeat(16),
+            ca_epoch: 3,
+            ca_pq_public_key: String::new(),
+            ca_tls_epoch: 4,
+            client_tls_ca_der: String::new(),
+            client_generation: 7,
+            astra_authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: "11".repeat(32),
+            credential_registry_epoch: 12,
+            astra_service_key_epoch: 2,
+            astra_service_public_key: String::new(),
+        });
+
+        let found = inventory(Some(&settings), 1_000);
+        assert_eq!(
+            found.operator_credentials,
+            Some(OperatorCredentialInventory {
+                registry_epoch: 12,
+                detail: OperatorCredentialDetail::EpochOnly,
+            })
+        );
     }
 
     /// A block whose pinned material is unreadable names which half failed.

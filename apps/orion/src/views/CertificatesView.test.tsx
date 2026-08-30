@@ -8,9 +8,7 @@ import type { ProfileCertificates } from '../types'
 const api = vi.hoisted(() => ({
   certificateOverview: vi.fn(),
   runCertificateAction: vi.fn(),
-  certificateApprovalManifest: vi.fn(),
-  certificateApprovalNeedsPin: vi.fn(),
-  approveCertificateRenewal: vi.fn(),
+  launchCertificateCompanion: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -36,6 +34,7 @@ const entry = (overrides: Partial<ProfileCertificates> = {}): ProfileCertificate
     faults: [],
     identity_sealed: true,
     previous_identity: null,
+    operator_credentials: null,
   },
   actions: [
     {
@@ -91,6 +90,7 @@ const expiredFacts = () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  api.launchCertificateCompanion.mockResolvedValue(undefined)
   api.runCertificateAction.mockResolvedValue(
     outcome({
       step: 'awaiting_operator',
@@ -210,12 +210,8 @@ describe('CertificatesView', () => {
     expect(api.certificateOverview).toHaveBeenCalledTimes(2)
   })
 
-  /**
-   * `awaiting_operator` is where every renewal legitimately waits. What ends
-   * the wait is a security key, and Orion now asks for it itself — there is no
-   * second binary to launch.
-   */
-  it('offers the ceremony in place of a command to run', async () => {
+  /** The shell launches from its session; the WebView supplies only a name. */
+  it('launches the companion and keeps the exact fallback command visible', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
@@ -223,58 +219,55 @@ describe('CertificatesView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
 
     await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
-    expect(await screen.findByRole('button', { name: 'Lire la demande' })).toBeTruthy()
-    expect(screen.queryByText(/astra-signer/)).toBeNull()
+    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledWith('portable'))
+    expect(screen.getByText(awaiting().companion_command)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copier approbation' })).toBeTruthy()
+    expect(await screen.findByText(/Compagnon lancé/)).toBeTruthy()
   })
 
-  /**
-   * The manifest is shown, and only then is the key asked for: what is signed
-   * has to be what the user saw.
-   */
-  it('shows the request before asking for a touch', async () => {
-    api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
-    api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
-    api.certificateApprovalManifest.mockResolvedValue({
-      operation_id: 'f'.repeat(32),
-      client_wg_public_key: 'AAAA',
-      active_generation: 4,
-      requested_generation: 5,
-      request_fingerprint: 'a'.repeat(64),
-      expires_at: 1_700_000_300,
-      eligible_credentials: 2,
-    })
-    api.certificateApprovalNeedsPin.mockResolvedValue(false)
-    api.approveCertificateRenewal.mockResolvedValue({ step: 'issuing', operation_id: 'f'.repeat(32) })
-    render(<CertificatesView />)
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande' }))
-
-    await waitFor(() => expect(api.approveCertificateRenewal).toHaveBeenCalledWith('portable', undefined))
-    expect(api.certificateApprovalManifest).toHaveBeenCalledWith('portable')
-  })
-
-  /**
-   * When the ceremony cannot run — no platform dialog, a key that needs an
-   * elevated process — the companion is the answer, and that is the one place
-   * its command line belongs.
-   */
-  it('falls back to the companion command only after a failed ceremony', async () => {
+  /** A missing binary is named, while the copyable command remains the exit. */
+  it('shows a launch failure and lets the operator retry', async () => {
     const command =
       'astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id ' + 'f'.repeat(32)
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(
       outcome({ ...awaiting(), companion_command: command }),
     )
-    api.certificateApprovalManifest.mockRejectedValue('aucune clé de sécurité n’a répondu')
+    api.launchCertificateCompanion.mockRejectedValue('fichier introuvable')
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
-    expect(screen.queryByText(command)).toBeNull()
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Lire la demande' }))
     await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
+    expect(screen.getByText(/fichier introuvable/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Copier approbation' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Relancer le compagnon' }))
+    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledTimes(2))
+  })
+
+  /** Epoch and recovery are local facts; no registry fetch is implied. */
+  it('shows the credential epoch and the reason recovery is unavailable', async () => {
+    api.certificateOverview.mockResolvedValue([
+      entry({
+        inventory: {
+          ...entry().inventory,
+          operator_credentials: { registry_epoch: 7, detail: 'epoch_only' },
+        },
+        actions: [
+          {
+            action: 'recover_expired',
+            label: 'Récupérer le certificat expiré',
+            blocked_by: { kind: 'nothing_expired' },
+            message: 'Aucun certificat client n’est expiré.',
+          },
+        ],
+      }),
+    ])
+    render(<CertificatesView />)
+
+    expect(await screen.findByText('registre époque 7')).toBeTruthy()
+    expect(screen.getByText(/Détail non conservé sur ce poste/)).toBeTruthy()
+    expect(screen.getByText('indisponible')).toBeTruthy()
+    expect(screen.getByText('Aucun certificat client n’est expiré.')).toBeTruthy()
   })
 
   /** A committed renewal names the generation, and nothing to run. */
@@ -337,7 +330,9 @@ describe('CertificatesView', () => {
 
     await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
     expect(screen.getByText('e'.repeat(32))).toBeTruthy()
-    expect(screen.getAllByRole('button', { name: 'Lire la demande' })).toHaveLength(2)
+    await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledTimes(2))
+    expect(api.launchCertificateCompanion).toHaveBeenCalledWith('portable')
+    expect(api.launchCertificateCompanion).toHaveBeenCalledWith('bureau')
   })
 
   it('drops the previous step when a later press is refused', async () => {

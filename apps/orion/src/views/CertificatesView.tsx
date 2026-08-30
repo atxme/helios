@@ -12,12 +12,16 @@ import { CertificatePanel, PhasePill, isAlarming, worstPhase } from '../componen
 import { CopyButton } from '../components/CopyButton'
 import { GUTTER, RULE } from '../theme'
 import type {
-  ApprovalManifest,
   CertificateAction,
   CertificatePhase,
   ProfileCertificates,
   RenewalProgress,
 } from '../types'
+
+type CompanionLaunch =
+  | { state: 'launching' }
+  | { state: 'launched' }
+  | { state: 'failed'; reason: string }
 
 /**
  * Certificates — its own destination, between Profiles and the log.
@@ -57,19 +61,13 @@ export function CertificatesView() {
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
-  // A ceremony's refusal comes back from the rejection, not from the overview:
-  // the shell records the *action*'s reason, and a key that was not plugged in
-  // is not an action that was refused.
-  const [failure, setFailure] = useState<Record<string, string>>({})
+  // Process launch is separate from the certificate action: the operation may
+  // be validly waiting even when this machine cannot start its companion.
+  const [companion, setCompanion] = useState<Record<string, CompanionLaunch>>({})
   // Where each profile's renewal stopped, from the press that opened it.
   // Not persisted and not refreshed: it describes one attempt made here, and a
   // step surviving a reload would outlive the operation it names.
   const [progress, setProgress] = useState<Record<string, RenewalProgress>>({})
-  // The approval request, once read and verified. Held so that what the user
-  // approves is what they were shown: re-fetching between the display and the
-  // touch would ask for a touch on something nobody saw.
-  const [manifest, setManifest] = useState<Record<string, ApprovalManifest>>({})
-  const [ceremony, setCeremony] = useState<string | null>(null)
   const [reloading, setReloading] = useState(false)
 
   const refresh = useCallback(async () => {
@@ -91,6 +89,19 @@ export function CertificatesView() {
     void refresh()
   }, [refresh])
 
+  const launchCompanion = async (name: string) => {
+    setCompanion((current) => ({ ...current, [name]: { state: 'launching' } }))
+    try {
+      await api.launchCertificateCompanion(name)
+      setCompanion((current) => ({ ...current, [name]: { state: 'launched' } }))
+    } catch (cause) {
+      setCompanion((current) => ({
+        ...current,
+        [name]: { state: 'failed', reason: String(cause) },
+      }))
+    }
+  }
+
   const run = async (name: string, action: CertificateAction) => {
     setBusy(true)
     try {
@@ -105,6 +116,19 @@ export function CertificatesView() {
         for (const refused of Object.keys(outcome.refused)) delete merged[refused]
         return merged
       })
+      setCompanion((current) => {
+        const next = { ...current }
+        for (const [profile, step] of Object.entries(outcome.progress)) {
+          if (step.step !== 'awaiting_operator') delete next[profile]
+        }
+        for (const refused of Object.keys(outcome.refused)) delete next[refused]
+        return next
+      })
+      await Promise.all(
+        Object.entries(outcome.progress)
+          .filter(([, step]) => step.step === 'awaiting_operator')
+          .map(([profile]) => launchCompanion(profile)),
+      )
     } catch {
       // The refusal is recorded on the Rust side and comes back with the
       // refreshed overview: showing it from the rejection as well would print
@@ -117,33 +141,12 @@ export function CertificatesView() {
         const { [name]: _dropped, ...rest } = current
         return rest
       })
-    } finally {
-      setBusy(false)
-      await refresh()
-    }
-  }
-
-  /// Reads the approval request, then runs the ceremony on the same object.
-  const approve = async (name: string) => {
-    setCeremony(name)
-    try {
-      const request = manifest[name] ?? (await api.certificateApprovalManifest(name))
-      setManifest((current) => ({ ...current, [name]: request }))
-      const pin = (await api.certificateApprovalNeedsPin(name))
-        ? // Only the HID transport asks. Under Windows the system collects it
-          // in its own dialog and it never enters Orion.
-          (window.prompt('PIN de la clé de sécurité') ?? '')
-        : undefined
-      const step = await api.approveCertificateRenewal(name, pin)
-      setProgress((current) => ({ ...current, [name]: step }))
-      setManifest((current) => {
-        const { [name]: _done, ...rest } = current
+      setCompanion((current) => {
+        const { [name]: _dropped, ...rest } = current
         return rest
       })
-    } catch (cause) {
-      setFailure((current) => ({ ...current, [name]: String(cause) }))
     } finally {
-      setCeremony(null)
+      setBusy(false)
       await refresh()
     }
   }
@@ -225,10 +228,8 @@ export function CertificatesView() {
             />
             <RenewalStep
               step={progress[profile.name]}
-              manifest={manifest[profile.name]}
-              failure={failure[profile.name]}
-              busy={ceremony === profile.name}
-              onApprove={ceremony ? undefined : () => void approve(profile.name)}
+              launch={companion[profile.name]}
+              onLaunch={() => void launchCompanion(profile.name)}
             />
           </Paper>
         ))}
@@ -249,25 +250,21 @@ export function CertificatesView() {
  * Where the renewal this press opened has stopped.
  *
  * Values only. `awaiting_operator` is not a warning to explain — it is where
- * every renewal legitimately waits — so what the row carries is the two things
- * an operator acts on: the operation, and the exact command that approves it.
- * The command is copyable for the same reason every other value here is:
- * selecting truncated monospace text with the mouse is where it goes wrong.
+ * every renewal legitimately waits — so what the row carries is the operation,
+ * the launch result and the exact fallback command. The command remains
+ * copyable even after a successful launch: policy may stop Orion from opening
+ * a process on another machine, and the operation must stay recoverable.
  */
 function RenewalStep({
   step,
-  manifest,
-  failure,
-  busy,
-  onApprove,
+  launch,
+  onLaunch,
 }: {
   step: RenewalProgress | undefined
-  manifest: ApprovalManifest | undefined
-  failure: string | undefined
-  busy: boolean
-  onApprove?: () => void
+  launch: CompanionLaunch | undefined
+  onLaunch: () => void
 }) {
-  if (!step && !failure) return null
+  if (!step) return null
   return (
     <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
       {step?.step === 'committed' && (
@@ -285,42 +282,35 @@ function RenewalStep({
       {step && (step.step === 'awaiting_operator' || step.step === 'issuing') && (
         <Row label="opération" value={step.operation_id} copyable />
       )}
-      {manifest && (
-        <>
-          <Row
-            label="générations"
-            value={`${manifest.active_generation} → ${manifest.requested_generation}`}
-          />
-          <Row label="demande" value={manifest.request_fingerprint} copyable />
-          <Row label="clés éligibles" value={String(manifest.eligible_credentials)} />
-        </>
-      )}
       {step?.step === 'awaiting_operator' && (
-        <Button
-          size="small"
-          variant="outlined"
-          color="inherit"
-          disabled={busy || !onApprove}
-          startIcon={
-            busy ? <CircularProgress size={13} color="inherit" /> : <KeyRound size={14} aria-hidden />
-          }
-          onClick={onApprove}
-          sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
-        >
-          {manifest ? 'Approuver avec la clé' : 'Lire la demande'}
-        </Button>
-      )}
-      {failure && (
         <>
-          <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
-            {failure}
-          </Alert>
-          {/* The command line is the escape hatch, and only here: a machine
-              where the platform key dialog cannot run is exactly where an
-              operator needs the companion, and nowhere else does showing it
-              add anything. */}
-          {step?.step === 'awaiting_operator' && (
-            <Row label="approbation" value={step.companion_command} copyable />
+          <Row label="approbation" value={step.companion_command} copyable />
+          <Button
+            size="small"
+            variant="outlined"
+            color="inherit"
+            disabled={launch?.state === 'launching'}
+            startIcon={
+              launch?.state === 'launching' ? (
+                <CircularProgress size={13} color="inherit" />
+              ) : (
+                <KeyRound size={14} aria-hidden />
+              )
+            }
+            onClick={onLaunch}
+            sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+          >
+            {launch?.state === 'launching' ? 'Lancement…' : 'Relancer le compagnon'}
+          </Button>
+          {launch?.state === 'launched' && (
+            <Alert severity="info" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+              Compagnon lancé. L’approbation et la clé matérielle restent dans sa fenêtre.
+            </Alert>
+          )}
+          {launch?.state === 'failed' && (
+            <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+              Lancement du compagnon impossible : {launch.reason}
+            </Alert>
           )}
         </>
       )}
