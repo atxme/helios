@@ -187,58 +187,17 @@ impl TrustUpdateSession {
         store: &mut TrustStore,
         now_unix: u64,
     ) -> Result<TrustUpdateOutcome, TrustUpdateError> {
-        let mut pending: Option<PendingTrustTransaction> = None;
-        let mut collected: Vec<aether::certificates::transport::TrustUpdateChunk> = Vec::new();
+        let mut collection = Collection::default();
         for _ in 0..MAX_POLLS {
             let answer = self.poll().await?;
-            let Some(chunk) = answer.chunk else {
-                // No fragment. Either nothing is owed, or the gateway sent a
-                // manifest alone — which authorizes nothing and is not a state
-                // this collection can advance from.
-                return match (answer.manifest, pending) {
-                    (None, None) => Ok(TrustUpdateOutcome::UpToDate),
-                    _ => Err(TrustUpdateError::ManifestMissing),
-                };
-            };
-            let manifest = answer.manifest.ok_or(TrustUpdateError::ManifestMissing)?;
-
-            let accumulator = match pending {
-                None => {
-                    // One cheap check before spending a whole fragment cycle:
-                    // the token this transaction was built for against the one
-                    // this store is in. Everything else — the signature, the
-                    // authority, the window, the target — is checked by
-                    // `verify_and_apply_transaction`, at the only instant that
-                    // matters, and is deliberately not duplicated here.
-                    if !manifest
-                        .base_state_fingerprint
-                        .matches(&store.base_state_fingerprint()?)
-                    {
-                        return Err(TrustUpdateError::BaseStateMoved);
-                    }
-                    pending = Some(PendingTrustTransaction::new(manifest));
-                    pending.as_mut().expect("just set")
+            match collection.accept(answer, &store.base_state_fingerprint()?)? {
+                Step::Poll => continue,
+                Step::Done(outcome) => return Ok(outcome),
+                Step::Apply { manifest, chunks } => {
+                    let objects =
+                        store.verify_and_apply_transaction(&manifest, &chunks, now_unix)?;
+                    return Ok(TrustUpdateOutcome::Applied { objects });
                 }
-                Some(ref mut accumulator) => {
-                    // A manifest comes back with every fragment. A different
-                    // one mid-collection is a second decision, and two of them
-                    // cannot be assembled into one.
-                    if !accumulator
-                        .manifest_fingerprint()
-                        .matches(&manifest.fingerprint())
-                    {
-                        return Err(TrustUpdateError::ManifestChanged);
-                    }
-                    accumulator
-                }
-            };
-            accumulator.accept(&chunk)?;
-            collected.push(chunk);
-            if accumulator.is_complete() {
-                let manifest = accumulator.manifest().clone();
-                let objects =
-                    store.verify_and_apply_transaction(&manifest, &collected, now_unix)?;
-                return Ok(TrustUpdateOutcome::Applied { objects });
             }
         }
         Err(TrustUpdateError::NeverCompleted)
@@ -270,12 +229,101 @@ impl TrustUpdateSession {
     }
 }
 
+/// What one answer means for a collection in progress.
+enum Step {
+    /// Ask again: the transaction is real but not yet whole.
+    Poll,
+    /// Nothing more will come.
+    Done(TrustUpdateOutcome),
+    /// Every fragment is in. Apply, once, against the live store.
+    ///
+    /// Boxed: a manifest is the largest thing this enum carries by a wide
+    /// margin, and every `Poll` in the collection loop would otherwise pay for
+    /// it.
+    Apply {
+        manifest: Box<aether::certificates::transport::TrustUpdateTransactionManifest>,
+        chunks: Vec<aether::certificates::transport::TrustUpdateChunk>,
+    },
+}
+
+/// The collection state one session carries between polls.
+///
+/// Split out from the transport so what an answer *means* can be decided —
+/// and tested — without a gateway on the other end. Every refusal below is a
+/// property of the exchange, not of the network: a fragment without its
+/// manifest, a manifest that changes mid-collection, a transaction computed
+/// against a store this client has already left.
+#[derive(Default)]
+struct Collection {
+    pending: Option<PendingTrustTransaction>,
+    collected: Vec<aether::certificates::transport::TrustUpdateChunk>,
+}
+
+impl Collection {
+    fn accept(
+        &mut self,
+        answer: TrustUpdateAnswer,
+        base_state_fingerprint: &Fingerprint,
+    ) -> Result<Step, TrustUpdateError> {
+        let Some(chunk) = answer.chunk else {
+            // No fragment. Either nothing is owed, or the gateway sent a
+            // manifest alone — which authorizes nothing and is not a state
+            // this collection can advance from.
+            return match (answer.manifest, &self.pending) {
+                (None, None) => Ok(Step::Done(TrustUpdateOutcome::UpToDate)),
+                _ => Err(TrustUpdateError::ManifestMissing),
+            };
+        };
+        let manifest = answer.manifest.ok_or(TrustUpdateError::ManifestMissing)?;
+
+        let accumulator = match self.pending {
+            None => {
+                // One cheap check before spending a whole fragment cycle:
+                // the token this transaction was built for against the one
+                // this store is in. Everything else — the signature, the
+                // authority, the window, the target — is checked by
+                // `verify_and_apply_transaction`, at the only instant that
+                // matters, and is deliberately not duplicated here.
+                if !manifest
+                    .base_state_fingerprint
+                    .matches(base_state_fingerprint)
+                {
+                    return Err(TrustUpdateError::BaseStateMoved);
+                }
+                self.pending = Some(PendingTrustTransaction::new(manifest));
+                self.pending.as_mut().expect("just set")
+            }
+            Some(ref mut accumulator) => {
+                // A manifest comes back with every fragment. A different
+                // one mid-collection is a second decision, and two of them
+                // cannot be assembled into one.
+                if !accumulator
+                    .manifest_fingerprint()
+                    .matches(&manifest.fingerprint())
+                {
+                    return Err(TrustUpdateError::ManifestChanged);
+                }
+                accumulator
+            }
+        };
+        accumulator.accept(&chunk)?;
+        self.collected.push(chunk);
+        if accumulator.is_complete() {
+            return Ok(Step::Apply {
+                manifest: Box::new(accumulator.manifest().clone()),
+                chunks: std::mem::take(&mut self.collected),
+            });
+        }
+        Ok(Step::Poll)
+    }
+}
+
 /// The gateway's answer, exactly as `helios-api` renders it.
 ///
 /// Redeclared here rather than imported: `orion-core` does not depend on the
 /// gateway's crate, and a client that could only be built against the server's
 /// own types would be a client that cannot be tested without one.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct TrustUpdateAnswer {
     #[serde(default)]
     manifest: Option<aether::certificates::transport::TrustUpdateTransactionManifest>,
@@ -347,4 +395,292 @@ pub async fn refresh(
 
     let session = TrustUpdateSession::prepare(&store, heliosd_url, certificate, &private_key)?;
     session.run(&mut store, now_unix).await
+}
+
+#[cfg(all(test, feature = "certificate-signing"))]
+mod tests {
+    use super::*;
+    use aether::certificates::authority::CaTransition;
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, MlDsa87Signature, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::transport::{
+        ManifestAuthority, TrustUpdateChunk, TrustUpdateObject, TrustUpdateObjectRef,
+        TrustUpdateTransactionManifest,
+    };
+    use aether::certificates::window::TransitionWindow;
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+    /// The token the fixture store is in. `Collection` compares against it and
+    /// never computes it, which is what lets these tests run without a store.
+    fn base() -> Fingerprint {
+        Fingerprint::of(b"the state this client is in")
+    }
+
+    /// A cheap object to fill a transaction with. `Collection` verifies no
+    /// signature — that is `verify_and_apply_transaction`, on the live store,
+    /// at the only instant it means anything — so the halves here are
+    /// placeholders on purpose.
+    fn object(seed: u8) -> TrustUpdateObject {
+        let (_, next) = generate_ml_dsa_87_keypair().expect("keygen");
+        TrustUpdateObject::CaTransition(Box::new(CaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([5; 16]).expect("domain"),
+            current_ca_epoch: u64::from(seed),
+            next_ca_epoch: u64::from(seed) + 1,
+            current_ca_fingerprint: Fingerprint::of(&[seed]),
+            next_ca_fingerprint: next.authority_fingerprint(),
+            next_ca_public_key: next,
+            window: TransitionWindow::new(1_000, 2_000, 3_000).expect("window"),
+            current_ca_signature: MlDsa87Signature::placeholder(),
+            next_ca_signature: MlDsa87Signature::placeholder(),
+        }))
+    }
+
+    fn manifest(
+        objects: &[TrustUpdateObject],
+        chunk_count: u16,
+        base_state_fingerprint: Fingerprint,
+    ) -> TrustUpdateTransactionManifest {
+        TrustUpdateTransactionManifest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            transaction_id: Id16::new([6; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([5; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([1; 32]),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            base_state_fingerprint,
+            created_at: 1_000,
+            expires_at: 5_000,
+            minimum_activation_at: 9_000,
+            chunk_count,
+            objects: objects
+                .iter()
+                .map(|object| TrustUpdateObjectRef {
+                    apply_order: object.apply_order(),
+                    object_fingerprint: object.fingerprint().expect("fingerprint"),
+                    prerequisite_bitmap: 0,
+                })
+                .collect(),
+            manifest_authority_kind: ManifestAuthority::AstraServiceKey,
+            manifest_authority_epoch: 1,
+            signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    fn chunk(
+        manifest: &TrustUpdateTransactionManifest,
+        index: u16,
+        first_object_index: u16,
+        objects: Vec<TrustUpdateObject>,
+    ) -> TrustUpdateChunk {
+        TrustUpdateChunk {
+            manifest_fingerprint: manifest.fingerprint(),
+            chunk_index: index,
+            chunk_count: manifest.chunk_count,
+            first_object_index,
+            objects,
+        }
+    }
+
+    fn answer(
+        manifest: Option<&TrustUpdateTransactionManifest>,
+        chunk: Option<TrustUpdateChunk>,
+    ) -> TrustUpdateAnswer {
+        TrustUpdateAnswer {
+            manifest: manifest.cloned(),
+            chunk,
+        }
+    }
+
+    /// The ordinary answer, and the one that must cost nothing: the gateway
+    /// holds nothing this client lacks.
+    #[test]
+    fn an_empty_answer_is_up_to_date_and_writes_nothing() {
+        let mut collection = Collection::default();
+        assert!(matches!(
+            collection
+                .accept(TrustUpdateAnswer::default(), &base())
+                .expect("an empty answer is legal"),
+            Step::Done(TrustUpdateOutcome::UpToDate)
+        ));
+        assert!(collection.pending.is_none());
+        assert!(collection.collected.is_empty());
+    }
+
+    /// A manifest alone authorizes nothing. Accepting it would leave the
+    /// collection holding a decision it can neither complete nor discard, and
+    /// the next fragment would look like the second of a transaction whose
+    /// first was never sent.
+    #[test]
+    fn a_manifest_without_a_fragment_is_refused() {
+        let objects = vec![object(1)];
+        let manifest = manifest(&objects, 1, base());
+        let mut collection = Collection::default();
+        assert!(matches!(
+            collection.accept(answer(Some(&manifest), None), &base()),
+            Err(TrustUpdateError::ManifestMissing)
+        ));
+        assert!(collection.pending.is_none());
+    }
+
+    /// And a fragment without its manifest is refused for the mirror reason:
+    /// nothing attributes it, orders it, or says how many more there are.
+    #[test]
+    fn a_fragment_without_its_manifest_is_refused() {
+        let objects = vec![object(1)];
+        let manifest = manifest(&objects, 1, base());
+        let orphan = chunk(&manifest, 0, 0, objects);
+        let mut collection = Collection::default();
+        assert!(matches!(
+            collection.accept(answer(None, Some(orphan)), &base()),
+            Err(TrustUpdateError::ManifestMissing)
+        ));
+    }
+
+    /// The compare-and-swap token of §0.6, checked before a fragment cycle is
+    /// spent: a transaction computed against a state this client has already
+    /// left describes a domain it is no longer in.
+    #[test]
+    fn a_transaction_built_for_another_local_state_is_refused_at_once() {
+        let objects = vec![object(1)];
+        let manifest = manifest(
+            &objects,
+            1,
+            Fingerprint::of(b"a state this client has left"),
+        );
+        let fragment = chunk(&manifest, 0, 0, objects);
+        let mut collection = Collection::default();
+        assert!(matches!(
+            collection.accept(answer(Some(&manifest), Some(fragment)), &base()),
+            Err(TrustUpdateError::BaseStateMoved)
+        ));
+        assert!(collection.pending.is_none());
+    }
+
+    /// A transaction is one decision. A manifest that changes mid-collection
+    /// is a second one, and two of them cannot be assembled into it.
+    #[test]
+    fn a_manifest_that_changes_mid_collection_is_a_conflict() {
+        let objects = vec![object(1), object(2)];
+        let first = manifest(&objects, 2, base());
+        let mut collection = Collection::default();
+        assert!(matches!(
+            collection
+                .accept(
+                    answer(
+                        Some(&first),
+                        Some(chunk(&first, 0, 0, vec![objects[0].clone()]))
+                    ),
+                    &base(),
+                )
+                .expect("the first fragment lands"),
+            Step::Poll
+        ));
+
+        // Same base state, same client, different transaction.
+        let mut second = manifest(&objects, 2, base());
+        second.transaction_id = Id16::new([7; 16]).expect("id");
+        assert!(matches!(
+            collection.accept(
+                answer(
+                    Some(&second),
+                    Some(chunk(&second, 1, 1, vec![objects[1].clone()])),
+                ),
+                &base(),
+            ),
+            Err(TrustUpdateError::ManifestChanged)
+        ));
+    }
+
+    /// Nothing is handed to the store until the last fragment lands, and what
+    /// is handed over is the whole ordered list — never a partial one.
+    #[test]
+    fn nothing_is_applied_before_the_last_fragment() {
+        let objects = vec![object(1), object(2)];
+        let manifest = manifest(&objects, 2, base());
+        let mut collection = Collection::default();
+
+        assert!(matches!(
+            collection
+                .accept(
+                    answer(
+                        Some(&manifest),
+                        Some(chunk(&manifest, 0, 0, vec![objects[0].clone()])),
+                    ),
+                    &base(),
+                )
+                .expect("first fragment"),
+            Step::Poll
+        ));
+
+        let step = collection
+            .accept(
+                answer(
+                    Some(&manifest),
+                    Some(chunk(&manifest, 1, 1, vec![objects[1].clone()])),
+                ),
+                &base(),
+            )
+            .expect("second fragment");
+        let Step::Apply {
+            manifest: applied,
+            chunks,
+        } = step
+        else {
+            panic!("a complete transaction is applied");
+        };
+        assert!(applied.fingerprint().matches(&manifest.fingerprint()));
+        assert_eq!(chunks.len(), 2);
+        // Taken, not copied: a second completion cannot replay the same
+        // fragments into a second write.
+        assert!(collection.collected.is_empty());
+    }
+
+    /// A gateway that returns the same fragment forever ends the collection
+    /// rather than spinning: `MAX_POLLS` bounds it, and an incomplete
+    /// transaction applies nothing.
+    #[test]
+    fn a_repeated_fragment_never_completes_the_transaction() {
+        let objects = vec![object(1), object(2)];
+        let manifest = manifest(&objects, 2, base());
+        let mut collection = Collection::default();
+        for _ in 0..MAX_POLLS {
+            let step = collection
+                .accept(
+                    answer(
+                        Some(&manifest),
+                        Some(chunk(&manifest, 0, 0, vec![objects[0].clone()])),
+                    ),
+                    &base(),
+                )
+                .expect("an identical fragment is idempotent, not a conflict");
+            assert!(matches!(step, Step::Poll));
+        }
+        // The loop in `run` gives up here; nothing was ever handed to the store.
+        assert!(collection
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.is_complete()));
+    }
+
+    /// Every object slot filled is not the same as every fragment received:
+    /// the chunk count is part of the signed manifest, so a transaction
+    /// completed on one fragment is one the sender never emitted.
+    #[test]
+    fn one_fragment_covering_every_object_does_not_complete_a_two_chunk_transaction() {
+        let objects = vec![object(1), object(2)];
+        let manifest = manifest(&objects, 2, base());
+        let mut collection = Collection::default();
+        let step = collection
+            .accept(
+                answer(
+                    Some(&manifest),
+                    Some(chunk(&manifest, 0, 0, objects.clone())),
+                ),
+                &base(),
+            )
+            .expect("a wide fragment is legal");
+        assert!(matches!(step, Step::Poll));
+    }
 }

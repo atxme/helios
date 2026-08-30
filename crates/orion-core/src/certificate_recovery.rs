@@ -138,6 +138,92 @@ impl RecoverySession {
     }
 }
 
+/// Assembles and double-signs the request, from the store and from nothing else.
+///
+/// Split out from [`begin`] so the decisions can be checked without a network
+/// and without an OS identity store: whether this identity has actually
+/// expired, which operator credential the request names, which generation it
+/// asks for, and that both halves sign it. What remains in `begin` is the
+/// transport and the sealed material it reads.
+///
+/// # Order
+///
+/// Expiry is confirmed **before** anything is generated. A client that ran
+/// this on a live identity would burn a generation and ask an operator for a
+/// touch that an ordinary renewal would have got without one.
+fn build_request(
+    state: &crate::certificates::TrustState,
+    expired_pq: PqCertificate,
+    expired_tls: DerCertificate,
+    expired_pq_private_key: &Zeroizing<Vec<u8>>,
+    astra_challenge: [u8; 32],
+    now_unix: u64,
+) -> Result<(ExpiredCertificateRecoveryRequest, CandidateKeys), RecoveryError> {
+    if now_unix < expired_pq.not_after_unix {
+        return Err(RecoveryError::NotExpired);
+    }
+    // The operator credential this request names. Any active row will do —
+    // the operator picks the physical key — and naming one is what lets Astra
+    // and the companion agree on which row an assertion must verify under.
+    let credential_id = state
+        .astra
+        .credential_bindings
+        .values()
+        .find(|binding| binding.state == aether::certificates::approval::CredentialState::Active)
+        .map(|binding| binding.credential_id.clone())
+        .ok_or_else(|| {
+            RecoveryError::Identity(
+                "ce profil ne connaît aucun credential opérateur actif : sans lui personne ne \
+                 peut approuver une récupération"
+                    .into(),
+            )
+        })?;
+
+    let tls = client_rotation_csr(&subject_of(&expired_pq))?;
+    let (pq_private_key, pq_public_key) = generate_ml_dsa_87_keypair()?;
+
+    let mut request_id = [0u8; 16];
+    aether::random::fill_public(&mut request_id)
+        .map_err(|_| CertificateError::RandomnessUnavailable)?;
+    let request = ExpiredCertificateRecoveryRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
+        trust_domain_id: state.trust_domain_id,
+        astra_challenge,
+        request_id: Id16::new(request_id)?,
+        gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+        server_name: state.gateway.server_name.clone(),
+        client_wg_public_key: state.client_wg_public_key,
+        expired_generation: state.certificates.active.generation,
+        requested_generation: state
+            .certificates
+            .active
+            .generation
+            .checked_add(1)
+            .ok_or(CertificateError::ArithmeticOverflow)?,
+        expired_tls_certificate: expired_tls,
+        expired_pq_certificate: expired_pq,
+        tls_csr: tls.csr.clone(),
+        new_ml_dsa_87_public_key: pq_public_key,
+        credential_id,
+        created_at: now_unix,
+        expires_at: now_unix
+            .checked_add(aether::certificates::approval::MAX_APPROVAL_LIFETIME_SECS)
+            .ok_or(CertificateError::ArithmeticOverflow)?,
+        expired_pq_signature: MlDsa87Signature::placeholder(),
+        new_pq_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(expired_pq_private_key, &pq_private_key)?;
+
+    Ok((
+        request,
+        CandidateKeys {
+            tls,
+            pq_private_key,
+        },
+    ))
+}
+
 /// Opens a recovery: draws the new keys, signs the request, posts it.
 ///
 /// # Order
@@ -172,9 +258,6 @@ pub async fn begin(
     )?;
 
     let expired_pq = crate::certificate_renewal::client_pq_leaf(&bundle)?;
-    if now_unix < expired_pq.not_after_unix {
-        return Err(RecoveryError::NotExpired);
-    }
     let expired_tls = leaf_of(&bundle)?;
     let expired_pq_private_key = decode_secret(&bundle.pq_private_key, "clé privée PQ expirée")?;
 
@@ -183,22 +266,6 @@ pub async fn begin(
     if authority.is_empty() {
         return Err(RecoveryError::TrustMaterialMissing);
     }
-    // The operator credential this request names. Any active row will do —
-    // the operator picks the physical key — and naming one is what lets Astra
-    // and the companion agree on which row an assertion must verify under.
-    let credential_id = state
-        .astra
-        .credential_bindings
-        .values()
-        .find(|binding| binding.state == aether::certificates::approval::CredentialState::Active)
-        .map(|binding| binding.credential_id.clone())
-        .ok_or_else(|| {
-            RecoveryError::Identity(
-                "ce profil ne connaît aucun credential opérateur actif : sans lui personne ne \
-                 peut approuver une récupération"
-                    .into(),
-            )
-        })?;
 
     let http = reqwest::Client::builder()
         .timeout(CALL_TIMEOUT)
@@ -214,41 +281,14 @@ pub async fn begin(
     )
     .await?;
 
-    let tls = client_rotation_csr(&subject_of(&expired_pq))?;
-    let (pq_private_key, pq_public_key) = generate_ml_dsa_87_keypair()?;
-
-    let mut request_id = [0u8; 16];
-    aether::random::fill_public(&mut request_id)
-        .map_err(|_| CertificateError::RandomnessUnavailable)?;
-    let request = ExpiredCertificateRecoveryRequest {
-        format_version: CERTIFICATE_FORMAT_VERSION,
-        protocol_version: aether::certificates::CERTIFICATE_PROTOCOL_VERSION,
-        trust_domain_id: state.trust_domain_id,
-        astra_challenge: challenge.astra_challenge,
-        request_id: Id16::new(request_id)?,
-        gateway_wg_public_key: state.gateway.gateway_wg_public_key,
-        server_name: state.gateway.server_name.clone(),
-        client_wg_public_key: state.client_wg_public_key,
-        expired_generation: state.certificates.active.generation,
-        requested_generation: state
-            .certificates
-            .active
-            .generation
-            .checked_add(1)
-            .ok_or(CertificateError::ArithmeticOverflow)?,
-        expired_tls_certificate: expired_tls,
-        expired_pq_certificate: expired_pq,
-        tls_csr: tls.csr.clone(),
-        new_ml_dsa_87_public_key: pq_public_key,
-        credential_id,
-        created_at: now_unix,
-        expires_at: now_unix
-            .checked_add(aether::certificates::approval::MAX_APPROVAL_LIFETIME_SECS)
-            .ok_or(CertificateError::ArithmeticOverflow)?,
-        expired_pq_signature: MlDsa87Signature::placeholder(),
-        new_pq_signature: MlDsa87Signature::placeholder(),
-    }
-    .sign(&expired_pq_private_key, &pq_private_key)?;
+    let (request, keys) = build_request(
+        state,
+        expired_pq,
+        expired_tls,
+        &expired_pq_private_key,
+        challenge.astra_challenge,
+        now_unix,
+    )?;
 
     let view: ExpiredRecoveryOperationView = post_json(
         &http,
@@ -261,10 +301,7 @@ pub async fn begin(
         http,
         operation_id: view.operation_id,
         request: Box::new(request),
-        keys: CandidateKeys {
-            tls,
-            pq_private_key,
-        },
+        keys,
     };
     let step = session.step_of(&view)?;
     Ok((session, step))
@@ -516,4 +553,300 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
 /// The fingerprint the interface shows while a recovery waits.
 pub fn request_fingerprint(session: &RecoverySession) -> Fingerprint {
     session.request.fingerprint()
+}
+
+#[cfg(all(test, feature = "certificate-signing"))]
+mod tests {
+    use super::*;
+    use crate::test_domain::{domain, store, Domain, NOW, SERVER_NAME, SUBJECT};
+    use aether::certificates::approval::{AstraCredentialBinding, CredentialState};
+    use aether::certificates::client::ClientCertificateGeneration;
+    use aether::certificates::encoding::WireGuardKey;
+    use aether::certificates::transport::ExpiredRecoveryState;
+    use aether::key_negotiation::{
+        issue_pq_certificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
+    };
+
+    /// The instant the recovery is attempted: past the fixture's expiry.
+    const LATER: u64 = NOW + 20 * 86_400;
+
+    /// The client's own leaf, already expired. A recovery exists for exactly
+    /// this document — no ordinary renewal accepts it.
+    fn expired_leaf(domain: &Domain) -> (PqCertificate, Zeroizing<Vec<u8>>) {
+        let (private, public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("client key");
+        let leaf = issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [8; 16],
+                subject: SUBJECT.into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Client,
+                wireguard_public_key: crate::test_domain::client_key().to_base64(),
+                ml_dsa_87_public_key:
+                    <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        public.as_bytes(),
+                    ),
+                not_before_unix: NOW - 86_400,
+                not_after_unix: NOW + 10 * 86_400,
+                ml_dsa_87_signature: String::new(),
+            },
+            &domain.ca_pq_private,
+        )
+        .expect("expired client leaf");
+        (leaf, private)
+    }
+
+    fn binding(state: CredentialState) -> AstraCredentialBinding {
+        AstraCredentialBinding {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id: vec![0xAB, 0xCD],
+            credential_public_key: vec![1; 32],
+            aaguid: [0; 16],
+            trust_domain_id: crate::test_domain::domain_id(),
+            gateway_wg_public_key: crate::test_domain::gateway_key(),
+            state,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: NOW,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    /// A store carrying the operator credentials this profile knows about,
+    /// and an active generation that describes the very leaves handed to
+    /// [`build_request`].
+    ///
+    /// Aligned rather than approximate: the historical validator compares the
+    /// presented leaves against the generation Astra last recorded, so a
+    /// fixture whose fingerprints only *look* right would pass a test that the
+    /// real exchange fails.
+    fn state_with(
+        directory: &std::path::Path,
+        domain: &Domain,
+        credentials: Vec<AstraCredentialBinding>,
+        expired: &PqCertificate,
+    ) -> crate::certificates::TrustState {
+        let mut state = store(directory, domain).state().clone();
+        state.astra.credential_bindings = credentials
+            .into_iter()
+            .enumerate()
+            .map(|(index, binding)| (format!("credential-{index}"), binding))
+            .collect();
+        state.certificates =
+            aether::certificates::state::ClientCertificateState::new(ClientCertificateGeneration {
+                generation: 4,
+                ca_tls_epoch: 1,
+                tls_ca_certificate_fingerprint: domain.tls_ca_der.fingerprint(),
+                tls_certificate_fingerprint: domain.active_client_tls.fingerprint(),
+                pq_certificate_fingerprint:
+                    aether::certificates::gateway::pq_certificate_fingerprint(expired)
+                        .expect("pq fingerprint"),
+                not_before: NOW - 86_400,
+                not_after: NOW + 10 * 86_400,
+            });
+        state
+    }
+
+    /// The order the module's own doc-comment claims: expiry is confirmed
+    /// before a single key is drawn. Running this on a live identity would
+    /// burn a generation and ask an operator for a touch that an ordinary
+    /// renewal gets without one.
+    #[test]
+    fn a_live_identity_is_refused_before_any_key_is_generated() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+        let state = state_with(
+            directory.path(),
+            &domain,
+            vec![binding(CredentialState::Active)],
+            &leaf,
+        );
+
+        assert!(matches!(
+            build_request(
+                &state,
+                leaf,
+                domain.active_client_tls.clone(),
+                &private,
+                [3; 32],
+                NOW, // before not_after: the identity is still in service
+            ),
+            Err(RecoveryError::NotExpired)
+        ));
+    }
+
+    /// A recovery names the credential an operator will answer under. Without
+    /// one, nobody can approve it — and the profile says so instead of posting
+    /// a request that Astra would open and no touch could ever close.
+    #[test]
+    fn a_profile_with_no_active_operator_credential_is_refused_by_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+
+        for credentials in [vec![], vec![binding(CredentialState::Revoked)]] {
+            let state = state_with(directory.path(), &domain, credentials, &leaf);
+            let refusal = build_request(
+                &state,
+                leaf.clone(),
+                domain.active_client_tls.clone(),
+                &private,
+                [3; 32],
+                LATER,
+            );
+            assert!(matches!(refusal, Err(RecoveryError::Identity(_))));
+        }
+    }
+
+    /// The whole point of the client half: what it assembles is what the
+    /// authority's historical validator accepts. Both signatures, the
+    /// challenge, the domain, the gateway, the generation.
+    #[test]
+    fn the_request_this_client_builds_is_the_one_the_validator_accepts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+        let state = state_with(
+            directory.path(),
+            &domain,
+            vec![binding(CredentialState::Active)],
+            &leaf,
+        );
+        let challenge = [7u8; 32];
+
+        let (request, keys) = build_request(
+            &state,
+            leaf,
+            domain.active_client_tls.clone(),
+            &private,
+            challenge,
+            LATER,
+        )
+        .expect("the request is built");
+
+        // A recovery restores an identity; it never renames one, and it never
+        // skips a generation.
+        assert_eq!(request.expired_pq_certificate.subject, SUBJECT);
+        assert_eq!(
+            request.requested_generation,
+            state.certificates.active.generation + 1
+        );
+        assert_eq!(request.credential_id, vec![0xAB, 0xCD]);
+        // The candidate keys stay here. What travels is a PKCS#10 and a public
+        // key, each covered by a signature of its own private half.
+        assert_eq!(request.tls_csr, keys.tls.csr);
+
+        let issuer = &domain.ca_pq_public;
+        request
+            .verify_historical(
+                &[issuer],
+                &state.trust_domain_id,
+                &state.gateway.gateway_wg_public_key,
+                SERVER_NAME,
+                &state.client_wg_public_key,
+                &state.certificates.active,
+                &challenge,
+                LATER,
+            )
+            .expect("the authority accepts what this client signed");
+
+        // The challenge is not decoration: another one breaks the request.
+        assert!(request
+            .verify_historical(
+                &[issuer],
+                &state.trust_domain_id,
+                &state.gateway.gateway_wg_public_key,
+                SERVER_NAME,
+                &state.client_wg_public_key,
+                &state.certificates.active,
+                &[9; 32],
+                LATER,
+            )
+            .is_err());
+    }
+
+    /// The answer must be about **this** request and **this** client. A view
+    /// that names another recovery would advance a session towards installing
+    /// a grant nobody asked for on this machine.
+    #[test]
+    fn an_answer_about_another_recovery_advances_nothing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let domain = domain();
+        let (leaf, private) = expired_leaf(&domain);
+        let state = state_with(
+            directory.path(),
+            &domain,
+            vec![binding(CredentialState::Active)],
+            &leaf,
+        );
+        let (request, keys) = build_request(
+            &state,
+            leaf,
+            domain.active_client_tls.clone(),
+            &private,
+            [7; 32],
+            LATER,
+        )
+        .expect("request");
+
+        let operation_id = Id16::new([4; 16]).expect("id");
+        let session = RecoverySession {
+            base: "https://astra.example".into(),
+            http: reqwest::Client::new(),
+            operation_id,
+            request: Box::new(request),
+            keys,
+        };
+
+        let view = |fingerprint: Fingerprint, client: WireGuardKey| ExpiredRecoveryOperationView {
+            operation_id,
+            state: ExpiredRecoveryState::AwaitingOperator,
+            client_wg_public_key: client,
+            request_fingerprint: fingerprint,
+            created_at: LATER,
+            expires_at: LATER + 300,
+            request: None,
+            receipt: None,
+            gateway_pq_certificate: None,
+            grant: None,
+        };
+
+        let mine = session.request.fingerprint();
+        assert!(matches!(
+            session
+                .step_of(&view(mine, session.request.client_wg_public_key))
+                .expect("this recovery"),
+            RecoveryStep::AwaitingOperator { .. }
+        ));
+        assert!(matches!(
+            session.step_of(&view(
+                Fingerprint::of(b"another request"),
+                session.request.client_wg_public_key
+            )),
+            Err(RecoveryError::Refused)
+        ));
+        assert!(matches!(
+            session.step_of(&view(mine, WireGuardKey::from_bytes([0x5A; 32]))),
+            Err(RecoveryError::Refused)
+        ));
+    }
+
+    /// The known limit of §7.5, as an error rather than a panic: without the
+    /// historical material there is no proof to produce, and the client says
+    /// which door is left — an operator readmission.
+    #[test]
+    fn a_bundle_without_its_historical_leaf_names_the_missing_proof() {
+        let bundle = ClientIdentityBundle {
+            certificate_chain: Vec::new(),
+            ..crate::test_domain::bundle(&domain())
+        };
+        assert!(matches!(
+            leaf_of(&bundle),
+            Err(RecoveryError::NoHistoricalProof)
+        ));
+    }
 }

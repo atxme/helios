@@ -38,6 +38,8 @@ pub mod profile_import;
 pub mod provisioning;
 pub mod speedtest;
 pub mod telemetry;
+#[cfg(all(test, feature = "certificate-signing"))]
+pub(crate) mod test_domain;
 pub mod trust_update;
 pub mod vault;
 

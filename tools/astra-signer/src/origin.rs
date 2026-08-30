@@ -106,6 +106,37 @@ impl Origin {
             )
             .context("lecture de l'opération")?;
 
+        let answer: SignerRequestAnswer = {
+            let read_token = Self::read_token(operation_id, &view)?;
+            self.get(
+                &format!("{}/v1/signer-requests/{}", self.base, operation_id.to_hex()),
+                Some(&read_token),
+            )
+            .context("lecture de la demande de signature")?
+        };
+        Self::accept(operation_id, view, answer)
+    }
+
+    /// The read token this operation still delivers, or the reason it does not.
+    ///
+    /// Separate from [`Self::accept`] because it is the one thing the caller
+    /// needs *before* the second call, and the only reason `fetch` reads the
+    /// view twice would otherwise be to hand it over.
+    fn read_token(
+        operation_id: &Id16,
+        view: &astra::signing::SigningOperationView,
+    ) -> Result<String> {
+        Self::assert_view(operation_id, view)?;
+        view.signer_request_token.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "l'opération ne délivre plus de jeton de lecture : sa fenêtre est passée. \
+                 Rouvrir la campagne par `astra campaign open`."
+            )
+        })
+    }
+
+    /// What an operation read must say before anything else is asked of it.
+    fn assert_view(operation_id: &Id16, view: &astra::signing::SigningOperationView) -> Result<()> {
         if view.operation_id != *operation_id {
             bail!(
                 "l'autorité a répondu au sujet de l'opération {} et non de {}",
@@ -119,25 +150,27 @@ impl Origin {
                  l'autorité la refuserait comme un conflit."
             );
         }
-        let read_token = view.signer_request_token.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "l'opération ne délivre plus de jeton de lecture : sa fenêtre est passée. \
-                 Rouvrir la campagne par `astra campaign open`."
-            )
-        })?;
+        Ok(())
+    }
+
+    /// Everything the two answers must agree on before the operator is asked.
+    ///
+    /// Kept apart from the transport on purpose: nothing here is about HTTP,
+    /// and all of it is about what the origin is not allowed to decide — which
+    /// operation this is, whether it still awaits a touch, and that the text
+    /// the operator will read is the one the *signed* request names.
+    fn accept(
+        operation_id: &Id16,
+        view: astra::signing::SigningOperationView,
+        answer: SignerRequestAnswer,
+    ) -> Result<CampaignRequest> {
+        Self::assert_view(operation_id, &view)?;
         let result_token = view.signer_result_token.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "l'opération ne délivre plus de jeton de dépôt : sa fenêtre est passée. \
                  Rouvrir la campagne par `astra campaign open`."
             )
         })?;
-
-        let answer: SignerRequestAnswer = self
-            .get(
-                &format!("{}/v1/signer-requests/{}", self.base, operation_id.to_hex()),
-                Some(&read_token),
-            )
-            .context("lecture de la demande de signature")?;
 
         if answer.signer_request.operation_id != *operation_id {
             bail!(
@@ -208,7 +241,21 @@ impl Origin {
                 bytes.len()
             );
         }
-        let bytes = zeroize::Zeroizing::new(bytes.to_vec());
+        Self::accept_vault(request, bytes.to_vec())
+    }
+
+    /// The vault bytes, or a refusal that says not to open them.
+    ///
+    /// The fingerprint compared is the one the **signed** request names, so a
+    /// substituted file is refused here rather than at an unlock that fails
+    /// obscurely — with an operator holding a security key and no idea which
+    /// of the two halves is wrong.
+    fn accept_vault(
+        request: &CampaignRequest,
+        bytes: Vec<u8>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let expected = request.signer_request.encrypted_vault_fingerprint;
+        let bytes = zeroize::Zeroizing::new(bytes);
         if !Fingerprint::of(&bytes).matches(&expected) {
             bail!(
                 "le coffre reçu n'est pas celui que la demande signée nomme. Ne pas l'ouvrir : \
@@ -386,4 +433,213 @@ struct SignerRequestAnswer {
     credential_registry: Box<aether::certificates::approval::CredentialRegistry>,
     webauthn_rp_id: String,
     webauthn_origin: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::approval::CredentialRegistry;
+    use aether::certificates::encoding::{MlDsa87Signature, TrustDomainId, WireGuardKey};
+    use aether::certificates::status::{
+        CampaignScope, CampaignTarget, CertificateKind, MAX_CAMPAIGN_TARGETS,
+    };
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+    use astra::signing::{SigningOperationState, SigningOperationView};
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn operation() -> Id16 {
+        Id16::new([4; 16]).expect("id")
+    }
+
+    fn campaign() -> Box<AstraRotationCampaign> {
+        let scope = CampaignScope::FleetLeafs;
+        Box::new(AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([7; 16]).expect("id"),
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            server_name: "gateway.example".into(),
+            created_at: NOW,
+            expires_at: NOW + 300,
+            scope,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientPq,
+                identity_key: WireGuardKey::from_bytes([3; 32]),
+                epoch: 1,
+                generation: 4,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"tls"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"pq"),
+            }],
+            reason: "rotation trimestrielle".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: scope.required_credentials(),
+        })
+    }
+
+    fn signer_request(
+        campaign: &AstraRotationCampaign,
+        vault: Fingerprint,
+    ) -> Box<AstraSignerRequest> {
+        Box::new(AstraSignerRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id: operation(),
+            campaign_fingerprint: campaign.fingerprint(),
+            authority_url: "https://astra.example".into(),
+            encrypted_vault_fingerprint: vault,
+            required_credentials: campaign.required_credentials,
+            created_at: NOW,
+            expires_at: NOW + 300,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        })
+    }
+
+    fn view(campaign: &AstraRotationCampaign) -> SigningOperationView {
+        SigningOperationView {
+            operation_id: operation(),
+            state: SigningOperationState::AwaitingOperator,
+            scope: campaign.scope,
+            target_count: campaign.targets.len(),
+            required_credentials: campaign.required_credentials,
+            campaign_fingerprint: campaign.fingerprint(),
+            created_at: NOW,
+            expires_at: NOW + 300,
+            signer_request_token: Some("read".into()),
+            vault_token: None,
+            signer_result_token: Some("submit".into()),
+        }
+    }
+
+    fn answer(campaign: Box<AstraRotationCampaign>, vault: Fingerprint) -> SignerRequestAnswer {
+        SignerRequestAnswer {
+            signer_request: signer_request(&campaign, vault),
+            campaign,
+            credential_registry: Box::new(CredentialRegistry {
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            }),
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+        }
+    }
+
+    /// This channel leaves the tunnel, so TLS is what authenticates it. A
+    /// plain-text origin is refused before a single token could travel on it.
+    #[test]
+    fn an_origin_that_is_not_https_is_refused() {
+        assert!(Origin::new("http://astra.example").is_err());
+        assert!(Origin::new("astra.example").is_err());
+        Origin::new("https://astra.example/").expect("an https origin");
+    }
+
+    /// The two answers must agree, and they must agree about *this* operation.
+    #[test]
+    fn the_campaign_served_must_be_the_one_the_signed_request_names() {
+        let campaign = campaign();
+        let vault = Fingerprint::of(b"vault");
+        let request = Origin::accept(
+            &operation(),
+            view(&campaign),
+            answer(campaign.clone(), vault),
+        )
+        .expect("both answers describe one campaign");
+        assert_eq!(request.operation_id, operation());
+        assert_eq!(request.result_token, "submit");
+        // Compared, never adopted: the caller checks these against the vault.
+        assert_eq!(request.webauthn_rp_id, "astra.example");
+
+        // A campaign whose text moved after the request was signed. Its
+        // fingerprint no longer matches, so the token would authorize a
+        // decision the operator never read.
+        let mut moved = campaign.clone();
+        moved.reason = "autre chose".into();
+        assert!(Origin::accept(&operation(), view(&campaign), answer(moved, vault),).is_err());
+    }
+
+    /// An origin answering about another operation is answering about another
+    /// operator's touch.
+    #[test]
+    fn an_answer_about_another_operation_is_refused() {
+        let campaign = campaign();
+        let vault = Fingerprint::of(b"vault");
+
+        let mut elsewhere = view(&campaign);
+        elsewhere.operation_id = Id16::new([9; 16]).expect("id");
+        assert!(Origin::accept(&operation(), elsewhere, answer(campaign.clone(), vault)).is_err());
+
+        // And the reverse: the signed request naming another operation.
+        let mut other_answer = answer(campaign.clone(), vault);
+        other_answer.signer_request.operation_id = Id16::new([9; 16]).expect("id");
+        assert!(Origin::accept(&operation(), view(&campaign), other_answer).is_err());
+    }
+
+    /// A campaign already approved does not take a second assertion: the
+    /// authority would refuse it as a conflict, and asking for a touch that
+    /// cannot land is the one thing a companion must not do.
+    #[test]
+    fn an_operation_already_approved_asks_for_no_second_touch() {
+        let campaign = campaign();
+        let vault = Fingerprint::of(b"vault");
+        let mut spent = view(&campaign);
+        spent.state = SigningOperationState::Approved;
+        let refusal = Origin::accept(&operation(), spent, answer(campaign, vault))
+            .expect_err("an approved campaign opens no second ceremony");
+        assert!(refusal.to_string().contains("déjà approuvée"));
+    }
+
+    /// A window that has passed takes its tokens with it, and the refusal says
+    /// which gesture reopens one rather than failing at the deposit.
+    #[test]
+    fn an_operation_without_its_tokens_is_refused_by_name() {
+        let campaign = campaign();
+        let vault = Fingerprint::of(b"vault");
+
+        let mut no_read = view(&campaign);
+        no_read.signer_request_token = None;
+        let refusal = Origin::read_token(&operation(), &no_read).expect_err("no read token");
+        assert!(refusal.to_string().contains("astra campaign open"));
+
+        let mut no_submit = view(&campaign);
+        no_submit.signer_result_token = None;
+        assert!(Origin::accept(&operation(), no_submit, answer(campaign, vault)).is_err());
+    }
+
+    /// The vault is compared against the fingerprint the **signed** request
+    /// names. A substituted file is refused here, not at an unlock that fails
+    /// obscurely with a security key already in hand.
+    #[test]
+    fn a_vault_that_is_not_the_one_the_request_names_is_refused() {
+        let campaign = campaign();
+        let bytes = b"an encrypted vault".to_vec();
+        let request = Origin::accept(
+            &operation(),
+            view(&campaign),
+            answer(campaign, Fingerprint::of(&bytes)),
+        )
+        .expect("request");
+
+        let opened = Origin::accept_vault(&request, bytes.clone()).expect("the named vault");
+        assert_eq!(opened.as_slice(), bytes.as_slice());
+
+        let refusal = Origin::accept_vault(&request, b"another file entirely".to_vec())
+            .expect_err("a substituted vault");
+        assert!(refusal.to_string().contains("Ne pas l'ouvrir"));
+    }
+
+    /// The ceiling of §8.2 is a real bound, and the campaign fixture stays
+    /// under it — a test that resolved more targets than the format allows
+    /// would be testing a document the authority never emits.
+    #[test]
+    fn the_fixture_campaign_is_one_an_authority_could_actually_emit() {
+        let campaign = campaign();
+        assert!(campaign.targets.len() <= MAX_CAMPAIGN_TARGETS);
+        campaign
+            .validate(NOW + 1)
+            .expect("a campaign an operator may read");
+    }
 }
