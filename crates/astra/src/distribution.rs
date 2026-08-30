@@ -419,6 +419,7 @@ mod tests {
             ca_public_key: ca_public,
             ca_tls_epoch: 1,
             ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+            ca_tls_rotation: None,
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,

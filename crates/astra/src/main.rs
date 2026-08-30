@@ -563,6 +563,7 @@ fn bootstrap(
         ca_public_key,
         ca_tls_epoch: 1,
         ca_tls_fingerprint,
+        ca_tls_rotation: None,
         astra_service_key_epoch: 1,
         astra_service_public_key: service_public_key.clone(),
         issuer: None,

@@ -115,6 +115,33 @@ pub const MAX_STORED_TRANSITIONS: usize = 8;
 /// recipient can remember would only defer a deterministic refusal.
 pub const MAX_STORED_REVOCATIONS: usize = aether::certificates::state::MAX_REVOCATION_TOMBSTONES;
 
+/// The incoming client TLS anchor Astra has accepted but not yet adopted.
+///
+/// The complete certificate remains in the signed transition held below. The
+/// registry only needs the state that becomes authoritative at retirement,
+/// kept together so a partially described window is not representable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTlsCaRotation {
+    pub next_ca_tls_epoch: u64,
+    pub next_ca_tls_fingerprint: Fingerprint,
+    pub activation_at: u64,
+    pub retire_active_at: u64,
+}
+
+impl ClientTlsCaRotation {
+    fn from_transition(
+        transition: &aether::certificates::authority::ClientTlsCaTransition,
+    ) -> Self {
+        Self {
+            next_ca_tls_epoch: transition.next_ca_tls_epoch,
+            next_ca_tls_fingerprint: transition.next_client_tls_ca_certificate.fingerprint(),
+            activation_at: transition.window.activation_at,
+            retire_active_at: transition.window.not_after,
+        }
+    }
+}
+
 /// Everything Astra persists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +167,12 @@ pub struct AstraState {
     /// name; `astra pin-ca-tls` records it once.
     #[serde(default)]
     pub ca_tls_fingerprint: Option<Fingerprint>,
+    /// Signed `CA-TLS` successor awaiting retirement of the active anchor.
+    ///
+    /// Additive and defaulted so a registry written before Astra adopted the
+    /// anchor it distributes still loads with no rotation in flight.
+    #[serde(default)]
+    pub ca_tls_rotation: Option<ClientTlsCaRotation>,
 
     pub astra_service_key_epoch: u64,
     pub astra_service_public_key: MlDsa87PublicKey,
@@ -234,9 +267,10 @@ impl AstraRegistry {
         let raw = std::fs::read(path)?;
         let mut document: serde_json::Value = serde_json::from_slice(&raw)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
-        let migrated = Self::migrate(&mut document)?;
-        let state: AstraState = serde_json::from_value(document)
+        let mut migrated = Self::migrate(&mut document)?;
+        let mut state: AstraState = serde_json::from_value(document)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+        migrated |= Self::recover_client_tls_ca_rotation(&mut state)?;
         match expected_head {
             Some(expected) if allow_status_tail => {
                 state.audit.verify_after_status_tail(expected)?
@@ -254,8 +288,8 @@ impl AstraRegistry {
             registry.save()?;
             tracing::info!(
                 path = %path.display(),
-                "registry migrated: the pinned issuance policy and the credential registry epoch \
-                 were recomputed from the identity already recorded"
+                "registry migrated: derived state was restored from the identity and signed \
+                 transitions already recorded"
             );
         }
         Ok(registry)
@@ -323,6 +357,54 @@ impl AstraRegistry {
             migrated = true;
         }
         Ok(migrated)
+    }
+
+    /// Restores the `CA-TLS` window accepted by a registry written before the
+    /// window itself was persisted.
+    ///
+    /// The transition is verified again against the active pin. Two different
+    /// successors for the same epoch are refused as corruption rather than
+    /// choosing one based on storage order.
+    fn recover_client_tls_ca_rotation(state: &mut AstraState) -> Result<bool, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        if state.ca_tls_rotation.is_some() {
+            return Ok(false);
+        }
+        let Some(active) = state.ca_tls_fingerprint else {
+            return Ok(false);
+        };
+        let mut recovered = None;
+        for transition in state
+            .transitions
+            .iter()
+            .filter_map(|stored| match &stored.object {
+                TrustUpdateObject::ClientTlsCaTransition(transition)
+                    if transition.current_ca_tls_epoch == state.ca_tls_epoch
+                        && transition.active_client_tls_ca_fingerprint.matches(&active) =>
+                {
+                    Some(transition.as_ref())
+                }
+                _ => None,
+            })
+        {
+            transition.verify(
+                &state.ca_public_key,
+                &state.trust_domain_id,
+                state.ca_epoch,
+                state.ca_tls_epoch,
+                &active,
+            )?;
+            if recovered.is_some() {
+                return Err(RegistryError::Corrupt(
+                    "multiple client CA-TLS rotations target the active epoch".into(),
+                ));
+            }
+            recovered = Some(ClientTlsCaRotation::from_transition(transition));
+        }
+        let restored = recovered.is_some();
+        state.ca_tls_rotation = recovered;
+        Ok(restored)
     }
 
     pub fn state(&self) -> &AstraState {
@@ -421,6 +503,7 @@ impl AstraRegistry {
 
         let mut fresh = Vec::new();
         let mut withdrawn = Vec::new();
+        let mut ca_tls_rotation = self.state.ca_tls_rotation.clone();
         for object in objects {
             let fingerprint = object.fingerprint()?;
             let held = self.state.transitions.iter().try_fold(
@@ -598,6 +681,14 @@ impl AstraRegistry {
                         self.state.ca_tls_epoch,
                         &active,
                     )?;
+                    if ca_tls_rotation.is_some() {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "a client CA-TLS rotation is already in flight",
+                            ),
+                        ));
+                    }
+                    ca_tls_rotation = Some(ClientTlsCaRotation::from_transition(transition));
                 }
                 _ => {
                     return Err(RegistryError::Transition(
@@ -653,6 +744,7 @@ impl AstraRegistry {
         self.state.transitions.retain(|stored| {
             retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
         });
+        self.state.ca_tls_rotation = ca_tls_rotation;
         let accepted = fresh.len();
         for object in fresh {
             // A gateway transition is held back until §11.1 step 6; every
@@ -699,13 +791,17 @@ impl AstraRegistry {
         Ok(accepted)
     }
 
-    /// Drops the transitions no peer can still be told about (spec §4.1).
+    /// Adopts a due client TLS anchor and drops transitions no peer can still
+    /// be told about (spec §§4.1 and 9.4).
     ///
     /// A transition past its `not_after` authorizes nothing: a client that
     /// received it would refuse it, and one that did not has to be repaired by
     /// an operator rather than by a delivery that arrives after the window it
     /// was signed for. Forgetting it is what keeps the bounded store from
-    /// filling with objects that can no longer do anything.
+    /// filling with objects that can no longer do anything. Promotion and the
+    /// removal of the transition it consumes share this method and therefore
+    /// one atomic registry write: after a restart Astra cannot observe one
+    /// without the other.
     pub fn forget_expired_transitions(&mut self, now_unix: u64) -> Result<usize, RegistryError> {
         let before = self.state.transitions.len();
         self.state
@@ -717,7 +813,21 @@ impl AstraRegistry {
                 None => false,
             });
         let dropped = before - self.state.transitions.len();
-        if dropped > 0 {
+        let due_rotation = self
+            .state
+            .ca_tls_rotation
+            .as_ref()
+            .filter(|rotation| now_unix >= rotation.retire_active_at)
+            .cloned();
+        let promoted = if let Some(rotation) = due_rotation {
+            self.state.ca_tls_epoch = rotation.next_ca_tls_epoch;
+            self.state.ca_tls_fingerprint = Some(rotation.next_ca_tls_fingerprint);
+            self.state.ca_tls_rotation = None;
+            true
+        } else {
+            false
+        };
+        if dropped > 0 || promoted {
             self.save()?;
         }
         Ok(dropped)
@@ -1165,6 +1275,7 @@ mod tests {
                 ca_public_key: ca_public.clone(),
                 ca_tls_epoch: 1,
                 ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+                ca_tls_rotation: None,
                 astra_service_key_epoch: 1,
                 astra_service_public_key: service,
                 issuer: None,
@@ -1694,9 +1805,28 @@ mod tests {
             TrustUpdateObject,
             aether::certificates::encoding::DerCertificate,
         ) {
+            client_tls_ca_transition_with_window(
+                anchored,
+                current_epoch,
+                active,
+                "successor",
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+        }
+
+        fn client_tls_ca_transition_with_window(
+            anchored: &Anchored,
+            current_epoch: u64,
+            active: Fingerprint,
+            successor_name: &str,
+            window: TransitionWindow,
+        ) -> (
+            TrustUpdateObject,
+            aether::certificates::encoding::DerCertificate,
+        ) {
             use aether::certificates::authority::ClientTlsCaTransition;
 
-            let next = aether::certificates::test_x509::client_material("successor").authority;
+            let next = aether::certificates::test_x509::client_material(successor_name).authority;
             let object = ClientTlsCaTransition {
                 format_version: CERTIFICATE_FORMAT_VERSION,
                 trust_domain_id: anchored.registry.state().trust_domain_id,
@@ -1705,7 +1835,7 @@ mod tests {
                 next_ca_tls_epoch: current_epoch + 1,
                 active_client_tls_ca_fingerprint: active,
                 next_client_tls_ca_certificate: next.clone(),
-                window: TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+                window,
                 ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
             }
             .sign(&anchored.ca_private)
@@ -1727,7 +1857,7 @@ mod tests {
                 .state()
                 .ca_tls_fingerprint
                 .expect("pinned by the fixture");
-            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+            let (object, next) = client_tls_ca_transition(&anchored, 1, active);
 
             assert_eq!(
                 anchored
@@ -1736,6 +1866,188 @@ mod tests {
                     .expect("accepted"),
                 1
             );
+            assert_eq!(
+                anchored.registry.state().ca_tls_rotation,
+                Some(ClientTlsCaRotation {
+                    next_ca_tls_epoch: 2,
+                    next_ca_tls_fingerprint: next.fingerprint(),
+                    activation_at: 3_000,
+                    retire_active_at: 5_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_client_tls_ca_rotation_does_not_promote_before_not_after() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, next) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(4_999)
+                    .expect("sweep before retirement"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(active));
+            assert!(anchored.registry.state().ca_tls_rotation.is_some());
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+            assert!(!active.matches(&next.fingerprint()));
+        }
+
+        #[test]
+        fn a_due_client_tls_ca_rotation_is_promoted_once_and_allows_the_next_rotation() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (first, first_successor) = client_tls_ca_transition(&anchored, 1, active);
+            let first_successor_fingerprint = first_successor.fingerprint();
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first rotation accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("promoted at retirement"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_tls_fingerprint,
+                Some(first_successor_fingerprint)
+            );
+            assert!(anchored.registry.state().ca_tls_rotation.is_none());
+            assert!(anchored.registry.state().transitions.is_empty());
+
+            anchored.registry =
+                AstraRegistry::load(&anchored._directory.path().join("astra.json"), None)
+                    .expect("the promotion and removal were persisted together");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("second promotion is a no-op"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_tls_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_tls_fingerprint,
+                Some(first_successor_fingerprint)
+            );
+
+            let (second, second_successor) = client_tls_ca_transition_with_window(
+                &anchored,
+                2,
+                first_successor_fingerprint,
+                "second-successor",
+                TransitionWindow::new(6_000, 7_000, 8_000).expect("second window"),
+            );
+            let second_campaign = campaign(
+                aether::certificates::status::CampaignScope::TrustAuthorities,
+                vec![aether::certificates::status::CampaignTarget {
+                    certificate_kind: aether::certificates::status::CertificateKind::CaTls,
+                    identity_key: anchored.registry.state().gateway_wg_public_key,
+                    epoch: 2,
+                    generation: 2,
+                    active_tls_certificate_fingerprint: first_successor_fingerprint,
+                    active_pq_certificate_fingerprint: first_successor_fingerprint,
+                }],
+            );
+            second_campaign
+                .covers_authority_object(&second)
+                .expect("the next campaign describes the promoted anchor");
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&second_campaign, &[second], None, 6_500)
+                    .expect("second rotation accepted"),
+                1
+            );
+            assert_eq!(
+                anchored.registry.state().ca_tls_rotation,
+                Some(ClientTlsCaRotation {
+                    next_ca_tls_epoch: 3,
+                    next_ca_tls_fingerprint: second_successor.fingerprint(),
+                    activation_at: 7_000,
+                    retire_active_at: 8_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_registry_recovers_a_stored_client_tls_ca_window_from_the_legacy_format() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (object, _) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            let expected = anchored.registry.state().ca_tls_rotation.clone();
+            let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+            encoded
+                .as_object_mut()
+                .expect("registry object")
+                .remove("ca_tls_rotation");
+            let path = anchored._directory.path().join("astra.json");
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&encoded).expect("legacy encoding"),
+            )
+            .expect("legacy registry written");
+
+            let restored = AstraRegistry::load(&path, None).expect("legacy registry loaded");
+            assert_eq!(restored.state().ca_tls_rotation, expected);
+        }
+
+        #[test]
+        fn a_second_client_tls_ca_rotation_is_refused_while_one_is_in_flight() {
+            let mut anchored = anchored();
+            let active = anchored
+                .registry
+                .state()
+                .ca_tls_fingerprint
+                .expect("pinned");
+            let (first, _) = client_tls_ca_transition(&anchored, 1, active);
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first accepted");
+            let held = anchored.registry.state().ca_tls_rotation.clone();
+            let (competing, _) = client_tls_ca_transition_with_window(
+                &anchored,
+                1,
+                active,
+                "competing-successor",
+                TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+            );
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[competing], None, 2_100)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_tls_rotation, held);
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
         }
 
         #[test]
@@ -2005,6 +2317,7 @@ mod tests {
             ca_public_key: ca,
             ca_tls_epoch: 1,
             ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+            ca_tls_rotation: None,
             astra_service_key_epoch: 1,
             astra_service_public_key: service,
             issuer: None,

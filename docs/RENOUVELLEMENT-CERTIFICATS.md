@@ -488,6 +488,14 @@ continuent de monter des tunnels le temps que le parc soit ré-émis. À
 de générations — une purge qui déplacerait l'une sans l'autre laisserait
 accepter une chaîne que le domaine a retirée.
 
+**Astra adopte le pin qu'il distribue.** Le dépôt signé ouvre dans son registre
+un slot entrant portant l'empreinte, la génération et la fenêtre. La passe
+horodatée du service ne le promeut pas à `activation_at` : à `not_after`, elle
+avance l'époque et l'empreinte actives, referme le slot et oublie la transition
+consommée dans une seule écriture atomique. Une campagne
+`trust-authorities` suivante décrit donc bien l'ancre désormais active ;
+`pin-ca-tls` reste incapable de la remplacer.
+
 **Limite connue** : la rotation ne ré-émet pas les feuilles clientes. Elles
 restent valides sous l'ancienne ancre jusqu'à `not_after`, et c'est une
 campagne `fleet_leafs` — ou le renouvellement ordinaire à 80 % — qui les fait
@@ -520,7 +528,8 @@ fait.
   et §11.6 garde cette résolution locale — une campagne est l'inventaire du
   domaine. La console les nomme avec leur commande ; elles se lancent dans le
   conteneur Astra.
-- **L'adoption d'une ancre distribuée** par Astra et par la gateway.
+- **L'adoption de l'ancre `CA-PQ` distribuée** par Astra et par la gateway.
+  `CA-TLS` est adoptée automatiquement à `not_after` des deux côtés.
 
 ## Vérifier où en est le domaine
 

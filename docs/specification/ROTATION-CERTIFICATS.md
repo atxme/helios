@@ -2598,7 +2598,7 @@ libellé montre avant approbation le nombre de cibles, les générations et si u
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
 
-### 12.3 État de l'implémentation au 27 août 2026
+### 12.3 État de l'implémentation au 30 août 2026
 
 **Livré et testé.**
 
@@ -2889,7 +2889,13 @@ contournés :
   l'ancre sortante pendant tout le recouvrement, parce que la gateway compare
   `ca_tls_epoch` à l'identique et ne l'avance qu'à `retire_active_at` : les
   deux côtés basculent donc à la même seconde, et le successeur ne certifie
-  rien avant elle. La décision
+  rien avant elle. Astra conserve lui aussi un slot entrant — empreinte,
+  génération et fenêtre — dès qu'il accepte la transition signée. Sa passe
+  horodatée ne promeut ni à `not_before`, ni à `activation_at` : à
+  `not_after`, elle avance ensemble `ca_tls_epoch` et le pin actif, referme le
+  slot et oublie la transition consommée dans une seule écriture atomique du
+  registre. Une seconde rotation est alors vérifiée contre l'ancre réellement
+  en service, sans commande capable de déplacer le pin. La décision
   est écrite avant d'être annoncée : la cérémonie dépose `astra-prepared.json`
   — les octets exacts du dépôt — avant de contacter l'autorité, et
   `astra-signer resume-rotation` rejoue ce dépôt à l'identique après une panne,
@@ -2904,12 +2910,10 @@ contournés :
   échéance — les deux feuilles gateway n'expirent pas ensemble, contrairement à
   une génération cliente — et la gateway applique la décision sur son propre
   axe de compteur, terminale.
-  **Limite connue** : le domaine n'**adopte** pas de lui-même une ancre
-  distribuée. Les clients l'appliquent ; le registre Astra et l'épinglage de la
-  gateway restent sur l'ancre sortante jusqu'à ce que l'opérateur les avance.
-  Une adoption qui ne toucherait qu'une moitié du domaine serait pire qu'une
-  limite nommée : elle laisserait Astra et la gateway en désaccord sur ce qui
-  est courant.
+  **Limite connue** : l'adoption automatique de l'ancre `CA-PQ` distribuée
+  reste absente d'Astra et de la gateway. `CA-TLS`, elle, est adoptée à
+  `not_after` par Astra et par la gateway ; les deux avancent donc sur la même
+  époque que le compagnon une fois sa promotion opérateur exécutée.
   La réponse ne porte par ailleurs **jamais** de statut signé, parce qu'un
   statut est signé par la clé de service Astra, que `heliosd` ne détient pas et
   ne doit pas détenir. La comparaison qui décide « à jour » couvre en revanche
