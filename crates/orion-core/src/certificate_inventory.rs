@@ -40,7 +40,7 @@ use aether::key_negotiation::PqCertificate;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::identity_store::ProtectedIdentityStore;
+use crate::identity_store::{PreviousIdentityStatus, ProtectedIdentityStore};
 use crate::KeyNegotiationSettings;
 
 /// Where a certificate stands on the renewal ladder of spec §4.3.
@@ -108,6 +108,8 @@ pub struct CertificateInventory {
     pub faults: Vec<String>,
     /// The protected identity named by the profile is on this machine.
     pub identity_sealed: bool,
+    /// Outgoing identity retained for a bounded service rollback.
+    pub previous_identity: Option<PreviousIdentityStatus>,
 }
 
 /// Reads a PQ certificate as the negotiation format carries it.
@@ -200,8 +202,8 @@ pub fn client_inventory(
     if !inventory.identity_sealed {
         return;
     }
-    let bundle = match store.load(identity) {
-        Ok(bundle) => bundle,
+    let snapshot = match store.snapshot_at(identity, now_unix) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             inventory
                 .faults
@@ -209,6 +211,18 @@ pub fn client_inventory(
             return;
         }
     };
+    if snapshot
+        .previous
+        .is_some_and(|previous| previous.phase == crate::PreviousIdentityPhase::Expired)
+    {
+        if let Err(error) = store.retire_previous(identity, now_unix) {
+            inventory.faults.push(format!(
+                "purge de l'identité cliente précédente impossible : {error}"
+            ));
+        }
+    }
+    inventory.previous_identity = snapshot.previous;
+    let bundle = snapshot.served;
 
     match bundle
         .certificate_chain

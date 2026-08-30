@@ -273,7 +273,16 @@ function RenewalStep({
       {step?.step === 'committed' && (
         <Row label="génération suivante" value={String(step.generation)} />
       )}
-      {step && step.step !== 'committed' && (
+      {step?.step === 'rolled_back' && (
+        <>
+          <Row label="identité servie" value={`génération ${step.generation}`} />
+          <Row
+            label="sélection jusqu’au"
+            value={new Date(step.available_until * 1000).toLocaleString()}
+          />
+        </>
+      )}
+      {step && (step.step === 'awaiting_operator' || step.step === 'issuing') && (
         <Row label="opération" value={step.operation_id} copyable />
       )}
       {manifest && (

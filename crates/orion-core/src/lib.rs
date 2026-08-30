@@ -49,7 +49,10 @@ pub use config::{
     DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
 pub use events::{ClientEvent, PskKind};
-pub use identity_store::{ClientIdentityBundle, IdentityStoreError, ProtectedIdentityStore};
+pub use identity_store::{
+    ClientIdentityBundle, IdentityStoreError, PreviousIdentityPhase, PreviousIdentityStatus,
+    ProtectedIdentityStore,
+};
 pub use profile_import::{
     complete_profile_import, inspect_profile, parse_profile_import, read_profile_import_path,
     CompletedImport, ProfileImport, ProfileIssues, MAX_PROFILE_IMPORT_BYTES,

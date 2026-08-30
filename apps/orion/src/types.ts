@@ -110,6 +110,7 @@ export type CertificateActionBlockKind =
   | 'identity_missing'
   | 'nothing_expired'
   | 'no_previous_identity'
+  | 'previous_identity_expired'
   | 'trust_material_missing'
   | 'companion_transport_missing'
   | 'operator_credential_required'
@@ -136,6 +137,7 @@ export type RenewalProgress =
   | { step: 'awaiting_operator'; operation_id: string; companion_command: string }
   | { step: 'issuing'; operation_id: string }
   | { step: 'committed'; generation: number }
+  | { step: 'rolled_back'; generation: number; available_until: number }
 
 /**
  * What one press produced, per profile.
@@ -189,6 +191,12 @@ export interface CertificateInventory {
   client_pq: CertificateFacts | null
   faults: string[]
   identity_sealed: boolean
+  previous_identity: {
+    available_from: number
+    available_until: number
+    phase: 'not_yet_available' | 'available' | 'expired'
+    selected: boolean
+  } | null
 }
 
 /**

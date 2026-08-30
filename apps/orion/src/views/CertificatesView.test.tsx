@@ -35,6 +35,7 @@ const entry = (overrides: Partial<ProfileCertificates> = {}): ProfileCertificate
     client_pq: null,
     faults: [],
     identity_sealed: true,
+    previous_identity: null,
   },
   actions: [
     {

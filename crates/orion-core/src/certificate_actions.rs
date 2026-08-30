@@ -14,14 +14,12 @@
 //! action becomes reachable, the surface does not change: the block simply
 //! stops being returned.
 //!
-//! # Limite connue : aucune de ces actions ne s'exécute encore
+//! # Execution stays behind the same gate
 //!
-//! Two of them — recovery and rollback — need an operator hardware credential
-//! and the `astra-signer` companion, which Astra itself refuses with `501`
-//! (spec §12.3). That is a known, documented gap.
-//!
-//! The other two are blocked by one of two things, and which one matters: the
-//! first is the operator's to fix, the second is ours.
+//! Renewal and recovery have their network drivers; rollback is a local service
+//! selector over two already-authorized generations. Keeping their admission
+//! here means none of them can begin work and only then discover the state was
+//! unavailable.
 //!
 //! The ordinary §7 renewal has the client sign a rotation request, hand it to
 //! Astra's delegated issuer, relay the resulting staging to the gateway, and
@@ -52,7 +50,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::certificate_inventory::{CertificateInventory, CertificatePhase};
-use crate::KeyNegotiationSettings;
+use crate::{KeyNegotiationSettings, PreviousIdentityPhase};
 
 /// The four actions spec §12.2 requires the Profiles surface to offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +109,8 @@ pub enum CertificateActionBlock {
     NothingExpired,
     /// No previous identity is held, so there is nothing to roll back to.
     NoPreviousIdentity,
+    /// A retained identity exists, but its overlap has ended definitively.
+    PreviousIdentityExpired { expired_at: u64 },
     /// The profile carries no trust domain, no Astra authority and no client
     /// `CA-TLS`: §19's discriminant.
     TrustMaterialMissing,
@@ -154,6 +154,10 @@ impl CertificateActionBlock {
                  pendant le chevauchement qui suit un renouvellement."
                     .into()
             }
+            Self::PreviousIdentityExpired { expired_at } => format!(
+                "L'identité précédente a été retirée à l'échéance {expired_at} du chevauchement. \
+                 La réintroduire ferait redescendre l'état de certificat."
+            ),
             Self::TrustMaterialMissing => {
                 "Ce profil ne porte pas le matériel de confiance qu'un renouvellement exige — \
                  domaine de confiance, autorité Astra épinglée et CA TLS cliente. Il a été \
@@ -280,6 +284,38 @@ fn recovery_block(
     None
 }
 
+/// What stands between this profile and a local §4.4 service rollback.
+fn rollback_block(
+    settings: &KeyNegotiationSettings,
+    inventory: &CertificateInventory,
+    identity_store: bool,
+) -> Option<CertificateActionBlock> {
+    if !identity_store {
+        return Some(CertificateActionBlock::NoIdentityStore);
+    }
+    if !inventory.identity_sealed {
+        return Some(CertificateActionBlock::IdentityMissing {
+            identity: settings.identity.clone(),
+        });
+    }
+    if settings.trust.is_none() {
+        return Some(CertificateActionBlock::TrustMaterialMissing);
+    }
+    let Some(previous) = inventory.previous_identity else {
+        return Some(CertificateActionBlock::NoPreviousIdentity);
+    };
+    match previous.phase {
+        PreviousIdentityPhase::Available => None,
+        // The slot is only created when activation is due, so this state can
+        // only come from a restored future record. Refuse it without inventing
+        // a second pre-activation action reason.
+        PreviousIdentityPhase::NotYetAvailable => Some(CertificateActionBlock::NoPreviousIdentity),
+        PreviousIdentityPhase::Expired => Some(CertificateActionBlock::PreviousIdentityExpired {
+            expired_at: previous.available_until,
+        }),
+    }
+}
+
 /// The state of all four actions for one profile.
 pub fn action_states(
     settings: Option<&KeyNegotiationSettings>,
@@ -327,10 +363,16 @@ pub fn action_states(
                     },
                 }
             }
-            // A rollback needs a previous identity held locally. Nothing keeps
-            // one: the protected store holds exactly one bundle per name.
             CertificateAction::RollbackToPrevious => {
-                CertificateActionState::blocked(action, CertificateActionBlock::NoPreviousIdentity)
+                match rollback_block(settings, inventory, identity_store) {
+                    Some(block) => CertificateActionState::blocked(action, block),
+                    None => CertificateActionState {
+                        action,
+                        label: action.label().to_string(),
+                        blocked_by: None,
+                        message: None,
+                    },
+                }
             }
         })
         .collect()
@@ -343,9 +385,9 @@ pub fn action_states(
 /// action that produced a key and then discovered it could not finish would
 /// leave a half-rotation behind on every press.
 ///
-/// What follows an `Ok` is [`crate::certificate_renewal::begin`] for the two
-/// renewals. The other two have no driver yet and are still refused by
-/// [`action_states`], each for its own reason.
+/// What follows an `Ok` is [`crate::certificate_renewal::begin`] for renewal,
+/// the recovery driver for an expired identity, or the local service selector
+/// for a rollback.
 pub fn admits(
     action: CertificateAction,
     settings: Option<&KeyNegotiationSettings>,
@@ -593,6 +635,64 @@ mod tests {
             )
             .blocked_by,
             Some(CertificateActionBlock::TrustMaterialMissing)
+        );
+    }
+
+    #[test]
+    fn rollback_is_offered_only_while_the_previous_slot_is_in_overlap() {
+        let settings = settings_with_trust();
+        let available = CertificateInventory {
+            identity_sealed: true,
+            previous_identity: Some(crate::PreviousIdentityStatus {
+                available_from: 2_000,
+                available_until: 3_000,
+                phase: PreviousIdentityPhase::Available,
+                selected: false,
+            }),
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &available, true),
+                CertificateAction::RollbackToPrevious
+            )
+            .blocked_by,
+            None
+        );
+
+        let expired = CertificateInventory {
+            previous_identity: Some(crate::PreviousIdentityStatus {
+                phase: PreviousIdentityPhase::Expired,
+                ..available.previous_identity.expect("status")
+            }),
+            ..available
+        };
+        let states = action_states(Some(&settings), &expired, true);
+        let state = state_of(&states, CertificateAction::RollbackToPrevious);
+        assert_eq!(
+            state.blocked_by,
+            Some(CertificateActionBlock::PreviousIdentityExpired { expired_at: 3_000 })
+        );
+        assert!(state
+            .message
+            .as_ref()
+            .is_some_and(|message| message.contains("retirée")));
+    }
+
+    #[test]
+    fn rollback_without_a_retained_slot_keeps_its_specific_reason() {
+        let settings = settings_with_trust();
+        let inventory = CertificateInventory {
+            identity_sealed: true,
+            ..CertificateInventory::default()
+        };
+        assert_eq!(
+            state_of(
+                &action_states(Some(&settings), &inventory, true),
+                CertificateAction::RollbackToPrevious
+            )
+            .blocked_by,
+            Some(CertificateActionBlock::NoPreviousIdentity)
         );
     }
 

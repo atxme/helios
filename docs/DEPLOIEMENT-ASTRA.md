@@ -44,10 +44,15 @@ s'installe (`astra issuer request` / `issuer install`), et le client présente
 l'intermédiaire de la délégation dans sa chaîne. Voir « Ce qui fait qu'une
 feuille renouvelée se connecte encore » plus bas.
 
+Pendant le chevauchement, Orion conserve aussi l'identité sortante dans le
+même enregistrement protégé que l'identité servie. L'action « Revenir
+temporairement à l'ancienne identité » ne déplace aucun compteur : elle choisit
+seulement lequel des deux lots DPAPI est présenté. L'écran montre l'échéance de
+ce choix ; à `not_after`, l'ancienne feuille et ses clés sont retirées et une
+restauration de fichier ne les rend pas de nouveau sélectionnables.
+
 Ce qui **manque** encore :
 
-- le **retour à l'identité précédente** du §12.2 : rien ne la conserve, refusé
-  en le disant ;
 - la **révocation de la gateway** : la révocation cliente est produite,
   déposée et relayée ; celle de la gateway reste refusée faute de feuilles
   gateway dans le registre Astra ;

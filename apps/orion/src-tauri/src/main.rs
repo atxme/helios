@@ -551,8 +551,7 @@ async fn run_certificate_action(
 ) -> Result<ActionOutcome, String> {
     match action {
         orion_core::CertificateAction::RenewEveryProfile => renew_every_profile(&state).await,
-        // The other three each concern one profile — including the two that
-        // have no driver, refused by `admits` before anything is generated.
+        // The other three each concern one profile.
         _ => {
             let step = run_for_one(&state, &name, action).await?;
             Ok(ActionOutcome::of(&name, step))
@@ -631,9 +630,6 @@ async fn run_for_one(
         return Err(record_certificate_error(state, name, block.message()).await);
     }
 
-    // `RenewNow` is the only per-profile action with a driver. The other two
-    // are refused above, each for its own reason, and reaching this point with
-    // one of them would mean `action_states` and this match had drifted apart.
     let outcome = match action {
         orion_core::CertificateAction::RenewNow => {
             drive_renewal(state, name, settings, heliosd_url).await
@@ -644,11 +640,16 @@ async fn run_for_one(
         orion_core::CertificateAction::RecoverExpired => {
             drive_recovery(state, name, settings).await
         }
-        orion_core::CertificateAction::RollbackToPrevious => Err(
-            "cette action n'a pas encore de pilote : rien ne conserve l'identité précédente, le \
-             magasin protégé ne garde qu'un lot par nom."
-                .to_string(),
-        ),
+        orion_core::CertificateAction::RollbackToPrevious => {
+            let settings = settings.ok_or_else(|| "ce profil ne négocie pas de clé".to_string())?;
+            let rollback =
+                orion_core::certificate_renewal::rollback_to_previous(&settings, now_unix())
+                    .map_err(|error| error.to_string())?;
+            Ok(RenewalProgress::RolledBack {
+                generation: rollback.selected_generation,
+                available_until: rollback.available_until,
+            })
+        }
     };
     match outcome {
         Ok(progress) => {
@@ -761,6 +762,10 @@ enum RenewalProgress {
     },
     Recovered {
         generation: u64,
+    },
+    RolledBack {
+        generation: u64,
+        available_until: u64,
     },
 }
 

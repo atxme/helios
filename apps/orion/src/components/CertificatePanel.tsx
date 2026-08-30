@@ -271,6 +271,20 @@ export function CertificatePanel({
         </Box>
       )}
 
+      {inventory.previous_identity?.phase === 'available' && (
+        <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, minWidth: 0 }}>
+          <Typography color="text.secondary" sx={{ width: 110, flexShrink: 0, fontSize: 11.5 }}>
+            retour temporaire
+          </Typography>
+          <Typography color="text.primary" sx={{ fontSize: 11.5, fontWeight: 600 }}>
+            {inventory.previous_identity.selected ? 'ancienne identité servie' : 'disponible'}
+          </Typography>
+          <Typography noWrap color="text.disabled" sx={{ minWidth: 0, fontSize: 11 }}>
+            jusqu’au {instant(inventory.previous_identity.available_until)}
+          </Typography>
+        </Box>
+      )}
+
       {clientMissing && (
         <Fault>
           Aucune identité protégée nommée <strong>{identityName}</strong> scellée sur ce poste.

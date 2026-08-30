@@ -62,7 +62,7 @@ de rotation de parc défini ci-dessous.
 | exploitation | coordinateur Astra co-implanté dans un conteneur séparé sur la gateway ; opérations ordinaires relayées de WireGuard vers un veth privé mTLS, HTTPS public réservé aux chemins sans tunnel et aux campagnes opérateur hors tunnel |
 | garde des CA | clés maîtresses `CA-PQ` et `CA-TLS` dans un coffre HVLT chiffré ; déverrouillage hors de la gateway par une YubiKey opérateur |
 | émission ordinaire | clé Astra déléguée, bornée à une gateway, un domaine, une fenêtre et aux leafs de pairs déjà admis ; émission impossible sans approbation YubiKey liée à la demande exacte |
-| YubiKey | deux credentials matériels 1-sur-N au bootstrap ; un credential actif pour un renouvellement client ordinaire, une récupération expirée avec continuité ou un rollback ; deux credentials actifs distincts pour une ancre, `trust_authorities` ou une réadmission sans continuité ; une campagne applique le maximum exigé par ses cibles ; ce modèle mono-opérateur n'est pas un quorum humain |
+| YubiKey | deux credentials matériels 1-sur-N au bootstrap ; un credential actif pour un renouvellement client ordinaire, une récupération expirée avec continuité ou un rollback gateway ; le sélecteur local de l'identité cliente précédente n'est pas une nouvelle décision d'autorité ; deux credentials actifs distincts pour une ancre, `trust_authorities` ou une réadmission sans continuité ; une campagne applique le maximum exigé par ses cibles ; ce modèle mono-opérateur n'est pas un quorum humain |
 | renouvellement | préparation planifiée à 80 % de la validité écoulée, puis état `awaiting_operator` jusqu'à une approbation YubiKey ; aucune émission silencieuse |
 | expiration | une leaf expirée reste refusée par la négociation ; elle peut seulement prouver une continuité historique dans la récupération Astra |
 | rotation de `CA-PQ` | transition signée par l'ancienne **et** la nouvelle CA, générations consécutives |
@@ -1018,6 +1018,14 @@ Pendant `overlap`, une sélection manuelle peut demander de servir ou présenter
 temporairement l'ancienne leaf. Elle ne modifie aucun compteur, n'efface pas le
 slot suivant et porte une échéance au plus égale au `not_after` de la
 transition. Elle est refusée dans `active`, `promoted`, `expired` ou `revoked`.
+
+Sur une gateway, cette sélection reste une décision de service signée par
+`CA-PQ` et approuvée avec un credential actif. Dans Orion, elle sélectionne
+localement une identité cliente dont les deux générations ont déjà été
+autorisées par le grant approuvé et acceptées par la gateway pendant le
+chevauchement : elle ne requiert donc pas un second objet signé. Ce sélecteur
+local ne peut ni ouvrir une rotation, ni modifier une génération, une époque
+ou une révocation.
 
 Après promotion, l'ancienne leaf et sa clé privée ne peuvent pas être
 réintroduites. Une restauration de fichier qui tenterait de les ramener reste
@@ -3104,9 +3112,17 @@ contournés :
   suivant jusqu'au commit relayé. Elle n'est proposée que si une feuille
   **cliente** est expirée : un certificat gateway périmé est le côté opérateur
   du domaine, qu'aucun credential client ne déplace.
-  Manquent encore : `RollbackToPrevious`, refusée en le disant — côté client
-  rien ne conserve l'identité précédente —, le lancement automatique du
-  compagnon plutôt que sa ligne de commande, et l'affichage des credentials
+  `RollbackToPrevious` **agit** pendant le chevauchement : l'écriture qui sert
+  le candidat conserve dans la même enveloppe protégée l'identité sortante et
+  l'échéance `not_after`; l'action ne change que le sélecteur de service. Le
+  magasin de confiance, ses générations et ses compteurs restent inchangés.
+  Passé l'échéance, la lecture répond par l'identité courante et la clé
+  sortante est retirée. Ce choix est local au poste : les deux générations ont
+  déjà été autorisées par le grant approuvé et la gateway les accepte pendant
+  le chevauchement ; contrairement au rollback gateway, aucune clé privée de
+  service détenue par un autre composant n'est dégradée et aucun nouvel objet
+  `CA-PQ` n'ajouterait d'autorité. Manquent encore : le lancement automatique
+  du compagnon plutôt que sa ligne de commande, et l'affichage des credentials
   opérateur enregistrés. Côté console Helios, `CertificateDomainPanel` montre le
   domaine — gateway, CA, émetteur délégué, synthèse du parc — et
   `GatewayIdentityActions` **agit** sur les gestes que cette gateway possède :

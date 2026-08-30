@@ -177,6 +177,10 @@ pub enum RenewalError {
          pas un renouvellement."
     )]
     ActiveExpired { not_after: u64 },
+    #[error(
+        "le retour à l'identité précédente n'est disponible que pendant le chevauchement actif"
+    )]
+    RollbackUnavailable,
 }
 
 /// Where one identity's trust store lives, beside the profile file.
@@ -498,18 +502,24 @@ pub fn promote_due(
     identity: &str,
     now_unix: u64,
 ) -> Result<bool, RenewalError> {
-    let due = store
+    let due_window = store
         .state()
         .certificates
         .next
         .as_ref()
         .zip(store.state().certificates.activation_at)
-        .is_some_and(|(_, activation_at)| now_unix >= activation_at);
-    if !due {
+        .zip(store.state().certificates.retire_active_at)
+        .map(|((_, activation_at), retire_at)| (activation_at, retire_at))
+        .filter(|(activation_at, _)| now_unix >= *activation_at);
+    let Some((activation_at, retire_at)) = due_window else {
         // Everything else the store promotes on its own schedule — anchors,
         // gateway identity, service key — has no local key material to move.
-        return Ok(store.refresh(now_unix)?);
-    }
+        let refreshed = store.refresh(now_unix)?;
+        let retired = identities
+            .retire_previous(identity, now_unix)
+            .map_err(|error| RenewalError::Identity(error.to_string()))?;
+        return Ok(refreshed || retired);
+    };
 
     let candidate_identity = candidate_identity_of(identity);
     let candidate = identities
@@ -519,11 +529,128 @@ pub fn promote_due(
         identity: identity.trim().to_string(),
         ..candidate
     };
-    identities
-        .store(&promoted)
+    let installed = identities
+        .promote_with_previous(identity, &promoted, activation_at, retire_at)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
-    store.refresh(now_unix)?;
-    Ok(true)
+    let refreshed = store.refresh(now_unix)?;
+    let retired = identities
+        .retire_previous(identity, now_unix)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    Ok(installed || refreshed || retired)
+}
+
+/// Result of selecting the outgoing identity for service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientServiceRollback {
+    pub selected_generation: u64,
+    pub available_until: u64,
+}
+
+fn bundle_matches_generation(
+    bundle: &ClientIdentityBundle,
+    generation: &ClientCertificateGeneration,
+) -> Result<(), RenewalError> {
+    let tls = client_tls_leaf(bundle)?;
+    let pq = client_pq_leaf(bundle)?;
+    if !generation
+        .tls_certificate_fingerprint
+        .matches(&tls.fingerprint())
+    {
+        return Err(RenewalError::Certificate(
+            CertificateError::FingerprintMismatch("client TLS identity"),
+        ));
+    }
+    if !generation
+        .pq_certificate_fingerprint
+        .matches(&pq_certificate_fingerprint(&pq)?)
+    {
+        return Err(RenewalError::Certificate(
+            CertificateError::FingerprintMismatch("client PQ identity"),
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_window(
+    state: &TrustState,
+    now_unix: u64,
+) -> Result<
+    (
+        ClientCertificateGeneration,
+        ClientCertificateGeneration,
+        u64,
+    ),
+    RenewalError,
+> {
+    let certificates = &state.certificates;
+    let incoming = certificates
+        .next
+        .as_ref()
+        .ok_or(RenewalError::RollbackUnavailable)?;
+    let activation_at = certificates
+        .activation_at
+        .ok_or(RenewalError::RollbackUnavailable)?;
+    let retire_at = certificates
+        .retire_active_at
+        .ok_or(RenewalError::RollbackUnavailable)?;
+    if certificates.revoked || now_unix < activation_at || now_unix >= retire_at {
+        return Err(RenewalError::RollbackUnavailable);
+    }
+    Ok((certificates.active.clone(), incoming.clone(), retire_at))
+}
+
+/// Selects the outgoing client identity during its overlap (§4.4).
+///
+/// This is deliberately a local service selection, not a signed trust-state
+/// mutation. Both generations were already authorized by the operator-approved
+/// grant and are accepted by the gateway during the overlap; a CA signature
+/// cannot add authority to the client's possession of either private key. The
+/// gateway case is different because a console user does not possess its
+/// private keys, hence its separate `CA-PQ` rollback authorization.
+///
+/// The authoritative trust store is read and validated but never mutated. In
+/// particular, no generation or revocation counter can move backwards, and a
+/// restored protected file naming certificates outside active/next is refused
+/// before the selector is written.
+pub fn rollback_to_previous(
+    settings: &KeyNegotiationSettings,
+    now_unix: u64,
+) -> Result<ClientServiceRollback, RenewalError> {
+    let identity = settings.identity.trim();
+    if identity.is_empty() {
+        return Err(RenewalError::Identity(
+            "ce profil ne nomme aucune identité protégée".into(),
+        ));
+    }
+    let identities = ProtectedIdentityStore::for_current_user()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let snapshot = identities
+        .snapshot_at(identity, now_unix)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let mut store = open_identity_store(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        settings,
+        &snapshot.served,
+        now_unix,
+    )?;
+    promote_due(&mut store, &identities, identity, now_unix)?;
+
+    let (outgoing, incoming, retire_at) = rollback_window(store.state(), now_unix)?;
+    let selected_generation = outgoing.generation;
+
+    identities
+        .select_previous(identity, now_unix, |current, previous| {
+            bundle_matches_generation(current, &incoming).map_err(anyhow::Error::from)?;
+            bundle_matches_generation(previous, &outgoing).map_err(anyhow::Error::from)
+        })
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+
+    Ok(ClientServiceRollback {
+        selected_generation,
+        available_until: retire_at,
+    })
 }
 
 /// The five in-tunnel routes, resolved against one gateway.
@@ -2221,6 +2348,35 @@ mod tests {
     fn the_candidate_is_sealed_under_a_name_of_its_own() {
         assert_eq!(candidate_identity_of("poste-windows"), "poste-windows-next");
         assert_ne!(candidate_identity_of("poste"), "poste");
+    }
+
+    #[test]
+    fn service_rollback_reads_the_overlap_without_lowering_any_counter() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut state = store(directory.path(), &domain).state().clone();
+        let mut incoming = state.certificates.active.clone();
+        incoming.generation += 1;
+        incoming.tls_certificate_fingerprint = Fingerprint::of(b"incoming TLS");
+        incoming.pq_certificate_fingerprint = Fingerprint::of(b"incoming PQ");
+        state.certificates.next = Some(incoming.clone());
+        state.certificates.activation_at = Some(NOW + 100);
+        state.certificates.retire_active_at = Some(NOW + 200);
+        state.certificates.revocation_epoch = 7;
+        let before = state.clone();
+
+        let (outgoing, selected_incoming, retire_at) =
+            rollback_window(&state, NOW + 150).expect("inside overlap");
+        assert_eq!(outgoing.generation, 4);
+        assert_eq!(selected_incoming, incoming);
+        assert_eq!(retire_at, NOW + 200);
+        assert_eq!(
+            state, before,
+            "service selection must not mutate trust state"
+        );
+        assert_eq!(state.certificates.revocation_epoch, 7);
+        assert!(rollback_window(&state, NOW + 99).is_err());
+        assert!(rollback_window(&state, NOW + 200).is_err());
     }
 
     /// The command the surface launches is complete and names this operation.

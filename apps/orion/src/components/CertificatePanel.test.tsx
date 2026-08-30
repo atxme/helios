@@ -32,6 +32,7 @@ const inventory = (overrides: Partial<CertificateInventory> = {}): CertificateIn
   client_pq: null,
   faults: [],
   identity_sealed: false,
+  previous_identity: null,
   ...overrides,
 })
 
@@ -192,6 +193,40 @@ describe('CertificatePanel', () => {
     expect((button as HTMLButtonElement).disabled).toBe(false)
     button.click()
     expect(run).toEqual(['renew_now'])
+  })
+
+  it('shows how long a selected previous identity may stay in service', () => {
+    render(
+      <CertificatePanel
+        inventory={inventory({
+          identity_sealed: true,
+          previous_identity: {
+            available_from: 1_000,
+            available_until: Date.now() / 1000 + 3_600,
+            phase: 'available',
+            selected: true,
+          },
+        })}
+        identityName="orion-poste"
+        actions={[
+          {
+            action: 'rollback_to_previous',
+            label: 'Revenir temporairement à l’ancienne identité',
+            blocked_by: null,
+            message: null,
+          },
+        ]}
+        onRun={() => {}}
+      />,
+    )
+
+    expect(screen.getByText('ancienne identité servie')).toBeTruthy()
+    expect(screen.getByText(/jusqu’au/)).toBeTruthy()
+    expect(
+      (screen.getByRole('button', {
+        name: 'Revenir temporairement à l’ancienne identité',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
   })
 
   /** The two other things §12.2 asks the surface to show. */

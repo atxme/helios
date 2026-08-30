@@ -65,6 +65,7 @@ const emptyInventory: CertificateInventory = {
   client_pq: null,
   faults: [],
   identity_sealed: false,
+  previous_identity: null,
 }
 
 const noIssues: ProfileIssues = {
