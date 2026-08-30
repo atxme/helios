@@ -1,6 +1,6 @@
 [package]
 name = "astra-signer"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -47,4 +47,3 @@ tempfile = "3"
 # signature et le `basicConstraints` qui comptent, pas ce que `rcgen` croit
 # avoir posé. Même version que celle qu'`aether` vérifie déjà.
 x509-parser = { version = "0.16", features = ["verify"] }
-
