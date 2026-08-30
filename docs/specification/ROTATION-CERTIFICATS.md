@@ -1,18 +1,19 @@
 # Spécification — cycle de vie et rotation des certificats v5
 
 **Statut** : cible spécifiée — **cycle de vie partiellement implémenté**
-(revu le 2026-08-09, amendé les 2026-08-15, 2026-08-16 et 2026-08-22). Le protocole de
-négociation servi est déjà la v5. Le §12.3 nomme précisément ce qui est livré
-et ce qui ne l'est pas ; ne pas lire le reste de la note comme une capacité
-disponible.
+(revu le 2026-08-09, amendé les 2026-08-15, 2026-08-16, 2026-08-22 et
+2026-08-30). Le protocole de négociation servi est déjà la v5. Le §12.3 nomme
+précisément ce qui est livré et ce qui ne l'est pas ; ne pas lire le reste de
+la note comme une capacité disponible, et ne pas déduire d'une liste raccourcie
+que le §12.1 est atteint — le §12.5 tranche cette question, et il répond non.
 
-Le lot livré ferme les moitiés serveur du chemin « demande → autorisation →
-persistance gateway → reçu → grant → commit » et les branche aux deux démons.
-Le relais typé WireGuard–veth est livré. Ce qui manque est l'exploitation de
-bout en bout : `astra-signer` ne récupère ni ne dépose encore ses documents par
-`heliosd_url`, Orion ne pilote pas encore l'opération ni le commit, les objets
-de transition ne sont pas distribués, et la bascule de profil du §13 comme les
-deux IHM restent à faire.
+Le chemin « demande → autorisation → persistance gateway → reçu → grant →
+commit » est fermé de bout en bout, sur les deux démons et dans les deux IHM.
+Le transport hors tunnel du compagnon (§8.2), la distribution des objets de
+transition (§0.6), la récupération d'une identité expirée (§7.5), le cycle
+complet de l'identité gateway (§5, §6, §11.1), les rotations d'ancres (§9.1,
+§9.4), les révocations d'urgence (§10) et les campagnes des quatre familles
+(§7.6) sont livrés. Ce qui manque est nommé au §12.5.
 
 ## 0. État de départ et décisions
 
@@ -3233,7 +3234,8 @@ contournés :
   état qui aurait silencieusement perdu les révocations qu'il portait.
 
 Tant que ces points ne sont pas livrés, cette livraison **ne doit pas** être
-présentée comme « cycle de vie implémenté » (§12.1).
+présentée comme « cycle de vie implémenté » (§12.1). Le §12.5 fait le compte
+de ce qui reste, et distingue le travail restant des décisions prises.
 
 ### 12.4 Fonctions reportables après le cycle complet
 
@@ -3247,6 +3249,50 @@ présentée comme « cycle de vie implémenté » (§12.1).
 Ces extensions ne peuvent augmenter le nombre de slots, ignorer une
 génération, prolonger le chevauchement, réactiver une leaf expirée ou révoquée,
 ni élargir une délégation Astra déjà signée.
+
+### 12.5 Arbitrage du §12.1, au 30 août 2026
+
+Le §12.1 énumère ce qu'il faut pour dire « cycle de vie implémenté ». **Ce
+n'est pas encore le cas**, et cette section existe pour que le raccourcissement
+progressif du §12.3 ne finisse pas par le faire croire.
+
+Quatre points restent, et ils ne sont pas de même nature.
+
+**Un est du travail restant** : la bascule du §13.1, où une installation neuve
+n'émet plus de leaf PQ gateway auto-signée mais la fait émettre par `CA-PQ`.
+Tant qu'elle n'est pas faite, un domaine neuf naît avec une ancre épinglée et
+une feuille gateway que cette ancre n'a jamais signée.
+
+**Trois sont des décisions prises**, et les nommer comme des manques serait
+aussi trompeur que les taire :
+
+- **Le §13.2**, l'amorçage de confiance d'un parc v5 déjà déployé. La première
+  installation de `CA-PQ` n'est pas la génération `N -> N+1` d'une rotation :
+  elle exige une confirmation d'empreinte hors bande, faute de quoi la
+  compromission de la leaf d'une seule gateway créerait une CA valable pour
+  tout le parc. C'est une cérémonie humaine, et aucune commande ne peut la
+  remplacer. Elle reste une procédure opérateur documentée.
+- **`POST /v1/campaigns`**, l'ouverture d'une campagne depuis l'origine
+  publique. Le §11.6 dit pourquoi : cette route *résout* une campagne sur les
+  cibles et générations courantes, donc sur un canal public non authentifié
+  elle répondrait l'inventaire du domaine à n'importe quel appelant.
+  L'authentification qu'elle exigerait n'est décrite nulle part, et l'inventer
+  serait construire le trou. La résolution reste locale — ce qui entraîne que
+  les trois actions de campagne du §12.2 restent nommées par leur commande
+  dans la console plutôt que portées par un bouton.
+- **La cérémonie `GetAssertion` unique du §7.5.** Le compagnon interroge la
+  même clé deux fois dans la même session, `approve` sans sel puis `derive`
+  avec. Les propriétés que le §7.5 nomme tiennent — même credential, même
+  connexion, assertion vérifiée avant tout emploi du secret ; ce qui manque est
+  le confort d'un seul appui. Le débloquer demande un appel combiné dans
+  `helios-fido` et dans les deux transports, sur le chemin le plus sensible du
+  produit et sans matériel pour l'éprouver.
+
+**Et un point ne sera pas tranché ici** : les essais d'intégration du §14.2
+supposent un vrai plan de données, un TPM et une clé FIDO2. Aucun ne peut
+tourner dans l'environnement de développement, et le `docs/testing/TESTING.md`
+dit quel environnement prouve quoi. Aucune revendication de validation
+matérielle n'est portée par cette note.
 
 ## 13. Migration depuis la v5 actuellement servie
 
