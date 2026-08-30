@@ -417,6 +417,7 @@ mod tests {
             credential_registry_epoch: 1,
             ca_epoch: current_ca_epoch,
             ca_public_key: ca_public,
+            ca_rotation: None,
             ca_tls_epoch: 1,
             ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
             ca_tls_rotation: None,

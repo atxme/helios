@@ -561,6 +561,7 @@ fn bootstrap(
         credential_registry_epoch: 1,
         ca_epoch: 1,
         ca_public_key,
+        ca_rotation: None,
         ca_tls_epoch: 1,
         ca_tls_fingerprint,
         ca_tls_rotation: None,

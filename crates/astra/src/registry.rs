@@ -115,6 +115,32 @@ pub const MAX_STORED_TRANSITIONS: usize = 8;
 /// recipient can remember would only defer a deterministic refusal.
 pub const MAX_STORED_REVOCATIONS: usize = aether::certificates::state::MAX_REVOCATION_TOMBSTONES;
 
+/// The incoming `CA-PQ` anchor Astra has accepted but not yet adopted.
+///
+/// The signed transition remains in the bounded public store. Keeping the
+/// successor and its window together here makes the authority's active/next
+/// state explicit and lets retirement move the pin without consulting an
+/// object that may already have been pruned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaPqRotation {
+    pub next_ca_epoch: u64,
+    pub next_ca_public_key: MlDsa87PublicKey,
+    pub activation_at: u64,
+    pub retire_active_at: u64,
+}
+
+impl CaPqRotation {
+    fn from_transition(transition: &aether::certificates::authority::CaTransition) -> Self {
+        Self {
+            next_ca_epoch: transition.next_ca_epoch,
+            next_ca_public_key: transition.next_ca_public_key.clone(),
+            activation_at: transition.window.activation_at,
+            retire_active_at: transition.window.not_after,
+        }
+    }
+}
+
 /// The incoming client TLS anchor Astra has accepted but not yet adopted.
 ///
 /// The complete certificate remains in the signed transition held below. The
@@ -156,6 +182,13 @@ pub struct AstraState {
 
     pub ca_epoch: u64,
     pub ca_public_key: MlDsa87PublicKey,
+    /// Signed `CA-PQ` successor awaiting retirement of the active anchor.
+    ///
+    /// Additive and defaulted so a registry written while Astra only
+    /// redistributed this transition can recover the slot from that signed
+    /// object when it next loads.
+    #[serde(default)]
+    pub ca_rotation: Option<CaPqRotation>,
     pub ca_tls_epoch: u64,
     /// SHA-256 of the client `CA-TLS` in service, confirmed out of band.
     ///
@@ -270,6 +303,7 @@ impl AstraRegistry {
         let mut migrated = Self::migrate(&mut document)?;
         let mut state: AstraState = serde_json::from_value(document)
             .map_err(|error| RegistryError::Corrupt(error.to_string()))?;
+        migrated |= Self::recover_ca_pq_rotation(&mut state)?;
         migrated |= Self::recover_client_tls_ca_rotation(&mut state)?;
         match expected_head {
             Some(expected) if allow_status_tail => {
@@ -407,6 +441,46 @@ impl AstraRegistry {
         Ok(restored)
     }
 
+    /// Restores a `CA-PQ` window accepted before Astra persisted its own
+    /// active/next anchor state.
+    ///
+    /// Recovery still verifies both signatures under the anchor already
+    /// pinned in the registry. Ambiguous successors are corruption, never a
+    /// storage-order choice.
+    fn recover_ca_pq_rotation(state: &mut AstraState) -> Result<bool, RegistryError> {
+        use aether::certificates::transport::TrustUpdateObject;
+
+        if state.ca_rotation.is_some() {
+            return Ok(false);
+        }
+        let active = state.ca_public_key.authority_fingerprint();
+        let mut recovered = None;
+        for transition in state
+            .transitions
+            .iter()
+            .filter_map(|stored| match &stored.object {
+                TrustUpdateObject::CaTransition(transition)
+                    if transition.current_ca_epoch == state.ca_epoch
+                        && transition.current_ca_fingerprint.matches(&active) =>
+                {
+                    Some(transition.as_ref())
+                }
+                _ => None,
+            })
+        {
+            transition.verify(&state.ca_public_key, &state.trust_domain_id, state.ca_epoch)?;
+            if recovered.is_some() {
+                return Err(RegistryError::Corrupt(
+                    "multiple CA-PQ rotations target the active epoch".into(),
+                ));
+            }
+            recovered = Some(CaPqRotation::from_transition(transition));
+        }
+        let restored = recovered.is_some();
+        state.ca_rotation = recovered;
+        Ok(restored)
+    }
+
     pub fn state(&self) -> &AstraState {
         &self.state
     }
@@ -503,6 +577,7 @@ impl AstraRegistry {
 
         let mut fresh = Vec::new();
         let mut withdrawn = Vec::new();
+        let mut ca_rotation = self.state.ca_rotation.clone();
         let mut ca_tls_rotation = self.state.ca_tls_rotation.clone();
         for object in objects {
             let fingerprint = object.fingerprint()?;
@@ -526,11 +601,21 @@ impl AstraRegistry {
                 continue;
             }
             match object {
-                TrustUpdateObject::CaTransition(transition) => transition.verify(
-                    &self.state.ca_public_key,
-                    &self.state.trust_domain_id,
-                    self.state.ca_epoch,
-                )?,
+                TrustUpdateObject::CaTransition(transition) => {
+                    transition.verify(
+                        &self.state.ca_public_key,
+                        &self.state.trust_domain_id,
+                        self.state.ca_epoch,
+                    )?;
+                    if ca_rotation.is_some() {
+                        return Err(RegistryError::Transition(
+                            aether::certificates::CertificateError::IllegalStateTransition(
+                                "a CA-PQ rotation is already in flight",
+                            ),
+                        ));
+                    }
+                    ca_rotation = Some(CaPqRotation::from_transition(transition));
+                }
                 TrustUpdateObject::CertificateRevocation(revocation) => {
                     use aether::certificates::revocation::RevocationScope;
 
@@ -744,6 +829,7 @@ impl AstraRegistry {
         self.state.transitions.retain(|stored| {
             retained_until(&stored.object).is_some_and(|not_after| now_unix < not_after)
         });
+        self.state.ca_rotation = ca_rotation;
         self.state.ca_tls_rotation = ca_tls_rotation;
         let accepted = fresh.len();
         for object in fresh {
@@ -791,8 +877,8 @@ impl AstraRegistry {
         Ok(accepted)
     }
 
-    /// Adopts a due client TLS anchor and drops transitions no peer can still
-    /// be told about (spec §§4.1 and 9.4).
+    /// Adopts due `CA-PQ` and client TLS anchors, then drops transitions no
+    /// peer can still be told about (spec §§4.1, 9.2 and 9.4).
     ///
     /// A transition past its `not_after` authorizes nothing: a client that
     /// received it would refuse it, and one that did not has to be repaired by
@@ -813,13 +899,27 @@ impl AstraRegistry {
                 None => false,
             });
         let dropped = before - self.state.transitions.len();
-        let due_rotation = self
+        let due_ca_rotation = self
+            .state
+            .ca_rotation
+            .as_ref()
+            .filter(|rotation| now_unix >= rotation.retire_active_at)
+            .cloned();
+        let ca_promoted = if let Some(rotation) = due_ca_rotation {
+            self.state.ca_epoch = rotation.next_ca_epoch;
+            self.state.ca_public_key = rotation.next_ca_public_key;
+            self.state.ca_rotation = None;
+            true
+        } else {
+            false
+        };
+        let due_tls_rotation = self
             .state
             .ca_tls_rotation
             .as_ref()
             .filter(|rotation| now_unix >= rotation.retire_active_at)
             .cloned();
-        let promoted = if let Some(rotation) = due_rotation {
+        let ca_tls_promoted = if let Some(rotation) = due_tls_rotation {
             self.state.ca_tls_epoch = rotation.next_ca_tls_epoch;
             self.state.ca_tls_fingerprint = Some(rotation.next_ca_tls_fingerprint);
             self.state.ca_tls_rotation = None;
@@ -827,7 +927,7 @@ impl AstraRegistry {
         } else {
             false
         };
-        if dropped > 0 || promoted {
+        if dropped > 0 || ca_promoted || ca_tls_promoted {
             self.save()?;
         }
         Ok(dropped)
@@ -1273,6 +1373,7 @@ mod tests {
                 credential_registry_epoch: 1,
                 ca_epoch: 1,
                 ca_public_key: ca_public.clone(),
+                ca_rotation: None,
                 ca_tls_epoch: 1,
                 ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
                 ca_tls_rotation: None,
@@ -1292,24 +1393,49 @@ mod tests {
             }
         }
 
-        fn transition(anchored: &Anchored, current_epoch: u64) -> TrustUpdateObject {
+        fn transition_from(
+            registry: &AstraRegistry,
+            current_private: &[u8],
+            current_public: &MlDsa87PublicKey,
+            current_epoch: u64,
+            window: TransitionWindow,
+        ) -> (
+            TrustUpdateObject,
+            zeroize::Zeroizing<Vec<u8>>,
+            MlDsa87PublicKey,
+        ) {
             let (next_private, next_public) = generate_ml_dsa_87_keypair().expect("keygen");
             let transition = CaTransition {
                 format_version: CERTIFICATE_FORMAT_VERSION,
-                trust_domain_id: anchored.registry.state().trust_domain_id,
+                trust_domain_id: registry.state().trust_domain_id,
                 current_ca_epoch: current_epoch,
                 next_ca_epoch: current_epoch + 1,
-                current_ca_fingerprint: anchored.ca_public.authority_fingerprint(),
+                current_ca_fingerprint: current_public.authority_fingerprint(),
                 next_ca_fingerprint: next_public.authority_fingerprint(),
-                next_ca_public_key: next_public,
-                window: TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+                next_ca_public_key: next_public.clone(),
+                window,
                 current_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(
                 ),
                 next_ca_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
             }
-            .sign(&anchored.ca_private, &next_private)
+            .sign(current_private, &next_private)
             .expect("signing");
-            TrustUpdateObject::CaTransition(Box::new(transition))
+            (
+                TrustUpdateObject::CaTransition(Box::new(transition)),
+                next_private,
+                next_public,
+            )
+        }
+
+        fn transition(anchored: &Anchored, current_epoch: u64) -> TrustUpdateObject {
+            transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                current_epoch,
+                TransitionWindow::new(1_000, 90_000, 200_000).expect("window"),
+            )
+            .0
         }
 
         fn campaign_id() -> Id16 {
@@ -2107,6 +2233,198 @@ mod tests {
             assert_eq!(anchored.registry.state().ca_tls_fingerprint, Some(held));
         }
 
+        #[test]
+        fn a_ca_pq_rotation_opens_an_active_next_window() {
+            let mut anchored = anchored();
+            let (object, _, next) = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            );
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                    .expect("accepted"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_public_key, anchored.ca_public);
+            assert_eq!(
+                anchored.registry.state().ca_rotation,
+                Some(CaPqRotation {
+                    next_ca_epoch: 2,
+                    next_ca_public_key: next,
+                    activation_at: 3_000,
+                    retire_active_at: 5_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_ca_pq_rotation_does_not_promote_before_not_after() {
+            let mut anchored = anchored();
+            let object = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(4_999)
+                    .expect("sweep before retirement"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 1);
+            assert_eq!(anchored.registry.state().ca_public_key, anchored.ca_public);
+            assert!(anchored.registry.state().ca_rotation.is_some());
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
+        #[test]
+        fn a_due_ca_pq_rotation_is_promoted_once_and_allows_the_next_rotation() {
+            let mut anchored = anchored();
+            let (first, first_successor_private, first_successor_public) = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("first window"),
+            );
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first rotation accepted");
+
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("promoted at retirement"),
+                1
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 2);
+            assert_eq!(
+                anchored.registry.state().ca_public_key,
+                first_successor_public
+            );
+            assert!(anchored.registry.state().ca_rotation.is_none());
+            assert!(anchored.registry.state().transitions.is_empty());
+
+            anchored.registry =
+                AstraRegistry::load(&anchored._directory.path().join("astra.json"), None)
+                    .expect("the promotion and removal were persisted together");
+            assert_eq!(
+                anchored
+                    .registry
+                    .forget_expired_transitions(5_000)
+                    .expect("second promotion is a no-op"),
+                0
+            );
+            assert_eq!(anchored.registry.state().ca_epoch, 2);
+
+            let (second, _, second_successor_public) = transition_from(
+                &anchored.registry,
+                &first_successor_private,
+                &first_successor_public,
+                2,
+                TransitionWindow::new(6_000, 7_000, 8_000).expect("second window"),
+            );
+            assert_eq!(
+                anchored
+                    .registry
+                    .accept_transitions(&anchor_campaign(), &[second], None, 6_500)
+                    .expect("second rotation accepted"),
+                1
+            );
+            assert_eq!(
+                anchored.registry.state().ca_rotation,
+                Some(CaPqRotation {
+                    next_ca_epoch: 3,
+                    next_ca_public_key: second_successor_public,
+                    activation_at: 7_000,
+                    retire_active_at: 8_000,
+                })
+            );
+        }
+
+        #[test]
+        fn a_registry_recovers_a_stored_ca_pq_window_from_the_legacy_format() {
+            let mut anchored = anchored();
+            let object = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[object], None, 2_000)
+                .expect("accepted");
+            let expected = anchored.registry.state().ca_rotation.clone();
+            let mut encoded = serde_json::to_value(anchored.registry.state()).expect("encoding");
+            encoded
+                .as_object_mut()
+                .expect("registry object")
+                .remove("ca_rotation");
+            let path = anchored._directory.path().join("astra.json");
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&encoded).expect("legacy encoding"),
+            )
+            .expect("legacy registry written");
+
+            let restored = AstraRegistry::load(&path, None).expect("legacy registry loaded");
+            assert_eq!(restored.state().ca_rotation, expected);
+        }
+
+        #[test]
+        fn a_second_ca_pq_rotation_is_refused_while_one_is_in_flight() {
+            let mut anchored = anchored();
+            let first = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_000, 5_000).expect("first window"),
+            )
+            .0;
+            anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[first], None, 2_000)
+                .expect("first accepted");
+            let held = anchored.registry.state().ca_rotation.clone();
+            let competing = transition_from(
+                &anchored.registry,
+                &anchored.ca_private,
+                &anchored.ca_public,
+                1,
+                TransitionWindow::new(1_000, 3_500, 5_500).expect("competing window"),
+            )
+            .0;
+
+            assert!(anchored
+                .registry
+                .accept_transitions(&anchor_campaign(), &[competing], None, 2_100)
+                .is_err());
+            assert_eq!(anchored.registry.state().ca_rotation, held);
+            assert_eq!(anchored.registry.state().transitions.len(), 1);
+        }
+
         /// The one property that lets an online authority hold `CA-PQ` output
         /// at all: it re-derives the proof under the anchor it already pins.
         #[test]
@@ -2252,18 +2570,30 @@ mod tests {
         #[test]
         fn the_store_refuses_rather_than_dropping_what_a_peer_still_needs() {
             let mut anchored = anchored();
+            let tls = Fingerprint::of(b"gateway tls in service");
+            let pq = Fingerprint::of(b"gateway pq in service");
             for index in 0..MAX_STORED_TRANSITIONS {
-                let object = transition(&anchored, 1);
+                let active_epoch = index as u64 + 1;
+                let object = gateway_transition(&anchored, active_epoch + 1, tls, pq);
                 anchored
                     .registry
-                    .accept_transitions(&anchor_campaign(), &[object], None, 2_000 + index as u64)
+                    .accept_transitions(
+                        &gateway_campaign(active_epoch, tls, pq),
+                        &[object],
+                        None,
+                        2_000 + index as u64,
+                    )
                     .expect("accepted");
             }
-            let overflow = transition(&anchored, 1);
+            let active_epoch = MAX_STORED_TRANSITIONS as u64 + 1;
+            let overflow = gateway_transition(&anchored, active_epoch + 1, tls, pq);
             assert!(matches!(
-                anchored
-                    .registry
-                    .accept_transitions(&anchor_campaign(), &[overflow], None, 3_000),
+                anchored.registry.accept_transitions(
+                    &gateway_campaign(active_epoch, tls, pq),
+                    &[overflow],
+                    None,
+                    3_000,
+                ),
                 Err(RegistryError::TransitionStoreFull { .. })
             ));
             assert_eq!(
@@ -2315,6 +2645,7 @@ mod tests {
             credential_registry_epoch: 1,
             ca_epoch: 1,
             ca_public_key: ca,
+            ca_rotation: None,
             ca_tls_epoch: 1,
             ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
             ca_tls_rotation: None,
