@@ -2882,10 +2882,21 @@ contournés :
   Un domaine antérieur à ce champ est refusé **par son nom** plutôt que
   contrôlé contre un défaut qui accepterait tout. `astra-signer rotate-ca-tls`
   crée l'ancre entrante, la fait auto-signer, signe la transition sous `CA-PQ`
-  et fait adopter la nouvelle clé privée TLS par le coffre dans la même
-  écriture ; `heliosd install-client-tls-ca` la met en attente, les deux
-  chaînes sont acceptées pendant le chevauchement, et l'ancienne est retirée
-  par la même passe qui promeut les générations. La révocation d'une **gateway**
+  et **scelle la clé suivante à côté** de celle qui émet plutôt que par-dessus :
+  le coffre porte `active` et `next`, et `astra-signer promote-ca-tls` les
+  échange à `not_after` en détruisant la sortante dans la même écriture
+  scellée. C'est ce que le §9.2 autorise et rien de plus. L'autorité émet sous
+  l'ancre sortante pendant tout le recouvrement, parce que la gateway compare
+  `ca_tls_epoch` à l'identique et ne l'avance qu'à `retire_active_at` : les
+  deux côtés basculent donc à la même seconde, et le successeur ne certifie
+  rien avant elle. La décision
+  est écrite avant d'être annoncée : la cérémonie dépose `astra-prepared.json`
+  — les octets exacts du dépôt — avant de contacter l'autorité, et
+  `astra-signer resume-rotation` rejoue ce dépôt à l'identique après une panne,
+  sans redemander de clé (§8.2). `heliosd install-client-tls-ca` met la
+  transition en attente, les deux chaînes sont acceptées pendant le
+  chevauchement, et l'ancienne est retirée par la même passe qui promeut les
+  générations. La révocation d'une **gateway**
   s'exécute désormais : `astra revocation open --scope gateway` lit les deux
   feuilles et leurs échéances signées **en direct** sur le canal privé, auprès
   du démon qui les sert, parce que ce registre ne les a jamais détenues ;

@@ -93,7 +93,7 @@ use astra_signer::authenticator::{Opened, Transport};
 use astra_signer::authority::{self, DelegationBounds, DomainIdentity, IssuerDelegationRequest};
 use astra_signer::credentials;
 use astra_signer::gestures::{self, NewAuthority, NewKey};
-use astra_signer::{authenticator, documents, handoff, store, tunnel};
+use astra_signer::{authenticator, documents, handoff, prepared, store, tunnel};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
@@ -505,8 +505,9 @@ enum Command {
     ///
     /// L'ancre entrante est créée ici, auto-signée pour prouver qu'elle
     /// détient sa clé, et la transition qui l'installe est signée par `CA-PQ`
-    /// — laquelle ne bouge pas. Le coffre adopte la nouvelle clé privée
-    /// TLS dans la même écriture ; l'ancienne ne signe plus rien.
+    /// — laquelle ne bouge pas. Le coffre scelle la clé suivante *à côté* de
+    /// celle qui émet : c'est `promote-ca-tls` qui les échange à
+    /// `activation_at`, puis détruit l'ancienne au retrait.
     RotateCaTls {
         #[arg(long)]
         authority_url: String,
@@ -527,6 +528,27 @@ enum Command {
         #[arg(long, default_value_t = 1825)]
         validity_days: u64,
     },
+    /// Rejoue le dépôt d'une rotation préparée mais jamais déposée.
+    ///
+    /// La cérémonie écrit sa décision avant d'en parler à quiconque. Si la
+    /// machine s'est arrêtée entre l'écriture et le dépôt, ceci renvoie les
+    /// mêmes octets : Astra traite un résultat identique comme le même, et
+    /// aucune clé n'est redemandée — la décision a déjà été approuvée.
+    ResumeRotation {
+        #[arg(long)]
+        authority_url: String,
+    },
+    /// Referme la fenêtre de rotation CA-TLS à `not_after` (§9.2).
+    ///
+    /// Une seule écriture scellée : la clé suivante devient celle qui émet et
+    /// l'ancienne clé privée cesse d'exister. Pendant tout le recouvrement,
+    /// l'autorité émet sous l'ancre sortante — la gateway compare
+    /// `ca_tls_epoch` à l'identique et ne l'avance qu'à `not_after`. Appelée
+    /// trop tôt, la commande n'écrit rien et dit quelle seconde elle attend.
+    ///
+    /// Limite connue : rien ne la lance à `not_after`. Le compagnon attend
+    /// l'opérateur, et émet sous l'ancienne époque jusque-là.
+    PromoteCaTls,
     /// Signe l'annulation d'une transition gateway en attente (§6.3).
     ///
     /// Refusée une fois la transition distribuée ou `activation_at` atteint :
@@ -775,6 +797,8 @@ fn run() -> Result<()> {
             (prepare_days, overlap_days, validity_days),
             transport,
         ),
+        Command::ResumeRotation { authority_url } => resume_rotation(&path, &authority_url),
+        Command::PromoteCaTls => promote_ca_tls(&path, transport),
         Command::AbortGatewayTransition {
             authority_url,
             operation_id,
@@ -1905,6 +1929,27 @@ fn rotate_ca_tls(
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let mut vault = store::load(path)?;
+    // One window at a time, and one *finished* window at a time. A second
+    // ceremony opened over an outstanding deposit would spend a second
+    // campaign approval on a domain that has not accepted the first, and the
+    // two rotations would then name each other's outgoing anchor.
+    let prepared_path = prepared::path_beside(path);
+    if let Some(outstanding) = prepared::load(&prepared_path)? {
+        bail!(
+            "une rotation CA-TLS est déjà préparée vers l'époque {} ({}) : {}. Rien n'a été signé.",
+            outstanding.next_ca_tls_epoch,
+            if outstanding.submitted {
+                "déposée, en attente de promotion"
+            } else {
+                "jamais déposée"
+            },
+            if outstanding.submitted {
+                "la mener à son terme par `astra-signer promote-ca-tls`"
+            } else {
+                "la déposer par `astra-signer resume-rotation`"
+            }
+        );
+    }
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
@@ -2005,9 +2050,30 @@ fn rotate_ca_tls(
         .covers_authority_object(&object)
         .context("la transition signée ne correspond pas à la campagne approuvée")?;
 
-    // The vault already holds the successor. Writing the object before the
-    // deposit keeps a failed deposit a ceremony to redo rather than a domain
-    // whose operator holds a key nobody has heard of.
+    // Signed, verified, and covered by the approval. Only now does anything
+    // durable move, and the vault moves first: it is the one file on this
+    // machine built to hold the successor's private half.
+    store::save(path, &vault)?;
+
+    let result = campaign_result(&approval, vec![object.clone()], None);
+    let record = prepared::PreparedRotation {
+        kind: prepared::PreparedKind::CaTls,
+        operation_id: request.operation_id.to_hex(),
+        result_token: request.result_token.clone(),
+        result,
+        transition_path: out.display().to_string(),
+        next_ca_tls_epoch: identity.ca_tls_epoch + 1,
+        next_ca_tls_certificate: rotated.next_certificate.to_base64(),
+        activation_at: window.activation_at,
+        not_after: window.not_after,
+        submitted: false,
+        prepared_at: now,
+    };
+    // Written before the deposit is attempted, and holding the exact bytes of
+    // it. A crash after this point is a replay; a crash before it is a
+    // ceremony that changed nothing anyone else can see.
+    prepared::save(&prepared_path, &record)?;
+
     let encoded = serde_json::to_vec_pretty(&object).context("encodage de la transition")?;
     std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
     println!("transition écrite: {}", out.display());
@@ -2016,19 +2082,130 @@ fn rotate_ca_tls(
         rotated.next_certificate.fingerprint()
     );
 
-    store::save(path, &vault)?;
-    let mut handoff = handoff;
-    handoff.ca_tls_epoch = Some(identity.ca_tls_epoch + 1);
-    handoff.ca_tls_certificate = Some(rotated.next_certificate.to_base64());
-    handoff::save(&handoff::path_beside(path), &handoff)?;
-
-    let result = campaign_result(&approval, vec![object], None);
-    let state = client.submit(&request.operation_id, &request.result_token, &result)?;
-    println!("état             : {state:?}");
+    submit_prepared(&client, &prepared_path, record)?;
     println!(
         "à reporter sur la gateway : heliosd install-client-tls-ca {}",
         out.display()
     );
+    println!(
+        "puis, à partir de {} : astra-signer promote-ca-tls (l'époque CA-TLS reste à {} pendant \
+         tout le recouvrement)",
+        window.not_after, identity.ca_tls_epoch
+    );
+    Ok(())
+}
+
+/// Deposits a prepared rotation and records that it landed.
+///
+/// The record is updated **after** the authority accepts, never before: a
+/// machine that marked it submitted and then failed to send would have lost
+/// the only trace that anything still had to be sent.
+fn submit_prepared(
+    client: &astra_signer::origin::Origin,
+    prepared_path: &Path,
+    mut record: prepared::PreparedRotation,
+) -> Result<()> {
+    let operation = Id16::parse_hex(&record.operation_id)
+        .map_err(|error| anyhow::anyhow!("rotation préparée illisible : {error}"))?;
+    let state = client.submit(&operation, &record.result_token, &record.result)?;
+    record.submitted = true;
+    prepared::save(prepared_path, &record)?;
+    println!("état             : {state:?}");
+    Ok(())
+}
+
+/// Replays the deposit of a rotation the ceremony already committed to (§8.2).
+fn resume_rotation(path: &Path, authority_url: &str) -> Result<()> {
+    let prepared_path = prepared::path_beside(path);
+    let Some(record) = prepared::load(&prepared_path)? else {
+        println!("aucune rotation préparée : rien à reprendre.");
+        return Ok(());
+    };
+    if record.submitted {
+        println!(
+            "la rotation vers l'époque {} est déjà déposée. La poursuivre par `astra-signer \
+             promote-ca-tls` à partir de {}.",
+            record.next_ca_tls_epoch, record.activation_at
+        );
+        return Ok(());
+    }
+    println!(
+        "reprise du dépôt : rotation CA-TLS vers l'époque {}, préparée à {}.",
+        record.next_ca_tls_epoch, record.prepared_at
+    );
+    println!("transition       : {}", record.transition_path);
+    // No security key. The decision was approved when it was signed; this
+    // sends bytes that already exist.
+    let client = astra_signer::origin::Origin::new(authority_url)?;
+    submit_prepared(&client, &prepared_path, record)
+}
+
+/// Advances the open `CA-TLS` window by one step (§9.2).
+fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
+    use astra::vault::CaTlsAdvance;
+
+    let mut vault = store::load(path)?;
+    let prepared_path = prepared::path_beside(path);
+    let Some(record) = prepared::load(&prepared_path)? else {
+        bail!("aucune rotation CA-TLS en cours : rien à promouvoir.");
+    };
+    if !record.submitted {
+        bail!(
+            "la rotation vers l'époque {} n'a jamais été déposée : la promouvoir ici ferait \
+             émettre sous une ancre que le domaine ignore. La déposer par `astra-signer \
+             resume-rotation`.",
+            record.next_ca_tls_epoch
+        );
+    }
+
+    let now = now_unix();
+    println!("rotation CA-TLS  : époque {}.", record.next_ca_tls_epoch);
+    println!("activation parc  : {}", record.activation_at);
+    println!("retrait          : {}", record.not_after);
+
+    // One key: this executes a decision two credentials already approved. It
+    // opens the vault, it does not authorise anything new.
+    let opened = connect_authorized_key(
+        &vault,
+        transport,
+        "Brancher une clé autorisée, puis appuyer sur Entrée.",
+    )?;
+    let opening = gestures::open_with_authorized_key(opened.key.as_ref(), &vault, &opened.pin)?;
+    let advance = authority::advance_ca_tls(&mut vault, &opening, now)?;
+
+    match &advance {
+        CaTlsAdvance::Idle => {
+            bail!(
+                "le coffre ne porte aucune fenêtre CA-TLS ouverte alors qu'une rotation est \
+                 enregistrée : les deux fichiers ne décrivent pas le même coffre."
+            );
+        }
+        CaTlsAdvance::Awaiting { at } => {
+            println!(
+                "rien à faire : l'ancre sortante émet jusqu'à {at}. C'est le recouvrement — la \
+                 gateway exige encore la génération {} et refuserait la suivante.",
+                record.next_ca_tls_epoch - 1
+            );
+        }
+        CaTlsAdvance::Rotated {
+            certificate_fingerprint,
+            destroyed_fingerprint,
+        } => {
+            store::save(path, &vault)?;
+            // The hand-off moves with the vault, and only now: every issuance
+            // command resolves its anchor and its generation from it, and the
+            // gateway advances its own `ca_tls_epoch` at this same second.
+            let mut handoff = handoff::DomainHandoff::beside(path, &vault)?;
+            handoff.ca_tls_epoch = Some(record.next_ca_tls_epoch);
+            handoff.ca_tls_certificate = Some(record.next_ca_tls_certificate.clone());
+            handoff::save(&handoff::path_beside(path), &handoff)?;
+            prepared::clear(&prepared_path)?;
+            println!("ancre en service : {certificate_fingerprint}");
+            println!("époque CA-TLS    : {}", record.next_ca_tls_epoch);
+            println!("clé privée détruite : {destroyed_fingerprint}");
+            println!("fenêtre refermée : une nouvelle rotation peut être ouverte.");
+        }
+    }
     Ok(())
 }
 

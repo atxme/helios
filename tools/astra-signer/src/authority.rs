@@ -81,7 +81,7 @@ use aether::certificates::webauthn::{
 };
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
-use astra::vault::{AuthoritySecrets, AuthorityVault};
+use astra::vault::{AuthoritySecrets, AuthorityVault, CaTlsAdvance, RetainedCaTls};
 use base64::Engine as _;
 use helios_fido::authenticator::Authenticator;
 use rcgen::{
@@ -986,6 +986,7 @@ pub fn rotate_ca_pq(
                 ca_pq_private_key: encode(&next_private_key),
                 ca_pq_public_key: next_public_key.to_base64(),
                 ca_tls_private_key: secrets.ca_tls_private_key.clone(),
+                retained_ca_tls: secrets.retained_ca_tls.clone(),
             },
         ))
     })?;
@@ -1035,14 +1036,21 @@ pub struct RotatedClientTlsCa {
 /// `CA-PQ`, which does not move here. Requiring two would be borrowing the
 /// weight of a different ceremony; the campaign scope is what carries it.
 ///
-/// # Why the outgoing key is not kept
+/// # Why the vault does not swap here
 ///
-/// The overlap lives in the **certificates**: both anchors are acceptable
-/// until `not_after`, and each verifies chains issued under it with its own
-/// public half. Nothing signs under the outgoing key once the successor
-/// exists — the delegated issuer's intermediate is re-issued under the new
-/// anchor by §9.5 — so keeping its private half would be keeping a key whose
-/// only remaining use is to forge a chain the fleet still accepts.
+/// The successor is sealed **beside** the issuing key, not over it. §9.4 makes
+/// the gateway prepare the anchor before anything is issued under it, and §4.1
+/// puts an `activation_at` between the decision and that moment: a vault that
+/// swapped at the ceremony would certify leaves the fleet does not yet accept,
+/// and a crash before the decision reached the authority would leave an
+/// operator holding an anchor nobody has heard of.
+///
+/// The outgoing key keeps issuing for the whole overlap — the gateway checks
+/// `ca_tls_epoch` with strict equality and only advances it at `not_after`, so
+/// stamping the next generation earlier would have every issuance of the
+/// window refused. At `not_after`, [`AuthorityVault::advance_ca_tls`] promotes
+/// the successor and destroys the outgoing private half in one sealed write,
+/// which is where §9.2 permits that destruction and nowhere before.
 pub fn rotate_ca_tls(
     vault: &mut AuthorityVault,
     opening: &crate::authenticator::Opened,
@@ -1095,7 +1103,7 @@ pub fn rotate_ca_tls(
     // Proved rather than intended, exactly as at issuance.
     aether::certificates::x509::assert_certificate_authority(&next_certificate)?;
 
-    let (transition, next_secrets) = with_anchors(vault, opening, |secrets| {
+    let transition = with_anchors(vault, opening, |secrets| {
         let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
         let transition = ClientTlsCaTransition {
             format_version: CERTIFICATE_FORMAT_VERSION,
@@ -1116,26 +1124,39 @@ pub fn rotate_ca_tls(
             identity.ca_tls_epoch,
             &active_certificate.fingerprint(),
         )?;
-        Ok((
-            transition,
-            AuthoritySecrets {
-                ca_pq_private_key: secrets.ca_pq_private_key.clone(),
-                ca_pq_public_key: secrets.ca_pq_public_key.clone(),
-                ca_tls_private_key: encode(&key.serialize_der()),
-            },
-        ))
+        Ok(transition)
     })?;
+    let successor = RetainedCaTls {
+        private_key: encode(&key.serialize_der()),
+        certificate_fingerprint: next_certificate.fingerprint().to_hex(),
+        counterpart_fingerprint: active_certificate.fingerprint().to_hex(),
+        activation_at: window.activation_at,
+        not_after: window.not_after,
+    };
 
     // The object is signed and verified before the vault moves. A vault that
     // held a successor no transition names would leave the operator unable to
     // rotate again — the next ceremony would resolve its target from an anchor
     // the domain has never heard of.
-    vault.replace_anchors(&opening.credential_id, &opening.secret, &next_secrets)?;
+    vault.stage_ca_tls_successor(&opening.credential_id, &opening.secret, successor)?;
 
     Ok(RotatedClientTlsCa {
         transition,
         next_certificate,
     })
+}
+
+/// Closes an open `CA-TLS` window once its `not_after` has passed (spec §9.2).
+///
+/// A thin wrapper: the whole decision is [`AuthorityVault::advance_ca_tls`],
+/// which does it in one re-seal. This exists so the command reaches it the
+/// same way every other gesture reaches the anchors.
+pub fn advance_ca_tls(
+    vault: &mut AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    now_unix: u64,
+) -> Result<CaTlsAdvance> {
+    Ok(vault.advance_ca_tls(&opening.credential_id, &opening.secret, now_unix)?)
 }
 
 /// What one recovery ceremony produced (spec §7.5).

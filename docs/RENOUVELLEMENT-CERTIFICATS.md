@@ -428,12 +428,58 @@ astra-signer rotate-ca-tls --authority-url https://astra.exemple \
   --operation-id <identifiant> --out ca-tls-transition.json
 # --prepare-days 7 --overlap-days 30 --validity-days 1825
 heliosd install-client-tls-ca ca-tls-transition.json
+
+# à not_after, une fois le recouvrement écoulé :
+astra-signer promote-ca-tls
 ```
 
 L'ancre entrante est créée au compagnon, auto-signée pour prouver qu'elle
 détient sa clé — cette auto-signature ne remplace jamais la signature `CA-PQ`
-comme autorisation —, et le coffre adopte la nouvelle clé privée TLS dans la
-même écriture. `CA-PQ`, elle, ne bouge pas.
+comme autorisation. `CA-PQ`, elle, ne bouge pas.
+
+**Le coffre ne bascule pas à la cérémonie.** La clé suivante est scellée *à
+côté* de celle qui émet, dans le rôle `successor`. C'est ce que demandent le
+§9.4 — la gateway est préparée avant qu'une feuille soit émise sous la
+nouvelle ancre — et le §4.1, qui place un `activation_at` entre la décision et
+son effet. Un coffre qui aurait échangé les clés au moment de la signature
+aurait certifié des feuilles que le parc n'accepte pas encore.
+
+`promote-ca-tls` referme la fenêtre, en une seule réécriture scellée :
+
+| Moment | Ce que la commande fait |
+| --- | --- |
+| avant `not_after` | rien, et elle dit quelle seconde elle attend |
+| à `not_after` | la clé suivante devient celle qui émet, l'ancienne clé privée cesse d'exister, le relais de domaine passe à la nouvelle époque, la fenêtre se referme |
+
+**Pourquoi l'autorité émet sous l'ancre sortante pendant tout le
+recouvrement** : une génération cliente porte `ca_tls_epoch`, et la gateway le
+compare **à l'identique** à son propre `ca_tls_epoch`, qu'elle n'avance qu'à
+`retire_active_at` — c'est-à-dire `not_after`, pas `activation_at`. Une
+autorité qui se serait mise à estampiller la génération suivante dès
+l'activation aurait vu refuser **toutes** les émissions du recouvrement,
+pendant toute sa durée. Les deux côtés basculent donc à la même seconde.
+
+**Conserver n'est pas détruire, et le successeur ne certifie rien.** Le §9.2
+n'autorise la destruction de l'ancienne clé privée qu'après la fin de la
+fenêtre et la publication durable de la transition ; la détruire à la
+cérémonie laisserait un domaine ayant annoncé un successeur qu'aucune gateway
+n'a encore installé sans aucun retour possible. Symétriquement, la clé
+entrante n'est jamais `ca_tls_private_key` — le seul champ que lisent les
+gestes de signature — avant que `promote-ca-tls` ne l'y déplace.
+
+**La décision est écrite avant d'être annoncée.** La cérémonie scelle le
+successeur, puis écrit `astra-prepared.json` à côté du coffre — les octets
+exacts du dépôt, la fenêtre, et le fichier de transition —, et seulement
+ensuite dépose auprès d'Astra. Une machine qui s'arrête entre les deux se
+reprend par :
+
+```sh
+astra-signer resume-rotation --authority-url https://astra.exemple
+```
+
+Astra traite un résultat identique comme le même (§8.2) : la reprise ne
+redemande aucune clé, parce qu'elle n'approuve rien de neuf. Tant que ce
+fichier existe, `rotate-ca-tls` refuse d'ouvrir une seconde fenêtre.
 
 **Pendant le chevauchement, les deux chaînes sont acceptées.** C'est tout
 l'objet de la fenêtre : les feuilles clientes émises sous l'ancienne ancre
@@ -451,6 +497,14 @@ revenir couperait les retardataires.
 **Limite connue** : l'intermédiaire de l'émetteur délégué est signé par
 l'ancre sortante. Le faire ré-émettre sous la nouvelle est la rotation du
 §9.5, qui reste un geste distinct.
+
+**Limite connue** : rien ne lance `promote-ca-tls` à `not_after`. La gateway
+avance son époque toute seule à cette seconde ; le compagnon, lui, attend
+l'opérateur, et jusque-là il continue d'estampiller l'ancienne — que la
+gateway refusera désormais. Le fichier `astra-prepared.json` en garde la trace
+et `resume-rotation` la rappelle. Ce qui la lèverait est un ordonnanceur côté
+opérateur, qui n'existe pas : le compagnon est une machine hors ligne qu'on
+branche.
 
 ## 10. Ce qui n'a pas encore de commande
 

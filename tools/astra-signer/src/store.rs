@@ -97,6 +97,7 @@ mod tests {
                 ca_pq_private_key: "cHE=".into(),
                 ca_pq_public_key: "cHViCg==".into(),
                 ca_tls_private_key: "dGxz".into(),
+                retained_ca_tls: None,
             },
             SlotEnrolment {
                 role: SlotRole::Primary,

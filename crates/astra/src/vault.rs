@@ -159,6 +159,11 @@ pub enum VaultError {
          `AstraCredentialBinding` ne peut le décrire. Le retirer et réenrôler la clé"
     )]
     CredentialKeyMissing,
+    #[error(
+        "une fenêtre de rotation CA-TLS est déjà ouverte : la mener à son terme par \
+         `astra-signer promote-ca-tls` avant d'en ouvrir une seconde"
+    )]
+    CaTlsWindowOpen,
     #[error("contenu du coffre illisible : {0}")]
     Corrupt(String),
 }
@@ -269,8 +274,79 @@ pub struct AuthoritySecrets {
     /// from the other, and a public anchor an operator hands to two other
     /// programs must not be a value anybody can edit unnoticed.
     pub ca_pq_public_key: String,
-    /// PKCS#8 private key of the client `CA-TLS`, base64.
+    /// PKCS#8 private key of the client `CA-TLS` **currently issuing**.
     pub ca_tls_private_key: String,
+    /// The other half of an open `CA-TLS` window, sealed beside the issuing
+    /// one (spec §9.2, §9.4). `None` outside a rotation.
+    #[serde(default)]
+    pub retained_ca_tls: Option<RetainedCaTls>,
+}
+
+/// The successor `CA-TLS` key, sealed beside the one that issues.
+///
+/// # Why the outgoing key stays the issuing one for the whole window
+///
+/// A client generation carries `ca_tls_epoch`, and the gateway checks it with
+/// strict equality against [`ClientTlsCaState::ca_tls_epoch`], which advances
+/// at `retire_active_at` — the window's `not_after`, not its `activation_at`.
+/// So an authority that started stamping the next generation at activation
+/// would have every issuance of the overlap refused, for as long as the
+/// overlap lasts. The overlap exists exactly so leaves under the outgoing
+/// anchor keep working; the authority stays on it until the fleet has moved.
+///
+/// # Why it is kept, and why keeping it is not using it
+///
+/// §9.2 lets the old private half be destroyed **only** after the window ends
+/// and the transition is durably published. Destroying it at the ceremony
+/// instead would leave a domain that has announced a successor no gateway has
+/// installed yet with no way back: the anchor the fleet still accepts would
+/// have no key, and the one with a key nothing yet trusts.
+///
+/// The successor, meanwhile, certifies nothing. It is not
+/// [`AuthoritySecrets::ca_tls_private_key`], which is the only key any
+/// issuance path reads, and the one thing that moves it there is
+/// [`AuthorityVault::advance_ca_tls`] — which the clock gates, and which
+/// destroys the outgoing key in the same sealed write.
+///
+/// [`ClientTlsCaState::ca_tls_epoch`]: aether::certificates::state::ClientTlsCaState
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedCaTls {
+    /// PKCS#8 private key of the incoming anchor, base64.
+    pub private_key: String,
+    /// SHA-256 of the DER certificate this key belongs to, hex.
+    #[zeroize(skip)]
+    pub certificate_fingerprint: String,
+    /// The same, for the anchor currently issuing — the one this replaces.
+    #[zeroize(skip)]
+    pub counterpart_fingerprint: String,
+    /// The window this successor belongs to, from the transition that opened
+    /// it. `activation_at` is when the *fleet* starts accepting the incoming
+    /// anchor; `not_after` is when the outgoing one is retired, and the only
+    /// second at which this vault moves.
+    #[zeroize(skip)]
+    pub activation_at: u64,
+    #[zeroize(skip)]
+    pub not_after: u64,
+}
+
+/// What one call to [`AuthorityVault::advance_ca_tls`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaTlsAdvance {
+    /// No window is open. Nothing was written.
+    Idle,
+    /// A successor is sealed and the retirement second has not arrived. An
+    /// operator who runs the command early is told when to come back rather
+    /// than left wondering whether it worked.
+    Awaiting { at: u64 },
+    /// The successor is now the issuing key and the outgoing private key is
+    /// gone, in one sealed write. The window is closed.
+    Rotated {
+        /// The anchor that now issues.
+        certificate_fingerprint: String,
+        /// The anchor whose private half was destroyed.
+        destroyed_fingerprint: String,
+    },
 }
 
 /// The vault as it travels: an encrypted body and a table of key-slots.
@@ -703,12 +779,120 @@ impl AuthorityVault {
         // The current body must open before it is replaced: an operator who
         // cannot read the anchors is not entitled to overwrite them, and this
         // is where a corrupt file says so rather than producing a second one.
-        let _ = self.open_payload(&master)?;
+        let current = self.open_payload(&master)?;
+        // A `CA-PQ` rotation must carry an open `CA-TLS` window through
+        // untouched. Dropping it here would destroy a successor the domain
+        // has already been told about, or an outgoing key §9.2 keeps until
+        // `not_after` — on an operation that rotates neither.
+        if current.retained_ca_tls != secrets.retained_ca_tls {
+            return Err(VaultError::Corrupt(
+                "le remplacement d'ancre ne conserve pas la fenêtre CA-TLS ouverte".into(),
+            ));
+        }
         let slots = self.slots.clone();
         let public_key = secrets.ca_pq_public_key.clone();
         self.reseal(slots, &master, secrets)?;
         self.ca_pq_public_key = public_key;
         Ok(())
+    }
+
+    /// Seals the successor of a `CA-TLS` rotation beside the issuing key.
+    ///
+    /// The issuing key is **not** replaced. §9.4 requires the gateway to be
+    /// prepared before anything is issued under the new anchor, and §4.1 puts
+    /// an `activation_at` between the two: a vault that swapped at the
+    /// ceremony would certify leaves the fleet does not yet accept.
+    ///
+    /// One window at a time. Two overlapping rotations would leave three
+    /// anchors alive, of which the domain's registry names only two, and the
+    /// third would be a key nothing can retire.
+    pub fn stage_ca_tls_successor(
+        &mut self,
+        opening_credential: &[u8],
+        opening_secret: &SlotSecret,
+        successor: RetainedCaTls,
+    ) -> Result<()> {
+        if successor.private_key.trim().is_empty()
+            || successor.certificate_fingerprint.trim().is_empty()
+        {
+            return Err(VaultError::Corrupt("successeur CA-TLS incomplet".into()));
+        }
+        if successor.activation_at >= successor.not_after {
+            return Err(VaultError::Corrupt(
+                "fenêtre de rotation CA-TLS vide : activation au plus tard au retrait".into(),
+            ));
+        }
+        let opening_slot = self.slot_for_credential(opening_credential)?.slot_id;
+        let master = self.master(&opening_slot, opening_secret)?;
+        let secrets = self.open_payload(&master)?;
+        if secrets.retained_ca_tls.is_some() {
+            return Err(VaultError::CaTlsWindowOpen);
+        }
+        let staged = AuthoritySecrets {
+            ca_pq_private_key: secrets.ca_pq_private_key.clone(),
+            ca_pq_public_key: secrets.ca_pq_public_key.clone(),
+            ca_tls_private_key: secrets.ca_tls_private_key.clone(),
+            retained_ca_tls: Some(successor),
+        };
+        let slots = self.slots.clone();
+        self.reseal(slots, &master, &staged)
+    }
+
+    /// Closes an open `CA-TLS` window at `not_after` (spec §9.2).
+    ///
+    /// One sealed write does everything: the successor becomes the issuing
+    /// key and the outgoing private half ceases to exist. Splitting the two
+    /// would allow a restart to find a vault that had destroyed the anchor it
+    /// was still issuing under, or one issuing under an anchor it had not yet
+    /// stopped calling a successor.
+    ///
+    /// Idempotent: called before `not_after`, it writes nothing and reports
+    /// which second it is waiting for.
+    pub fn advance_ca_tls(
+        &mut self,
+        opening_credential: &[u8],
+        opening_secret: &SlotSecret,
+        now_unix: u64,
+    ) -> Result<CaTlsAdvance> {
+        let opening_slot = self.slot_for_credential(opening_credential)?.slot_id;
+        let master = self.master(&opening_slot, opening_secret)?;
+        let secrets = self.open_payload(&master)?;
+        let Some(retained) = secrets.retained_ca_tls.clone() else {
+            return Ok(CaTlsAdvance::Idle);
+        };
+        if now_unix < retained.not_after {
+            return Ok(CaTlsAdvance::Awaiting {
+                at: retained.not_after,
+            });
+        }
+        let rotated = AuthoritySecrets {
+            ca_pq_private_key: secrets.ca_pq_private_key.clone(),
+            ca_pq_public_key: secrets.ca_pq_public_key.clone(),
+            ca_tls_private_key: retained.private_key.clone(),
+            retained_ca_tls: None,
+        };
+        let slots = self.slots.clone();
+        self.reseal(slots, &master, &rotated)?;
+        Ok(CaTlsAdvance::Rotated {
+            certificate_fingerprint: retained.certificate_fingerprint.clone(),
+            destroyed_fingerprint: retained.counterpart_fingerprint.clone(),
+        })
+    }
+
+    /// What the vault holds beside the issuing `CA-TLS` key, if anything.
+    ///
+    /// Public material only: the caller learns which window is open and when
+    /// it closes, never the key.
+    pub fn ca_tls_window(
+        &self,
+        opening_credential: &[u8],
+        opening_secret: &SlotSecret,
+    ) -> Result<Option<(String, u64)>> {
+        let secrets = self.open(opening_credential, opening_secret)?;
+        Ok(secrets
+            .retained_ca_tls
+            .as_ref()
+            .map(|retained| (retained.certificate_fingerprint.clone(), retained.not_after)))
     }
 
     /// Renames a slot. Never re-seals: the label is outside the digest, which
@@ -806,17 +990,70 @@ fn seal_payload(
     Ok(encode(&blob))
 }
 
+/// Fixtures shared by the test modules below.
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
 
-    const RP_ID: &str = "astra.example";
+    pub const RP_ID: &str = "astra.example";
+
+    pub fn secrets() -> AuthoritySecrets {
+        AuthoritySecrets {
+            ca_pq_private_key: "Y2EtcHEtcHJpdmF0ZQ==".into(),
+            ca_pq_public_key: "Y2EtcHEtcHVibGlj".into(),
+            ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
+            retained_ca_tls: None,
+        }
+    }
+
+    pub fn domain() -> TrustDomainId {
+        TrustDomainId::new([3; 16]).expect("domain")
+    }
+
+    pub fn credential(seed: u8) -> Vec<u8> {
+        vec![seed; 64]
+    }
+
+    pub fn enrolment(role: SlotRole, seed: u8) -> SlotEnrolment {
+        SlotEnrolment {
+            role,
+            label: format!("clé {seed}"),
+            credential_id: credential(seed),
+            credential_public_key: vec![0xa5, seed],
+            aaguid: [seed; 16],
+            enrolled_at: 2_000,
+        }
+    }
+
+    pub fn material(seed: u8) -> SlotSecret {
+        SlotSecret::new(vec![seed; 32])
+    }
+
+    pub fn vault() -> AuthorityVault {
+        AuthorityVault::create(
+            domain(),
+            RP_ID,
+            draw_salt().expect("salt"),
+            &secrets(),
+            enrolment(SlotRole::Primary, 1),
+            &material(1),
+            1_000,
+        )
+        .expect("create")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     fn secrets() -> AuthoritySecrets {
         AuthoritySecrets {
             ca_pq_private_key: "Y2EtcHEtcHJpdmF0ZQ==".into(),
             ca_pq_public_key: "Y2EtcHEtcHVibGlj".into(),
             ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
+            retained_ca_tls: None,
         }
     }
 
@@ -1207,5 +1444,179 @@ mod tests {
     fn the_clear_anchor_is_the_one_the_vault_seals() {
         let vault = vault();
         assert_eq!(vault.ca_pq_public_key, secrets().ca_pq_public_key);
+    }
+}
+
+#[cfg(test)]
+mod ca_tls_window_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    fn successor() -> RetainedCaTls {
+        RetainedCaTls {
+            private_key: "c3VjY2Vzc2V1cg==".into(),
+            certificate_fingerprint: "b".repeat(64),
+            counterpart_fingerprint: "a".repeat(64),
+            activation_at: 5_000,
+            not_after: 9_000,
+        }
+    }
+
+    /// The successor is sealed **beside** the issuing key, not over it: the
+    /// gateway checks `ca_tls_epoch` with strict equality and only advances it
+    /// at `not_after`, so the authority keeps issuing under the outgoing
+    /// anchor for the whole overlap.
+    #[test]
+    fn staging_a_successor_leaves_the_issuing_key_where_it_was() {
+        let mut vault = vault();
+        let before = vault.open(&credential(1), &material(1)).expect("open");
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let after = vault.open(&credential(1), &material(1)).expect("open");
+        assert_eq!(after.ca_tls_private_key, before.ca_tls_private_key);
+        assert_eq!(after.retained_ca_tls, Some(successor()));
+    }
+
+    /// Two windows would leave three anchors alive, of which the domain's
+    /// registry names two.
+    #[test]
+    fn a_second_window_is_refused_while_one_is_open() {
+        let mut vault = vault();
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let refused = vault.stage_ca_tls_successor(&credential(1), &material(1), successor());
+        assert!(matches!(refused, Err(VaultError::CaTlsWindowOpen)));
+    }
+
+    /// `activation_at` is the fleet's second, not this vault's: at that point
+    /// the gateway accepts both anchors but still requires the outgoing
+    /// generation, so nothing here moves.
+    #[test]
+    fn nothing_moves_at_the_activation_second() {
+        let mut vault = vault();
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let sealed = vault.sealed_payload.clone();
+        let advance = vault
+            .advance_ca_tls(&credential(1), &material(1), 5_000)
+            .expect("advance");
+        assert_eq!(advance, CaTlsAdvance::Awaiting { at: 9_000 });
+        assert_eq!(vault.sealed_payload, sealed);
+        let after = vault.open(&credential(1), &material(1)).expect("open");
+        assert_eq!(after.retained_ca_tls, Some(successor()));
+    }
+
+    /// And nothing moves the second before the retirement either.
+    #[test]
+    fn nothing_moves_before_the_retirement_second() {
+        let mut vault = vault();
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let sealed = vault.sealed_payload.clone();
+        assert_eq!(
+            vault
+                .advance_ca_tls(&credential(1), &material(1), 8_999)
+                .expect("advance"),
+            CaTlsAdvance::Awaiting { at: 9_000 }
+        );
+        assert_eq!(vault.sealed_payload, sealed);
+    }
+
+    /// At `not_after`, one sealed write does both halves: the successor issues
+    /// and the outgoing private key ceases to exist. §9.2 permits the
+    /// destruction only here.
+    #[test]
+    fn the_window_closes_in_a_single_write_that_destroys_the_outgoing_key() {
+        let mut vault = vault();
+        let before = vault.open(&credential(1), &material(1)).expect("open");
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let advance = vault
+            .advance_ca_tls(&credential(1), &material(1), 9_000)
+            .expect("advance");
+        assert_eq!(
+            advance,
+            CaTlsAdvance::Rotated {
+                certificate_fingerprint: "b".repeat(64),
+                destroyed_fingerprint: "a".repeat(64),
+            }
+        );
+        let after = vault.open(&credential(1), &material(1)).expect("open");
+        assert_eq!(after.ca_tls_private_key, successor().private_key);
+        assert_ne!(after.ca_tls_private_key, before.ca_tls_private_key);
+        assert_eq!(after.retained_ca_tls, None);
+        assert_eq!(
+            vault
+                .advance_ca_tls(&credential(1), &material(1), 10_000)
+                .expect("idle"),
+            CaTlsAdvance::Idle
+        );
+    }
+
+    /// A `CA-PQ` rotation must carry an open `CA-TLS` window through
+    /// untouched: it rotates the operator anchor, not the transport one.
+    #[test]
+    fn replacing_the_pq_anchor_may_not_drop_an_open_window() {
+        let mut vault = vault();
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        let dropped = AuthoritySecrets {
+            ca_pq_private_key: "bmV3LXBx".into(),
+            ca_pq_public_key: "bmV3LXBxLXB1Yg==".into(),
+            ca_tls_private_key: "Y2EtdGxzLXByaXZhdGU=".into(),
+            retained_ca_tls: None,
+        };
+        let refused = vault.replace_anchors(&credential(1), &material(1), &dropped);
+        assert!(matches!(refused, Err(VaultError::Corrupt(_))));
+        let carried = AuthoritySecrets {
+            ca_pq_private_key: dropped.ca_pq_private_key.clone(),
+            ca_pq_public_key: dropped.ca_pq_public_key.clone(),
+            ca_tls_private_key: dropped.ca_tls_private_key.clone(),
+            retained_ca_tls: Some(successor()),
+        };
+        vault
+            .replace_anchors(&credential(1), &material(1), &carried)
+            .expect("replace");
+        let after = vault.open(&credential(1), &material(1)).expect("open");
+        assert_eq!(after.retained_ca_tls, Some(successor()));
+    }
+
+    /// A window whose activation is not before its retirement is not a window.
+    #[test]
+    fn an_empty_window_is_refused() {
+        let mut vault = vault();
+        let empty = RetainedCaTls {
+            activation_at: 9_000,
+            ..successor()
+        };
+        let refused = vault.stage_ca_tls_successor(&credential(1), &material(1), empty);
+        assert!(matches!(refused, Err(VaultError::Corrupt(_))));
+    }
+
+    /// The window is readable without the key it holds.
+    #[test]
+    fn the_open_window_is_readable_as_public_material() {
+        let mut vault = vault();
+        assert_eq!(
+            vault
+                .ca_tls_window(&credential(1), &material(1))
+                .expect("w"),
+            None
+        );
+        vault
+            .stage_ca_tls_successor(&credential(1), &material(1), successor())
+            .expect("stage");
+        assert_eq!(
+            vault
+                .ca_tls_window(&credential(1), &material(1))
+                .expect("w"),
+            Some(("b".repeat(64), 9_000))
+        );
     }
 }
