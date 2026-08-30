@@ -4,7 +4,7 @@ import Skeleton from '@mui/material/Skeleton'
 import Stack from '@mui/material/Stack'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { BadgeCheck, Fingerprint, KeyRound, Users } from 'lucide-react'
+import { BadgeCheck, CalendarClock, Fingerprint, KeyRound, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { fetchCertificateDomain } from '../api'
 import { shortKey } from '../format'
@@ -134,6 +134,128 @@ function PhaseChip({ phase }: { phase: CertificatePhase }) {
         sx={{ bgcolor: skin.container, color: skin.onContainer, fontWeight: 600 }}
       />
     </Tooltip>
+  )
+}
+
+/**
+ * The transitions in flight, with the two instants that decide them.
+ *
+ * # Why this is not a chip saying « en cours »
+ *
+ * A staged transition is a decision already taken, waiting on two instants an
+ * operator has to plan around: `activation_at`, when both halves start being
+ * accepted, and `not_after`, when the outgoing one is destroyed and — for the
+ * gateway identity — a restart becomes mandatory. Those instants live in the
+ * domain view and were reachable nowhere on this screen: they appeared once,
+ * in the echo of the document that had just been pasted, and a reload lost
+ * them. An operator asking «quand est-ce que ça bascule» had to go back to the
+ * CLI to answer.
+ *
+ * # Why `published` is stated rather than implied
+ *
+ * It is the door of §6.3 closing. Before distribution a transition can be
+ * aborted and its epoch consumed; after it, the only thing left is the bounded
+ * rollback of §4.4. Those are two different sets of options, and which one the
+ * operator has is not something to deduce from a date.
+ *
+ * Nothing pending renders nothing at all: a domain at rest must not leave a
+ * card of dashes on the screen, and what stays visible is what somebody has to
+ * look at.
+ */
+function TransitionTimeline({ domain }: { domain: CertificateDomain }) {
+  const anything =
+    domain.ca_transition_pending ||
+    domain.client_tls_ca_transition_pending ||
+    domain.gateway_transition_pending ||
+    domain.gateway_rollback_expires_at !== null
+  if (!anything) return null
+
+  const now = domain.now_unix
+  const at = (unix: number | null): string =>
+    unix === null ? '—' : `${formatDate(unix)} · ${formatDelay(unix - now)}`
+
+  return (
+    <SectionCard
+      title="Transitions en cours"
+      subtitle="Un successeur est installé. Rien ne bascule avant son instant d’activation."
+      icon={CalendarClock}
+      accent="tertiary.main"
+    >
+      <Box>
+        {domain.ca_transition_pending && (
+          <>
+            <DataRow
+              label="CA-PQ"
+              value={`époque ${domain.ca_epoch} → ${domain.ca_epoch + 1}`}
+              hint="L’époque ne bouge qu’au retrait de l’ancre sortante, par la même passe qui promeut les générations clientes."
+            />
+            <DataRow
+              label="Ancre entrante"
+              value={domain.next_ca_fingerprint}
+              hint="À comparer avec l’empreinte qu’affiche le compagnon : au §9.1, c’est cette comparaison qui fait foi, pas la signature seule."
+              wrap
+            />
+            <DataRow
+              label="Activation CA-PQ"
+              value={at(domain.ca_activation_at)}
+              hint="À partir de cet instant les deux ancres vérifient."
+            />
+            <DataRow
+              label="Retrait CA-PQ"
+              value={at(domain.ca_retire_active_at)}
+              hint="L’ancre sortante est retirée et l’époque avance."
+            />
+          </>
+        )}
+
+        {domain.client_tls_ca_transition_pending && (
+          <DataRow
+            label="CA TLS cliente"
+            value={`époque ${domain.client_tls_ca_epoch} → ${domain.client_tls_ca_epoch + 1}`}
+            hint="Une CA TLS cliente suivante est installée. Elle est refusée sans signature CA-PQ et ne peut pas précéder la persistance gateway."
+          />
+        )}
+
+        {domain.gateway_transition_pending && (
+          <>
+            <DataRow
+              label="Identité gateway"
+              value={`époque ${domain.gateway_identity_epoch} → ${
+                domain.gateway_identity_epoch + 1
+              }`}
+              hint="La feuille servie ne change pas ici : le basculement appartient à activation_at et demande un redémarrage."
+            />
+            <DataRow
+              label="Activation gateway"
+              value={at(domain.gateway_activation_at)}
+              hint="Début du chevauchement : les deux feuilles sont acceptées."
+            />
+            <DataRow
+              label="Retrait gateway"
+              value={at(domain.gateway_retire_active_at)}
+              hint="Fin du chevauchement : la feuille sortante est détruite et la suivante promue."
+            />
+            <DataRow
+              label="Distribution"
+              value={
+                domain.gateway_transition_published
+                  ? 'distribuée — l’avortement n’est plus accepté'
+                  : 'non distribuée — encore annulable'
+              }
+              hint="§6.3 : l’avortement n’est accepté que tant que rien n’a été distribué. Passé ce point il ne reste que le rollback borné du §4.4."
+            />
+          </>
+        )}
+
+        {domain.gateway_rollback_expires_at !== null && (
+          <DataRow
+            label="Rollback en force"
+            value={`ancienne feuille servie · jusqu’à ${at(domain.gateway_rollback_expires_at)}`}
+            hint="Rollback de service, pas d’état : aucun compteur ne bouge et la promotion a lieu comme prévu. Son expiration est elle aussi un redémarrage."
+          />
+        )}
+      </Box>
+    </SectionCard>
   )
 }
 
@@ -310,21 +432,12 @@ export function CertificateDomainPanel() {
               hint="La feuille PQ que ce démon sert réellement. Une rotation sans redémarrage laisse un certificat plus récent sur disque que celui-ci."
               wrap
             />
-            {(domain.ca_transition_pending ||
-              domain.client_tls_ca_transition_pending ||
-              domain.gateway_transition_pending) && (
-              <DataRow
-                label="Transition"
-                value={[
-                  domain.ca_transition_pending ? 'CA-PQ' : null,
-                  domain.client_tls_ca_transition_pending ? 'CA TLS' : null,
-                  domain.gateway_transition_pending ? 'identité gateway' : null,
-                ]
-                  .filter(Boolean)
-                  .join(', ')}
-                hint="Un successeur est installé et attend son instant d’activation. Les deux restent acceptés pendant le chevauchement."
-              />
-            )}
+            <DataRow
+              label="Feuille TLS gateway"
+              value={domain.gateway_tls_fingerprint}
+              hint="La feuille TLS servie sur le même chemin. Le §6.1 fait de chaque moitié une rotation indépendante : celle-ci peut rester inchangée pendant qu’une transition PQ court."
+              wrap
+            />
           </Box>
         </SectionCard>
 
@@ -366,6 +479,8 @@ export function CertificateDomainPanel() {
           </Box>
         </SectionCard>
       </Box>
+
+      <TransitionTimeline domain={domain} />
 
       <GatewayIdentityActions domain={domain} />
 

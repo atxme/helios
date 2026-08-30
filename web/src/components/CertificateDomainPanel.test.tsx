@@ -198,6 +198,84 @@ describe('CertificateDomainPanel', () => {
   })
 
   /**
+   * A domain at rest leaves nothing behind. The card of dashes it would
+   * otherwise draw is the thing that teaches an operator to stop reading the
+   * screen.
+   */
+  it('draws no transition card while nothing is in flight', async () => {
+    answer(DOMAIN)
+    mount()
+
+    await screen.findByText('poste-windows')
+    expect(screen.queryByText('Transitions en cours')).toBeNull()
+  })
+
+  /**
+   * The two instants an operator plans around, and the door of §6.3: before
+   * distribution a transition can still be aborted, after it only the bounded
+   * rollback remains. Both used to vanish on a reload.
+   */
+  it('states when a staged gateway transition switches, retires, and can still be aborted', async () => {
+    answer({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_activation_at: 60_000,
+      gateway_retire_active_at: 150_000,
+      gateway_transition_published: false,
+    })
+    mount()
+
+    await screen.findByText('Transitions en cours')
+    expect(screen.getByText('époque 3 → 4')).toBeTruthy()
+    expect(screen.getByText(/non distribuée/)).toBeTruthy()
+    // Both instants are drawn against the gateway's clock, not the browser's.
+    expect(screen.getAllByText(/dans 1 j/).length).toBeGreaterThan(0)
+  })
+
+  /** Past distribution the options change, and the screen says which ones. */
+  it('says the abort is gone once the transition has been distributed', async () => {
+    answer({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_activation_at: 40_000,
+      gateway_retire_active_at: 150_000,
+      gateway_transition_published: true,
+    })
+    mount()
+
+    await screen.findByText('Transitions en cours')
+    expect(screen.getByText(/l’avortement n’est plus accepté/)).toBeTruthy()
+  })
+
+  /**
+   * §9.1 makes the comparison with the companion the check, not the signature
+   * alone — so the incoming anchor has to be on the screen to be compared.
+   */
+  it('shows the incoming anchor and its window during a CA-PQ rotation', async () => {
+    answer({
+      ...DOMAIN,
+      ca_transition_pending: true,
+      ca_activation_at: 60_000,
+      ca_retire_active_at: 150_000,
+      next_ca_fingerprint: 'ab'.repeat(32),
+    })
+    mount()
+
+    await screen.findByText('Transitions en cours')
+    expect(screen.getByText('époque 1 → 2')).toBeTruthy()
+    expect(screen.getByText('ab'.repeat(32))).toBeTruthy()
+  })
+
+  /** A selection in force is a restart pending, so it is never silent. */
+  it('shows a service rollback in force', async () => {
+    answer({ ...DOMAIN, gateway_rollback_expires_at: 90_000 })
+    mount()
+
+    await screen.findByText('Transitions en cours')
+    expect(screen.getByText(/ancienne feuille servie/)).toBeTruthy()
+  })
+
+  /**
    * The worst rung first. An operator opens this screen to find what needs
    * doing, and alphabetical order buries it under whatever is fine.
    */

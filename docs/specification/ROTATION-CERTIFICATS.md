@@ -2604,11 +2604,20 @@ l'époque et qu'elle n'est plus disponible dès que la transition a pu être
 distribuée.
 
 Chaque renouvellement, planifié ou manuel, crée une opération ; chaque action
-globale crée une campagne. Pour un profil actif, l'IHM lance `astra-signer`
-avec `heliosd_url` et `operation_id`; hors tunnel elle emploie l'origine Astra.
-Le compagnon dialogue directement avec la YubiKey et affiche le manifeste ;
-l'IHM ignore un callback non signé, interroge l'état, vérifie le résultat sous
-la clé de service Astra puis vérifie chaque objet sous sa propre autorité. Le
+globale crée une campagne. L'approbation a deux chemins, et l'IHM les offre
+tous les deux. Quand la clé de sécurité est sur le poste, **Orion mène la
+cérémonie lui-même** : il lit d'abord le manifeste vérifié — pair, générations
+active et demandée, empreinte de la demande, échéance, nombre de credentials
+du domaine habilités à répondre — puis exécute l'unique `GetAssertion` et
+dépose l'assertion. L'ordre est la garantie, pas une commodité : ce qui est
+signé est ce qui a été montré, et la cérémonie est refusée tant que le
+manifeste n'a pas été lu. Quand la clé est ailleurs, ou que la politique du
+poste refuse à Orion l'accès au transport, l'IHM lance `astra-signer` avec
+`heliosd_url` et `operation_id`; hors tunnel elle emploie l'origine Astra. Le
+compagnon dialogue alors directement avec la YubiKey et affiche le même
+manifeste ; l'IHM ignore un callback non signé, interroge l'état, vérifie le
+résultat sous la clé de service Astra puis vérifie chaque objet sous sa propre
+autorité. Le
 libellé montre avant approbation le nombre de cibles, les générations et si une
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
@@ -3194,8 +3203,22 @@ contournés :
   le chevauchement ; contrairement au rollback gateway, aucune clé privée de
   service détenue par un autre composant n'est dégradée et aucun nouvel objet
   `CA-PQ` n'ajouterait d'autorité.
-  Orion lance désormais automatiquement `astra-signer` quand l'opération
-  atteint `awaiting_operator`. Le frontend ne transmet que le nom du profil à
+  L'écran mène désormais **la cérémonie elle-même** quand la clé est sur ce
+  poste : « Lire la demande d'approbation » appelle
+  `certificate_approval_manifest`, qui vérifie ce que la gateway a servi contre
+  ce que le profil épingle et rend le pair, les deux générations, l'empreinte
+  de la demande, l'échéance et le nombre de credentials habilités ; puis
+  « Approuver avec la clé » exécute l'unique `GetAssertion` et dépose
+  l'assertion. Les deux boutons sont deux gestes parce que la vérification est
+  la garantie : `approve_certificate_renewal` refuse tant que le manifeste n'a
+  pas été lu, et la demande vérifiée est consommée par la cérémonie — un second
+  toucher porterait sur une fenêtre que l'autorité a déjà fermée. Le PIN n'est
+  demandé que si `certificate_approval_needs_pin` le dit : sous Windows la
+  boîte du système le collecte et il n'entre jamais dans Orion. Un domaine dont
+  aucun credential n'est habilité n'offre aucun toucher, et le dit.
+  Orion lance aussi automatiquement `astra-signer` quand l'opération
+  atteint `awaiting_operator`, et cette voie reste entière : c'est celle qu'on
+  emprunte quand la clé est sur un autre poste. Le frontend ne transmet que le nom du profil à
   une permission Tauri dédiée ; la session Rust fournit le binaire fixe et les
   arguments, et la ligne exacte reste visible et copiable si `PATH`, l'OS ou
   la politique du poste refuse le lancement. Sous Windows, le compagnon ouvre
@@ -3228,6 +3251,14 @@ contournés :
   démarrage neuf choisirait, et nomme le geste — l'identité servie ne se
   recharge pas à chaud, et un écran qui tairait cela laisserait une gateway
   présenter l'ancienne identité sans trace du pourquoi.
+  Une transition en vol y porte enfin ses deux instants : `activation_at`,
+  `not_after`, l'ancre entrante à comparer au compagnon (§9.1), et l'état de
+  distribution — parce que c'est lui, et non une date, qui dit s'il reste
+  l'avortement du §6.3 ou seulement le rollback borné du §4.4. Ces valeurs
+  voyageaient déjà dans `GET /api/certificates`; elles n'apparaissaient que
+  dans l'écho du document qu'on venait de coller, et un rechargement les
+  perdait. Un domaine au repos n'affiche rien : la carte n'existe que tant
+  qu'une transition ou un rollback court.
   **Reste ouvert** : « Renouveler les leafs du parc », « Renouveler toute la
   chaîne » et « Tourner les autorités » ouvrent une campagne **Astra**, dont
   §11.6 garde la résolution locale parce qu'une campagne est l'inventaire du

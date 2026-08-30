@@ -4,14 +4,16 @@ import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
 import Paper from '@mui/material/Paper'
+import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { KeyRound, RefreshCw } from 'lucide-react'
+import { Fingerprint, KeyRound, RefreshCw } from 'lucide-react'
 
 import * as api from '../api'
 import { CertificatePanel, PhasePill, isAlarming, worstPhase } from '../components/CertificatePanel'
 import { CopyButton } from '../components/CopyButton'
 import { GUTTER, RULE } from '../theme'
 import type {
+  ApprovalManifest,
   CertificateAction,
   CertificatePhase,
   ProfileCertificates,
@@ -227,9 +229,14 @@ export function CertificatesView() {
               onRun={busy ? undefined : (action) => void run(profile.name, action)}
             />
             <RenewalStep
+              name={profile.name}
               step={progress[profile.name]}
               launch={companion[profile.name]}
               onLaunch={() => void launchCompanion(profile.name)}
+              onApproved={(step) => {
+                setProgress((current) => ({ ...current, [profile.name]: step }))
+                void refresh()
+              }}
             />
           </Paper>
         ))}
@@ -251,19 +258,79 @@ export function CertificatesView() {
  *
  * Values only. `awaiting_operator` is not a warning to explain — it is where
  * every renewal legitimately waits — so what the row carries is the operation,
- * the launch result and the exact fallback command. The command remains
- * copyable even after a successful launch: policy may stop Orion from opening
- * a process on another machine, and the operation must stay recoverable.
+ * what is about to be approved, and the way to approve it.
+ *
+ * # Two doors, and why the ceremony is the first
+ *
+ * A renewal parked here needs one touch on a security key. That key is very
+ * often plugged into *this* machine, and Orion has held the whole ceremony
+ * since §8.1.2 — read the request, verify it against what the profile pins,
+ * run the assertion, post it. Sending the user to a separate companion for a
+ * key already in front of them was making them leave the screen that told them
+ * to act. So the ceremony is here, and the companion stays as what it is: the
+ * way in when the key is on another machine, or when policy stops Orion from
+ * talking to it.
+ *
+ * # The manifest is read before anything is signed
+ *
+ * `certificateApprovalManifest` returns fields taken from the **verified**
+ * request, never from the envelope, and the shell refuses to run the ceremony
+ * until it has been read: what is signed is what was shown. Which is why the
+ * button that reads it and the button that touches the key are two buttons.
  */
 function RenewalStep({
+  name,
   step,
   launch,
   onLaunch,
+  onApproved,
 }: {
+  name: string
   step: RenewalProgress | undefined
   launch: CompanionLaunch | undefined
   onLaunch: () => void
+  onApproved: (step: RenewalProgress) => void
 }) {
+  const [manifest, setManifest] = useState<ApprovalManifest | null>(null)
+  const [needsPin, setNeedsPin] = useState(false)
+  const [pin, setPin] = useState('')
+  const [ceremony, setCeremony] = useState<null | 'reading' | 'signing'>(null)
+  const [refusal, setRefusal] = useState<string | null>(null)
+
+  const readManifest = async () => {
+    setCeremony('reading')
+    setRefusal(null)
+    try {
+      setManifest(await api.certificateApprovalManifest(name))
+      // Asked, never assumed: under Windows the platform dialog collects the
+      // PIN and it never enters Orion, so a field here would be asking for a
+      // secret nothing in this process can use.
+      setNeedsPin(await api.certificateApprovalNeedsPin(name))
+    } catch (cause) {
+      setRefusal(String(cause))
+    } finally {
+      setCeremony(null)
+    }
+  }
+
+  const approve = async () => {
+    setCeremony('signing')
+    setRefusal(null)
+    try {
+      const reached = await api.approveCertificateRenewal(name, needsPin ? pin : undefined)
+      // The verified request is consumed by the ceremony: keeping the manifest
+      // on screen would offer a second touch against a window the authority
+      // has already closed.
+      setManifest(null)
+      setPin('')
+      onApproved(reached)
+    } catch (cause) {
+      setRefusal(String(cause))
+    } finally {
+      setCeremony(null)
+    }
+  }
+
   if (!step) return null
   return (
     <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
@@ -284,7 +351,108 @@ function RenewalStep({
       )}
       {step?.step === 'awaiting_operator' && (
         <>
-          <Row label="approbation" value={step.companion_command} copyable />
+          {manifest === null ? (
+            <Button
+              size="small"
+              variant="contained"
+              disabled={ceremony !== null}
+              startIcon={
+                ceremony === 'reading' ? (
+                  <CircularProgress size={13} color="inherit" />
+                ) : (
+                  <Fingerprint size={14} aria-hidden />
+                )
+              }
+              onClick={() => void readManifest()}
+              sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+            >
+              {ceremony === 'reading' ? 'Lecture…' : 'Lire la demande d’approbation'}
+            </Button>
+          ) : (
+            <Box sx={{ mt: 0.75 }}>
+              <Typography color="text.disabled" sx={{ fontSize: 11, lineHeight: 1.5, mb: 0.5 }}>
+                Vérifié contre ce que ce profil épingle. C’est cela qui sera signé.
+              </Typography>
+              <Row label="pair" value={manifest.client_wg_public_key} copyable />
+              <Row
+                label="génération"
+                value={`${manifest.active_generation} → ${manifest.requested_generation}`}
+              />
+              <Row label="empreinte" value={manifest.request_fingerprint} copyable />
+              <Row
+                label="expire"
+                value={new Date(manifest.expires_at * 1000).toLocaleString()}
+              />
+              <Row
+                label="clés"
+                value={
+                  manifest.eligible_credentials === 1
+                    ? '1 clé du domaine peut répondre'
+                    : `${manifest.eligible_credentials} clés du domaine peuvent répondre`
+                }
+              />
+
+              {manifest.eligible_credentials === 0 ? (
+                <Alert severity="warning" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+                  Aucune clé du domaine n’est autorisée à répondre à cette demande. Rien à
+                  toucher ici : c’est le registre de credentials qu’il faut reprendre côté
+                  autorité.
+                </Alert>
+              ) : (
+                <>
+                  {needsPin && (
+                    <TextField
+                      size="small"
+                      type="password"
+                      label="PIN de la clé"
+                      value={pin}
+                      onChange={(event) => setPin(event.target.value)}
+                      autoComplete="off"
+                      sx={{ mt: 0.75, width: 200 }}
+                      slotProps={{ htmlInput: { style: { fontSize: 12 } } }}
+                    />
+                  )}
+                  <Box>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={ceremony !== null || (needsPin && pin === '')}
+                      startIcon={
+                        ceremony === 'signing' ? (
+                          <CircularProgress size={13} color="inherit" />
+                        ) : (
+                          <KeyRound size={14} aria-hidden />
+                        )
+                      }
+                      onClick={() => void approve()}
+                      sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+                    >
+                      {ceremony === 'signing' ? 'Touchez la clé…' : 'Approuver avec la clé'}
+                    </Button>
+                  </Box>
+                </>
+              )}
+            </Box>
+          )}
+
+          {refusal && (
+            <Alert
+              severity="error"
+              variant="outlined"
+              sx={{ mt: 0.75, fontSize: 11.5 }}
+              onClose={() => setRefusal(null)}
+            >
+              {refusal}
+            </Alert>
+          )}
+
+          {/* The way in when the key is not on this machine. Kept whole —
+              command included — because a failed launch must still leave the
+              operation recoverable by hand. */}
+          <Typography color="text.disabled" sx={{ mt: 1, fontSize: 11, lineHeight: 1.5 }}>
+            Si la clé est sur un autre poste, l’approbation s’y fait par le compagnon.
+          </Typography>
+          <Row label="compagnon" value={step.companion_command} copyable />
           <Button
             size="small"
             variant="outlined"
