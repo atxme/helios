@@ -538,6 +538,35 @@ enum Command {
         #[arg(long)]
         authority_url: String,
     },
+    /// Signe un rollback de service vers l'ancienne identité gateway (§4.4).
+    ///
+    /// Pendant le recouvrement uniquement, et sans rien déplacer : aucun
+    /// compteur ne bouge, le slot suivant reste scellé, et sa promotion a lieu
+    /// à `not_after` comme prévu. La sélection expire d'elle-même, au plus tard
+    /// avec le recouvrement.
+    ///
+    /// Hors campagne Astra, délibérément : un rollback ne distribue rien et ne
+    /// change aucun état du domaine. La campagne est résolue localement depuis
+    /// la transition elle-même, affichée, et attestée par une clé autorisée.
+    SignGatewayRollback {
+        /// La transition en recouvrement, telle qu'elle a été signée.
+        #[arg(long)]
+        transition: PathBuf,
+        /// Où écrire l'autorisation signée.
+        #[arg(long)]
+        out: PathBuf,
+        /// Durée de la sélection, en heures. Bornée par `not_after`.
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
+        /// Motif, affiché avant le toucher et scellé dans la campagne.
+        #[arg(long)]
+        reason: String,
+        /// Qui demande, affiché avant le toucher.
+        #[arg(long)]
+        requested_by: String,
+        #[arg(long)]
+        origin: Option<String>,
+    },
     /// Referme la fenêtre de rotation CA-TLS à `not_after` (§9.2).
     ///
     /// Une seule écriture scellée : la clé suivante devient celle qui émet et
@@ -798,6 +827,23 @@ fn run() -> Result<()> {
             transport,
         ),
         Command::ResumeRotation { authority_url } => resume_rotation(&path, &authority_url),
+        Command::SignGatewayRollback {
+            transition,
+            out,
+            hours,
+            reason,
+            requested_by,
+            origin,
+        } => sign_gateway_rollback(
+            &path,
+            &transition,
+            &out,
+            hours,
+            &reason,
+            &requested_by,
+            origin.as_deref(),
+            transport,
+        ),
         Command::PromoteCaTls => promote_ca_tls(&path, transport),
         Command::AbortGatewayTransition {
             authority_url,
@@ -2548,6 +2594,165 @@ fn abort_gateway_transition(
         out,
         "avortement",
     )
+}
+
+/// Signs the temporary selection of the outgoing gateway leaf (spec §11.1
+/// step 8).
+///
+/// # Why this one opens no Astra operation
+///
+/// Every other gateway gesture goes through the authority because it produces
+/// a `TrustUpdateObject` the domain distributes. A rollback produces none: it
+/// moves no counter, removes no slot, and no client ever sees it — §4.4 calls
+/// it a service rollback precisely to say that. The authority's own guard
+/// agrees, and by construction: a gateway-identity campaign result must carry
+/// exactly one trust-update object, so depositing this would mean inventing a
+/// distributable form of a decision that must never be distributed.
+///
+/// So the campaign is resolved here, from the signed transition itself —
+/// §11.6 keeps that resolution local anyway — displayed in full, and attested
+/// by one authorized key before `CA-PQ` signs. The record of the gesture is
+/// the gateway's, which is where the selection takes effect.
+#[allow(clippy::too_many_arguments)]
+fn sign_gateway_rollback(
+    path: &Path,
+    transition_path: &Path,
+    out: &Path,
+    hours: u64,
+    reason: &str,
+    requested_by: &str,
+    origin: Option<&str>,
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::gateway::GatewayIdentityTransition;
+    use aether::certificates::status::{
+        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
+    };
+
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let identity = identity_of(&handoff)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
+    })?;
+
+    let transition: GatewayIdentityTransition =
+        read_json(transition_path, "la transition en recouvrement")?;
+    if transition.gateway_wg_public_key != identity.gateway_wg_public_key {
+        bail!("cette transition vise une autre gateway. Rien n'a été signé.");
+    }
+    let now = now_unix();
+    if now < transition.window.activation_at {
+        bail!(
+            "activation_at n'est pas atteint : l'ancienne identité est encore celle qui sert, il              n'y a rien à retrouver. Pour annuler la transition, `abort-gateway-transition`              (§6.3)."
+        );
+    }
+    if now >= transition.window.not_after {
+        bail!(
+            "le recouvrement est terminé : après not_after, ramener l'ancienne feuille serait un              rollback d'état, pas un rollback de service (§4.4)."
+        );
+    }
+    let expires_at = hours
+        .checked_mul(3_600)
+        .and_then(|seconds| now.checked_add(seconds))
+        .context("durée hors bornes")?
+        .min(transition.window.not_after);
+
+    // Resolved from the transition `CA-PQ` signed, never from a command line:
+    // a campaign whose target an operator typed would describe a decision the
+    // domain never took.
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new(aether::random::public_bytes::<16>()?)
+            .map_err(|error| anyhow::anyhow!("identifiant de campagne : {error}"))?,
+        trust_domain_id: identity.trust_domain_id,
+        gateway_wg_public_key: identity.gateway_wg_public_key,
+        server_name: identity.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope: CampaignScope::GatewayIdentity,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::GatewayTls,
+            identity_key: identity.gateway_wg_public_key,
+            epoch: transition.gateway_identity_epoch,
+            generation: transition.gateway_identity_epoch,
+            active_tls_certificate_fingerprint: transition
+                .active_gateway_tls_certificate_fingerprint,
+            active_pq_certificate_fingerprint: transition.active_gateway_certificate_fingerprint,
+        }],
+        reason: reason.to_string(),
+        requested_by: requested_by.to_string(),
+        policy_fingerprint: identity.policy()?.fingerprint()?,
+        required_credentials: CampaignScope::GatewayIdentity.required_credentials(),
+    };
+
+    println!("rollback de service : la gateway resert l'ancienne feuille.");
+    println!("gateway          : {}", identity.server_name);
+    println!("époque en cours  : {}", transition.gateway_identity_epoch);
+    println!("transition       : {}", transition.fingerprint()?);
+    println!(
+        "feuille resservie: {}",
+        transition.active_gateway_tls_certificate_fingerprint
+    );
+    println!("expire à         : {expires_at}");
+    println!("fin du recouvr.  : {}", transition.window.not_after);
+    println!("motif            : {reason}");
+    println!("demandé par      : {requested_by}");
+    println!("empreinte        : {}", campaign.fingerprint());
+    println!(
+        "effet            : aucun compteur ne bouge, le slot suivant reste scellé et sa          promotion a lieu à not_after comme prévu"
+    );
+
+    let origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+    wait_for_operator()?;
+    let key = authenticator::connect(transport)?;
+    let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+
+    // The assertion attests the text above, not merely the vault: §7.6 binds a
+    // rollback to a YubiKey campaign, and an unenrolled key is refused here
+    // against the credential document `CA-PQ` signed.
+    let approval = authority::approve_campaign(
+        &[key.as_ref()],
+        &campaign,
+        &registry,
+        &identity,
+        &ca_pq_public_key,
+        &vault.rp_id,
+        &origin,
+        &[pin.as_str()],
+        now,
+    )?;
+    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+    let authorization = authority::sign_service_rollback(
+        &vault,
+        &opening,
+        &identity,
+        &ca_pq_public_key,
+        &authority::ServiceRollbackDecision {
+            transition: &transition,
+            campaign_fingerprint: approval.campaign_fingerprint,
+            expires_at,
+        },
+        now,
+    )?;
+
+    let encoded =
+        serde_json::to_vec_pretty(&authorization).context("encodage de l'autorisation")?;
+    std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
+    println!("autorisation écrite : {}", out.display());
+    println!(
+        "à reporter sur la gateway : console Certificats, ou POST \
+         /api/certificates/gateway-transition/rollback"
+    );
+    println!(
+        "puis redémarrer heliosd : la feuille en service est déscellée au démarrage et tenue \
+         pour la vie du processus"
+    );
+    Ok(())
 }
 
 /// Writes the signed decision out, then deposits it.

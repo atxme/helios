@@ -3034,10 +3034,19 @@ contournés :
   existe et retire l'identité, mais rien n'enchaîne dans le même geste sur la
   transition qui la remplace. `verify` accepte les trois motifs et refuse les
   trois autres de `RotationReason`, qui décrivent une décision cliente.
-  **Limite connue** : le rollback de service de §11.1 étape 8 n'a pas de
-  commande. L'ancien slot reste scellé pendant tout le chevauchement, donc
-  l'état nécessaire existe, mais rien ne demande à `heliosd` de le resservir
-  temporairement ;
+  Le **rollback de service** de §11.1 étape 8 est livré :
+  `astra-signer sign-gateway-rollback` résout la campagne localement depuis la
+  transition signée — un rollback ne distribue rien, et le garde d'Astra
+  l'impose, un résultat `gateway_identity` devant porter exactement un objet
+  distribuable —, l'affiche, la fait attester par une clé autorisée puis signe
+  `CertificateServiceRollbackAuthorization` sous `CA-PQ`. La gateway la vérifie
+  contre l'ancre, la transition et la feuille qu'elle détient déjà, la refuse
+  hors chevauchement, et la sélection expire par l'horloge, au plus tard avec
+  le recouvrement. Rien d'autre ne bouge : aucun compteur, aucun slot, et la
+  promotion a toujours lieu à `not_after`. **Limite connue** : la sélection est
+  lue au démarrage, parce que la feuille en service est descellée une fois et
+  tenue pour la vie du processus — l'installer enregistre la décision, un
+  redémarrage l'applique, et rien ne redémarre le démon quand elle expire ;
 - la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
   `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le

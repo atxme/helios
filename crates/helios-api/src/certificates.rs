@@ -183,6 +183,14 @@ pub struct CertificateDomainView {
     pub gateway_pq_fingerprint: String,
     pub gateway_transition_pending: bool,
     pub gateway_activation_at: Option<u64>,
+    /// End of the overlap: when the incoming leaf is promoted and the outgoing
+    /// one is destroyed.
+    pub gateway_retire_active_at: Option<u64>,
+    /// Whether the staged transition has been distributed (spec §6.3). Past
+    /// this point no abort is accepted and only the bounded rollback remains.
+    pub gateway_transition_published: bool,
+    /// End of a service rollback in force, absent when none is (spec §4.4).
+    pub gateway_rollback_expires_at: Option<u64>,
     pub astra_authority_url: String,
     pub astra_service_key_epoch: u64,
     pub astra_policy_fingerprint: String,
@@ -293,6 +301,20 @@ pub struct GatewayDecisionView {
     pub not_after: Option<u64>,
 }
 
+/// A service rollback, as the console displays it back (spec §4.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRollbackView {
+    /// The staged generation whose overlap this selection lives in.
+    pub gateway_identity_epoch: u64,
+    /// The leaf now selected — always the outgoing one.
+    pub selected_certificate_fingerprint: String,
+    /// When the selection lapses on its own, at most the overlap's `not_after`.
+    pub expires_at: u64,
+    /// `true` when this exact authorization was already applied.
+    pub already_present: bool,
+}
+
 /// The gateway's own identity, driven from the console (spec §12.2).
 ///
 /// Separate from [`TrustUpdateHandler`] because it needs something that
@@ -319,6 +341,12 @@ pub trait GatewayIdentityHandler: Send + Sync {
         &self,
         abort: Box<aether::certificates::gateway::GatewayTransitionAbort>,
     ) -> Result<GatewayDecisionView, GatewayActionRefusal>;
+
+    /// Selects the outgoing leaf for the rest of the overlap (spec §4.4).
+    async fn install_rollback(
+        &self,
+        authorization: Box<aether::certificates::status::CertificateServiceRollbackAuthorization>,
+    ) -> Result<GatewayRollbackView, GatewayActionRefusal>;
 }
 
 /// Why a gateway identity gesture was refused, in words the operator reads.
@@ -388,6 +416,22 @@ pub async fn gateway_transition_abort(
         return gateway_identity_absent();
     };
     match handler.abort_transition(Box::new(abort)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// `POST /api/certificates/gateway-transition/rollback`, on the admin surface.
+pub async fn gateway_transition_rollback(
+    State(s): State<AppState>,
+    Json(authorization): Json<
+        aether::certificates::status::CertificateServiceRollbackAuthorization,
+    >,
+) -> Response {
+    let Some(handler) = s.gateway_identity.as_ref() else {
+        return gateway_identity_absent();
+    };
+    match handler.install_rollback(Box::new(authorization)).await {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(refusal) => refusal.into_response(),
     }

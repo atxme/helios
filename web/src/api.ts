@@ -5,6 +5,7 @@ import type {
   GatewayDecisionView,
   GatewayRenewalRequest,
   GatewayRenewalView,
+  GatewayRollbackView,
   CommandResponse,
   FinalizedRelease,
   FirewallRules,
@@ -192,3 +193,9 @@ export const installGatewayTransition = (transition: unknown) =>
 
 export const abortGatewayTransition = (abort: unknown) =>
   gatewayAction<GatewayDecisionView>('/api/certificates/gateway-transition/abort', abort)
+
+export const installGatewayRollback = (authorization: unknown) =>
+  gatewayAction<GatewayRollbackView>(
+    '/api/certificates/gateway-transition/rollback',
+    authorization,
+  )

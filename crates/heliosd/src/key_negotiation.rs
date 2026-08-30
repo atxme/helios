@@ -1638,6 +1638,12 @@ enum ServedIdentitySlot {
 /// must first have persisted `published`. At `not_after` the overlap is over,
 /// so startup refuses an unpromoted state rather than reviving either side of
 /// a decision whose finalization should already be durable.
+///
+/// A service rollback in force turns the overlap back to the outgoing leaf
+/// (spec §4.4). It is read **here**, at startup, because the identity served
+/// is unsealed once and held for the life of the process: installing a
+/// rollback does not swap the leaf under a running daemon, it decides what the
+/// next start serves.
 fn served_identity_slot(
     gateway: Option<&aether::certificates::state::GatewayCertificateState>,
     now_unix: u64,
@@ -1651,16 +1657,19 @@ fn served_identity_slot(
         gateway.activation_at,
         gateway.retire_active_at,
         gateway.published,
+        gateway.active_service_rollback(now_unix).is_some(),
         now_unix,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_served_identity_slot(
     revoked: bool,
     next_epoch: Option<u64>,
     activation_at: Option<u64>,
     retire_active_at: Option<u64>,
     published: bool,
+    rolled_back: bool,
     now_unix: u64,
 ) -> Result<ServedIdentitySlot> {
     anyhow::ensure!(
@@ -1684,6 +1693,12 @@ fn select_served_identity_slot(
         published,
         "gateway identity epoch {epoch} reached activation_at before publication"
     );
+    // The selection is bounded and the promotion is not: at `not_after` the
+    // ensure above still fires, so a rollback can postpone which leaf is
+    // served but never the end of the decision it lives in.
+    if rolled_back {
+        return Ok(ServedIdentitySlot::Active);
+    }
     Ok(ServedIdentitySlot::Candidate { epoch })
 }
 
@@ -2439,20 +2454,55 @@ mod tests {
     #[test]
     fn a_restart_selects_only_a_published_candidate_inside_the_overlap() {
         assert_eq!(
-            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 199)
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, false, 199)
                 .expect("before activation"),
             ServedIdentitySlot::Active
         );
         assert_eq!(
-            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 200)
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, false, 200)
                 .expect("published overlap"),
             ServedIdentitySlot::Candidate { epoch: 2 }
         );
-        assert!(
-            select_served_identity_slot(false, Some(2), Some(200), Some(300), false, 200,).is_err()
+        assert!(select_served_identity_slot(
+            false,
+            Some(2),
+            Some(200),
+            Some(300),
+            false,
+            false,
+            200,
+        )
+        .is_err());
+        assert!(select_served_identity_slot(
+            false,
+            Some(2),
+            Some(200),
+            Some(300),
+            true,
+            false,
+            300,
+        )
+        .is_err());
+    }
+
+    /// A rollback puts the overlap back on the outgoing leaf without moving
+    /// the end of the decision it lives in (spec §4.4, §11.1 step 8).
+    #[test]
+    fn a_service_rollback_returns_the_restart_to_the_outgoing_leaf() {
+        assert_eq!(
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, true, 250)
+                .expect("rolled back"),
+            ServedIdentitySlot::Active
         );
         assert!(
-            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, 300,).is_err()
+            select_served_identity_slot(false, Some(2), Some(200), Some(300), true, true, 300,)
+                .is_err(),
+            "a rollback postpones which leaf is served, never the end of the overlap"
+        );
+        assert!(
+            select_served_identity_slot(true, Some(2), Some(200), Some(300), true, true, 250,)
+                .is_err(),
+            "a revoked identity serves nothing, rolled back or not"
         );
     }
 

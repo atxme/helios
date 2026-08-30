@@ -246,6 +246,9 @@ export interface CertificateDomain {
   gateway_pq_fingerprint: string
   gateway_transition_pending: boolean
   gateway_activation_at: number | null
+  gateway_retire_active_at: number | null
+  gateway_transition_published: boolean
+  gateway_rollback_expires_at: number | null
   astra_authority_url: string
   astra_service_key_epoch: number
   astra_policy_fingerprint: string
@@ -281,4 +284,12 @@ export interface GatewayDecisionView {
   already_present: boolean
   activation_at: number | null
   not_after: number | null
+}
+
+/** A service rollback, as the console displays it back (§4.4). */
+export interface GatewayRollbackView {
+  gateway_identity_epoch: number
+  selected_certificate_fingerprint: string
+  expires_at: number
+  already_present: boolean
 }

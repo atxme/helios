@@ -75,7 +75,9 @@ use aether::certificates::gateway::{
 use aether::certificates::revocation::{
     EmergencyCertificateRevocation, RevocationReason, RevocationScope,
 };
-use aether::certificates::status::AstraRotationCampaign;
+use aether::certificates::status::{
+    AstraRotationCampaign, CertificateServiceRollbackAuthorization,
+};
 use aether::certificates::webauthn::{
     validate_https_origin, verify_assertion, AssertionExpectation,
 };
@@ -448,6 +450,84 @@ pub fn sign_gateway_abort(
         // never be applied anywhere.
         abort.verify(ca_pq_public_key, transition, false, aborted_at)?;
         Ok(abort)
+    })
+}
+
+/// What one service rollback selects (spec §4.4).
+pub struct ServiceRollbackDecision<'a> {
+    /// The staged transition whose overlap this selection lives inside.
+    pub transition: &'a GatewayIdentityTransition,
+    pub campaign_fingerprint: Fingerprint,
+    /// When the selection lapses. At most the transition's `not_after`.
+    pub expires_at: u64,
+}
+
+/// Signs the temporary selection of the outgoing gateway leaf (spec §4.4).
+///
+/// # Why the outgoing leaf is read from the transition
+///
+/// The transition names `active_gateway_tls_certificate_fingerprint` — the
+/// leaf it is replacing — and `CA-PQ` signed that. Taking the selection from
+/// an operator's command line instead would let one typo authorize serving a
+/// certificate the domain never issued, and the gateway's own check would be
+/// the only thing between that and a downgrade.
+///
+/// # Why no window is opened
+///
+/// A rollback moves no counter and removes no slot. It cannot outlive the
+/// overlap it lives in, so its expiry is bounded here by `not_after` rather
+/// than by a window of its own — a second window would be a second decision
+/// about the same transition.
+pub fn sign_service_rollback(
+    vault: &AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    identity: &DomainIdentity,
+    ca_pq_public_key: &MlDsa87PublicKey,
+    decision: &ServiceRollbackDecision<'_>,
+    now_unix: u64,
+) -> Result<CertificateServiceRollbackAuthorization> {
+    let ServiceRollbackDecision {
+        transition,
+        campaign_fingerprint,
+        expires_at,
+    } = *decision;
+    if expires_at > transition.window.not_after || now_unix >= expires_at {
+        return Err(GestureError::Anchors(
+            "un rollback de service expire au plus tard avec le recouvrement qu'il vise, et pas              dans le passé"
+                .into(),
+        ));
+    }
+    let transition_fingerprint = transition.fingerprint()?;
+    with_anchors(vault, opening, |secrets| {
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
+        let authorization = CertificateServiceRollbackAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: identity.trust_domain_id,
+            ca_epoch: identity.ca_epoch,
+            gateway_wg_public_key: transition.gateway_wg_public_key,
+            server_name: transition.server_name.clone(),
+            transition_fingerprint,
+            selected_certificate_fingerprint: transition.active_gateway_tls_certificate_fingerprint,
+            campaign_fingerprint,
+            expires_at,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_pq_private_key)?;
+        // Verified here against the same transition the gateway will verify it
+        // against, so a document that could never be applied is not handed to
+        // an operator to carry.
+        authorization.verify(
+            ca_pq_public_key,
+            &identity.trust_domain_id,
+            identity.ca_epoch,
+            &transition.gateway_wg_public_key,
+            &transition.server_name,
+            &transition_fingerprint,
+            &transition.active_gateway_tls_certificate_fingerprint,
+            transition.window.not_after,
+            now_unix,
+        )?;
+        Ok(authorization)
     })
 }
 

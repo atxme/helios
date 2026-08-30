@@ -44,6 +44,7 @@ use aether::certificates::gateway::{
     GatewayCertificateRequest, GatewayIdentityTransition, GatewayTransitionAbort,
 };
 use aether::certificates::state::InstallOutcome;
+use aether::certificates::status::CertificateServiceRollbackAuthorization;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use helios_provisioning::certificates::CertificateRegistry;
 
@@ -587,6 +588,46 @@ fn maintain_gateway_identity_in(
 /// that already holds the tombstone refuses a second decision numbered the
 /// same, and reusing the number would be the gateway asking a fleet to choose
 /// between two documents at one epoch.
+/// A service rollback the registry accepted (spec §4.4, §11.1 step 8).
+pub(crate) struct InstalledRollback {
+    pub(crate) gateway_identity_epoch: u64,
+    pub(crate) selected_certificate_fingerprint: Fingerprint,
+    pub(crate) expires_at: u64,
+    pub(crate) already_present: bool,
+}
+
+/// Selects the outgoing leaf for the rest of the overlap (spec §11.1 step 8).
+///
+/// Nothing is written outside the registry, and nothing on disk is destroyed:
+/// the candidate slot stays exactly where it is, because the overlap it
+/// belongs to is untouched and its promotion still happens at `not_after`.
+/// That is what makes this a *service* rollback — no key moves, only the
+/// answer to «which leaf does the next start serve».
+///
+/// The daemon does not swap identity underneath itself: the leaf in service
+/// was unsealed at startup and is held for the life of the process. This
+/// records the decision; a restart applies it.
+pub(crate) fn install_rollback(
+    registry: &mut CertificateRegistry,
+    authorization: CertificateServiceRollbackAuthorization,
+    now_unix: u64,
+) -> Result<InstalledRollback> {
+    let epoch = registry
+        .state()
+        .gateway
+        .next_gateway_identity_epoch
+        .context("no gateway transition is staged: a rollback lives inside an overlap")?;
+    let outcome = registry
+        .install_gateway_rollback(&authorization, now_unix)
+        .context("selecting the outgoing gateway leaf in the certificate registry")?;
+    Ok(InstalledRollback {
+        gateway_identity_epoch: epoch,
+        selected_certificate_fingerprint: authorization.selected_certificate_fingerprint,
+        expires_at: authorization.expires_at,
+        already_present: matches!(outcome, InstallOutcome::AlreadyPresent),
+    })
+}
+
 pub(crate) fn abort_transition(
     registry: &mut CertificateRegistry,
     abort: GatewayTransitionAbort,
@@ -731,6 +772,7 @@ mod tests {
             published: false,
             revoked: false,
             revocation_epoch: 0,
+            service_rollback: None,
         }
     }
 

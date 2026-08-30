@@ -400,6 +400,58 @@ porte pas de champ TLS, donc la feuille candidate se copie depuis la gateway.
 Une feuille substituée est refusée à l'installation — la gateway seule sait
 laquelle elle a scellée.
 
+### 8.1 Revenir temporairement à l'ancienne identité (§11.1 étape 8)
+
+Pendant le chevauchement — et là seulement —, la gateway peut resservir la
+feuille sortante. C'est un rollback **de service**, pas d'état : aucun compteur
+ne bouge, le slot suivant reste scellé, et sa promotion a lieu à `not_after`
+comme prévu.
+
+Au poste opérateur :
+
+```sh
+astra-signer sign-gateway-rollback --transition transition.json \
+  --out rollback.json --hours 24 --reason … --requested-by …
+```
+
+Puis sur la gateway, depuis l'écran *Certificats* (ou
+`POST /api/certificates/gateway-transition/rollback`), coller l'autorisation,
+**et redémarrer `heliosd`**.
+
+Le redémarrage n'est pas un détail : la feuille en service est descellée au
+démarrage et tenue pour la vie du processus. Installer l'autorisation
+enregistre la décision ; c'est le démarrage suivant qui l'applique.
+
+**Hors campagne Astra, délibérément.** Tous les autres gestes gateway passent
+par l'autorité parce qu'ils produisent un objet que le domaine distribue. Un
+rollback n'en produit aucun : aucun client ne le voit, c'est ce que veut dire
+« de service » au §4.4. Le garde d'Astra le confirme par construction — le
+résultat d'une campagne `gateway_identity` doit porter exactement un objet de
+mise à jour de confiance, si bien que déposer celui-ci obligerait à inventer
+une forme distribuable d'une décision qui ne doit jamais être distribuée. La
+campagne est donc résolue localement depuis la transition signée elle-même
+(§11.6 garde de toute façon cette résolution locale), affichée en entier, et
+attestée par une clé autorisée avant que `CA-PQ` ne signe.
+
+**Ce que le geste refuse**, et pourquoi :
+
+| Moment | Refus |
+| --- | --- |
+| avant `activation_at` | l'ancienne feuille est déjà celle qui sert. Pour annuler la décision, c'est l'avortement du §6.3 |
+| transition non publiée | idem : rien n'a basculé, et l'époque peut encore être rendue |
+| après `not_after` | ramener la feuille sortante serait un rollback d'**état**, que le §4.4 interdit |
+| une autre feuille que la sortante | l'autorisation nomme l'empreinte que la transition désigne, jamais une saisie d'opérateur |
+| identité révoquée | une gateway révoquée n'offre aucune feuille acceptable |
+
+L'expiration est répondue par l'horloge : la sélection cesse d'être servie à la
+seconde où elle expire, sans qu'aucune écriture n'ait à passer.
+
+**Limite connue** : rien ne redémarre `heliosd` à votre place, et rien ne le
+redémarre non plus quand la sélection expire. Un rollback posé pour 24 h laisse
+la gateway sur l'ancienne feuille jusqu'au redémarrage suivant, même après
+l'expiration — ce qui la lèverait est un superviseur qui relance le démon sur
+changement d'état, et il n'y en a pas.
+
 ## 9. Faire tourner la CA TLS cliente (§9.4)
 
 `CA-TLS` authentifie le transport mTLS **avant** qu'aucune signature PQ soit
@@ -520,9 +572,6 @@ Nommé plutôt que passé sous silence : chacune de ces lignes est un geste qu'u
 opérateur pourrait avoir besoin de faire aujourd'hui, et qu'aucune commande ne
 fait.
 
-- **Le retour à l'identité précédente** : l'ancien slot reste scellé pendant
-  le recouvrement, mais aucune commande ne demande encore à `heliosd` de le
-  resservir temporairement.
 - **Les campagnes depuis la console** : « Renouveler les leafs du parc »,
   « toute la chaîne » et « Tourner les autorités » ouvrent une campagne Astra,
   et §11.6 garde cette résolution locale — une campagne est l'inventaire du

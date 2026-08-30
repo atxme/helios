@@ -60,9 +60,10 @@ use aether::certificates::{
     gateway::{GatewayIdentityTransition, GatewayTransitionAbort},
     state::{
         AstraIssuerState, AstraProfile, ClientCertificateState, ClientTlsCaState,
-        GatewayCertificateState, InstallOutcome, PendingStageState, RevocationTombstone,
-        RevokedFamily, TrustLedger,
+        GatewayCertificateState, GatewayServiceRollback, InstallOutcome, PendingStageState,
+        RevocationTombstone, RevokedFamily, TrustLedger,
     },
+    status::CertificateServiceRollbackAuthorization,
     transport::{TrustUpdateChunk, TrustUpdateTransactionManifest},
     CertificateError, CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
 };
@@ -1090,6 +1091,36 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
+    /// Selects the outgoing gateway leaf for the rest of the overlap (§4.4).
+    ///
+    /// The state machine verifies the authorization against the anchor, the
+    /// staged transition and the leaf this registry holds, and refuses it
+    /// outside an overlap. Persisted only when the state moved: an operator
+    /// carrying the same document twice must not rewrite the registry.
+    ///
+    /// It moves no counter and removes no slot — `promote_gateway_if_due`
+    /// still fires at `not_after`, and the selection dies with the overlap it
+    /// lives in.
+    pub fn install_gateway_rollback(
+        &mut self,
+        authorization: &CertificateServiceRollbackAuthorization,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, RegistryError> {
+        let mut state = self.state.clone();
+        let outcome = state
+            .gateway
+            .apply_service_rollback(authorization, now_unix)?;
+        if matches!(outcome, InstallOutcome::Installed) {
+            self.persist(state)?;
+        }
+        Ok(outcome)
+    }
+
+    /// The gateway selection in force at `now_unix`, if any.
+    pub fn active_gateway_rollback(&self, now_unix: u64) -> Option<&GatewayServiceRollback> {
+        self.state.gateway.active_service_rollback(now_unix)
+    }
+
     /// Promotes the gateway identity once its published overlap has ended.
     ///
     /// The registry is persisted before this method reports success. The
@@ -1560,6 +1591,7 @@ mod tests {
                 published: false,
                 revoked: false,
                 revocation_epoch: 0,
+                service_rollback: None,
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 1,
@@ -2875,6 +2907,101 @@ mod tests {
             .registry
             .promote_gateway_if_due(u64::MAX)
             .expect("idempotent"));
+    }
+
+    /// A rollback authorization signed by the fixture's `CA-PQ` for its own
+    /// staged overlap.
+    fn rollback(
+        fixture: &Fixture,
+        transition: &GatewayIdentityTransition,
+        expires_at: u64,
+    ) -> aether::certificates::status::CertificateServiceRollbackAuthorization {
+        let gateway = &fixture.registry.state().gateway;
+        let authorization = aether::certificates::status::CertificateServiceRollbackAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            transition_fingerprint: transition.fingerprint().expect("fingerprint"),
+            selected_certificate_fingerprint: gateway.active_tls_fingerprint(),
+            campaign_fingerprint: Fingerprint::of(b"campaign"),
+            expires_at,
+            ca_signature: MlDsa87Signature::placeholder(),
+        };
+        authorization.sign(&fixture.ca.private).expect("sign")
+    }
+
+    /// §11.1 step 8: the selection is persisted, and it moves nothing else —
+    /// the promotion still fires at `not_after`, and it takes the selection
+    /// with it.
+    #[test]
+    fn a_gateway_rollback_is_persisted_and_dies_with_the_overlap_it_lives_in() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+        fixture
+            .registry
+            .publish_gateway_transition(2, &transition.fingerprint().expect("fingerprint"))
+            .expect("publish");
+
+        let authorization = rollback(&fixture, &transition, 2_800);
+        assert!(matches!(
+            fixture
+                .registry
+                .install_gateway_rollback(&authorization, 2_100)
+                .expect("rollback"),
+            InstallOutcome::Installed
+        ));
+        assert!(fixture.registry.active_gateway_rollback(2_100).is_some());
+        assert_eq!(
+            fixture
+                .registry
+                .state()
+                .gateway
+                .active_gateway_identity_epoch,
+            1,
+            "a service rollback moves no counter"
+        );
+        assert_eq!(
+            fixture.registry.state().gateway.next_gateway_identity_epoch,
+            Some(2),
+            "and removes no slot"
+        );
+
+        assert!(fixture
+            .registry
+            .promote_gateway_if_due(3_000)
+            .expect("promotion"));
+        assert!(fixture.registry.active_gateway_rollback(3_000).is_none());
+    }
+
+    /// Before publication there is nothing to roll back from: the outgoing
+    /// leaf is still the one served, and an abort is the gesture that applies.
+    #[test]
+    fn a_gateway_rollback_is_refused_outside_the_overlap() {
+        let mut fixture = fixture();
+        let next = keys();
+        let transition = gateway_transition(&fixture, &next, 2, window());
+        fixture
+            .registry
+            .install_gateway_transition(&transition, 1_500)
+            .expect("install");
+
+        let authorization = rollback(&fixture, &transition, 2_800);
+        let refusal = fixture
+            .registry
+            .install_gateway_rollback(&authorization, 2_100)
+            .expect_err("unpublished");
+        assert!(matches!(
+            refusal,
+            RegistryError::Certificate(CertificateError::RollbackUnavailable)
+        ));
+        assert!(fixture.registry.active_gateway_rollback(2_100).is_none());
     }
 
     #[test]

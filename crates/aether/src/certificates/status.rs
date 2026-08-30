@@ -1234,6 +1234,17 @@ pub struct CertificateServiceRollbackAuthorization {
 }
 
 impl CertificateServiceRollbackAuthorization {
+    /// Everything this document is, as bytes.
+    ///
+    /// The gateway stores it so that carrying the same authorization twice is
+    /// a replay, while a different one — a later expiry, another slot — is a
+    /// second decision rather than a silent extension of the first.
+    pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| CertificateError::InvalidAssertion("encoding"))?;
+        Ok(Fingerprint::of(&encoded))
+    }
+
     fn signing_bytes(&self) -> SignedTranscript {
         let mut bytes = CanonicalBytes::new(SERVICE_ROLLBACK_DOMAIN);
         bytes

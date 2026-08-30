@@ -31,6 +31,9 @@ const DOMAIN: CertificateDomain = {
   gateway_pq_fingerprint: '12'.repeat(32),
   gateway_transition_pending: false,
   gateway_activation_at: null,
+  gateway_retire_active_at: null,
+  gateway_transition_published: false,
+  gateway_rollback_expires_at: null,
   astra_authority_url: 'https://astra.example',
   astra_service_key_epoch: 5,
   astra_policy_fingerprint: '34'.repeat(32),
@@ -150,5 +153,103 @@ describe('GatewayIdentityActions', () => {
   it('names the campaign actions it cannot open itself', () => {
     mount()
     expect(screen.getByText(/astra campaign open --scope fleet-leafs/)).toBeTruthy()
+  })
+
+  /**
+   * The rollback window is the daemon's, and the console computes it the same
+   * way: offering the button outside it would offer a refusal.
+   */
+  it('offers no rollback outside a published overlap', () => {
+    mount()
+    expect(screen.getByText(/Aucun chevauchement en cours/)).toBeTruthy()
+    expect(screen.queryByText('Resservir l’ancienne feuille')).toBeNull()
+  })
+
+  it('offers the rollback only once the overlap has actually started', () => {
+    mount({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_transition_published: true,
+      gateway_activation_at: 60_000,
+      gateway_retire_active_at: 90_000,
+    })
+    expect(screen.queryByText('Resservir l’ancienne feuille')).toBeNull()
+
+    cleanup()
+    mount({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_transition_published: true,
+      gateway_activation_at: 40_000,
+      gateway_retire_active_at: 90_000,
+    })
+    expect(screen.getByText('Resservir l’ancienne feuille')).toBeTruthy()
+  })
+
+  /** A staged but undistributed transition is aborted, never rolled back. */
+  it('offers no rollback while the transition is unpublished', () => {
+    mount({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_transition_published: false,
+      gateway_activation_at: 40_000,
+      gateway_retire_active_at: 90_000,
+    })
+    expect(screen.queryByText('Resservir l’ancienne feuille')).toBeNull()
+  })
+
+  it('hands back the leaf it reselected and when the selection lapses', async () => {
+    const answer = {
+      gateway_identity_epoch: 4,
+      selected_certificate_fingerprint: 'ef'.repeat(32),
+      expires_at: 80_000,
+      already_present: false,
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response(JSON.stringify(answer), { status: 200 }))),
+    )
+    mount({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_transition_published: true,
+      gateway_activation_at: 40_000,
+      gateway_retire_active_at: 90_000,
+    })
+
+    const textarea = screen.getByPlaceholderText(/Coller ici la transition/)
+    fireEvent.change(textarea, { target: { value: '{"format_version":1}' } })
+    fireEvent.click(screen.getByText('Resservir l’ancienne feuille'))
+
+    expect(await screen.findByText('ef'.repeat(32))).toBeTruthy()
+  })
+
+  /** A refusal from the state machine reaches the operator with its reason. */
+  it('shows why a rollback was refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ message: 'rollback is only available during an overlap' }), {
+            status: 409,
+          }),
+        ),
+      ),
+    )
+    mount({
+      ...DOMAIN,
+      gateway_transition_pending: true,
+      gateway_transition_published: true,
+      gateway_activation_at: 40_000,
+      gateway_retire_active_at: 90_000,
+    })
+
+    const textarea = screen.getByPlaceholderText(/Coller ici la transition/)
+    fireEvent.change(textarea, { target: { value: '{"format_version":1}' } })
+    fireEvent.click(screen.getByText('Resservir l’ancienne feuille'))
+
+    await waitFor(() =>
+      expect(screen.getByText('rollback is only available during an overlap')).toBeTruthy(),
+    )
   })
 })

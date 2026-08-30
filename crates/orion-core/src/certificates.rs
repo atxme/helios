@@ -924,6 +924,7 @@ mod tests {
                     published: false,
                     revoked: false,
                     revocation_epoch: 0,
+                    service_rollback: None,
                 },
                 client_tls_ca: ClientTlsCaState {
                     ca_tls_epoch: 1,

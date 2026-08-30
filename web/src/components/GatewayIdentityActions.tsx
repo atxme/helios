@@ -7,10 +7,20 @@ import Stack from '@mui/material/Stack'
 import Switch from '@mui/material/Switch'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import { KeyRound, ShieldCheck, Undo2 } from 'lucide-react'
+import { History, KeyRound, ShieldCheck, Undo2 } from 'lucide-react'
 import { useState } from 'react'
-import { abortGatewayTransition, installGatewayTransition, prepareGatewayRenewal } from '../api'
-import type { CertificateDomain, GatewayDecisionView, GatewayRenewalView } from '../types'
+import {
+  abortGatewayTransition,
+  installGatewayRollback,
+  installGatewayTransition,
+  prepareGatewayRenewal,
+} from '../api'
+import type {
+  CertificateDomain,
+  GatewayDecisionView,
+  GatewayRenewalView,
+  GatewayRollbackView,
+} from '../types'
 import { DataRow } from './DataRow'
 import { KnownLimit } from './KnownLimit'
 import { SectionCard } from './SectionCard'
@@ -48,17 +58,31 @@ function formatInstant(unix: number): string {
 }
 
 export function GatewayIdentityActions({ domain }: Props) {
-  const [busy, setBusy] = useState<null | 'renewal' | 'install' | 'abort'>(null)
+  const [busy, setBusy] = useState<null | 'renewal' | 'install' | 'abort' | 'rollback'>(null)
   const [error, setError] = useState<string | null>(null)
   const [renewal, setRenewal] = useState<GatewayRenewalView | null>(null)
   const [decision, setDecision] = useState<GatewayDecisionView | null>(null)
+  const [rollback, setRollback] = useState<GatewayRollbackView | null>(null)
   const [rotateTls, setRotateTls] = useState(false)
   const [newKey, setNewKey] = useState(false)
   const [document, setDocument] = useState('')
 
   const staged = domain.gateway_transition_pending
+  // The window a rollback lives in, computed the same way the daemon does:
+  // published, past `activation_at`, short of `not_after`. Outside it the
+  // button would offer a gesture the gateway refuses.
+  const inOverlap =
+    staged &&
+    domain.gateway_transition_published &&
+    domain.gateway_activation_at !== null &&
+    domain.gateway_retire_active_at !== null &&
+    domain.now_unix >= domain.gateway_activation_at &&
+    domain.now_unix < domain.gateway_retire_active_at
 
-  const run = async <T,>(kind: 'renewal' | 'install' | 'abort', action: () => Promise<T>) => {
+  const run = async <T,>(
+    kind: 'renewal' | 'install' | 'abort' | 'rollback',
+    action: () => Promise<T>,
+  ) => {
     setBusy(kind)
     setError(null)
     try {
@@ -81,6 +105,22 @@ export function GatewayIdentityActions({ domain }: Props) {
     }
   }
 
+  const onRollback = async () => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(document)
+    } catch {
+      setError('Ce n’est pas un document JSON. Coller l’autorisation signée telle quelle.')
+      return
+    }
+    const answer = await run('rollback', () => installGatewayRollback(parsed))
+    if (answer) {
+      setRollback(answer)
+      setDecision(null)
+      setDocument('')
+    }
+  }
+
   const onApply = async (kind: 'install' | 'abort') => {
     let parsed: unknown
     try {
@@ -94,6 +134,7 @@ export function GatewayIdentityActions({ domain }: Props) {
     )
     if (answer) {
       setDecision(answer)
+      setRollback(null)
       setDocument('')
     }
   }
@@ -267,6 +308,82 @@ export function GatewayIdentityActions({ domain }: Props) {
         </Stack>
       </SectionCard>
 
+      <SectionCard
+        title="Revenir à l’identité précédente"
+        subtitle="§11.1 étape 8 : pendant le chevauchement seulement, et sans rien déplacer."
+        icon={History}
+        accent="tertiary.main"
+      >
+        <Stack spacing={2}>
+          <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+            Un rollback de <strong>service</strong>, pas d’état : aucun compteur ne bouge, la
+            feuille suivante reste scellée et sa promotion a lieu à <code>not_after</code> comme
+            prévu. La sélection expire d’elle-même, au plus tard avec le chevauchement.
+          </Typography>
+
+          {!inOverlap ? (
+            <Alert severity="info">
+              Aucun chevauchement en cours. Avant <code>activation_at</code> l’ancienne feuille est
+              déjà celle qui sert&nbsp;; après <code>not_after</code>, la ramener serait un
+              rollback d’état, que le §4.4 interdit.
+            </Alert>
+          ) : (
+            <>
+              <Alert severity="warning">
+                À signer au poste opérateur&nbsp;:
+                <br />
+                <code>
+                  astra-signer sign-gateway-rollback --transition … --out rollback.json --reason …
+                  --requested-by …
+                </code>
+                <br />
+                Puis coller l’autorisation ci-dessus et <strong>redémarrer heliosd</strong> : la
+                feuille en service est descellée au démarrage et tenue pour la vie du processus.
+              </Alert>
+              <Button
+                variant="outlined"
+                color="warning"
+                disabled={busy !== null || document.trim() === ''}
+                onClick={() => void onRollback()}
+                startIcon={
+                  busy === 'rollback' ? (
+                    <CircularProgress size={16} color="inherit" />
+                  ) : (
+                    <History size={18} />
+                  )
+                }
+              >
+                Resservir l’ancienne feuille
+              </Button>
+            </>
+          )}
+
+          {domain.gateway_rollback_expires_at !== null && (
+            <DataRow
+              label="Sélection en cours"
+              value={`ancienne feuille jusqu’à ${formatInstant(domain.gateway_rollback_expires_at)}`}
+            />
+          )}
+
+          {rollback && (
+            <Box>
+              <DataRow label="Époque" value={String(rollback.gateway_identity_epoch)} />
+              <DataRow
+                label="Feuille resservie"
+                value={rollback.selected_certificate_fingerprint}
+                wrap
+              />
+              <DataRow label="Expire" value={formatInstant(rollback.expires_at)} />
+              {rollback.already_present && (
+                <Typography variant="body2" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Cette autorisation était déjà appliquée. Rien n’a bougé.
+                </Typography>
+              )}
+            </Box>
+          )}
+        </Stack>
+      </SectionCard>
+
       {error && (
         <Alert severity="error" onClose={() => setError(null)}>
           {error}
@@ -280,10 +397,6 @@ export function GatewayIdentityActions({ domain }: Props) {
         est l’inventaire du domaine. Les ouvrir depuis ici demanderait une surface qui n’existe
         pas&nbsp;: <code>astra campaign open --scope fleet-leafs</code> ou{' '}
         <code>--scope trust-authorities</code>, dans le conteneur Astra.
-        <br />
-        Le retour temporaire à l’identité précédente pendant le chevauchement n’a pas de commande
-        non plus : l’ancien slot reste scellé jusqu’à <code>not_after</code>, mais rien ne demande
-        au démon de le resservir.
       </KnownLimit>
     </Stack>
   )

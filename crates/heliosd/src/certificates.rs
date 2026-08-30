@@ -497,6 +497,38 @@ impl helios_api::certificates::GatewayIdentityHandler for CertificateService {
             not_after: None,
         })
     }
+
+    /// §11.1 step 8, driven from the console.
+    ///
+    /// Records the selection; it takes effect at the next start, because the
+    /// leaf in service was unsealed once and is held for the life of this
+    /// process. Nothing else moves: the candidate stays sealed and its
+    /// promotion still happens at `not_after`.
+    async fn install_rollback(
+        &self,
+        authorization: Box<aether::certificates::status::CertificateServiceRollbackAuthorization>,
+    ) -> Result<helios_api::certificates::GatewayRollbackView, GatewayActionRefusal> {
+        let now = now_unix();
+        let mut registry = self.registry.lock().await;
+        let installed =
+            crate::gateway_rotation::install_rollback(&mut registry, *authorization, now).map_err(
+                |error| {
+                    tracing::warn!(%error, "gateway service rollback refused");
+                    GatewayActionRefusal::new(format!("{error:#}"))
+                },
+            )?;
+        tracing::warn!(
+            epoch = installed.gateway_identity_epoch,
+            expires_at = installed.expires_at,
+            "gateway service rollback selected from the console; it applies at the next restart"
+        );
+        Ok(helios_api::certificates::GatewayRollbackView {
+            gateway_identity_epoch: installed.gateway_identity_epoch,
+            selected_certificate_fingerprint: installed.selected_certificate_fingerprint.to_hex(),
+            expires_at: installed.expires_at,
+            already_present: installed.already_present,
+        })
+    }
 }
 
 #[async_trait]
@@ -1118,6 +1150,12 @@ pub fn domain_view(
             .unwrap_or_default(),
         gateway_transition_pending: state.gateway.next_gateway_certificate.is_some(),
         gateway_activation_at: state.gateway.activation_at,
+        gateway_retire_active_at: state.gateway.retire_active_at,
+        gateway_transition_published: state.gateway.published,
+        gateway_rollback_expires_at: state
+            .gateway
+            .active_service_rollback(now_unix)
+            .map(|rollback| rollback.expires_at),
         astra_authority_url: state.astra.authority_url.clone(),
         astra_service_key_epoch: state.astra.astra_service_key_epoch,
         astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),
@@ -1524,6 +1562,7 @@ mod tests {
                 published: false,
                 revoked: false,
                 revocation_epoch: 0,
+                service_rollback: None,
             },
             client_tls_ca: ClientTlsCaState {
                 ca_tls_epoch: 2,

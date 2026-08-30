@@ -56,7 +56,7 @@ use super::{
         GatewayTransitionAbortTombstone,
     },
     revocation::{EmergencyCertificateRevocation, RevocationScope},
-    status::AstraCertificateStatus,
+    status::{AstraCertificateStatus, CertificateServiceRollbackAuthorization},
     window::TransitionWindow,
     CertificateError,
 };
@@ -130,6 +130,40 @@ pub struct GatewayCertificateState {
     pub revoked: bool,
     #[serde(default)]
     pub revocation_epoch: u64,
+    /// A manual selection of the outgoing leaf, in force during the overlap.
+    ///
+    /// Absent outside a rollback, which is the resting state (spec §4.4).
+    #[serde(default)]
+    pub service_rollback: Option<GatewayServiceRollback>,
+}
+
+/// A bounded, manual selection of the outgoing identity (spec §4.4).
+///
+/// It is a **service** rollback and never a state rollback: no counter moves,
+/// no slot is removed, and the decision it lives inside is untouched. It only
+/// says which of the two leaves the gateway presents while the overlap lasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayServiceRollback {
+    /// Fingerprint of the authorization that installed it.
+    ///
+    /// So the same signed document carried twice is a replay, and a different
+    /// one — a later expiry, say — is a second decision rather than a silent
+    /// extension of the first.
+    pub authorization_fingerprint: Fingerprint,
+    /// The leaf selected. Always the outgoing one; the authorization cannot
+    /// name another, and this state re-checks it.
+    pub selected_certificate_fingerprint: Fingerprint,
+    /// At most the transition's `not_after`: a rollback cannot outlive the
+    /// overlap it rolls back within.
+    pub expires_at: u64,
+}
+
+impl GatewayServiceRollback {
+    /// Whether this selection is still the one to serve at `now_unix`.
+    pub const fn in_force(&self, now_unix: u64) -> bool {
+        now_unix < self.expires_at
+    }
 }
 
 impl GatewayCertificateState {
@@ -283,6 +317,94 @@ impl GatewayCertificateState {
     /// Returns whether anything moved. Promotion is definitive even for a
     /// client that never observed the transition: the decision was persisted,
     /// and the alternative is a fleet that waits forever on its slowest member.
+    /// Whether an overlap is in force at `now_unix` (spec §6.2).
+    ///
+    /// Exactly the window in which the daemon would otherwise serve the
+    /// incoming leaf: staged, published, past `activation_at` and short of
+    /// `not_after`. A rollback is available there and nowhere else — before
+    /// publication the outgoing leaf is already the one served, and after
+    /// `not_after` reviving it would be a state rollback.
+    pub fn in_overlap(&self, now_unix: u64) -> bool {
+        if self.revoked || !self.published || self.next_gateway_identity_epoch.is_none() {
+            return false;
+        }
+        matches!(
+            (self.activation_at, self.retire_active_at),
+            (Some(activation_at), Some(retire_at))
+                if now_unix >= activation_at && now_unix < retire_at
+        )
+    }
+
+    /// Selects the outgoing leaf for the rest of the overlap (spec §4.4).
+    ///
+    /// Changes no counter and removes no slot: the transition it lives inside
+    /// is exactly as it was, and `promote_if_due` will still fire at
+    /// `not_after`. What it changes is which of the two leaves the daemon
+    /// serves — and that is read at startup, not mid-process.
+    ///
+    /// Refused outside an overlap, on a revoked identity, for any leaf other
+    /// than the outgoing one, and for an expiry past the overlap's end.
+    ///
+    /// Verification happens **here**, against the anchor, the transition and
+    /// the leaf this state already holds — as for every other document it
+    /// installs, a caller cannot hand in an authorization it verified against
+    /// something else.
+    pub fn apply_service_rollback(
+        &mut self,
+        authorization: &CertificateServiceRollbackAuthorization,
+        now_unix: u64,
+    ) -> Result<InstallOutcome, CertificateError> {
+        // The state question before the cryptographic one: an operator who
+        // asks for a rollback outside an overlap should be told that, not told
+        // their signature failed against fields that do not exist yet.
+        if !self.in_overlap(now_unix) {
+            return Err(CertificateError::RollbackUnavailable);
+        }
+        let staged = self
+            .next_transition_fingerprint
+            .ok_or(CertificateError::RollbackUnavailable)?;
+        let retire_at = self
+            .retire_active_at
+            .ok_or(CertificateError::RollbackUnavailable)?;
+        // `verify` is what refuses a leaf other than the outgoing one and an
+        // expiry past the overlap: both are checked against the values this
+        // state holds, which is the point of passing them from here.
+        authorization.verify(
+            &self.current_ca_public_key,
+            &self.trust_domain_id,
+            self.ca_epoch,
+            &self.gateway_wg_public_key,
+            &self.server_name,
+            &staged,
+            &self.active_tls_fingerprint(),
+            retire_at,
+            now_unix,
+        )?;
+        let fingerprint = authorization.fingerprint()?;
+        if let Some(existing) = &self.service_rollback {
+            if existing.authorization_fingerprint.matches(&fingerprint) {
+                return Ok(InstallOutcome::AlreadyPresent);
+            }
+        }
+        self.service_rollback = Some(GatewayServiceRollback {
+            authorization_fingerprint: fingerprint,
+            selected_certificate_fingerprint: authorization.selected_certificate_fingerprint,
+            expires_at: authorization.expires_at,
+        });
+        Ok(InstallOutcome::Installed)
+    }
+
+    /// The selection in force at `now_unix`, if any.
+    ///
+    /// Expiry is answered by the clock rather than by a purge: a rollback that
+    /// has run out stops being served the second it does, whether or not
+    /// anything has written to the registry since.
+    pub fn active_service_rollback(&self, now_unix: u64) -> Option<&GatewayServiceRollback> {
+        self.service_rollback
+            .as_ref()
+            .filter(|rollback| rollback.in_force(now_unix))
+    }
+
     pub fn promote_if_due(&mut self, now_unix: u64) -> Result<bool, CertificateError> {
         let Some(retire_at) = self.retire_active_at else {
             return Ok(false);
@@ -305,6 +427,9 @@ impl GatewayCertificateState {
         self.activation_at = None;
         self.retire_active_at = None;
         self.published = false;
+        // The overlap is over, so its selection is too. Keeping it would leave
+        // a document naming a leaf this state no longer holds.
+        self.service_rollback = None;
         Ok(true)
     }
 
@@ -345,6 +470,7 @@ impl GatewayCertificateState {
             self.activation_at = None;
             self.retire_active_at = None;
             self.published = false;
+            self.service_rollback = None;
             return Ok(true);
         }
 
@@ -368,6 +494,7 @@ impl GatewayCertificateState {
             self.activation_at = None;
             self.retire_active_at = None;
             self.published = false;
+            self.service_rollback = None;
             return Ok(true);
         }
         // A revocation naming a leaf this state never held is not an error —
@@ -2241,6 +2368,7 @@ mod tests {
         use crate::certificates::authority::RotationReason;
         use crate::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
         use crate::certificates::gateway::AbortReason;
+        use crate::certificates::status::CertificateServiceRollbackAuthorization;
         use crate::certificates::{CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION};
         use crate::key_negotiation::{
             issue_pq_certificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
@@ -2305,6 +2433,7 @@ mod tests {
                 published: false,
                 revoked: false,
                 revocation_epoch: 0,
+                service_rollback: None,
             }
         }
 
@@ -2355,6 +2484,245 @@ mod tests {
                 ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
             };
             abort.sign(&ca.private).expect("sign")
+        }
+
+        /// Builds a state sitting inside a published overlap: the window is
+        /// [2_000, 3_000), so 2_000 is the first second the daemon would serve
+        /// the incoming leaf and 2_999 the last.
+        fn in_overlap(ca: &Keys, active: &Keys, candidate: &Keys) -> GatewayCertificateState {
+            let mut state = state(ca, leaf(ca, active, 1));
+            let transition = transition(ca, &state, 2, leaf(ca, candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            state.mark_published().expect("publish");
+            state
+        }
+
+        /// A rollback authorization signed by `ca` for the state's own overlap.
+        fn rollback(
+            ca: &Keys,
+            state: &GatewayCertificateState,
+            selected: Fingerprint,
+            expires_at: u64,
+        ) -> CertificateServiceRollbackAuthorization {
+            let authorization = CertificateServiceRollbackAuthorization {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: state.trust_domain_id,
+                ca_epoch: state.ca_epoch,
+                gateway_wg_public_key: state.gateway_wg_public_key,
+                server_name: state.server_name.clone(),
+                transition_fingerprint: state
+                    .next_transition_fingerprint
+                    .unwrap_or_else(|| Fingerprint::of(b"no staged transition")),
+                selected_certificate_fingerprint: selected,
+                campaign_fingerprint: Fingerprint::of(b"campaign"),
+                expires_at,
+                ca_signature: MlDsa87Signature::new(vec![0; 4627]).expect("placeholder"),
+            };
+            authorization.sign(&ca.private).expect("sign")
+        }
+
+        /// The window a rollback lives in is exactly the window in which the
+        /// daemon would otherwise serve the incoming leaf.
+        #[test]
+        fn the_overlap_opens_at_activation_and_closes_at_not_after() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            assert!(!state.in_overlap(2_500), "nothing staged");
+
+            let transition = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            assert!(!state.in_overlap(2_500), "staged but not published");
+
+            state.mark_published().expect("publish");
+            assert!(!state.in_overlap(1_999), "before activation_at");
+            assert!(state.in_overlap(2_000));
+            assert!(state.in_overlap(2_999));
+            assert!(!state.in_overlap(3_000), "at not_after the overlap is over");
+        }
+
+        /// The nominal gesture of §11.1 step 8: during the overlap, the
+        /// outgoing leaf is selected again, and nothing else moves.
+        #[test]
+        fn a_rollback_selects_the_outgoing_leaf_without_moving_a_counter() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+
+            assert_eq!(
+                state
+                    .apply_service_rollback(&authorization, 2_100)
+                    .expect("rollback"),
+                InstallOutcome::Installed
+            );
+            assert_eq!(state.active_gateway_identity_epoch, 1);
+            assert_eq!(state.gateway_decision_epoch, 2);
+            assert_eq!(state.next_gateway_identity_epoch, Some(2));
+            assert!(state.published);
+            assert_eq!(
+                state.acceptable_pq_fingerprints(2_100).unwrap().len(),
+                2,
+                "a service rollback changes what is served, not what is accepted"
+            );
+            assert!(state.active_service_rollback(2_100).is_some());
+        }
+
+        /// The same signed document twice is a replay; the state says so
+        /// rather than writing a second time.
+        #[test]
+        fn the_same_authorization_carried_twice_is_a_replay() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert_eq!(
+                state
+                    .apply_service_rollback(&authorization, 2_200)
+                    .expect("replay"),
+                InstallOutcome::AlreadyPresent
+            );
+        }
+
+        /// Expiry is answered by the clock, not by a purge.
+        #[test]
+        fn a_rollback_stops_being_served_the_second_it_expires() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state.active_service_rollback(2_799).is_some());
+            assert!(state.active_service_rollback(2_800).is_none());
+            assert!(
+                state.service_rollback.is_some(),
+                "the document is kept; only its effect ends"
+            );
+        }
+
+        /// Outside the overlap there is nothing to roll back to: before
+        /// publication the outgoing leaf is already served, and after
+        /// `not_after` reviving it would be a state rollback.
+        #[test]
+        fn a_rollback_is_refused_outside_an_overlap() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = state(&ca, leaf(&ca, &active, 1));
+            let outgoing = state.active_tls_fingerprint();
+            let unstaged = rollback(&ca, &state, outgoing, 2_800);
+            assert!(matches!(
+                state.apply_service_rollback(&unstaged, 2_100),
+                Err(CertificateError::RollbackUnavailable)
+            ));
+
+            let transition = transition(&ca, &state, 2, leaf(&ca, &candidate, 2));
+            state
+                .install_transition(&transition, &TrustLedger::default(), 500)
+                .expect("install");
+            let authorization = rollback(&ca, &state, outgoing, 2_800);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&authorization, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "staged but unpublished: the outgoing leaf is already the one served"
+            );
+
+            state.mark_published().expect("publish");
+            let early = rollback(&ca, &state, outgoing, 1_900);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&early, 1_800),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "before activation_at"
+            );
+        }
+
+        /// Naming any leaf but the outgoing one would make this a downgrade
+        /// primitive rather than a selection.
+        #[test]
+        fn a_rollback_may_name_only_the_outgoing_leaf() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let elsewhere = rollback(&ca, &state, Fingerprint::of(b"another leaf"), 2_800);
+            assert!(matches!(
+                state.apply_service_rollback(&elsewhere, 2_100),
+                Err(CertificateError::RollbackUnavailable)
+            ));
+        }
+
+        /// A rollback cannot outlive the overlap it rolls back within, and
+        /// cannot be installed already expired.
+        #[test]
+        fn a_rollback_is_bounded_by_the_overlap_it_lives_in() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let beyond = rollback(&ca, &state, outgoing, 3_001);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&beyond, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "past not_after"
+            );
+            let spent = rollback(&ca, &state, outgoing, 2_100);
+            assert!(
+                matches!(
+                    state.apply_service_rollback(&spent, 2_100),
+                    Err(CertificateError::RollbackUnavailable)
+                ),
+                "already expired"
+            );
+            let exact = rollback(&ca, &state, outgoing, 3_000);
+            state
+                .apply_service_rollback(&exact, 2_100)
+                .expect("exactly not_after is allowed");
+        }
+
+        /// Promotion ends the overlap, so it ends the selection: keeping it
+        /// would leave a document naming a leaf the state no longer holds.
+        #[test]
+        fn promotion_clears_the_selection_it_ends() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 3_000);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state.promote_if_due(3_000).expect("promotion"));
+            assert!(state.service_rollback.is_none());
+        }
+
+        /// A revoked identity offers nothing to serve, rolled back or not.
+        #[test]
+        fn revocation_clears_the_selection_and_forbids_a_new_one() {
+            let (ca, active, candidate) = (keys(), keys(), keys());
+            let mut state = in_overlap(&ca, &active, &candidate);
+            let outgoing = state.active_tls_fingerprint();
+            let authorization = rollback(&ca, &state, outgoing, 3_000);
+            let second = rollback(&ca, &state, outgoing, 2_900);
+            state
+                .apply_service_rollback(&authorization, 2_100)
+                .expect("rollback");
+            assert!(state
+                .apply_revocation(Some(&outgoing), None, 1)
+                .expect("revocation"));
+            assert!(state.service_rollback.is_none());
+            assert!(!state.in_overlap(2_200));
+            assert!(matches!(
+                state.apply_service_rollback(&second, 2_200),
+                Err(CertificateError::RollbackUnavailable)
+            ));
         }
 
         #[test]

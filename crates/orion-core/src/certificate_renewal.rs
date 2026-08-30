@@ -426,6 +426,7 @@ fn seed(
             published: false,
             revoked: false,
             revocation_epoch: 0,
+            service_rollback: None,
         },
         client_tls_ca: ClientTlsCaState {
             ca_tls_epoch: trust.ca_tls_epoch,
@@ -1560,6 +1561,7 @@ mod tests {
                     published: false,
                     revoked: false,
                     revocation_epoch: 0,
+                    service_rollback: None,
                 },
                 client_tls_ca: ClientTlsCaState {
                     ca_tls_epoch: 1,
