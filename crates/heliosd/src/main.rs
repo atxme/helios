@@ -120,6 +120,10 @@ enum Command {
         /// anchor of the domain, and the only one this gateway ever trusts.
         #[arg(long)]
         ca_public_key: String,
+        /// Gateway PQ leaf returned by the offline `astra-signer
+        /// issue-gateway-bootstrap` ceremony.
+        #[arg(long)]
+        gateway_certificate: std::path::PathBuf,
         /// Astra's service public key, base64 — printed by `astra bootstrap`.
         /// It signs statuses and receipts; it certifies nothing.
         #[arg(long)]
@@ -496,12 +500,14 @@ async fn main() -> anyhow::Result<()> {
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
+            gateway_certificate,
             astra_service_public_key,
             authority_url,
             webauthn_rp_id,
         } => init_trust_domain(
             &trust_domain_id,
             &ca_public_key,
+            &gateway_certificate,
             &astra_service_public_key,
             &authority_url,
             &webauthn_rp_id,
@@ -661,8 +667,14 @@ fn init_key_negotiation(
     )?;
     println!("certificate: {}", result.certificate_path.display());
     println!("sha256: {}", result.certificate_sha256);
-    println!("PQ certificate: {}", result.pq_certificate_path.display());
-    println!("PQ sha256: {}", result.pq_certificate_sha256);
+    println!(
+        "gateway bootstrap request: {}",
+        result.bootstrap_request_path.display()
+    );
+    println!(
+        "request fingerprint: {}",
+        result.bootstrap_request_fingerprint
+    );
     info!("key-negotiation TLS and PQ private keys generated on the gateway and sealed");
     Ok(())
 }
@@ -909,20 +921,31 @@ fn show_uplink() -> anyhow::Result<()> {
 /// a script that has to parse JSON over SSH parses it with `sed`, and a `sed`
 /// pattern over a certificate is a defect waiting for a field to move.
 fn show_identity() -> anyhow::Result<()> {
-    let Some(served) = key_negotiation::served_identity()? else {
+    if let Some(served) = key_negotiation::served_identity()? {
+        println!("server_name={}", served.pq_certificate.subject);
+        println!(
+            "wireguard_public_key={}",
+            served.pq_certificate.wireguard_public_key
+        );
+        println!(
+            "pq_certificate_not_after={}",
+            served.pq_certificate.not_after_unix
+        );
+    } else if let Some(request) = key_negotiation::gateway_bootstrap_request()? {
+        request
+            .verify()
+            .context("verifying the gateway bootstrap request")?;
+        println!("server_name={}", request.server_name);
+        println!(
+            "wireguard_public_key={}",
+            request.gateway_wg_public_key.to_base64()
+        );
+        println!("bootstrap_request_fingerprint={}", request.fingerprint());
+    } else {
         anyhow::bail!(
             "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
         );
-    };
-    println!("server_name={}", served.pq_certificate.subject);
-    println!(
-        "wireguard_public_key={}",
-        served.pq_certificate.wireguard_public_key
-    );
-    println!(
-        "pq_certificate_not_after={}",
-        served.pq_certificate.not_after_unix
-    );
+    }
     Ok(())
 }
 
@@ -1021,6 +1044,7 @@ fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
 fn init_trust_domain(
     trust_domain_id: &str,
     ca_public_key: &str,
+    gateway_certificate: &std::path::Path,
     astra_service_public_key: &str,
     authority_url: &str,
     webauthn_rp_id: &str,
@@ -1038,10 +1062,21 @@ fn init_trust_domain(
     let astra_service_public_key = MlDsa87PublicKey::parse(astra_service_public_key)
         .context("reading the Astra service public key")?;
 
+    let path = CertificateRegistry::path();
+    anyhow::ensure!(
+        !path.exists(),
+        "a certificate registry already exists at {}; init-trust-domain only creates a domain",
+        path.display()
+    );
+    key_negotiation::install_gateway_bootstrap_certificate(
+        gateway_certificate,
+        &ca_public_key,
+        now_unix()?,
+    )?;
     let Some(served) = key_negotiation::served_identity()? else {
         anyhow::bail!(
             "this gateway has no key-negotiation identity yet: run `heliosd \
-             init-key-negotiation` first, since the registry describes the leaves it serves"
+             init-key-negotiation`, complete the CA-PQ ceremony, then retry"
         );
     };
     let gateway_wg_public_key = WireGuardKey::parse(&served.pq_certificate.wireguard_public_key)
@@ -1116,7 +1151,6 @@ fn init_trust_domain(
         ledger: TrustLedger::default(),
     };
 
-    let path = CertificateRegistry::path();
     let registry = CertificateRegistry::bootstrap(path.clone(), state)
         .context("creating the certificate registry")?;
 
@@ -1882,6 +1916,30 @@ mod tests {
                 .unwrap()
                 .command,
             Command::InitIdentity { rotate: true }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "heliosd",
+                "init-trust-domain",
+                "--trust-domain-id",
+                "00112233445566778899aabbccddeeff",
+                "--ca-public-key",
+                "ca",
+                "--gateway-certificate",
+                "/tmp/gateway.json",
+                "--astra-service-public-key",
+                "service",
+                "--authority-url",
+                "https://astra.example",
+                "--webauthn-rp-id",
+                "astra.example",
+            ])
+            .unwrap()
+            .command,
+            Command::InitTrustDomain {
+                gateway_certificate,
+                ..
+            } if gateway_certificate == std::path::Path::new("/tmp/gateway.json")
         ));
         assert!(Cli::try_parse_from([
             "heliosd",

@@ -70,7 +70,7 @@ use aether::certificates::encoding::{
     TrustDomainId, WireGuardKey,
 };
 use aether::certificates::gateway::{
-    AbortReason, GatewayIdentityTransition, GatewayTransitionAbort,
+    AbortReason, GatewayBootstrapRequest, GatewayIdentityTransition, GatewayTransitionAbort,
 };
 use aether::certificates::revocation::{
     EmergencyCertificateRevocation, RevocationReason, RevocationScope,
@@ -320,6 +320,57 @@ pub struct GatewayTransitionDecision {
     pub leaf_validity: (u64, u64),
     pub reason: RotationReason,
     pub serial: [u8; 16],
+}
+
+/// Public inputs of the one-time, continuity-free issuance (§13.1).
+pub struct GatewayBootstrapDecision<'a> {
+    pub request: &'a GatewayBootstrapRequest,
+    pub leaf_validity: (u64, u64),
+    pub serial: [u8; 16],
+}
+
+/// Issues epoch 1 directly under `CA-PQ`, before Astra has any online state.
+pub fn issue_gateway_bootstrap_certificate(
+    vault: &AuthorityVault,
+    opening: &crate::authenticator::Opened,
+    ca_pq_public_key: &MlDsa87PublicKey,
+    decision: &GatewayBootstrapDecision<'_>,
+) -> Result<aether::key_negotiation::PqCertificate> {
+    decision.request.verify()?;
+    if decision.leaf_validity.1 <= decision.leaf_validity.0 {
+        return Err(GestureError::Anchors(
+            "période de validité de la feuille gateway vide".into(),
+        ));
+    }
+    with_anchors(vault, opening, |secrets| {
+        let ca_pq_private_key = decode(&secrets.ca_pq_private_key, "clé privée CA-PQ")?;
+        let leaf = aether::key_negotiation::issue_pq_certificate(
+            aether::key_negotiation::PqCertificate {
+                version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+                serial: decision.serial,
+                subject: decision.request.server_name.clone(),
+                issuer: "helios-ca-pq".to_string(),
+                role: aether::key_negotiation::PqCertificateRole::Gateway,
+                wireguard_public_key: decision.request.gateway_wg_public_key.to_base64(),
+                ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
+                    .encode(decision.request.ml_dsa_87_public_key.as_bytes()),
+                not_before_unix: decision.leaf_validity.0,
+                not_after_unix: decision.leaf_validity.1,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_pq_private_key,
+        )
+        .map_err(|_| CertificateError::Signing)?;
+        leaf.verify(
+            ca_pq_public_key.as_bytes(),
+            aether::key_negotiation::PqCertificateRole::Gateway,
+            Some(&decision.request.server_name),
+            &decision.request.gateway_wg_public_key.to_base64(),
+            decision.leaf_validity.0,
+        )
+        .map_err(|error| GestureError::Anchors(error.to_string()))?;
+        Ok(leaf)
+    })
 }
 
 /// Issues the next gateway leaf and signs its transition (spec §11.1 step 4).

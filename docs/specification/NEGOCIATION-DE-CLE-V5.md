@@ -2402,12 +2402,17 @@ retour est vérifié sous cette ancre déjà épinglée.
 
 ### 15.4 Gateway
 
-`heliosd init-key-negotiation` lit la CA TLS opérateur et la clé publique
-`CA-PQ`, génère une clé TLS gateway et une clé **ML-DSA-87** gateway, scelle les
-deux clés privées au TPM et produit la demande publique de certificat liée à la
-clé WireGuard gateway. Le poste opérateur vérifie la preuve de possession,
-émet la leaf PQ sous `CA-PQ`, puis réinstalle seulement les certificats et CA
-publics. Aucune clé privée ne revient vers la gateway.
+`heliosd init-key-negotiation` lit les CA clientes publiques, génère une clé TLS
+gateway et une clé **ML-DSA-87** gateway, scelle les deux clés privées au TPM et
+produit `GatewayBootstrapRequest`, demande publique signée par la nouvelle clé
+et liée à la clé WireGuard gateway. Il ne produit aucune leaf PQ. Le poste
+opérateur vérifie la preuve de possession, exige les deux credentials de
+`CampaignScope::GatewayBootstrap`, puis émet la leaf PQ sous `CA-PQ` par
+`astra-signer issue-gateway-bootstrap`. `heliosd init-trust-domain` reçoit
+ensuite cette leaf publique, la vérifie sous l'ancre fournie et refuse une leaf
+auto-signée avant de créer le registre d'époque 1. Aucune clé privée ne revient
+vers la gateway ; l'échange se fait par fichiers, avant qu'Astra possède un
+registre ou un canal en ligne.
 
 L'identité est chargée une fois au démarrage. Une rotation exige
 `systemctl restart heliosd` ; le démarrage journalise l'empreinte servie et la

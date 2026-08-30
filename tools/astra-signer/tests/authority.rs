@@ -20,6 +20,7 @@ use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
     MlDsa87Signature, TrustDomainId, WireGuardKey,
 };
+use aether::certificates::gateway::GatewayBootstrapRequest;
 use aether::certificates::revocation::{RevocationReason, RevocationScope};
 use aether::certificates::status::{
     AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
@@ -101,6 +102,49 @@ fn ca_pq_public_key(vault: &AuthorityVault) -> MlDsa87PublicKey {
 fn bindings(vault: &AuthorityVault, opening: &Opened) -> CredentialRegistry {
     authority::sign_credential_bindings(vault, opening, &identity(), None, &[], NOW)
         .expect("bindings")
+}
+
+#[test]
+fn bootstrap_issues_the_gateway_leaf_under_ca_pq() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().expect("gateway key");
+    let request = GatewayBootstrapRequest {
+        format_version: CERTIFICATE_FORMAT_VERSION,
+        gateway_wg_public_key: gateway_key(),
+        server_name: SERVER_NAME.into(),
+        ml_dsa_87_public_key: gateway_public,
+        key_possession_proof: MlDsa87Signature::placeholder(),
+    }
+    .sign(&gateway_private)
+    .expect("bootstrap request");
+
+    let leaf = authority::issue_gateway_bootstrap_certificate(
+        &vault,
+        &opening,
+        &ca_pq_public_key(&vault),
+        &authority::GatewayBootstrapDecision {
+            request: &request,
+            leaf_validity: (NOW, NOW + 365 * 86_400),
+            serial: [9; 16],
+        },
+    )
+    .expect("bootstrap leaf");
+
+    leaf.verify(
+        ca_pq_public_key(&vault).as_bytes(),
+        aether::key_negotiation::PqCertificateRole::Gateway,
+        Some(SERVER_NAME),
+        &gateway_key().to_base64(),
+        NOW,
+    )
+    .expect("CA-PQ signature");
+    assert_eq!(
+        leaf.ml_dsa_87_public_key,
+        request.ml_dsa_87_public_key.to_base64()
+    );
 }
 
 /// The `CA-TLS` this companion self-signs is a real CA: it certifies, and it

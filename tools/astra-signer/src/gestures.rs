@@ -26,6 +26,34 @@ use base64::Engine as _;
 
 use crate::authenticator::{Authenticator, AuthenticatorError, CredentialSubject, Opened};
 
+/// Enforces the credential policy attached to a lifecycle scope.
+///
+/// Bootstrap has no online campaign to carry this field, so the offline
+/// ceremony calls the same policy directly. Distinct credential identifiers
+/// are mandatory: presenting one key twice never becomes two approvals.
+pub fn require_scope_credentials(
+    scope: aether::certificates::status::CampaignScope,
+    openings: &[&Opened],
+) -> Result<()> {
+    let required = usize::from(scope.required_credentials());
+    if openings.len() != required {
+        return Err(GestureError::Anchors(format!(
+            "la portée {scope:?} exige {required} credentials actifs distincts"
+        )));
+    }
+    for (index, opening) in openings.iter().enumerate() {
+        if openings[..index]
+            .iter()
+            .any(|earlier| earlier.credential_id == opening.credential_id)
+        {
+            return Err(GestureError::Anchors(
+                "le même credential a été présenté deux fois".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GestureError {
     #[error(transparent)]
@@ -211,4 +239,30 @@ fn subject(trust_domain_id: &TrustDomainId) -> CredentialSubject {
 
 fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::status::CampaignScope;
+    use astra::vault::SlotSecret;
+
+    fn opened(id: u8) -> Opened {
+        Opened {
+            credential_id: vec![id],
+            secret: SlotSecret::new(vec![id; 32]),
+        }
+    }
+
+    #[test]
+    fn bootstrap_requires_two_distinct_credentials() {
+        let first = opened(1);
+        let second = opened(2);
+        require_scope_credentials(CampaignScope::GatewayBootstrap, &[&first, &second])
+            .expect("two credentials");
+        assert!(require_scope_credentials(CampaignScope::GatewayBootstrap, &[&first]).is_err());
+        assert!(
+            require_scope_credentials(CampaignScope::GatewayBootstrap, &[&first, &first]).is_err()
+        );
+    }
 }

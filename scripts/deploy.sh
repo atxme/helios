@@ -42,6 +42,10 @@ SEQUENCE=""
 # Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
 RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
+# Leaf publique rendue par la cérémonie hors ligne du §13.1. Le chemin par
+# défaut est à côté du relais : le premier passage y dépose la demande, le
+# compagnon y écrit la réponse, puis `--astra` reprend sans valeur à recopier.
+CERTIFICAT_AMORCAGE="${HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE:-$(dirname "$RELAIS")/gateway-bootstrap-certificate.json}"
 # L'installation ne met rien dans le PATH : `heliosd` n'existe que sous ce
 # chemin, et root ne le trouve pas autrement. Le nommer en clair évite un
 # « command not found » là où l'on croirait lire un refus d'amorçage.
@@ -85,7 +89,7 @@ n'en prend aucun. L'argument reste accepté pour viser ponctuellement une
 autre machine, sans rien changer aux appels suivants.
 
 Variables reconnues : HELIOS_CIBLE, HELIOS_PUBLISHER_EPOCH,
-HELIOS_DEPLOY_CHANNEL.
+HELIOS_DEPLOY_CHANNEL, ASTRA_HANDOFF, HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE.
 EOF
     exit 1
 }
@@ -248,7 +252,7 @@ deployer_astra() {
     local cle_service tete_audit identite moteur compose_env statut_astra
     local tete_attendue registre_gateway statut_tete_ancienne tete_ancienne
     local unite_build etat_build resultat_build code_build tentative astra_lire_frais
-    local canal_present cert_astra cert_gateway
+    local canal_present cert_astra cert_gateway demande_gateway certificat_distant
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -306,6 +310,31 @@ deployer_astra() {
         return 1
     fi
     echo "    serveur $nom_serveur"
+
+    # La première leaf naît avant tout registre Astra. Le premier passage
+    # transporte donc seulement la demande publique vers le poste opérateur et
+    # s'arrête ; la reprise reçoit la leaf signée et peut alors amorcer les deux
+    # moitiés du domaine. Aucun endpoint en ligne n'est inventé pour franchir
+    # une frontière qui n'existe pas encore.
+    registre_gateway="$(helios_ssh_sudo_capture "$CIBLE" \
+        "if test -f /var/lib/helios/certificates.json; then echo present; else echo absent; fi" \
+        | tr -d '\r' | tail -1)"
+    if [ "$registre_gateway" = "absent" ] && [ ! -f "$CERTIFICAT_AMORCAGE" ]; then
+        demande_gateway="$(dirname "$RELAIS")/gateway-bootstrap-request.json"
+        mkdir -p "$(dirname "$demande_gateway")"
+        helios_ssh_sudo_capture "$CIBLE" \
+            "cat /var/lib/helios/gateway-bootstrap-certificate-request.json" \
+            > "$demande_gateway" || {
+            echo "    demande d'amorçage gateway introuvable" >&2
+            return 1
+        }
+        echo "    demande publique rapatriée : $demande_gateway"
+        echo "    deux credentials distincts doivent maintenant émettre la leaf :" >&2
+        echo "      astra-signer issue-gateway-bootstrap --request '$demande_gateway' \\" >&2
+        echo "        --out '$CERTIFICAT_AMORCAGE'" >&2
+        echo "    puis reprendre : ./scripts/deploy.sh --astra" >&2
+        return 1
+    fi
 
     # ── Sources et image, sur la cible ──────────────────────────────────────
     # `git archive` plutôt qu'un rsync : ce qui part est ce qui est commité,
@@ -730,13 +759,16 @@ deployer_astra() {
     # Elle peut manquer alors que le volume Astra existe déjà : une coupure
     # entre les deux amorçages ne doit ni fabriquer une seconde autorité, ni
     # laisser les routes de cycle de vie fermées pour toujours.
-    registre_gateway="$(helios_ssh_sudo_capture "$CIBLE" \
-        "if test -f /var/lib/helios/certificates.json; then echo present; else echo absent; fi" \
-        | tr -d '\r' | tail -1)"
     if [ "$registre_gateway" = "absent" ]; then
         echo "    amorçage du registre gateway"
+        certificat_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/gateway-bootstrap-certificate.json"
+        scp -q "$CERTIFICAT_AMORCAGE" "$CIBLE:$certificat_distant" || {
+            echo "    transfert de la leaf gateway impossible" >&2
+            return 1
+        }
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
+            --gateway-certificate '$certificat_distant' \
             --astra-service-public-key '$cle_service' \
             --authority-url '$url' --webauthn-rp-id '$rp'" || {
             echo "    le registre gateway n'a pas été amorcé — Astra tourne, la" >&2
@@ -744,6 +776,7 @@ deployer_astra() {
             echo "    vie in-tunnel restent fermées." >&2
             return 1
         }
+        ssh "$CIBLE" "rm -f '$certificat_distant'"
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
     fi

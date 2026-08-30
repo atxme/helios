@@ -75,6 +75,7 @@ const SUPPORTED_CONTEXTS: &[&[u8]] = &[
     b"helios-key-negotiation-pq-in-tunnel-release-v5",
     // ROTATION-CERTIFICATS §2.3.1.
     b"helios-trust-base-state-v5",
+    b"helios-gateway-bootstrap-request-v5",
     b"helios-gateway-certificate-request-v5",
     b"helios-gateway-identity-transition-v5",
     b"helios-gateway-identity-transition-abort-v5",

@@ -287,6 +287,7 @@ différentes :
 | Type signé ou preuve signée | `ctx` ML-DSA-87 exact |
 | --- | --- |
 | `TrustBaseState` | `helios-trust-base-state-v5` |
+| `GatewayBootstrapRequest` | `helios-gateway-bootstrap-request-v5` |
 | `GatewayCertificateRequest` | `helios-gateway-certificate-request-v5` |
 | `GatewayIdentityTransition` | `helios-gateway-identity-transition-v5` |
 | `GatewayTransitionAbort` | `helios-gateway-identity-transition-abort-v5` |
@@ -1576,6 +1577,11 @@ Ces portées forment quatre familles d'objets, et une campagne n'en produit
 qu'une : aucun objet signé, pour les portées clientes ; une transition d'ancre ;
 une décision d'identité gateway ; une révocation. Un objet déposé sous une
 campagne d'une autre famille est refusé, dans les deux sens.
+
+`CampaignScope::GatewayBootstrap` porte uniquement la politique à deux
+credentials du §13.1. `AstraRotationCampaign::validate` le refuse : avant le
+premier registre il n'existe ni campagne en ligne, ni état sortant à figer, ni
+clé de service capable de signer `AstraSignerRequest`.
 
 Astra signe ensuite `AstraSignerRequest` de §2.4. Pour un profil actif, Orion
 ouvre le compagnon avec `heliosd_url` et `operation_id`; la requête et le
@@ -3135,8 +3141,14 @@ contournés :
   faire là. **Limite connue** : rien ne redémarre le démon à la place de
   l'opérateur, et rien ne doit le faire tant que la feuille servie est
   descellée une seule fois ;
-- la **bascule coordonnée du §13**, depuis la leaf gateway auto-signée vers
-  `CA-PQ`. Le **discriminant de profil Orion** `helios_key_negotiation`, lui,
+- la **bascule coordonnée du §13.2** d'un parc existant, depuis la leaf gateway
+  auto-signée vers `CA-PQ`, reste une procédure opérateur hors bande. Le
+  bootstrap neuf du §13.1 est livré : `init-key-negotiation` ne produit plus
+  de leaf PQ, mais une `GatewayBootstrapRequest` publique avec preuve de
+  possession ; `astra-signer issue-gateway-bootstrap` l'émet sous `CA-PQ` par
+  fichiers après deux credentials distincts ; `init-trust-domain` vérifie la
+  leaf sous l'ancre fournie et refuse par son nom une auto-signature. Le
+  **discriminant de profil Orion** `helios_key_negotiation`, lui,
   est livré : le document `.orion` porte `type`, le manifeste de coffre le
   scelle en v5, l'écran *Profils* le montre, et le chemin de connexion lit le
   type déclaré plutôt que la présence du bloc — une leaf perdue ne dégrade donc
@@ -3256,15 +3268,10 @@ Le §12.1 énumère ce qu'il faut pour dire « cycle de vie implémenté ». **C
 n'est pas encore le cas**, et cette section existe pour que le raccourcissement
 progressif du §12.3 ne finisse pas par le faire croire.
 
-Quatre points restent, et ils ne sont pas de même nature.
-
-**Un est du travail restant** : la bascule du §13.1, où une installation neuve
-n'émet plus de leaf PQ gateway auto-signée mais la fait émettre par `CA-PQ`.
-Tant qu'elle n'est pas faite, un domaine neuf naît avec une ancre épinglée et
-une feuille gateway que cette ancre n'a jamais signée.
-
-**Trois sont des décisions prises**, et les nommer comme des manques serait
-aussi trompeur que les taire :
+Trois points restent, et **aucun n'est du travail en attente** : la bascule du
+§13.1 est livrée, une installation neuve reçoit désormais sa feuille gateway de
+`CA-PQ`. Ce qui subsiste tient à des décisions prises, et les nommer comme des
+manques serait aussi trompeur que les taire :
 
 - **Le §13.2**, l'amorçage de confiance d'un parc v5 déjà déployé. La première
   installation de `CA-PQ` n'est pas la génération `N -> N+1` d'une rotation :
@@ -3294,6 +3301,11 @@ tourner dans l'environnement de développement, et le `docs/testing/TESTING.md`
 dit quel environnement prouve quoi. Aucune revendication de validation
 matérielle n'est portée par cette note.
 
+C'est ce dernier point qui empêche de cocher le §12.1, et non les trois
+au-dessus : le §12.1 exige les tests du §14, et rien de ce qui est écrit ici ne
+les remplace. Le reste du cycle est en place ; ce qui manque est la preuve
+qu'il fonctionne sur la cible.
+
 ## 13. Migration depuis la v5 actuellement servie
 
 ### 13.1 Installation neuve après implémentation du lot
@@ -3313,6 +3325,46 @@ auto-signée. L'enrôlement initial crée directement :
   `credential_registry_epoch = 1` et une délégation bornée ;
 - `authority_url`, `webauthn_rp_id` et `astra_policy_fingerprint` confirmé hors
   bande dans chaque profil Helios.
+
+Le geste est entièrement hors ligne. `heliosd init-key-negotiation` génère et
+scelle les clés TLS et ML-DSA-87 sur la gateway, installe les seules ancres
+clientes publiques et exporte `GatewayBootstrapRequest`. Sa transcription est :
+
+```text
+"helios-gateway-bootstrap-request-v5"
+|| format_version:u16
+|| gateway_wg_public_key:32
+|| len(server_name):u32 || server_name
+|| len(ml_dsa_87_public_key):u32 || ml_dsa_87_public_key
+```
+
+`key_possession_proof` est la signature ML-DSA-87 de cette transcription sous
+la clé privée gateway nouvellement scellée. La demande ne porte ni
+`trust_domain_id` ni époque : ces deux valeurs appartiennent au coffre
+opérateur qui émet directement l'époque 1. Elle ne transporte aucune clé
+privée.
+
+Le poste opérateur exécute `astra-signer issue-gateway-bootstrap --request
+<demande> --out <leaf>`. Cette cérémonie n'est pas une campagne Astra en ligne :
+le domaine neuf n'a encore ni registre, ni clé de service, ni veth. Elle exige
+néanmoins **deux credentials actifs distincts**. C'est une réadmission sans
+continuité au sens de §0.2, et non une rotation `gateway_identity` ordinaire :
+aucune identité sortante et aucun état de domaine ne bornent la nouvelle clé.
+La décision réside dans `CampaignScope::GatewayBootstrap` et son
+`required_credentials() = 2`; aucun appelant ne fixe ce nombre séparément.
+Chaque credential doit ouvrir le coffre courant, puis le premier slot ouvert
+sert à l'émission sous `CA-PQ`.
+
+La leaf publique revient seule sur la gateway. `heliosd init-trust-domain
+--gateway-certificate <leaf>` vérifie la preuve locale, l'identité WireGuard,
+le `server_name`, la clé ML-DSA-87 et la signature sous l'ancre fournie avant
+d'écrire la leaf et le registre. Une leaf dont la signature vérifie sous sa
+propre clé est refusée par l'erreur nommée
+`SelfSignedGatewayCertificate`. Ce refus ne s'exécute que lors de la création
+du registre : le chargement d'un registre existant reste inchangé et les
+installations antérieures continuent donc de redémarrer. Sans registre, le
+lecteur historique exige encore une leaf auto-signée ; une leaf `CA-PQ`
+installée à mi-amorçage ne devient jamais un repli silencieux.
 
 ### 13.2 Parc v5 existant
 

@@ -44,6 +44,7 @@ use super::{
 };
 
 const GATEWAY_REQUEST_DOMAIN: &[u8] = b"helios-gateway-certificate-request-v5";
+const GATEWAY_BOOTSTRAP_REQUEST_DOMAIN: &[u8] = b"helios-gateway-bootstrap-request-v5";
 const GATEWAY_TRANSITION_DOMAIN: &[u8] = b"helios-gateway-identity-transition-v5";
 const GATEWAY_ABORT_DOMAIN: &[u8] = b"helios-gateway-identity-transition-abort-v5";
 
@@ -70,6 +71,58 @@ pub enum Continuity<'a> {
     /// operator procedure, and the resulting transition must carry
     /// [`RotationReason::KeyRecovery`].
     WaivedForKeyRecovery,
+}
+
+/// Public proof exported before a trust domain knows this gateway (§13.1).
+///
+/// The request deliberately carries no trust-domain identifier or epoch: the
+/// operator's offline authority supplies those when it issues epoch 1. The
+/// stable WireGuard identity and server name are signed by the private half of
+/// `ml_dsa_87_public_key`, proving that the key certified by `CA-PQ` is the one
+/// generated and sealed on the gateway. No private material leaves that host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayBootstrapRequest {
+    pub format_version: u16,
+    pub gateway_wg_public_key: WireGuardKey,
+    pub server_name: String,
+    pub ml_dsa_87_public_key: MlDsa87PublicKey,
+    pub key_possession_proof: MlDsa87Signature,
+}
+
+impl GatewayBootstrapRequest {
+    fn signing_bytes(&self) -> SignedTranscript {
+        let mut bytes = CanonicalBytes::new(GATEWAY_BOOTSTRAP_REQUEST_DOMAIN);
+        bytes
+            .u16(self.format_version)
+            .key(&self.gateway_wg_public_key)
+            .text(&self.server_name)
+            .length_prefixed(self.ml_dsa_87_public_key.as_bytes());
+        bytes.finish_signed()
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
+        bytes.length_prefixed(self.key_possession_proof.as_bytes());
+        Fingerprint::of(&bytes.finish())
+    }
+
+    /// Verifies the stable identity and proof of possession before issuance.
+    pub fn verify(&self) -> Result<(), CertificateError> {
+        if self.format_version != CERTIFICATE_FORMAT_VERSION {
+            return Err(CertificateError::UnsupportedFormatVersion {
+                received: self.format_version,
+                supported: CERTIFICATE_FORMAT_VERSION,
+            });
+        }
+        validate_server_name(&self.server_name)?;
+        verify_ml_dsa_87(
+            &self.ml_dsa_87_public_key,
+            &self.signing_bytes(),
+            &self.key_possession_proof,
+        )
+        .map_err(|_| CertificateError::MissingProof("bootstrap gateway"))
+    }
 }
 
 /// Public request the operator companion turns into a leaf (spec §5).
@@ -531,6 +584,13 @@ mod signing {
     use super::*;
     use crate::certificates::encoding::sign_ml_dsa_87;
 
+    impl GatewayBootstrapRequest {
+        pub fn sign(mut self, private_key: &[u8]) -> Result<Self, CertificateError> {
+            self.key_possession_proof = sign_ml_dsa_87(private_key, &self.signing_bytes())?;
+            Ok(self)
+        }
+    }
+
     impl GatewayCertificateRequest {
         /// `current_key_private` is `None` on the key-recovery path, where the
         /// field must be **absent** rather than merely unverified.
@@ -623,6 +683,29 @@ mod tests {
         let key = KeyPair::generate().expect("TLS key");
         let certificate = params.self_signed(&key).expect("TLS certificate");
         DerCertificate::new(certificate.der().to_vec()).expect("DER")
+    }
+
+    #[test]
+    fn a_bootstrap_request_proves_the_key_sealed_by_the_gateway() {
+        let gateway = keys();
+        let request = GatewayBootstrapRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            ml_dsa_87_public_key: gateway.public.clone(),
+            key_possession_proof: MlDsa87Signature::placeholder(),
+        }
+        .sign(&gateway.private)
+        .expect("sign request");
+
+        request.verify().expect("verify request");
+
+        let mut substituted = request;
+        substituted.gateway_wg_public_key = WireGuardKey::from_bytes([9; 32]);
+        assert!(matches!(
+            substituted.verify(),
+            Err(CertificateError::MissingProof("bootstrap gateway"))
+        ));
     }
 
     fn transition(ca: &Keys, next_leaf: Option<PqCertificate>) -> GatewayIdentityTransition {

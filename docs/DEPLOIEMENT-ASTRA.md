@@ -5,24 +5,34 @@ décrit ce qui existe aujourd'hui et **nomme ce qui manque encore**, parce qu'un
 guide qui laisse croire que la rotation fonctionne coûte une journée à celui
 qui le suit.
 
-## Deux commandes
+## Amorçage en deux passages
 
 ```sh
 astra-signer init --rp-id astra.helios.local --label "YubiKey du bureau"
+astra-signer enrol --label "YubiKey de récupération"
 ./scripts/deploy.sh
+# Le premier passage rapatrie la demande publique et indique exactement :
+astra-signer issue-gateway-bootstrap \
+  --request ~/.helios/astra/gateway-bootstrap-request.json \
+  --out ~/.helios/astra/gateway-bootstrap-certificate.json
+./scripts/deploy.sh --astra
 ```
 
-C'est tout. La première exige une clé de sécurité branchée et ne peut pas être
-automatisée — c'est le but d'une clé physique. La seconde fait le reste :
-image, transfert, amorçage d'Astra, amorçage du registre gateway, redémarrage.
+C'est tout. Les deux gestes `astra-signer` exigent les clés de sécurité et ne
+peuvent pas être automatisés — c'est le but des objets physiques. Le premier
+passage du déploiement installe la gateway, puis rapatrie la demande publique
+créée et signée par sa clé ML-DSA-87 scellée. Il s'arrête **avant** de créer un
+registre Astra. La cérémonie hors ligne émet la leaf sous `CA-PQ` ; la reprise
+la reporte sur la gateway, amorce Astra et le registre gateway, puis redémarre.
 
 Aucune valeur n'est recopiée à la main. `init` écrit un **relais** public à côté
 du coffre (`~/.helios/astra/astra-domain.json`, `%APPDATA%\astra\` sous Windows) :
 domaine, RP ID, ancre `CA-PQ`.
 `deploy.sh` le lit, demande à la gateway son identité servie
-(`heliosd show-identity`), amorce Astra, **capture** dans sa sortie la clé de
-service et la tête de chaîne d'audit, les reporte dans le `.env` distant et
-enchaîne sur `heliosd init-trust-domain`.
+(`heliosd show-identity` lit la demande tant que la leaf n'existe pas), amorce
+Astra, **capture** dans sa sortie la clé de service et la tête de chaîne
+d'audit, les reporte dans le `.env` distant et enchaîne sur `heliosd
+init-trust-domain --gateway-certificate ...`.
 
 Sans relais, `deploy.sh` saute cette partie en une ligne et déploie la gateway
 comme avant : une gateway sans autorité reste une gateway qui marche.
@@ -153,9 +163,10 @@ n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
 
 ## Prérequis
 
-- La gateway tourne, et `heliosd init-key-negotiation` a déjà été passé. Le
-  registre décrit les leaves effectivement servies ; sans elles il n'y a rien à
-  décrire, et `deploy.sh` le dit.
+- La gateway tourne, et `heliosd init-key-negotiation` a déjà été passé. La
+  commande scelle les clés privées et exporte une demande publique ; elle
+  n'émet plus de leaf PQ auto-signée. `deploy.sh` rapatrie cette demande au
+  premier passage.
 - Un moteur de conteneur sur la gateway (`docker compose` ou `podman compose`).
   Absent, l'étape est sautée avec la commande d'installation en clair. `buildx`
   n'est **pas** exigé : compose ≥ 2.33 délègue par défaut la construction à
@@ -163,9 +174,12 @@ n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
   alors d'un avertissement — l'image n'est pas construite, mais rien n'échoue.
   `deploy.sh` force donc `COMPOSE_BAKE=0`, vérifie que l'image existe après
   construction, et n'avale plus la sortie du constructeur.
-- **Deux** clés de sécurité FIDO2 avec PIN. Une seule suffit pour commencer :
-  l'autorité restera « non amorcée » et le dira à chaque commande, jusqu'à
-  l'enrôlement de la seconde.
+- **Deux** clés de sécurité FIDO2 avec PIN, enregistrées et essayées avant
+  l'émission de la première leaf gateway. Cette admission ne possède aucune
+  continuité sortante ; `CampaignScope::GatewayBootstrap` exige donc deux
+  credentials actifs distincts, comme une réadmission sans continuité. Le
+  coffre reste 1-sur-N : ce n'est pas un quorum humain, mais deux barrières
+  matérielles appliquées par le compagnon honnête.
 - Le compagnon bâti sur la machine où la clé se branche :
   `cargo build -p astra-signer`. En **debug** : le garde-fou ADR-002 refuse le
   trousseau éditeur de développement dans toute compilation `--release`, et
@@ -218,20 +232,26 @@ slot.
 
 1. détecte `docker compose` ou `podman compose` sur la gateway ;
 2. lit le relais — domaine, RP ID, ancre ;
-3. `heliosd show-identity` : nom de serveur et clé WireGuard, lus dans la leaf
-   PQ servie plutôt que retapés ;
+3. `heliosd show-identity` : nom de serveur et clé WireGuard, lus dans la
+   demande d'amorçage vérifiée tant que la leaf n'existe pas, puis dans la leaf
+   servie ; si le registre gateway est absent et la réponse opérateur aussi,
+   le script rapatrie la demande et s'arrête avant l'amorçage d'Astra ;
 4. envoie les sources par `git archive HEAD` et construit l'image **sur la
    gateway** — ce qui part est donc ce qui est commité, jamais l'arbre de
    travail. Y compris le trousseau éditeur *public*, sans lequel `aether/build.rs`
    refuse la compilation `--release` de l'image. La construction tourne dans
    une unité systemd transitoire : une coupure SSH n'annule pas BuildKit, et le
    script se reconnecte pour lire son résultat et son journal ;
-5. si le domaine n'est pas amorcé : `astra bootstrap`
+5. à la reprise, la leaf publique issue de
+   `astra-signer issue-gateway-bootstrap` est copiée sur la gateway ; si le
+   domaine n'est pas amorcé : `astra bootstrap`
    — avec `--ca-tls-fingerprint`, l'empreinte de la CA TLS cliente en service,
    sans laquelle la rotation du §9.4 reste invérifiable ici et se refuse par
    son nom —, capture de la clé de
    service et de la tête d'audit, écriture du `.env` distant, puis
-   `heliosd init-trust-domain` et `systemctl restart heliosd` ;
+   `heliosd init-trust-domain --gateway-certificate ...` — qui vérifie la
+   signature `CA-PQ` et refuse une auto-signature — puis `systemctl restart
+   heliosd` ;
 6. `compose up -d`.
 
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le

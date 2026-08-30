@@ -371,8 +371,8 @@ pub fn status_query_signing_bytes(
 /// What a manual campaign covers (spec §7.6).
 ///
 /// The names are the ones the interfaces must show. No short label may
-/// conflate [`Self::TrustAuthorities`] with an ordinary renewal: it rotates
-/// `CA-PQ`, and it is the one scope that requires two operator credentials.
+/// conflate [`Self::TrustAuthorities`] or [`Self::GatewayBootstrap`] with an
+/// ordinary renewal: both require two operator credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignScope {
@@ -392,6 +392,8 @@ pub enum CampaignScope {
     GatewayIdentity,
     /// Astra's delegated issuer: one bounded delegation (spec §9.5).
     IssuerDelegation,
+    /// Initial gateway leaf, issued offline before Astra has a registry (§13.1).
+    GatewayBootstrap,
 }
 
 /// Which family of signed objects a scope may produce.
@@ -423,6 +425,8 @@ pub enum CampaignFamily {
     /// distributed as a trust update. Folding it into any of the three above
     /// would let a campaign for one of them deliver it, or the reverse.
     IssuerDelegation,
+    /// Initial admission of a gateway with no outgoing identity.
+    GatewayBootstrap,
 }
 
 impl CampaignScope {
@@ -436,6 +440,7 @@ impl CampaignScope {
             Self::EmergencyRevocation => 5,
             Self::GatewayIdentity => 6,
             Self::IssuerDelegation => 7,
+            Self::GatewayBootstrap => 8,
         }
     }
 
@@ -450,13 +455,14 @@ impl CampaignScope {
             Self::EmergencyRevocation => CampaignFamily::Revocation,
             Self::GatewayIdentity => CampaignFamily::GatewayIdentity,
             Self::IssuerDelegation => CampaignFamily::IssuerDelegation,
+            Self::GatewayBootstrap => CampaignFamily::GatewayBootstrap,
         }
     }
 
     /// Operator credentials this scope requires (spec §7.6, ADR-008 §4).
     pub const fn required_credentials(self) -> u8 {
         match self {
-            Self::TrustAuthorities => 2,
+            Self::TrustAuthorities | Self::GatewayBootstrap => 2,
             _ => 1,
         }
     }
@@ -585,6 +591,11 @@ impl AstraRotationCampaign {
         }
         if self.targets.is_empty() {
             return Err(CertificateError::EmptyTransition);
+        }
+        if matches!(self.scope, CampaignScope::GatewayBootstrap) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "gateway bootstrap is an offline credential policy, not an Astra campaign",
+            ));
         }
         if self.targets.len() > MAX_CAMPAIGN_TARGETS {
             return Err(CertificateError::TooManyObjects);
@@ -2229,18 +2240,28 @@ mod tests {
         assert!(with_registry.validate(&campaign).is_err());
     }
 
-    /// Rotating the authorities is the one scope that needs two credentials,
-    /// and no short label may make it look like an ordinary renewal.
+    /// Anchor rotation and continuity-free bootstrap need two credentials;
+    /// every decision that starts from an authenticated identity needs one.
     #[test]
-    fn only_a_trust_authority_campaign_requires_two_credentials() {
+    fn authority_and_bootstrap_scopes_require_two_credentials() {
         assert_eq!(CampaignScope::FleetLeafs.required_credentials(), 1);
         assert_eq!(
             CampaignScope::FullCertificateChain.required_credentials(),
             1
         );
         assert_eq!(CampaignScope::TrustAuthorities.required_credentials(), 2);
+        assert_eq!(CampaignScope::GatewayBootstrap.required_credentials(), 2);
         assert!(CampaignScope::TrustAuthorities.rotates_authority());
         assert!(!CampaignScope::FullCertificateChain.rotates_authority());
+    }
+
+    #[test]
+    fn bootstrap_scope_never_becomes_an_online_astra_campaign() {
+        let campaign = campaign(CampaignScope::GatewayBootstrap, vec![target(1)]);
+        assert!(matches!(
+            campaign.validate(1_100),
+            Err(CertificateError::IssuerScopeViolation(_))
+        ));
     }
 
     #[test]

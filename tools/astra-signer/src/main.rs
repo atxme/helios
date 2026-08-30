@@ -37,6 +37,8 @@
 //!   see [`astra_signer::authority::approve_renewal`].
 //! - `approve-campaign` approves a manual rotation campaign, at as many
 //!   distinct keys as its scope demands.
+//! - `issue-gateway-bootstrap` verifies the public request of a new gateway
+//!   and issues its epoch-1 leaf under `CA-PQ`, after two distinct keys.
 //! - `rotate-ca-pq` moves the anchor, under two distinct keys.
 //!
 //! This file is the prompts and the printing. The sequences themselves are in
@@ -64,13 +66,15 @@
 //! vérifiée sous la clé de service que ce compagnon épingle, et le RP ID
 //! annoncé est **comparé** à celui du coffre, jamais adopté.
 //!
-//! # Limite connue : deux commandes voyagent encore par fichiers
+//! # Gestes qui voyagent par fichiers
 //!
-//! `authorize-issuer` et `rotate-ca-pq` lisent une demande sur disque et
-//! écrivent leur résultat à côté. Elles ne portent pas de campagne, donc rien
-//! ne les rattache à une opération : les routes du §8.2 sont liées à un
-//! `operation_id` et à un manifeste, et il n'existe pas encore d'opération qui
-//! les décrive.
+//! `issue-gateway-bootstrap` voyage nécessairement par fichiers : le domaine
+//! neuf ne possède encore ni registre, ni clé de service, ni veth.
+//! `authorize-issuer` et la forme hors ligne de `rotate-ca-pq` lisent aussi une
+//! demande sur disque et écrivent leur résultat à côté. Elles ne portent pas
+//! de campagne, donc rien ne les rattache à une opération : les routes du §8.2
+//! sont liées à un `operation_id` et à un manifeste, et il n'existe pas encore
+//! d'opération qui les décrive.
 //!
 //! # Limite connue : le matériel ne s'exerce pas en WSL2
 //!
@@ -489,6 +493,23 @@ enum Command {
         #[arg(long)]
         replacement_transition: Option<PathBuf>,
     },
+    /// Émet hors ligne la première feuille PQ gateway sous `CA-PQ` (§13.1).
+    ///
+    /// Aucun registre Astra n'existe encore : la demande et la feuille
+    /// voyagent par fichiers. Deux credentials distincts sont exigés parce
+    /// que cette admission n'a aucune identité sortante pour prouver une
+    /// continuité.
+    IssueGatewayBootstrap {
+        /// Demande publique exportée par `heliosd init-key-negotiation`.
+        #[arg(long)]
+        request: PathBuf,
+        /// Où écrire la feuille PQ à rapporter à la gateway.
+        #[arg(long)]
+        out: PathBuf,
+        /// Durée de vie de la feuille, en jours.
+        #[arg(long, default_value_t = 365)]
+        validity_days: u64,
+    },
     /// Émet la feuille gateway suivante et signe sa transition (§11.1 étape 4).
     ///
     /// La gateway a scellé sa clé et exporté une demande ; cette commande
@@ -838,6 +859,11 @@ fn run() -> Result<()> {
             },
             transport,
         ),
+        Command::IssueGatewayBootstrap {
+            request,
+            out,
+            validity_days,
+        } => issue_gateway_bootstrap(&path, &request, &out, validity_days, transport),
         Command::SignGatewayTransition {
             authority_url,
             operation_id,
@@ -2494,6 +2520,78 @@ fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
             println!("fenêtre refermée : une nouvelle rotation peut être ouverte.");
         }
     }
+    Ok(())
+}
+
+/// Issues the first gateway leaf without inventing an online Astra campaign.
+fn issue_gateway_bootstrap(
+    path: &Path,
+    request_path: &Path,
+    out: &Path,
+    validity_days: u64,
+    transport: Transport,
+) -> Result<()> {
+    use aether::certificates::gateway::GatewayBootstrapRequest;
+    use aether::certificates::status::CampaignScope;
+
+    let vault = store::load(path)?;
+    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
+    let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+    let request: GatewayBootstrapRequest =
+        read_json(request_path, "la demande d'amorçage gateway")?;
+    request.verify()?;
+    let now = now_unix();
+    let validity = validity_days
+        .checked_mul(DAY_SECS)
+        .and_then(|seconds| now.checked_add(seconds))
+        .context("durée de validité hors bornes")?;
+
+    let scope = CampaignScope::GatewayBootstrap;
+    println!("amorçage gateway : émission de l'époque 1 sous CA-PQ");
+    println!("gateway          : {}", request.server_name);
+    println!(
+        "identité         : {}",
+        request.gateway_wg_public_key.to_base64()
+    );
+    println!("demande          : {}", request.fingerprint());
+    println!("valide jusqu'à   : {validity}");
+    println!(
+        "credentials      : {} actifs distincts (admission sans continuité)",
+        scope.required_credentials()
+    );
+    println!("transport        : fichiers uniquement ; Astra n'a encore aucun registre");
+
+    let first = connect_authorized_key(
+        &vault,
+        transport,
+        "Brancher le PREMIER credential autorisé, puis appuyer sur Entrée.",
+    )?;
+    eprintln!();
+    let second = connect_authorized_key(
+        &vault,
+        transport,
+        "Débrancher celui-ci, brancher le SECOND credential autorisé, puis Entrée.",
+    )?;
+    gestures::require_scope_credentials(scope, &[&first.opened, &second.opened])?;
+    // Both credentials must open the current vault, not merely resolve to a
+    // slot. This is the bootstrap trial ADR-008 requires before first use.
+    gestures::prove_anchors_open(&vault, &first.opened)?;
+    gestures::prove_anchors_open(&vault, &second.opened)?;
+
+    let certificate = authority::issue_gateway_bootstrap_certificate(
+        &vault,
+        &first.opened,
+        &ca_pq_public_key,
+        &authority::GatewayBootstrapDecision {
+            request: &request,
+            leaf_validity: (now.saturating_sub(300), validity),
+            serial: random_id()?,
+        },
+    )?;
+    let encoded = serde_json::to_vec_pretty(&certificate).context("encodage de la feuille")?;
+    std::fs::write(out, encoded).with_context(|| format!("écriture de {}", out.display()))?;
+    println!("feuille écrite   : {}", out.display());
+    println!("empreinte        : {}", certificate.fingerprint()?);
     Ok(())
 }
 

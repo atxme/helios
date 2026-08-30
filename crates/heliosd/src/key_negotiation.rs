@@ -10,10 +10,9 @@ use std::{
 use aether::{
     key_negotiation::{
         authenticate_commit, authenticate_response, generate_ml_dsa_87_keypair,
-        issue_pq_certificate, AuthenticatedKeyNegotiationCommit,
-        AuthenticatedKeyNegotiationConfirmation, AuthenticatedKeyNegotiationRequest,
-        AuthenticatedPskRelease, PqCertificate, PqCertificateRole, ProtectionMode,
-        KEY_NEGOTIATION_VERSION, PQ_CERTIFICATE_VERSION, SERVER_CHALLENGE_LEN,
+        AuthenticatedKeyNegotiationCommit, AuthenticatedKeyNegotiationConfirmation,
+        AuthenticatedKeyNegotiationRequest, AuthenticatedPskRelease, PqCertificate,
+        PqCertificateRole, ProtectionMode, KEY_NEGOTIATION_VERSION, SERVER_CHALLENGE_LEN,
     },
     InstallPskRequest, NetworkConfig, SecretString,
 };
@@ -43,6 +42,8 @@ const MAX_PSK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 
 const CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-cert.der";
 const CLIENT_CA_PATH: &str = "/var/lib/helios/key-negotiation-client-ca.der";
 const PQ_CERTIFICATE_PATH: &str = "/var/lib/helios/key-negotiation-pq-cert.json";
+const GATEWAY_BOOTSTRAP_REQUEST_PATH: &str =
+    "/var/lib/helios/gateway-bootstrap-certificate-request.json";
 /// The one ML-DSA-87 authority a client leaf is authenticated under, on the
 /// public port.
 ///
@@ -84,8 +85,8 @@ const MAX_REPLAY_IDENTIFIERS: usize = 4096;
 pub struct InitializedIdentity {
     pub certificate_path: std::path::PathBuf,
     pub certificate_sha256: String,
-    pub pq_certificate_path: std::path::PathBuf,
-    pub pq_certificate_sha256: String,
+    pub bootstrap_request_path: std::path::PathBuf,
+    pub bootstrap_request_fingerprint: String,
 }
 
 struct Transaction {
@@ -1577,6 +1578,100 @@ pub struct ServedIdentity {
     pub client_tls_ca: aether::certificates::encoding::DerCertificate,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayBootstrapCertificateError {
+    #[error("a self-signed gateway PQ leaf cannot become the active trust-domain identity")]
+    SelfSignedGatewayCertificate,
+    #[error("the gateway PQ leaf does not match its sealed bootstrap request")]
+    IdentityMismatch,
+    #[error("invalid gateway bootstrap request: {0}")]
+    InvalidRequest(#[source] aether::certificates::CertificateError),
+    #[error("invalid CA-PQ-issued gateway certificate: {0}")]
+    InvalidCertificate(#[source] aether::key_negotiation::KeyNegotiationError),
+}
+
+/// Reads the proof exported by `init-key-negotiation`, if that gesture ran.
+pub fn gateway_bootstrap_request(
+) -> Result<Option<aether::certificates::gateway::GatewayBootstrapRequest>> {
+    let encoded = match std::fs::read(GATEWAY_BOOTSTRAP_REQUEST_PATH) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {GATEWAY_BOOTSTRAP_REQUEST_PATH}"))
+        }
+    };
+    serde_json::from_slice(&encoded)
+        .with_context(|| format!("reading {GATEWAY_BOOTSTRAP_REQUEST_PATH}"))
+        .map(Some)
+}
+
+/// Checks that epoch 1 is a `CA-PQ` issuance for the locally sealed key.
+pub fn verify_gateway_bootstrap_certificate(
+    request: &aether::certificates::gateway::GatewayBootstrapRequest,
+    certificate: &PqCertificate,
+    ca_public_key: &aether::certificates::encoding::MlDsa87PublicKey,
+    now_unix: u64,
+) -> std::result::Result<(), GatewayBootstrapCertificateError> {
+    request
+        .verify()
+        .map_err(GatewayBootstrapCertificateError::InvalidRequest)?;
+
+    // Test the signature at the leaf's own lower bound so an expired legacy
+    // self-signed leaf is still identified by the named refusal, rather than
+    // falling through to a generic CA signature error.
+    if certificate
+        .verify_self_signed(
+            PqCertificateRole::Gateway,
+            Some(&request.server_name),
+            &request.gateway_wg_public_key.to_base64(),
+            certificate.not_before_unix,
+        )
+        .is_ok()
+    {
+        return Err(GatewayBootstrapCertificateError::SelfSignedGatewayCertificate);
+    }
+
+    certificate
+        .verify(
+            ca_public_key.as_bytes(),
+            PqCertificateRole::Gateway,
+            Some(&request.server_name),
+            &request.gateway_wg_public_key.to_base64(),
+            now_unix,
+        )
+        .map_err(GatewayBootstrapCertificateError::InvalidCertificate)?;
+    let certificate_key =
+        aether::certificates::encoding::MlDsa87PublicKey::parse(&certificate.ml_dsa_87_public_key)
+            .map_err(GatewayBootstrapCertificateError::InvalidRequest)?;
+    if certificate_key != request.ml_dsa_87_public_key {
+        return Err(GatewayBootstrapCertificateError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+/// Installs only the public leaf returned by the offline CA-PQ ceremony.
+pub fn install_gateway_bootstrap_certificate(
+    source: &Path,
+    ca_public_key: &aether::certificates::encoding::MlDsa87PublicKey,
+    now_unix: u64,
+) -> Result<PqCertificate> {
+    let request = gateway_bootstrap_request()?.context(
+        "the gateway has no bootstrap request: run `heliosd init-key-negotiation` first",
+    )?;
+    let encoded = std::fs::read(source)
+        .with_context(|| format!("reading gateway certificate {}", source.display()))?;
+    let certificate: PqCertificate = serde_json::from_slice(&encoded)
+        .with_context(|| format!("reading gateway certificate {}", source.display()))?;
+    verify_gateway_bootstrap_certificate(&request, &certificate, ca_public_key, now_unix)
+        .context("verifying the initial gateway certificate under CA-PQ")?;
+    write_public_atomic(
+        Path::new(PQ_CERTIFICATE_PATH),
+        &serde_json::to_vec_pretty(&certificate).context("encoding the gateway PQ certificate")?,
+    )
+    .context("installing the CA-PQ-issued gateway certificate")?;
+    Ok(certificate)
+}
+
 pub fn served_identity() -> Result<Option<ServedIdentity>> {
     use aether::certificates::encoding::DerCertificate;
 
@@ -2028,7 +2123,7 @@ pub fn initialize(
 
     let certificate_path = std::path::PathBuf::from(CERTIFICATE_PATH);
     let client_ca_destination = std::path::PathBuf::from(CLIENT_CA_PATH);
-    let pq_certificate_path = std::path::PathBuf::from(PQ_CERTIFICATE_PATH);
+    let bootstrap_request_path = std::path::PathBuf::from(GATEWAY_BOOTSTRAP_REQUEST_PATH);
     let client_pq_ca_destination = std::path::PathBuf::from(CLIENT_PQ_CA_PATH);
     let keystore = SealedKeystore::new(
         PRIVATE_KEYSTORE_PATH,
@@ -2037,7 +2132,8 @@ pub fn initialize(
     let already_initialized = keystore.exists()
         || certificate_path.exists()
         || client_ca_destination.exists()
-        || pq_certificate_path.exists()
+        || std::path::Path::new(PQ_CERTIFICATE_PATH).exists()
+        || bootstrap_request_path.exists()
         || client_pq_ca_destination.exists();
     anyhow::ensure!(
         rotate || !already_initialized,
@@ -2075,25 +2171,23 @@ pub fn initialize(
     let tls_private_key = Zeroizing::new(key_pair.serialize_der());
     let (pq_private_key, pq_public_key) =
         generate_ml_dsa_87_keypair().context("generating the gateway PQ identity")?;
-    let now = unix_time_now()?;
     aether::wg::validate_key(gateway_wg_public_key)
         .context("gateway WireGuard identity is unavailable")?;
-    let pq_certificate = issue_pq_certificate(
-        PqCertificate {
-            version: PQ_CERTIFICATE_VERSION,
-            serial: random_nonce()?,
-            subject: server_name.trim().to_string(),
-            issuer: server_name.trim().to_string(),
-            role: PqCertificateRole::Gateway,
-            wireguard_public_key: gateway_wg_public_key.to_string(),
-            ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(pq_public_key),
-            not_before_unix: now.saturating_sub(300),
-            not_after_unix: now + 825 * 24 * 60 * 60,
-            ml_dsa_87_signature: String::new(),
-        },
-        pq_private_key.as_slice(),
-    )
-    .context("creating the gateway PQ certificate")?;
+    let bootstrap_request = aether::certificates::gateway::GatewayBootstrapRequest {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        gateway_wg_public_key: aether::certificates::encoding::WireGuardKey::parse(
+            gateway_wg_public_key,
+        )
+        .context("reading the gateway WireGuard identity")?,
+        server_name: server_name.trim().to_string(),
+        ml_dsa_87_public_key: aether::certificates::encoding::MlDsa87PublicKey::parse(
+            &base64::engine::general_purpose::STANDARD.encode(pq_public_key),
+        )
+        .context("reading the generated gateway PQ public key")?,
+        key_possession_proof: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+    }
+    .sign(pq_private_key.as_slice())
+    .context("signing the gateway bootstrap request")?;
     let private_identity = Zeroizing::new(
         serde_json::to_vec(&StoredPrivateIdentity {
             tls_private_key: base64::engine::general_purpose::STANDARD
@@ -2116,17 +2210,23 @@ pub fn initialize(
     write_public_atomic(&client_ca_destination, &client_ca)
         .context("installing the Orion client CA")?;
     write_public_atomic(
-        &pq_certificate_path,
-        &serde_json::to_vec_pretty(&pq_certificate)
-            .context("encoding the gateway PQ certificate")?,
+        &bootstrap_request_path,
+        &serde_json::to_vec_pretty(&bootstrap_request)
+            .context("encoding the gateway bootstrap request")?,
     )
-    .context("installing the gateway PQ certificate")?;
+    .context("installing the gateway bootstrap request")?;
+    // A replacement must not leave the previous self-signed leaf looking like
+    // the answer to this new request. Without a registry the loader still
+    // requires self-signature, so absence fails closed until CA-PQ answers;
+    // with a registry, the persisted active leaf remains authoritative.
+    remove_if_present(Path::new(PQ_CERTIFICATE_PATH))
+        .context("retiring the previous gateway PQ certificate")?;
     write_public_atomic(&client_pq_ca_destination, &client_pq_ca)
         .context("installing the Orion client PQ CA")?;
 
     if rotate {
         tracing::warn!(
-            "key-negotiation identity rotated; Orion profiles must trust the new certificate"
+            "key-negotiation identity replaced; a CA-PQ bootstrap leaf must be issued before restart"
         );
     }
     Ok(InitializedIdentity {
@@ -2134,8 +2234,8 @@ pub fn initialize(
             certificate.der().as_ref(),
         ),
         certificate_path,
-        pq_certificate_sha256: pq_certificate.fingerprint()?,
-        pq_certificate_path,
+        bootstrap_request_fingerprint: bootstrap_request.fingerprint().to_hex(),
+        bootstrap_request_path,
     })
 }
 
@@ -2510,6 +2610,59 @@ mod tests {
     const GATEWAY_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const CERTIFICATE_FINGERPRINT: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn trust_bootstrap_accepts_only_the_ca_pq_issued_leaf() {
+        use aether::certificates::{
+            encoding::{MlDsa87PublicKey, MlDsa87Signature, WireGuardKey},
+            gateway::GatewayBootstrapRequest,
+            CERTIFICATE_FORMAT_VERSION,
+        };
+
+        let now = test_now();
+        let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().expect("gateway key");
+        let gateway_public = MlDsa87PublicKey::parse(
+            &base64::engine::general_purpose::STANDARD.encode(gateway_public),
+        )
+        .expect("gateway public key");
+        let request = GatewayBootstrapRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            gateway_wg_public_key: WireGuardKey::parse(GATEWAY_KEY).expect("WireGuard key"),
+            server_name: "gateway.example".into(),
+            ml_dsa_87_public_key: gateway_public,
+            key_possession_proof: MlDsa87Signature::placeholder(),
+        }
+        .sign(&gateway_private)
+        .expect("request");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA key");
+        let ca_public =
+            MlDsa87PublicKey::parse(&base64::engine::general_purpose::STANDARD.encode(ca_public))
+                .expect("CA public key");
+        let unsigned = PqCertificate {
+            version: PQ_CERTIFICATE_VERSION,
+            serial: [3; 16],
+            subject: request.server_name.clone(),
+            issuer: "helios-ca-pq".into(),
+            role: PqCertificateRole::Gateway,
+            wireguard_public_key: GATEWAY_KEY.into(),
+            ml_dsa_87_public_key: request.ml_dsa_87_public_key.to_base64(),
+            not_before_unix: now.saturating_sub(1),
+            not_after_unix: now + 3_600,
+            ml_dsa_87_signature: String::new(),
+        };
+        let ca_leaf = issue_pq_certificate(unsigned.clone(), &ca_private).expect("CA leaf");
+        verify_gateway_bootstrap_certificate(&request, &ca_leaf, &ca_public, now)
+            .expect("CA-PQ leaf");
+
+        let mut self_issued = unsigned;
+        self_issued.issuer = self_issued.subject.clone();
+        let self_signed =
+            issue_pq_certificate(self_issued, &gateway_private).expect("self-signed leaf");
+        assert!(matches!(
+            verify_gateway_bootstrap_certificate(&request, &self_signed, &ca_public, now),
+            Err(GatewayBootstrapCertificateError::SelfSignedGatewayCertificate)
+        ));
+    }
 
     #[test]
     fn a_restart_selects_only_a_published_candidate_inside_the_overlap() {

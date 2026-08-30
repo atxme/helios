@@ -140,6 +140,7 @@ impl ChainStep {
             CampaignScope::OrionDevice => "orion_device",
             CampaignScope::FullCertificateChain => "full_certificate_chain",
             CampaignScope::EmergencyRevocation => "emergency_revocation",
+            CampaignScope::GatewayBootstrap => "gateway_bootstrap",
         }
     }
 
