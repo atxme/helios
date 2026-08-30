@@ -292,6 +292,13 @@ pub struct AstraService {
     /// volume, which is also when a campaign that rotates an anchor is refused
     /// by name rather than left to fail at the download.
     pub encrypted_vault: Option<Vec<u8>>,
+    /// Where this authority's state volume is mounted.
+    ///
+    /// Held because one operator ceremony writes into it: a delegation the
+    /// companion deposits is recorded only after the private halves sealed
+    /// beside the registry are proven to match it (spec §9.5). Nothing else
+    /// here reads it, and no route exposes it.
+    pub state_dir: std::path::PathBuf,
     /// The private veth link to `heliosd`, when the deployment has one.
     ///
     /// It lives here because this is where staging will be driven from: an
@@ -929,6 +936,35 @@ async fn signer_result(
                 }
             }
         }
+    }
+
+    if let Some(authorization) = verified.issuer_authorization.clone() {
+        let issuer_epoch = authorization.issuer_epoch;
+        let mut domain = service.registry.lock().await;
+        // Recorded before the approval is marked spent, like the transitions
+        // above and for the same reason: a delegation the operator approved
+        // and this authority did not write is a ceremony to redo, whereas a
+        // spent approval with nothing behind it is a ceremony that cannot be.
+        crate::issuer::adopt(
+            &mut domain,
+            *authorization,
+            &crate::issuer::pq_key_path(&service.state_dir, issuer_epoch),
+            &crate::issuer::tls_key_path(&service.state_dir, issuer_epoch),
+            now,
+        )
+        .map_err(|error| {
+            tracing::error!(
+                %operation_id,
+                %error,
+                "the delegation this campaign produced was refused: the approval is not spent,                  and an identical deposit may be retried"
+            );
+            ServiceError::Refused
+        })?;
+        tracing::info!(
+            %operation_id,
+            issuer_epoch,
+            "delegation recorded; restart this authority to issue under it"
+        );
     }
 
     let mut operations = service.signing.lock().await;

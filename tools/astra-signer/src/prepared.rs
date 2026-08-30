@@ -150,6 +150,7 @@ mod tests {
                 }),
                 objects: Vec::new(),
                 credential_registry: None,
+                issuer_authorization: None,
             },
             transition_path: "/tmp/transition.json".into(),
             next_ca_tls_epoch: 2,

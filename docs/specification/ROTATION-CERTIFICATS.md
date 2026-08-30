@@ -2835,9 +2835,23 @@ contournés :
   trou. La résolution se fait donc localement.
   `rotate-ca-pq` porte désormais une campagne (`--authority-url`,
   `--operation-id`) et emprunte les quatre routes du §8.2 comme
-  `approve-campaign`. `authorize-issuer` lit encore une demande sur disque :
-  elle ne porte aucune campagne, donc rien ne la rattache à une opération, et
-  les jetons du §8.2 sont liés à une opération et à un manifeste ;
+  `approve-campaign`. `authorize-issuer` aussi : `astra issuer request
+  --reason --requested-by` résout la campagne `issuer_delegation` sur la
+  demande qu'il vient de produire et la dépose, le compagnon la récupère, la
+  montre, prend l'assertion et **redépose la délégation signée**, qu'Astra
+  enregistre après avoir prouvé la possession des deux moitiés privées
+  scellées à côté de son registre. Ce n'est pas une portée de `astra campaign
+  open` : la cible de cette campagne n'existe pas avant que la commande ne la
+  crée — l'époque, la clé ML-DSA-87 et la PKCS#10 naissent là, à côté des clés
+  privées qu'elles nomment. Ce que la campagne épingle est la **matière
+  exacte** qui sera certifiée : l'époque, la clé PQ, et le
+  `SubjectPublicKeyInfo` dont la PKCS#10 prouve la possession — la même valeur
+  se dérive de la demande avant la signature et de l'intermédiaire après elle.
+  Une demande de délégation ne porte aucune signature ; hors campagne, le
+  compagnon signe donc le fichier qu'on lui présente, et cette forme survit
+  pour un domaine sans origine joignable, en le disant. Réinstaller la même
+  délégation est un rejeu du §8.2, pas un retour en arrière : seule une
+  délégation *différente* à une époque dépensée est refusée ;
 - la **production** des transactions de transition, pour les objets qu'aucune
   cérémonie hors ligne ne signe. Le chemin complet du §0.6 est livré :
   `aether::certificates::transport::signing::build_transaction` construit et
@@ -3004,9 +3018,13 @@ contournés :
   refuse la réciproque.
   La famille **identité gateway** s'exécute aussi ; elle a sa propre ligne
   ci-dessous.
-  **Reste ouvert** : `authorize-issuer`, qui ne porte encore aucune campagne, et
-  `full_certificate_chain`, dont aucune portée n'ordonne encore émetteur, CA
-  TLS, gateway puis clients en une seule campagne ;
+  La famille **délégation d'émetteur** s'exécute aussi, et elle a sa propre
+  famille : l'objet qu'elle autorise n'est pas un `TrustUpdateObject`, aucun
+  détenteur ne le reçoit, l'autorité émet dessous et tous les autres le
+  vérifient sous l'ancre qu'ils épinglent déjà. La replier dans l'une des trois
+  autres aurait laissé une campagne de celles-ci le livrer, ou l'inverse.
+  **Reste ouvert** : `full_certificate_chain`, dont aucune portée n'ordonne
+  encore émetteur, CA TLS, gateway puis clients ;
 - le **cycle complet de l'identité gateway**, §5, §6 et les neuf étapes de
   §11.1, est livré. La gateway génère et scelle sa clé suivante **à côté** de
   celle en service et exporte une `GatewayCertificateRequest`

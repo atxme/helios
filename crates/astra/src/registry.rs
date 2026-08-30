@@ -538,6 +538,13 @@ impl AstraRegistry {
         now_unix: u64,
     ) -> Result<(), RegistryError> {
         if let Some(installed) = &self.state.issuer {
+            // Installing the delegation already held is a no-op, not a
+            // walk-back: a companion whose response was lost retries the same
+            // bytes, and §8.2 makes that replay the repair. Only a *different*
+            // delegation at a spent epoch is the substitution this refuses.
+            if installed == &issuer {
+                return Ok(());
+            }
             if issuer.issuer_epoch <= installed.issuer_epoch {
                 return Err(RegistryError::IssuerEpochNotAdvancing {
                     installed: installed.issuer_epoch,
@@ -2722,8 +2729,19 @@ mod tests {
         registry
             .install_issuer(delegation(1), 1_000)
             .expect("first");
+        // The same delegation again is a replay of §8.2, not a walk-back: a
+        // companion whose response was lost redeposits the same bytes.
+        registry
+            .install_issuer(delegation(1), 1_100)
+            .expect("an identical delegation is a no-op");
+        // A *different* delegation at a spent epoch is the substitution this
+        // refuses — it would bring back an intermediate that was withdrawn,
+        // under a signature that still verifies.
+        let mut substituted = delegation(1);
+        substituted.authorization.tls_intermediate_certificate =
+            DerCertificate::new(vec![7; 64]).expect("der");
         assert!(matches!(
-            registry.install_issuer(delegation(1), 1_100),
+            registry.install_issuer(substituted, 1_150),
             Err(RegistryError::IssuerEpochNotAdvancing {
                 installed: 1,
                 offered: 1

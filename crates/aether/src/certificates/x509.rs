@@ -343,6 +343,27 @@ pub fn subject_public_key_info(certificate: &DerCertificate) -> Result<Vec<u8>, 
     Ok(parse(certificate.as_bytes())?.public_key().raw.to_vec())
 }
 
+/// The `SubjectPublicKeyInfo` a PKCS#10 request proves possession of.
+///
+/// The same bytes [`subject_public_key_info`] reads from a certificate, taken
+/// from the request instead — so a decision made **before** issuance and a
+/// check made **after** it compare one value rather than two descriptions of
+/// it. The request's self-signature is verified first: pinning a key nobody
+/// proved they hold would pin whatever the file happened to contain.
+pub fn certification_request_public_key_info(
+    csr: &DerCertificate,
+) -> Result<Vec<u8>, CertificateError> {
+    let (rest, request) = X509CertificationRequest::from_der(csr.as_bytes())
+        .map_err(|_| CertificateError::InvalidX509("unparsable CSR"))?;
+    if !rest.is_empty() {
+        return Err(CertificateError::InvalidX509("trailing bytes after CSR"));
+    }
+    request
+        .verify_signature()
+        .map_err(|_| CertificateError::InvalidX509("CSR signature does not verify"))?;
+    Ok(request.certification_request_info.subject_pki.raw.to_vec())
+}
+
 /// The leaf certifies the key the CSR proved possession of.
 ///
 /// The signature on a grant says the authority meant to issue *something*; it
@@ -680,6 +701,29 @@ mod tests {
         assert!(matches!(
             assert_chains_to(&leaf, &[], &[&ca_der], activation, anchor.not_after),
             Err(CertificateError::InvalidX509("unusable chain link"))
+        ));
+    }
+
+    /// The value pinned before issuance and the value read after it are the
+    /// same bytes, or the check made before the operator's touch decides
+    /// nothing about what was actually certified.
+    #[test]
+    fn a_request_and_the_certificate_it_produced_name_one_public_key() {
+        let (_, ca, ca_key) = authority("ca");
+        let (leaf, csr, _) = client_leaf(&ca, &ca_key);
+        assert_eq!(
+            certification_request_public_key_info(&csr).expect("csr spki"),
+            subject_public_key_info(&leaf).expect("leaf spki")
+        );
+
+        // Proof of possession, not a claim: a request whose signature was
+        // stripped pins a key nobody showed they hold.
+        let mut tampered = csr.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(matches!(
+            certification_request_public_key_info(&DerCertificate::new(tampered).expect("der")),
+            Err(CertificateError::InvalidX509(_))
         ));
     }
 

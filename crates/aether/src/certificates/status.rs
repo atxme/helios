@@ -390,6 +390,8 @@ pub enum CampaignScope {
     EmergencyRevocation,
     /// The gateway's own identity: one transition, or its abort (spec §6).
     GatewayIdentity,
+    /// Astra's delegated issuer: one bounded delegation (spec §9.5).
+    IssuerDelegation,
 }
 
 /// Which family of signed objects a scope may produce.
@@ -412,6 +414,15 @@ pub enum CampaignFamily {
     GatewayIdentity,
     /// Emergency withdrawal of active leaves (spec §10).
     Revocation,
+    /// The bounded delegation Astra issues under (spec §9.5).
+    ///
+    /// Its own family because the object it authorizes is not a
+    /// [`super::transport::TrustUpdateObject`] at all: a delegation is
+    /// consumed by the authority that issues under it and verified by the
+    /// holders against the anchor they already pin, so it is never
+    /// distributed as a trust update. Folding it into any of the three above
+    /// would let a campaign for one of them deliver it, or the reverse.
+    IssuerDelegation,
 }
 
 impl CampaignScope {
@@ -424,6 +435,7 @@ impl CampaignScope {
             Self::TrustAuthorities => 4,
             Self::EmergencyRevocation => 5,
             Self::GatewayIdentity => 6,
+            Self::IssuerDelegation => 7,
         }
     }
 
@@ -437,6 +449,7 @@ impl CampaignScope {
             Self::TrustAuthorities => CampaignFamily::Authorities,
             Self::EmergencyRevocation => CampaignFamily::Revocation,
             Self::GatewayIdentity => CampaignFamily::GatewayIdentity,
+            Self::IssuerDelegation => CampaignFamily::IssuerDelegation,
         }
     }
 
@@ -851,6 +864,56 @@ impl AstraRotationCampaign {
             .ok_or(CertificateError::CampaignMismatch)
     }
 
+    /// The row authorizing one bounded delegation to Astra's issuer (§9.5).
+    ///
+    /// # Why the keys and not only the epoch
+    ///
+    /// A delegation request carries no signature of its own: it is a domain
+    /// identifier, an epoch, an ML-DSA-87 public key and a PKCS#10 request,
+    /// produced beside private halves that never leave the authority's state
+    /// volume. Signed on its own, it would authorize whoever handed the
+    /// operator a file. So what the campaign pins — and what the operator
+    /// therefore reads before the touch — is the **exact material** that will
+    /// be certified: substituting either half changes a fingerprint here and
+    /// the approval no longer covers the request.
+    ///
+    /// The epoch must match for the reason
+    /// [`crate::certificates::state::AstraIssuerState`] exists: a delegation
+    /// reinstalled at a spent epoch would bring a withdrawn intermediate back
+    /// under a signature that still verifies.
+    pub fn covers_issuer_delegation(
+        &self,
+        trust_domain_id: TrustDomainId,
+        issuer_epoch: u64,
+        pq_issuer_public_key_fingerprint: &Fingerprint,
+        tls_public_key_info_fingerprint: &Fingerprint,
+    ) -> Result<(), CertificateError> {
+        if !matches!(self.scope.family(), CampaignFamily::IssuerDelegation) {
+            return Err(CertificateError::IssuerScopeViolation(
+                "only an issuer-delegation campaign authorizes a delegation",
+            ));
+        }
+        if trust_domain_id != self.trust_domain_id {
+            return Err(CertificateError::TrustDomainMismatch);
+        }
+        let covered = self.targets.iter().any(|target| {
+            target.certificate_kind == CertificateKind::AstraIssuer
+                && target.identity_key == self.gateway_wg_public_key
+                && target.epoch == issuer_epoch
+                && target
+                    .active_pq_certificate_fingerprint
+                    .matches(pq_issuer_public_key_fingerprint)
+                && target
+                    .active_tls_certificate_fingerprint
+                    .matches(tls_public_key_info_fingerprint)
+        });
+        if covered {
+            Ok(())
+        } else {
+            Err(CertificateError::CampaignMismatch)
+        }
+    }
+
     /// Refuses a campaign whose targets moved after approval (spec §7.6).
     pub fn assert_unchanged(
         &self,
@@ -1029,6 +1092,15 @@ pub struct AstraSignerResult {
     /// approval would then fail, on the one path that repairs anything.
     #[serde(default)]
     pub credential_registry: Option<Box<super::approval::CredentialRegistry>>,
+    /// The bounded delegation an issuer campaign authorized (spec §9.5).
+    ///
+    /// Present exactly when the campaign's family is
+    /// [`CampaignFamily::IssuerDelegation`], and absent everywhere else. It
+    /// travels beside `objects` rather than inside them because it is not a
+    /// trust update: no holder ever receives it, the authority issues under
+    /// it, and everyone else verifies it against the anchor they already pin.
+    #[serde(default)]
+    pub issuer_authorization: Option<Box<super::authority::AstraIssuerAuthorization>>,
 }
 
 impl AstraSignerResult {
@@ -1072,6 +1144,36 @@ impl AstraSignerResult {
         ) && self.objects.len() != 1
         {
             return Err(CertificateError::CampaignMismatch);
+        }
+        // Total the other way too: exactly one family delivers a delegation,
+        // and it delivers nothing else. Checked before the object loop, so a
+        // delegation smuggled beside an anchor transition is refused by the
+        // family rather than by whichever arm of the loop happened to run.
+        match (campaign.scope.family(), &self.issuer_authorization) {
+            (CampaignFamily::IssuerDelegation, Some(authorization)) => {
+                if !self.objects.is_empty() || self.credential_registry.is_some() {
+                    return Err(CertificateError::IssuerScopeViolation(
+                        "an issuer campaign authorizes a delegation and nothing else",
+                    ));
+                }
+                return campaign.covers_issuer_delegation(
+                    authorization.trust_domain_id,
+                    authorization.issuer_epoch,
+                    &Fingerprint::of(authorization.pq_issuer_public_key.as_bytes()),
+                    &Fingerprint::of(&super::x509::subject_public_key_info(
+                        &authorization.tls_intermediate_certificate,
+                    )?),
+                );
+            }
+            (CampaignFamily::IssuerDelegation, None) => {
+                return Err(CertificateError::EmptyTransition);
+            }
+            (_, Some(_)) => {
+                return Err(CertificateError::IssuerScopeViolation(
+                    "only an issuer campaign delivers a delegation",
+                ));
+            }
+            (_, None) => {}
         }
         if matches!(campaign.scope.family(), CampaignFamily::ClientLeaves) {
             // An ordinary leaf campaign has nothing for the companion to
@@ -1466,6 +1568,172 @@ mod tests {
                 }),
                 objects,
                 credential_registry,
+                issuer_authorization: None,
+            }
+        }
+
+        /// A delegation, and the exact material it will certify (spec §9.5).
+        mod issuer_delegation {
+            use super::*;
+            use crate::certificates::authority::{AllowedUsage, AstraIssuerAuthorization};
+            use crate::certificates::encoding::{DerCertificate, MlDsa87Signature};
+
+            /// A self-signed certificate, standing in for the intermediate the
+            /// companion issues. What matters below is its public key: it is
+            /// the value the campaign pinned before the touch.
+            fn intermediate() -> DerCertificate {
+                let key = rcgen::KeyPair::generate().expect("key");
+                let mut params =
+                    rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+                DerCertificate::new(
+                    params
+                        .self_signed(&key)
+                        .expect("intermediate")
+                        .der()
+                        .to_vec(),
+                )
+                .expect("der")
+            }
+
+            fn pq_key() -> crate::certificates::encoding::MlDsa87PublicKey {
+                let (_, public_key) = crate::ml_dsa::generate_keypair().expect("keypair");
+                crate::certificates::encoding::MlDsa87PublicKey::new(public_key).expect("key")
+            }
+
+            fn authorization(
+                issuer_epoch: u64,
+                pq_issuer_public_key: crate::certificates::encoding::MlDsa87PublicKey,
+                tls_intermediate_certificate: DerCertificate,
+            ) -> Box<AstraIssuerAuthorization> {
+                Box::new(AstraIssuerAuthorization {
+                    format_version: CERTIFICATE_FORMAT_VERSION,
+                    trust_domain_id: domain(),
+                    ca_epoch: 1,
+                    ca_tls_epoch: 1,
+                    gateway_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+                    server_name: "gateway.example".into(),
+                    issuer_epoch,
+                    pq_issuer_public_key,
+                    tls_intermediate_certificate,
+                    allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+                    maximum_leaf_lifetime_secs: 90 * 86_400,
+                    policy_fingerprint: Fingerprint::of(b"policy"),
+                    not_before: 1_000,
+                    not_after: 2_000,
+                    ca_pq_signature: MlDsa87Signature::placeholder(),
+                })
+            }
+
+            fn issuer_campaign(
+                issuer_epoch: u64,
+                pq: &crate::certificates::encoding::MlDsa87PublicKey,
+                intermediate: &DerCertificate,
+            ) -> AstraRotationCampaign {
+                super::super::campaign(
+                    CampaignScope::IssuerDelegation,
+                    vec![CampaignTarget {
+                        certificate_kind: CertificateKind::AstraIssuer,
+                        identity_key: WireGuardKey::from_bytes([2; 32]),
+                        epoch: issuer_epoch,
+                        generation: 0,
+                        active_tls_certificate_fingerprint: Fingerprint::of(
+                            &crate::certificates::x509::subject_public_key_info(intermediate)
+                                .expect("spki"),
+                        ),
+                        active_pq_certificate_fingerprint: Fingerprint::of(pq.as_bytes()),
+                    }],
+                )
+            }
+
+            fn result(
+                campaign: &AstraRotationCampaign,
+                authorization: Option<Box<AstraIssuerAuthorization>>,
+            ) -> AstraSignerResult {
+                let mut result = signer_result(campaign, Vec::new(), None);
+                result.issuer_authorization = authorization;
+                result
+            }
+
+            /// The delegation request carries no signature of its own, so the
+            /// campaign is what binds it. Either half substituted, and the
+            /// approval no longer covers what would be certified.
+            #[test]
+            fn a_delegation_is_covered_by_the_exact_material_the_operator_read() {
+                let pq = pq_key();
+                let tls = intermediate();
+                let campaign = issuer_campaign(2, &pq, &tls);
+
+                result(&campaign, Some(authorization(2, pq.clone(), tls.clone())))
+                    .validate(&campaign)
+                    .expect("the delegation the campaign named");
+
+                // Another PQ issuer key, under the same touch.
+                assert!(matches!(
+                    result(&campaign, Some(authorization(2, pq_key(), tls.clone())))
+                        .validate(&campaign),
+                    Err(CertificateError::CampaignMismatch)
+                ));
+                // Another intermediate, therefore another certified key.
+                assert!(matches!(
+                    result(
+                        &campaign,
+                        Some(authorization(2, pq.clone(), intermediate()))
+                    )
+                    .validate(&campaign),
+                    Err(CertificateError::CampaignMismatch)
+                ));
+                // A spent epoch: the walk-back `install_issuer` refuses, caught
+                // before a signature is ever produced for it.
+                assert!(matches!(
+                    result(&campaign, Some(authorization(1, pq, tls))).validate(&campaign),
+                    Err(CertificateError::CampaignMismatch)
+                ));
+            }
+
+            /// Total in both directions, like every other family.
+            #[test]
+            fn a_delegation_belongs_to_its_family_and_to_no_other() {
+                let pq = pq_key();
+                let tls = intermediate();
+                let campaign = issuer_campaign(2, &pq, &tls);
+
+                // An issuer campaign with nothing to install is not a
+                // ceremony that succeeded quietly.
+                assert!(matches!(
+                    result(&campaign, None).validate(&campaign),
+                    Err(CertificateError::EmptyTransition)
+                ));
+
+                // No other family delivers one.
+                let fleet = super::super::campaign(CampaignScope::FleetLeafs, vec![target(3)]);
+                assert!(matches!(
+                    result(&fleet, Some(authorization(2, pq.clone(), tls.clone())))
+                        .validate(&fleet),
+                    Err(CertificateError::IssuerScopeViolation(_))
+                ));
+
+                // And an issuer campaign delivers nothing else: no trust
+                // update, and no re-signed credential registry.
+                let mut smuggled = result(&campaign, Some(authorization(2, pq, tls)));
+                smuggled.credential_registry = Some(registry());
+                assert!(matches!(
+                    smuggled.validate(&campaign),
+                    Err(CertificateError::IssuerScopeViolation(_))
+                ));
+            }
+
+            /// One credential, and the vault opens: the companion issues the
+            /// intermediate under `CA-TLS` and signs under `CA-PQ`. It rotates
+            /// no anchor, so it is not the two-credential decision of §0.2.
+            #[test]
+            fn an_issuer_campaign_is_a_one_credential_vault_ceremony() {
+                let scope = CampaignScope::IssuerDelegation;
+                assert_eq!(scope.required_credentials(), 1);
+                assert!(scope.opens_vault());
+                assert!(!scope.rotates_authority());
+                assert!(!scope.authorizes_client_rotation());
+                assert!(!scope.revokes());
             }
         }
 
@@ -1906,6 +2174,7 @@ mod tests {
             }),
             objects: vec![object.clone()],
             credential_registry: None,
+            issuer_authorization: None,
         };
         result.validate(&campaign).expect("one signed decision");
 

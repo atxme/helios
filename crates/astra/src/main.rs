@@ -56,13 +56,6 @@ const SERVICE_KEY_FILE: &str = "service-key.bin";
 /// therefore leaves an unreferenced pair of files and a working issuer, rather
 /// than a live delegation whose keys were overwritten by a candidate nobody
 /// signed.
-fn issuer_pq_key_path(state_dir: &Path, issuer_epoch: u64) -> PathBuf {
-    state_dir.join(format!("issuer-pq-key-{issuer_epoch}.bin"))
-}
-
-fn issuer_tls_key_path(state_dir: &Path, issuer_epoch: u64) -> PathBuf {
-    state_dir.join(format!("issuer-tls-key-{issuer_epoch}.der"))
-}
 const OPERATIONS_FILE: &str = "client-renewal-operations.json";
 /// The signed credential decisions of the domain, as the companion emits them.
 ///
@@ -361,6 +354,27 @@ enum IssuerCommand {
         /// Where to write the request, in addition to standard output.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Free text shown to the operator before the touch.
+        ///
+        /// With `--requested-by`, the request is also deposited as an
+        /// `issuer_delegation` campaign (§7.6): the companion then fetches it
+        /// over the §8.2 transport, reads the exact material it is about to
+        /// certify, and deposits the delegation back here. Without the two,
+        /// the request is only written to a file, and the companion signs it
+        /// with nothing tying it to this authority.
+        ///
+        /// Not a `campaign open --scope` variant, because the target of this
+        /// campaign does not exist until this command creates it: the epoch,
+        /// the ML-DSA-87 key and the PKCS#10 request are produced here, beside
+        /// the private halves they name.
+        #[arg(long, requires = "requested_by")]
+        reason: Option<String>,
+        /// Who asked for it. Shown to the operator, and audited.
+        #[arg(long, requires = "reason")]
+        requested_by: Option<String>,
+        /// How long the operator has, in seconds.
+        #[arg(long, default_value_t = 300)]
+        window_secs: u64,
     },
     /// Installs the `AstraIssuerAuthorization` the companion signed.
     ///
@@ -436,7 +450,17 @@ fn main() -> Result<()> {
             gateway_client_certificate.as_deref(),
         ),
         Command::Issuer { command } => match command {
-            IssuerCommand::Request { out } => issuer_request(&cli.state_dir, out.as_deref()),
+            IssuerCommand::Request {
+                out,
+                reason,
+                requested_by,
+                window_secs,
+            } => issuer_request(
+                &cli.state_dir,
+                out.as_deref(),
+                reason.as_deref().zip(requested_by.as_deref()),
+                window_secs,
+            ),
             IssuerCommand::Install { authorization } => {
                 issuer_install(&cli.state_dir, authorization.as_deref())
             }
@@ -744,6 +768,7 @@ fn run(
             .context("loading the client renewal operations")?;
     let encrypted_vault = load_encrypted_vault(state_dir)?;
     let service = Arc::new(AstraService {
+        state_dir: state_dir.to_path_buf(),
         registry: Mutex::new(registry),
         issuer,
         challenges: Mutex::new(ChallengeStore::with_capacity(MAX_LIVE_CHALLENGES)),
@@ -1086,8 +1111,8 @@ fn load_issuer(state_dir: &Path, registry: &AstraRegistry) -> Result<Option<Dele
         );
         return Ok(None);
     };
-    let pq_key = issuer_pq_key_path(state_dir, installed.issuer_epoch);
-    let tls_key = issuer_tls_key_path(state_dir, installed.issuer_epoch);
+    let pq_key = astra::issuer::pq_key_path(state_dir, installed.issuer_epoch);
+    let tls_key = astra::issuer::tls_key_path(state_dir, installed.issuer_epoch);
     if !pq_key.exists() || !tls_key.exists() {
         tracing::error!(
             issuer_epoch = installed.issuer_epoch,
@@ -1732,8 +1757,17 @@ fn campaign_open(
     Ok(())
 }
 
-fn issuer_request(state_dir: &Path, out: Option<&Path>) -> Result<()> {
+fn issuer_request(
+    state_dir: &Path,
+    out: Option<&Path>,
+    campaign: Option<(&str, &str)>,
+    window_secs: u64,
+) -> Result<()> {
     use base64::Engine as _;
+
+    if campaign.is_some() && (window_secs == 0 || window_secs > 300) {
+        anyhow::bail!("--window-secs must be between 1 and 300");
+    }
 
     let registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
         .context("loading the Astra registry")?;
@@ -1770,12 +1804,12 @@ fn issuer_request(state_dir: &Path, out: Option<&Path>) -> Result<()> {
     // name a public key nobody can ever sign with, and the operator would only
     // discover it after a security-key ceremony.
     aether::private_file::write_private_atomic(
-        &issuer_pq_key_path(state_dir, issuer_epoch),
+        &astra::issuer::pq_key_path(state_dir, issuer_epoch),
         &pq_private_key,
     )
     .context("sealing the delegated issuer ML-DSA-87 key")?;
     aether::private_file::write_private_atomic(
-        &issuer_tls_key_path(state_dir, issuer_epoch),
+        &astra::issuer::tls_key_path(state_dir, issuer_epoch),
         &tls_key.serialize_der(),
     )
     .context("sealing the delegated issuer TLS key")?;
@@ -1792,14 +1826,128 @@ fn issuer_request(state_dir: &Path, out: Option<&Path>) -> Result<()> {
         eprintln!("delegation request : {}", out.display());
     }
     eprintln!("issuer epoch       : {issuer_epoch}");
-    eprintln!(
-        "sign it with `astra-signer authorize-issuer --request <file> --out <file>`, then feed \
-         the result back to `astra issuer install`"
-    );
+
+    match campaign {
+        Some((reason, requested_by)) => {
+            let operation_id = deposit_issuer_campaign(
+                state_dir,
+                state,
+                &request,
+                reason,
+                requested_by,
+                window_secs,
+            )?;
+            eprintln!(
+                "sign it from the operator machine:\n  astra-signer authorize-issuer \\\n    \
+                 --authority-url {} \\\n    --operation-id {}",
+                state.authority_url,
+                operation_id.to_hex()
+            );
+            eprintln!(
+                "the delegation is recorded here as soon as the companion deposits it; restart \
+                 Astra to issue under it"
+            );
+        }
+        None => eprintln!(
+            "hors campagne      : `astra-signer authorize-issuer --request <file> --out <file>`, \
+             puis `astra issuer install`. Rien ne rattache alors cette demande à cette autorité : \
+             l'opérateur signe le fichier qu'on lui présente. Passer --reason et --requested-by \
+             pour la cérémonie du §8.2."
+        ),
+    }
     // On standard output, alone, so a deployment script can pipe it out of the
     // container without a shared volume.
     println!("{}", String::from_utf8_lossy(&encoded));
     Ok(())
+}
+
+/// Resolves one delegation request into a signing campaign and deposits it.
+///
+/// The campaign pins the **exact material** that will be certified: the
+/// epoch, the ML-DSA-87 public key, and the `SubjectPublicKeyInfo` the PKCS#10
+/// request proved possession of. That is what the operator reads before the
+/// touch, and what refuses a substituted request afterwards — the request
+/// itself carries no signature, so nothing else could.
+fn deposit_issuer_campaign(
+    state_dir: &Path,
+    state: &astra::registry::AstraState,
+    request: &astra::issuer::IssuerDelegationRequest,
+    reason: &str,
+    requested_by: &str,
+    window_secs: u64,
+) -> Result<aether::certificates::encoding::Id16> {
+    use aether::certificates::status::{
+        AstraRotationCampaign, CampaignScope, CampaignTarget, CertificateKind,
+    };
+    use base64::Engine as _;
+
+    if reason.trim().is_empty() || requested_by.trim().is_empty() {
+        anyhow::bail!("--reason and --requested-by are what the operator reads before the touch");
+    }
+    if load_encrypted_vault(state_dir)?.is_none() {
+        // The companion issues the intermediate under `CA-TLS` and signs the
+        // delegation under `CA-PQ`; both live in the vault it fetches from
+        // here. Opening the campaign anyway would spend an operator's window
+        // on a ceremony that cannot reach a private key.
+        anyhow::bail!(
+            "this state volume holds no encrypted vault: the companion would have no `CA-PQ` to              sign the delegation with"
+        );
+    }
+
+    let csr = aether::certificates::encoding::DerCertificate::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(request.tls_intermediate_csr.trim())
+            .context("decoding the intermediate request")?,
+    )
+    .context("reading the intermediate request")?;
+    let public_key_info =
+        aether::certificates::x509::certification_request_public_key_info(&csr)
+            .context("reading the public key the intermediate request proves possession of")?;
+    let pq_issuer_public_key = aether::certificates::encoding::MlDsa87PublicKey::parse(
+        request.pq_issuer_public_key.trim(),
+    )
+    .context("reading the delegated issuer's ML-DSA-87 key")?;
+
+    let now = now_unix();
+    let expires_at = now
+        .checked_add(window_secs)
+        .context("campaign window overflow")?;
+    let scope = CampaignScope::IssuerDelegation;
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: fresh_id()?,
+        trust_domain_id: state.trust_domain_id,
+        gateway_wg_public_key: state.gateway_wg_public_key,
+        server_name: state.server_name.clone(),
+        created_at: now,
+        expires_at,
+        scope,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::AstraIssuer,
+            identity_key: state.gateway_wg_public_key,
+            epoch: request.issuer_epoch,
+            generation: request.issuer_epoch,
+            active_tls_certificate_fingerprint: Fingerprint::of(&public_key_info),
+            active_pq_certificate_fingerprint: Fingerprint::of(pq_issuer_public_key.as_bytes()),
+        }],
+        reason: reason.trim().to_string(),
+        requested_by: requested_by.trim().to_string(),
+        policy_fingerprint: *state.astra_policy_fingerprint.fingerprint(),
+        required_credentials: scope.required_credentials(),
+    };
+    campaign.validate(now).map_err(|error| {
+        anyhow::anyhow!("the resolved campaign is not one an operator may be shown: {error}")
+    })?;
+
+    let deposit = deposit_campaign(state_dir, state, campaign, now, expires_at)?;
+    let operation_id = deposit.signer_request.operation_id;
+    // Standard error, unlike `campaign open`: on this command standard output
+    // already belongs to the delegation request, which a deployment script
+    // pipes out of the container. Two things there would give the script
+    // neither.
+    eprintln!("operation         : {}", operation_id.to_hex());
+    eprintln!("empreinte de campagne : {}", deposit.campaign.fingerprint());
+    Ok(operation_id)
 }
 
 /// Installs a signed delegation, after checking it three ways.
@@ -1827,54 +1975,21 @@ fn issuer_install(state_dir: &Path, authorization: Option<&Path>) -> Result<()> 
     let mut registry = AstraRegistry::load(&state_dir.join(REGISTRY_FILE), None)
         .context("loading the Astra registry")?;
     let now = now_unix();
-    {
-        let state = registry.state();
-        authorization
-            .verify(
-                &state.ca_public_key,
-                &state.trust_domain_id,
-                state.ca_epoch,
-                state.ca_tls_epoch,
-                &state.gateway_wg_public_key,
-                &state.server_name,
-                now,
-            )
-            .context("verifying the issuer authorization under this domain's anchor")?;
-        state
-            .astra_policy_fingerprint
-            .assert_authorizes(&authorization)
-            .context("the delegation does not match the pinned Astra issuance policy")?;
-    }
-
-    let issuer_epoch = authorization.issuer_epoch;
-    let pq_key = issuer_pq_key_path(state_dir, issuer_epoch);
-    let tls_key = issuer_tls_key_path(state_dir, issuer_epoch);
-    anyhow::ensure!(
-        pq_key.exists() && tls_key.exists(),
-        "no private material for issuer epoch {issuer_epoch} in {}: this authorization answers a \
-         request another state directory made, or `astra issuer request` was never run here",
-        state_dir.display()
-    );
-    let pq_private_key =
-        Zeroizing::new(std::fs::read(&pq_key).context("reading the delegated issuer PQ key")?);
-    let tls_private_key =
-        Zeroizing::new(std::fs::read(&tls_key).context("reading the delegated issuer TLS key")?);
-    // Possession, before anything is recorded: this is the check that refuses
-    // a delegation signed around somebody else's public key.
-    DelegatedIssuer::load(authorization.clone(), pq_private_key, tls_private_key)
-        .context("checking the delegation against the private material on disk")?;
-
     let not_after = authorization.not_after;
-    registry
-        .install_issuer(
-            aether::certificates::state::AstraIssuerState {
-                issuer_epoch,
-                authorization,
-                state: aether::certificates::state::IssuerLifecycle::Active,
-            },
-            now,
+    let issuer_epoch = authorization.issuer_epoch;
+    astra::issuer::adopt(
+        &mut registry,
+        authorization,
+        &astra::issuer::pq_key_path(state_dir, issuer_epoch),
+        &astra::issuer::tls_key_path(state_dir, issuer_epoch),
+        now,
+    )
+    .with_context(|| {
+        format!(
+            "installing the delegation of issuer epoch {issuer_epoch} from {}",
+            state_dir.display()
         )
-        .context("recording the delegation")?;
+    })?;
 
     println!("issuer epoch     : {issuer_epoch}");
     println!("delegation until : {not_after}");

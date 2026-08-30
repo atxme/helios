@@ -320,13 +320,36 @@ enum Command {
         out: Option<PathBuf>,
     },
     /// Signe une `AstraIssuerAuthorization` pour l'émetteur délégué d'Astra.
+    ///
+    /// Avec `--authority-url` et `--operation-id`, la demande est **récupérée**
+    /// par les routes du §8.2 et la délégation y est redéposée : la campagne
+    /// nomme l'époque et les deux clés exactes qui seront certifiées, et
+    /// l'opérateur les lit avant le toucher. Une demande de délégation ne
+    /// porte aucune signature — hors campagne, ce compagnon signe donc le
+    /// fichier qu'on lui présente, et rien ne le rattache à une autorité.
     AuthorizeIssuer {
-        /// Demande de délégation produite par Astra, en JSON.
+        /// Demande de délégation produite par `astra issuer request`, en JSON.
+        ///
+        /// Le fichier reste le transport, même en campagne : la campagne est
+        /// ce qui l'authentifie, pas ce qui le porte.
         #[arg(long)]
         request: PathBuf,
         /// Où écrire l'autorisation signée, en JSON.
+        ///
+        /// Facultatif en campagne : la délégation est déposée sur l'autorité.
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        /// Origine HTTPS publique d'Astra, p. ex. https://astra.example.
+        #[arg(long, requires = "operation_id")]
+        authority_url: Option<String>,
+        /// Opération à approuver, 32 caractères hexadécimaux.
+        ///
+        /// Imprimée par `astra issuer request --reason --requested-by`.
+        #[arg(long, requires = "authority_url")]
+        operation_id: Option<String>,
+        /// Origine WebAuthn attendue. Par défaut `https://<rp_id>`.
+        #[arg(long)]
+        origin: Option<String>,
         /// Durée de la délégation, en jours.
         #[arg(long, default_value_t = 30)]
         days: u64,
@@ -711,9 +734,21 @@ fn run() -> Result<()> {
         Command::AuthorizeIssuer {
             request,
             out,
+            authority_url,
+            operation_id,
+            origin,
             days,
             leaf_days,
-        } => authorize_issuer(&path, &request, &out, days, leaf_days, transport),
+        } => authorize_issuer(
+            &path,
+            &request,
+            out.as_deref(),
+            authority_url.as_deref().zip(operation_id.as_deref()),
+            days,
+            leaf_days,
+            origin.as_deref(),
+            transport,
+        ),
         Command::Bindings { lost, active } => bindings(&path, &lost, &active, transport),
         Command::Approve {
             request,
@@ -1340,14 +1375,30 @@ fn issue_ca_tls(path: &Path, days: u64, out: Option<&Path>, transport: Transport
     Ok(())
 }
 
+/// Signs one bounded delegation to Astra's online issuer (spec §9.5).
+///
+/// # Why the campaign is the ordinary path
+///
+/// An [`IssuerDelegationRequest`] carries no signature. Read from a file, it
+/// authorizes whoever handed the operator that file: substitute the ML-DSA-87
+/// key, and the delegation certifies a key its holder chose. The campaign is
+/// what closes that — it is signed by the authority's service key, it pins the
+/// epoch and both public halves, and the operator reads them before the touch.
+/// The offline form survives for a domain with no reachable origin, and says
+/// so rather than pretending the two are equivalent.
+#[allow(clippy::too_many_arguments)]
 fn authorize_issuer(
     path: &Path,
     request_path: &Path,
-    out: &Path,
+    out: Option<&Path>,
+    online: Option<(&str, &str)>,
     days: u64,
     leaf_days: u64,
+    origin: Option<&str>,
     transport: Transport,
 ) -> Result<()> {
+    use aether::certificates::status::CampaignFamily;
+
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
     let identity = identity_of(&handoff)?;
@@ -1356,7 +1407,52 @@ fn authorize_issuer(
         "le certificat CA-TLS",
         "issue-ca-tls",
     )?)?;
+    let campaign_context = match online {
+        Some((authority_url, operation_id)) => {
+            let operation = Id16::parse_hex(operation_id)
+                .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
+            let client = astra_signer::origin::Origin::new(authority_url)?;
+            let request_document = origin_client_fetch(&client, &operation)?;
+            verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+            let campaign = request_document.campaign.as_ref().clone();
+            if !matches!(campaign.scope.family(), CampaignFamily::IssuerDelegation) {
+                bail!(
+                    "cette opération n'autorise pas de délégation d'émetteur. Rien n'a été signé."
+                );
+            }
+            Some((client, request_document, campaign))
+        }
+        None => None,
+    };
+
     let request: IssuerDelegationRequest = documents::read(request_path)?;
+
+    // The campaign pins the exact material, so a substituted request is
+    // refused here — before the vault opens, and before the operator is asked
+    // for anything.
+    if let Some((_, _, campaign)) = &campaign_context {
+        let csr = DerCertificate::new(
+            <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::decode(
+                &base64::engine::general_purpose::STANDARD,
+                request.tls_intermediate_csr.trim(),
+            )
+            .context("décodage de la demande d'intermédiaire")?,
+        )?;
+        let public_key_info =
+            aether::certificates::x509::certification_request_public_key_info(&csr)?;
+        let pq = MlDsa87PublicKey::parse(request.pq_issuer_public_key.trim())?;
+        campaign
+            .covers_issuer_delegation(
+                identity.trust_domain_id,
+                request.issuer_epoch,
+                &aether::certificates::encoding::Fingerprint::of(pq.as_bytes()),
+                &aether::certificates::encoding::Fingerprint::of(&public_key_info),
+            )
+            .context(
+                "la demande de délégation n'est pas celle que la campagne nomme : époque ou clé \
+                 substituée. Rien n'a été signé.",
+            )?;
+    }
 
     let not_before = now_unix();
     let bounds = DelegationBounds {
@@ -1374,23 +1470,99 @@ fn authorize_issuer(
     println!("gateway          : {}", identity.gateway_wg_public_key);
     println!("leaf au plus     : {leaf_days} jours");
     println!("délégation       : {days} jours");
-    let opening = open_vault(
-        &vault,
-        transport,
-        "Signature de la délégation. Brancher une clé autorisée, puis appuyer sur Entrée.",
-    )?;
-    let authorization = authority::authorize_issuer(
-        &vault,
-        &opening,
-        &identity,
-        &ca_tls,
-        &request,
-        &bounds,
-        now_unix(),
-    )?;
-    documents::write(out, &authorization)?;
+    match &campaign_context {
+        Some((_, _, campaign)) => {
+            println!("campagne         : {}", campaign.campaign_id.to_hex());
+            println!("empreinte        : {}", campaign.fingerprint());
+            println!("motif            : {}", campaign.reason);
+            println!("demandée par     : {}", campaign.requested_by);
+        }
+        None => println!(
+            "hors campagne    : rien ne rattache cette demande à une autorité ; elle vaut ce que \
+             vaut le fichier"
+        ),
+    }
 
-    println!("autorisation     : {}", out.display());
+    let authorization = match &campaign_context {
+        Some((_, _, campaign)) => {
+            let origin = origin
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+            let registry =
+                credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "aucun document de credentials : l'émettre par `astra-signer bindings`"
+                    )
+                })?;
+            let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
+            eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
+            wait_for_operator()?;
+            let key = authenticator::connect(transport)?;
+            let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
+            let approval = authority::approve_campaign(
+                &[key.as_ref()],
+                campaign,
+                &registry,
+                &identity,
+                &ca_pq_public_key,
+                &vault.rp_id,
+                &origin,
+                &[pin.as_str()],
+                now_unix(),
+            )?;
+            let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
+            let authorization = authority::authorize_issuer(
+                &vault,
+                &opening,
+                &identity,
+                &ca_tls,
+                &request,
+                &bounds,
+                now_unix(),
+            )?;
+            (Some(approval), authorization)
+        }
+        None => {
+            let opening = open_vault(
+                &vault,
+                transport,
+                "Signature de la délégation. Brancher une clé autorisée, puis appuyer sur Entrée.",
+            )?;
+            let authorization = authority::authorize_issuer(
+                &vault,
+                &opening,
+                &identity,
+                &ca_tls,
+                &request,
+                &bounds,
+                now_unix(),
+            )?;
+            (None, authorization)
+        }
+    };
+    let (approval, authorization) = authorization;
+
+    if let Some(out) = out {
+        documents::write(out, &authorization)?;
+        println!("autorisation     : {}", out.display());
+    }
+    match (&campaign_context, approval) {
+        (Some((client, request_document, _)), Some(approval)) => {
+            let mut result = campaign_result(&approval, Vec::new(), None);
+            result.issuer_authorization = Some(Box::new(authorization));
+            let state = client.submit(
+                &request_document.operation_id,
+                &request_document.result_token,
+                &result,
+            )?;
+            println!("état             : {state:?}");
+            println!(
+                "la délégation est enregistrée par l'autorité ; redémarrer Astra pour émettre \
+                 sous elle"
+            );
+        }
+        _ => println!("à reporter sur l'autorité : astra issuer install --authorization <fichier>"),
+    }
     println!(
         "cette délégation n'autorise qu'un renouvellement de leaf cliente admise, et rien \
          d'autre : ni gateway, ni CA, ni pair inconnu"
@@ -1797,6 +1969,7 @@ fn campaign_result(
         approval: Box::new(approval.clone()),
         objects,
         credential_registry,
+        issuer_authorization: None,
     }
 }
 

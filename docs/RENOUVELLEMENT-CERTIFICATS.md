@@ -140,32 +140,54 @@ retirée.
 L'émetteur délégué est ce qui permet à Astra de renouveler les feuilles
 clientes **en ligne**, sans ouvrir le coffre. Il porte sa propre échéance.
 
-**Sur la gateway** :
+**Sur la gateway** — la demande et sa campagne, en un seul geste :
 
 ```sh
-astra issuer request --out issuer-request.json
+astra issuer request --out issuer-request.json \
+  --reason "délégation trimestrielle" --requested-by "prénom.nom"
 ```
 
-**Sur le poste de l'opérateur** (le fichier voyage par un canal quelconque —
-il est public) :
+La demande sort sur la sortie standard et dans le fichier ; l'identifiant
+d'opération s'affiche sur l'erreur standard, avec la commande à recopier. Les
+deux clés privées naissent dans le volume d'Astra et n'en sortent pas.
+
+**Sur le poste de l'opérateur**, clé branchée :
 
 ```sh
 astra-signer authorize-issuer --request issuer-request.json \
-  --out issuer-authorization.json --days 30 --leaf-days 90
+  --authority-url https://astra.example --operation-id <identifiant> \
+  --days 30 --leaf-days 90
 ```
 
-**Sur la gateway** :
+Le compagnon vérifie la campagne sous la clé de service qu'il épingle déjà,
+compare la demande à ce que la campagne nomme — l'époque, la clé ML-DSA-87 et
+la clé publique dont la PKCS#10 prouve la possession —, affiche le tout, prend
+l'assertion, signe et **redépose** la délégation. Astra l'enregistre après
+avoir prouvé que les deux moitiés privées scellées dans son volume
+correspondent. Il reste à le redémarrer pour qu'il émette dessous.
+
+Le fichier de demande voyage toujours par un canal quelconque : il est public,
+et c'est la campagne qui l'authentifie. Une demande substituée est refusée
+avant même que le coffre s'ouvre.
+
+Chaque installation doit faire **avancer** l'époque : réinstaller une époque
+déjà employée avec une *autre* délégation ferait revenir un intermédiaire
+retiré sous une signature encore parfaitement valide. Redéposer la **même**
+délégation est un rejeu sans effet, ce qui répare une réponse perdue.
+
+**Hors campagne**, pour un domaine dont l'origine publique n'est pas
+joignable :
 
 ```sh
+astra issuer request --out issuer-request.json
+astra-signer authorize-issuer --request issuer-request.json \
+  --out issuer-authorization.json --days 30 --leaf-days 90
 astra issuer install --authorization issuer-authorization.json
 ```
 
-Chaque installation doit faire **avancer** l'époque : réinstaller une époque
-déjà employée ferait revenir un intermédiaire retiré sous une signature encore
-parfaitement valide.
-
-**Limite connue** : ce geste ne porte encore aucune campagne, donc il passe par
-des fichiers plutôt que par les routes à jeton du §8.2.
+Une demande de délégation ne porte **aucune signature**. Par ce chemin, le
+compagnon signe donc le fichier qu'on lui présente, et rien ne le rattache à
+cette autorité : c'est la forme de repli, pas la forme ordinaire.
 
 ## 5. Récupérer une identité expirée (§7.5)
 

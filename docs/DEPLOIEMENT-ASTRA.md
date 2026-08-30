@@ -56,9 +56,8 @@ Ce qui **manque** encore :
 - la **révocation de la gateway** : la révocation cliente est produite,
   déposée et relayée ; celle de la gateway reste refusée faute de feuilles
   gateway dans le registre Astra ;
-- `authorize-issuer` ne porte **aucune campagne**, donc pas d'opération à
-  laquelle se rattacher : ce geste passe par des fichiers, comme décrit ici.
-  `approve`, `approve-campaign`, `revoke` et `rotate-ca-pq` ont leur transport ;
+- `full_certificate_chain` : aucune portée n'ordonne encore émetteur, CA TLS,
+  gateway puis clients. Les campagnes s'ouvrent une par une ;
 - l'**adoption** d'une ancre distribuée. Les clients l'appliquent ; le registre
   Astra et l'épinglage de la gateway restent sur l'ancre sortante jusqu'à ce
   que l'opérateur les avance. Une adoption qui ne toucherait qu'une moitié du
@@ -400,28 +399,36 @@ Trois commandes, dans cet ordre :
 
 ```sh
 # 1. sur la gateway : les deux clés privées naissent dans le volume d'Astra,
-#    adressées par époque. Rien n'est installé, rien n'est annoncé.
+#    adressées par époque. Rien n'est installé, rien n'est annoncé. La
+#    campagne est déposée dans le même geste, et son identifiant s'affiche.
 ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
     --env-file /var/lib/helios/astra-compose.env exec -T astra \
-    /usr/local/bin/astra issuer request" > delegation-request.json
+    /usr/local/bin/astra issuer request \
+    --reason 'délégation trimestrielle' --requested-by 'prénom.nom'" \
+    > delegation-request.json
 
 # 2. sur le poste opérateur, clé branchée : CA-TLS d'abord si le domaine n'en
-#    a pas encore, puis la délégation elle-même.
+#    a pas encore, puis la délégation elle-même. Le compagnon récupère la
+#    campagne, compare la demande à la matière qu'elle épingle, et redépose la
+#    délégation signée.
 astra-signer issue-ca-tls
 astra-signer authorize-issuer --request delegation-request.json \
-    --out delegation.json --days 30 --leaf-days 90
+    --authority-url https://astra.example --operation-id <identifiant> \
+    --days 30 --leaf-days 90
 
-# 3. retour sur la gateway.
-ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
-    --env-file /var/lib/helios/astra-compose.env exec -T astra \
-    /usr/local/bin/astra issuer install" < delegation.json
+# 3. Astra a enregistré la délégation ; il reste à le redémarrer.
 ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.yaml \
     --env-file /var/lib/helios/astra-compose.env restart astra"
 ```
 
-La demande sort sur la **sortie standard** et les journaux d'Astra sur
-l'erreur standard, précisément pour que ce `>` fonctionne. `install` lit
-l'autorisation sur l'entrée standard quand `--authorization` est absent.
+La demande sort sur la **sortie standard** — d'où le `>` de l'étape 1 — et
+tout le reste, l'identifiant d'opération compris, sur l'erreur standard. Sans
+`--reason` ni `--requested-by`, aucune campagne n'est déposée : le compagnon
+écrit alors son autorisation avec `--out` et `astra issuer install` la relit
+sur l'entrée standard quand `--authorization` est absent. Cette forme de repli
+existe pour un domaine dont l'origine publique n'est pas joignable : une
+demande de délégation ne porte aucune signature, donc l'opérateur y signe le
+fichier qu'on lui présente.
 
 `install` vérifie trois choses qui viennent de trois endroits différents :
 l'ancre que le registre épingle, la politique d'émission calculée à l'amorçage,

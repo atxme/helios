@@ -463,6 +463,7 @@ impl SigningOperationStore {
                 // side effect such as the private-channel revocation relay.
                 objects: result.objects.clone(),
                 credential_registry: result.credential_registry.clone(),
+                issuer_authorization: result.issuer_authorization.clone(),
                 already_accepted: true,
             });
         }
@@ -486,6 +487,7 @@ impl SigningOperationStore {
             campaign: Box::new(operation.campaign.as_ref().clone()),
             objects: result.objects.clone(),
             credential_registry: result.credential_registry.clone(),
+            issuer_authorization: result.issuer_authorization.clone(),
             already_accepted: false,
         })
     }
@@ -540,6 +542,14 @@ pub struct VerifiedResult {
     /// them, while external relays may need another attempt.
     pub objects: Vec<TrustUpdateObject>,
     pub credential_registry: Option<Box<CredentialRegistry>>,
+    /// The bounded delegation an issuer campaign authorized (spec §9.5).
+    ///
+    /// Beside `objects` rather than among them: no holder receives it, so it
+    /// is recorded here and never distributed. Repeated on an idempotent
+    /// replay for the same reason the objects are — the registry deduplicates
+    /// on the epoch, and a lost response must be retryable.
+    pub issuer_authorization:
+        Option<Box<aether::certificates::authority::AstraIssuerAuthorization>>,
     /// `true` when these exact bytes were already accepted.
     pub already_accepted: bool,
 }
@@ -847,6 +857,7 @@ mod tests {
             }),
             objects: vec![smuggled],
             credential_registry: None,
+            issuer_authorization: None,
         };
         let registry = CredentialRegistry {
             trust_domain_id,
@@ -954,6 +965,7 @@ mod tests {
             approval: Box::new(nonsense),
             objects: Vec::new(),
             credential_registry: None,
+            issuer_authorization: None,
         };
         assert!(store
             .verify_result(

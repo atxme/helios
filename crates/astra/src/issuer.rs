@@ -80,7 +80,11 @@ pub enum IssuerError {
 /// binds both to one [`AstraIssuerAuthorization`] under `CA-PQ`.
 ///
 /// It carries nothing secret, which is what lets it cross to another machine
-/// by hand while the §8.2 transport is still unimplemented.
+/// by hand. It also carries **no signature**, which is why the ordinary path
+/// deposits it as an [`aether::certificates::status::CampaignScope::IssuerDelegation`]
+/// campaign instead: signed on its own the request would authorize whoever
+/// handed the operator a file, whereas a campaign pins the exact material and
+/// shows it before the touch (spec §7.6, §9.5).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuerDelegationRequest {
@@ -941,4 +945,102 @@ mod tests {
             Err(IssuerError::ReceiptMismatch)
         ));
     }
+}
+
+/// Where one delegation's ML-DSA-87 private half is sealed in the state volume.
+///
+/// Named here rather than in the two callers, because «where the key is» is
+/// one fact: a request written by one path and adopted by another must look
+/// in the same place, and two spellings of the same format string is exactly
+/// how they stop doing so.
+pub fn pq_key_path(state_dir: &std::path::Path, issuer_epoch: u64) -> std::path::PathBuf {
+    state_dir.join(format!("issuer-pq-key-{issuer_epoch}.bin"))
+}
+
+/// Where one delegation's TLS private half is sealed in the state volume.
+pub fn tls_key_path(state_dir: &std::path::Path, issuer_epoch: u64) -> std::path::PathBuf {
+    state_dir.join(format!("issuer-tls-key-{issuer_epoch}.der"))
+}
+
+/// Everything that must be true before a signed delegation is recorded.
+///
+/// Three checks from three different places, and the delegation is only
+/// installed when all three agree: the anchor and epochs this registry pins,
+/// the issuance policy confirmed out of band at bootstrap, and the private
+/// halves already sealed in the state volume. A file that satisfies all three
+/// is one this authority can actually issue under; skipping the last would
+/// announce an issuer whose first use fails at 80 % of a client's leaf — and
+/// would make the next start-up refuse to load a registry it just wrote.
+///
+/// Recording the delegation already held is a no-op, so an operator result
+/// whose response was lost may be redeposited byte for byte (§8.2).
+#[derive(Debug, thiserror::Error)]
+pub enum AdoptionError {
+    #[error("delegation refused under this domain's anchor: {0}")]
+    Authorization(#[from] CertificateError),
+    #[error("the delegation does not match the pinned Astra issuance policy: {0}")]
+    Policy(#[source] CertificateError),
+    #[error(
+        "no private material for issuer epoch {issuer_epoch} in this state volume: the \
+         delegation answers a request another state directory made"
+    )]
+    NoPrivateMaterial { issuer_epoch: u64 },
+    #[error("reading the delegated issuer's private material: {0}")]
+    PrivateMaterial(#[source] std::io::Error),
+    #[error("the delegation does not match the private material on disk: {0}")]
+    Possession(#[source] IssuerError),
+    #[error("recording the delegation: {0}")]
+    Registry(#[from] crate::registry::RegistryError),
+}
+
+/// Verifies a signed delegation and records it (spec §9.5).
+///
+/// Shared by the local `astra issuer install` and by the operator result the
+/// service accepts on the §8.2 transport, because the checks are the same
+/// checks: which path the document arrived by decides nothing about whether
+/// this authority may issue under it.
+pub fn adopt(
+    registry: &mut crate::registry::AstraRegistry,
+    authorization: AstraIssuerAuthorization,
+    pq_key_path: &std::path::Path,
+    tls_key_path: &std::path::Path,
+    now_unix: u64,
+) -> Result<u64, AdoptionError> {
+    {
+        let state = registry.state();
+        authorization.verify(
+            &state.ca_public_key,
+            &state.trust_domain_id,
+            state.ca_epoch,
+            state.ca_tls_epoch,
+            &state.gateway_wg_public_key,
+            &state.server_name,
+            now_unix,
+        )?;
+        state
+            .astra_policy_fingerprint
+            .assert_authorizes(&authorization)
+            .map_err(AdoptionError::Policy)?;
+    }
+
+    let issuer_epoch = authorization.issuer_epoch;
+    if !pq_key_path.exists() || !tls_key_path.exists() {
+        return Err(AdoptionError::NoPrivateMaterial { issuer_epoch });
+    }
+    let pq_private_key =
+        Zeroizing::new(std::fs::read(pq_key_path).map_err(AdoptionError::PrivateMaterial)?);
+    let tls_private_key =
+        Zeroizing::new(std::fs::read(tls_key_path).map_err(AdoptionError::PrivateMaterial)?);
+    DelegatedIssuer::load(authorization.clone(), pq_private_key, tls_private_key)
+        .map_err(AdoptionError::Possession)?;
+
+    registry.install_issuer(
+        aether::certificates::state::AstraIssuerState {
+            issuer_epoch,
+            authorization,
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        },
+        now_unix,
+    )?;
+    Ok(issuer_epoch)
 }

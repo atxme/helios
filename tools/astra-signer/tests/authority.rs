@@ -670,3 +670,116 @@ fn the_signing_gestures_fit_the_stack_the_binary_reserves() {
         .join();
     assert!(done.is_ok(), "the gestures completed within the stack");
 }
+
+/// A delegation request carries no signature; the campaign is what binds it.
+///
+/// The whole point of the §8.2 path for `authorize-issuer`: the epoch and both
+/// public halves are pinned by the authority and read by the operator, so a
+/// substituted request fails before the vault opens. Without it the companion
+/// signs whatever file it is handed, and the delegation certifies a key its
+/// holder chose.
+#[test]
+fn an_issuer_campaign_pins_the_exact_material_it_will_certify() {
+    use aether::certificates::status::{
+        AstraSignerResult, CampaignApproval, CampaignScope, CampaignTarget, CertificateKind,
+    };
+    use aether::certificates::x509::certification_request_public_key_info;
+
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let opening = open(&first, &vault);
+    let identity = identity();
+    let ca_tls =
+        authority::issue_ca_tls(&vault, &opening, &identity, NOW, NOW + 365 * 86_400).unwrap();
+
+    let delegation_request = |seed: u8| {
+        let (_, issuer_public) = generate_ml_dsa_87_keypair().expect("issuer keypair");
+        let issuer_tls_key = rcgen::KeyPair::generate().expect("issuer TLS key");
+        let mut params = rcgen::CertificateParams::new(vec![SERVER_NAME.into()]).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("issuer {seed}"));
+        let csr = params
+            .serialize_request(&issuer_tls_key)
+            .expect("PKCS#10")
+            .der()
+            .to_vec();
+        (
+            IssuerDelegationRequest {
+                trust_domain_id: identity.trust_domain_id.to_hex(),
+                issuer_epoch: 1,
+                pq_issuer_public_key: issuer_public.to_base64(),
+                tls_intermediate_csr: base64::engine::general_purpose::STANDARD.encode(&csr),
+            },
+            issuer_public,
+            DerCertificate::new(csr).expect("der"),
+        )
+    };
+
+    let (request, pq_public_key, csr) = delegation_request(1);
+    let campaign = AstraRotationCampaign {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        campaign_id: Id16::new([9; 16]).expect("id"),
+        trust_domain_id: identity.trust_domain_id,
+        gateway_wg_public_key: identity.gateway_wg_public_key,
+        server_name: identity.server_name.clone(),
+        created_at: NOW,
+        expires_at: NOW + 300,
+        scope: CampaignScope::IssuerDelegation,
+        targets: vec![CampaignTarget {
+            certificate_kind: CertificateKind::AstraIssuer,
+            identity_key: identity.gateway_wg_public_key,
+            epoch: 1,
+            generation: 1,
+            active_tls_certificate_fingerprint: Fingerprint::of(
+                &certification_request_public_key_info(&csr).expect("csr spki"),
+            ),
+            active_pq_certificate_fingerprint: Fingerprint::of(pq_public_key.as_bytes()),
+        }],
+        reason: "délégation trimestrielle".into(),
+        requested_by: "operator".into(),
+        policy_fingerprint: identity
+            .policy()
+            .expect("policy")
+            .fingerprint()
+            .expect("fingerprint"),
+        required_credentials: CampaignScope::IssuerDelegation.required_credentials(),
+    };
+    campaign
+        .validate(NOW)
+        .expect("a campaign an operator may read");
+
+    let bounds = DelegationBounds {
+        maximum_leaf_lifetime_secs: 90 * 86_400,
+        not_before: NOW,
+        not_after: NOW + 30 * 86_400,
+    };
+    let signed =
+        |request: &IssuerDelegationRequest| -> aether::certificates::authority::AstraIssuerAuthorization {
+            authority::authorize_issuer(&vault, &opening, &identity, &ca_tls, request, &bounds, NOW)
+                .expect("the delegation signs")
+        };
+    let result = |authorization| AstraSignerResult {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        approval: Box::new(CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: campaign.required_credentials,
+            approved_at: NOW,
+            approvals: Vec::new(),
+        }),
+        objects: Vec::new(),
+        credential_registry: None,
+        issuer_authorization: Some(Box::new(authorization)),
+    };
+
+    result(signed(&request))
+        .validate(&campaign)
+        .expect("the delegation the operator read");
+
+    // Another request, signed just as validly by the same anchor, under the
+    // same approval. It is the substitution the whole path exists to refuse.
+    let (other, _, _) = delegation_request(2);
+    assert!(result(signed(&other)).validate(&campaign).is_err());
+}
