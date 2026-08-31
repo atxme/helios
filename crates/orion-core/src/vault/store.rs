@@ -36,7 +36,10 @@
 //! oversteps what a client arbitrates — revoking an admission belongs to the
 //! operator, who alone has the means (ADR-006 §3, arbitrage du 2 août 2026).
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use zeroize::Zeroizing;
 
@@ -104,7 +107,7 @@ pub struct ProfileStore {
     ///
     /// Same distinction as above, for the same reason: an unencrypted volume is
     /// a refusal, and only this flag turns it into a stated choice.
-    unencrypted_volume: bool,
+    unencrypted_volume: AtomicBool,
     /// Installation root, unwrapped once. See [`ProfileStore::root`].
     root_cache: std::sync::Mutex<Option<Arc<DeviceRootKey>>>,
 }
@@ -115,7 +118,7 @@ impl ProfileStore {
             dir: dir.into(),
             provider,
             software_keystore: false,
-            unencrypted_volume: false,
+            unencrypted_volume: AtomicBool::new(false),
             root_cache: std::sync::Mutex::new(None),
         }
     }
@@ -130,8 +133,25 @@ impl ProfileStore {
     /// Records that the volume-encryption prerequisite was waived on purpose.
     #[must_use]
     pub fn allowing_unencrypted_volume(mut self, allowed: bool) -> Self {
-        self.unencrypted_volume = allowed;
+        self.unencrypted_volume = AtomicBool::new(allowed);
         self
+    }
+
+    /// Records an informed volume-encryption waiver and applies it now.
+    ///
+    /// Persistence happens first: an interface that reports success must not
+    /// leave a choice that disappears at the next start. A malformed existing
+    /// file is refused rather than overwritten, because it may carry another
+    /// deliberate downgrade that must not be silently lost.
+    pub fn persist_unencrypted_volume_waiver(&self) -> Result<(), VaultError> {
+        let (mut settings, complaint) = super::LocalSettings::load(&self.dir);
+        if let Some(complaint) = complaint {
+            return Err(VaultError::LocalSettings(complaint));
+        }
+        settings.danger_allow_unencrypted_volume = true;
+        settings.save(&self.dir)?;
+        self.unencrypted_volume.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// May a secret be written to this installation's directory?
@@ -141,7 +161,7 @@ impl ProfileStore {
     /// the same fact, and a screen that states a refusal nothing enforces is
     /// worse than one that states nothing.
     pub fn may_write_secrets(&self) -> Result<(), VaultError> {
-        if self.unencrypted_volume {
+        if self.unencrypted_volume.load(Ordering::Acquire) {
             return Ok(());
         }
         super::windows::bitlocker::require_protected(&self.dir)
@@ -542,7 +562,7 @@ impl ProfileStore {
             software_keystore: self.software_keystore,
             volume: volume.detail(),
             volume_protected: volume.allows_secrets(),
-            unencrypted_volume_waived: self.unencrypted_volume,
+            unencrypted_volume_waived: self.unencrypted_volume.load(Ordering::Acquire),
             memory_locked: lock.holds(),
             memory: lock.detail(),
             dumps_excluded: exclusion.holds(),
@@ -831,6 +851,32 @@ mod tests {
             "lever l'exigence ne chiffre pas le disque"
         );
         assert!(!posture.is_clean());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The interface can obtain informed consent after startup. The choice
+    /// takes effect for the pending save and survives the next launch.
+    #[test]
+    fn the_volume_waiver_can_be_persisted_and_applied_live() {
+        let (dir, store) = store("volume-live-waiver");
+        assert!(store.may_write_secrets().is_err());
+        super::super::LocalSettings {
+            danger_allow_software_keystore: true,
+            danger_allow_unencrypted_volume: false,
+        }
+        .save(&dir)
+        .unwrap();
+
+        store.persist_unencrypted_volume_waiver().unwrap();
+
+        assert!(store.may_write_secrets().is_ok());
+        assert!(store.posture().unencrypted_volume_waived);
+        let saved = super::super::LocalSettings::load(&dir).0;
+        assert!(saved.danger_allow_unencrypted_volume);
+        assert!(
+            saved.danger_allow_software_keystore,
+            "persisting one choice must preserve the other"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

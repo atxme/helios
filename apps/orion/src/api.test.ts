@@ -11,6 +11,7 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: mocks.listen }))
 import {
   aboutOrion,
   adapterIsUp,
+  allowUnencryptedVolume,
   backendKind,
   certificateActions,
   certificateInventory,
@@ -55,6 +56,7 @@ describe('Orion Tauri bridge', () => {
     await importProfilePath()
     await validateProfile(profile as never)
     await vaultPosture()
+    await allowUnencryptedVolume()
     await keyNegotiationSupport()
     await certificateInventory(profile as never)
     await certificateActions(profile as never)
@@ -88,6 +90,7 @@ describe('Orion Tauri bridge', () => {
       ['import_profile_path', { path: null }],
       ['validate_profile', { draft: profile }],
       ['vault_posture'],
+      ['allow_unencrypted_volume'],
       ['key_negotiation_support'],
       ['certificate_inventory', { keyNegotiation: profile }],
       ['certificate_actions', { keyNegotiation: profile }],

@@ -315,3 +315,12 @@ export function onConfigChanged(cb: () => void): Promise<UnlistenFn> {
  * once at startup would eventually claim a protection that has since gone.
  */
 export const vaultPosture = () => invoke<VaultPosture>('vault_posture')
+
+/**
+ * Persists the informed choice made in the bare-volume warning.
+ *
+ * Kept separate from save/import so neither action can silently manufacture
+ * consent merely because BitLocker is absent.
+ */
+export const allowUnencryptedVolume = () =>
+  invoke<VaultPosture>('allow_unencrypted_volume')

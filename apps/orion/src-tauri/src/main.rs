@@ -1578,6 +1578,29 @@ async fn vault_posture(
     Ok(state.store.posture())
 }
 
+/// Persists the user's informed choice to keep profiles on a bare volume.
+///
+/// This command is deliberately separate from import/save: the interface must
+/// first state the guarantees being withdrawn, and an ordinary write must
+/// never turn a missing BitLocker posture into consent by itself.
+#[tauri::command]
+async fn allow_unencrypted_volume(
+    state: State<'_, AppState>,
+) -> Result<orion_core::vault::VaultPosture, String> {
+    let posture = state.store.posture();
+    if posture.volume_protected || posture.unencrypted_volume_waived {
+        return Ok(posture);
+    }
+    state
+        .store
+        .persist_unencrypted_volume_waiver()
+        .map_err(|error| error.to_string())?;
+    tracing::warn!(
+        "CHIFFREMENT DE VOLUME NON EXIGÉ après confirmation dans Orion — les anciens blocs disque, le fichier d'échange et celui d'hibernation ne sont pas couverts"
+    );
+    Ok(state.store.posture())
+}
+
 /// Draws a WireGuard key pair and returns its **public** half.
 ///
 /// The private half stays in [`AppState::staged_key`] until the profile is
@@ -2677,6 +2700,7 @@ fn main() {
             export_logs,
             resize_for_view,
             validate_profile,
+            allow_unencrypted_volume,
             key_negotiation_support,
             certificate_inventory,
             certificate_actions,

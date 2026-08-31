@@ -273,6 +273,8 @@ pub enum VaultError {
     GenerationWentBackwards { observed: u64, offered: u64 },
     #[error("hygiène mémoire : {0}")]
     MemoryHygiene(&'static str),
+    #[error("réglages locaux du coffre : {0}")]
+    LocalSettings(String),
     #[error(transparent)]
     Container(helios_vault::VaultError),
 }

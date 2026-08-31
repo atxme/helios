@@ -145,6 +145,9 @@ function blankProfile(): ClientProfile {
  */
 type Notice = { tone: 'success' | 'error'; message: string; transient?: boolean }
 
+/** Action waiting for the user's informed bare-volume decision. */
+type VolumeWarningAction = 'import' | 'save'
+
 /** How long a transient notice stays, in milliseconds. */
 const NOTICE_MS = 3000
 
@@ -239,6 +242,9 @@ export function ProfilesView({
   const [issues, setIssues] = useState<Partial<ProfileIssues>>({})
   const [history, setHistory] = useState<ClientProfile[]>([])
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [volumeWarningAction, setVolumeWarningAction] =
+    useState<VolumeWarningAction | null>(null)
+  const [volumeWarningBusy, setVolumeWarningBusy] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
@@ -361,13 +367,6 @@ export function ProfilesView({
     })
     onPathImportHandled()
   }, [config.profiles, loadDraft, onPathImportHandled, pathImport])
-
-  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
-  // picker belongs to this screen, and opening it from the shell would mean a
-  // second one. `0` is the mounted value and opens nothing.
-  useEffect(() => {
-    if (importRequest > 0) fileInput.current?.click()
-  }, [importRequest])
 
   const set = <Key extends keyof ClientProfile>(key: Key, value: ClientProfile[Key]) => {
     setHistory((past) => [...past, draft].slice(-HISTORY_LIMIT))
@@ -522,7 +521,7 @@ export function ProfilesView({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [undo])
 
-  const save = async () => {
+  const persistDraft = async () => {
     try {
       await onSave(toDraft(draft))
       setDirty(false)
@@ -544,6 +543,72 @@ export function ProfilesView({
       // The global error keeps the draft intact to allow a correction.
     }
   }
+
+  /**
+   * Checks the measured volume posture before an action can persist a key.
+   *
+   * A missing BitLocker posture is not silently accepted: the warning is the
+   * gesture that turns the strict refusal into the existing, visible local
+   * waiver. Once chosen, the backend persists it and subsequent actions do not
+   * nag while the posture panel continues to report the downgrade.
+   */
+  const volumeAllows = async (action: VolumeWarningAction): Promise<boolean> => {
+    try {
+      const posture = await api.vaultPosture()
+      if (posture.volumeProtected || posture.unencryptedVolumeWaived) return true
+      setVolumeWarningAction(action)
+      return false
+    } catch (cause) {
+      setNotice({
+        tone: 'error',
+        message: `Posture du volume indéterminable : ${String(cause)}`,
+      })
+      return false
+    }
+  }
+
+  const save = async () => {
+    if (await volumeAllows('save')) await persistDraft()
+  }
+
+  const requestImport = async () => {
+    if (await volumeAllows('import')) fileInput.current?.click()
+  }
+
+  const acceptUnencryptedVolume = async () => {
+    const action = volumeWarningAction
+    if (!action) return
+    setVolumeWarningBusy(true)
+    try {
+      await api.allowUnencryptedVolume()
+      setVolumeWarningAction(null)
+      setNotice({
+        tone: 'success',
+        message:
+          'Volume non chiffré accepté : le coffre applicatif reste actif, mais la protection au repos est incomplète.',
+      })
+      if (action === 'import') fileInput.current?.click()
+      else await persistDraft()
+    } catch (cause) {
+      setNotice({
+        tone: 'error',
+        message: `Impossible d’enregistrer l’autorisation locale : ${String(cause)}`,
+      })
+    } finally {
+      setVolumeWarningBusy(false)
+    }
+  }
+
+  // The tray's «Importer un profil à partir d'un fichier…» ends here: the
+  // picker belongs to this screen, and opening it from the shell would mean a
+  // second one. `0` is the mounted value and opens nothing. It follows the
+  // same volume warning as the visible Import button.
+  useEffect(() => {
+    if (importRequest > 0) void requestImport()
+    // A counter is the event. The callback intentionally follows the current
+    // measured posture on each event rather than becoming another trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importRequest])
 
   /** Draws a pair in Rust and shows the public half at once. */
   const generateKey = async () => {
@@ -920,7 +985,7 @@ export function ProfilesView({
               variant="contained"
               startIcon={<Upload size={15} aria-hidden />}
               disabled={importing}
-              onClick={() => fileInput.current?.click()}
+              onClick={() => void requestImport()}
             >
               {importing ? 'Chargement…' : 'Importer'}
             </Button>
@@ -1267,6 +1332,53 @@ export function ProfilesView({
           </Button>
           <Button color="error" variant="contained" onClick={() => void remove()}>
             Supprimer
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={volumeWarningAction !== null}
+        onClose={() => {
+          if (!volumeWarningBusy) setVolumeWarningAction(null)
+        }}
+        aria-labelledby="unencrypted-volume-title"
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle
+          id="unencrypted-volume-title"
+          sx={{ display: 'flex', alignItems: 'center', gap: 1 }}
+        >
+          <AlertTriangle size={20} aria-hidden />
+          Continuer sans BitLocker ?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText component="div">
+            Le volume qui stocke les profils Orion n’est pas chiffré par BitLocker. Orion
+            chiffrera la configuration dans son coffre, mais la protection restera incomplète :
+            d’anciens blocs SSD, le fichier d’échange et le fichier d’hibernation peuvent conserver
+            des traces de la clé.
+            <Box component="span" sx={{ display: 'block', mt: 1.5 }}>
+              En continuant, vous acceptez cette protection dégradée pour ce poste. Orion la
+              signalera par « volume non chiffré — exigence levée ».
+            </Box>
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            color="inherit"
+            disabled={volumeWarningBusy}
+            onClick={() => setVolumeWarningAction(null)}
+          >
+            Annuler
+          </Button>
+          <Button
+            color="warning"
+            variant="contained"
+            disabled={volumeWarningBusy}
+            onClick={() => void acceptUnencryptedVolume()}
+          >
+            {volumeWarningBusy ? 'Autorisation…' : 'Continuer avec une protection incomplète'}
           </Button>
         </DialogActions>
       </Dialog>

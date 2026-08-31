@@ -22,6 +22,8 @@ const api = vi.hoisted(() => ({
   discardStagedKey: vi.fn(),
   adoptPresharedKey: vi.fn(),
   discardStagedPsk: vi.fn(),
+  vaultPosture: vi.fn(),
+  allowUnencryptedVolume: vi.fn(),
 }))
 const documents = vi.hoisted(() => ({ readProfileDocument: vi.fn() }))
 
@@ -106,6 +108,20 @@ beforeEach(() => {
   api.discardStagedKey.mockResolvedValue(undefined)
   api.adoptPresharedKey.mockResolvedValue(undefined)
   api.discardStagedPsk.mockResolvedValue(undefined)
+  api.vaultPosture.mockResolvedValue({
+    hardwareBacked: true,
+    softwareKeystore: false,
+    volume: 'Volume chiffré.',
+    volumeProtected: true,
+    unencryptedVolumeWaived: false,
+    memoryLocked: true,
+    memory: '',
+    dumpsExcluded: true,
+    dumps: '',
+    rotationRequired: [],
+    legacyPresent: false,
+  })
+  api.allowUnencryptedVolume.mockResolvedValue(undefined)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
 })
 
@@ -656,7 +672,88 @@ describe('ProfilesView interactions', () => {
         />,
       )
     }
-    expect(click).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(click).toHaveBeenCalledTimes(2))
+  })
+
+  it('allows import without BitLocker only after stating the incomplete protection', async () => {
+    api.vaultPosture.mockResolvedValueOnce({
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume non chiffré.',
+      volumeProtected: false,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+    })
+    const handlers = callbacks()
+    const { container } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement
+    const click = vi.spyOn(input, 'click')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Importer' }))
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(screen.getByText(/anciens blocs SSD/)).toBeTruthy()
+    expect(screen.getByText(/volume non chiffré — exigence levée/)).toBeTruthy()
+    expect(click).not.toHaveBeenCalled()
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Continuer avec une protection incomplète' }),
+    )
+
+    await waitFor(() => expect(api.allowUnencryptedVolume).toHaveBeenCalledOnce())
+    await waitFor(() => expect(click).toHaveBeenCalledOnce())
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('retries the pending save as soon as the bare-volume choice is persisted', async () => {
+    api.vaultPosture.mockResolvedValueOnce({
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume non chiffré.',
+      volumeProtected: false,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+    })
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable' }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.change(screen.getByLabelText('Endpoint'), {
+      target: { value: 'vpn.example:51820' },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect(handlers.onSave).not.toHaveBeenCalled()
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Continuer avec une protection incomplète' }),
+    )
+
+    await waitFor(() => expect(api.allowUnencryptedVolume).toHaveBeenCalledOnce())
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].endpoint).toBe('vpn.example:51820')
   })
 
   it('loads an associated profile and explains a failed identity seal', async () => {
