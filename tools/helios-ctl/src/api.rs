@@ -13,7 +13,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// Secret-free view returned by `GET /api/network`.
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfigView {
-    pub wan_iface: String,
+    /// Uplinks, in the gateway's order of preference: the API publishes the
+    /// whole set, not a single interface.
+    pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
     pub admin_iface: Option<String>,
@@ -292,7 +294,7 @@ mod tests {
         assert_eq!(command.error.as_deref(), Some("refused"));
 
         let body = json!({
-            "wan_iface": "eth0",
+            "wan_ifaces": ["eth0"],
             "lan_ifaces": ["lan0"],
             "allow_ssh_from": ["192.0.2.0/24"],
             "admin_iface": "helios0",
@@ -371,7 +373,7 @@ mod tests {
     async fn http_helpers_decode_successful_get_and_post_responses() {
         let client = Client::new();
         let network_body = json!({
-            "wan_iface": "eth0",
+            "wan_ifaces": ["eth0"],
             "lan_ifaces": [],
             "allow_ssh_from": [],
             "admin_iface": null,
@@ -387,6 +389,7 @@ mod tests {
         let (base, server) = response_server("200 OK", network_body).await;
         let view = network(&client, &base).await.unwrap();
         assert_eq!(view.wg_iface, "helios0");
+        assert_eq!(view.wan_ifaces, ["eth0"]);
         assert!(server.await.unwrap().starts_with("GET /api/network "));
 
         let (base, server) =

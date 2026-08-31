@@ -244,7 +244,7 @@ mod tests {
 
     fn network_view(peers: serde_json::Value) -> String {
         serde_json::json!({
-            "wan_iface": "eth0",
+            "wan_ifaces": ["eth0"],
             "lan_ifaces": [],
             "allow_ssh_from": [],
             "admin_iface": "helios0",

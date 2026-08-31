@@ -397,7 +397,9 @@ enum NetworkCmd {
 struct Status {
     state: String,
     version: String,
-    wan_iface: String,
+    /// Uplinks, in the gateway's order of preference: the API publishes the
+    /// whole set, not a single interface.
+    wan_ifaces: Vec<String>,
     lan_ifaces: Vec<String>,
     wg_peers: Vec<String>,
     allow_ssh_from: Vec<String>,
@@ -508,7 +510,7 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     println!();
     println!("  {}  {}", state_dot(&s.state), colored_state(&s.state));
     println!();
-    println!("  {:<14} {}", "WAN", s.wan_iface);
+    println!("  {:<14} {}", "WAN", s.wan_ifaces.join(", "));
     println!("  {:<14} {}", "LAN", s.lan_ifaces.join(", "));
     println!(
         "  {:<14} {}{}",
@@ -602,10 +604,10 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
     println!(
         "  {:<16} {}",
         "WAN",
-        if cfg.wan_iface.is_empty() {
-            "(not set)"
+        if cfg.wan_ifaces.is_empty() {
+            "(not set)".to_string()
         } else {
-            &cfg.wan_iface
+            cfg.wan_ifaces.join(", ")
         }
     );
     println!(
@@ -1125,14 +1127,17 @@ mod tests {
     #[test]
     fn current_wireguard_status_is_deserializable() {
         let raw = r#"{
-            "state":"down","version":"0.1.0","wan_iface":"eth0",
+            "state":"down","version":"0.1.0","wan_ifaces":["enp3s0","wlo1"],
             "lan_ifaces":["eth1"],"wg_peers":[],"allow_ssh_from":[],
             "peers":[{"name":"orion","public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":"100.64.1.2/32","post_quantum":false}],
-            "wg_iface":"helios0","wg_listen_port":51820,"dry_run":true,
-            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null
+            "wg_iface":"helios0","wg_listen_port":51820,
+            "key_negotiation_port":51821,"dry_run":true,
+            "split_tunnel_cidrs":[],"mss_clamp":null,"captive_portal_gateway":null,
+            "handshake_stale_after_seconds":150
         }"#;
         let status: Status = serde_json::from_str(raw).expect("valid status");
         assert_eq!(status.wg_iface, "helios0");
+        assert_eq!(status.wan_ifaces, ["enp3s0", "wlo1"]);
         assert_eq!(status.peers[0].name, "orion");
     }
 
