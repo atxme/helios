@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod api;
+mod app_update;
 mod campaign;
 mod campaign_key_nego;
 mod enroll;
@@ -45,6 +46,8 @@ EXAMPLES:
   cargo run -p helios-ctl -- watch
   cargo run -p helios-ctl -- network show
   cargo run -p helios-ctl -- network load config/network.toml
+  cargo run -p helios-ctl -- --url http://100.64.0.1:8080 app-update \
+    --manifest heliosd.release.json --binary heliosd
   cargo run -p helios-ctl -- scenario nominal
   cargo run -p helios-ctl -- update                 # on the gateway
   cargo run -p helios-ctl -- --url http://192.168.1.1:8080 status"
@@ -188,6 +191,21 @@ enum Cmd {
     KeyNego {
         #[command(subcommand)]
         command: key_nego::KeyNegoCmd,
+    },
+    /// Transfers and activates a signed heliosd release through the admin API.
+    AppUpdate {
+        /// Signed `helios-binary-release-v1` JSON manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Exact heliosd ELF named by the manifest.
+        #[arg(long)]
+        binary: PathBuf,
+        /// Stages and verifies the release without activating it.
+        #[arg(long, conflicts_with = "yes")]
+        stage_only: bool,
+        /// Activates without an interactive confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Upgrades this gateway's OS and reboots, keeping its identity (ADR-007).
     ///
@@ -1044,6 +1062,24 @@ async fn main() -> Result<()> {
             } => escrow::open(&escrow, &private_key, &output),
         },
         Cmd::KeyNego { command } => key_nego::run(command).await,
+        Cmd::AppUpdate {
+            manifest,
+            binary,
+            stage_only,
+            yes,
+        } => {
+            app_update::run(
+                &client,
+                base,
+                app_update::Options {
+                    manifest,
+                    binary,
+                    stage_only,
+                    yes,
+                },
+            )
+            .await
+        }
         Cmd::Update { yes } => update::run(yes),
         Cmd::Scenario { name } => match name.as_str() {
             "nominal" => scenario_nominal(&client, base).await,
@@ -1167,6 +1203,15 @@ mod tests {
             vec!["helios-ctl", "network", "load", "network.toml"],
             vec!["helios-ctl", "profile", "check", "client.orion"],
             vec!["helios-ctl", "escrow", "keygen", "--output-dir", "keys"],
+            vec![
+                "helios-ctl",
+                "app-update",
+                "--manifest",
+                "heliosd.release.json",
+                "--binary",
+                "heliosd",
+                "--yes",
+            ],
             vec!["helios-ctl", "scenario", "flap"],
             vec!["helios-ctl", "campaign", "--generate-keys"],
         ] {
@@ -1189,6 +1234,17 @@ mod tests {
             .is_err(),
             "partial offline enrollment material must be refused"
         );
+        assert!(Cli::try_parse_from([
+            "helios-ctl",
+            "app-update",
+            "--manifest",
+            "heliosd.release.json",
+            "--binary",
+            "heliosd",
+            "--stage-only",
+            "--yes",
+        ])
+        .is_err());
     }
 
     #[test]

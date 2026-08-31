@@ -119,6 +119,19 @@ Les étapes détaillées ci-dessous restent la référence — pour comprendre c
 le script fait, ou pour une release publique où la signature se joue sur un
 poste séparé.
 
+Une fois la gateway installée et un pair administrateur connecté par
+`helios0`, les mises à jour ordinaires du seul daemon ne repassent pas par SSH
+ni par le bundle complet :
+
+```sh
+./scripts/deploy-app.sh
+```
+
+La commande construit, signe, transfère par l'API, active et attend la
+confirmation ou le rollback. `deploy.sh` reste le chemin du premier
+déploiement et des releases qui modifient aussi l'installateur, les outils ou
+les unités systemd.
+
 ## Étape 2 — Fabriquer le bundle
 
 ```sh

@@ -2311,6 +2311,8 @@ dependencies = [
  "futures-util",
  "helio-tpm",
  "helios-key-negotiation",
+ "helios-update",
+ "hex",
  "orion-core",
  "rcgen",
  "reqwest 0.12.28",

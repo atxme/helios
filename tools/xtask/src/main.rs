@@ -79,6 +79,15 @@ struct Cli {
 enum Cmd {
     /// Downloads and verifies the WireGuardNT DLLs needed by the Orion bundle.
     OrionDeps,
+    /// Builds the production heliosd binary for an API application update.
+    App {
+        /// Target triple. Default: the host.
+        #[arg(long)]
+        target: Option<String>,
+        /// Does not rebuild the embedded frontend (local iteration).
+        #[arg(long)]
+        skip_frontend: bool,
+    },
     /// Builds the binaries and assembles the bundle directory.
     Bundle {
         /// Target triple. Default: the host.
@@ -124,6 +133,10 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::OrionDeps => orion_deps(),
+        Cmd::App {
+            target,
+            skip_frontend,
+        } => app(target, skip_frontend),
         Cmd::Bundle {
             target,
             skip_frontend,
@@ -141,6 +154,17 @@ fn main() -> Result<()> {
 fn orion_deps() -> Result<()> {
     let root = workspace_root()?;
     orion_deps::prepare(&root)
+}
+
+fn app(target: Option<String>, skip_frontend: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let target = match target {
+        Some(target) => target,
+        None => host_target()?,
+    };
+    let binary = build_gateway(&root, &target, skip_frontend)?;
+    println!("\n==> Application ready: {}", binary.display());
+    Ok(())
 }
 
 /// Features the Orion installer must carry.
@@ -291,42 +315,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
     };
     let version = workspace_version(&root)?;
 
-    // The publisher's public keyring is required by `heliosd`'s release
-    // build. Checking it here avoids waiting several minutes of compilation
-    // to learn it was missing.
-    let keyring = std::env::var("HELIOS_PUBLISHER_KEYRING_PATH").map_err(|_| {
-        anyhow::anyhow!(
-            "HELIOS_PUBLISHER_KEYRING_PATH must point to the publisher's public keyring: \
-             a bundle built without a trust anchor cannot verify any update"
-        )
-    })?;
-    if !Path::new(&keyring).is_file() {
-        bail!("public keyring not found: {keyring}");
-    }
-
-    if skip_frontend {
-        println!("==> Frontend: reused as is (--skip-frontend)");
-    } else {
-        println!("==> Embedded frontend");
-        run(&root, NPM, &["ci", "--prefix", "web"])?;
-        run(&root, NPM, &["run", "build", "--prefix", "web"])?;
-    }
-
-    println!("==> heliosd ({GATEWAY_FEATURES})");
-    run(
-        &root,
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "--target",
-            &target,
-            "-p",
-            "heliosd",
-            "--features",
-            GATEWAY_FEATURES,
-        ],
-    )?;
+    let heliosd = build_gateway(&root, &target, skip_frontend)?;
 
     println!("==> helios-installer, helios-ctl");
     run(
@@ -354,7 +343,12 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         .with_context(|| format!("creating {}", staging.display()))?;
 
     let built = root.join("target").join(&target).join("release");
-    for binary in BINARIES {
+    copy_executable(&heliosd, &staging.join("heliosd"))?;
+    for binary in BINARIES
+        .iter()
+        .copied()
+        .filter(|binary| *binary != "heliosd")
+    {
         copy_executable(&built.join(binary), &staging.join(binary))?;
     }
     for unit in SYSTEMD_UNITS {
@@ -380,11 +374,63 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         "  helios-publisher bundle --dir {} \\\n    --key-epoch <N> --release-sequence <N> \\\n    \
          --channel <testing|production> --version {version} \\\n    --git-commit $(git rev-parse \
          --short=16 HEAD) --target {target} \\\n    --ed25519-private-key <…> \
-         --ml-dsa-65-private-key <…> --keyring {keyring}",
-        staging.display()
+         --ml-dsa-65-private-key <…> --keyring {}",
+        staging.display(),
+        publisher_keyring()?.display()
     );
     println!("  cargo xtask pack --dir {}", staging.display());
     Ok(())
+}
+
+/// Builds the exact daemon shape shipped to a real gateway.
+///
+/// Kept in one function because installation bundles and application updates
+/// must never drift to different feature sets or embedded frontends.
+fn build_gateway(root: &Path, target: &str, skip_frontend: bool) -> Result<PathBuf> {
+    publisher_keyring()?;
+
+    if skip_frontend {
+        println!("==> Frontend: reused as is (--skip-frontend)");
+    } else {
+        println!("==> Embedded frontend");
+        run(root, NPM, &["ci", "--prefix", "web"])?;
+        run(root, NPM, &["run", "build", "--prefix", "web"])?;
+    }
+
+    println!("==> heliosd ({GATEWAY_FEATURES})");
+    run(
+        root,
+        "cargo",
+        &[
+            "build",
+            "--release",
+            "--target",
+            target,
+            "-p",
+            "heliosd",
+            "--features",
+            GATEWAY_FEATURES,
+        ],
+    )?;
+    Ok(root
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("heliosd"))
+}
+
+fn publisher_keyring() -> Result<PathBuf> {
+    let keyring = std::env::var_os("HELIOS_PUBLISHER_KEYRING_PATH").ok_or_else(|| {
+        anyhow::anyhow!(
+            "HELIOS_PUBLISHER_KEYRING_PATH must point to the publisher's public keyring: \
+             a gateway binary built without a trust anchor cannot verify any update"
+        )
+    })?;
+    let keyring = PathBuf::from(keyring);
+    if !keyring.is_file() {
+        bail!("public keyring not found: {}", keyring.display());
+    }
+    Ok(keyring)
 }
 
 fn pack(dir: &Path, output: Option<PathBuf>) -> Result<()> {
