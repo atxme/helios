@@ -58,6 +58,19 @@ npm run build --prefix apps/orion
 cargo run -p orion
 ```
 
+Une mise à jour applicative peut être lancée depuis PowerShell tout en gardant
+le build et les clés éditeur dans WSL :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -BuildInWsl `
+  -WslRepo /home/utilisateur/helios
+```
+
+Si le réseau WSL ne reprend pas la route du tunnel Orion, construire et signer
+dans WSL puis appeler le script avec `-Manifest` et `-Binary` envoie l'artefact
+depuis le réseau Windows natif.
+
 Le dernier lancement requiert WSLg (`xdpyinfo` doit réussir). Il utilise le
 backend Orion simulé mais le véritable shell Tauri et son pont IPC. Sans WSLg,
 les trois commandes de test et de build restent utilisables, pas l'IHM native.

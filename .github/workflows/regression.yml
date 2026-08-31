@@ -80,6 +80,9 @@ jobs:
         run: |
           npm run test:unit --prefix apps/orion
           npm run build --prefix apps/orion
+      - name: Validation du lanceur de mise à jour PowerShell
+        shell: pwsh
+        run: Get-Command .\scripts\deploy-app.ps1 -Syntax | Out-Null
       - name: Analyse statique des chemins Windows
         run: cargo clippy -p helios-fido -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
       - name: Tests du compagnon Astra sous Windows

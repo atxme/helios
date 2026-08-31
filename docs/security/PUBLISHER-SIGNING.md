@@ -132,6 +132,32 @@ helios-ctl --url http://100.64.0.1:8080 app-update \
   --manifest heliosd.release.json --binary heliosd
 ```
 
+Depuis PowerShell sous Windows, le script natif pilote la même commande et
+envoie un ELF Linux déjà construit et son manifeste signé :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -Manifest .\heliosd.release.json `
+  -Binary .\heliosd `
+  -Yes
+```
+
+`-HeliosCtl C:\outils\helios-ctl.exe` évite `cargo run` lorsqu'un binaire
+Windows de l'outil est déjà disponible. Windows ne construit pas nativement
+le daemon Linux et ses dépendances noyau/TPM. Quand le dépôt et les clés
+éditeur vivent dans WSL, PowerShell peut lancer la chaîne complète :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -BuildInWsl `
+  -WslRepo /home/utilisateur/helios
+```
+
+Dans ce second mode, build, signature et transfert s'exécutent dans WSL ;
+`-WslDistribution Ubuntu` sélectionne explicitement la distribution. Si WSL
+ne voit pas la route installée par Orion sous Windows, produire les artefacts
+dans WSL puis employer le premier mode fait partir l'appel API de Windows.
+
 Sans `--yes`, `helios-ctl` demande confirmation après le staging. `--stage-only`
 n’active rien. Ce chemin ne remplace pas le bundle signé : une modification de
 `helios-installer`, `helios-ctl` ou d’une unité systemd exige toujours un bundle.

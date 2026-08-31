@@ -127,6 +127,19 @@ ni par le bundle complet :
 ./scripts/deploy-app.sh
 ```
 
+Depuis le poste Orion Windows, un manifeste et un ELF déjà signés empruntent
+le même flux avec PowerShell :
+
+```powershell
+.\scripts\deploy-app.ps1 `
+  -Manifest .\heliosd.release.json `
+  -Binary .\heliosd `
+  -Yes
+```
+
+Le poste qui construit et signe dans WSL peut tout enchaîner depuis PowerShell
+avec `-BuildInWsl -WslRepo /home/utilisateur/helios`.
+
 La commande construit, signe, transfère par l'API, active et attend la
 confirmation ou le rollback. `deploy.sh` reste le chemin du premier
 déploiement et des releases qui modifient aussi l'installateur, les outils ou
