@@ -8,7 +8,7 @@ SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPTS/.."
 
 URL="${HELIOS_URL:-http://100.64.0.1:8080}"
-EPOCH_DIR="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
+EPOCH_DIR="$HOME/.helios/publisher-epoch-1"
 CHANNEL="${HELIOS_DEPLOY_CHANNEL:-production}"
 SEQUENCE=""
 SKIP_FRONTEND=0
@@ -24,7 +24,7 @@ Usage: ./scripts/deploy-app.sh [options]
   --skip-frontend    Reuse web/dist for a faster Rust-only iteration
   --stage-only       Upload and verify without activating
 
-Variables: HELIOS_URL, HELIOS_PUBLISHER_EPOCH, HELIOS_DEPLOY_CHANNEL.
+Variables: HELIOS_URL, HELIOS_DEPLOY_CHANNEL.
 EOF
     exit "${1:-1}"
 }

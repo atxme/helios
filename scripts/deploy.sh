@@ -33,7 +33,7 @@ cd "$SCRIPTS/.."
 # shellcheck source=scripts/lib-remote.sh
 . "$SCRIPTS/lib-remote.sh"
 
-EPOQUE="${HELIOS_PUBLISHER_EPOCH:-$HOME/.helios/publisher-epoch-1}"
+EPOQUE="$HOME/.helios/publisher-epoch-1"
 CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
 ASTRA=1
@@ -88,8 +88,8 @@ L'hôte est en dur dans scripts/lib-remote.sh (HELIOS_CIBLE) : la commande
 n'en prend aucun. L'argument reste accepté pour viser ponctuellement une
 autre machine, sans rien changer aux appels suivants.
 
-Variables reconnues : HELIOS_CIBLE, HELIOS_PUBLISHER_EPOCH,
-HELIOS_DEPLOY_CHANNEL, ASTRA_HANDOFF, HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE.
+Variables reconnues : HELIOS_CIBLE, HELIOS_DEPLOY_CHANNEL, ASTRA_HANDOFF,
+HELIOS_GATEWAY_BOOTSTRAP_CERTIFICATE.
 EOF
     exit 1
 }
