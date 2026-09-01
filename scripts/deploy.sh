@@ -164,8 +164,15 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 CIBLE_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
-VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml |
+# La version du démon, pas celle du workspace : `heliosd` n'hérite pas de
+# `version.workspace`, et le marqueur de disponibilité qu'il écrit après une
+# mise à jour porte la version de son crate. Un manifeste étiqueté avec la
+# version du workspace ne peut jamais être confirmé, et le nom du bundle ne
+# correspondrait plus à celui que `xtask bundle` produit. Même source que
+# `xtask::release_version`.
+VERSION="$(sed -n '/^\[package\]/,/^\[/p' crates/heliosd/Cargo.toml |
     sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+[ -n "$VERSION" ] || { echo "version illisible dans crates/heliosd/Cargo.toml" >&2; exit 1; }
 NOM="helios-$VERSION-$CIBLE_TRIPLE"
 REP="target/bundle/$NOM"
 ARCHIVE="target/bundle/$NOM.tar.gz"

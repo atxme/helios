@@ -63,8 +63,14 @@ KEY_EPOCH="$(sed -n 's/.*"key_epoch"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' 
 [ -n "$KEY_EPOCH" ] || { echo "cannot read key epoch from publisher-keyring.json" >&2; exit 1; }
 
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml |
+# The daemon's own version, not the workspace's: `heliosd` does not inherit
+# `version.workspace`, and the readiness marker it writes after an update
+# carries its crate version. A manifest labeled with the workspace version can
+# never be confirmed — the health check would compare two different numbers for
+# the same release. Same source as `xtask::release_version`.
+VERSION="$(sed -n '/^\[package\]/,/^\[/p' crates/heliosd/Cargo.toml |
     sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+[ -n "$VERSION" ] || { echo "version missing from crates/heliosd/Cargo.toml" >&2; exit 1; }
 COMMIT="$(git rev-parse --short=16 HEAD)"
 if [ -n "$(git status --porcelain)" ]; then
     COMMIT="${COMMIT}-dirty"
