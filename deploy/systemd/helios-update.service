@@ -13,4 +13,14 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateNetwork=true
-ReadWritePaths=/var/lib/helios/updates /opt/helios /run/helios
+ReadWritePaths=/var/lib/helios/updates /opt/helios
+# `/run/helios` n'est pas listé au-dessus, et c'est délibéré : sous
+# `ProtectSystem=strict` un chemin de `ReadWritePaths` absent au moment où
+# l'espace de noms est construit est ignoré **en silence**, et le service démarre
+# avec un `/run` en lecture seule. Le répertoire appartient au démon, qui le
+# détruit à chaque arrêt — dont celui que cet installateur déclenche : la course
+# est gagnable, et l'a été. `RuntimeDirectory` le fait exister et le monte en
+# écriture ; `RuntimeDirectoryPreserve` empêche la sortie de l'installateur
+# d'emporter le marqueur du démon qui vient de redémarrer.
+RuntimeDirectory=helios
+RuntimeDirectoryPreserve=yes

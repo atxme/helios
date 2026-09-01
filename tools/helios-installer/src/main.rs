@@ -158,6 +158,15 @@ fn reload_units() -> Result<()> {
     Ok(())
 }
 
+/// Consumes one activation request, whatever the outcome.
+///
+/// The activation is cleared *before* the rollback is attempted, and that
+/// order is the point. `helios-update.path` re-triggers this service on the
+/// mere existence of the request file, so an activation left behind by a
+/// rollback that could not run turns a single failed update into a gateway
+/// that restarts every thirty seconds until someone notices. A request that
+/// has already restarted the daemon has been consumed; retrying it on its own
+/// is never the right answer.
 fn install_pending() -> Result<()> {
     let layout = UpdateLayout::for_daemon(false);
     let request = read_activation(&layout.activation_path).context("reading activation")?;
@@ -169,8 +178,8 @@ fn install_pending() -> Result<()> {
     match outcome {
         Ok(()) => {
             if let Err(error) = guard.confirm(&layout.state_path) {
-                restore(&layout, &guard).context("rollback after confirmation failure")?;
                 clear_activation(&layout.activation_path)?;
+                restore(&layout, &guard).context("rollback after confirmation failure")?;
                 return Err(error).context("persisting the confirmed sequence");
             }
             clear_activation(&layout.activation_path)?;
@@ -181,8 +190,9 @@ fn install_pending() -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            restore(&layout, &guard).context("rollback of the previous binary")?;
             clear_activation(&layout.activation_path)?;
+            restore(&layout, &guard)
+                .with_context(|| format!("rollback of the previous binary after: {error:#}"))?;
             Err(error)
         }
     }

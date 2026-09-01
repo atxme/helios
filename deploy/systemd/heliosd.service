@@ -31,6 +31,11 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/helios
 RuntimeDirectory=helios
+# /run/helios porte le marqueur de disponibilité que l'installateur relit après
+# avoir redémarré le démon. Sans `RuntimeDirectoryPreserve`, systemd détruit ce
+# répertoire à chaque arrêt : celui que l'installateur provoque lui-même efface
+# donc, en plein milieu de la bascule, le répertoire dont il attend le marqueur.
+RuntimeDirectoryPreserve=yes
 
 # Tout fichier créé par le démon naît en 0600 / 0700 (ADR-006). `save()` pose
 # déjà le mode explicitement ; ceci couvre à la source tout ce qui écrirait sans

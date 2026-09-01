@@ -123,6 +123,23 @@ Le helper possède uniquement les droits nécessaires sur `/opt/helios`, l’ét
 de mise à jour et le contrôle du service. Il ne télécharge rien et revérifie les
 octets même si `heliosd` les a déjà acceptés.
 
+Deux conséquences de l’étape 5, qui ne se voient qu’en service.
+
+`/run/helios` est le seul point de rendez-vous entre les deux processus, et
+c’est un répertoire d’exécution que le démon détruit en s’arrêtant — dont
+l’arrêt que l’installateur provoque lui-même à l’étape 4. Les deux unités le
+déclarent donc en `RuntimeDirectory` et le préservent : sous
+`ProtectSystem=strict`, un `ReadWritePaths` dont le répertoire manque au
+montage est ignoré **sans un mot**, et le service démarre avec un `/run` en
+lecture seule.
+
+La version que le manifeste porte est celle du **binaire livré**, jamais celle
+du workspace : c’est elle que le marqueur de disponibilité publie, et la
+comparaison de l’étape 5 lit les deux. Étiqueter une release avec un autre
+numéro rend son contrôle de santé structurellement infaisable — le démon
+démarre, l’installateur ne le reconnaît pas, et restaure une version qui
+n’avait pas échoué.
+
 Avant de sortir sur `SIGTERM`, `heliosd` repasse en `TunnelState::Down`, engage
 le pare-feu fail-closed puis démonte WireGuard. Le kill-switch reste installé.
 

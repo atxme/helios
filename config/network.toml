@@ -181,12 +181,14 @@ allow_gateway_egress = true
 # Meshnet est un second overlay WireGuard local, jamais une interface WAN.
 # Helios autorise son transport Internet uniquement quand libtelio porte la
 # marque 0xe1f1, puis borne le trafic applicatif à nordlynx, aux pairs nommés
-# ici et aux seuls ports entrants nécessaires. Le pair ci-dessous est celui
-# observé sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH et
-# TCP 49111 au service Nord Fileshare. Le routage Internet est accordé à ce
-# pair, mais l'accès aux réseaux privés reste fermé. Le déploiement reconstruit
-# ces deux listes depuis les permissions que NordVPN porte dans nftables.
-nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32"], traffic_routing_peer_cidrs = ["100.70.36.212/32"], local_network_peer_cidrs = [], inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }
+# ici et aux seuls ports entrants nécessaires. Les pairs ci-dessous sont ceux
+# observés sur cette gateway ; TCP 22 convient à Borg/Restic/rsync sur SSH et
+# TCP 49111 au service Nord Fileshare. Le routage Internet n'est accordé qu'aux
+# pairs qui le tiennent déjà de NordVPN, et l'accès aux réseaux privés reste
+# fermé. Le déploiement reconstruit ces trois listes depuis l'inventaire de
+# `wg show nordlynx` et les permissions que NordVPN porte dans nftables : un
+# poste ajouté au Meshnet n'entre ici qu'au déploiement suivant.
+nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.36.212/32", "100.127.32.93/32"], traffic_routing_peer_cidrs = ["100.70.36.212/32"], local_network_peer_cidrs = [], inbound_tcp_ports = [22, 49111], inbound_udp_ports = [], allow_icmp = true }
 
 # ── ICMP sur le tunnel ───────────────────────────────────────────────────────
 # Ouvert par défaut, contrairement à tout le reste de ce fichier, et l'écart

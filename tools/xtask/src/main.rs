@@ -313,7 +313,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         Some(target) => target,
         None => host_target()?,
     };
-    let version = workspace_version(&root)?;
+    let version = release_version(&root)?;
 
     let heliosd = build_gateway(&root, &target, skip_frontend)?;
 
@@ -573,15 +573,27 @@ fn workspace_root() -> Result<PathBuf> {
         .context("workspace root not found")
 }
 
-fn workspace_version(root: &Path) -> Result<String> {
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
-        .context("reading the workspace Cargo.toml")?;
+/// The version the bundle is labeled with, read from the `heliosd` crate.
+///
+/// It must be the daemon's own version, not the workspace's. `heliosd` does
+/// not inherit `version.workspace`, and the readiness marker it writes after
+/// an update carries `env!("CARGO_PKG_VERSION")` — its crate version. The
+/// installer compares that marker to the manifest before confirming, so a
+/// bundle labeled with the workspace version cannot be confirmed by the
+/// binary it ships: the health check reads two different numbers for the same
+/// release, times out, and rolls back a daemon that had in fact started.
+fn release_version(root: &Path) -> Result<String> {
+    let manifest = std::fs::read_to_string(root.join("crates").join("heliosd").join("Cargo.toml"))
+        .context("reading crates/heliosd/Cargo.toml")?;
     manifest
         .lines()
-        .skip_while(|line| line.trim() != "[workspace.package]")
+        .take_while(|line| {
+            let line = line.trim();
+            !line.starts_with('[') || line == "[package]"
+        })
         .find_map(|line| line.trim().strip_prefix("version = "))
         .map(|value| value.trim().trim_matches('"').to_string())
-        .context("version missing from [workspace.package]")
+        .context("version missing from crates/heliosd/Cargo.toml [package]")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -593,13 +605,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_version_comes_from_the_workspace() {
+    fn the_version_is_the_daemon_s_own() {
         let root = workspace_root().expect("root");
-        let version = workspace_version(&root).expect("version");
+        let version = release_version(&root).expect("version");
         assert!(
             version.split('.').count() == 3,
             "unexpected version: {version}"
         );
+
+        // The label and the readiness marker must be the same number. The
+        // marker is `heliosd`'s `CARGO_PKG_VERSION`, so reading anything but
+        // that crate's `[package] version` re-opens the mismatch that makes
+        // every update time out on its own health check.
+        let daemon = std::fs::read_to_string(root.join("crates/heliosd/Cargo.toml"))
+            .expect("heliosd manifest");
+        let declared = daemon
+            .lines()
+            .take_while(|line| {
+                let line = line.trim();
+                !line.starts_with('[') || line == "[package]"
+            })
+            .find_map(|line| line.trim().strip_prefix("version = "))
+            .map(|value| value.trim().trim_matches('"'))
+            .expect("heliosd version");
+        assert_eq!(version, declared);
     }
 
     /// The target is read from `rustc`, never from a constant: a bundle
@@ -796,6 +825,42 @@ mod tests {
 
         assert!(unit.contains("ExecStart=/opt/helios/current/heliosd tpm expire-window"));
         assert!(!unit.contains("/opt/helios/current/bin/heliosd"));
+    }
+
+    /// The readiness handshake between the installer and the daemon runs
+    /// through `/run/helios`. Under `ProtectSystem=strict` a `ReadWritePaths`
+    /// entry whose directory does not yet exist is dropped without a word, so
+    /// the directory each unit needs is declared as its own runtime directory,
+    /// preserved across the restart the installer performs.
+    #[test]
+    fn the_readiness_directory_survives_the_update_restart() {
+        let root = workspace_root().expect("root");
+        let installer = std::fs::read_to_string(root.join("deploy/systemd/helios-update.service"))
+            .expect("update service");
+        let daemon =
+            std::fs::read_to_string(root.join("deploy/systemd/heliosd.service")).expect("daemon");
+
+        for (unit, text) in [
+            ("helios-update.service", &installer),
+            ("heliosd.service", &daemon),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.trim() == "RuntimeDirectory=helios"),
+                "{unit} must declare RuntimeDirectory=helios"
+            );
+            assert!(
+                text.lines()
+                    .any(|line| line.trim() == "RuntimeDirectoryPreserve=yes"),
+                "{unit} must preserve /run/helios across restarts"
+            );
+        }
+        assert!(
+            !installer
+                .lines()
+                .any(|line| line.starts_with("ReadWritePaths=") && line.contains("/run/helios")),
+            "/run/helios must come from RuntimeDirectory, not from a ReadWritePaths entry              that is ignored when the directory is absent"
+        );
     }
 
     #[test]

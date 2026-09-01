@@ -703,6 +703,31 @@ sont pas observables ailleurs.
 | tunnel Meshnet sain mais services et routage incomplets | Helios n'ouvrait que SSH en entrée et ne produisait aucune règle `forward`. TCP 49111 couvre désormais Nord Fileshare ; les listes `traffic_routing_peer_cidrs` et `local_network_peer_cidrs`, relues depuis les ensembles de permissions NordVPN au déploiement, bornent le routage pair par pair |
 | arrêt de `heliosd` figé après le retrait de `helios0` | le serveur brut de mesure attendait indéfiniment dans un `spawn_blocking`; Tokio attend les tâches bloquantes à la destruction du runtime, donc systemd finissait par tuer le démon après son délai. Les sockets TCP/UDP observent désormais un signal d'arrêt testé |
 
+### Boucle de mise à jour sur gateway en service (1er septembre 2026)
+
+Une activation poussée depuis la console d'administration a laissé la gateway
+en redémarrage toutes les 30 s pendant une heure. Trois défauts indépendants,
+dont deux que le premier masquait.
+
+| Défaut | Effet |
+| --- | --- |
+| `/run/helios` absent du bac à sable de `helios-update.service` | `ReadWritePaths` ne monte rien pour un répertoire qui n'existe pas au montage, **sans le dire**, et `ProtectSystem=strict` laisse alors `/run` en lecture seule. Le répertoire appartient au démon, qui le détruit à chaque arrêt — dont celui que l'installateur déclenche lui-même. Le retrait du marqueur échouait en `EROFS`, et l'erreur du rollback masquait celle d'origine. Les deux unités déclarent désormais `RuntimeDirectory=helios` et `RuntimeDirectoryPreserve=yes` |
+| activation non consommée quand le rollback échoue | `helios-update.path` redéclenche sur la seule existence de `activate.json` : une mise à jour ratée redémarrait la gateway indéfiniment. L'activation est maintenant consommée **avant** la tentative de restauration, et l'erreur d'origine n'est plus effacée par celle du rollback |
+| release étiquetée avec la version du workspace | `xtask pack` lisait `[workspace.package] version` (`0.1.0`) alors que le marqueur de disponibilité porte celle du crate `heliosd` (`1.12.0`) : le contrôle de santé comparait deux numéros différents pour la même release et ne pouvait jamais aboutir. L'étiquette vient désormais de `crates/heliosd/Cargo.toml`, avec test de non-régression |
+
+Vérification cible, après déploiement des unités corrigées :
+
+```sh
+sudo systemd-run -q --wait --pipe --collect --service-type=oneshot \
+    -p ProtectSystem=strict -p RuntimeDirectory=helios \
+    -p RuntimeDirectoryPreserve=yes \
+    /bin/sh -c 'touch /run/helios/.probe && rm /run/helios/.probe && echo RW-OK'
+# attendu : RW-OK
+```
+
+Un `Read-only file system` signifie que l'unité installée est antérieure au
+correctif : le bac à sable est le seul endroit où l'écart se voit.
+
 Vérification cible du second, après déploiement :
 
 ```sh
