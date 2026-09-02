@@ -277,7 +277,23 @@ function emit_missing(    i, key) {
     emitted = 1
 }
 
-/^[[:space:]]*\[\[peers\]\][[:space:]]*$/ {
+# Tout en-tete de table, pas seulement `[[peers]]`.
+#
+# En TOML, une cle ecrite apres `[nordvpn_meshnet]` appartient a cette table et
+# non a la racine. Emettre les cles manquantes au seul `[[peers]]` les placait
+# donc **dans** la table qui precede : `admin_ifaces` est devenu
+# `nordvpn_meshnet.admin_ifaces`, champ inconnu, ignore en silence. Le fichier
+# restait du TOML valide, heliosd demarrait sans rien dire, et le pare-feu
+# nouvrait aucune des interfaces annoncees.
+#
+# `seen[nom]` est marque ici parce quun en-tete **definit** cette cle : sans
+# cela, emit_missing ecrirait en plus une version inline juste avant la table,
+# et deux definitions de la meme cle racine ne sont pas du TOML valide.
+/^[[:space:]]*\[/ {
+    header = $0
+    sub(/^[[:space:]]*\[+[[:space:]]*/, "", header)
+    sub(/[[:space:]]*\]+[[:space:]]*$/, "", header)
+    seen[header] = 1
     emit_missing()
     in_peers = 1
     print
