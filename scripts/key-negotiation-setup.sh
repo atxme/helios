@@ -543,6 +543,48 @@ VIP="$(grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$SORTIE/peer-add.log" | he
 }
 echo "    VIP : $VIP"
 
+# ── 6 bis. Bloc de confiance §19 ─────────────────────────────────────────────
+#
+# Une gateway qui porte un domaine sert une feuille PQ émise sous `CA-PQ`, et
+# l'ancre qui la vérifie n'existe nulle part ailleurs que dans ce bloc : ni
+# dans la feuille, qui ne nomme son émetteur que par son nom, ni dans les deux
+# certificats publics rapatriés plus haut. Sans lui, `enroll` refuse la feuille
+# — et il a raison de la refuser, puisqu'il n'aurait rien pour la vérifier.
+#
+# Il se demande après l'admission, jamais avant : la génération qu'il porte est
+# celle de CE pair, et elle n'existe pas tant qu'il n'est pas admis. Sur une
+# gateway sans domaine la commande ne rend rien, et le profil s'en passe comme
+# avant — la négociation ne dépend pas d'une autorité.
+TRUST="$SORTIE/trust-enrolment.json"
+BRUT="$SORTIE/trust-enrolment.raw"
+ARG_TRUST=""
+rm -f "$TRUST" "$BRUT"
+# Réessayé, parce que `peer add` le dit lui-même : un heliosd en marche détient
+# le registre en mémoire et l'écrit sur ses propres mutations, « within
+# seconds ». Interroger dans la foulée de l'admission tombe donc régulièrement
+# avant que le pair y soit, et un profil sans bloc de confiance est refusé à
+# l'assemblage — pour une raison qui n'a rien à voir avec la gateway.
+for _essai in 1 2 3 4 5 6; do
+    if helios_ssh_sudo_capture "$CIBLE" \
+            "\"$HELIOSD\" show-trust-enrolment --public-key '$PUBLIC_KEY'" \
+            > "$BRUT" 2>/dev/null; then
+        # Le binaire journalise sur la même sortie que son document : ne garder
+        # que le JSON, à partir de sa première accolade.
+        sed -n '/^{/,$p' "$BRUT" > "$TRUST"
+        [ -s "$TRUST" ] && break
+    fi
+    rm -f "$TRUST"
+    sleep 3
+done
+rm -f "$BRUT"
+if [ -s "$TRUST" ]; then
+    ARG_TRUST="--trust-material $TRUST"
+    echo "    bloc de confiance récupéré"
+else
+    rm -f "$TRUST"
+    echo "    aucun domaine de confiance sur cette gateway — profil sans renouvellement"
+fi
+
 # ── 7. Assemblage du profil Orion ────────────────────────────────────────────
 PROFIL="$SORTIE/$NOM.orion"
 rm -f "$PROFIL"
@@ -558,7 +600,7 @@ cargo run --quiet -p helios-ctl -- enroll \
     --address "$VIP" \
     --public-key "$PUBLIC_KEY" \
     --client-pki-dir "$SORTIE/client-pki" \
-    --output "$PROFIL" $ARG_CLE_PRIVEE
+    --output "$PROFIL" $ARG_CLE_PRIVEE $ARG_TRUST
 
 # Les secrets intermédiaires sont désormais dans le document : les laisser en
 # clair à côté multiplierait les copies de la même chose.
