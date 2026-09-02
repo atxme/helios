@@ -61,6 +61,10 @@ enum Command {
         /// absent.
         #[arg(long)]
         dev: bool,
+        /// Unsafe maintenance mode: real WireGuard/TPM, but remove and keep
+        /// absent only the Helios nftables table. Never selected implicitly.
+        #[arg(long, conflicts_with = "dev")]
+        unsafe_disable_firewall: bool,
     },
     /// Displays the resolved configuration and system state.
     Status,
@@ -452,10 +456,18 @@ async fn main() -> anyhow::Result<()> {
     info!(%drbg, "randomness provider");
 
     match cli.command {
-        Command::Run { dev } => {
+        Command::Run {
+            dev,
+            unsafe_disable_firewall,
+        } => {
             let network = NetworkConfig::load().context("loading the network config")?;
             let dry_run = resolve_dry_run(dev);
-            run(network, dry_run).await
+            let firewall_mode = if unsafe_disable_firewall {
+                orchestrator::FirewallMode::DisabledForMaintenance
+            } else {
+                orchestrator::FirewallMode::Enforced
+            };
+            run(network, dry_run, firewall_mode).await
         }
         Command::Status => {
             let mut network = NetworkConfig::load().context("loading the network config")?;
@@ -1512,7 +1524,11 @@ fn forbid_core_dumps(_dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
+async fn run(
+    mut network: NetworkConfig,
+    dry_run: bool,
+    firewall_mode: orchestrator::FirewallMode,
+) -> anyhow::Result<()> {
     // Before the TPM unseal below, which is where the first key appears.
     forbid_core_dumps(dry_run)?;
 
@@ -1852,6 +1868,7 @@ async fn run(mut network: NetworkConfig, dry_run: bool) -> anyhow::Result<()> {
     let result = orchestrator::run(
         shared_network,
         dry_run,
+        firewall_mode,
         tunnel_state,
         event_tx,
         cmd_rx,
@@ -1877,8 +1894,23 @@ mod tests {
             Cli::try_parse_from(["heliosd", "run", "--dev"])
                 .unwrap()
                 .command,
-            Command::Run { dev: true }
+            Command::Run {
+                dev: true,
+                unsafe_disable_firewall: false
+            }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["heliosd", "run", "--unsafe-disable-firewall"])
+                .unwrap()
+                .command,
+            Command::Run {
+                dev: false,
+                unsafe_disable_firewall: true
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["heliosd", "run", "--dev", "--unsafe-disable-firewall"]).is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["heliosd", "status"]).unwrap().command,
             Command::Status

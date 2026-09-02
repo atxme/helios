@@ -1,17 +1,21 @@
 //! Firewall data plane: the **kill-switch**.
 //!
 //! The rendering engine ([`ruleset`]) translates a [`FirewallPolicy`] + a
-//! [`TunnelState`] into a declarative ruleset, independent of the backend. Two
+//! [`TunnelState`] into a declarative ruleset, independent of the backend. Three
 //! backends consume this ruleset:
 //!
 //! * [`DryRunBackend`] — logs the rules without touching the kernel. Default
 //!   backend, usable everywhere (including WSL2).
 //! * `NetlinkBackend` (feature `netlink`) — applies the rules atomically via
 //!   nf_tables' Netlink API (`rustables` crate). Target-only.
+//! * `FirewallDisabledBackend` (feature `netlink`) — explicit maintenance
+//!   backend which atomically removes only the Helios table and keeps it
+//!   absent. It is never selected implicitly.
 //!
-//! Guiding principle: **fail-closed**. At startup, before any network access,
-//! the kill-switch is engaged; LAN traffic is only opened once the state
-//! transitions to `Up`.
+//! Guiding principle in nominal operation: **fail-closed**. At startup, before
+//! any network access, the kill-switch is engaged; LAN traffic is only opened
+//! once the state transitions to `Up`. The maintenance backend is the explicit
+//! operator exception documented in ADR-001 §3 ter.
 
 pub mod ruleset;
 
@@ -23,7 +27,7 @@ pub use dryrun::DryRunBackend;
 pub use ruleset::{render, Ruleset, Verdict};
 
 #[cfg(feature = "netlink")]
-pub use netlink::NetlinkBackend;
+pub use netlink::{FirewallDisabledBackend, NetlinkBackend};
 
 use aether::{FirewallPolicy, Result, TunnelState};
 use async_trait::async_trait;

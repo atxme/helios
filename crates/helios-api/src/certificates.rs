@@ -703,6 +703,26 @@ impl From<TrustUpdateRefusal> for StatusCode {
     }
 }
 
+/// The field name a `deny_unknown_fields` refusal names, if that is what failed.
+///
+/// Serde reports a field this binary does not know exactly like a malformed
+/// body, and the two call for opposite actions: one is a broken client, the
+/// other a gateway due an upgrade. Only the field **name** is lifted out — the
+/// rest of the error quotes the payload, which carries certificate material
+/// that has no business in a log line.
+fn unknown_field(error: &serde_json::Error) -> Option<String> {
+    let rendered = error.to_string();
+    let rest = rendered.strip_prefix("unknown field `")?;
+    let (field, _) = rest.split_once('`')?;
+    // A name is an identifier here; anything else means the shape moved and
+    // this heuristic no longer holds, so it declines rather than guessing.
+    field
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then(|| field.to_string())
+        .filter(|field| !field.is_empty())
+}
+
 /// `POST /api/key-negotiation/trust-update`, inside the tunnel.
 pub async fn trust_update(
     State(s): State<AppState>,
@@ -725,7 +745,26 @@ pub async fn trust_update(
     let request: AuthenticatedTrustUpdateRequest = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
-            tracing::warn!(peer = %caller_key, %error, "trust update refused: unreadable body");
+            match unknown_field(&error) {
+                // `deny_unknown_fields` is what a client newer than this
+                // gateway runs into: it sends a field added after this binary
+                // was built, and serde reports it as a parse error like any
+                // other. Said plainly, that is a version skew, and it is worth
+                // naming — the raw serde dump reads as a malformed request, so
+                // the one action that fixes it (upgrade the gateway) is the one
+                // nobody takes. It silently cost eleven days of failed renewals
+                // between 2026-08-21 and 2026-09-01.
+                Some(field) => tracing::warn!(
+                    peer = %caller_key,
+                    unknown_field = %field,
+                    "trust update refused: this client sent a field this gateway does not know. \
+                     The client is NEWER than this gateway — upgrade heliosd. Renewals keep \
+                     failing until then."
+                ),
+                None => {
+                    tracing::warn!(peer = %caller_key, %error, "trust update refused: unreadable body")
+                }
+            }
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -965,6 +1004,49 @@ mod tests {
     use aether::{NetworkConfig, TunnelState};
     use axum::body::to_bytes;
     use std::sync::{Arc, Mutex};
+
+    /// A version skew must be told apart from a malformed body.
+    ///
+    /// The two read the same in a serde error and call for opposite actions:
+    /// upgrade the gateway, or distrust the client. Between 2026-08-21 and
+    /// 2026-09-01 a gateway older than its client refused every renewal while
+    /// logging only serde's raw dump, and the field it named was the one clue
+    /// that the daemon — not the request — was the stale half.
+    #[test]
+    fn an_unknown_field_is_named_and_a_malformed_body_is_not() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Known {
+            #[allow(dead_code)]
+            protocol_version: u16,
+        }
+
+        let skew = serde_json::from_str::<Known>(
+            r#"{"protocol_version":5,"base_state_fingerprint":"abc"}"#,
+        )
+        .expect_err("an unknown field must not deserialize");
+        assert_eq!(
+            unknown_field(&skew).as_deref(),
+            Some("base_state_fingerprint"),
+            "the field that dates the gateway has to reach the log line"
+        );
+
+        // Everything else stays on the generic path: calling a truncated body
+        // a version skew would send the operator upgrading the wrong side.
+        for malformed in [
+            r#"{"protocol_version":"#,
+            r#"{"protocol_version":"five"}"#,
+            "[",
+        ] {
+            let error = serde_json::from_str::<Known>(malformed)
+                .expect_err("malformed input must not deserialize");
+            assert_eq!(
+                unknown_field(&error),
+                None,
+                "`{malformed}` is malformed, not a newer client"
+            );
+        }
+    }
     use tokio::sync::{broadcast, mpsc, RwLock};
 
     const CLIENT_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

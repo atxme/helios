@@ -793,6 +793,35 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         ));
     }
 
+    // ── Out-of-band administration overlays, regardless of tunnel state ──────
+    //
+    // The operator's way back in when Helios itself is down, so it is rendered
+    // in every state — `Down` and `Connecting` included, which is the whole
+    // point: those are the states a broken tunnel leaves the gateway in.
+    //
+    // Scoped by interface, never by address, for the reason on the tunnel
+    // openings above — and for a second one specific to overlays. Tailscale
+    // and NordVPN each carry several addresses (v4 and v6), reassigned
+    // without notice. An address list stops matching the day the address
+    // moves, which is the day the recovery path is needed; `iifname` covers
+    // every address the interface will ever hold.
+    for iface in &policy.admin_ifaces {
+        rules.push(
+            Rule::new(
+                Input,
+                vec![
+                    Match::InIface(iface.clone()),
+                    Match::DestPort {
+                        port: 22,
+                        proto: L4::Tcp,
+                    },
+                ],
+                Verdict::Accept,
+            )
+            .with_note("out-of-band administration SSH: survives a tunnel that cannot come up"),
+        );
+    }
+
     if state.captive_portal_active() {
         // Captive portal: the kill-switch is lifted for HTTP/HTTPS only.
         let ports = Match::DestPortSet {
@@ -926,6 +955,7 @@ mod tests {
             key_negotiation_port: Some(51821),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: vec![],
+            admin_ifaces: vec![],
             allow_dhcp_on_wan: false,
             allow_client_internet: false,
             allow_tunnel_icmp: false,
@@ -1396,6 +1426,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The way back in when the tunnel is the thing that is broken.
+    ///
+    /// The incident this encodes: a deployment ran *through* the Helios
+    /// tunnel, read its own source address — a peer VIP — and pinned SSH to
+    /// it via `allow_ssh_from`. Restarting `heliosd` dropped the tunnel, the
+    /// rule stopped matching, and the only permitted SSH source no longer
+    /// existed. `admin_ifaces` has to hold in exactly the states that
+    /// followed, which is why `Down` and `Connecting` are asserted here and
+    /// not just `Up`.
+    #[test]
+    fn admin_ifaces_open_ssh_in_every_state_scoped_to_their_interface() {
+        let mut p = policy();
+        p.admin_ifaces = vec!["tailscale0".into(), "nordlynx".into()];
+
+        for state in [TunnelState::Down, TunnelState::Connecting, TunnelState::Up] {
+            let input = text(&render(&p, state), ChainKind::Input);
+            for iface in ["tailscale0", "nordlynx"] {
+                assert!(
+                    input
+                        .iter()
+                        .any(|r| r == &format!("iifname \"{iface}\" tcp dport 22 accept")),
+                    "{state:?}: {iface} must keep administrative SSH open"
+                );
+            }
+        }
+
+        // Never by address: an overlay carries several, and they move. The
+        // interface match is what covers v4 and v6 at once, today and after
+        // the next reassignment.
+        for rule in render(&p, TunnelState::Down).chain(ChainKind::Input) {
+            if rule.verdict == Verdict::Accept
+                && rule.matches.contains(&Match::DestPort {
+                    port: 22,
+                    proto: L4::Tcp,
+                })
+            {
+                assert!(
+                    rule.matches
+                        .iter()
+                        .any(|m| matches!(m, Match::InIface(_) | Match::SourceNet(_))),
+                    "`{rule}` opens SSH with neither an interface nor a source scope"
+                );
+            }
+        }
+    }
+
+    /// An empty list renders nothing at all — the default stays fail-closed.
+    #[test]
+    fn no_admin_iface_opens_no_ssh() {
+        let input = text(&render(&policy(), TunnelState::Down), ChainKind::Input);
+        assert!(
+            !input.iter().any(|r| r.contains("tcp dport 22")),
+            "SSH must stay closed when nothing declares an administration path"
+        );
     }
 
     /// A gateway that cannot bring up its interface must open neither.

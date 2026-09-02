@@ -116,7 +116,31 @@ admin_iface = "helios0"
 # escrow_public_key = "<clé publique X25519 de l'opérateur, base64>"
 
 # Optionnel : SSH d'administration autorisé même kill-switch engagé.
+#
+# Filtre sur l'adresse source seule, sans contrainte d'interface. Une adresse
+# que la gateway n'atteint qu'à travers un de ses propres overlays n'a donc
+# rien à faire ici : la règle ne tient que tant que l'overlay tient. Helios
+# refuse désormais toute entrée située dans le réseau du tunnel.
 # allow_ssh_from = ["10.0.0.0/8"]
+
+# ── Accès d'administration hors-bande ────────────────────────────────────────
+# Interfaces sur lesquelles SSH reste ouvert quel que soit l'état du tunnel :
+# le chemin de retour quand c'est Helios lui-même qui est tombé.
+#
+# Filtré par interface et non par adresse, pour deux raisons. La sécurité
+# d'abord : seul le démon de l'overlay pose des paquets sur son interface, et
+# seulement après avoir authentifié le pair — un `iifname` n'est pas
+# satisfaisable par une source falsifiée depuis le WAN, contrairement à une
+# entrée de `allow_ssh_from`. L'exploitation ensuite : un overlay n'a pas *une*
+# adresse. Tailscale en porte une v4 et une v6, celle de NordVPN suit le
+# serveur choisi, et les deux peuvent être réattribuées sans préavis. Les
+# énumérer ici voudrait dire que le chemin de secours cesse de correspondre le
+# jour où l'adresse bouge — c'est-à-dire le jour où on en a besoin. Une règle
+# par interface couvre toutes les adresses qu'elle portera, v4 comme v6.
+#
+# Ne doit jamais nommer l'interface Helios (c'est `allow_ssh_over_tunnel`) ni
+# une interface WAN : Helios refuse les deux.
+# admin_ifaces = ["tailscale0", "nordlynx"]
 
 # ── Adresse du WAN obtenue par bail DHCP ─────────────────────────────────────
 # Le kill-switch n'ouvre pas DHCP par défaut : une gateway a normalement une

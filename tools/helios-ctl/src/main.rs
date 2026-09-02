@@ -403,6 +403,8 @@ struct Status {
     lan_ifaces: Vec<String>,
     wg_peers: Vec<String>,
     allow_ssh_from: Vec<String>,
+    #[serde(default)]
+    admin_ifaces: Vec<String>,
     peers: Vec<PeerSummary>,
     wg_iface: String,
     wg_listen_port: Option<u16>,
@@ -534,6 +536,9 @@ async fn cmd_status(client: &Client, base: &str) -> Result<()> {
     if !s.allow_ssh_from.is_empty() {
         println!("  {:<14} {}", "SSH allowed", s.allow_ssh_from.join(", "));
     }
+    if !s.admin_ifaces.is_empty() {
+        println!("  {:<14} {}", "Admin access", s.admin_ifaces.join(", "));
+    }
     if !s.split_tunnel_cidrs.is_empty() {
         println!(
             "  {:<14} {}",
@@ -625,6 +630,9 @@ async fn cmd_network_show(client: &Client, base: &str) -> Result<()> {
             "SSH allowed from",
             cfg.allow_ssh_from.join(", ")
         );
+    }
+    if !cfg.admin_ifaces.is_empty() {
+        println!("  {:<16} {}", "Admin ifaces", cfg.admin_ifaces.join(", "));
     }
     if let Some(ref iface) = cfg.admin_iface {
         println!("  {:<16} {}", "Admin iface", iface);

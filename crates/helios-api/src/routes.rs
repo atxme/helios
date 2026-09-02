@@ -22,6 +22,9 @@ pub struct StatusResponse {
     pub lan_ifaces: Vec<String>,
     pub wg_peers: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Out-of-band administration interfaces, so an operator can see the way
+    /// back in without reading `network.toml` on the gateway.
+    pub admin_ifaces: Vec<String>,
     pub peers: Vec<PeerSummary>,
     pub wg_iface: String,
     pub wg_listen_port: Option<u16>,
@@ -119,6 +122,12 @@ pub struct NetworkConfigView {
     pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Exposed for the same reason as [`Self::allow_dhcp_on_wan`], and the
+    /// cost of omitting it is higher: a view that dropped it would erase the
+    /// out-of-band administration path on the first config reload from the
+    /// UI, and the gateway would become unreachable at the next restart of
+    /// `heliosd` — precisely the failure this field exists to prevent.
+    pub admin_ifaces: Vec<String>,
     /// Deliberately exposed: it isn't a secret, and a view that omitted it
     /// would drop the field back to `false` on the first config reload from
     /// the UI — the gateway would lose its lease hours later, with nothing
@@ -163,6 +172,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             wan_ifaces: config.wan_ifaces.clone(),
             lan_ifaces: config.lan_ifaces.clone(),
             allow_ssh_from: config.allow_ssh_from.clone(),
+            admin_ifaces: config.admin_ifaces.clone(),
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
             allow_client_internet: config.allow_client_internet,
             admin_iface: config.admin_iface.clone(),
@@ -315,6 +325,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         lan_ifaces: network.lan_ifaces.clone(),
         wg_peers: network.wg_peers(),
         allow_ssh_from: network.allow_ssh_from.clone(),
+        admin_ifaces: network.admin_ifaces.clone(),
         peers,
         wg_iface: network.wg_iface.clone(),
         wg_listen_port: policy.wg_listen_port,

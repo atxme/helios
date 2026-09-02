@@ -864,6 +864,39 @@ mod tests {
     }
 
     #[test]
+    fn firewall_maintenance_is_explicit_persistent_and_verified_on_target() {
+        let root = workspace_root().expect("root");
+        let deploy = std::fs::read_to_string(root.join("scripts/deploy.sh"))
+            .expect("gateway deployment script");
+        let bootstrap = std::fs::read_to_string(root.join("scripts/target-bootstrap.sh"))
+            .expect("target bootstrap script");
+        let unit = std::fs::read_to_string(root.join("deploy/systemd/heliosd.service"))
+            .expect("daemon service");
+
+        for required in ["--sans-firewall", "--avec-firewall", "ASTRA=0"] {
+            assert!(
+                deploy.contains(required),
+                "deployment maintenance contract is missing `{required}`"
+            );
+        }
+        for required in [
+            "firewall-maintenance.conf",
+            "run --unsafe-disable-firewall",
+            "firewall_enforced=false",
+            "nft list table inet helios",
+        ] {
+            assert!(
+                bootstrap.contains(required),
+                "target maintenance verification is missing `{required}`"
+            );
+        }
+        assert!(
+            !unit.contains("--unsafe-disable-firewall"),
+            "maintenance must never become the signed service's default"
+        );
+    }
+
+    #[test]
     fn wireguard_nt_is_pinned_and_stays_out_of_git() {
         assert!(orion_deps::WIREGUARD_NT_URL.starts_with("https://download.wireguard.com/"));
         assert_eq!(orion_deps::WIREGUARD_NT_SHA256.len(), 64);

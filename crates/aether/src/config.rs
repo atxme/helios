@@ -93,8 +93,21 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub lan_ifaces: Vec<String>,
     /// CIDRs or IPs allowed for administrative SSH, even with the kill-switch engaged.
+    ///
+    /// Matches the source address only. For an address the gateway reaches
+    /// through one of its own overlays, use [`Self::admin_ifaces`] instead:
+    /// see [`crate::FirewallPolicy::admin_ifaces`] for why an address list is
+    /// the wrong shape for a recovery path.
     #[serde(default)]
     pub allow_ssh_from: Vec<String>,
+    /// Out-of-band administration interfaces (`tailscale0`, `nordlynx`, …).
+    ///
+    /// SSH is accepted on them whatever the tunnel state, so they stay usable
+    /// when Helios itself is down. One entry covers every address the
+    /// interface carries, v4 and v6 — see
+    /// [`crate::FirewallPolicy::admin_ifaces`].
+    #[serde(default, alias = "admin_iface_extra")]
+    pub admin_ifaces: Vec<String>,
     /// Allows DHCP (UDP 67/68) on the WAN interface, kill-switch engaged.
     ///
     /// Enable when the WAN address comes from a lease. See
@@ -549,6 +562,47 @@ impl NetworkConfig {
                     .into(),
             ));
         }
+        for iface in &self.admin_ifaces {
+            let iface = iface.trim();
+            if iface.is_empty() {
+                return Err(HeliosError::Config(
+                    "admin_ifaces: an empty interface name matches nothing, and an administration \
+                     opening that matches nothing is a lockout waiting for the next restart"
+                        .into(),
+                ));
+            }
+            if iface == self.wg_iface.trim() {
+                return Err(HeliosError::Config(format!(
+                    "admin_ifaces: {iface} is the Helios tunnel interface — SSH through the \
+                     tunnel is allow_ssh_over_tunnel, which is opted into deliberately"
+                )));
+            }
+            if self.wan_ifaces.iter().any(|wan| wan.trim() == iface) {
+                return Err(HeliosError::Config(format!(
+                    "admin_ifaces: {iface} is a WAN interface — that would expose SSH to the \
+                     Internet, not to an out-of-band overlay"
+                )));
+            }
+        }
+        // The lockout this catches: a deployment run *through* the Helios
+        // tunnel reads its own source address — a peer VIP — and pins SSH to
+        // it. The rule then survives only as long as the tunnel does, so the
+        // next restart of `heliosd` takes remote access down with it, and the
+        // one interface that could let the operator back in is the one that
+        // just went away. `admin_ifaces` is the shape that survives.
+        if self.wireguard_ready() {
+            for source in &self.allow_ssh_from {
+                if Self::cidr_contains(&self.wg_address, source) {
+                    return Err(HeliosError::Config(format!(
+                        "allow_ssh_from: {source} is inside the Helios tunnel network {} — it \
+                         only matches while the tunnel is up, so it cannot be the way back in \
+                         when it is down. Use allow_ssh_over_tunnel for access through the \
+                         tunnel, or admin_ifaces for an out-of-band overlay.",
+                        self.wg_address
+                    )));
+                }
+            }
+        }
         if let Some(port) = self.key_negotiation_port {
             if port == 0 {
                 return Err(HeliosError::Config(
@@ -669,6 +723,81 @@ impl NetworkConfig {
         !self.wg_private_key.trim().is_empty() && !self.wg_address.trim().is_empty()
     }
 
+    /// Out-of-band administration interfaces, trimmed and deduplicated.
+    ///
+    /// An entry naming the Helios interface is dropped rather than rendered:
+    /// that opening is `allow_ssh_over_tunnel`, and letting it in here would
+    /// turn an opt-in flag into something a typo can switch on.
+    /// [`Self::validate`] refuses the overlap outright, so this only guards
+    /// the paths that build a policy without validating first.
+    pub fn admin_ifaces(&self) -> Vec<String> {
+        let mut resolved: Vec<String> = Vec::new();
+        for iface in &self.admin_ifaces {
+            let iface = iface.trim();
+            if iface.is_empty() || iface == self.wg_iface.trim() {
+                continue;
+            }
+            if !resolved.iter().any(|kept| kept == iface) {
+                resolved.push(iface.to_string());
+            }
+        }
+        resolved
+    }
+
+    /// Is `candidate` an address or CIDR contained in `network`?
+    ///
+    /// Both sides are `addr/len`, a bare address counting as a full-length
+    /// prefix. Anything unparseable answers `false`: this backs a refusal,
+    /// and refusing a configuration nobody can interpret is not this
+    /// function's call to make.
+    fn cidr_contains(network: &str, candidate: &str) -> bool {
+        fn parse(text: &str) -> Option<(std::net::IpAddr, u8)> {
+            let text = text.trim();
+            let (addr, len) = match text.split_once('/') {
+                Some((addr, len)) => (addr, Some(len)),
+                None => (text, None),
+            };
+            let addr: std::net::IpAddr = addr.trim().parse().ok()?;
+            let full = if addr.is_ipv4() { 32 } else { 128 };
+            let len = match len {
+                Some(len) => len.trim().parse::<u8>().ok()?,
+                None => full,
+            };
+            (len <= full).then_some((addr, len))
+        }
+        fn octets(addr: std::net::IpAddr) -> Vec<u8> {
+            match addr {
+                std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+            }
+        }
+
+        let (Some((net_addr, net_len)), Some((cand_addr, cand_len))) =
+            (parse(network), parse(candidate))
+        else {
+            return false;
+        };
+        if net_addr.is_ipv4() != cand_addr.is_ipv4() {
+            return false;
+        }
+        // A candidate wider than the network cannot be inside it, and a
+        // *wider* candidate is the dangerous direction: `0.0.0.0/0` must not
+        // pass as « not in the tunnel range » on a technicality.
+        if cand_len < net_len {
+            return false;
+        }
+        let (net, cand) = (octets(net_addr), octets(cand_addr));
+        let (whole, spare) = (net_len as usize / 8, net_len as usize % 8);
+        if net[..whole] != cand[..whole] {
+            return false;
+        }
+        if spare == 0 {
+            return true;
+        }
+        let mask = 0xffu8 << (8 - spare);
+        net[whole] & mask == cand[whole] & mask
+    }
+
     /// Listen address of the HTTP server.
     ///
     /// **The API must listen on the tunnel address**, not on loopback: that
@@ -754,6 +883,12 @@ impl NetworkConfig {
                 .flatten(),
             mode: PolicyMode::FailClosed,
             allow_ssh_from: self.allow_ssh_from.clone(),
+            // Deliberately ungated by `wireguard_ready()`, unlike the tunnel
+            // openings below: this is the way back in when the tunnel cannot
+            // come up, so gating it on the tunnel would close it exactly when
+            // the operator needs it. `admin_ifaces()` drops any entry naming
+            // the tunnel interface, which is `allow_ssh_over_tunnel`'s job.
+            admin_ifaces: self.admin_ifaces(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
             allow_client_internet: self.allow_client_internet,
             // No `wireguard_ready()` gate: this one is scoped to the WAN, not
@@ -938,6 +1073,94 @@ mod tests {
         assert!(policy.allow_tunnel_icmp);
         assert!(policy.allow_ssh_over_tunnel);
         assert_eq!(policy.iperf_port, Some(5202));
+    }
+
+    /// An out-of-band overlay is not gated on the tunnel it exists to survive.
+    #[test]
+    fn admin_ifaces_do_not_follow_wireguard_readiness() {
+        let toml = r#"
+            wan_iface = "eth0"
+            admin_ifaces = ["tailscale0", "nordlynx"]
+        "#;
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.wireguard_ready());
+        assert_eq!(
+            cfg.firewall_policy().admin_ifaces,
+            vec!["tailscale0".to_string(), "nordlynx".to_string()],
+            "the recovery path must not need the tunnel to be up"
+        );
+    }
+
+    /// The tunnel interface is `allow_ssh_over_tunnel`'s business, not this list's.
+    #[test]
+    fn admin_ifaces_refuse_the_tunnel_and_the_wan() {
+        for (field, value) in [("admin_ifaces", "helios0"), ("admin_ifaces", "eth0")] {
+            let toml = format!(
+                r#"
+                wan_iface = "eth0"
+                {field} = ["{value}"]
+            "#
+            );
+            let cfg: NetworkConfig = toml::from_str(&toml).unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "{value} must not be usable as an out-of-band administration interface"
+            );
+        }
+    }
+
+    /// The exact configuration that locked the gateway out on 2026-09-01.
+    ///
+    /// A deployment running through the tunnel read its own source address —
+    /// the peer VIP `100.89.226.187` — and pinned SSH to it. The rule held
+    /// until `heliosd` restarted, then the tunnel went away and took the only
+    /// permitted SSH source with it.
+    #[test]
+    fn allow_ssh_from_refuses_an_address_inside_the_tunnel() {
+        let toml = r#"
+            wan_iface = "eth0"
+            wg_address = "100.64.0.1/10"
+            wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            allow_ssh_from = ["100.89.226.187/32"]
+        "#;
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("100.89.226.187/32") && error.contains("admin_ifaces"),
+            "the refusal must name the offending source and the way out: {error}"
+        );
+
+        // A LAN source is the shape that legitimately survives a tunnel
+        // outage, and it must keep working.
+        let toml = toml.replace("100.89.226.187/32", "192.168.1.41/32");
+        let cfg: NetworkConfig = toml::from_str(&toml).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "a LAN source is a valid way back in"
+        );
+    }
+
+    /// Containment, both directions, so the refusal cannot be stepped around.
+    #[test]
+    fn cidr_containment_handles_widths_and_families() {
+        assert!(NetworkConfig::cidr_contains(
+            "100.64.0.1/10",
+            "100.89.226.187"
+        ));
+        assert!(NetworkConfig::cidr_contains(
+            "100.64.0.1/10",
+            "100.64.0.0/10"
+        ));
+        assert!(!NetworkConfig::cidr_contains(
+            "100.64.0.1/10",
+            "192.168.1.41"
+        ));
+        // Wider than the network: must not pass as « outside » on a technicality.
+        assert!(!NetworkConfig::cidr_contains("100.64.0.1/10", "0.0.0.0/0"));
+        // Mixed families never contain one another.
+        assert!(!NetworkConfig::cidr_contains("100.64.0.1/10", "fd7a::1"));
+        // Unparseable input backs a refusal, so it answers false.
+        assert!(!NetworkConfig::cidr_contains("100.64.0.1/10", "not-an-ip"));
     }
 
     /// A diagnostic, so it is absent unless asked for by name.

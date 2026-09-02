@@ -38,6 +38,7 @@ CANAL="${HELIOS_DEPLOY_CHANNEL:-production}"
 INSTALLER=1
 ASTRA=1
 ASTRA_ONLY=0
+FIREWALL_MODE=preserve
 SEQUENCE=""
 # Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
@@ -77,7 +78,10 @@ Usage : ./scripts/deploy.sh [hôte-ssh] [options]
   --copie-seule    Copie l'archive sans lancer l'installation privilégiée
   --canal C        testing ou production (défaut : production)
   --sans-astra     Saute le conteneur d'autorité, même si un relais existe
-  --astra    Reprend uniquement l'étape Astra, sans relivrer la gateway
+  --astra           Reprend uniquement l'étape Astra, sans relivrer la gateway
+  --sans-firewall   Mode maintenance persistant : firewall Helios désactivé
+                    après redémarrage et Astra sauté
+  --avec-firewall   Retire explicitement le mode maintenance au redémarrage
 
 Astra (ADR-008) se déploie tout seul dès qu'un relais de domaine existe —
 celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
@@ -101,6 +105,8 @@ while [ $# -gt 0 ]; do
         --copie-seule) INSTALLER=0; shift ;;
         --sans-astra) ASTRA=0; shift ;;
         --astra) ASTRA_ONLY=1; shift ;;
+        --sans-firewall) FIREWALL_MODE=disabled; ASTRA=0; shift ;;
+        --avec-firewall) FIREWALL_MODE=enabled; shift ;;
         --canal) CANAL="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         -*) echo "option inconnue : $1" >&2; usage ;;
@@ -119,6 +125,10 @@ if [ -z "$CIBLE" ]; then
 fi
 if [ "$ASTRA_ONLY" = "1" ] && [ "$ASTRA" = "0" ]; then
     echo "--astra et --sans-astra sont incompatibles" >&2
+    exit 1
+fi
+if [ "$ASTRA_ONLY" = "1" ] && [ "$FIREWALL_MODE" != "preserve" ]; then
+    echo "--astra ne modifie pas le mode firewall ; relivrer la gateway séparément" >&2
     exit 1
 fi
 
@@ -241,7 +251,12 @@ helios_ssh_sudo "$CIBLE" \
 ssh "$CIBLE" "rm -rf ~/$NOM"
 
 echo "==> 6/7  Network, TPM, PKI and Orion identity bootstrap"
-./scripts/target-bootstrap.sh "$CIBLE"
+FIREWALL_ARG=()
+case "$FIREWALL_MODE" in
+    disabled) FIREWALL_ARG=(--disable-firewall) ;;
+    enabled) FIREWALL_ARG=(--enable-firewall) ;;
+esac
+./scripts/target-bootstrap.sh "$CIBLE" "${FIREWALL_ARG[@]}"
 else
     echo "==> Reprise Astra seule sur $CIBLE"
 fi

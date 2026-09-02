@@ -18,6 +18,10 @@ pub struct NetworkConfigView {
     pub wan_ifaces: Vec<String>,
     pub lan_ifaces: Vec<String>,
     pub allow_ssh_from: Vec<String>,
+    /// Out-of-band administration interfaces: the way back in when the tunnel
+    /// is down. Absent on a gateway older than this field.
+    #[serde(default)]
+    pub admin_ifaces: Vec<String>,
     pub admin_iface: Option<String>,
     pub wg_iface: String,
     pub wg_private_key_configured: bool,

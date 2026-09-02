@@ -103,6 +103,21 @@ archivage, copie, vérification d'empreinte et installation privilégiée :
 ./scripts/deploy.sh root@autre-machine    # ponctuellement ailleurs
 ```
 
+Pendant une campagne de maintenance distante où la conservation de l'accès
+prime temporairement sur le kill-switch :
+
+```sh
+./scripts/deploy.sh christophe@100.102.179.177 --sans-firewall
+```
+
+Cette option saute Astra, pose un drop-in systemd persistant aux mises à jour,
+et vérifie après redémarrage que `firewall_enforced=false` et que la table
+`inet helios` est absente. Le retour au comportement nominal est explicite :
+
+```sh
+./scripts/deploy.sh christophe@100.102.179.177 --sans-astra --avec-firewall
+```
+
 L'adresse de la gateway vit dans `scripts/lib-remote.sh`, sur la ligne
 `HELIOS_CIBLE` : c'est le seul endroit à changer quand elle déménage, et
 `provision-client.sh`, `key-negotiation-setup.sh` et `target-bootstrap.sh` la
@@ -393,11 +408,41 @@ Trois résidus que la désinstallation ne retire pas :
   C'est le pilote du client WireGuard officiel : le supprimer casserait une
   installation de WireGuard for Windows présente sur la même machine.
 
+## Garder un chemin de retour : `admin_ifaces`
+
+`allow_ssh_from` filtre sur l'adresse source seule. Une adresse portée par un
+overlay — Tailscale, NordVPN — ne convient donc pas : l'overlay en porte
+plusieurs (v4 et v6), elles se réattribuent, et surtout une adresse que Helios
+lui-même route disparaît avec le tunnel.
+
+Déclarer plutôt les **interfaces** :
+
+```toml
+admin_ifaces = ["tailscale0", "nordlynx"]
+```
+
+SSH y reste ouvert dans tous les états du tunnel, y compris quand `heliosd` est
+en échec de démarrage. Une règle par interface couvre toutes les adresses
+qu'elle portera, aujourd'hui et après la prochaine réattribution.
+
+`target-bootstrap.sh` détecte les interfaces candidates et retient celle par
+laquelle le déploiement arrive ; `HELIOS_ADMIN_IFACES="tailscale0,nordlynx"`
+impose la liste. Un redéploiement qui ne passe pas l'option **préserve** la
+valeur en place : l'accès de secours ne s'efface pas par omission.
+
+Ne jamais déployer *à travers* le tunnel Helios. Le script le refuse désormais,
+parce que c'est ainsi que la gateway s'est verrouillée le 1er septembre 2026 :
+le déploiement a lu sa propre adresse source — un VIP de pair — et a épinglé
+SSH dessus ; le redémarrage de `heliosd` a coupé le tunnel et la seule source
+autorisée avec lui. Attention aux adresses en `100.64.0.0/10` : un overlay tiers
+peut y répondre alors que Helios route cette plage.
+
 ## Si vous perdez l'accès
 
 1. Redémarrer la machine. Le service n'étant pas activé, `heliosd` ne se relance
    pas et les règles nftables disparaissent.
-2. Corriger `allow_ssh_from` dans `/var/lib/helios/network.toml`.
+2. Corriger `allow_ssh_from` — ou ajouter `admin_ifaces` — dans
+   `/var/lib/helios/network.toml`.
 3. Recommencer à l'étape 6.
 
 Si le service avait été activé, il faut une console physique et

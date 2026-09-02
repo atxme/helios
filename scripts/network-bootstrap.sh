@@ -41,6 +41,7 @@ while [ "$#" -gt 0 ]; do
         --key-negotiation-port) KEY_NEGOTIATION_PORT="${2:-}"; shift 2 ;;
         --escrow-public-key) ESCROW_PUBLIC_KEY="${2:-}"; shift 2 ;;
         --dynamic-wan) DYNAMIC_WAN="1"; shift ;;
+        --admin-ifaces) ADMIN_IFACES="${2:-}"; shift 2 ;;
         --meshnet-peer-cidrs) MESHNET_PEER_CIDRS="${2:-}"; shift 2 ;;
         --meshnet-routing-peer-cidrs) MESHNET_ROUTING_PEER_CIDRS="${2:-}"; shift 2 ;;
         --meshnet-local-network-peer-cidrs) MESHNET_LOCAL_NETWORK_PEER_CIDRS="${2:-}"; shift 2 ;;
@@ -101,6 +102,27 @@ for cidr in $(printf '%s' "$MESHNET_LOCAL_NETWORK_PEER_CIDRS" | tr ',' ' '); do
         { echo "Meshnet local-network peer has no routing permission: $cidr" >&2; exit 2; }
 done
 
+# Left empty when the caller names none, and an empty value keeps the key
+# **unmanaged** below. That is deliberate: a redeploy that forgets
+# `--admin-ifaces` must not silently erase the operator's way back in.
+ADMIN_IFACES_TOML=""
+if [ -n "${ADMIN_IFACES:-}" ]; then
+    admin_toml=""
+    old_ifs=$IFS
+    IFS=,
+    for iface in $ADMIN_IFACES; do
+        case "$iface" in
+            ""|*[!A-Za-z0-9_.:-]*) echo "invalid administration interface: $iface" >&2; exit 2 ;;
+        esac
+        if [ -n "$admin_toml" ]; then
+            admin_toml="$admin_toml, "
+        fi
+        admin_toml="$admin_toml\"$iface\""
+    done
+    IFS=$old_ifs
+    ADMIN_IFACES_TOML="[$admin_toml]"
+fi
+
 MESHNET_TOML=""
 MESHNET_ROUTING_TOML="[]"
 MESHNET_LOCAL_NETWORK_TOML="[]"
@@ -133,6 +155,7 @@ awk \
     -v wg_port="$WG_PORT" \
     -v key_port="$KEY_NEGOTIATION_PORT" \
     -v escrow_key="$ESCROW_PUBLIC_KEY" \
+    -v admin_ifaces="$ADMIN_IFACES_TOML" \
     -v dynamic_wan="$DYNAMIC_WAN" \
     -v meshnet_cidrs="$MESHNET_TOML" \
     -v meshnet_routing_cidrs="$MESHNET_ROUTING_TOML" \
@@ -155,11 +178,14 @@ BEGIN {
     order[15] = "allow_tunnel_icmp"
     order[16] = "allow_ssh_over_tunnel"
     order[17] = "allow_gateway_egress"
+    order_count = 17
+    if (admin_ifaces != "") {
+        order_count++
+        order[order_count] = "admin_ifaces"
+    }
     if (meshnet_cidrs != "") {
-        order[18] = "nordvpn_meshnet"
-        order_count = 18
-    } else {
-        order_count = 17
+        order_count++
+        order[order_count] = "nordvpn_meshnet"
     }
 
     managed["wan_iface"] = 1
@@ -179,6 +205,12 @@ BEGIN {
     managed["allow_tunnel_icmp"] = 1
     managed["allow_ssh_over_tunnel"] = 1
     managed["allow_gateway_egress"] = 1
+    # Unmanaged when the caller names none: a redeploy without --admin-ifaces
+    # leaves whatever the operator already relies on in place.
+    if (admin_ifaces != "") {
+        managed["admin_ifaces"] = 1
+        desired["admin_ifaces"] = admin_ifaces
+    }
     if (meshnet_cidrs != "") {
         managed["nordvpn_meshnet"] = 1
     }

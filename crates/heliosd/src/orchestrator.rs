@@ -45,6 +45,22 @@ const WG_PORT: u16 = WG_LISTEN_PORT;
 const HANDSHAKE_STALE_AFTER: Duration =
     Duration::from_secs(helios_wireguard::HANDSHAKE_STALE_AFTER_SECS);
 
+/// Firewall posture selected explicitly for this daemon process.
+///
+/// Maintenance mode still uses the real TPM and WireGuard backends. It only
+/// replaces firewall enforcement, and never results from a backend failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirewallMode {
+    Enforced,
+    DisabledForMaintenance,
+}
+
+impl FirewallMode {
+    fn enforced(self) -> bool {
+        self == Self::Enforced
+    }
+}
+
 /// Selects the WireGuard data plane. Like for the firewall: dry-run by
 /// default, real kernel backend behind the `wireguard` feature.
 fn wireguard_backend(dry_run: bool, ifname: &str) -> anyhow::Result<Box<dyn WireguardBackend>> {
@@ -88,9 +104,25 @@ fn wg_config(network: &NetworkConfig) -> (InterfaceConfig, Vec<PeerConfig>) {
     (iface, peers)
 }
 
-fn firewall_backend(dry_run: bool) -> anyhow::Result<Box<dyn FirewallBackend>> {
+fn firewall_backend(
+    dry_run: bool,
+    firewall_mode: FirewallMode,
+) -> anyhow::Result<Box<dyn FirewallBackend>> {
     if dry_run {
         return Ok(Box::new(DryRunBackend));
+    }
+    if firewall_mode == FirewallMode::DisabledForMaintenance {
+        #[cfg(feature = "netlink")]
+        {
+            return Ok(Box::new(helios_firewall::FirewallDisabledBackend::new()));
+        }
+        #[cfg(not(feature = "netlink"))]
+        {
+            anyhow::bail!(
+                "firewall maintenance mode requested without the `netlink` feature; \
+                 the daemon cannot prove that a persistent Helios table was removed"
+            );
+        }
     }
     #[cfg(feature = "netlink")]
     {
@@ -148,6 +180,7 @@ async fn sync_policy(shared: &Arc<RwLock<FirewallPolicy>>, policy: &FirewallPoli
 pub async fn run(
     shared_network: Arc<RwLock<NetworkConfig>>,
     dry_run: bool,
+    firewall_mode: FirewallMode,
     shared_state: Arc<RwLock<TunnelState>>,
     event_tx: broadcast::Sender<HeliosEvent>,
     mut cmd_rx: mpsc::Receiver<OrchestratorCmd>,
@@ -171,14 +204,16 @@ pub async fn run(
     let mut policy = shared_network.read().await.firewall_policy();
     sync_policy(&shared_policy, &policy).await;
 
-    let fw = firewall_backend(dry_run)?;
+    let fw = firewall_backend(dry_run, firewall_mode)?;
     let wg: Arc<dyn WireguardBackend> = {
         let ifname = shared_network.read().await.wg_iface.clone();
         Arc::from(wireguard_backend(dry_run, &ifname)?)
     };
     let (internal_tx, mut internal_rx) = mpsc::channel::<OrchestratorCmd>(8);
 
-    // 1. Fail-closed BEFORE any network contact.
+    // 1. Establish the explicitly selected firewall posture before bringing
+    // up WireGuard. Maintenance removes an old table; normal mode engages the
+    // kill-switch.
     transition(
         &shared_state,
         &event_tx,
@@ -187,7 +222,11 @@ pub async fn run(
         &policy,
     )
     .await?;
-    info!("kill-switch engaged, starting fail-closed");
+    if firewall_mode.enforced() {
+        info!("kill-switch engaged, starting fail-closed");
+    } else {
+        warn!("UNSAFE MAINTENANCE MODE: Helios firewall disabled by explicit operator request");
+    }
 
     // 2. Initial tunnel bring-up.
     {
@@ -239,14 +278,18 @@ pub async fn run(
     let state_str = shared_state.read().await.as_str();
     info!("heliosd operational (state {state_str}). Ctrl-C to quit.");
     wait_api_ready(&api_ready).await?;
-    publish_readiness(dry_run)?;
+    publish_readiness(dry_run, firewall_mode)?;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                info!("shutdown requested: kill-switch maintained (fail-closed)");
+                if firewall_mode.enforced() {
+                    info!("shutdown requested: kill-switch maintained (fail-closed)");
+                } else {
+                    warn!("shutdown requested: Helios firewall remains disabled");
+                }
                 break;
             }
 
@@ -287,7 +330,13 @@ pub async fn run(
                         let state = *shared_state.read().await;
                         fw.apply(&policy, state).await.context("firewall MSS clamping")?;
                         sync_policy(&shared_policy, &policy).await;
-                        info!("PMTUD: MSS clamping applied at {mss} bytes");
+                        if firewall_mode.enforced() {
+                            info!("PMTUD: MSS clamping applied at {mss} bytes");
+                        } else {
+                            warn!(
+                                "PMTUD: optimal MSS is {mss} bytes but firewall enforcement is disabled"
+                            );
+                        }
                         emit_log(&event_tx, "info",
                             &format!("PMTUD: optimal MSS detected = {mss} bytes"));
                     }
@@ -297,7 +346,9 @@ pub async fn run(
                     // was never applied.
                     Some(OrchestratorCmd::TunnelStateInferred(state)) => {
                         transition(&shared_state, &event_tx, state, fw.as_ref(), &policy).await?;
-                        let msg = if state == TunnelState::Up {
+                        let msg = if !firewall_mode.enforced() {
+                            "Tunnel state changed — Helios firewall remains disabled for maintenance"
+                        } else if state == TunnelState::Up {
                             "Peer connected — recent WireGuard handshake, firewall reapplied"
                         } else {
                             "Every peer handshake has gone stale — kill-switch re-engaged"
@@ -331,7 +382,11 @@ pub async fn run(
     )
     .await
     {
-        warn!("engaging the kill-switch at shutdown: {error:#}");
+        if firewall_mode.enforced() {
+            warn!("engaging the kill-switch at shutdown: {error:#}");
+        } else {
+            warn!("keeping the Helios firewall disabled at shutdown: {error:#}");
+        }
     }
     if let Err(error) = wg.down().await {
         warn!("tearing down WireGuard at shutdown: {error}");
@@ -370,7 +425,7 @@ async fn shutdown_signal() {
     }
 }
 
-fn publish_readiness(dry_run: bool) -> anyhow::Result<()> {
+fn publish_readiness(dry_run: bool, firewall_mode: FirewallMode) -> anyhow::Result<()> {
     let path = std::env::var_os("HELIOS_READY_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -386,7 +441,11 @@ fn publish_readiness(dry_run: bool) -> anyhow::Result<()> {
     let temporary = path.with_extension("tmp");
     std::fs::write(
         &temporary,
-        format!("version={VERSION}\nmode_reel={}\n", !dry_run),
+        format!(
+            "version={VERSION}\nmode_reel={}\nfirewall_enforced={}\n",
+            !dry_run,
+            !dry_run && firewall_mode.enforced()
+        ),
     )?;
     std::fs::rename(temporary, path)?;
     Ok(())

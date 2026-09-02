@@ -123,7 +123,14 @@ poste et la négociation avec une gateway réelle.
 13. Une `release_sequence` inférieure ou égale à la dernière confirmée est
    refusée, y compris avec des signatures valides.
 14. Un binaire installé qui n’atteint pas son point de disponibilité rend la
-   main à la version précédente.
+    main à la version précédente.
+
+Le mode explicite `--unsafe-disable-firewall` est testé séparément de ces
+invariants nominaux : il exige toujours les backends WireGuard/TPM réels,
+supprime `inet helios` par une transaction idempotente `Add → Del`, publie
+`firewall_enforced=false` et n'est jamais sélectionné après une erreur du
+backend Netlink. Le drop-in posé par `deploy.sh --sans-firewall` survit à une
+mise à jour applicative ; seul `--avec-firewall` le retire.
 
 Lorsqu’un bug de sécurité est corrigé, ajouter d’abord un test qui échoue avec
 l’ancien comportement et le garder comme test de non-régression.

@@ -327,6 +327,11 @@ mod tests {
             Some("1.2.0"),
             true
         ));
+        assert!(readiness_matches(
+            "version=1.2.0\nmode_reel=true\nfirewall_enforced=false\n",
+            Some("1.2.0"),
+            true
+        ));
     }
 
     #[test]
