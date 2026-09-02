@@ -267,7 +267,7 @@ Depuis le poste opérateur, une seule commande produit les deux fichiers de
 configuration :
 
 ```sh
-./scripts/key-negotiation-setup.sh christophe@192.168.1.44 --nom portable
+./scripts/key-negotiation-setup.sh christophe@100.72.220.76 --nom portable
 ```
 
 Pour **ajouter la négociation à un profil Orion déjà en place**, repartir de sa

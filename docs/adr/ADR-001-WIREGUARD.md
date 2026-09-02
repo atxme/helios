@@ -326,10 +326,22 @@ du trafic relayé ; il ne doit donc pas devenir une configuration nominale.
 
 ### 3 quater. Accès d'administration hors-bande : `admin_ifaces`
 
-Le kill-switch doit rester franc, mais il ne doit pas pouvoir emporter le seul
-chemin par lequel un opérateur peut revenir. `admin_ifaces` nomme les
-interfaces d'overlay — Tailscale, NordVPN — sur lesquelles SSH reste accepté
-dans **tous** les états du tunnel, `Down` et `Connecting` compris.
+**La gateway est administrée à distance, sans accès LAN.** C'est une donnée du
+déploiement, pas une hypothèse de confort : l'opérateur n'est pas sur le réseau
+de la gateway et n'y reviendra pas. Trois chemins existent, et seulement trois —
+l'API Helios dans le tunnel pour le nominal, Tailscale et NordVPN Meshnet pour
+la reprise en main. Les deux derniers sont les seuls qui survivent à un
+`heliosd` arrêté.
+
+Il en découle un invariant : **le pare-feu ne doit jamais fermer les interfaces
+de ces deux overlays.** Ce sont elles qui portent la réparation quand Helios est
+ce qui est cassé, et un kill-switch qui emporte le moyen de le lever transforme
+une panne en déplacement physique.
+
+`admin_ifaces` nomme ces interfaces. SSH y est accepté dans **tous** les états
+du tunnel, `Down` et `Connecting` compris. Le déploiement les retient **toutes**
+plutôt que la seule qui porte la session courante : n'en garder qu'une
+réintroduit un point de défaillance unique là où il est le moins acceptable.
 
 **Filtré par interface, jamais par adresse.** L'argument de sécurité est celui
 de `allow_ssh_over_tunnel` : seul le démon de l'overlay pose des paquets sur son

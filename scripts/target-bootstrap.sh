@@ -221,9 +221,14 @@ EOF
 fi
 
 # Out-of-band administration interfaces: the way back in when the tunnel is
-# the thing that broke. Detected here and *proposed*, never opened silently —
-# HELIOS_ADMIN_IFACES is what actually decides, so nothing reaches the firewall
-# that the operator did not name.
+# the thing that broke.
+#
+# **Every** overlay found is kept, not just the one this deployment came in on.
+# This gateway is not reachable from a LAN — the operator is remote for good —
+# so Tailscale and NordVPN Meshnet are the only paths that survive a Helios
+# outage, and closing one because the other happened to carry today's session
+# would leave a single point of failure on the recovery path itself.
+# HELIOS_ADMIN_IFACES overrides the list when an operator wants to narrow it.
 #
 # Filtered by interface rather than by address on purpose: Tailscale carries a
 # v4 and a v6, NordVPN's address follows the server it picked, and an address
@@ -236,20 +241,36 @@ ADMIN_IFACE_CANDIDATES="$(ssh "$TARGET" '
         grep -E "^(tailscale[0-9]*|nordlynx|zt[a-z0-9]+|tun[0-9]+)$" |
         sort -u
 ')"
-ADMIN_IFACES="${HELIOS_ADMIN_IFACES-}"
 if [ -z "${HELIOS_ADMIN_IFACES+set}" ]; then
-    # Unset (not merely empty): adopt the interface this deployment arrives on
-    # when it is one of the recognised overlays. That is the one path we have
-    # positive evidence works — the operator is using it right now.
-    for candidate in $ADMIN_IFACE_CANDIDATES; do
-        if [ "$candidate" = "$SSH_ARRIVAL_IFACE" ]; then
-            ADMIN_IFACES="$candidate"
-        fi
-    done
+    ADMIN_IFACES="$(printf '%s' "$ADMIN_IFACE_CANDIDATES" | paste -sd' ' -)"
+else
+    ADMIN_IFACES="$HELIOS_ADMIN_IFACES"
 fi
 if [ -n "$ADMIN_IFACE_CANDIDATES" ]; then
     echo "    Interfaces d'administration détectées : $(printf '%s' "$ADMIN_IFACE_CANDIDATES" | paste -sd' ' -)"
-    echo "    Retenues (HELIOS_ADMIN_IFACES) : ${ADMIN_IFACES:-aucune}"
+    echo "    Retenues : ${ADMIN_IFACES:-aucune}"
+fi
+
+# Closing the door this session came through is the one mistake that cannot be
+# undone remotely: the refusal has to happen before the firewall is written,
+# not after the operator has lost the shell that would have fixed it.
+case " $ADMIN_IFACES " in
+    *" $SSH_ARRIVAL_IFACE "*) ;;
+    *)
+        for candidate in $ADMIN_IFACE_CANDIDATES; do
+            [ "$candidate" = "$SSH_ARRIVAL_IFACE" ] || continue
+            echo "    $SSH_ARRIVAL_IFACE porte cette session mais est exclue de" >&2
+            echo "    HELIOS_ADMIN_IFACES : le déploiement fermerait l'accès qu'il utilise." >&2
+            exit 1
+        done
+        ;;
+esac
+
+# A remote gateway with no overlay left has no way back in once heliosd stops.
+if [ -z "$ADMIN_IFACES" ] && [ "$SSH_ARRIVAL_IFACE" != "$WAN_IFACE" ]; then
+    echo "    Aucune interface d'administration hors-bande : après un arrêt de" >&2
+    echo "    heliosd, seule allow_ssh_from ($SSH_CIDR) restera. Vérifier que cette" >&2
+    echo "    source survit à une coupure du tunnel." >&2
 fi
 for iface in $ADMIN_IFACES; do
     case "$iface" in

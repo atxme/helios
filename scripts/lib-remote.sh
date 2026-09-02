@@ -42,7 +42,16 @@
 # `HELIOS_CIBLE` dans l'environnement l'emporte, et chaque script accepte
 # toujours un hôte en argument pour un déploiement ponctuel ailleurs — sans
 # rien enregistrer : l'appel suivant repart de la valeur ci-dessous.
-HELIOS_CIBLE="${HELIOS_CIBLE:-christophe@192.168.1.44}"
+# Tailscale, pas le LAN : l'opérateur n'est pas sur le réseau de la gateway et
+# n'y sera plus. Une adresse LAN par défaut envoie chaque script vers un réseau
+# injoignable, et le message d'erreur — « No route to host » — ressemble à une
+# gateway en panne plutôt qu'à un défaut de configuration.
+#
+# Cette adresse est dans `100.64.0.0/10`, que le profil Orion capture vers le
+# tunnel : tunnel monté, un déploiement lancé ainsi passerait *par Helios* et se
+# couperait au redémarrage du démon. `target-bootstrap.sh` interroge le noyau et
+# refuse ce cas — voir docs/testing/PREMIER-DEPLOIEMENT.md.
+HELIOS_CIBLE="${HELIOS_CIBLE:-christophe@100.72.220.76}"
 
 # Multiplexage : une seule connexion TCP réutilisée par tous les appels. Ça ne
 # change rien au ticket sudo — c'est le pseudo-terminal qui le porte — mais ça

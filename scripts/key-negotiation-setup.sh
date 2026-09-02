@@ -2,7 +2,7 @@
 # Met en place la négociation de clé PQC de bout en bout, et produit les deux
 # fichiers de configuration à charger : celui de la gateway, celui d'Orion.
 #
-#   ./scripts/key-negotiation-setup.sh christophe@192.168.1.44 --nom portable
+#   ./scripts/key-negotiation-setup.sh christophe@100.72.220.76 --nom portable
 #
 # Ce que le script enchaîne, dans l'ordre où chaque étape débloque la suivante :
 #

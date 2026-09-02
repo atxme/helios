@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provisionne un client Orion de bout en bout, en une commande.
 #
-#   ./scripts/provision-client.sh poste-windows christophe@192.168.1.44 \
+#   ./scripts/provision-client.sh poste-windows christophe@100.72.220.76 \
 #       --endpoint 86.229.12.86:51820
 #   ./scripts/provision-client.sh portable --endpoint 86.229.12.86:51820
 #
