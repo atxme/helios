@@ -250,6 +250,18 @@ BEGIN {
         forced["allow_gateway_egress"] = 1
         forced["nordvpn_meshnet"] = 1
     }
+    # Imposée dès que ce script la nomme, et seulement alors. Sans « forced »
+    # la valeur en place gagne, donc une entree fautive ne peut plus etre
+    # reparee par un deploiement — un `admin_ifaces` corrompu a ainsi survecu a
+    # la correction censee le remplacer. Option absente, la cle nest pas geree
+    # du tout et la valeur posee par loperateur est preservee.
+    #
+    # Pas dapostrophe dans ce programme awk : il est cite en guillemets
+    # simples, et une seule apostrophe termine la chaine shell — le reste du
+    # programme est alors interprete comme du shell, en silence.
+    if (admin_ifaces != "") {
+        forced["admin_ifaces"] = 1
+    }
 }
 
 function emit_missing(    i, key) {

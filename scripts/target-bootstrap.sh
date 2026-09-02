@@ -288,7 +288,26 @@ for iface in $ADMIN_IFACES; do
         echo "admin_ifaces must not name the Helios tunnel or the WAN: $iface" >&2
         exit 1
     fi
+    # Une interface d'administration qui n'existe pas sur la cible produit une
+    # règle nftables qui ne matchera jamais : le pare-feu paraît ouvert et ne
+    # l'est pas, et cela ne se découvre qu'au moment où l'accès est déjà perdu.
+    #
+    # C'est ce qui est arrivé le 2 septembre 2026 : deux noms concaténés en un
+    # seul — `nordlynxtailscale0` — ont été écrits sans que rien ne proteste,
+    # laissant une configuration qui annonçait un secours inexistant. Le nom est
+    # donc confronté au noyau, pas seulement à une expression régulière.
+    if ! ssh "$TARGET" "ip -brief link show dev '$iface'" >/dev/null 2>&1; then
+        echo "admin_ifaces nomme une interface absente de la cible : $iface" >&2
+        echo "    la règle SSH correspondante ne matcherait jamais, et l'accès de" >&2
+        echo "    secours n'existerait que dans le fichier." >&2
+        exit 1
+    fi
 done
+
+# La liste part en CSV vers `network-bootstrap.sh`. Construite avec `paste` et
+# non avec `printf '%s'`, qui réapplique son format à **chaque** argument sans
+# séparateur : `printf '%s' nordlynx tailscale0` donne `nordlynxtailscale0`.
+ADMIN_IFACES_CSV="$(printf '%s\n' $ADMIN_IFACES | paste -sd, -)"
 
 DYNAMIC_ARG=()
 if ssh "$TARGET" "ip -4 addr show dev '$WAN_IFACE'" | grep -qw dynamic; then
@@ -370,7 +389,7 @@ helios_ssh_sudo "$TARGET" "sh /tmp/helios-network-bootstrap.sh \
     --wg-port '$WG_PORT' \
     --key-negotiation-port '$KEY_PORT' \
     --escrow-public-key '$ESCROW_PUBLIC_KEY' \
-    ${ADMIN_IFACES:+--admin-ifaces \"$(printf '%s' $ADMIN_IFACES | tr ' ' ,)\"} \
+    ${ADMIN_IFACES:+--admin-ifaces \"$ADMIN_IFACES_CSV\"} \
     ${MESHNET_ARG[*]} \
     ${DYNAMIC_ARG[*]} && \
     '$REMOTE_HELIOSD' status && \
