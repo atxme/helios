@@ -91,8 +91,16 @@ pub struct KeyNegotiationClient {
     pub client_pq_private_key: Vec<u8>,
     /// CA certificate that authenticates the gateway certificate.
     pub gateway_ca: Vec<u8>,
-    /// Pinned self-signed ML-DSA-87 gateway certificate.
+    /// Pinned ML-DSA-87 gateway certificate — self-signed, or issued by the
+    /// `CA-PQ` below once the gateway carries a trust domain.
     pub gateway_pq_certificate: PqCertificate,
+    /// `CA-PQ` of the trust domain this profile belongs to, raw ML-DSA-87.
+    ///
+    /// `None` for a profile issued by a gateway that carries no domain: the
+    /// pinned leaf is then self-signed and *is* the trust, with no anchor above
+    /// it. Carried here rather than re-derived at each negotiation because the
+    /// profile is the only place it exists.
+    pub gateway_ca_pq_public_key: Option<Vec<u8>>,
     /// Orion refuses any locally selected mode below this floor.
     pub minimum_mode: ProtectionMode,
 }
@@ -112,6 +120,10 @@ impl std::fmt::Debug for KeyNegotiationClient {
             .field("client_pq_private_key", &"***")
             .field("gateway_ca", &self.gateway_ca.len())
             .field("gateway_pq_certificate", &"pinned")
+            .field(
+                "gateway_ca_pq_public_key",
+                &self.gateway_ca_pq_public_key.is_some(),
+            )
             .field("minimum_mode", &self.minimum_mode)
             .finish()
     }
@@ -340,6 +352,7 @@ pub async fn prepare(
             &client.gateway_pq_certificate,
             &client.server_name,
             expected_gateway_wg_public_key,
+            client.gateway_ca_pq_public_key.as_deref(),
             unix_time_now()?,
         )
         .context("rejecting an invalid PQ-authenticated key-negotiation response")?;
@@ -399,6 +412,19 @@ pub async fn prepare_for_profile(
             .context("decoding the gateway PQ certificate")?,
     )
     .context("parsing the gateway PQ certificate")?;
+    // Absent for a gateway with no trust domain, and that is the whole of the
+    // distinction: the pinned leaf is then self-signed, and there is no anchor
+    // above it to hold.
+    let gateway_ca_pq_public_key = match settings.trust.as_ref() {
+        Some(trust) => Some(
+            trust
+                .ca_pq()
+                .context("reading the CA-PQ anchor of the profile trust block")?
+                .as_bytes()
+                .to_vec(),
+        ),
+        None => None,
+    };
     let client_wg_public_key = profile
         .public_key()
         .context("deriving the client WireGuard public key")?;
@@ -425,6 +451,7 @@ pub async fn prepare_for_profile(
             client_pq_private_key: identity.pq_private_key,
             gateway_ca,
             gateway_pq_certificate,
+            gateway_ca_pq_public_key,
             minimum_mode: settings.minimum_mode,
         },
         settings.mode,

@@ -435,22 +435,48 @@ pub struct AuthenticatedKeyNegotiationResponse {
 }
 
 impl AuthenticatedKeyNegotiationResponse {
+    /// `ca_pq_public_key` is the anchor of the trust domain the caller belongs
+    /// to, and `None` when it belongs to none.
+    ///
+    /// A gateway serves one of two certificate shapes, and which one is not the
+    /// caller's choice: self-signed while it carries no trust domain, issued by
+    /// `CA-PQ` once `heliosd init-trust-domain` has run (ADR-008 §13.1).
+    /// Verifying a `CA-PQ`-issued leaf against its own subject key — which is
+    /// what `verify_self_signed` does — rejects every gateway that has an
+    /// authority, which is to say every gateway the authority is for.
+    ///
+    /// The shape is read off `issuer == subject`, never off the presence of an
+    /// anchor, so the two cases cannot swap silently: a CA-issued leaf reaching
+    /// a peer that holds no anchor is refused rather than checked against
+    /// itself.
     pub fn verify(
         &self,
         request: &KeyNegotiationRequest,
         pinned_certificate: &PqCertificate,
         expected_subject: &str,
         expected_gateway_wireguard_key: &str,
+        ca_pq_public_key: Option<&[u8]>,
         now_unix: u64,
     ) -> Result<(), KeyNegotiationError> {
         self.response
             .validate_for(request, expected_gateway_wireguard_key)?;
-        self.certificate.verify_self_signed(
-            PqCertificateRole::Gateway,
-            Some(expected_subject),
-            expected_gateway_wireguard_key,
-            now_unix,
-        )?;
+        if self.certificate.issuer == self.certificate.subject {
+            self.certificate.verify_self_signed(
+                PqCertificateRole::Gateway,
+                Some(expected_subject),
+                expected_gateway_wireguard_key,
+                now_unix,
+            )?;
+        } else {
+            let anchor = ca_pq_public_key.ok_or(KeyNegotiationError::MissingPqCertificateAnchor)?;
+            self.certificate.verify(
+                anchor,
+                PqCertificateRole::Gateway,
+                Some(expected_subject),
+                expected_gateway_wireguard_key,
+                now_unix,
+            )?;
+        }
         if self.certificate.fingerprint()? != pinned_certificate.fingerprint()? {
             return Err(KeyNegotiationError::PqCertificateFingerprintMismatch);
         }
@@ -1482,6 +1508,8 @@ pub enum KeyNegotiationError {
     InvalidPqCertificateSignature,
     #[error("PQ certificate does not match the admitted identity")]
     PqCertificateFingerprintMismatch,
+    #[error("PQ certificate is issued by an authority this peer carries no anchor for")]
+    MissingPqCertificateAnchor,
     #[error("PQ protocol transcript signature is invalid")]
     InvalidPqProtocolSignature,
     #[error("PQ private key is invalid")]
@@ -1969,6 +1997,38 @@ mod tests {
         .unwrap()
     }
 
+    /// The leaf a gateway with no trust domain serves: the issuer **is** the
+    /// subject, so the pinned bytes are the whole of the trust.
+    ///
+    /// [`pq_certificate`] always writes `test-ca` as the issuer, which is
+    /// right for a client leaf and wrong for this one: a certificate that
+    /// names an authority it was not signed by is not a shape any gateway
+    /// serves, and a fixture that carries it hides which of the two paths a
+    /// verification took.
+    fn self_signed_gateway_certificate(
+        subject: &str,
+        wireguard_key: &str,
+        subject_public_key: &[u8],
+        subject_private_key: &[u8],
+    ) -> PqCertificate {
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [9; 16],
+                subject: subject.into(),
+                issuer: subject.into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: wireguard_key.into(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public_key),
+                not_before_unix: 1,
+                not_after_unix: u64::MAX,
+                ml_dsa_87_signature: String::new(),
+            },
+            subject_private_key,
+        )
+        .unwrap()
+    }
+
     /// A `CA-PQ` signature is refused when its external context is not the
     /// one of §8, however valid the arithmetic is.
     ///
@@ -2279,8 +2339,7 @@ mod tests {
     #[test]
     fn substituting_the_ml_kem_ciphertext_breaks_gateway_authentication() {
         let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().unwrap();
-        let certificate = pq_certificate(
-            PqCertificateRole::Gateway,
+        let certificate = self_signed_gateway_certificate(
             SERVER_NAME,
             GATEWAY_WG_KEY,
             &gateway_public,
@@ -2293,13 +2352,112 @@ mod tests {
         let mut authenticated =
             authenticate_response(answer, certificate.clone(), gateway_private.as_slice()).unwrap();
         authenticated
-            .verify(&plain, &certificate, SERVER_NAME, GATEWAY_WG_KEY, 100)
+            .verify(&plain, &certificate, SERVER_NAME, GATEWAY_WG_KEY, None, 100)
             .unwrap();
 
         authenticated.response.kem_ciphertext.as_mut().unwrap()[0] ^= 1;
         assert_eq!(
-            authenticated.verify(&plain, &certificate, SERVER_NAME, GATEWAY_WG_KEY, 100),
+            authenticated.verify(&plain, &certificate, SERVER_NAME, GATEWAY_WG_KEY, None, 100),
             Err(KeyNegotiationError::InvalidPqProtocolSignature)
+        );
+    }
+
+    /// The shape a gateway serves once it carries a trust domain (ADR-008
+    /// §13.1). Checking this leaf against its own subject key is what
+    /// `verify_self_signed` does, and it fails on every such gateway — which
+    /// is to say on every gateway an authority exists for.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_ca_issued_gateway_leaf_verifies_under_the_domain_anchor() {
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Gateway,
+            SERVER_NAME,
+            GATEWAY_WG_KEY,
+            &gateway_public,
+            ca_private.as_slice(),
+        );
+        let mut plain = request(ProtectionMode::MlKem);
+        plain.kem_public_key = Some(vec![4; crate::pq::PUBLIC_KEY_LEN]);
+        let mut answer = response(&plain, ProtectionMode::MlKem);
+        answer.kem_ciphertext = Some(vec![5; crate::pq::CIPHERTEXT_LEN]);
+        let authenticated =
+            authenticate_response(answer, certificate.clone(), gateway_private.as_slice()).unwrap();
+
+        authenticated
+            .verify(
+                &plain,
+                &certificate,
+                SERVER_NAME,
+                GATEWAY_WG_KEY,
+                Some(ca_public.as_slice()),
+                100,
+            )
+            .unwrap();
+    }
+
+    /// Refused, rather than checked against itself. A peer that holds no
+    /// anchor has nothing to verify a delegated leaf with, and falling back to
+    /// the subject key would accept any leaf naming any authority.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_ca_issued_gateway_leaf_is_refused_without_an_anchor() {
+        let (ca_private, _) = generate_ml_dsa_87_keypair().unwrap();
+        let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Gateway,
+            SERVER_NAME,
+            GATEWAY_WG_KEY,
+            &gateway_public,
+            ca_private.as_slice(),
+        );
+        let mut plain = request(ProtectionMode::MlKem);
+        plain.kem_public_key = Some(vec![4; crate::pq::PUBLIC_KEY_LEN]);
+        let mut answer = response(&plain, ProtectionMode::MlKem);
+        answer.kem_ciphertext = Some(vec![5; crate::pq::CIPHERTEXT_LEN]);
+        let authenticated =
+            authenticate_response(answer, certificate.clone(), gateway_private.as_slice()).unwrap();
+
+        assert_eq!(
+            authenticated.verify(&plain, &certificate, SERVER_NAME, GATEWAY_WG_KEY, None, 100),
+            Err(KeyNegotiationError::MissingPqCertificateAnchor)
+        );
+    }
+
+    /// Another domain's anchor is not this domain's. The fingerprint of the
+    /// pinned leaf still matches, so only the issuer signature separates the
+    /// two — which is exactly what must be checked.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_ca_issued_gateway_leaf_is_refused_under_a_foreign_anchor() {
+        let (ca_private, _) = generate_ml_dsa_87_keypair().unwrap();
+        let (_, foreign_public) = generate_ml_dsa_87_keypair().unwrap();
+        let (gateway_private, gateway_public) = generate_ml_dsa_87_keypair().unwrap();
+        let certificate = pq_certificate(
+            PqCertificateRole::Gateway,
+            SERVER_NAME,
+            GATEWAY_WG_KEY,
+            &gateway_public,
+            ca_private.as_slice(),
+        );
+        let mut plain = request(ProtectionMode::MlKem);
+        plain.kem_public_key = Some(vec![4; crate::pq::PUBLIC_KEY_LEN]);
+        let mut answer = response(&plain, ProtectionMode::MlKem);
+        answer.kem_ciphertext = Some(vec![5; crate::pq::CIPHERTEXT_LEN]);
+        let authenticated =
+            authenticate_response(answer, certificate.clone(), gateway_private.as_slice()).unwrap();
+
+        assert_eq!(
+            authenticated.verify(
+                &plain,
+                &certificate,
+                SERVER_NAME,
+                GATEWAY_WG_KEY,
+                Some(foreign_public.as_slice()),
+                100,
+            ),
+            Err(KeyNegotiationError::InvalidPqCertificateSignature)
         );
     }
 

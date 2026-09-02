@@ -2824,6 +2824,36 @@ mod tests {
         .unwrap()
     }
 
+    /// The leaf a gateway with no trust domain serves.
+    ///
+    /// [`certificate`] always writes `test-ca` as the issuer, which is right
+    /// for a client leaf and wrong for this one: naming an authority that did
+    /// not sign it is a shape no gateway serves, and it hides which of the two
+    /// verification paths a test actually took.
+    fn self_signed_gateway_certificate(
+        subject: &str,
+        wireguard_key: &str,
+        public_key: &[u8],
+        private_key: &[u8],
+    ) -> PqCertificate {
+        issue_pq_certificate(
+            PqCertificate {
+                version: PQ_CERTIFICATE_VERSION,
+                serial: [9; 16],
+                subject: subject.into(),
+                issuer: subject.into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: wireguard_key.into(),
+                ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD.encode(public_key),
+                not_before_unix: 1,
+                not_after_unix: u64::MAX,
+                ml_dsa_87_signature: String::new(),
+            },
+            private_key,
+        )
+        .unwrap()
+    }
+
     fn pq_fixture() -> PqFixture {
         let (ca_private, ca_public) = generate_ml_dsa_87_keypair().unwrap();
         let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
@@ -3817,8 +3847,29 @@ mod tests {
     /// PSKs, and every WireGuard handshake fails afterwards with no error
     /// pointing at the cause. Comparing the two values is the only way to
     /// know they agree.
+    /// Both certificate shapes are exercised, because both are legal and the
+    /// gateway alone decides which it serves: self-signed while it carries no
+    /// trust domain, issued by `CA-PQ` once it does (ADR-008 §13.1). A client
+    /// that only ever met the first refuses every gateway an authority exists
+    /// for, and nothing below the wire would say so.
     #[tokio::test]
     async fn the_gateway_and_orion_derive_the_same_psk() {
+        end_to_end_negotiation(GatewayLeaf::SelfSigned).await;
+    }
+
+    #[tokio::test]
+    async fn the_gateway_and_orion_derive_the_same_psk_under_a_trust_domain() {
+        end_to_end_negotiation(GatewayLeaf::IssuedByCaPq).await;
+    }
+
+    /// Which authority signs the leaf the gateway serves.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GatewayLeaf {
+        SelfSigned,
+        IssuedByCaPq,
+    }
+
+    async fn end_to_end_negotiation(leaf: GatewayLeaf) {
         use aether::key_negotiation::PqCertificateRole;
 
         let gateway_wg = aether::wg::generate_keypair().unwrap();
@@ -3836,13 +3887,23 @@ mod tests {
             ca_private.as_slice(),
         );
         let (gateway_pq_private, gateway_pq_public) = generate_ml_dsa_87_keypair().unwrap();
-        let gateway_pq_certificate = certificate(
-            "localhost",
-            PqCertificateRole::Gateway,
-            &gateway_wg.public_key,
-            &gateway_pq_public,
-            gateway_pq_private.as_slice(),
-        );
+        let gateway_pq_certificate = match leaf {
+            // Issuer **is** subject: the pinned bytes are the whole of the
+            // trust, with no anchor above them.
+            GatewayLeaf::SelfSigned => self_signed_gateway_certificate(
+                "localhost",
+                &gateway_wg.public_key,
+                &gateway_pq_public,
+                gateway_pq_private.as_slice(),
+            ),
+            GatewayLeaf::IssuedByCaPq => certificate(
+                "localhost",
+                PqCertificateRole::Gateway,
+                &gateway_wg.public_key,
+                &gateway_pq_public,
+                ca_private.as_slice(),
+            ),
+        };
 
         let tls = test_tls();
         let mut network = NetworkConfig::default();
@@ -3871,7 +3932,7 @@ mod tests {
             psk_tx,
             handshake_tx,
             gateway_public_key: gateway_wg.public_key.clone(),
-            client_pq_ca_public_key: ca_public,
+            client_pq_ca_public_key: ca_public.clone(),
             registry: None,
             gateway_pq_certificate: gateway_pq_certificate.clone(),
             served_certificate_fingerprint: gateway_pq_certificate.fingerprint().unwrap(),
@@ -3913,7 +3974,30 @@ mod tests {
                 gateway_pq_certificate: base64::engine::general_purpose::STANDARD
                     .encode(serde_json::to_vec(&gateway_pq_certificate).unwrap()),
                 identity: "orion".into(),
-                trust: None,
+                // Only the `CA-PQ` anchor is read on this path; the rest of
+                // the block belongs to renewal, which this test does not
+                // reach. Filled with well-formed placeholders rather than
+                // left out, so the shape stays the one a real profile has.
+                trust: match leaf {
+                    GatewayLeaf::SelfSigned => None,
+                    GatewayLeaf::IssuedByCaPq => Some(orion_core::TrustMaterial {
+                        trust_domain_id: "00112233445566778899aabbccddeeff".into(),
+                        ca_epoch: 1,
+                        ca_pq_public_key: base64::engine::general_purpose::STANDARD
+                            .encode(&ca_public),
+                        ca_tls_epoch: 1,
+                        client_tls_ca_der: base64::engine::general_purpose::STANDARD
+                            .encode(&tls.ca_der),
+                        client_generation: 1,
+                        astra_authority_url: "https://astra.helios.local".into(),
+                        webauthn_rp_id: "astra.helios.local".into(),
+                        astra_policy_fingerprint: "11".repeat(32),
+                        credential_registry_epoch: 1,
+                        astra_service_key_epoch: 1,
+                        astra_service_public_key: base64::engine::general_purpose::STANDARD
+                            .encode(&ca_public),
+                    }),
+                },
             }),
             ..orion_core::ClientProfile::default()
         };
