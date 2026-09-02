@@ -75,6 +75,23 @@ const ASTRA_PRIVATE_PEER: &str = "10.88.7.2/32";
 const HELIOS_LIFECYCLE_PORT: u16 = 8444;
 const ASTRA_LIFECYCLE_PORT: u16 = 8445;
 
+/// Fixed bridge of the Astra **public** origin, and its two coordinates.
+///
+/// Named for the same reason `astra0` is: compose pins the bridge and the
+/// addresses, so the opening below can state all four coordinates instead of
+/// wildcarding an interface Docker renames on every recreation.
+///
+/// The origin is published on `127.0.0.1:8443`, which Docker DNATs onto this
+/// bridge. Without this rule the translated packet leaves through `astra1`,
+/// matches nothing in a chain whose policy is `drop`, and dies — so the
+/// authority's own machine cannot reach the authority. That is what blocks
+/// the expired-identity recovery of ADR-008 §7.5, whose whole point is to be
+/// reachable when the tunnel is not.
+const ASTRA_PUBLIC_IFACE: &str = "astra1";
+const ASTRA_PUBLIC_HOST: &str = "10.88.7.9/32";
+const ASTRA_PUBLIC_PEER: &str = "10.88.7.10/32";
+const ASTRA_ORIGIN_PORT: u16 = 8443;
+
 /// Verdict of a rule or default policy of a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -379,6 +396,28 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
             Verdict::Accept,
         )
         .with_note("Helios mTLS client to the private Astra lifecycle API"),
+    );
+    // The gateway reaching the authority's public origin, on its own machine.
+    //
+    // Output only, and scoped to the container: nothing here lets the origin
+    // out to the WAN, and nothing lets a third party in. `forward` stays
+    // `drop`, so the container gains no route through the gateway either —
+    // the opening is the host's, not Astra's.
+    rules.push(
+        Rule::new(
+            Output,
+            vec![
+                Match::OutIface(ASTRA_PUBLIC_IFACE.into()),
+                Match::SourceNet(ASTRA_PUBLIC_HOST.into()),
+                Match::DestNet(ASTRA_PUBLIC_PEER.into()),
+                Match::DestPort {
+                    port: ASTRA_ORIGIN_PORT,
+                    proto: L4::Tcp,
+                },
+            ],
+            Verdict::Accept,
+        )
+        .with_note("Helios client to the public Astra origin, published on loopback"),
     );
 
     // ── WireGuard listener (server role) ─────────────────────────────────────
@@ -1015,6 +1054,34 @@ mod tests {
         assert!(!text(&rs, ChainKind::Forward)
             .iter()
             .any(|rule| rule.contains("astra0") || rule.contains("10.88.7.")));
+    }
+
+    /// The origin published on loopback is DNATed onto the public Astra
+    /// bridge, so the packet leaves through `astra1` and is judged by the
+    /// output chain — not by the loopback rule its destination address
+    /// suggests. Without this opening the gateway cannot reach its own
+    /// authority, and the §7.5 recovery of an expired identity has nowhere to
+    /// go: it is the one exchange that must work when the tunnel does not.
+    #[test]
+    fn the_public_astra_origin_is_reachable_from_the_gateway_only_outbound() {
+        let rs = render(&policy(), TunnelState::Down);
+        let expected =
+            "oifname \"astra1\" ip saddr 10.88.7.9/32 ip daddr 10.88.7.10/32 tcp dport 8443 accept";
+        assert!(
+            text(&rs, ChainKind::Output)
+                .iter()
+                .any(|rule| rule == expected),
+            "the gateway must be able to dial the origin: {:?}",
+            text(&rs, ChainKind::Output)
+        );
+        // The opening is the host's. Nothing here admits the container inbound
+        // or grants it a route through the gateway.
+        assert!(!text(&rs, ChainKind::Input)
+            .iter()
+            .any(|rule| rule.contains("astra1")));
+        assert!(!text(&rs, ChainKind::Forward)
+            .iter()
+            .any(|rule| rule.contains("astra1")));
     }
 
     /// UDP conntrack is not a transport contract. A WireGuard rekey or the

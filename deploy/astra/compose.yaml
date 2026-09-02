@@ -87,7 +87,10 @@ services:
       - astra-state:/var/lib/astra
 
     networks:
-      astra-public: {}
+      # Adresse fixe ici aussi, et pour la même raison qu'en dessous : le
+      # pare-feu nomme la cible plutôt que d'ouvrir une interface entière.
+      astra-public:
+        ipv4_address: 10.88.7.10
       # Le veth privé du §8.3. Adresse fixe : `heliosd` écoute sur l'autre bout
       # et n'accepte qu'une identité épinglée, donc les deux extrémités sont
       # nommées une fois pour toutes plutôt que découvertes.
@@ -113,8 +116,27 @@ volumes:
   astra-state:
 
 networks:
+  # L'origine publique, publiée sur la boucle locale et traduite par Docker
+  # vers ce pont.
+  #
+  # Nom de pont et plage figés, alors que Docker sait les inventer : c'est ce
+  # qui permet au pare-feu d'ouvrir la sortie de la gateway vers *cette*
+  # adresse et ce port, au lieu d'ouvrir une interface dont le nom change à
+  # chaque recréation. Sans cette ouverture, le paquet traduit sortait par un
+  # pont que la chaîne `output` en `drop` ne connaissait pas, et l'autorité
+  # était injoignable depuis sa propre machine — donc la récupération d'une
+  # identité expirée (ADR-008 §7.5) aussi, elle dont c'est tout l'objet.
+  #
+  # Pas `internal: true` : ce réseau porte la publication de port. C'est le
+  # `forward` en `drop` du pare-feu, et lui seul, qui empêche le conteneur de
+  # sortir par la gateway.
   astra-public:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: astra1
+    ipam:
+      config:
+        - subnet: 10.88.7.8/29
 
   # Le canal privé vers `heliosd` — ADR-008 §2, ROTATION-CERTIFICATS §8.3.
   #
