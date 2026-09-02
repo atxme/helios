@@ -268,14 +268,13 @@ pub fn validate_key_negotiation(
         .duration_since(std::time::UNIX_EPOCH)
         .context("l'horloge système précède l'époque Unix")?
         .as_secs();
-    certificate
-        .verify_self_signed(
-            aether::key_negotiation::PqCertificateRole::Gateway,
-            Some(&settings.server_name),
-            peer_public_key,
-            now,
-        )
-        .context("le certificat PQ épinglé ne correspond pas à cette gateway")?;
+    verify_pinned_gateway_certificate(
+        &certificate,
+        &settings.server_name,
+        peer_public_key,
+        settings.trust.as_ref(),
+        now,
+    )?;
 
     match (settings.mode, has_preshared_key) {
         (ProtectionMode::StaticPsk, false) => {
@@ -286,6 +285,49 @@ pub fn validate_key_negotiation(
         }
         _ => Ok(()),
     }
+}
+
+/// Verifies the pinned gateway leaf under the authority that actually issued it.
+///
+/// Two shapes exist, and a profile is only ever right about one of them. A
+/// gateway with no trust domain serves a self-signed leaf: the pinned bytes
+/// *are* the trust, and there is no anchor to check them against. Once
+/// `heliosd init-trust-domain` installs the CA-PQ bootstrap leaf (ADR-008
+/// §13.1) the same gateway serves a leaf signed by `CA-PQ`, and the anchor
+/// that verifies it is the one the trust block carries.
+///
+/// The choice is made on `issuer == subject`, not on the presence of a trust
+/// block, so the two cases can never swap silently: a CA-issued leaf in a
+/// profile that carries no anchor is refused by name rather than accepted on
+/// its own signature — which is what `verify_self_signed` would do if the
+/// leaf ever carried the issuer's key.
+pub fn verify_pinned_gateway_certificate(
+    certificate: &aether::key_negotiation::PqCertificate,
+    server_name: &str,
+    peer_public_key: &str,
+    trust: Option<&TrustMaterial>,
+    now_unix: u64,
+) -> Result<()> {
+    let role = aether::key_negotiation::PqCertificateRole::Gateway;
+    let subject = Some(server_name.trim());
+    if certificate.issuer == certificate.subject {
+        return certificate
+            .verify_self_signed(role, subject, peer_public_key, now_unix)
+            .context("le certificat PQ épinglé ne correspond pas à cette gateway");
+    }
+    let trust = trust.ok_or_else(|| {
+        anyhow::anyhow!(
+            "le certificat PQ épinglé est émis par l'autorité « {} », que ce profil ne porte \
+             pas : réimporter un profil produit après l'amorçage du domaine de confiance",
+            certificate.issuer.trim()
+        )
+    })?;
+    let anchor =
+        aether::certificates::encoding::MlDsa87PublicKey::parse(trust.ca_pq_public_key.trim())
+            .map_err(|_| anyhow::anyhow!("clé publique CA-PQ illisible"))?;
+    certificate
+        .verify(anchor.as_bytes(), role, subject, peer_public_key, now_unix)
+        .context("le certificat PQ épinglé n'est pas émis par le CA-PQ de ce domaine")
 }
 
 /// Name of a mode as the user reads it on screen.
@@ -800,6 +842,123 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verification of the pinned gateway leaf, which only has two legal
+    /// shapes. Gated like [`crate::test_domain`]: the fixture signs real
+    /// ML-DSA-87 objects, and a test that faked them would not exercise the
+    /// signature check that is the whole point here.
+    #[cfg(feature = "certificate-signing")]
+    mod pinned_gateway_certificate {
+        use crate::config::{verify_pinned_gateway_certificate, TrustMaterial};
+        use crate::test_domain::{domain, gateway_key, settings, Domain, NOW, SERVER_NAME};
+        use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+        use aether::key_negotiation::{
+            issue_pq_certificate, PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        /// The shape a gateway serves once it has no trust domain: the pinned
+        /// bytes are the whole trust, and there is no anchor to check them under.
+        fn self_signed_gateway_leaf() -> PqCertificate {
+            let (private, public) = generate_ml_dsa_87_keypair().expect("gateway key");
+            issue_pq_certificate(
+                PqCertificate {
+                    version: PQ_CERTIFICATE_VERSION,
+                    serial: [3; 16],
+                    subject: SERVER_NAME.into(),
+                    issuer: SERVER_NAME.into(),
+                    role: PqCertificateRole::Gateway,
+                    wireguard_public_key: gateway_key().to_base64(),
+                    ml_dsa_87_public_key: B64.encode(public.as_bytes()),
+                    not_before_unix: NOW - 3_600,
+                    not_after_unix: NOW + 10 * 86_400,
+                    ml_dsa_87_signature: String::new(),
+                },
+                &private,
+            )
+            .expect("self-signed gateway leaf")
+        }
+
+        fn trust_of(domain: &Domain) -> TrustMaterial {
+            settings(domain)
+                .trust
+                .expect("the fixture carries a trust block")
+        }
+
+        /// The regression this pair of checks exists for.
+        ///
+        /// `heliosd init-trust-domain` replaces the gateway's self-signed leaf
+        /// with one issued under `CA-PQ` (ADR-008 §13.1). Verifying that leaf
+        /// against its own key — which is what `verify_self_signed` does — fails
+        /// by construction, so a profile pinned to a gateway with a trust domain
+        /// was refused at load and no client could be enrolled at all.
+        #[test]
+        fn a_ca_issued_gateway_leaf_verifies_under_the_domain_anchor() {
+            let domain = domain();
+            let trust = trust_of(&domain);
+            verify_pinned_gateway_certificate(
+                &domain.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                Some(&trust),
+                NOW,
+            )
+            .expect("the anchor the profile pins is the one that issued the leaf");
+        }
+
+        /// The half that keeps the fix from being a downgrade: a CA-issued leaf
+        /// carries the issuer's name, never the issuer's key, so there is nothing
+        /// in it to fall back on. Without the anchor it must be refused by name.
+        #[test]
+        fn a_ca_issued_gateway_leaf_is_refused_without_an_anchor() {
+            let domain = domain();
+            let error = verify_pinned_gateway_certificate(
+                &domain.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                None,
+                NOW,
+            )
+            .expect_err("no anchor, no verification");
+            let message = format!("{error}");
+            assert!(
+                message.contains("CA-PQ") && message.contains("ne porte pas"),
+                "the message must name the missing anchor, not the signature: {message}"
+            );
+        }
+
+        /// A second domain's anchor is not this domain's anchor.
+        #[test]
+        fn a_ca_issued_gateway_leaf_is_refused_under_a_foreign_anchor() {
+            let this = domain();
+            let other = domain();
+            let mut trust = trust_of(&this);
+            trust.ca_pq_public_key = other.ca_pq_public.to_base64();
+            verify_pinned_gateway_certificate(
+                &this.gateway_leaf,
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                Some(&trust),
+                NOW,
+            )
+            .expect_err("a leaf signed by another authority is not this domain's gateway");
+        }
+
+        /// Profiles issued before any trust domain existed keep working: they pin
+        /// a self-signed leaf and carry no anchor, and that combination stays
+        /// valid rather than becoming collateral of the fix.
+        #[test]
+        fn a_self_signed_gateway_leaf_still_verifies_without_a_trust_block() {
+            verify_pinned_gateway_certificate(
+                &self_signed_gateway_leaf(),
+                SERVER_NAME,
+                &gateway_key().to_base64(),
+                None,
+                NOW,
+            )
+            .expect("a gateway without a trust domain is verified by its own key");
+        }
+    }
 
     /// The failure the discriminant exists for.
     ///
