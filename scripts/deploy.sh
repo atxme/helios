@@ -589,6 +589,33 @@ deployer_astra() {
             -f '{{range .Mounts}}{{if eq .Destination \"/var/lib/astra\"}}{{.Name}}{{end}}{{end}}' \
             '$conteneur_astra' 2>/dev/null" | tr -d '\r' | tail -1)"
     fi
+
+    # Le conteneur en marche porte encore la **release précédente** : l'image
+    # fraîche ne devient la sienne qu'au `up -d` final. Or l'amorçage ci-dessous
+    # écrit dans le registre avec des sous-verbes que la version en place peut
+    # ne pas connaître — c'est exactement ce qui a échoué le 2 septembre 2026,
+    # sur `pin-ca-tls` : `exec` a atteint le binaire d'août, qui a répondu
+    # « unrecognized subcommand » alors que la commande existait dans l'image
+    # qu'on venait de construire.
+    #
+    # L'arrêter ici plutôt que de lancer l'image fraîche à côté : `pin-ca-tls`
+    # **écrit**, et deux processus sur `/var/lib/astra` sont une corruption de
+    # registre, pas une lecture concurrente. Une fois arrêté, la sélection
+    # ci-dessous retombe d'elle-même sur le conteneur jetable monté sur le
+    # volume — la branche prévue pour « présent, arrêté ». Le service remonte au
+    # `up -d` final, avec la nouvelle image et un registre déjà amorcé, donc
+    # sans jamais servir un domaine à moitié écrit.
+    if [ "$astra_en_marche" = oui ] && [ -n "${volume_astra:-}" ]; then
+        echo "    arrêt d'Astra pendant l'amorçage (l'image fraîche écrit sur le volume)"
+        helios_ssh_sudo "$CIBLE" "cd '$racine' && $compose_env $compose \
+            -f deploy/astra/compose.yaml --env-file '$env_distant' \
+            stop astra" >/dev/null || {
+            echo "    Astra n'a pas pu être arrêté : l'amorçage écrirait sur un" >&2
+            echo "    volume que le service utilise encore." >&2
+            return 1
+        }
+        astra_en_marche=non
+    fi
     # A compatibility check must use the freshly built image. The running
     # container can still be the previous release until the final `up -d`, so
     # `exec` would not know about the status-tail migration below. A direct
