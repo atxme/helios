@@ -161,6 +161,7 @@ awk \
     -v meshnet_routing_cidrs="$MESHNET_ROUTING_TOML" \
     -v meshnet_local_cidrs="$MESHNET_LOCAL_NETWORK_TOML" '
 BEGIN {
+    SQ = sprintf("%c", 39)
     order[1] = "wan_iface"
     order[2] = "lan_ifaces"
     order[3] = "allow_ssh_from"
@@ -264,6 +265,41 @@ BEGIN {
     }
 }
 
+# Profondeur de crochets/accolades laissee ouverte par un texte TOML.
+#
+# Les chaines citees sont ignorees : un CIDR nen contient pas, mais un nom
+# dinterface pourrait, et une valeur qui ferme faussement le compte ferait
+# avaler la suite du fichier. Le commentaire de fin de ligne aussi.
+#
+# `SQ` plutot que lapostrophe litterale : ce programme est cite en guillemets
+# simples, et une seule apostrophe terminerait la chaine shell.
+function open_depth(text,    i, c, in_str, quote, depth) {
+    depth = 0
+    in_str = 0
+    for (i = 1; i <= length(text); i++) {
+        c = substr(text, i, 1)
+        if (in_str) {
+            if (c == "\\") {
+                i++
+            } else if (c == quote) {
+                in_str = 0
+            }
+            continue
+        }
+        if (c == "\"" || c == SQ) {
+            in_str = 1
+            quote = c
+        } else if (c == "#") {
+            break
+        } else if (c == "[" || c == "{") {
+            depth++
+        } else if (c == "]" || c == "}") {
+            depth--
+        }
+    }
+    return depth
+}
+
 function emit_missing(    i, key) {
     if (emitted) {
         return
@@ -308,20 +344,35 @@ function emit_missing(    i, key) {
         sub(/[[:space:]]*=.*/, "", assignment)
         key = assignment
         if (managed[key]) {
-            if (in_peers) {
-                next
-            }
-            if (seen[key]) {
-                next
-            }
-            seen[key] = 1
-            if (forced[key]) {
-                print key " = " desired[key]
-            } else if (key == "allow_ssh_from" &&
-                       line ~ /=[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
-                print key " = " desired[key]
+            drop = 0
+            if (in_peers || seen[key]) {
+                drop = 1
             } else {
-                print line
+                seen[key] = 1
+                if (forced[key]) {
+                    print key " = " desired[key]
+                    drop = 1
+                } else if (key == "allow_ssh_from" &&
+                           line ~ /=[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
+                    print key " = " desired[key]
+                    drop = 1
+                } else {
+                    print line
+                }
+            }
+            # Une valeur TOML peut sétendre sur plusieurs lignes : un tableau
+            # ou une table inline que loperateur a aere. Juger une ligne a la
+            # fois remplacait alors la ligne douverture et abandonnait sa
+            # suite sur place — le fichier gardait un fragment orphelin, qui
+            # nest plus du TOML, et heliosd refusait de le lire en entier.
+            # Ici la valeur est consommee jusqua sa fermeture, puis rendue ou
+            # jetee avec la ligne qui la portait.
+            depth = open_depth(line)
+            while (depth > 0 && (getline continuation) > 0) {
+                depth += open_depth(continuation)
+                if (!drop) {
+                    print continuation
+                }
             }
             next
         }
