@@ -71,6 +71,14 @@ TARGET_DIR="$CERTS_ROOT/$TARGET_ID"
 # directory: nothing is merged, so no enrolment can be silently overwritten.
 if [ ! -d "$TARGET_DIR" ] && [ -d "$CERTS_ROOT/$ADDRESS_ID" ]; then
     echo "==> Reprise de l'état de déploiement $ADDRESS_ID -> $TARGET_ID"
+    # `client-enrollment.conf` stores the profile path absolutely, so the rename
+    # would leave it pointing at a directory that no longer exists. It is read
+    # back to tell the operator which profile to install: a stale path there
+    # sends them to a file that is not the one the gateway admits.
+    RENAMED_STATE="$CERTS_ROOT/$ADDRESS_ID/client-enrollment.conf"
+    if [ -f "$RENAMED_STATE" ]; then
+        sed -i "s|$CERTS_ROOT/$ADDRESS_ID/|$TARGET_DIR/|g" "$RENAMED_STATE"
+    fi
     mv "$CERTS_ROOT/$ADDRESS_ID" "$TARGET_DIR"
 fi
 CA_DIR="$CERTS_ROOT/internal-ca"
