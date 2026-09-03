@@ -127,6 +127,14 @@ pub enum KeyNegoCmd {
         client_private_key: PathBuf,
         #[arg(long)]
         gateway_pq_certificate: PathBuf,
+        /// `CA-PQ` anchor of the gateway's trust domain, base64 ML-DSA-87.
+        ///
+        /// Required against a gateway that carries a domain, since it then
+        /// serves a leaf `CA-PQ` issued rather than a self-signed one
+        /// (ADR-008 §13.1). Omitted for a gateway that carries none, where the
+        /// pinned leaf is the whole of the trust.
+        #[arg(long)]
+        gateway_ca_pq_public_key: Option<PathBuf>,
         #[arg(long)]
         client_pq_certificate: PathBuf,
         #[arg(long)]
@@ -202,6 +210,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
             client_certificate,
             client_private_key,
             gateway_pq_certificate,
+            gateway_ca_pq_public_key,
             client_pq_certificate,
             client_pq_private_key,
             client_wg_private_key_file,
@@ -229,6 +238,19 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
                 }
                 None => None,
             };
+            let ca_pq_anchor = match gateway_ca_pq_public_key {
+                Some(path) => Some(
+                    aether::certificates::encoding::MlDsa87PublicKey::parse(
+                        std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading {}", path.display()))?
+                            .trim(),
+                    )
+                    .context("the CA-PQ anchor is not a readable ML-DSA-87 public key")?
+                    .as_bytes()
+                    .to_vec(),
+                ),
+                None => None,
+            };
             let negotiated = orion_core::key_negotiation::prepare(
                 KeyNegotiationClient {
                     remote: endpoint,
@@ -240,6 +262,7 @@ pub async fn run(command: KeyNegoCmd) -> Result<()> {
                     gateway_ca: read(&gateway_certificate)?,
                     gateway_pq_certificate: serde_json::from_slice(&read(&gateway_pq_certificate)?)
                         .context("parsing the gateway PQ certificate")?,
+                    gateway_ca_pq_public_key: ca_pq_anchor,
                     minimum_mode: mode.into(),
                 },
                 mode.into(),
