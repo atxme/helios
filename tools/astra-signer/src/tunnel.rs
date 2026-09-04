@@ -258,6 +258,13 @@ impl Tunnel {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
+        Self::decode_bounded(response, MAX_ANSWER_BYTES)
+    }
+
+    fn decode_bounded<T: serde::de::DeserializeOwned>(
+        response: reqwest::blocking::Response,
+        max_answer_bytes: usize,
+    ) -> Result<T> {
         let status = response.status();
         if !status.is_success() {
             // The gateway keeps the reason in its own log by design (§8.1.2):
@@ -280,7 +287,7 @@ impl Tunnel {
             }
         }
         let bytes = response.bytes().context("lecture de la réponse")?;
-        if bytes.len() > MAX_ANSWER_BYTES {
+        if bytes.len() > max_answer_bytes {
             bail!(
                 "la gateway a répondu {} octets : au-delà de la borne de cette route",
                 bytes.len()
@@ -302,6 +309,21 @@ impl Tunnel {
 const OPERATOR_PREFIX: &str = "/api/certificates/operator";
 
 impl Tunnel {
+    fn get_campaign<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<T> {
+        let mut request = self.http.get(url);
+        if let Some(token) = token {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        Self::decode_bounded(
+            request.send().context("appel de la gateway")?,
+            crate::origin::MAX_ANSWER_BYTES,
+        )
+    }
+
     /// Reads the campaign operation, then the request it is waiting on.
     ///
     /// The verification is [`crate::origin::Origin::accept`] — the same
@@ -312,7 +334,7 @@ impl Tunnel {
     /// accepting different things.
     pub fn fetch_campaign(&self, operation_id: &Id16) -> Result<crate::origin::CampaignRequest> {
         let view: astra::signing::SigningOperationView = self
-            .get(
+            .get_campaign(
                 &format!(
                     "{}{OPERATOR_PREFIX}/operations/{}",
                     self.base,
@@ -324,7 +346,7 @@ impl Tunnel {
 
         let answer: crate::origin::SignerRequestAnswer = {
             let read_token = crate::origin::Origin::read_token(operation_id, &view)?;
-            self.get(
+            self.get_campaign(
                 &format!(
                     "{}{OPERATOR_PREFIX}/signer-requests/{}",
                     self.base,
@@ -401,7 +423,8 @@ impl Tunnel {
             .body(body)
             .send()
             .context("dépôt de l'approbation")?;
-        let view: astra::signing::SigningOperationView = Self::decode(response)?;
+        let view: astra::signing::SigningOperationView =
+            Self::decode_bounded(response, crate::origin::MAX_ANSWER_BYTES)?;
         Ok(view.state)
     }
 }

@@ -24,24 +24,25 @@
 //!
 //! # What the authority is told, and what it is not
 //!
-//! The administrator the gateway resolved from its source VIP travels in the
-//! body, and it is an audit label rather than a permission: a campaign is
-//! authorized by the WebAuthn assertion and the `CA-PQ` signatures its objects
-//! carry, never by who relayed it. No path, no method and no header of the
-//! original caller's crosses this link.
+//! The administrator identity the gateway resolved from its source VIP travels
+//! in the body for the structured service log, rather than as a permission: a
+//! campaign is authorized by the WebAuthn assertion and the `CA-PQ` signatures
+//! its objects carry, never by who relayed it. No path, no method and no header
+//! of the original caller's crosses this link.
 
 use std::sync::Arc;
 
 use aether::certificates::encoding::{Fingerprint, Id16};
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use helios_api::internal::{
-    RelayedOperatorCampaign, RelayedOperatorSignerResult, OPERATOR_OPERATION_ROUTE,
-    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
+    OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorSignerResult,
+    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE,
+    OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
 };
 
 use crate::service::{
@@ -55,7 +56,10 @@ pub fn private_routes() -> Router<Arc<AstraService>> {
         .route(OPERATOR_OPERATION_ROUTE, post(operation))
         .route(OPERATOR_SIGNER_REQUEST_ROUTE, post(signer_request))
         .route(OPERATOR_VAULT_ROUTE, post(vault))
-        .route(OPERATOR_SIGNER_RESULT_ROUTE, post(signer_result))
+        .route(
+            OPERATOR_SIGNER_RESULT_ROUTE,
+            post(signer_result).layer(DefaultBodyLimit::max(MAX_OPERATOR_RELAY_BODY_BYTES)),
+        )
 }
 
 fn now_unix() -> u64 {
@@ -67,11 +71,11 @@ fn now_unix() -> u64 {
 
 /// One refusal, logged with the administrator it came through.
 ///
-/// The class is what crosses back; the reason stays here and in the protected
-/// audit. The gateway maps the class to the same coarse `403` every other
-/// probe of these routes receives.
-fn refuse(operator: &str, route: &str, error: ServiceError) -> Response {
-    tracing::warn!(operator, route, %error, "private operator route refused");
+/// The class is what crosses back; the reason stays in Astra's structured
+/// service log. The hash-chained registry audit records durable authority
+/// decisions, not read-side probes that would churn its anti-fork witness.
+fn refuse(operator: &OperatorIdentity, route: &str, error: ServiceError) -> Response {
+    tracing::warn!(operator = %operator, route, %error, "private operator route refused");
     error.into_response()
 }
 
@@ -160,7 +164,14 @@ async fn signer_result(
         return refuse(&relayed.operator, "signer-result", ServiceError::Protocol);
     };
     match operator_signer_result(&service, &id, token, relayed.result, now_unix()).await {
-        Ok(view) => (axum::http::StatusCode::OK, Json(view)).into_response(),
+        Ok(view) => {
+            tracing::info!(
+                operator = %relayed.operator,
+                operation = %id,
+                "private operator result accepted"
+            );
+            (axum::http::StatusCode::OK, Json(view)).into_response()
+        }
         Err(error) => refuse(&relayed.operator, "signer-result", error),
     }
 }

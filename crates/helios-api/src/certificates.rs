@@ -678,21 +678,21 @@ pub trait ClientRenewalRelay: Send + Sync {
 /// signatures its objects carry. Merging the two would put a campaign behind
 /// `require_peer`, which is the whole distinction §8.5 draws.
 ///
-/// The administrator is carried for the authority's protected log, never as a
-/// permission. Nothing in this trait accepts a path, a method or a header.
+/// The administrator is carried for Astra's structured service log, never as
+/// a permission. Nothing in this trait accepts a path, a method or a header.
 #[async_trait]
 pub trait OperatorCampaignRelay: Send + Sync {
     /// Reads one campaign operation.
     async fn operation(
         &self,
-        operator: &str,
+        operator: &crate::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
     ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal>;
 
     /// Fetches what the companion has to display before it asks for a touch.
     async fn signer_request(
         &self,
-        operator: &str,
+        operator: &crate::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
     ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal>;
@@ -700,7 +700,7 @@ pub trait OperatorCampaignRelay: Send + Sync {
     /// Downloads the encrypted vault this campaign names, still encrypted.
     async fn encrypted_vault(
         &self,
-        operator: &str,
+        operator: &crate::internal::OperatorIdentity,
         fingerprint: &aether::certificates::encoding::Fingerprint,
         capability_token: &str,
     ) -> Result<Vec<u8>, TrustUpdateRefusal>;
@@ -708,7 +708,7 @@ pub trait OperatorCampaignRelay: Send + Sync {
     /// Delivers the operator's assertion and returns what it produced.
     async fn signer_result(
         &self,
-        operator: &str,
+        operator: &crate::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
         result: Box<aether::certificates::status::AstraSignerResult>,
@@ -1036,9 +1036,12 @@ pub async fn renewal_signer_result(
 /// `require_admin` has already resolved and checked the caller; this checks it
 /// again. Not superstition: it is what makes these handlers safe to call, and
 /// what keeps a future remount on the wrong router from silently turning a
-/// campaign relay into a peer-reachable one. The name is an audit label, never
-/// a permission.
-fn operator_caller(caller: &crate::auth::Caller, route: &str) -> Option<String> {
+/// campaign relay into a peer-reachable one. The stable WireGuard key is a log
+/// identity, never a permission.
+fn operator_caller(
+    caller: &crate::auth::Caller,
+    route: &str,
+) -> Result<crate::internal::OperatorIdentity, StatusCode> {
     if !caller.admin {
         tracing::warn!(
             pair = %caller.name,
@@ -1046,19 +1049,47 @@ fn operator_caller(caller: &crate::auth::Caller, route: &str) -> Option<String> 
             route,
             "operator campaign refused: the caller is not an administrator"
         );
-        return None;
+        return Err(StatusCode::FORBIDDEN);
     }
-    Some(caller.name.clone())
+    if caller.dev_loopback {
+        return Ok(crate::internal::OperatorIdentity::DevLoopback);
+    }
+    let Some(public_key) = caller.public_key.as_deref() else {
+        tracing::error!(
+            pair = %caller.name,
+            source = %caller.source,
+            route,
+            "operator campaign refused: authenticated peer has no WireGuard identity"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let public_key =
+        aether::certificates::encoding::WireGuardKey::parse(public_key).map_err(|error| {
+            tracing::error!(
+                pair = %caller.name,
+                source = %caller.source,
+                route,
+                %error,
+                "operator campaign refused: authenticated peer has an invalid WireGuard identity"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(crate::internal::OperatorIdentity::WireGuard { public_key })
 }
 
 /// One coarse refusal for everything a caller could probe with.
 ///
 /// Unknown administrator, unparseable identifier, unknown operation, expired
 /// operation, missing or out-of-scope capability: all `403`, and told apart
-/// only in this gateway's log and the authority's protected audit. A finer
-/// status here would answer «that campaign exists» to whoever asked.
-fn operator_refused(operator: &str, route: &str, reason: &str) -> Response {
-    tracing::warn!(operator, route, reason, "operator campaign refused");
+/// only in the gateway log before relay, or Astra's structured service log
+/// after relay. A finer status here would answer «that campaign exists» to
+/// whoever asked.
+fn operator_refused(
+    operator: &crate::internal::OperatorIdentity,
+    route: &str,
+    reason: &str,
+) -> Response {
+    tracing::warn!(operator = %operator, route, reason, "operator campaign refused");
     StatusCode::FORBIDDEN.into_response()
 }
 
@@ -1068,9 +1099,9 @@ fn operator_refused(operator: &str, route: &str, reason: &str) -> Response {
 /// This is the one refusal on these routes allowed to be specific, because it
 /// says nothing about the domain — only that this deployment has no private
 /// channel to dial.
-fn operator_unavailable(operator: &str, route: &str) -> Response {
+fn operator_unavailable(operator: &crate::internal::OperatorIdentity, route: &str) -> Response {
     tracing::warn!(
-        operator,
+        operator = %operator,
         route,
         "operator campaign unavailable: this gateway has no private channel to the authority"
     );
@@ -1083,8 +1114,9 @@ pub async fn operator_operation(
     Extension(caller): Extension<crate::auth::Caller>,
     axum::extract::Path(operation): axum::extract::Path<String>,
 ) -> Response {
-    let Some(operator) = operator_caller(&caller, "operation") else {
-        return StatusCode::FORBIDDEN.into_response();
+    let operator = match operator_caller(&caller, "operation") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
     };
     let Ok(operation) = parse_operation_id(&operation) else {
         return operator_refused(&operator, "operation", "unparseable operation identifier");
@@ -1105,8 +1137,9 @@ pub async fn operator_signer_request(
     axum::extract::Path(operation): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(operator) = operator_caller(&caller, "signer-request") else {
-        return StatusCode::FORBIDDEN.into_response();
+    let operator = match operator_caller(&caller, "signer-request") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
     };
     let Ok(operation) = parse_operation_id(&operation) else {
         return operator_refused(
@@ -1139,8 +1172,9 @@ pub async fn operator_vault(
     axum::extract::Path(fingerprint): axum::extract::Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(operator) = operator_caller(&caller, "vault") else {
-        return StatusCode::FORBIDDEN.into_response();
+    let operator = match operator_caller(&caller, "vault") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
     };
     let Ok(fingerprint) = aether::certificates::encoding::Fingerprint::parse_hex(&fingerprint)
     else {
@@ -1172,8 +1206,9 @@ pub async fn operator_signer_result(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(operator) = operator_caller(&caller, "signer-result") else {
-        return StatusCode::FORBIDDEN.into_response();
+    let operator = match operator_caller(&caller, "signer-result") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
     };
     let Ok(operation) = parse_operation_id(&operation) else {
         return operator_refused(
@@ -1186,17 +1221,18 @@ pub async fn operator_signer_result(
         return operator_refused(&operator, "signer-result", "no capability token");
     };
     let token = token.to_string();
-    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
+    if body.len() > crate::internal::MAX_OPERATOR_REQUEST_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let result: aether::certificates::status::AstraSignerResult =
-        match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(operator, %error, "operator campaign refused: unreadable result");
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-        };
+    let result: aether::certificates::status::AstraSignerResult = match serde_json::from_slice(
+        &body,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(operator = %operator, %error, "operator campaign refused: unreadable result");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
     let Some(relay) = s.operator_campaign.as_ref() else {
         return operator_unavailable(&operator, "signer-result");
     };
@@ -1357,7 +1393,7 @@ mod tests {
     /// A relay that records who reached it, and answers what it was given.
     struct SpyCampaign {
         answer: Result<crate::internal::SigningOperationView, TrustUpdateRefusal>,
-        seen: Mutex<Option<String>>,
+        seen: Mutex<Option<crate::internal::OperatorIdentity>>,
     }
 
     impl SpyCampaign {
@@ -1380,41 +1416,41 @@ mod tests {
     impl OperatorCampaignRelay for SpyCampaign {
         async fn operation(
             &self,
-            operator: &str,
+            operator: &crate::internal::OperatorIdentity,
             _operation: &Id16,
         ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
-            *self.seen.lock().unwrap() = Some(operator.to_string());
+            *self.seen.lock().unwrap() = Some(operator.clone());
             self.answer.clone()
         }
 
         async fn signer_request(
             &self,
-            operator: &str,
+            operator: &crate::internal::OperatorIdentity,
             _operation: &Id16,
             _capability_token: &str,
         ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal> {
-            *self.seen.lock().unwrap() = Some(operator.to_string());
+            *self.seen.lock().unwrap() = Some(operator.clone());
             Err(TrustUpdateRefusal::Rejected)
         }
 
         async fn encrypted_vault(
             &self,
-            operator: &str,
+            operator: &crate::internal::OperatorIdentity,
             _fingerprint: &Fingerprint,
             _capability_token: &str,
         ) -> Result<Vec<u8>, TrustUpdateRefusal> {
-            *self.seen.lock().unwrap() = Some(operator.to_string());
+            *self.seen.lock().unwrap() = Some(operator.clone());
             Err(TrustUpdateRefusal::Rejected)
         }
 
         async fn signer_result(
             &self,
-            operator: &str,
+            operator: &crate::internal::OperatorIdentity,
             _operation: &Id16,
             _capability_token: &str,
             _result: Box<aether::certificates::status::AstraSignerResult>,
         ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
-            *self.seen.lock().unwrap() = Some(operator.to_string());
+            *self.seen.lock().unwrap() = Some(operator.clone());
             self.answer.clone()
         }
     }
@@ -1459,9 +1495,35 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            relay.seen.lock().unwrap().as_deref(),
-            Some("poste-operateur"),
-            "the authority's audit has to name the administrator the ceremony came through"
+            relay.seen.lock().unwrap().as_ref(),
+            Some(&crate::internal::OperatorIdentity::WireGuard {
+                public_key: aether::certificates::encoding::WireGuardKey::parse(CLIENT_KEY)
+                    .unwrap(),
+            }),
+            "Astra's service log receives the administrator's stable identity, not its mutable label"
+        );
+    }
+
+    #[tokio::test]
+    async fn development_loopback_never_impersonates_a_wireguard_operator() {
+        let relay = SpyCampaign::granting();
+        let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+        let response = operator_operation(
+            State(state),
+            Extension(crate::auth::Caller {
+                source: "127.0.0.1".parse().unwrap(),
+                name: "dev-loopback".into(),
+                public_key: None,
+                admin: true,
+                dev_loopback: true,
+            }),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            relay.seen.lock().unwrap().as_ref(),
+            Some(&crate::internal::OperatorIdentity::DevLoopback)
         );
     }
 

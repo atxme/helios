@@ -305,9 +305,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/certificates/operator/signer-results/:operation",
-            post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
-            )),
+            post(certificates::operator_signer_result)
+                .layer(DefaultBodyLimit::max(internal::MAX_OPERATOR_REQUEST_BYTES)),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -624,6 +623,43 @@ mod security_tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "the administrator is admitted; what is missing is the private channel"
         );
+    }
+
+    /// Operator results have their own 64 KiB contract.
+    ///
+    /// The trust-update protocol is chunked and uses a smaller 32 KiB request
+    /// bound. Reusing that constant here would make the tunnel reject a result
+    /// which Astra's public operator origin accepts. Invalid JSON below lets us
+    /// distinguish "the route read it" (`400`) from "the body limit stopped it"
+    /// (`413`) without constructing a signed authority result.
+    #[tokio::test]
+    async fn operator_results_use_the_operator_body_bound() {
+        const URI: &str =
+            "/api/certificates/operator/signer-results/07070707070707070707070707070707";
+
+        let (within_state, _cmd_rx) = state();
+        let within = " ".repeat(40 * 1024);
+        let mut request = admin_request(URI, &within);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer invalid".parse().expect("header"),
+        );
+        let response = router(within_state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a body above the trust-update bound but within the operator bound must reach the parser"
+        );
+
+        let (oversized_state, _cmd_rx) = state();
+        let oversized = " ".repeat(internal::MAX_OPERATOR_REQUEST_BYTES + 1);
+        let mut request = admin_request(URI, &oversized);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer invalid".parse().expect("header"),
+        );
+        let response = router(oversized_state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

@@ -586,10 +586,11 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
     /// renewal relay above: a campaign belongs to no peer. What bounds who may
     /// make one circulate is `require_admin` on the route; what authorizes it
     /// is the assertion and the `CA-PQ` signatures its objects carry. The
-    /// administrator's name travels for the authority's audit only.
+    /// administrator's stable WireGuard identity travels for Astra's
+    /// structured service log only.
     async fn operation(
         &self,
-        operator: &str,
+        operator: &helios_api::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
     ) -> Result<
         helios_api::internal::SigningOperationView,
@@ -599,7 +600,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
             .operator_operation(
                 operation,
                 &helios_api::internal::RelayedOperatorCampaign {
-                    operator: operator.to_string(),
+                    operator: operator.clone(),
                 },
             )
             .await
@@ -608,7 +609,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn signer_request(
         &self,
-        operator: &str,
+        operator: &helios_api::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
     ) -> Result<
@@ -620,7 +621,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
                 operation,
                 capability_token,
                 &helios_api::internal::RelayedOperatorCampaign {
-                    operator: operator.to_string(),
+                    operator: operator.clone(),
                 },
             )
             .await
@@ -629,7 +630,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn encrypted_vault(
         &self,
-        operator: &str,
+        operator: &helios_api::internal::OperatorIdentity,
         fingerprint: &aether::certificates::encoding::Fingerprint,
         capability_token: &str,
     ) -> Result<Vec<u8>, helios_api::certificates::TrustUpdateRefusal> {
@@ -638,7 +639,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
                 fingerprint,
                 capability_token,
                 &helios_api::internal::RelayedOperatorCampaign {
-                    operator: operator.to_string(),
+                    operator: operator.clone(),
                 },
             )
             .await
@@ -647,7 +648,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
 
     async fn signer_result(
         &self,
-        operator: &str,
+        operator: &helios_api::internal::OperatorIdentity,
         operation: &aether::certificates::encoding::Id16,
         capability_token: &str,
         result: Box<aether::certificates::status::AstraSignerResult>,
@@ -660,7 +661,7 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
                 operation,
                 capability_token,
                 &helios_api::internal::RelayedOperatorSignerResult {
-                    operator: operator.to_string(),
+                    operator: operator.clone(),
                     result,
                 },
             )

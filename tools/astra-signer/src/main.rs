@@ -3691,19 +3691,6 @@ fn connect_authorized_key(
     Ok(ConnectedKey { key, pin, opened })
 }
 
-/// Checks what the authority served, before an operator is asked for anything.
-///
-/// The request is signed by Astra's service key and verified under the key
-/// this companion already pins; the campaign is bound to that signature; and
-/// the relying party the authority announces is **compared** to the vault's,
-/// never adopted.
-///
-/// The URL is checked **inside** the signature rather than against a local
-/// copy: Astra signs the origin it serves itself, so an operator pointed at
-/// another host gets a request whose `authority_url` does not match what they
-/// dialled — and no signature under the pinned service key can be produced for
-/// one that does. That is why the hand-off records the key and not the
-/// address.
 /// The authority origin a signed request must name, from what is already held.
 ///
 /// Never from the answer being verified: an `authority_url` taken out of the
@@ -3738,6 +3725,15 @@ fn expected_authority_url(
     }
 }
 
+/// Checks what the authority served, before an operator is asked for anything.
+///
+/// The request is signed by Astra's service key and verified under the key
+/// this companion already pins; the campaign is bound to that signature; and
+/// the relying party the authority announces is **compared** to the vault's,
+/// never adopted.
+///
+/// `authority_url` is the expected value [`expected_authority_url`] resolved —
+/// never one this answer supplied.
 fn verify_campaign_request(
     handoff: &handoff::DomainHandoff,
     vault: &AuthorityVault,

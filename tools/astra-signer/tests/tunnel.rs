@@ -372,6 +372,36 @@ fn an_address_without_a_scheme_is_refused() {
     assert!(Tunnel::new("http://100.64.0.1:8080").is_ok());
 }
 
+/// Campaign responses use the public operator ceiling, not the larger bound
+/// retained by the ordinary renewal transport.
+#[test]
+fn operator_campaign_answers_stop_at_128_kib() {
+    let operation_id = operation();
+
+    let within = format!("{{}}{}", " ".repeat(96 * 1024));
+    let stub = Stub::serving(vec![(200, within)]);
+    let refusal = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .fetch_campaign(&operation_id)
+        .expect_err("an incomplete operation view");
+    assert!(
+        refusal.to_string().contains("lecture de l'opération")
+            && !format!("{refusal:#}").contains("au-delà de la borne"),
+        "a response below 128 KiB must reach decoding: {refusal:#}"
+    );
+
+    let oversized = " ".repeat(128 * 1024 + 1);
+    let stub = Stub::serving(vec![(200, oversized)]);
+    let refusal = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .fetch_campaign(&operation_id)
+        .expect_err("an oversized campaign answer");
+    assert!(
+        format!("{refusal:#}").contains("au-delà de la borne"),
+        "an answer above 128 KiB was not rejected at the transport boundary: {refusal:#}"
+    );
+}
+
 /// An approval shaped like a real one. Nothing here verifies — the gesture
 /// does that, on the operator's machine, with a key in hand. What the wire
 /// carries is these bytes, and that is what the test asserts on.

@@ -179,9 +179,11 @@ source ; une opération de campagne n'appartient à aucun pair et son autorité
 est ailleurs — dans l'assertion YubiKey et les signatures applicatives. Le
 relais opérateur exige donc un pair **administrateur**, jamais un simple pair
 admis, et son identité est établie avant toute lecture comme avant tout
-relais. Il ne donne accès à aucune opération de renouvellement : les deux
-surfaces adressent deux magasins distincts chez Astra, et la séparation est
-structurelle plutôt que vérifiée.
+relais. L'identité transmise est sa clé publique WireGuard, unique et stable,
+jamais son nom convivial ; le loopback de développement possède une variante
+explicite et ne peut pas être confondu avec un pair réel. Il ne donne accès à
+aucune opération de renouvellement : les deux surfaces adressent deux magasins
+distincts chez Astra, et la séparation est structurelle plutôt que vérifiée.
 
 Ce relais reste ce que le §2 exige déjà de l'autre : il transporte des objets
 canoniques et rien d'autre. Pas de chemin choisi par l'appelant, pas de
@@ -193,8 +195,12 @@ le même magasin d'opérations qui les émet.
 
 Les refus publics restent grossiers : un pair non administrateur, une origine
 incohérente, une opération inconnue et une opération expirée reçoivent des
-réponses qui ne se distinguent pas entre elles. Le détail n'existe que dans
-les journaux de la gateway et l'audit protégé d'Astra.
+réponses qui ne se distinguent pas entre elles. Un refus antérieur au relais
+n'existe que dans le journal structuré de la gateway ; un refus rendu par
+l'autorité existe aussi dans le journal structuré d'Astra. Ces sondes en
+lecture n'avancent pas l'audit chaîné : sa tête est un témoin des mutations
+durables du registre, et la faire changer à chaque appel refusé rendrait le
+témoin anti-fork caduc sans changement d'autorité.
 
 Ce que cet amendement ne fait **pas** : il n'ajoute aucune ancre de confiance.
 En particulier, aucune CA TLS privée d'Astra n'entre dans un profil Orion.

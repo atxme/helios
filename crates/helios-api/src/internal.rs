@@ -1082,10 +1082,10 @@ impl PinnedHttpClient {
 
     /// The same call under a caller-chosen answer ceiling.
     ///
-    /// One route needs a larger one — the encrypted vault of §8.5, which the
-    /// public origin also serves above the ordinary body bound. The limit is
-    /// still applied before the answer is read into memory, so an authority
-    /// that has been taken over cannot make this process allocate without end.
+    /// The operator surface needs the 128 KiB ceiling of §8.5, including for a
+    /// large campaign description and its encrypted vault. The limit is still
+    /// applied before the answer is read into memory, so an authority that has
+    /// been taken over cannot make this process allocate without end.
     async fn request_bounded(
         &self,
         method: &str,
@@ -1207,30 +1207,68 @@ pub const OPERATOR_SIGNER_REQUEST_ROUTE: &str = "/internal/v1/operator/signer-re
 pub const OPERATOR_VAULT_ROUTE: &str = "/internal/v1/operator/vaults/:fingerprint";
 pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-results/:operation";
 
-/// Ceiling on an operator answer, which may be an encrypted vault.
+/// Ceiling on every operator answer, including the encrypted vault.
 ///
 /// 128 KiB, the §8.2 response ceiling — the public origin serves the same file
 /// under the same bound, and Astra refuses to serve one that is larger. The
-/// ordinary [`MAX_INTERNAL_BODY_BYTES`] stays what it is for every other call
-/// on this link: a vault is the one object on it that is not a signed
-/// certificate object.
+/// ordinary [`MAX_INTERNAL_BODY_BYTES`] stays what it is for every non-operator
+/// call on this link.
 pub const MAX_OPERATOR_ANSWER_BYTES: usize = 128 * 1024;
+
+/// Largest canonical operator request accepted on either public surface.
+///
+/// Operator results may contain several ML-DSA-87-signed transition objects.
+/// Their §8.5 ceiling is intentionally larger than the 32 KiB transaction
+/// request used by the chunked trust-update protocol.
+pub const MAX_OPERATOR_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Largest private body carrying an operator result.
+///
+/// The public route bounds the canonical result at 64 KiB. The private route
+/// adds only the gateway-resolved, fixed-size operator identity and the JSON
+/// field names around that result. Keeping a separate ceiling preserves the
+/// public bound without making a valid boundary-sized result impossible to
+/// relay.
+pub const MAX_OPERATOR_RELAY_BODY_BYTES: usize = MAX_OPERATOR_REQUEST_BYTES + 256;
+
+/// Administrator identity established from the request's WireGuard source.
+///
+/// A peer name is a mutable UI label; the WireGuard public key is the unique
+/// identity from the admitted peer table. Development loopback has no such
+/// key and is represented explicitly so it can never be confused with a real
+/// peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperatorIdentity {
+    WireGuard { public_key: WireGuardKey },
+    DevLoopback,
+}
+
+impl std::fmt::Display for OperatorIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WireGuard { public_key } => write!(formatter, "wireguard:{public_key}"),
+            Self::DevLoopback => formatter.write_str("dev-loopback"),
+        }
+    }
+}
 
 /// What the gateway relays for an operator campaign (spec §8.5).
 ///
-/// The administrator the gateway resolved from the source VIP, and nothing
-/// else. It is **not** an authorization: a campaign is authorized by the
+/// The administrator identity the gateway resolved from the source VIP, and
+/// nothing else. It is **not** an authorization: a campaign is authorized by the
 /// WebAuthn assertion and by the `CA-PQ` signatures the objects carry, never
-/// by who relayed it. It travels so the authority's protected log can name the
+/// by who relayed it. It travels so Astra's structured log can name the
 /// admitted administrator the ceremony came through — the same reason the
-/// client relay carries its caller.
+/// client relay carries its caller. It does not advance the registry's
+/// hash-chained mutation audit.
 ///
 /// No path, no method, no header of the caller's: this is the whole of what
 /// crosses, and the route is chosen by the gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayedOperatorCampaign {
-    pub operator: String,
+    pub operator: OperatorIdentity,
 }
 
 /// What the companion deposits, relayed with its administrator (spec §8.5).
@@ -1240,7 +1278,7 @@ pub struct RelayedOperatorCampaign {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayedOperatorSignerResult {
-    pub operator: String,
+    pub operator: OperatorIdentity,
     pub result: Box<aether::certificates::status::AstraSignerResult>,
 }
 
@@ -1455,10 +1493,11 @@ impl AstraLifecycleClient {
         operation: &Id16,
         relayed: &RelayedOperatorCampaign,
     ) -> Result<SigningOperationView, ChannelError> {
-        self.post(
+        self.post_bounded(
             &operator_path("operations", &operation.to_string()),
             relayed,
             None,
+            MAX_OPERATOR_ANSWER_BYTES,
         )
         .await
     }
@@ -1470,10 +1509,11 @@ impl AstraLifecycleClient {
         token: &str,
         relayed: &RelayedOperatorCampaign,
     ) -> Result<OperatorSignerRequestResponse, ChannelError> {
-        self.post(
+        self.post_bounded(
             &operator_path("signer-requests", &operation.to_string()),
             relayed,
             Some(token),
+            MAX_OPERATOR_ANSWER_BYTES,
         )
         .await
     }
@@ -1512,10 +1552,11 @@ impl AstraLifecycleClient {
         token: &str,
         relayed: &RelayedOperatorSignerResult,
     ) -> Result<SigningOperationView, ChannelError> {
-        self.post(
+        self.post_bounded(
             &operator_path("signer-results", &operation.to_string()),
             relayed,
             Some(token),
+            MAX_OPERATOR_ANSWER_BYTES,
         )
         .await
     }
@@ -1529,6 +1570,28 @@ impl AstraLifecycleClient {
         let body =
             serde_json::to_vec(body).map_err(|error| ChannelError::Body(error.to_string()))?;
         let answer = self.http.request("POST", path, Some(body), bearer).await?;
+        serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
+    }
+
+    async fn post_bounded<B: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        bearer: Option<&str>,
+        max_answer_bytes: usize,
+    ) -> Result<R, ChannelError> {
+        let body =
+            serde_json::to_vec(body).map_err(|error| ChannelError::Body(error.to_string()))?;
+        if body.len() > MAX_OPERATOR_RELAY_BODY_BYTES {
+            return Err(ChannelError::Body(format!(
+                "operator relay body is {} bytes, above the private route ceiling",
+                body.len()
+            )));
+        }
+        let answer = self
+            .http
+            .request_bounded("POST", path, Some(body), bearer, max_answer_bytes)
+            .await?;
         serde_json::from_slice(&answer).map_err(|error| ChannelError::Body(error.to_string()))
     }
 }
@@ -1625,6 +1688,33 @@ mod tests {
             "an encoded segment holds no separator, so it stays one segment: {segment}"
         );
         assert!(!path.contains("client-rotation/request"));
+    }
+
+    /// The private result envelope has a fixed and explicitly reserved cost.
+    ///
+    /// The canonical result may consume the whole public 64 KiB allowance.
+    /// Only a typed WireGuard key (or the smaller development marker) is added
+    /// on the private hop, so the extra 256-byte allowance must cover every
+    /// identity variant and the surrounding JSON field names.
+    #[test]
+    fn every_operator_identity_fits_the_reserved_relay_overhead() {
+        for operator in [
+            OperatorIdentity::WireGuard {
+                public_key: WireGuardKey::from_bytes([7; 32]),
+            },
+            OperatorIdentity::DevLoopback,
+        ] {
+            let envelope = serde_json::json!({
+                "operator": operator,
+                "result": null,
+            });
+            let encoded = serde_json::to_vec(&envelope).expect("operator envelope");
+            let overhead = encoded.len() - b"null".len();
+            assert!(
+                overhead <= MAX_OPERATOR_RELAY_BODY_BYTES - MAX_OPERATOR_REQUEST_BYTES,
+                "operator envelope uses {overhead} bytes"
+            );
+        }
     }
 
     /// A disposable transport identity, built exactly as the two `init`

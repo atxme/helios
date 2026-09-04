@@ -2165,9 +2165,15 @@ l'autorité qui tourne sur elle-même. Un journal de refus doit pouvoir dire
 laquelle des deux surfaces a été sondée.
 
 Le corps relayé porte l'identité résolue par la gateway et l'objet canonique,
-jamais le chemin, la méthode ni un en-tête de l'appelant. Les bornes de §8.2
-s'appliquent à l'identique : 64 Kio par corps avant désérialisation, 128 Kio
-par réponse — le coffre chiffré compris —, 128 octets par identifiant opaque.
+jamais le chemin, la méthode ni un en-tête de l'appelant. Cette identité est la
+clé publique WireGuard, unique dans la table d'admission, et non le nom
+convivial mutable ; le loopback de développement est une variante explicite.
+
+Les bornes de §8.2 s'appliquent à l'objet canonique : 64 Kio avant
+désérialisation et 128 octets par identifiant opaque. L'enveloppe privée d'un
+résultat ajoute au plus 256 octets d'identité typée et de structure JSON : son
+plafond est donc 64 Kio + 256 octets. Toutes les réponses, pas seulement le
+coffre chiffré, sont limitées à 128 Kio.
 
 #### 8.5.2 Autorisation
 
@@ -2210,8 +2216,11 @@ publique.
 
 Les réponses publiques sont grossières et ne se distinguent pas entre elles :
 pair non administrateur, origine incohérente, opération inconnue, opération
-expirée, capacité absente ou hors scope. Le détail reste dans les journaux de
-la gateway et l'audit protégé d'Astra. Une gateway sans canal privé répond
+expirée, capacité absente ou hors scope. Le détail d'un refus antérieur au
+relais reste dans le journal structuré de la gateway ; celui d'un refus rendu
+par l'autorité existe aussi dans le journal structuré d'Astra. Un refus de
+lecture n'avance pas l'audit chaîné : sa tête témoigne des mutations durables
+du registre, pas des sondes réseau. Une gateway sans canal privé répond
 `503` et le dit dans son journal, comme en §8.1.2 : la route existe et
 l'appelant a raison de l'employer.
 

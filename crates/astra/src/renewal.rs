@@ -1257,14 +1257,16 @@ pub mod router {
     use super::{now_unix, RenewalError};
     use crate::service::AstraService;
 
-    /// Largest body this listener reads.
+    /// Largest ordinary body this listener reads.
     ///
     /// A rotation request carries two certificate requests and three ML-DSA-87
     /// signatures; sixty-four kilobytes is well above that and far below what
     /// an allocation driven by a caller would be. A relayed preparation adds a
     /// peer snapshot and one PQ leaf to a request already bounded by
     /// [`aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES`],
-    /// which stays inside the same ceiling.
+    /// which stays inside the same ceiling. The operator result route has its
+    /// own 64 KiB canonical body plus the fixed typed-identity envelope; its
+    /// route-local limit is defined in [`crate::operator`].
     pub const MAX_PRIVATE_BODY_BYTES: usize = 64 * 1024;
 
     /// Builds the private router.
