@@ -1259,6 +1259,26 @@ pub fn domain_view(
 /// offered as a second root, and a new anchor would in any case need a
 /// restart, since rebuilding the endpoint under live sessions would drop the
 /// PSK slots they hold. Nothing performs that rotation yet.
+/// Every authority a client leaf may chain to, in the order the negotiation
+/// port asks them.
+///
+/// Pure on purpose, like [`assert_candidate_is_presentable`]: the key is read
+/// from disk by the caller, so this can be exercised without a
+/// `/var/lib/helios` on the machine running it.
+fn client_leaf_issuers<'a>(
+    state: &'a helios_provisioning::certificates::RegistryState,
+    operator_ca: &'a aether::certificates::encoding::MlDsa87PublicKey,
+    now_unix: u64,
+) -> Vec<&'a aether::certificates::encoding::MlDsa87PublicKey> {
+    let mut issuers = vec![operator_ca];
+    for key in state.client_leaf_issuers(now_unix) {
+        if !issuers.contains(&key) {
+            issuers.push(key);
+        }
+    }
+    issuers
+}
+
 fn assert_candidate_is_presentable(
     state: &helios_provisioning::certificates::RegistryState,
     client_pq_ca: &[u8],
@@ -1402,15 +1422,40 @@ impl TrustUpdateHandler for CertificateService {
         let registry = self.registry.lock().await;
         let state = registry.state();
 
-        // Both authorities that may have issued the caller's leaf: the anchor,
-        // and the delegated issuer an ordinary renewal chains to.
-        let mut issuers = vec![&state.gateway.current_ca_public_key];
-        if let Some(next) = &state.gateway.next_ca_public_key {
-            issuers.push(next);
-        }
-        if let Some(issuer) = &state.issuer {
-            issuers.push(&issuer.authorization.pq_issuer_public_key);
-        }
+        // Every authority that may have issued the caller's leaf, asked as
+        // exactly the question the negotiation port answers: the operator CA
+        // on disk, then the registry's anchors and the delegated issuer an
+        // ordinary renewal chains to.
+        //
+        // The operator CA is not optional here. A client's *first* leaf is
+        // issued under it at admission — only a renewal moves it to the
+        // delegated issuer — so a set built from the registry alone refuses
+        // every client that has never renewed, which on a fresh domain is all
+        // of them. Both other sites that ask this question build it the same
+        // way, and the three must not drift: this one did, and the symptom was
+        // a `403` on every connection with nothing naming the cause.
+        let operator_ca = std::fs::read(crate::key_negotiation::CLIENT_PQ_CA_PATH)
+            .map_err(|error| {
+                tracing::error!(
+                    peer = %caller_wg_public_key,
+                    %error,
+                    "trust update refused: the client PQ CA the negotiation port authenticates \
+                     under is unreadable"
+                );
+                TrustUpdateRefusal::Internal
+            })
+            .and_then(|bytes| {
+                aether::certificates::encoding::MlDsa87PublicKey::new(bytes).map_err(|error| {
+                    tracing::error!(
+                        peer = %caller_wg_public_key,
+                        %error,
+                        "trust update refused: the client PQ CA on disk is not a readable \
+                         ML-DSA-87 public key"
+                    );
+                    TrustUpdateRefusal::Internal
+                })
+            })?;
+        let issuers = client_leaf_issuers(state, &operator_ca, now);
 
         request
             .verify(
@@ -2570,5 +2615,47 @@ mod tests {
         });
         assert_candidate_is_presentable(&state, on_disk_ca.as_bytes(), &authorization)
             .expect("the delegated issuer is one the negotiation admits");
+    }
+
+    /// The operator CA is the authority a client's **first** leaf is issued
+    /// under: only a renewal moves it to the delegated issuer. A trust-update
+    /// route that asked the registry alone therefore refused every client that
+    /// had never renewed — on a fresh domain, all of them — with a bare `403`
+    /// and nothing naming the cause.
+    #[test]
+    fn the_issuer_set_admits_a_client_that_has_never_renewed() {
+        let (_, operator_ca) = generate_ml_dsa_87_keypair().expect("operator CA");
+        let state = state();
+
+        let issuers = client_leaf_issuers(&state, &operator_ca, 1_000);
+
+        assert_eq!(
+            issuers.first().copied(),
+            Some(&operator_ca),
+            "the operator CA is asked first, as the negotiation port asks it"
+        );
+        assert!(
+            issuers.contains(&&state.gateway.current_ca_public_key),
+            "the anchor stays in the set: a leaf reissued under CA-PQ must keep working"
+        );
+    }
+
+    /// Asked twice, offered once. The registry may already carry the same key
+    /// the gateway holds on disk, and a duplicated issuer would make every
+    /// refusal report one more failed attempt than actually happened.
+    #[test]
+    fn the_issuer_set_does_not_repeat_an_authority_it_already_holds() {
+        let state = state();
+        let operator_ca = state.gateway.current_ca_public_key.clone();
+
+        let issuers = client_leaf_issuers(&state, &operator_ca, 1_000);
+
+        assert_eq!(
+            issuers
+                .iter()
+                .filter(|issuer| ***issuer == operator_ca)
+                .count(),
+            1
+        );
     }
 }
