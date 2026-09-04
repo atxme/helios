@@ -141,6 +141,70 @@ l'opération, au manifeste, au coffre éventuel et à cinq minutes au plus. La c
 racine de ces capacités est éphémère au processus Astra : un redémarrage les
 invalide, sans dériver aucun droit d'une CA ou de la clé de service.
 
+#### Amendement du 4 septembre 2026 — le tunnel porte aussi les campagnes opérateur
+
+La réserve « et pour les opérations opérateur explicitement lancées hors
+tunnel » se lisait comme une dispense : toute campagne passait par l'origine
+publique, y compris depuis une machine dont le tunnel était monté. Sur un
+déploiement dont le nom d'autorité n'est pas publiquement résoluble — le cas
+attendu, puisque le RP ID est fixé avant l'amorçage et ne peut plus changer
+sans invalider les key-slots — cette origine n'existe pas, et les quatre
+commandes de chaîne devenaient inatteignables. La rotation de la CA TLS
+cliente en fait partie ; elle est aussi ce qui débloque §9.4. Une autorité
+qu'on ne peut joindre qu'en publiant un port ou en ajoutant un terminateur
+TLS n'est pas un modèle de récupération, c'est une dépendance de déploiement.
+
+La règle devient la même que pour un renouvellement ordinaire : **le canal
+WireGuard est obligatoire dès qu'il existe**, pour les campagnes opérateur
+comme pour le reste. L'origine publique ne sert plus qu'un opérateur qui n'a
+réellement aucun tunnel, et le document hors ligne reste le dernier recours.
+
+Trois transports, un seul geste. Ce qui diffère est le chemin ; la
+vérification est identique, parce que ce sont les objets qui portent les
+signatures :
+
+* **Tunnel** — `--heliosd-url` et `--operation-id`, chemin prioritaire.
+* **HTTPS** — `--authority-url` et `--operation-id`, pour un opérateur sans
+  tunnel, sur un déploiement qui a choisi un nom public avant l'amorçage.
+* **Hors ligne** — `--request` / `--campaign` et `--out`, dernier recours.
+
+Le choix est explicite et ne se rattrape pas : un transport tunnel qui échoue
+est une erreur, jamais un repli silencieux vers l'origine publique. Un repli
+ferait dépendre le chemin réellement emprunté d'une panne, et l'opérateur
+croirait avoir approuvé dans le tunnel une cérémonie partie ailleurs.
+
+Le relais opérateur de `heliosd` n'est pas celui du §8.1.2 et ne s'y confond
+pas. Une opération de renouvellement appartient à un pair, résolu par sa VIP
+source ; une opération de campagne n'appartient à aucun pair et son autorité
+est ailleurs — dans l'assertion YubiKey et les signatures applicatives. Le
+relais opérateur exige donc un pair **administrateur**, jamais un simple pair
+admis, et son identité est établie avant toute lecture comme avant tout
+relais. Il ne donne accès à aucune opération de renouvellement : les deux
+surfaces adressent deux magasins distincts chez Astra, et la séparation est
+structurelle plutôt que vérifiée.
+
+Ce relais reste ce que le §2 exige déjà de l'autre : il transporte des objets
+canoniques et rien d'autre. Pas de chemin choisi par l'appelant, pas de
+méthode transmise, pas d'en-tête relayé. La seule valeur qui traverse hors du
+corps est la capacité bearer, qui reste liée à son opération, à son manifeste,
+à son coffre éventuel et à cinq minutes — les mêmes capacités, les mêmes
+fenêtres et les mêmes `operation_id` que sur l'origine publique, puisque c'est
+le même magasin d'opérations qui les émet.
+
+Les refus publics restent grossiers : un pair non administrateur, une origine
+incohérente, une opération inconnue et une opération expirée reçoivent des
+réponses qui ne se distinguent pas entre elles. Le détail n'existe que dans
+les journaux de la gateway et l'audit protégé d'Astra.
+
+Ce que cet amendement ne fait **pas** : il n'ajoute aucune ancre de confiance.
+En particulier, aucune CA TLS privée d'Astra n'entre dans un profil Orion.
+Réutiliser `CA-TLS` serait pire encore — elle appartient aux certificats
+clients, et l'employer comme ancre de transport créerait une dépendance
+circulaire au moment précis où on la fait tourner. Le HTTPS natif reste
+possible pour une installation ayant choisi un vrai domaine public avant son
+amorçage ; il est une option de déploiement, jamais la racine du modèle de
+récupération.
+
 ### 3. Une ancre maîtresse et un émetteur Astra délégué
 
 `CA-PQ` reste l'ancre du domaine et autorise les transitions de confiance. Sa

@@ -1855,8 +1855,10 @@ canal public ou n'omet l'approbation YubiKey.
 
 Le profil contient `authority_url`, `webauthn_rp_id` et le pin
 `astra_policy_fingerprint`. Orion ne contacte cette origine directement que
-lorsqu'il ne peut plus établir WireGuard, ou pour une opération opérateur
-explicitement hors tunnel. Le port QUIC n'est jamais un repli. Les routes
+lorsqu'il ne peut plus établir WireGuard. Une opération opérateur ne l'emprunte
+que depuis une machine réellement hors tunnel : depuis un tunnel monté, elle
+passe par §8.5, et l'échec de ce chemin ne se rabat pas ici. Le port QUIC n'est
+jamais un repli. Les routes
 publiques versionnées sont :
 
 ```text
@@ -2128,6 +2130,120 @@ précédente et persisté avant le suivant. À aucun instant le magasin de confi
 ne contient plus de deux CA. Au-delà de trois générations manquées, une
 réinitialisation opérateur explicite est exigée afin de borner taille, temps de
 vérification et complexité de récupération.
+
+### 8.5 Canal opérateur dans le tunnel
+
+Amendement du 4 septembre 2026, ADR-008 §2. Une campagne opérateur emprunte le
+tunnel dès qu'il existe. L'origine publique de §8.2 ne sert qu'un opérateur qui
+n'en a aucun ; le document hors ligne de §8.4 reste le dernier recours.
+
+#### 8.5.1 Routes
+
+`heliosd` sert quatre routes typées, image exacte des quatre surfaces
+opérateur d'Astra et d'aucune autre :
+
+```text
+GET  /api/certificates/operator/operations/<operation_id>
+GET  /api/certificates/operator/signer-requests/<operation_id>
+GET  /api/certificates/operator/vaults/<encrypted_vault_fingerprint>
+POST /api/certificates/operator/signer-results/<operation_id>
+```
+
+Elles relaient vers un préfixe privé propre, distinct de celui du
+renouvellement client et de celui de la mise à jour de confiance :
+
+```text
+POST /internal/v1/operator/operations/<operation_id>
+POST /internal/v1/operator/signer-requests/<operation_id>
+POST /internal/v1/operator/vaults/<encrypted_vault_fingerprint>
+POST /internal/v1/operator/signer-results/<operation_id>
+```
+
+Un préfixe séparé et non une cinquième route sous celui de la rotation : un
+renouvellement est un pair qui demande à être recertifié, une campagne est
+l'autorité qui tourne sur elle-même. Un journal de refus doit pouvoir dire
+laquelle des deux surfaces a été sondée.
+
+Le corps relayé porte l'identité résolue par la gateway et l'objet canonique,
+jamais le chemin, la méthode ni un en-tête de l'appelant. Les bornes de §8.2
+s'appliquent à l'identique : 64 Kio par corps avant désérialisation, 128 Kio
+par réponse — le coffre chiffré compris —, 128 octets par identifiant opaque.
+
+#### 8.5.2 Autorisation
+
+Ces routes exigent un pair **administrateur**. La résolution est celle de
+§8.1 : l'adresse source de la socket est comparée à l'unique `/32` de la
+configuration, aucun en-tête de proxy n'est consulté, et le drapeau `admin` du
+pair est exigé en plus. Un pair admis non administrateur est refusé ; la
+cohérence d'origine du navigateur est exigée comme sur toute mutation
+administrative.
+
+L'identité est établie **avant** toute lecture comme avant tout relais :
+aucune de ces routes ne consulte l'autorité pour un appelant qu'elle n'a pas
+d'abord résolu en administrateur.
+
+Une opération de campagne n'appartient à aucun pair, et rien ici ne prétend le
+contraire : l'autorisation normative reste l'assertion WebAuthn de la YubiKey
+et les signatures applicatives ML-DSA-87 que les objets portent. Le drapeau
+`admin` borne qui peut faire circuler la cérémonie, pas qui peut l'approuver.
+
+Ces routes ne donnent accès à aucune opération de renouvellement client. La
+séparation est structurelle : le préfixe `/internal/v1/operator/` adresse le
+magasin des opérations de campagne, un `operation_id` de renouvellement
+ordinaire y est absent et reçoit le refus grossier d'un identifiant que
+personne n'a émis.
+
+#### 8.5.3 Capacités et fenêtres
+
+Rien n'est assoupli pour être passé dans le tunnel. Les mêmes
+`operation_id`, les mêmes capacités bearer MACées par scope, liées à
+l'opération, au manifeste, au coffre éventuel et à cinq minutes au plus, la
+même clé racine éphémère au processus Astra. La capacité est la seule valeur
+qui traverse hors du corps ; elle voyage en `Authorization: Bearer`, jamais
+dans une URL, un cookie ou un journal.
+
+La lecture du coffre reste liée à son opération : l'empreinte du chemin est
+comparée à celle que nomme la demande **signée**, comme sur l'origine
+publique.
+
+#### 8.5.4 Refus
+
+Les réponses publiques sont grossières et ne se distinguent pas entre elles :
+pair non administrateur, origine incohérente, opération inconnue, opération
+expirée, capacité absente ou hors scope. Le détail reste dans les journaux de
+la gateway et l'audit protégé d'Astra. Une gateway sans canal privé répond
+`503` et le dit dans son journal, comme en §8.1.2 : la route existe et
+l'appelant a raison de l'employer.
+
+#### 8.5.5 Choix du transport, sans repli
+
+`astra-signer` porte trois transports pour une campagne, et le choix est
+explicite :
+
+| Transport   | Arguments                            | Emploi                     |
+| ----------- | ------------------------------------ | -------------------------- |
+| Tunnel      | `--heliosd-url` et `--operation-id`  | Chemin prioritaire         |
+| HTTPS       | `--authority-url` et `--operation-id`| Opérateur sans tunnel      |
+| Hors ligne  | `--request`/`--campaign` et `--out`  | Dernier recours            |
+
+Les trois sont mutuellement exclusifs. Un transport tunnel qui échoue est une
+erreur ; il ne se rabat jamais sur l'origine publique. Un repli ferait
+dépendre le chemin réellement emprunté d'une panne, et l'opérateur croirait
+avoir approuvé dans le tunnel une cérémonie partie ailleurs.
+
+La vérification ne dépend pas du transport. `authority_url` et
+`webauthn_rp_id` servis par une réponse sont **affichés, jamais adoptés** : le
+RP ID vient du hand-off que le compagnon détient, sinon une gateway pourrait
+faire répondre la clé de l'opérateur à un challenge d'un autre domaine.
+
+#### 8.5.6 Couverture
+
+Le transport tunnel couvre les quatre commandes de chaîne qui n'avaient que
+l'origine publique : `rotate-ca-tls` (§9.4), `sign-gateway-transition` (§6),
+`abort-gateway-transition` (§8 de l'ADR) et `resume-rotation`. Les commandes
+qui disposent déjà d'un mode hors ligne — `rotate-ca-pq` (§9.1),
+`approve-campaign` (§7.6), `sign-gateway-rollback` (§4.4) — le gagnent aussi,
+par le même canal partagé.
 
 ## 9. Rotation de `CA-PQ`
 
@@ -2621,6 +2737,12 @@ autorité. Le
 libellé montre avant approbation le nombre de cibles, les générations et si une
 CA sera tournée. Aucune action globale n'est placée derrière un bouton au
 libellé ambigu « Renouveler ».
+
+Les actions d'autorité de cette console — rotation des autorités, annulation
+d'une transition préparée, rollback gateway — sont des campagnes opérateur et
+suivent §8.5 : le compagnon est lancé avec `heliosd_url` et `operation_id`, et
+l'origine publique n'est proposée que si aucun tunnel n'existe. La console
+n'offre pas de bascule automatique entre les deux.
 
 ### 12.3 État de l'implémentation au 30 août 2026
 
