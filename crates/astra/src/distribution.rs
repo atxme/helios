@@ -135,6 +135,20 @@ pub async fn prepare(
         return Err(PrepareError::PeerMismatch);
     }
 
+    // Fill the registry from the gateway first, exactly as the renewal route
+    // does and for the same reason: Astra admits nobody, it transcribes what
+    // the end that was handed the leaves already decided. Without this, a peer
+    // reaching this route before its first renewal is unknown here, and the
+    // leaf it recorded — the only thing that can authenticate a
+    // first-generation identity — does not exist yet.
+    //
+    // A failure is reported and not raised: the verification below refuses an
+    // unknown peer on its own, and turning a transient gateway problem into a
+    // different refusal would only rename it.
+    if let Err(error) = crate::renewal::transcribe_peer(service, &caller, now_unix).await {
+        tracing::warn!(%error, "trust update: this peer could not be transcribed from the gateway");
+    }
+
     let (trust_domain_id, gateway_key, service_epoch, objects) = {
         let registry = service.registry.lock().await;
         let state = registry.state();
