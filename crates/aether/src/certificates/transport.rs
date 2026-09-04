@@ -148,6 +148,61 @@ impl AuthenticatedTrustUpdateRequest {
         acceptable_pq_fingerprints: &[Fingerprint],
         now_unix: u64,
     ) -> Result<(), CertificateError> {
+        self.verify_preconditions(
+            trust_domain_id,
+            gateway_wg_public_key,
+            resolved_client_wg_public_key,
+        )?;
+        // The leaf may chain to `CA-PQ` **or** to the delegated Astra issuer:
+        // an ordinary renewal produces the second, and a route that only tried
+        // the anchor would refuse every client that had ever renewed.
+        crate::certificates::client::verify_client_leaf_under_any(
+            &self.certificate,
+            issuers,
+            resolved_client_wg_public_key,
+            now_unix,
+        )?;
+        self.verify_bound(resolved_client_wg_public_key, acceptable_pq_fingerprints)
+    }
+
+    /// The same verification, for a verifier that recorded the peer's leaf
+    /// rather than the authority that issued it.
+    ///
+    /// Astra is that verifier. A first-generation leaf is issued by the
+    /// operator CA, which its registry does not carry and must not learn from
+    /// the request; the leaf it stored at admission answers the question an
+    /// issuer set cannot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_against_recorded_leaf(
+        &self,
+        recorded_leaf: &crate::key_negotiation::PqCertificate,
+        trust_domain_id: &TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+        resolved_client_wg_public_key: &WireGuardKey,
+        acceptable_pq_fingerprints: &[Fingerprint],
+        now_unix: u64,
+    ) -> Result<(), CertificateError> {
+        self.verify_preconditions(
+            trust_domain_id,
+            gateway_wg_public_key,
+            resolved_client_wg_public_key,
+        )?;
+        crate::certificates::client::verify_client_leaf_against_recorded(
+            &self.certificate,
+            recorded_leaf,
+            resolved_client_wg_public_key,
+            now_unix,
+        )?;
+        self.verify_bound(resolved_client_wg_public_key, acceptable_pq_fingerprints)
+    }
+
+    /// Everything both entry points check before the leaf is authenticated.
+    fn verify_preconditions(
+        &self,
+        trust_domain_id: &TrustDomainId,
+        gateway_wg_public_key: &WireGuardKey,
+        resolved_client_wg_public_key: &WireGuardKey,
+    ) -> Result<(), CertificateError> {
         if self.request.protocol_version != CERTIFICATE_PROTOCOL_VERSION {
             return Err(CertificateError::UnsupportedProtocolVersion {
                 received: self.request.protocol_version,
@@ -163,15 +218,15 @@ impl AuthenticatedTrustUpdateRequest {
         if self.request.client_wg_public_key != *resolved_client_wg_public_key {
             return Err(CertificateError::ClientIdentityMismatch);
         }
-        // The leaf may chain to `CA-PQ` **or** to the delegated Astra issuer:
-        // an ordinary renewal produces the second, and a route that only tried
-        // the anchor would refuse every client that had ever renewed.
-        crate::certificates::client::verify_client_leaf_under_any(
-            &self.certificate,
-            issuers,
-            resolved_client_wg_public_key,
-            now_unix,
-        )?;
+        Ok(())
+    }
+
+    /// Everything both entry points check once the leaf is authenticated.
+    fn verify_bound(
+        &self,
+        _resolved_client_wg_public_key: &WireGuardKey,
+        acceptable_pq_fingerprints: &[Fingerprint],
+    ) -> Result<(), CertificateError> {
         let presented = pq_certificate_fingerprint(&self.certificate)?;
         if !self
             .request
@@ -1084,6 +1139,159 @@ mod tests {
     /// The opaque CAS token is part of the client's signature. A gateway may
     /// relay it, but cannot retarget the future manifest to another local
     /// state without invalidating the request first.
+    /// A client leaf issued by an authority the verifier does not hold, bound
+    /// to `client_key()` and valid over `1..=u64::MAX`.
+    #[cfg(feature = "key-negotiation-signing")]
+    fn client_leaf(
+        subject: &str,
+        subject_public: &MlDsa87PublicKey,
+        issuer_private: &[u8],
+        not_after: u64,
+    ) -> crate::key_negotiation::PqCertificate {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        crate::key_negotiation::issue_pq_certificate(
+            crate::key_negotiation::PqCertificate {
+                version: crate::key_negotiation::PQ_CERTIFICATE_VERSION,
+                serial: [4; 16],
+                subject: subject.into(),
+                issuer: "operator-ca".into(),
+                role: crate::key_negotiation::PqCertificateRole::Client,
+                wireguard_public_key: client_key().to_base64(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 1,
+                not_after_unix: not_after,
+                ml_dsa_87_signature: String::new(),
+            },
+            issuer_private,
+        )
+        .expect("client leaf")
+    }
+
+    /// A request signed by that leaf, naming its own fingerprint.
+    #[cfg(feature = "key-negotiation-signing")]
+    fn signed_request(
+        leaf: &crate::key_negotiation::PqCertificate,
+        leaf_private: &[u8],
+    ) -> AuthenticatedTrustUpdateRequest {
+        let request = TrustUpdateRequest {
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            request_id: Id16::new([3; 16]).expect("request"),
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            ca_epoch: 1,
+            ca_tls_epoch: 2,
+            astra_service_key_epoch: 3,
+            issuer_epoch: 4,
+            active_gateway_identity_epoch: 5,
+            gateway_decision_epoch: 6,
+            client_identity_generation: 7,
+            active_gateway_tls_certificate_fingerprint: Fingerprint::of(b"gateway tls"),
+            active_gateway_certificate_fingerprint: Fingerprint::of(b"gateway pq"),
+            active_client_tls_certificate_fingerprint: Fingerprint::of(b"client tls"),
+            active_client_pq_certificate_fingerprint: Fingerprint::of(b"client pq"),
+            client_pq_certificate_fingerprint: pq_certificate_fingerprint(leaf).expect("presented"),
+            base_state_fingerprint: Fingerprint::of(b"local state"),
+        };
+        let signature = sign_ml_dsa_87(leaf_private, &request.signing_bytes()).expect("signature");
+        AuthenticatedTrustUpdateRequest {
+            request,
+            certificate: leaf.clone(),
+            ml_dsa_87_signature: signature,
+        }
+    }
+
+    /// A client's **first** leaf is issued by the operator CA, an authority a
+    /// domain registry does not carry — and must not learn from the request it
+    /// is checking. No issuer set can authenticate it, so Astra refused every
+    /// peer that had never renewed: on a fresh domain, every peer.
+    ///
+    /// The leaf it recorded at admission answers what the issuer set cannot,
+    /// and answers it more narrowly: one certificate rather than every
+    /// certificate that authority ever signed.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_first_generation_leaf_verifies_against_the_recorded_one_and_under_no_issuer() {
+        let operator_ca = keys();
+        let leaf_keys = keys();
+        let leaf = client_leaf("poste", &leaf_keys.public, &operator_ca.private, u64::MAX);
+        let authenticated = signed_request(&leaf, &leaf_keys.private);
+        let acceptable = [pq_certificate_fingerprint(&leaf).expect("presented")];
+        let domain_anchor = keys();
+
+        assert_eq!(
+            authenticated.verify(
+                &[&domain_anchor.public],
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &acceptable,
+                100,
+            ),
+            Err(CertificateError::UnauthorizedIssuer),
+            "the operator CA is not an authority this registry holds"
+        );
+        authenticated
+            .verify_against_recorded_leaf(
+                &leaf,
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &acceptable,
+                100,
+            )
+            .expect("the leaf Astra recorded at admission");
+    }
+
+    /// Identity, not resemblance: another leaf for the same peer, issued by
+    /// the same authority, is refused.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_leaf_other_than_the_recorded_one_is_refused() {
+        let operator_ca = keys();
+        let leaf_keys = keys();
+        let leaf = client_leaf("poste", &leaf_keys.public, &operator_ca.private, u64::MAX);
+        let other = client_leaf("autre", &leaf_keys.public, &operator_ca.private, u64::MAX);
+        let authenticated = signed_request(&leaf, &leaf_keys.private);
+        let acceptable = [pq_certificate_fingerprint(&leaf).expect("presented")];
+
+        assert_eq!(
+            authenticated.verify_against_recorded_leaf(
+                &other,
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &acceptable,
+                100,
+            ),
+            Err(CertificateError::UnauthorizedIssuer)
+        );
+    }
+
+    /// Recorded is not eternal. Identity replaces the issuer check, never the
+    /// clock: a peer whose leaf has expired renews through §7.5, not here.
+    #[cfg(feature = "key-negotiation-signing")]
+    #[test]
+    fn a_recorded_leaf_past_its_validity_is_refused() {
+        let operator_ca = keys();
+        let leaf_keys = keys();
+        let leaf = client_leaf("poste", &leaf_keys.public, &operator_ca.private, 50);
+        let authenticated = signed_request(&leaf, &leaf_keys.private);
+        let acceptable = [pq_certificate_fingerprint(&leaf).expect("presented")];
+
+        assert_eq!(
+            authenticated.verify_against_recorded_leaf(
+                &leaf,
+                &domain(),
+                &gateway_key(),
+                &client_key(),
+                &acceptable,
+                100,
+            ),
+            Err(CertificateError::OutsideValidityPeriod)
+        );
+    }
+
     #[test]
     fn the_base_state_fingerprint_is_bound_into_the_client_request() {
         let signer = keys();

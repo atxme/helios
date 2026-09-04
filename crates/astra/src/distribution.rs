@@ -157,17 +157,44 @@ pub async fn prepare(
                 acceptable.push(next.pq_certificate_fingerprint);
             }
         }
-        relayed
-            .request
-            .verify(
-                &issuers,
-                &state.trust_domain_id,
-                &state.gateway_wg_public_key,
-                &caller,
-                &acceptable,
-                now_unix,
-            )
-            .map_err(PrepareError::Request)?;
+        // Two ways a client leaf is authentic here, and a peer needs only one.
+        //
+        // A renewed leaf chains to an authority this registry holds, and the
+        // issuer set above answers for it. A **first-generation** leaf does
+        // not: it is issued by the operator CA at admission, an authority this
+        // registry does not carry and must not learn from the request it is
+        // checking. What answers for that one is the leaf Astra itself
+        // recorded when it admitted the peer — kept for exactly this.
+        //
+        // Asking only the first question refused every peer that had never
+        // renewed, which on a fresh domain is every peer.
+        let recorded = state.peers.get(&caller.to_base64());
+        let by_record = recorded.is_some_and(|peer| {
+            relayed
+                .request
+                .verify_against_recorded_leaf(
+                    &peer.active_pq_certificate,
+                    &state.trust_domain_id,
+                    &state.gateway_wg_public_key,
+                    &caller,
+                    &acceptable,
+                    now_unix,
+                )
+                .is_ok()
+        });
+        if !by_record {
+            relayed
+                .request
+                .verify(
+                    &issuers,
+                    &state.trust_domain_id,
+                    &state.gateway_wg_public_key,
+                    &caller,
+                    &acceptable,
+                    now_unix,
+                )
+                .map_err(PrepareError::Request)?;
+        }
 
         (
             state.trust_domain_id,

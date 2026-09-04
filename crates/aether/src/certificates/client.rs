@@ -102,6 +102,44 @@ pub fn verify_client_leaf_under_any(
     Err(CertificateError::UnauthorizedIssuer)
 }
 
+/// Authenticates a client PQ leaf by **identity**, against the one the verifier
+/// itself recorded at admission, instead of by issuer.
+///
+/// A client's first leaf is issued by the operator CA. A domain registry does
+/// not carry that authority — and must not learn it from the request it is
+/// checking — so no issuer set can ever authenticate a first-generation leaf.
+/// Astra refused every peer that had never renewed, which on a fresh domain is
+/// every peer.
+///
+/// This is not the weaker question. An issuer set admits every certificate
+/// that authority ever signed; the recorded leaf admits exactly one. What
+/// identity does not replace is time: the validity window is still read
+/// against `now_unix` below, because a leaf that was recorded is not a leaf
+/// that is eternal.
+pub fn verify_client_leaf_against_recorded(
+    certificate: &PqCertificate,
+    recorded: &PqCertificate,
+    client_wg_public_key: &WireGuardKey,
+    now_unix: u64,
+) -> Result<(), CertificateError> {
+    if certificate != recorded {
+        return Err(CertificateError::UnauthorizedIssuer);
+    }
+    // The signature is not re-checked, and cannot be: its issuer is precisely
+    // the authority this side does not hold. It was checked once, by the side
+    // that admitted this exact certificate and stored it — which is what makes
+    // the equality above an authentication rather than a comparison.
+    if certificate.role != PqCertificateRole::Client
+        || certificate.wireguard_public_key != client_wg_public_key.to_base64()
+    {
+        return Err(CertificateError::UnauthorizedIssuer);
+    }
+    if certificate.not_before_unix > now_unix || now_unix > certificate.not_after_unix {
+        return Err(CertificateError::OutsideValidityPeriod);
+    }
+    Ok(())
+}
+
 /// One client generation: TLS and PQ bound together (spec §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
