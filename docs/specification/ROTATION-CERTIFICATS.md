@@ -2239,11 +2239,18 @@ faire répondre la clé de l'opérateur à un challenge d'un autre domaine.
 #### 8.5.6 Couverture
 
 Le transport tunnel couvre les quatre commandes de chaîne qui n'avaient que
-l'origine publique : `rotate-ca-tls` (§9.4), `sign-gateway-transition` (§6),
-`abort-gateway-transition` (§8 de l'ADR) et `resume-rotation`. Les commandes
-qui disposent déjà d'un mode hors ligne — `rotate-ca-pq` (§9.1),
-`approve-campaign` (§7.6), `sign-gateway-rollback` (§4.4) — le gagnent aussi,
-par le même canal partagé.
+l'origine publique, et qui étaient donc inatteignables sur un déploiement sans
+nom public : `rotate-ca-tls` (§9.4), `sign-gateway-transition` (§6),
+`abort-gateway-transition` (§8 de l'ADR) et `resume-rotation`.
+
+Les commandes qui disposent déjà d'un mode hors ligne — `rotate-ca-pq` (§9.1),
+`approve-campaign` (§7.6), `sign-gateway-rollback` (§4.4) — ne sont bloquées
+par rien et conservent leurs deux transports. Le canal partagé les accepte
+sans changement de contrat lorsqu'un déploiement le demandera ; ce n'est pas
+une obligation de cette section.
+
+La récupération d'une identité expirée (§7.5) reste sur l'origine publique par
+construction : ce qui a expiré est précisément le tunnel.
 
 ## 9. Rotation de `CA-PQ`
 

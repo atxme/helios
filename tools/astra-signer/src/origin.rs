@@ -42,7 +42,7 @@ use anyhow::{bail, Context, Result};
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Ceiling on any answer (spec §8.2).
-const MAX_ANSWER_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_ANSWER_BYTES: usize = 128 * 1024;
 
 /// What the companion fetched, and what it must not believe.
 #[derive(Debug)]
@@ -98,6 +98,11 @@ impl Origin {
     /// Two calls and not one: the tokens are minted per read and live five
     /// minutes at most, so the companion takes them as late as it can — the
     /// operator may be several minutes from touching their key.
+    /// The origin this client dials, normalized.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     pub fn fetch(&self, operation_id: &Id16) -> Result<CampaignRequest> {
         let view: astra::signing::SigningOperationView = self
             .get(
@@ -122,7 +127,7 @@ impl Origin {
     /// Separate from [`Self::accept`] because it is the one thing the caller
     /// needs *before* the second call, and the only reason `fetch` reads the
     /// view twice would otherwise be to hand it over.
-    fn read_token(
+    pub(crate) fn read_token(
         operation_id: &Id16,
         view: &astra::signing::SigningOperationView,
     ) -> Result<String> {
@@ -159,7 +164,7 @@ impl Origin {
     /// and all of it is about what the origin is not allowed to decide — which
     /// operation this is, whether it still awaits a touch, and that the text
     /// the operator will read is the one the *signed* request names.
-    fn accept(
+    pub(crate) fn accept(
         operation_id: &Id16,
         view: astra::signing::SigningOperationView,
         answer: SignerRequestAnswer,
@@ -250,7 +255,7 @@ impl Origin {
     /// substituted file is refused here rather than at an unlock that fails
     /// obscurely — with an operator holding a security key and no idea which
     /// of the two halves is wrong.
-    fn accept_vault(
+    pub(crate) fn accept_vault(
         request: &CampaignRequest,
         bytes: Vec<u8>,
     ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -402,7 +407,7 @@ impl Origin {
     /// bad token from a wrong one — before a valid proof, the endpoint tells a
     /// caller nothing about what exists. What is worth naming is where the
     /// operator should go next, and that depends only on the class.
-    fn refusal(code: u16) -> String {
+    pub(crate) fn refusal(code: u16) -> String {
         match code {
             400 => "l'autorité a refusé la requête (400) : identifiant ou jeton malformé.".into(),
             403 => {
@@ -426,13 +431,13 @@ impl Origin {
 /// companion **reads**, and a decoder that shared the server's type would
 /// silently accept whatever that type grew next.
 #[derive(Debug, serde::Deserialize)]
-struct SignerRequestAnswer {
-    signer_request: Box<AstraSignerRequest>,
-    campaign: Box<AstraRotationCampaign>,
+pub(crate) struct SignerRequestAnswer {
+    pub(crate) signer_request: Box<AstraSignerRequest>,
+    pub(crate) campaign: Box<AstraRotationCampaign>,
     #[allow(dead_code)]
-    credential_registry: Box<aether::certificates::approval::CredentialRegistry>,
-    webauthn_rp_id: String,
-    webauthn_origin: String,
+    pub(crate) credential_registry: Box<aether::certificates::approval::CredentialRegistry>,
+    pub(crate) webauthn_rp_id: String,
+    pub(crate) webauthn_origin: String,
 }
 
 #[cfg(test)]

@@ -1076,6 +1076,24 @@ impl PinnedHttpClient {
         body: Option<Vec<u8>>,
         bearer: Option<&str>,
     ) -> Result<Bytes, ChannelError> {
+        self.request_bounded(method, path, body, bearer, MAX_INTERNAL_BODY_BYTES)
+            .await
+    }
+
+    /// The same call under a caller-chosen answer ceiling.
+    ///
+    /// One route needs a larger one — the encrypted vault of §8.5, which the
+    /// public origin also serves above the ordinary body bound. The limit is
+    /// still applied before the answer is read into memory, so an authority
+    /// that has been taken over cannot make this process allocate without end.
+    async fn request_bounded(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        bearer: Option<&str>,
+        max_answer_bytes: usize,
+    ) -> Result<Bytes, ChannelError> {
         use http_body_util::BodyExt as _;
         use hyper_util::rt::TokioIo;
 
@@ -1116,7 +1134,7 @@ impl PinnedHttpClient {
         // Bounded before it is read into memory, exactly as the server bounds
         // what it accepts: an authority that has been taken over must not be
         // able to make the process that trusts it allocate without end.
-        let collected = http_body_util::Limited::new(response.into_body(), MAX_INTERNAL_BODY_BYTES)
+        let collected = http_body_util::Limited::new(response.into_body(), max_answer_bytes)
             .collect()
             .await
             .map_err(|error| ChannelError::Body(error.to_string()))?
@@ -1173,6 +1191,63 @@ pub const ROTATION_SIGNER_RESULT_ROUTE: &str =
 pub const ASTRA_TRUST_UPDATE_PREFIX: &str = "/internal/v1/trust-update/";
 
 pub const TRUST_UPDATE_PREPARE_PATH: &str = "/internal/v1/trust-update/prepare";
+
+/// The third prefix Astra's private listener serves (spec §8.5).
+///
+/// Its own prefix, like the two above and for the same reason: a renewal
+/// belongs to one peer, a preparation to one peer's backlog, and an operator
+/// campaign to no peer at all. Sharing a prefix would leave a refusal log
+/// unable to say which of the three surfaces was probed — and would make it
+/// look as though a client identifier and a campaign identifier were
+/// interchangeable, which is exactly the confusion §8.5 forbids.
+pub const ASTRA_OPERATOR_PREFIX: &str = "/internal/v1/operator/";
+
+pub const OPERATOR_OPERATION_ROUTE: &str = "/internal/v1/operator/operations/:operation";
+pub const OPERATOR_SIGNER_REQUEST_ROUTE: &str = "/internal/v1/operator/signer-requests/:operation";
+pub const OPERATOR_VAULT_ROUTE: &str = "/internal/v1/operator/vaults/:fingerprint";
+pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-results/:operation";
+
+/// Ceiling on an operator answer, which may be an encrypted vault.
+///
+/// 128 KiB, the §8.2 response ceiling — the public origin serves the same file
+/// under the same bound, and Astra refuses to serve one that is larger. The
+/// ordinary [`MAX_INTERNAL_BODY_BYTES`] stays what it is for every other call
+/// on this link: a vault is the one object on it that is not a signed
+/// certificate object.
+pub const MAX_OPERATOR_ANSWER_BYTES: usize = 128 * 1024;
+
+/// What the gateway relays for an operator campaign (spec §8.5).
+///
+/// The administrator the gateway resolved from the source VIP, and nothing
+/// else. It is **not** an authorization: a campaign is authorized by the
+/// WebAuthn assertion and by the `CA-PQ` signatures the objects carry, never
+/// by who relayed it. It travels so the authority's protected log can name the
+/// admitted administrator the ceremony came through — the same reason the
+/// client relay carries its caller.
+///
+/// No path, no method, no header of the caller's: this is the whole of what
+/// crosses, and the route is chosen by the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperatorCampaign {
+    pub operator: String,
+}
+
+/// What the companion deposits, relayed with its administrator (spec §8.5).
+///
+/// Only the result. Astra holds the campaign it answers, and a result verified
+/// against a campaign the same message supplied would verify nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayedOperatorSignerResult {
+    pub operator: String,
+    pub result: Box<aether::certificates::status::AstraSignerResult>,
+}
+
+/// The two operator shapes both ends parse, defined once in `aether`.
+pub use aether::certificates::transport::{
+    OperatorSignerRequestResponse, SigningOperationState, SigningOperationView,
+};
 
 /// The name the gateway puts in SNI when it dials Astra.
 ///
@@ -1367,6 +1442,84 @@ impl AstraLifecycleClient {
         .await
     }
 
+    // -- The operator ceremony, relayed from inside the tunnel (spec §8.5) --
+    //
+    // Four calls, one per surface the public origin exposes, and no fifth. The
+    // administrator travels in the body on every one of them for the reason
+    // the caller does on a renewal: on this link the authenticated party is
+    // the gateway, and the authority has to be told who it resolved.
+
+    /// Reads one campaign operation, on behalf of an administrator.
+    pub async fn operator_operation(
+        &self,
+        operation: &Id16,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<SigningOperationView, ChannelError> {
+        self.post(
+            &operator_path("operations", &operation.to_string()),
+            relayed,
+            None,
+        )
+        .await
+    }
+
+    /// Fetches what the companion has to display before it asks for a touch.
+    pub async fn operator_signer_request(
+        &self,
+        operation: &Id16,
+        token: &str,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<OperatorSignerRequestResponse, ChannelError> {
+        self.post(
+            &operator_path("signer-requests", &operation.to_string()),
+            relayed,
+            Some(token),
+        )
+        .await
+    }
+
+    /// Downloads the encrypted vault this campaign names.
+    ///
+    /// Bytes rather than a decoded object: this process holds no key-slot
+    /// secret, cannot read the file and has no business parsing it. The
+    /// fingerprint is compared against the operation's **signed** request on
+    /// the authority side, exactly as on the public origin.
+    pub async fn operator_encrypted_vault(
+        &self,
+        fingerprint: &aether::certificates::encoding::Fingerprint,
+        token: &str,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let body =
+            serde_json::to_vec(relayed).map_err(|error| ChannelError::Body(error.to_string()))?;
+        let answer = self
+            .http
+            .request_bounded(
+                "POST",
+                &operator_path("vaults", &fingerprint.to_string()),
+                Some(body),
+                Some(token),
+                MAX_OPERATOR_ANSWER_BYTES,
+            )
+            .await?;
+        Ok(answer.to_vec())
+    }
+
+    /// Delivers the operator's assertion and returns the operation it produced.
+    pub async fn operator_signer_result(
+        &self,
+        operation: &Id16,
+        token: &str,
+        relayed: &RelayedOperatorSignerResult,
+    ) -> Result<SigningOperationView, ChannelError> {
+        self.post(
+            &operator_path("signer-results", &operation.to_string()),
+            relayed,
+            Some(token),
+        )
+        .await
+    }
+
     async fn post<B: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1386,6 +1539,19 @@ impl AstraLifecycleClient {
 /// today — and it goes through the same percent-encoder as a WireGuard key
 /// anyway, because "this value happens to be safe" is how the next change of
 /// encoding introduces a traversal.
+/// Builds one of Astra's operator paths.
+///
+/// Its own builder rather than a parameter on [`operation_path`]: the two
+/// prefixes address two stores, and a single function with a prefix argument
+/// is one wrong argument away from relaying a campaign read onto a peer's
+/// renewal. The identifier goes through the same percent-encoder.
+fn operator_path(collection: &str, identifier: &str) -> String {
+    format!(
+        "{ASTRA_OPERATOR_PREFIX}{collection}/{}",
+        percent_encode_segment(identifier)
+    )
+}
+
 fn operation_path(collection: &str, operation: &Id16) -> String {
     format!(
         "{ASTRA_INTERNAL_PREFIX}{collection}/{}",
@@ -1416,6 +1582,50 @@ mod tests {
     use axum::http::Request;
     use std::sync::Mutex;
     use tower::ServiceExt as _;
+
+    /// The two relayed surfaces address two prefixes, and never each other.
+    ///
+    /// This is where "an operator route reaches no peer's renewal operation"
+    /// is actually decided (spec §8.5.2): the same 128-bit identifier under
+    /// the operator prefix reaches the campaign store, and under the rotation
+    /// prefix the renewal one. A single builder with a prefix argument would
+    /// be one wrong argument away from crossing them.
+    #[test]
+    fn a_campaign_path_and_a_renewal_path_never_name_the_same_route() {
+        let id = Id16::new([7; 16]).expect("identifier");
+        let campaign = operator_path("operations", &id.to_string());
+        let renewal = operation_path("operations", &id);
+
+        assert!(campaign.starts_with(ASTRA_OPERATOR_PREFIX));
+        assert!(renewal.starts_with(ASTRA_INTERNAL_PREFIX));
+        assert_ne!(campaign, renewal);
+        assert!(!campaign.starts_with(ASTRA_INTERNAL_PREFIX));
+        assert!(!renewal.starts_with(ASTRA_OPERATOR_PREFIX));
+        assert!(!ASTRA_OPERATOR_PREFIX.starts_with(ASTRA_TRUST_UPDATE_PREFIX));
+    }
+
+    /// A path segment a caller chose cannot escape its segment.
+    ///
+    /// The identifiers are hexadecimal today, so nothing in them needs
+    /// escaping — which is exactly how the next change of encoding introduces
+    /// a traversal. The encoder is what makes that impossible rather than
+    /// improbable.
+    #[test]
+    fn an_operator_path_segment_cannot_escape_its_segment() {
+        let path = operator_path("vaults", "../../internal/v1/client-rotation/request");
+        assert!(
+            path.starts_with(ASTRA_OPERATOR_PREFIX),
+            "the prefix is not something a caller can leave"
+        );
+        let segment = path
+            .strip_prefix(&format!("{ASTRA_OPERATOR_PREFIX}vaults/"))
+            .expect("the collection is the gateway's, not the caller's");
+        assert!(
+            !segment.contains('/'),
+            "an encoded segment holds no separator, so it stays one segment: {segment}"
+        );
+        assert!(!path.contains("client-rotation/request"));
+    }
 
     /// A disposable transport identity, built exactly as the two `init`
     /// commands build theirs.

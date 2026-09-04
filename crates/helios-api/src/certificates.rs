@@ -664,6 +664,57 @@ pub trait ClientRenewalRelay: Send + Sync {
     ) -> Result<crate::internal::ClientRenewalOperationView, TrustUpdateRefusal>;
 }
 
+/// The gateway's half of the in-tunnel operator campaign (spec §8.5).
+///
+/// Four operations, one per surface Astra's public origin exposes, and no
+/// fifth. Every one takes the **resolved** administrator as its first
+/// argument — the identity `require_admin` derived from the source VIP.
+///
+/// # Why this is not [`ClientRenewalRelay`]
+///
+/// A renewal operation belongs to a peer, and the peer's resolved key is what
+/// lets the authority refuse somebody else's operation. A campaign belongs to
+/// no peer: its authority is the WebAuthn assertion and the `CA-PQ`
+/// signatures its objects carry. Merging the two would put a campaign behind
+/// `require_peer`, which is the whole distinction §8.5 draws.
+///
+/// The administrator is carried for the authority's protected log, never as a
+/// permission. Nothing in this trait accepts a path, a method or a header.
+#[async_trait]
+pub trait OperatorCampaignRelay: Send + Sync {
+    /// Reads one campaign operation.
+    async fn operation(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+    ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal>;
+
+    /// Fetches what the companion has to display before it asks for a touch.
+    async fn signer_request(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+    ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal>;
+
+    /// Downloads the encrypted vault this campaign names, still encrypted.
+    async fn encrypted_vault(
+        &self,
+        operator: &str,
+        fingerprint: &aether::certificates::encoding::Fingerprint,
+        capability_token: &str,
+    ) -> Result<Vec<u8>, TrustUpdateRefusal>;
+
+    /// Delivers the operator's assertion and returns what it produced.
+    async fn signer_result(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+        result: Box<aether::certificates::status::AstraSignerResult>,
+    ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal>;
+}
+
 /// Private Astra-to-Helios staging contract.
 ///
 /// This trait deliberately has no route in the in-tunnel router. The future
@@ -976,6 +1027,188 @@ pub async fn renewal_signer_result(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The operator campaign inside the tunnel (spec §8.5).
+// ---------------------------------------------------------------------------
+
+/// The administrator behind an operator route, or nothing.
+///
+/// `require_admin` has already resolved and checked the caller; this checks it
+/// again. Not superstition: it is what makes these handlers safe to call, and
+/// what keeps a future remount on the wrong router from silently turning a
+/// campaign relay into a peer-reachable one. The name is an audit label, never
+/// a permission.
+fn operator_caller(caller: &crate::auth::Caller, route: &str) -> Option<String> {
+    if !caller.admin {
+        tracing::warn!(
+            pair = %caller.name,
+            source = %caller.source,
+            route,
+            "operator campaign refused: the caller is not an administrator"
+        );
+        return None;
+    }
+    Some(caller.name.clone())
+}
+
+/// One coarse refusal for everything a caller could probe with.
+///
+/// Unknown administrator, unparseable identifier, unknown operation, expired
+/// operation, missing or out-of-scope capability: all `403`, and told apart
+/// only in this gateway's log and the authority's protected audit. A finer
+/// status here would answer «that campaign exists» to whoever asked.
+fn operator_refused(operator: &str, route: &str, reason: &str) -> Response {
+    tracing::warn!(operator, route, reason, "operator campaign refused");
+    StatusCode::FORBIDDEN.into_response()
+}
+
+/// The answer of a gateway with no authority behind it, and why it is `503`.
+///
+/// Not `404`: the route exists and the administrator is right to be using it.
+/// This is the one refusal on these routes allowed to be specific, because it
+/// says nothing about the domain — only that this deployment has no private
+/// channel to dial.
+fn operator_unavailable(operator: &str, route: &str) -> Response {
+    tracing::warn!(
+        operator,
+        route,
+        "operator campaign unavailable: this gateway has no private channel to the authority"
+    );
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+/// `GET /api/certificates/operator/operations/<operation_id>`.
+pub async fn operator_operation(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+) -> Response {
+    let Some(operator) = operator_caller(&caller, "operation") else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return operator_refused(&operator, "operation", "unparseable operation identifier");
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "operation");
+    };
+    match relay.operation(&operator, &operation).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `GET /api/certificates/operator/signer-requests/<operation_id>`.
+pub async fn operator_signer_request(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(operator) = operator_caller(&caller, "signer-request") else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return operator_refused(
+            &operator,
+            "signer-request",
+            "unparseable operation identifier",
+        );
+    };
+    let Some(token) = crate::internal::bearer_token(&headers) else {
+        return operator_refused(&operator, "signer-request", "no capability token");
+    };
+    let token = token.to_string();
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "signer-request");
+    };
+    match relay.signer_request(&operator, &operation, &token).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `GET /api/certificates/operator/vaults/<encrypted_vault_fingerprint>`.
+///
+/// Served as it is held: encrypted. This gateway holds no key-slot secret and
+/// no PRF output, and the fingerprint is checked against the operation's
+/// **signed** request by the authority, not here.
+pub async fn operator_vault(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(fingerprint): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(operator) = operator_caller(&caller, "vault") else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(fingerprint) = aether::certificates::encoding::Fingerprint::parse_hex(&fingerprint)
+    else {
+        return operator_refused(&operator, "vault", "unparseable vault fingerprint");
+    };
+    let Some(token) = crate::internal::bearer_token(&headers) else {
+        return operator_refused(&operator, "vault", "no capability token");
+    };
+    let token = token.to_string();
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "vault");
+    };
+    match relay.encrypted_vault(&operator, &fingerprint, &token).await {
+        Ok(vault) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            vault,
+        )
+            .into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
+/// `POST /api/certificates/operator/signer-results/<operation_id>`.
+pub async fn operator_signer_result(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(operator) = operator_caller(&caller, "signer-result") else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Ok(operation) = parse_operation_id(&operation) else {
+        return operator_refused(
+            &operator,
+            "signer-result",
+            "unparseable operation identifier",
+        );
+    };
+    let Some(token) = crate::internal::bearer_token(&headers) else {
+        return operator_refused(&operator, "signer-result", "no capability token");
+    };
+    let token = token.to_string();
+    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let result: aether::certificates::status::AstraSignerResult =
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(operator, %error, "operator campaign refused: unreadable result");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "signer-result");
+    };
+    match relay
+        .signer_result(&operator, &operation, &token, Box::new(result))
+        .await
+    {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
 /// The answer of a gateway that has no authority to relay to.
 ///
 /// `503` and not `404`: the route exists and the client is right to be using
@@ -1117,6 +1350,204 @@ mod tests {
             Some(handler) => state.with_trust_update(handler),
             None => state,
         }
+    }
+
+    // -- The in-tunnel operator campaign (spec §8.5) --
+
+    /// A relay that records who reached it, and answers what it was given.
+    struct SpyCampaign {
+        answer: Result<crate::internal::SigningOperationView, TrustUpdateRefusal>,
+        seen: Mutex<Option<String>>,
+    }
+
+    impl SpyCampaign {
+        fn granting() -> Arc<Self> {
+            Arc::new(Self {
+                answer: Ok(campaign_view()),
+                seen: Mutex::new(None),
+            })
+        }
+
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                answer: Err(TrustUpdateRefusal::Rejected),
+                seen: Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OperatorCampaignRelay for SpyCampaign {
+        async fn operation(
+            &self,
+            operator: &str,
+            _operation: &Id16,
+        ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
+            *self.seen.lock().unwrap() = Some(operator.to_string());
+            self.answer.clone()
+        }
+
+        async fn signer_request(
+            &self,
+            operator: &str,
+            _operation: &Id16,
+            _capability_token: &str,
+        ) -> Result<crate::internal::OperatorSignerRequestResponse, TrustUpdateRefusal> {
+            *self.seen.lock().unwrap() = Some(operator.to_string());
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn encrypted_vault(
+            &self,
+            operator: &str,
+            _fingerprint: &Fingerprint,
+            _capability_token: &str,
+        ) -> Result<Vec<u8>, TrustUpdateRefusal> {
+            *self.seen.lock().unwrap() = Some(operator.to_string());
+            Err(TrustUpdateRefusal::Rejected)
+        }
+
+        async fn signer_result(
+            &self,
+            operator: &str,
+            _operation: &Id16,
+            _capability_token: &str,
+            _result: Box<aether::certificates::status::AstraSignerResult>,
+        ) -> Result<crate::internal::SigningOperationView, TrustUpdateRefusal> {
+            *self.seen.lock().unwrap() = Some(operator.to_string());
+            self.answer.clone()
+        }
+    }
+
+    fn campaign_view() -> crate::internal::SigningOperationView {
+        crate::internal::SigningOperationView {
+            operation_id: Id16::new([7; 16]).unwrap(),
+            state: crate::internal::SigningOperationState::AwaitingOperator,
+            scope: aether::certificates::status::CampaignScope::TrustAuthorities,
+            target_count: 1,
+            required_credentials: 1,
+            campaign_fingerprint: Fingerprint::of(b"campaign"),
+            created_at: 0,
+            expires_at: u64::MAX,
+            signer_request_token: Some("read".into()),
+            vault_token: None,
+            signer_result_token: Some("submit".into()),
+        }
+    }
+
+    fn operator_caller_at(admin: bool) -> crate::auth::Caller {
+        crate::auth::Caller {
+            source: "100.64.1.2".parse().unwrap(),
+            name: "poste-operateur".into(),
+            public_key: Some(CLIENT_KEY.into()),
+            admin,
+            dev_loopback: false,
+        }
+    }
+
+    const OPERATION_HEX: &str = "07070707070707070707070707070707";
+
+    #[tokio::test]
+    async fn an_administrator_reaches_the_campaign_and_the_authority_is_told_who() {
+        let relay = SpyCampaign::granting();
+        let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+        let response = operator_operation(
+            State(state),
+            Extension(operator_caller_at(true)),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            relay.seen.lock().unwrap().as_deref(),
+            Some("poste-operateur"),
+            "the authority's audit has to name the administrator the ceremony came through"
+        );
+    }
+
+    /// An admitted peer is not an operator.
+    ///
+    /// `require_admin` refuses this first in the real router; the handler
+    /// refuses it again, which is what makes these functions safe to mount and
+    /// keeps a future remount from turning a campaign relay into a
+    /// peer-reachable one.
+    #[tokio::test]
+    async fn an_admitted_peer_that_is_not_an_administrator_never_reaches_the_authority() {
+        let relay = SpyCampaign::granting();
+        let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+        let response = operator_operation(
+            State(state),
+            Extension(operator_caller_at(false)),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            relay.seen.lock().unwrap().is_none(),
+            "identity is established before any read or relay, not after"
+        );
+    }
+
+    /// Every probe answers the same, so none of them confirms anything.
+    #[tokio::test]
+    async fn an_unknown_a_malformed_and_an_expired_operation_are_told_apart_only_in_the_log() {
+        let malformed = operator_operation(
+            State(state_with(None).with_operator_campaign(SpyCampaign::granting() as Arc<_>)),
+            Extension(operator_caller_at(true)),
+            axum::extract::Path("pas-un-identifiant".into()),
+        )
+        .await;
+        let refused = operator_operation(
+            State(state_with(None).with_operator_campaign(SpyCampaign::refusing() as Arc<_>)),
+            Extension(operator_caller_at(true)),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        let not_admin = operator_operation(
+            State(state_with(None).with_operator_campaign(SpyCampaign::granting() as Arc<_>)),
+            Extension(operator_caller_at(false)),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::FORBIDDEN);
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(not_admin.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A capability token is not optional, and a missing one is not a hint.
+    #[tokio::test]
+    async fn the_capability_bound_reads_refuse_a_request_that_carries_no_token() {
+        let state = state_with(None).with_operator_campaign(SpyCampaign::granting() as Arc<_>);
+        let response = operator_signer_request(
+            State(state),
+            Extension(operator_caller_at(true)),
+            axum::extract::Path(OPERATION_HEX.into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The two surfaces are two relays, and a campaign route reaches neither
+    /// store of the other.
+    ///
+    /// A gateway wired for client renewals and not for campaigns answers that
+    /// campaigns are unavailable — it does not fall back onto the renewal
+    /// relay, where a peer's operation lives.
+    #[tokio::test]
+    async fn a_campaign_route_never_falls_back_onto_the_client_renewal_relay() {
+        let state = state_with(None);
+        assert!(
+            state.operator_campaign.is_none(),
+            "this test is about a gateway that has no campaign relay"
+        );
+        let response = operator_operation(
+            State(state),
+            Extension(operator_caller_at(true)),
+            axum::extract::Path(OPERATION_HEX.into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     fn caller(public_key: Option<&str>) -> crate::auth::Caller {

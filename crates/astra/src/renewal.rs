@@ -1275,6 +1275,11 @@ pub mod router {
             .route(ROTATION_SIGNER_REQUEST_ROUTE, post(signer_request))
             .route(ROTATION_SIGNER_RESULT_ROUTE, post(signer_result))
             .route(TRUST_UPDATE_PREPARE_PATH, post(prepare_trust_update))
+            // The third surface this listener serves (spec §8.5). Its routes
+            // live in their own module for the reason they have their own
+            // prefix: a campaign belongs to no peer, and a refusal log has to
+            // be able to say which of the three surfaces was probed.
+            .merge(crate::operator::private_routes())
             .fallback(refuse_unknown_route)
             .layer(DefaultBodyLimit::max(MAX_PRIVATE_BODY_BYTES))
             .with_state(service)

@@ -145,6 +145,25 @@ astra-signer rotate-ca-pq --out ca-pq-transition.json \
   --authority-url https://astra.exemple --operation-id <identifiant>
 ```
 
+### Par le tunnel, quand il est monté
+
+Les quatre commandes de chaîne — `rotate-ca-tls`, `sign-gateway-transition`,
+`abort-gateway-transition` et `resume-rotation` — n'avaient que l'origine
+publique. Depuis l'amendement du 4 septembre 2026 elles passent par le tunnel
+dès qu'il existe, ce qui est le seul chemin praticable quand le nom de
+l'autorité n'est pas résoluble publiquement (spécification §8.5) :
+
+```sh
+astra-signer rotate-ca-tls --out ca-tls-transition.json \
+  --heliosd-url http://<VIP de la gateway>:8080 --operation-id <identifiant>
+```
+
+Le poste opérateur doit être un pair **administrateur** du tunnel : les routes
+sont derrière la barrière d'administration de la gateway, pas derrière la
+simple appartenance au réseau. `--heliosd-url` et `--authority-url` s'excluent,
+et un tunnel qui échoue est une erreur — jamais un repli silencieux vers
+l'origine publique.
+
 La campagne est résolue **sur l'ancre que le registre détient**, et le
 compagnon la compare à celle de son propre coffre : deux moitiés du domaine qui
 se contredisent sur ce qui est courant s'arrêtent, elles ne se réconcilient pas
@@ -231,6 +250,19 @@ il est déjà chiffré, donc une copie hors ligne ne coûte rien.
 
 Le relais, à côté, ne contient que du public. `astra-signer domain` le réécrit
 depuis le coffre, sans clé de sécurité.
+
+Une valeur à y enregistrer une fois pour toutes : l'origine que le domaine
+déclare.
+
+```sh
+astra-signer domain --astra-authority-url https://astra.exemple
+```
+
+Toute demande de signature nomme cette origine, et le compagnon compare les
+deux au lieu de croire celle qu'on lui envoie. Sur le canal public, l'URL
+composée jouait ce rôle ; dans le tunnel aucune URL n'est composée, donc une
+campagne portée par le tunnel s'arrête tant que cette valeur manque — en
+nommant cette commande.
 
 Quand la seconde clé est en main :
 

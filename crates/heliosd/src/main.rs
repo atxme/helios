@@ -1751,6 +1751,13 @@ async fn run(
                 // trust-update route must keep working while the renewal
                 // routes report the authority unreachable.
                 if let Some(relay) = authority {
+                    // The same relay on both surfaces: one veth client, two
+                    // stores at the far end. The operator routes sit behind
+                    // `require_admin` rather than `require_peer` (spec §8.5),
+                    // which is what keeps a campaign out of reach of an
+                    // ordinary admitted peer.
+                    state = state.with_operator_campaign(Arc::clone(&relay)
+                        as Arc<dyn helios_api::certificates::OperatorCampaignRelay>);
                     state = state.with_client_renewal(relay);
                 }
                 // The same service, on two surfaces: the lifecycle screen

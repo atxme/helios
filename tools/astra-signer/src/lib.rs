@@ -31,6 +31,7 @@ pub const WORK_STACK_BYTES: usize = 32 * 1024 * 1024;
 /// second copy of a security boundary.
 pub use helios_fido::authenticator;
 pub mod authority;
+pub mod campaign;
 pub mod credentials;
 pub mod documents;
 pub mod gestures;

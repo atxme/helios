@@ -103,6 +103,13 @@ pub struct AppState {
     /// renewal routes answer `503` — the route exists and the client is right
     /// to use it; what is missing is the authority behind it.
     pub client_renewal: Option<Arc<dyn certificates::ClientRenewalRelay>>,
+    /// The relay for operator campaigns inside the tunnel (spec §8.5).
+    ///
+    /// Separate from `client_renewal` because the two surfaces are separate:
+    /// one is a peer's own renewal, the other an authority ceremony an
+    /// administrator makes circulate. `None` is a gateway with no private
+    /// channel, and its routes answer `503`.
+    pub operator_campaign: Option<Arc<dyn certificates::OperatorCampaignRelay>>,
     /// Non-secret summary of the boot-time sealing decision, `None` when the
     /// daemon runs without TPM validation. A projection: `BootDecision` itself
     /// carries the unlock secret and must not reach this crate.
@@ -158,6 +165,7 @@ impl AppState {
             gateway_identity: None,
             trust_update: None,
             client_renewal: None,
+            operator_campaign: None,
             tpm: None,
             peer_runtime: Arc::new(RwLock::new(Vec::new())),
         }
@@ -219,6 +227,14 @@ impl AppState {
     /// a registry and yet have no private channel, and in that state the
     /// trust-update route must keep working while the renewal routes report
     /// that the authority is unreachable.
+    pub fn with_operator_campaign(
+        mut self,
+        relay: Arc<dyn certificates::OperatorCampaignRelay>,
+    ) -> Self {
+        self.operator_campaign = Some(relay);
+        self
+    }
+
     pub fn with_client_renewal(mut self, relay: Arc<dyn certificates::ClientRenewalRelay>) -> Self {
         self.client_renewal = Some(relay);
         self
@@ -267,6 +283,31 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/certificates/ca-transition",
             post(certificates::ca_transition_install),
+        )
+        // The operator campaign, relayed from inside the tunnel (spec §8.5).
+        // Four routes, image of the four surfaces Astra's public origin
+        // exposes, and on the **admin** surface rather than the peer one: a
+        // campaign belongs to no peer, and letting any admitted peer make one
+        // circulate is the distinction this placement exists to draw. None of
+        // them is a proxy — each accepts one type, one size, and relays an
+        // object this gateway built itself.
+        .route(
+            "/api/certificates/operator/operations/:operation",
+            get(certificates::operator_operation),
+        )
+        .route(
+            "/api/certificates/operator/signer-requests/:operation",
+            get(certificates::operator_signer_request),
+        )
+        .route(
+            "/api/certificates/operator/vaults/:fingerprint",
+            get(certificates::operator_vault),
+        )
+        .route(
+            "/api/certificates/operator/signer-results/:operation",
+            post(certificates::operator_signer_result).layer(DefaultBodyLimit::max(
+                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+            )),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -529,6 +570,60 @@ mod security_tests {
             }
         });
         tx
+    }
+
+    /// The operator campaign sits on the admin surface, not the peer one.
+    ///
+    /// Three probes of the same route, in the real router: a source tied to no
+    /// admitted peer, a browser origin that is not this host, and — in the
+    /// third — an admitted administrator whose gateway simply has no authority
+    /// to relay to. The first two must not be told the route exists; the third
+    /// is told the authority is missing, which is the one answer §8.5 allows
+    /// to be specific.
+    #[tokio::test]
+    async fn the_operator_campaign_routes_live_behind_the_admin_barrier() {
+        const URI: &str = "/api/certificates/operator/operations/07070707070707070707070707070707";
+
+        let (unknown_state, _cmd_rx) = state();
+        let mut unknown = Request::builder().uri(URI).body(Body::empty()).unwrap();
+        unknown.extensions_mut().insert(ConnectInfo(
+            "100.64.9.9:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(unknown_state).oneshot(unknown).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a source tied to no admitted peer must not reach a campaign"
+        );
+
+        let (cross_state, _cmd_rx) = state();
+        let mut cross_origin = Request::builder()
+            .uri(URI)
+            .header(header::HOST, "100.64.0.1:8080")
+            .header(header::ORIGIN, "https://hostile.example")
+            .body(Body::empty())
+            .unwrap();
+        cross_origin.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(cross_state).oneshot(cross_origin).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an inconsistent browser origin is refused before the caller is resolved"
+        );
+
+        let (admin_state, _cmd_rx) = state();
+        let mut administrator = Request::builder().uri(URI).body(Body::empty()).unwrap();
+        administrator.extensions_mut().insert(ConnectInfo(
+            "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = router(admin_state).oneshot(administrator).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the administrator is admitted; what is missing is the private channel"
+        );
     }
 
     #[tokio::test]

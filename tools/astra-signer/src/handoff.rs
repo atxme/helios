@@ -85,6 +85,18 @@ pub struct DomainHandoff {
     pub astra_service_public_key: Option<String>,
     #[serde(default)]
     pub astra_service_key_epoch: Option<u64>,
+    /// The authority origin **the domain** declares, as `astra
+    /// init-trust-domain` recorded it.
+    ///
+    /// Every `AstraSignerRequest` names it, and the companion compares the two
+    /// rather than believing the one it was sent. On the public channel the
+    /// dialled URL served as that expected value; inside the tunnel there is
+    /// no dialled URL, so it has to come from something this companion already
+    /// holds — which is this file. Optional because a hand-off written before
+    /// the amendment of 4 September 2026 has none; a campaign carried by the
+    /// tunnel then says so and names the command that records it.
+    #[serde(default)]
+    pub astra_authority_url: Option<String>,
 }
 
 impl DomainHandoff {
@@ -102,6 +114,7 @@ impl DomainHandoff {
             server_name: None,
             astra_service_public_key: None,
             astra_service_key_epoch: None,
+            astra_authority_url: None,
         };
         handoff.adopt(vault)?;
         Ok(handoff)

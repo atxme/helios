@@ -289,3 +289,119 @@ impl Tunnel {
         serde_json::from_slice(&bytes).context("réponse illisible")
     }
 }
+
+// ---------------------------------------------------------------------------
+// The operator campaign, on the same tunnel (spec §8.5).
+// ---------------------------------------------------------------------------
+
+/// The four gateway routes an operator campaign travels on.
+///
+/// A different prefix from the renewal above, because they are different
+/// surfaces: a renewal belongs to the peer whose VIP the gateway resolved, a
+/// campaign belongs to no peer and sits behind the administration surface.
+const OPERATOR_PREFIX: &str = "/api/certificates/operator";
+
+impl Tunnel {
+    /// Reads the campaign operation, then the request it is waiting on.
+    ///
+    /// The verification is [`crate::origin::Origin::accept`] — the same
+    /// function the public origin path uses, deliberately: the objects carry
+    /// the signatures, so a campaign fetched through a tunnel is trusted
+    /// exactly as much, and exactly as little, as one fetched from HTTPS.
+    /// Sharing the check is what keeps the two transports from drifting into
+    /// accepting different things.
+    pub fn fetch_campaign(&self, operation_id: &Id16) -> Result<crate::origin::CampaignRequest> {
+        let view: astra::signing::SigningOperationView = self
+            .get(
+                &format!(
+                    "{}{OPERATOR_PREFIX}/operations/{}",
+                    self.base,
+                    operation_id.to_hex()
+                ),
+                None,
+            )
+            .context("lecture de l'opération de campagne")?;
+
+        let answer: crate::origin::SignerRequestAnswer = {
+            let read_token = crate::origin::Origin::read_token(operation_id, &view)?;
+            self.get(
+                &format!(
+                    "{}{OPERATOR_PREFIX}/signer-requests/{}",
+                    self.base,
+                    operation_id.to_hex()
+                ),
+                Some(&read_token),
+            )
+            .context("lecture de la demande de signature")?
+        };
+        crate::origin::Origin::accept(operation_id, view, answer)
+    }
+
+    /// Downloads the encrypted vault this campaign names.
+    ///
+    /// Encrypted, and there is no other form: neither this companion's gateway
+    /// nor the authority behind it holds a key-slot secret. The bytes are
+    /// checked against the fingerprint the **signed** request names before
+    /// they are handed back.
+    pub fn campaign_vault(
+        &self,
+        request: &crate::origin::CampaignRequest,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let token = request.vault_token.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cette campagne ne fait signer aucune ancre : l'autorité ne délivre pas de jeton \
+                 de coffre, et il n'y a rien à ouvrir"
+            )
+        })?;
+        let expected = request.signer_request.encrypted_vault_fingerprint;
+        let response = self
+            .http
+            .get(format!(
+                "{}{OPERATOR_PREFIX}/vaults/{}",
+                self.base,
+                expected.to_hex()
+            ))
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .context("téléchargement du coffre chiffré")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(crate::origin::Origin::refusal(status.as_u16()));
+        }
+        let bytes = response.bytes().context("lecture du coffre")?;
+        if bytes.len() > crate::origin::MAX_ANSWER_BYTES {
+            bail!(
+                "la gateway a renvoyé {} octets : au-delà de la borne de cette route",
+                bytes.len()
+            );
+        }
+        crate::origin::Origin::accept_vault(request, bytes.to_vec())
+    }
+
+    /// Posts the operator's approval, and reports where the operation landed.
+    pub fn submit_campaign(
+        &self,
+        operation_id: &Id16,
+        result_token: &str,
+        result: &aether::certificates::status::AstraSignerResult,
+    ) -> Result<astra::signing::SigningOperationState> {
+        let body = serde_json::to_vec(result).context("encodage du résultat de campagne")?;
+        let response = self
+            .http
+            .post(format!(
+                "{}{OPERATOR_PREFIX}/signer-results/{}",
+                self.base,
+                operation_id.to_hex()
+            ))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {result_token}"),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .context("dépôt de l'approbation")?;
+        let view: astra::signing::SigningOperationView = Self::decode(response)?;
+        Ok(view.state)
+    }
+}

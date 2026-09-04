@@ -313,6 +313,12 @@ enum Command {
         astra_service_public_key: Option<String>,
         #[arg(long)]
         astra_service_key_epoch: Option<u64>,
+        /// Origine que le domaine déclare, telle qu'`astra init-trust-domain`
+        /// l'a enregistrée. Comparée à celle que nomme toute demande signée —
+        /// et seule source de cette comparaison lorsque la campagne passe par
+        /// le tunnel, où aucune URL n'est composée.
+        #[arg(long)]
+        astra_authority_url: Option<String>,
     },
     /// Auto-signe le certificat `CA-TLS` client autour de la clé du coffre.
     IssueCaTls {
@@ -520,8 +526,12 @@ enum Command {
     /// Le fichier produit se rapporte sur la gateway, à
     /// `heliosd install-gateway-transition`.
     SignGatewayTransition {
-        #[arg(long)]
-        authority_url: String,
+        /// Origine publique d'Astra, pour un opérateur sans tunnel (§8.2).
+        #[arg(long, conflicts_with = "heliosd_url")]
+        authority_url: Option<String>,
+        /// API de la gateway dans le tunnel, chemin prioritaire (§8.5).
+        #[arg(long, conflicts_with = "authority_url")]
+        heliosd_url: Option<String>,
         #[arg(long)]
         operation_id: String,
         #[arg(long)]
@@ -574,8 +584,12 @@ enum Command {
     /// celle qui émet : c'est `promote-ca-tls` qui les échange à
     /// `activation_at`, puis détruit l'ancienne au retrait.
     RotateCaTls {
-        #[arg(long)]
-        authority_url: String,
+        /// Origine publique d'Astra, pour un opérateur sans tunnel (§8.2).
+        #[arg(long, conflicts_with = "heliosd_url")]
+        authority_url: Option<String>,
+        /// API de la gateway dans le tunnel, chemin prioritaire (§8.5).
+        #[arg(long, conflicts_with = "authority_url")]
+        heliosd_url: Option<String>,
         #[arg(long)]
         operation_id: String,
         #[arg(long)]
@@ -600,8 +614,12 @@ enum Command {
     /// mêmes octets : Astra traite un résultat identique comme le même, et
     /// aucune clé n'est redemandée — la décision a déjà été approuvée.
     ResumeRotation {
-        #[arg(long)]
-        authority_url: String,
+        /// Origine publique d'Astra, pour un opérateur sans tunnel (§8.2).
+        #[arg(long, conflicts_with = "heliosd_url")]
+        authority_url: Option<String>,
+        /// API de la gateway dans le tunnel, chemin prioritaire (§8.5).
+        #[arg(long, conflicts_with = "authority_url")]
+        heliosd_url: Option<String>,
     },
     /// Signe un rollback de service vers l'ancienne identité gateway (§4.4).
     ///
@@ -649,8 +667,12 @@ enum Command {
     /// un client peut déjà l'avoir persistée, repartir hors ligne et
     /// promouvoir seul. L'époque reste consommée.
     AbortGatewayTransition {
-        #[arg(long)]
-        authority_url: String,
+        /// Origine publique d'Astra, pour un opérateur sans tunnel (§8.2).
+        #[arg(long, conflicts_with = "heliosd_url")]
+        authority_url: Option<String>,
+        /// API de la gateway dans le tunnel, chemin prioritaire (§8.5).
+        #[arg(long, conflicts_with = "authority_url")]
+        heliosd_url: Option<String>,
         #[arg(long)]
         operation_id: String,
         #[arg(long)]
@@ -742,12 +764,14 @@ fn run() -> Result<()> {
             server_name,
             astra_service_public_key,
             astra_service_key_epoch,
+            astra_authority_url,
         } => domain(
             &path,
             gateway_wg_public_key.as_deref(),
             server_name.as_deref(),
             astra_service_public_key.as_deref(),
             astra_service_key_epoch,
+            astra_authority_url.as_deref(),
         ),
         Command::Remove { slot } => remove(&path, &slot, transport),
         Command::Rename { slot, label } => rename(&path, &slot, &label),
@@ -866,6 +890,7 @@ fn run() -> Result<()> {
         } => issue_gateway_bootstrap(&path, &request, &out, validity_days, transport),
         Command::SignGatewayTransition {
             authority_url,
+            heliosd_url,
             operation_id,
             origin,
             request,
@@ -879,7 +904,10 @@ fn run() -> Result<()> {
             emergency_replacement,
         } => sign_gateway_transition(
             &path,
-            &authority_url,
+            astra_signer::campaign::Campaign::select(
+                authority_url.as_deref(),
+                heliosd_url.as_deref(),
+            )?,
             &operation_id,
             origin.as_deref(),
             GatewayTransitionInputs {
@@ -897,6 +925,7 @@ fn run() -> Result<()> {
         ),
         Command::RotateCaTls {
             authority_url,
+            heliosd_url,
             operation_id,
             origin,
             out,
@@ -905,14 +934,26 @@ fn run() -> Result<()> {
             validity_days,
         } => rotate_ca_tls(
             &path,
-            &authority_url,
+            astra_signer::campaign::Campaign::select(
+                authority_url.as_deref(),
+                heliosd_url.as_deref(),
+            )?,
             &operation_id,
             origin.as_deref(),
             &out,
             (prepare_days, overlap_days, validity_days),
             transport,
         ),
-        Command::ResumeRotation { authority_url } => resume_rotation(&path, &authority_url),
+        Command::ResumeRotation {
+            authority_url,
+            heliosd_url,
+        } => resume_rotation(
+            &path,
+            astra_signer::campaign::Campaign::select(
+                authority_url.as_deref(),
+                heliosd_url.as_deref(),
+            )?,
+        ),
         Command::SignGatewayRollback {
             transition,
             out,
@@ -933,6 +974,7 @@ fn run() -> Result<()> {
         Command::PromoteCaTls => promote_ca_tls(&path, transport),
         Command::AbortGatewayTransition {
             authority_url,
+            heliosd_url,
             operation_id,
             origin,
             transition,
@@ -940,7 +982,10 @@ fn run() -> Result<()> {
             reason,
         } => abort_gateway_transition(
             &path,
-            &authority_url,
+            astra_signer::campaign::Campaign::select(
+                authority_url.as_deref(),
+                heliosd_url.as_deref(),
+            )?,
             &operation_id,
             origin.as_deref(),
             &transition,
@@ -1206,6 +1251,7 @@ fn domain(
     server_name: Option<&str>,
     astra_service_public_key: Option<&str>,
     astra_service_key_epoch: Option<u64>,
+    astra_authority_url: Option<&str>,
 ) -> Result<()> {
     let vault = store::load(path)?;
     let handoff_path = handoff::path_beside(path);
@@ -1235,6 +1281,13 @@ fn domain(
         }
         handoff.astra_service_key_epoch = Some(epoch);
     }
+    if let Some(value) = astra_authority_url {
+        let value = value.trim();
+        if !value.starts_with("https://") {
+            bail!("l'origine de l'autorité doit être une URL https:// : {value}");
+        }
+        handoff.astra_authority_url = Some(value.trim_end_matches('/').to_string());
+    }
     handoff::save(&handoff_path, &handoff)?;
 
     println!("relais           : {}", handoff_path.display());
@@ -1251,6 +1304,10 @@ fn domain(
     println!(
         "nom de service   : {}",
         handoff.server_name.as_deref().unwrap_or("—")
+    );
+    println!(
+        "origine autorité : {}",
+        handoff.astra_authority_url.as_deref().unwrap_or("—")
     );
     println!(
         "clé Astra        : {}",
@@ -2231,7 +2288,7 @@ fn revoke(
 /// the vault alone could name an anchor the fleet retired months ago.
 fn rotate_ca_tls(
     path: &Path,
-    authority_url: &str,
+    channel: astra_signer::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     out: &Path,
@@ -2276,9 +2333,10 @@ fn rotate_ca_tls(
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let client = astra_signer::origin::Origin::new(authority_url)?;
-    let request = origin_client_fetch(&client, &operation)?;
-    verify_campaign_request(&handoff, &vault, &request, authority_url)?;
+    let expected_url = expected_authority_url(&handoff, &channel)?;
+    println!("transport        : {}", channel.description());
+    let request = channel.fetch(&operation)?;
+    verify_campaign_request(&handoff, &vault, &request, &expected_url)?;
     let campaign = request.campaign.as_ref().clone();
     if !campaign.scope.rotates_authority() {
         bail!("cette campagne ne fait tourner aucune ancre. Rien n'a été signé.");
@@ -2396,7 +2454,7 @@ fn rotate_ca_tls(
         rotated.next_certificate.fingerprint()
     );
 
-    submit_prepared(&client, &prepared_path, record)?;
+    submit_prepared(&channel, &prepared_path, record)?;
     println!(
         "à reporter sur la gateway : heliosd install-client-tls-ca {}",
         out.display()
@@ -2415,7 +2473,7 @@ fn rotate_ca_tls(
 /// machine that marked it submitted and then failed to send would have lost
 /// the only trace that anything still had to be sent.
 fn submit_prepared(
-    client: &astra_signer::origin::Origin,
+    client: &astra_signer::campaign::Campaign,
     prepared_path: &Path,
     mut record: prepared::PreparedRotation,
 ) -> Result<()> {
@@ -2429,7 +2487,7 @@ fn submit_prepared(
 }
 
 /// Replays the deposit of a rotation the ceremony already committed to (§8.2).
-fn resume_rotation(path: &Path, authority_url: &str) -> Result<()> {
+fn resume_rotation(path: &Path, channel: astra_signer::campaign::Campaign) -> Result<()> {
     let prepared_path = prepared::path_beside(path);
     let Some(record) = prepared::load(&prepared_path)? else {
         println!("aucune rotation préparée : rien à reprendre.");
@@ -2450,8 +2508,8 @@ fn resume_rotation(path: &Path, authority_url: &str) -> Result<()> {
     println!("transition       : {}", record.transition_path);
     // No security key. The decision was approved when it was signed; this
     // sends bytes that already exist.
-    let client = astra_signer::origin::Origin::new(authority_url)?;
-    submit_prepared(&client, &prepared_path, record)
+    println!("transport        : {}", channel.description());
+    submit_prepared(&channel, &prepared_path, record)
 }
 
 /// Advances the open `CA-TLS` window by one step (§9.2).
@@ -2649,7 +2707,7 @@ struct GatewayTransitionInputs<'a> {
 /// Issues the next gateway leaf and signs its transition (spec §11.1 step 4).
 fn sign_gateway_transition(
     path: &Path,
-    authority_url: &str,
+    channel: astra_signer::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     inputs: GatewayTransitionInputs<'_>,
@@ -2668,9 +2726,10 @@ fn sign_gateway_transition(
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let client = astra_signer::origin::Origin::new(authority_url)?;
-    let request_document = origin_client_fetch(&client, &operation)?;
-    verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+    let expected_url = expected_authority_url(&handoff, &channel)?;
+    println!("transport        : {}", channel.description());
+    let request_document = channel.fetch(&operation)?;
+    verify_campaign_request(&handoff, &vault, &request_document, &expected_url)?;
     let campaign = request_document.campaign.as_ref().clone();
     if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
         bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
@@ -2848,7 +2907,7 @@ fn sign_gateway_transition(
         .context("la décision signée ne correspond pas à la campagne approuvée")?;
 
     deposit_gateway_decision(
-        &client,
+        &channel,
         &request_document,
         &approval,
         aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(Box::new(
@@ -2863,7 +2922,7 @@ fn sign_gateway_transition(
 #[allow(clippy::too_many_arguments)]
 fn abort_gateway_transition(
     path: &Path,
-    authority_url: &str,
+    channel: astra_signer::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     transition_path: &Path,
@@ -2884,9 +2943,10 @@ fn abort_gateway_transition(
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let client = astra_signer::origin::Origin::new(authority_url)?;
-    let request_document = origin_client_fetch(&client, &operation)?;
-    verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+    let expected_url = expected_authority_url(&handoff, &channel)?;
+    println!("transport        : {}", channel.description());
+    let request_document = channel.fetch(&operation)?;
+    verify_campaign_request(&handoff, &vault, &request_document, &expected_url)?;
     let campaign = request_document.campaign.as_ref().clone();
     if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
         bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
@@ -2966,7 +3026,7 @@ fn abort_gateway_transition(
         .context("l'avortement signé ne correspond pas à la campagne approuvée")?;
 
     deposit_gateway_decision(
-        &client,
+        &channel,
         &request_document,
         &approval,
         aether::certificates::transport::TrustUpdateObject::GatewayTransitionAbort(Box::new(abort)),
@@ -3140,7 +3200,7 @@ fn sign_gateway_rollback(
 /// fails after `CA-PQ` has signed must not also lose the object — the
 /// alternative is a second ceremony for a decision that already exists.
 fn deposit_gateway_decision(
-    client: &astra_signer::origin::Origin,
+    client: &astra_signer::campaign::Campaign,
     request: &astra_signer::origin::CampaignRequest,
     approval: &aether::certificates::status::CampaignApproval,
     object: aether::certificates::transport::TrustUpdateObject,
@@ -3644,6 +3704,40 @@ fn connect_authorized_key(
 /// dialled — and no signature under the pinned service key can be produced for
 /// one that does. That is why the hand-off records the key and not the
 /// address.
+/// The authority origin a signed request must name, from what is already held.
+///
+/// Never from the answer being verified: an `authority_url` taken out of the
+/// object it authenticates would authenticate nothing. On the public channel
+/// the dialled origin was that value historically, and it still is for a
+/// hand-off written before the amendment of 4 September 2026. Inside the
+/// tunnel nothing is dialled, so the hand-off is the only source — and a
+/// hand-off that does not carry it says which command records it.
+///
+/// When both exist they must agree: a companion dialling one origin while its
+/// domain declares another is holding two answers to a question with one.
+fn expected_authority_url(
+    handoff: &handoff::DomainHandoff,
+    channel: &astra_signer::campaign::Campaign,
+) -> Result<String> {
+    use astra_signer::campaign::Campaign;
+
+    match (handoff.astra_authority_url.as_deref(), channel) {
+        (Some(declared), Campaign::Origin(origin)) if origin.base() != declared => bail!(
+            "ce relais de domaine déclare l'origine « {declared} » et cette commande compose \
+             « {} ». Rien n'a été signé : corriger l'une des deux avant de continuer.",
+            origin.base()
+        ),
+        (Some(declared), _) => Ok(declared.to_string()),
+        (None, Campaign::Origin(origin)) => Ok(origin.base().to_string()),
+        (None, Campaign::Tunnel(_)) => bail!(
+            "le relais de domaine ne porte pas l'origine déclarée par l'autorité : la renseigner \
+             par `astra-signer domain --astra-authority-url <url>`. Dans le tunnel aucune URL \
+             n'est composée, donc rien d'autre ne peut servir de valeur attendue à la demande \
+             signée."
+        ),
+    }
+}
+
 fn verify_campaign_request(
     handoff: &handoff::DomainHandoff,
     vault: &AuthorityVault,

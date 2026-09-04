@@ -669,31 +669,35 @@ async fn signing_operation(
     let now = now_unix();
     service.charge(source.ip(), now).await?;
     let operation_id = path_id(&raw)?;
-    let operations = service.signing.lock().await;
-    let operation = operations
-        .get(&operation_id, now)
-        .map_err(|_| ServiceError::Refused)?;
-    Ok(Json(mint_view(&service, operation, now).await))
+    Ok(Json(
+        operator_operation(&service, &operation_id, now).await?,
+    ))
 }
 
-/// What the companion fetches before it asks for a touch.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignerRequestResponse {
-    pub signer_request: Box<aether::certificates::status::AstraSignerRequest>,
-    /// The campaign itself, because the companion must display its scope, its
-    /// target count and their exact current fingerprints — and must recompute
-    /// the challenge from it rather than be handed one.
-    pub campaign: Box<aether::certificates::status::AstraRotationCampaign>,
-    /// The allow-list, signed by `CA-PQ`.
-    ///
-    /// It travels because whoever runs the ceremony verifies it under the
-    /// anchor themselves: an allow-list this service merely asserted would let
-    /// a compromised Astra name a credential nobody enrolled.
-    pub credential_registry: Box<aether::certificates::approval::CredentialRegistry>,
-    pub webauthn_rp_id: String,
-    pub webauthn_origin: String,
+/// The read itself, shared by the public origin and the in-tunnel relay.
+///
+/// Everything above it in the public handler is transport: the rate budget of
+/// §8.2, which is charged per real source address and would be a single shared
+/// bucket on a link whose only caller is the gateway. The decision is here, so
+/// the two channels cannot drift into deciding differently.
+pub(crate) async fn operator_operation(
+    service: &Arc<AstraService>,
+    operation_id: &Id16,
+    now: u64,
+) -> Result<crate::signing::SigningOperationView, ServiceError> {
+    let operations = service.signing.lock().await;
+    let operation = operations
+        .get(operation_id, now)
+        .map_err(|_| ServiceError::Refused)?;
+    Ok(mint_view(service, operation, now).await)
 }
+
+/// What the companion fetches before it asks for a touch, defined in `aether`.
+///
+/// There rather than here for the reason [`crate::signing::SigningOperationView`]
+/// is: the in-tunnel relay of spec §8.5 names it, and `helios-api` cannot
+/// depend on this crate.
+pub use aether::certificates::transport::OperatorSignerRequestResponse as SignerRequestResponse;
 
 /// `GET /v1/signer-requests/<operation_id>`, scope `signer_request_read`.
 async fn signer_request(
@@ -702,13 +706,25 @@ async fn signer_request(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<SignerRequestResponse>, ServiceError> {
-    use aether::certificates::capability::CapabilityScope;
-
     let now = now_unix();
     service.charge(source.ip(), now).await?;
     let operation_id = path_id(&raw)?;
     let token = bearer(&headers)?;
-    let (webauthn_rp_id, webauthn_origin) = relying_party(&service).await;
+    Ok(Json(
+        operator_signer_request(&service, &operation_id, token, now).await?,
+    ))
+}
+
+/// The capability-bound read, shared by both channels (§8.2, §8.5).
+pub(crate) async fn operator_signer_request(
+    service: &Arc<AstraService>,
+    operation_id: &Id16,
+    token: &str,
+    now: u64,
+) -> Result<SignerRequestResponse, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
+    let (webauthn_rp_id, webauthn_origin) = relying_party(service).await;
     let credential_registry = service
         .approval_credential_registry
         .clone()
@@ -716,10 +732,10 @@ async fn signer_request(
 
     let operations = service.signing.lock().await;
     let operation = operations
-        .get(&operation_id, now)
+        .get(operation_id, now)
         .map_err(|_| ServiceError::Refused)?;
     authenticate(
-        &service,
+        service,
         CapabilityScope::SignerRequestRead,
         operation,
         None,
@@ -727,13 +743,13 @@ async fn signer_request(
         now,
     )
     .await?;
-    Ok(Json(SignerRequestResponse {
+    Ok(SignerRequestResponse {
         signer_request: operation.signer_request.clone(),
         campaign: operation.campaign.clone(),
         credential_registry,
         webauthn_rp_id,
         webauthn_origin,
-    }))
+    })
 }
 
 /// `GET /v1/vaults/<encrypted_vault_fingerprint>`, scope `encrypted_vault_read`.
@@ -748,8 +764,6 @@ async fn encrypted_vault(
     Path(raw): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ServiceError> {
-    use aether::certificates::capability::CapabilityScope;
-
     let now = now_unix();
     service.charge(source.ip(), now).await?;
     if raw.len() > MAX_PATH_IDENTIFIER_BYTES {
@@ -757,6 +771,24 @@ async fn encrypted_vault(
     }
     let requested = Fingerprint::parse_hex(&raw).map_err(|_| ServiceError::Refused)?;
     let token = bearer(&headers)?;
+    let vault = operator_encrypted_vault(&service, &requested, token, now).await?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        vault,
+    )
+        .into_response())
+}
+
+/// The vault read itself, shared by both channels (§8.2, §8.5).
+pub(crate) async fn operator_encrypted_vault(
+    service: &Arc<AstraService>,
+    requested: &Fingerprint,
+    token: &str,
+    now: u64,
+) -> Result<Vec<u8>, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
     let vault = service
         .encrypted_vault
         .as_ref()
@@ -776,12 +808,12 @@ async fn encrypted_vault(
     // chose.
     let operations = service.signing.lock().await;
     let mut authorized = None;
-    for candidate in operations.awaiting_vault(&requested, now) {
+    for candidate in operations.awaiting_vault(requested, now) {
         if authenticate(
-            &service,
+            service,
             CapabilityScope::EncryptedVaultRead,
             candidate,
-            Some(&requested),
+            Some(requested),
             token,
             now,
         )
@@ -793,7 +825,7 @@ async fn encrypted_vault(
         }
     }
     authorized.ok_or(ServiceError::Refused)?;
-    if !Fingerprint::of(vault).matches(&requested) {
+    if !Fingerprint::of(vault).matches(requested) {
         // The operation names a vault this volume does not hold: the operator
         // copied an older file, or none. Naming it is the whole content.
         tracing::error!(
@@ -803,12 +835,7 @@ async fn encrypted_vault(
         );
         return Err(ServiceError::Internal);
     }
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        vault.clone(),
-    )
-        .into_response())
+    Ok(vault.clone())
 }
 
 /// `POST /v1/signer-results/<operation_id>`, scope `signer_result_submit`.
@@ -838,13 +865,27 @@ async fn signer_result(
     headers: HeaderMap,
     Json(result): Json<Box<aether::certificates::status::AstraSignerResult>>,
 ) -> Result<Json<crate::signing::SigningOperationView>, ServiceError> {
-    use aether::certificates::capability::CapabilityScope;
-
     let now = now_unix();
     service.charge(source.ip(), now).await?;
     let operation_id = path_id(&raw)?;
     let token = bearer(&headers)?;
-    let (webauthn_rp_id, webauthn_origin) = relying_party(&service).await;
+    Ok(Json(
+        operator_signer_result(&service, &operation_id, token, result, now).await?,
+    ))
+}
+
+/// The submission itself, shared by both channels (§8.2, §8.5).
+pub(crate) async fn operator_signer_result(
+    service: &Arc<AstraService>,
+    operation_id: &Id16,
+    token: &str,
+    result: Box<aether::certificates::status::AstraSignerResult>,
+    now: u64,
+) -> Result<crate::signing::SigningOperationView, ServiceError> {
+    use aether::certificates::capability::CapabilityScope;
+
+    let operation_id = *operation_id;
+    let (webauthn_rp_id, webauthn_origin) = relying_party(service).await;
     let registry = service
         .approval_credential_registry
         .clone()
@@ -856,7 +897,7 @@ async fn signer_result(
             .get(&operation_id, now)
             .map_err(|_| ServiceError::Refused)?;
         authenticate(
-            &service,
+            service,
             CapabilityScope::SignerResultSubmit,
             operation,
             None,
@@ -974,8 +1015,7 @@ async fn signer_result(
             tracing::warn!(%operation_id, %error, "operator result refused");
             ServiceError::Refused
         })?;
-    let view = mint_view(&service, operation, now).await;
-    Ok(Json(view))
+    Ok(mint_view(service, operation, now).await)
 }
 
 /// `POST /v1/client-rotation/recovery` (spec §7.5).

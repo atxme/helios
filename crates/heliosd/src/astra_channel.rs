@@ -579,6 +579,97 @@ impl helios_api::internal::TrustUpdatePreparer for AstraRenewalRelay {
 }
 
 #[async_trait::async_trait]
+impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
+    /// Reads one campaign operation on behalf of an administrator.
+    ///
+    /// No caller key is resolved here, and that is the difference from the
+    /// renewal relay above: a campaign belongs to no peer. What bounds who may
+    /// make one circulate is `require_admin` on the route; what authorizes it
+    /// is the assertion and the `CA-PQ` signatures its objects carry. The
+    /// administrator's name travels for the authority's audit only.
+    async fn operation(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+    ) -> Result<
+        helios_api::internal::SigningOperationView,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_operation(
+                operation,
+                &helios_api::internal::RelayedOperatorCampaign {
+                    operator: operator.to_string(),
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("operator-operation", error))
+    }
+
+    async fn signer_request(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+    ) -> Result<
+        helios_api::internal::OperatorSignerRequestResponse,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_signer_request(
+                operation,
+                capability_token,
+                &helios_api::internal::RelayedOperatorCampaign {
+                    operator: operator.to_string(),
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("operator-signer-request", error))
+    }
+
+    async fn encrypted_vault(
+        &self,
+        operator: &str,
+        fingerprint: &aether::certificates::encoding::Fingerprint,
+        capability_token: &str,
+    ) -> Result<Vec<u8>, helios_api::certificates::TrustUpdateRefusal> {
+        self.client
+            .operator_encrypted_vault(
+                fingerprint,
+                capability_token,
+                &helios_api::internal::RelayedOperatorCampaign {
+                    operator: operator.to_string(),
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("operator-vault", error))
+    }
+
+    async fn signer_result(
+        &self,
+        operator: &str,
+        operation: &aether::certificates::encoding::Id16,
+        capability_token: &str,
+        result: Box<aether::certificates::status::AstraSignerResult>,
+    ) -> Result<
+        helios_api::internal::SigningOperationView,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_signer_result(
+                operation,
+                capability_token,
+                &helios_api::internal::RelayedOperatorSignerResult {
+                    operator: operator.to_string(),
+                    result,
+                },
+            )
+            .await
+            .map_err(|error| Self::refuse("operator-signer-result", error))
+    }
+}
+
+#[async_trait::async_trait]
 impl helios_api::certificates::ClientRenewalRelay for AstraRenewalRelay {
     async fn open(
         &self,

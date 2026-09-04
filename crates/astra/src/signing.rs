@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use aether::certificates::{
     approval::CredentialRegistry,
     encoding::{Fingerprint, Id16, WireGuardKey},
-    status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult, CampaignScope},
+    status::{AstraRotationCampaign, AstraSignerRequest, AstraSignerResult},
     transport::TrustUpdateObject,
     CertificateError,
 };
@@ -98,45 +98,13 @@ pub enum SigningError {
     Approval(#[from] CertificateError),
 }
 
-/// Where an operator operation stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SigningOperationState {
-    /// Open, and waiting for the companion's assertions.
-    AwaitingOperator,
-    /// The assertions arrived and verified.
-    ///
-    /// # What an approval authorizes, and what still does not act on one
-    ///
-    /// A campaign covering **client leaves** is applied: when a covered peer
-    /// sends its rotation request, [`crate::renewal::open`] finds this
-    /// operation through [`SigningOperationStore::approved_for_client`], opens
-    /// an operation already approved, and issues without asking anyone a
-    /// second time. It also overrides the 80 % threshold, which is what a
-    /// manual campaign is for.
-    ///
-    /// # Limite connue : une campagne n'atteint que les clients qui reviennent
-    ///
-    /// A client leaf cannot be rotated without the client: it holds the private
-    /// key and writes the CSR. So a campaign authorizes rotations, and each
-    /// peer's own request is what spends that authorization — inside the
-    /// campaign window, which `astra campaign open` caps at 300 seconds (§7.6).
-    /// A peer that is offline for those five minutes is simply not renewed, and
-    /// the operator opens another campaign. Reaching an absent fleet would mean
-    /// an authorization that outlives the text its operator read, which is the
-    /// property §7.6 exists to hold.
-    ///
-    /// # What an authority campaign produces instead
-    ///
-    /// [`CampaignScope::TrustAuthorities`] makes `CA-PQ` sign, which happens
-    /// in the companion and nowhere else. Such a campaign is therefore
-    /// approved **and** answered in one deposit: the result carries the signed
-    /// transition objects, and the registry stores them before this state is
-    /// reached (§0.6). Nothing here reads it as a per-client authorization —
-    /// [`AstraRotationCampaign::covers_client`] refuses an authority campaign
-    /// outright rather than approximating one.
-    Approved,
-}
+/// The two shapes an operator operation is read as, defined in `aether`.
+///
+/// They live there rather than here because the in-tunnel operator relay of
+/// spec §8.5 has to name them, and `helios-api` cannot depend on this crate —
+/// this crate depends on it. Same reason
+/// [`aether::certificates::transport::ClientRenewalOperationView`] is there.
+pub use aether::certificates::transport::{SigningOperationState, SigningOperationView};
 
 /// One manual campaign, from the command that opened it to its approval.
 #[derive(Debug, Clone)]
@@ -267,36 +235,6 @@ impl SigningOperation {
         self.approval = Some(approval);
         self.state = SigningOperationState::Approved;
     }
-}
-
-/// What a caller learns about an operation it holds the identifier of.
-///
-/// Unsigned, exactly like [`aether::certificates::transport::ClientRenewalOperationView`]
-/// and for the same reason: everything here that decides anything is
-/// re-derivable from the signed `AstraSignerRequest` the companion fetches and
-/// verifies under the service key it already pins. A view is how an interface
-/// follows progress, never how it concludes that a signature succeeded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SigningOperationView {
-    pub operation_id: Id16,
-    pub state: SigningOperationState,
-    pub scope: CampaignScope,
-    pub target_count: usize,
-    pub required_credentials: u8,
-    /// SHA-256 of the canonical campaign — the value the operator reads on the
-    /// companion's screen, and the challenge their key answers.
-    pub campaign_fingerprint: Fingerprint,
-    pub created_at: u64,
-    pub expires_at: u64,
-    /// Bearer token for the companion's read route, absent once the operation
-    /// no longer accepts one.
-    pub signer_request_token: Option<String>,
-    /// Bearer token for the encrypted vault, present only for a scope that
-    /// makes an anchor sign.
-    pub vault_token: Option<String>,
-    /// Bearer token for the companion's submission route.
-    pub signer_result_token: Option<String>,
 }
 
 /// Every operator operation this process holds.
@@ -592,7 +530,7 @@ pub fn adopt_deposit(
 mod tests {
     use super::*;
     use aether::certificates::encoding::MlDsa87Signature;
-    use aether::certificates::status::{CampaignTarget, CertificateKind};
+    use aether::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
     use aether::certificates::{
         encoding::{TrustDomainId, WireGuardKey},
         CERTIFICATE_FORMAT_VERSION,
