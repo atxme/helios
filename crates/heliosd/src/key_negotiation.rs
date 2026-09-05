@@ -1453,20 +1453,44 @@ pub async fn start(
         gateway_certificates.as_ref(),
         now_unix,
     )?;
-    let client_ca =
+    let operator_client_ca =
         std::fs::read(CLIENT_CA_PATH).context("reading key-negotiation client CA certificate")?;
+    // The TLS half of the admission question, asked as the PQ half already
+    // asks it (`client_leaf_issuers`): the operator CA that admits a
+    // first-generation leaf, plus the domain anchors the registry names —
+    // active, and its successor once a §9.4 window has opened. A renewed leaf
+    // chains to Astra's delegated intermediate, which is signed by the domain
+    // anchor and by nothing on this disk, so a verifier holding the operator
+    // CA alone locks every renewed client out of the port it just renewed for.
+    let mut client_cas = vec![operator_client_ca];
+    if let Some(registry) = &registry {
+        for anchor in registry.lock().await.state().client_tls_anchors(now_unix) {
+            let bytes = anchor.as_bytes().to_vec();
+            if !client_cas.contains(&bytes) {
+                client_cas.push(bytes);
+            }
+        }
+    }
     // The identity is read **once**, here, and served for the lifetime of the
     // process — unlike `network.toml`, which is watched and re-read.
     //
     // Reloading an identity under a live data plane would rebuild the QUIC
     // endpoint while negotiations own PSK slots on it. The scheduled switch
     // therefore remains a restart: this selection is stable for the process,
-    // and a restart inside the overlap selects the published candidate.
+    // and a restart inside the overlap selects the published candidate. The
+    // accepted client anchors are fixed here for exactly the same reason; a
+    // client renewal never moves them, and a §9.4 overlap lasts a month.
     tracing::info!(
         certificate_sha256 = %helios_key_negotiation::certificate_fingerprint_der(
             identity.tls.certificate_chain.first().map_or(&[], Vec::as_slice)
         ),
-        client_ca_sha256 = %helios_key_negotiation::certificate_fingerprint_der(&client_ca),
+        client_ca_sha256 = %client_cas
+            .iter()
+            .map(|client_ca| {
+                helios_key_negotiation::certificate_fingerprint_der(client_ca).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         gateway_identity_slot = ?slot,
         "key-negotiation identity selected at startup and served until this daemon restarts"
     );
@@ -1477,7 +1501,7 @@ pub async fn start(
     let endpoint = server_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
         &identity.tls,
-        client_ca,
+        &client_cas,
     )
     .context("binding the key-negotiation QUIC listener")?;
     let handler = Arc::new(GatewayHandler {
@@ -3945,7 +3969,7 @@ mod tests {
         let server = helios_key_negotiation::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             &tls.server,
-            tls.ca_der.clone(),
+            std::slice::from_ref(&tls.ca_der),
         )
         .unwrap();
         let address = server.local_addr().unwrap();

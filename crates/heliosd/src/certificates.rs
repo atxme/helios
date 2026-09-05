@@ -1248,17 +1248,18 @@ pub fn domain_view(
 /// stages a leaf whose owner is locked out at the end of the overlap, on a
 /// machine whose only channel for saying so was the tunnel.
 ///
-/// # Limite connue — the TLS root set is still read once, from disk
+/// # Limite connue — the TLS root set is still read once, at startup
 ///
-/// The QUIC endpoint's client trust anchors are loaded at start-up from
-/// `/var/lib/helios/key-negotiation-client-ca.der`. `heliosd
-/// init-trust-domain` seeds the registry from that same file, so today the two
-/// agree and a delegated leaf validates as long as the client presents the
-/// delegation's TLS intermediate in its chain. What is not wired is a **client
-/// TLS CA rotation**: the registry's `next_client_tls_ca_certificate` is not
-/// offered as a second root, and a new anchor would in any case need a
-/// restart, since rebuilding the endpoint under live sessions would drop the
-/// PSK slots they hold. Nothing performs that rotation yet.
+/// The QUIC endpoint loads the operator admission CA from
+/// `/var/lib/helios/key-negotiation-client-ca.der`, then adds the domain
+/// anchors the registry accepts at that instant. A delegated leaf therefore
+/// validates when the client presents its intermediate. The set stays fixed
+/// for the process lifetime: a `CA-TLS` transition installed before
+/// `activation_at` still requires a restart during the overlap to offer its
+/// successor, and another after retirement to stop offering the outgoing
+/// root at the TLS layer. The paired TLS/PQ registry check remains
+/// time-bounded on every request, so a root merely present in the endpoint is
+/// never sufficient to admit a stale generation.
 /// Every authority a client leaf may chain to, in the order the negotiation
 /// port asks them.
 ///

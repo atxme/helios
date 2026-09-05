@@ -560,14 +560,16 @@ canal pour le dire.
    donc `[feuille, intermédiaire]`, et seulement quand cet intermédiaire est
    celui qui a signé cette feuille.
 
-**Limite connue** : le jeu d'ancres TLS clientes est lu une fois sur disque au
-démarrage, et `heliosd init-trust-domain` amorce le registre depuis ce même
-fichier — les deux concordent donc, et l'intermédiaire de la délégation chaîne
-vers cette ancre. Ce qui n'est pas câblé, c'est une **rotation de CA TLS
-cliente** : `next_client_tls_ca_certificate` n'est pas offert en seconde racine,
-et une nouvelle ancre exigerait de toute façon un redémarrage — reconstruire le
-point d'écoute sous des sessions vivantes ferait tomber les slots PSK qu'elles
-tiennent. Rien n'effectue cette rotation aujourd'hui.
+**Limite connue** : le jeu d'ancres TLS clientes est construit une fois au
+démarrage. Il contient la CA opérateur — nécessaire aux feuilles de première
+génération — et les ancres `CA-TLS` que le registre accepte à cet instant. Une
+leaf renouvelée chaîne donc vers la CA du domaine via l'intermédiaire qu'Orion
+présente. Une rotation `CA-TLS` installée avant `activation_at` demande encore
+un redémarrage pendant le chevauchement pour ajouter le successeur au point
+d'écoute, puis un autre après le retrait pour en retirer la racine sortante.
+La reconstruction automatique du point d'écoute n'est pas câblée : elle ferait
+tomber les sessions qui détiennent des slots PSK. Le contrôle applicatif de la
+paire TLS/PQ reste, lui, borné par les fenêtres du registre à chaque requête.
 
 ### À la main
 

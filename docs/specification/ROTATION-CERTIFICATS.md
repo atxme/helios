@@ -2860,7 +2860,12 @@ n'offre pas de bascule automatique entre les deux.
   ouverte en exploitation.
 - `heliosd::certificates` : propriétaire unique du registre, signature des
   reçus par la leaf servie, boucle de balayage des leases et des
-  chevauchements.
+  chevauchements. Le listener de négociation charge au démarrage la CA
+  opérateur et les ancres `CA-TLS` alors acceptables dans ce registre, afin
+  qu'une leaf renouvelée présentée avec l'intermédiaire délégué franchisse le
+  mTLS. L'ajout et le retrait automatiques d'une racine aux bornes d'une
+  rotation exigent encore un redémarrage du listener ; la résolution de la
+  paire TLS/PQ reste bornée par l'horloge à chaque requête.
 - `astra` : registre, audit chaîné dont la tête distingue une restauration d'un
   fork, émetteur délégué borné qui fixe lui-même la validité des leafs,
   planificateur, statut signé, budgets plafonnés par source et par identité.
