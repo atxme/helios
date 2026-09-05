@@ -1360,7 +1360,7 @@ export function ProfilesView({
             des traces de la clé.
             <Box component="span" sx={{ display: 'block', mt: 1.5 }}>
               En continuant, vous acceptez cette protection dégradée pour ce poste. Orion la
-              signalera par « volume non chiffré — exigence levée ».
+              signalera comme protection incomplète.
             </Box>
           </DialogContentText>
         </DialogContent>

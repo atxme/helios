@@ -61,6 +61,7 @@ pub mod capability;
 pub mod client;
 pub mod encoding;
 pub mod gateway;
+pub mod operator_ipc;
 pub mod revocation;
 pub mod state;
 pub mod status;
