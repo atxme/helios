@@ -150,7 +150,6 @@ mod tests {
         let command: AstraIpcCommand =
             serde_json::from_str(r#"{"command":"continue"}"#).expect("command");
         assert_eq!(command, AstraIpcCommand::Continue);
-        assert!(serde_json::from_str::<AstraIpcCommand>(r#"{"command":"run","args":[]}"#)
-            .is_err());
+        assert!(serde_json::from_str::<AstraIpcCommand>(r#"{"command":"run","args":[]}"#).is_err());
     }
 }

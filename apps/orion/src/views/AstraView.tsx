@@ -171,7 +171,7 @@ export function AstraView() {
             ? 'Clé de promotion branchée — continuer'
             : status?.can_continue
               ? 'Réessayer'
-        : 'Démarrer la rotation'
+              : 'Démarrer la rotation'
 
   return (
     <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>

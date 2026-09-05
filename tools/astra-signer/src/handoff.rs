@@ -34,9 +34,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
+use anyhow::{bail, Context, Result};
 use astra::vault::AuthorityVault;
 use serde::{Deserialize, Serialize};
+
+use crate::authority::DomainIdentity;
+use crate::campaign::Campaign;
+use crate::origin::CampaignRequest;
 
 /// Name of the hand-off file, beside the vault.
 pub const HANDOFF_FILE: &str = "astra-domain.json";
@@ -187,6 +192,96 @@ pub fn save(path: &Path, handoff: &DomainHandoff) -> Result<()> {
 pub fn load(path: &Path) -> Result<DomainHandoff> {
     let bytes = std::fs::read(path).with_context(|| format!("lecture de {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("lecture du relais {}", path.display()))
+}
+
+/// The domain identity every signing gesture reads out of the relay.
+///
+/// Shared rather than rebuilt at each call site: an identity assembled twice
+/// is an identity that can differ once, and what it names — the gateway, the
+/// server name, the two epochs — is exactly what `CA-PQ` vouches for.
+pub fn identity_of(handoff: &DomainHandoff) -> Result<DomainIdentity> {
+    let gateway = handoff.require(
+        handoff.gateway_wg_public_key.as_ref(),
+        "la clé publique de la gateway",
+        "--gateway-wg-public-key",
+    )?;
+    let server_name = handoff.require(
+        handoff.server_name.as_ref(),
+        "le nom de service de la gateway",
+        "--server-name",
+    )?;
+    Ok(DomainIdentity {
+        trust_domain_id: TrustDomainId::parse_hex(&handoff.trust_domain_id)?,
+        gateway_wg_public_key: WireGuardKey::parse(gateway)?,
+        server_name: server_name.clone(),
+        ca_epoch: handoff.ca_epoch.unwrap_or(1),
+        ca_tls_epoch: handoff.ca_tls_epoch.unwrap_or(1),
+    })
+}
+
+/// The authority origin a signed request must name, from what is already held.
+///
+/// Never from the answer being verified: an `authority_url` taken out of the
+/// response would let whoever served it choose the value it is checked
+/// against.
+pub fn expected_authority_url(handoff: &DomainHandoff, channel: &Campaign) -> Result<String> {
+    match (handoff.astra_authority_url.as_deref(), channel) {
+        (Some(declared), Campaign::Origin(origin)) if origin.base() != declared => bail!(
+            "ce relais de domaine déclare l'origine « {declared} » et cette commande compose \
+             « {} ». Rien n'a été signé : corriger l'une des deux avant de continuer.",
+            origin.base()
+        ),
+        (Some(declared), _) => Ok(declared.to_string()),
+        (None, Campaign::Origin(origin)) => Ok(origin.base().to_string()),
+        (None, Campaign::Tunnel(_)) => bail!(
+            "le relais de domaine ne porte pas l'origine déclarée par l'autorité : la renseigner \
+             par `astra-signer domain --astra-authority-url <url>`. Dans le tunnel aucune URL \
+             n'est composée, donc rien d'autre ne peut servir de valeur attendue à la demande \
+             signée."
+        ),
+    }
+}
+
+/// Checks what the authority served, before an operator is asked for anything.
+///
+/// The request is signed by Astra's service key and verified under the key
+/// this companion already pins; the campaign is bound to that signature; and
+/// the relying party the authority announces is **compared** to the vault's,
+/// never adopted.
+///
+/// `authority_url` is the expected value [`expected_authority_url`] resolved —
+/// never one this answer supplied.
+pub fn verify_campaign_request(
+    handoff: &DomainHandoff,
+    vault: &AuthorityVault,
+    request: &CampaignRequest,
+    authority_url: &str,
+    now: u64,
+) -> Result<()> {
+    let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
+             `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
+        )
+    })?;
+    let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {
+        anyhow::anyhow!("ce relais de domaine ne porte pas l'époque de la clé de service")
+    })?;
+    request.signer_request.verify(
+        &MlDsa87PublicKey::parse(service_key)?,
+        service_key_epoch,
+        authority_url,
+        now,
+    )?;
+    if request.webauthn_rp_id != vault.rp_id {
+        bail!(
+            "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} ». Rien n'est \
+             signé : une assertion produite sous un autre RP ID vaudrait pour un autre domaine.",
+            request.webauthn_rp_id,
+            vault.rp_id
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

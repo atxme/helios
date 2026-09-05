@@ -94,10 +94,10 @@ use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
 use astra::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
 use astra_signer::authenticator::{Opened, Transport};
-use astra_signer::authority::{self, DelegationBounds, DomainIdentity, IssuerDelegationRequest};
+use astra_signer::authority::{self, DelegationBounds, IssuerDelegationRequest};
 use astra_signer::credentials;
 use astra_signer::gestures::{self, NewAuthority, NewKey};
-use astra_signer::{authenticator, documents, handoff, prepared, store, tunnel};
+use astra_signer::{authenticator, documents, handoff, orion, prepared, store, tunnel};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
@@ -607,6 +607,42 @@ enum Command {
         #[arg(long, default_value_t = 1825)]
         validity_days: u64,
     },
+    /// Mène la rotation CA-TLS sous la conduite d'Orion, sans console (§9.4).
+    ///
+    /// Même cérémonie que `rotate-ca-tls`, et exactement les mêmes
+    /// vérifications : seules les invites changent de support. Orion tient une
+    /// socket loopback et un jeton à usage unique, ce compagnon s'y reconnecte
+    /// et n'y publie que des états publics. Le coffre, le PIN et le geste FIDO
+    /// ne quittent jamais ce processus.
+    ///
+    /// Les arguments sont composés par Orion, jamais saisis : la sous-commande
+    /// n'est pas destinée à une frappe manuelle.
+    #[command(hide = true)]
+    Orion {
+        /// API de la gateway dans le tunnel (§8.5).
+        #[arg(long)]
+        heliosd_url: String,
+        #[arg(long)]
+        operation_id: String,
+        /// Où écrire la transition signée, pour la porter sur la gateway.
+        #[arg(long)]
+        out: PathBuf,
+        /// Point d'écoute loopback ouvert par Orion.
+        #[arg(long)]
+        ipc_address: String,
+        /// Jeton d'authentification du canal, 32 octets en hexadécimal.
+        #[arg(long, env = "ASTRA_ORION_IPC_TOKEN", hide_env_values = true)]
+        ipc_token: String,
+        /// Délai avant `activation_at`, en jours.
+        #[arg(long, default_value_t = 7)]
+        prepare_days: u64,
+        /// Recouvrement pendant lequel les deux ancres sont acceptées.
+        #[arg(long, default_value_t = 30)]
+        overlap_days: u64,
+        /// Durée de vie de l'ancre entrante, en jours.
+        #[arg(long, default_value_t = 1825)]
+        validity_days: u64,
+    },
     /// Rejoue le dépôt d'une rotation préparée mais jamais déposée.
     ///
     /// La cérémonie écrit sa décision avant d'en parler à quiconque. Si la
@@ -944,6 +980,26 @@ fn run() -> Result<()> {
             (prepare_days, overlap_days, validity_days),
             transport,
         ),
+        Command::Orion {
+            heliosd_url,
+            operation_id,
+            out,
+            ipc_address,
+            ipc_token,
+            prepare_days,
+            overlap_days,
+            validity_days,
+        } => orion::run_helper(orion::HelperOptions {
+            vault_path: path,
+            heliosd_url,
+            operation_id,
+            output_path: out,
+            ipc_address,
+            ipc_token: Zeroizing::new(ipc_token),
+            prepare_days,
+            overlap_days,
+            validity_days,
+        }),
         Command::ResumeRotation {
             authority_url,
             heliosd_url,
@@ -1336,26 +1392,6 @@ fn domain(
 /// operator who retypes a gateway key eventually signs a delegation for the
 /// wrong one, and `CA-PQ` vouching for it is not something a later check
 /// undoes.
-fn identity_of(handoff: &handoff::DomainHandoff) -> Result<DomainIdentity> {
-    let gateway = handoff.require(
-        handoff.gateway_wg_public_key.as_ref(),
-        "la clé publique de la gateway",
-        "--gateway-wg-public-key",
-    )?;
-    let server_name = handoff.require(
-        handoff.server_name.as_ref(),
-        "le nom de service de la gateway",
-        "--server-name",
-    )?;
-    Ok(DomainIdentity {
-        trust_domain_id: TrustDomainId::parse_hex(&handoff.trust_domain_id)?,
-        gateway_wg_public_key: WireGuardKey::parse(gateway)?,
-        server_name: server_name.clone(),
-        ca_epoch: handoff.ca_epoch.unwrap_or(1),
-        ca_tls_epoch: handoff.ca_tls_epoch.unwrap_or(1),
-    })
-}
-
 /// Opens the vault at one plugged-in key, and says which slot answered.
 fn open_vault(vault: &AuthorityVault, transport: Transport, prompt: &str) -> Result<Opened> {
     eprintln!("{prompt}");
@@ -1379,7 +1415,7 @@ fn open_vault(vault: &AuthorityVault, transport: Transport, prompt: &str) -> Res
 /// than emitting one bound to a guess.
 fn resign_bindings(path: &Path, vault: &AuthorityVault, opening: &Opened) -> Result<()> {
     let handoff = handoff::DomainHandoff::beside(path, vault)?;
-    let identity = match identity_of(&handoff) {
+    let identity = match handoff::identity_of(&handoff) {
         Ok(identity) => identity,
         Err(_) => {
             println!(
@@ -1419,7 +1455,7 @@ fn issue_ca_tls(path: &Path, days: u64, out: Option<&Path>, transport: Transport
             handoff.ca_tls_epoch.unwrap_or(1)
         );
     }
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let not_before = now_unix();
     let not_after = not_before
         .checked_add(days.checked_mul(DAY_SECS).context("durée hors bornes")?)
@@ -1484,7 +1520,7 @@ fn authorize_issuer(
 
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_tls = DerCertificate::parse(handoff.require(
         handoff.ca_tls_certificate.as_ref(),
         "le certificat CA-TLS",
@@ -1496,7 +1532,13 @@ fn authorize_issuer(
                 .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
             let client = astra_signer::origin::Origin::new(authority_url)?;
             let request_document = origin_client_fetch(&client, &operation)?;
-            verify_campaign_request(&handoff, &vault, &request_document, authority_url)?;
+            handoff::verify_campaign_request(
+                &handoff,
+                &vault,
+                &request_document,
+                authority_url,
+                now_unix(),
+            )?;
             let campaign = request_document.campaign.as_ref().clone();
             if !matches!(campaign.scope.family(), CampaignFamily::IssuerDelegation) {
                 bail!(
@@ -1656,7 +1698,7 @@ fn authorize_issuer(
 fn bindings(path: &Path, lost: &[String], active: &[String], transport: Transport) -> Result<()> {
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
 
     // Slot identifiers rather than credential identifiers: `list` prints the
     // first, and a credential a decision is about is one the vault still
@@ -1745,7 +1787,7 @@ fn approve(
 
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let service_key = MlDsa87PublicKey::parse(handoff.require(
         handoff.astra_service_public_key.as_ref(),
         "la clé de service d'Astra",
@@ -1905,7 +1947,7 @@ fn approve_campaign(
 ) -> Result<()> {
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
@@ -1924,7 +1966,13 @@ fn approve_campaign(
 
     let campaign = match &online {
         Some((_, request)) => {
-            verify_campaign_request(&handoff, &vault, request, authority_url.unwrap_or_default())?;
+            handoff::verify_campaign_request(
+                &handoff,
+                &vault,
+                request,
+                authority_url.unwrap_or_default(),
+                now_unix(),
+            )?;
             request.campaign.as_ref().clone()
         }
         None => {
@@ -2091,7 +2139,7 @@ fn revoke(
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
@@ -2099,7 +2147,7 @@ fn revoke(
 
     let client = astra_signer::origin::Origin::new(authority_url)?;
     let request = origin_client_fetch(&client, &operation)?;
-    verify_campaign_request(&handoff, &vault, &request, authority_url)?;
+    handoff::verify_campaign_request(&handoff, &vault, &request, authority_url, now_unix())?;
     let campaign = request.campaign.as_ref().clone();
     if !campaign.scope.revokes() {
         bail!("cette opération n'est pas une révocation. Rien n'a été signé.");
@@ -2322,7 +2370,7 @@ fn rotate_ca_tls(
         );
     }
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let active_certificate = DerCertificate::parse(handoff.require(
         handoff.ca_tls_certificate.as_ref(),
@@ -2333,10 +2381,10 @@ fn rotate_ca_tls(
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let expected_url = expected_authority_url(&handoff, &channel)?;
+    let expected_url = handoff::expected_authority_url(&handoff, &channel)?;
     println!("transport        : {}", channel.description());
     let request = channel.fetch(&operation)?;
-    verify_campaign_request(&handoff, &vault, &request, &expected_url)?;
+    handoff::verify_campaign_request(&handoff, &vault, &request, &expected_url, now_unix())?;
     let campaign = request.campaign.as_ref().clone();
     if !campaign.scope.rotates_authority() {
         bail!("cette campagne ne fait tourner aucune ancre. Rien n'a été signé.");
@@ -2458,6 +2506,16 @@ fn rotate_ca_tls(
         not_after: window.not_after,
         submitted: false,
         prepared_at: now,
+        // The same public campaign summary the terminal printed above. A
+        // window survives its ceremony by days, and whatever resumes it — this
+        // binary or the Orion companion — must be able to name what was
+        // approved without re-fetching a campaign that is already closed.
+        manifest: Some(orion::manifest_of(
+            &campaign,
+            &identity,
+            &active_certificate,
+            window,
+        )?),
     };
     // Written before the deposit is attempted, and holding the exact bytes of
     // it. A crash after this point is a replay; a crash before it is a
@@ -2750,16 +2808,22 @@ fn sign_gateway_transition(
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let expected_url = expected_authority_url(&handoff, &channel)?;
+    let expected_url = handoff::expected_authority_url(&handoff, &channel)?;
     println!("transport        : {}", channel.description());
     let request_document = channel.fetch(&operation)?;
-    verify_campaign_request(&handoff, &vault, &request_document, &expected_url)?;
+    handoff::verify_campaign_request(
+        &handoff,
+        &vault,
+        &request_document,
+        &expected_url,
+        now_unix(),
+    )?;
     let campaign = request_document.campaign.as_ref().clone();
     if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
         bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
@@ -2967,16 +3031,22 @@ fn abort_gateway_transition(
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let expected_url = expected_authority_url(&handoff, &channel)?;
+    let expected_url = handoff::expected_authority_url(&handoff, &channel)?;
     println!("transport        : {}", channel.description());
     let request_document = channel.fetch(&operation)?;
-    verify_campaign_request(&handoff, &vault, &request_document, &expected_url)?;
+    handoff::verify_campaign_request(
+        &handoff,
+        &vault,
+        &request_document,
+        &expected_url,
+        now_unix(),
+    )?;
     let campaign = request_document.campaign.as_ref().clone();
     if !matches!(campaign.scope.family(), CampaignFamily::GatewayIdentity) {
         bail!("cette opération ne décide pas l'identité gateway. Rien n'a été signé.");
@@ -3100,7 +3170,7 @@ fn sign_gateway_rollback(
 
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let ca_pq_public_key = MlDsa87PublicKey::parse(&handoff.ca_pq_public_key)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
@@ -3338,7 +3408,7 @@ fn recover(
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
     let vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
@@ -3520,7 +3590,7 @@ fn rotate_ca_pq(
 
     let mut vault = store::load(path)?;
     let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = identity_of(&handoff)?;
+    let identity = handoff::identity_of(&handoff)?;
     let current_ca_public_key = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
     let now = now_unix();
     let activation_at = now
@@ -3548,7 +3618,7 @@ fn rotate_ca_pq(
                 Id16::parse_hex(id).map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
             let client = astra_signer::origin::Origin::new(url)?;
             let request = origin_client_fetch(&client, &operation)?;
-            verify_campaign_request(&handoff, &vault, &request, url)?;
+            handoff::verify_campaign_request(&handoff, &vault, &request, url, now_unix())?;
             let campaign = request.campaign.as_ref().clone();
             if !campaign.scope.rotates_authority() {
                 bail!(
@@ -3789,81 +3859,6 @@ fn horodatage(seconds: u64) -> String {
         ),
         Err(_) => format!("{seconds} (horodatage illisible)"),
     }
-}
-
-/// The authority origin a signed request must name, from what is already held.
-///
-/// Never from the answer being verified: an `authority_url` taken out of the
-/// object it authenticates would authenticate nothing. On the public channel
-/// the dialled origin was that value historically, and it still is for a
-/// hand-off written before the amendment of 4 September 2026. Inside the
-/// tunnel nothing is dialled, so the hand-off is the only source — and a
-/// hand-off that does not carry it says which command records it.
-///
-/// When both exist they must agree: a companion dialling one origin while its
-/// domain declares another is holding two answers to a question with one.
-fn expected_authority_url(
-    handoff: &handoff::DomainHandoff,
-    channel: &astra_signer::campaign::Campaign,
-) -> Result<String> {
-    use astra_signer::campaign::Campaign;
-
-    match (handoff.astra_authority_url.as_deref(), channel) {
-        (Some(declared), Campaign::Origin(origin)) if origin.base() != declared => bail!(
-            "ce relais de domaine déclare l'origine « {declared} » et cette commande compose \
-             « {} ». Rien n'a été signé : corriger l'une des deux avant de continuer.",
-            origin.base()
-        ),
-        (Some(declared), _) => Ok(declared.to_string()),
-        (None, Campaign::Origin(origin)) => Ok(origin.base().to_string()),
-        (None, Campaign::Tunnel(_)) => bail!(
-            "le relais de domaine ne porte pas l'origine déclarée par l'autorité : la renseigner \
-             par `astra-signer domain --astra-authority-url <url>`. Dans le tunnel aucune URL \
-             n'est composée, donc rien d'autre ne peut servir de valeur attendue à la demande \
-             signée."
-        ),
-    }
-}
-
-/// Checks what the authority served, before an operator is asked for anything.
-///
-/// The request is signed by Astra's service key and verified under the key
-/// this companion already pins; the campaign is bound to that signature; and
-/// the relying party the authority announces is **compared** to the vault's,
-/// never adopted.
-///
-/// `authority_url` is the expected value [`expected_authority_url`] resolved —
-/// never one this answer supplied.
-fn verify_campaign_request(
-    handoff: &handoff::DomainHandoff,
-    vault: &AuthorityVault,
-    request: &astra_signer::origin::CampaignRequest,
-    authority_url: &str,
-) -> Result<()> {
-    let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
-             `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
-        )
-    })?;
-    let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {
-        anyhow::anyhow!("ce relais de domaine ne porte pas l'époque de la clé de service")
-    })?;
-    request.signer_request.verify(
-        &MlDsa87PublicKey::parse(service_key)?,
-        service_key_epoch,
-        authority_url,
-        now_unix(),
-    )?;
-    if request.webauthn_rp_id != vault.rp_id {
-        bail!(
-            "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} ». Rien n'est \
-             signé : une assertion produite sous un autre RP ID vaudrait pour un autre domaine.",
-            request.webauthn_rp_id,
-            vault.rp_id
-        );
-    }
-    Ok(())
 }
 
 fn ca_pq_rotation_journal_path(vault_path: &Path) -> PathBuf {

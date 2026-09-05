@@ -9,12 +9,12 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey};
+use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey};
 use aether::certificates::operator_ipc::{
     AstraCaTlsManifest, AstraCaTlsPhase, AstraCaTlsStatus, AstraIpcCommand, AstraIpcHello,
     MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
-use aether::certificates::status::{AstraSignerResult, CampaignApproval};
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult, CampaignApproval};
 use aether::certificates::transport::TrustUpdateObject;
 use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
@@ -74,33 +74,37 @@ impl CaTlsCeremony {
         let operation = Id16::parse_hex(operation_id)
             .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
         if prepared::load(&prepared::path_beside(vault_path))?.is_some() {
-            bail!("une rotation CA-TLS est déjà préparée ; la reprendre avant d'en ouvrir une autre");
+            bail!(
+                "une rotation CA-TLS est déjà préparée ; la reprendre avant d'en ouvrir une autre"
+            );
         }
 
         let vault = store::load(vault_path)?;
         let relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
-        let identity = identity_of(&relay)?;
+        let identity = handoff::identity_of(&relay)?;
         let ca_pq_public_key = MlDsa87PublicKey::parse(&relay.ca_pq_public_key)?;
         let active_certificate = DerCertificate::parse(relay.require(
             relay.ca_tls_certificate.as_ref(),
             "le certificat CA-TLS en service",
             "--ca-tls-certificate",
         )?)?;
-        let registry = credentials::load(&credentials::path_beside(vault_path))?.ok_or_else(|| {
-            anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
-        })?;
+        let registry =
+            credentials::load(&credentials::path_beside(vault_path))?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "aucun document de credentials : l'émettre par `astra-signer bindings`"
+                )
+            })?;
 
-        let expected_url = expected_authority_url(&relay, &channel)?;
+        let expected_url = handoff::expected_authority_url(&relay, &channel)?;
         let request = channel.fetch(&operation)?;
-        verify_campaign_request(&relay, &vault, &request, &expected_url, now)?;
+        handoff::verify_campaign_request(&relay, &vault, &request, &expected_url, now)?;
         let campaign = request.campaign.as_ref().clone();
         if !campaign.scope.rotates_authority() {
             bail!("cette campagne ne fait tourner aucune ancre. Rien n'a été signé.");
         }
 
-        let day = |days: u64| -> Result<u64> {
-            days.checked_mul(DAY_SECS).context("durée hors bornes")
-        };
+        let day =
+            |days: u64| -> Result<u64> { days.checked_mul(DAY_SECS).context("durée hors bornes") };
         let activation_at = now
             .checked_add(day(prepare_days)?)
             .context("délai hors bornes")?;
@@ -135,21 +139,7 @@ impl CaTlsCeremony {
             );
         }
 
-        let manifest = AstraCaTlsManifest {
-            reason: campaign.reason.clone(),
-            requested_by: campaign.requested_by.clone(),
-            fingerprint: campaign.fingerprint().to_hex(),
-            current_ca_tls_epoch: identity.ca_tls_epoch,
-            next_ca_tls_epoch: identity
-                .ca_tls_epoch
-                .checked_add(1)
-                .context("époque CA-TLS hors bornes")?,
-            activation_at,
-            not_after: window.not_after,
-            outgoing_anchor_fingerprint: active_certificate.fingerprint().to_hex(),
-            affected_ca: "client_tls".into(),
-            target_count: campaign.targets.len(),
-        };
+        let manifest = manifest_of(&campaign, &identity, &active_certificate, window)?;
 
         Ok(Self {
             vault_path: vault_path.to_path_buf(),
@@ -168,12 +158,7 @@ impl CaTlsCeremony {
     }
 
     /// Opens and approves with the one key currently connected.
-    pub fn approve_key(
-        &mut self,
-        key: &dyn Authenticator,
-        pin: &str,
-        now: u64,
-    ) -> Result<String> {
+    pub fn approve_key(&mut self, key: &dyn Authenticator, pin: &str, now: u64) -> Result<String> {
         let approval = self
             .approval
             .as_mut()
@@ -217,6 +202,7 @@ impl CaTlsCeremony {
             self.window,
             self.validity,
         )?;
+        let transition_document = rotated.transition.clone();
         let object = TrustUpdateObject::ClientTlsCaTransition(Box::new(rotated.transition));
         self.request
             .campaign
@@ -241,7 +227,12 @@ impl CaTlsCeremony {
         };
         let prepared_path = prepared::path_beside(&self.vault_path);
         prepared::save(&prepared_path, &record)?;
-        let encoded = serde_json::to_vec_pretty(&object).context("encodage de la transition")?;
+        // The bare transition, not the tagged `TrustUpdateObject` envelope: the
+        // envelope is what Astra's registry routes on, while this file is what
+        // `heliosd install-client-tls-ca` reads — and that reader refuses an
+        // unknown `kind` field.
+        let encoded =
+            serde_json::to_vec_pretty(&transition_document).context("encodage de la transition")?;
         std::fs::write(&self.output_path, &encoded)
             .with_context(|| format!("écriture de {}", self.output_path.display()))?;
         Ok(record)
@@ -384,7 +375,8 @@ fn resume_existing(
     let mut status = status_from_record(record);
     if !record.submitted {
         status.phase = AstraCaTlsPhase::Prepared;
-        status.message = "Une transition locale attend son dépôt. Aucune clé ne sera redemandée.".into();
+        status.message =
+            "Une transition locale attend son dépôt. Aucune clé ne sera redemandée.".into();
         status.can_continue = true;
         send_frame(stream, &status)?;
         if wait_for_continue(stream, &status)? != AstraIpcCommand::Continue {
@@ -415,7 +407,8 @@ fn resume_existing(
     }
 
     status.phase = AstraCaTlsPhase::AwaitingPromotionKey;
-    status.message = "Le recouvrement est terminé. Branchez une clé autorisée pour promouvoir l'ancre.".into();
+    status.message =
+        "Le recouvrement est terminé. Branchez une clé autorisée pour promouvoir l'ancre.".into();
     status.can_continue = true;
     send_frame(stream, &status)?;
     if wait_for_continue(stream, &status)? != AstraIpcCommand::Continue {
@@ -437,7 +430,10 @@ fn resume_existing(
             handoff::save(&handoff::path_beside(&options.vault_path), &relay)?;
             prepared::clear(&prepared::path_beside(&options.vault_path))?;
             status.phase = AstraCaTlsPhase::Promoted;
-            status.message = format!("Ancre CA-TLS promue à l'époque {}.", record.next_ca_tls_epoch);
+            status.message = format!(
+                "Ancre CA-TLS promue à l'époque {}.",
+                record.next_ca_tls_epoch
+            );
             send_frame(stream, &status)?;
             Ok(())
         }
@@ -466,7 +462,10 @@ fn submit_prepared(
     prepared::save(&prepared::path_beside(vault_path), record)
 }
 
-fn campaign_result(approval: &CampaignApproval, objects: Vec<TrustUpdateObject>) -> AstraSignerResult {
+fn campaign_result(
+    approval: &CampaignApproval,
+    objects: Vec<TrustUpdateObject>,
+) -> AstraSignerResult {
     AstraSignerResult {
         format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
         approval: Box::new(approval.clone()),
@@ -476,67 +475,33 @@ fn campaign_result(approval: &CampaignApproval, objects: Vec<TrustUpdateObject>)
     }
 }
 
-fn identity_of(relay: &handoff::DomainHandoff) -> Result<DomainIdentity> {
-    let gateway = relay.require(
-        relay.gateway_wg_public_key.as_ref(),
-        "la clé publique de la gateway",
-        "--gateway-wg-public-key",
-    )?;
-    let server_name = relay.require(
-        relay.server_name.as_ref(),
-        "le nom de service de la gateway",
-        "--server-name",
-    )?;
-    Ok(DomainIdentity {
-        trust_domain_id: TrustDomainId::parse_hex(&relay.trust_domain_id)?,
-        gateway_wg_public_key: WireGuardKey::parse(gateway)?,
-        server_name: server_name.clone(),
-        ca_epoch: relay.ca_epoch.unwrap_or(1),
-        ca_tls_epoch: relay.ca_tls_epoch.unwrap_or(1),
+/// The public campaign summary both front ends show before a key is touched.
+///
+/// One constructor for the terminal and for Orion: the manifest is what the
+/// operator compares against the campaign they asked for, and two independent
+/// renderings of it could disagree about the very values that decide whether
+/// the ceremony should continue.
+pub fn manifest_of(
+    campaign: &AstraRotationCampaign,
+    identity: &DomainIdentity,
+    active_certificate: &DerCertificate,
+    window: TransitionWindow,
+) -> Result<AstraCaTlsManifest> {
+    Ok(AstraCaTlsManifest {
+        reason: campaign.reason.clone(),
+        requested_by: campaign.requested_by.clone(),
+        fingerprint: campaign.fingerprint().to_hex(),
+        current_ca_tls_epoch: identity.ca_tls_epoch,
+        next_ca_tls_epoch: identity
+            .ca_tls_epoch
+            .checked_add(1)
+            .context("époque CA-TLS hors bornes")?,
+        activation_at: window.activation_at,
+        not_after: window.not_after,
+        outgoing_anchor_fingerprint: active_certificate.fingerprint().to_hex(),
+        affected_ca: "client_tls".into(),
+        target_count: campaign.targets.len(),
     })
-}
-
-fn expected_authority_url(relay: &handoff::DomainHandoff, channel: &Campaign) -> Result<String> {
-    match (relay.astra_authority_url.as_deref(), channel) {
-        (Some(declared), Campaign::Origin(origin)) if origin.base() != declared => bail!(
-            "le relais déclare l'origine « {declared} » mais le transport vise « {} »",
-            origin.base()
-        ),
-        (Some(declared), _) => Ok(declared.to_string()),
-        (None, Campaign::Origin(origin)) => Ok(origin.base().to_string()),
-        (None, Campaign::Tunnel(_)) => bail!(
-            "le relais de domaine ne porte pas l'origine Astra attendue ; la renseigner par `astra-signer domain --astra-authority-url <url>`"
-        ),
-    }
-}
-
-fn verify_campaign_request(
-    relay: &handoff::DomainHandoff,
-    vault: &AuthorityVault,
-    request: &crate::origin::CampaignRequest,
-    authority_url: &str,
-    now: u64,
-) -> Result<()> {
-    let service_key = relay.astra_service_public_key.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("le relais de domaine ne porte pas la clé de service Astra")
-    })?;
-    let service_key_epoch = relay
-        .astra_service_key_epoch
-        .context("le relais de domaine ne porte pas l'époque de la clé de service")?;
-    request.signer_request.verify(
-        &MlDsa87PublicKey::parse(service_key)?,
-        service_key_epoch,
-        authority_url,
-        now,
-    )?;
-    if request.webauthn_rp_id != vault.rp_id {
-        bail!(
-            "l'autorité annonce le RP ID « {} » alors que ce coffre épingle « {} »",
-            request.webauthn_rp_id,
-            vault.rp_id
-        );
-    }
-    Ok(())
 }
 
 fn status_for(
@@ -606,7 +571,9 @@ fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> Result<
             }
         }
     }
-    Ok(Some(serde_json::from_slice(&bytes).context("message IPC illisible")?))
+    Ok(Some(
+        serde_json::from_slice(&bytes).context("message IPC illisible")?,
+    ))
 }
 
 fn now_unix() -> u64 {
@@ -622,8 +589,16 @@ mod tests {
 
     #[test]
     fn helper_endpoint_must_be_loopback_and_token_is_exactly_256_bits() {
-        assert!("127.0.0.1:1234".parse::<SocketAddr>().unwrap().ip().is_loopback());
-        assert!(!"192.0.2.1:1234".parse::<SocketAddr>().unwrap().ip().is_loopback());
+        assert!("127.0.0.1:1234"
+            .parse::<SocketAddr>()
+            .unwrap()
+            .ip()
+            .is_loopback());
+        assert!(!"192.0.2.1:1234"
+            .parse::<SocketAddr>()
+            .unwrap()
+            .ip()
+            .is_loopback());
         assert_eq!(hex::decode("ab".repeat(32)).unwrap().len(), 32);
     }
 
