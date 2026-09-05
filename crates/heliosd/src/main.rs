@@ -139,6 +139,21 @@ enum Command {
         /// `astra-signer init --rp-id` and to `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
+        /// DER of the client `CA-TLS` **the domain** serves, self-signed from
+        /// the authority vault by `astra-signer issue-ca-tls` and carried by
+        /// the domain hand-off as `ca_tls_certificate`.
+        ///
+        /// This is not the operator CA that admits clients. That one lives on
+        /// this gateway as a file and decides who may open an mTLS session;
+        /// this one is the anchor a **renewed** leaf chains to, through Astra's
+        /// delegated intermediate. Seeding the registry with the operator CA
+        /// instead puts the admission authority where the domain anchor
+        /// belongs, and every staging is then refused with «the candidate TLS
+        /// leaf chains to no client CA this gateway holds» — a §9.4 rotation
+        /// cannot repair it, because a transition can only move away from an
+        /// anchor the gateway already holds.
+        #[arg(long)]
+        client_tls_ca: Option<std::path::PathBuf>,
     },
     /// Prepares this gateway's next identity and exports its request (§5).
     ///
@@ -516,6 +531,7 @@ async fn main() -> anyhow::Result<()> {
             astra_service_public_key,
             authority_url,
             webauthn_rp_id,
+            client_tls_ca,
         } => init_trust_domain(
             &trust_domain_id,
             &ca_public_key,
@@ -523,6 +539,7 @@ async fn main() -> anyhow::Result<()> {
             &astra_service_public_key,
             &authority_url,
             &webauthn_rp_id,
+            client_tls_ca.as_deref(),
         ),
         Command::InitAstraChannel {
             bind,
@@ -1053,6 +1070,40 @@ fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The client `CA-TLS` a fresh registry records as generation 1.
+///
+/// The domain's own anchor when the deployment supplies it, and the operator
+/// admission CA otherwise. The fallback exists because a domain may be
+/// bootstrapped before `astra-signer issue-ca-tls` has run, but it is never
+/// silent: a registry seeded with the admission CA stages no renewal — the
+/// candidate leaf chains to Astra's delegated intermediate, which is signed by
+/// the domain anchor — and §9.4 cannot repair it afterwards, because a
+/// transition can only move away from an anchor the gateway already holds.
+fn domain_client_tls_ca(
+    supplied: Option<&std::path::Path>,
+    served: aether::certificates::encoding::DerCertificate,
+) -> anyhow::Result<aether::certificates::encoding::DerCertificate> {
+    let Some(path) = supplied else {
+        warn!(
+            fingerprint = %served.fingerprint(),
+            "no --client-tls-ca given: the registry records the operator admission CA as the \
+             domain anchor. Renewals will not stage until the domain's own CA-TLS is the active \
+             one, and a §9.4 rotation cannot install it — it can only move away from an anchor \
+             this gateway already holds"
+        );
+        return Ok(served);
+    };
+    let der = std::fs::read(path)
+        .with_context(|| format!("reading the domain client CA-TLS in {}", path.display()))?;
+    let certificate = aether::certificates::encoding::DerCertificate::new(der)
+        .context("the domain client CA-TLS is not a readable certificate")?;
+    info!(
+        fingerprint = %certificate.fingerprint(),
+        "client CA-TLS of the domain recorded as generation 1"
+    );
+    Ok(certificate)
+}
+
 fn init_trust_domain(
     trust_domain_id: &str,
     ca_public_key: &str,
@@ -1060,6 +1111,7 @@ fn init_trust_domain(
     astra_service_public_key: &str,
     authority_url: &str,
     webauthn_rp_id: &str,
+    client_tls_ca: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
     use aether::certificates::state::{
@@ -1102,6 +1154,7 @@ fn init_trust_domain(
     .pin()
     .context("building the pinned Astra issuance policy")?;
 
+    let domain_client_tls_ca = domain_client_tls_ca(client_tls_ca, served.client_tls_ca)?;
     let state = RegistryState {
         trust_domain_id,
         gateway: GatewayCertificateState {
@@ -1133,7 +1186,7 @@ fn init_trust_domain(
         },
         client_tls_ca: ClientTlsCaState {
             ca_tls_epoch: 1,
-            active_client_tls_ca_certificate: served.client_tls_ca,
+            active_client_tls_ca_certificate: domain_client_tls_ca,
             next_client_tls_ca_certificate: None,
             next_transition_fingerprint: None,
             activation_at: None,
@@ -2160,5 +2213,58 @@ mod tests {
         // SAFETY: PR_GET_DUMPABLE has no pointer argument and only reads the
         // current test process attribute.
         assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE) }, 0);
+    }
+}
+
+#[cfg(test)]
+mod trust_domain_seeding_tests {
+    use super::domain_client_tls_ca;
+    use aether::certificates::encoding::DerCertificate;
+
+    fn certificate(byte: u8) -> DerCertificate {
+        DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, byte]).expect("certificate")
+    }
+
+    /// The domain's own anchor wins over the admission CA that was served.
+    ///
+    /// This is the whole point of the option: `served.client_tls_ca` is the
+    /// operator CA that decides who may open an mTLS session, and recording it
+    /// as the domain anchor is what made every staging refuse the candidate
+    /// leaf — which chains to Astra's delegated intermediate, signed by the
+    /// domain's CA-TLS and by nothing else.
+    #[test]
+    fn a_supplied_domain_anchor_replaces_the_admission_ca() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("domain-client-ca-tls.der");
+        let domain = certificate(7);
+        std::fs::write(&path, domain.as_bytes()).expect("writing the anchor");
+
+        let seeded = domain_client_tls_ca(Some(&path), certificate(1)).expect("seeding");
+        assert_eq!(
+            seeded, domain,
+            "the registry records what the domain serves"
+        );
+    }
+
+    /// Without the option, the served CA is kept — a bootstrap before
+    /// `issue-ca-tls` must not fail — and the caller is warned it will not
+    /// stage a renewal.
+    #[test]
+    fn without_the_option_the_served_ca_is_kept() {
+        let served = certificate(1);
+        let seeded = domain_client_tls_ca(None, served.clone()).expect("seeding");
+        assert_eq!(seeded, served);
+    }
+
+    /// A file that is not a certificate is named, not recorded.
+    #[test]
+    fn a_file_that_is_not_a_certificate_is_refused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("pas-un-certificat.der");
+        std::fs::write(&path, b"").expect("writing");
+        assert!(domain_client_tls_ca(Some(&path), certificate(1)).is_err());
+
+        let absent = directory.path().join("absent.der");
+        assert!(domain_client_tls_ca(Some(&absent), certificate(1)).is_err());
     }
 }

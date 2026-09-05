@@ -2328,6 +2328,30 @@ confirmation hors bande est la seule nouvelle autorité dans ce cas.
 
 ### 9.4 Rotation de la CA TLS cliente
 
+#### 9.4.0 Amorçage de l'ancre, avant toute rotation
+
+Deux autorités distinctes se ressemblent et ont été confondues :
+
+* la **CA opérateur** (`CN=helios-orion-clients`), fichier local de la gateway,
+  ancre mTLS du listener de négociation : elle décide qui a le droit de se
+  connecter, et elle émet la feuille de première génération d'un client ;
+* la **CA-TLS du domaine**, auto-signée depuis le coffre d'autorité par
+  `astra-signer issue-ca-tls`, portée par le relais de domaine sous
+  `ca_tls_certificate` et épinglée dans Astra par `astra pin-ca-tls` : c'est
+  l'ancre à laquelle une feuille **renouvelée** se rattache, au travers de
+  l'intermédiaire délégué d'Astra.
+
+Le registre de la gateway retient la seconde. `heliosd init-trust-domain
+--client-tls-ca <der>` l'enregistre en génération 1 ; le déploiement la lui
+passe depuis le relais.
+
+Sans elle, le registre retient l'autorité d'admission à la place de l'ancre du
+domaine, et toute mise en attente d'un renouvellement est refusée — la feuille
+candidate ne se rattache à aucune ancre que la gateway détient. Une rotation
+du §9.4 ne répare pas cet état : une transition ne sait que **quitter** une
+ancre déjà détenue. L'amorçage est donc le seul moment où cette valeur se
+pose, et `init-trust-domain` la journalise explicitement quand elle manque.
+
 `CA-TLS` authentifie le transport mTLS avant que la signature PQ cliente soit
 vérifiée. Sa rotation doit donc être préparée sur la gateway avant d'émettre
 des leafs clientes sous la nouvelle CA. La gateway conserve au plus

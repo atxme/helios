@@ -275,7 +275,7 @@ deployer_astra() {
     local tete_attendue registre_gateway statut_tete_ancienne tete_ancienne
     local unite_build etat_build resultat_build code_build tentative astra_lire_frais
     local canal_present cert_astra cert_gateway demande_gateway certificat_distant
-    local ca_tls_der empreinte_ca_tls
+    local ca_tls_der empreinte_ca_tls ca_tls_distant arg_ca_tls
 
     # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
     # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
@@ -881,17 +881,37 @@ deployer_astra() {
             echo "    transfert de la leaf gateway impossible" >&2
             return 1
         }
+        # L'ancre TLS **du domaine**, et non la CA opérateur qui admet les
+        # clients. Sans elle, le registre retient l'autorité d'admission à la
+        # place de l'ancre du domaine : plus aucun renouvellement ne se stage,
+        # et une rotation du §9.4 ne le répare pas — elle ne sait que quitter
+        # une ancre déjà détenue. Le DER est celui que le relais porte déjà et
+        # dont l'empreinte a été épinglée dans Astra plus haut.
+        arg_ca_tls=""
+        if [ -n "$ca_tls_der" ]; then
+            ca_tls_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/domain-client-ca-tls.der"
+            printf '%s' "$ca_tls_der" | base64 -d |
+                ssh "$CIBLE" "cat > '$ca_tls_distant'" || {
+                echo "    transfert de la CA-TLS du domaine impossible" >&2
+                return 1
+            }
+            arg_ca_tls="--client-tls-ca '$ca_tls_distant'"
+        else
+            echo "    relais sans ca_tls_certificate : le registre gateway va retenir la CA" >&2
+            echo "    opérateur comme ancre du domaine, et aucun renouvellement ne pourra" >&2
+            echo "    se stager. Émettre la CA-TLS par astra-signer issue-ca-tls." >&2
+        fi
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
             --gateway-certificate '$certificat_distant' \
             --astra-service-public-key '$cle_service' \
-            --authority-url '$url' --webauthn-rp-id '$rp'" || {
+            --authority-url '$url' --webauthn-rp-id '$rp' $arg_ca_tls" || {
             echo "    le registre gateway n'a pas été amorcé — Astra tourne, la" >&2
             echo "    gateway ignore encore le domaine. Ses routes de cycle de" >&2
             echo "    vie in-tunnel restent fermées." >&2
             return 1
         }
-        ssh "$CIBLE" "rm -f '$certificat_distant'"
+        ssh "$CIBLE" "rm -f '$certificat_distant' '$ca_tls_distant'"
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
     fi
