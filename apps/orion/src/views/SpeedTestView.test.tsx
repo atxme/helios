@@ -177,6 +177,45 @@ describe('SpeedTestView', () => {
     expect(screen.getByText('Qualité')).toBeTruthy()
   })
 
+  /**
+   * The reference the arc is read against.
+   *
+   * A filled arc alone stated a proportion of a ceiling the screen never
+   * named, so half a dial could be 5 Mb/s or 500. The printed rates are that
+   * ceiling, and they follow the `CEILINGS` ladder rather than the raw rate:
+   * a 123,4 Mb/s reading is read against 0–250.
+   */
+  it('prints the scale the dial is read against', async () => {
+    api.runSpeedTest.mockResolvedValue(result)
+    render(<SpeedTestView state="up" profile={profile} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+
+    await waitFor(() => expect(screen.getByText('123,4 Mb/s')).toBeTruthy())
+    // 250 is the rung 123,4 lands on; five divisions make its graduations
+    // round.
+    ;['0', '50', '100', '150', '200', '250'].forEach((rate) => {
+      expect(screen.getByText(rate)).toBeTruthy()
+    })
+    expect(screen.getByRole('img', { name: /échelle de 0 à 250/ })).toBeTruthy()
+  })
+
+  /** A gigabit scale prints thousands, not five-figure numbers on a 200px face. */
+  it('abbreviates the thousands on a fast line', async () => {
+    api.runSpeedTest.mockResolvedValue({
+      ...result,
+      tcp_download_mbps: 1_287.4,
+      download_mbps: 1_287.4,
+    })
+    render(<SpeedTestView state="up" profile={profile} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+
+    await waitFor(() => expect(screen.getByText('1 287,4 Mb/s')).toBeTruthy())
+    expect(screen.getByText('1,5k')).toBeTruthy()
+    expect(screen.getByText('2,5k')).toBeTruthy()
+  })
+
   it('surfaces a gateway refusal without leaving the button stuck', async () => {
     api.runSpeedTest.mockRejectedValue('gateway indisponible')
     render(<SpeedTestView state="up" profile={profile} />)

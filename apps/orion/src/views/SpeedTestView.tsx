@@ -6,7 +6,7 @@ import Typography from '@mui/material/Typography'
 import { ArrowDown, ArrowUp, Gauge } from 'lucide-react'
 
 import * as store from '../speedtest-store'
-import { EMERALD, GUTTER, INK, PINE, RULE } from '../theme'
+import { EMERALD, GUTTER, INK, PINE, RULE, SLATE } from '../theme'
 import type {
   ClientProfile,
   SpeedTestMode,
@@ -33,13 +33,21 @@ import type {
  * «Émission», «Qualité» — and no screen says TCP or UDP. See `MODE` for why
  * the honest answer to «WireGuard, c'est de l'UDP» is not to measure with it.
  *
- * # The dial lost its needle
+ * # The dial says what it is measuring against
  *
- * A needle, nine ticks, a drop shadow and a radial gradient stated one scalar.
- * What remains is the arc that fills, because it is the part that reads at a
- * glance, and the value at its centre in the unit the engine actually
- * produces — megabits, `bytes * 8 / s / 1e6`. The old caption said `MB/S` over
- * that same number, off by a factor of eight.
+ * The face carries a **graduated scale**: five printed rates around the arc,
+ * subdivided, and an index that crosses the band at the measurement. Without
+ * them the arc stated a proportion of a ceiling the screen never named, so a
+ * dial half full could equally be 5 Mb/s or 500 — which is the reading a
+ * speedometer exists to make impossible, and the one this screen could not
+ * give.
+ *
+ * The scale is not decoration on top of the old face: it replaces the
+ * drop shadow and radial gradient that were removed for stating nothing. The
+ * ticks are numbered off `CEILINGS`, so every rung of the ladder prints round
+ * figures. The unit is the one the engine produces — megabits,
+ * `bytes * 8 / s / 1e6`; an older caption said `MB/S` over the same number,
+ * off by a factor of eight.
  *
  * # No captions
  *
@@ -76,10 +84,30 @@ const MODE: SpeedTestMode = 'full'
 const DIAL_BOX = 200
 const DIAL_CENTER = DIAL_BOX / 2
 const DIAL_RADIUS = 84
-const DIAL_STROKE = 13
+const DIAL_STROKE = 10
 /** Arc opening, in degrees: a 270° sweep leaves the gap at the bottom. */
 const DIAL_START = 135
 const DIAL_SWEEP = 270
+
+/**
+ * The graduated scale, drawn inside the arc.
+ *
+ * `TICK_MAJOR` divisions carry a printed rate; each is subdivided
+ * `TICK_MINOR` times. Five divisions is what makes every rung of `CEILINGS`
+ * land on a round number — 10 reads 0/2/4/6/8/10, 2 500 reads
+ * 0/500/1k/1,5k/2k/2,5k — so the scale never prints a figure nobody would
+ * choose to write.
+ */
+const TICK_MAJOR = 5
+const TICK_MINOR = 5
+const TICK_OUTER = 75
+const TICK_MAJOR_INNER = 67
+const TICK_MINOR_INNER = 71
+/** Radius the printed rates sit on: inside the ticks, outside the readout. */
+const LABEL_RADIUS = 58
+/** The index, crossing the arc band at the measured rate. */
+const INDEX_INNER = 70
+const INDEX_OUTER = 93
 
 /**
  * Ceilings the dial is allowed to adopt, in Mb/s.
@@ -209,6 +237,59 @@ const DIAL_PATH = (() => {
   return `M ${startX} ${startY} A ${DIAL_RADIUS} ${DIAL_RADIUS} 0 1 1 ${endX} ${endY}`
 })()
 
+/**
+ * A printed rate, short enough to sit on the dial.
+ *
+ * Thousands are abbreviated because a gigabit line would otherwise print
+ * «1 000» five times around a 200 px face and leave no room for the reading
+ * it is there to qualify.
+ */
+/**
+ * Type size for the reading, so a gigabit figure stays inside its own dial.
+ *
+ * A fixed size fitted «63,7» and ran «1 287,4» straight through the printed
+ * rates on either side — the two things the face has to show at once, drawn
+ * on top of each other exactly when the line is fast enough to be interesting.
+ */
+function readingSize(reading: string): number {
+  if (reading.length <= 5) return 36
+  if (reading.length === 6) return 32
+  return reading.length === 7 ? 27 : 24
+}
+
+function scaleLabel(rate: number): string {
+  if (rate < 1_000) return String(rate)
+  const thousands = rate / 1_000
+  return Number.isInteger(thousands)
+    ? `${thousands}k`
+    : `${thousands.toLocaleString('fr-FR', { maximumFractionDigits: 1 })}k`
+}
+
+/** Angle, in degrees, at which a rate sits on the scale. */
+function angleFor(rate: number, ceiling: number): number {
+  const fraction = Math.min(1, Math.max(0, rate / ceiling))
+  return DIAL_START + fraction * DIAL_SWEEP
+}
+
+/**
+ * The graduation the dial is read against.
+ *
+ * Recomputed from the ceiling rather than fixed: the ladder in `CEILINGS`
+ * changes the scale as a run finds its rate, and ticks that kept their old
+ * values would number a face they no longer describe.
+ */
+function graduations(ceiling: number) {
+  const steps = TICK_MAJOR * TICK_MINOR
+  return Array.from({ length: steps + 1 }, (_, index) => {
+    const angle = DIAL_START + (index / steps) * DIAL_SWEEP
+    const major = index % TICK_MINOR === 0
+    const [outerX, outerY] = polar(angle, TICK_OUTER)
+    const [innerX, innerY] = polar(angle, major ? TICK_MAJOR_INNER : TICK_MINOR_INNER)
+    const rate = (index / steps) * ceiling
+    return { angle, major, index, rate, outerX, outerY, innerX, innerY }
+  })
+}
+
 function Dial({
   rate,
   ceiling,
@@ -221,11 +302,17 @@ function Dial({
   idle: boolean
 }) {
   const fraction = Math.min(1, Math.max(0, rate / ceiling))
+  // A round cap draws a dot even at nothing, so an empty arc is removed
+  // rather than drawn at length zero: the dial at rest showed a bead of
+  // colour parked at «0» that read as a measurement.
+  const drawn = !idle && fraction > 0.002
+  const ticks = graduations(ceiling)
+  const reading = decimal(rate)
 
   return (
     <Box
       role="img"
-      aria-label={`${caption} : ${decimal(rate)} mégabits par seconde`}
+      aria-label={`${caption} : ${decimal(rate)} mégabits par seconde, sur une échelle de 0 à ${ceiling}`}
       sx={{ position: 'relative', width: DIAL_BOX, height: DIAL_BOX, mx: 'auto' }}
     >
       <svg viewBox={`0 0 ${DIAL_BOX} ${DIAL_BOX}`} width="100%" height="100%" aria-hidden="true">
@@ -244,20 +331,68 @@ function Dial({
           strokeLinecap="round"
           pathLength="100"
         />
-        <path
-          d={DIAL_PATH}
-          fill="none"
-          stroke="url(#speedtest-arc)"
-          strokeWidth={DIAL_STROKE}
-          strokeLinecap="round"
-          pathLength="100"
-          strokeDasharray="100"
-          strokeDashoffset={100 - fraction * 100}
-          style={{
-            transition: 'stroke-dashoffset 320ms ease-out',
-            opacity: idle ? 0 : 1,
-          }}
-        />
+        {drawn && (
+          <path
+            d={DIAL_PATH}
+            fill="none"
+            stroke="url(#speedtest-arc)"
+            strokeWidth={DIAL_STROKE}
+            strokeLinecap="round"
+            pathLength="100"
+            strokeDasharray={`${fraction * 100} 100`}
+            style={{ transition: 'stroke-dasharray 320ms ease-out' }}
+          />
+        )}
+
+        {/* The scale. Without it the arc states a proportion of a ceiling the
+            screen never names, so a half-filled dial could be 5 Mb/s or 500. */}
+        {ticks.map((tick) => (
+          <line
+            key={tick.index}
+            x1={tick.outerX}
+            y1={tick.outerY}
+            x2={tick.innerX}
+            y2={tick.innerY}
+            stroke={tick.major ? SLATE : RULE}
+            strokeWidth={tick.major ? 1.8 : 1}
+            strokeLinecap="round"
+          />
+        ))}
+        {ticks
+          .filter((tick) => tick.major)
+          .map((tick) => {
+            const [x, y] = polar(tick.angle, LABEL_RADIUS)
+            return (
+              <text
+                key={`label-${tick.index}`}
+                x={x}
+                y={y}
+                textAnchor="middle"
+                dominantBaseline="central"
+                fill={SLATE}
+                fontSize={9}
+                fontWeight={650}
+                style={{ fontVariantNumeric: 'tabular-nums' }}
+              >
+                {scaleLabel(tick.rate)}
+              </text>
+            )
+          })}
+
+        {/* The index. A filled arc says how far along the scale the rate is;
+            this says where on it the rate is, which is the reading a dial is
+            for. */}
+        {drawn && (
+          <line
+            x1={polar(angleFor(rate, ceiling), INDEX_INNER)[0]}
+            y1={polar(angleFor(rate, ceiling), INDEX_INNER)[1]}
+            x2={polar(angleFor(rate, ceiling), INDEX_OUTER)[0]}
+            y2={polar(angleFor(rate, ceiling), INDEX_OUTER)[1]}
+            stroke={INK}
+            strokeWidth={2.5}
+            strokeLinecap="round"
+          />
+        )}
       </svg>
 
       <Box
@@ -271,25 +406,27 @@ function Dial({
           pointerEvents: 'none',
         }}
       >
+        {/* Caption above the figure, not below it: the printed rates now
+            occupy the bottom of the face, where the caption used to sit. */}
+        <Typography color="text.secondary" sx={{ mb: 0.75, fontSize: 11.5, fontWeight: 650 }}>
+          {caption}
+        </Typography>
         <Typography
           sx={{
             color: idle ? 'text.disabled' : INK,
-            fontSize: 40,
+            fontSize: readingSize(reading),
             fontWeight: 760,
             letterSpacing: '-0.05em',
             lineHeight: 1,
             fontVariantNumeric: 'tabular-nums',
           }}
         >
-          {idle ? '—' : decimal(rate)}
+          {idle ? '—' : reading}
         </Typography>
         <Typography
-          sx={{ mt: 0.5, color: PINE, fontSize: 11, fontWeight: 750, letterSpacing: '0.1em' }}
+          sx={{ mt: 0.5, color: PINE, fontSize: 10.5, fontWeight: 750, letterSpacing: '0.1em' }}
         >
           Mb/s
-        </Typography>
-        <Typography color="text.secondary" sx={{ mt: 1, fontSize: 11.5, fontWeight: 650 }}>
-          {caption}
         </Typography>
       </Box>
     </Box>
