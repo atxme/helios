@@ -2369,8 +2369,8 @@ fn rotate_ca_tls(
         identity.ca_tls_epoch + 1
     );
     println!("ancre sortante   : {}", active_certificate.fingerprint());
-    println!("activation       : {activation_at}");
-    println!("retrait          : {}", window.not_after);
+    println!("activation       : {}", horodatage(activation_at));
+    println!("retrait          : {}", horodatage(window.not_after));
     println!("motif            : {}", campaign.reason);
     println!("demandée par     : {}", campaign.requested_by);
     println!("empreinte        : {}", campaign.fingerprint());
@@ -2434,6 +2434,7 @@ fn rotate_ca_tls(
         window,
         validity,
     )?;
+    let transition_document = rotated.transition.clone();
     let object = TrustUpdateObject::ClientTlsCaTransition(Box::new(rotated.transition));
     campaign
         .covers_authority_object(&object)
@@ -2463,7 +2464,13 @@ fn rotate_ca_tls(
     // ceremony that changed nothing anyone else can see.
     prepared::save(&prepared_path, &record)?;
 
-    let encoded = serde_json::to_vec_pretty(&object).context("encodage de la transition")?;
+    // The bare transition, not the tagged `TrustUpdateObject` envelope. The
+    // envelope is what Astra's registry consumes; this file is what
+    // `heliosd install-client-tls-ca` reads, and that reader refuses an
+    // unknown `kind` field — so writing the envelope produced a file the very
+    // command printed below could not parse.
+    let encoded =
+        serde_json::to_vec_pretty(&transition_document).context("encodage de la transition")?;
     std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
     println!("transition écrite: {}", out.display());
     println!(
@@ -2472,14 +2479,20 @@ fn rotate_ca_tls(
     );
 
     submit_prepared(&channel, &prepared_path, record)?;
+    // The file is on *this* machine; the command runs on the gateway. Naming
+    // the local path inside the remote command printed an instruction that
+    // could not work — the operator has to copy the file across first.
+    println!();
+    println!("à reporter sur la gateway, en deux temps :");
+    println!("  1. copier {} sur la gateway", out.display());
+    println!("  2. y lancer : heliosd install-client-tls-ca <le fichier copié>");
     println!(
-        "à reporter sur la gateway : heliosd install-client-tls-ca {}",
-        out.display()
+        "puis, à partir du {} : astra-signer promote-ca-tls",
+        horodatage(window.not_after)
     );
     println!(
-        "puis, à partir de {} : astra-signer promote-ca-tls (l'époque CA-TLS reste à {} pendant \
-         tout le recouvrement)",
-        window.not_after, identity.ca_tls_epoch
+        "  (l'époque CA-TLS reste à {} pendant tout le recouvrement)",
+        identity.ca_tls_epoch
     );
     Ok(())
 }
@@ -2549,8 +2562,8 @@ fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
 
     let now = now_unix();
     println!("rotation CA-TLS  : époque {}.", record.next_ca_tls_epoch);
-    println!("activation parc  : {}", record.activation_at);
-    println!("retrait          : {}", record.not_after);
+    println!("activation parc  : {}", horodatage(record.activation_at));
+    println!("retrait          : {}", horodatage(record.not_after));
 
     // One key: this executes a decision two credentials already approved. It
     // opens the vault, it does not authorise anything new.
@@ -2868,8 +2881,8 @@ fn sign_gateway_transition(
             "levée (récupération de clé)"
         }
     );
-    println!("activation       : {activation_at}");
-    println!("retrait          : {}", window.not_after);
+    println!("activation       : {}", horodatage(activation_at));
+    println!("retrait          : {}", horodatage(window.not_after));
     println!("motif            : {}", campaign.reason);
     println!("demandée par     : {}", campaign.requested_by);
     println!("empreinte        : {}", campaign.fingerprint());
@@ -3224,23 +3237,50 @@ fn deposit_gateway_decision(
     out: &Path,
     what: &str,
 ) -> Result<()> {
-    let encoded = serde_json::to_vec_pretty(&object).context("encodage de la décision signée")?;
+    let encoded = document_nu(&object)?;
     std::fs::write(out, &encoded).with_context(|| format!("écriture de {}", out.display()))?;
     println!("{what} écrit : {}", out.display());
 
     let result = campaign_result(approval, vec![object], None);
     let state = client.submit(&request.operation_id, &request.result_token, &result)?;
     println!("état             : {state:?}");
+    println!();
+    println!("à reporter sur la gateway, en deux temps :");
+    println!("  1. copier {} sur la gateway", out.display());
     println!(
-        "à reporter sur la gateway : heliosd {} {}",
+        "  2. y lancer : heliosd {} <le fichier copié>",
         if what == "transition" {
             "install-gateway-transition"
         } else {
             "abort-gateway-transition"
-        },
-        out.display()
+        }
     );
     Ok(())
+}
+
+/// The signed object as `heliosd` reads it: bare, without the routing envelope.
+///
+/// [`TrustUpdateObject`] is internally tagged, and that tag is how Astra's
+/// registry tells one decision from another. The `heliosd install-*` readers
+/// take one concrete type and refuse an unknown `kind` field, so a file
+/// carrying the envelope is a file the command this companion prints cannot
+/// parse. The envelope still travels to the authority; only the operator's
+/// copy is unwrapped.
+fn document_nu(object: &aether::certificates::transport::TrustUpdateObject) -> Result<Vec<u8>> {
+    use aether::certificates::transport::TrustUpdateObject as Objet;
+
+    let encoded = match object {
+        Objet::GatewayIdentityTransition(transition) => serde_json::to_vec_pretty(transition),
+        Objet::GatewayTransitionAbort(abort) => serde_json::to_vec_pretty(abort),
+        Objet::CaTransition(transition) => serde_json::to_vec_pretty(transition),
+        Objet::ClientTlsCaTransition(transition) => serde_json::to_vec_pretty(transition),
+        // No `heliosd install-*` command reads the remaining variants from a
+        // file; they reach the gateway through the distribution channel. The
+        // envelope is kept rather than guessed at, so a future reader sees the
+        // type it was given instead of an unlabelled body.
+        other => serde_json::to_vec_pretty(other),
+    };
+    encoded.context("encodage de la décision signée")
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<T> {
@@ -3728,6 +3768,29 @@ fn connect_authorized_key(
     Ok(ConnectedKey { key, pin, opened })
 }
 
+/// A Unix timestamp, as a date an operator can act on.
+///
+/// The raw seconds stay out of the operator-facing lines: a rotation window is
+/// something someone has to diary, and «1791792171» is not a date anyone
+/// compares to a calendar. UTC rather than local time, because the value it
+/// comes from is what the gateway and the authority both compare against.
+fn horodatage(seconds: u64) -> String {
+    let Ok(seconds) = i64::try_from(seconds) else {
+        return format!("{seconds} (hors plage)");
+    };
+    match time::OffsetDateTime::from_unix_timestamp(seconds) {
+        Ok(moment) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            moment.year(),
+            u8::from(moment.month()),
+            moment.day(),
+            moment.hour(),
+            moment.minute()
+        ),
+        Err(_) => format!("{seconds} (horodatage illisible)"),
+    }
+}
+
 /// The authority origin a signed request must name, from what is already held.
 ///
 /// Never from the answer being verified: an `authority_url` taken out of the
@@ -3996,4 +4059,66 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::authority::ClientTlsCaTransition;
+    use aether::certificates::encoding::{
+        DerCertificate, Fingerprint, MlDsa87Signature, TrustDomainId,
+    };
+    use aether::certificates::transport::TrustUpdateObject;
+    use aether::certificates::window::TransitionWindow;
+    use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+    fn transition() -> ClientTlsCaTransition {
+        ClientTlsCaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+            ca_epoch: 1,
+            current_ca_tls_epoch: 1,
+            next_ca_tls_epoch: 2,
+            active_client_tls_ca_fingerprint: Fingerprint::of(b"ancre sortante"),
+            next_client_tls_ca_certificate: DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, 0x00])
+                .expect("certificate"),
+            window: TransitionWindow {
+                not_before: 10,
+                activation_at: 20,
+                not_after: 30,
+            },
+            ca_pq_signature: MlDsa87Signature::new(vec![7; 4627]).expect("signature"),
+        }
+    }
+
+    /// The operator's copy is what `heliosd install-*` reads, so it carries no
+    /// routing envelope.
+    ///
+    /// The tag `TrustUpdateObject` adds is how Astra's registry tells one
+    /// decision from another; the gateway readers take one concrete type and
+    /// refuse an unknown `kind`. Writing the envelope produced a file the very
+    /// command this companion printed could not parse — which is the failure
+    /// this test exists to keep from coming back.
+    #[test]
+    fn the_file_written_for_the_gateway_carries_no_routing_envelope() {
+        let object = TrustUpdateObject::ClientTlsCaTransition(Box::new(transition()));
+        let encoded = document_nu(&object).expect("encoding");
+
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("readable JSON");
+        assert!(
+            value.get("kind").is_none(),
+            "the gateway reader refuses an unknown `kind` field"
+        );
+        let parsed: ClientTlsCaTransition =
+            serde_json::from_slice(&encoded).expect("the gateway must be able to read this file");
+        assert_eq!(parsed.next_ca_tls_epoch, 2);
+    }
+
+    /// A rotation window is a date an operator diaries, not a raw counter.
+    #[test]
+    fn a_window_bound_is_printed_as_a_date() {
+        assert_eq!(horodatage(1_791_792_171), "2026-10-12 08:02 UTC");
+        // Out of range is named rather than silently rendered as an epoch.
+        assert!(horodatage(u64::MAX).contains("hors plage"));
+    }
 }
