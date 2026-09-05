@@ -501,6 +501,32 @@ Le provisioning ML-KEM peut être testé au niveau protocole, mais son PSK ne do
 pas être considéré comme installé automatiquement tant que le câblage atomique
 du plan de données gateway n'est pas terminé.
 
+## Le speedtest ne répond pas
+
+Orion affiche « aucune réponse de la gateway sur le port 5201 » : les paquets
+partent dans le tunnel et rien ne revient. Deux causes, deux vérifications sur
+la gateway.
+
+```sh
+# 1. heliosd écoute-t-il, et sur la bonne adresse ?
+ss -ulnp | grep 5201   # attendu : 100.64.0.1:5201, pas 127.0.0.1:5201
+journalctl -u heliosd | grep 'raw speedtest'
+
+# 2. le pare-feu ouvre-t-il le port sur l'interface du tunnel ?
+nft list chain inet helios input | grep 5201
+# attendu : deux règles `iifname "helios0" ... dport 5201 accept`
+```
+
+Une écoute sur `127.0.0.1` signifie que la gateway a démarré sans identité
+WireGuard : l'adresse du tunnel n'existait pas, et le service s'est replié sur
+la boucle locale jusqu'au prochain démarrage.
+
+À ne pas confondre avec un port **occupé** : là, Orion dit que la gateway ne
+sert pas le speedtest (un refus, `os error 10054`), et `ss -tlnp | grep 5201`
+nomme le programme fautif — `iperf3` en écoute sur `0.0.0.0:5201` étant le cas
+courant. Le silence est un problème de joignabilité, le refus un problème
+d'occupation.
+
 ## Recouper le speedtest avec `iperf3`
 
 Le speedtest intégré mesure le plan de données WireGuard avec ses propres

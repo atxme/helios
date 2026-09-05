@@ -203,6 +203,14 @@ pub enum SpeedTestError {
          le dit : « raw speedtest »"
     )]
     ServiceAbsent { port: u16, detail: String },
+    #[error(
+        "aucune réponse de la gateway sur le port {port} ({detail}). Les paquets partent dans le \
+         tunnel et rien ne revient — ni donnée, ni refus. Soit heliosd n’écoute pas sur l’adresse \
+         du tunnel — son journal l’annonce : « raw speedtest on … » —, soit le pare-feu de la \
+         gateway n’ouvre pas ce port sur l’interface WireGuard. Sur la gateway : \
+         `ss -ulnp | grep {port}` et `nft list chain inet helios input`"
+    )]
+    Unreachable { port: u16, detail: String },
     #[error("la gateway a refusé le speedtest (HTTP {status}) : {body}")]
     Rejected { status: u16, body: String },
     #[error("réponse du speedtest illisible : {0}")]
@@ -600,8 +608,11 @@ fn raw_tcp_stream(
     // handshake fails. Otherwise the parent and the other streams could wait
     // forever for a peer that already returned an error.
     let prepared = (|| -> Result<TcpStream, String> {
+        // A connection that never completes is the same fact as a latency
+        // probe that never answers, and deserves the same sentence rather than
+        // « os error 10060 ».
         let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
+            .map_err(foreign_or_transport)?;
         stream
             .set_nodelay(true)
             .and_then(|_| {
@@ -1061,6 +1072,8 @@ fn raw_transport(error: std::io::Error) -> SpeedTestError {
 fn raw_udp_transport(error: std::io::Error) -> SpeedTestError {
     if looks_like_a_foreign_listener(&error) {
         service_absent(&error.to_string())
+    } else if looks_unanswered(&error) {
+        unreachable(&error.to_string())
     } else {
         SpeedTestError::Transport(error.to_string())
     }
@@ -1083,10 +1096,40 @@ fn service_absent(detail: &str) -> SpeedTestError {
     }
 }
 
+/// The refusal that names what **silence** on this port actually means.
+fn unreachable(detail: &str) -> SpeedTestError {
+    SpeedTestError::Unreachable {
+        port: aether::speedtest::SPEEDTEST_PORT,
+        detail: detail.to_string(),
+    }
+}
+
+/// Whether a failure means "the probe left and nothing came back".
+///
+/// The counterpart of [`looks_like_a_foreign_listener`], and its opposite
+/// remedy. A reset says a machine answered — something is on the port, or the
+/// host refused. Silence says the packets are being dropped, or that they are
+/// arriving where nothing is bound: on the gateway, either the firewall does
+/// not open 5201 on the tunnel interface, or `heliosd` bound its listeners
+/// elsewhere. Both are facts about the gateway, and neither is worth retrying
+/// from the client.
+///
+/// A connected UDP socket surfaces the exhausted read timeout as `TimedOut` on
+/// Windows (`os error 10060`) and as `WouldBlock` on Unix; `TcpStream::
+/// connect_timeout` reports its own expiry as `TimedOut` on both.
+fn looks_unanswered(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// A control-channel I/O failure, named for what it most likely is.
 fn foreign_or_transport(error: std::io::Error) -> String {
     if looks_like_a_foreign_listener(&error) {
         foreign_service(&error.to_string())
+    } else if looks_unanswered(&error) {
+        unreachable(&error.to_string()).to_string()
     } else {
         error.to_string()
     }
@@ -1689,6 +1732,41 @@ mod tests {
         sync::Mutex,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Silence and a reset are different facts about the gateway.
+    ///
+    /// A reset means something answered on 5201 — another service, or the host
+    /// refusing. A timeout means the probe left and nothing came back at all:
+    /// the packets are dropped, or they arrive where nothing is bound. The
+    /// operator's next move differs, so the two must not share a sentence —
+    /// and neither may be reported as a bare `os error`.
+    #[test]
+    fn a_gateway_that_never_answers_is_named_rather_than_reported_as_an_os_error() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = raw_udp_transport(std::io::Error::new(kind, "os error 10060"));
+            assert!(
+                matches!(error, SpeedTestError::Unreachable { port, .. }
+                    if port == aether::speedtest::SPEEDTEST_PORT),
+                "{kind:?} must be named unreachable, got {error}"
+            );
+            assert!(error.to_string().contains("pare-feu"));
+        }
+
+        let reset = raw_udp_transport(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "os error 10054",
+        ));
+        assert!(matches!(reset, SpeedTestError::ServiceAbsent { .. }));
+
+        // Anything else keeps its own words: inventing a diagnosis for a
+        // failure we have not identified would send the operator to the wrong
+        // machine.
+        let other = raw_udp_transport(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusé",
+        ));
+        assert!(matches!(other, SpeedTestError::Transport(_)));
+    }
 
     #[tokio::test]
     async fn adaptive_engine_uses_latency_and_both_transfer_directions() {

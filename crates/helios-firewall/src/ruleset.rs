@@ -302,34 +302,6 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         rules.push(
             Rule::new(
                 Input,
-                vec![
-                    Match::DestPort {
-                        port: SPEEDTEST_PORT,
-                        proto: L4::Tcp,
-                    },
-                    Match::InIface(iface.to_string()),
-                ],
-                Verdict::Accept,
-            )
-            .with_note("raw speedtest TCP: only via the tunnel interface"),
-        );
-        rules.push(
-            Rule::new(
-                Input,
-                vec![
-                    Match::DestPort {
-                        port: SPEEDTEST_PORT,
-                        proto: L4::Udp,
-                    },
-                    Match::InIface(iface.to_string()),
-                ],
-                Verdict::Accept,
-            )
-            .with_note("raw speedtest UDP: only via the tunnel interface"),
-        );
-        rules.push(
-            Rule::new(
-                Input,
                 vec![Match::DestPort {
                     port,
                     proto: L4::Tcp,
@@ -776,6 +748,37 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
                     Verdict::Accept,
                 )
                 .with_note("administrative SSH arriving through the tunnel"),
+            );
+        }
+        // The Helios speedtest, on the address the daemon binds inside the
+        // tunnel.
+        //
+        // It lives here, with the tunnel's own openings, and no longer beside
+        // the administration API. It sat in that block for as long as it took
+        // one gateway to leave `admin_iface` unset: `admin_port` is derived
+        // from that field, the whole block is skipped when it is absent, and
+        // the two rules below went with it. Nothing else opens 5201, so every
+        // probe was dropped in `input` — and a drop is silent, so the client
+        // reported a timeout (`os error 10060`) against a daemon that was
+        // listening perfectly well. The opening belongs to the interface the
+        // service listens on, not to another service's configuration.
+        //
+        // Input only: the gateway never opens a speedtest flow of its own, and
+        // its answers are `established`.
+        for proto in [L4::Tcp, L4::Udp] {
+            rules.push(
+                Rule::new(
+                    Input,
+                    vec![
+                        Match::InIface(policy.wg_iface.clone()),
+                        Match::DestPort {
+                            port: SPEEDTEST_PORT,
+                            proto,
+                        },
+                    ],
+                    Verdict::Accept,
+                )
+                .with_note("raw speedtest: only via the tunnel interface"),
             );
         }
         // `iperf3`, and the only opening here that touches `output`.
@@ -1625,15 +1628,49 @@ mod tests {
             accept < drop,
             "the scoped accept must take precedence over the drop"
         );
-        assert!(input
-            .iter()
-            .any(|r| r.contains("tcp dport 5201") && r.contains("iifname \"helios0\"")));
-        assert!(input
-            .iter()
-            .any(|r| r.contains("udp dport 5201") && r.contains("iifname \"helios0\"")));
+    }
+
+    /// The speedtest opening follows the tunnel interface, not the API's.
+    ///
+    /// It used to be rendered inside the administration block, which is
+    /// skipped entirely when `admin_iface` is unset. On such a gateway nothing
+    /// opened 5201, every probe was dropped in `input`, and the client — with
+    /// no answer and no refusal — reported a timeout against a daemon that was
+    /// listening.
+    #[test]
+    fn speedtest_stays_open_on_the_tunnel_without_an_administration_interface() {
+        let mut p = policy();
+        p.admin_port = None;
+        p.admin_iface = None;
+        let input = text(&render(&p, TunnelState::Up), ChainKind::Input);
+
+        for proto in ["tcp", "udp"] {
+            assert!(
+                input
+                    .iter()
+                    .any(|r| r.contains(&format!("{proto} dport 5201"))
+                        && r.contains("iifname \"helios0\"")),
+                "the speedtest must stay reachable through the tunnel ({proto})"
+            );
+        }
+        // Never unscoped: only WireGuard puts packets on the tunnel interface.
         assert!(!input
             .iter()
             .any(|r| r == "tcp dport 5201 accept" || r == "udp dport 5201 accept"));
+    }
+
+    /// Nothing to scope the opening to means no opening at all.
+    #[test]
+    fn speedtest_is_closed_without_a_tunnel_interface() {
+        let mut p = policy();
+        p.wg_iface = String::new();
+        let rs = render(&p, TunnelState::Up);
+        for chain in [ChainKind::Input, ChainKind::Output] {
+            assert!(
+                !text(&rs, chain).iter().any(|r| r.contains("5201")),
+                "no speedtest opening without a tunnel interface"
+            );
+        }
     }
 
     /// Closed unless asked for: an always-open `iperf3` is always-open surface.
