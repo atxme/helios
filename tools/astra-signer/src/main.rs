@@ -2379,39 +2379,56 @@ fn rotate_ca_tls(
          not_after, une leaf émise sous l'ancienne ne monte plus de tunnel"
     );
 
-    // Two keys, because §7.6 makes `trust_authorities` a two-credential
-    // decision. The vault opens at the first: the second confirms the text,
-    // not the key-slot — that is what the campaign approval is.
-    let first = connect_authorized_key(
-        &vault,
-        transport,
-        "Brancher la PREMIÈRE clé autorisée, puis appuyer sur Entrée.",
-    )?;
-    eprintln!();
-    let second = connect_authorized_key(
-        &vault,
-        transport,
-        "Débrancher celle-ci, brancher la SECONDE clé autorisée, puis Entrée.",
-    )?;
     let origin = origin
         .map(str::to_string)
         .unwrap_or_else(|| format!("https://{}", vault.rp_id));
-    let approval = authority::approve_campaign(
-        &[first.key.as_ref(), second.key.as_ref()],
+    let mut approval = authority::CampaignApprovalSession::new(
         &campaign,
         &registry,
         &identity,
         &ca_pq_public_key,
         &vault.rp_id,
         &origin,
-        &[first.pin.as_str(), second.pin.as_str()],
         now,
     )?;
-    let opening = gestures::open_with_authorized_key(first.key.as_ref(), &vault, &first.pin)?;
+
+    // Approve with each key while it is still plugged in. Windows WebAuthn
+    // handles are platform selectors, not handles tied to the physical token
+    // present when `connect` ran; delaying both assertions until after the
+    // swap makes the second token answer the first slot and leaves the first
+    // token requested forever by the narrowed allow-list.
+    let first = connect_authorized_key(
+        &vault,
+        transport,
+        "Brancher la PREMIÈRE clé autorisée, puis appuyer sur Entrée.",
+    )?;
+    let offered = approval.offered_credentials();
+    let assertion = first.key.approve(
+        approval.webauthn_rp_id(),
+        &offered,
+        approval.client_data_json(),
+        &first.pin,
+    )?;
+    approval.accept_for(assertion, Some(&first.opened.credential_id), now_unix())?;
+    eprintln!();
+    let second = connect_authorized_key(
+        &vault,
+        transport,
+        "Débrancher celle-ci, brancher la SECONDE clé autorisée, puis Entrée.",
+    )?;
+    let offered = approval.offered_credentials();
+    let assertion = second.key.approve(
+        approval.webauthn_rp_id(),
+        &offered,
+        approval.client_data_json(),
+        &second.pin,
+    )?;
+    approval.accept_for(assertion, Some(&second.opened.credential_id), now_unix())?;
+    let approval = approval.finish(now_unix())?;
 
     let rotated = authority::rotate_ca_tls(
         &mut vault,
-        &opening,
+        &first.opened,
         &identity,
         &active_certificate,
         window,
@@ -3533,6 +3550,32 @@ fn rotate_ca_pq(
         );
     }
 
+    let registry_path = credentials::path_beside(path);
+    let previous = credentials::load(&registry_path)?;
+    let approval_origin = origin
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://{}", vault.rp_id));
+    let mut approval_session = match &online {
+        Some((_, _, campaign)) => {
+            let registry = previous.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "aucun document de credentials : l'émettre par `astra-signer bindings` avant \
+                     d'exécuter une campagne d'autorité"
+                )
+            })?;
+            Some(authority::CampaignApprovalSession::new(
+                campaign,
+                registry,
+                &identity,
+                &current_ca_public_key,
+                &vault.rp_id,
+                &approval_origin,
+                now,
+            )?)
+        }
+        None => None,
+    };
+
     // Two distinct keys, plugged one after the other. Both are proven to open
     // the vault before anything is generated: an operator whose second key
     // does not work should find out now, and not after the anchor has moved.
@@ -3545,44 +3588,38 @@ fn rotate_ca_pq(
         transport,
         "Brancher la PREMIÈRE clé autorisée, puis appuyer sur Entrée.",
     )?;
+    if let Some(session) = approval_session.as_mut() {
+        let offered = session.offered_credentials();
+        let assertion = first.key.approve(
+            session.webauthn_rp_id(),
+            &offered,
+            session.client_data_json(),
+            &first.pin,
+        )?;
+        session.accept_for(assertion, Some(&first.opened.credential_id), now_unix())?;
+    }
     eprintln!();
     let second = connect_authorized_key(
         &vault,
         transport,
         "Débrancher celle-ci, brancher la SECONDE clé autorisée, puis Entrée.",
     )?;
-
-    let registry_path = credentials::path_beside(path);
-    let previous = credentials::load(&registry_path)?;
+    if let Some(session) = approval_session.as_mut() {
+        let offered = session.offered_credentials();
+        let assertion = second.key.approve(
+            session.webauthn_rp_id(),
+            &offered,
+            session.client_data_json(),
+            &second.pin,
+        )?;
+        session.accept_for(assertion, Some(&second.opened.credential_id), now_unix())?;
+    }
 
     // The approval is taken **before** the anchor moves, under the credential
     // document the outgoing anchor signed — which is also the one Astra holds.
-    let approval = match &online {
-        Some((_, _, campaign)) => {
-            let registry = previous.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "aucun document de credentials : l'émettre par `astra-signer bindings` avant \
-                     d'exécuter une campagne d'autorité"
-                )
-            })?;
-            let origin = match origin {
-                Some(origin) => origin.to_string(),
-                None => format!("https://{}", vault.rp_id),
-            };
-            Some(authority::approve_campaign(
-                &[first.key.as_ref(), second.key.as_ref()],
-                campaign,
-                &registry,
-                &identity,
-                &current_ca_public_key,
-                &vault.rp_id,
-                &origin,
-                &[first.pin.as_str(), second.pin.as_str()],
-                now,
-            )?)
-        }
-        None => None,
-    };
+    let approval = approval_session
+        .map(|session| session.finish(now_unix()))
+        .transpose()?;
 
     let rotated = authority::rotate_ca_pq(
         &mut vault,

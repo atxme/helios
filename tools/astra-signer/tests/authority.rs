@@ -30,7 +30,8 @@ use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 use astra::vault::{AuthorityVault, SlotRole};
 use astra_signer::authenticator::Opened;
 use astra_signer::authority::{
-    self, DelegationBounds, DomainIdentity, IssuerDelegationRequest, MAX_CA_TLS_LIFETIME_SECS,
+    self, CampaignApprovalSession, DelegationBounds, DomainIdentity, IssuerDelegationRequest,
+    MAX_CA_TLS_LIFETIME_SECS,
 };
 use astra_signer::credentials::CredentialRegistry;
 use astra_signer::gestures::{
@@ -612,6 +613,84 @@ fn a_two_credential_campaign_refuses_two_touches_of_one_token() {
     assert!(moved
         .assert_unchanged(&approval.campaign_fingerprint)
         .is_err());
+}
+
+/// The Windows WebAuthn object selects whichever physical token is present at
+/// call time. The companion must therefore consume the first assertion before
+/// asking the operator to swap keys; retaining a platform handle does not
+/// retain that first token.
+#[test]
+fn a_two_key_campaign_can_be_collected_before_each_physical_swap() {
+    let first = FakeKey::new(1);
+    let second = FakeKey::new(2);
+    let vault = bootstrapped(&first, &second);
+    let registry = bindings(&vault, &open(&first, &vault));
+    let campaign = campaign(&registry);
+    let mut session = CampaignApprovalSession::new(
+        &campaign,
+        &registry,
+        &identity(),
+        &ca_pq_public_key(&vault),
+        RP_ID,
+        ORIGIN,
+        NOW,
+    )
+    .expect("campaign starts");
+
+    // This is the platform-handle failure mode: the companion recognized the
+    // first slot, but the operator swapped tokens before WebAuthn selected a
+    // device. The second token can produce a valid assertion from the broad
+    // allow-list; it must still be refused because it is not the displayed
+    // and opened slot.
+    let selected_after_early_swap = astra_signer::authenticator::Authenticator::approve(
+        &second,
+        session.webauthn_rp_id(),
+        &session.offered_credentials(),
+        session.client_data_json(),
+        PIN,
+    )
+    .expect("the platform selects the token currently present");
+    let first_credential = first.credential_ids().remove(0);
+    assert!(session
+        .accept_for(selected_after_early_swap, Some(&first_credential), NOW + 1)
+        .expect_err("an assertion from a swapped token must be rejected")
+        .to_string()
+        .contains("n'est pas celle"));
+
+    let first_assertion = astra_signer::authenticator::Authenticator::approve(
+        &first,
+        session.webauthn_rp_id(),
+        &session.offered_credentials(),
+        session.client_data_json(),
+        PIN,
+    )
+    .expect("first key answers while connected");
+    session
+        .accept_for(first_assertion, Some(&first_credential), NOW + 1)
+        .expect("first assertion is retained before the swap");
+
+    let second_assertion = astra_signer::authenticator::Authenticator::approve(
+        &second,
+        session.webauthn_rp_id(),
+        &session.offered_credentials(),
+        session.client_data_json(),
+        PIN,
+    )
+    .expect("second key answers after the swap");
+    session
+        .accept_for(
+            second_assertion,
+            Some(&second.credential_ids().remove(0)),
+            NOW + 2,
+        )
+        .expect("second assertion is distinct");
+
+    let approval = session.finish(NOW + 2).expect("campaign completes");
+    assert_eq!(approval.approvals.len(), 2);
+    assert_ne!(
+        approval.approvals[0].credential_id,
+        approval.approvals[1].credential_id
+    );
 }
 
 /// A `CA-PQ` rotation moves the anchor and leaves every key-slot where it was:
