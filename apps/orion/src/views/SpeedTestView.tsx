@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
@@ -21,7 +21,7 @@ import {
 
 import { Sparkline } from '../components/Sparkline'
 import * as store from '../speedtest-store'
-import { EMERALD, GUTTER, INK, PINE, RULE } from '../theme'
+import { EMERALD, GUTTER, INK, PINE, RULE, VIOLET } from '../theme'
 import type {
   ClientProfile,
   SpeedTestMode,
@@ -248,6 +248,93 @@ function stamp(at: number): string {
   return `${date} · ${clock(at)}`
 }
 
+/**
+ * The colour of a direction.
+ *
+ * Reception is the brand's green; emission is the one hue outside it. Two
+ * shades of the same green made the pair readable only by its labels — see
+ * `VIOLET` in the theme.
+ */
+function accentFor(direction: 'download' | 'upload'): string {
+  return direction === 'download' ? EMERALD : VIOLET
+}
+
+/** Entrance of the block that changes when the run moves to the next step. */
+const RISE = {
+  animation: 'speedtest-rise 320ms cubic-bezier(0.22, 1, 0.36, 1)',
+  '@keyframes speedtest-rise': {
+    from: { opacity: 0, transform: 'translateY(6px)' },
+    to: { opacity: 1, transform: 'none' },
+  },
+} as const
+
+/** Whether the machine has been asked to keep motion to a minimum. */
+function reducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
+/**
+ * A number that walks to its target instead of jumping to it.
+ *
+ * The engine emits a rate about four times a second. Printed as it arrives, a
+ * 50 px headline snaps between distant values — the figure is unreadable while
+ * it moves and the screen looks like it is struggling, which is precisely the
+ * thing being measured. Interpolating between frames costs no accuracy: every
+ * target is reached before the next one arrives, and the last frame of a leg
+ * is the figure the result confirms.
+ *
+ * Honoured motion preference: with `prefers-reduced-motion`, the value is
+ * adopted as it comes.
+ */
+function useSmoothed(target: number | null, duration = 400): number | null {
+  const [shown, setShown] = useState<number | null>(target)
+  const current = useRef<number | null>(target)
+  const frame = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (frame.current !== null) {
+      cancelAnimationFrame(frame.current)
+      frame.current = null
+    }
+    if (target === null || reducedMotion()) {
+      current.current = target
+      setShown(target)
+      return
+    }
+    const from = current.current
+    if (from === null || from === target) {
+      current.current = target
+      setShown(target)
+      return
+    }
+    const started = performance.now()
+    const step = (now: number) => {
+      const share = Math.min(1, (now - started) / duration)
+      // Ease-out: the value arrives quickly and settles, so the figure is
+      // legible for most of the interval rather than racing through it.
+      const eased = 1 - (1 - share) ** 3
+      const value = share >= 1 ? target : from + (target - from) * eased
+      current.current = value
+      setShown(value)
+      frame.current = share >= 1 ? null : requestAnimationFrame(step)
+    }
+    frame.current = requestAnimationFrame(step)
+
+    return () => {
+      if (frame.current !== null) {
+        cancelAnimationFrame(frame.current)
+        frame.current = null
+      }
+    }
+  }, [target, duration])
+
+  return shown
+}
+
 /** Header of every state: the mark, the title, and what the run is doing. */
 function Header({ subtitle, done, right }: { subtitle?: string; done?: boolean; right?: React.ReactNode }) {
   return (
@@ -336,6 +423,7 @@ function MetricCard({
       <Typography
         sx={{
           mt: 0.3,
+          transition: 'color 200ms ease',
           fontSize: 19,
           fontWeight: 760,
           lineHeight: 1.1,
@@ -355,7 +443,7 @@ function MetricCard({
 /** One direction of a finished run, at the size the figure deserves. */
 function ResultCard({ direction, value }: { direction: 'download' | 'upload'; value: number }) {
   const download = direction === 'download'
-  const accent = download ? EMERALD : PINE
+  const accent = accentFor(direction)
   const Arrow = download ? ArrowDown : ArrowUp
 
   return (
@@ -384,12 +472,17 @@ function ResultCard({ direction, value }: { direction: 'download' | 'upload'; va
           fontWeight: 780,
           lineHeight: 1.05,
           letterSpacing: '-0.03em',
+          // The direction is carried by the figure itself, not only by the
+          // arrow above it: the two numbers are read side by side.
+          color: download ? INK : VIOLET,
           fontVariantNumeric: 'tabular-nums',
         }}
       >
         {decimal(value)}
       </Typography>
-      <Typography sx={{ fontSize: 11, fontWeight: 700, color: PINE }}>Mb/s</Typography>
+      <Typography color="text.secondary" sx={{ fontSize: 11, fontWeight: 700 }}>
+        Mb/s
+      </Typography>
     </Paper>
   )
 }
@@ -407,7 +500,7 @@ function LiveChart({ points, ceiling, color, label }: { points: number[]; ceilin
     <Box sx={{ display: 'flex', gap: 1, alignItems: 'stretch' }}>
       <Box sx={{ flex: '1 1 0', minWidth: 0, display: 'flex', alignItems: 'flex-end' }}>
         <Box sx={{ width: '100%', borderBottom: `1px solid ${RULE}` }}>
-          <Sparkline points={points} ceiling={ceiling} color={color} height={46} label={label} />
+          <Sparkline points={points} ceiling={ceiling} color={color} height={46} label={label} smooth />
         </Box>
       </Box>
       <Box
@@ -522,7 +615,9 @@ export function SpeedTestView({ state, profile }: Props) {
   // usually judged by.
   const headline =
     running && isThroughputPhase(phase) ? (progress?.current_mbps ?? 0) : downRate
+  const smoothHeadline = useSmoothed(headline)
   const upload = isUploadPhase(phase)
+  const accent = accentFor(upload ? 'upload' : 'download')
   const latency = result ? milliseconds(result.latency_ms) : '—'
 
   /**
@@ -636,15 +731,22 @@ export function SpeedTestView({ state, profile }: Props) {
             />
 
             <Stack spacing={0.25} aria-live="polite" sx={{ alignItems: 'center', pt: 0.5 }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+              {/* Keyed on the step: the title and its arrow are replaced when
+                  the run changes direction, and the replacement is seen. */}
+              <Box
+                key={phaseStep(phase)}
+                sx={{ display: 'flex', alignItems: 'center', gap: 0.75, ...RISE }}
+              >
                 {isDownloadPhase(phase) ? (
                   <ArrowDown size={16} aria-hidden style={{ color: EMERALD }} />
                 ) : upload ? (
-                  <ArrowUp size={16} aria-hidden style={{ color: PINE }} />
+                  <ArrowUp size={16} aria-hidden style={{ color: VIOLET }} />
                 ) : (
                   <Activity size={16} aria-hidden style={{ color: PINE }} />
                 )}
-                <Typography sx={{ fontSize: 13.5, fontWeight: 700 }}>{phaseLabel(phase)}</Typography>
+                <Typography sx={{ fontSize: 13.5, fontWeight: 700, color: upload ? VIOLET : INK }}>
+                  {phaseLabel(phase)}
+                </Typography>
               </Box>
               <Typography
                 sx={{
@@ -652,23 +754,25 @@ export function SpeedTestView({ state, profile }: Props) {
                   fontWeight: 780,
                   lineHeight: 1.05,
                   letterSpacing: '-0.045em',
-                  color: headline === null ? 'text.disabled' : INK,
+                  color:
+                    smoothHeadline === null ? 'text.disabled' : upload ? VIOLET : INK,
+                  transition: 'color 240ms ease',
                   fontVariantNumeric: 'tabular-nums',
                 }}
               >
-                {headline === null ? '—' : decimal(headline)}
+                {smoothHeadline === null ? '—' : decimal(smoothHeadline)}
               </Typography>
               <Typography color="text.secondary" sx={{ fontSize: 12, fontWeight: 650 }}>
                 Mb/s
               </Typography>
             </Stack>
 
-            <LiveChart
-              points={upload ? samples.up : samples.down}
-              ceiling={ceiling}
-              color={upload ? PINE : EMERALD}
-              label={upload ? 'Émission' : 'Réception'}
-            />
+            {/* Keyed on the direction too: the emission curve starts empty,
+                and fading it in reads as a new measurement rather than as the
+                reception curve collapsing. */}
+            <Box key={upload ? 'up' : 'down'} sx={RISE}>
+              <LiveChart points={upload ? samples.up : samples.down} ceiling={ceiling} color={accent} label={upload ? 'Émission' : 'Réception'} />
+            </Box>
 
             <Box sx={{ display: 'flex', gap: 1 }}>
               <MetricCard
@@ -684,7 +788,7 @@ export function SpeedTestView({ state, profile }: Props) {
                 label="Émission"
                 value={upRate === null ? '—' : decimal(upRate)}
                 unit="Mb/s"
-                accent={PINE}
+                accent={VIOLET}
                 active={upload}
               />
               <MetricCard

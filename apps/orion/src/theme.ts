@@ -40,6 +40,19 @@ export const PINE = '#0B6B4E'
 export const EMERALD = '#12B981'
 /** The interface's only tinted surface. */
 export const MINT = '#E3F6EE'
+/**
+ * Emission's accent — the one hue outside the green family.
+ *
+ * Reserved for the speedtest, and there for a single job: the run measures the
+ * same quantity twice, once in each direction, and the two figures are read
+ * side by side. Told apart by two shades of the same green, they were compared
+ * by their labels rather than seen apart — the reason the screen showed the
+ * uplink where the downlink belonged for as long as it took to read.
+ *
+ * It is not a second brand colour: nothing outside the direction pair may use
+ * it, and the protected state stays `PINE`.
+ */
+export const VIOLET = '#6D28D9'
 
 /**
  * Shared gutter, in MUI spacing units (2 = 16 px).

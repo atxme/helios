@@ -149,7 +149,7 @@ describe('SpeedTestView', () => {
       message: 'TCP descendant · flux continus',
     })
     // Twice: the headline meters the leg, the «Réception» card holds it.
-    expect(screen.getAllByText('90,5')).toHaveLength(2)
+    await waitFor(() => expect(screen.getAllByText('90,5')).toHaveLength(2))
     expect(screen.getByText('Test de réception')).toBeTruthy()
     expect(screen.getByText('Étape 1/3')).toBeTruthy()
 
@@ -162,8 +162,10 @@ describe('SpeedTestView', () => {
       message: 'TCP montant · flux continus',
     })
 
-    // Reception keeps the figure it reached; emission shows its own.
-    expect(screen.getAllByText('30,3')).toHaveLength(2)
+    // Reception keeps the figure it reached; emission shows its own. The
+    // headline walks to its new value over a few frames rather than snapping
+    // to it — see `useSmoothed` — so it is awaited, not read.
+    await waitFor(() => expect(screen.getAllByText('30,3')).toHaveLength(2))
     expect(screen.getByText('90,5')).toBeTruthy()
     expect(screen.queryByText(/TCP montant/)).toBeNull()
     expect(screen.getByText("Test d'émission")).toBeTruthy()
@@ -181,6 +183,11 @@ describe('SpeedTestView', () => {
       message: 'UDP montant · perte et jitter',
     })
     expect(screen.queryByText('25,7')).toBeNull()
+    // The headline goes back to holding the reception figure, and the
+    // «Émission» card keeps the rate its own leg found.
+    // Twice again once the headline has walked back up to it: the reception
+    // card never stopped showing it.
+    await waitFor(() => expect(screen.getAllByText('90,5')).toHaveLength(2))
     expect(screen.getByText('30,3')).toBeTruthy()
     expect(screen.getByText('Mesure de la qualité')).toBeTruthy()
     expect(screen.getByText('Étape 3/3')).toBeTruthy()
