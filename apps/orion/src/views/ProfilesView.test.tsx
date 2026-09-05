@@ -704,7 +704,8 @@ describe('ProfilesView interactions', () => {
 
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(screen.getByText(/anciens blocs SSD/)).toBeTruthy()
-    expect(screen.getByText(/volume non chiffré — exigence levée/)).toBeTruthy()
+    expect(screen.getByText(/Orion la signalera comme protection incomplète/)).toBeTruthy()
+    expect(screen.queryByText(/exigence levée/)).toBeNull()
     expect(click).not.toHaveBeenCalled()
 
     fireEvent.click(

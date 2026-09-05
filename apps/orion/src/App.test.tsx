@@ -31,6 +31,9 @@ vi.mock('./views/ProfilesView', () => ({
 vi.mock('./views/SpeedTestView', () => ({
   SpeedTestView: () => <div>speedtest-view</div>,
 }))
+vi.mock('./views/AstraView', () => ({
+  AstraView: () => <div>astra-view</div>,
+}))
 vi.mock('./components/EventLog', () => ({
   EventLog: () => <div>logs-view</div>,
 }))
@@ -110,6 +113,10 @@ describe('App interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Speedtest' }))
     expect(screen.getByText('speedtest-view')).toBeTruthy()
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('speedtest'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Astra' }))
+    expect(screen.getByText('astra-view')).toBeTruthy()
+    await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

@@ -480,6 +480,65 @@ export interface SpeedTestResult {
   measurement_rounds: number
 }
 
+/** Paths and existing Astra campaign chosen by the operator for a CA-TLS rotation. */
+export interface AstraRotationInput {
+  vault_path: string
+  heliosd_url: string
+  operation_id: string
+  output_path: string
+}
+
+/** One observable boundary of the two-key CA-TLS ceremony. */
+export type AstraRotationPhase =
+  | 'idle'
+  | 'starting'
+  | 'awaiting_first_key'
+  | 'processing_first_key'
+  | 'awaiting_second_key'
+  | 'processing_second_key'
+  | 'finalizing'
+  | 'prepared'
+  | 'deposited'
+  | 'awaiting_promotion_key'
+  | 'promoting'
+  | 'promoted'
+  | 'failed'
+  | 'cancelled'
+
+/** Verified campaign fields displayed before either credential is exercised. */
+export interface AstraCaTlsRotationManifest {
+  reason: string
+  requested_by: string
+  fingerprint: string
+  current_ca_tls_epoch: number
+  next_ca_tls_epoch: number
+  activation_at: number
+  not_after: number
+  outgoing_anchor_fingerprint: string
+  affected_ca: 'client_tls'
+  target_count: number
+}
+
+/**
+ * State returned by the Rust-owned signer session.
+ *
+ * Labels identify the credentials that actually answered; the WebView never
+ * discovers security keys or handles their PINs itself.
+ */
+export interface AstraRotationStatus {
+  phase: AstraRotationPhase
+  message: string
+  can_continue: boolean
+  can_cancel: boolean
+  manifest?: AstraCaTlsRotationManifest | null
+  first_key_label?: string | null
+  second_key_label?: string | null
+  output_path?: string | null
+  next_ca_tls_epoch?: number | null
+  activation_at?: number | null
+  not_after?: number | null
+}
+
 /**
  * What the vault can honestly claim about itself (ADR-006 §3).
  *

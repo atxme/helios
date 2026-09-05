@@ -65,6 +65,11 @@ mod companion;
 /// everywhere; only the wiring inside is Windows-only.
 mod tray;
 
+/// The Astra CA-TLS ceremony, driven from this window and signed elsewhere.
+/// The vault, the PIN and the FIDO gesture stay inside the companion; only
+/// the public progress states cross into Orion.
+mod astra;
+
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
     controller: Arc<VpnController>,
@@ -117,6 +122,13 @@ struct AppState {
     /// back out. `None` means "no new PSK this session" — whatever the profile
     /// already held is left alone.
     staged_psk: Arc<Mutex<Option<StagedPsk>>>,
+    /// The Astra CA-TLS rotation this window is hosting, if one is open.
+    ///
+    /// Owned by Rust, not by the WebView: the ceremony outlives the view that
+    /// started it — leaving the screen mid-rotation must not abandon a
+    /// companion that is about to write a durable decision — and its phase is
+    /// the one thing a reload has to be able to recover.
+    astra: astra::Ceremony,
     /// Why the vault could not be opened at startup, if it could not.
     ///
     /// Orion keeps running — the screen is more useful than a blank window —
@@ -2660,6 +2672,7 @@ fn main() {
             pending_imports: Arc::new(Mutex::new(std::collections::HashMap::new())),
             staged_key: Arc::new(Mutex::new(None)),
             staged_psk: Arc::new(Mutex::new(None)),
+            astra: astra::Ceremony::default(),
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
@@ -2713,9 +2726,58 @@ fn main() {
             last_certificate_error,
             run_speed_test,
             vault_posture,
+            start_astra_ca_tls_rotation,
+            continue_astra_ca_tls_rotation,
+            cancel_astra_ca_tls_rotation,
+            astra_ca_tls_rotation_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");
+}
+
+/// Opens the two-key CA-TLS ceremony described in ADR-008 §9.4.
+///
+/// Everything that decides anything happens in the companion: the campaign is
+/// fetched and verified there, under the Astra service key the vault's
+/// hand-off pins, and the two credentials are exercised there. This command
+/// starts it and returns the first state it publishes.
+#[tauri::command]
+async fn start_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+    input: astra::RotationInput,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state.astra.start(input).await
+}
+
+/// Takes the next step, once the operator says the requested key is plugged in.
+#[tauri::command]
+async fn continue_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state
+        .astra
+        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Continue)
+        .await
+}
+
+/// Abandons the ceremony, which only the phases before the first durable write
+/// accept.
+#[tauri::command]
+async fn cancel_astra_ca_tls_rotation(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    state
+        .astra
+        .advance(aether::certificates::operator_ipc::AstraIpcCommand::Cancel)
+        .await
+}
+
+/// The ceremony's current state, for a view that was opened after it started.
+#[tauri::command]
+async fn astra_ca_tls_rotation_status(
+    state: State<'_, AppState>,
+) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
+    Ok(state.astra.status().await)
 }
 
 #[cfg(test)]

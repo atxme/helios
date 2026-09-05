@@ -64,6 +64,23 @@ const result: SpeedTestResult = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // These tests assert the values and phase transitions, not browser frame
+  // scheduling. Exercising the supported reduced-motion path keeps the
+  // headline deterministic under jsdom while preserving the same rendered
+  // targets a user eventually sees.
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: vi.fn((query: string) => ({
+      matches: query === '(prefers-reduced-motion: reduce)',
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  })
   // The run now lives above the component, at module scope, so it survives an
   // unmount — which is the point, and which means one test's measurement would
   // otherwise be the next one's starting state.

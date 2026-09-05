@@ -33,6 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aether::certificates::operator_ipc::AstraCaTlsManifest;
 use aether::certificates::status::AstraSignerResult;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,10 @@ pub struct PreparedRotation {
     /// exist, and no other rotation may start.
     pub submitted: bool,
     pub prepared_at: u64,
+    /// Public campaign details retained for a GUI that resumes the durable
+    /// decision after the companion or Orion restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<AstraCaTlsManifest>,
 }
 
 /// Where the prepared rotation sits: beside the vault, whatever its path.
@@ -159,6 +164,7 @@ mod tests {
             not_after: 200,
             submitted: false,
             prepared_at: 10,
+            manifest: None,
         }
     }
 
