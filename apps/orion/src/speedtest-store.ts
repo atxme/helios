@@ -38,6 +38,15 @@ import type { SpeedTestMode, SpeedTestProgress, SpeedTestResult } from './types'
  */
 export const HISTORY_LENGTH = 5
 
+/**
+ * How many live rates the curve of the run in progress keeps, per direction.
+ *
+ * The engine emits a frame about every 250 ms, so forty-eight of them span the
+ * ten seconds of one throughput leg: the curve shows the whole leg without
+ * ever redrawing more points than the 460 px it is given can distinguish.
+ */
+export const SAMPLE_LENGTH = 48
+
 /** One finished measurement, and when it finished. */
 export interface SpeedTestRecord {
   /**
@@ -67,6 +76,14 @@ export interface SpeedTestState {
    */
   live: { down: number | null; up: number | null }
   /**
+   * Rates seen during each throughput leg, oldest first.
+   *
+   * The curve on screen is the run itself, not a summary of it: a single
+   * number rising and falling says nothing about whether the line is steady,
+   * and stability is most of what a speedtest is asked to reveal.
+   */
+  samples: { down: number[]; up: number[] }
+  /**
    * Every finished run, most recent first, capped at `HISTORY_LENGTH + 1`:
    * the newest is on the dial, and excluding it still leaves a full list of
    * previous ones.
@@ -80,6 +97,7 @@ const EMPTY: SpeedTestState = {
   progress: null,
   error: null,
   live: { down: null, up: null },
+  samples: { down: [], up: [] },
   history: [],
 }
 
@@ -114,6 +132,7 @@ function ensureSubscribed() {
         ...state,
         progress: update,
         live: liveAfter(state.live, update),
+        samples: samplesAfter(state.samples, update),
       })
     })
     .catch(() => {
@@ -140,6 +159,22 @@ export function liveAfter(
   if (update.phase === 'tcp_download') return { ...live, down: update.current_mbps }
   if (update.phase === 'tcp_upload') return { ...live, up: update.current_mbps }
   return live
+}
+
+/**
+ * Where each direction's curve stands after one progress frame.
+ *
+ * Same restriction as `liveAfter`, for the same reason: a quality leg's paced
+ * rate plotted on the reception curve would draw a cliff the line never had.
+ */
+export function samplesAfter(
+  samples: SpeedTestState['samples'],
+  update: SpeedTestProgress,
+): SpeedTestState['samples'] {
+  const append = (points: number[]) => [...points, update.current_mbps].slice(-SAMPLE_LENGTH)
+  if (update.phase === 'tcp_download') return { ...samples, down: append(samples.down) }
+  if (update.phase === 'tcp_upload') return { ...samples, up: append(samples.up) }
+  return samples
 }
 
 export function getSnapshot(): SpeedTestState {
@@ -170,6 +205,7 @@ export async function start(mode: SpeedTestMode): Promise<void> {
     result: null,
     progress: null,
     live: { down: null, up: null },
+    samples: { down: [], up: [] },
   })
   try {
     const measured = await api.runSpeedTest(mode)
@@ -190,6 +226,7 @@ export async function start(mode: SpeedTestMode): Promise<void> {
       // The dial falls back to «—» on failure; leaving the rows on the last
       // frames received would have the screen state a rate it just disowned.
       live: { down: null, up: null },
+      samples: { down: [], up: [] },
       progress: null,
     })
   }

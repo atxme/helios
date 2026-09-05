@@ -2221,9 +2221,10 @@ fn window_size_for(view: &str) -> (f64, f64) {
         // device that holds one spent the difference on empty paper. Beyond
         // what fits, the view scrolls.
         "certificates" => (680.0, 620.0),
-        // The speedtest is a single centred column — a dial, two direction
-        // rows, three qualities. It was given the width of a two-column form
-        // and spent it on margins.
+        // The speedtest is a single centred column showing one state at a
+        // time — the launch, the leg under way and its curve, or the finished
+        // figures above the previous runs. It was given the width of a
+        // two-column form and spent it on margins.
         "speedtest" => (520.0, 620.0),
         "logs" => (760.0, 640.0),
         // Connection has only an orb, a state, and a button: giving it the

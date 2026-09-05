@@ -77,7 +77,7 @@ describe('SpeedTestView', () => {
     render(<SpeedTestView state="down" profile={profile} />)
 
     expect(screen.getByText(/Connectez le profil/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Lancer le speedtest' })).toHaveProperty('disabled', true)
+    expect(screen.getByRole('button', { name: 'Lancer le test' })).toHaveProperty('disabled', true)
     expect(api.runSpeedTest).not.toHaveBeenCalled()
   })
 
@@ -85,12 +85,17 @@ describe('SpeedTestView', () => {
     api.runSpeedTest.mockResolvedValue(result)
     render(<SpeedTestView state="up" profile={profile} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le test' }))
 
-    await waitFor(() => expect(screen.getByText('123,4 Mb/s')).toBeTruthy())
-    expect(screen.getByText('45,6 Mb/s')).toBeTruthy()
-    expect(screen.getByText('12 ms')).toBeTruthy()
-    expect(screen.getByText('0,4 %')).toBeTruthy()
+    // Value and unit are separate: the finished screen prints the figure at
+    // headline size and its unit under it.
+    await waitFor(() => expect(screen.getByText('123,4')).toBeTruthy())
+    expect(screen.getByText('45,6')).toBeTruthy()
+    expect(screen.getByText('Test terminé')).toBeTruthy()
+    // Ping, gigue, perte — the three cards below the two directions.
+    expect(screen.getByText('12')).toBeTruthy()
+    expect(screen.getByText('1,2')).toBeTruthy()
+    expect(screen.getByText('0,4')).toBeTruthy()
   })
 
   /**
@@ -105,7 +110,7 @@ describe('SpeedTestView', () => {
     expect(screen.queryByRole('group', { name: /speedtest/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /TCP/i })).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le test' }))
 
     await waitFor(() => expect(api.runSpeedTest).toHaveBeenCalledWith('full'))
   })
@@ -126,7 +131,7 @@ describe('SpeedTestView', () => {
     api.runSpeedTest.mockReturnValue(new Promise(() => {}))
     render(<SpeedTestView state="up" profile={profile} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le test' }))
 
     const emit = (update: SpeedTestProgress) =>
       act(() => {
@@ -143,7 +148,10 @@ describe('SpeedTestView', () => {
       elapsed_ms: 5_000,
       message: 'TCP descendant · flux continus',
     })
-    expect(screen.getByText('90,5 Mb/s')).toBeTruthy()
+    // Twice: the headline meters the leg, the «Réception» card holds it.
+    expect(screen.getAllByText('90,5')).toHaveLength(2)
+    expect(screen.getByText('Test de réception')).toBeTruthy()
+    expect(screen.getByText('Étape 1/3')).toBeTruthy()
 
     emit({
       phase: 'tcp_upload',
@@ -155,11 +163,11 @@ describe('SpeedTestView', () => {
     })
 
     // Reception keeps the figure it reached; emission shows its own.
-    expect(screen.getByText('30,3 Mb/s')).toBeTruthy()
-    expect(screen.getByText('90,5 Mb/s')).toBeTruthy()
+    expect(screen.getAllByText('30,3')).toHaveLength(2)
+    expect(screen.getByText('90,5')).toBeTruthy()
     expect(screen.queryByText(/TCP montant/)).toBeNull()
-    // Twice: the dial names the phase it is metering, the row names its own.
-    expect(screen.getAllByText('Émission')).toHaveLength(2)
+    expect(screen.getByText("Test d'émission")).toBeTruthy()
+    expect(screen.getByText('Étape 2/3')).toBeTruthy()
 
     // The quality leg runs *below* the rate TCP just found. Letting its
     // progress reach the rows would walk the reading down and then snap it
@@ -172,19 +180,21 @@ describe('SpeedTestView', () => {
       elapsed_ms: 24_000,
       message: 'UDP montant · perte et jitter',
     })
-    expect(screen.queryByText('25,7 Mb/s')).toBeNull()
-    expect(screen.getByText('30,3 Mb/s')).toBeTruthy()
-    expect(screen.getByText('Qualité')).toBeTruthy()
+    expect(screen.queryByText('25,7')).toBeNull()
+    expect(screen.getByText('30,3')).toBeTruthy()
+    expect(screen.getByText('Mesure de la qualité')).toBeTruthy()
+    expect(screen.getByText('Étape 3/3')).toBeTruthy()
   })
 
   it('surfaces a gateway refusal without leaving the button stuck', async () => {
     api.runSpeedTest.mockRejectedValue('gateway indisponible')
     render(<SpeedTestView state="up" profile={profile} />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le test' }))
 
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('gateway indisponible'))
-    expect(screen.getByRole('button', { name: 'Lancer le speedtest' })).toHaveProperty('disabled', false)
+    expect(screen.getByText('Impossible de réaliser le test')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Réessayer' })).toHaveProperty('disabled', false)
   })
 
   /**
@@ -204,10 +214,10 @@ describe('SpeedTestView', () => {
       }),
     )
     const first = render(<SpeedTestView state="up" profile={profile} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Lancer le speedtest' }))
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Mesure en cours…' })).toBeTruthy(),
-    )
+    fireEvent.click(screen.getByRole('button', { name: 'Lancer le test' }))
+    // While the run works the screen *is* the run: the step and its curve,
+    // with no button to press.
+    await waitFor(() => expect(screen.getByText('Test en cours…')).toBeTruthy())
 
     // The user goes to another screen. The router unmounts this one.
     first.unmount()
@@ -215,10 +225,10 @@ describe('SpeedTestView', () => {
       settle(result)
     })
 
-    // …and comes back to the finished measurement, not to an empty dial.
+    // …and comes back to the finished measurement, not to an empty screen.
     render(<SpeedTestView state="up" profile={profile} />)
-    expect(screen.getByText('123,4 Mb/s')).toBeTruthy()
-    expect(screen.getByText('45,6 Mb/s')).toBeTruthy()
+    expect(screen.getByText('123,4')).toBeTruthy()
+    expect(screen.getByText('45,6')).toBeTruthy()
     expect(api.runSpeedTest).toHaveBeenCalledTimes(1)
   })
 
@@ -235,14 +245,14 @@ describe('SpeedTestView', () => {
     }
     render(<SpeedTestView state="up" profile={profile} />)
 
-    // The newest is the dial; the five kept rows are the ones before it, and
-    // the seventh run has pushed the first two out.
-    expect(screen.getByText('106,0 Mb/s')).toBeTruthy()
+    // The newest is the pair of cards; the five kept rows are the ones before
+    // it, and the seventh run has pushed the first two out.
+    expect(screen.getByText('106,0')).toBeTruthy()
     expect(screen.getAllByText(/Mb\/s/).length).toBeGreaterThan(5)
-    expect(screen.getByText('Mesures précédentes')).toBeTruthy()
-    expect(screen.getByText('105,0')).toBeTruthy()
-    expect(screen.getByText('101,0')).toBeTruthy()
-    expect(screen.queryByText('100,0')).toBeNull()
+    expect(screen.getByText('Historique récent')).toBeTruthy()
+    expect(screen.getByText('105,0 / 45,6 Mb/s')).toBeTruthy()
+    expect(screen.getByText('101,0 / 45,6 Mb/s')).toBeTruthy()
+    expect(screen.queryByText('100,0 / 45,6 Mb/s')).toBeNull()
   })
 
   /**
