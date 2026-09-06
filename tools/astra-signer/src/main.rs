@@ -3474,33 +3474,36 @@ fn recover(
         )
         .context("durée hors bornes")?,
     );
-    // The new generation activates immediately: the old one expired, so there
-    // is nothing to overlap *with*. The window exists only so the gateway and
-    // the client have a common instant to change over on.
+    let stage_expires_at = request.expires_at;
+    // The recovered generation has nothing to overlap *with* — the leaf it
+    // replaces has expired — so it changes over as early as the protocol
+    // allows. That instant is the end of the staging lease, not `now`: §7.2
+    // refuses a lease that outlives the activation it prepares, so a window
+    // activating at `now` would be refused by the gateway a moment after the
+    // operator touched their key. Which is what happened, every time.
     //
-    // `not_before` is therefore *behind* now rather than equal to it. A window
-    // is refused unless `not_before < activation_at < not_after` — strictly —
-    // so making the three collapse onto one instant refused every recovery
-    // this command has ever attempted. Backdating the opening instead of
-    // pushing the activation forward is what keeps the promise the comment
-    // above makes: at `now` the window is already in its overlap phase, and
-    // the client changes over at once instead of waiting out a `Prepared`
-    // second it has no reason to sit through.
+    // Making the three instants collapse onto `now` was refused earlier still,
+    // since a window demands `not_before < activation_at < not_after`
+    // strictly. Both refusals say the same thing: staging comes first, and the
+    // change-over follows it.
     //
-    // The amount is the clock-skew allowance leaves are issued with, and for
-    // the same reason: a verifier whose clock sits slightly behind must not
-    // refuse a window that has genuinely opened.
+    // The bound is short — a recovery lives five minutes — so the wait is
+    // measured in minutes and cannot drift.
+    //
+    // `not_before` is backdated by the clock-skew allowance leaves are issued
+    // with, and doubly deserved here: a machine left off long enough for its
+    // identity to expire is a machine whose clock has had time to wander.
     let window = TransitionWindow::new(
         now.saturating_sub(RECOVERY_WINDOW_BACKDATE_SECS),
-        now,
-        now.checked_add(
-            overlap_days
-                .checked_mul(DAY_SECS)
-                .context("durée hors bornes")?,
-        )
-        .context("durée hors bornes")?,
+        stage_expires_at,
+        stage_expires_at
+            .checked_add(
+                overlap_days
+                    .checked_mul(DAY_SECS)
+                    .context("durée hors bornes")?,
+            )
+            .context("durée hors bornes")?,
     )?;
-    let stage_expires_at = request.expires_at;
 
     eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
     wait_for_operator()?;
@@ -4090,25 +4093,33 @@ mod tests {
     use aether::certificates::window::TransitionWindow;
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
 
-    /// A recovery replaces a leaf that has already expired, so its window has
-    /// nothing to overlap with and must be in force the instant it is signed.
-    /// Collapsing the three instants onto `now` looked like that and was
-    /// refused outright — `not_before < activation_at < not_after` is strict —
-    /// which made every recovery this command attempted fail at the last step,
-    /// after the operator had already touched the key.
+    /// A recovery window has to clear two rules that pull against each other:
+    /// `not_before < activation_at < not_after`, strictly, and a staging lease
+    /// that never outlives the activation it prepares. Collapsing the three
+    /// instants onto `now` broke the first; activating at `now` broke the
+    /// second — and that one only surfaced at the gateway, a moment after the
+    /// operator had already touched their key.
     #[test]
-    fn a_recovery_window_is_valid_and_already_in_overlap() {
+    fn a_recovery_window_clears_both_rules_it_has_to() {
         let now = 1_800_000_000u64;
+        let stage_expires_at = now + 300;
         let window = TransitionWindow::new(
             now - RECOVERY_WINDOW_BACKDATE_SECS,
-            now,
-            now + 7 * DAY_SECS,
+            stage_expires_at,
+            stage_expires_at + 7 * DAY_SECS,
         )
         .expect("a recovery window is a valid window");
+        aether::certificates::window::validate_lease(
+            now,
+            stage_expires_at,
+            aether::certificates::window::MAX_STAGE_LEASE_SECS,
+            &[window.activation_at, stage_expires_at],
+        )
+        .expect("the staging lease does not outlive the activation it prepares");
         assert_eq!(
             window.phase(now),
-            aether::certificates::window::WindowPhase::Overlap,
-            "the recovered identity changes over at once, not after a wait"
+            aether::certificates::window::WindowPhase::Prepared,
+            "the change-over waits for the staging, and for nothing else"
         );
     }
 
