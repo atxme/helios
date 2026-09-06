@@ -1,14 +1,8 @@
 name: Régression
 
-# Ce que la campagne garde, c'est `main` : elle tourne donc sur ce qui y entre,
-# et pas sur chaque poussée d'une branche de travail. Une campagne complète
-# coûte plusieurs minutes d'exécutant, et la jouer à chaque commit intermédiaire
-# n'apprend rien que le développeur ne puisse obtenir localement — la référence
-# reste `bash scripts/regression.sh`, qui joue exactement les mêmes étapes.
-#
-# `pull_request` est conservé volontairement : une PR vers `main` est le dernier
-# moment où la branche peut être arrêtée avant d'y entrer. La retirer laisserait
-# `main` sans filet, ce qui est l'inverse du but.
+# Les pull requests jouent le socle rapide ; `main` et les lancements manuels
+# jouent la campagne complète, dont les audits et couvertures coûteux.
+# `bash scripts/regression.sh` reste la référence locale de cette campagne.
 #
 # `workflow_dispatch` reste ouvert à toutes les branches : une campagne à la
 # demande sur une branche de travail est possible, elle n'est simplement plus
@@ -22,12 +16,48 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
+  fast-check:
+    if: github.event_name == 'pull_request'
+    name: Vérifications rapides
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            apps/orion/package-lock.json
+      - name: Cache Cargo et outils de contrôle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Dépendances système de Tauri et TPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev
+      - name: Vérifications rapides
+        run: bash scripts/check.sh
+
   regression:
-    name: Tests de non-régression
+    if: github.event_name != 'pull_request'
+    name: Tests de non-régression complets
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -41,16 +71,32 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             apps/orion/package-lock.json
+      - name: Cache Cargo et outils de contrôle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
       - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
           sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev
-      - name: Audit Rust
-        run: cargo install cargo-audit --locked
+      - name: Outil d'audit Rust
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
       - name: Campagne de régression
         run: bash scripts/regression.sh
-      - name: Outillage de couverture Rust
-        run: cargo install cargo-llvm-cov --locked
+      - name: Outil de couverture Rust
+        run: |
+          if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+            cargo install cargo-llvm-cov --locked
+          fi
       - name: Couverture Linux complète
         run: bash scripts/coverage.sh
       - name: Rapports de couverture Linux
@@ -74,6 +120,15 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: apps/orion/package-lock.json
+      - name: Cache Cargo et outils de contrôle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
       - name: Dépendances Orion
         run: npm ci --prefix apps/orion
       - name: Tests et build de l'IHM
@@ -87,16 +142,18 @@ jobs:
         run: cargo clippy -p helios-fido -p orion-core -p orion -p astra-signer --all-targets --all-features -- -D warnings
       - name: Tests du compagnon Astra sous Windows
         run: cargo test -p helios-fido -p astra-signer --all-features
-      - name: Outillage de couverture Rust
-        run: cargo install cargo-llvm-cov --locked
       - name: Tests et couverture Orion sous Windows
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
+          if (-not (Get-Command cargo-llvm-cov -ErrorAction SilentlyContinue)) {
+            cargo install cargo-llvm-cov --locked
+          }
           New-Item -ItemType Directory -Force target/coverage | Out-Null
           cargo llvm-cov --package orion-core --package orion --all-features --json --output-path target/coverage/orion-windows.json
           cargo llvm-cov report --html --output-dir target/coverage/orion-windows-html
       - name: Rapport de couverture Windows
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-orion-windows

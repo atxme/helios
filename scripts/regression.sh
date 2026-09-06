@@ -7,25 +7,13 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-echo '==> Formatage Rust'
-cargo fmt --check
+echo '==> Vérifications rapides communes'
+bash "$repo_root/scripts/check.sh"
 
 for app in web apps/orion; do
-  echo "==> Dépendances verrouillées : $app"
-  npm ci --prefix "$app"
   echo "==> Audit de sécurité : $app"
   npm audit --prefix "$app" --audit-level=moderate
-  echo "==> Tests frontend : $app"
-  npm run test:unit --prefix "$app"
-  echo "==> Build frontend : $app"
-  npm run build --prefix "$app"
 done
-
-echo '==> Analyse Rust, toutes les features'
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-echo '==> Tests Rust, toutes les features'
-cargo test --workspace --all-features
 
 echo '==> Campagne de provisioning post-quantique (dry-run)'
 # Monte un daemon isolé et joue la campagne de bout en bout : c'est le seul
