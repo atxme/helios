@@ -391,15 +391,16 @@ fn seed(
         not_before: client_pq.not_before_unix,
         not_after: client_pq.not_after_unix,
     };
-    // A leaf outside its own validity cannot sign the continuity proof of a
-    // renewal, and seeding a state around it would move the failure to the
-    // authority — which refuses without saying that the local clock, or the
-    // certificate, is the problem.
-    if now_unix >= active.not_after {
-        return Err(RenewalError::ActiveExpired {
-            not_after: active.not_after,
-        });
-    }
+    // Une feuille hors de sa validité est décrite, pas refusée. Le magasin est
+    // le compte rendu de ce que ce poste détient, et un poste resté éteint trop
+    // longtemps détient une feuille expirée — c'est même la seule situation que
+    // la récupération du §7.5 traite. Refuser ici la rendait inatteignable :
+    // un profil importé après l'échéance n'a pas encore de magasin, la
+    // récupération en demande un, et le semis lui répondait d'aller renouveler.
+    //
+    // Ce qu'une feuille expirée ne peut pas faire, c'est signer la preuve de
+    // continuité d'une rotation. C'est donc le renouvellement qui le vérifie,
+    // là où il peut encore le dire utilement.
 
     Ok(TrustState {
         trust_domain_id: trust
@@ -1505,6 +1506,8 @@ pub async fn begin(
         });
     }
 
+    assert_active_can_prove_continuity(store.state(), now_unix)?;
+
     let active = ActiveIdentity::from_bundle(&bundle)?;
     let mut session = RenewalSession::prepare(&store, identity, heliosd_url, now_unix)?;
     session.sign(&active)?;
@@ -1515,6 +1518,26 @@ pub async fn begin(
             .await?;
     }
     Ok((session, store, step))
+}
+
+/// Refuses a rotation whose active leaf can no longer prove continuity.
+///
+/// Called after `promote_due`, and that order is the point: a client holding a
+/// staged generation whose activation has passed is not expired at all, and
+/// checking before the promotion would refuse it for the state it just left.
+///
+/// The refusal names the recovery. Letting the authority answer instead would
+/// produce a refusal that says nothing about which side is wrong — the local
+/// clock, or the certificate.
+fn assert_active_can_prove_continuity(
+    state: &TrustState,
+    now_unix: u64,
+) -> Result<(), RenewalError> {
+    let not_after = state.certificates.active.not_after;
+    if now_unix >= not_after {
+        return Err(RenewalError::ActiveExpired { not_after });
+    }
+    Ok(())
 }
 
 /// Takes one more step on a renewal already opened.
@@ -2195,21 +2218,46 @@ mod tests {
         );
     }
 
-    /// An expired leaf cannot sign the continuity proof a rotation needs, so
-    /// the refusal names the recovery rather than letting the authority refuse
-    /// without saying which side is wrong.
+    /// A machine left off past its own expiry is exactly what §7.5 recovers,
+    /// and it reaches that path through a store it does not have yet. Seeding
+    /// therefore describes the expired leaf instead of refusing it — the
+    /// refusal that used to live here made the recovery unreachable.
     #[test]
-    fn an_expired_active_leaf_is_named_rather_than_seeded() {
+    fn an_expired_active_leaf_is_seeded_so_the_recovery_can_read_it() {
         let directory = tempfile::tempdir().expect("temp dir");
         let domain = domain();
         let settings = settings(&domain);
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
+        let expired_at = NOW + 20 * 86_400;
+        let store = open_or_seed(&path, &settings, &bundle, expired_at).expect("seeded");
+        assert!(path.exists(), "the store the recovery opens must be written");
+        assert!(
+            store.state().certificates.active.not_after <= expired_at,
+            "the seeded state describes the expired leaf rather than hiding it"
+        );
+    }
+
+    /// An expired leaf cannot sign the continuity proof a rotation needs, so
+    /// the refusal names the recovery rather than letting the authority refuse
+    /// without saying which side is wrong.
+    #[test]
+    fn an_expired_active_leaf_cannot_prove_continuity() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let settings = settings(&domain);
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        let expired_at = NOW + 20 * 86_400;
+        let store = open_or_seed(&path, &settings, &bundle, expired_at).expect("seeded");
         assert!(matches!(
-            open_or_seed(&path, &settings, &bundle, NOW + 20 * 86_400),
+            assert_active_can_prove_continuity(store.state(), expired_at),
             Err(RenewalError::ActiveExpired { .. })
         ));
-        assert!(!path.exists(), "a refused seed writes nothing");
+        assert!(
+            assert_active_can_prove_continuity(store.state(), NOW).is_ok(),
+            "a leaf still inside its validity proves continuity"
+        );
     }
 
     /// A profile enrolled before §19 carries no trust block, and the refusal
