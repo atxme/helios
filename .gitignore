@@ -1,9 +1,46 @@
-/target
-/resources-windows
+# Build and package output
+/target/
+**/target/
+/dist/
+**/dist/
+/coverage/
+**/coverage/
+/resources-windows/
+
+# Local dependencies and tool caches
+node_modules/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.eslintcache
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.fleet/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs, temporary files and editor recovery files
+*.log
+*.pid
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local environment and secret material
+.env
+.env.*
+!.env.example
+
+# Rust backup files and generated release material
 **/*.rs.bk
 *.pem
 *.raucb
-.env
 
 # Artefacts Python (scripts/target_campaign.py)
 __pycache__/
@@ -16,10 +53,9 @@ __pycache__/
 /orion-client-ca
 **/orion-client-ca-key.der
 **/orion-client-pq-ca-private.bin
+
 # Profils clients. Un profil complet porte la clé privée WireGuard du poste :
 # `.orionprofile` est le suffixe distribué jusqu'en août 2026, `.orion` celui
 # que l'outillage écrit depuis.
 *.orionprofile
 *.orion
-
-deploy/astra/.env
