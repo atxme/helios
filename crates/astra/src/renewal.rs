@@ -192,7 +192,20 @@ pub(crate) async fn transcribe_peer(
     caller: &WireGuardKey,
     now_unix: u64,
 ) -> Result<(), RenewalError> {
-    if service.registry.lock().await.peer(caller).is_some() {
+    // Un pair déjà transcrit **et complet** n'est pas relu. « Complet » compte
+    // l'ancre d'admission : un enregistrement écrit avant qu'elle existe la
+    // porte à `None`, et sortir ici le figerait dans cet état — le champ ne se
+    // remplirait jamais, et la récupération d'une feuille de première
+    // génération resterait refusée sur un domaine qui a déjà relayé un
+    // renouvellement. La relecture est un appel sur le canal privé, et
+    // `admit` ne réécrit rien quand l'enregistrement est inchangé.
+    if service
+        .registry
+        .lock()
+        .await
+        .peer(caller)
+        .is_some_and(|peer| peer.admission_pq_ca.is_some())
+    {
         return Ok(());
     }
     let Some(gateway) = service.gateway.as_ref() else {
