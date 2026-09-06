@@ -105,6 +105,16 @@ use zeroize::Zeroizing;
 /// line, because that is the unit an operator reasons about.
 const DAY_SECS: u64 = 86_400;
 
+/// How far a recovery window opens before the instant it activates on.
+///
+/// A recovered identity has nothing to overlap with — the leaf it replaces
+/// expired — so it activates at once. The window still needs a strictly
+/// earlier opening, and dating it slightly in the past is also what a client
+/// whose clock drifted while it was off needs: that drift is the ordinary
+/// case here, since a machine left off long enough to expire is a machine
+/// whose clock has had time to wander.
+const RECOVERY_WINDOW_BACKDATE_SECS: u64 = 300;
+
 /// Prepared before any of the four files of a CA-PQ rotation is replaced.
 ///
 /// A filesystem cannot atomically rename four unrelated destinations.  This
@@ -3467,8 +3477,21 @@ fn recover(
     // The new generation activates immediately: the old one expired, so there
     // is nothing to overlap *with*. The window exists only so the gateway and
     // the client have a common instant to change over on.
+    //
+    // `not_before` is therefore *behind* now rather than equal to it. A window
+    // is refused unless `not_before < activation_at < not_after` — strictly —
+    // so making the three collapse onto one instant refused every recovery
+    // this command has ever attempted. Backdating the opening instead of
+    // pushing the activation forward is what keeps the promise the comment
+    // above makes: at `now` the window is already in its overlap phase, and
+    // the client changes over at once instead of waiting out a `Prepared`
+    // second it has no reason to sit through.
+    //
+    // The amount is the clock-skew allowance leaves are issued with, and for
+    // the same reason: a verifier whose clock sits slightly behind must not
+    // refuse a window that has genuinely opened.
     let window = TransitionWindow::new(
-        now,
+        now.saturating_sub(RECOVERY_WINDOW_BACKDATE_SECS),
         now,
         now.checked_add(
             overlap_days
@@ -4066,6 +4089,28 @@ mod tests {
     use aether::certificates::transport::TrustUpdateObject;
     use aether::certificates::window::TransitionWindow;
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
+
+    /// A recovery replaces a leaf that has already expired, so its window has
+    /// nothing to overlap with and must be in force the instant it is signed.
+    /// Collapsing the three instants onto `now` looked like that and was
+    /// refused outright — `not_before < activation_at < not_after` is strict —
+    /// which made every recovery this command attempted fail at the last step,
+    /// after the operator had already touched the key.
+    #[test]
+    fn a_recovery_window_is_valid_and_already_in_overlap() {
+        let now = 1_800_000_000u64;
+        let window = TransitionWindow::new(
+            now - RECOVERY_WINDOW_BACKDATE_SECS,
+            now,
+            now + 7 * DAY_SECS,
+        )
+        .expect("a recovery window is a valid window");
+        assert_eq!(
+            window.phase(now),
+            aether::certificates::window::WindowPhase::Overlap,
+            "the recovered identity changes over at once, not after a wait"
+        );
+    }
 
     fn transition() -> ClientTlsCaTransition {
         ClientTlsCaTransition {
