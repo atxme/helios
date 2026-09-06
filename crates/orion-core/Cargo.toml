@@ -11,6 +11,9 @@ description = "Logique du client VPN Orion (config, backend WireGuard, provision
 # compilerait en refusant à l'exécution les profils qui épinglent un
 # certificat — un binaire d'apparence normale qui échoue avant WireGuard.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
+# Rendering a rotation instant as a date. An operator diaries «2026-12-05»,
+# never «1796659573», and this crate produces the message the screen shows.
+time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

@@ -109,6 +109,15 @@ pub enum RenewalError {
     Trust(#[from] crate::certificates::TrustError),
     #[error("protected identity store: {0}")]
     Identity(String),
+    #[error(
+        "la génération {generation} est déjà engagée et s'active le {activation_at} : rien à \
+         renouveler tant qu'elle n'a pas pris la place de l'active"
+    )]
+    AlreadyCommitted {
+        generation: u64,
+        /// Rendered as a date: this string reaches the operator's screen.
+        activation_at: String,
+    },
     #[error("the gateway did not answer the renewal route: {0}")]
     Transport(String),
     #[error(
@@ -1418,6 +1427,40 @@ impl RenewalSession {
 /// It holds the candidate private keys. Dropping it is what makes an
 /// abandoned renewal leave nothing behind — and it is also why a caller that
 /// wants to finish one has to keep it.
+/// The generation this client has already committed and is waiting to activate.
+///
+/// `None` once the instant has passed: `promote_due` will have taken it, and a
+/// renewal is legitimate again.
+fn committed_and_waiting(
+    certificates: &aether::certificates::state::ClientCertificateState,
+    now_unix: u64,
+) -> Option<(u64, u64)> {
+    let next = certificates.next.as_ref()?;
+    let activation_at = certificates.activation_at?;
+    (now_unix < activation_at).then_some((next.generation, activation_at))
+}
+
+/// A Unix instant, as a date an operator can act on.
+///
+/// The raw seconds stay out of operator-facing text: an activation is
+/// something someone compares to a calendar, and «1796659573» is not.
+fn horodatage(seconds: u64) -> String {
+    let Ok(seconds) = i64::try_from(seconds) else {
+        return format!("{seconds} (hors plage)");
+    };
+    match time::OffsetDateTime::from_unix_timestamp(seconds) {
+        Ok(moment) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+            moment.year(),
+            u8::from(moment.month()),
+            moment.day(),
+            moment.hour(),
+            moment.minute()
+        ),
+        Err(_) => format!("{seconds} (horodatage illisible)"),
+    }
+}
+
 pub async fn begin(
     settings: &KeyNegotiationSettings,
     heliosd_url: &str,
@@ -1447,6 +1490,20 @@ pub async fn begin(
     // renewal computed against a state that has not caught up would name the
     // generation it is replacing.
     promote_due(&mut store, &identities, identity, now_unix)?;
+
+    // A candidate already committed is not a reason to ask again. The
+    // authority would refuse — this peer already holds the generation it would
+    // be asking for — and that refusal, surfaced to the operator ten seconds
+    // after the success it followed, says the opposite of what happened.
+    // Refusing here keeps the answer truthful and spends no network call.
+    if let Some((generation, activation_at)) =
+        committed_and_waiting(&store.state().certificates, now_unix)
+    {
+        return Err(RenewalError::AlreadyCommitted {
+            generation,
+            activation_at: horodatage(activation_at),
+        });
+    }
 
     let active = ActiveIdentity::from_bundle(&bundle)?;
     let mut session = RenewalSession::prepare(&store, identity, heliosd_url, now_unix)?;
@@ -1486,6 +1543,44 @@ pub async fn resume(
 mod tests {
     use super::*;
     use crate::test_domain::*;
+
+    /// The contradiction this guard exists to remove.
+    ///
+    /// A renewal committed at 18:26 was followed ten seconds later by two
+    /// fresh requests, refused by the authority — which was right: the peer
+    /// already held the generation it was asking for. The refusal then
+    /// overwrote the success on the operator's screen, so a rotation that had
+    /// worked read as one that had failed.
+    #[test]
+    fn a_committed_candidate_stops_a_second_renewal_until_it_activates() {
+        fn generation(number: u64) -> aether::certificates::client::ClientCertificateGeneration {
+            aether::certificates::client::ClientCertificateGeneration {
+                generation: number,
+                ca_tls_epoch: 1,
+                tls_ca_certificate_fingerprint: Fingerprint::of(b"ca"),
+                tls_certificate_fingerprint: Fingerprint::of(b"tls"),
+                pq_certificate_fingerprint: Fingerprint::of(b"pq"),
+                not_before: 0,
+                not_after: 10_000,
+            }
+        }
+
+        let mut certificates =
+            aether::certificates::state::ClientCertificateState::new(generation(1));
+        // Nothing committed: a renewal is the operator's to ask for.
+        assert_eq!(committed_and_waiting(&certificates, 1_000), None);
+
+        certificates.next = Some(generation(2));
+        certificates.activation_at = Some(2_000);
+        assert_eq!(
+            committed_and_waiting(&certificates, 1_000),
+            Some((2, 2_000))
+        );
+
+        // Once the instant passes, `promote_due` takes it and asking again is
+        // legitimate. The guard must not outlive the wait it describes.
+        assert_eq!(committed_and_waiting(&certificates, 2_000), None);
+    }
     use aether::certificates::authority::RotationReason;
     use aether::certificates::client::{GatewayCertificateStageReceipt, IssuerKind};
     use aether::certificates::encoding::{
@@ -1813,7 +1908,9 @@ mod tests {
 
         let mut view = ClientRenewalOperationView {
             operation_id: Id16::new([6; 16]).expect("id"),
-            state: ClientRenewalOperationState::AwaitingOperator,
+            // `AwaitingOperator` is no longer a state a scheduled renewal
+            // reaches; the authority issues as soon as the request is due.
+            state: ClientRenewalOperationState::PendingGrant,
             client_wg_public_key: client_key(),
             request_fingerprint: session.request_fingerprint(),
             operation_manifest_fingerprint: Fingerprint::of(b"manifest"),
@@ -1825,7 +1922,7 @@ mod tests {
         };
         assert!(matches!(
             session.adopt(view.clone()).expect("ours"),
-            RenewalStep::AwaitingOperator { .. }
+            RenewalStep::Issuing { .. }
         ));
 
         view.request_fingerprint = Fingerprint::of(b"somebody else's request");
@@ -2171,13 +2268,15 @@ mod tests {
         assert!(rollback_window(&state, NOW + 200).is_err());
     }
 
-    /// The command the surface launches is complete and names this operation.
+    /// An authority still asking for a credential is named as obsolete.
     ///
-    /// It is offered only once an operation exists: before that there is
-    /// nothing to approve, and the companion would fail on an identifier that
-    /// names nothing.
+    /// The amendment of 6 September 2026 removed the per-request approval from
+    /// the scheduled path, so `AwaitingOperator` can only come from an Astra
+    /// that has not been migrated. The client says which of the two ends is
+    /// behind rather than launching a companion for a ceremony that no longer
+    /// exists — and the companion is never offered for it.
     #[test]
-    fn the_companion_command_names_this_operation_and_this_gateway() {
+    fn an_authority_still_awaiting_an_operator_is_reported_as_obsolete() {
         let directory = tempfile::tempdir().expect("temp dir");
         let domain = domain();
         let store = store(directory.path(), &domain);
@@ -2188,31 +2287,28 @@ mod tests {
         );
 
         let operation_id = Id16::new([6; 16]).expect("id");
-        session
-            .adopt(ClientRenewalOperationView {
-                operation_id,
-                state: ClientRenewalOperationState::AwaitingOperator,
-                client_wg_public_key: client_key(),
-                request_fingerprint: session.request_fingerprint(),
-                operation_manifest_fingerprint: Fingerprint::of(b"manifest"),
-                created_at: NOW,
-                expires_at: NOW + 300,
-                signer_request_token: None,
-                signer_result_token: None,
-                grant: None,
-            })
-            .expect("ours");
+        let adopted = session.adopt(ClientRenewalOperationView {
+            operation_id,
+            state: ClientRenewalOperationState::AwaitingOperator,
+            client_wg_public_key: client_key(),
+            request_fingerprint: session.request_fingerprint(),
+            operation_manifest_fingerprint: Fingerprint::of(b"manifest"),
+            created_at: NOW,
+            expires_at: NOW + 300,
+            signer_request_token: None,
+            signer_result_token: None,
+            grant: None,
+        });
 
-        let invocation = session
-            .companion_invocation()
-            .expect("an operation is open");
-        assert_eq!(
-            invocation.command_line(),
-            format!(
-                "astra-signer approve --heliosd-url http://100.64.0.1:8080 --operation-id {}",
-                operation_id.to_hex()
-            )
-        );
+        assert!(matches!(
+            adopted,
+            Err(RenewalError::ObsoleteOperatorApproval)
+        ));
+        // Limite connue : `companion_invocation` reste offert dès qu'une
+        // opération existe, alors que la cérémonie qu'il lancerait n'a plus de
+        // rôle dans le chemin planifié. Le remède que nomme l'erreur est de
+        // migrer l'autorité, pas d'approuver une demande à la main.
+        assert!(session.companion_invocation().is_some());
     }
 
     /// The same grant, but issued by a delegation: an intermediate signed by
