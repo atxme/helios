@@ -1621,7 +1621,7 @@ pub fn recover_expired_identity(
             issuer_authorization: None,
             stage_id,
             request_fingerprint: request.fingerprint(),
-            operator_approval_fingerprint,
+            renewal_authorization_fingerprint: operator_approval_fingerprint,
             // Neither delegated family. A recovery is authorized by the anchor
             // and by the assertion beside it, and carrying one of the other two
             // would leave «which one was checked» to the reader.
@@ -1693,7 +1693,7 @@ pub fn grant_recovered_identity(
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
-            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             renewal_approval: None,
             campaign_approval: None,
             stage_receipt_fingerprint: receipt.fingerprint(),
