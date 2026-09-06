@@ -42,7 +42,6 @@
 //! oracle on other peers' generations.
 
 use aether::certificates::{
-    client::{ClientCertificateRotationGrant, ClientCertificateStageCommit},
     encoding::DerCertificate,
     status::AstraCertificateStatus,
     transport::{
@@ -79,19 +78,7 @@ pub struct TrustUpdateResponse {
     pub chunk: Option<TrustUpdateChunk>,
 }
 
-/// A commit and the grant that authorizes it (spec §7.3).
-///
-/// The two travel together because the gateway needs both: the signatures
-/// prove who is committing, the grant proves the authority released anything
-/// at all. A commit alone would let a client that holds its own two private
-/// keys — which it always does, it generated them — activate a candidate the
-/// authority never granted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StageCommitRequest {
-    pub commit: ClientCertificateStageCommit,
-    pub grant: ClientCertificateRotationGrant,
-}
+pub use aether::certificates::client::StageCommitRequest;
 
 /// Why a trust update was refused, in the only shapes the API may report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -51,6 +51,7 @@ use std::time::Duration;
 use aether::certificates::client::ClientCertificateGeneration;
 use aether::certificates::client::{
     ClientCertificateRotationGrant, ClientCertificateRotationRequest, ClientCertificateStageCommit,
+    StageCommitRequest,
 };
 use aether::certificates::encoding::{
     generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, Id16, MlDsa87PublicKey,
@@ -1157,8 +1158,14 @@ impl RenewalSession {
         }
         .sign(&active.pq_private_key, &self.keys.pq_private_key)?;
 
-        let body = serde_json::to_vec(&commit)
-            .map_err(|error| RenewalError::Malformed(error.to_string()))?;
+        // The grant travels with the commit. The gateway needs both — the
+        // signatures say who is committing, the grant says the authority
+        // released anything at all — and it refuses a bare commit outright.
+        let body = serde_json::to_vec(&StageCommitRequest {
+            commit: commit.clone(),
+            grant: grant.clone(),
+        })
+        .map_err(|error| RenewalError::Malformed(error.to_string()))?;
         self.post_ignoring_body(&self.routes.stage_commit(), body)
             .await?;
 

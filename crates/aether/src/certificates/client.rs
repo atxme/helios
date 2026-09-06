@@ -1421,6 +1421,26 @@ impl ClientCertificateRotationGrant {
     }
 }
 
+/// A commit and the grant that authorizes it (spec §7.3).
+///
+/// The two travel together because the gateway needs both: the signatures
+/// prove who is committing, the grant proves the authority released anything
+/// at all. A commit alone would let a client that holds its own two private
+/// keys — which it always does, it generated them — activate a candidate the
+/// authority never granted.
+///
+/// It lives beside its two members rather than in the API crate that serves
+/// the route: a client cannot depend on the gateway's HTTP layer, and when the
+/// shape was defined there the two ends drifted — Orion posted a bare commit
+/// to a gateway that had always required the pair, and the mismatch only
+/// surfaced as an unreadable body on a real renewal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageCommitRequest {
+    pub commit: ClientCertificateStageCommit,
+    pub grant: ClientCertificateRotationGrant,
+}
+
 /// The client's commit, signed by the active **and** the candidate PQ key.
 ///
 /// Two signatures because the commit does two things: it proves the client
@@ -2678,5 +2698,44 @@ mod tests {
             base,
             expired_recovery_approval_challenge(&request, &challenge, 1_001)
         );
+    }
+
+    /// The bug this pairing exists to prevent, pinned as a test.
+    ///
+    /// Orion once posted a bare commit to a gateway that had always required
+    /// the pair. Both ends compiled, both ends were self-consistent, and the
+    /// disagreement surfaced only as an unreadable body on a real renewal.
+    /// The shape now lives here, and a bare commit must not pass for a request.
+    #[test]
+    fn a_bare_commit_is_not_a_stage_commit_request() {
+        let commit = ClientCertificateStageCommit {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            protocol_version: CERTIFICATE_PROTOCOL_VERSION,
+            trust_domain_id: domain(),
+            stage_id: Id16::new([5; 16]).expect("stage"),
+            grant_fingerprint: Fingerprint::of(b"grant"),
+            stage_receipt_fingerprint: Fingerprint::of(b"receipt"),
+            gateway_wg_public_key: gateway_key(),
+            client_wg_public_key: client_key(),
+            active_generation: 4,
+            staged_generation: 5,
+            staged_tls_certificate_fingerprint: Fingerprint::of(b"next tls"),
+            staged_pq_certificate_fingerprint: Fingerprint::of(b"next pq"),
+            stage_expires_at: 5_000,
+            committed_at: 1_200,
+            active_pq_signature: MlDsa87Signature::new(vec![0; 4627]).unwrap(),
+            staged_pq_signature: MlDsa87Signature::new(vec![0; 4627]).unwrap(),
+        };
+        let bare = serde_json::to_vec(&commit).expect("encode");
+        assert!(
+            serde_json::from_slice::<StageCommitRequest>(&bare).is_err(),
+            "a bare commit must not deserialize as the paired request"
+        );
+        // And the field the reader complains about is the first one it meets,
+        // which is exactly the message the gateway logged.
+        let error = serde_json::from_slice::<StageCommitRequest>(&bare)
+            .expect_err("bare commit")
+            .to_string();
+        assert!(error.contains("format_version"), "{error}");
     }
 }
