@@ -900,7 +900,7 @@ fn install_astra_issuer(source: &Path) -> anyhow::Result<()> {
     match migration {
         PolicyMigration::AlreadyCurrent => {
             println!("policy pin: unchanged");
-            info!("this registry already pins the current issuance policy; nothing was written");
+            info!("the delegation is recorded; this registry already pinned the policy it names");
         }
         PolicyMigration::Adopted(pin) => {
             println!("policy pin: {}", pin.fingerprint().to_hex());
