@@ -344,7 +344,21 @@ terminateur_tailscale() {
     # certificat public, Serve, publication Docker, Astra. `--fail` pour qu'un
     # 502 de `tailscaled` devant un conteneur arrêté ne compte pas comme un
     # succès, et pas de `--insecure` : valider la chaîne est tout l'objet.
+    #
+    # `--resolve` plutôt que le DNS de la cible : une gateway n'a aucune raison
+    # de résoudre son propre nom MagicDNS — son `resolved` peut ne pas pointer
+    # vers `100.100.100.100`, et sa propre politique de sortie peut fermer le
+    # port 53. Ce que cette étape doit prouver est que l'origine répond à qui
+    # l'appelle depuis le tailnet, pas que la machine sait s'appeler elle-même :
+    # échouer là-dessus serait un faux négatif sur un déploiement correct.
+    local ip4
+    ip4="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale ip -4' | head -1 | tr -d '\r')"
+    if [ -z "$ip4" ]; then
+        echo "    adresse Tailscale de la cible illisible" >&2
+        return 1
+    fi
     if ! sortie="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" "curl -fsS --max-time 15 \
+        --resolve '$hote:443:$ip4' \
         -X POST -H 'content-type: application/json' -d 'null' \
         'https://$hote/v1/client-rotation/challenge' 2>&1")"; then
         echo "    l'origine https://$hote ne répond pas encore :" >&2
