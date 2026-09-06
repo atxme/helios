@@ -46,7 +46,7 @@ use aether::certificates::{
     status::AstraCertificateStatus,
     transport::{
         AuthenticatedTrustUpdateRequest, TrustUpdateChunk, TrustUpdateTransactionManifest,
-        MAX_TRUST_UPDATE_REQUEST_BYTES,
+        MAX_STAGE_COMMIT_REQUEST_BYTES, MAX_TRUST_UPDATE_REQUEST_BYTES,
     },
 };
 use aether::key_negotiation::PqCertificate;
@@ -831,7 +831,7 @@ pub async fn stage_commit(
     let Some(caller_key) = caller.public_key.as_deref() else {
         return StatusCode::UNAUTHORIZED;
     };
-    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
+    if body.len() > MAX_STAGE_COMMIT_REQUEST_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let request: StageCommitRequest = match serde_json::from_slice(&body) {

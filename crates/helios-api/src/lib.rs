@@ -353,7 +353,7 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/key-negotiation/stage-commit",
             post(certificates::stage_commit).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+                aether::certificates::transport::MAX_STAGE_COMMIT_REQUEST_BYTES,
             )),
         )
         // The relayed ordinary renewal (spec §8.1.2). A peer opens an
@@ -376,7 +376,7 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/key-negotiation/certificate-renewal/stage-commit",
             post(certificates::stage_commit).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
+                aether::certificates::transport::MAX_STAGE_COMMIT_REQUEST_BYTES,
             )),
         )
         .route("/ws", get(ws::handler))

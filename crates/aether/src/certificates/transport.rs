@@ -63,6 +63,20 @@ pub const MAX_TRUST_UPDATE_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_TRUST_UPDATE_OBJECT_BYTES: usize = 60 * 1024;
 /// Largest number of objects in one transaction (spec §8.1).
 pub const MAX_TRUST_UPDATE_OBJECTS: usize = 64;
+/// Largest `StageCommitRequest` body read before deserialization (spec §7.3).
+///
+/// A bound of its own, because the commit route does not carry a trust update
+/// and the two have nothing in common but the word "request". What it carries
+/// is a commit with two ML-DSA-87 signatures, and a grant holding a third,
+/// a PQ leaf, a TLS leaf, a stage receipt, and — whenever a delegated issuer
+/// signed the generation, which is the ordinary case — a whole
+/// `AstraIssuerAuthorization` with its own key and signature.
+///
+/// An ML-DSA-87 signature is 4627 bytes and a public key 2592, before base64
+/// inflates them by a third. The 32 KiB sized for a trust update covers none
+/// of that: the route rejected every real commit with 413, and the shape it
+/// was measuring had never actually been sent.
+pub const MAX_STAGE_COMMIT_REQUEST_BYTES: usize = 128 * 1024;
 
 /// Request an admitted Orion sends inside the tunnel (spec §8.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -932,6 +946,30 @@ mod tests {
     use crate::certificates::encoding::{generate_ml_dsa_87_keypair, sign_ml_dsa_87};
     use crate::certificates::window::TransitionWindow;
     use zeroize::Zeroizing;
+
+    /// The bound is not a round number picked by feel: it has to clear what a
+    /// commit and its grant actually weigh, base64 included.
+    #[test]
+    fn the_stage_commit_bound_clears_what_the_pair_carries() {
+        const ML_DSA_87_SIGNATURE: usize = 4627;
+        const ML_DSA_87_PUBLIC_KEY: usize = 2592;
+        // Two on the commit, one on the grant, one on the PQ leaf, one on the
+        // stage receipt, one on the delegation.
+        let signatures = 6 * ML_DSA_87_SIGNATURE;
+        // The PQ leaf's key, and the delegated issuer's.
+        let keys = 2 * ML_DSA_87_PUBLIC_KEY;
+        // The client TLS leaf and the delegated intermediate, generously.
+        let certificates = 2 * 2_048;
+        let base64 = (signatures + keys + certificates).div_ceil(3) * 4;
+        assert!(
+            MAX_STAGE_COMMIT_REQUEST_BYTES > base64,
+            "the bound must hold the signed material: {base64} bytes of base64"
+        );
+        assert!(
+            MAX_TRUST_UPDATE_REQUEST_BYTES < base64,
+            "if a trust update body could hold it, this constant would be pointless"
+        );
+    }
 
     struct Keys {
         private: Zeroizing<Vec<u8>>,
