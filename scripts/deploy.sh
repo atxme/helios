@@ -261,6 +261,101 @@ else
     echo "==> Reprise Astra seule sur $CIBLE"
 fi
 
+# ── Le terminateur TLS de l'origine publique ────────────────────────────────
+#
+# Astra sert du HTTP clair sur `127.0.0.1:8443`. Ce n'est pas un oubli : le
+# certificat de transport n'authentifie pas l'autorité — c'est sa clé de
+# service ML-DSA-87 épinglée qui le fait (ADR-008 §9.6). Mais la récupération
+# d'une identité expirée (§7.5) est le seul chemin qui n'a plus de tunnel : elle
+# monte un client HTTPS ordinaire, qui valide la chaîne sous les racines du
+# système. Sans terminateur devant, cette origine n'existe pas et §7.5 est
+# fermée — c'est exactement la limite que ce dépôt documentait.
+#
+# Quand l'origine est un nom `*.ts.net`, le terminateur est déjà là. Tailscale
+# émet et renouvelle tout seul un certificat publiquement reconnu pour le nom du
+# nœud, et `tailscale serve` le présente sur 443 **à l'intérieur du tailnet
+# seulement**. Rien à installer sur l'hôte, aucune autorité locale à faire
+# approuver dans le magasin racine du poste opérateur, et aucune règle 443 dans
+# le pare-feu applicatif : l'écoute appartient à `tailscaled`, pas à Helios, et
+# le contrôle d'accès est celui des ACL du tailnet.
+#
+# Funnel exposerait ce même nom sur l'Internet public. Il n'est jamais activé
+# ici, et le trouver activé arrête l'étape plutôt que de la confirmer.
+#
+# Toute autre origine garde le modèle documenté par l'ADR-008 §2 : un
+# terminateur externe, à la charge de l'opérateur.
+terminateur_tailscale() {
+    local url="$1" hote fqdn sortie
+    hote="${url#https://}"
+    hote="${hote%%/*}"
+    hote="${hote%%:*}"
+    case "$hote" in
+        *.ts.net) ;;
+        *)
+            echo "    origine $hote : terminateur TLS externe attendu (ADR-008 §2)"
+            return 0
+            ;;
+    esac
+
+    if ! ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'command -v tailscale >/dev/null 2>&1'; then
+        echo "    l'origine est $hote mais la cible n'a pas de tailscale : rien ne" >&2
+        echo "    termine le TLS, et la récupération §7.5 reste fermée." >&2
+        return 1
+    fi
+
+    # `tailscale serve` ne sait présenter que le certificat du nœud sur lequel
+    # il tourne. Une origine qui nomme une autre machine ne serait donc pas
+    # servie ici — et le dire maintenant vaut mieux qu'un échec de validation
+    # TLS le jour où une identité est déjà expirée.
+    fqdn="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale status --json --peers=false' |
+        sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    fqdn="${fqdn%.}"
+    if [ -z "$fqdn" ]; then
+        echo "    nom Tailscale de la cible illisible : MagicDNS est-il actif ?" >&2
+        return 1
+    fi
+    if [ "$fqdn" != "$hote" ]; then
+        echo "    l'origine du domaine est $hote, mais cette machine est $fqdn." >&2
+        echo "    Tailscale ne peut présenter que son propre nom : servir ici" >&2
+        echo "    donnerait un certificat que le client refuserait." >&2
+        return 1
+    fi
+
+    if ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" 'tailscale serve status --json 2>/dev/null' |
+        grep -q '"AllowFunnel"'; then
+        echo "    Funnel est configuré sur ce nœud : l'origine de l'autorité serait" >&2
+        echo "    exposée sur l'Internet public. Le retirer par « tailscale funnel" >&2
+        echo "    reset » avant de reprendre." >&2
+        return 1
+    fi
+
+    # Idempotent : rejouer la même cartographie ne change rien. `--bg` la rend
+    # persistante, donc elle survit au redémarrage de la cible sans unité
+    # systemd à écrire.
+    if ! sortie="$(helios_ssh_sudo_capture "$CIBLE" \
+        'tailscale serve --bg --https=443 http://127.0.0.1:8443 2>&1')"; then
+        echo "    « tailscale serve » a échoué :" >&2
+        printf '%s\n' "$sortie" | tail -10 >&2
+        return 1
+    fi
+
+    # La vérification est la première requête que fait §7.5, et pas une sonde
+    # inventée pour l'occasion : si celle-ci passe, le chemin complet passe —
+    # certificat public, Serve, publication Docker, Astra. `--fail` pour qu'un
+    # 502 de `tailscaled` devant un conteneur arrêté ne compte pas comme un
+    # succès, et pas de `--insecure` : valider la chaîne est tout l'objet.
+    if ! sortie="$(ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" "curl -fsS --max-time 15 \
+        -X POST -H 'content-type: application/json' -d 'null' \
+        'https://$hote/v1/client-rotation/challenge' 2>&1")"; then
+        echo "    l'origine https://$hote ne répond pas encore :" >&2
+        printf '%s\n' "$sortie" | tail -5 >&2
+        echo "    la cartographie Serve est posée ; reprendre après le démarrage" >&2
+        echo "    d'Astra la vérifiera." >&2
+        return 1
+    fi
+    echo "    origine   https://$hote (Tailscale Serve, tailnet seulement)"
+}
+
 # ── 7. Astra et le domaine de confiance (ADR-008) ────────────────────────────
 #
 # Tout est déduit ou capturé, rien n'est recopié : le relais donne le domaine,
@@ -1090,6 +1185,8 @@ deployer_astra() {
             logs --tail 40 astra" >&2 || true
         return 1
     }
+
+    terminateur_tailscale "$url"
 }
 
 if [ "$ASTRA" = "0" ]; then

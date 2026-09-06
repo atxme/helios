@@ -8,7 +8,7 @@ qui le suit.
 ## Amorçage en deux passages
 
 ```sh
-astra-signer init --rp-id astra.helios.local --label "YubiKey du bureau"
+astra-signer init --rp-id <gateway>.<tailnet>.ts.net --label "YubiKey du bureau"
 astra-signer enrol --label "YubiKey de récupération"
 ./scripts/deploy.sh
 # Le premier passage rapatrie la demande publique et indique exactement :
@@ -191,9 +191,28 @@ le même. Le coffre le mémorise à `astra-signer init` ; en changer rend tous l
 key-slots inouvrables, définitivement, sans recours — la spécification refuse
 explicitement toute phrase de passe de secours.
 
-Choisissez un nom que vous garderez : `astra.helios.local` en interne, ou un nom
-public si Astra sort. Il se propage ensuite tout seul aux trois endroits qui en
-ont besoin.
+Choisissez un nom que vous garderez. Il se propage ensuite tout seul aux trois
+endroits qui en ont besoin — l'URL d'autorité vaut `https://<rp_id>` par défaut.
+
+**Prenez le nom Tailscale de la gateway**, `<gateway>.<tailnet>.ts.net`, si elle
+est dans un tailnet. C'est le seul choix qui rend l'origine publique joignable
+sans rien installer : Tailscale émet et renouvelle un certificat publiquement
+reconnu pour ce nom, `deploy.sh` le présente sur 443 par `tailscale serve`, et
+la récupération d'une identité expirée (§7.5) marche depuis n'importe quel
+poste du tailnet — sans autorité locale à approuver dans le magasin racine de
+Windows, sans entrée `hosts`, sans reverse proxy à maintenir et sans jamais
+ouvrir 443 sur l'Internet.
+
+Un nom interne comme `astra.helios.local` reste possible et ne change rien au
+renouvellement ordinaire, qui passe par le tunnel. Il vous laisse en revanche
+le terminateur TLS à poser, et donc à faire approuver un certificat auto-signé
+sur chaque poste opérateur.
+
+Ce choix se fait **au premier `init` et ne se rattrape pas** : le RP ID
+n'est pas un réglage de déploiement mais la moitié du chemin de dérivation des
+key-slots, et l'origine de l'autorité doit être gouvernée par lui — un profil
+Orion dont l'hôte n'est ni le RP ID ni l'un de ses sous-domaines est refusé à
+l'import. En changer après coup revient à recréer le domaine.
 
 Ce nom reste le RP ID et l'origine logique de l'assertion WebAuthn même quand
 le renouvellement ordinaire voyage par l'adresse WireGuard de Helios. Il
@@ -345,15 +364,26 @@ client (§8.1.2). Chaque moitié est indépendante — absente, elle est journal
 et l'autre continue ; sans la seconde, la gateway répond `503` à chaque
 renouvellement client.
 
-**L'origine publique, elle, n'est pas montée par ce déploiement.** `astra run`
-sert du HTTP clair sur `127.0.0.1:8443` et attend un terminateur TLS devant lui
-(ADR-008 §2) : ni `compose.yaml`, ni le ruleset atomique de `helios-firewall`
-n'en installent un, et aucune règle `input` n'ouvre le port sur le WAN. Tant
-que ce terminateur n'est pas posé — reverse proxy sur TCP 443 devant le
-conteneur, avec le nom DNS qui sert aussi de RP ID —, la récupération d'une
-identité expirée (§7.5), le statut authentifié hors tunnel et les trois routes
-compagnon du §8.2 restent injoignables depuis une autre machine. Le
-renouvellement ordinaire, qui passe par le tunnel et le veth, n'en dépend pas.
+**L'origine publique** est la seule chose qu'`astra run` ne termine pas
+lui-même : il sert du HTTP clair sur `127.0.0.1:8443` et attend un terminateur
+TLS devant lui (ADR-008 §2). Ni `compose.yaml` ni le ruleset atomique de
+`helios-firewall` n'en installent un, et aucune règle `input` n'ouvre le port
+sur le WAN.
+
+Quand l'origine du domaine est un nom `*.ts.net`, `deploy.sh` la monte tout
+seul : il vérifie que ce nom est bien celui du nœud, refuse de continuer si
+Funnel est configuré — ce qui exposerait l'autorité sur l'Internet public —,
+pose `tailscale serve --bg --https=443 http://127.0.0.1:8443`, puis vérifie
+d'une vraie requête `POST /v1/client-rotation/challenge`, la première que fait
+§7.5. Le certificat est celui du tailnet, publiquement reconnu et renouvelé
+sans intervention ; l'écoute appartient à `tailscaled`, donc rien n'est ajouté
+au pare-feu applicatif et le contrôle d'accès est celui des ACL du tailnet.
+
+Pour toute autre origine, le terminateur reste à la charge de l'opérateur, et
+tant qu'il n'est pas posé la récupération d'une identité expirée (§7.5), le
+statut authentifié hors tunnel et les trois routes compagnon du §8.2 restent
+injoignables depuis une autre machine. Le renouvellement ordinaire, qui passe
+par le tunnel et le veth, n'en dépend jamais.
 
 ### Pourquoi la construction emprunte le réseau de l'hôte
 
