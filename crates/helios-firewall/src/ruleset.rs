@@ -757,11 +757,12 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Ruleset {
         // the administration API. It sat in that block for as long as it took
         // one gateway to leave `admin_iface` unset: `admin_port` is derived
         // from that field, the whole block is skipped when it is absent, and
-        // the two rules below went with it. Nothing else opens 5201, so every
-        // probe was dropped in `input` — and a drop is silent, so the client
-        // reported a timeout (`os error 10060`) against a daemon that was
-        // listening perfectly well. The opening belongs to the interface the
-        // service listens on, not to another service's configuration.
+        // the two rules below went with it. Nothing else opens the speedtest
+        // port, so every probe was dropped in `input` — and a drop is silent,
+        // so the client reported a timeout (`os error 10060`) against a daemon
+        // that was listening perfectly well. The opening belongs to the
+        // interface the service listens on, not to another service's
+        // configuration.
         //
         // Input only: the gateway never opens a speedtest flow of its own, and
         // its answers are `established`.
@@ -1634,9 +1635,9 @@ mod tests {
     ///
     /// It used to be rendered inside the administration block, which is
     /// skipped entirely when `admin_iface` is unset. On such a gateway nothing
-    /// opened 5201, every probe was dropped in `input`, and the client — with
-    /// no answer and no refusal — reported a timeout against a daemon that was
-    /// listening.
+    /// opened the speedtest port, every probe was dropped in `input`, and the
+    /// client — with no answer and no refusal — reported a timeout against a
+    /// daemon that was listening.
     #[test]
     fn speedtest_stays_open_on_the_tunnel_without_an_administration_interface() {
         let mut p = policy();
@@ -1648,7 +1649,7 @@ mod tests {
             assert!(
                 input
                     .iter()
-                    .any(|r| r.contains(&format!("{proto} dport 5201"))
+                    .any(|r| r.contains(&format!("{proto} dport {SPEEDTEST_PORT}"))
                         && r.contains("iifname \"helios0\"")),
                 "the speedtest must stay reachable through the tunnel ({proto})"
             );
@@ -1656,7 +1657,8 @@ mod tests {
         // Never unscoped: only WireGuard puts packets on the tunnel interface.
         assert!(!input
             .iter()
-            .any(|r| r == "tcp dport 5201 accept" || r == "udp dport 5201 accept"));
+            .any(|r| r == &format!("tcp dport {SPEEDTEST_PORT} accept")
+                || r == &format!("udp dport {SPEEDTEST_PORT} accept")));
     }
 
     /// Nothing to scope the opening to means no opening at all.
@@ -1667,7 +1669,9 @@ mod tests {
         let rs = render(&p, TunnelState::Up);
         for chain in [ChainKind::Input, ChainKind::Output] {
             assert!(
-                !text(&rs, chain).iter().any(|r| r.contains("5201")),
+                !text(&rs, chain)
+                    .iter()
+                    .any(|r| r.contains(&SPEEDTEST_PORT.to_string())),
                 "no speedtest opening without a tunnel interface"
             );
         }

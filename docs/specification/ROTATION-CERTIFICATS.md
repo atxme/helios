@@ -82,6 +82,16 @@ la porte. Tant que cette migration n'est pas achevée, le renouvellement
 automatique est indisponible ; aucun binaire mis à jour ne peut élargir
 silencieusement l'autorité d'une ancienne empreinte.
 
+La délégation est elle-même le véhicule de la migration. Signée par `CA-PQ`
+et portant l'empreinte de la politique courante, elle déplace l'épingle
+d'Astra au moment de son installation, et celle de la gateway par `heliosd
+adopt-issuance-policy`. Les deux extrémités vérifient la signature sous
+l'ancre qu'elles détiennent déjà avant de lire la politique nommée, refusent
+une délégation qui en nomme une troisième, et laissent intacte une épingle
+qui n'est ni la politique courante ni celle qu'elle remplace. L'empreinte de
+la politique remplacée reste calculable pour la reconnaître ; aucun chemin ne
+l'accepte comme autorisation.
+
 Le choix de faire émettre le certificat PQ gateway par `CA-PQ` est retenu à la
 place d'une simple cosignature par l'ancienne leaf. Une leaf compromise ne peut
 ainsi autoriser seule sa remplaçante. Astra conserve le coffre chiffré et le

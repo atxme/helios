@@ -614,6 +614,21 @@ impl NetworkConfig {
                     "key_negotiation_port and wg_listen_port must be distinct".into(),
                 ));
             }
+            if port == SPEEDTEST_PORT {
+                return Err(HeliosError::Config(format!(
+                    "key_negotiation_port and the built-in speedtest port ({SPEEDTEST_PORT}) must be distinct"
+                )));
+            }
+        }
+        if self.wg_listen_port == SPEEDTEST_PORT {
+            return Err(HeliosError::Config(format!(
+                "wg_listen_port and the built-in speedtest port ({SPEEDTEST_PORT}) must be distinct"
+            )));
+        }
+        if self.iperf_port == Some(SPEEDTEST_PORT) {
+            return Err(HeliosError::Config(format!(
+                "iperf_port and the built-in speedtest port ({SPEEDTEST_PORT}) must be distinct"
+            )));
         }
         if let Some(meshnet) = &self.nordvpn_meshnet {
             if !self.allow_gateway_egress {
@@ -1337,6 +1352,26 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn configured_services_cannot_claim_the_builtin_speedtest_port() {
+        let mut config = NetworkConfig {
+            key_negotiation_port: Some(SPEEDTEST_PORT),
+            ..NetworkConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.key_negotiation_port = Some(51821);
+        config.wg_listen_port = SPEEDTEST_PORT;
+        assert!(config.validate().is_err());
+
+        config.wg_listen_port = 51820;
+        config.iperf_port = Some(SPEEDTEST_PORT);
+        assert!(config.validate().is_err());
+
+        config.iperf_port = Some(5201);
+        assert!(config.validate().is_ok());
+    }
+
     /// The API must listen on the tunnel address. On `127.0.0.1`, no Orion
     /// client could reach provisioning, and the firewall rule filtering on
     /// `admin_iface` could never apply.
@@ -1362,8 +1397,8 @@ mod tests {
             wg_address: "100.64.0.1/10".into(),
             ..NetworkConfig::default()
         };
-        assert_eq!(cfg.speedtest_bind(), "100.64.0.1:5201");
-        assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:5201");
+        assert_eq!(cfg.speedtest_bind(), "100.64.0.1:51822");
+        assert_eq!(NetworkConfig::default().speedtest_bind(), "127.0.0.1:51822");
     }
 
     /// Without a configured gateway, no reason to expose the API: loopback.

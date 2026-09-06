@@ -1110,9 +1110,9 @@ fn unreachable(detail: &str) -> SpeedTestError {
 /// remedy. A reset says a machine answered — something is on the port, or the
 /// host refused. Silence says the packets are being dropped, or that they are
 /// arriving where nothing is bound: on the gateway, either the firewall does
-/// not open 5201 on the tunnel interface, or `heliosd` bound its listeners
-/// elsewhere. Both are facts about the gateway, and neither is worth retrying
-/// from the client.
+/// not open the speedtest port on the tunnel interface, or `heliosd` bound its
+/// listeners elsewhere. Both are facts about the gateway, and neither is worth
+/// retrying from the client.
 ///
 /// A connected UDP socket surfaces the exhausted read timeout as `TimedOut` on
 /// Windows (`os error 10060`) and as `WouldBlock` on Unix; `TcpStream::
@@ -1735,11 +1735,11 @@ mod tests {
 
     /// Silence and a reset are different facts about the gateway.
     ///
-    /// A reset means something answered on 5201 — another service, or the host
-    /// refusing. A timeout means the probe left and nothing came back at all:
-    /// the packets are dropped, or they arrive where nothing is bound. The
-    /// operator's next move differs, so the two must not share a sentence —
-    /// and neither may be reported as a bare `os error`.
+    /// A reset means something answered on the speedtest port — another
+    /// service, or the host refusing. A timeout means the probe left and
+    /// nothing came back at all: the packets are dropped, or they arrive where
+    /// nothing is bound. The operator's next move differs, so the two must not
+    /// share a sentence — and neither may be reported as a bare `os error`.
     #[test]
     fn a_gateway_that_never_answers_is_named_rather_than_reported_as_an_os_error() {
         for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {

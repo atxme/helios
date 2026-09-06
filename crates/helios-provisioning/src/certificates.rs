@@ -1191,6 +1191,54 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
+    /// Moves this registry off the superseded per-request issuance policy.
+    ///
+    /// The gateway pins the policy independently of Astra, so it has to be
+    /// carried across by the same evidence and not by a message from the
+    /// authority: an [`AstraIssuerAuthorization`] signed by the `CA-PQ` this
+    /// registry already holds, naming the current standard policy. Verified
+    /// here under that anchor before its policy is read, and refused for any
+    /// other pin — see
+    /// [`AstraPolicyPin::adopt_automatic_renewal_policy`](aether::certificates::approval::AstraPolicyPin::adopt_automatic_renewal_policy).
+    ///
+    /// Nothing else in the registry moves. The delegation is not installed by
+    /// this call: on the gateway a delegation travels inside the approval it
+    /// authorizes, and recording one here would be a second, unbound copy.
+    pub fn adopt_automatic_renewal_policy(
+        &mut self,
+        delegation: &aether::certificates::authority::AstraIssuerAuthorization,
+        now_unix: u64,
+    ) -> Result<aether::certificates::approval::PolicyMigration, RegistryError> {
+        use aether::certificates::approval::PolicyMigration;
+
+        let gateway = &self.state.gateway;
+        delegation.verify(
+            &gateway.current_ca_public_key,
+            &gateway.trust_domain_id,
+            gateway.ca_epoch,
+            self.state.client_tls_ca.ca_tls_epoch,
+            &gateway.gateway_wg_public_key,
+            &gateway.server_name,
+            now_unix,
+        )?;
+        let migration = self
+            .state
+            .astra
+            .astra_policy_fingerprint
+            .adopt_automatic_renewal_policy(
+                gateway.trust_domain_id,
+                gateway.gateway_wg_public_key,
+                &gateway.server_name,
+                delegation,
+            )?;
+        if let PolicyMigration::Adopted(pin) = migration {
+            let mut candidate = self.state.clone();
+            candidate.astra.astra_policy_fingerprint = pin;
+            self.persist(candidate)?;
+        }
+        Ok(migration)
+    }
+
     /// Repairs the one legacy bootstrap that stored the admission CA where
     /// the domain's client `CA-TLS` belongs.
     ///
@@ -3641,6 +3689,115 @@ mod tests {
         }
         .sign(&fixture.ca.private)
         .expect("sign the rotation")
+    }
+
+    fn gateway_delegation_naming(
+        ca: &Keys,
+        policy_fingerprint: Fingerprint,
+    ) -> aether::certificates::authority::AstraIssuerAuthorization {
+        let (_, issuer_public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("keygen");
+        aether::certificates::authority::AstraIssuerAuthorization {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            issuer_epoch: 1,
+            pq_issuer_public_key: issuer_public,
+            tls_intermediate_certificate: aether::certificates::test_x509::certificate_authority(
+                "astra-issuer",
+            ),
+            allowed_usage: aether::certificates::authority::AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 200_000,
+            policy_fingerprint,
+            not_before: 0,
+            not_after: 1_000_000,
+            ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca.private)
+        .expect("sign delegation")
+    }
+
+    /// Pins this fixture's registry to the superseded policy, as a gateway
+    /// bootstrapped before the amendment of 6 September 2026 holds it.
+    fn pin_to_superseded(fixture: &mut Fixture) -> Fingerprint {
+        let superseded = aether::certificates::approval::superseded_per_request_policy_fingerprint(
+            domain(),
+            gateway_key(),
+            SERVER_NAME,
+        )
+        .expect("superseded");
+        let mut candidate = fixture.registry.state().clone();
+        candidate.astra.astra_policy_fingerprint =
+            aether::certificates::approval::AstraPolicyPin::new(superseded).expect("pin");
+        fixture.registry.persist(candidate).expect("pinned");
+        superseded
+    }
+
+    /// The gateway pins the policy for itself, so it has to be carried across
+    /// by the same `CA-PQ`-signed evidence — and carrying it must move nothing
+    /// else, least of all the peers whose renewals depend on their generation.
+    #[test]
+    fn a_superseded_gateway_pin_adopts_the_current_policy_and_keeps_every_peer() {
+        use aether::certificates::approval::PolicyMigration;
+
+        let mut fixture = fixture();
+        pin_to_superseded(&mut fixture);
+        let peers_before = fixture.registry.state().peers.clone();
+        let ledger_before = fixture.registry.state().ledger.clone();
+        let current = aether::certificates::approval::AstraIssuancePolicy::standard(
+            domain(),
+            gateway_key(),
+            SERVER_NAME.into(),
+        )
+        .fingerprint()
+        .expect("current");
+
+        let migration = fixture
+            .registry
+            .adopt_automatic_renewal_policy(&gateway_delegation_naming(&fixture.ca, current), 1_000)
+            .expect("migration");
+
+        assert!(matches!(migration, PolicyMigration::Adopted(_)));
+        assert!(fixture
+            .registry
+            .state()
+            .astra
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&current));
+        assert_eq!(fixture.registry.state().peers, peers_before);
+        assert_eq!(fixture.registry.state().ledger, ledger_before);
+    }
+
+    /// The evidence has to be this domain's. A delegation signed by another
+    /// anchor names the right policy and still moves nothing.
+    #[test]
+    fn a_delegation_from_another_anchor_never_moves_the_gateway_pin() {
+        let mut fixture = fixture();
+        let superseded = pin_to_superseded(&mut fixture);
+        let current = aether::certificates::approval::AstraIssuancePolicy::standard(
+            domain(),
+            gateway_key(),
+            SERVER_NAME.into(),
+        )
+        .fingerprint()
+        .expect("current");
+        let stranger = keys();
+
+        assert!(fixture
+            .registry
+            .adopt_automatic_renewal_policy(&gateway_delegation_naming(&stranger, current), 1_000)
+            .is_err());
+        assert!(fixture
+            .registry
+            .state()
+            .astra
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&superseded));
     }
 
     /// The migration fixes the bootstrap metadata and nothing else: peer

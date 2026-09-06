@@ -275,6 +275,25 @@ enum Command {
         /// Signed `ClientTlsCaTransition`, as JSON.
         transition: PathBuf,
     },
+    /// Adopts the current Astra issuance policy on a pre-amendment registry.
+    ///
+    /// Until the amendment of 6 September 2026 a scheduled renewal asked for
+    /// one operator credential per request. Dropping it widens what the
+    /// delegated issuer may do unattended, so the policy fingerprint changed
+    /// with it and no binary upgrade reinterprets the old one — the gateway
+    /// would refuse every automatic renewal instead.
+    ///
+    /// The evidence that moves it is an `AstraIssuerAuthorization` signed by
+    /// this domain's `CA-PQ` and naming the current policy: the out-of-band
+    /// confirmation §2.4 asks for, in the form the operator's security keys
+    /// already produce. A registry pinned to anything but the superseded
+    /// policy is left untouched.
+    ///
+    /// **For a stopped daemon**, like the other registry commands.
+    AdoptIssuancePolicy {
+        /// Signed `AstraIssuerAuthorization`, as JSON.
+        delegation: PathBuf,
+    },
     /// Prints the trust block a client's profile must carry (spec §19).
     ///
     /// Read from the certificate registry in one pass, and printed as the
@@ -541,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
         Command::InstallCaTransition { transition } => install_ca_transition(&transition),
         Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
+        Command::AdoptIssuancePolicy { delegation } => adopt_issuance_policy(&delegation),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -854,6 +874,38 @@ fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
         InstallOutcome::Installed => warn!(
             "CA-PQ rotation staged: both anchors verify from activation_at, and the outgoing one              is retired at not_after. Every client must have received this transition before that              date — one that has not is repaired by an operator, not by a late delivery"
         ),
+    }
+    Ok(())
+}
+
+/// Carries a pre-amendment registry onto the current issuance policy.
+///
+/// Prints the pin it ends on either way, because "nothing changed" and "it was
+/// already right" are the same silence otherwise, and an operator running a
+/// migration is entitled to know which of the two happened.
+fn adopt_issuance_policy(source: &Path) -> anyhow::Result<()> {
+    use aether::certificates::approval::PolicyMigration;
+
+    let now_unix = now_unix()?;
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let delegation: aether::certificates::authority::AstraIssuerAuthorization =
+        gateway_rotation::read_signed_document(source, "Astra issuer authorization")?;
+    let migration = registry
+        .adopt_automatic_renewal_policy(&delegation, now_unix)
+        .context("adopting the current Astra issuance policy")?;
+
+    println!("issuer epoch: {}", delegation.issuer_epoch);
+    match migration {
+        PolicyMigration::AlreadyCurrent => {
+            println!("policy pin: unchanged");
+            info!("this registry already pins the current issuance policy; nothing was written");
+        }
+        PolicyMigration::Adopted(pin) => {
+            println!("policy pin: {}", pin.fingerprint().to_hex());
+            info!(
+                "issuance policy adopted: scheduled renewal of an active identity no longer asks                  for an operator credential on this gateway"
+            );
+        }
     }
     Ok(())
 }
@@ -1941,10 +1993,10 @@ async fn run(
         // when WireGuard comes up, so the first binds legitimately fail — that
         // is what the fast burst is for. But the port can also be held by
         // **another program**, and that is not transient: `iperf3` listening on
-        // `0.0.0.0:5201` wins the port and keeps it, and a gateway that stopped
-        // trying after ten seconds served no speedtest until someone restarted
-        // the daemon. Worse, it said so once, in a line long gone by the time a
-        // client reports « connexion fermée par l'hôte ».
+        // a wildcard listener wins the port and keeps it, and a gateway that
+        // stopped trying after ten seconds served no speedtest until someone
+        // restarted the daemon. Worse, it said so once, in a line long gone by
+        // the time a client reports « connexion fermée par l'hôte ».
         //
         // So after the burst it keeps retrying slowly, and logs only when the
         // situation *changes* — a conflict that persists for a day is one line,

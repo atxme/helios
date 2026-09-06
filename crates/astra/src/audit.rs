@@ -30,6 +30,11 @@ pub enum AuditEvent {
     IssuerInstalled {
         issuer_epoch: u64,
     },
+    /// The domain left the superseded per-request issuance policy for the
+    /// current one, on the evidence of a `CA-PQ`-signed delegation.
+    IssuancePolicyAdopted {
+        policy_fingerprint: String,
+    },
     IssuerRevoked {
         issuer_epoch: u64,
     },

@@ -202,6 +202,17 @@ impl AstraIssuancePolicy {
     /// SHA-256 of the canonical form of §2.4, once the policy is in bounds.
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
         self.validate()?;
+        Ok(self.fingerprint_with_scheduled_credentials(self.scheduled_renewal_credentials))
+    }
+
+    /// The canonical form, with the scheduled-renewal count supplied.
+    ///
+    /// Every other field comes from `self`. The count is a parameter for one
+    /// reason only: [`superseded_per_request_policy_fingerprint`] has to
+    /// reproduce a fingerprint whose count [`Self::validate`] now refuses, and
+    /// re-typing the encoder there would be a second canonical form to keep
+    /// equal to this one by hand.
+    fn fingerprint_with_scheduled_credentials(&self, scheduled_credentials: u8) -> Fingerprint {
         let mut bytes = CanonicalBytes::new(ISSUANCE_POLICY_DOMAIN);
         bytes
             .u16(self.format_version)
@@ -213,16 +224,54 @@ impl AstraIssuancePolicy {
             .u64(self.maximum_stage_lease_secs)
             .u64(self.maximum_overlap_secs)
             .u8(self.renewal_start_percent)
-            .u8(self.scheduled_renewal_credentials)
+            .u8(scheduled_credentials)
             .u8(self.expired_recovery_credentials)
             .u8(self.authority_mutation_credentials);
-        Ok(Fingerprint::of(&bytes.finish()))
+        Fingerprint::of(&bytes.finish())
     }
 
     /// The value a profile and a registry store.
     pub fn pin(&self) -> Result<AstraPolicyPin, CertificateError> {
         AstraPolicyPin::new(self.fingerprint()?)
     }
+}
+
+/// The fingerprint the **superseded** policy of 15 August 2026 produced.
+///
+/// That policy asked one operator credential per scheduled renewal. Its
+/// fingerprint is no longer reachable through
+/// [`AstraIssuancePolicy::fingerprint`] — [`AstraIssuancePolicy::validate`]
+/// refuses the count — so it is recomputed here from the same canonical form
+/// with the single byte that changed.
+///
+/// It exists to **recognise** a domain still pinned to it, and for nothing
+/// else. No path accepts it as an authorization: a pin that equals this value
+/// refuses automatic renewal until an operator has confirmed the current
+/// policy out of band.
+pub fn superseded_per_request_policy_fingerprint(
+    trust_domain_id: TrustDomainId,
+    gateway_wg_public_key: WireGuardKey,
+    server_name: &str,
+) -> Result<Fingerprint, CertificateError> {
+    let policy = AstraIssuancePolicy::standard(
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name.to_owned(),
+    );
+    // Validated on the current policy, so a domain whose *other* bounds are
+    // out of specification is refused here rather than recognised as legacy.
+    policy.validate()?;
+    Ok(policy.fingerprint_with_scheduled_credentials(PER_REQUEST_APPROVAL_CREDENTIALS))
+}
+
+/// What [`AstraPolicyPin::adopt_automatic_renewal_policy`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyMigration {
+    /// The pin already names the current standard policy.
+    AlreadyCurrent,
+    /// The pin named the superseded policy and the delegation carries the
+    /// current one. The caller persists the returned pin.
+    Adopted(AstraPolicyPin),
 }
 
 /// The out-of-band pin of the issuance policy (spec §2.4).
@@ -295,6 +344,54 @@ impl AstraPolicyPin {
         )
         .fingerprint()?;
         self.assert_matches(&expected)
+    }
+
+    /// Moves a domain off the superseded policy, once, and only on evidence.
+    ///
+    /// Removing the per-request credential widens what the delegated issuer
+    /// may do unattended, so the pin cannot follow a binary upgrade. What it
+    /// follows instead is an [`AstraIssuerAuthorization`] carrying the current
+    /// standard policy — a document `CA-PQ` signed, which is the out-of-band
+    /// confirmation §2.4 asks for. **The caller must have verified that
+    /// signature under its own pinned anchor before calling**: this decides
+    /// which policy the document names, never whether the document is genuine.
+    ///
+    /// Every other shape is refused. A pin that is neither the current nor the
+    /// superseded standard is left alone — it belongs to a domain this
+    /// migration does not describe, and guessing would be exactly the silent
+    /// broadening the amendment forbids.
+    pub fn adopt_automatic_renewal_policy(
+        &self,
+        trust_domain_id: TrustDomainId,
+        gateway_wg_public_key: WireGuardKey,
+        server_name: &str,
+        delegation: &AstraIssuerAuthorization,
+    ) -> Result<PolicyMigration, CertificateError> {
+        let current = AstraIssuancePolicy::standard(
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name.to_owned(),
+        )
+        .fingerprint()?;
+        if self.0.matches(&current) {
+            return Ok(PolicyMigration::AlreadyCurrent);
+        }
+        let superseded = superseded_per_request_policy_fingerprint(
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name,
+        )?;
+        if !self.0.matches(&superseded) {
+            return Err(CertificateError::InvalidPolicy(
+                "the pinned policy is neither the current nor the superseded standard",
+            ));
+        }
+        if !delegation.policy_fingerprint.matches(&current) {
+            return Err(CertificateError::FingerprintMismatch(
+                "delegation does not carry the current issuance policy",
+            ));
+        }
+        Ok(PolicyMigration::Adopted(AstraPolicyPin::new(current)?))
     }
 }
 
@@ -2306,6 +2403,144 @@ mod tests {
             Err(CertificateError::FingerprintMismatch(
                 "Astra issuance policy"
             ))
+        ));
+    }
+
+    /// The migration recognises exactly one legacy shape, and it is not the
+    /// current one: a fingerprint that collided would let the superseded
+    /// policy pass for the amended one.
+    #[test]
+    fn the_superseded_policy_is_not_the_current_policy() {
+        let current = AstraIssuancePolicy::standard(domain(), gateway(), "gateway.example".into())
+            .fingerprint()
+            .expect("current");
+        let superseded =
+            superseded_per_request_policy_fingerprint(domain(), gateway(), "gateway.example")
+                .expect("superseded");
+        assert!(!current.matches(&superseded));
+    }
+
+    /// Signs a delegation naming `policy_fingerprint`, under `ca`.
+    fn delegation_naming(
+        ca: &Key,
+        policy_fingerprint: Fingerprint,
+    ) -> crate::certificates::authority::AstraIssuerAuthorization {
+        let (_, issuer) = generate_ml_dsa_87_keypair().expect("keygen");
+        crate::certificates::authority::AstraIssuerAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: gateway(),
+            server_name: "gateway.example".into(),
+            issuer_epoch: 1,
+            pq_issuer_public_key: issuer,
+            tls_intermediate_certificate: crate::certificates::test_x509::certificate_authority(
+                "astra-issuer",
+            ),
+            allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 90 * 86_400,
+            policy_fingerprint,
+            not_before: 1_000,
+            not_after: 100_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca.private)
+        .expect("sign")
+    }
+
+    /// The whole point of the migration: a domain pinned before the amendment
+    /// moves onto the current policy, and only on a delegation that names it.
+    #[test]
+    fn a_superseded_pin_adopts_the_current_policy_from_a_delegation_that_names_it() {
+        let ca = key();
+        let current = AstraIssuancePolicy::standard(domain(), gateway(), "gateway.example".into())
+            .fingerprint()
+            .expect("current");
+        let superseded =
+            superseded_per_request_policy_fingerprint(domain(), gateway(), "gateway.example")
+                .expect("superseded");
+        let pin = AstraPolicyPin::new(superseded).expect("pin");
+
+        let adopted = pin
+            .adopt_automatic_renewal_policy(
+                domain(),
+                gateway(),
+                "gateway.example",
+                &delegation_naming(&ca, current),
+            )
+            .expect("migration");
+        let PolicyMigration::Adopted(moved) = adopted else {
+            panic!("a superseded pin must move");
+        };
+        assert!(moved.fingerprint().matches(&current));
+    }
+
+    /// Running the migration twice must be a no-op rather than a second move,
+    /// so an interrupted operator can simply run it again.
+    #[test]
+    fn a_pin_already_on_the_current_policy_moves_nothing() {
+        let ca = key();
+        let current = AstraIssuancePolicy::standard(domain(), gateway(), "gateway.example".into())
+            .fingerprint()
+            .expect("current");
+        let pin = AstraPolicyPin::new(current).expect("pin");
+        assert_eq!(
+            pin.adopt_automatic_renewal_policy(
+                domain(),
+                gateway(),
+                "gateway.example",
+                &delegation_naming(&ca, current),
+            )
+            .expect("migration"),
+            PolicyMigration::AlreadyCurrent
+        );
+    }
+
+    /// A `CA-PQ` signature says the document is genuine, never that its policy
+    /// is the one this domain is migrating to. A delegation naming a third
+    /// policy must leave the pin where it is.
+    #[test]
+    fn a_delegation_naming_a_third_policy_never_moves_a_superseded_pin() {
+        let ca = key();
+        let mut widened =
+            AstraIssuancePolicy::standard(domain(), gateway(), "gateway.example".into());
+        widened.maximum_leaf_lifetime_secs = 10 * 365 * 86_400;
+        let superseded =
+            superseded_per_request_policy_fingerprint(domain(), gateway(), "gateway.example")
+                .expect("superseded");
+        let pin = AstraPolicyPin::new(superseded).expect("pin");
+
+        assert!(matches!(
+            pin.adopt_automatic_renewal_policy(
+                domain(),
+                gateway(),
+                "gateway.example",
+                &delegation_naming(&ca, widened.fingerprint().expect("widened")),
+            ),
+            Err(CertificateError::FingerprintMismatch(_))
+        ));
+    }
+
+    /// A pin this migration does not describe belongs to some other domain or
+    /// some other policy. Guessing at it is the silent broadening the
+    /// amendment forbids, so it is refused rather than overwritten.
+    #[test]
+    fn a_pin_that_is_neither_standard_is_left_alone() {
+        let ca = key();
+        let current = AstraIssuancePolicy::standard(domain(), gateway(), "gateway.example".into())
+            .fingerprint()
+            .expect("current");
+        let pin = AstraPolicyPin::new(Fingerprint::of(b"some other domain")).expect("pin");
+
+        assert!(matches!(
+            pin.adopt_automatic_renewal_policy(
+                domain(),
+                gateway(),
+                "gateway.example",
+                &delegation_naming(&ca, current),
+            ),
+            Err(CertificateError::InvalidPolicy(_))
         ));
     }
 }

@@ -26,7 +26,7 @@
 //! degraded path.
 
 use aether::certificates::{
-    approval::DelegatedApproval,
+    approval::{DelegatedApproval, PolicyMigration},
     authority::{AstraIssuerAuthorization, RotationReason},
     client::{
         ClientCertificateGeneration, ClientCertificateRotationGrant,
@@ -664,6 +664,175 @@ mod tests {
             .expect("the gateway accepts a delegated staging");
     }
 
+    /// A domain on disk, pinned to one policy, holding everything `adopt` reads.
+    struct PinnedDomain {
+        registry: crate::registry::AstraRegistry,
+        ca_private: Zeroizing<Vec<u8>>,
+        issuer_public: MlDsa87PublicKey,
+        pq_key: std::path::PathBuf,
+        tls_key: std::path::PathBuf,
+        intermediate_der: DerCertificate,
+        /// Keeps the directory the two key paths point into alive.
+        _directory: tempfile::TempDir,
+    }
+
+    /// Builds a registry pinned to `policy`, with the private issuer material
+    /// on disk beside it.
+    fn domain_pinned_to(policy: Fingerprint) -> PinnedDomain {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (_, service) = generate_ml_dsa_87_keypair().expect("keygen");
+        let (intermediate_der, intermediate_key) = intermediate();
+
+        let pq_key = directory.path().join("issuer-pq.bin");
+        let tls_key = directory.path().join("issuer-tls.der");
+        std::fs::write(&pq_key, issuer_private.as_slice()).expect("pq key");
+        std::fs::write(&tls_key, intermediate_key.as_slice()).expect("tls key");
+
+        let state = crate::registry::AstraState {
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            authority_url: "https://astra.example".into(),
+            webauthn_rp_id: "astra.example".into(),
+            astra_policy_fingerprint: AstraPolicyPin::new(policy).expect("policy pin"),
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            ca_public_key: ca_public,
+            ca_rotation: None,
+            ca_tls_epoch: 1,
+            ca_tls_fingerprint: Some(Fingerprint::of(b"client tls ca")),
+            ca_tls_rotation: None,
+            astra_service_key_epoch: 1,
+            astra_service_public_key: service,
+            issuer: None,
+            transitions: Vec::new(),
+            peers: std::collections::BTreeMap::new(),
+            status_epochs: std::collections::BTreeMap::new(),
+            audit: crate::audit::AuditChain::default(),
+        };
+        PinnedDomain {
+            registry: crate::registry::AstraRegistry::new(
+                directory.path().join("astra.json"),
+                state,
+            ),
+            ca_private,
+            issuer_public,
+            pq_key,
+            tls_key,
+            intermediate_der,
+            _directory: directory,
+        }
+    }
+
+    fn delegation_naming(
+        ca_private: &[u8],
+        issuer_public: MlDsa87PublicKey,
+        intermediate_der: DerCertificate,
+        policy_fingerprint: Fingerprint,
+    ) -> AstraIssuerAuthorization {
+        AstraIssuerAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: domain(),
+            ca_epoch: 1,
+            ca_tls_epoch: 1,
+            gateway_wg_public_key: gateway_key(),
+            server_name: SERVER_NAME.into(),
+            issuer_epoch: 1,
+            pq_issuer_public_key: issuer_public,
+            tls_intermediate_certificate: intermediate_der,
+            allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
+            maximum_leaf_lifetime_secs: 200_000,
+            policy_fingerprint,
+            not_before: 0,
+            not_after: 1_000_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(ca_private)
+        .expect("sign delegation")
+    }
+
+    /// The migration of 6 September 2026, through the door it actually uses:
+    /// installing a delegation. The pin and the delegation land together, so a
+    /// crash can never leave an authority allowed to issue unattended under a
+    /// policy nobody confirmed.
+    #[test]
+    fn installing_a_delegation_that_names_the_current_policy_migrates_a_superseded_domain() {
+        let superseded = aether::certificates::approval::superseded_per_request_policy_fingerprint(
+            domain(),
+            gateway_key(),
+            SERVER_NAME,
+        )
+        .expect("superseded");
+        let mut pinned = domain_pinned_to(superseded);
+
+        adopt(
+            &mut pinned.registry,
+            delegation_naming(
+                &pinned.ca_private,
+                pinned.issuer_public.clone(),
+                pinned.intermediate_der.clone(),
+                automatic_policy_fingerprint(),
+            ),
+            &pinned.pq_key,
+            &pinned.tls_key,
+            1_000,
+        )
+        .expect("the migration is accepted");
+
+        assert!(pinned
+            .registry
+            .state()
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&automatic_policy_fingerprint()));
+        assert!(
+            pinned.registry.state().issuer.is_some(),
+            "the delegation is installed by the same write"
+        );
+    }
+
+    /// A `CA-PQ` signature makes a delegation genuine, not applicable. One
+    /// naming a third policy leaves a superseded domain exactly where it was —
+    /// still refusing unattended issuance.
+    #[test]
+    fn a_delegation_naming_a_third_policy_migrates_nothing() {
+        let superseded = aether::certificates::approval::superseded_per_request_policy_fingerprint(
+            domain(),
+            gateway_key(),
+            SERVER_NAME,
+        )
+        .expect("superseded");
+        let mut pinned = domain_pinned_to(superseded);
+        let mut widened =
+            AstraIssuancePolicy::standard(domain(), gateway_key(), SERVER_NAME.into());
+        widened.maximum_leaf_lifetime_secs = 10 * 365 * 86_400;
+
+        assert!(matches!(
+            adopt(
+                &mut pinned.registry,
+                delegation_naming(
+                    &pinned.ca_private,
+                    pinned.issuer_public.clone(),
+                    pinned.intermediate_der.clone(),
+                    widened.fingerprint().expect("widened"),
+                ),
+                &pinned.pq_key,
+                &pinned.tls_key,
+                1_000,
+            ),
+            Err(AdoptionError::Policy(_))
+        ));
+        assert!(pinned
+            .registry
+            .state()
+            .astra_policy_fingerprint
+            .fingerprint()
+            .matches(&superseded));
+        assert!(pinned.registry.state().issuer.is_none());
+    }
+
     /// Present is not correct. The delegation and the two private keys arrive
     /// from different places, and a mismatch that startup lets through only
     /// surfaces at the first renewal — on a client with no fallback.
@@ -1020,7 +1189,9 @@ pub fn adopt(
     tls_key_path: &std::path::Path,
     now_unix: u64,
 ) -> Result<u64, AdoptionError> {
-    {
+    // `None` unless this delegation is the one that carries the domain off the
+    // superseded per-request policy; then it is the pin to persist with it.
+    let adopted_policy = {
         let state = registry.state();
         authorization.verify(
             &state.ca_public_key,
@@ -1031,11 +1202,30 @@ pub fn adopt(
             &state.server_name,
             now_unix,
         )?;
-        state
+        // §2.4 ordering is preserved: `CA-PQ` has spoken above, and only then
+        // is the policy the document names read.
+        match state
             .astra_policy_fingerprint
             .assert_authorizes(&authorization)
-            .map_err(AdoptionError::Policy)?;
-    }
+        {
+            Ok(()) => None,
+            Err(refusal) => match state
+                .astra_policy_fingerprint
+                .adopt_automatic_renewal_policy(
+                    state.trust_domain_id,
+                    state.gateway_wg_public_key,
+                    &state.server_name,
+                    &authorization,
+                ) {
+                Ok(PolicyMigration::Adopted(pin)) => Some(pin),
+                // The pin already names the current policy, yet the delegation
+                // did not match it: the document carries some third policy.
+                // The first refusal is the accurate one.
+                Ok(PolicyMigration::AlreadyCurrent) => return Err(AdoptionError::Policy(refusal)),
+                Err(_) => return Err(AdoptionError::Policy(refusal)),
+            },
+        }
+    };
 
     let issuer_epoch = authorization.issuer_epoch;
     if !pq_key_path.exists() || !tls_key_path.exists() {
@@ -1048,12 +1238,13 @@ pub fn adopt(
     DelegatedIssuer::load(authorization.clone(), pq_private_key, tls_private_key)
         .map_err(AdoptionError::Possession)?;
 
-    registry.install_issuer(
+    registry.install_issuer_adopting_policy(
         aether::certificates::state::AstraIssuerState {
             issuer_epoch,
             authorization,
             state: aether::certificates::state::IssuerLifecycle::Active,
         },
+        adopted_policy,
         now_unix,
     )?;
     Ok(issuer_epoch)

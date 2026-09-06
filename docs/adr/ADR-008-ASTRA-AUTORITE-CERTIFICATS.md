@@ -24,6 +24,16 @@ nouvelle confirmation hors bande et une nouvelle délégation. Une mise à jour
 logicielle seule ne réinterprète jamais l'ancienne empreinte comme une
 autorisation automatique.
 
+La confirmation hors bande prend la forme que les clés de l'opérateur
+produisent déjà : une `AstraIssuerAuthorization` signée par `CA-PQ` et portant
+l'empreinte de la politique courante. Astra l'adopte en installant cette
+délégation, dans la même écriture durable ; la gateway, qui épingle la
+politique pour son propre compte, l'adopte par `heliosd
+adopt-issuance-policy`, sur la même délégation et sous la même ancre. Un
+registre épinglé à autre chose que la politique remplacée n'est pas déplacé :
+il n'appartient pas à cette migration, et le deviner serait l'élargissement
+silencieux que cet amendement refuse.
+
 **Clarification du 2026-08-16** : dans ce relais, la demande et le commit Orion
 passent dans WireGuard ; l'autorisation de stage et le reçu passent directement
 entre Astra et Helios sur le veth. Le reçu laisse le candidat en
