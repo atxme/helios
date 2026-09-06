@@ -219,6 +219,17 @@ pub struct PeerCertificateStateView {
     pub state: ClientCertificateState,
     /// The leaf of the active generation, as the registry holds it.
     pub active_pq_certificate: aether::key_negotiation::PqCertificate,
+    /// The operator admission anchor this gateway verifies client PQ leaves
+    /// under, beside the domain's own authorities.
+    ///
+    /// A first-generation leaf is signed by it: enrolment happens offline,
+    /// without the vault, so it cannot be signed by `CA-PQ`. Renewed leaves
+    /// come from the domain anchor or its delegated issuer instead. An
+    /// authority that verified a historical leaf under the domain half alone
+    /// would refuse every identity that has never been renewed — which is
+    /// precisely the population a §7.5 recovery is for.
+    #[serde(default)]
+    pub admission_pq_ca: Option<aether::certificates::encoding::MlDsa87PublicKey>,
 }
 
 /// The gateway side of the private channel, implemented by the daemon.
@@ -2211,6 +2222,7 @@ mod tests {
                 not_after_unix: 1_000_000,
                 ml_dsa_87_signature: "c2lnbmF0dXJl".into(),
             },
+            admission_pq_ca: None,
         };
         let encoded = serde_json::to_string(&view)
             .expect("encode")

@@ -185,6 +185,7 @@ mod tests {
             pending: None,
             revoked: false,
             revocation_epoch: 0,
+            admission_pq_ca: None,
         }
     }
 

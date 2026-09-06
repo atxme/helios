@@ -46,6 +46,15 @@ pub struct PeerRecord {
     /// identity (spec §10.2).
     pub revoked: bool,
     pub revocation_epoch: u64,
+    /// The operator admission anchor the gateway named when it transcribed
+    /// this peer.
+    ///
+    /// A first-generation leaf is signed by it and by nothing this domain
+    /// holds: enrolment is offline, so `CA-PQ` cannot sign it. Recorded so a
+    /// §7.5 recovery can verify a leaf that has never been renewed — the only
+    /// population that recovery is for.
+    #[serde(default)]
+    pub admission_pq_ca: Option<MlDsa87PublicKey>,
 }
 
 /// A rotation in flight, from the authority's point of view.
@@ -1533,6 +1542,7 @@ mod tests {
                     }),
                     revoked: false,
                     revocation_epoch: 0,
+                    admission_pq_ca: None,
                 },
             );
             client
@@ -2778,6 +2788,7 @@ mod tests {
                     pending: None,
                     revoked: false,
                     revocation_epoch: 0,
+                    admission_pq_ca: None,
                 },
                 1_000,
             )

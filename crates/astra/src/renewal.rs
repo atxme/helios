@@ -219,6 +219,7 @@ pub(crate) async fn transcribe_peer(
         pending: None,
         revoked: view.state.revoked,
         revocation_epoch: view.state.revocation_epoch,
+        admission_pq_ca: view.admission_pq_ca,
     };
     service.registry.lock().await.admit(record, now_unix)?;
     Ok(())

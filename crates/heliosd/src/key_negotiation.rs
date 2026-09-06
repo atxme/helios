@@ -4017,6 +4017,7 @@ mod tests {
                         webauthn_rp_id: "astra.helios.local".into(),
                         astra_policy_fingerprint: "11".repeat(32),
                         credential_registry_epoch: 1,
+                        astra_credential_bindings: Vec::new(),
                         astra_service_key_epoch: 1,
                         astra_service_public_key: base64::engine::general_purpose::STANDARD
                             .encode(&ca_public),

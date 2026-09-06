@@ -176,6 +176,7 @@ impl CertificateService {
                 name: peer.name.clone(),
                 state: peer.state.clone(),
                 active_pq_certificate: peer.active_pq_certificate.clone(),
+                admission_pq_ca: admission_pq_ca(),
             }
         };
         let relayed = helios_api::internal::RelayedTrustUpdatePreparation {
@@ -648,6 +649,18 @@ impl AstraStageHandler for CertificateService {
 /// once at startup and served until the process stops. Applying it here would
 /// mark a state nothing acts on, which is worse than refusing. Delivering §6's
 /// transition path, with the restart it implies, is what unblocks it.
+/// The operator admission anchor, as the negotiation port reads it.
+///
+/// Absent when the file is missing or unreadable rather than fatal: the
+/// authority then verifies a historical leaf under the domain's own
+/// authorities alone, which is the behaviour that predates this field. A
+/// gateway without it refuses recoveries of never-renewed identities; one that
+/// failed the whole private channel over it would refuse everything.
+fn admission_pq_ca() -> Option<aether::certificates::encoding::MlDsa87PublicKey> {
+    let bytes = std::fs::read(crate::key_negotiation::CLIENT_PQ_CA_PATH).ok()?;
+    aether::certificates::encoding::MlDsa87PublicKey::new(bytes).ok()
+}
+
 #[async_trait]
 impl helios_api::internal::AstraChannelHandler for CertificateService {
     async fn revoke(
@@ -722,6 +735,11 @@ impl helios_api::internal::AstraChannelHandler for CertificateService {
             name: peer.name.clone(),
             state: peer.state.clone(),
             active_pq_certificate: peer.active_pq_certificate.clone(),
+            // Lu ici plutôt que mémorisé : c'est le fichier que le port de
+            // négociation lit lui-même, donc les deux ne peuvent pas diverger.
+            // Absent, l'autorité garde le comportement d'avant — les feuilles
+            // du domaine, et rien d'autre.
+            admission_pq_ca: admission_pq_ca(),
         })
     }
 

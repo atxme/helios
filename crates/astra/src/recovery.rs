@@ -263,6 +263,20 @@ pub async fn open(
         if let Some(issuer) = &state.issuer {
             issuers.push(issuer.authorization.pq_issuer_public_key.clone());
         }
+        // Et l'ancre d'admission, quand la gateway l'a nommée. Une feuille de
+        // première génération est signée par elle et par rien que ce domaine
+        // détienne : l'enrôlement se fait hors ligne, sans le coffre, donc
+        // `CA-PQ` ne peut pas la signer. Ne fournir que les autorités du
+        // domaine revenait à refuser toute identité jamais renouvelée — c'est
+        // exactement la population que §7.5 sert.
+        //
+        // Elle n'affaiblit pas la vérification : la feuille présentée doit
+        // déjà être, empreinte pour empreinte, celle que la gateway a
+        // transcrite. La signature d'émetteur confirme cette liaison, elle ne
+        // la remplace pas.
+        if let Some(admission) = &peer.admission_pq_ca {
+            issuers.push(admission.clone());
+        }
         (
             issuers,
             state.trust_domain_id,
