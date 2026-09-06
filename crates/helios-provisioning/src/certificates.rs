@@ -99,6 +99,11 @@ pub enum RegistryError {
     AlreadyBootstrapped(PathBuf),
     #[error("legacy client CA-TLS bootstrap repair refused: {0}")]
     LegacyClientTlsCaRepair(&'static str),
+    #[error(
+        "delegation at issuer epoch {offered} does not advance past the installed epoch \
+         {installed}: a spent epoch carrying different bytes is a substitution"
+    )]
+    IssuerEpochNotAdvancing { installed: u64, offered: u64 },
 }
 
 /// Result of checking the narrowly-scoped historical CA-TLS bootstrap bug.
@@ -1191,26 +1196,43 @@ impl CertificateRegistry {
         Ok(outcome)
     }
 
-    /// Moves this registry off the superseded per-request issuance policy.
+    /// Records Astra's delegated issuer, and the policy that delegation names.
     ///
-    /// The gateway pins the policy independently of Astra, so it has to be
-    /// carried across by the same evidence and not by a message from the
-    /// authority: an [`AstraIssuerAuthorization`] signed by the `CA-PQ` this
-    /// registry already holds, naming the current standard policy. Verified
-    /// here under that anchor before its policy is read, and refused for any
-    /// other pin — see
+    /// The gateway has to hold the delegation itself, not merely see one
+    /// inside an approval: [`RegistryState::client_leaf_issuers`] is what both
+    /// the staging check and the negotiation port build their issuer set from,
+    /// and the two must not drift — a staging check that trusted a delegation
+    /// the port does not hold would stage a leaf that locks its owner out at
+    /// the end of the overlap. So the delegation is durable state here, as it
+    /// is on the authority side.
+    ///
+    /// It is verified under the `CA-PQ` this registry already holds before its
+    /// policy is read, and its epoch must advance — a spent epoch carrying
+    /// different bytes is a substitution, not a replay.
+    ///
+    /// The pinned policy is decided in the same call and written in the same
+    /// atomic persist: a delegation recorded without the policy it names would
+    /// be refused on the next read, and a policy adopted without its
+    /// delegation would widen what may be issued before anything authorized
+    /// it. See
     /// [`AstraPolicyPin::adopt_automatic_renewal_policy`](aether::certificates::approval::AstraPolicyPin::adopt_automatic_renewal_policy).
-    ///
-    /// Nothing else in the registry moves. The delegation is not installed by
-    /// this call: on the gateway a delegation travels inside the approval it
-    /// authorizes, and recording one here would be a second, unbound copy.
-    pub fn adopt_automatic_renewal_policy(
+    pub fn install_astra_issuer(
         &mut self,
         delegation: &aether::certificates::authority::AstraIssuerAuthorization,
         now_unix: u64,
     ) -> Result<aether::certificates::approval::PolicyMigration, RegistryError> {
         use aether::certificates::approval::PolicyMigration;
 
+        if let Some(installed) = &self.state.issuer {
+            if &installed.authorization != delegation
+                && delegation.issuer_epoch <= installed.issuer_epoch
+            {
+                return Err(RegistryError::IssuerEpochNotAdvancing {
+                    installed: installed.issuer_epoch,
+                    offered: delegation.issuer_epoch,
+                });
+            }
+        }
         let gateway = &self.state.gateway;
         delegation.verify(
             &gateway.current_ca_public_key,
@@ -1231,11 +1253,16 @@ impl CertificateRegistry {
                 &gateway.server_name,
                 delegation,
             )?;
+        let mut candidate = self.state.clone();
         if let PolicyMigration::Adopted(pin) = migration {
-            let mut candidate = self.state.clone();
             candidate.astra.astra_policy_fingerprint = pin;
-            self.persist(candidate)?;
         }
+        candidate.issuer = Some(aether::certificates::state::AstraIssuerState {
+            issuer_epoch: delegation.issuer_epoch,
+            authorization: delegation.clone(),
+            state: aether::certificates::state::IssuerLifecycle::Active,
+        });
+        self.persist(candidate)?;
         Ok(migration)
     }
 
@@ -3757,7 +3784,7 @@ mod tests {
 
         let migration = fixture
             .registry
-            .adopt_automatic_renewal_policy(&gateway_delegation_naming(&fixture.ca, current), 1_000)
+            .install_astra_issuer(&gateway_delegation_naming(&fixture.ca, current), 1_000)
             .expect("migration");
 
         assert!(matches!(migration, PolicyMigration::Adopted(_)));
@@ -3768,8 +3795,60 @@ mod tests {
             .astra_policy_fingerprint
             .fingerprint()
             .matches(&current));
+        // Without this the negotiation port cannot authenticate a renewed
+        // leaf, and the staging check would refuse every candidate Astra
+        // issues under the delegation it just accepted.
+        let issuer = fixture
+            .registry
+            .state()
+            .issuer
+            .as_ref()
+            .expect("the delegation is recorded");
+        assert_eq!(issuer.issuer_epoch, 1);
+        assert!(fixture
+            .registry
+            .state()
+            .client_leaf_issuers(1_000)
+            .contains(&&issuer.authorization.pq_issuer_public_key));
         assert_eq!(fixture.registry.state().peers, peers_before);
         assert_eq!(fixture.registry.state().ledger, ledger_before);
+    }
+
+    /// A spent epoch carrying different bytes is a substitution, not the
+    /// replay of a delegation whose delivery was lost.
+    #[test]
+    fn a_delegation_that_does_not_advance_its_epoch_is_refused() {
+        let mut fixture = fixture();
+        pin_to_superseded(&mut fixture);
+        let current = aether::certificates::approval::AstraIssuancePolicy::standard(
+            domain(),
+            gateway_key(),
+            SERVER_NAME.into(),
+        )
+        .fingerprint()
+        .expect("current");
+        let installed = gateway_delegation_naming(&fixture.ca, current);
+        fixture
+            .registry
+            .install_astra_issuer(&installed, 1_000)
+            .expect("first install");
+
+        // The same bytes again are a replay, and stay accepted.
+        fixture
+            .registry
+            .install_astra_issuer(&installed, 1_000)
+            .expect("replaying the same delegation is idempotent");
+
+        // Different bytes at the same epoch are not.
+        assert!(matches!(
+            fixture
+                .registry
+                .install_astra_issuer(&gateway_delegation_naming(&fixture.ca, current), 1_000),
+            Err(RegistryError::IssuerEpochNotAdvancing {
+                installed: 1,
+                offered: 1
+            })
+        ));
     }
 
     /// The evidence has to be this domain's. A delegation signed by another
@@ -3789,7 +3868,7 @@ mod tests {
 
         assert!(fixture
             .registry
-            .adopt_automatic_renewal_policy(&gateway_delegation_naming(&stranger, current), 1_000)
+            .install_astra_issuer(&gateway_delegation_naming(&stranger, current), 1_000)
             .is_err());
         assert!(fixture
             .registry

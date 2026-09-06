@@ -275,7 +275,7 @@ enum Command {
         /// Signed `ClientTlsCaTransition`, as JSON.
         transition: PathBuf,
     },
-    /// Adopts the current Astra issuance policy on a pre-amendment registry.
+    /// Records Astra's delegated issuer, and the policy it names.
     ///
     /// Until the amendment of 6 September 2026 a scheduled renewal asked for
     /// one operator credential per request. Dropping it widens what the
@@ -290,7 +290,7 @@ enum Command {
     /// policy is left untouched.
     ///
     /// **For a stopped daemon**, like the other registry commands.
-    AdoptIssuancePolicy {
+    InstallAstraIssuer {
         /// Signed `AstraIssuerAuthorization`, as JSON.
         delegation: PathBuf,
     },
@@ -560,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AbortGatewayTransition { abort } => abort_gateway_transition(&abort),
         Command::InstallCaTransition { transition } => install_ca_transition(&transition),
         Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
-        Command::AdoptIssuancePolicy { delegation } => adopt_issuance_policy(&delegation),
+        Command::InstallAstraIssuer { delegation } => install_astra_issuer(&delegation),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -878,12 +878,14 @@ fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Carries a pre-amendment registry onto the current issuance policy.
+/// Records the delegation the authority issues under, and its policy.
 ///
-/// Prints the pin it ends on either way, because "nothing changed" and "it was
-/// already right" are the same silence otherwise, and an operator running a
-/// migration is entitled to know which of the two happened.
-fn adopt_issuance_policy(source: &Path) -> anyhow::Result<()> {
+/// Both halves matter and neither is optional: without the delegation the
+/// negotiation port cannot authenticate a renewed leaf, and without the policy
+/// the authority refuses to issue one unattended. Prints the pin it ends on
+/// either way, because "nothing changed" and "it was already right" are the
+/// same silence otherwise.
+fn install_astra_issuer(source: &Path) -> anyhow::Result<()> {
     use aether::certificates::approval::PolicyMigration;
 
     let now_unix = now_unix()?;
@@ -891,7 +893,7 @@ fn adopt_issuance_policy(source: &Path) -> anyhow::Result<()> {
     let delegation: aether::certificates::authority::AstraIssuerAuthorization =
         gateway_rotation::read_signed_document(source, "Astra issuer authorization")?;
     let migration = registry
-        .adopt_automatic_renewal_policy(&delegation, now_unix)
+        .install_astra_issuer(&delegation, now_unix)
         .context("adopting the current Astra issuance policy")?;
 
     println!("issuer epoch: {}", delegation.issuer_epoch);
