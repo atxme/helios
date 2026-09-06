@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Cache Rust standard : registre, dépendances git et artefacts de build.
+      # Le toolchain et le job distinguent naturellement Linux et Windows.
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -38,16 +41,6 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             apps/orion/package-lock.json
-      - name: Cache Cargo et outils de contrôle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
       - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
@@ -64,6 +57,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -71,16 +65,6 @@ jobs:
           cache-dependency-path: |
             web/package-lock.json
             apps/orion/package-lock.json
-      - name: Cache Cargo et outils de contrôle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
       - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
@@ -115,20 +99,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: apps/orion/package-lock.json
-      - name: Cache Cargo et outils de contrôle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin/cargo-llvm-cov
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
       - name: Dépendances Orion
         run: npm ci --prefix apps/orion
       - name: Tests et build de l'IHM
