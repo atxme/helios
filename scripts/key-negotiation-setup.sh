@@ -228,12 +228,22 @@ ARG_ROTATE=""
 # sous /opt/helios/current.
 # Une identité déjà en place n'est pas une erreur : c'est le cas nominal dès le
 # deuxième client. La rotation reste un geste explicite.
+#
+# La leaf sous `CA-PQ` ne fait pas partie du test : elle n'est pas produite par
+# cette étape mais par la cérémonie hors ligne, plus tard. L'exiger ici faisait
+# passer pour « partielle » l'identité qu'un domaine neuf vient tout juste de
+# créer, et `init-key-negotiation` refusait alors de rejouer — le premier
+# passage ne pouvait pas être relancé. Ce que cette étape produit, et donc ce
+# qu'elle vérifie, est la paire scellée, son certificat de transport, les deux
+# CA opérateur et la demande d'amorçage. C'est aussi ce que `heliosd` retient
+# pour dire qu'une identité existe.
 if [ "$ROTATE_GW" -eq 0 ] &&
    ssh "$CIBLE" "test -f /var/lib/helios/key-negotiation-cert.der &&
-       test -f /var/lib/helios/key-negotiation-pq-cert.json &&
        test -f /var/lib/helios/key-negotiation-key.sealed &&
        test -f /var/lib/helios/key-negotiation-client-ca.der &&
-       test -f /var/lib/helios/key-negotiation-client-pq-ca-public.bin"; then
+       test -f /var/lib/helios/key-negotiation-client-pq-ca-public.bin &&
+       { test -f /var/lib/helios/key-negotiation-pq-cert.json ||
+         test -f /var/lib/helios/gateway-bootstrap-certificate-request.json; }"; then
     echo "    existing gateway identity reused"
 else
     if ! helios_ssh_sudo "$CIBLE" "\"$HELIOSD\" init-key-negotiation \
@@ -334,8 +344,14 @@ helios_ssh_sudo "$CIBLE" "
     install -d -m 700 '$REMOTE_PUBLIC_DIR'
     install -m 600 /var/lib/helios/key-negotiation-cert.der \
         '$REMOTE_PUBLIC_DIR/gateway-cert.der'
-    install -m 600 /var/lib/helios/key-negotiation-pq-cert.json \
-        '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json'
+    # La leaf sous \`CA-PQ\` peut ne pas exister encore : \`init-key-negotiation\`
+    # n'en émet plus d'auto-signée, et c'est la cérémonie hors ligne qui la
+    # produit. Une gateway qui attend la sienne est donc un état normal du
+    # premier passage, pas une panne — et \`set -e\` en ferait une.
+    if [ -f /var/lib/helios/key-negotiation-pq-cert.json ]; then
+        install -m 600 /var/lib/helios/key-negotiation-pq-cert.json \
+            '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json'
+    fi
     install -m 600 /var/lib/helios/key-negotiation-client-ca.der \
         '$REMOTE_PUBLIC_DIR/client-ca.der'
     install -m 600 /var/lib/helios/key-negotiation-client-pq-ca-public.bin \
@@ -345,7 +361,15 @@ helios_ssh_sudo "$CIBLE" "
     chown \$SUDO_UID:\$SUDO_GID '$REMOTE_PUBLIC_DIR' '$REMOTE_PUBLIC_DIR/'*
 "
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-cert.der" "$SORTIE/gateway-cert.der"
-scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-pq-cert.json" "$SORTIE/gateway-pq-cert.json"
+if ssh "${HELIOS_SSH_OPTS[@]}" "$CIBLE" \
+    "test -f '$REMOTE_PUBLIC_DIR/gateway-pq-cert.json'"; then
+    scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/gateway-pq-cert.json" "$SORTIE/gateway-pq-cert.json"
+else
+    # Et surtout : retirer celle d'avant. Un fichier laissé par un domaine
+    # précédent signerait une identité client sous une ancre que cette gateway
+    # ne sert plus, et la panne ne se verrait qu'à la première poignée de main.
+    rm -f "$SORTIE/gateway-pq-cert.json"
+fi
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-ca.der" "$SORTIE/installed-client-ca.der"
 scp -q "$CIBLE:$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin" \
     "$SORTIE/installed-client-pq-ca-public.bin"
@@ -360,10 +384,20 @@ ssh "$CIBLE" "rm -f '$REMOTE_PUBLIC_DIR/gateway-cert.der' \
     '$REMOTE_PUBLIC_DIR/client-ca.der' \
     '$REMOTE_PUBLIC_DIR/client-pq-ca-public.bin' \
     '$REMOTE_PUBLIC_DIR/peer-list.log'; rmdir '$REMOTE_PUBLIC_DIR'"
-[ -s "$SORTIE/gateway-cert.der" ] && [ -s "$SORTIE/gateway-pq-cert.json" ] || {
-    echo "ÉCHEC : certificats de négociation vides ou absents sur la gateway." >&2
+[ -s "$SORTIE/gateway-cert.der" ] || {
+    echo "ÉCHEC : certificat de négociation vide ou absent sur la gateway." >&2
     exit 1
 }
+# La leaf PQ n'est exigée que par le chemin client, qui la contresigne. Le
+# chemin gateway s'arrête juste après et n'en fait rien : l'imposer ici
+# interdirait le premier passage d'un domaine neuf, où elle n'existe pas encore.
+if [ "$GATEWAY_ONLY" -eq 0 ] && [ ! -s "$SORTIE/gateway-pq-cert.json" ]; then
+    echo "ÉCHEC : la gateway n'a pas encore de leaf sous CA-PQ." >&2
+    echo "        Émettre la cérémonie d'amorçage (astra-signer" >&2
+    echo "        issue-gateway-bootstrap), la reporter par heliosd" >&2
+    echo "        init-trust-domain, puis relancer." >&2
+    exit 1
+fi
 
 LOCAL_TLS_CA_SHA="$(sha256sum "$CA_DIR/orion-client-ca.der" | awk '{print $1}')"
 REMOTE_TLS_CA_SHA="$(sha256sum "$SORTIE/installed-client-ca.der" | awk '{print $1}')"
