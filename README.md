@@ -1,7 +1,8 @@
 # Helios
 
-Passerelle VPN **WireGuard** pour appliance Linux, pilotée par un daemon Rust.
-**Orion** est son client de bureau Tauri, `aether` porte les contrats partagés.
+Helios est une passerelle VPN WireGuard pour appliance Linux, pilotée par un
+daemon Rust. Orion est son client de bureau Tauri ; `aether` porte les contrats
+partagés.
 
 Avant tout paquet WireGuard, Orion négocie avec la gateway sur un port UDP dédié
 (QUIC/mTLS, PKI **ML-DSA-87**) et en ressort avec le PSK post-quantique que le
@@ -32,22 +33,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
           backend WireGuard · TPM/coffres · mise à jour signée
 ```
 
-## Fonctionnement
-
-La gateway crée `helios0`, écoute en UDP 51820 et attend les clients admis.
-WireGuard n'ayant pas de connexion persistante, l'état est inféré du handshake :
-`up` sous 150 s, `connecting` au-delà, plus `down`, `failed` et `captive_portal`.
-
-Le pare-feu est **fail-closed** : seul `up` autorise le trafic LAN, et le
-kill-switch reste engagé partout ailleurs, y compris à l'arrêt. Le backend
-Netlink traduit tout le ruleset puis l'applique — filtrage **et** NAT — en une
-seule transaction atomique.
-
-Orion n'a pas de pare-feu local : avec `AllowedIPs = 0.0.0.0/0`, son adaptateur
-reste monté après un échec pour que WireGuard jette les paquets. Seule une
-déconnexion explicite le démonte.
-
-## Workspace
+## Composants principaux
 
 | Composant | Rôle |
 |---|---|
@@ -69,13 +55,17 @@ déconnexion explicite le démonte.
 | `helios-installer` | Helper privilégié sans réseau : activation et rollback |
 | `xtask` | Bundles d'installation et installateur Windows d'Orion |
 
-## Démarrage
+## Construire et tester
 
 Prérequis : Rust 1.82+, Node.js 20.19+ ou 22.12+. Shell Tauri Linux :
 WebKitGTK 4.1 et GTK3 (`scripts/setup-dev.sh`).
 
 ```sh
+cargo build
 cargo test --workspace --all-features
+bash scripts/regression.sh             # campagne complète locale et CI
+
+# Développement local
 cargo run -p heliosd -- run --dev      # gateway en simulation
 npm run dev --prefix web               # console, proxy vers :8080
 bash scripts/lab.sh --keep             # banc jetable + profil importable
@@ -84,7 +74,7 @@ bash scripts/lab.sh --keep             # banc jetable + profil importable
 `scripts/regression.sh` est la référence avant chaque version : fmt, Clippy,
 tests toutes features, audits Cargo/npm, Vitest et builds frontend.
 
-## Exploitation
+## Développement et exploitation
 
 ```sh
 # sur la gateway
@@ -112,7 +102,7 @@ négociation, elle, est lue une fois au démarrage : une rotation s'applique par
 La CA opérateur vit dans `~/.helios/certs/internal-ca`, et à **un seul** endroit :
 la gateway n'en épingle qu'une.
 
-## Compilation cible
+## Compilation cible et limites
 
 ```sh
 npm run build --prefix web
@@ -163,5 +153,11 @@ Une compilation WSL2 n'est jamais une validation matérielle.
 
 ## Documentation
 
-[Index complet](docs/README.md) — architecture, ADR, spécifications, sécurité et
-tests. En cas de doute, le code et les ADR acceptés font foi.
+- [Architecture](docs/architecture/overview.md) — composants et responsabilités.
+- [Développement](docs/development/build.md) — construire, tester et travailler
+  localement.
+- [Contribution](CONTRIBUTING.md) — branches, commits et pull requests.
+- [Sécurité](SECURITY.md) — signalement et gestion des secrets.
+- [Index technique](docs/README.md) — ADR, spécifications, sécurité et tests.
+
+En cas de doute, le code et les ADR acceptés font foi.

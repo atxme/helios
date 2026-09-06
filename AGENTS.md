@@ -77,6 +77,12 @@ Before writing code, inspect the nearest analogous implementation, follow its na
 While implementing:
 
 * Prefer the smallest coherent change that fully solves the requested problem.
+* Respect the requested scope: do not modify unrelated components, runtime
+  configuration, packaging or deployment without explicit authorization.
+* Do not move or rename files or directories unless the task requires it and the
+  impact has been documented.
+* Keep commits atomic and never commit generated artifacts, credentials or
+  local environment files.
 * Extend existing patterns instead of introducing parallel architecture.
 * Do not add a dependency, framework, state store, crypto primitive or serialization format when an existing project mechanism fits.
 * Do not perform unrelated refactors or formatting churn.
@@ -179,3 +185,6 @@ If an expected check cannot run, report exactly what was not run and why. Do not
 ## Finish work cleanly
 
 Before finishing: review the diff for scope creep/duplication/secret leakage; confirm existing architectural and visual patterns were followed; ensure tests cover behavior + failure paths; update docs/specs when contracts changed; state checks run and target-only validation still required.
+
+For documentation-only work, verify that no source or test file changed and
+report the exact validation commands that were run.
