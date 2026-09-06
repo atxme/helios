@@ -225,6 +225,30 @@ pub async fn open(
     now_unix: u64,
 ) -> Result<ExpiredRecoveryOperationView, RecoveryError> {
     let client = request.client_wg_public_key;
+    // Le pair est transcrit depuis la gateway s'il ne l'est pas encore. Astra
+    // n'admet personne — la gateway le fait, et c'est elle qui a remis les
+    // feuilles à l'enrôlement — donc son registre se remplit en lisant le
+    // canal privé, jamais par une seconde admission qu'un opérateur devrait
+    // tenir à jour en double.
+    //
+    // Le renouvellement le faisait déjà ; la récupération, non. Elle refusait
+    // donc « aucun pair admis ne détient cette identité » à un poste que la
+    // gateway venait d'admettre, et cela pour toujours : la transcription
+    // n'avait lieu qu'au premier renouvellement ordinaire, et un poste éteint
+    // depuis son enrôlement n'en fait jamais. Le seul cas que §7.5 traite
+    // était exactement celui qu'il ne pouvait pas atteindre.
+    //
+    // Aucune date n'entre dans la transcription : elle compare la clé
+    // WireGuard et l'empreinte de la génération active, pas leur validité.
+    // C'est ce qui la rend utilisable ici, sur une feuille déjà périmée.
+    crate::renewal::transcribe_peer(service, &client, now_unix)
+        .await
+        .map_err(|error| match error {
+            crate::renewal::RenewalError::UnknownPeer => RecoveryError::UnknownPeer,
+            crate::renewal::RenewalError::Gateway(message) => RecoveryError::Gateway(message),
+            other => RecoveryError::Gateway(other.to_string()),
+        })?;
+
     let (issuers, trust_domain_id, gateway_key, server_name, last_known) = {
         let registry = service.registry.lock().await;
         let state = registry.state();
