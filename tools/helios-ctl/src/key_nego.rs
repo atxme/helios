@@ -73,10 +73,28 @@ const CLIENT_PQ_CERTIFICATE_FILE: &str = "orion-client-pq-cert.json";
 const CLIENT_PQ_PRIVATE_KEY_FILE: &str = "orion-client-pq-private.bin";
 /// The production validity used by the ordinary provisioning path.
 pub const DEFAULT_CLIENT_VALIDITY_SECS: u64 = 825 * 24 * 60 * 60;
-/// A short-lived identity is useful for lifecycle tests, but a certificate
-/// that expires while the profile is being admitted makes the result depend
-/// on operator typing speed rather than on the renewal window being tested.
-pub const MIN_CLIENT_VALIDITY_SECS: u64 = 10 * 60;
+/// Floor on a client leaf's life, for lifecycle tests only.
+///
+/// A renewal opens at 80 % of the life, and the leaf is backdated by
+/// [`CLOCK_SKEW_BACKDATE_SECS`], so the wait an operator actually sits through
+/// is `0.8 * (validity + backdate) - backdate` and the window left to act on
+/// the result is `0.2 * (validity + backdate)`. Two minutes of validity leaves
+/// under two minutes to act.
+///
+/// That is deliberately close to the edge: below it, a leaf can expire while
+/// the profile is still being admitted, and the test then measures operator
+/// typing speed instead of the renewal window it was meant to exercise. The
+/// floor is what keeps that failure mode a choice rather than an accident.
+pub const MIN_CLIENT_VALIDITY_SECS: u64 = 2 * 60;
+
+/// How far a freshly issued leaf is backdated.
+///
+/// Not a correction for a badly synchronised clock — it covers the moment when
+/// there is no synchronisation yet: a gateway restarted before its first NTP
+/// exchange, a workstation whose clock drifted while it was off. A verifier
+/// whose clock sits slightly behind the issuer's would otherwise refuse a leaf
+/// that is genuinely valid.
+pub const CLOCK_SKEW_BACKDATE_SECS: u64 = 300;
 
 #[derive(Subcommand)]
 pub enum KeyNegoCmd {
@@ -439,7 +457,7 @@ pub fn issue_client_material_with_validity(
             wireguard_public_key: wireguard_public_key.trim().to_string(),
             ml_dsa_87_public_key: base64::engine::general_purpose::STANDARD
                 .encode(client_pq_public_key),
-            not_before_unix: now.saturating_sub(300),
+            not_before_unix: now.saturating_sub(CLOCK_SKEW_BACKDATE_SECS),
             not_after_unix: now
                 .checked_add(validity_secs)
                 .context("client validity exceeds the Unix timestamp range")?,
@@ -872,7 +890,9 @@ mod tests {
             Ok(_) => panic!("a profile must leave time to complete admission"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("at least 600 seconds"));
+        assert!(error
+            .to_string()
+            .contains(&format!("at least {MIN_CLIENT_VALIDITY_SECS} seconds")));
 
         std::fs::remove_dir_all(root).unwrap();
     }

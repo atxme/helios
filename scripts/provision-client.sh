@@ -75,8 +75,9 @@ Usage : ./scripts/provision-client.sh <nom-client> [hôte-ssh] [options]
                          --trafic "100.64.0.0/10, 192.168.1.0/24"
   --leaf-validity-secs N
                        Validité des feuilles clientes en secondes, pour un
-                       profil de test du renouvellement (minimum 600 ;
-                       défaut 825 jours).
+                       profil de test du renouvellement (minimum 120 ;
+                       défaut 825 jours). L'attente avant que le
+                       renouvellement s'ouvre vaut 0,8 × (V + 300) − 300.
   --remplacer          (sans effet : un pair du même nom est toujours remplacé)
   --refaire-ca         Régénère la CA opérateur ET la négociation de la
                        gateway. Invalide tous les clients déjà admis.
@@ -196,8 +197,8 @@ if [ -n "$LEAF_VALIDITY_SECS" ]; then
             exit 1
             ;;
     esac
-    if [ "$LEAF_VALIDITY_SECS" -lt 600 ]; then
-        echo "--leaf-validity-secs doit valoir au moins 600 secondes." >&2
+    if [ "$LEAF_VALIDITY_SECS" -lt 120 ]; then
+        echo "--leaf-validity-secs doit valoir au moins 120 secondes." >&2
         exit 1
     fi
     ARG_LEAF_VALIDITY=(--validity-secs "$LEAF_VALIDITY_SECS")
