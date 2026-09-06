@@ -15,18 +15,15 @@
 //! 1. **here** — generate the candidate keys, sign
 //!    [`ClientCertificateRotationRequest`], post it to `request`;
 //! 2. Helios authenticates the peer and relays;
-//! 3. Astra opens an `awaiting_operator` operation;
-//! 4. the **companion** answers the WebAuthn challenge through the two
-//!    `signer-*` routes;
-//! 5. Astra issues, Helios persists the candidate and signs its receipt, and
+//! 3. Astra verifies the due window and its narrow issuer delegation;
+//! 4. Astra issues, Helios persists the candidate and signs its receipt, and
 //!    Astra releases the grant — three steps this client only observes;
-//! 6. **here** — verify the grant against what this store already trusts,
+//! 5. **here** — verify the grant against what this store already trusts,
 //!    persist the candidate, sign [`ClientCertificateStageCommit`], post it to
 //!    `stage-commit`, and commit locally.
 //!
-//! Step 4 is the operator's, not Orion's, and this module does not attempt it:
-//! Orion's job is to expose the operation so that a surface can launch
-//! `astra-signer` with `heliosd_url` and `operation_id`, then keep polling.
+//! No operator credential participates in this ordinary path. Recovery and
+//! manual authority campaigns use their separate companion-backed flows.
 //!
 //! # Why the private keys never leave this process
 //!
@@ -48,15 +45,6 @@
 //! the operation has to be reopened — which is the cheap failure, because the
 //! active generation is untouched and still connects.
 //!
-//! # Limite connue : le compagnon ne se lance pas d'ici
-//!
-//! This module drives the operation and reports `awaiting_operator`; it does
-//! not spawn `astra-signer`. The companion's own transport is still file-based
-//! — the public routes of §8.2 answer `501` and the binary does not yet know
-//! `heliosd_url` (spec §12.3, *non livré*). Until it does, a renewal reaches
-//! `awaiting_operator` and stops there, which is why [`RenewalStep`] names
-//! that state rather than treating it as an error.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -140,6 +128,12 @@ pub enum RenewalError {
          acceptée sous cet identifiant : en ouvrir une nouvelle."
     )]
     OperationFailed,
+    #[error(
+        "l'autorité demande encore une approbation YubiKey pour un renouvellement ordinaire. \
+         Mettre Astra à jour : la politique courante autorise automatiquement une identité \
+         active à partir de 80 % de sa validité."
+    )]
+    ObsoleteOperatorApproval,
     #[error("the operation named {returned} instead of {expected}")]
     OperationMismatch { expected: String, returned: String },
     #[error(
@@ -713,12 +707,12 @@ impl RenewalRoutes {
 
 /// Where a renewal stands, as a surface states it.
 ///
-/// `AwaitingOperator` is a step and not a failure: it is where every renewal
-/// legitimately waits, sometimes for hours, while a human finds their key.
+/// `AwaitingOperator` is retained only to decode the obsolete per-request
+/// ceremony. Current Orion refuses that state and asks for an Astra upgrade;
+/// scheduled renewal advances without a human or hardware credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenewalStep {
-    /// The request is in; the authority is waiting for the operator's
-    /// hardware credential. The surface launches the companion from here.
+    /// An obsolete server is waiting for a per-request hardware credential.
     AwaitingOperator { operation_id: Id16 },
     /// The approval landed and the authority is issuing. Nothing to do but
     /// poll.
@@ -1072,7 +1066,7 @@ impl RenewalSession {
         self.check_identity(&view)?;
         match view.state {
             ClientRenewalOperationState::AwaitingOperator => {
-                Ok(RenewalStep::AwaitingOperator { operation_id })
+                Err(RenewalError::ObsoleteOperatorApproval)
             }
             ClientRenewalOperationState::PendingGrant => Ok(RenewalStep::Issuing { operation_id }),
             ClientRenewalOperationState::Failed => Err(RenewalError::OperationFailed),
@@ -1246,7 +1240,7 @@ impl RenewalSession {
         };
         match view.state {
             ClientRenewalOperationState::AwaitingOperator => {
-                Ok(RenewalStep::AwaitingOperator { operation_id })
+                Err(RenewalError::ObsoleteOperatorApproval)
             }
             ClientRenewalOperationState::PendingGrant
             | ClientRenewalOperationState::PendingCommit => {
@@ -1410,20 +1404,7 @@ impl RenewalSession {
     }
 }
 
-/// One renewal, driven from a profile to whatever it can reach in one go.
-///
-/// # Why this returns rather than loops
-///
-/// A renewal waits on a human. The authority opens an operation and stops
-/// there until an operator touches a security key, which may be minutes or
-/// hours later — a driver that blocked on that would hold the interface, and a
-/// driver that polled in a loop would decide, on the user's behalf, how long
-/// they are allowed to take.
-///
-/// So this goes as far as it can and reports where it stopped.
-/// [`RenewalStep::AwaitingOperator`] carries the operation, and the caller
-/// shows [`RenewalSession::companion_invocation`] beside it; calling
-/// [`resume`] later with the same session finishes the job.
+/// One renewal, driven from a profile through the automatic ordinary path.
 ///
 /// # Why the session is returned even on the first step
 ///
@@ -1463,7 +1444,12 @@ pub async fn begin(
     let active = ActiveIdentity::from_bundle(&bundle)?;
     let mut session = RenewalSession::prepare(&store, identity, heliosd_url, now_unix)?;
     session.sign(&active)?;
-    let step = session.open().await?;
+    let mut step = session.open().await?;
+    if matches!(step, RenewalStep::Issuing { .. }) {
+        step = session
+            .advance(&mut store, &identities, identity, &active, now_unix)
+            .await?;
+    }
     Ok((session, store, step))
 }
 
@@ -1579,7 +1565,7 @@ mod tests {
             stage_id: Id16::new([5; 16]).expect("stage id"),
             stage_authorization_fingerprint: Fingerprint::of(b"authorization"),
             request_fingerprint: request.fingerprint(),
-            operator_approval_fingerprint: approval,
+            renewal_authorization_fingerprint: approval,
             gateway_wg_public_key: gateway_key(),
             client_wg_public_key: client_key(),
             active_generation: request.active_generation,
@@ -1609,7 +1595,7 @@ mod tests {
             issuer_authorization_fingerprint: Fingerprint::from_bytes([0; 32]),
             issuer_authorization: None,
             request_fingerprint: request.fingerprint(),
-            operator_approval_fingerprint: approval,
+            renewal_authorization_fingerprint: approval,
             renewal_approval: None,
             campaign_approval: None,
             stage_receipt_fingerprint: receipt.fingerprint(),

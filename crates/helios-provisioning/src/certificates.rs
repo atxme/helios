@@ -527,35 +527,16 @@ impl CertificateRegistry {
                         )
                         .into());
                     }
-                    let evidence = authorization.renewal_approval.as_ref().ok_or(
-                        CertificateError::ApprovalMismatch("delegated renewal approval"),
-                    )?;
-                    let service_epoch = evidence.approval_request.astra_service_key_epoch;
-                    let service_key = state
-                        .astra
-                        .service_key_for(service_epoch, now_unix)
-                        .ok_or(CertificateError::UnauthorizedIssuer)?;
-                    evidence.verify(
-                        &authorization.request_fingerprint,
-                        &state.gateway.current_ca_public_key,
-                        service_key,
-                        service_epoch,
-                        &state.trust_domain_id,
-                        &state.gateway.gateway_wg_public_key,
-                        caller_wg_public_key,
-                        &state.astra.webauthn_rp_id,
-                        peer.state.active.generation,
-                        state.gateway.ca_epoch,
-                        state.astra.credential_registry_epoch,
-                        // The approval is a five-minute authorization to
-                        // *issue*, not a five-minute lifetime for the staged
-                        // certificate. Prove it was live when Astra signed
-                        // this authorization; the stage's own lease governs
-                        // replay afterwards.
-                        authorization.issued_at,
-                    )?;
-                    let binding = evidence.approval.credential_binding.clone();
-                    state.astra.accept_credential_binding(&binding)?;
+                    if authorization.renewal_approval.is_some()
+                        || !authorization
+                            .renewal_authorization_fingerprint
+                            .matches(&authorization.request_fingerprint)
+                    {
+                        return Err(CertificateError::ApprovalMismatch(
+                            "automatic renewal request binding",
+                        )
+                        .into());
+                    }
                 }
                 RotationReason::ManualGlobal => {
                     if authorization.renewal_approval.is_some() {
@@ -569,7 +550,7 @@ impl CertificateRegistry {
                     )?;
                     if !evidence
                         .fingerprint()?
-                        .matches(&authorization.operator_approval_fingerprint)
+                        .matches(&authorization.renewal_authorization_fingerprint)
                     {
                         return Err(CertificateError::ApprovalMismatch(
                             "campaign approval fingerprint",
@@ -651,7 +632,7 @@ impl CertificateRegistry {
             stage_id: authorization.stage_id,
             stage_authorization_fingerprint: authorization.fingerprint()?,
             request_fingerprint: authorization.request_fingerprint,
-            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             gateway_wg_public_key: self.state.gateway.gateway_wg_public_key,
             client_wg_public_key: *caller_wg_public_key,
             active_generation,
@@ -783,35 +764,17 @@ impl CertificateRegistry {
                             )
                             .into());
                         }
-                        let evidence = grant.renewal_approval.as_ref().ok_or(
-                            CertificateError::ApprovalMismatch("delegated renewal approval"),
-                        )?;
-                        let service_epoch = evidence.approval_request.astra_service_key_epoch;
-                        let service_key = self
-                            .state
-                            .astra
-                            .service_key_for(service_epoch, now_unix)
-                            .ok_or(CertificateError::UnauthorizedIssuer)?;
-                        evidence.verify(
-                            &grant.request_fingerprint,
-                            &self.state.gateway.current_ca_public_key,
-                            service_key,
-                            service_epoch,
-                            &self.state.trust_domain_id,
-                            &self.state.gateway.gateway_wg_public_key,
-                            caller_wg_public_key,
-                            &self.state.astra.webauthn_rp_id,
-                            peer.state.active.generation,
-                            self.state.gateway.ca_epoch,
-                            self.state.astra.credential_registry_epoch,
-                            // Helios already verified the approval at stage
-                            // issuance. Re-check its signatures at commit
-                            // without turning the five-minute operator
-                            // ceremony into a five-minute commit deadline;
-                            // `stage_expires_at` is that deadline.
-                            evidence.approval.approved_at,
-                        )?;
-                        vec![evidence.approval.credential_binding.clone()]
+                        if grant.renewal_approval.is_some()
+                            || !grant
+                                .renewal_authorization_fingerprint
+                                .matches(&grant.request_fingerprint)
+                        {
+                            return Err(CertificateError::ApprovalMismatch(
+                                "automatic renewal request binding",
+                            )
+                            .into());
+                        }
+                        Vec::new()
                     }
                     RotationReason::ManualGlobal => {
                         if grant.renewal_approval.is_some() {
@@ -825,7 +788,7 @@ impl CertificateRegistry {
                         )?;
                         if !evidence
                             .fingerprint()?
-                            .matches(&grant.operator_approval_fingerprint)
+                            .matches(&grant.renewal_authorization_fingerprint)
                         {
                             return Err(CertificateError::ApprovalMismatch(
                                 "campaign approval fingerprint",
@@ -1745,10 +1708,14 @@ mod tests {
             astra: AstraProfile {
                 authority_url: "https://astra.example".into(),
                 webauthn_rp_id: "astra.example".into(),
-                astra_policy_fingerprint: aether::certificates::AstraPolicyPin::new(
-                    Fingerprint::of(b"policy"),
-                )
-                .expect("policy"),
+                astra_policy_fingerprint:
+                    aether::certificates::approval::AstraIssuancePolicy::standard(
+                        domain(),
+                        gateway_key(),
+                        SERVER_NAME.into(),
+                    )
+                    .pin()
+                    .expect("policy"),
                 credential_registry_epoch: 1,
                 credential_bindings: Default::default(),
                 active_astra_service_public_key: astra_key.public.clone(),
@@ -2041,7 +2008,7 @@ mod tests {
             issuer_authorization: None,
             stage_id: Id16::new([stage_id; 16]).expect("stage"),
             request_fingerprint: Fingerprint::of(b"request"),
-            operator_approval_fingerprint: Fingerprint::of(b"operator approval"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"operator approval"),
             renewal_approval: None,
             campaign_approval: None,
             gateway_wg_public_key: gateway_key(),
@@ -2087,7 +2054,7 @@ mod tests {
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
-            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             renewal_approval: authorization.renewal_approval.clone(),
             campaign_approval: authorization.campaign_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),

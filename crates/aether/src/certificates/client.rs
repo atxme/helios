@@ -351,7 +351,7 @@ pub struct ClientCertificateStageAuthorization {
     pub stage_id: Id16,
     pub request_fingerprint: Fingerprint,
     /// Non-zero fingerprint of the exact operator approval carried below.
-    pub operator_approval_fingerprint: Fingerprint,
+    pub renewal_authorization_fingerprint: Fingerprint,
     /// Complete ordinary-renewal evidence. Master-authority paths use another
     /// approval family and therefore leave this absent; their caller must
     /// verify that family before invoking this leaf-level verifier.
@@ -395,7 +395,7 @@ impl ClientCertificateStageAuthorization {
             .fingerprint(&self.issuer_authorization_fingerprint)
             .id(&self.stage_id)
             .fingerprint(&self.request_fingerprint)
-            .fingerprint(&self.operator_approval_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .key(&self.gateway_wg_public_key)
             .text(&self.server_name)
             .key(&self.client_wg_public_key)
@@ -480,36 +480,49 @@ impl ClientCertificateStageAuthorization {
             return Err(CertificateError::ClientIdentityMismatch);
         }
         if self
-            .operator_approval_fingerprint
+            .renewal_authorization_fingerprint
             .as_bytes()
             .iter()
             .all(|byte| *byte == 0)
         {
             return Err(CertificateError::ApprovalMismatch("missing approval"));
         }
-        match (self.issuer_kind, &self.renewal_approval) {
-            (IssuerKind::Astra, Some(evidence))
+        match (self.issuer_kind, self.reason, &self.renewal_approval) {
+            (IssuerKind::Astra, RotationReason::Scheduled, None)
                 if self
-                    .operator_approval_fingerprint
-                    .matches(&evidence.fingerprint()) => {}
-            (IssuerKind::Astra, Some(_)) => {
+                    .renewal_authorization_fingerprint
+                    .matches(&self.request_fingerprint) =>
+            {
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_allows_automatic_renewal(
+                        *trust_domain_id,
+                        *gateway_wg_public_key,
+                        server_name,
+                    )?;
+            }
+            (IssuerKind::Astra, RotationReason::Scheduled, _) => {
                 return Err(CertificateError::ApprovalMismatch(
-                    "operator approval fingerprint",
+                    "automatic renewal request binding",
                 ));
             }
-            (IssuerKind::Astra, None) => {
+            (IssuerKind::Astra, RotationReason::ManualGlobal, None) => {}
+            (IssuerKind::Astra, RotationReason::ManualGlobal, Some(_)) => {
                 return Err(CertificateError::ApprovalMismatch(
-                    "delegated renewal approval",
+                    "unexpected per-request approval",
                 ));
+            }
+            (IssuerKind::Astra, _, _) => {
+                return Err(CertificateError::UnauthorizedIssuer);
             }
             // Master-authority operations use their own approval family. It
             // must not be confused with an ordinary delegated renewal.
-            (IssuerKind::Master, Some(_)) => {
+            (IssuerKind::Master, _, Some(_)) => {
                 return Err(CertificateError::ApprovalMismatch(
                     "unexpected delegated renewal approval",
                 ));
             }
-            (IssuerKind::Master, None) => {}
+            (IssuerKind::Master, _, None) => {}
         }
         if self.active_generation != active.generation {
             return Err(CertificateError::GenerationRollback {
@@ -706,7 +719,7 @@ pub struct GatewayCertificateStageReceipt {
     pub stage_id: Id16,
     pub stage_authorization_fingerprint: Fingerprint,
     pub request_fingerprint: Fingerprint,
-    pub operator_approval_fingerprint: Fingerprint,
+    pub renewal_authorization_fingerprint: Fingerprint,
     pub gateway_wg_public_key: WireGuardKey,
     pub client_wg_public_key: WireGuardKey,
     pub active_generation: u64,
@@ -731,7 +744,7 @@ impl GatewayCertificateStageReceipt {
             .id(&self.stage_id)
             .fingerprint(&self.stage_authorization_fingerprint)
             .fingerprint(&self.request_fingerprint)
-            .fingerprint(&self.operator_approval_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .key(&self.gateway_wg_public_key)
             .key(&self.client_wg_public_key)
             .u64(self.active_generation)
@@ -788,8 +801,8 @@ impl GatewayCertificateStageReceipt {
                 .request_fingerprint
                 .matches(&authorization.request_fingerprint)
             || !self
-                .operator_approval_fingerprint
-                .matches(&authorization.operator_approval_fingerprint)
+                .renewal_authorization_fingerprint
+                .matches(&authorization.renewal_authorization_fingerprint)
         {
             return Err(CertificateError::FingerprintMismatch("stage authorization"));
         }
@@ -847,7 +860,7 @@ pub struct ClientCertificateRotationGrant {
     pub issuer_authorization_fingerprint: Fingerprint,
     pub issuer_authorization: Option<AstraIssuerAuthorization>,
     pub request_fingerprint: Fingerprint,
-    pub operator_approval_fingerprint: Fingerprint,
+    pub renewal_authorization_fingerprint: Fingerprint,
     pub renewal_approval: Option<AstraRenewalApprovalEvidence>,
     /// Carried onward from the authorization, so the client checks the same
     /// family the gateway did rather than trusting that it happened.
@@ -884,7 +897,7 @@ impl ClientCertificateRotationGrant {
             .u64(self.issuer_epoch)
             .fingerprint(&self.issuer_authorization_fingerprint)
             .fingerprint(&self.request_fingerprint)
-            .fingerprint(&self.operator_approval_fingerprint)
+            .fingerprint(&self.renewal_authorization_fingerprint)
             .fingerprint(&self.stage_receipt_fingerprint)
             .key(&self.gateway_wg_public_key)
             .text(&self.server_name)
@@ -1205,34 +1218,47 @@ impl ClientCertificateRotationGrant {
             return Err(CertificateError::ClientIdentityMismatch);
         }
         if self
-            .operator_approval_fingerprint
+            .renewal_authorization_fingerprint
             .as_bytes()
             .iter()
             .all(|byte| *byte == 0)
         {
             return Err(CertificateError::ApprovalMismatch("missing approval"));
         }
-        match (self.issuer_kind, &self.renewal_approval) {
-            (IssuerKind::Astra, Some(evidence))
+        match (self.issuer_kind, self.reason, &self.renewal_approval) {
+            (IssuerKind::Astra, RotationReason::Scheduled, None)
                 if self
-                    .operator_approval_fingerprint
-                    .matches(&evidence.fingerprint()) => {}
-            (IssuerKind::Astra, Some(_)) => {
+                    .renewal_authorization_fingerprint
+                    .matches(&self.request_fingerprint) =>
+            {
+                policy_pin
+                    .ok_or(CertificateError::PolicyNotPinned)?
+                    .assert_allows_automatic_renewal(
+                        *trust_domain_id,
+                        *gateway_wg_public_key,
+                        server_name,
+                    )?;
+            }
+            (IssuerKind::Astra, RotationReason::Scheduled, _) => {
                 return Err(CertificateError::ApprovalMismatch(
-                    "operator approval fingerprint",
+                    "automatic renewal request binding",
                 ));
             }
-            (IssuerKind::Astra, None) => {
+            (IssuerKind::Astra, RotationReason::ManualGlobal, None) => {}
+            (IssuerKind::Astra, RotationReason::ManualGlobal, Some(_)) => {
                 return Err(CertificateError::ApprovalMismatch(
-                    "delegated renewal approval",
+                    "unexpected per-request approval",
                 ));
             }
-            (IssuerKind::Master, Some(_)) => {
+            (IssuerKind::Astra, _, _) => {
+                return Err(CertificateError::UnauthorizedIssuer);
+            }
+            (IssuerKind::Master, _, Some(_)) => {
                 return Err(CertificateError::ApprovalMismatch(
                     "unexpected delegated renewal approval",
                 ));
             }
-            (IssuerKind::Master, None) => {}
+            (IssuerKind::Master, _, None) => {}
         }
         if !self
             .stage_receipt_fingerprint
@@ -1248,8 +1274,8 @@ impl ClientCertificateRotationGrant {
                 .matches(&self.request_fingerprint)
             || !self
                 .stage_receipt
-                .operator_approval_fingerprint
-                .matches(&self.operator_approval_fingerprint)
+                .renewal_authorization_fingerprint
+                .matches(&self.renewal_authorization_fingerprint)
         {
             return Err(CertificateError::FingerprintMismatch("stage receipt"));
         }
@@ -1814,12 +1840,7 @@ mod signing {
 #[cfg(all(test, feature = "key-negotiation-signing"))]
 mod tests {
     use super::*;
-    use crate::certificates::approval::{
-        AstraCredentialApprovalRequest, AstraCredentialBinding, AstraRenewalApproval,
-        CredentialState,
-    };
     use crate::certificates::encoding::{generate_ml_dsa_87_keypair, sign_ml_dsa_87};
-    use crate::certificates::webauthn::WebAuthnAssertion;
     use crate::key_negotiation::{issue_pq_certificate, PQ_CERTIFICATE_VERSION};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use zeroize::Zeroizing;
@@ -1846,6 +1867,16 @@ mod tests {
 
     fn client_key() -> WireGuardKey {
         WireGuardKey::from_bytes([2; 32])
+    }
+
+    fn automatic_policy_fingerprint() -> Fingerprint {
+        crate::certificates::approval::AstraIssuancePolicy::standard(
+            domain(),
+            gateway_key(),
+            SERVER_NAME.into(),
+        )
+        .fingerprint()
+        .expect("automatic policy")
     }
 
     fn client_leaf(ca: &Keys, subject: &Keys, serial: u8) -> PqCertificate {
@@ -1877,70 +1908,6 @@ mod tests {
             pq_certificate_fingerprint: Fingerprint::of(b"active pq"),
             not_before: 0,
             not_after: 100_000,
-        }
-    }
-
-    /// Structurally complete evidence for tests whose subject is issuer
-    /// resolution. Full WebAuthn and CA-PQ verification lives in
-    /// `certificates::approval`; the leaf-level verifier only binds its exact
-    /// fingerprint before the registry performs that cryptographic check.
-    fn approval_evidence(request_fingerprint: Fingerprint) -> AstraRenewalApprovalEvidence {
-        let operation_id = Id16::new([7; 16]).expect("operation id");
-        let approval_request = AstraCredentialApprovalRequest {
-            format_version: CERTIFICATE_FORMAT_VERSION,
-            operation_id,
-            request_fingerprint,
-            trust_domain_id: domain(),
-            gateway_wg_public_key: gateway_key(),
-            client_wg_public_key: client_key(),
-            active_generation: 4,
-            requested_generation: 5,
-            credential_registry_epoch: 1,
-            webauthn_rp_id: "astra.example".into(),
-            webauthn_origin: "https://astra.example".into(),
-            allowed_credential_ids: vec![vec![1]],
-            required_credentials: 1,
-            created_at: 1_000,
-            expires_at: 1_300,
-            astra_service_key_epoch: 1,
-            astra_signature: MlDsa87Signature::placeholder(),
-        };
-        let binding = AstraCredentialBinding {
-            format_version: CERTIFICATE_FORMAT_VERSION,
-            credential_id: vec![1],
-            credential_public_key: vec![1],
-            aaguid: [0; 16],
-            trust_domain_id: domain(),
-            gateway_wg_public_key: gateway_key(),
-            state: CredentialState::Active,
-            credential_epoch: 1,
-            credential_registry_epoch: 1,
-            ca_epoch: 1,
-            created_at: 1_000,
-            ca_pq_signature: MlDsa87Signature::placeholder(),
-        };
-        let assertion = WebAuthnAssertion {
-            authenticator_data: vec![1],
-            client_data_json: vec![1],
-            signature: vec![1],
-        };
-        let approval = AstraRenewalApproval {
-            format_version: CERTIFICATE_FORMAT_VERSION,
-            operation_id,
-            request_fingerprint,
-            approval_request_fingerprint: approval_request.fingerprint(),
-            credential_fingerprint: binding.fingerprint(),
-            assertion_fingerprint: assertion.fingerprint(),
-            credential_binding: binding,
-            webauthn_assertion: assertion,
-            approved_at: 1_000,
-            expires_at: 1_300,
-            astra_service_key_epoch: 1,
-            astra_signature: MlDsa87Signature::placeholder(),
-        };
-        AstraRenewalApprovalEvidence {
-            approval_request,
-            approval,
         }
     }
 
@@ -2102,7 +2069,7 @@ mod tests {
             issuer_authorization: None,
             stage_id: Id16::new([5; 16]).expect("stage"),
             request_fingerprint,
-            operator_approval_fingerprint: Fingerprint::of(b"operator approval"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"operator approval"),
             renewal_approval: None,
             campaign_approval: None,
             gateway_wg_public_key: gateway_key(),
@@ -2212,7 +2179,7 @@ mod tests {
             ),
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 200_000,
-            policy_fingerprint: Fingerprint::of(b"policy"),
+            policy_fingerprint: automatic_policy_fingerprint(),
             not_before: 0,
             not_after: 500_000,
             ca_pq_signature: MlDsa87Signature::placeholder(),
@@ -2227,9 +2194,8 @@ mod tests {
         authorization.issuer_epoch = 3;
         authorization.issuer_authorization_fingerprint = delegation.fingerprint();
         authorization.issuer_authorization = Some(delegation.clone());
-        let evidence = approval_evidence(authorization.request_fingerprint);
-        authorization.operator_approval_fingerprint = evidence.fingerprint();
-        authorization.renewal_approval = Some(evidence);
+        authorization.renewal_authorization_fingerprint = authorization.request_fingerprint;
+        authorization.renewal_approval = None;
         let authorization = authorization.sign(&issuer.private).expect("sign");
 
         authorization
@@ -2243,17 +2209,17 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
-                Some(&AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("policy pin")),
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin")),
                 None,
                 1_100,
             )
             .expect("a delegated leaf verifies under its delegation");
 
-        let mut missing_approval = authorization.clone();
-        missing_approval.renewal_approval = None;
-        let missing_approval = missing_approval.sign(&issuer.private).expect("sign");
+        let mut missing_binding = authorization.clone();
+        missing_binding.renewal_authorization_fingerprint = Fingerprint::of(b"another request");
+        let missing_binding = missing_binding.sign(&issuer.private).expect("sign");
         assert!(matches!(
-            missing_approval.verify(
+            missing_binding.verify(
                 &ca.public,
                 &domain(),
                 1,
@@ -2263,12 +2229,12 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
-                Some(&AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("policy pin"),),
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin"),),
                 None,
                 1_100,
             ),
             Err(CertificateError::ApprovalMismatch(
-                "delegated renewal approval"
+                "automatic renewal request binding"
             ))
         ));
 
@@ -2289,7 +2255,7 @@ mod tests {
                 &client_key(),
                 &active_generation(),
                 &[&tls.authority],
-                Some(&AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("policy pin"),),
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin"),),
                 None,
                 1_100,
             ),

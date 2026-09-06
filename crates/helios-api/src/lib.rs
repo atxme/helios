@@ -356,12 +356,9 @@ pub fn router(state: AppState) -> Router {
                 aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
             )),
         )
-        // The relayed ordinary renewal (spec §8.1.2). Four routes, all behind
-        // the same source-VIP resolution: a peer opens an operation, polls it,
-        // and passes its companion through the two `signer-*` exchanges. None
-        // of them reaches Astra's public origin, and none of them is a proxy —
-        // each accepts one type, one size, and relays an object the gateway
-        // built itself.
+        // The relayed ordinary renewal (spec §8.1.2). A peer opens an
+        // operation, polls it, then commits the resulting grant. The 80 %
+        // path has no operator-companion exchange.
         .route(
             "/api/key-negotiation/certificate-renewal/request",
             post(certificates::renewal_request).layer(DefaultBodyLimit::max(
@@ -371,16 +368,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/key-negotiation/certificate-renewal/operations/:operation",
             get(certificates::renewal_operation),
-        )
-        .route(
-            "/api/key-negotiation/certificate-renewal/signer-requests/:operation",
-            get(certificates::renewal_signer_request),
-        )
-        .route(
-            "/api/key-negotiation/certificate-renewal/signer-results/:operation",
-            post(certificates::renewal_signer_result).layer(DefaultBodyLimit::max(
-                aether::certificates::transport::MAX_TRUST_UPDATE_REQUEST_BYTES,
-            )),
         )
         // The commit of §8.1.2 is the route above under its historical path.
         // Both are mounted on the same handler: the spec's list names the

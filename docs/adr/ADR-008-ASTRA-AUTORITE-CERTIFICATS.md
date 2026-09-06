@@ -13,6 +13,17 @@ Astra sur le veth privé. Chaque renouvellement exige désormais une approbation
 YubiKey liée à sa demande exacte ; cette approbation autorise l'émetteur
 délégué et n'ouvre pas les clés maîtresses.
 
+**Amendement du 2026-09-06** : l'approbation YubiKey par demande introduite le
+15 août est retirée du renouvellement client ordinaire. À 80 % de la validité,
+Orion génère une identité candidate et le renouvellement s'exécute
+automatiquement dans le tunnel sous la délégation Astra bornée. La YubiKey
+reste obligatoire pour une récupération après expiration, une réadmission,
+une campagne anticipée ou globale et toute mutation d'autorité.
+Cette réduction de cérémonie modifie l'empreinte de politique : elle exige une
+nouvelle confirmation hors bande et une nouvelle délégation. Une mise à jour
+logicielle seule ne réinterprète jamais l'ancienne empreinte comme une
+autorisation automatique.
+
 **Clarification du 2026-08-16** : dans ce relais, la demande et le commit Orion
 passent dans WireGuard ; l'autorisation de stage et le reçu passent directement
 entre Astra et Helios sur le veth. Le reçu laisse le candidat en
@@ -49,10 +60,9 @@ Trois contraintes déterminent la décision :
 2. les clés privées TLS et ML-DSA-87 d'Orion naissent et restent dans son
    stockage protégé Windows ; une autorité ne reçoit que leurs parties
    publiques et preuves de possession ;
-3. une autorité en ligne doit pouvoir préparer le renouvellement d'un pair déjà
-   admis, mais ne doit l'émettre qu'après une présence YubiKey explicite, sans
-   pour autant détenir sans limite le pouvoir de créer un pair, de ressusciter
-   une identité expirée ou de tourner l'ancre du parc.
+3. une autorité en ligne doit renouveler automatiquement un pair encore actif
+   et déjà admis, sans pour autant détenir le pouvoir de créer un pair, de
+   ressusciter une identité expirée ou de tourner l'ancre du parc.
 
 ## Décision
 
@@ -126,9 +136,9 @@ le message avec `ctx = ""` n'est pas équivalent et est refusé, en particulier
 pour toute signature de `CA-PQ`.
 
 Le canal WireGuard est obligatoire dès qu'il existe. Une opération ordinaire
-initiée par Orion, y compris la récupération de la requête par `astra-signer`
-et le dépôt de son assertion WebAuthn, passe par des routes typées de l'API
-interne du tunnel. `heliosd` résout d'abord la VIP source vers l'unique pair
+initiée par Orion passe par des routes typées de l'API interne du tunnel, sans
+appel à `astra-signer` ni assertion WebAuthn. `heliosd` résout d'abord la VIP
+source vers l'unique pair
 admis, compare la clé WireGuard portée par l'objet, puis relaie l'objet
 canonique vers Astra par le veth. Il n'est jamais un reverse proxy générique et
 n'accepte aucun en-tête de proxy. Le canal public Astra ne contourne ce chemin
@@ -276,17 +286,12 @@ key-slot. Elle signe localement, zéroïse le matériel maître et ne renvoie qu
 les objets signés. Ni la clé de déverrouillage ni une clé privée de CA ne
 transitent par Astra, Helios ou le navigateur.
 
-Une approbation de renouvellement ordinaire est une opération distincte :
-`astra-signer` vérifie la requête signée par Astra, affiche le pair, les
-générations et les empreintes candidates, puis demande une assertion FIDO2
-avec présence et vérification utilisateur. Cette assertion couvre le hash
-canonique exact de la demande et expire après cinq minutes. Elle n'ouvre aucun
-key-slot et ne rend disponible ni `CA-PQ` ni `CA-TLS` ; après sa validation,
-l'émetteur Astra délégué produit les leafs ordinaires. Une assertion destinée
-à une autre demande, génération, gateway ou opération est inutilisable.
-L'approbation transporte l'assertion WebAuthn complète et la liaison publique
-du credential signée par `CA-PQ`; Astra, Helios et Orion la vérifient chacun.
-Elle n'est donc pas une simple affirmation du coordinateur en ligne.
+Le renouvellement ordinaire n'emploie ni `astra-signer`, ni assertion FIDO2,
+ni ouverture du coffre. La demande signée par l'identité active et par la clé
+candidate, son empreinte, le seuil de 80 %, l'admission non révoquée et la
+délégation bornée forment son autorisation. Astra, Helios et Orion vérifient
+indépendamment que la demande vise exactement `active + 1` et que
+l'autorisation de stage est liée à son empreinte.
 
 La récupération expirée, qui doit employer `CA-PQ`, combine au contraire les
 deux fonctions dans une seule cérémonie `GetAssertion` par credential : le
@@ -309,8 +314,8 @@ deux YubiKeys, sans dépendre du poste d'origine.
 Règles de gestion :
 
 - le bootstrap n'est finalisé qu'après enregistrement et essai des deux clés ;
-- chaque renouvellement client, planifié ou demandé manuellement, exige au
-  moins un credential opérateur actif lié à la demande exacte ;
+- le renouvellement client planifié à 80 % n'emploie aucun credential
+  opérateur ; une campagne anticipée ou globale en exige au moins un ;
 - ajouter une clé exige une clé autorisée existante et la présence de la
   nouvelle ;
 - retirer une clé exige une autre clé autorisée et ne peut laisser aucun slot
@@ -377,7 +382,7 @@ digest canonique de la table de slots. L'AAD couvre l'en-tête HVLT complet,
 sel et nonce inclus. Le format exact et les métadonnées qui ne portent aucune
 autorité sont fixés par la spécification §2.4.1.
 
-### 5. Renouvellement ordinaire assisté, ouvert à 80 %
+### 5. Renouvellement ordinaire automatique à 80 %
 
 Pour une leaf active :
 
@@ -385,28 +390,23 @@ Pour une leaf active :
 renewal_at = not_before + 0,80 * (not_after - not_before)
 ```
 
-Les calculs utilisent des entiers vérifiés. Astra publie une fenêtre conseillée
-et Orion choisit un instant stable dispersé dans cette fenêtre. À l'ouverture,
-Orion génère les nouvelles clés TLS et ML-DSA-87, les scelle, puis produit la
-CSR et les preuves de continuité et de possession.
+Les calculs utilisent des entiers vérifiés. À cet instant exact, Orion génère
+les nouvelles clés TLS et ML-DSA-87, les scelle, puis produit la CSR et les
+preuves de continuité et de possession. Il n'attend ni dispersion dans les
+20 % restants, ni présence opérateur.
 
-Le planificateur prépare la demande mais ne la fait jamais émettre seul. Orion
-crée une opération Astra et ouvre `astra-signer`; une YubiKey opérateur active
-doit approuver le hash exact de la demande. L'identité encore active, la
-nouvelle preuve de possession, l'admission non révoquée, l'approbation
-matérielle, l'émetteur Astra borné et le reçu de staging Helios sont tous
-obligatoires. L'approbation autorise l'émetteur délégué ; elle ne déchiffre pas
-les CA maîtresses et la YubiKey ne produit aucune signature ML-DSA-87.
-
-Sans approbation, l'opération reste `awaiting_operator` jusqu'à l'expiration de
-sa demande et aucune leaf n'est émise. Le choix d'exiger une présence humaine
-à chaque renouvellement accepte explicitement qu'une absence de l'opérateur
-puisse conduire à l'expiration ; le planificateur et les alertes rendent ce
-risque visible, ils ne le contournent pas.
+L'identité encore active, la preuve de possession candidate, l'admission non
+révoquée, la génération strictement `active + 1`, l'émetteur Astra borné et le
+reçu de staging Helios sont tous obligatoires. L'empreinte de la demande tient
+lieu de liaison d'autorisation dans le stage, le reçu et le grant. Une
+compromission d'Astra peut renouveler silencieusement les identités encore
+admissibles jusqu'à l'échéance de la délégation, mais ne peut sortir de ce
+périmètre ; ce risque est accepté pour supprimer la dépendance humaine du
+maintien en service.
 
 Astra annonce la fenêtre avant son ouverture, renforce l'alerte après 90 % de
-durée écoulée et passe en état critique après 95 %. Une panne d'Astra ou une
-approbation absente ne coupe jamais un tunnel ni ne prolonge une leaf : Orion
+durée écoulée et passe en état critique après 95 %. Une panne d'Astra ne coupe
+jamais un tunnel ni ne prolonge une leaf : Orion
 conserve son échéance locale et réessaie avec backoff.
 
 ### 6. Une leaf expirée reste expirée
@@ -472,7 +472,10 @@ La console Helios expose :
 - l'annulation signée d'une transition gateway préparée mais non publiée ;
 - le rollback temporaire de l'identité gateway pendant le chevauchement.
 
-Toute commande manuelle ci-dessus exige au moins une YubiKey opérateur. Une
+Un renouvellement ordinaire « Renouveler maintenant » arrivé dans sa fenêtre
+suit le même chemin automatique. Une commande qui anticipe cette fenêtre, une
+campagne globale ou une autre mutation ci-dessus exige au moins une YubiKey
+opérateur. Une
 rotation de `CA-PQ`, une réadmission sans ancienne preuve ou une campagne qui
 change la politique d'autorité en exige deux. Le challenge WebAuthn couvre le
 hash d'un `AstraRotationCampaign` qui énumère chaque cible, empreinte et
@@ -519,9 +522,8 @@ confiance mixte.
 
 ## Conséquences
 
-Astra rend le renouvellement ordinaire indépendant des clés maîtresses, mais
-pas de la présence de l'opérateur : chaque nouvelle génération cliente attend
-une approbation YubiKey exacte. Elle ferme aussi le cas du client revenu après
+Astra rend le renouvellement ordinaire indépendant des clés maîtresses et de
+la présence de l'opérateur. Elle ferme aussi le cas du client revenu après
 expiration, tant que celui-ci possède encore son ancienne clé et une YubiKey
 opérateur. La gateway reste l'autorité sur l'admission et doit persister la
 génération avant que le client ne la reçoive.
@@ -535,8 +537,8 @@ reconstruire la gateway, pas à exploiter silencieusement une seconde autorité.
 Le risque résiduel principal est explicite : `root` sur la gateway peut voler
 ou employer la clé opérationnelle Astra et modifier le coordinateur. La
 délégation en borne les usages et la durée, et une leaf cliente ordinaire reste
-inacceptable pour Orion sans l'assertion YubiKey liée à sa demande exacte,
-mais aucune de ces bornes ne fabrique une enclave. `root` peut aussi présenter
+inacceptable sans une demande cliente valide liée de bout en bout, mais aucune
+de ces bornes ne fabrique une enclave. `root` peut aussi présenter
 une campagne mensongère, que le compagnon rend visible avant approbation, mais
 il ne peut ni forger l'assertion du credential ni déchiffrer silencieusement le
 coffre maître. Protéger la disponibilité de l'émetteur opérationnel contre le
@@ -577,16 +579,16 @@ pas l'autorité du propriétaire de l'hôte.
 downgrade. La récupération Astra émet une nouvelle leaf avant toute nouvelle
 négociation.
 
-**Renouvellement entièrement automatique.** Il supprimerait le geste opérateur,
-mais supprimerait la preuve cryptographique d'intention que Helios et Orion
-vérifient indépendamment d'Astra. La décision retient une assertion YubiKey par
-demande et accepte en contrepartie que l'absence humaine puisse laisser expirer
-une leaf.
+**Approbation YubiKey à chaque renouvellement.** Elle ajoute une preuve humaine
+d'intention indépendante d'Astra, mais transforme une opération de maintien en
+service bornée en cérémonie répétitive et permet à l'absence de l'opérateur de
+faire expirer le parc. Elle reste réservée aux récupérations, campagnes et
+mutations qui dépassent le renouvellement ordinaire d'une identité active.
 
 **Ouverture du coffre maître à chaque renouvellement.** Elle satisferait aussi
 la présence matérielle, mais exposerait inutilement `CA-PQ` et `CA-TLS` pour une
-opération que la délégation borne déjà. L'assertion autorise l'émetteur
-opérationnel ; elle ne déverrouille jamais le coffre.
+opération que la délégation borne déjà. Les opérations d'autorité et de
+récupération continuent, elles, de déverrouiller le coffre hors gateway.
 
 ## Références
 

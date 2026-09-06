@@ -198,6 +198,33 @@ impl Operation {
         }
     }
 
+    /// Authorizes a due ordinary renewal from the pinned delegated policy.
+    ///
+    /// The active client's signed request is the authorization boundary: it
+    /// proves continuity, proves possession of the candidate key, names only
+    /// `active + 1`, and has already passed the 80 % gate. Persisting its
+    /// fingerprint before issuance gives retries the same one-shot property
+    /// that operator evidence provides to manual campaigns.
+    pub fn authorize_automatic(&mut self) -> Result<(), OperationError> {
+        if self.state != ClientRenewalOperationState::AwaitingOperator {
+            return Err(OperationError::NotAwaitingOperator);
+        }
+        if self.approved_with.is_some() {
+            return Err(OperationError::ApprovalAlreadySpent);
+        }
+        self.approved_with = Some(self.request_fingerprint);
+        self.state = ClientRenewalOperationState::PendingGrant;
+        Ok(())
+    }
+
+    fn is_automatic(&self) -> bool {
+        self.approval_evidence.is_none()
+            && self.campaign_evidence.is_none()
+            && self
+                .approved_with
+                .is_some_and(|fingerprint| fingerprint.matches(&self.request_fingerprint))
+    }
+
     /// The manifest the capability tokens of §8.2 are bound to.
     ///
     /// The fingerprint of the signed approval request — the exact document the
@@ -264,6 +291,9 @@ impl Operation {
                     .matches(&self.request_fingerprint)
                 || authorization.renewal_approval.as_ref() != self.approval_evidence.as_deref()
                 || authorization.campaign_approval.as_deref() != self.campaign_evidence.as_deref()
+                || !self.approved_with.is_some_and(|fingerprint| {
+                    fingerprint.matches(&authorization.renewal_authorization_fingerprint)
+                })
             {
                 return Err(OperationError::Corrupt("stage authorization binding"));
             }
@@ -284,8 +314,8 @@ impl Operation {
                     .request_fingerprint
                     .matches(&authorization.request_fingerprint)
                 || !receipt
-                    .operator_approval_fingerprint
-                    .matches(&authorization.operator_approval_fingerprint)
+                    .renewal_authorization_fingerprint
+                    .matches(&authorization.renewal_authorization_fingerprint)
                 || receipt.client_wg_public_key != self.client_wg_public_key
                 || receipt.staged_generation != authorization.next_generation
             {
@@ -306,8 +336,8 @@ impl Operation {
                     .request_fingerprint
                     .matches(&authorization.request_fingerprint)
                 || !grant
-                    .operator_approval_fingerprint
-                    .matches(&authorization.operator_approval_fingerprint)
+                    .renewal_authorization_fingerprint
+                    .matches(&authorization.renewal_authorization_fingerprint)
                 || grant.client_wg_public_key != self.client_wg_public_key
                 || grant.active_generation != authorization.active_generation
                 || grant.next_generation != authorization.next_generation
@@ -333,7 +363,9 @@ impl Operation {
             }
             ClientRenewalOperationState::PendingGrant
                 if self.approved_with.is_none()
-                    || self.approval_evidence.is_none()
+                    || (self.approval_evidence.is_none()
+                        && self.campaign_evidence.is_none()
+                        && !self.is_automatic())
                     || self.grant.is_some() =>
             {
                 Err(OperationError::Corrupt(
@@ -342,7 +374,9 @@ impl Operation {
             }
             ClientRenewalOperationState::PendingCommit
                 if self.approved_with.is_none()
-                    || self.approval_evidence.is_none()
+                    || (self.approval_evidence.is_none()
+                        && self.campaign_evidence.is_none()
+                        && !self.is_automatic())
                     || self.stage_id.is_none()
                     || self.stage_authorization.is_none()
                     || self.receipt.is_none()
@@ -440,6 +474,9 @@ impl Operation {
         match (&self.approval_evidence, &self.campaign_evidence) {
             (Some(renewal), None) => Some(DelegatedApproval::Renewal(renewal.clone())),
             (None, Some(campaign)) => Some(DelegatedApproval::Campaign(campaign.clone())),
+            (None, None) if self.is_automatic() => {
+                Some(DelegatedApproval::Automatic(self.request_fingerprint))
+            }
             // Both, or neither. `validate_persisted` refuses the first on
             // reload and `consume_*` never creates it; treating it as "no
             // approval" here is the refusal that costs nothing.
@@ -987,7 +1024,7 @@ mod tests {
             stage_id: Id16::new([8; 16]).expect("id"),
             stage_authorization_fingerprint: Fingerprint::of(b"authorization"),
             request_fingerprint: Fingerprint::of(b"request"),
-            operator_approval_fingerprint: Fingerprint::of(b"approval"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
             gateway_wg_public_key: key(9),
             client_wg_public_key: key(2),
             active_generation: 4,
@@ -1015,7 +1052,7 @@ mod tests {
             issuer_authorization_fingerprint: Fingerprint::of(b"delegation"),
             issuer_authorization: None,
             request_fingerprint: Fingerprint::of(b"request"),
-            operator_approval_fingerprint: Fingerprint::of(b"approval"),
+            renewal_authorization_fingerprint: Fingerprint::of(b"approval"),
             renewal_approval: None,
             campaign_approval: None,
             stage_receipt_fingerprint: receipt().fingerprint(),
@@ -1069,6 +1106,26 @@ mod tests {
         assert!(view.grant.is_none());
         assert_eq!(view.signer_request_token.as_deref(), Some("read"));
         assert_eq!(view.signer_result_token.as_deref(), Some("submit"));
+    }
+
+    /// The current ordinary path spends no credential: the signed request is
+    /// persisted as its exact authorization and the operation can issue.
+    #[test]
+    fn a_due_operation_is_authorized_automatically_for_its_exact_request() {
+        let mut operation = operation(1, key(2));
+        let expected = operation.request_fingerprint;
+        operation
+            .authorize_automatic()
+            .expect("automatic authorization");
+
+        assert_eq!(operation.state, ClientRenewalOperationState::PendingGrant);
+        assert!(matches!(
+            operation.approval(),
+            Some(DelegatedApproval::Automatic(fingerprint)) if fingerprint.matches(&expected)
+        ));
+        let view = operation.view(Some("read".into()), Some("submit".into()));
+        assert!(view.signer_request_token.is_none());
+        assert!(view.signer_result_token.is_none());
     }
 
     #[test]

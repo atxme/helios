@@ -1,16 +1,11 @@
-//! Operator approval of a client renewal, and the policy it is bounded by —
-//! spec §2.4, §7.2 and the amendment of 15 August 2026.
+//! Astra's pinned issuance policy and operator credentials — spec §2.4.
 //!
-//! # What changed, and why it changed
+//! Scheduled client renewal is automatic from 80 % and is authorized by the
+//! narrow delegated issuer policy. The WebAuthn objects in this module remain
+//! for recovery, campaigns and strict decoding of persisted pre-amendment
+//! renewal records; current scheduled staging refuses them.
 //!
-//! Until that amendment the 80 % planner could finish a rotation on its own:
-//! Astra noticed a leaf was old, the delegated issuer signed the next one, and
-//! nobody was asked. That made a compromise of the Astra host a silent licence
-//! to re-issue the fleet, one leaf at a time, within the bounds of §3.4. The
-//! threshold now only *prepares* an operation — it moves it to
-//! `awaiting_operator` — and issuance waits for a hardware credential.
-//!
-//! # The three objects, and the one property they exist for
+//! # Legacy per-request approval objects
 //!
 //! [`AstraCredentialApprovalRequest`] states what is about to be renewed and
 //! fixes the WebAuthn challenge as the SHA-256 of its own canonical form.
@@ -18,7 +13,7 @@
 //! challenge, together with the [`AstraCredentialBinding`] of the credential
 //! that produced it, signed by `CA-PQ`.
 //!
-//! The property is that **Astra's word alone authorizes nothing**. Astra signs
+//! Their property is that **Astra's word alone authorizes nothing**. Astra signs
 //! the approval, and that signature is checked — but a consumer that stopped
 //! there would be trusting the online service the delegation exists to
 //! distrust. So [`AstraRenewalApproval::verify`] independently re-derives the
@@ -30,9 +25,9 @@
 //!
 //! Worth restating where it is easiest to get wrong: a YubiKey produces no
 //! ML-DSA-87 signature, and no field here holds one from it. The assertion
-//! authorizes the use of the delegated issuer. It does not open the authority
-//! vault — an ordinary renewal asks for no `hmac-secret` output at all — and
-//! it never becomes a signature of the certificate lifecycle.
+//! historically authorized the use of the delegated issuer. It does not open
+//! the authority vault and never becomes a signature of the certificate
+//! lifecycle.
 //!
 //! # Why the policy is pinned rather than delegated
 //!
@@ -95,8 +90,12 @@ pub const ISSUANCE_POLICY_FORMAT_VERSION: u16 = 1;
 /// Percentage of a leaf's life at which a renewal is prepared (spec §4.3).
 pub const POLICY_RENEWAL_START_PERCENT: u8 = 80;
 
-/// Credentials an ordinary client renewal requires: exactly one.
-pub const ORDINARY_APPROVAL_CREDENTIALS: u8 = 1;
+/// Credentials a scheduled client renewal requires: none.
+pub const AUTOMATIC_RENEWAL_CREDENTIALS: u8 = 0;
+
+/// Credentials carried by the superseded per-request approval document.
+/// Kept only so older persisted documents remain strictly parseable.
+pub const PER_REQUEST_APPROVAL_CREDENTIALS: u8 = 1;
 
 /// Credentials an anchor or admission mutation requires: exactly two.
 pub const AUTHORITY_MUTATION_CREDENTIALS: u8 = 2;
@@ -124,7 +123,7 @@ pub struct AstraIssuancePolicy {
     pub maximum_stage_lease_secs: u64,
     pub maximum_overlap_secs: u64,
     pub renewal_start_percent: u8,
-    pub ordinary_approval_credentials: u8,
+    pub scheduled_renewal_credentials: u8,
     pub expired_recovery_credentials: u8,
     pub authority_mutation_credentials: u8,
 }
@@ -150,7 +149,7 @@ impl AstraIssuancePolicy {
             maximum_stage_lease_secs: MAX_STAGE_LEASE_SECS,
             maximum_overlap_secs: MAX_OVERLAP_SECS,
             renewal_start_percent: POLICY_RENEWAL_START_PERCENT,
-            ordinary_approval_credentials: ORDINARY_APPROVAL_CREDENTIALS,
+            scheduled_renewal_credentials: AUTOMATIC_RENEWAL_CREDENTIALS,
             expired_recovery_credentials: 1,
             authority_mutation_credentials: AUTHORITY_MUTATION_CREDENTIALS,
         }
@@ -186,8 +185,10 @@ impl AstraIssuancePolicy {
         if self.renewal_start_percent != POLICY_RENEWAL_START_PERCENT {
             return Err(CertificateError::InvalidPolicy("renewal start"));
         }
-        if self.ordinary_approval_credentials != ORDINARY_APPROVAL_CREDENTIALS {
-            return Err(CertificateError::InvalidPolicy("ordinary credentials"));
+        if self.scheduled_renewal_credentials != AUTOMATIC_RENEWAL_CREDENTIALS {
+            return Err(CertificateError::InvalidPolicy(
+                "scheduled renewal credentials",
+            ));
         }
         if self.expired_recovery_credentials != 1 && self.expired_recovery_credentials != 2 {
             return Err(CertificateError::InvalidPolicy("recovery credentials"));
@@ -212,7 +213,7 @@ impl AstraIssuancePolicy {
             .u64(self.maximum_stage_lease_secs)
             .u64(self.maximum_overlap_secs)
             .u8(self.renewal_start_percent)
-            .u8(self.ordinary_approval_credentials)
+            .u8(self.scheduled_renewal_credentials)
             .u8(self.expired_recovery_credentials)
             .u8(self.authority_mutation_credentials);
         Ok(Fingerprint::of(&bytes.finish()))
@@ -272,6 +273,28 @@ impl AstraPolicyPin {
         delegation: &AstraIssuerAuthorization,
     ) -> Result<(), CertificateError> {
         self.assert_matches(&delegation.policy_fingerprint)
+    }
+
+    /// Refuses to reinterpret a pin confirmed under an older issuance policy
+    /// as permission for credential-free scheduled renewal.
+    ///
+    /// Removing the per-request credential changes the authority represented
+    /// by the policy fingerprint.  A deployment must therefore confirm the
+    /// current standard policy out of band before this path is enabled; merely
+    /// upgrading the binaries cannot silently broaden an older delegation.
+    pub fn assert_allows_automatic_renewal(
+        &self,
+        trust_domain_id: TrustDomainId,
+        gateway_wg_public_key: WireGuardKey,
+        server_name: &str,
+    ) -> Result<(), CertificateError> {
+        let expected = AstraIssuancePolicy::standard(
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name.to_owned(),
+        )
+        .fingerprint()?;
+        self.assert_matches(&expected)
     }
 }
 
@@ -752,9 +775,9 @@ impl AstraCredentialApprovalRequest {
             });
         }
         require_next_generation(self.active_generation, self.requested_generation)?;
-        if self.required_credentials != ORDINARY_APPROVAL_CREDENTIALS {
+        if self.required_credentials != PER_REQUEST_APPROVAL_CREDENTIALS {
             return Err(CertificateError::InsufficientApprovals {
-                required: ORDINARY_APPROVAL_CREDENTIALS,
+                required: PER_REQUEST_APPROVAL_CREDENTIALS,
                 provided: self.required_credentials,
             });
         }
@@ -847,7 +870,7 @@ impl AstraRenewalApproval {
         bytes.finish_signed()
     }
 
-    /// The `operator_approval_fingerprint` of the stage and of the grant.
+    /// The `renewal_authorization_fingerprint` of the stage and of the grant.
     pub fn fingerprint(&self) -> Fingerprint {
         let mut bytes = CanonicalBytes::new(self.signing_bytes().as_bytes());
         bytes.length_prefixed(self.astra_signature.as_bytes());
@@ -1011,7 +1034,7 @@ pub struct AstraRenewalApprovalEvidence {
 }
 
 impl AstraRenewalApprovalEvidence {
-    /// The value carried as `operator_approval_fingerprint` by stage, receipt
+    /// The value carried as `renewal_authorization_fingerprint` by stage, receipt
     /// and grant.
     pub fn fingerprint(&self) -> Fingerprint {
         self.approval.fingerprint()
@@ -1101,7 +1124,7 @@ pub struct AstraCampaignApprovalEvidence {
 }
 
 impl AstraCampaignApprovalEvidence {
-    /// The value carried as `operator_approval_fingerprint` (spec §7.2).
+    /// The value carried as `renewal_authorization_fingerprint` (spec §7.2).
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
         self.approval.fingerprint()
     }
@@ -1256,7 +1279,7 @@ pub struct ExpiredRecoveryApprovalEvidence {
 }
 
 impl ExpiredRecoveryApprovalEvidence {
-    /// The value carried as `operator_approval_fingerprint`.
+    /// The value carried as `renewal_authorization_fingerprint`.
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
         self.approval.fingerprint()
     }
@@ -1354,7 +1377,14 @@ impl ExpiredRecoveryApprovalEvidence {
 /// widens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DelegatedApproval {
-    /// One request, approved once, by one credential (§7.1).
+    /// A due ordinary renewal authorized by the pinned delegated-issuer
+    /// policy. The request fingerprint is carried so the stage and grant bind
+    /// the automatic decision to the exact continuity and possession proofs
+    /// the client submitted.
+    Automatic(Fingerprint),
+    /// One request, approved once, by one credential. Kept for decoding an
+    /// operation opened by an older Astra; current scheduled renewals never
+    /// create this variant.
     Renewal(Box<AstraRenewalApprovalEvidence>),
     /// One campaign, approved once, covering this target among others (§7.6).
     Campaign(Box<AstraCampaignApprovalEvidence>),
@@ -1364,14 +1394,16 @@ impl DelegatedApproval {
     /// The rotation reason this family — and only this family — authorizes.
     pub const fn reason(&self) -> super::authority::RotationReason {
         match self {
+            Self::Automatic(_) => super::authority::RotationReason::Scheduled,
             Self::Renewal(_) => super::authority::RotationReason::Scheduled,
             Self::Campaign(_) => super::authority::RotationReason::ManualGlobal,
         }
     }
 
-    /// The value carried as `operator_approval_fingerprint`.
+    /// The value carried as `renewal_authorization_fingerprint`.
     pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
         match self {
+            Self::Automatic(request_fingerprint) => Ok(*request_fingerprint),
             Self::Renewal(evidence) => Ok(evidence.fingerprint()),
             Self::Campaign(evidence) => evidence.fingerprint(),
         }
@@ -1453,7 +1485,7 @@ mod tests {
             maximum_stage_lease_secs: 3_600,
             maximum_overlap_secs: 7 * 86_400,
             renewal_start_percent: POLICY_RENEWAL_START_PERCENT,
-            ordinary_approval_credentials: ORDINARY_APPROVAL_CREDENTIALS,
+            scheduled_renewal_credentials: AUTOMATIC_RENEWAL_CREDENTIALS,
             expired_recovery_credentials: 2,
             authority_mutation_credentials: AUTHORITY_MUTATION_CREDENTIALS,
         }
@@ -1496,7 +1528,7 @@ mod tests {
             webauthn_rp_id: RELYING_PARTY.into(),
             webauthn_origin: ORIGIN.into(),
             allowed_credential_ids: vec![b"credential-one".to_vec()],
-            required_credentials: ORDINARY_APPROVAL_CREDENTIALS,
+            required_credentials: PER_REQUEST_APPROVAL_CREDENTIALS,
             created_at: 1_000,
             expires_at: 1_240,
             astra_service_key_epoch: 7,
@@ -2210,7 +2242,7 @@ mod tests {
             |policy| policy.maximum_overlap_secs = MAX_OVERLAP_SECS + 1,
             |policy| policy.expired_recovery_credentials = 3,
             |policy| policy.renewal_start_percent = 50,
-            |policy| policy.ordinary_approval_credentials = 0,
+            |policy| policy.scheduled_renewal_credentials = 1,
             |policy| policy.authority_mutation_credentials = 1,
             |policy| policy.maximum_leaf_lifetime_secs = 0,
         ] {

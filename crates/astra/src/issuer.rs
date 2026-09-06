@@ -255,8 +255,16 @@ impl DelegatedIssuer {
         if !reason.is_delegable() {
             return Err(IssuerError::MasterAuthorityRequired);
         }
-        let operator_approval_fingerprint = approval.fingerprint()?;
+        let renewal_authorization_fingerprint = approval.fingerprint()?;
         let (renewal_approval, campaign_approval) = match approval {
+            DelegatedApproval::Automatic(request_fingerprint) => {
+                if !request_fingerprint.matches(&request.fingerprint()) {
+                    return Err(IssuerError::Certificate(
+                        CertificateError::ApprovalMismatch("automatic renewal request fingerprint"),
+                    ));
+                }
+                (None, None)
+            }
             DelegatedApproval::Renewal(evidence) => (Some(*evidence), None),
             DelegatedApproval::Campaign(evidence) => (None, Some(evidence)),
         };
@@ -272,7 +280,7 @@ impl DelegatedIssuer {
             issuer_authorization: Some(self.authorization.clone()),
             stage_id,
             request_fingerprint: request.fingerprint(),
-            operator_approval_fingerprint,
+            renewal_authorization_fingerprint,
             renewal_approval,
             campaign_approval,
             gateway_wg_public_key: self.authorization.gateway_wg_public_key,
@@ -326,7 +334,7 @@ impl DelegatedIssuer {
             issuer_authorization_fingerprint: authorization.issuer_authorization_fingerprint,
             issuer_authorization: authorization.issuer_authorization.clone(),
             request_fingerprint: authorization.request_fingerprint,
-            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             renewal_approval: authorization.renewal_approval.clone(),
             campaign_approval: authorization.campaign_approval.clone(),
             stage_receipt_fingerprint: receipt.fingerprint(),
@@ -376,8 +384,8 @@ mod tests {
     };
     use aether::certificates::{
         approval::{
-            AstraCredentialApprovalRequest, AstraCredentialBinding, AstraPolicyPin,
-            AstraRenewalApproval, CredentialState,
+            AstraCredentialApprovalRequest, AstraCredentialBinding, AstraIssuancePolicy,
+            AstraPolicyPin, AstraRenewalApproval, CredentialState,
         },
         authority::AllowedUsage,
         webauthn::WebAuthnAssertion,
@@ -408,6 +416,12 @@ mod tests {
 
     fn client_key() -> WireGuardKey {
         WireGuardKey::from_bytes([2; 32])
+    }
+
+    fn automatic_policy_fingerprint() -> Fingerprint {
+        AstraIssuancePolicy::standard(domain(), gateway_key(), SERVER_NAME.into())
+            .fingerprint()
+            .expect("automatic policy")
     }
 
     fn intermediate() -> (DerCertificate, Zeroizing<Vec<u8>>) {
@@ -450,7 +464,7 @@ mod tests {
             tls_intermediate_certificate: intermediate_der,
             allowed_usage: AllowedUsage::AdmittedClientLeafRenewal,
             maximum_leaf_lifetime_secs: 200_000,
-            policy_fingerprint: Fingerprint::of(b"policy"),
+            policy_fingerprint: automatic_policy_fingerprint(),
             not_before: 0,
             not_after: 1_000_000,
             ca_pq_signature: MlDsa87Signature::placeholder(),
@@ -628,7 +642,7 @@ mod tests {
                 window,
                 1_000,
                 1_000 + 3_600,
-                DelegatedApproval::Renewal(Box::new(approval_evidence(&request))),
+                DelegatedApproval::Automatic(request.fingerprint()),
             )
             .expect("authorization");
 
@@ -643,7 +657,7 @@ mod tests {
                 &client_key(),
                 &active(),
                 &[&fixture.tls_anchor],
-                Some(&AstraPolicyPin::new(Fingerprint::of(b"policy")).expect("policy pin")),
+                Some(&AstraPolicyPin::new(automatic_policy_fingerprint()).expect("policy pin")),
                 None,
                 1_100,
             )
@@ -841,7 +855,7 @@ mod tests {
         // carrying both would leave "which one was checked" to its reader.
         assert!(authorization.renewal_approval.is_none());
         assert!(authorization
-            .operator_approval_fingerprint
+            .renewal_authorization_fingerprint
             .matches(&expected));
     }
 
@@ -918,7 +932,7 @@ mod tests {
             stage_id: authorization.stage_id,
             stage_authorization_fingerprint: authorization.fingerprint().expect("fingerprint"),
             request_fingerprint: authorization.request_fingerprint,
-            operator_approval_fingerprint: authorization.operator_approval_fingerprint,
+            renewal_authorization_fingerprint: authorization.renewal_authorization_fingerprint,
             gateway_wg_public_key: gateway_key(),
             client_wg_public_key: client_key(),
             active_generation: 4,

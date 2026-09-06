@@ -4,9 +4,7 @@
 //!
 //! ```text
 //! Orion --WireGuard--> Helios --veth/mTLS--> Astra   open()
-//!                                            Astra prepares awaiting_operator
-//!            companion assertion, through the same two hops
-//!                                            Astra verifies the approval
+//!                                            Astra verifies the 80 % gate
 //!                                            Astra issues the two leaves
 //!                             <-- stage authorization on the veth --
 //!                             -- signed receipt on the same link -->
@@ -17,9 +15,9 @@
 //!
 //! Three properties are decided by that order alone:
 //!
-//! - **nothing is issued before the assertion**. The 80 % threshold only
-//!   decides that a request is admissible; [`open`] refuses a request that is
-//!   not yet due and creates an operation that holds no certificate;
+//! - **nothing is issued before the renewal window**. [`open`] refuses a
+//!   request that is not yet due; after it, the signed request and the pinned
+//!   delegated policy authorize only `active + 1`;
 //! - **the authorization never touches Orion**. It is handed to the gateway on
 //!   the veth and the receipt comes back on that same relationship (§8.3,
 //!   amendment of 16 August 2026). The client is a client of `helios-api`, not
@@ -30,19 +28,17 @@
 //!
 //! # What a failure leaves behind
 //!
-//! Once the operator approval is accepted, its exact evidence and the exact
-//! random issuance bytes are persisted. A transport failure therefore leaves
+//! Once the request is accepted, its exact fingerprint and the exact random
+//! issuance bytes are persisted. A transport failure therefore leaves
 //! `pending_grant`, not a second ceremony: polling the same `operation_id`
 //! replays the same authorization. The gateway treats that stage idempotently
 //! and its signed lease bounds any reservation that cannot be completed.
 //!
-//! # Two approval families reach this module, and only two
+//! # Scheduled and manual authorization
 //!
-//! An ordinary renewal is approved for *this* request, by a companion ceremony
-//! this module drives itself: [`open`] creates `awaiting_operator`, [`submit`]
-//! consumes the assertion. A manual campaign (§7.6) is approved once, for a set
-//! of targets, **before** any of their requests exist — so nothing is asked of
-//! anyone when the request finally arrives. [`open`] looks the campaign up in
+//! An ordinary renewal is authorized automatically once its active leaf is
+//! due. A manual campaign (§7.6) is approved once, for a set of targets,
+//! **before** any of their requests exist. [`open`] looks the campaign up in
 //! [`crate::signing::SigningOperationStore`], and if one covers this peer at
 //! this exact state, the operation is born already approved and goes straight
 //! to issuance.
@@ -57,7 +53,7 @@ use std::sync::Arc;
 use aether::certificates::{
     approval::{
         AstraCampaignApprovalEvidence, AstraCredentialApprovalRequest, AstraRenewalApproval,
-        AstraRenewalApprovalEvidence, MAX_APPROVAL_LIFETIME_SECS, ORDINARY_APPROVAL_CREDENTIALS,
+        AstraRenewalApprovalEvidence, MAX_APPROVAL_LIFETIME_SECS, PER_REQUEST_APPROVAL_CREDENTIALS,
     },
     capability::{CapabilityGrant, CapabilityRequirement, CapabilityScope},
     client::{ClientCertificateRotationRequest, IssuerKind},
@@ -114,6 +110,12 @@ pub enum RenewalError {
          validator accepts, and the recovery path of §7.5 is the only way back"
     )]
     ExpiredIdentity,
+    #[error(
+        "automatic renewal is disabled until the current credential-free issuance policy has \
+         been confirmed and delegated; an older policy pin cannot be broadened by a software \
+         upgrade"
+    )]
+    AutomaticPolicyMigrationRequired,
     #[error("the request is refused: {0}")]
     Request(aether::certificates::CertificateError),
     #[error("the operator approval is refused: {0}")]
@@ -160,7 +162,10 @@ impl RenewalError {
             Self::Registry(RegistryError::Io(_) | RegistryError::Corrupt(_))
             | Self::Operation(OperationError::Persistence(_) | OperationError::Corrupt(_))
             | Self::Internal(_) => Refusal::Internal,
-            Self::NoIssuer | Self::NoGatewayChannel | Self::Gateway(_) => Refusal::Unavailable,
+            Self::NoIssuer
+            | Self::NoGatewayChannel
+            | Self::Gateway(_)
+            | Self::AutomaticPolicyMigrationRequired => Refusal::Unavailable,
             _ => Refusal::Rejected,
         }
     }
@@ -226,8 +231,8 @@ pub(crate) async fn transcribe_peer(
 /// 80 % threshold, and the three signatures of §7.1 verify under the **active**
 /// PQ key the registry holds — never under a key the request supplied.
 ///
-/// What it does **not** do is issue. The answer is an `awaiting_operator`
-/// operation, which is the entire point of the 15 August 2026 amendment.
+/// A due request proceeds immediately. The delegated issuer remains bounded
+/// to an admitted, non-revoked peer and the exact `active + 1` generation.
 pub async fn open(
     service: &Arc<AstraService>,
     caller: &WireGuardKey,
@@ -239,7 +244,7 @@ pub async fn open(
     }
     transcribe_peer(service, caller, now_unix).await?;
 
-    let (peer, trust_domain_id, gateway_key, server_name, rp_id, service_epoch) = {
+    let (peer, trust_domain_id, gateway_key, server_name, policy_pin, rp_id, service_epoch) = {
         let registry = service.registry.lock().await;
         let state = registry.state();
         let peer = registry
@@ -251,6 +256,7 @@ pub async fn open(
             state.trust_domain_id,
             state.gateway_wg_public_key,
             state.server_name.clone(),
+            state.astra_policy_fingerprint,
             state.webauthn_rp_id.clone(),
             state.astra_service_key_epoch,
         )
@@ -285,9 +291,8 @@ pub async fn open(
             })
     };
 
-    // The threshold, and the only thing it decides: whether the request is
-    // admissible at all. Past it, an operator still has to answer — unless one
-    // already has, for this exact target.
+    // The threshold decides whether the delegated policy may act. A campaign
+    // remains the explicit operator-authorized way to renew earlier.
     match urgency(&peer.active, now_unix).map_err(RenewalError::Internal)? {
         RenewalUrgency::Idle if campaign.is_none() => return Err(RenewalError::NotDue),
         // Expired is never lifted here, campaign or not: an ordinary rotation
@@ -343,6 +348,10 @@ pub async fn open(
         operation.consume_campaign_approval(fingerprint, Box::new(evidence))?;
         true
     } else {
+        policy_pin
+            .assert_allows_automatic_renewal(trust_domain_id, gateway_key, &server_name)
+            .map_err(|_| RenewalError::AutomaticPolicyMigrationRequired)?;
+        operation.authorize_automatic()?;
         false
     };
     let mut operations = service.operations.lock().await;
@@ -381,17 +390,14 @@ pub async fn open(
             peer = %peer.name,
             operation = %operation_id,
             generation = requested_generation,
-            "renewal prepared and awaiting an operator credential"
+            "due renewal authorized automatically by the delegated policy"
         );
     }
     drop(registry);
-    if campaign_authorized {
-        // The touch already happened, so there is nothing to poll for: issue,
-        // stage and grant in this same call. A failure here leaves
-        // `pending_grant`, which the next poll resumes — the campaign is not
-        // spent twice.
-        resume_stage(service, caller, &operation_id, now_unix).await?;
-    }
+    // Both paths are already authorized: scheduled by the narrow delegation,
+    // or manually by a previously approved campaign. A failure here leaves
+    // `pending_grant`, which the next poll resumes with identical bytes.
+    resume_stage(service, caller, &operation_id, now_unix).await?;
     let operations = service.operations.lock().await;
     let operation = operations.get(&operation_id, caller, now_unix)?;
     mint_view(service, operation, now_unix).await
@@ -992,7 +998,7 @@ fn build_approval_request(
         webauthn_rp_id: webauthn_rp_id.to_string(),
         webauthn_origin: format!("https://{webauthn_rp_id}"),
         allowed_credential_ids,
-        required_credentials: ORDINARY_APPROVAL_CREDENTIALS,
+        required_credentials: PER_REQUEST_APPROVAL_CREDENTIALS,
         created_at: now_unix,
         expires_at: now_unix
             .checked_add(MAX_APPROVAL_LIFETIME_SECS)
@@ -1250,8 +1256,7 @@ pub mod router {
         InternalRefusal, PreparedTrustUpdate, PreparedTrustUpdateTransaction,
         RelayedOperationQuery, RelayedRotationRequest, RelayedTrustUpdatePreparation,
         ASTRA_INTERNAL_PREFIX, ASTRA_TRUST_UPDATE_PREFIX, ROTATION_OPERATION_ROUTE,
-        ROTATION_REQUEST_PATH, ROTATION_SIGNER_REQUEST_ROUTE, ROTATION_SIGNER_RESULT_ROUTE,
-        TRUST_UPDATE_PREPARE_PATH,
+        ROTATION_REQUEST_PATH, TRUST_UPDATE_PREPARE_PATH,
     };
 
     use super::{now_unix, RenewalError};
@@ -1274,8 +1279,6 @@ pub mod router {
         Router::new()
             .route(ROTATION_REQUEST_PATH, post(request))
             .route(ROTATION_OPERATION_ROUTE, post(operation))
-            .route(ROTATION_SIGNER_REQUEST_ROUTE, post(signer_request))
-            .route(ROTATION_SIGNER_RESULT_ROUTE, post(signer_result))
             .route(TRUST_UPDATE_PREPARE_PATH, post(prepare_trust_update))
             // The third surface this listener serves (spec §8.5). Its routes
             // live in their own module for the reason they have their own
@@ -1324,18 +1327,6 @@ pub mod router {
         InternalRefusal::from(error.refusal()).into_response()
     }
 
-    /// The capability token of §8.2, from the header it is allowed to be in.
-    ///
-    /// The `Authorization` header and nowhere else: never a query parameter,
-    /// never a path segment, so it never reaches an access log.
-    fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
-        headers
-            .get(axum::http::header::AUTHORIZATION)?
-            .to_str()
-            .ok()?
-            .strip_prefix("Bearer ")
-    }
-
     fn operation_id(raw: &str) -> Result<Id16, InternalRefusal> {
         Id16::parse_hex(raw).map_err(|_| InternalRefusal::Protocol)
     }
@@ -1369,61 +1360,6 @@ pub mod router {
         match super::read(&service, &query.caller_wg_public_key, &id, now_unix()).await {
             Ok(view) => (StatusCode::OK, Json(view)).into_response(),
             Err(error) => refuse("operation", error),
-        }
-    }
-
-    async fn signer_request(
-        State(service): State<Arc<AstraService>>,
-        Path(raw): Path<String>,
-        headers: axum::http::HeaderMap,
-        Json(query): Json<RelayedOperationQuery>,
-    ) -> Response {
-        let id = match operation_id(&raw) {
-            Ok(id) => id,
-            Err(refusal) => return refusal.into_response(),
-        };
-        let Some(token) = bearer(&headers) else {
-            return InternalRefusal::Protocol.into_response();
-        };
-        match super::signer_request(
-            &service,
-            &query.caller_wg_public_key,
-            &id,
-            token,
-            now_unix(),
-        )
-        .await
-        {
-            Ok(view) => (StatusCode::OK, Json(view)).into_response(),
-            Err(error) => refuse("signer-request", error),
-        }
-    }
-
-    async fn signer_result(
-        State(service): State<Arc<AstraService>>,
-        Path(raw): Path<String>,
-        headers: axum::http::HeaderMap,
-        Json(result): Json<helios_api::internal::ClientRenewalSignerResult>,
-    ) -> Response {
-        let id = match operation_id(&raw) {
-            Ok(id) => id,
-            Err(refusal) => return refusal.into_response(),
-        };
-        let Some(token) = bearer(&headers) else {
-            return InternalRefusal::Protocol.into_response();
-        };
-        match super::signer_result(
-            &service,
-            &result.caller_wg_public_key,
-            &id,
-            token,
-            result.approval,
-            now_unix(),
-        )
-        .await
-        {
-            Ok(view) => (StatusCode::OK, Json(view)).into_response(),
-            Err(error) => refuse("signer-result", error),
         }
     }
 

@@ -362,7 +362,7 @@ pub async fn authorize(
     }
     if !evidence
         .fingerprint()?
-        .matches(&authorization.operator_approval_fingerprint)
+        .matches(&authorization.renewal_authorization_fingerprint)
     {
         return Err(RecoveryError::Certificate(
             CertificateError::ApprovalMismatch("recovery approval fingerprint"),
@@ -476,8 +476,8 @@ pub async fn grant(
             .request_fingerprint
             .matches(&authorization.request_fingerprint)
         || !grant
-            .operator_approval_fingerprint
-            .matches(&authorization.operator_approval_fingerprint)
+            .renewal_authorization_fingerprint
+            .matches(&authorization.renewal_authorization_fingerprint)
         || !grant
             .stage_receipt_fingerprint
             .matches(&receipt.fingerprint())

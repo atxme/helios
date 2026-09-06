@@ -895,8 +895,9 @@ fn parse_operation_id(
 /// `POST /api/key-negotiation/certificate-renewal/request` (spec §8.1.2).
 ///
 /// Step 1 of the relayed flow. The gateway resolves the peer, hands the
-/// canonical request to Astra and returns the `awaiting_operator` operation it
-/// opened. It never returns a certificate, because at this point none exists.
+/// canonical request to Astra and returns the operation Astra advanced. A due
+/// request normally already carries its grant; no operator ceremony sits
+/// between these two services.
 pub async fn renewal_request(
     State(s): State<AppState>,
     Extension(caller): Extension<crate::auth::Caller>,
@@ -945,83 +946,6 @@ pub async fn renewal_operation(
         return renewal_unavailable(&caller_key, "operation");
     };
     match relay.operation(&caller_key, &operation).await {
-        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
-        Err(refusal) => refusal.status().into_response(),
-    }
-}
-
-/// `GET /api/key-negotiation/certificate-renewal/signer-requests/<operation_id>`.
-///
-/// Step 4a: the companion reads what it must display before it asks for a
-/// touch. It needs the capability token the operation handed the client, and
-/// the token is bound to that operation, that manifest and that scope.
-pub async fn renewal_signer_request(
-    State(s): State<AppState>,
-    Extension(caller): Extension<crate::auth::Caller>,
-    axum::extract::Path(operation): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    let Some(caller_key) = renewal_caller(&caller, "signer-request") else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Ok(operation) = parse_operation_id(&operation) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let Some(token) = crate::internal::bearer_token(&headers) else {
-        // Missing is refused exactly like wrong: the answer must not tell a
-        // caller whether the operation it named exists.
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    let token = token.to_string();
-    let Some(relay) = s.client_renewal.as_ref() else {
-        return renewal_unavailable(&caller_key, "signer-request");
-    };
-    match relay.signer_request(&caller_key, &operation, &token).await {
-        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
-        Err(refusal) => refusal.status().into_response(),
-    }
-}
-
-/// `POST /api/key-negotiation/certificate-renewal/signer-results/<operation_id>`.
-///
-/// Step 4b and step 5: the companion delivers the assertion, and the answer is
-/// the operation Astra reached with it — `pending_commit` with a grant when
-/// the whole chain succeeded, `failed` when it did not.
-pub async fn renewal_signer_result(
-    State(s): State<AppState>,
-    Extension(caller): Extension<crate::auth::Caller>,
-    axum::extract::Path(operation): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    let Some(caller_key) = renewal_caller(&caller, "signer-result") else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Ok(operation) = parse_operation_id(&operation) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let Some(token) = crate::internal::bearer_token(&headers) else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    let token = token.to_string();
-    if body.len() > MAX_TRUST_UPDATE_REQUEST_BYTES {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    let approval: aether::certificates::approval::AstraRenewalApproval =
-        match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(peer = %caller_key, %error, "renewal refused: unreadable approval");
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-        };
-    let Some(relay) = s.client_renewal.as_ref() else {
-        return renewal_unavailable(&caller_key, "signer-result");
-    };
-    match relay
-        .signer_result(&caller_key, &operation, &token, Box::new(approval))
-        .await
-    {
         Ok(view) => (StatusCode::OK, Json(view)).into_response(),
         Err(refusal) => refusal.status().into_response(),
     }

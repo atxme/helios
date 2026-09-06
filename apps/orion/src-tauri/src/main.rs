@@ -166,6 +166,10 @@ struct AppState {
     /// touched. The cost is that a restart reopens rather than resumes — the
     /// cheap failure, since nothing was committed.
     renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    /// One automatic renewal timer for the mounted profile. It is cancelled
+    /// with the connection so reconnecting cannot leave stale tasks racing a
+    /// newer profile.
+    certificate_renewal_task: Arc<StdMutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     /// Recoveries of expired identities in progress (§7.5).
     ///
     /// A separate map, for the same reason Astra keeps a separate store: a
@@ -594,7 +598,7 @@ fn spawn_trust_refresh(
     settings: orion_core::KeyNegotiationSettings,
     heliosd_url: String,
     sink: EventSink,
-) {
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         match orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await {
             Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
@@ -620,7 +624,82 @@ fn spawn_trust_refresh(
                 sink(ClientEvent::log("warn", message));
             }
         }
-    });
+    })
+}
+
+/// Runs the ordinary client renewal at the fixed 80 % threshold.
+///
+/// The task is tied to the mounted connection. It first lets the authenticated
+/// trust refresh finish, then waits for the locally computed threshold. A
+/// reconnect cancels this task and creates a new one from the current durable
+/// state, so no timer can act for a profile that is no longer mounted.
+fn spawn_automatic_certificate_renewal(
+    prerequisite: tauri::async_runtime::JoinHandle<()>,
+    controller: Arc<VpnController>,
+    renewals: Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    profile_name: String,
+    settings: orion_core::KeyNegotiationSettings,
+    heliosd_url: String,
+    sink: EventSink,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let _ = prerequisite.await;
+        let now = now_unix();
+        let inventory = orion_core::certificate_inventory::inventory(Some(&settings), now);
+        let Some(client) = inventory.client_pq else {
+            tracing::warn!(profile = %profile_name, "automatic renewal skipped: client PQ certificate is unavailable");
+            return;
+        };
+        if client.phase == orion_core::certificate_inventory::CertificatePhase::Expired {
+            sink(ClientEvent::log(
+                "warn",
+                format!(
+                    "certificat du profil « {profile_name} » expiré : le renouvellement automatique ne peut plus prouver une identité active ; utiliser la récupération YubiKey"
+                ),
+            ));
+            return;
+        }
+
+        let wait = client.renewal_at.saturating_sub(now);
+        if wait > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        }
+        if controller.state() != TunnelState::Up
+            || controller.mounted_profile().await.as_deref() != Some(profile_name.as_str())
+        {
+            return;
+        }
+
+        match drive_renewal_in_map(&renewals, &profile_name, settings, heliosd_url).await {
+            Ok(RenewalProgress::Committed { generation }) => {
+                tracing::info!(profile = %profile_name, generation, "automatic certificate renewal committed");
+                sink(ClientEvent::log(
+                    "info",
+                    format!(
+                        "certificats du profil « {profile_name} » renouvelés automatiquement ; génération {generation} prête pour le chevauchement"
+                    ),
+                ));
+            }
+            Ok(progress) => {
+                tracing::warn!(profile = %profile_name, ?progress, "automatic certificate renewal remains in progress");
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "renouvellement automatique du profil « {profile_name} » incomplet ; Orion réessaiera à la prochaine connexion"
+                    ),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(profile = %profile_name, %error, "automatic certificate renewal failed");
+                sink(ClientEvent::log(
+                    "warn",
+                    format!(
+                        "renouvellement automatique du profil « {profile_name} » impossible : {error}. Orion réessaiera à la prochaine connexion"
+                    ),
+                ));
+            }
+        }
+    })
 }
 
 /// One action, one profile.
@@ -874,7 +953,16 @@ async fn drive_renewal(
             .to_string()
     })?;
 
-    let mut renewals = state.renewals.lock().await;
+    drive_renewal_in_map(&state.renewals, name, settings, url).await
+}
+
+async fn drive_renewal_in_map(
+    renewals: &Arc<Mutex<std::collections::HashMap<String, InFlightRenewal>>>,
+    name: &str,
+    settings: orion_core::KeyNegotiationSettings,
+    url: String,
+) -> Result<RenewalProgress, String> {
+    let mut renewals = renewals.lock().await;
     if let Some(in_flight) = renewals.get_mut(name) {
         let step = orion_core::certificate_renewal::resume(
             &mut in_flight.session,
@@ -2016,6 +2104,9 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
     // asking again on every one would poll the gateway for the life of the
     // session.
     let trust_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let renewal_task = Arc::clone(&state.certificate_renewal_task);
+    let renewal_controller = Arc::clone(&state.controller);
+    let renewal_sessions = Arc::clone(&state.renewals);
     let negotiated_profile = profile.name.clone();
     let config = Arc::clone(&state.config);
     let store = Arc::clone(&state.store);
@@ -2046,10 +2137,31 @@ async fn start_connection(app: AppHandle, name: Option<String>) -> Result<(), St
                         trust_url.clone(),
                         trust_asked.swap(true, std::sync::atomic::Ordering::SeqCst),
                     ) {
-                        spawn_trust_refresh(settings, url, emit_sink(app_for_tel.clone()));
+                        let refresh = spawn_trust_refresh(
+                            settings.clone(),
+                            url.clone(),
+                            emit_sink(app_for_tel.clone()),
+                        );
+                        let renewal = spawn_automatic_certificate_renewal(
+                            refresh,
+                            Arc::clone(&renewal_controller),
+                            Arc::clone(&renewal_sessions),
+                            negotiated_profile.clone(),
+                            settings,
+                            url,
+                            emit_sink(app_for_tel.clone()),
+                        );
+                        if let Some(previous) = renewal_task.lock().unwrap().replace(renewal) {
+                            previous.abort();
+                        }
                     }
                 }
-                TunnelState::Down | TunnelState::Failed => telemetry.stop(),
+                TunnelState::Down | TunnelState::Failed => {
+                    telemetry.stop();
+                    if let Some(task) = renewal_task.lock().unwrap().take() {
+                        task.abort();
+                    }
+                }
                 _ => {}
             }
         }
@@ -2678,6 +2790,7 @@ fn main() {
             log_path,
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
             renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            certificate_renewal_task: Arc::new(StdMutex::new(None)),
             recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
         .setup(|_app| {

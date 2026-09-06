@@ -5,18 +5,11 @@
 //! service key, and its own certificate generations — and it applies trust
 //! updates in **one** local write.
 //!
-//! # Why the renewal instant is derived, not drawn
+//! # Renewal starts at the fixed safety threshold
 //!
-//! The window opens at 80 % of the leaf's life, and every client in a fleet
-//! reaches it at nearly the same moment. Drawing a random instant inside it
-//! would disperse them — until the first restart, when a fresh draw would
-//! bunch them up again or move a renewal that was about to happen.
-//!
-//! [`renewal_instant`] instead derives the instant from values that do not
-//! change: the client's WireGuard key, the generation and the certificate's
-//! own period. It is stable across restarts by construction — there is nothing
-//! to persist, and therefore nothing that can be lost — and it is uniform
-//! across the fleet because the keys are.
+//! The ordinary path opens at 80 % of the active leaf's life. It does not
+//! disperse a client anywhere in the remaining 20 %: doing so could postpone
+//! the only automatic attempt until immediately before expiry.
 //!
 //! # Why nothing is applied halfway
 //!
@@ -737,38 +730,13 @@ fn absorb_status(
 
 /// The instant this client opens its renewal window (spec §4.3).
 ///
-/// Derived, never drawn: the offset inside `[renewal_at, not_after)` comes
-/// from the client's WireGuard key, the generation and the certificate period.
-/// Restarting recomputes the same value, so a renewal that was about to happen
-/// still happens, and the fleet stays spread out.
+/// The fixed 80 % threshold. The key remains an argument because callers
+/// identify the generation and its owner together.
 pub fn renewal_instant(
     generation: &ClientCertificateGeneration,
-    client_wg_public_key: &WireGuardKey,
+    _client_wg_public_key: &WireGuardKey,
 ) -> Result<u64, CertificateError> {
-    let validity = generation.validity()?;
-    let renewal_at = validity.renewal_at()?;
-    let span = validity
-        .not_after
-        .checked_sub(renewal_at)
-        .filter(|span| *span > 0)
-        .ok_or(CertificateError::ArithmeticOverflow)?;
-
-    let mut input = Vec::with_capacity(64);
-    input.extend_from_slice(b"helios-client-renewal-dispersion-v5");
-    input.extend_from_slice(client_wg_public_key.as_bytes());
-    input.extend_from_slice(&generation.generation.to_be_bytes());
-    input.extend_from_slice(&validity.not_before.to_be_bytes());
-    input.extend_from_slice(&validity.not_after.to_be_bytes());
-    let digest = Fingerprint::of(&input);
-    let offset = u64::from_be_bytes(
-        digest.as_bytes()[..8]
-            .try_into()
-            .expect("a fingerprint is 32 bytes"),
-    ) % span;
-
-    renewal_at
-        .checked_add(offset)
-        .ok_or(CertificateError::ArithmeticOverflow)
+    generation.validity()?.renewal_at()
 }
 
 /// Whether a renewal is due at `now_unix`.
@@ -828,28 +796,32 @@ mod tests {
         }
     }
 
-    /// Different clients land on different instants: that dispersion is the
-    /// whole point, and a fleet arriving together is what it prevents.
+    /// Every client gets the full remaining 20 % as its retry margin.
     #[test]
-    fn two_clients_do_not_renew_at_the_same_instant() {
+    fn clients_renew_at_the_eighty_percent_threshold() {
         let generation = generation(4);
-        let instants: std::collections::BTreeSet<_> = (0..32u8)
-            .map(|seed| renewal_instant(&generation, &key(seed)).expect("instant"))
-            .collect();
-        assert!(
-            instants.len() > 24,
-            "expected a spread, got {} distinct instants",
-            instants.len()
-        );
+        let expected = generation
+            .validity()
+            .expect("validity")
+            .renewal_at()
+            .expect("renewal");
+        for seed in 0..32u8 {
+            assert_eq!(
+                renewal_instant(&generation, &key(seed)).expect("instant"),
+                expected
+            );
+        }
     }
 
-    /// A new generation moves the instant even for the same client, so two
-    /// consecutive renewals do not fall on the same offset.
+    /// A generation with a different validity period gets its own threshold.
     #[test]
-    fn a_new_generation_moves_the_instant() {
+    fn a_new_generation_uses_its_own_validity_period() {
+        let mut next = generation(5);
+        next.not_before = 1_000_000;
+        next.not_after = 2_000_000;
         assert_ne!(
             renewal_instant(&generation(4), &key(1)).expect("instant"),
-            renewal_instant(&generation(5), &key(1)).expect("instant")
+            renewal_instant(&next, &key(1)).expect("instant")
         );
     }
 
