@@ -2029,7 +2029,7 @@ async fn run(
                             "raw speedtest still unavailable after {attempt} attempts: {reason}. \
                              A client asking for a speedtest will be told the service is absent. \
                              If the address is in use, another program holds this port — \
-                             `ss -tlnp | grep {port}` names it, iperf3 on 0.0.0.0 being the \
+                             `ss -lntup | grep {port}` names it, iperf3 on 0.0.0.0 being the \
                              usual one. Retrying every {retry}s.",
                             port = aether::speedtest::SPEEDTEST_PORT,
                             retry = RAW_SPEEDTEST_RETRY.as_secs(),

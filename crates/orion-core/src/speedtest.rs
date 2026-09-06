@@ -208,7 +208,7 @@ pub enum SpeedTestError {
          tunnel et rien ne revient — ni donnée, ni refus. Soit heliosd n’écoute pas sur l’adresse \
          du tunnel — son journal l’annonce : « raw speedtest on … » —, soit le pare-feu de la \
          gateway n’ouvre pas ce port sur l’interface WireGuard. Sur la gateway : \
-         `ss -ulnp | grep {port}` et `nft list chain inet helios input`"
+         `ss -lntup | grep {port}` et `nft list chain inet helios input`"
     )]
     Unreachable { port: u16, detail: String },
     #[error("la gateway a refusé le speedtest (HTTP {status}) : {body}")]

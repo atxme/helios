@@ -509,7 +509,7 @@ la gateway.
 
 ```sh
 # 1. heliosd écoute-t-il, et sur la bonne adresse ?
-ss -ulnp | grep 51822   # attendu : 100.64.0.1:51822, pas 127.0.0.1:51822
+ss -lntup | grep 51822  # attendu : 100.64.0.1:51822, pas 127.0.0.1:51822
 journalctl -u heliosd | grep 'raw speedtest'
 
 # 2. le pare-feu ouvre-t-il le port sur l'interface du tunnel ?
@@ -523,7 +523,7 @@ la boucle locale jusqu'au prochain démarrage.
 
 À ne pas confondre avec un port **occupé** : là, Orion dit que la gateway ne
 sert pas le speedtest (un refus, `os error 10054`), et
-`ss -tlnp | grep 51822` nomme le programme fautif. Le service Helios utilise
+`ss -lntup | grep 51822` nomme le programme fautif. Le service Helios utilise
 précisément `51822` afin de ne plus entrer en conflit avec iperf3, dont le port
 par défaut est `5201`. Le silence est un problème de joignabilité, le refus un
 problème d'occupation.
