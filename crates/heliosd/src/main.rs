@@ -306,6 +306,11 @@ enum Command {
     /// Nothing secret crosses: the rows are public and each carries its own
     /// `CA-PQ` signature, which this registry checks under the anchor it
     /// already holds.
+    ///
+    /// **Run it with `heliosd` stopped.** A running daemon holds the registry
+    /// in memory and rewrites it whole at the first decision it records, so an
+    /// edit made beside it is undone without a word at the next peer
+    /// admission — which is usually the very next thing a deployment does.
     InstallAstraCredentials {
         /// `CA-PQ`-signed credential registry, as JSON.
         credentials: PathBuf,

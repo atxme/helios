@@ -1184,11 +1184,26 @@ deployer_astra() {
             # récupérer une identité expirée commence par nommer le credential
             # qui l'approuvera. Un client qui devrait aller chercher la liste
             # devrait le faire par le lien qu'il vient justement de perdre.
+            #
+            # `heliosd` est arrêté le temps de l'écriture, comme pour la
+            # réparation d'ancre plus haut et pour la même raison : le démon
+            # tient le registre en mémoire et le réécrit entier à la première
+            # décision qu'il enregistre. Une édition hors du démon serait donc
+            # annulée sans bruit à la prochaine admission de pair — et c'est
+            # exactement ce qui arrive, puisque la commande suivante d'un
+            # déploiement est souvent d'enrôler un client.
             credentials_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/astra-credentials.json"
             if printf '%s' "$credentials_b64" | base64 -d |
                 ssh "$CIBLE" "cat > '$credentials_distant'"; then
-                helios_ssh_sudo "$CIBLE" "$HELIOSD install-astra-credentials \
-                    '$credentials_distant'" || {
+                helios_ssh_sudo "$CIBLE" "
+                    set -e
+                    redemarrer_heliosd() { systemctl start heliosd; }
+                    trap redemarrer_heliosd EXIT HUP INT TERM
+                    systemctl stop heliosd
+                    '$HELIOSD' install-astra-credentials '$credentials_distant'
+                    systemctl start heliosd
+                    trap - EXIT HUP INT TERM
+                " || {
                     echo "    le registre gateway n'a pas retenu les credentials :" >&2
                     echo "    les profils émis ensuite ne pourront pas récupérer une" >&2
                     echo "    identité expirée." >&2
