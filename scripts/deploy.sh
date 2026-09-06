@@ -914,6 +914,37 @@ deployer_astra() {
         ssh "$CIBLE" "rm -f '$certificat_distant' '$ca_tls_distant'"
         helios_ssh_sudo "$CIBLE" "systemd-run --collect --unit=helios-trust-restart \
             systemctl restart heliosd >/dev/null"
+    elif [ -n "$ca_tls_der" ]; then
+        # Les versions antérieures à `init-trust-domain --client-tls-ca`
+        # pouvaient avoir amorcé le registre avec la CA opérateur. Corriger ce
+        # cas en place évite de supprimer le registre et de réadmettre tous les
+        # pairs. La commande refuse tout état qui a déjà quitté la génération
+        # initiale ; elle n'est donc ni une rotation non signée, ni un chemin
+        # de récupération général.
+        echo "    vérification de l'ancre CA-TLS du registre gateway"
+        ca_tls_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/domain-client-ca-tls.der"
+        printf '%s' "$ca_tls_der" | base64 -d |
+            ssh "$CIBLE" "cat > '$ca_tls_distant'" || {
+            echo "    transfert de la CA-TLS du domaine impossible" >&2
+            return 1
+        }
+        if ! sortie_reparation="$(helios_ssh_sudo_capture "$CIBLE" "
+            set -e
+            redemarrer_heliosd() { systemctl start heliosd; }
+            trap redemarrer_heliosd EXIT HUP INT TERM
+            systemctl stop heliosd
+            '$HELIOSD' repair-client-tls-ca-bootstrap \
+                --client-tls-ca '$ca_tls_distant'
+            systemctl start heliosd
+            trap - EXIT HUP INT TERM
+        ")"; then
+            ssh "$CIBLE" "rm -f '$ca_tls_distant'"
+            echo "    réparation de l'ancre CA-TLS refusée ; heliosd a été redémarré" >&2
+            printf '%s\n' "$sortie_reparation" >&2
+            return 1
+        fi
+        printf '%s\n' "$sortie_reparation"
+        ssh "$CIBLE" "rm -f '$ca_tls_distant'"
     fi
 
     # ── Le canal privé Astra ↔ Helios (ROTATION-CERTIFICATS §8.3) ───────────

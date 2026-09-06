@@ -155,6 +155,23 @@ enum Command {
         #[arg(long)]
         client_tls_ca: Option<std::path::PathBuf>,
     },
+    /// Repairs registries created before `init-trust-domain --client-tls-ca`.
+    ///
+    /// The affected release stored the operator admission CA as the domain
+    /// anchor. This command accepts only that exact untouched epoch-1 shape,
+    /// replaces it atomically with the supplied self-signed domain CA-TLS and
+    /// keeps every peer identity and queued signed distribution.
+    ///
+    /// **For a stopped daemon.** A running process owns the registry in memory
+    /// and could overwrite an offline repair with its previous state.
+    RepairClientTlsCaBootstrap {
+        /// DER of the domain's original client CA-TLS, as carried by the
+        /// operator hand-off. The operator admission CA is read from the
+        /// gateway's served key-negotiation identity and must match the bad
+        /// anchor exactly.
+        #[arg(long)]
+        client_tls_ca: std::path::PathBuf,
+    },
     /// Prepares this gateway's next identity and exports its request (§5).
     ///
     /// Step 1 and 2 of §11.1, and the only two that happen on the gateway
@@ -541,6 +558,9 @@ async fn main() -> anyhow::Result<()> {
             &webauthn_rp_id,
             client_tls_ca.as_deref(),
         ),
+        Command::RepairClientTlsCaBootstrap { client_tls_ca } => {
+            repair_client_tls_ca_bootstrap(&client_tls_ca)
+        }
         Command::InitAstraChannel {
             bind,
             astra_certificate,
@@ -1102,6 +1122,51 @@ fn domain_client_tls_ca(
         "client CA-TLS of the domain recorded as generation 1"
     );
     Ok(certificate)
+}
+
+/// Applies the one-time, fail-closed correction for the legacy CA-TLS seed.
+fn repair_client_tls_ca_bootstrap(client_tls_ca: &std::path::Path) -> anyhow::Result<()> {
+    use aether::certificates::encoding::DerCertificate;
+    use helios_provisioning::certificates::{BootstrapRepairOutcome, CertificateRegistry};
+
+    let domain_ca = DerCertificate::new(
+        std::fs::read(client_tls_ca)
+            .with_context(|| format!("reading {}", client_tls_ca.display()))?,
+    )
+    .context("the supplied domain client CA-TLS is not a readable certificate")?;
+    let served = key_negotiation::served_identity()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the gateway has no served key-negotiation identity from which to read the operator \
+             admission CA"
+        )
+    })?;
+    let path = CertificateRegistry::path();
+    let mut registry = CertificateRegistry::load(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this gateway has no certificate registry; use init-trust-domain for a new domain"
+            )
+        })?;
+    let admission_fingerprint = served.client_tls_ca.fingerprint();
+    let domain_fingerprint = domain_ca.fingerprint();
+    let outcome = registry
+        .repair_legacy_client_tls_ca_bootstrap(&served.client_tls_ca, &domain_ca)
+        .context("repairing the legacy client CA-TLS bootstrap")?;
+
+    match outcome {
+        BootstrapRepairOutcome::Repaired => println!(
+            "client CA-TLS bootstrap repaired atomically: {admission_fingerprint} -> \
+             {domain_fingerprint}"
+        ),
+        BootstrapRepairOutcome::AlreadyCorrect => {
+            println!("client CA-TLS bootstrap already current; nothing changed")
+        }
+        BootstrapRepairOutcome::LaterEpoch => {
+            println!("client CA-TLS bootstrap repair not applicable after epoch 1; nothing changed")
+        }
+    }
+    Ok(())
 }
 
 fn init_trust_domain(
@@ -2032,6 +2097,18 @@ mod tests {
                 gateway_certificate,
                 ..
             } if gateway_certificate == std::path::Path::new("/tmp/gateway.json")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "heliosd",
+                "repair-client-tls-ca-bootstrap",
+                "--client-tls-ca",
+                "/tmp/domain-ca.der",
+            ])
+            .unwrap()
+            .command,
+            Command::RepairClientTlsCaBootstrap { client_tls_ca }
+                if client_tls_ca == std::path::Path::new("/tmp/domain-ca.der")
         ));
         assert!(Cli::try_parse_from([
             "heliosd",

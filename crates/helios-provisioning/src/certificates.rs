@@ -97,6 +97,19 @@ pub enum RegistryError {
          already hold higher ones, and every one of them refused"
     )]
     AlreadyBootstrapped(PathBuf),
+    #[error("legacy client CA-TLS bootstrap repair refused: {0}")]
+    LegacyClientTlsCaRepair(&'static str),
+}
+
+/// Result of checking the narrowly-scoped historical CA-TLS bootstrap bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapRepairOutcome {
+    /// The legacy operator CA was replaced by the domain CA-TLS.
+    Repaired,
+    /// The registry already holds the supplied domain CA-TLS at epoch 1.
+    AlreadyCorrect,
+    /// A signed rotation has already advanced the registry past bootstrap.
+    LaterEpoch,
 }
 
 /// One peer's certificate generations, with the PQ leaves they resolve to.
@@ -1213,6 +1226,99 @@ impl CertificateRegistry {
             self.persist(state)?;
         }
         Ok(outcome)
+    }
+
+    /// Repairs the one legacy bootstrap that stored the admission CA where
+    /// the domain's client `CA-TLS` belongs.
+    ///
+    /// This is deliberately narrower than a rotation. It changes only an
+    /// epoch-1 registry whose anchor and every first-generation peer still
+    /// name the exact admission CA supplied by the caller. Any staged or
+    /// committed certificate generation refuses the repair: after issuance
+    /// has moved, only a signed §9.4 transition may move the anchor.
+    ///
+    /// Pending *distributions* are preserved. They are signed objects queued
+    /// for a peer and may be precisely the domain transition that exposed the
+    /// bad bootstrap; they are not certificate generations owned by this
+    /// registry.
+    pub fn repair_legacy_client_tls_ca_bootstrap(
+        &mut self,
+        admission_ca: &DerCertificate,
+        domain_ca: &DerCertificate,
+    ) -> Result<BootstrapRepairOutcome, RegistryError> {
+        aether::certificates::x509::assert_certificate_authority(admission_ca)?;
+        aether::certificates::x509::assert_certificate_authority(domain_ca)?;
+        aether::certificates::x509::assert_issued_by(admission_ca, admission_ca)?;
+        aether::certificates::x509::assert_issued_by(domain_ca, domain_ca)?;
+
+        let admission_fingerprint = admission_ca.fingerprint();
+        let domain_fingerprint = domain_ca.fingerprint();
+        let client_tls_ca = &self.state.client_tls_ca;
+
+        if client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint()
+            .matches(&domain_fingerprint)
+        {
+            return Ok(BootstrapRepairOutcome::AlreadyCorrect);
+        }
+        if client_tls_ca.ca_tls_epoch > 1 {
+            return Ok(BootstrapRepairOutcome::LaterEpoch);
+        }
+        if client_tls_ca.ca_tls_epoch != 1 {
+            return Err(RegistryError::LegacyClientTlsCaRepair(
+                "the registry is not at client CA-TLS epoch 1",
+            ));
+        }
+        if !client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint()
+            .matches(&admission_fingerprint)
+        {
+            return Err(RegistryError::LegacyClientTlsCaRepair(
+                "the active anchor is not the operator admission CA",
+            ));
+        }
+        if client_tls_ca.next_client_tls_ca_certificate.is_some()
+            || client_tls_ca.next_transition_fingerprint.is_some()
+            || client_tls_ca.activation_at.is_some()
+            || client_tls_ca.retire_active_at.is_some()
+        {
+            return Err(RegistryError::LegacyClientTlsCaRepair(
+                "a client CA-TLS rotation is already in flight",
+            ));
+        }
+        self.state
+            .ledger
+            .assert_not_revoked(&[domain_fingerprint])?;
+
+        let every_peer_is_first_generation = self.state.peers.values().all(|peer| {
+            let certificates = &peer.state;
+            certificates.active.generation == 1
+                && certificates.active.ca_tls_epoch == 1
+                && certificates
+                    .active
+                    .tls_ca_certificate_fingerprint
+                    .matches(&admission_fingerprint)
+                && certificates.pending.is_none()
+                && certificates.next.is_none()
+                && certificates.activation_at.is_none()
+                && certificates.retire_active_at.is_none()
+                && certificates.last_committed_stage.is_none()
+        });
+        if !every_peer_is_first_generation {
+            return Err(RegistryError::LegacyClientTlsCaRepair(
+                "at least one peer has left its untouched first generation",
+            ));
+        }
+
+        let mut candidate = self.state.clone();
+        candidate.client_tls_ca.active_client_tls_ca_certificate = domain_ca.clone();
+        for peer in candidate.peers.values_mut() {
+            peer.state.active.tls_ca_certificate_fingerprint = domain_fingerprint;
+        }
+        self.persist(candidate)?;
+        Ok(BootstrapRepairOutcome::Repaired)
     }
 
     /// Records that the authority has let a staged transition leave (§6.3).
@@ -3568,6 +3674,156 @@ mod tests {
         }
         .sign(&fixture.ca.private)
         .expect("sign the rotation")
+    }
+
+    /// The migration fixes the bootstrap metadata and nothing else: peer
+    /// identities, revocations and queued signed distributions survive the
+    /// same atomic write.
+    #[test]
+    fn the_legacy_admission_ca_bootstrap_is_repaired_without_reenrolling_peers() {
+        let mut fixture = fixture();
+        let admission_ca = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .clone();
+        let admission_fingerprint = admission_ca.fingerprint();
+        let peer_key = client_key(2).to_base64();
+        let peer = fixture
+            .registry
+            .state
+            .peers
+            .get_mut(&peer_key)
+            .expect("peer");
+        peer.state.active.generation = 1;
+        peer.state.active.ca_tls_epoch = 1;
+        peer.state.active.tls_ca_certificate_fingerprint = admission_fingerprint;
+        let (manifest, chunks) = distribution(&client_key(2), 2, 10_000);
+        fixture
+            .registry
+            .stage_distribution(&client_key(2), manifest, chunks, 0)
+            .expect("queue a signed distribution");
+        let peer = fixture.registry.state().peers.get(&peer_key).expect("peer");
+        let peer_before = peer.clone();
+        let ledger_before = fixture.registry.state().ledger.clone();
+        let domain_ca = aether::certificates::test_x509::client_material("domain").authority;
+        let domain_fingerprint = domain_ca.fingerprint();
+
+        assert_eq!(
+            fixture
+                .registry
+                .repair_legacy_client_tls_ca_bootstrap(&admission_ca, &domain_ca)
+                .expect("repair"),
+            BootstrapRepairOutcome::Repaired
+        );
+
+        let state = fixture.registry.state();
+        assert!(state
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .fingerprint()
+            .matches(&domain_fingerprint));
+        let peer_after = state.peers.get(&peer_key).expect("peer preserved");
+        assert_eq!(peer_after.name, peer_before.name);
+        assert_eq!(
+            peer_after.active_pq_certificate,
+            peer_before.active_pq_certificate
+        );
+        assert_eq!(peer_after.distribution, peer_before.distribution);
+        assert_eq!(state.ledger, ledger_before);
+        assert!(peer_after
+            .state
+            .active
+            .tls_ca_certificate_fingerprint
+            .matches(&domain_fingerprint));
+
+        let reloaded = CertificateRegistry::load(&fixture.registry.path)
+            .expect("read repaired registry")
+            .expect("registry present");
+        assert_eq!(reloaded.state(), fixture.registry.state());
+        assert_eq!(
+            fixture
+                .registry
+                .repair_legacy_client_tls_ca_bootstrap(&admission_ca, &domain_ca)
+                .expect("idempotent repair"),
+            BootstrapRepairOutcome::AlreadyCorrect
+        );
+    }
+
+    /// Once any peer has moved, rewriting its generation-one anchor would be
+    /// an unsigned rotation rather than a bootstrap correction.
+    #[test]
+    fn the_legacy_bootstrap_repair_refuses_a_peer_that_already_moved() {
+        let mut fixture = fixture();
+        let admission_ca = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .clone();
+        fixture.registry.state.peers.values_mut().for_each(|peer| {
+            peer.state.active.tls_ca_certificate_fingerprint = admission_ca.fingerprint();
+        });
+        let domain_ca = aether::certificates::test_x509::client_material("domain").authority;
+        let before = fixture.registry.state().clone();
+
+        let error = fixture
+            .registry
+            .repair_legacy_client_tls_ca_bootstrap(&admission_ca, &domain_ca)
+            .expect_err("generation four is not a bootstrap state");
+
+        assert!(matches!(
+            error,
+            RegistryError::LegacyClientTlsCaRepair(
+                "at least one peer has left its untouched first generation"
+            )
+        ));
+        assert_eq!(fixture.registry.state(), &before);
+    }
+
+    #[test]
+    fn the_legacy_bootstrap_repair_refuses_a_foreign_active_anchor() {
+        let mut fixture = fixture();
+        let admission_ca = aether::certificates::test_x509::client_material("operator").authority;
+        let domain_ca = aether::certificates::test_x509::client_material("domain").authority;
+        let before = fixture.registry.state().clone();
+
+        let error = fixture
+            .registry
+            .repair_legacy_client_tls_ca_bootstrap(&admission_ca, &domain_ca)
+            .expect_err("only the exact operator admission CA can be replaced");
+
+        assert!(matches!(
+            error,
+            RegistryError::LegacyClientTlsCaRepair(
+                "the active anchor is not the operator admission CA"
+            )
+        ));
+        assert_eq!(fixture.registry.state(), &before);
+    }
+
+    #[test]
+    fn the_bootstrap_repair_is_a_no_op_after_a_signed_rotation_epoch() {
+        let mut fixture = fixture();
+        let admission_ca = fixture
+            .registry
+            .state()
+            .client_tls_ca
+            .active_client_tls_ca_certificate
+            .clone();
+        fixture.registry.state.client_tls_ca.ca_tls_epoch = 2;
+        let domain_ca = aether::certificates::test_x509::client_material("domain").authority;
+        let before = fixture.registry.state().clone();
+
+        assert_eq!(
+            fixture
+                .registry
+                .repair_legacy_client_tls_ca_bootstrap(&admission_ca, &domain_ca)
+                .expect("a later signed epoch needs no bootstrap repair"),
+            BootstrapRepairOutcome::LaterEpoch
+        );
+        assert_eq!(fixture.registry.state(), &before);
     }
 
     /// §9.4: both chains are acceptable during the overlap, and only then.

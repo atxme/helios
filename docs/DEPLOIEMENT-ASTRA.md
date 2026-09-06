@@ -310,7 +310,12 @@ slot.
    Cet épinglage étend la chaîne d'audit, donc les deux témoins qui en portent
    la tête — le `.env` de compose et `~/.helios/astra/audit-head` — sont
    réécrits après lui, jamais avant. Un relais sans CA TLS ne bloque rien :
-   l'étape le dit et continue ;
+   l'étape le dit et continue. Si le registre gateway existe déjà dans la
+   forme erronée produite avant `init-trust-domain --client-tls-ca`, le script
+   arrête `heliosd`, remplace atomiquement la CA opérateur par la CA-TLS du
+   relais et redémarre le service. Cette correction conserve les pairs et les
+   distributions signées en attente, mais refuse tout registre qui a quitté
+   l'époque et les générations initiales ;
 7. `compose up -d`.
 
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le

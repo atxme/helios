@@ -2349,8 +2349,14 @@ Sans elle, le registre retient l'autorité d'admission à la place de l'ancre du
 domaine, et toute mise en attente d'un renouvellement est refusée — la feuille
 candidate ne se rattache à aucune ancre que la gateway détient. Une rotation
 du §9.4 ne répare pas cet état : une transition ne sait que **quitter** une
-ancre déjà détenue. L'amorçage est donc le seul moment où cette valeur se
-pose, et `init-trust-domain` la journalise explicitement quand elle manque.
+ancre déjà détenue. `heliosd repair-client-tls-ca-bootstrap` couvre uniquement
+la migration des registres historiques encore à l'époque 1, dont l'ancre et
+toutes les générations clientes actives désignent exactement la CA opérateur,
+sans candidat, successeur ni chevauchement. Exécutée daemon arrêté, elle
+remplace atomiquement l'ancre et les empreintes de ces générations 1, sans
+toucher aux identités, certificats PQ, révocations ni distributions signées en
+attente. Tout état ayant déjà évolué est refusé : hors de cette correction
+bornée, seule une transition signée du §9.4 peut déplacer l'ancre.
 
 `CA-TLS` authentifie le transport mTLS avant que la signature PQ cliente soit
 vérifiée. Sa rotation doit donc être préparée sur la gateway avant d'émettre

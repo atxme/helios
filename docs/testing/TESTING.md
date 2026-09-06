@@ -304,6 +304,13 @@ Valider avec accès console :
   qu'au redémarrage le journal passe de « no certificate registry » à
   « certificate lifecycle ready ».
 
+  Pour un registre historique créé sans `--client-tls-ca`, vérifier daemon
+  arrêté que `heliosd repair-client-tls-ca-bootstrap` remplace la CA opérateur
+  par la CA-TLS du relais tout en conservant les pairs, leurs certificats PQ,
+  les révocations et les distributions en attente. La répétition doit être
+  idempotente ; une génération cliente supérieure à 1, un candidat, un
+  successeur ou une rotation d'ancre en cours doit refuser toute écriture.
+
   Le conteneur lui-même : rootfs en lecture seule effectif (une écriture hors
   `/var/lib/astra` et `/tmp` doit échouer), aucune capacité, UID 10001, et le
   volume d'état seul montage. Restaurer une sauvegarde du volume dont la tête
