@@ -1103,6 +1103,7 @@ pub fn enrolment_view(
         webauthn_rp_id: state.astra.webauthn_rp_id.clone(),
         astra_policy_fingerprint: state.astra.astra_policy_fingerprint.fingerprint().to_hex(),
         credential_registry_epoch: state.astra.credential_registry_epoch,
+        astra_credential_bindings: state.astra.credential_bindings.values().cloned().collect(),
         astra_service_key_epoch: state.astra.astra_service_key_epoch,
         astra_service_public_key: state.astra.active_astra_service_public_key.to_base64(),
     }

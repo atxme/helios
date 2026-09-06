@@ -383,6 +383,7 @@ mod tests {
             webauthn_rp_id: "astra.example".into(),
             astra_policy_fingerprint: "11".repeat(32),
             credential_registry_epoch: 12,
+            astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 2,
             astra_service_public_key: String::new(),
         });

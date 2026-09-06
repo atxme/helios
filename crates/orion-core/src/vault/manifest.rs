@@ -31,7 +31,7 @@ use aether::key_negotiation::ProtectionMode;
 
 /// Version written today. Any version not listed below is refused, never
 /// guessed.
-const MANIFEST_VERSION: u8 = 5;
+const MANIFEST_VERSION: u8 = 6;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
 ///
@@ -67,6 +67,42 @@ const MANIFEST_VERSION_WITHOUT_ASTRA_POLICY: u8 = 3;
 /// client always did — once, on the way in. Re-sealing writes the answer down,
 /// and from then on the guess is never made again.
 const MANIFEST_VERSION_WITHOUT_PROFILE_KIND: u8 = 4;
+
+/// Previous version: everything of today except the domain's operator
+/// credential bindings.
+///
+/// Read as an empty list, which is what such a profile actually knows. It
+/// still mounts a tunnel and still renews; what it cannot do is recover an
+/// expired identity, because §7.5 begins by naming the credential that will
+/// approve it. Re-sealing after a re-issued enrolment writes the list down.
+const MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS: u8 = 5;
+
+/// The credential bindings, as the one text field the manifest stores them in.
+///
+/// JSON rather than a hand-rolled framing: a binding is a signed document with
+/// a dozen fields, and a second encoder for it would be a second place for the
+/// bytes under a `CA-PQ` signature to drift. What the manifest needs of it is
+/// only that it round-trips, and the signature is re-checked on the way out of
+/// the seed anyway.
+///
+/// An unencodable list yields an empty one rather than failing the seal: this
+/// value is a convenience the enrolment can restate, and refusing to save a
+/// profile over it would trade a recoverable identity for an unopenable vault.
+fn credential_bindings_json(trust: &crate::config::TrustMaterial) -> String {
+    serde_json::to_string(&trust.astra_credential_bindings).unwrap_or_else(|_| "[]".into())
+}
+
+/// The inverse, refusing what it cannot read exactly.
+fn decode_credential_bindings(
+    text: &str,
+) -> Result<Vec<aether::certificates::approval::AstraCredentialBinding>, VaultError> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(text).map_err(|error| {
+        VaultError::ManifestEncoding(format!("invalid Astra credential bindings: {error}"))
+    })
+}
 
 /// Bound on a decoded manifest, checked before any allocation.
 ///
@@ -230,6 +266,13 @@ impl ProfileManifest {
                         field(trust.webauthn_rp_id.as_bytes());
                         field(trust.astra_policy_fingerprint.as_bytes());
                         field(&trust.credential_registry_epoch.to_be_bytes());
+                        // Les liaisons de credentials sont délibérément
+                        // absentes : ADR-006 §2 fait monter la génération sur
+                        // un changement d'**ancre**, et une liaison n'en est
+                        // pas une — elle est signée par celle-ci. L'y mettre
+                        // ferait monter le compteur à chaque enrôlement de clé
+                        // opérateur, et un vrai retour en arrière deviendrait
+                        // indiscernable d'une routine.
                         field(&trust.astra_service_key_epoch.to_be_bytes());
                         field(trust.astra_service_public_key.as_bytes());
                     }
@@ -283,6 +326,7 @@ impl ProfileManifest {
                         codec::put(&mut out, trust.webauthn_rp_id.as_bytes())?;
                         codec::put(&mut out, trust.astra_policy_fingerprint.as_bytes())?;
                         out.extend_from_slice(&trust.credential_registry_epoch.to_be_bytes());
+                        codec::put(&mut out, credential_bindings_json(trust).as_bytes())?;
                         out.extend_from_slice(&trust.astra_service_key_epoch.to_be_bytes());
                         codec::put(&mut out, trust.astra_service_public_key.as_bytes())?;
                     }
@@ -303,6 +347,7 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
             && version != MANIFEST_VERSION_WITHOUT_PROFILE_KIND
             && version != MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
             && version != MANIFEST_VERSION_WITHOUT_TRUST
@@ -347,6 +392,7 @@ impl ProfileManifest {
                 // Read where it was written, so a v2 manifest keeps decoding
                 // byte for byte as it always did.
                 trust: if version == MANIFEST_VERSION
+                    || version == MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
                     || version == MANIFEST_VERSION_WITHOUT_PROFILE_KIND
                     || version == MANIFEST_VERSION_WITHOUT_ASTRA_POLICY
                 {
@@ -378,6 +424,11 @@ impl ProfileManifest {
                                 u64::from_be_bytes(cursor.array::<8>()?)
                             } else {
                                 0
+                            },
+                            astra_credential_bindings: if version == MANIFEST_VERSION {
+                                decode_credential_bindings(&cursor.text()?)?
+                            } else {
+                                Vec::new()
                             },
                             astra_service_key_epoch: u64::from_be_bytes(cursor.array::<8>()?),
                             astra_service_public_key: cursor.text()?,
@@ -582,6 +633,7 @@ mod tests {
             webauthn_rp_id: "astra.example".into(),
             astra_policy_fingerprint: "11".repeat(32),
             credential_registry_epoch: 6,
+            astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 5,
             astra_service_public_key: "c2VydmljZQ==".into(),
         });

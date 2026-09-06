@@ -375,7 +375,6 @@ pub async fn refresh(
         config.parent().unwrap_or_else(|| Path::new(".")),
         settings,
         &bundle,
-        now_unix,
     )
     .map_err(|error| TrustUpdateError::Transport(error.to_string()))?;
     promote_due(&mut store, &identities, identity, now_unix)

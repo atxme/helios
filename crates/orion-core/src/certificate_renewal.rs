@@ -234,7 +234,6 @@ pub(crate) fn open_identity_store(
     directory: &Path,
     settings: &KeyNegotiationSettings,
     bundle: &ClientIdentityBundle,
-    now_unix: u64,
 ) -> Result<TrustStore, RenewalError> {
     let trust = settings
         .trust
@@ -247,7 +246,7 @@ pub(crate) fn open_identity_store(
     let path = identity_trust_store_path(directory, &trust_domain_id, &client_wg_public_key);
 
     if TrustStore::load(&path)?.is_some() {
-        return open_or_seed(&path, settings, bundle, now_unix);
+        return open_or_seed(&path, settings, bundle);
     }
 
     let legacy_path = directory.join("trust.json");
@@ -262,7 +261,7 @@ pub(crate) fn open_identity_store(
         }
     }
 
-    open_or_seed(&path, settings, bundle, now_unix)
+    open_or_seed(&path, settings, bundle)
 }
 
 /// Opens the trust store, or seeds it from the profile and the sealed identity.
@@ -293,7 +292,6 @@ pub fn open_or_seed(
     path: &Path,
     settings: &KeyNegotiationSettings,
     bundle: &ClientIdentityBundle,
-    now_unix: u64,
 ) -> Result<TrustStore, RenewalError> {
     let trust = settings
         .trust
@@ -324,7 +322,7 @@ pub fn open_or_seed(
         return Ok(existing);
     }
 
-    let seeded = seed(settings, trust, bundle, client_wg_public_key, now_unix)?;
+    let seeded = seed(settings, trust, bundle, client_wg_public_key)?;
     let store = TrustStore::new(path.to_path_buf(), seeded);
     store.save()?;
     Ok(store)
@@ -365,7 +363,6 @@ fn seed(
     trust: &TrustMaterial,
     bundle: &ClientIdentityBundle,
     client_wg_public_key: WireGuardKey,
-    now_unix: u64,
 ) -> Result<TrustState, RenewalError> {
     let gateway_leaf = settings
         .gateway_pq_certificate()
@@ -402,7 +399,7 @@ fn seed(
     // continuité d'une rotation. C'est donc le renouvellement qui le vérifie,
     // là où il peut encore le dire utilement.
 
-    Ok(TrustState {
+    let mut state = TrustState {
         trust_domain_id: trust
             .trust_domain()
             .map_err(|error| RenewalError::Identity(error.to_string()))?,
@@ -452,7 +449,13 @@ fn seed(
             astra_policy_fingerprint: trust
                 .astra_policy_pin()
                 .map_err(|error| RenewalError::Identity(error.to_string()))?,
-            credential_registry_epoch: trust.credential_registry_epoch,
+            // Le compteur part à zéro et les liaisons le font monter. Il ne
+            // peut pas partir du plancher que le profil épingle : une liaison
+            // porte l'époque de la décision qui l'a créée, donc une clé
+            // enrôlée tôt en a une plus basse que le registre courant, et
+            // `accept_credential_binding` la refuserait comme un retour en
+            // arrière. Le plancher est rétabli juste après l'adoption.
+            credential_registry_epoch: 0,
             credential_bindings: Default::default(),
             active_astra_service_public_key: MlDsa87PublicKey::parse(
                 trust.astra_service_public_key.trim(),
@@ -471,7 +474,45 @@ fn seed(
         certificates: ClientCertificateState::new(active),
         staged_gateway_transition: None,
         ledger: TrustLedger::default(),
-    })
+    };
+
+    // Les credentials opérateur du domaine, vérifiés sous l'ancre de ce profil
+    // et sous rien d'autre. Le document qui les a transportés — le bloc
+    // d'enrôlement — ne prouve rien par lui-même, et c'est voulu : chaque
+    // liaison porte sa propre signature `CA-PQ`.
+    //
+    // Ils voyagent avec l'enrôlement plutôt que par une route, parce que le
+    // seul moment où ce poste en a besoin est celui où il n'a plus de tunnel :
+    // la récupération d'une identité expirée (§7.5) nomme le credential qui
+    // l'approuvera, et un client qui aurait appris cette liste par le tunnel
+    // qu'il vient de perdre n'aurait pas de liste du tout.
+    let ca_pq = trust
+        .ca_pq()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    for binding in &trust.astra_credential_bindings {
+        binding
+            .verify(
+                &ca_pq,
+                &state.trust_domain_id,
+                &state.gateway.gateway_wg_public_key,
+                trust.ca_epoch,
+                0,
+            )
+            .map_err(RenewalError::Certificate)?;
+        state
+            .astra
+            .accept_credential_binding(binding)
+            .map_err(RenewalError::Certificate)?;
+    }
+    // Le plancher anti-retour du profil, rétabli. Les liaisons ont pu porter
+    // l'époque à leur propre valeur, jamais au-dessous de celle que
+    // l'opérateur a inscrite dans le bloc d'enrôlement.
+    state.astra.credential_registry_epoch = state
+        .astra
+        .credential_registry_epoch
+        .max(trust.credential_registry_epoch);
+
+    Ok(state)
 }
 
 /// Name the candidate identity is sealed under until it activates.
@@ -638,7 +679,6 @@ pub fn rollback_to_previous(
         config.parent().unwrap_or_else(|| Path::new(".")),
         settings,
         &snapshot.served,
-        now_unix,
     )?;
     promote_due(&mut store, &identities, identity, now_unix)?;
 
@@ -1485,7 +1525,6 @@ pub async fn begin(
         config.parent().unwrap_or_else(|| Path::new(".")),
         settings,
         &bundle,
-        now_unix,
     )?;
     // Anything already due is applied before a new generation is asked for: a
     // renewal computed against a state that has not caught up would name the
@@ -2011,7 +2050,7 @@ mod tests {
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
 
-        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
         let state = store.state();
         assert_eq!(state.trust_domain_id, domain_id());
         assert_eq!(state.client_wg_public_key, client_key());
@@ -2040,12 +2079,12 @@ mod tests {
         let mut settings = settings(&domain);
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
-        open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        open_or_seed(&path, &settings, &bundle).expect("seeded");
 
         // The operator re-emits a document claiming a generation that has
         // already been superseded locally.
         settings.trust.as_mut().expect("trust").client_generation = 1;
-        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("reopened");
+        let store = open_or_seed(&path, &settings, &bundle).expect("reopened");
         assert_eq!(
             store.state().certificates.active.generation,
             4,
@@ -2092,7 +2131,7 @@ mod tests {
         let legacy = store(directory.path(), &domain);
         legacy.save().expect("legacy saved");
 
-        let migrated = open_identity_store(directory.path(), &settings, &bundle, NOW)
+        let migrated = open_identity_store(directory.path(), &settings, &bundle)
             .expect("legacy imported");
         let scoped_path = identity_trust_store_path(directory.path(), &domain_id(), &client_key());
 
@@ -2116,7 +2155,7 @@ mod tests {
         let other_key = WireGuardKey::from_bytes([3; 32]);
         let other_bundle = bundle_for_client_key(&domain, other_key);
 
-        let opened = open_identity_store(directory.path(), &settings, &other_bundle, NOW)
+        let opened = open_identity_store(directory.path(), &settings, &other_bundle)
             .expect("independent store seeded");
         let scoped_path = identity_trust_store_path(directory.path(), &domain_id(), &other_key);
 
@@ -2137,12 +2176,12 @@ mod tests {
         let settings = settings(&domain);
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
-        open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        open_or_seed(&path, &settings, &bundle).expect("seeded");
 
         let mut stranger = settings.clone();
         stranger.trust.as_mut().expect("trust").trust_domain_id = "ab".repeat(16);
         assert!(matches!(
-            open_or_seed(&path, &stranger, &bundle, NOW),
+            open_or_seed(&path, &stranger, &bundle),
             Err(RenewalError::ForeignTrustStore { .. })
         ));
     }
@@ -2157,11 +2196,11 @@ mod tests {
         let domain = domain();
         let settings = settings(&domain);
         let path = directory.path().join("trust.json");
-        open_or_seed(&path, &settings, &bundle(&domain), NOW).expect("seeded");
+        open_or_seed(&path, &settings, &bundle(&domain)).expect("seeded");
 
         let stranger = bundle_for_client_key(&domain, WireGuardKey::from_bytes([3; 32]));
         assert!(matches!(
-            open_or_seed(&path, &settings, &stranger, NOW),
+            open_or_seed(&path, &settings, &stranger),
             Err(RenewalError::ForeignTrustStore { .. })
         ));
     }
@@ -2179,7 +2218,7 @@ mod tests {
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
 
-        let store = open_or_seed(&path, &settings, &bundle, NOW).expect("seeded");
+        let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
         let state = store.state();
         let active = &state.certificates.active;
         let trust = settings.trust.as_ref().expect("trust");
@@ -2218,6 +2257,96 @@ mod tests {
         );
     }
 
+    /// A COSE ES256 public key, as an authenticator publishes one.
+    ///
+    /// Built here rather than faked: the binding's own verification parses
+    /// this field, so a placeholder would make the test pass on a shape the
+    /// real exchange refuses.
+    fn cose_es256_key() -> Vec<u8> {
+        let mut key = vec![
+            0xA5, // map(5)
+            0x01, 0x02, // 1 (kty)  : 2   — EC2
+            0x03, 0x26, // 3 (alg)  : -7  — ES256
+            0x20, 0x01, // -1 (crv) : 1   — P-256
+            0x21, 0x58, 0x20, // -2 (x) : bstr(32)
+        ];
+        key.extend_from_slice(&[3u8; 32]);
+        key.extend_from_slice(&[0x22, 0x58, 0x20]); // -3 (y) : bstr(32)
+        key.extend_from_slice(&[5u8; 32]);
+        key
+    }
+
+    /// A binding the domain's `CA-PQ` signed, carried by the enrolment.
+    fn signed_binding(
+        domain: &Domain,
+        credential_id: Vec<u8>,
+    ) -> aether::certificates::approval::AstraCredentialBinding {
+        aether::certificates::approval::AstraCredentialBinding {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id,
+            credential_public_key: cose_es256_key(),
+            aaguid: [0; 16],
+            trust_domain_id: crate::test_domain::domain_id(),
+            gateway_wg_public_key: crate::test_domain::gateway_key(),
+            state: aether::certificates::approval::CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: NOW,
+            ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::placeholder(),
+        }
+        .sign(&domain.ca_pq_private)
+        .expect("signed under CA-PQ")
+    }
+
+    /// Recovering an expired identity begins by naming the credential that
+    /// will approve it, and a client with no tunnel cannot go and ask. The
+    /// enrolment therefore carries the list, and the seed adopts it.
+    #[test]
+    fn the_operator_credentials_travel_with_the_enrolment() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings
+            .trust
+            .as_mut()
+            .expect("trust")
+            .astra_credential_bindings = vec![signed_binding(&domain, vec![0xAB, 0xCD])];
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
+        let bindings = &store.state().astra.credential_bindings;
+        assert_eq!(bindings.len(), 1, "the credential the enrolment carried");
+        assert!(
+            bindings.values().any(|binding| binding.state
+                == aether::certificates::approval::CredentialState::Active),
+            "an active row is what a recovery may name"
+        );
+    }
+
+    /// The document that carried the bindings proves nothing by itself: each
+    /// one is verified under the anchor of this profile, and a row signed by
+    /// another authority is refused rather than adopted.
+    #[test]
+    fn a_credential_binding_signed_by_another_anchor_is_refused() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let stranger = crate::test_domain::domain();
+        let mut settings = settings(&domain);
+        settings
+            .trust
+            .as_mut()
+            .expect("trust")
+            .astra_credential_bindings = vec![signed_binding(&stranger, vec![0xAB, 0xCD])];
+        let bundle = bundle(&domain);
+        let path = directory.path().join("trust.json");
+        assert!(
+            open_or_seed(&path, &settings, &bundle).is_err(),
+            "a row the domain never signed is not adopted"
+        );
+        assert!(!path.exists(), "a refused seed writes nothing");
+    }
+
     /// A machine left off past its own expiry is exactly what §7.5 recovers,
     /// and it reaches that path through a store it does not have yet. Seeding
     /// therefore describes the expired leaf instead of refusing it — the
@@ -2230,7 +2359,7 @@ mod tests {
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
         let expired_at = NOW + 20 * 86_400;
-        let store = open_or_seed(&path, &settings, &bundle, expired_at).expect("seeded");
+        let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
         assert!(path.exists(), "the store the recovery opens must be written");
         assert!(
             store.state().certificates.active.not_after <= expired_at,
@@ -2249,7 +2378,7 @@ mod tests {
         let bundle = bundle(&domain);
         let path = directory.path().join("trust.json");
         let expired_at = NOW + 20 * 86_400;
-        let store = open_or_seed(&path, &settings, &bundle, expired_at).expect("seeded");
+        let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
         assert!(matches!(
             assert_active_can_prove_continuity(store.state(), expired_at),
             Err(RenewalError::ActiveExpired { .. })
@@ -2272,8 +2401,7 @@ mod tests {
             open_or_seed(
                 &directory.path().join("trust.json"),
                 &settings,
-                &bundle(&domain),
-                NOW
+                &bundle(&domain)
             ),
             Err(RenewalError::TrustMaterialMissing)
         ));

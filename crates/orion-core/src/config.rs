@@ -106,6 +106,17 @@ pub struct TrustMaterial {
     /// Highest CA-PQ-signed credential registry decision this profile saw.
     #[serde(default)]
     pub credential_registry_epoch: u64,
+    /// The operator credentials of the domain, as `CA-PQ` signed them.
+    ///
+    /// Verified under [`Self::ca_pq_public_key`] before anything is done with
+    /// them, so the document that carried them proves nothing by itself.
+    ///
+    /// Absent on a profile emitted before this field existed. That profile
+    /// still mounts a tunnel and still renews; what it cannot do is recover an
+    /// expired identity, because naming the credential that will approve it is
+    /// the first thing §7.5 does.
+    #[serde(default)]
+    pub astra_credential_bindings: Vec<aether::certificates::approval::AstraCredentialBinding>,
     pub astra_service_key_epoch: u64,
     /// Astra's service key, base64 ML-DSA-87.
     pub astra_service_public_key: String,

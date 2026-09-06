@@ -254,7 +254,6 @@ pub async fn begin(
         config.parent().unwrap_or_else(|| Path::new(".")),
         settings,
         &bundle,
-        now_unix,
     )?;
 
     let expired_pq = crate::certificate_renewal::client_pq_leaf(&bundle)?;
@@ -385,7 +384,6 @@ async fn install(
         config.parent().unwrap_or_else(|| Path::new(".")),
         settings,
         &bundle,
-        now_unix,
     )?;
 
     {

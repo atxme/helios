@@ -269,6 +269,7 @@ pub(crate) fn settings(domain: &Domain) -> KeyNegotiationSettings {
             webauthn_rp_id: "astra.example".into(),
             astra_policy_fingerprint: Fingerprint::of(b"policy").to_hex(),
             credential_registry_epoch: 1,
+            astra_credential_bindings: Vec::new(),
             astra_service_key_epoch: 1,
             astra_service_public_key: domain.service_public.to_base64(),
         }),

@@ -121,6 +121,19 @@ pub struct TrustEnrolmentView {
     pub webauthn_rp_id: String,
     pub astra_policy_fingerprint: String,
     pub credential_registry_epoch: u64,
+    /// The operator credentials of the domain, as `CA-PQ` signed them.
+    ///
+    /// Public: a binding carries a credential identifier and a public key, and
+    /// the consumer is what authenticates it — Orion under the `CA-PQ` of its
+    /// own profile, never under this gateway's word.
+    ///
+    /// Carried by the enrolment rather than fetched, because the one moment a
+    /// client needs them is the one where it has no tunnel: recovering an
+    /// expired identity (§7.5) names the credential that will approve it, and
+    /// a client that learned that list over the tunnel it no longer has would
+    /// have no list at all.
+    #[serde(default)]
+    pub astra_credential_bindings: Vec<aether::certificates::approval::AstraCredentialBinding>,
     pub astra_service_key_epoch: u64,
     pub astra_service_public_key: String,
 }
