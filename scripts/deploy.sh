@@ -1177,6 +1177,24 @@ deployer_astra() {
                     echo "    d'autorisation précédente." >&2
                 }
             fi
+            # Le même document, dans le registre de la gateway. Astra s'en
+            # sert pour proposer un credential à une approbation ; la gateway
+            # s'en sert pour le **distribuer** — le bloc d'enrôlement du §19
+            # est la seule chose qu'un client lit avant d'avoir un tunnel, et
+            # récupérer une identité expirée commence par nommer le credential
+            # qui l'approuvera. Un client qui devrait aller chercher la liste
+            # devrait le faire par le lien qu'il vient justement de perdre.
+            credentials_distant="$(ssh "$CIBLE" 'printf %s "$HOME"')/astra-credentials.json"
+            if printf '%s' "$credentials_b64" | base64 -d |
+                ssh "$CIBLE" "cat > '$credentials_distant'"; then
+                helios_ssh_sudo "$CIBLE" "$HELIOSD install-astra-credentials \
+                    '$credentials_distant'" || {
+                    echo "    le registre gateway n'a pas retenu les credentials :" >&2
+                    echo "    les profils émis ensuite ne pourront pas récupérer une" >&2
+                    echo "    identité expirée." >&2
+                }
+                ssh "$CIBLE" "rm -f '$credentials_distant'"
+            fi
         else
             echo "    les credentials opérateur n'ont pas pu être copiés :" >&2
             echo "      $credentials_local" >&2

@@ -1216,6 +1216,60 @@ impl CertificateRegistry {
     /// delegation would widen what may be issued before anything authorized
     /// it. See
     /// [`AstraPolicyPin::adopt_automatic_renewal_policy`](aether::certificates::approval::AstraPolicyPin::adopt_automatic_renewal_policy).
+    /// Records the domain's operator credentials, from the `CA-PQ`-signed
+    /// document the companion emits.
+    ///
+    /// # Why the gateway holds them at all
+    ///
+    /// It never approves anything with them: an approval is a WebAuthn
+    /// assertion, verified by Astra and by the client. What the gateway owes
+    /// them is *distribution* — the §19 enrolment block is the only thing a
+    /// client reads before it has a tunnel, and recovering an expired identity
+    /// (§7.5) begins by naming the credential that will approve it. A client
+    /// that had to fetch the list would have to fetch it over the link it has
+    /// just lost.
+    ///
+    /// Until this call the registry learned a row only by verifying an
+    /// approval that named it, which is to say: never, on a domain where no
+    /// renewal had yet been approved. A freshly bootstrapped domain therefore
+    /// enrolled clients that could never recover.
+    ///
+    /// # What is checked
+    ///
+    /// Every row, under the `CA-PQ` this registry already holds — not only the
+    /// rows about to be used. A document carrying one forged row beside honest
+    /// ones would otherwise install it, and that row is what a later
+    /// `supersedes` would be compared against.
+    pub fn install_astra_credentials(
+        &mut self,
+        registry: &aether::certificates::approval::CredentialRegistry,
+    ) -> Result<usize, RegistryError> {
+        registry.verify(
+            &self.state.gateway.current_ca_public_key,
+            &self.state.trust_domain_id,
+            &self.state.gateway.gateway_wg_public_key,
+            self.state.gateway.ca_epoch,
+            self.state.astra.credential_registry_epoch,
+        )?;
+
+        // One candidate, one persist: a registry left holding half a document
+        // would answer an enrolment with a list nobody signed as a whole.
+        let mut candidate = self.state.clone();
+        let mut installed = 0usize;
+        for binding in &registry.bindings {
+            if matches!(
+                candidate.astra.accept_credential_binding(binding)?,
+                aether::certificates::state::InstallOutcome::Installed
+            ) {
+                installed += 1;
+            }
+        }
+        if installed > 0 {
+            self.persist(candidate)?;
+        }
+        Ok(installed)
+    }
+
     pub fn install_astra_issuer(
         &mut self,
         delegation: &aether::certificates::authority::AstraIssuerAuthorization,
@@ -1709,6 +1763,104 @@ mod tests {
             not_before: 0,
             not_after: 1_000_000,
         }
+    }
+
+    /// A COSE ES256 public key, as an authenticator publishes one. The
+    /// binding's own verification parses this field, so a placeholder would
+    /// pass a test the real exchange refuses.
+    fn cose_es256_key() -> Vec<u8> {
+        let mut key = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        key.extend_from_slice(&[3u8; 32]);
+        key.extend_from_slice(&[0x22, 0x58, 0x20]);
+        key.extend_from_slice(&[5u8; 32]);
+        key
+    }
+
+    fn credential_row(
+        ca: &Keys,
+        credential_id: Vec<u8>,
+    ) -> aether::certificates::approval::AstraCredentialBinding {
+        aether::certificates::approval::AstraCredentialBinding {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            credential_id,
+            credential_public_key: cose_es256_key(),
+            aaguid: [0; 16],
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            state: aether::certificates::approval::CredentialState::Active,
+            credential_epoch: 1,
+            credential_registry_epoch: 1,
+            ca_epoch: 1,
+            created_at: 1_000,
+            ca_pq_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca.private)
+        .expect("signed under CA-PQ")
+    }
+
+    fn credential_document(
+        rows: Vec<aether::certificates::approval::AstraCredentialBinding>,
+    ) -> aether::certificates::approval::CredentialRegistry {
+        aether::certificates::approval::CredentialRegistry {
+            trust_domain_id: domain(),
+            gateway_wg_public_key: gateway_key(),
+            ca_epoch: 1,
+            credential_registry_epoch: 1,
+            bindings: rows,
+        }
+    }
+
+    /// The gateway distributes the operator credentials it never uses: the
+    /// §19 enrolment block is all a client reads before it has a tunnel, and
+    /// §7.5 begins by naming the credential that will approve the recovery.
+    #[test]
+    fn the_operator_credentials_are_recorded_for_the_enrolment_to_carry() {
+        let mut fixture = fixture();
+        let document = credential_document(vec![
+            credential_row(&fixture.ca, vec![0xAB, 0xCD]),
+            credential_row(&fixture.ca, vec![0x01, 0x02]),
+        ]);
+
+        assert_eq!(
+            fixture
+                .registry
+                .install_astra_credentials(&document)
+                .expect("recorded"),
+            2
+        );
+        assert_eq!(
+            fixture.registry.state().astra.credential_bindings.len(),
+            2,
+            "both rows reach the state the enrolment view reads"
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .install_astra_credentials(&document)
+                .expect("idempotent"),
+            0,
+            "replaying the same document installs nothing again"
+        );
+    }
+
+    /// One forged row beside honest ones rejects the whole document. It is
+    /// that row a later `supersedes` would be compared against, so installing
+    /// its neighbours and skipping it would leave the registry worse than
+    /// untouched.
+    #[test]
+    fn a_document_carrying_one_unsigned_row_is_refused_whole() {
+        let mut fixture = fixture();
+        let stranger = keys();
+        let document = credential_document(vec![
+            credential_row(&fixture.ca, vec![0xAB, 0xCD]),
+            credential_row(&stranger, vec![0x01, 0x02]),
+        ]);
+
+        assert!(fixture.registry.install_astra_credentials(&document).is_err());
+        assert!(
+            fixture.registry.state().astra.credential_bindings.is_empty(),
+            "a refused document installs none of its rows"
+        );
     }
 
     struct Fixture {

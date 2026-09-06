@@ -294,6 +294,22 @@ enum Command {
         /// Signed `AstraIssuerAuthorization`, as JSON.
         delegation: PathBuf,
     },
+    /// Records the domain's operator credentials, so an enrolment can carry
+    /// them (spec §19, §7.5).
+    ///
+    /// The document is the one `astra-signer bindings` emits beside the vault,
+    /// and `deploy.sh` already copies it to Astra. This installs the same
+    /// bytes here, because the enrolment block is the only thing a client
+    /// reads before it has a tunnel — and recovering an expired identity
+    /// begins by naming the credential that will approve it.
+    ///
+    /// Nothing secret crosses: the rows are public and each carries its own
+    /// `CA-PQ` signature, which this registry checks under the anchor it
+    /// already holds.
+    InstallAstraCredentials {
+        /// `CA-PQ`-signed credential registry, as JSON.
+        credentials: PathBuf,
+    },
     /// Prints the trust block a client's profile must carry (spec §19).
     ///
     /// Read from the certificate registry in one pass, and printed as the
@@ -561,6 +577,9 @@ async fn main() -> anyhow::Result<()> {
         Command::InstallCaTransition { transition } => install_ca_transition(&transition),
         Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
         Command::InstallAstraIssuer { delegation } => install_astra_issuer(&delegation),
+        Command::InstallAstraCredentials { credentials } => {
+            install_astra_credentials(&credentials)
+        }
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,
@@ -874,6 +893,23 @@ fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
         InstallOutcome::Installed => warn!(
             "CA-PQ rotation staged: both anchors verify from activation_at, and the outgoing one              is retired at not_after. Every client must have received this transition before that              date — one that has not is repaired by an operator, not by a late delivery"
         ),
+    }
+    Ok(())
+}
+
+/// Records the domain's operator credentials, for the enrolment to carry.
+fn install_astra_credentials(source: &Path) -> anyhow::Result<()> {
+    let mut registry = gateway_rotation::open_registry_for_command()?;
+    let credentials: aether::certificates::approval::CredentialRegistry =
+        gateway_rotation::read_signed_document(source, "Astra credential registry")?;
+    let installed = registry
+        .install_astra_credentials(&credentials)
+        .context("recording the Astra operator credentials")?;
+
+    println!("registry epoch: {}", credentials.credential_registry_epoch);
+    println!("rows installed: {installed}");
+    if installed == 0 {
+        info!("this registry already holds every row of that document");
     }
     Ok(())
 }
