@@ -60,7 +60,13 @@ astra campaign open --scope fleet-leafs \
 # → imprime un identifiant d'opération
 ```
 
-**Sur le poste de l'opérateur** :
+**Sur le poste de l'opérateur**, l'onglet Astra d'Orion s'allume et montre le
+motif, le demandeur, les cibles et l'empreinte avant de demander les clés — une
+à la fois, parce que deux touchers d'un même jeton sont refusés et qu'il vaut
+mieux l'apprendre à la seconde invite qu'après les deux.
+
+Si la clé est ailleurs, l'adaptateur en ligne de commande exécute la même
+cérémonie :
 
 ```sh
 astra-signer approve-campaign --authority-url https://astra.exemple \
@@ -201,15 +207,19 @@ affiche un identifiant. Il n'y a plus aucun canal automatique entre le poste et
 l'opérateur — l'identifiant se lit à voix haute, se copie dans un message, peu
 importe : il n'autorise rien à lui seul.
 
-**Sur le poste de l'opérateur** :
+**Sur le poste de l'opérateur**, si c'est le même poste, la ligne « Approuver
+ici avec la clé » ouvre la cérémonie dans l'onglet Astra. Sinon, l'adaptateur
+en ligne de commande fait la même chose :
 
 ```sh
 astra-signer recover --authority-url https://astra.exemple \
-  --operation-id <identifiant> --validity-days 365
+  --operation-id <identifiant>
 ```
 
-Le compagnon affiche le pair, la génération et depuis combien de temps elle est
-expirée, **avant** de demander le toucher. Puis, dans Orion, cliquer une
+L'un comme l'autre affichent le pair, la génération et depuis combien de temps
+elle est expirée, **avant** de demander le toucher. Les durées ne sont plus
+demandées : une génération récupérée vit un an et ne recouvre qu'un jour —
+l'ancienne a déjà expiré, il n'y a rien à recouvrir. Puis, dans Orion, cliquer une
 seconde fois : le poste installe sa nouvelle génération et son commit repart
 par Astra, qui le relaie à la gateway sur le canal privé.
 

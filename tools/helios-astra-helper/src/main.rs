@@ -153,6 +153,9 @@ fn run() -> Result<()> {
 
     match ceremony.operation {
         OperationKind::RecoverIdentity => recover(&mut ceremony, &mut reader, &mut writer, &window),
+        OperationKind::ApproveCampaign => {
+            approve_campaign(&mut ceremony, &mut reader, &mut writer, &window)
+        }
         // Named rather than swallowed: an operator whose tab offered a
         // ceremony this build cannot run must be told that, and not left
         // watching a status that never moves.
@@ -251,6 +254,112 @@ fn recover<R: std::io::BufRead, W: std::io::Write>(
     }
     match outcome {
         Ok(()) => {
+            ceremony.gesture = GestureState::Done;
+            session::write_status(writer, &ceremony.status())?;
+            Ok(())
+        }
+        Err(error) => {
+            ceremony.refuse(Refusal::AuthorityRefused { status: 0 });
+            session::write_status(writer, &ceremony.status())?;
+            Err(error)
+        }
+    }
+}
+
+/// §8.5, with its keys asked for one at a time.
+///
+/// The campaign says how many distinct credentials must approve it, and each
+/// one is a separate wait: an operator about to touch the same token twice
+/// finds that out at the *second* prompt rather than after both, which is the
+/// only moment where the answer is still theirs to change.
+fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
+    ceremony: &mut Ceremony,
+    reader: &mut R,
+    writer: &mut W,
+    window: &owner::OwnerWindow,
+) -> Result<()> {
+    let operation = ceremony
+        .operation_id
+        .context("une campagne est désignée par l'opération que l'autorité a ouverte")?;
+    let vault_path = astra_operator::store::default_path()?;
+
+    let verified = match astra_operator::operations::campaign::begin(
+        &vault_path,
+        operation,
+        None,
+        None,
+        now_unix(),
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            ceremony.refuse(Refusal::HandoffMismatch);
+            session::write_status(writer, &ceremony.status())?;
+            return Err(error);
+        }
+    };
+
+    let required = verified.required_credentials();
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.manifest = Some(AstraManifest::Campaign(verified.manifest().clone()));
+
+    let mut keys = Vec::new();
+    for index in 1..=required {
+        ceremony.gesture = GestureState::AwaitingKey {
+            index,
+            of: required,
+            // Every credential of a campaign is an approval, and naming the
+            // first one differently would suggest an order the protocol does
+            // not have.
+            purpose: KeyPurpose::SecondApproval,
+        };
+        let offered = ceremony.status();
+        session::write_status(writer, &offered)?;
+
+        match awaited_action(reader, &offered)? {
+            Some(OperatorAction::Continue) => {}
+            Some(OperatorAction::Cancel) | None => {
+                ceremony.cancel();
+                session::write_status(writer, &ceremony.status())?;
+                return Ok(());
+            }
+        }
+
+        ceremony.gesture = GestureState::ProcessingKey {
+            index,
+            of: required,
+        };
+        session::write_status(writer, &ceremony.status())?;
+        let key = helios_fido::authenticator::connect_owned(
+            helios_fido::authenticator::Transport::default(),
+            window.owner(),
+        )?;
+        if key.needs_pin() {
+            ceremony.refuse(Refusal::ProtocolViolation);
+            session::write_status(writer, &ceremony.status())?;
+            bail!(
+                "ce transport demande que le PIN soit saisi par le programme, et ce processus \
+                 n'a aucune interface pour le demander"
+            );
+        }
+        keys.push(key);
+    }
+
+    ceremony.gesture = GestureState::Signing;
+    session::write_status(writer, &ceremony.status())?;
+
+    let key_refs: Vec<&dyn astra_operator::authenticator::Authenticator> =
+        keys.iter().map(|key| key.as_ref()).collect();
+    let pins: Vec<&str> = vec![""; key_refs.len()];
+    let mut reached = Vec::new();
+    let outcome = verified.approve(&key_refs, &pins, now_unix(), &mut |state| {
+        reached.push(state)
+    });
+    for state in reached {
+        ceremony.remote = state;
+        session::write_status(writer, &ceremony.status())?;
+    }
+    match outcome {
+        Ok(_) => {
             ceremony.gesture = GestureState::Done;
             session::write_status(writer, &ceremony.status())?;
             Ok(())

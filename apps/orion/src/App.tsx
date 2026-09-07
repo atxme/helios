@@ -6,11 +6,12 @@ import ButtonBase from '@mui/material/ButtonBase'
 import IconButton from '@mui/material/IconButton'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
-import { ChevronDown, Gauge, KeyRound, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
+import { ChevronDown, Gauge, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
 import * as api from './api'
 import type { VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { CertificatesView } from './views/CertificatesView'
+import { AstraMark } from './components/AstraMark'
 import { AstraView } from './views/AstraView'
 import { ConnectView } from './views/ConnectView'
 import { ProfilesView } from './views/ProfilesView'
@@ -47,7 +48,7 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
   // §12.2's «tous les profils Helios de cet appareil» cannot live on a screen
   // that shows one profile at a time.
   { value: 'certificates', label: 'Certificats', icon: ShieldCheck },
-  { value: 'astra', label: 'Astra', icon: KeyRound },
+  { value: 'astra', label: 'Astra', icon: AstraMark },
   { value: 'speedtest', label: 'Speedtest', icon: Gauge },
   { value: 'logs', label: 'Journal', icon: Terminal },
 ]

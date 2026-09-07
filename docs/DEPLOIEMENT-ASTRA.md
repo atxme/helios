@@ -108,13 +108,23 @@ refusée par mTLS, par QUIC et par tous les validateurs ordinaires. C'est le
 seul cas où le client parle à l'**origine publique** d'Astra plutôt qu'à la
 gateway.
 
-Dans Orion : « Récupérer le certificat expiré ». Puis, sur le poste de
-l'opérateur :
+Dans Orion : « Récupérer le certificat expiré ».
+
+**Si la clé est sur ce poste**, la ligne suivante affiche « Approuver ici avec
+la clé » : l'onglet Astra s'allume, montre le pair, la génération et depuis
+combien de temps elle est expirée, puis demande le toucher. Rien n'est saisi —
+l'origine de l'autorité, le RP ID et les durées viennent du relais de domaine
+épinglé à côté du coffre.
+
+**Si la clé est sur un autre poste**, Orion affiche la ligne à y exécuter :
 
 ```sh
 astra-signer recover --authority-url https://astra.exemple \
-  --operation-id <identifiant> --validity-days 365
+  --operation-id <identifiant>
 ```
+
+L'adaptateur en ligne de commande subsiste pour ce cas, et pour le transport
+hors ligne du §8.5. Il exécute exactement la même cérémonie que l'onglet.
 
 Une seule clé suffit, et §7.5 dit pourquoi : elle n'est pas la seule preuve —
 la clé privée de la dernière génération admise signe aussi la demande, et une

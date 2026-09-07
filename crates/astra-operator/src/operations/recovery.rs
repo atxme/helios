@@ -138,7 +138,7 @@ pub fn begin(
             .context("CA-TLS cliente : base64 illisible")?,
     )?;
 
-    let authority_url = resolve_authority_url(
+    let authority_url = super::resolve_authority_url(
         handoff.astra_authority_url.as_deref(),
         offered_authority_url,
     )?;
@@ -289,33 +289,6 @@ impl Verified {
     }
 }
 
-/// The pinned origin wins; a disagreement refuses.
-///
-/// Not «the caller's value if given», and not «the pin if given»: either rule
-/// silently picks a side of a disagreement that means one of the two is wrong
-/// about which domain this is. Refusing is the only answer that does not
-/// choose for the operator.
-fn resolve_authority_url(pinned: Option<&str>, offered: Option<&str>) -> Result<String> {
-    match (pinned.map(str::trim), offered.map(str::trim)) {
-        (Some(pinned), Some(offered))
-            if pinned.trim_end_matches('/') != offered.trim_end_matches('/') =>
-        {
-            bail!(
-                "ce coffre épingle l'origine « {pinned} » et on lui en présente « {offered} » : \
-                 l'une des deux se trompe de domaine, et rien n'est signé tant que la question \
-                 n'est pas tranchée"
-            )
-        }
-        (Some(pinned), _) => Ok(pinned.to_string()),
-        (None, Some(offered)) => Ok(offered.to_string()),
-        (None, None) => bail!(
-            "ce relais de domaine ne nomme pas l'origine de l'autorité : elle est écrite par \
-             l'amorçage du domaine, et la prendre d'ailleurs reviendrait à laisser l'appelant \
-             choisir où partent les signatures"
-        ),
-    }
-}
-
 fn random_id() -> Result<[u8; 16]> {
     let mut out = [0u8; 16];
     aether::random::fill_secret(&mut out)
@@ -335,29 +308,6 @@ mod tests {
     fn the_recovered_generation_overlaps_briefly_and_lives_a_year() {
         assert_eq!(VALIDITY_DAYS, 365);
         assert_eq!(OVERLAP_DAYS, 1);
-    }
-
-    /// The pin is the authority on where signatures go, and a caller that
-    /// disagrees with it is a question, not an input.
-    #[test]
-    fn a_disagreement_about_the_origin_refuses_rather_than_choosing() {
-        assert_eq!(
-            resolve_authority_url(Some("https://a.example"), None).expect("pinned"),
-            "https://a.example"
-        );
-        assert_eq!(
-            resolve_authority_url(Some("https://a.example/"), Some("https://a.example"))
-                .expect("same origin, one trailing slash"),
-            "https://a.example/"
-        );
-        assert!(
-            resolve_authority_url(Some("https://a.example"), Some("https://b.example")).is_err()
-        );
-        assert_eq!(
-            resolve_authority_url(None, Some("https://b.example")).expect("legacy hand-off"),
-            "https://b.example"
-        );
-        assert!(resolve_authority_url(None, None).is_err());
     }
 
     /// The two refusals that cost an evening, stated as arithmetic rather than
