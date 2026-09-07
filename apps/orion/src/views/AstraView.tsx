@@ -352,6 +352,7 @@ function unixDate(seconds: number): string {
   return new Intl.DateTimeFormat('fr-FR', {
     dateStyle: 'medium',
     timeStyle: 'short',
+    timeZone: 'Europe/Paris',
   }).format(new Date(seconds * 1_000))
 }
 

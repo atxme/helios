@@ -796,7 +796,10 @@ fn prepare_gateway_certificate(
     println!("epoch: {}", prepared.request.gateway_identity_epoch);
     println!("request id: {}", prepared.request.request_id.to_hex());
     println!("fingerprint: {}", prepared.request.fingerprint().to_hex());
-    println!("expires at: {}", prepared.request.expires_at);
+    println!(
+        "expires at: {}",
+        aether::display_time::format_paris_timestamp(prepared.request.expires_at)
+    );
     match &prepared.tls_certificate {
         Some(certificate) => println!("candidate TLS leaf: {}", certificate.fingerprint().to_hex()),
         None => println!("candidate TLS leaf: unchanged"),
@@ -822,9 +825,18 @@ fn install_gateway_transition(source: &Path) -> anyhow::Result<()> {
     println!("epoch: {}", transition.gateway_identity_epoch);
     println!("fingerprint: {}", transition.fingerprint()?.to_hex());
     println!("reason: {:?}", transition.reason);
-    println!("not before: {}", transition.window.not_before);
-    println!("activation at: {}", transition.window.activation_at);
-    println!("not after: {}", transition.window.not_after);
+    println!(
+        "not before: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_before)
+    );
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
     match &transition.next_gateway_certificate {
         Some(certificate) => println!(
             "next PQ leaf: {}",
@@ -891,8 +903,14 @@ fn install_ca_transition(source: &Path) -> anyhow::Result<()> {
         transition.current_ca_epoch, transition.next_ca_epoch
     );
     println!("next anchor: {}", transition.next_ca_fingerprint.to_hex());
-    println!("activation at: {}", transition.window.activation_at);
-    println!("not after: {}", transition.window.not_after);
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
     match outcome {
         InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
         InstallOutcome::Installed => warn!(
@@ -975,8 +993,14 @@ fn install_client_tls_ca(source: &Path) -> anyhow::Result<()> {
             .fingerprint()
             .to_hex()
     );
-    println!("activation at: {}", transition.window.activation_at);
-    println!("not after: {}", transition.window.not_after);
+    println!(
+        "activation at: {}",
+        aether::display_time::format_paris_timestamp(transition.window.activation_at)
+    );
+    println!(
+        "not after: {}",
+        aether::display_time::format_paris_timestamp(transition.window.not_after)
+    );
     match outcome {
         InstallOutcome::AlreadyPresent => info!("this rotation was already installed"),
         InstallOutcome::Installed => info!(

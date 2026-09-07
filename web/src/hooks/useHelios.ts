@@ -26,7 +26,10 @@ export function useHelios() {
   const backoffRef = useRef(1000)
 
   const pushEvent = useCallback((event: DisplayEvent) => {
-    const ts = new Date().toLocaleTimeString('fr-FR', { hour12: false })
+    const ts = new Date().toLocaleTimeString('fr-FR', {
+      hour12: false,
+      timeZone: 'Europe/Paris',
+    })
     setEvents(previous => [{ ...event, ts }, ...previous].slice(0, MAX_EVENTS))
   }, [])
 

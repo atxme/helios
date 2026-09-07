@@ -1495,8 +1495,8 @@ fn issue_ca_tls(path: &Path, days: u64, out: Option<&Path>, transport: Transport
         handoff::path_beside(path).display()
     );
     println!("époque CA-TLS    : {}", identity.ca_tls_epoch);
-    println!("valide de        : {not_before}");
-    println!("valide jusqu'à   : {not_after}");
+    println!("valide de        : {}", horodatage(not_before));
+    println!("valide jusqu'à   : {}", horodatage(not_after));
     println!(
         "cette CA est épinglée par la gateway : la remplacer coupe tous les clients déjà \
          admis, et c'est la rotation du §9.4 qui la remplace"
@@ -1858,7 +1858,7 @@ fn approve(
         "demande          : {}",
         request.request_fingerprint.to_hex()
     );
-    println!("expire à         : {}", request.expires_at);
+    println!("expire à         : {}", horodatage(request.expires_at));
 
     // No vault, and no salt: §14.1 in the shape of a call. This is the whole
     // reason the vault is loaded above only for the hand-off and the registry.
@@ -1922,7 +1922,7 @@ fn approve(
     }
 
     println!("empreinte        : {}", approval.fingerprint().to_hex());
-    println!("valable jusqu'à  : {}", approval.expires_at);
+    println!("valable jusqu'à  : {}", horodatage(approval.expires_at));
     println!(
         "le coffre n'a pas été ouvert : une approbation ordinaire n'obtient aucune sortie PRF \
          et Astra y ajoute sa propre signature"
@@ -2244,10 +2244,10 @@ fn revoke(
     );
     println!(
         "échéances signées: TLS {} · PQ {}",
-        tls_not_after.map_or("—".to_string(), |value| value.to_string()),
-        pq_not_after.map_or("—".to_string(), |value| value.to_string())
+        tls_not_after.map_or("—".to_string(), horodatage),
+        pq_not_after.map_or("—".to_string(), horodatage)
     );
-    println!("effet            : immédiat ({now})");
+    println!("effet            : immédiat ({})", horodatage(now));
     println!("catégorie        : {reason:?}");
     println!("motif            : {}", campaign.reason);
     println!("demandée par     : {}", campaign.requested_by);
@@ -2595,13 +2595,15 @@ fn resume_rotation(path: &Path, channel: astra_signer::campaign::Campaign) -> Re
         println!(
             "la rotation vers l'époque {} est déjà déposée. La poursuivre par `astra-signer \
              promote-ca-tls` à partir de {}.",
-            record.next_ca_tls_epoch, record.activation_at
+            record.next_ca_tls_epoch,
+            horodatage(record.activation_at)
         );
         return Ok(());
     }
     println!(
         "reprise du dépôt : rotation CA-TLS vers l'époque {}, préparée à {}.",
-        record.next_ca_tls_epoch, record.prepared_at
+        record.next_ca_tls_epoch,
+        horodatage(record.prepared_at)
     );
     println!("transition       : {}", record.transition_path);
     // No security key. The decision was approved when it was signed; this
@@ -2748,7 +2750,7 @@ fn issue_gateway_bootstrap(
         request.gateway_wg_public_key.to_base64()
     );
     println!("demande          : {}", request.fingerprint());
-    println!("valide jusqu'à   : {validity}");
+    println!("valide jusqu'à   : {}", horodatage(validity));
     println!(
         "credentials      : {} actifs distincts (admission sans continuité)",
         scope.required_credentials()
@@ -3091,7 +3093,10 @@ fn abort_gateway_transition(
     println!("gateway          : {}", campaign.server_name);
     println!("époque annulée   : {}", transition.gateway_identity_epoch);
     println!("transition       : {}", transition.fingerprint()?);
-    println!("activation prévue: {}", transition.window.activation_at);
+    println!(
+        "activation prévue: {}",
+        horodatage(transition.window.activation_at)
+    );
     println!("motif            : {reason:?}");
     println!("demandé par      : {}", campaign.requested_by);
     println!("empreinte        : {}", campaign.fingerprint());
@@ -3244,8 +3249,11 @@ fn sign_gateway_rollback(
         "feuille resservie: {}",
         transition.active_gateway_tls_certificate_fingerprint
     );
-    println!("expire à         : {expires_at}");
-    println!("fin du recouvr.  : {}", transition.window.not_after);
+    println!("expire à         : {}", horodatage(expires_at));
+    println!(
+        "fin du recouvr.  : {}",
+        horodatage(transition.window.not_after)
+    );
     println!("motif            : {reason}");
     println!("demandé par      : {requested_by}");
     println!("empreinte        : {}", campaign.fingerprint());
@@ -3868,23 +3876,10 @@ fn connect_authorized_key(
 ///
 /// The raw seconds stay out of the operator-facing lines: a rotation window is
 /// something someone has to diary, and «1791792171» is not a date anyone
-/// compares to a calendar. UTC rather than local time, because the value it
-/// comes from is what the gateway and the authority both compare against.
+/// compares to a calendar. The signed value remains a Unix instant; only this
+/// operator-facing representation uses Europe/Paris civil time.
 fn horodatage(seconds: u64) -> String {
-    let Ok(seconds) = i64::try_from(seconds) else {
-        return format!("{seconds} (hors plage)");
-    };
-    match time::OffsetDateTime::from_unix_timestamp(seconds) {
-        Ok(moment) => format!(
-            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
-            moment.year(),
-            u8::from(moment.month()),
-            moment.day(),
-            moment.hour(),
-            moment.minute()
-        ),
-        Err(_) => format!("{seconds} (horodatage illisible)"),
-    }
+    aether::display_time::format_paris_timestamp(seconds)
 }
 
 fn ca_pq_rotation_journal_path(vault_path: &Path) -> PathBuf {
@@ -4168,7 +4163,7 @@ mod tests {
     /// A rotation window is a date an operator diaries, not a raw counter.
     #[test]
     fn a_window_bound_is_printed_as_a_date() {
-        assert_eq!(horodatage(1_791_792_171), "2026-10-12 08:02 UTC");
+        assert_eq!(horodatage(1_791_792_171), "2026-10-12 10:02 CEST");
         // Out of range is named rather than silently rendered as an epoch.
         assert!(horodatage(u64::MAX).contains("hors plage"));
     }

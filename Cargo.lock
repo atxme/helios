@@ -45,6 +45,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "toml 0.8.2",
  "windows-sys 0.61.2",

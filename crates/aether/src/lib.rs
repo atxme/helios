@@ -12,6 +12,7 @@
 pub mod certificates;
 
 pub mod config;
+pub mod display_time;
 pub mod enroll;
 pub mod error;
 pub mod events;

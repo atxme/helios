@@ -1486,20 +1486,7 @@ fn committed_and_waiting(
 /// The raw seconds stay out of operator-facing text: an activation is
 /// something someone compares to a calendar, and «1796659573» is not.
 fn horodatage(seconds: u64) -> String {
-    let Ok(seconds) = i64::try_from(seconds) else {
-        return format!("{seconds} (hors plage)");
-    };
-    match time::OffsetDateTime::from_unix_timestamp(seconds) {
-        Ok(moment) => format!(
-            "{:04}-{:02}-{:02} {:02}:{:02} UTC",
-            moment.year(),
-            u8::from(moment.month()),
-            moment.day(),
-            moment.hour(),
-            moment.minute()
-        ),
-        Err(_) => format!("{seconds} (horodatage illisible)"),
-    }
+    aether::display_time::format_paris_timestamp(seconds)
 }
 
 pub async fn begin(

@@ -350,7 +350,9 @@ function RenewalStep({
           <Row label="identité servie" value={`génération ${step.generation}`} />
           <Row
             label="sélection jusqu’au"
-            value={new Date(step.available_until * 1000).toLocaleString()}
+            value={new Date(step.available_until * 1000).toLocaleString('fr-FR', {
+              timeZone: 'Europe/Paris',
+            })}
           />
         </>
       )}
@@ -411,7 +413,9 @@ function RenewalStep({
               <Row label="empreinte" value={manifest.request_fingerprint} copyable />
               <Row
                 label="expire"
-                value={new Date(manifest.expires_at * 1000).toLocaleString()}
+                value={new Date(manifest.expires_at * 1000).toLocaleString('fr-FR', {
+                  timeZone: 'Europe/Paris',
+                })}
               />
               <Row
                 label="clés"

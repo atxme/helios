@@ -977,6 +977,11 @@ l'utilise pour toutes les comparaisons. Les additions et soustractions sont
 vérifiées. Une horloge invalide fait échouer fermement l'installation de la
 transition ; elle ne produit aucune extension implicite.
 
+Les objets signés et les API conservent ces instants sous forme de secondes
+Unix. Leur affichage destiné à l'opérateur est uniformisé sur l'heure civile
+`Europe/Paris` : CET en hiver et CEST en été. Ce rendu ne participe ni aux
+comparaisons ni aux signatures.
+
 ### 4.2 Générations
 
 Les espaces de génération et de révocation sont indépendants :

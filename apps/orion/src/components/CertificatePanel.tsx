@@ -143,11 +143,12 @@ export function isAlarming(phase: CertificatePhase): boolean {
   return PHASE[phase].alarming
 }
 
-/** Date in the machine's locale, to the minute. Seconds say nothing here. */
+/** Date in Europe/Paris civil time, to the minute. Seconds say nothing here. */
 function instant(seconds: number): string {
-  return new Date(seconds * 1000).toLocaleString(undefined, {
+  return new Date(seconds * 1000).toLocaleString('fr-FR', {
     dateStyle: 'medium',
     timeStyle: 'short',
+    timeZone: 'Europe/Paris',
   })
 }
 

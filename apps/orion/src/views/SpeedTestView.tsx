@@ -235,7 +235,11 @@ function resultRate(result: SpeedTestResult, direction: 'download' | 'upload'): 
 
 /** The hour a run finished, which is all that dates it within a session. */
 function clock(at: number): string {
-  return new Date(at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  return new Date(at).toLocaleTimeString('fr-FR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'Europe/Paris',
+  })
 }
 
 /** Day and hour, for a row that may be older than the current session. */
@@ -244,6 +248,7 @@ function stamp(at: number): string {
     day: 'numeric',
     month: 'short',
     year: 'numeric',
+    timeZone: 'Europe/Paris',
   })
   return `${date} · ${clock(at)}`
 }

@@ -101,11 +101,12 @@ const PHASE: Record<CertificatePhase, PhaseSkin> = {
   },
 }
 
-/** A date, in the operator's own locale, from a Unix instant. */
+/** A date in Europe/Paris civil time, from a Unix instant. */
 function formatDate(unix: number): string {
   return new Date(unix * 1000).toLocaleString('fr-FR', {
     dateStyle: 'medium',
     timeStyle: 'short',
+    timeZone: 'Europe/Paris',
   })
 }
 
