@@ -1217,6 +1217,9 @@ pub const OPERATOR_OPERATION_ROUTE: &str = "/internal/v1/operator/operations/:op
 pub const OPERATOR_SIGNER_REQUEST_ROUTE: &str = "/internal/v1/operator/signer-requests/:operation";
 pub const OPERATOR_VAULT_ROUTE: &str = "/internal/v1/operator/vaults/:fingerprint";
 pub const OPERATOR_SIGNER_RESULT_ROUTE: &str = "/internal/v1/operator/signer-results/:operation";
+/// Everything waiting for an operator. Carries no capability token: see
+/// [`aether::certificates::transport::OperatorPendingOperation`].
+pub const OPERATOR_PENDING_ROUTE: &str = "/internal/v1/operator/pending";
 
 /// Ceiling on every operator answer, including the encrypted vault.
 ///
@@ -1295,7 +1298,8 @@ pub struct RelayedOperatorSignerResult {
 
 /// The two operator shapes both ends parse, defined once in `aether`.
 pub use aether::certificates::transport::{
-    OperatorSignerRequestResponse, SigningOperationState, SigningOperationView,
+    OperatorPendingList, OperatorPendingOperation, OperatorSignerRequestResponse,
+    SigningOperationState, SigningOperationView,
 };
 
 /// The name the gateway puts in SNI when it dials Astra.
@@ -1506,6 +1510,20 @@ impl AstraLifecycleClient {
     ) -> Result<SigningOperationView, ChannelError> {
         self.post_bounded(
             &operator_path("operations", &operation.to_string()),
+            relayed,
+            None,
+            MAX_OPERATOR_ANSWER_BYTES,
+        )
+        .await
+    }
+
+    /// Reads everything waiting for an operator. No capability token crosses.
+    pub async fn operator_pending(
+        &self,
+        relayed: &RelayedOperatorCampaign,
+    ) -> Result<OperatorPendingList, ChannelError> {
+        self.post_bounded(
+            OPERATOR_PENDING_ROUTE,
             relayed,
             None,
             MAX_OPERATOR_ANSWER_BYTES,

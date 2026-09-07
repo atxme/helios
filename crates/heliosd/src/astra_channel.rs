@@ -588,6 +588,21 @@ impl helios_api::certificates::OperatorCampaignRelay for AstraRenewalRelay {
     /// is the assertion and the `CA-PQ` signatures its objects carry. The
     /// administrator's stable WireGuard identity travels for Astra's
     /// structured service log only.
+    async fn pending(
+        &self,
+        operator: &helios_api::internal::OperatorIdentity,
+    ) -> Result<
+        helios_api::internal::OperatorPendingList,
+        helios_api::certificates::TrustUpdateRefusal,
+    > {
+        self.client
+            .operator_pending(&helios_api::internal::RelayedOperatorCampaign {
+                operator: operator.clone(),
+            })
+            .await
+            .map_err(|error| Self::refuse("operator-pending", error))
+    }
+
     async fn operation(
         &self,
         operator: &helios_api::internal::OperatorIdentity,

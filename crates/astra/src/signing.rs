@@ -256,6 +256,47 @@ impl SigningOperationStore {
         self.operations.is_empty()
     }
 
+    /// Everything still waiting for an operator, oldest first.
+    ///
+    /// Expired entries are skipped rather than returned and filtered later: an
+    /// operation whose window closed is not «pending», it is over, and offering
+    /// it would send an operator to a ceremony that refuses at the first step.
+    ///
+    /// Carries no capability token. Tokens are minted for the caller about to
+    /// act on the operation they named; a list that carried them would hand
+    /// every reader a credential for every operation on it.
+    pub fn pending(
+        &self,
+        now_unix: u64,
+    ) -> Vec<aether::certificates::transport::OperatorPendingOperation> {
+        let mut pending: Vec<_> = self
+            .operations
+            .values()
+            .filter(|operation| {
+                !operation.is_expired(now_unix)
+                    && operation.state
+                        == aether::certificates::transport::SigningOperationState::AwaitingOperator
+            })
+            .map(
+                |operation| aether::certificates::transport::OperatorPendingOperation {
+                    operation_id: operation.operation_id,
+                    scope: operation.campaign.scope.clone(),
+                    reason: operation.campaign.reason.clone(),
+                    requested_by: operation.campaign.requested_by.clone(),
+                    target_count: operation.campaign.targets.len(),
+                    required_credentials: operation.campaign.required_credentials,
+                    campaign_fingerprint: operation.campaign.fingerprint(),
+                    created_at: operation.created_at,
+                    expires_at: operation.expires_at,
+                },
+            )
+            .collect();
+        // Oldest first: the one closest to its deadline is the one an operator
+        // has least time to reach.
+        pending.sort_by_key(|operation| operation.expires_at);
+        pending
+    }
+
     /// Admits a new operation, dropping the ones the clock has ended.
     ///
     /// Expired entries are collected before the ceiling is applied, so a burst

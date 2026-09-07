@@ -2875,6 +2875,7 @@ fn main() {
             begin_operator_ceremony,
             advance_operator_ceremony,
             operator_ceremony_status,
+            operator_pending_operations,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");
@@ -2950,6 +2951,45 @@ async fn advance_operator_ceremony(
     revision: u64,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
     state.operator.advance(action, revision).await
+}
+
+/// Everything waiting for an operator, through the gateway of one profile.
+///
+/// The gateway rather than Astra's public origin, and the difference is the
+/// access control: the origin serves a §7.5 recovery without a tunnel, so a
+/// list there would be readable by anyone who can reach it. Recoveries are
+/// absent from what comes back — Orion already holds the identifier of the
+/// ones it opened, and nothing else may enumerate them.
+///
+/// An unreachable gateway returns an empty list rather than an error: this
+/// runs on a timer behind a navigation rail, and a tunnel that is down is
+/// «rien en attente», not a red banner.
+#[tauri::command]
+async fn operator_pending_operations(
+    state: State<'_, AppState>,
+) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
+    let gateways: Vec<String> = {
+        let cfg = state.config.lock().await;
+        let mut seen: Vec<String> = Vec::new();
+        for profile in &cfg.profiles {
+            if let Some(url) = profile.heliosd_url.as_ref() {
+                if !seen.iter().any(|held| held == url) {
+                    seen.push(url.clone());
+                }
+            }
+        }
+        seen
+    };
+    let mut pending = Vec::new();
+    for gateway in gateways {
+        match orion_core::operator_pending::pending(&gateway).await {
+            Ok(list) => pending.extend(list.operations),
+            Err(error) => {
+                tracing::debug!(%gateway, %error, "aucune opération lisible sur cette gateway")
+            }
+        }
+    }
+    Ok(pending)
 }
 
 /// The ceremony's current state, for a view opened after it started.

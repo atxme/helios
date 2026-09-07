@@ -16,6 +16,7 @@ import type {
   AstraRotationInput,
   AstraRotationPhase,
   AstraRotationStatus,
+  OperatorPendingOperation,
   OperatorStatus,
 } from '../types'
 
@@ -103,6 +104,7 @@ export function AstraView() {
   // helper keeps working while the operator looks at another tab — so it is
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
+  const [pending, setPending] = useState<OperatorPendingOperation[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -112,10 +114,33 @@ export function AstraView() {
         if (!cancelled) setCeremony(found)
       })
       .catch(() => {})
+    void api
+      .operatorPendingOperations()
+      .then((found) => {
+        if (!cancelled) setPending(found)
+      })
+      .catch(() => {})
     return () => {
       cancelled = true
     }
   }, [])
+
+  const openCampaign = async (operationId: string) => {
+    setBusy(true)
+    setError(null)
+    try {
+      setCeremony(
+        await api.beginOperatorCeremony({
+          kind: 'approve_campaign',
+          operation_id: operationId,
+        }),
+      )
+    } catch (cause) {
+      setError(String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const phase = status?.phase ?? 'idle'
   const cancellable = status?.can_cancel === true
@@ -210,6 +235,62 @@ export function AstraView() {
           ci-dessous vient de ce que le coffre épingle.
         </Typography>
         <OperatorCeremonyPanel status={ceremony} onStatus={setCeremony} />
+      </Box>
+    )
+  }
+
+  // Campaigns the domain opened and nobody has approved yet. Read from the
+  // gateway in the tunnel: they are how an operator finds work without being
+  // handed an identifier by whoever ran the command that created it.
+  if (pending.length > 0) {
+    return (
+      <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
+        <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
+          Astra
+        </Typography>
+        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
+          {pending.length === 1
+            ? 'Une opération attend l’opérateur.'
+            : `${pending.length} opérations attendent l’opérateur.`}{' '}
+          Le détail complet est montré avant qu’une clé soit demandée.
+        </Typography>
+        <Stack spacing={1.25}>
+          {pending.map((operation) => (
+            <Paper key={operation.operation_id} variant="outlined" sx={{ px: 1.75, py: 1.5 }}>
+              <Typography sx={{ fontSize: 12.5, fontWeight: 650 }}>{operation.reason}</Typography>
+              <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5 }}>
+                Demandée par {operation.requested_by} — {operation.target_count} pair
+                {operation.target_count > 1 ? 's' : ''}, {operation.required_credentials} clé
+                {operation.required_credentials > 1 ? 's' : ''} distincte
+                {operation.required_credentials > 1 ? 's' : ''}
+              </Typography>
+              <Typography
+                color="text.disabled"
+                sx={{ mt: 0.25, fontSize: 10.5, fontFamily: 'monospace' }}
+              >
+                {operation.operation_id}
+              </Typography>
+              <Typography color="text.disabled" sx={{ mt: 0.25, fontSize: 11 }}>
+                jusqu’au {new Date(operation.expires_at * 1000).toLocaleString()}
+              </Typography>
+              <Button
+                size="small"
+                variant="contained"
+                disabled={busy}
+                startIcon={<KeyRound size={14} aria-hidden />}
+                onClick={() => void openCampaign(operation.operation_id)}
+                sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
+              >
+                Ouvrir la cérémonie
+              </Button>
+            </Paper>
+          ))}
+        </Stack>
+        {error && (
+          <Alert severity="error" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
+            {error}
+          </Alert>
+        )}
       </Box>
     )
   }

@@ -682,6 +682,16 @@ pub trait ClientRenewalRelay: Send + Sync {
 /// a permission. Nothing in this trait accepts a path, a method or a header.
 #[async_trait]
 pub trait OperatorCampaignRelay: Send + Sync {
+    /// Reads everything waiting for an operator.
+    ///
+    /// The list carries no capability token: tokens are minted for the caller
+    /// about to act on the operation they named, and a list that carried them
+    /// would hand every reader a credential for every operation on it.
+    async fn pending(
+        &self,
+        operator: &crate::internal::OperatorIdentity,
+    ) -> Result<crate::internal::OperatorPendingList, TrustUpdateRefusal>;
+
     /// Reads one campaign operation.
     async fn operation(
         &self,
@@ -1054,6 +1064,29 @@ pub async fn operator_operation(
     }
 }
 
+/// `GET /api/certificates/operator/pending`.
+///
+/// On the **admin** surface, beside the other operator routes and for the same
+/// reason: a campaign belongs to no peer, and letting any admitted peer
+/// enumerate what the domain is about to sign is the distinction this
+/// placement exists to draw.
+pub async fn operator_pending(
+    State(s): State<AppState>,
+    Extension(caller): Extension<crate::auth::Caller>,
+) -> Response {
+    let operator = match operator_caller(&caller, "pending") {
+        Ok(operator) => operator,
+        Err(status) => return status.into_response(),
+    };
+    let Some(relay) = s.operator_campaign.as_ref() else {
+        return operator_unavailable(&operator, "pending");
+    };
+    match relay.pending(&operator).await {
+        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+        Err(refusal) => refusal.status().into_response(),
+    }
+}
+
 /// `GET /api/certificates/operator/signer-requests/<operation_id>`.
 pub async fn operator_signer_request(
     State(s): State<AppState>,
@@ -1338,6 +1371,16 @@ mod tests {
 
     #[async_trait]
     impl OperatorCampaignRelay for SpyCampaign {
+        async fn pending(
+            &self,
+            operator: &crate::internal::OperatorIdentity,
+        ) -> Result<crate::internal::OperatorPendingList, TrustUpdateRefusal> {
+            *self.seen.lock().unwrap() = Some(operator.clone());
+            Ok(crate::internal::OperatorPendingList {
+                operations: Vec::new(),
+            })
+        }
+
         async fn operation(
             &self,
             operator: &crate::internal::OperatorIdentity,

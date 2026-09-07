@@ -41,8 +41,8 @@ use axum::{
 };
 use helios_api::internal::{
     OperatorIdentity, RelayedOperatorCampaign, RelayedOperatorSignerResult,
-    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_SIGNER_REQUEST_ROUTE,
-    OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
+    MAX_OPERATOR_RELAY_BODY_BYTES, OPERATOR_OPERATION_ROUTE, OPERATOR_PENDING_ROUTE,
+    OPERATOR_SIGNER_REQUEST_ROUTE, OPERATOR_SIGNER_RESULT_ROUTE, OPERATOR_VAULT_ROUTE,
 };
 
 use crate::service::{
@@ -50,9 +50,10 @@ use crate::service::{
     AstraService, ServiceError,
 };
 
-/// The four private operator routes, for the listener of §8.3 to merge.
+/// The five private operator routes, for the listener of §8.3 to merge.
 pub fn private_routes() -> Router<Arc<AstraService>> {
     Router::new()
+        .route(OPERATOR_PENDING_ROUTE, post(pending))
         .route(OPERATOR_OPERATION_ROUTE, post(operation))
         .route(OPERATOR_SIGNER_REQUEST_ROUTE, post(signer_request))
         .route(OPERATOR_VAULT_ROUTE, post(vault))
@@ -90,6 +91,30 @@ fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 fn operation_id(raw: &str) -> Result<Id16, ServiceError> {
     Id16::parse_hex(raw).map_err(|_| ServiceError::Refused)
+}
+
+/// Everything waiting for an operator, without a capability token in sight.
+///
+/// The list exists so a campaign can be *found*: an administrator opens one in
+/// the tunnel, and until now the only way to reach it was an identifier
+/// carried by hand from the terminal that printed it — the transcription this
+/// whole surface exists to remove.
+///
+/// Recoveries are deliberately absent, and their absence is the access control
+/// (§7.5): a recovery is served without a tunnel, its only claim is the
+/// identifier the client holds, and enumerating them would replace that claim
+/// with a list.
+async fn pending(
+    State(service): State<Arc<AstraService>>,
+    Json(relayed): Json<RelayedOperatorCampaign>,
+) -> Response {
+    let _ = &relayed.operator;
+    let operations = service.signing.lock().await.pending(now_unix());
+    (
+        axum::http::StatusCode::OK,
+        Json(helios_api::internal::OperatorPendingList { operations }),
+    )
+        .into_response()
 }
 
 async fn operation(

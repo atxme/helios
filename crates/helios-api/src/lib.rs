@@ -292,6 +292,10 @@ pub fn router(state: AppState) -> Router {
         // them is a proxy — each accepts one type, one size, and relays an
         // object this gateway built itself.
         .route(
+            "/api/certificates/operator/pending",
+            get(certificates::operator_pending),
+        )
+        .route(
             "/api/certificates/operator/operations/:operation",
             get(certificates::operator_operation),
         )

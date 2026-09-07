@@ -1738,6 +1738,48 @@ pub struct SigningOperationView {
     pub signer_result_token: Option<String>,
 }
 
+/// One operation waiting for an operator, as a list may name it.
+///
+/// # Why this is not [`SigningOperationView`]
+///
+/// That view carries the capability tokens of the operation it describes.
+/// Tokens are minted for the caller who is about to act, on the operation they
+/// named, and putting them in a **list** would hand every reader of the list a
+/// credential for every operation on it — including the ones they were never
+/// going to run. So this type has none, by construction rather than by
+/// filtering: the tokens are produced when the chosen operation is opened.
+///
+/// # Why recoveries are absent from it
+///
+/// A §7.5 recovery is served without a tunnel, because the tunnel is what
+/// expired. Its only access control is the identifier the client holds and
+/// reads out, and enumerating recoveries would replace that with a list
+/// anybody on the admin surface could read. Campaigns are the opposite case:
+/// they are opened *by* an administrator, in the tunnel, and being findable is
+/// the whole point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPendingOperation {
+    pub operation_id: Id16,
+    pub scope: CampaignScope,
+    /// The text the operator will read in full before touching a key. Carried
+    /// here so a list of three campaigns can be told apart.
+    pub reason: String,
+    pub requested_by: String,
+    pub target_count: usize,
+    pub required_credentials: u8,
+    pub campaign_fingerprint: Fingerprint,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// Everything waiting for an operator, at one instant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPendingList {
+    pub operations: Vec<OperatorPendingOperation>,
+}
+
 /// What the companion fetches before it asks for a touch.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -68,15 +68,18 @@ export default function App() {
   useEffect(() => {
     let cancelled = false
     const look = () => {
-      void Promise.allSettled([api.operatorCeremonyStatus(), api.astraCaTlsRotationStatus()]).then(
-        ([operator, legacy]) => {
-          if (cancelled) return
-          const live =
-            (operator.status === 'fulfilled' && operator.value !== null) ||
-            (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle')
-          setAstraPending((current) => current || live)
-        },
-      )
+      void Promise.allSettled([
+        api.operatorCeremonyStatus(),
+        api.astraCaTlsRotationStatus(),
+        api.operatorPendingOperations(),
+      ]).then(([operator, legacy, pending]) => {
+        if (cancelled) return
+        const live =
+          (operator.status === 'fulfilled' && operator.value !== null) ||
+          (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle') ||
+          (pending.status === 'fulfilled' && pending.value.length > 0)
+        setAstraPending((current) => current || live)
+      })
     }
     look()
     const timer = window.setInterval(look, 3000)

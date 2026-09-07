@@ -748,3 +748,27 @@ export interface OperatorStatus {
   keys?: KeySlotLabel[]
   refusal?: Refusal
 }
+
+/**
+ * Une opération qui attend l'opérateur, telle qu'une liste peut la nommer.
+ *
+ * Aucun jeton de capacité : ils sont émis pour l'appelant qui va agir, sur
+ * l'opération qu'il a nommée. Une liste qui les porterait donnerait à tout
+ * lecteur un droit sur toutes les opérations qu'elle contient.
+ *
+ * Les récupérations en sont **absentes**, et cette absence est leur contrôle
+ * d'accès : une récupération est servie sans tunnel — le tunnel est ce qui a
+ * expiré — et sa seule revendication est l'identifiant que le client détient.
+ * Orion a déjà celui des siennes, puisque c'est lui qui les ouvre.
+ */
+export interface OperatorPendingOperation {
+  operation_id: string
+  scope: unknown
+  reason: string
+  requested_by: string
+  target_count: number
+  required_credentials: number
+  campaign_fingerprint: string
+  created_at: number
+  expires_at: number
+}

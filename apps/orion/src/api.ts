@@ -11,6 +11,7 @@ import type {
   AstraRotationStatus,
   OperationLocator,
   OperatorAction,
+  OperatorPendingOperation,
   OperatorStatus,
   CertificateAction,
   CertificateActionState,
@@ -281,6 +282,12 @@ export const advanceOperatorCeremony = (action: OperatorAction, revision: number
 
 export const operatorCeremonyStatus = () =>
   invoke<OperatorStatus | null>('operator_ceremony_status')
+
+/* Lu sur la gateway, dans le tunnel, sur la surface administrateur : l'origine
+ * publique d'Astra sert une récupération sans tunnel, et y placer une liste la
+ * rendrait lisible par quiconque l'atteint. */
+export const operatorPendingOperations = () =>
+  invoke<OperatorPendingOperation[]>('operator_pending_operations')
 
 /**
  * Adjusts the window to the displayed view.

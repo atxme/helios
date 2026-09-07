@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   operatorCeremonyStatus: vi.fn(),
   astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
+  operatorPendingOperations: vi.fn(),
 }))
 
 vi.mock('./api', () => ({
@@ -20,6 +21,7 @@ vi.mock('./api', () => ({
   operatorCeremonyStatus: mocks.operatorCeremonyStatus,
   astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
+  operatorPendingOperations: mocks.operatorPendingOperations,
 }))
 vi.mock('./hooks/useClient', () => ({ useClient: mocks.useClient }))
 vi.mock('./views/ConnectView', () => ({
@@ -84,6 +86,7 @@ beforeEach(() => {
   // is the state every other assertion here is written against.
   mocks.operatorCeremonyStatus.mockResolvedValue(null)
   mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
+  mocks.operatorPendingOperations.mockResolvedValue([])
   // The shell reads the vault posture when the panel opens. A rejection is
   // the honest default here: the panel must survive it, and every test that
   // needs a real posture says so explicitly.
