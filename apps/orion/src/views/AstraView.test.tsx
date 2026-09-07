@@ -8,6 +8,8 @@ const api = vi.hoisted(() => ({
   continueAstraCaTlsRotation: vi.fn(),
   cancelAstraCaTlsRotation: vi.fn(),
   astraCaTlsRotationStatus: vi.fn(),
+  operatorCeremonyStatus: vi.fn(),
+  advanceOperatorCeremony: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -40,6 +42,7 @@ const manifest = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  api.operatorCeremonyStatus.mockResolvedValue(null)
   api.astraCaTlsRotationStatus.mockResolvedValue({
     phase: 'idle',
     message: '',

@@ -55,6 +55,42 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
 export default function App() {
   const c = useClient()
   const [view, setView] = useState<View>('connect')
+  // Whether the Astra tab has anything to show. It is greyed otherwise: an
+  // operator ceremony is not a place to browse, and a tab that is always open
+  // invites starting one for no reason.
+  const [astraPending, setAstraPending] = useState(false)
+
+  // What makes the tab live: a protocol-2 ceremony the helper is running, or
+  // the legacy CA-TLS rotation still in flight. Polled rather than pushed
+  // because a ceremony outlives any one view, and an operator who switched
+  // away must find it again where they left it.
+  useEffect(() => {
+    let cancelled = false
+    const look = () => {
+      void Promise.allSettled([api.operatorCeremonyStatus(), api.astraCaTlsRotationStatus()]).then(
+        ([operator, legacy]) => {
+          if (cancelled) return
+          const live =
+            (operator.status === 'fulfilled' && operator.value !== null) ||
+            (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle')
+          setAstraPending((current) => current || live)
+        },
+      )
+    }
+    look()
+    const timer = window.setInterval(look, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  /// Opens the §7.5 ceremony for one operation, and goes to where it shows.
+  const approveRecovery = async (operationId: string) => {
+    await api.beginOperatorCeremony({ kind: 'recover_identity', operation_id: operationId })
+    setAstraPending(true)
+    setView('astra')
+  }
   const [navOpen, setNavOpen] = useState(false)
   const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
   // Read on every opening rather than once at startup: BitLocker can be
@@ -250,12 +286,26 @@ export default function App() {
           >
             {VIEWS.map(({ value, label, icon: Icon }) => {
               const active = view === value
-              const pending = value === 'logs' && view !== 'logs' ? c.logs.length : 0
+              const pending =
+                value === 'logs' && view !== 'logs'
+                  ? c.logs.length
+                  : value === 'astra' && astraPending && view !== 'astra'
+                    ? 1
+                    : 0
+              // Greyed rather than hidden: a user looking for Astra has to
+              // learn that nothing is waiting, not conclude the tab vanished.
+              const unavailable = value === 'astra' && !astraPending
               return (
                 <ButtonBase
                   key={value}
                   onClick={() => setView(value)}
+                  disabled={unavailable}
                   aria-current={active ? 'page' : undefined}
+                  title={
+                    unavailable
+                      ? 'Aucune opération n’attend l’opérateur.'
+                      : undefined
+                  }
                   sx={{
                     position: 'relative',
                     display: 'flex',
@@ -264,6 +314,7 @@ export default function App() {
                     minHeight: 46,
                     flexShrink: 0,
                     color: active ? 'primary.main' : 'text.secondary',
+                    '&.Mui-disabled': { color: 'text.disabled', opacity: 0.55 },
                     '&:hover': { bgcolor: 'action.hover' },
                     '&.Mui-focusVisible': { outline: `2px solid ${PINE}`, outlineOffset: -2 },
                   }}
@@ -348,7 +399,7 @@ export default function App() {
 
           {view === 'certificates' && (
             <Box role="region" aria-label="Certificats" sx={{ height: '100%' }}>
-              <CertificatesView />
+              <CertificatesView onApprove={approveRecovery} />
             </Box>
           )}
 

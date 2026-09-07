@@ -105,16 +105,6 @@ use zeroize::Zeroizing;
 /// line, because that is the unit an operator reasons about.
 const DAY_SECS: u64 = 86_400;
 
-/// How far a recovery window opens before the instant it activates on.
-///
-/// A recovered identity has nothing to overlap with — the leaf it replaces
-/// expired — so it activates at once. The window still needs a strictly
-/// earlier opening, and dating it slightly in the past is also what a client
-/// whose clock drifted while it was off needs: that drift is the ordinary
-/// case here, since a machine left off long enough to expire is a machine
-/// whose clock has had time to wander.
-const RECOVERY_WINDOW_BACKDATE_SECS: u64 = 300;
-
 /// Prepared before any of the four files of a CA-PQ rotation is replaced.
 ///
 /// A filesystem cannot atomically rename four unrelated destinations.  This
@@ -3948,36 +3938,6 @@ mod tests {
     use aether::certificates::transport::TrustUpdateObject;
     use aether::certificates::window::TransitionWindow;
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
-
-    /// A recovery window has to clear two rules that pull against each other:
-    /// `not_before < activation_at < not_after`, strictly, and a staging lease
-    /// that never outlives the activation it prepares. Collapsing the three
-    /// instants onto `now` broke the first; activating at `now` broke the
-    /// second — and that one only surfaced at the gateway, a moment after the
-    /// operator had already touched their key.
-    #[test]
-    fn a_recovery_window_clears_both_rules_it_has_to() {
-        let now = 1_800_000_000u64;
-        let stage_expires_at = now + 300;
-        let window = TransitionWindow::new(
-            now - RECOVERY_WINDOW_BACKDATE_SECS,
-            stage_expires_at,
-            stage_expires_at + 7 * DAY_SECS,
-        )
-        .expect("a recovery window is a valid window");
-        aether::certificates::window::validate_lease(
-            now,
-            stage_expires_at,
-            aether::certificates::window::MAX_STAGE_LEASE_SECS,
-            &[window.activation_at, stage_expires_at],
-        )
-        .expect("the staging lease does not outlive the activation it prepares");
-        assert_eq!(
-            window.phase(now),
-            aether::certificates::window::WindowPhase::Prepared,
-            "the change-over waits for the staging, and for nothing else"
-        );
-    }
 
     fn transition() -> ClientTlsCaTransition {
         ClientTlsCaTransition {

@@ -22,6 +22,13 @@ use orion_core::certificate_renewal::CompanionInvocation;
 
 const PROGRAM: &str = "astra-signer";
 
+/// The operator process of protocol 2.
+///
+/// A second literal beside the first, and not a parameter: this module exists
+/// so that no WebView value, profile field or network answer can ever name an
+/// executable. Two names it will launch, both written here.
+const HELPER: &str = "helios-astra-helper";
+
 fn arguments(invocation: &CompanionInvocation) -> Result<&[String], String> {
     if invocation.program != PROGRAM {
         return Err(format!(
@@ -49,6 +56,32 @@ pub fn launch(invocation: &CompanionInvocation) -> Result<(), String> {
             .map_err(|error| format!("lancement de « {PROGRAM} » impossible : {error}"))?;
         // Reap in the existing application runtime without tying the
         // companion's interactive lifetime to an IPC request.
+        tauri::async_runtime::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Ok(())
+    }
+}
+
+/// Starts the operator helper, handing it the session in its environment.
+///
+/// `arguments` carries the address to connect back to — public, and useful in
+/// a log. `environment` carries the session token, which is neither: on both
+/// platforms a command line is readable by any process of the same user, an
+/// environment block is not.
+pub fn launch_helper(arguments: &[String], environment: &[(String, String)]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::deelevate::spawn_astra_helper(arguments, environment)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut child = tokio::process::Command::new(HELPER)
+            .args(arguments)
+            .envs(environment.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .spawn()
+            .map_err(|error| format!("lancement de « {HELPER} » impossible : {error}"))?;
         tauri::async_runtime::spawn(async move {
             let _ = child.wait().await;
         });

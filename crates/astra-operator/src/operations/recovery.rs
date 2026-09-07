@@ -361,8 +361,12 @@ mod tests {
     }
 
     /// The two refusals that cost an evening, stated as arithmetic rather than
-    /// as a comment: the window has to open strictly before it activates, and
-    /// it has to activate no earlier than the end of the staging lease.
+    /// as a comment. They pull against each other: `not_before <
+    /// activation_at < not_after` strictly, and a staging lease that never
+    /// outlives the activation it prepares. Collapsing the three instants onto
+    /// `now` broke the first; activating at `now` broke the second — and that
+    /// one surfaced only at the gateway, a moment after the operator had
+    /// already touched their key.
     #[test]
     fn the_window_satisfies_both_rules_that_bound_it() {
         let now: u64 = 1_800_000_000;
@@ -372,12 +376,20 @@ mod tests {
             stage_expires_at,
             stage_expires_at + OVERLAP_DAYS * DAY_SECS,
         )
-        .expect("both rules");
+        .expect("a recovery window is a valid window");
         assert!(window.not_before < window.activation_at);
         assert!(window.activation_at < window.not_after);
-        assert!(
-            stage_expires_at <= window.activation_at,
-            "§7.2 refuses a staging lease that outlives the activation it prepares"
+        aether::certificates::window::validate_lease(
+            now,
+            stage_expires_at,
+            aether::certificates::window::MAX_STAGE_LEASE_SECS,
+            &[window.activation_at, stage_expires_at],
+        )
+        .expect("the staging lease does not outlive the activation it prepares");
+        assert_eq!(
+            window.phase(now),
+            aether::certificates::window::WindowPhase::Prepared,
+            "the change-over waits for the staging, and for nothing else"
         );
     }
 }

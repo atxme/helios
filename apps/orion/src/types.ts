@@ -585,3 +585,166 @@ export interface VaultPosture {
   /** A plaintext `profiles.toml` is still present and not yet migrated. */
   legacyPresent: boolean
 }
+
+/* ─────────────────────────── Cérémonies opérateur ───────────────────────────
+ *
+ * Protocole 2. Deux machines d'état et non une : une récupération est tenue par
+ * deux parties à la fois — Orion détient les clés privées clientes et signe le
+ * commit, le processus opérateur détient le coffre et signe le grant. « Attente
+ * de la clé » et « mis en scène chez la gateway » sont deux coordonnées, pas
+ * deux points d'une ligne.
+ *
+ * Les manifestes sont typés par opération. Une liste libre `label/valeur`
+ * laisserait omettre une génération ou reformuler une opération dangereuse sans
+ * que rien ici puisse s'en apercevoir, et §12.2 demande que ce qui est signé
+ * soit ce qui a été montré. Les mots affichés sont choisis **ici**, jamais
+ * transportés depuis le processus opérateur ou le réseau.
+ */
+
+export type OperationKind =
+  | 'recover_identity'
+  | 'approve_campaign'
+  | 'authorize_issuer'
+  | 'rotate_client_tls_ca'
+  | 'rotate_anchor'
+  | 'revoke_certificate'
+
+/** Ce que le WebView a le droit de nommer : un genre, au plus un identifiant. */
+export interface OperationLocator {
+  kind: OperationKind
+  operation_id?: string
+}
+
+export type OperatorAction = 'continue' | 'cancel'
+
+/** Où en est la cérémonie **chez l'autorité**. */
+export type RemoteState =
+  | 'local'
+  | 'awaiting_operator'
+  | 'prepared'
+  | 'deposited'
+  | 'staged'
+  | 'pending_grant'
+  | 'granted'
+  | 'committed'
+  | { activation_deferred: { activation_at: number } }
+  | 'refused'
+
+export type KeyPurpose = 'open_vault' | 'second_approval' | 'promotion'
+
+/** Où en est la cérémonie **sur ce poste**. */
+export type GestureState =
+  | 'verifying'
+  | 'idle'
+  | { awaiting_key: { index: number; of: number; purpose: KeyPurpose } }
+  | { processing_key: { index: number; of: number } }
+  | 'signing'
+  | 'done'
+  | 'cancelled'
+  | 'failed'
+
+export type Refusal =
+  | { refusal: 'vault_unavailable' }
+  | { refusal: 'key_declined' }
+  | { refusal: 'key_not_enrolled' }
+  | { refusal: 'key_repeated' }
+  | { refusal: 'window_expired' }
+  | { refusal: 'authority_refused'; status: number }
+  | { refusal: 'handoff_mismatch' }
+  | { refusal: 'manifest_mismatch' }
+  | { refusal: 'protocol_violation' }
+  | { refusal: 'cancelled' }
+  | { refusal: 'internal' }
+
+export interface RecoveryManifest {
+  operation: 'recovery'
+  trust_domain_id: string
+  peer_name: string
+  client_wg_public_key: string
+  expired_generation: number
+  next_generation: number
+  expired_since_secs: number
+  request_fingerprint: string
+  ca_epoch: number
+  ca_tls_epoch: number
+  activation_at: number
+  not_after: number
+}
+
+export type AffectedCa = 'ca_pq' | 'ca_tls'
+
+export interface CampaignManifest {
+  operation: 'campaign'
+  trust_domain_id: string
+  reason: string
+  requested_by: string
+  fingerprint: string
+  affected_ca: AffectedCa
+  current_epoch: number
+  next_epoch: number
+  activation_at: number
+  not_after: number
+  outgoing_anchor_fingerprint: string
+  target_count: number
+}
+
+export interface IssuerManifest {
+  operation: 'issuer_authorization'
+  trust_domain_id: string
+  issuer_epoch: number
+  not_before: number
+  not_after: number
+  allowed_usages: string[]
+  policy_fingerprint: string
+  request_fingerprint: string
+}
+
+export interface CaRotationManifest {
+  operation: 'ca_rotation'
+  trust_domain_id: string
+  affected_ca: AffectedCa
+  current_epoch: number
+  next_epoch: number
+  activation_at: number
+  not_after: number
+  outgoing_anchor_fingerprint: string
+  next_anchor_fingerprint: string
+  target_count: number
+}
+
+export interface RevocationManifest {
+  operation: 'revocation'
+  trust_domain_id: string
+  target: string
+  scope: string
+  reason: string
+  revocation_epoch: number
+  effective_at: number
+}
+
+export type AstraManifest =
+  | RecoveryManifest
+  | CampaignManifest
+  | IssuerManifest
+  | CaRotationManifest
+  | RevocationManifest
+
+export interface KeySlotLabel {
+  slot: string
+  label: string
+}
+
+export interface OperatorStatus {
+  session_id: string
+  /** Strictement croissante. Une commande nomme celle à laquelle elle répond. */
+  revision: number
+  operation: OperationKind
+  operation_id?: string
+  remote: RemoteState
+  gesture: GestureState
+  /** Dérivé côté Rust, et vérifié à l'arrivée : un bouton inventé ici ne sert à rien. */
+  allowed: OperatorAction[]
+  manifest?: AstraManifest
+  keys?: KeySlotLabel[]
+  refusal?: Refusal
+}

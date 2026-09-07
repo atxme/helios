@@ -55,9 +55,11 @@ use windows_sys::Win32::Security::{
     DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TokenElevation, TokenPrimary,
     TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, LOGON_WITH_PROFILE,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -100,7 +102,96 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
 /// profile value from turning this into a general process launcher.
 pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
     let command = windows_command_line("astra-signer", arguments);
-    spawn_with_standard_token(command, "lancement du compagnon")
+    spawn_with_standard_token(command, "lancement du compagnon", &[], CREATE_NEW_CONSOLE)
+}
+
+/// Runs the Astra operator helper as the standard user, with no console and
+/// with `environment` added to the block Windows builds for that user.
+///
+/// The two differences from the companion above are the whole point of this
+/// entry:
+///
+/// * **No console.** The helper draws its own owner window for the WebAuthn
+///   dialog; a console would be an empty black rectangle appearing beside
+///   Orion for the length of a ceremony.
+/// * **An environment block of its own.** The session token travels in it.
+///   A command line is readable by any process of the same user — that was the
+///   documented limitation of protocol 1 — while an environment block is
+///   readable only by the process itself and whoever can already debug it.
+///
+/// The block is the user's own, from `CreateEnvironmentBlock`, with these
+/// variables appended. Not a bare block of two variables: the helper resolves
+/// the vault beside the user's profile, and a child with no `USERPROFILE`
+/// would look for the domain in a directory that does not exist.
+pub fn spawn_astra_helper(
+    arguments: &[String],
+    environment: &[(String, String)],
+) -> Result<(), String> {
+    let command = windows_command_line("helios-astra-helper", arguments);
+    spawn_with_standard_token(
+        command,
+        "lancement du processus opérateur",
+        environment,
+        CREATE_NO_WINDOW,
+    )
+}
+
+/// The user's environment block, with `additions` appended.
+///
+/// A Windows environment block is a run of NUL-terminated `NAME=VALUE` strings
+/// ended by one further NUL. Held alive by the returned vector for the length
+/// of the `CreateProcessWithTokenW` call, and zeroed on drop because one of
+/// the values it carries is a session token.
+struct EnvironmentBlock {
+    block: Vec<u16>,
+}
+
+impl Drop for EnvironmentBlock {
+    fn drop(&mut self) {
+        self.block.iter_mut().for_each(|unit| *unit = 0);
+    }
+}
+
+fn environment_block(
+    token: &Token,
+    additions: &[(String, String)],
+) -> Result<EnvironmentBlock, String> {
+    let mut inherited: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `token` is a live primary token; the pointer is written by the
+    // call and released below.
+    let created = unsafe { CreateEnvironmentBlock(&mut inherited, token.0, 0) };
+    if created == 0 {
+        return Err(format!(
+            "environnement de l'utilisateur indisponible : {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut block = Vec::new();
+    // SAFETY: the block Windows returned is a NUL-separated run of UTF-16
+    // strings terminated by an empty one; the walk stops on that terminator.
+    unsafe {
+        let mut cursor = inherited as *const u16;
+        loop {
+            let mut length = 0usize;
+            while *cursor.add(length) != 0 {
+                length += 1;
+            }
+            if length == 0 {
+                break;
+            }
+            block.extend_from_slice(std::slice::from_raw_parts(cursor, length));
+            block.push(0);
+            cursor = cursor.add(length + 1);
+        }
+        DestroyEnvironmentBlock(inherited);
+    }
+    for (name, value) in additions {
+        block.extend(OsStr::new(&format!("{name}={value}")).encode_wide());
+        block.push(0);
+    }
+    // The block itself ends on an empty string.
+    block.push(0);
+    Ok(EnvironmentBlock { block })
 }
 
 /// Quotes one argument according to the Windows command-line grammar consumed
@@ -143,7 +234,12 @@ fn windows_command_line(program: &str, arguments: &[String]) -> String {
         .join(" ")
 }
 
-fn spawn_with_standard_token(command: String, action: &str) -> Result<(), String> {
+fn spawn_with_standard_token(
+    command: String,
+    action: &str,
+    environment: &[(String, String)],
+    creation_flags: u32,
+) -> Result<(), String> {
     let token = standard_user_token()?;
     if is_elevated(&token)? {
         return Err(format!(
@@ -159,6 +255,22 @@ fn spawn_with_standard_token(command: String, action: &str) -> Result<(), String
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
+    // Built only when something is being added. With nothing to add, NULL is
+    // the better answer: Windows then builds the block itself from the profile
+    // `token` selects, which is what the companion has always relied on.
+    let mut block = if environment.is_empty() {
+        None
+    } else {
+        Some(environment_block(&token, environment)?)
+    };
+    let (environment_pointer, creation_flags) = match block.as_mut() {
+        Some(block) => (
+            block.block.as_ptr() as *const std::ffi::c_void,
+            creation_flags | CREATE_UNICODE_ENVIRONMENT,
+        ),
+        None => (std::ptr::null(), creation_flags),
+    };
+
     // SAFETY: `command` is NUL-terminated and remains alive for the call;
     // `startup` and `process` are correctly sized initialized structures.
     let created = unsafe {
@@ -167,10 +279,11 @@ fn spawn_with_standard_token(command: String, action: &str) -> Result<(), String
             LOGON_WITH_PROFILE,
             std::ptr::null(),
             command.as_mut_ptr(),
-            CREATE_NEW_CONSOLE,
-            // NULL rather than Orion's environment: Windows builds one from
-            // the standard user's profile selected by `token`.
-            std::ptr::null(),
+            creation_flags,
+            // NULL unless something had to be added: Windows then builds the
+            // block itself from the standard user's profile selected by
+            // `token`. Never Orion's own environment.
+            environment_pointer,
             std::ptr::null(),
             &startup,
             &mut process,

@@ -69,6 +69,7 @@ mod tray;
 /// The vault, the PIN and the FIDO gesture stay inside the companion; only
 /// the public progress states cross into Orion.
 mod astra;
+mod operator;
 
 /// Shared application state, injected into each command via [`State`].
 struct AppState {
@@ -129,6 +130,9 @@ struct AppState {
     /// companion that is about to write a durable decision — and its phase is
     /// the one thing a reload has to be able to recover.
     astra: astra::Ceremony,
+    /// The protocol-2 ceremony, which every operation but the `CA-TLS`
+    /// rotation now runs through.
+    operator: operator::OperatorCeremony,
     /// Why the vault could not be opened at startup, if it could not.
     ///
     /// Orion keeps running — the screen is more useful than a blank window —
@@ -2809,6 +2813,7 @@ fn main() {
             staged_key: Arc::new(Mutex::new(None)),
             staged_psk: Arc::new(Mutex::new(None)),
             astra: astra::Ceremony::default(),
+            operator: operator::OperatorCeremony::default(),
             handshake_poll: StdMutex::new(None),
             vault_error,
             log_path,
@@ -2867,6 +2872,9 @@ fn main() {
             continue_astra_ca_tls_rotation,
             cancel_astra_ca_tls_rotation,
             astra_ca_tls_rotation_status,
+            begin_operator_ceremony,
+            advance_operator_ceremony,
+            operator_ceremony_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while launching Tauri");
@@ -2915,6 +2923,41 @@ async fn astra_ca_tls_rotation_status(
     state: State<'_, AppState>,
 ) -> Result<aether::certificates::operator_ipc::AstraCaTlsStatus, String> {
     Ok(state.astra.status().await)
+}
+
+/// Opens an operator ceremony for the operation the WebView names.
+///
+/// The locator is all it may name — a kind, and at most an identifier this
+/// process itself opened. Everything else the helper resolves from the hand-off
+/// pinned beside the vault it holds.
+#[tauri::command]
+async fn begin_operator_ceremony(
+    state: State<'_, AppState>,
+    locator: aether::certificates::operator_session::OperationLocator,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state.operator.begin(locator).await
+}
+
+/// Takes the next step, or abandons, against the status the operator saw.
+///
+/// The revision is not decoration: a press on a screen the helper has already
+/// left is refused here and again there, rather than applied to whatever
+/// replaced it.
+#[tauri::command]
+async fn advance_operator_ceremony(
+    state: State<'_, AppState>,
+    action: aether::certificates::operator_session::OperatorAction,
+    revision: u64,
+) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
+    state.operator.advance(action, revision).await
+}
+
+/// The ceremony's current state, for a view opened after it started.
+#[tauri::command]
+async fn operator_ceremony_status(
+    state: State<'_, AppState>,
+) -> Result<Option<aether::certificates::operator_session::OperatorStatus>, String> {
+    Ok(state.operator.status().await)
 }
 
 #[cfg(test)]

@@ -59,7 +59,12 @@ type CompanionLaunch =
  * arrow read as *revenir en arrière*, which is exactly what the four actions
  * below it can be asked to do.
  */
-export function CertificatesView() {
+export function CertificatesView({
+  onApprove,
+}: {
+  /** Starts a §7.5 ceremony in the Astra tab, when the key is on this machine. */
+  onApprove?: (operationId: string) => Promise<void>
+} = {}) {
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -233,6 +238,7 @@ export function CertificatesView() {
               step={progress[profile.name]}
               launch={companion[profile.name]}
               onLaunch={() => void launchCompanion(profile.name)}
+              onApprove={onApprove}
               onApproved={(step) => {
                 setProgress((current) => ({ ...current, [profile.name]: step }))
                 void refresh()
@@ -284,18 +290,22 @@ function RenewalStep({
   launch,
   onLaunch,
   onApproved,
+  onApprove,
 }: {
   name: string
   step: RenewalProgress | undefined
   launch: CompanionLaunch | undefined
   onLaunch: () => void
   onApproved: (step: RenewalProgress) => void
+  /** Opens the §7.5 ceremony in the Astra tab, when the key is on this machine. */
+  onApprove?: (operationId: string) => Promise<void>
 }) {
   const [manifest, setManifest] = useState<ApprovalManifest | null>(null)
   const [needsPin, setNeedsPin] = useState(false)
   const [pin, setPin] = useState('')
   const [ceremony, setCeremony] = useState<null | 'reading' | 'signing'>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
+  const [approving, setApproving] = useState(false)
 
   const readManifest = async () => {
     setCeremony('reading')
@@ -374,11 +384,36 @@ function RenewalStep({
             Demande déposée. Elle attend un opérateur muni de sa clé, sur son propre poste :
             l’identité de celui-ci a expiré et ne peut plus rien approuver.
           </Typography>
-          <Row label="commande" value={step.operator_command} copyable />
-          <Typography color="text.disabled" sx={{ mt: 0.75, fontSize: 11, lineHeight: 1.5 }}>
-            Une fois la clé touchée là-bas, relancer « Récupérer le certificat expiré » ici
-            pour installer la génération émise.
+          {onApprove && (
+            <Button
+              size="small"
+              variant="contained"
+              disabled={approving}
+              startIcon={
+                approving ? (
+                  <CircularProgress size={13} color="inherit" />
+                ) : (
+                  <KeyRound size={14} aria-hidden />
+                )
+              }
+              onClick={() => {
+                setApproving(true)
+                void onApprove(step.operation_id).finally(() => setApproving(false))
+              }}
+              sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+            >
+              Approuver ici avec la clé
+            </Button>
+          )}
+          {/* The way out when the key is on another machine. Kept whole —
+              command included — because §8.5 still requires a portable
+              companion, and an operator on another workstation has no other
+              channel than this line. */}
+          <Typography color="text.disabled" sx={{ mt: 1, fontSize: 11, lineHeight: 1.5 }}>
+            Si la clé est sur un autre poste, l’approbation s’y fait par cette commande, puis
+            on relance « Récupérer le certificat expiré » ici.
           </Typography>
+          <Row label="commande" value={step.operator_command} copyable />
         </>
       )}
       {step?.step === 'awaiting_operator' && (

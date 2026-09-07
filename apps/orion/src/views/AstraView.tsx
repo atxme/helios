@@ -10,8 +10,14 @@ import Typography from '@mui/material/Typography'
 import { Check, KeyRound } from 'lucide-react'
 
 import * as api from '../api'
+import { OperatorCeremonyPanel } from './OperatorCeremony'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
-import type { AstraRotationInput, AstraRotationPhase, AstraRotationStatus } from '../types'
+import type {
+  AstraRotationInput,
+  AstraRotationPhase,
+  AstraRotationStatus,
+  OperatorStatus,
+} from '../types'
 
 const EMPTY_INPUT: AstraRotationInput = {
   vault_path: '',
@@ -93,6 +99,23 @@ export function AstraView() {
   const [status, setStatus] = useState<AstraRotationStatus | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // A protocol-2 ceremony, when one is open. It can outlive this view — the
+  // helper keeps working while the operator looks at another tab — so it is
+  // read on mount rather than only created here.
+  const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void api
+      .operatorCeremonyStatus()
+      .then((found) => {
+        if (!cancelled) setCeremony(found)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const phase = status?.phase ?? 'idle'
   const cancellable = status?.can_cancel === true
@@ -173,14 +196,33 @@ export function AstraView() {
               ? 'Réessayer'
               : 'Démarrer la rotation'
 
+  // A live protocol-2 ceremony owns the tab entirely. It is not a section
+  // beside the CA-TLS form: an operator holding a security key must not be
+  // shown, in the same view, a second ceremony they could start by mistake.
+  if (ceremony) {
+    return (
+      <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
+        <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
+          Astra
+        </Typography>
+        <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
+          Une opération attend l’opérateur. Rien n’est à saisir : tout ce qui est montré
+          ci-dessous vient de ce que le coffre épingle.
+        </Typography>
+        <OperatorCeremonyPanel status={ceremony} onStatus={setCeremony} />
+      </Box>
+    )
+  }
+
   return (
     <Box sx={{ height: '100%', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
       <Typography component="h2" sx={{ fontSize: 13, fontWeight: 700, mb: 0.5 }}>
         Astra
       </Typography>
       <Typography color="text.secondary" sx={{ fontSize: 11.5, lineHeight: 1.55, mb: 1.5 }}>
-        Rotation de l’autorité CA-TLS cliente. L’opération doit déjà être ouverte dans
-        Astra ; Orion guide ensuite les deux clés autorisées, une à la fois.
+        Rotation de l’autorité CA-TLS cliente. C’est la dernière cérémonie encore pilotée
+        par cette page : les autres se présentent d’elles-mêmes quand elles attendent
+        l’opérateur, sans rien à saisir.
       </Typography>
 
       <Paper variant="outlined" sx={{ p: 1.75 }}>

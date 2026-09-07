@@ -9,6 +9,9 @@ import type {
   ApprovalManifest,
   AstraRotationInput,
   AstraRotationStatus,
+  OperationLocator,
+  OperatorAction,
+  OperatorStatus,
   CertificateAction,
   CertificateActionState,
   ActionOutcome,
@@ -266,6 +269,18 @@ export const cancelAstraCaTlsRotation = () =>
 /** Restores or polls the Rust-owned ceremony after a view change. */
 export const astraCaTlsRotationStatus = () =>
   invoke<AstraRotationStatus>('astra_ca_tls_rotation_status')
+
+/* Cérémonies opérateur (protocole 2). Le WebView ne nomme qu'un localisateur ;
+ * l'origine, le RP ID, le domaine et la clé de service viennent du hand-off que
+ * le processus opérateur épingle lui-même. */
+export const beginOperatorCeremony = (locator: OperationLocator) =>
+  invoke<OperatorStatus>('begin_operator_ceremony', { locator })
+
+export const advanceOperatorCeremony = (action: OperatorAction, revision: number) =>
+  invoke<OperatorStatus>('advance_operator_ceremony', { action, revision })
+
+export const operatorCeremonyStatus = () =>
+  invoke<OperatorStatus | null>('operator_ceremony_status')
 
 /**
  * Adjusts the window to the displayed view.

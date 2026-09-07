@@ -8,12 +8,18 @@ const mocks = vi.hoisted(() => ({
   resizeForView: vi.fn(),
   vaultPosture: vi.fn(),
   useClient: vi.fn(),
+  operatorCeremonyStatus: vi.fn(),
+  astraCaTlsRotationStatus: vi.fn(),
+  beginOperatorCeremony: vi.fn(),
 }))
 
 vi.mock('./api', () => ({
   onTrayView: mocks.onTrayView,
   resizeForView: mocks.resizeForView,
   vaultPosture: mocks.vaultPosture,
+  operatorCeremonyStatus: mocks.operatorCeremonyStatus,
+  astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
+  beginOperatorCeremony: mocks.beginOperatorCeremony,
 }))
 vi.mock('./hooks/useClient', () => ({ useClient: mocks.useClient }))
 vi.mock('./views/ConnectView', () => ({
@@ -74,6 +80,10 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocks.resizeForView.mockResolvedValue(undefined)
   mocks.onTrayView.mockResolvedValue(vi.fn())
+  // Nothing waits on the operator by default: the Astra tab is greyed, which
+  // is the state every other assertion here is written against.
+  mocks.operatorCeremonyStatus.mockResolvedValue(null)
+  mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   // The shell reads the vault posture when the panel opens. A rejection is
   // the honest default here: the panel must survive it, and every test that
   // needs a real posture says so explicitly.
@@ -114,7 +124,28 @@ describe('App interactions', () => {
     expect(screen.getByText('speedtest-view')).toBeTruthy()
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('speedtest'))
 
-    fireEvent.click(screen.getByRole('button', { name: 'Astra' }))
+    // Greyed while nothing waits on the operator, and clicking it does
+    // nothing: an operator ceremony is not a place to browse.
+    const astra = screen.getByRole('button', { name: 'Astra' })
+    expect(astra).toHaveProperty('disabled', true)
+    fireEvent.click(astra)
+    expect(screen.queryByText('astra-view')).toBeNull()
+  })
+
+  it('opens the Astra tab exactly when a ceremony waits on the operator', async () => {
+    mocks.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'a'.repeat(32),
+      revision: 1,
+      operation: 'recover_identity',
+      remote: 'awaiting_operator',
+      gesture: { awaiting_key: { index: 1, of: 1, purpose: 'open_vault' } },
+      allowed: ['continue', 'cancel'],
+    })
+    render(<App />)
+
+    const astra = await screen.findByRole('button', { name: 'Astra' })
+    await waitFor(() => expect(astra).toHaveProperty('disabled', false))
+    fireEvent.click(astra)
     expect(screen.getByText('astra-view')).toBeTruthy()
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
