@@ -2323,6 +2323,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-astra-helper"
+version = "0.1.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "astra-operator",
+ "helios-fido",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+ "zeroize",
+]
+
+[[package]]
 name = "helios-ctl"
 version = "0.11.0"
 dependencies = [

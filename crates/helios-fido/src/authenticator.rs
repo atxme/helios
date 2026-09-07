@@ -485,20 +485,60 @@ fn cose_key_length(bytes: &[u8]) -> Result<usize> {
     Ok(offset)
 }
 
+/// The window the platform dialog belongs to.
+///
+/// # Why a caller has to say
+///
+/// Windows attaches its WebAuthn dialog to an owner window. A console program
+/// has one for free, and asking the system for it was the whole of this
+/// decision while the only caller was a terminal. A program launched with no
+/// console — the helper Orion starts — gets a null handle from that same call,
+/// and the dialog then opens **unowned**: it can appear behind the window the
+/// operator is looking at, on a machine where the only instruction is «touchez
+/// la clé». A prompt nobody sees is indistinguishable from a key that is not
+/// answering.
+///
+/// So the owner is named by whoever knows: a terminal says [`Self::Console`],
+/// a windowed program hands the handle of a window it owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogOwner {
+    /// The console window of this process, if it has one.
+    #[default]
+    Console,
+    /// A top-level window this process owns.
+    ///
+    /// Carried as `isize` rather than a platform handle type so the choice can
+    /// be made, passed and tested in code that compiles everywhere.
+    Window(isize),
+}
+
 /// Opens the single connected security key, over `transport`.
 ///
 /// Exactly one: a second key plugged in during an enrolment is how an operator
 /// registers the credential of one token into the slot they meant for another.
+///
+/// The dialog attaches to this process's console. A program without one must
+/// use [`connect_owned`] and say where its prompts belong.
 pub fn connect(transport: Transport) -> Result<Box<dyn Authenticator>> {
+    connect_owned(transport, DialogOwner::Console)
+}
+
+/// Opens the key and attaches any platform dialog to `owner`.
+pub fn connect_owned(transport: Transport, owner: DialogOwner) -> Result<Box<dyn Authenticator>> {
     match transport {
+        // Raw CTAP shows nothing: the gesture is on the token, and there is no
+        // dialog for an owner to own.
         Transport::Hid => Ok(Box::new(ctap::Ctap2Authenticator::connect()?)),
         #[cfg(windows)]
-        Transport::Platform => Ok(Box::new(webauthn::WebAuthnAuthenticator::connect()?)),
+        Transport::Platform => Ok(Box::new(webauthn::WebAuthnAuthenticator::connect(owner)?)),
         #[cfg(not(windows))]
-        Transport::Platform => Err(AuthenticatorError::Device(
-            "aucune API de plateforme sur ce système : seule `--transport hid` existe ici"
-                .to_string(),
-        )),
+        Transport::Platform => {
+            let _ = owner;
+            Err(AuthenticatorError::Device(
+                "aucune API de plateforme sur ce système : seule `--transport hid` existe ici"
+                    .to_string(),
+            ))
+        }
     }
 }
 

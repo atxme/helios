@@ -74,7 +74,7 @@ pub struct WebAuthnAuthenticator {
 }
 
 impl WebAuthnAuthenticator {
-    pub fn connect() -> Result<Self> {
+    pub fn connect(owner: super::DialogOwner) -> Result<Self> {
         let version = unsafe { WebAuthNGetApiVersionNumber() };
         if version < WEBAUTHN_API_VERSION_4 {
             return Err(AuthenticatorError::Device(format!(
@@ -83,8 +83,24 @@ impl WebAuthnAuthenticator {
                  jour, ou utiliser `--transport hid` dans une console administrateur"
             )));
         }
+        // A null owner is refused rather than passed on. Windows accepts it and
+        // opens the dialog unowned, which is the failure that cannot be seen:
+        // the prompt exists, behind something, and the operator is told to
+        // touch a key for a box that is not on screen.
+        let window = match owner {
+            super::DialogOwner::Console => unsafe { GetConsoleWindow() },
+            super::DialogOwner::Window(handle) => handle as HWND,
+        };
+        if window.is_null() {
+            return Err(AuthenticatorError::Device(
+                "ce processus n'a aucune fenêtre à laquelle attacher la boîte WebAuthn : elle \
+                 s'ouvrirait sans propriétaire, et donc possiblement derrière la fenêtre que \
+                 l'opérateur regarde"
+                    .to_string(),
+            ));
+        }
         Ok(Self {
-            window: unsafe { GetConsoleWindow() },
+            window,
             api_version: version,
         })
     }

@@ -1,0 +1,34 @@
+[package]
+name = "helios-astra-helper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Processus opérateur d'Astra, lancé par Orion et par rien d'autre : il ouvre le coffre d'autorité et parle à la clé de sécurité, dans la session interactive où Windows accepte de répondre. Aucune interface en ligne de commande."
+
+[[bin]]
+name = "helios-astra-helper"
+path = "src/main.rs"
+
+[dependencies]
+aether = { workspace = true, features = ["key-negotiation-signing"] }
+astra-operator.workspace = true
+helios-fido = { workspace = true }
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+# La fenêtre à laquelle la boîte WebAuthn s'attache. Ce processus n'a pas de
+# console : sans elle la boîte s'ouvrirait sans propriétaire, donc possiblement
+# derrière Orion.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -16,6 +16,7 @@ members = [
     "crates/orion-core",
     "crates/heliosd",
     "tools/astra-signer",
+    "tools/helios-astra-helper",
     "tools/helios-ctl",
     "tools/helios-publisher",
     "tools/helios-installer",
@@ -45,6 +46,7 @@ default-members = [
     "crates/orion-core",
     "crates/heliosd",
     "tools/astra-signer",
+    "tools/helios-astra-helper",
     "tools/helios-ctl",
     "tools/helios-installer",
     "tools/xtask",
@@ -152,6 +154,7 @@ defguard_wireguard_rs = "0.11"
 aether = { path = "crates/aether" }
 astra = { path = "crates/astra" }
 astra-operator = { path = "crates/astra-operator" }
+helios-astra-helper = { path = "tools/helios-astra-helper" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }
