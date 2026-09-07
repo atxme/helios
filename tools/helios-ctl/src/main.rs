@@ -213,7 +213,7 @@ enum Cmd {
     /// pending packages move which PCR, upgrades, then arms a TPM update
     /// window and reboots — which kills this command. Whether the window was
     /// consumed is in the journal at the next boot:
-    /// `journalctl -u heliosd -b | grep -i 'update window'`.
+    /// `journalctl --namespace=helios -u heliosd -b | grep -i 'update window'`.
     Update {
         /// Skips the confirmation.
         #[arg(long)]

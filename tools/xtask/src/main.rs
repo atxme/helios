@@ -60,6 +60,8 @@ const SYSTEMD_UNITS: &[&str] = &[
     "helios-update.path",
     "helios-update-window.service",
     "helios-update-window.timer",
+    "helios-log-prune.service",
+    "helios-log-prune.timer",
 ];
 
 /// Shipped binaries, and their role.
@@ -671,6 +673,8 @@ mod tests {
             // happened stays live until the next boot.
             "helios-update-window.service",
             "helios-update-window.timer",
+            "helios-log-prune.service",
+            "helios-log-prune.timer",
         ] {
             assert!(
                 SYSTEMD_UNITS.contains(&unit),

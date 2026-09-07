@@ -796,7 +796,7 @@ ne dit donc rien à un attaquant non admis.
 
 Le motif réel est journalisé côté gateway, en clair et nommé, dans le journal
 protégé du service — jamais sur le réseau. Un opérateur qui diagnostique lit
-`journalctl -u heliosd` ; un attaquant qui sonde lit `rejected`.
+`journalctl --namespace=helios -u heliosd` ; un attaquant qui sonde lit `rejected`.
 
 L'uniformité du code ne prétend pas rendre des chemins cryptographiques de
 coûts différents strictement constants. La gateway ferme la connexion après

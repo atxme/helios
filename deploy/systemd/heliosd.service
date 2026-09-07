@@ -16,6 +16,9 @@ Environment=HELIOS_READY_PATH=/run/helios/ready
 ExecStart=/opt/helios/current/heliosd run
 Restart=on-failure
 RestartSec=2
+# Isoler les journaux Helios pour que leur rétention ne purge pas ceux des
+# autres services de la gateway. La purge est assurée par helios-log-prune.
+LogNamespace=helios
 
 # heliosd manipule nftables et l'interface WireGuard.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW

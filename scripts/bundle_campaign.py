@@ -21,7 +21,13 @@ import subprocess
 import sys
 
 BINAIRES = ("heliosd", "helios-installer", "helios-ctl")
-UNITES = ("heliosd.service", "helios-update.service", "helios-update.path")
+UNITES = (
+    "heliosd.service",
+    "helios-update.service",
+    "helios-update.path",
+    "helios-log-prune.service",
+    "helios-log-prune.timer",
+)
 SEQUENCE = 9002
 
 
@@ -221,6 +227,8 @@ def run(racine_depot: pathlib.Path, tmp: pathlib.Path, epoque: pathlib.Path,
         cible / "etc/systemd/system/heliosd.service",
         cible / "etc/systemd/system/helios-update.service",
         cible / "etc/systemd/system/helios-update.path",
+        cible / "etc/systemd/system/helios-log-prune.service",
+        cible / "etc/systemd/system/helios-log-prune.timer",
         cible / "var/lib/helios/network.toml",
     ]
     for chemin in attendus:

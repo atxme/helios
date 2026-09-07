@@ -105,7 +105,7 @@ rien à attendre ni à rapporter ensuite. Ce qui s'est passé est au journal du
 démarrage suivant :
 
 ```sh
-journalctl -u heliosd -b | grep -i 'update window'
+journalctl --namespace=helios -u heliosd -b | grep -i 'update window'
 ```
 
 Le classement des paquets est ce que la commande apporte de plus qu'un

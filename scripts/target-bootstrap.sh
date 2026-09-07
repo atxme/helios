@@ -522,8 +522,9 @@ esac
 # redémarrage se fait hors de la session, et l'état se relit ensuite sur une
 # connexion neuve.
 helios_ssh_sudo "$TARGET" "
-    systemctl enable heliosd helios-update.path >/dev/null
+    systemctl enable heliosd helios-update.path helios-log-prune.timer >/dev/null
     systemctl start helios-update.path
+    systemctl start helios-log-prune.timer
     systemd-run --collect --unit=helios-deploy-restart \
         systemctl restart heliosd >/dev/null
 "

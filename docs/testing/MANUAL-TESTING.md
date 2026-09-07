@@ -510,7 +510,7 @@ la gateway.
 ```sh
 # 1. heliosd écoute-t-il, et sur la bonne adresse ?
 ss -lntup | grep 51822  # attendu : 100.64.0.1:51822, pas 127.0.0.1:51822
-journalctl -u heliosd | grep 'raw speedtest'
+journalctl --namespace=helios -u heliosd | grep 'raw speedtest'
 
 # 2. le pare-feu ouvre-t-il le port sur l'interface du tunnel ?
 nft list chain inet helios input | grep 51822
