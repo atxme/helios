@@ -623,15 +623,18 @@ pub async fn commit(
     // for a commit the gateway then refuses costs one idempotent re-read at
     // the next start, which is the cheap side of the trade.
     let expected_generation = commit.staged_generation;
-    crate::reconciliation::record(
-        &service.state_dir,
-        &crate::reconciliation::PendingReconciliation {
-            peer: client,
-            expected_generation,
-            recorded_at: now_unix,
-        },
-    )
-    .map_err(|error| RecoveryError::Reconciliation(error.to_string()))?;
+    {
+        let _reconciliation = service.reconciliation.lock().await;
+        crate::reconciliation::record(
+            &service.state_dir,
+            &crate::reconciliation::PendingReconciliation {
+                peer: client,
+                expected_generation,
+                recorded_at: now_unix,
+            },
+        )
+        .map_err(|error| RecoveryError::Reconciliation(error.to_string()))?;
+    }
 
     gateway
         .commit_recovery(&helios_api::internal::RelayedStageCommit {
@@ -678,7 +681,7 @@ pub async fn commit(
 }
 
 /// Adopts what the gateway serves for one peer, and closes the intent when it
-/// has caught up.
+/// has caught up or the gateway proves that no such promotion remains.
 ///
 /// Returns whether the intent was closed. Idempotent: it reads the gateway and
 /// reconciles forward-only, so replaying it after a crash — or at every start
@@ -689,7 +692,7 @@ pub async fn reconcile(
     expected_generation: u64,
     now_unix: u64,
 ) -> Result<bool, RecoveryError> {
-    crate::renewal::transcribe_peer(service, client, now_unix)
+    let gateway = crate::renewal::transcribe_peer(service, client, now_unix)
         .await
         .map_err(|error| match error {
             crate::renewal::RenewalError::UnknownPeer => RecoveryError::UnknownPeer,
@@ -701,11 +704,22 @@ pub async fn reconcile(
         .await
         .peer(client)
         .is_some_and(|peer| peer.active.generation >= expected_generation);
-    if reached {
-        crate::reconciliation::clear(&service.state_dir)
+    let promotion_still_present = gateway
+        .state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.candidate.generation >= expected_generation)
+        || gateway
+            .state
+            .next
+            .as_ref()
+            .is_some_and(|next| next.generation >= expected_generation);
+    if reached || !promotion_still_present {
+        let _reconciliation = service.reconciliation.lock().await;
+        crate::reconciliation::clear(&service.state_dir, client, expected_generation)
             .map_err(|error| RecoveryError::Reconciliation(error.to_string()))?;
     }
-    Ok(reached)
+    Ok(reached || !promotion_still_present)
 }
 
 /// The bounded class a public caller learns.

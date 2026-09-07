@@ -6,6 +6,7 @@
 /coverage/
 **/coverage/
 /resources-windows/
+/apps/orion/src-tauri/binaries/
 
 # Local dependencies and tool caches
 node_modules/

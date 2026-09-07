@@ -2656,9 +2656,11 @@ supprime jamais l'ancien pin avant la fin du chevauchement.
    les nouvelles clés.
 2. Il produit `ExpiredCertificateRecoveryRequest` avec les preuves ancienne et
    nouvelle.
-3. Orion lance `astra-signer`, qui affiche la cible ; une seule cérémonie
-   `GetAssertion` de la YubiKey opérateur approuve le hash exact et dérive le
-   secret qui ouvre localement le coffre maître.
+3. Orion lance son sidecar désélevé `helios-astra-helper`, qui affiche dans
+   l'onglet Astra le manifeste vérifié ; une seule cérémonie `GetAssertion` de
+   la YubiKey opérateur approuve le hash exact et dérive le secret qui ouvre
+   localement le coffre maître. Le jeton de session et l'état passent par le
+   canal IPC local borné, jamais par la WebView.
 4. Astra vérifie la dernière génération historique et l'absence de révocation,
    puis le compagnon signe l'autorisation exacte par `CA-PQ`.
 5. Astra remet l'autorisation à Helios par le veth privé.
@@ -3960,7 +3962,9 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | `aether::key_negotiation` | certificats gateway émis par CA, objets signés, encodage canonique et empreintes |
 | `aether::config` | états bornés, pending/next, tombstones, générations, profil Astra et invariants temporels |
 | `astra` | coordinateur public HTTPS et privé veth, statut authentifié, renouvellements automatiques, campagnes, contrôle des approbations sensibles, émetteur délégué, transactions chunkées, registre et audit |
-| compagnon `astra-signer` | assertions FIDO2 des récupérations/campagnes ; ouverture locale du coffre par PRF pour les signatures maîtresses, puis zéroïsation |
+| bibliothèque `astra-operator` | vérification et exécution des cérémonies sans dépendre d'une ligne de commande |
+| sidecar `helios-astra-helper` | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation |
+| adaptateur `astra-signer` | flux portables et hors ligne tant que leur parité Orion n'est pas validée sur Windows |
 | `helios-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
 | `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth et API privée appelée par Astra, authentification de source et limites HTTP |
 | `heliosd::key_negotiation` | identité active, staging gateway, marqueur publié, avortement, reçu signé et preuve de leaf servie |

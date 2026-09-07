@@ -12,6 +12,7 @@ const api = vi.hoisted(() => ({
   advanceOperatorCeremony: vi.fn(),
   beginOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
+  dismissOperatorCeremony: vi.fn(),
 }))
 vi.mock('../api', () => api)
 
@@ -46,6 +47,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   api.operatorCeremonyStatus.mockResolvedValue(null)
   api.operatorPendingOperations.mockResolvedValue([])
+  api.dismissOperatorCeremony.mockResolvedValue(undefined)
   api.astraCaTlsRotationStatus.mockResolvedValue({
     phase: 'idle',
     message: '',
@@ -144,5 +146,36 @@ describe('AstraView', () => {
     fillForm()
     fireEvent.click(screen.getByRole('button', { name: 'Démarrer la rotation' }))
     expect(await screen.findByText('coffre illisible')).toBeTruthy()
+  })
+
+  it('polls past processing so a campaign can reach its next key', async () => {
+    api.operatorCeremonyStatus
+      .mockResolvedValueOnce({
+        session_id: 'd'.repeat(32),
+        revision: 2,
+        operation: 'approve_campaign',
+        operation_id: 'e'.repeat(32),
+        remote: 'awaiting_operator',
+        gesture: { processing_key: { index: 1, of: 2 } },
+        allowed: [],
+      })
+      .mockResolvedValue({
+        session_id: 'd'.repeat(32),
+        revision: 3,
+        operation: 'approve_campaign',
+        operation_id: 'e'.repeat(32),
+        remote: 'awaiting_operator',
+        gesture: {
+          awaiting_key: { index: 2, of: 2, purpose: 'approve_campaign' },
+        },
+        allowed: ['continue', 'cancel'],
+      })
+
+    render(<AstraView />)
+
+    expect(await screen.findByText('Clé 1 sur 2 en cours de lecture…')).toBeTruthy()
+    expect(
+      await screen.findByText('Brancher la clé autorisée (2 sur 2), pour approuver la campagne affichée.'),
+    ).toBeTruthy()
   })
 })

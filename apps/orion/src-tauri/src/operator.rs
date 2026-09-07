@@ -191,6 +191,22 @@ impl OperatorCeremony {
         send(&mut session.commands, &command).await?;
         awaited(&mut session.status).await
     }
+
+    /// Forgets a completed session after its final state has been shown.
+    /// A live session cannot be dismissed: dropping its command channel would
+    /// look like cancellation even after the helper crossed the point where
+    /// cancellation is honest.
+    pub async fn dismiss(&self) -> Result<(), String> {
+        let mut held = self.0.lock().await;
+        if let Some(session) = held.as_mut() {
+            let current = session.status.borrow_and_update().clone();
+            if !current.gesture.is_terminal() {
+                return Err("la cérémonie opérateur est encore en cours".to_string());
+            }
+        }
+        *held = None;
+        Ok(())
+    }
 }
 
 /// 256 bits from the one entry point this repository draws randomness through.

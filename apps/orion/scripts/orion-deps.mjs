@@ -32,3 +32,13 @@ if (process.env.ORION_DEPS_READY === '1' || resourcesReady) {
     process.exit(1)
   }
 }
+
+if (process.env.ORION_HELPER_READY === '1') {
+  console.log('==> Astra helper: already provided by cargo xtask')
+} else {
+  try {
+    execFileSync('cargo', ['xtask', 'orion-helper'], { stdio: 'inherit' })
+  } catch {
+    process.exit(1)
+  }
+}

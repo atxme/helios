@@ -285,6 +285,8 @@ pub struct AstraService {
     /// never resolve on a route that authorizes an ordinary renewal. Absence
     /// carries that rule; a comparison would only describe it.
     pub recoveries: Mutex<crate::recovery::RecoveryStore>,
+    /// Serializes the reconciliation file's read-modify-write operations.
+    pub reconciliation: Mutex<()>,
     /// The encrypted authority vault, byte for byte as the companion wrote it.
     ///
     /// Astra transports and backs it up; it cannot open it, and nothing in

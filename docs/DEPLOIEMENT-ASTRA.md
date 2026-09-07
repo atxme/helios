@@ -351,10 +351,12 @@ Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
 témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
 dans `/var/lib/helios/astra-compose.env`. Sur une reprise, `deploy.sh` relit la
 tête du volume et la compare au témoin opérateur `~/.helios/astra/audit-head`.
-Les anciennes versions ajoutaient une entrée `StatusPublished` à chaque lecture
-de télémétrie ; une extension composée uniquement de ces entrées est reprise et
-le témoin est avancé. Tout écart qui contient une admission, une émission, une
-rotation ou une révocation reste un fork et est refusé.
+Le témoin doit encore apparaître dans la chaîne. Le suffixe peut contenir les
+événements de cycle de vie d'un pair qui n'élargissent pas les pouvoirs de
+l'autorité — admission transcrite, demande, staging, récupération et adoption
+de génération. Une décision de configuration postérieure au témoin (politique,
+délégation, rotation d'ancre, campagne approuvée ou révocation) est refusée et
+demande l'enregistrement explicite d'une nouvelle tête.
 
 Après une panne limitée à cette étape, la reprise ne relivre ni les binaires ni
 la configuration de la gateway :

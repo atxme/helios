@@ -49,6 +49,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt as _;
+use std::path::Path;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
@@ -57,11 +58,13 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
-    CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, TerminateProcess, CREATE_NEW_CONSOLE,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+    PROCESS_QUERY_INFORMATION, STARTUPINFOW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+};
 
 /// A handle closed on drop — a token, or the shell process it came from.
 ///
@@ -88,8 +91,12 @@ impl Drop for Token {
 /// command line, and the allow-list grammar is what makes that inert.
 pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
     spawn_with_standard_token(
+        None,
         format!("powershell.exe -NoExit -Command ssh {target}"),
         "ouverture du terminal",
+        &[],
+        CREATE_NEW_CONSOLE,
+        false,
     )?;
     tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
     Ok(())
@@ -102,7 +109,14 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
 /// profile value from turning this into a general process launcher.
 pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
     let command = windows_command_line("astra-signer", arguments);
-    spawn_with_standard_token(command, "lancement du compagnon", &[], CREATE_NEW_CONSOLE)
+    spawn_with_standard_token(
+        None,
+        command,
+        "lancement du compagnon",
+        &[],
+        CREATE_NEW_CONSOLE,
+        false,
+    )
 }
 
 /// Runs the Astra operator helper as the standard user, with no console and
@@ -114,25 +128,28 @@ pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
 /// * **No console.** The helper draws its own owner window for the WebAuthn
 ///   dialog; a console would be an empty black rectangle appearing beside
 ///   Orion for the length of a ceremony.
-/// * **An environment block of its own.** The session token travels in it.
-///   A command line is readable by any process of the same user — that was the
-///   documented limitation of protocol 1 — while an environment block is
-///   readable only by the process itself and whoever can already debug it.
+/// * **An environment block of its own.** The session token travels in it,
+///   outside ordinary process-list command lines. A process allowed to debug
+///   this child remains outside that protection boundary.
 ///
 /// The block is the user's own, from `CreateEnvironmentBlock`, with these
 /// variables appended. Not a bare block of two variables: the helper resolves
 /// the vault beside the user's profile, and a child with no `USERPROFILE`
 /// would look for the domain in a directory that does not exist.
 pub fn spawn_astra_helper(
+    program: &Path,
     arguments: &[String],
     environment: &[(String, String)],
 ) -> Result<(), String> {
-    let command = windows_command_line("helios-astra-helper", arguments);
+    let program_text = program.to_string_lossy();
+    let command = windows_command_line(&program_text, arguments);
     spawn_with_standard_token(
+        Some(program),
         command,
         "lancement du processus opérateur",
         environment,
         CREATE_NO_WINDOW,
+        true,
     )
 }
 
@@ -179,8 +196,17 @@ fn environment_block(
             if length == 0 {
                 break;
             }
-            block.extend_from_slice(std::slice::from_raw_parts(cursor, length));
-            block.push(0);
+            let entry = std::slice::from_raw_parts(cursor, length);
+            let text = String::from_utf16_lossy(entry);
+            let shadowed = additions.iter().any(|(name, _)| {
+                text.get(..name.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+                    && text.as_bytes().get(name.len()) == Some(&b'=')
+            });
+            if !shadowed {
+                block.extend_from_slice(entry);
+                block.push(0);
+            }
             cursor = cursor.add(length + 1);
         }
         DestroyEnvironmentBlock(inherited);
@@ -235,10 +261,12 @@ fn windows_command_line(program: &str, arguments: &[String]) -> String {
 }
 
 fn spawn_with_standard_token(
+    application: Option<&Path>,
     command: String,
     action: &str,
     environment: &[(String, String)],
     creation_flags: u32,
+    allow_foreground: bool,
 ) -> Result<(), String> {
     let token = standard_user_token()?;
     if is_elevated(&token)? {
@@ -251,6 +279,12 @@ fn spawn_with_standard_token(
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let application: Option<Vec<u16>> = application.map(|path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    });
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -277,7 +311,9 @@ fn spawn_with_standard_token(
         CreateProcessWithTokenW(
             token.0,
             LOGON_WITH_PROFILE,
-            std::ptr::null(),
+            application
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
             command.as_mut_ptr(),
             creation_flags,
             // NULL unless something had to be added: Windows then builds the
@@ -293,6 +329,21 @@ fn spawn_with_standard_token(
         return Err(format!(
             "{action} impossible : CreateProcessWithTokenW a échoué ({})",
             std::io::Error::last_os_error()
+        ));
+    }
+    if allow_foreground && unsafe { AllowSetForegroundWindow(process.dwProcessId) } == 0 {
+        let foreground_error = std::io::Error::last_os_error();
+        // The helper has not authenticated or touched a key yet. Leaving it
+        // alive after refusing foreground permission would create exactly the
+        // invisible WebAuthn prompt the owner window is meant to prevent.
+        unsafe { TerminateProcess(process.hProcess, 1) };
+        unsafe {
+            CloseHandle(process.hProcess);
+            CloseHandle(process.hThread);
+        }
+        return Err(format!(
+            "{action} annulé : impossible d'autoriser sa boîte WebAuthn au premier plan ({})",
+            foreground_error
         ));
     }
     // SAFETY: both handles were returned by the successful call above.

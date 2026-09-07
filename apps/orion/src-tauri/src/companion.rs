@@ -18,6 +18,8 @@
 //! no generic shell permission, and this module refuses if the core ever asks
 //! it to launch anything other than the companion named here.
 
+use std::path::PathBuf;
+
 use orion_core::certificate_renewal::CompanionInvocation;
 
 const PROGRAM: &str = "astra-signer";
@@ -66,18 +68,18 @@ pub fn launch(invocation: &CompanionInvocation) -> Result<(), String> {
 /// Starts the operator helper, handing it the session in its environment.
 ///
 /// `arguments` carries the address to connect back to — public, and useful in
-/// a log. `environment` carries the session token, which is neither: on both
-/// platforms a command line is readable by any process of the same user, an
-/// environment block is not.
+/// a log. `environment` carries the session token, keeping it out of ordinary
+/// process-list command lines.
 pub fn launch_helper(arguments: &[String], environment: &[(String, String)]) -> Result<(), String> {
+    let program = helper_program()?;
     #[cfg(target_os = "windows")]
     {
-        crate::deelevate::spawn_astra_helper(arguments, environment)
+        crate::deelevate::spawn_astra_helper(&program, arguments, environment)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let mut child = tokio::process::Command::new(HELPER)
+        let mut child = tokio::process::Command::new(&program)
             .args(arguments)
             .envs(environment.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .spawn()
@@ -87,6 +89,24 @@ pub fn launch_helper(arguments: &[String], environment: &[(String, String)]) -> 
         });
         Ok(())
     }
+}
+
+/// The helper is a sidecar of this exact Orion build, never a name resolved
+/// through the current directory or `PATH`.
+fn helper_program() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("emplacement d'Orion introuvable : {error}"))?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "le chemin d'Orion n'a aucun répertoire parent".to_string())?;
+    let helper = directory.join(format!("{HELPER}{}", std::env::consts::EXE_SUFFIX));
+    if !helper.is_file() {
+        return Err(format!(
+            "le processus opérateur installé avec Orion est absent : {}",
+            helper.display()
+        ));
+    }
+    Ok(helper)
 }
 
 #[cfg(test)]

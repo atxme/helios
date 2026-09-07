@@ -12,11 +12,9 @@
 //!
 //! # What this ceremony refuses to be
 //!
-//! Two campaign families are declined here by name rather than run: one that
-//! withdraws an identity, and one that rotates an anchor. Neither is an
-//! approval followed by an application — the approval and the objects `CA-PQ`
-//! signs travel in a single deposit (§0.6) — so taking the touch here would
-//! spend the operator's window on a result that carries nothing.
+//! Only client-leaf campaigns are accepted here. Every other family produces
+//! an object in the same ceremony as its approval, so submitting the empty
+//! result used for client leaves would spend a gesture and then be refused.
 //!
 //! # Où sont les tests
 //!
@@ -29,7 +27,7 @@
 use std::path::Path;
 
 use aether::certificates::encoding::{Id16, MlDsa87PublicKey};
-use aether::certificates::operator_session::{AffectedCa, CampaignManifest, RemoteState};
+use aether::certificates::operator_session::{CampaignManifest, RemoteState};
 use aether::certificates::status::{AstraRotationCampaign, CampaignApproval};
 use anyhow::{bail, Context, Result};
 
@@ -98,35 +96,17 @@ pub fn begin(
     handoff::verify_campaign_request(&handoff, &vault, &request, &authority_url, now)?;
     let campaign = request.campaign.as_ref().clone();
 
-    if campaign.scope.revokes() {
+    if !campaign.scope.authorizes_client_rotation() {
         bail!(
-            "cette campagne retire une identité : elle se dépose en un seul geste, avec la \
-             décision signée. Rien n'a été signé."
-        );
-    }
-    if campaign.scope.rotates_authority() {
-        bail!(
-            "cette campagne fait tourner une ancre : l'approbation et les objets que `CA-PQ` \
-             signe voyagent dans un seul dépôt (§0.6). Rien n'a été signé."
+            "cette campagne ne renouvelle pas des certificats clients : sa décision et les \
+             objets qu'elle produit doivent voyager dans une cérémonie dédiée. Rien n'a été \
+             signé."
         );
     }
 
     let manifest = CampaignManifest {
-        trust_domain_id: identity.trust_domain_id,
-        reason: campaign.reason.clone(),
-        requested_by: campaign.requested_by.clone(),
+        campaign: Box::new(campaign.clone()),
         fingerprint: campaign.fingerprint(),
-        // Client leaves are what an ordinary campaign moves; the two families
-        // that touch an authority are refused above.
-        affected_ca: AffectedCa::CaTls,
-        current_epoch: identity.ca_tls_epoch,
-        next_epoch: identity.ca_tls_epoch,
-        activation_at: campaign.created_at,
-        not_after: campaign.expires_at,
-        outgoing_anchor_fingerprint: aether::certificates::encoding::Fingerprint::of(
-            ca_pq_public_key.as_bytes(),
-        ),
-        target_count: campaign.targets.len(),
     };
 
     Ok(Verified {
@@ -145,44 +125,78 @@ pub fn begin(
 }
 
 impl Verified {
-    /// Signs the approval with the keys collected and submits it.
-    ///
-    /// `keys` and `pins` are positional and must be as long as
-    /// [`Self::required_credentials`]. They are collected by the caller, one
-    /// gesture at a time, because that is the only order in which an operator
-    /// finds out at the *second* prompt that they were about to reuse one
-    /// token — rather than after both.
-    pub fn approve(
-        self,
-        keys: &[&dyn Authenticator],
-        pins: &[&str],
-        now: u64,
-        progress: &mut dyn FnMut(RemoteState),
-    ) -> Result<CampaignApproval> {
-        let required = usize::from(self.campaign.required_credentials);
-        if keys.len() != required || pins.len() != required {
-            bail!("cette campagne demande {required} clé(s) distincte(s)");
-        }
-        let approval = authority::approve_campaign(
-            keys,
+    /// Starts the credential session without touching a key.
+    pub fn start_approval(self, now: u64) -> Result<InProgressApproval> {
+        let approval = authority::CampaignApprovalSession::new(
             &self.campaign,
             &self.registry,
             &self.identity,
             &self.ca_pq_public_key,
             &self.vault.rp_id,
             &self.webauthn_origin,
-            pins,
             now,
         )?;
+        Ok(InProgressApproval {
+            vault: self.vault,
+            client: self.client,
+            operation: self.request.operation_id,
+            result_token: self.request.result_token.clone(),
+            approval,
+        })
+    }
+}
+
+/// A campaign whose assertions are collected while each physical key is
+/// still connected.
+///
+/// A Windows WebAuthn value is a platform selector, not a handle bound to the
+/// token present when `connect` ran. Delaying all assertions until after the
+/// key swaps therefore lets the last token answer every stored selector. This
+/// type makes the assertion itself the per-key operation.
+pub struct InProgressApproval {
+    vault: AuthorityVault,
+    client: origin::Origin,
+    operation: Id16,
+    result_token: String,
+    approval: authority::CampaignApprovalSession,
+}
+
+impl InProgressApproval {
+    pub fn required_credentials(&self) -> u8 {
+        u8::try_from(self.approval.required()).unwrap_or(u8::MAX)
+    }
+
+    /// Obtains and validates one assertion now, before the caller asks for the
+    /// next physical key.
+    pub fn approve_key(&mut self, key: &dyn Authenticator, pin: &str, now: u64) -> Result<String> {
+        let offered = self.approval.offered_credentials();
+        let assertion = key.approve(
+            self.approval.webauthn_rp_id(),
+            &offered,
+            self.approval.client_data_json(),
+            pin,
+        )?;
+        let credential_id = assertion.credential_id.clone();
+        self.approval.accept(assertion, now)?;
+        Ok(self
+            .vault
+            .slot_for_credential(&credential_id)?
+            .label
+            .clone())
+    }
+
+    /// Finishes the already-collected decision and deposits it.
+    pub fn finish(
+        self,
+        now: u64,
+        progress: &mut dyn FnMut(RemoteState),
+    ) -> Result<CampaignApproval> {
+        let approval = self.approval.finish(now)?;
         progress(RemoteState::Prepared);
 
         let result = super::campaign_result(&approval, Vec::new(), None);
         self.client
-            .submit(
-                &self.request.operation_id,
-                &self.request.result_token,
-                &result,
-            )
+            .submit(&self.operation, &self.result_token, &result)
             .context("dépôt de l'approbation")?;
         progress(RemoteState::Deposited);
         Ok(approval)

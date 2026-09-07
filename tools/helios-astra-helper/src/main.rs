@@ -20,9 +20,9 @@
 //!
 //! So there is exactly one argument, and it is not a secret: where to connect
 //! back. The session token comes through the environment block, which Orion
-//! gives this child alone. On both platforms a command line is readable by any
-//! process of the same user; an environment block is not, and protocol 1 put
-//! the token on the command line as a known limitation. This closes it.
+//! gives this child alone. This keeps the token out of ordinary process-list
+//! command lines. It is not a boundary against a same-account debugger; that
+//! actor can already inspect or control this medium-integrity process.
 //!
 //! # What it may be asked to do
 //!
@@ -41,18 +41,17 @@ use std::net::TcpStream;
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::operator_session::{
-    AstraManifest, BeginCommand, GestureState, KeyPurpose, OperationKind, OperationLocator,
-    OperatorAction, OperatorCommand, OperatorHello, OperatorStatus, Refusal, RemoteState,
-    PROTOCOL_VERSION,
+    AstraManifest, BeginCommand, GestureState, KeyPurpose, KeySlotLabel, OperationKind,
+    OperationLocator, OperatorAction, OperatorCommand, OperatorHello, OperatorStatus, Refusal,
+    RemoteState, PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 /// Where the session token is read from.
 ///
-/// Orion builds this child an environment block of its own. Unlike a command
-/// line it is not readable by other processes of the same user, which is the
-/// limitation protocol 1 documented and did not close.
+/// Orion builds this child an environment block of its own, keeping the token
+/// out of ordinary process-list command lines.
 const TOKEN_VARIABLE: &str = "HELIOS_ASTRA_SESSION_TOKEN";
 
 /// Where the session identifier is read from.
@@ -223,10 +222,17 @@ fn recover<R: std::io::BufRead, W: std::io::Write>(
     ceremony.gesture = GestureState::ProcessingKey { index: 1, of: 1 };
     session::write_status(writer, &ceremony.status())?;
 
-    let key = helios_fido::authenticator::connect_owned(
+    let key = match helios_fido::authenticator::connect_owned(
         helios_fido::authenticator::Transport::default(),
         window.owner(),
-    )?;
+    ) {
+        Ok(key) => key,
+        Err(error) => {
+            ceremony.refuse(Refusal::KeyDeclined);
+            session::write_status(writer, &ceremony.status())?;
+            return Err(error.into());
+        }
+    };
     // The platform collects the PIN in its own dialog, so it never enters this
     // process. A transport that needs one has no way to ask from here — there
     // is no console — and saying so is better than an empty string that fails
@@ -298,19 +304,23 @@ fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
         }
     };
 
-    let required = verified.required_credentials();
     ceremony.remote = RemoteState::AwaitingOperator;
     ceremony.manifest = Some(AstraManifest::Campaign(verified.manifest().clone()));
+    let mut approval = match verified.start_approval(now_unix()) {
+        Ok(approval) => approval,
+        Err(error) => {
+            ceremony.refuse(Refusal::ManifestMismatch);
+            session::write_status(writer, &ceremony.status())?;
+            return Err(error);
+        }
+    };
+    let required = approval.required_credentials();
 
-    let mut keys = Vec::new();
     for index in 1..=required {
         ceremony.gesture = GestureState::AwaitingKey {
             index,
             of: required,
-            // Every credential of a campaign is an approval, and naming the
-            // first one differently would suggest an order the protocol does
-            // not have.
-            purpose: KeyPurpose::SecondApproval,
+            purpose: KeyPurpose::ApproveCampaign,
         };
         let offered = ceremony.status();
         session::write_status(writer, &offered)?;
@@ -329,10 +339,17 @@ fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
             of: required,
         };
         session::write_status(writer, &ceremony.status())?;
-        let key = helios_fido::authenticator::connect_owned(
+        let key = match helios_fido::authenticator::connect_owned(
             helios_fido::authenticator::Transport::default(),
             window.owner(),
-        )?;
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                ceremony.refuse(Refusal::KeyDeclined);
+                session::write_status(writer, &ceremony.status())?;
+                return Err(error.into());
+            }
+        };
         if key.needs_pin() {
             ceremony.refuse(Refusal::ProtocolViolation);
             session::write_status(writer, &ceremony.status())?;
@@ -341,19 +358,24 @@ fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
                  n'a aucune interface pour le demander"
             );
         }
-        keys.push(key);
+        match approval.approve_key(key.as_ref(), "", now_unix()) {
+            Ok(label) => ceremony.keys.push(KeySlotLabel {
+                slot: index.to_string(),
+                label,
+            }),
+            Err(error) => {
+                ceremony.refuse(Refusal::KeyDeclined);
+                session::write_status(writer, &ceremony.status())?;
+                return Err(error);
+            }
+        }
     }
 
     ceremony.gesture = GestureState::Signing;
     session::write_status(writer, &ceremony.status())?;
 
-    let key_refs: Vec<&dyn astra_operator::authenticator::Authenticator> =
-        keys.iter().map(|key| key.as_ref()).collect();
-    let pins: Vec<&str> = vec![""; key_refs.len()];
     let mut reached = Vec::new();
-    let outcome = verified.approve(&key_refs, &pins, now_unix(), &mut |state| {
-        reached.push(state)
-    });
+    let outcome = approval.finish(now_unix(), &mut |state| reached.push(state));
     for state in reached {
         ceremony.remote = state;
         session::write_status(writer, &ceremony.status())?;
@@ -415,6 +437,7 @@ struct Ceremony {
     gesture: GestureState,
     manifest: Option<AstraManifest>,
     refusal: Option<Refusal>,
+    keys: Vec<KeySlotLabel>,
 }
 
 impl Ceremony {
@@ -428,6 +451,7 @@ impl Ceremony {
             gesture: GestureState::Verifying,
             manifest: None,
             refusal: None,
+            keys: Vec::new(),
         }
     }
 
@@ -448,6 +472,7 @@ impl Ceremony {
         status.operation_id = self.operation_id;
         status.manifest = self.manifest.clone();
         status.refusal = self.refusal;
+        status.keys = self.keys.clone();
         status
     }
 

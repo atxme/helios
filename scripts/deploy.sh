@@ -901,11 +901,10 @@ deployer_astra() {
             return 1
         fi
         if [ "$tete_attendue" != "$tete_audit" ]; then
-            # Releases before the status-read fix appended `StatusPublished`
-            # for every telemetry query. Ask the freshly built image whether
-            # the old witness is followed only by that harmless legacy suffix.
-            # A renewal, admission, issuer or revocation after the witness
-            # remains a hard fork and is never adopted automatically.
+            # Ask the freshly built image whether the old witness is still in
+            # the chain and its suffix contains only unattended per-peer
+            # lifecycle. Authority configuration decisions still require an
+            # explicitly recorded witness.
             # Conserver la sortie même en cas d'échec : elle nomme l'option
             # de runtime ou le volume qui empêcherait la sonde de s'exécuter,
             # au lieu de transformer cette panne en faux « fork » silencieux.
@@ -925,7 +924,7 @@ deployer_astra() {
                     printf '%s\n' "$statut_tete_ancienne" | tail -20 >&2
                 return 1
             fi
-            echo "    témoin avancé : l'écart ne contient que d'anciennes publications de statut"
+            echo "    témoin avancé : l'écart ne contient que du cycle de vie pair non privilégié"
             mkdir -p "$(dirname "$RELAIS")"
             printf '%s\n' "$tete_audit" > "$(dirname "$RELAIS")/audit-head"
         fi

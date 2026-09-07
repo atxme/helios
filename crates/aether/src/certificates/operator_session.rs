@@ -47,6 +47,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::encoding::{Fingerprint, Id16, TrustDomainId};
+use super::status::AstraRotationCampaign;
 
 /// Protocol version carried by the first frame.
 pub const PROTOCOL_VERSION: u16 = 2;
@@ -229,6 +230,8 @@ impl RemoteState {
 pub enum KeyPurpose {
     /// Opening the authority vault.
     OpenVault,
+    /// Approving the campaign currently shown.
+    ApproveCampaign,
     /// The second, distinct credential a two-key ceremony requires.
     SecondApproval,
     /// Promoting an object already prepared.
@@ -355,7 +358,7 @@ impl AstraManifest {
     pub fn trust_domain_id(&self) -> TrustDomainId {
         match self {
             Self::Recovery(manifest) => manifest.trust_domain_id,
-            Self::Campaign(manifest) => manifest.trust_domain_id,
+            Self::Campaign(manifest) => manifest.campaign.trust_domain_id,
             Self::IssuerAuthorization(manifest) => manifest.trust_domain_id,
             Self::CaRotation(manifest) => manifest.trust_domain_id,
             Self::Revocation(manifest) => manifest.trust_domain_id,
@@ -387,18 +390,11 @@ pub struct RecoveryManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignManifest {
-    pub trust_domain_id: TrustDomainId,
-    /// The reason the campaign was created under, as the authority recorded it.
-    pub reason: String,
-    pub requested_by: String,
+    /// The complete canonical value whose fingerprint the credentials approve.
+    /// Keeping the original type here prevents this display contract from
+    /// silently omitting a target or reinterpreting a scope.
+    pub campaign: Box<AstraRotationCampaign>,
     pub fingerprint: Fingerprint,
-    pub affected_ca: AffectedCa,
-    pub current_epoch: u64,
-    pub next_epoch: u64,
-    pub activation_at: u64,
-    pub not_after: u64,
-    pub outgoing_anchor_fingerprint: Fingerprint,
-    pub target_count: usize,
 }
 
 /// §9.5, the delegation.
@@ -534,6 +530,8 @@ impl OperatorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificates::encoding::WireGuardKey;
+    use crate::certificates::status::{CampaignScope, CampaignTarget, CertificateKind};
 
     fn session() -> Id16 {
         Id16::new([3; 16]).expect("id")
@@ -680,6 +678,52 @@ mod tests {
         assert_eq!(
             manifest.trust_domain_id(),
             Id16::new([1; 16]).expect("domain")
+        );
+    }
+
+    /// A campaign approval binds every exact target. The IPC manifest must
+    /// carry that same canonical object rather than a lossy count or summary.
+    #[test]
+    fn a_campaign_manifest_keeps_every_signed_target() {
+        let domain = Id16::new([1; 16]).expect("domain");
+        let campaign = AstraRotationCampaign {
+            format_version: crate::certificates::CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([2; 16]).expect("campaign"),
+            trust_domain_id: domain,
+            gateway_wg_public_key: WireGuardKey::from_bytes([3; 32]),
+            server_name: "gateway.example".into(),
+            created_at: 10,
+            expires_at: 20,
+            scope: CampaignScope::OrionProfile,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientTls,
+                identity_key: WireGuardKey::from_bytes([4; 32]),
+                epoch: 7,
+                generation: 8,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"tls"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"pq"),
+            }],
+            reason: "rotation".into(),
+            requested_by: "operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: 1,
+        };
+        let fingerprint = campaign.fingerprint();
+        let manifest = AstraManifest::Campaign(CampaignManifest {
+            campaign: Box::new(campaign.clone()),
+            fingerprint,
+        });
+
+        assert_eq!(manifest.trust_domain_id(), domain);
+        let encoded = serde_json::to_value(&manifest).expect("manifest");
+        assert_eq!(
+            encoded["campaign"]["targets"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(encoded["fingerprint"], fingerprint.to_string());
+        assert_eq!(
+            encoded["campaign"]["targets"][0]["identity_key"],
+            campaign.targets[0].identity_key.to_string()
         );
     }
 }

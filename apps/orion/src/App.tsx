@@ -35,6 +35,11 @@ import { GUTTER, PINE } from './theme'
 
 type View = 'connect' | 'profiles' | 'certificates' | 'astra' | 'speedtest' | 'logs'
 
+function operatorCeremonyIsLive(status: Awaited<ReturnType<typeof api.operatorCeremonyStatus>>) {
+  if (!status || typeof status.gesture !== 'string') return status !== null
+  return !['done', 'failed', 'cancelled'].includes(status.gesture)
+}
+
 /** Width of the collapsed rail. The icon slot is exactly this width. */
 const RAIL = 56
 /** Expanded width. The panel covers the content: nothing reflows. */
@@ -75,10 +80,20 @@ export default function App() {
       ]).then(([operator, legacy, pending]) => {
         if (cancelled) return
         const live =
-          (operator.status === 'fulfilled' && operator.value !== null) ||
+          (operator.status === 'fulfilled' && operatorCeremonyIsLive(operator.value)) ||
           (legacy.status === 'fulfilled' && legacy.value.phase !== 'idle') ||
           (pending.status === 'fulfilled' && pending.value.length > 0)
-        setAstraPending((current) => current || live)
+        if (live) {
+          setAstraPending(true)
+        } else if (
+          operator.status === 'fulfilled' &&
+          legacy.status === 'fulfilled' &&
+          pending.status === 'fulfilled'
+        ) {
+          // Only a complete observation may grey the entry. A transient
+          // failure must not hide work whose absence was never established.
+          setAstraPending(false)
+        }
       })
     }
     look()

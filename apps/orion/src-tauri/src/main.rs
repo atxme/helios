@@ -2874,6 +2874,7 @@ fn main() {
             astra_ca_tls_rotation_status,
             begin_operator_ceremony,
             advance_operator_ceremony,
+            dismiss_operator_ceremony,
             operator_ceremony_status,
             operator_pending_operations,
         ])
@@ -2951,6 +2952,12 @@ async fn advance_operator_ceremony(
     revision: u64,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
     state.operator.advance(action, revision).await
+}
+
+/// Removes the final status once the operator has acknowledged it.
+#[tauri::command]
+async fn dismiss_operator_ceremony(state: State<'_, AppState>) -> Result<(), String> {
+    state.operator.dismiss().await
 }
 
 /// Everything waiting for an operator, through the gateway of one profile.
@@ -3396,6 +3403,10 @@ mod security_tests {
         assert_eq!(
             config["bundle"]["resources"]["../../../resources-windows/"],
             "resources-windows/"
+        );
+        assert_eq!(
+            config["bundle"]["externalBin"][0],
+            "binaries/helios-astra-helper"
         );
         let args = config["bundle"]["windows"]["signCommand"]["args"]
             .as_array()

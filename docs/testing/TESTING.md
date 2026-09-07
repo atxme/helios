@@ -825,14 +825,16 @@ dernier effet exige la gateway réelle.
   ce que la chaîne `[feuille, intermédiaire]` scellée par `candidate_bundle` et
   l’ensemble d’émetteurs lu dans le registre existent pour éviter, et hors
   matériel on n’en prouve que la logique ;
-- **la cérémonie d'approbation dans Orion ne s'exerce pas en WSL2** : aucun
-  passthrough USB, et le transport plateforme est propre à Windows. Ce qui est
-  éprouvé hors matériel est tout ce qui la précède — l'ordre de vérification,
-  les refus, et le fait qu'aucun chemin n'atteigne le coffre : `orion-core` lie
-  `helios-fido` et **jamais** `astra`, donc le format de coffre n'est pas
-  atteignable depuis ce processus. Un essai réel demande Orion sous Windows,
-  tunnel monté, et la clé d'approbation du domaine branchée ;
-- la récupération signée attend l’arbitrage du compteur monotone ;
+- **le sidecar opérateur d'Orion ne s'exerce pas en WSL2** : aucun passthrough
+  USB, et le transport plateforme est propre à Windows. Hors matériel, les
+  tests couvrent le protocole IPC borné, le manifeste typé, l'ordre strict des
+  révisions et la collecte de chaque assertion pendant que sa clé physique est
+  encore branchée. La recette Windows part de l'installateur produit, vérifie
+  que `helios-astra-helper.exe` est installé à côté d'Orion et absent du
+  `PATH`, puis exerce d'abord les refus : sidecar absent, fenêtre propriétaire
+  impossible, jeton absent, session périmée et seconde clé identique. Elle
+  termine par une récupération complète et une campagne de certificats clients,
+  avec apparition au premier plan de chaque boîte WebAuthn ;
 - **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
   n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse
   fermement quand celui-ci échoue, et journalise au démarrage fournisseur,

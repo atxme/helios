@@ -125,6 +125,41 @@ export function AstraView() {
     }
   }, [])
 
+  // The command returns the first state after a press (usually
+  // `processing_key`). The helper then continues on its own while Windows
+  // owns the modal WebAuthn dialog, so later states must be observed here.
+  // Without this poll a two-key campaign never displays its second prompt.
+  useEffect(() => {
+    if (!ceremony) return
+    const terminal =
+      typeof ceremony.gesture === 'string' &&
+      ['done', 'failed', 'cancelled'].includes(ceremony.gesture)
+    if (terminal) return
+    const timer = window.setTimeout(() => {
+      void api
+        .operatorCeremonyStatus()
+        .then((found) => {
+          if (found && found.revision >= ceremony.revision) setCeremony(found)
+        })
+        .catch((cause) => setError(String(cause)))
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [ceremony])
+
+  const dismissCeremony = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await api.dismissOperatorCeremony()
+      setCeremony(null)
+      setPending(await api.operatorPendingOperations())
+    } catch (cause) {
+      setError(String(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const openCampaign = async (operationId: string) => {
     setBusy(true)
     setError(null)
@@ -234,7 +269,11 @@ export function AstraView() {
           Une opération attend l’opérateur. Rien n’est à saisir : tout ce qui est montré
           ci-dessous vient de ce que le coffre épingle.
         </Typography>
-        <OperatorCeremonyPanel status={ceremony} onStatus={setCeremony} />
+        <OperatorCeremonyPanel
+          status={ceremony}
+          onStatus={setCeremony}
+          onDismiss={() => void dismissCeremony()}
+        />
       </Box>
     )
   }

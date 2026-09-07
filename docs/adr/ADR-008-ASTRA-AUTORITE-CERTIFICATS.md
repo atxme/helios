@@ -311,15 +311,13 @@ l'assertion avant d'ouvrir le coffre. Une opération exigeant deux credentials
 répète cette cérémonie avec deux clés distinctes. Cette combinaison ne vaut
 jamais pour le renouvellement ordinaire, qui n'ouvre aucun coffre maître.
 
-Orion et la console Helios ne parlent pas directement à CTAP. Ils créent une
-opération Astra puis ouvrent `astra-signer` par un lien local enregistré qui ne
-contient qu'une URL de transport et l'identifiant opaque de l'opération :
-`heliosd_url` pour un profil actif, `authority_url` pour une récupération ou
-une opération opérateur hors tunnel. Le compagnon récupère lui-même la requête
-signée ; l'IHM ignore tout callback non signé et suit ensuite l'opération par
-interrogation sur le même canal. Le même compagnon peut être copié sur un autre
-poste : l'autorité reste transportable avec le coffre chiffré et l'une des
-deux YubiKeys, sans dépendre du poste d'origine.
+Orion ne parle pas directement à CTAP pour une cérémonie qui ouvre le coffre
+maître. Il lance le sidecar désélevé `helios-astra-helper`, installé à côté de
+lui, et ne lui transmet par IPC qu'un genre d'opération et son identifiant
+opaque. Le sidecar résout lui-même l'origine, le RP ID, le domaine et la clé de
+service depuis le hand-off épinglé au coffre, puis renvoie des états et un
+manifeste typés. `astra-signer` reste l'adaptateur portable des flux hors ligne
+et des cérémonies qui n'ont pas encore atteint cette parité dans Orion.
 
 Règles de gestion :
 

@@ -153,6 +153,21 @@ describe('App interactions', () => {
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
 
+  it('does not keep Astra enabled for an already finished ceremony', async () => {
+    mocks.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'a'.repeat(32),
+      revision: 4,
+      operation: 'approve_campaign',
+      remote: 'deposited',
+      gesture: 'done',
+      allowed: [],
+    })
+    render(<App />)
+
+    const astra = await screen.findByRole('button', { name: 'Astra' })
+    await waitFor(() => expect(astra).toHaveProperty('disabled', true))
+  })
+
   it('opens and closes posture details and delegates error dismissal', () => {
     const clearError = vi.fn()
     mocks.useClient.mockReturnValue(client({ error: 'backend unavailable', clearError }))

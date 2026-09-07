@@ -247,6 +247,10 @@ pub enum RegistryError {
          one number, two histories"
     )]
     GenerationDisagrees { generation: u64 },
+    #[error("the gateway and this authority disagree about the peer's terminal revocation state")]
+    RevocationDisagrees,
+    #[error("the gateway offered another admission anchor for an existing peer")]
+    AdmissionAnchorDisagrees,
     #[error("peer is revoked; no credential lifts that state")]
     Revoked,
     #[error("a rotation is already in flight for this peer")]
@@ -571,6 +575,8 @@ impl AstraRegistry {
     /// * a generation below the recorded one is refused, never adopted;
     /// * the same generation must describe the same leaf, or it is two
     ///   histories wearing one number and it is refused;
+    /// * terminal revocation state must agree, and an admission anchor already
+    ///   pinned here cannot be replaced by a later gateway view;
     /// * a rotation in flight survives an adoption it is still ahead of, and
     ///   is dropped only when the adopted generation has caught up with or
     ///   passed the candidate it was staging;
@@ -589,6 +595,16 @@ impl AstraRegistry {
             self.admit(record, now_unix)?;
             return Ok(true);
         };
+        if held.revoked != record.revoked || held.revocation_epoch != record.revocation_epoch {
+            return Err(RegistryError::RevocationDisagrees);
+        }
+        if held
+            .admission_pq_ca
+            .as_ref()
+            .is_some_and(|anchor| record.admission_pq_ca.as_ref() != Some(anchor))
+        {
+            return Err(RegistryError::AdmissionAnchorDisagrees);
+        }
         let (held_generation, adopted) = (held.active.generation, record.active.generation);
         if adopted < held_generation {
             return Err(RegistryError::GenerationRegression {
@@ -597,10 +613,8 @@ impl AstraRegistry {
             });
         }
         if adopted == held_generation
-            && !held
-                .active
-                .pq_certificate_fingerprint
-                .matches(&record.active.pq_certificate_fingerprint)
+            && (held.active != record.active
+                || held.active_pq_certificate != record.active_pq_certificate)
         {
             return Err(RegistryError::GenerationDisagrees {
                 generation: adopted,
@@ -618,7 +632,15 @@ impl AstraRegistry {
             .filter(|rotation| rotation.candidate.generation > adopted);
         let dropped_stage = held.pending.is_some() && pending.is_none();
         let name = record.name.clone();
-        let refreshed = PeerRecord { pending, ..record };
+        let admission_pq_ca = held
+            .admission_pq_ca
+            .clone()
+            .or(record.admission_pq_ca.clone());
+        let refreshed = PeerRecord {
+            pending,
+            admission_pq_ca,
+            ..record
+        };
         if self.state.peers.get(&key) == Some(&refreshed) {
             return Ok(false);
         }
@@ -2977,6 +2999,58 @@ mod tests {
         assert!(matches!(
             registry.reconcile_peer(divergent, 2_000),
             Err(RegistryError::GenerationDisagrees { generation: 4 })
+        ));
+    }
+
+    /// A generation is the TLS/PQ pair and its validity metadata, not only the
+    /// PQ fingerprint. Accepting another TLS leaf under the same number would
+    /// reintroduce the mixed-generation pair the lifecycle is built to reject.
+    #[test]
+    fn the_same_generation_with_other_tls_state_is_refused() {
+        let (mut registry, _dir) = registry();
+        let mut divergent = served(4);
+        divergent.active.tls_certificate_fingerprint = Fingerprint::of(b"another TLS leaf");
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::GenerationDisagrees { generation: 4 })
+        ));
+    }
+
+    /// Revocation is owned by the signed authority decision and is terminal.
+    /// A stale gateway view must not lift it before the caller checks it.
+    #[test]
+    fn reconciliation_never_lifts_a_revocation() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry.revoke(&key, 1, 1_200).expect("revoked");
+
+        assert!(matches!(
+            registry.reconcile_peer(served(4), 2_000),
+            Err(RegistryError::RevocationDisagrees)
+        ));
+        assert!(registry.peer(&key).expect("peer").revoked);
+    }
+
+    /// The gateway supplies the admission anchor at first sight, but it does
+    /// not get to replace that recovery root on a later lifecycle contact.
+    #[test]
+    fn reconciliation_never_replaces_a_pinned_admission_anchor() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        let (_, first) = generate_ml_dsa_87_keypair().expect("first anchor");
+        let (_, second) = generate_ml_dsa_87_keypair().expect("second anchor");
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .admission_pq_ca = Some(first);
+        let mut divergent = served(4);
+        divergent.admission_pq_ca = Some(second);
+
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::AdmissionAnchorDisagrees)
         ));
     }
 

@@ -280,6 +280,8 @@ export const beginOperatorCeremony = (locator: OperationLocator) =>
 export const advanceOperatorCeremony = (action: OperatorAction, revision: number) =>
   invoke<OperatorStatus>('advance_operator_ceremony', { action, revision })
 
+export const dismissOperatorCeremony = () => invoke<void>('dismiss_operator_ceremony')
+
 export const operatorCeremonyStatus = () =>
   invoke<OperatorStatus | null>('operator_ceremony_status')
 

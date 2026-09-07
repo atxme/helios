@@ -191,7 +191,7 @@ pub(crate) async fn transcribe_peer(
     service: &Arc<AstraService>,
     caller: &WireGuardKey,
     now_unix: u64,
-) -> Result<(), RenewalError> {
+) -> Result<helios_api::internal::PeerCertificateStateView, RenewalError> {
     // Le pair est **relu à chaque fois**, et non transcrit une seule fois.
     //
     // La gateway est ce qui promeut : elle seule sait quelle génération elle
@@ -220,21 +220,21 @@ pub(crate) async fn transcribe_peer(
         return Err(RenewalError::UnknownPeer);
     }
     let record = crate::registry::PeerRecord {
-        name: view.name,
+        name: view.name.clone(),
         client_wg_public_key: *caller,
-        active: view.state.active,
-        active_pq_certificate: view.active_pq_certificate,
+        active: view.state.active.clone(),
+        active_pq_certificate: view.active_pq_certificate.clone(),
         pending: None,
         revoked: view.state.revoked,
         revocation_epoch: view.state.revocation_epoch,
-        admission_pq_ca: view.admission_pq_ca,
+        admission_pq_ca: view.admission_pq_ca.clone(),
     };
     service
         .registry
         .lock()
         .await
         .reconcile_peer(record, now_unix)?;
-    Ok(())
+    Ok(view)
 }
 
 /// Step 1: opens an operation for a request the gateway just relayed.

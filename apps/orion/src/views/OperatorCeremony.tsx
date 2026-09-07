@@ -63,6 +63,27 @@ function duration(seconds: number): string {
 }
 
 const CA_NAMES = { ca_pq: 'CA-PQ (ancre du domaine)', ca_tls: 'CA-TLS cliente' } as const
+const CAMPAIGN_SCOPES = {
+  orion_profile: 'un profil Orion',
+  orion_device: 'les profils Orion de cet appareil',
+  fleet_leafs: 'les certificats clients de la flotte',
+  full_certificate_chain: 'la chaîne complète',
+  trust_authorities: 'les ancres du domaine',
+  emergency_revocation: 'une révocation d’urgence',
+  gateway_identity: 'l’identité de la gateway',
+  issuer_delegation: 'la délégation Astra',
+  gateway_bootstrap: 'l’identité initiale de la gateway',
+} as const
+const CERTIFICATE_KINDS = {
+  gateway_tls: 'TLS gateway',
+  gateway_pq: 'PQ gateway',
+  client_tls: 'TLS client',
+  client_pq: 'PQ client',
+  ca_pq: 'CA-PQ',
+  ca_tls: 'CA-TLS cliente',
+  astra_issuer: 'émetteur Astra',
+  astra_service_key: 'clé de service Astra',
+} as const
 
 /** The rows of one manifest, named here and never carried as text. */
 function rowsOf(manifest: AstraManifest): [string, string][] {
@@ -82,16 +103,26 @@ function rowsOf(manifest: AstraManifest): [string, string][] {
       ]
     case 'campaign':
       return [
-        ['motif', manifest.reason],
-        ['demandée par', manifest.requested_by],
-        ['autorité visée', CA_NAMES[manifest.affected_ca]],
-        ['époque', `${manifest.current_epoch} → ${manifest.next_epoch}`],
-        ['activation', instant(manifest.activation_at)],
-        ['échéance', instant(manifest.not_after)],
-        ['ancre sortante', manifest.outgoing_anchor_fingerprint],
-        ['pairs concernés', String(manifest.target_count)],
+        ['motif', manifest.campaign.reason],
+        ['demandée par', manifest.campaign.requested_by],
+        ['portée', CAMPAIGN_SCOPES[manifest.campaign.scope]],
+        ['créée le', instant(manifest.campaign.created_at)],
+        ['échéance', instant(manifest.campaign.expires_at)],
+        ['gateway', manifest.campaign.gateway_wg_public_key],
+        ['nom serveur', manifest.campaign.server_name],
+        ['politique', manifest.campaign.policy_fingerprint],
+        ['clés requises', String(manifest.campaign.required_credentials)],
+        ...manifest.campaign.targets.flatMap((target, index): [string, string][] => [
+          [
+            `cible ${index + 1}`,
+            `${CERTIFICATE_KINDS[target.certificate_kind]} — ${target.identity_key}`,
+          ],
+          [`cible ${index + 1} état`, `époque ${target.epoch}, génération ${target.generation}`],
+          [`cible ${index + 1} TLS`, target.active_tls_certificate_fingerprint],
+          [`cible ${index + 1} PQ`, target.active_pq_certificate_fingerprint],
+        ]),
         ['empreinte', manifest.fingerprint],
-        ['domaine', manifest.trust_domain_id],
+        ['domaine', manifest.campaign.trust_domain_id],
       ]
     case 'issuer_authorization':
       return [
@@ -163,6 +194,8 @@ function gestureSentence(gesture: GestureState, operation: OperationKind): strin
       const why =
         purpose === 'open_vault'
           ? 'pour ouvrir le coffre d’autorité'
+          : purpose === 'approve_campaign'
+            ? 'pour approuver la campagne affichée'
           : purpose === 'second_approval'
             ? 'pour la seconde approbation, qui doit venir d’une autre clé'
             : 'pour promouvoir ce qui a déjà été préparé'
@@ -244,9 +277,11 @@ function Row({ label, value }: { label: string; value: string }) {
 export function OperatorCeremonyPanel({
   status,
   onStatus,
+  onDismiss,
 }: {
   status: OperatorStatus
   onStatus: (next: OperatorStatus) => void
+  onDismiss?: () => void
 }) {
   const [busy, setBusy] = useState(false)
   const [refusal, setRefusal] = useState<string | null>(null)
@@ -350,6 +385,19 @@ export function OperatorCeremonyPanel({
             </Button>
           )}
         </Box>
+      )}
+
+      {(stopped || done) && onDismiss && (
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={busy}
+          onClick={onDismiss}
+          sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
+        >
+          Retour aux opérations
+        </Button>
       )}
 
       {refusal && (

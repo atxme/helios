@@ -630,7 +630,7 @@ export type RemoteState =
   | { activation_deferred: { activation_at: number } }
   | 'refused'
 
-export type KeyPurpose = 'open_vault' | 'second_approval' | 'promotion'
+export type KeyPurpose = 'open_vault' | 'approve_campaign' | 'second_approval' | 'promotion'
 
 /** Où en est la cérémonie **sur ce poste**. */
 export type GestureState =
@@ -675,17 +675,46 @@ export type AffectedCa = 'ca_pq' | 'ca_tls'
 
 export interface CampaignManifest {
   operation: 'campaign'
-  trust_domain_id: string
-  reason: string
-  requested_by: string
+  campaign: {
+    format_version: number
+    campaign_id: string
+    trust_domain_id: string
+    gateway_wg_public_key: string
+    server_name: string
+    created_at: number
+    expires_at: number
+    scope:
+      | 'orion_profile'
+      | 'orion_device'
+      | 'fleet_leafs'
+      | 'full_certificate_chain'
+      | 'trust_authorities'
+      | 'emergency_revocation'
+      | 'gateway_identity'
+      | 'issuer_delegation'
+      | 'gateway_bootstrap'
+    targets: Array<{
+      certificate_kind:
+        | 'gateway_tls'
+        | 'gateway_pq'
+        | 'client_tls'
+        | 'client_pq'
+        | 'ca_pq'
+        | 'ca_tls'
+        | 'astra_issuer'
+        | 'astra_service_key'
+      identity_key: string
+      epoch: number
+      generation: number
+      active_tls_certificate_fingerprint: string
+      active_pq_certificate_fingerprint: string
+    }>
+    reason: string
+    requested_by: string
+    policy_fingerprint: string
+    required_credentials: number
+  }
   fingerprint: string
-  affected_ca: AffectedCa
-  current_epoch: number
-  next_epoch: number
-  activation_at: number
-  not_after: number
-  outgoing_anchor_fingerprint: string
-  target_count: number
 }
 
 export interface IssuerManifest {

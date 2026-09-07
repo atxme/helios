@@ -883,6 +883,7 @@ fn run(
         approval_credential_registry,
         signing: Mutex::new(astra::signing::SigningOperationStore::new()),
         recoveries: Mutex::new(astra::recovery::RecoveryStore::new()),
+        reconciliation: Mutex::new(()),
         encrypted_vault,
         gateway,
     });
@@ -934,12 +935,12 @@ fn run(
     })
 }
 
-/// Finishes a recovery whose promotion this authority never adopted.
+/// Finishes recoveries whose promotions this authority never adopted.
 ///
 /// The intent is written before the gateway is asked to promote and cleared
 /// once this registry has caught up (see [`astra::reconciliation`]). A crash
 /// in between leaves it on disk, and this is what closes it: one read of the
-/// gateway, forward-only, at the start that follows.
+/// gateway per pending peer, forward-only, at the start that follows.
 ///
 /// Its own task, and never fatal. A gateway that is not answering yet is the
 /// ordinary case at boot, and refusing to serve over an adoption that the next
@@ -947,38 +948,42 @@ fn run(
 /// outage.
 fn spawn_reconciliation_repair(service: std::sync::Arc<astra::service::AstraService>) {
     tokio::spawn(async move {
-        let intent = match astra::reconciliation::load(&service.state_dir) {
-            Ok(Some(intent)) => intent,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(%error, "the pending reconciliation could not be read");
-                return;
+        let intents = {
+            let _reconciliation = service.reconciliation.lock().await;
+            match astra::reconciliation::load(&service.state_dir) {
+                Ok(intents) => intents,
+                Err(error) => {
+                    tracing::warn!(%error, "the pending reconciliation could not be read");
+                    return;
+                }
             }
         };
-        match astra::recovery::reconcile(
-            &service,
-            &intent.peer,
-            intent.expected_generation,
-            now_unix(),
-        )
-        .await
-        {
-            Ok(true) => tracing::info!(
-                peer = %intent.peer,
-                generation = intent.expected_generation,
-                "a recovery interrupted before this registry caught up is now adopted"
-            ),
-            Ok(false) => tracing::info!(
-                peer = %intent.peer,
-                generation = intent.expected_generation,
-                "the gateway has not promoted this recovered generation yet; it will be adopted \
-                 at the next contact"
-            ),
-            Err(error) => tracing::warn!(
-                peer = %intent.peer,
-                %error,
-                "the interrupted recovery could not be adopted at start"
-            ),
+        for intent in intents {
+            match astra::recovery::reconcile(
+                &service,
+                &intent.peer,
+                intent.expected_generation,
+                now_unix(),
+            )
+            .await
+            {
+                Ok(true) => tracing::info!(
+                    peer = %intent.peer,
+                    generation = intent.expected_generation,
+                    "a recovery reconciliation interrupted at commit is now closed"
+                ),
+                Ok(false) => tracing::info!(
+                    peer = %intent.peer,
+                    generation = intent.expected_generation,
+                    "the gateway has not promoted this recovered generation yet; it will be \
+                     adopted at the next contact"
+                ),
+                Err(error) => tracing::warn!(
+                    peer = %intent.peer,
+                    %error,
+                    "the interrupted recovery could not be adopted at start"
+                ),
+            }
         }
     });
 }
