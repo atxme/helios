@@ -582,9 +582,7 @@ async fn main() -> anyhow::Result<()> {
         Command::InstallCaTransition { transition } => install_ca_transition(&transition),
         Command::InstallClientTlsCa { transition } => install_client_tls_ca(&transition),
         Command::InstallAstraIssuer { delegation } => install_astra_issuer(&delegation),
-        Command::InstallAstraCredentials { credentials } => {
-            install_astra_credentials(&credentials)
-        }
+        Command::InstallAstraCredentials { credentials } => install_astra_credentials(&credentials),
         Command::InitTrustDomain {
             trust_domain_id,
             ca_public_key,

@@ -34,9 +34,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::vault::AuthorityVault;
 use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
 use anyhow::{bail, Context, Result};
-use astra::vault::AuthorityVault;
 use serde::{Deserialize, Serialize};
 
 use crate::authority::DomainIdentity;
@@ -287,13 +287,13 @@ pub fn verify_campaign_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra::vault::{AuthoritySecrets, SlotEnrolment, SlotRole, SlotSecret};
+    use crate::vault::{AuthoritySecrets, SlotEnrolment, SlotRole, SlotSecret};
 
     fn vault() -> AuthorityVault {
         AuthorityVault::create(
             aether::certificates::encoding::TrustDomainId::new([9; 16]).expect("domain"),
             "astra.example",
-            astra::vault::draw_salt().expect("salt"),
+            crate::vault::draw_salt().expect("salt"),
             &AuthoritySecrets {
                 ca_pq_private_key: "cHJpdmU=".into(),
                 ca_pq_public_key: "cHVibGlj".into(),

@@ -14,7 +14,6 @@ path = "src/main.rs"
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
-helios-vault.workspace = true
 # Les deux bouts du canal privé Astra–Helios (ROTATION-CERTIFICATS §8.3) sont
 # définis dans `helios_api::internal`, et Astra en consomme la moitié cliente.
 # La dépendance se lit à l'envers — l'autorité vers l'API de la gateway — et
@@ -58,4 +57,3 @@ tokio-rustls.workspace = true
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 # Conteneur AEAD unique du dépôt (ADR-006) : le coffre d'autorité en empile
 # trois — un par key-slot, plus le corps — au lieu d'inventer un format.
-helios-vault.workspace = true

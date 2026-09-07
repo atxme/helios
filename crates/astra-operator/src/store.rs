@@ -16,8 +16,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::vault::AuthorityVault;
 use anyhow::{bail, Context, Result};
-use astra::vault::AuthorityVault;
 
 /// Largest vault file read, in bytes.
 ///
@@ -25,7 +25,7 @@ use astra::vault::AuthorityVault;
 /// a megabyte is far above that, and refuses a file that would drive an
 /// allocation before a single field is parsed.
 ///
-/// [`MAX_SLOTS`]: astra::vault::MAX_SLOTS
+/// [`MAX_SLOTS`]: crate::vault::MAX_SLOTS
 const MAX_VAULT_BYTES: u64 = 1024 * 1024;
 
 /// Default location of the vault, per platform.
@@ -86,14 +86,14 @@ pub fn save(path: &Path, vault: &AuthorityVault) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra::vault::{AuthorityVault, SlotEnrolment, SlotRole, SlotSecret};
+    use crate::vault::{AuthorityVault, SlotEnrolment, SlotRole, SlotSecret};
 
     fn vault() -> AuthorityVault {
         AuthorityVault::create(
             aether::certificates::encoding::TrustDomainId::new([7; 16]).expect("domain"),
             "astra.example",
-            astra::vault::draw_salt().expect("salt"),
-            &astra::vault::AuthoritySecrets {
+            crate::vault::draw_salt().expect("salt"),
+            &crate::vault::AuthoritySecrets {
                 ca_pq_private_key: "cHE=".into(),
                 ca_pq_public_key: "cHViCg==".into(),
                 ca_tls_private_key: "dGxz".into(),

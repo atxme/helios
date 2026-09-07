@@ -18,10 +18,10 @@
 //! another one later is the same gesture with the same arguments, which is the
 //! whole point: an operator who buys a third key runs `enrol` again.
 
-use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId};
-use astra::vault::{
+use crate::vault::{
     draw_salt, AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, VaultError,
 };
+use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87PublicKey, TrustDomainId};
 use base64::Engine as _;
 
 use crate::authenticator::{Authenticator, AuthenticatorError, CredentialSubject, Opened};
@@ -244,8 +244,8 @@ fn encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::SlotSecret;
     use aether::certificates::status::CampaignScope;
-    use astra::vault::SlotSecret;
 
     fn opened(id: u8) -> Opened {
         Opened {

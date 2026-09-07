@@ -54,6 +54,7 @@
 //! — l'assertion, le binding, les quatre empreintes — est produit et
 //! **vérifié** ici, de sorte qu'Astra ne peut que signer un fait déjà établi.
 
+use crate::vault::{AuthoritySecrets, AuthorityVault, CaTlsAdvance, RetainedCaTls};
 use aether::certificates::approval::{
     AstraCredentialBinding, CredentialState, ExpiredRecoveryApproval,
     ExpiredRecoveryApprovalEvidence,
@@ -83,7 +84,6 @@ use aether::certificates::webauthn::{
 };
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::{CertificateError, CERTIFICATE_FORMAT_VERSION};
-use astra::vault::{AuthoritySecrets, AuthorityVault, CaTlsAdvance, RetainedCaTls};
 use base64::Engine as _;
 use helios_fido::authenticator::{Approval, Authenticator};
 use rcgen::{

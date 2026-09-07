@@ -9,6 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::vault::{AuthorityVault, CaTlsAdvance};
 use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey};
 use aether::certificates::operator_ipc::{
     AstraCaTlsManifest, AstraCaTlsPhase, AstraCaTlsStatus, AstraIpcCommand, AstraIpcHello,
@@ -18,7 +19,6 @@ use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult, Cam
 use aether::certificates::transport::TrustUpdateObject;
 use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
-use astra::vault::{AuthorityVault, CaTlsAdvance};
 use zeroize::Zeroizing;
 
 use crate::authenticator::{self, Authenticator, Opened, Transport};

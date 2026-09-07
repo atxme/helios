@@ -1,9 +1,24 @@
-//! The operator companion of ADR-008 §4, as a library.
+//! The operator half of ADR-008 §4.
 //!
-//! Split from the binary so the parts that have nothing to do with a terminal
-//! — the security-key boundary, the authority gestures and the vault file —
-//! are reachable from tests. The binary is the prompts; this is what they act
-//! on.
+//! # What lives here, and what must not depend on it
+//!
+//! Everything that opens the authority vault or signs under `CA-PQ`: the vault
+//! file itself, the FIDO2 gestures that unwrap a key-slot, and the objects
+//! those gestures produce. This is the master-signing surface of the domain.
+//!
+//! It is a crate of its own so that the boundary is a dependency edge rather
+//! than a convention. **Astra does not depend on it** — the server holds the
+//! encrypted vault as opaque bytes and never opens it, which is the whole
+//! point of §4. **Orion does not depend on it either**: Orion runs elevated so
+//! WireGuard-NT will load, and pulling the master-signing primitives into that
+//! process would put them one bug away from a privilege the operator never
+//! granted. Orion speaks to the process that holds them, through the typed
+//! session of [`aether::certificates::operator_session`], and knows nothing
+//! else.
+//!
+//! The terminal is not here either. Prompts, paths and arguments belong to
+//! whatever drives this — a helper launched by Orion, or the compatibility CLI
+//! kept while §8.5 still requires an offline transport.
 //!
 //! See [`authenticator`] for what a security key does here, and what it never
 //! does.
@@ -41,3 +56,4 @@ pub mod orion;
 pub mod prepared;
 pub mod store;
 pub mod tunnel;
+pub mod vault;

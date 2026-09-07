@@ -63,7 +63,6 @@ pub mod registry;
 pub mod renewal;
 pub mod service;
 pub mod signing;
-pub mod vault;
 
 pub use audit::{AuditChain, AuditEvent};
 pub use issuer::DelegatedIssuer;

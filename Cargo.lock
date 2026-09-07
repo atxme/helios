@@ -243,7 +243,6 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "helios-api",
- "helios-vault",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -260,12 +259,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-operator"
+version = "0.2.0"
+dependencies = [
+ "aether",
+ "anyhow",
+ "astra",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "helios-fido",
+ "helios-vault",
+ "hex",
+ "rcgen",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "x509-parser 0.16.0",
+ "zeroize",
+]
+
+[[package]]
 name = "astra-signer"
 version = "0.2.0"
 dependencies = [
  "aether",
  "anyhow",
  "astra",
+ "astra-operator",
  "aws-lc-rs",
  "base64 0.22.1",
  "clap",

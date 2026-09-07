@@ -27,16 +27,16 @@ use aether::certificates::status::{
 };
 use aether::certificates::window::TransitionWindow;
 use aether::certificates::CERTIFICATE_FORMAT_VERSION;
-use astra::vault::{AuthorityVault, SlotRole};
-use astra_signer::authenticator::Opened;
-use astra_signer::authority::{
+use astra_operator::authenticator::Opened;
+use astra_operator::authority::{
     self, CampaignApprovalSession, DelegationBounds, DomainIdentity, IssuerDelegationRequest,
     MAX_CA_TLS_LIFETIME_SECS,
 };
-use astra_signer::credentials::CredentialRegistry;
-use astra_signer::gestures::{
+use astra_operator::credentials::CredentialRegistry;
+use astra_operator::gestures::{
     add_key, create_authority, open_with_authorized_key, NewAuthority, NewKey,
 };
+use astra_operator::vault::{AuthorityVault, SlotRole};
 use base64::Engine as _;
 use support::{FakeKey, ORIGIN, PIN, RP_ID};
 
@@ -333,7 +333,7 @@ fn bindings_describe_the_slot_table_and_nothing_else() {
         .find(|slot| slot.credential_id().unwrap() == withdrawn)
         .map(|slot| slot.slot_id)
         .expect("the slot is there");
-    astra_signer::gestures::remove_key(&mut vault, &opening, &slot).expect("removes");
+    astra_operator::gestures::remove_key(&mut vault, &opening, &slot).expect("removes");
 
     let opening = open(&first, &vault);
     let next = authority::sign_credential_bindings(
@@ -642,7 +642,7 @@ fn a_two_key_campaign_can_be_collected_before_each_physical_swap() {
     // device. The second token can produce a valid assertion from the broad
     // allow-list; it must still be refused because it is not the displayed
     // and opened slot.
-    let selected_after_early_swap = astra_signer::authenticator::Authenticator::approve(
+    let selected_after_early_swap = astra_operator::authenticator::Authenticator::approve(
         &second,
         session.webauthn_rp_id(),
         &session.offered_credentials(),
@@ -657,7 +657,7 @@ fn a_two_key_campaign_can_be_collected_before_each_physical_swap() {
         .to_string()
         .contains("n'est pas celle"));
 
-    let first_assertion = astra_signer::authenticator::Authenticator::approve(
+    let first_assertion = astra_operator::authenticator::Authenticator::approve(
         &first,
         session.webauthn_rp_id(),
         &session.offered_credentials(),
@@ -669,7 +669,7 @@ fn a_two_key_campaign_can_be_collected_before_each_physical_swap() {
         .accept_for(first_assertion, Some(&first_credential), NOW + 1)
         .expect("first assertion is retained before the swap");
 
-    let second_assertion = astra_signer::authenticator::Authenticator::approve(
+    let second_assertion = astra_operator::authenticator::Authenticator::approve(
         &second,
         session.webauthn_rp_id(),
         &session.offered_credentials(),
@@ -734,7 +734,7 @@ fn rotating_the_anchor_leaves_every_key_slot_working() {
     assert_eq!(vault.slots.len(), 2);
     for key in [&first, &second] {
         let opening = open(key, &vault);
-        astra_signer::gestures::prove_anchors_open(&vault, &opening).expect("still opens");
+        astra_operator::gestures::prove_anchors_open(&vault, &opening).expect("still opens");
     }
     for binding in &rotated.bindings.bindings {
         binding
@@ -762,7 +762,7 @@ fn rotating_the_anchor_leaves_every_key_slot_working() {
 #[test]
 fn the_signing_gestures_fit_the_stack_the_binary_reserves() {
     let done = std::thread::Builder::new()
-        .stack_size(astra_signer::WORK_STACK_BYTES)
+        .stack_size(astra_operator::WORK_STACK_BYTES)
         .spawn(|| {
             let first = FakeKey::new(1);
             let second = FakeKey::new(2);

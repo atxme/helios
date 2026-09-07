@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aether",
     "crates/astra",
+    "crates/astra-operator",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
@@ -31,6 +32,7 @@ members = [
 default-members = [
     "crates/aether",
     "crates/astra",
+    "crates/astra-operator",
     "crates/helios-firewall",
     "crates/helios-update",
     "crates/helios-api",
@@ -149,6 +151,7 @@ defguard_wireguard_rs = "0.11"
 
 aether = { path = "crates/aether" }
 astra = { path = "crates/astra" }
+astra-operator = { path = "crates/astra-operator" }
 helios-provisioning = { path = "crates/helios-provisioning" }
 helios-wireguard = { path = "crates/helios-wireguard" }
 helios-key-negotiation = { path = "crates/helios-key-negotiation" }

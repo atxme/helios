@@ -17,7 +17,7 @@ use aether::certificates::encoding::{
 use aether::certificates::transport::{
     ClientRenewalOperationState, ClientRenewalOperationView, ClientRenewalSignerRequest,
 };
-use astra_signer::tunnel::Tunnel;
+use astra_operator::tunnel::Tunnel;
 
 const RP_ID: &str = "astra.helios.test";
 

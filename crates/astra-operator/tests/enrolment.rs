@@ -13,12 +13,12 @@
 mod support;
 
 use aether::certificates::encoding::TrustDomainId;
-use astra::vault::{AuthorityVault, SlotRole};
-use astra_signer::authenticator::{Authenticator, AuthenticatorError, CredentialSubject};
-use astra_signer::gestures::{
+use astra_operator::authenticator::{Authenticator, AuthenticatorError, CredentialSubject};
+use astra_operator::gestures::{
     self, add_key, create_authority, open_with_authorized_key, prove_anchors_open, remove_key,
     NewAuthority, NewKey,
 };
+use astra_operator::vault::{AuthorityVault, SlotRole};
 use support::{FakeKey, PIN, RP_ID};
 
 fn domain() -> TrustDomainId {
@@ -178,14 +178,14 @@ fn keys_still_open_the_vault_after_a_round_trip_through_disk() {
 
     let first = FakeKey::new(1);
     let vault = create(&first);
-    astra_signer::store::save_new(&path, &vault).expect("save");
+    astra_operator::store::save_new(&path, &vault).expect("save");
 
-    let mut reloaded = astra_signer::store::load(&path).expect("load");
+    let mut reloaded = astra_operator::store::load(&path).expect("load");
     let second = FakeKey::new(2);
     enrol(&mut reloaded, &first, &second, "récupération");
-    astra_signer::store::save(&path, &reloaded).expect("save again");
+    astra_operator::store::save(&path, &reloaded).expect("save again");
 
-    let finally = astra_signer::store::load(&path).expect("load again");
+    let finally = astra_operator::store::load(&path).expect("load again");
     for key in [&first, &second] {
         let opened = open_with_authorized_key(key, &finally, PIN).expect("opens");
         prove_anchors_open(&finally, &opened).expect("the anchors read");
@@ -207,7 +207,7 @@ fn keys_still_open_the_vault_after_a_round_trip_through_disk() {
 #[test]
 fn the_authority_gesture_fits_the_stack_the_binary_reserves() {
     let done = std::thread::Builder::new()
-        .stack_size(astra_signer::WORK_STACK_BYTES)
+        .stack_size(astra_operator::WORK_STACK_BYTES)
         .spawn(|| {
             let key = FakeKey::new(1);
             let vault = create(&key);

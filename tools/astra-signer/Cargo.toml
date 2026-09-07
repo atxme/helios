@@ -4,21 +4,18 @@ version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Compagnon opérateur d'Astra (ADR-008 §4) : ouvre le coffre d'autorité par une clé de sécurité FIDO2, sur le poste où elle est branchée. Ni Astra, ni la gateway, ni un navigateur ne voient jamais CA-PQ."
-
-[lib]
-name = "astra_signer"
-path = "src/lib.rs"
+description = "Adaptateur en ligne de commande de la bibliothèque opérateur d'Astra. Conservé le temps de la migration vers Orion : l'ADR-008 §4 exige encore un compagnon portable et un transport hors ligne."
 
 [[bin]]
 name = "astra-signer"
 path = "src/main.rs"
 
 [dependencies]
-# `key-negotiation-signing` sans condition : sans elle il n'existe aucune
-# fonction `sign`, et le compagnon est précisément le seul programme du dépôt
-# qui signe sous `CA-PQ`. La construire sans donnerait un binaire qui ouvre le
-# coffre et ne peut rien en faire.
+# Tout ce qui ouvre un coffre ou signe vit dans `astra-operator`. Ce binaire
+# n'est plus que des invites et des chemins de fichiers.
+astra-operator.workspace = true
+# `key-negotiation-signing` sans condition : les types signés traversent cette
+# interface, et sans la fonctionnalité ils n'existent pas.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
 astra.workspace = true
 helios-fido = { workspace = true }

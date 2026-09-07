@@ -34,7 +34,7 @@
 //!   automatically by every gesture that moves that table.
 //! - `approve` approves one exact client renewal, from files or straight
 //!   through the client's tunnel. **It does not open the vault**, and cannot:
-//!   see [`astra_signer::authority::approve_renewal`].
+//!   see [`astra_operator::authority::approve_renewal`].
 //! - `approve-campaign` approves a manual rotation campaign, at as many
 //!   distinct keys as its scope demands.
 //! - `issue-gateway-bootstrap` verifies the public request of a new gateway
@@ -42,7 +42,7 @@
 //! - `rotate-ca-pq` moves the anchor, under two distinct keys.
 //!
 //! This file is the prompts and the printing. The sequences themselves are in
-//! [`astra_signer::gestures`], where they are exercised.
+//! [`astra_operator::gestures`], where they are exercised.
 //!
 //! # Transport : le tunnel pour le renouvellement, des fichiers pour le reste
 //!
@@ -78,7 +78,7 @@
 //!
 //! # Limite connue : le matériel ne s'exerce pas en WSL2
 //!
-//! Voir [`astra_signer::authenticator`]. CTAP n'est pas une feature de
+//! Voir [`astra_operator::authenticator`]. CTAP n'est pas une feature de
 //! compilation : tout binaire porte la pile, et il n'existe aucun chemin qui
 //! ouvre le coffre sans clé.
 
@@ -92,12 +92,12 @@ use aether::certificates::encoding::{
 use aether::certificates::transport::ClientRenewalOperationState;
 use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
-use astra::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
-use astra_signer::authenticator::{Opened, Transport};
-use astra_signer::authority::{self, DelegationBounds, IssuerDelegationRequest};
-use astra_signer::credentials;
-use astra_signer::gestures::{self, NewAuthority, NewKey};
-use astra_signer::{authenticator, documents, handoff, orion, prepared, store, tunnel};
+use astra_operator::authenticator::{Opened, Transport};
+use astra_operator::authority::{self, DelegationBounds, IssuerDelegationRequest};
+use astra_operator::credentials;
+use astra_operator::gestures::{self, NewAuthority, NewKey};
+use astra_operator::vault::{AuthorityVault, KeySlot, SlotRole, MAX_SLOTS, REQUIRED_SLOTS};
+use astra_operator::{authenticator, documents, handoff, orion, prepared, store, tunnel};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
@@ -772,7 +772,7 @@ enum Command {
 fn main() -> Result<()> {
     std::thread::Builder::new()
         .name("astra-signer".into())
-        .stack_size(astra_signer::WORK_STACK_BYTES)
+        .stack_size(astra_operator::WORK_STACK_BYTES)
         .spawn(run)
         .context("démarrage du fil de travail")?
         .join()
@@ -950,7 +950,7 @@ fn run() -> Result<()> {
             emergency_replacement,
         } => sign_gateway_transition(
             &path,
-            astra_signer::campaign::Campaign::select(
+            astra_operator::campaign::Campaign::select(
                 authority_url.as_deref(),
                 heliosd_url.as_deref(),
             )?,
@@ -980,7 +980,7 @@ fn run() -> Result<()> {
             validity_days,
         } => rotate_ca_tls(
             &path,
-            astra_signer::campaign::Campaign::select(
+            astra_operator::campaign::Campaign::select(
                 authority_url.as_deref(),
                 heliosd_url.as_deref(),
             )?,
@@ -1015,7 +1015,7 @@ fn run() -> Result<()> {
             heliosd_url,
         } => resume_rotation(
             &path,
-            astra_signer::campaign::Campaign::select(
+            astra_operator::campaign::Campaign::select(
                 authority_url.as_deref(),
                 heliosd_url.as_deref(),
             )?,
@@ -1048,7 +1048,7 @@ fn run() -> Result<()> {
             reason,
         } => abort_gateway_transition(
             &path,
-            astra_signer::campaign::Campaign::select(
+            astra_operator::campaign::Campaign::select(
                 authority_url.as_deref(),
                 heliosd_url.as_deref(),
             )?,
@@ -1540,7 +1540,7 @@ fn authorize_issuer(
         Some((authority_url, operation_id)) => {
             let operation = Id16::parse_hex(operation_id)
                 .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
-            let client = astra_signer::origin::Origin::new(authority_url)?;
+            let client = astra_operator::origin::Origin::new(authority_url)?;
             let request_document = origin_client_fetch(&client, &operation)?;
             handoff::verify_campaign_request(
                 &handoff,
@@ -1967,7 +1967,7 @@ fn approve_campaign(
         (Some(url), Some(id)) => {
             let operation =
                 Id16::parse_hex(id).map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
-            let origin_client = astra_signer::origin::Origin::new(url)?;
+            let origin_client = astra_operator::origin::Origin::new(url)?;
             let request = origin_client_fetch(&origin_client, &operation)?;
             Some((origin_client, request))
         }
@@ -2044,7 +2044,7 @@ fn approve_campaign(
         pins.push(pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?);
         keys.push(key);
     }
-    let key_refs: Vec<&dyn astra_signer::authenticator::Authenticator> =
+    let key_refs: Vec<&dyn astra_operator::authenticator::Authenticator> =
         keys.iter().map(|key| key.as_ref()).collect();
     let pin_refs: Vec<&str> = pins.iter().map(|pin| pin.as_str()).collect();
 
@@ -2155,7 +2155,7 @@ fn revoke(
         anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
     })?;
 
-    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let client = astra_operator::origin::Origin::new(authority_url)?;
     let request = origin_client_fetch(&client, &operation)?;
     handoff::verify_campaign_request(&handoff, &vault, &request, authority_url, now_unix())?;
     let campaign = request.campaign.as_ref().clone();
@@ -2346,7 +2346,7 @@ fn revoke(
 /// the vault alone could name an anchor the fleet retired months ago.
 fn rotate_ca_tls(
     path: &Path,
-    channel: astra_signer::campaign::Campaign,
+    channel: astra_operator::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     out: &Path,
@@ -2571,7 +2571,7 @@ fn rotate_ca_tls(
 /// machine that marked it submitted and then failed to send would have lost
 /// the only trace that anything still had to be sent.
 fn submit_prepared(
-    client: &astra_signer::campaign::Campaign,
+    client: &astra_operator::campaign::Campaign,
     prepared_path: &Path,
     mut record: prepared::PreparedRotation,
 ) -> Result<()> {
@@ -2585,7 +2585,7 @@ fn submit_prepared(
 }
 
 /// Replays the deposit of a rotation the ceremony already committed to (§8.2).
-fn resume_rotation(path: &Path, channel: astra_signer::campaign::Campaign) -> Result<()> {
+fn resume_rotation(path: &Path, channel: astra_operator::campaign::Campaign) -> Result<()> {
     let prepared_path = prepared::path_beside(path);
     let Some(record) = prepared::load(&prepared_path)? else {
         println!("aucune rotation préparée : rien à reprendre.");
@@ -2614,7 +2614,7 @@ fn resume_rotation(path: &Path, channel: astra_signer::campaign::Campaign) -> Re
 
 /// Advances the open `CA-TLS` window by one step (§9.2).
 fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
-    use astra::vault::CaTlsAdvance;
+    use astra_operator::vault::CaTlsAdvance;
 
     let mut vault = store::load(path)?;
     let prepared_path = prepared::path_beside(path);
@@ -2807,7 +2807,7 @@ struct GatewayTransitionInputs<'a> {
 /// Issues the next gateway leaf and signs its transition (spec §11.1 step 4).
 fn sign_gateway_transition(
     path: &Path,
-    channel: astra_signer::campaign::Campaign,
+    channel: astra_operator::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     inputs: GatewayTransitionInputs<'_>,
@@ -3028,7 +3028,7 @@ fn sign_gateway_transition(
 #[allow(clippy::too_many_arguments)]
 fn abort_gateway_transition(
     path: &Path,
-    channel: astra_signer::campaign::Campaign,
+    channel: astra_operator::campaign::Campaign,
     operation_id: &str,
     origin: Option<&str>,
     transition_path: &Path,
@@ -3318,8 +3318,8 @@ fn sign_gateway_rollback(
 /// fails after `CA-PQ` has signed must not also lose the object — the
 /// alternative is a second ceremony for a decision that already exists.
 fn deposit_gateway_decision(
-    client: &astra_signer::campaign::Campaign,
-    request: &astra_signer::origin::CampaignRequest,
+    client: &astra_operator::campaign::Campaign,
+    request: &astra_operator::origin::CampaignRequest,
     approval: &aether::certificates::status::CampaignApproval,
     object: aether::certificates::transport::TrustUpdateObject,
     out: &Path,
@@ -3377,9 +3377,9 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<
 }
 
 fn origin_client_fetch(
-    client: &astra_signer::origin::Origin,
+    client: &astra_operator::origin::Origin,
     operation_id: &Id16,
-) -> Result<astra_signer::origin::CampaignRequest> {
+) -> Result<astra_operator::origin::CampaignRequest> {
     client.fetch(operation_id)
 }
 
@@ -3444,7 +3444,7 @@ fn recover(
         .context("CA-TLS cliente : base64 illisible")?,
     )?;
 
-    let client = astra_signer::origin::Origin::new(authority_url)?;
+    let client = astra_operator::origin::Origin::new(authority_url)?;
     let view = client.recovery(&operation)?;
     let request = view
         .request
@@ -3650,7 +3650,7 @@ fn rotate_ca_pq(
         (Some(url), Some(id)) => {
             let operation =
                 Id16::parse_hex(id).map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
-            let client = astra_signer::origin::Origin::new(url)?;
+            let client = astra_operator::origin::Origin::new(url)?;
             let request = origin_client_fetch(&client, &operation)?;
             handoff::verify_campaign_request(&handoff, &vault, &request, url, now_unix())?;
             let campaign = request.campaign.as_ref().clone();
@@ -3851,7 +3851,7 @@ fn anchor_probe(
 
 /// One security key, connected once and used for everything it owes.
 struct ConnectedKey {
-    key: Box<dyn astra_signer::authenticator::Authenticator>,
+    key: Box<dyn astra_operator::authenticator::Authenticator>,
     /// Zeroized on drop, like every other PIN this program holds.
     pin: zeroize::Zeroizing<String>,
     opened: Opened,
@@ -4028,7 +4028,7 @@ fn wait_for_operator() -> Result<()> {
 /// dialog. Prompting here would ask an operator for a secret this process has
 /// no use for — and would then have to hold it.
 fn pin_for(
-    key: &dyn astra_signer::authenticator::Authenticator,
+    key: &dyn astra_operator::authenticator::Authenticator,
     prompt: &str,
 ) -> Result<Zeroizing<String>> {
     if !key.needs_pin() {

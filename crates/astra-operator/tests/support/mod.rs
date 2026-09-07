@@ -19,10 +19,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use astra::vault::SlotSecret;
-use astra_signer::authenticator::{
+use astra_operator::authenticator::{
     Approval, Authenticator, AuthenticatorError, CredentialSubject, Opened, Registration,
 };
+use astra_operator::vault::SlotSecret;
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
 
 pub const RP_ID: &str = "astra.helios.test";

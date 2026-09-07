@@ -1856,9 +1856,17 @@ mod tests {
             credential_row(&stranger, vec![0x01, 0x02]),
         ]);
 
-        assert!(fixture.registry.install_astra_credentials(&document).is_err());
+        assert!(fixture
+            .registry
+            .install_astra_credentials(&document)
+            .is_err());
         assert!(
-            fixture.registry.state().astra.credential_bindings.is_empty(),
+            fixture
+                .registry
+                .state()
+                .astra
+                .credential_bindings
+                .is_empty(),
             "a refused document installs none of its rows"
         );
     }
