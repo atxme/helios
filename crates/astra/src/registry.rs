@@ -237,6 +237,16 @@ pub struct AstraState {
 pub enum RegistryError {
     #[error("unknown peer")]
     UnknownPeer,
+    #[error(
+        "this authority already records generation {held} for that peer: adopting {offered} \
+         would walk a client identity backwards"
+    )]
+    GenerationRegression { held: u64, offered: u64 },
+    #[error(
+        "generation {generation} is recorded here under a different leaf than the one served: \
+         one number, two histories"
+    )]
+    GenerationDisagrees { generation: u64 },
     #[error("peer is revoked; no credential lifts that state")]
     Revoked,
     #[error("a rotation is already in flight for this peer")]
@@ -292,9 +302,12 @@ impl AstraRegistry {
         Self::load_with(path, expected_head, false)
     }
 
-    /// Loads a registry for a daemon restart, accepting only a suffix made of
-    /// legacy read-only status publications after the operator witness.
-    pub fn load_allowing_status_tail(
+    /// Loads a registry for a daemon restart, accepting the unattended
+    /// per-peer lifecycle appended since the operator recorded the witness.
+    ///
+    /// See [`crate::audit::AuditChain::verify_from_witness`] for where the line
+    /// is drawn. What grew is logged rather than swallowed.
+    pub fn load_allowing_unattended_tail(
         path: &Path,
         expected_head: Option<&Fingerprint>,
     ) -> Result<Self, RegistryError> {
@@ -304,7 +317,7 @@ impl AstraRegistry {
     fn load_with(
         path: &Path,
         expected_head: Option<&Fingerprint>,
-        allow_status_tail: bool,
+        allow_unattended_tail: bool,
     ) -> Result<Self, RegistryError> {
         let raw = std::fs::read(path)?;
         let mut document: serde_json::Value = serde_json::from_slice(&raw)
@@ -315,8 +328,16 @@ impl AstraRegistry {
         migrated |= Self::recover_ca_pq_rotation(&mut state)?;
         migrated |= Self::recover_client_tls_ca_rotation(&mut state)?;
         match expected_head {
-            Some(expected) if allow_status_tail => {
-                state.audit.verify_after_status_tail(expected)?
+            Some(expected) if allow_unattended_tail => {
+                let growth = state.audit.verify_from_witness(expected)?;
+                if growth.appended > 0 {
+                    tracing::info!(
+                        witnessed_sequence = growth.witnessed_sequence,
+                        appended = growth.appended,
+                        "the audit chain grew past the recorded witness; every record after it \
+                         is per-peer lifecycle, which widens nothing this authority may do"
+                    );
+                }
             }
             _ => state.audit.verify(expected_head)?,
         }
@@ -533,6 +554,95 @@ impl AstraRegistry {
             now_unix,
         );
         self.save()
+    }
+
+    /// Adopts the gateway's view of a peer without ever moving it backwards.
+    ///
+    /// # Why this is not `admit`
+    ///
+    /// [`Self::admit`] writes a whole `PeerRecord`. Calling it to refresh a
+    /// peer would drop `pending` — a rotation whose grant may already be in a
+    /// client's hands — and would happily accept a generation lower than the
+    /// one already recorded, which is how a stale or rolled-back gateway view
+    /// would rewrite this authority's idea of who is current.
+    ///
+    /// So the rules are stated rather than implied:
+    ///
+    /// * a generation below the recorded one is refused, never adopted;
+    /// * the same generation must describe the same leaf, or it is two
+    ///   histories wearing one number and it is refused;
+    /// * a rotation in flight survives an adoption it is still ahead of, and
+    ///   is dropped only when the adopted generation has caught up with or
+    ///   passed the candidate it was staging;
+    /// * an unchanged record writes nothing and appends nothing.
+    ///
+    /// Returns whether anything moved. Idempotent by construction, which is
+    /// what makes it safe to replay after a crash: the gateway is the one that
+    /// promotes, and this only ever copies what it already serves.
+    pub fn reconcile_peer(
+        &mut self,
+        record: PeerRecord,
+        now_unix: u64,
+    ) -> Result<bool, RegistryError> {
+        let key = record.client_wg_public_key.to_base64();
+        let Some(held) = self.state.peers.get(&key) else {
+            self.admit(record, now_unix)?;
+            return Ok(true);
+        };
+        let (held_generation, adopted) = (held.active.generation, record.active.generation);
+        if adopted < held_generation {
+            return Err(RegistryError::GenerationRegression {
+                held: held_generation,
+                offered: adopted,
+            });
+        }
+        if adopted == held_generation
+            && !held
+                .active
+                .pq_certificate_fingerprint
+                .matches(&record.active.pq_certificate_fingerprint)
+        {
+            return Err(RegistryError::GenerationDisagrees {
+                generation: adopted,
+            });
+        }
+
+        // The rotation in flight is this authority's own, and the gateway view
+        // knows nothing of it. It is kept while it still names a generation
+        // ahead of what is served, and dropped once it no longer can: a
+        // candidate at or below the adopted generation has either landed or
+        // been overtaken, and either way nothing is left to grant.
+        let pending = held
+            .pending
+            .clone()
+            .filter(|rotation| rotation.candidate.generation > adopted);
+        let dropped_stage = held.pending.is_some() && pending.is_none();
+        let name = record.name.clone();
+        let refreshed = PeerRecord { pending, ..record };
+        if self.state.peers.get(&key) == Some(&refreshed) {
+            return Ok(false);
+        }
+        self.state.peers.insert(key, refreshed);
+        if dropped_stage {
+            self.state.audit.append(
+                AuditEvent::ClientStagePurged {
+                    peer: name.clone(),
+                    generation: adopted,
+                },
+                now_unix,
+            );
+        }
+        if adopted > held_generation {
+            self.state.audit.append(
+                AuditEvent::PeerGenerationAdopted {
+                    peer: name,
+                    generation: adopted,
+                },
+                now_unix,
+            );
+        }
+        self.save()?;
+        Ok(true)
     }
 
     /// Installs the delegation the operator companion signed (spec §9.5).
@@ -2805,6 +2915,126 @@ mod tests {
             stage_expires_at: expires_at,
             granted: false,
         }
+    }
+
+    fn served(index: u64) -> PeerRecord {
+        PeerRecord {
+            name: "workstation".into(),
+            client_wg_public_key: WireGuardKey::from_bytes([2; 32]),
+            active: generation(index),
+            active_pq_certificate: certificate(),
+            pending: None,
+            revoked: false,
+            revocation_epoch: 0,
+            admission_pq_ca: None,
+        }
+    }
+
+    /// The whole point of the method: the gateway promotes, this adopts, and
+    /// the chain says so with an event of its own.
+    #[test]
+    fn a_promoted_generation_is_adopted_and_recorded() {
+        let (mut registry, _dir) = registry();
+        assert!(registry.reconcile_peer(served(5), 2_000).expect("adopted"));
+        let key = WireGuardKey::from_bytes([2; 32]);
+        assert_eq!(registry.peer(&key).expect("peer").active.generation, 5);
+        assert!(matches!(
+            registry.state().audit.records.last().map(|r| &r.event),
+            Some(AuditEvent::PeerGenerationAdopted { generation: 5, .. })
+        ));
+    }
+
+    /// Idempotence is what makes the repair safe to replay after a crash.
+    #[test]
+    fn adopting_what_is_already_recorded_writes_nothing() {
+        let (mut registry, _dir) = registry();
+        let before = registry.state().audit.records.len();
+        assert!(!registry.reconcile_peer(served(4), 2_000).expect("no-op"));
+        assert_eq!(registry.state().audit.records.len(), before);
+    }
+
+    /// A stale or rolled-back gateway view must not rewrite this authority's
+    /// idea of who is current.
+    #[test]
+    fn a_generation_below_the_recorded_one_is_refused() {
+        let (mut registry, _dir) = registry();
+        assert!(matches!(
+            registry.reconcile_peer(served(3), 2_000),
+            Err(RegistryError::GenerationRegression {
+                held: 4,
+                offered: 3
+            })
+        ));
+    }
+
+    /// One number, two leaves, is two histories — and the fingerprint is what
+    /// tells them apart before either is believed.
+    #[test]
+    fn the_same_generation_under_another_leaf_is_refused() {
+        let (mut registry, _dir) = registry();
+        let mut divergent = served(4);
+        divergent.active.pq_certificate_fingerprint = Fingerprint::of(b"another leaf");
+        assert!(matches!(
+            registry.reconcile_peer(divergent, 2_000),
+            Err(RegistryError::GenerationDisagrees { generation: 4 })
+        ));
+    }
+
+    /// The reason `admit` could not be reused: a grant may already be in a
+    /// client's hands, and a refresh that dropped it would withhold something
+    /// this authority has no right to withhold.
+    #[test]
+    fn a_rotation_still_ahead_of_the_served_generation_survives() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .pending = Some(rotation(9, 50_000));
+
+        registry.reconcile_peer(served(4), 2_000).ok();
+        assert!(
+            registry.peer(&key).expect("peer").pending.is_some(),
+            "the candidate is generation 5 and the gateway still serves 4"
+        );
+    }
+
+    /// And its other half: once the served generation has caught up with the
+    /// candidate, the stage has either landed or been overtaken, and there is
+    /// nothing left to grant.
+    #[test]
+    fn a_rotation_the_served_generation_reached_is_purged() {
+        let (mut registry, _dir) = registry();
+        let key = WireGuardKey::from_bytes([2; 32]);
+        registry
+            .state
+            .peers
+            .get_mut(&key.to_base64())
+            .expect("peer")
+            .pending = Some(rotation(9, 50_000));
+
+        assert!(registry.reconcile_peer(served(5), 2_000).expect("adopted"));
+        assert!(registry.peer(&key).expect("peer").pending.is_none());
+        assert!(registry
+            .state()
+            .audit
+            .records
+            .iter()
+            .any(|record| matches!(record.event, AuditEvent::ClientStagePurged { .. })));
+    }
+
+    /// A peer nobody transcribed yet is the first-sight case, and it is still
+    /// an admission.
+    #[test]
+    fn an_unknown_peer_is_admitted_rather_than_refused() {
+        let (mut registry, _dir) = registry();
+        let mut fresh = served(1);
+        fresh.client_wg_public_key = WireGuardKey::from_bytes([9; 32]);
+        fresh.name = "laptop".into();
+        assert!(registry.reconcile_peer(fresh, 2_000).expect("admitted"));
+        assert!(registry.peer(&WireGuardKey::from_bytes([9; 32])).is_some());
     }
 
     /// A delegation is installed by epoch, and the epoch only ever rises.

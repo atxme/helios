@@ -57,6 +57,7 @@ pub mod issuer;
 pub mod operations;
 pub mod operator;
 pub mod planner;
+pub mod reconciliation;
 pub mod recovery;
 pub mod registry;
 pub mod renewal;

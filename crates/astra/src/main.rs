@@ -840,9 +840,11 @@ fn run(
         .map(Fingerprint::parse_hex)
         .transpose()
         .context("reading the expected audit head")?;
-    let registry =
-        AstraRegistry::load_allowing_status_tail(&state_dir.join(REGISTRY_FILE), expected.as_ref())
-            .context("loading the Astra registry")?;
+    let registry = AstraRegistry::load_allowing_unattended_tail(
+        &state_dir.join(REGISTRY_FILE),
+        expected.as_ref(),
+    )
+    .context("loading the Astra registry")?;
     let service_private_key = Zeroizing::new(
         std::fs::read(state_dir.join(SERVICE_KEY_FILE)).context("reading the Astra service key")?,
     );
@@ -917,6 +919,7 @@ fn run(
                 }
             });
         }
+        spawn_reconciliation_repair(service.clone());
         spawn_campaign_drain(service.clone(), state_dir.to_path_buf());
         let listener = tokio::net::TcpListener::bind(bind)
             .await
@@ -929,6 +932,55 @@ fn run(
         .await
         .context("serving the Astra public endpoint")
     })
+}
+
+/// Finishes a recovery whose promotion this authority never adopted.
+///
+/// The intent is written before the gateway is asked to promote and cleared
+/// once this registry has caught up (see [`astra::reconciliation`]). A crash
+/// in between leaves it on disk, and this is what closes it: one read of the
+/// gateway, forward-only, at the start that follows.
+///
+/// Its own task, and never fatal. A gateway that is not answering yet is the
+/// ordinary case at boot, and refusing to serve over an adoption that the next
+/// client contact would make anyway would turn a bookkeeping lag into an
+/// outage.
+fn spawn_reconciliation_repair(service: std::sync::Arc<astra::service::AstraService>) {
+    tokio::spawn(async move {
+        let intent = match astra::reconciliation::load(&service.state_dir) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "the pending reconciliation could not be read");
+                return;
+            }
+        };
+        match astra::recovery::reconcile(
+            &service,
+            &intent.peer,
+            intent.expected_generation,
+            now_unix(),
+        )
+        .await
+        {
+            Ok(true) => tracing::info!(
+                peer = %intent.peer,
+                generation = intent.expected_generation,
+                "a recovery interrupted before this registry caught up is now adopted"
+            ),
+            Ok(false) => tracing::info!(
+                peer = %intent.peer,
+                generation = intent.expected_generation,
+                "the gateway has not promoted this recovered generation yet; it will be adopted \
+                 at the next contact"
+            ),
+            Err(error) => tracing::warn!(
+                peer = %intent.peer,
+                %error,
+                "the interrupted recovery could not be adopted at start"
+            ),
+        }
+    });
 }
 
 /// Adopts the campaigns a local operator command deposited.
@@ -2381,9 +2433,11 @@ fn status(state_dir: &Path, expected_audit_head: Option<&str>) -> Result<()> {
         .map(Fingerprint::parse_hex)
         .transpose()
         .context("reading the expected audit head")?;
-    let registry =
-        AstraRegistry::load_allowing_status_tail(&state_dir.join(REGISTRY_FILE), expected.as_ref())
-            .context("loading the Astra registry")?;
+    let registry = AstraRegistry::load_allowing_unattended_tail(
+        &state_dir.join(REGISTRY_FILE),
+        expected.as_ref(),
+    )
+    .context("loading the Astra registry")?;
     let state = registry.state();
     println!("trust domain     : {}", state.trust_domain_id);
     println!("gateway          : {}", state.gateway_wg_public_key);

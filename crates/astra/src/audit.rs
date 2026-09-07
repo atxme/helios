@@ -98,6 +98,58 @@ pub enum AuditEvent {
         target: String,
         status_epoch: u64,
     },
+    /// A peer's generation, as the gateway serves it, was adopted here.
+    ///
+    /// Distinct from [`Self::ExpiredRecoveryApproved`] on purpose: that one
+    /// records that an operator's proof was **accepted**, this one that the
+    /// generation it unlocked is now the one this registry names. A recovery
+    /// that stopped between the two is exactly what the pair is meant to make
+    /// visible, and a single event could not tell the halves apart.
+    PeerGenerationAdopted {
+        peer: String,
+        generation: u64,
+    },
+}
+
+impl AuditEvent {
+    /// Whether this event changed **what the authority may do**.
+    ///
+    /// The operator witness pins the authority's own configuration: its
+    /// anchors, its delegation, its policy, the campaigns it approved. Those
+    /// are what a restore could resurrect, so a chain that moved past the
+    /// witness on one of them is refused until an operator records the new
+    /// head — and an operator was, by construction, present when it happened.
+    ///
+    /// Per-peer lifecycle is the other half, and it is not the same thing. A
+    /// peer admitted, renewed, staged or recovered widens nothing: the
+    /// authority's powers are identical before and after. Those records are
+    /// appended unattended, at any hour, by clients nobody is watching —
+    /// requiring a fresh witness for them would mean requiring an operator to
+    /// be present for every renewal, which is precisely what §8.1.2 removed.
+    pub fn changes_authority_configuration(&self) -> bool {
+        match self {
+            Self::DomainBootstrapped
+            | Self::IssuerInstalled { .. }
+            | Self::IssuancePolicyAdopted { .. }
+            | Self::IssuerRevoked { .. }
+            | Self::CampaignApproved { .. }
+            | Self::CampaignRefused { .. }
+            | Self::AnchorTransitionsAccepted { .. }
+            | Self::CertificateRevoked { .. }
+            | Self::ServiceKeyRotated { .. }
+            | Self::ClientTlsCaPinned { .. }
+            | Self::GatewayTransitionPublished { .. } => true,
+            Self::PeerAdmitted { .. }
+            | Self::PeerGenerationAdopted { .. }
+            | Self::ClientRenewalRequested { .. }
+            | Self::ClientStageAuthorized { .. }
+            | Self::ClientGrantReleased { .. }
+            | Self::ClientStagePurged { .. }
+            | Self::ExpiredRecoveryApproved { .. }
+            | Self::CampaignCreated { .. }
+            | Self::StatusPublished { .. } => false,
+        }
+    }
 }
 
 /// One link of the chain.
@@ -110,6 +162,18 @@ pub struct AuditRecord {
     /// Hash of the previous record, all-zero for the first.
     pub previous: Fingerprint,
     pub digest: Fingerprint,
+}
+
+/// What a chain grew by since the operator wrote its witness down.
+///
+/// Returned rather than swallowed: an operator restarting Astra is entitled to
+/// know that eleven client records were appended since they last looked, and a
+/// silent acceptance would make the witness feel checked when nothing about
+/// those records was ever attested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WitnessGrowth {
+    pub witnessed_sequence: u64,
+    pub appended: usize,
 }
 
 /// The chain itself.
@@ -182,16 +246,28 @@ impl AuditChain {
         Ok(())
     }
 
-    /// Verifies a recorded operator head, allowing only the legacy status
-    /// publications that were appended by read-only telemetry queries.
+    /// Verifies a recorded operator witness that the chain has since grown
+    /// past, and reports what grew.
     ///
-    /// Status publication used to advance the audit chain even though it did
-    /// not change an authority decision. A deployment witness captured at
-    /// bootstrap can therefore be an ancestor of the current head after an
-    /// otherwise harmless status read. This narrow compatibility path accepts
-    /// that suffix, but still refuses every renewal, admission, issuer,
-    /// campaign or revocation event after the witness.
-    pub fn verify_after_status_tail(&self, expected: &Fingerprint) -> Result<(), AuditError> {
+    /// # Why an ancestor is accepted, and where the line is drawn
+    ///
+    /// A witness is a digest an operator wrote down. It can only ever speak
+    /// about the history that existed when it was captured: events appended
+    /// afterwards are, arithmetically, outside what it attests. Demanding
+    /// strict equality therefore does not make the witness stronger — it makes
+    /// it require re-capture after every unattended client renewal, and a
+    /// witness re-captured by reading the very file it is meant to check
+    /// attests nothing at all.
+    ///
+    /// So the witness must appear **in** the chain, which is what catches a
+    /// restore that diverged before or at the recorded point, and the suffix
+    /// after it is judged by what it did. Anything that changed the
+    /// authority's configuration is refused: an operator was present when it
+    /// happened and can record the new head, and those are exactly the records
+    /// a rollback could use to resurrect a withdrawn anchor or delegation.
+    /// Per-peer lifecycle is accepted and named in the returned report, so
+    /// growth is visible rather than merely tolerated.
+    pub fn verify_from_witness(&self, expected: &Fingerprint) -> Result<WitnessGrowth, AuditError> {
         self.verify(None)?;
         let Some(index) = self
             .records
@@ -200,14 +276,19 @@ impl AuditChain {
         else {
             return Err(AuditError::Forked);
         };
-        if self.records[index + 1..]
+        let suffix = &self.records[index + 1..];
+        if let Some(record) = suffix
             .iter()
-            .all(|record| matches!(record.event, AuditEvent::StatusPublished { .. }))
+            .find(|record| record.event.changes_authority_configuration())
         {
-            Ok(())
-        } else {
-            Err(AuditError::Forked)
+            return Err(AuditError::WitnessOutdated {
+                sequence: record.sequence,
+            });
         }
+        Ok(WitnessGrowth {
+            witnessed_sequence: self.records[index].sequence,
+            appended: suffix.len(),
+        })
     }
 
     fn digest(
@@ -239,6 +320,15 @@ pub enum AuditError {
     OutOfOrder { sequence: u64 },
     #[error("audit chain ends on a different head than the one recorded: this is a fork")]
     Forked,
+    /// The witness is genuine but predates a decision that widened the
+    /// authority. Refused like a fork, and named apart from one so the
+    /// operator is told to record a head rather than to hunt for a restore
+    /// that never happened.
+    #[error(
+        "the recorded audit witness predates the authority decision at sequence {sequence}: \
+         record the current head before restarting"
+    )]
+    WitnessOutdated { sequence: u64 },
 }
 
 #[cfg(test)]
@@ -304,18 +394,68 @@ mod tests {
             },
             1_300,
         );
-        chain
-            .verify_after_status_tail(&witness)
+        let growth = chain
+            .verify_from_witness(&witness)
             .expect("read-only status suffix");
+        assert_eq!(growth.appended, 1);
     }
 
+    /// The lifecycle a client drives on its own is what the amendment of §8.1.2
+    /// made unattended. Refusing to start over it would mean an operator has to
+    /// be present for every renewal, which is the thing that was removed.
     #[test]
-    fn a_decision_after_the_witness_is_still_a_fork() {
+    fn unattended_client_lifecycle_after_the_witness_still_starts() {
+        let mut chain = chain();
+        let witness = chain.head();
+        chain.append(
+            AuditEvent::PeerAdmitted {
+                peer: "workstation".into(),
+                generation: 1,
+            },
+            1_300,
+        );
+        chain.append(
+            AuditEvent::ExpiredRecoveryApproved {
+                peer: "workstation".into(),
+                generation: 2,
+            },
+            1_400,
+        );
+        chain.append(
+            AuditEvent::PeerGenerationAdopted {
+                peer: "workstation".into(),
+                generation: 2,
+            },
+            1_500,
+        );
+        let growth = chain
+            .verify_from_witness(&witness)
+            .expect("per-peer lifecycle widens nothing");
+        assert_eq!(growth.appended, 3);
+        assert_eq!(growth.witnessed_sequence, 2);
+    }
+
+    /// The other half, and the reason the suffix is judged rather than
+    /// accepted: a delegation installed after the witness is exactly what a
+    /// restore could resurrect, and an operator was there when it happened.
+    #[test]
+    fn a_decision_after_the_witness_is_refused_and_named_as_such() {
         let mut chain = chain();
         let witness = chain.head();
         chain.append(AuditEvent::IssuerInstalled { issuer_epoch: 2 }, 1_300);
         assert!(matches!(
-            chain.verify_after_status_tail(&witness),
+            chain.verify_from_witness(&witness),
+            Err(AuditError::WitnessOutdated { sequence: 3 })
+        ));
+    }
+
+    /// A witness that is nowhere in the chain is the case the witness exists
+    /// for, and it stays a fork.
+    #[test]
+    fn a_witness_absent_from_the_chain_is_a_fork() {
+        let chain = chain();
+        assert!(matches!(
+            chain.verify_from_witness(&Fingerprint::from_bytes([7; 32])),
             Err(AuditError::Forked)
         ));
     }

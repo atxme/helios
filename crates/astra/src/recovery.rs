@@ -51,7 +51,7 @@ use aether::certificates::{
         ClientCertificateStageCommit, ExpiredCertificateRecoveryRequest,
         GatewayCertificateStageReceipt, IssuerKind,
     },
-    encoding::{Fingerprint, Id16},
+    encoding::{Fingerprint, Id16, WireGuardKey},
     transport::{ExpiredRecoveryOperationView, ExpiredRecoveryState},
     CertificateError,
 };
@@ -92,6 +92,10 @@ pub enum RecoveryError {
     Gateway(String),
     #[error("recovery refused: {0}")]
     Certificate(#[from] CertificateError),
+    #[error("registry: {0}")]
+    Registry(#[from] crate::registry::RegistryError),
+    #[error("reconciliation intent: {0}")]
+    Reconciliation(String),
 }
 
 /// One recovery, from the verified request to the relayed commit.
@@ -537,7 +541,41 @@ pub async fn grant(
         operation = %operation_id,
         "recovery grant released; the client may install and commit"
     );
-    Ok(operation.view())
+    let client = operation.request.client_wg_public_key;
+    let generation = operation
+        .authorization
+        .as_deref()
+        .map(|authorization| authorization.next_generation)
+        .unwrap_or_default();
+    let view = operation.view();
+    // The recoveries lock is released before the registry is taken: `open`
+    // holds them the other way round, and a lifecycle that can deadlock under
+    // two simultaneous recoveries is not one an operator can be asked to
+    // restart out of.
+    drop(recoveries);
+
+    // The one moment an operator credential resurrected a dead identity. It is
+    // recorded here, at acceptance, and not at the commit: what was proved is
+    // that the operator signed under `CA-PQ` against this staging. Whether the
+    // client then managed to install it is a different fact, and it gets its
+    // own record.
+    let peer = {
+        let registry = service.registry.lock().await;
+        registry
+            .peer(&client)
+            .map(|peer| peer.name.clone())
+            .unwrap_or_else(|| client.to_base64())
+    };
+    service
+        .registry
+        .lock()
+        .await
+        .record(
+            crate::audit::AuditEvent::ExpiredRecoveryApproved { peer, generation },
+            now_unix,
+        )
+        .map_err(RecoveryError::Registry)?;
+    Ok(view)
 }
 
 /// Step 4: the client's commit, relayed to the gateway over the veth.
@@ -578,6 +616,23 @@ pub async fn commit(
         .gateway
         .as_ref()
         .ok_or(RecoveryError::NoGatewayChannel)?;
+
+    // Written **before** the gateway is asked, and not after: the failure this
+    // guards against is a crash between the two writes, and an intent recorded
+    // afterwards would not exist in exactly the window it is for. Recording it
+    // for a commit the gateway then refuses costs one idempotent re-read at
+    // the next start, which is the cheap side of the trade.
+    let expected_generation = commit.staged_generation;
+    crate::reconciliation::record(
+        &service.state_dir,
+        &crate::reconciliation::PendingReconciliation {
+            peer: client,
+            expected_generation,
+            recorded_at: now_unix,
+        },
+    )
+    .map_err(|error| RecoveryError::Reconciliation(error.to_string()))?;
+
     gateway
         .commit_recovery(&helios_api::internal::RelayedStageCommit {
             authorization,
@@ -595,7 +650,62 @@ pub async fn commit(
         operation = %operation_id,
         "expired identity recovered: the gateway holds the new generation"
     );
-    Ok(operation.view())
+    let view = operation.view();
+    drop(recoveries);
+
+    // The gateway has not necessarily promoted yet: a recovered generation
+    // activates at the end of its staging lease, which §7.2 puts after the
+    // commit. So this is an attempt, not a guarantee, and the intent stays on
+    // disk until it succeeds. Failing here must not fail the recovery — the
+    // client's identity is installed at both ends by now, and refusing its
+    // commit over a bookkeeping read would be refusing something that already
+    // happened.
+    match reconcile(service, &client, expected_generation, now_unix).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            peer = %client,
+            expected_generation,
+            "the gateway has not promoted the recovered generation yet; the intent stays on \
+             disk and the next contact adopts it"
+        ),
+        Err(error) => tracing::warn!(
+            peer = %client,
+            %error,
+            "the recovered generation could not be adopted here; the intent stays on disk"
+        ),
+    }
+    Ok(view)
+}
+
+/// Adopts what the gateway serves for one peer, and closes the intent when it
+/// has caught up.
+///
+/// Returns whether the intent was closed. Idempotent: it reads the gateway and
+/// reconciles forward-only, so replaying it after a crash — or at every start
+/// — decides nothing it did not already decide.
+pub async fn reconcile(
+    service: &Arc<AstraService>,
+    client: &WireGuardKey,
+    expected_generation: u64,
+    now_unix: u64,
+) -> Result<bool, RecoveryError> {
+    crate::renewal::transcribe_peer(service, client, now_unix)
+        .await
+        .map_err(|error| match error {
+            crate::renewal::RenewalError::UnknownPeer => RecoveryError::UnknownPeer,
+            other => RecoveryError::Gateway(other.to_string()),
+        })?;
+    let reached = service
+        .registry
+        .lock()
+        .await
+        .peer(client)
+        .is_some_and(|peer| peer.active.generation >= expected_generation);
+    if reached {
+        crate::reconciliation::clear(&service.state_dir)
+            .map_err(|error| RecoveryError::Reconciliation(error.to_string()))?;
+    }
+    Ok(reached)
 }
 
 /// The bounded class a public caller learns.
