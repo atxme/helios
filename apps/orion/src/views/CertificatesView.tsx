@@ -337,6 +337,14 @@ function RenewalStep({
       {step?.step === 'committed' && (
         <Row label="génération suivante" value={String(step.generation)} />
       )}
+      {step?.step === 'recovered' && (
+        <>
+          <Row label="génération suivante" value={String(step.generation)} />
+          <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+            Identité récupérée : ce poste signe à nouveau.
+          </Typography>
+        </>
+      )}
       {step?.step === 'rolled_back' && (
         <>
           <Row label="identité servie" value={`génération ${step.generation}`} />
@@ -346,8 +354,30 @@ function RenewalStep({
           />
         </>
       )}
-      {step && (step.step === 'awaiting_operator' || step.step === 'issuing') && (
-        <Row label="opération" value={step.operation_id} copyable />
+      {step &&
+        (step.step === 'awaiting_operator' ||
+          step.step === 'issuing' ||
+          step.step === 'recovery_awaiting_operator') && (
+          <Row label="opération" value={step.operation_id} copyable />
+        )}
+
+      {/* A §7.5 recovery has no door on this machine: the active leaf has
+          expired, so there is no request this poste can offer to a key plugged
+          in here. What the surface owes the user is therefore the whole of what
+          remains to be done, in the form it has to be done in — the command,
+          entire, rather than an identifier to reassemble by hand. */}
+      {step?.step === 'recovery_awaiting_operator' && (
+        <>
+          <Typography color="text.secondary" sx={{ mt: 0.75, fontSize: 11.5, lineHeight: 1.55 }}>
+            Demande déposée. Elle attend un opérateur muni de sa clé, sur son propre poste :
+            l’identité de celui-ci a expiré et ne peut plus rien approuver.
+          </Typography>
+          <Row label="commande" value={step.operator_command} copyable />
+          <Typography color="text.disabled" sx={{ mt: 0.75, fontSize: 11, lineHeight: 1.5 }}>
+            Une fois la clé touchée là-bas, relancer « Récupérer le certificat expiré » ici
+            pour installer la génération émise.
+          </Typography>
+        </>
       )}
       {step?.step === 'awaiting_operator' && (
         <>

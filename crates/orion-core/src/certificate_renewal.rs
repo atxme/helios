@@ -2131,8 +2131,8 @@ mod tests {
         let legacy = store(directory.path(), &domain);
         legacy.save().expect("legacy saved");
 
-        let migrated = open_identity_store(directory.path(), &settings, &bundle)
-            .expect("legacy imported");
+        let migrated =
+            open_identity_store(directory.path(), &settings, &bundle).expect("legacy imported");
         let scoped_path = identity_trust_store_path(directory.path(), &domain_id(), &client_key());
 
         assert!(
@@ -2318,8 +2318,10 @@ mod tests {
         let bindings = &store.state().astra.credential_bindings;
         assert_eq!(bindings.len(), 1, "the credential the enrolment carried");
         assert!(
-            bindings.values().any(|binding| binding.state
-                == aether::certificates::approval::CredentialState::Active),
+            bindings
+                .values()
+                .any(|binding| binding.state
+                    == aether::certificates::approval::CredentialState::Active),
             "an active row is what a recovery may name"
         );
     }
@@ -2360,7 +2362,10 @@ mod tests {
         let path = directory.path().join("trust.json");
         let expired_at = NOW + 20 * 86_400;
         let store = open_or_seed(&path, &settings, &bundle).expect("seeded");
-        assert!(path.exists(), "the store the recovery opens must be written");
+        assert!(
+            path.exists(),
+            "the store the recovery opens must be written"
+        );
         assert!(
             store.state().certificates.active.not_after <= expired_at,
             "the seeded state describes the expired leaf rather than hiding it"

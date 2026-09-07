@@ -850,11 +850,14 @@ enum RenewalProgress {
     },
     /// A §7.5 recovery, waiting on an operator who is not on this machine.
     ///
-    /// It carries no companion command line: the operator runs `astra-signer`
-    /// on **their** workstation, against Astra's public origin, and the only
-    /// thing that has to travel between the two people is the identifier.
+    /// The operator runs `astra-signer` on **their** workstation, so nothing
+    /// here can be launched. `operator_command` is still carried, and for the
+    /// same reason the renewal carries its companion line: what travels
+    /// between the two people is a command to run, not an identifier to be
+    /// reassembled by hand into arguments only one of them knows.
     RecoveryAwaitingOperator {
         operation_id: String,
+        operator_command: String,
     },
     Recovered {
         generation: u64,
@@ -895,11 +898,19 @@ fn companion_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 }
 
 impl RenewalProgress {
-    fn of_recovery(step: &orion_core::certificate_recovery::RecoveryStep) -> Self {
+    fn of_recovery(
+        step: &orion_core::certificate_recovery::RecoveryStep,
+        session: &orion_core::certificate_recovery::RecoverySession,
+    ) -> Self {
         use orion_core::certificate_recovery::RecoveryStep;
         match step {
             RecoveryStep::AwaitingOperator { operation_id } => Self::RecoveryAwaitingOperator {
                 operation_id: operation_id.to_hex(),
+                operator_command: format!(
+                    "astra-signer recover --authority-url {} --operation-id {}",
+                    session.authority_url(),
+                    operation_id.to_hex()
+                ),
             },
             RecoveryStep::Issuing { operation_id } => Self::Issuing {
                 operation_id: operation_id.to_hex(),
@@ -1030,7 +1041,13 @@ async fn drive_recovery(
         )
         .await
         .map_err(|error| error.to_string())?;
-        let progress = RenewalProgress::of_recovery(&step);
+        let progress = RenewalProgress::of_recovery(&step, &in_flight.session);
+        tracing::info!(
+            profile = %name,
+            operation = %in_flight.session.operation_id().to_hex(),
+            ?step,
+            "récupération §7.5 reprise"
+        );
         if matches!(
             step,
             orion_core::certificate_recovery::RecoveryStep::Recovered { .. }
@@ -1043,7 +1060,14 @@ async fn drive_recovery(
     let (session, step) = orion_core::certificate_recovery::begin(&settings, now_unix())
         .await
         .map_err(|error| error.to_string())?;
-    let progress = RenewalProgress::of_recovery(&step);
+    let progress = RenewalProgress::of_recovery(&step, &session);
+    tracing::info!(
+        profile = %name,
+        operation = %session.operation_id().to_hex(),
+        autorite = %session.authority_url(),
+        ?step,
+        "récupération §7.5 ouverte"
+    );
     if !matches!(
         step,
         orion_core::certificate_recovery::RecoveryStep::Recovered { .. }

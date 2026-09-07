@@ -136,6 +136,15 @@ impl RecoverySession {
     pub fn operation_id(&self) -> Id16 {
         self.operation_id
     }
+
+    /// The public origin this recovery is waiting on.
+    ///
+    /// Read by the interface to render the line the operator has to run: the
+    /// identifier alone is not enough, because that operator is on another
+    /// machine and has no way to know which authority opened the operation.
+    pub fn authority_url(&self) -> &str {
+        &self.base
+    }
 }
 
 /// Assembles and double-signs the request, from the store and from nothing else.

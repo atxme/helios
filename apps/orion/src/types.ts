@@ -132,11 +132,20 @@ export interface CertificateActionState {
  * legitimately waits, sometimes for hours, while a human finds their key.
  * `companion_command` is the exact line that approves this operation — a value
  * the operator runs, which is why it is carried rather than described.
+ *
+ * The two recovery steps are the §7.5 path, where the active leaf has already
+ * expired. They are separate variants and not a flag on the others, because
+ * nothing about them can be done here: no manifest to read, no ceremony to
+ * run, no companion to launch. Every step the shell can send is named — one it
+ * does not know is one the surface renders as nothing at all, which is
+ * indistinguishable from a press that did nothing.
  */
 export type RenewalProgress =
   | { step: 'awaiting_operator'; operation_id: string; companion_command: string }
   | { step: 'issuing'; operation_id: string }
   | { step: 'committed'; generation: number }
+  | { step: 'recovery_awaiting_operator'; operation_id: string; operator_command: string }
+  | { step: 'recovered'; generation: number }
   | { step: 'rolled_back'; generation: number; available_until: number }
 
 /**
