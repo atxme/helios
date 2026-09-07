@@ -51,6 +51,7 @@ pub mod credentials;
 pub mod documents;
 pub mod gestures;
 pub mod handoff;
+pub mod operations;
 pub mod origin;
 pub mod orion;
 pub mod prepared;

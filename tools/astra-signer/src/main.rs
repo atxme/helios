@@ -749,16 +749,6 @@ enum Command {
         /// Origine WebAuthn, si elle diffère de `https://<rp_id>`.
         #[arg(long)]
         origin: Option<String>,
-        /// Durée de vie de la nouvelle génération, en jours.
-        #[arg(long, default_value_t = 365)]
-        validity_days: u64,
-        /// Recouvrement avant que l'ancienne génération soit retirée, en jours.
-        ///
-        /// Court par défaut : l'ancienne a déjà expiré, elle n'ouvre plus rien,
-        /// et le recouvrement n'existe ici que pour laisser la gateway et le
-        /// client se croiser.
-        #[arg(long, default_value_t = 1)]
-        overlap_days: u64,
     },
     /// Renames a slot. Needs no security key.
     Rename {
@@ -875,15 +865,11 @@ fn run() -> Result<()> {
             authority_url,
             operation_id,
             origin,
-            validity_days,
-            overlap_days,
         } => recover(
             &path,
             &authority_url,
             &operation_id,
             origin.as_deref(),
-            validity_days,
-            overlap_days,
             transport,
         ),
         Command::RotateCaPq {
@@ -3413,177 +3399,52 @@ fn origin_client_fetch(
 /// If anything fails before the grant is deposited, nothing has been installed
 /// anywhere: the gateway holds a candidate under a lease it will purge, and the
 /// operator reruns the command against a fresh request.
+/// §7.5, driven through the one implementation the helper also drives.
+///
+/// The prompts are here and the ceremony is not: `astra-operator` verifies,
+/// describes and signs, and this prints what it described. Two copies of a
+/// ceremony are two places for a window rule to be got wrong, and this one was
+/// got wrong twice.
 fn recover(
     path: &Path,
     authority_url: &str,
     operation_id: &str,
     origin: Option<&str>,
-    validity_days: u64,
-    overlap_days: u64,
     transport: Transport,
 ) -> Result<()> {
     let operation = Id16::parse_hex(operation_id)
         .map_err(|error| anyhow::anyhow!("--operation-id : {error}"))?;
-    let vault = store::load(path)?;
-    let handoff = handoff::DomainHandoff::beside(path, &vault)?;
-    let identity = handoff::identity_of(&handoff)?;
-    let registry = credentials::load(&credentials::path_beside(path))?.ok_or_else(|| {
-        anyhow::anyhow!("aucun document de credentials : l'émettre par `astra-signer bindings`")
-    })?;
-    let ca_tls_certificate = handoff.ca_tls_certificate.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "ce relais de domaine ne porte pas la CA-TLS cliente : l'émettre par `astra-signer \
-             issue-ca-tls`, sinon la feuille TLS de la génération récupérée ne chaîne à rien"
-        )
-    })?;
-    let ca_tls_certificate = DerCertificate::new(
-        <base64::engine::general_purpose::GeneralPurpose as base64::Engine>::decode(
-            &base64::engine::general_purpose::STANDARD,
-            ca_tls_certificate.trim(),
-        )
-        .context("CA-TLS cliente : base64 illisible")?,
+    let verified = astra_operator::operations::recovery::begin(
+        path,
+        operation,
+        Some(authority_url),
+        origin,
+        now_unix(),
     )?;
-
-    let client = astra_operator::origin::Origin::new(authority_url)?;
-    let view = client.recovery(&operation)?;
-    let request = view
-        .request
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("l'autorité ne rend pas la demande de cette opération"))?;
-
-    let origin = match origin {
-        Some(origin) => origin.to_string(),
-        None => format!("https://{}", vault.rp_id),
-    };
-    let now = now_unix();
 
     // Everything the operator has to weigh, before a key is asked for
     // anything. A recovery reaches past a validity period: the one fact that
     // must not be buried is *which* identity, and how long it has been dead.
-    println!("récupération     : {}", operation.to_hex());
-    println!("pair             : {}", request.client_wg_public_key);
-    println!("gateway          : {}", request.server_name);
+    let manifest = verified.manifest();
+    println!("récupération     : {}", verified.operation().to_hex());
+    println!("pair             : {}", manifest.client_wg_public_key);
+    println!("nom              : {}", manifest.peer_name);
     println!(
         "génération       : {} → {}",
-        request.expired_generation, request.requested_generation
+        manifest.expired_generation, manifest.next_generation
     );
-    println!(
-        "expirée depuis   : {} s",
-        now.saturating_sub(request.expired_pq_certificate.not_after_unix)
-    );
-    println!("empreinte        : {}", request.fingerprint());
-
-    let validity = (
-        now,
-        now.checked_add(
-            validity_days
-                .checked_mul(DAY_SECS)
-                .context("durée hors bornes")?,
-        )
-        .context("durée hors bornes")?,
-    );
-    let stage_expires_at = request.expires_at;
-    // The recovered generation has nothing to overlap *with* — the leaf it
-    // replaces has expired — so it changes over as early as the protocol
-    // allows. That instant is the end of the staging lease, not `now`: §7.2
-    // refuses a lease that outlives the activation it prepares, so a window
-    // activating at `now` would be refused by the gateway a moment after the
-    // operator touched their key. Which is what happened, every time.
-    //
-    // Making the three instants collapse onto `now` was refused earlier still,
-    // since a window demands `not_before < activation_at < not_after`
-    // strictly. Both refusals say the same thing: staging comes first, and the
-    // change-over follows it.
-    //
-    // The bound is short — a recovery lives five minutes — so the wait is
-    // measured in minutes and cannot drift.
-    //
-    // `not_before` is backdated by the clock-skew allowance leaves are issued
-    // with, and doubly deserved here: a machine left off long enough for its
-    // identity to expire is a machine whose clock has had time to wander.
-    let window = TransitionWindow::new(
-        now.saturating_sub(RECOVERY_WINDOW_BACKDATE_SECS),
-        stage_expires_at,
-        stage_expires_at
-            .checked_add(
-                overlap_days
-                    .checked_mul(DAY_SECS)
-                    .context("durée hors bornes")?,
-            )
-            .context("durée hors bornes")?,
-    )?;
+    println!("expirée depuis   : {} s", manifest.expired_since_secs);
+    println!("activation       : {}", manifest.activation_at);
+    println!("empreinte        : {}", manifest.request_fingerprint);
 
     eprintln!("Brancher la clé autorisée, puis appuyer sur Entrée.");
     wait_for_operator()?;
     let key = authenticator::connect(transport)?;
     let pin = pin_for(key.as_ref(), "PIN de la clé de sécurité : ")?;
 
-    let produced = authority::recover_expired_identity(
-        &vault,
-        key.as_ref(),
-        &pin,
-        &identity,
-        &registry,
-        &ca_tls_certificate,
-        &request,
-        &request.client_wg_public_key.to_base64(),
-        window,
-        validity,
-        Id16::new(random_id()?)?,
-        random_id()?,
-        &origin,
-        stage_expires_at,
-        now,
-    )?;
-    let authorization = produced.authorization;
-
-    let staged = client.deposit_recovery_authorization(
-        &operation,
-        &aether::certificates::transport::ExpiredRecoveryAuthorizationDeposit {
-            authorization: Box::new(authorization.clone()),
-            evidence: Box::new(produced.evidence),
-        },
-    )?;
-    println!("stade            : {:?}", staged.state);
-
-    let receipt = staged
-        .receipt
-        .ok_or_else(|| anyhow::anyhow!("l'autorité n'a pas rendu le reçu de la gateway"))?;
-    let gateway_leaf = staged.gateway_pq_certificate.ok_or_else(|| {
-        anyhow::anyhow!("l'autorité n'a pas rendu la feuille que la gateway sert")
+    verified.approve(key.as_ref(), &pin, &mut |state| {
+        println!("stade            : {state:?}");
     })?;
-    // The leaf is compared to the gateway this vault's own hand-off names,
-    // before anything is verified under it. Astra reads that leaf on the veth;
-    // this end must not adopt an identity because the relay reported it.
-    if gateway_leaf.wireguard_public_key != identity.gateway_wg_public_key.to_base64() {
-        bail!(
-            "la feuille que l'autorité annonce appartient à une autre gateway que celle que ce \
-             coffre épingle. Rien n'est signé."
-        );
-    }
-    let gateway_pq_public_key = MlDsa87PublicKey::parse(&gateway_leaf.ml_dsa_87_public_key)?;
-    let gateway_fingerprint =
-        aether::certificates::gateway::pq_certificate_fingerprint(&gateway_leaf)?;
-
-    // The vault opens a second time for the grant. Same key, same session:
-    // the operator is not asked to decide anything again, only to let the
-    // second signature happen.
-    let opening = gestures::open_with_authorized_key(key.as_ref(), &vault, &pin)?;
-    let grant = authority::grant_recovered_identity(
-        &vault,
-        &opening,
-        &authorization,
-        &receipt,
-        &gateway_pq_public_key,
-        &gateway_fingerprint,
-    )?;
-    let granted = client.deposit_recovery_grant(
-        &operation,
-        &aether::certificates::transport::ExpiredRecoveryGrantDeposit {
-            grant: Box::new(grant),
-        },
-    )?;
-    println!("stade            : {:?}", granted.state);
     println!(
         "le client peut installer sa nouvelle génération et committer ; la gateway relaiera son \
          commit par le canal privé"

@@ -41,8 +41,9 @@ use std::net::TcpStream;
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::operator_session::{
-    BeginCommand, GestureState, OperationKind, OperationLocator, OperatorCommand, OperatorHello,
-    OperatorStatus, Refusal, RemoteState, PROTOCOL_VERSION,
+    AstraManifest, BeginCommand, GestureState, KeyPurpose, OperationKind, OperationLocator,
+    OperatorAction, OperatorCommand, OperatorHello, OperatorStatus, Refusal, RemoteState,
+    PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
@@ -149,14 +150,150 @@ fn run() -> Result<()> {
     // for: a helper that discovered it had nowhere to show a dialog after
     // opening the vault would be holding `CA-PQ` with no way to finish.
     let window = owner::create()?;
-    let _owner = window.owner();
 
-    ceremony.refuse(Refusal::Internal);
-    session::write_status(&mut writer, &ceremony.status())?;
-    bail!(
-        "cette cérémonie n'est pas encore portée dans le helper ; elle reste dans l'adaptateur \
-         en ligne de commande"
-    )
+    match ceremony.operation {
+        OperationKind::RecoverIdentity => recover(&mut ceremony, &mut reader, &mut writer, &window),
+        // Named rather than swallowed: an operator whose tab offered a
+        // ceremony this build cannot run must be told that, and not left
+        // watching a status that never moves.
+        other => {
+            ceremony.refuse(Refusal::Internal);
+            session::write_status(&mut writer, &ceremony.status())?;
+            bail!("la cérémonie « {other:?} » n'est pas encore portée dans ce processus")
+        }
+    }
+}
+
+/// §7.5, driven from a screen instead of a terminal.
+///
+/// The shape is the protocol's: verify, show, wait for the operator, act. The
+/// waiting is a `Continue` naming the revision it answers, not a blocking read
+/// on a console this process does not have.
+fn recover<R: std::io::BufRead, W: std::io::Write>(
+    ceremony: &mut Ceremony,
+    reader: &mut R,
+    writer: &mut W,
+    window: &owner::OwnerWindow,
+) -> Result<()> {
+    let operation = ceremony
+        .operation_id
+        .context("une récupération est désignée par l'identifiant qu'Orion détient")?;
+    let vault_path = astra_operator::store::default_path()?;
+
+    let verified = match astra_operator::operations::recovery::begin(
+        &vault_path,
+        operation,
+        None,
+        None,
+        now_unix(),
+    ) {
+        Ok(verified) => verified,
+        Err(error) => {
+            ceremony.refuse(Refusal::HandoffMismatch);
+            session::write_status(writer, &ceremony.status())?;
+            return Err(error);
+        }
+    };
+
+    // Shown before a key is asked for anything, and it is this object that is
+    // signed — §12.2 is the reason the two are the same value rather than two
+    // descriptions of one intention.
+    ceremony.remote = RemoteState::AwaitingOperator;
+    ceremony.gesture = GestureState::AwaitingKey {
+        index: 1,
+        of: 1,
+        purpose: KeyPurpose::OpenVault,
+    };
+    ceremony.manifest = Some(AstraManifest::Recovery(verified.manifest().clone()));
+    let offered = ceremony.status();
+    session::write_status(writer, &offered)?;
+
+    match awaited_action(reader, &offered)? {
+        Some(OperatorAction::Continue) => {}
+        Some(OperatorAction::Cancel) | None => {
+            ceremony.cancel();
+            session::write_status(writer, &ceremony.status())?;
+            return Ok(());
+        }
+    }
+
+    ceremony.gesture = GestureState::ProcessingKey { index: 1, of: 1 };
+    session::write_status(writer, &ceremony.status())?;
+
+    let key = helios_fido::authenticator::connect_owned(
+        helios_fido::authenticator::Transport::default(),
+        window.owner(),
+    )?;
+    // The platform collects the PIN in its own dialog, so it never enters this
+    // process. A transport that needs one has no way to ask from here — there
+    // is no console — and saying so is better than an empty string that fails
+    // three steps later as «clé refusée».
+    if key.needs_pin() {
+        ceremony.refuse(Refusal::ProtocolViolation);
+        session::write_status(writer, &ceremony.status())?;
+        bail!(
+            "ce transport demande que le PIN soit saisi par le programme, et ce processus n'a \
+             aucune interface pour le demander"
+        );
+    }
+
+    ceremony.gesture = GestureState::Signing;
+    session::write_status(writer, &ceremony.status())?;
+
+    let mut reached = Vec::new();
+    let outcome = verified.approve(key.as_ref(), "", &mut |state| reached.push(state));
+    // Emitted after the fact rather than from inside the callback: the writer
+    // is borrowed by this frame, and a status lost to a closure's borrow would
+    // be a step the operator never saw.
+    for state in reached {
+        ceremony.remote = state;
+        session::write_status(writer, &ceremony.status())?;
+    }
+    match outcome {
+        Ok(()) => {
+            ceremony.gesture = GestureState::Done;
+            session::write_status(writer, &ceremony.status())?;
+            Ok(())
+        }
+        Err(error) => {
+            ceremony.refuse(Refusal::AuthorityRefused { status: 0 });
+            session::write_status(writer, &ceremony.status())?;
+            Err(error)
+        }
+    }
+}
+
+/// Waits for the operator's answer to one rendered status.
+///
+/// A command naming another revision is ignored rather than obeyed: it answers
+/// a screen this session has already left, and acting on it would apply a press
+/// to whatever replaced it.
+fn awaited_action<R: std::io::BufRead>(
+    reader: &mut R,
+    offered: &OperatorStatus,
+) -> Result<Option<OperatorAction>> {
+    loop {
+        let Some(command) = session::read_command(reader)? else {
+            return Ok(None);
+        };
+        let (action, revision) = match command {
+            OperatorCommand::Continue(step) => (OperatorAction::Continue, step.revision),
+            OperatorCommand::Cancel(step) => (OperatorAction::Cancel, step.revision),
+            OperatorCommand::Begin(_) => {
+                bail!("une session ne commence qu'une fois")
+            }
+        };
+        if offered.accepts(action, revision) {
+            return Ok(Some(action));
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// One ceremony, and the revision counter that orders what it says.
@@ -167,6 +304,7 @@ struct Ceremony {
     revision: u64,
     remote: RemoteState,
     gesture: GestureState,
+    manifest: Option<AstraManifest>,
     refusal: Option<Refusal>,
 }
 
@@ -179,6 +317,7 @@ impl Ceremony {
             revision: 0,
             remote: RemoteState::Local,
             gesture: GestureState::Verifying,
+            manifest: None,
             refusal: None,
         }
     }
@@ -198,6 +337,7 @@ impl Ceremony {
             self.gesture,
         );
         status.operation_id = self.operation_id;
+        status.manifest = self.manifest.clone();
         status.refusal = self.refusal;
         status
     }
@@ -205,6 +345,16 @@ impl Ceremony {
     fn refuse(&mut self, refusal: Refusal) {
         self.gesture = GestureState::Failed;
         self.refusal = Some(refusal);
+    }
+
+    /// Abandoned by the operator, before anything left this machine.
+    ///
+    /// A distinct state from a refusal: nothing failed, and an interface that
+    /// showed «échec» for a decision would be telling the operator their own
+    /// choice went wrong.
+    fn cancel(&mut self) {
+        self.gesture = GestureState::Cancelled;
+        self.refusal = Some(Refusal::Cancelled);
     }
 }
 
@@ -242,6 +392,69 @@ mod tests {
         assert_eq!(status.refusal, Some(Refusal::KeyDeclined));
         assert!(status.allowed.is_empty());
         assert!(!status.accepts(OperatorAction::Continue, status.revision));
+    }
+
+    /// A press answering a screen this session has already left must not be
+    /// applied to whatever replaced it.
+    #[test]
+    fn a_command_on_a_stale_revision_is_ignored_and_the_right_one_is_taken() {
+        let mut ceremony = Ceremony::new(Id16::new([1; 16]).expect("id"), locator());
+        ceremony.remote = RemoteState::AwaitingOperator;
+        ceremony.gesture = GestureState::AwaitingKey {
+            index: 1,
+            of: 1,
+            purpose: KeyPurpose::OpenVault,
+        };
+        let offered = ceremony.status();
+
+        let mut wire = Vec::new();
+        for command in [
+            OperatorCommand::Continue(aether::certificates::operator_session::StepCommand {
+                revision: offered.revision + 5,
+            }),
+            OperatorCommand::Continue(aether::certificates::operator_session::StepCommand {
+                revision: offered.revision,
+            }),
+        ] {
+            session::write_frame(
+                &mut wire,
+                &command,
+                aether::certificates::operator_session::limits::COMMAND_BYTES,
+            )
+            .expect("written");
+        }
+        let mut reader = std::io::BufReader::new(wire.as_slice());
+        assert_eq!(
+            awaited_action(&mut reader, &offered).expect("read"),
+            Some(OperatorAction::Continue)
+        );
+    }
+
+    /// A socket that closes while the operator is being waited on is an
+    /// abandonment, not a refusal: Orion's window was shut.
+    #[test]
+    fn a_closed_channel_while_waiting_is_an_abandonment() {
+        let mut ceremony = Ceremony::new(Id16::new([1; 16]).expect("id"), locator());
+        ceremony.gesture = GestureState::AwaitingKey {
+            index: 1,
+            of: 1,
+            purpose: KeyPurpose::OpenVault,
+        };
+        let offered = ceremony.status();
+        let mut reader = std::io::BufReader::new(&b""[..]);
+        assert_eq!(awaited_action(&mut reader, &offered).expect("closed"), None);
+    }
+
+    /// An abandonment is not a failure, and the interface must be able to tell
+    /// the operator's own choice from something that went wrong.
+    #[test]
+    fn a_cancellation_is_not_a_failure() {
+        let mut ceremony = Ceremony::new(Id16::new([1; 16]).expect("id"), locator());
+        ceremony.cancel();
+        let status = ceremony.status();
+        assert_eq!(status.gesture, GestureState::Cancelled);
+        assert_eq!(status.refusal, Some(Refusal::Cancelled));
+        assert!(status.allowed.is_empty());
     }
 
     /// The locator travels whole: an operation the authority opened is reached
