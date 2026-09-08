@@ -673,6 +673,17 @@ export interface RecoveryManifest {
 
 export type AffectedCa = 'ca_pq' | 'ca_tls'
 
+export type CampaignScope =
+  | 'orion_profile'
+  | 'orion_device'
+  | 'fleet_leafs'
+  | 'full_certificate_chain'
+  | 'trust_authorities'
+  | 'emergency_revocation'
+  | 'gateway_identity'
+  | 'issuer_delegation'
+  | 'gateway_bootstrap'
+
 export interface CampaignManifest {
   operation: 'campaign'
   campaign: {
@@ -683,16 +694,7 @@ export interface CampaignManifest {
     server_name: string
     created_at: number
     expires_at: number
-    scope:
-      | 'orion_profile'
-      | 'orion_device'
-      | 'fleet_leafs'
-      | 'full_certificate_chain'
-      | 'trust_authorities'
-      | 'emergency_revocation'
-      | 'gateway_identity'
-      | 'issuer_delegation'
-      | 'gateway_bootstrap'
+    scope: CampaignScope
     targets: Array<{
       certificate_kind:
         | 'gateway_tls'
@@ -792,7 +794,7 @@ export interface OperatorStatus {
  */
 export interface OperatorPendingOperation {
   operation_id: string
-  scope: unknown
+  scope: CampaignScope
   reason: string
   requested_by: string
   target_count: number

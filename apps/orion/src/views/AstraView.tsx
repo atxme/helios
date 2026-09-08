@@ -16,6 +16,7 @@ import type {
   AstraRotationInput,
   AstraRotationPhase,
   AstraRotationStatus,
+  CampaignScope,
   OperatorPendingOperation,
   OperatorStatus,
 } from '../types'
@@ -26,6 +27,12 @@ const EMPTY_INPUT: AstraRotationInput = {
   operation_id: '',
   output_path: '',
 }
+
+const HELPER_CAMPAIGN_SCOPES = new Set<CampaignScope>([
+  'orion_profile',
+  'orion_device',
+  'fleet_leafs',
+])
 
 type StepState = 'pending' | 'active' | 'done'
 
@@ -294,36 +301,47 @@ export function AstraView() {
           Le détail complet est montré avant qu’une clé soit demandée.
         </Typography>
         <Stack spacing={1.25}>
-          {pending.map((operation) => (
-            <Paper key={operation.operation_id} variant="outlined" sx={{ px: 1.75, py: 1.5 }}>
-              <Typography sx={{ fontSize: 12.5, fontWeight: 650 }}>{operation.reason}</Typography>
-              <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5 }}>
-                Demandée par {operation.requested_by} — {operation.target_count} pair
-                {operation.target_count > 1 ? 's' : ''}, {operation.required_credentials} clé
-                {operation.required_credentials > 1 ? 's' : ''} distincte
-                {operation.required_credentials > 1 ? 's' : ''}
-              </Typography>
-              <Typography
-                color="text.disabled"
-                sx={{ mt: 0.25, fontSize: 10.5, fontFamily: 'monospace' }}
-              >
-                {operation.operation_id}
-              </Typography>
-              <Typography color="text.disabled" sx={{ mt: 0.25, fontSize: 11 }}>
-                jusqu’au {new Date(operation.expires_at * 1000).toLocaleString()}
-              </Typography>
-              <Button
-                size="small"
-                variant="contained"
-                disabled={busy}
-                startIcon={<KeyRound size={14} aria-hidden />}
-                onClick={() => void openCampaign(operation.operation_id)}
-                sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
-              >
-                Ouvrir la cérémonie
-              </Button>
-            </Paper>
-          ))}
+          {pending.map((operation) => {
+            const supported = HELPER_CAMPAIGN_SCOPES.has(operation.scope)
+            return (
+              <Paper key={operation.operation_id} variant="outlined" sx={{ px: 1.75, py: 1.5 }}>
+                <Typography sx={{ fontSize: 12.5, fontWeight: 650 }}>
+                  {operation.reason}
+                </Typography>
+                <Typography color="text.secondary" sx={{ mt: 0.25, fontSize: 11.5 }}>
+                  Demandée par {operation.requested_by} — {operation.target_count} pair
+                  {operation.target_count > 1 ? 's' : ''}, {operation.required_credentials} clé
+                  {operation.required_credentials > 1 ? 's' : ''} distincte
+                  {operation.required_credentials > 1 ? 's' : ''}
+                </Typography>
+                <Typography
+                  color="text.disabled"
+                  sx={{ mt: 0.25, fontSize: 10.5, fontFamily: 'monospace' }}
+                >
+                  {operation.operation_id}
+                </Typography>
+                <Typography color="text.disabled" sx={{ mt: 0.25, fontSize: 11 }}>
+                  jusqu’au {new Date(operation.expires_at * 1000).toLocaleString()}
+                </Typography>
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={busy || !supported}
+                  startIcon={<KeyRound size={14} aria-hidden />}
+                  onClick={() => void openCampaign(operation.operation_id)}
+                  sx={{ mt: 1, minHeight: 30, fontSize: 11.5 }}
+                >
+                  Ouvrir la cérémonie
+                </Button>
+                {!supported && (
+                  <Alert severity="warning" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+                    Cette famille n’est pas encore portée dans Orion. Utiliser l’adaptateur
+                    astra-signer jusqu’à sa parité fonctionnelle et sa recette Windows.
+                  </Alert>
+                )}
+              </Paper>
+            )
+          })}
         </Stack>
         {error && (
           <Alert severity="error" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>

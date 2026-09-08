@@ -178,4 +178,29 @@ describe('AstraView', () => {
       await screen.findByText('Brancher la clé autorisée (2 sur 2), pour approuver la campagne affichée.'),
     ).toBeTruthy()
   })
+
+  it('shows but never launches a campaign the helper cannot execute', async () => {
+    api.operatorPendingOperations.mockResolvedValue([
+      {
+        operation_id: 'f'.repeat(32),
+        scope: 'trust_authorities',
+        reason: 'rotation des ancres',
+        requested_by: 'operator',
+        target_count: 2,
+        required_credentials: 2,
+        campaign_fingerprint: 'a'.repeat(64),
+        created_at: 1_800_000_000,
+        expires_at: 1_800_000_300,
+      },
+    ])
+
+    render(<AstraView />)
+
+    expect(await screen.findByText('rotation des ancres')).toBeTruthy()
+    const open = screen.getByRole('button', { name: 'Ouvrir la cérémonie' })
+    expect(open.hasAttribute('disabled')).toBe(true)
+    expect(screen.getByText(/n’est pas encore portée dans Orion/)).toBeTruthy()
+    fireEvent.click(open)
+    expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
+  })
 })
