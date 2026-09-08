@@ -21,8 +21,6 @@ hex = "0.4"
 aether.workspace = true
 # Effacement mémoire du secret descellé.
 zeroize = { version = "1", features = ["derive"] }
-# CSPRNG pour la génération du secret au provisionnement.
-getrandom = "0.2"
 # Empreinte d'identité de l'état PCR (liaison du billet).
 sha2 = "0.10"
 # AEAD (AES-256-GCM) du coffre : conteneur partagé HVLT (ADR-006 §2).

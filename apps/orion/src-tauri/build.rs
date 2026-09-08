@@ -27,6 +27,7 @@ fn main() {
     let npm = ensure_npm_available();
     ensure_npm_dependencies(&orion, &npm);
     ensure_windows_dependencies();
+    ensure_astra_helper();
 
     // Debug charge `devUrl` : Vite sert les sources, et
     // `ensure_frontend_dev_server` le démarre au besoin. Rien à construire, et
@@ -58,12 +59,59 @@ fn ensure_windows_dependencies() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+    xtask::orion_deps::prepare(&workspace_root())
+        .expect("unable to download and prepare Orion's Windows dependencies");
+}
+
+/// Stages the Astra operator sidecar the Windows bundle declares.
+///
+/// `tauri.windows.conf.json` lists `binaries/helios-astra-helper` as an
+/// `externalBin`, and `tauri_build` fails outright when the target-qualified
+/// file is absent. `cargo xtask orion-msi` and Tauri's `beforeBuildCommand`
+/// both stage it beforehand, but a plain `cargo build -p orion` — the gesture
+/// of every day — goes through neither, and would stop on a missing file that
+/// no source change can produce. So this build stages it too.
+///
+/// The helper is built in its own target directory: reusing the one this very
+/// build holds the lock on would make the nested Cargo wait for its parent,
+/// forever. `ORION_HELPER_READY` is what a caller that has already staged the
+/// helper sets to say so, and to keep it from being rebuilt in another profile.
+fn ensure_astra_helper() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-env-changed=ORION_HELPER_READY");
+    let workspace = workspace_root();
+    let helper = workspace.join("tools").join("helios-astra-helper");
+    println!(
+        "cargo:rerun-if-changed={}",
+        helper.join("Cargo.toml").display()
+    );
+    watch_tree(&helper.join("src"));
+
+    let target = std::env::var("TARGET").expect("Cargo announces the build target");
+    let staged = xtask::orion_helper::sidecar_path(&workspace, &target);
+    if std::env::var("ORION_HELPER_READY").as_deref() == Ok("1") && staged.is_file() {
+        return;
+    }
+
+    println!("cargo:warning=Astra operator sidecar missing or out of date — building it");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    xtask::orion_helper::prepare(
+        &workspace,
+        &target,
+        &workspace.join("target").join("orion-helper"),
+        release,
+    )
+    .expect("unable to build and stage Orion's Astra operator sidecar");
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
-        .expect("Orion workspace root not found");
-    xtask::orion_deps::prepare(workspace)
-        .expect("unable to download and prepare Orion's Windows dependencies");
+        .expect("Orion workspace root not found")
+        .to_path_buf()
 }
 
 fn frontend_root() -> PathBuf {

@@ -15,8 +15,6 @@ anyhow.workspace = true
 aws-lc-rs.workspace = true
 base64.workspace = true
 thiserror.workspace = true
-zeroize.workspace = true
-tracing.workspace = true
 # Pile CTAP2 sur HID, avec l'extension `hmac-secret`. Sans condition : un
 # binaire qui ne parle à aucune clé n'approuve rien, et il n'existe aucun
 # chemin qui approuve sans clé. Elle tire `hidapi`, donc `libudev` sous Linux

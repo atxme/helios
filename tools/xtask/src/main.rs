@@ -26,7 +26,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use xtask::orion_deps;
+use xtask::{orion_deps, orion_helper};
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -277,39 +277,15 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
 }
 
 /// Builds and stages the helper under Tauri's target-qualified sidecar name.
+///
+/// The installer ships the release helper, built in the workspace target
+/// directory: nothing holds its lock here, unlike inside Orion's build script.
 fn prepare_orion_helper(root: &Path) -> Result<()> {
     if !cfg!(windows) {
         bail!("the Orion helper sidecar is built only for a Windows installer");
     }
     let target = host_target()?;
-    run(
-        root,
-        "cargo",
-        &["build", "--release", "-p", "helios-astra-helper"],
-    )?;
-    let source = root
-        .join("target")
-        .join("release")
-        .join("helios-astra-helper.exe");
-    if !source.is_file() {
-        bail!("Orion helper was not produced at {}", source.display());
-    }
-    let directory = root
-        .join("apps")
-        .join("orion")
-        .join("src-tauri")
-        .join("binaries");
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("creating {}", directory.display()))?;
-    let destination = directory.join(format!("helios-astra-helper-{target}.exe"));
-    std::fs::copy(&source, &destination).with_context(|| {
-        format!(
-            "staging Orion helper from {} to {}",
-            source.display(),
-            destination.display()
-        )
-    })?;
-    Ok(())
+    orion_helper::prepare(root, &target, &root.join("target"), true)
 }
 
 /// Lists what was produced, with a fingerprint for each artifact.

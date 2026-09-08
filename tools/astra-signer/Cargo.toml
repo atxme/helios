@@ -17,24 +17,14 @@ astra-operator.workspace = true
 # `key-negotiation-signing` sans condition : les types signés traversent cette
 # interface, et sans la fonctionnalité ils n'existent pas.
 aether = { workspace = true, features = ["key-negotiation-signing"] }
-astra.workspace = true
 helios-fido = { workspace = true }
 anyhow.workspace = true
-aws-lc-rs.workspace = true
 base64.workspace = true
 clap.workspace = true
 hex.workspace = true
-rcgen.workspace = true
-# Le transport in-tunnel du §8.1.2. Bloquant : le compagnon est un programme
-# de terminal qui attend qu'un humain touche une clé, il n'a pas d'exécuteur
-# asynchrone et n'en veut pas un pour trois requêtes.
-reqwest = { workspace = true, features = ["blocking"] }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-# Les périodes de validité X.509 que `rcgen` attend.
-time.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

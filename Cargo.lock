@@ -238,13 +238,11 @@ dependencies = [
  "aether",
  "anyhow",
  "async-trait",
- "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "clap",
  "helios-api",
  "rcgen",
- "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
@@ -287,21 +285,15 @@ version = "0.2.0"
 dependencies = [
  "aether",
  "anyhow",
- "astra",
  "astra-operator",
- "aws-lc-rs",
  "base64 0.22.1",
  "clap",
  "helios-fido",
  "hex",
- "rcgen",
- "reqwest 0.12.28",
  "rpassword",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
- "time",
  "x509-parser 0.16.0",
  "zeroize",
 ]
@@ -2275,7 +2267,6 @@ version = "0.7.0"
 dependencies = [
  "aether",
  "aws-lc-rs",
- "getrandom 0.2.17",
  "helios-vault",
  "hex",
  "serde",
@@ -2344,7 +2335,6 @@ version = "0.11.0"
 dependencies = [
  "aether",
  "anyhow",
- "aws-lc-rs",
  "base64 0.22.1",
  "clap",
  "directories",
@@ -2377,9 +2367,7 @@ dependencies = [
  "base64 0.22.1",
  "ctap-hid-fido2",
  "thiserror 2.0.18",
- "tracing",
  "windows-sys 0.59.0",
- "zeroize",
 ]
 
 [[package]]
@@ -2409,7 +2397,6 @@ name = "helios-key-negotiation"
 version = "2.0.0"
 dependencies = [
  "aether",
- "anyhow",
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",
@@ -2430,7 +2417,6 @@ name = "helios-provisioning"
 version = "0.3.0"
 dependencies = [
  "aether",
- "aws-lc-rs",
  "base64 0.22.1",
  "blake3",
  "serde",
@@ -2466,7 +2452,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -2483,7 +2468,6 @@ dependencies = [
 name = "helios-wireguard"
 version = "0.3.0"
 dependencies = [
- "aether",
  "async-trait",
  "base64 0.22.1",
  "defguard_wireguard_rs",
@@ -7306,12 +7290,10 @@ dependencies = [
 name = "xtask"
 version = "0.4.0"
 dependencies = [
- "aether",
  "anyhow",
  "clap",
  "helios-update",
  "reqwest 0.12.28",
- "serde_json",
  "zip",
 ]
 
