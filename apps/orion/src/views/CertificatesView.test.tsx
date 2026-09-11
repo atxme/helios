@@ -228,8 +228,12 @@ describe('CertificatesView', () => {
     expect(api.certificateOverview).toHaveBeenCalledTimes(2)
   })
 
-  /** The shell launches from its session; the WebView supplies only a name. */
-  it('launches the companion and keeps the exact fallback command visible', async () => {
+  /** The shell launches from its session; the WebView supplies only a name.
+   *
+   * The command is no longer on screen by default — on the machine that holds
+   * the key, Orion launches the companion itself — but it stays whole, one
+   * press away, for the operator whose key is elsewhere. */
+  it('launches the companion and keeps the exact fallback command one press away', async () => {
     api.certificateOverview.mockResolvedValue([entry({ actions: [renewNow()] })])
     api.runCertificateAction.mockResolvedValue(outcome(awaiting()))
     render(<CertificatesView />)
@@ -238,6 +242,8 @@ describe('CertificatesView', () => {
 
     await waitFor(() => expect(screen.getByText('f'.repeat(32))).toBeTruthy())
     await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledWith('portable'))
+    expect(screen.queryByText(awaiting().companion_command)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'La clé est sur un autre poste ?' }))
     expect(screen.getByText(awaiting().companion_command)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Copier compagnon' })).toBeTruthy()
     expect(await screen.findByText(/Compagnon lancé/)).toBeTruthy()
@@ -255,8 +261,9 @@ describe('CertificatesView', () => {
     render(<CertificatesView />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Renouveler maintenant' }))
+    expect(await screen.findByText(/fichier introuvable/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'La clé est sur un autre poste ?' }))
     await waitFor(() => expect(screen.getByText(command)).toBeTruthy())
-    expect(screen.getByText(/fichier introuvable/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Copier compagnon' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Relancer le compagnon' }))
     await waitFor(() => expect(api.launchCertificateCompanion).toHaveBeenCalledTimes(2))

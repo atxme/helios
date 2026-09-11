@@ -306,6 +306,10 @@ function RenewalStep({
   const [ceremony, setCeremony] = useState<null | 'reading' | 'signing'>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
   const [approving, setApproving] = useState(false)
+  // The command line is a fallback, not the offer. An operator whose key is
+  // on this machine must never have to read one; the one whose key is
+  // elsewhere still needs it whole, so it is folded rather than removed.
+  const [manualPath, setManualPath] = useState(false)
 
   const readManifest = async () => {
     setCeremony('reading')
@@ -398,22 +402,54 @@ function RenewalStep({
               }
               onClick={() => {
                 setApproving(true)
-                void onApprove(step.operation_id).finally(() => setApproving(false))
+                setRefusal(null)
+                // A ceremony that never opens is the failure this screen is
+                // most likely to meet — no local channel, no helper beside
+                // Orion, a handshake that times out. Swallowing it left a
+                // spinner, then nothing: the operator had no way to tell a
+                // refusal from a button that does not work.
+                void onApprove(step.operation_id)
+                  .catch((cause) => setRefusal(String(cause)))
+                  .finally(() => setApproving(false))
               }}
               sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
             >
               Approuver ici avec la clé
             </Button>
           )}
+          {refusal && (
+            <Alert
+              severity="error"
+              variant="outlined"
+              sx={{ mt: 0.75, fontSize: 11.5 }}
+              onClose={() => setRefusal(null)}
+            >
+              {refusal}
+            </Alert>
+          )}
           {/* The way out when the key is on another machine. Kept whole —
               command included — because §8.5 still requires a portable
               companion, and an operator on another workstation has no other
-              channel than this line. */}
-          <Typography color="text.disabled" sx={{ mt: 1, fontSize: 11, lineHeight: 1.5 }}>
-            Si la clé est sur un autre poste, l’approbation s’y fait par cette commande, puis
-            on relance « Récupérer le certificat expiré » ici.
-          </Typography>
-          <Row label="commande" value={step.operator_command} copyable />
+              channel than this line. Folded, because on the machine that holds
+              the key the button above is the whole of the gesture. */}
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            onClick={() => setManualPath(!manualPath)}
+            sx={{ mt: 0.75, minHeight: 26, fontSize: 11, textTransform: 'none' }}
+          >
+            {manualPath ? 'Masquer le chemin manuel' : 'La clé est sur un autre poste ?'}
+          </Button>
+          {manualPath && (
+            <>
+              <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+                Sur le poste qui porte la clé, l’approbation s’y fait par cette commande, puis
+                on relance « Récupérer le certificat expiré » ici.
+              </Typography>
+              <Row label="commande" value={step.operator_command} copyable />
+            </>
+          )}
         </>
       )}
       {step?.step === 'awaiting_operator' && (
@@ -515,13 +551,6 @@ function RenewalStep({
             </Alert>
           )}
 
-          {/* The way in when the key is not on this machine. Kept whole —
-              command included — because a failed launch must still leave the
-              operation recoverable by hand. */}
-          <Typography color="text.disabled" sx={{ mt: 1, fontSize: 11, lineHeight: 1.5 }}>
-            Si la clé est sur un autre poste, l’approbation s’y fait par le compagnon.
-          </Typography>
-          <Row label="compagnon" value={step.companion_command} copyable />
           <Button
             size="small"
             variant="outlined"
@@ -548,6 +577,27 @@ function RenewalStep({
             <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
               Lancement du compagnon impossible : {launch.reason}
             </Alert>
+          )}
+          {/* The way in when the key is not on this machine. Kept whole —
+              command included — because a failed launch must still leave the
+              operation recoverable by hand. Folded below the button, because
+              here the companion is launched from Orion. */}
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            onClick={() => setManualPath(!manualPath)}
+            sx={{ mt: 0.75, minHeight: 26, fontSize: 11, textTransform: 'none' }}
+          >
+            {manualPath ? 'Masquer le chemin manuel' : 'La clé est sur un autre poste ?'}
+          </Button>
+          {manualPath && (
+            <>
+              <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+                Sur le poste qui porte la clé, l’approbation s’y fait par le compagnon.
+              </Typography>
+              <Row label="compagnon" value={step.companion_command} copyable />
+            </>
           )}
         </>
       )}
