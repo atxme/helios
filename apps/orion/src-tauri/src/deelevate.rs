@@ -63,7 +63,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+    AllowSetForegroundWindow, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+    SetForegroundWindow,
 };
 
 /// A handle closed on drop — a token, or the shell process it came from.
@@ -96,7 +97,7 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
         "ouverture du terminal",
         &[],
         CREATE_NEW_CONSOLE,
-        false,
+        None,
     )?;
     tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
     Ok(())
@@ -115,7 +116,7 @@ pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
         "lancement du compagnon",
         &[],
         CREATE_NEW_CONSOLE,
-        false,
+        None,
     )
 }
 
@@ -140,6 +141,7 @@ pub fn spawn_astra_helper(
     program: &Path,
     arguments: &[String],
     environment: &[(String, String)],
+    owner: isize,
 ) -> Result<(), String> {
     let program_text = program.to_string_lossy();
     let command = windows_command_line(&program_text, arguments);
@@ -149,7 +151,7 @@ pub fn spawn_astra_helper(
         "lancement du processus opérateur",
         environment,
         CREATE_NO_WINDOW,
-        true,
+        Some(owner),
     )
 }
 
@@ -266,7 +268,10 @@ fn spawn_with_standard_token(
     action: &str,
     environment: &[(String, String)],
     creation_flags: u32,
-    allow_foreground: bool,
+    // The window to re-assert the foreground on before ceding it, when the
+    // child is the one that must show a dialog. `None` for the companion,
+    // which opens its own console.
+    allow_foreground: Option<isize>,
 ) -> Result<(), String> {
     let token = standard_user_token()?;
     if is_elevated(&token)? {
@@ -331,20 +336,19 @@ fn spawn_with_standard_token(
             std::io::Error::last_os_error()
         ));
     }
-    if allow_foreground && unsafe { AllowSetForegroundWindow(process.dwProcessId) } == 0 {
-        let foreground_error = std::io::Error::last_os_error();
-        // The helper has not authenticated or touched a key yet. Leaving it
-        // alive after refusing foreground permission would create exactly the
-        // invisible WebAuthn prompt the owner window is meant to prevent.
-        unsafe { TerminateProcess(process.hProcess, 1) };
-        unsafe {
-            CloseHandle(process.hProcess);
-            CloseHandle(process.hThread);
+    if let Some(owner) = allow_foreground {
+        if let Err(refusal) = cede_foreground(owner, process.dwProcessId) {
+            // The helper has not authenticated or touched a key yet. Leaving
+            // it alive after refusing foreground permission would create
+            // exactly the invisible WebAuthn prompt the owner window is meant
+            // to prevent.
+            unsafe { TerminateProcess(process.hProcess, 1) };
+            unsafe {
+                CloseHandle(process.hProcess);
+                CloseHandle(process.hThread);
+            }
+            return Err(format!("{action} annulé : {refusal}"));
         }
-        return Err(format!(
-            "{action} annulé : impossible d'autoriser sa boîte WebAuthn au premier plan ({})",
-            foreground_error
-        ));
     }
     // SAFETY: both handles were returned by the successful call above.
     unsafe {
@@ -353,6 +357,57 @@ fn spawn_with_standard_token(
     }
     tracing::info!(%action, "processus ouvert sous le compte standard");
     Ok(())
+}
+
+/// Hands the child the right to raise its WebAuthn dialog.
+///
+/// # Why the right has to be taken back before it is given
+///
+/// `AllowSetForegroundWindow` gives away a right the caller must itself hold.
+/// Orion's press lands in a WebView, and Windows grants that right to the
+/// process that received the last input event — `msedgewebview2.exe`, which is
+/// not the process that owns the window drawn around it. `orion.exe` therefore
+/// calls with nothing to give, and Windows answers `ERROR_INVALID_PARAMETER`:
+/// a message that reads as a bad argument and means a missing privilege.
+///
+/// Re-asserting the foreground on Orion's own window is legitimate here and
+/// only here. This runs while answering a press **in that window**, which is
+/// the condition `SetForegroundWindow` documents; it takes focus from nobody,
+/// since the window asked for is the one already in front.
+///
+/// A refusal names what was seen. The same sentence otherwise covers three
+/// different situations — no window handed down, a foreground window belonging
+/// to another application, and a genuine refusal by Windows — and the operator
+/// has no way to tell them apart from the ceremony that did not open.
+fn cede_foreground(owner: isize, child: u32) -> Result<(), String> {
+    if owner != 0 {
+        // SAFETY: `owner` is the window handle Tauri reported for Orion's own
+        // window; the call only reads it.
+        unsafe { SetForegroundWindow(owner as *mut core::ffi::c_void) };
+    }
+    // SAFETY: no pointer argument. `child` is the process just created.
+    if unsafe { AllowSetForegroundWindow(child) } != 0 {
+        return Ok(());
+    }
+    let refusal = std::io::Error::last_os_error();
+    // SAFETY: returns this session's foreground window, or null.
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut foreground_pid = 0u32;
+    if !foreground.is_null() {
+        // SAFETY: `foreground` is a valid window handle; writes one u32.
+        unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
+    }
+    let missing_owner = if owner == 0 {
+        " ; aucune fenêtre propriétaire n'a été transmise"
+    } else {
+        ""
+    };
+    Err(format!(
+        "impossible d'autoriser sa boîte WebAuthn au premier plan ({refusal}). \
+         Premier plan tenu par le processus {foreground_pid}, Orion est le processus {}{}",
+        std::process::id(),
+        missing_owner
+    ))
 }
 
 /// The interactive user's token, borrowed from the desktop shell.

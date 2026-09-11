@@ -2935,9 +2935,28 @@ async fn astra_ca_tls_rotation_status(
 #[tauri::command]
 async fn begin_operator_ceremony(
     state: State<'_, AppState>,
+    window: tauri::Window,
     locator: aether::certificates::operator_session::OperationLocator,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
-    state.operator.begin(locator).await
+    state.operator.begin(locator, owner_window(&window)).await
+}
+
+/// The handle of the window the press came from, or `0` where there is none.
+///
+/// Handed to the launch so that Orion can re-assert its own foreground right
+/// before ceding it to the helper: the click was delivered to the WebView's
+/// renderer process, and Windows grants that right to whoever received the
+/// last input — not to the process that owns the window around it.
+fn owner_window(window: &tauri::Window) -> isize {
+    #[cfg(target_os = "windows")]
+    {
+        window.hwnd().map(|handle| handle.0 as isize).unwrap_or(0)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        0
+    }
 }
 
 /// Takes the next step, or abandons, against the status the operator saw.

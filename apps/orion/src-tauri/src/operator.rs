@@ -91,7 +91,11 @@ impl OperatorCeremony {
     }
 
     /// Launches the helper and returns the first state it publishes.
-    pub async fn begin(&self, locator: OperationLocator) -> Result<OperatorStatus, String> {
+    pub async fn begin(
+        &self,
+        locator: OperationLocator,
+        owner: isize,
+    ) -> Result<OperatorStatus, String> {
         let mut held = self.0.lock().await;
         if let Some(session) = held.as_mut() {
             let current = session.status.borrow_and_update().clone();
@@ -127,6 +131,7 @@ impl OperatorCeremony {
                 (SESSION_VARIABLE.to_string(), session_id.to_hex()),
                 (TOKEN_VARIABLE.to_string(), token.to_string()),
             ],
+            owner,
         )?;
 
         let (reader, mut commands) = tokio::time::timeout(

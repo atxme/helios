@@ -70,15 +70,23 @@ pub fn launch(invocation: &CompanionInvocation) -> Result<(), String> {
 /// `arguments` carries the address to connect back to — public, and useful in
 /// a log. `environment` carries the session token, keeping it out of ordinary
 /// process-list command lines.
-pub fn launch_helper(arguments: &[String], environment: &[(String, String)]) -> Result<(), String> {
+pub fn launch_helper(
+    arguments: &[String],
+    environment: &[(String, String)],
+    owner: isize,
+) -> Result<(), String> {
     let program = helper_program()?;
     #[cfg(target_os = "windows")]
     {
-        crate::deelevate::spawn_astra_helper(&program, arguments, environment)
+        crate::deelevate::spawn_astra_helper(&program, arguments, environment, owner)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        // No foreground to cede: the platform dialog this owner exists for is
+        // Windows'. The parameter stays in the signature so both builds carry
+        // the same contract.
+        let _ = owner;
         let mut child = tokio::process::Command::new(&program)
             .args(arguments)
             .envs(environment.iter().map(|(k, v)| (k.as_str(), v.as_str())))
