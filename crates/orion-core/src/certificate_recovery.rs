@@ -105,7 +105,11 @@ pub enum RecoveryStep {
     /// The operator answered and the gateway staged the candidate.
     Issuing { operation_id: Id16 },
     /// Installed locally and committed at the gateway.
-    Recovered { generation: u64 },
+    ///
+    /// The successor is deliberately not served before this instant. Carrying
+    /// it here keeps a successful recovery from looking like an immediately
+    /// usable identity while the signed staging window is still closed.
+    Recovered { generation: u64, activation_at: u64 },
 }
 
 /// One recovery, from the signed request to the relayed commit.
@@ -477,6 +481,7 @@ async fn install(
     store.commit_staged_candidate(&receipt.stage_id, &commit.fingerprint(), now_unix)?;
     Ok(RecoveryStep::Recovered {
         generation: grant.next_generation,
+        activation_at: grant.window.activation_at,
     })
 }
 

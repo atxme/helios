@@ -145,7 +145,7 @@ export type RenewalProgress =
   | { step: 'issuing'; operation_id: string }
   | { step: 'committed'; generation: number }
   | { step: 'recovery_awaiting_operator'; operation_id: string; operator_command: string }
-  | { step: 'recovered'; generation: number }
+  | { step: 'recovered'; generation: number; activation_at: number }
   | { step: 'rolled_back'; generation: number; available_until: number }
 
 /**

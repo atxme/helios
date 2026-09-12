@@ -319,6 +319,23 @@ describe('CertificatesView', () => {
     expect(screen.queryByText(/astra-signer/)).toBeNull()
   })
 
+  it('shows the recovery committed while the Astra view was open', async () => {
+    api.certificateOverview.mockResolvedValue([entry()])
+    const activationAt = 1_789_198_911
+
+    render(
+      <CertificatesView
+        completedRecovery={{
+          portable: { step: 'recovered', generation: 5, activation_at: activationAt },
+        }}
+      />,
+    )
+
+    expect(await screen.findByText('génération suivante')).toBeTruthy()
+    expect(screen.getByText('5')).toBeTruthy()
+    expect(screen.getByText(/Identité récupérée et commitée/)).toBeTruthy()
+  })
+
   /**
    * A refused press drops the step it followed. Leaving it on screen beside
    * the new error would show one renewal as progressing and refused at once.

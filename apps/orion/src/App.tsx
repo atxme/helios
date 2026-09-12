@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Badge from '@mui/material/Badge'
 import Box from '@mui/material/Box'
@@ -8,7 +8,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import { ChevronDown, Gauge, Radio, Settings2, ShieldCheck, Terminal, X } from 'lucide-react'
 import * as api from './api'
-import type { VaultPosture } from './types'
+import type { RenewalProgress, VaultPosture } from './types'
 import { useClient } from './hooks/useClient'
 import { CertificatesView } from './views/CertificatesView'
 import { AstraMark } from './components/AstraMark'
@@ -65,6 +65,13 @@ export default function App() {
   // also owns certificate-authority operations an operator may start there;
   // this state drives only the attention badge.
   const [astraPending, setAstraPending] = useState(false)
+  // The Certificates view is unmounted during the Astra ceremony. Keep the
+  // committed result here so returning to it does not erase the operation the
+  // user just completed.
+  const [completedRecovery, setCompletedRecovery] = useState<Record<
+    string,
+    RenewalProgress
+  > | null>(null)
 
   // What makes the tab live: a protocol-2 ceremony the helper is running, or
   // the legacy CA-TLS rotation still in flight. Polled rather than pushed
@@ -110,6 +117,17 @@ export default function App() {
     setAstraPending(true)
     setView('astra')
   }
+
+  const finishRecovery = useCallback(async (operationId: string) => {
+    const outcome = await api.resumeCertificateRecovery(operationId)
+    // The committed result shown below is the acknowledgement. Clear the
+    // terminal helper session so reopening Astra cannot try to finish the
+    // same, already-consumed recovery again.
+    await api.dismissOperatorCeremony().catch(() => undefined)
+    setCompletedRecovery(outcome.progress)
+    setAstraPending(false)
+    setView('certificates')
+  }, [])
   const [navOpen, setNavOpen] = useState(false)
   const [postureAnchor, setPostureAnchor] = useState<HTMLElement | null>(null)
   // Read on every opening rather than once at startup: BitLocker can be
@@ -409,13 +427,16 @@ export default function App() {
 
           {view === 'certificates' && (
             <Box role="region" aria-label="Certificats" sx={{ height: '100%' }}>
-              <CertificatesView onApprove={approveRecovery} />
+              <CertificatesView
+                onApprove={approveRecovery}
+                completedRecovery={completedRecovery}
+              />
             </Box>
           )}
 
           {view === 'astra' && (
             <Box role="region" aria-label="Astra" sx={{ height: '100%' }}>
-              <AstraView />
+              <AstraView onRecoveryReady={finishRecovery} />
             </Box>
           )}
 

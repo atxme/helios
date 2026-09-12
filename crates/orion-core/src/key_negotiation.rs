@@ -39,6 +39,15 @@ pub struct ClientIdentity {
 /// DPAPI or an equivalent protected platform store.
 #[async_trait]
 pub trait IdentityProvider: Send + Sync {
+    /// Applies any due local service selection before the identity is read.
+    ///
+    /// Test and external providers need no lifecycle store and keep the
+    /// no-op default. The protected Orion store overrides it so an expired
+    /// recovery can cross its activation boundary before a tunnel exists.
+    async fn prepare_for_profile(&self, _profile: &ClientProfile) -> Result<()> {
+        Ok(())
+    }
+
     async fn load(&self, identity: &str) -> Result<ClientIdentity>;
 }
 
@@ -49,6 +58,19 @@ pub trait IdentityProvider: Send + Sync {
 /// guarantees the bytes came back exactly as they were sealed.
 #[async_trait]
 impl IdentityProvider for crate::identity_store::ProtectedIdentityStore {
+    async fn prepare_for_profile(&self, profile: &ClientProfile) -> Result<()> {
+        let Some(settings) = profile.key_negotiation.as_ref() else {
+            return Ok(());
+        };
+        crate::certificate_renewal::prepare_identity_for_connection(
+            settings,
+            self,
+            unix_time_now()?,
+        )
+        .context("promoting a due key-negotiation identity before connecting")?;
+        Ok(())
+    }
+
     async fn load(&self, identity: &str) -> Result<ClientIdentity> {
         let bundle = self.load(identity)?;
         let decoder = base64::engine::general_purpose::STANDARD;
@@ -435,6 +457,7 @@ pub async fn prepare_for_profile(
         floor = ?settings.minimum_mode,
         "key negotiation: loading the protected identity"
     );
+    identities.prepare_for_profile(profile).await?;
     let identity = identities.load(&settings.identity).await.with_context(|| {
         format!(
             "loading key-negotiation identity {} from the machine's protected store",

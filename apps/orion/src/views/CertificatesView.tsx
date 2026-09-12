@@ -61,9 +61,12 @@ type CompanionLaunch =
  */
 export function CertificatesView({
   onApprove,
+  completedRecovery,
 }: {
   /** Starts a §7.5 ceremony in the Astra tab, when the key is on this machine. */
   onApprove?: (operationId: string) => Promise<void>
+  /** Result committed while this view was unmounted in the Astra tab. */
+  completedRecovery?: Record<string, RenewalProgress> | null
 } = {}) {
   const [profiles, setProfiles] = useState<ProfileCertificates[] | null>(null)
   const [failed, setFailed] = useState(false)
@@ -95,6 +98,20 @@ export function CertificatesView({
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  useEffect(() => {
+    if (!completedRecovery) return
+    setProgress((current) => ({ ...current, ...completedRecovery }))
+    const activation = Math.min(
+      ...Object.values(completedRecovery)
+        .filter((step) => step.step === 'recovered')
+        .map((step) => step.activation_at),
+    )
+    if (!Number.isFinite(activation)) return
+    const delay = Math.max(0, activation * 1000 - Date.now() + 250)
+    const timer = window.setTimeout(() => void refresh(), Math.min(delay, 2_147_483_647))
+    return () => window.clearTimeout(timer)
+  }, [completedRecovery, refresh])
 
   const launchCompanion = async (name: string) => {
     setCompanion((current) => ({ ...current, [name]: { state: 'launching' } }))
@@ -355,7 +372,10 @@ function RenewalStep({
         <>
           <Row label="génération suivante" value={String(step.generation)} />
           <Typography color="text.disabled" sx={{ mt: 0.5, fontSize: 11, lineHeight: 1.5 }}>
-            Identité récupérée : ce poste signe à nouveau.
+            Identité récupérée et commitée. Elle sera utilisée à partir du{' '}
+            {new Date(step.activation_at * 1000).toLocaleString('fr-FR', {
+              timeZone: 'Europe/Paris',
+            })}.
           </Typography>
         </>
       )}

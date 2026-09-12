@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -102,7 +102,12 @@ function CeremonyStep({
 }
 
 /** Operator surface for the two distinct credentials required by ADR-008 §7.6. */
-export function AstraView() {
+export function AstraView({
+  onRecoveryReady,
+}: {
+  /** Resumes the client-owned half once Astra has released the recovery grant. */
+  onRecoveryReady?: (operationId: string) => Promise<void>
+} = {}) {
   const [input, setInput] = useState<AstraRotationInput>(EMPTY_INPUT)
   const [status, setStatus] = useState<AstraRotationStatus | null>(null)
   const [busy, setBusy] = useState(false)
@@ -112,6 +117,21 @@ export function AstraView() {
   // read on mount rather than only created here.
   const [ceremony, setCeremony] = useState<OperatorStatus | null>(null)
   const [pending, setPending] = useState<OperatorPendingOperation[]>([])
+  const [finishingRecovery, setFinishingRecovery] = useState(false)
+  const recoveryAttempt = useRef<string | null>(null)
+
+  const finishRecovery = useCallback(
+    (operationId: string, attempt: string, force = false) => {
+      if (!onRecoveryReady || (!force && recoveryAttempt.current === attempt)) return
+      recoveryAttempt.current = attempt
+      setFinishingRecovery(true)
+      setError(null)
+      void onRecoveryReady(operationId)
+        .catch((cause) => setError(String(cause)))
+        .finally(() => setFinishingRecovery(false))
+    },
+    [onRecoveryReady],
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -152,6 +172,24 @@ export function AstraView() {
     }, 350)
     return () => window.clearTimeout(timer)
   }, [ceremony])
+
+  // The helper owns the operator half only. Once it has released the grant,
+  // Orion must immediately resume the client session it kept in Rust: that
+  // installs the candidate and relays the signed commit to the gateway. The
+  // old screen lost this hand-off when switching tabs and forced a second
+  // press on « Récupérer ».
+  useEffect(() => {
+    if (
+      !onRecoveryReady ||
+      ceremony?.operation !== 'recover_identity' ||
+      ceremony.gesture !== 'done' ||
+      !ceremony.operation_id
+    ) {
+      return
+    }
+    const attempt = `${ceremony.session_id}:${ceremony.operation_id}`
+    finishRecovery(ceremony.operation_id, attempt)
+  }, [ceremony, finishRecovery, onRecoveryReady])
 
   const dismissCeremony = async () => {
     setBusy(true)
@@ -281,6 +319,38 @@ export function AstraView() {
           onStatus={setCeremony}
           onDismiss={() => void dismissCeremony()}
         />
+        {finishingRecovery && (
+          <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
+            Grant reçu : installation et commit de la nouvelle identité…
+          </Alert>
+        )}
+        {error && (
+          <>
+            <Alert severity="error" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
+              La cérémonie Astra a abouti, mais Orion n’a pas pu terminer la récupération :{' '}
+              {error}
+            </Alert>
+            {ceremony.operation === 'recover_identity' &&
+              ceremony.gesture === 'done' &&
+              ceremony.operation_id && (
+                <Button
+                  size="small"
+                  variant="outlined"
+                  disabled={finishingRecovery}
+                  onClick={() =>
+                    finishRecovery(
+                      ceremony.operation_id as string,
+                      `${ceremony.session_id}:${ceremony.operation_id}`,
+                      true,
+                    )
+                  }
+                  sx={{ mt: 0.75, minHeight: 30, fontSize: 11.5 }}
+                >
+                  Réessayer la finalisation
+                </Button>
+              )}
+          </>
+        )}
       </Box>
     )
   }

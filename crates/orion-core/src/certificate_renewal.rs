@@ -118,6 +118,15 @@ pub enum RenewalError {
         /// Rendered as a date: this string reaches the operator's screen.
         activation_at: String,
     },
+    #[error(
+        "la génération récupérée {generation} est commitée mais ne sera admise qu'à partir du \
+         {activation_at}; réessayer la connexion après cette heure"
+    )]
+    ActivationPending {
+        generation: u64,
+        /// Rendered as a date: this string reaches the operator's screen.
+        activation_at: String,
+    },
     #[error("the gateway did not answer the renewal route: {0}")]
     Transport(String),
     #[error(
@@ -583,6 +592,78 @@ pub fn promote_due(
         .retire_previous(identity, now_unix)
         .map_err(|error| RenewalError::Identity(error.to_string()))?;
     Ok(installed || refreshed || retired)
+}
+
+/// Catches the protected service identity up before pre-WireGuard negotiation.
+///
+/// Trust updates and renewals already call [`promote_due`], but both normally
+/// run through the tunnel. An expired recovery has no tunnel yet: if its
+/// committed candidate becomes active while Orion is disconnected, waiting
+/// for an in-tunnel call to promote the sealed identity is a cycle that can
+/// never complete. The connection path calls this before loading its TLS/PQ
+/// pair, so the first negotiation at or after `activation_at` presents the
+/// generation the gateway now admits.
+pub fn promote_local_identity_if_due(
+    settings: &KeyNegotiationSettings,
+    identities: &ProtectedIdentityStore,
+    now_unix: u64,
+) -> Result<bool, RenewalError> {
+    if settings.trust.is_none() {
+        return Ok(false);
+    }
+    let identity = settings.identity.trim();
+    if identity.is_empty() {
+        return Err(RenewalError::Identity(
+            "ce profil ne nomme aucune identité protégée".into(),
+        ));
+    }
+    let bundle = identities
+        .load(identity)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let mut store = open_identity_store(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        settings,
+        &bundle,
+    )?;
+    promote_due(&mut store, identities, identity, now_unix)
+}
+
+/// Promotes what is due and refuses an expired outgoing identity while the
+/// recovered successor is still waiting for its signed activation instant.
+pub(crate) fn prepare_identity_for_connection(
+    settings: &KeyNegotiationSettings,
+    identities: &ProtectedIdentityStore,
+    now_unix: u64,
+) -> Result<bool, RenewalError> {
+    let promoted = promote_local_identity_if_due(settings, identities, now_unix)?;
+    if settings.trust.is_none() {
+        return Ok(promoted);
+    }
+
+    let identity = settings.identity.trim();
+    let bundle = identities
+        .load(identity)
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let config = crate::config::ClientConfig::path()
+        .map_err(|error| RenewalError::Identity(error.to_string()))?;
+    let store = open_identity_store(
+        config.parent().unwrap_or_else(|| Path::new(".")),
+        settings,
+        &bundle,
+    )?;
+    if now_unix >= store.state().certificates.active.not_after {
+        if let Some((generation, activation_at)) =
+            committed_and_waiting(&store.state().certificates, now_unix)
+        {
+            return Err(RenewalError::ActivationPending {
+                generation,
+                activation_at: horodatage(activation_at),
+            });
+        }
+    }
+    Ok(promoted)
 }
 
 /// Result of selecting the outgoing identity for service.
@@ -1629,6 +1710,15 @@ mod tests {
         // Once the instant passes, `promote_due` takes it and asking again is
         // legitimate. The guard must not outlive the wait it describes.
         assert_eq!(committed_and_waiting(&certificates, 2_000), None);
+
+        certificates.active.not_after = 900;
+        let (generation, activation_at) =
+            committed_and_waiting(&certificates, 1_000).expect("recovery still waits");
+        let refusal = RenewalError::ActivationPending {
+            generation,
+            activation_at: horodatage(activation_at),
+        };
+        assert!(refusal.to_string().contains("réessayer la connexion"));
     }
     use aether::certificates::authority::RotationReason;
     use aether::certificates::client::{GatewayCertificateStageReceipt, IssuerKind};

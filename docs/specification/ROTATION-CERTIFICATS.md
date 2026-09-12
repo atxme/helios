@@ -3383,10 +3383,21 @@ contournés :
   ferait dépendre le résultat de l'ordre d'une liste.
   `RecoverExpired` **agit** aussi désormais : elle ouvre la récupération du
   §7.5, rend l'identifiant que l'utilisateur lit à voix haute à qui détient une
-  clé de sécurité — il n'existe plus aucun autre canal — puis reprend au clic
-  suivant jusqu'au commit relayé. Elle n'est proposée que si une feuille
+  clé de sécurité — il n'existe plus aucun autre canal — puis, lorsque la
+  cérémonie intégrée libère le grant, Orion reprend automatiquement la session
+  cliente conservée en mémoire jusqu'au commit relayé. Le résultat revient
+  dans *Certificats* avec l'heure d'activation ; aucun second clic de
+  récupération n'est requis. Elle n'est proposée que si une feuille
   **cliente** est expirée : un certificat gateway périmé est le côté opérateur
   du domaine, qu'aucun credential client ne déplace.
+  Avant chaque négociation pré-WireGuard, Orion applique aussi toute promotion
+  locale arrivée à échéance. Cette lecture précède le chargement de l'identité
+  TLS/PQ : une génération récupérée pendant que le tunnel est absent ne dépend
+  donc pas d'une mise à jour de confiance dans ce même tunnel pour devenir la
+  génération servie. Avant `activation_at`, la connexion est refusée localement
+  avec cette heure plutôt que tentée avec la leaf expirée. L'écran
+  *Certificats* programme la même relecture à cette échéance afin de remplacer
+  la leaf expirée affichée par la génération effectivement promue.
   `RollbackToPrevious` **agit** pendant le chevauchement : l'écriture qui sert
   le candidat conserve dans la même enveloppe protégée l'identité sortante et
   l'échéance `not_after`; l'action ne change que le sélecteur de service. Le

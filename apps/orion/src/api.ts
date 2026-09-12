@@ -285,6 +285,10 @@ export const dismissOperatorCeremony = () => invoke<void>('dismiss_operator_cere
 export const operatorCeremonyStatus = () =>
   invoke<OperatorStatus | null>('operator_ceremony_status')
 
+/** Installs and commits the grant released by the matching §7.5 ceremony. */
+export const resumeCertificateRecovery = (operationId: string) =>
+  invoke<ActionOutcome>('resume_certificate_recovery', { operationId })
+
 /* Lu sur la gateway, dans le tunnel, sur la surface administrateur : l'origine
  * publique d'Astra sert une récupération sans tunnel, et y placer une liste la
  * rendrait lisible par quiconque l'atteint. */

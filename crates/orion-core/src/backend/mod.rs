@@ -734,6 +734,14 @@ const KEY_NEGOTIATION_RETRY_DELAY: Duration = Duration::from_secs(11);
 /// retryable: those are the desynchronisation and transient-network cases the
 /// bounded retry loop exists to recover from.
 fn is_terminal_negotiation_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::certificate_renewal::RenewalError>(),
+            Some(crate::certificate_renewal::RenewalError::ActivationPending { .. })
+        )
+    }) {
+        return true;
+    }
     let rendered = format!("{error:#}");
     rendered.contains("invalid peer certificate")
         || rendered.contains("BadSignature")
@@ -1026,6 +1034,18 @@ mod tests {
         let error = anyhow::anyhow!(
             "performing key negotiation: QUIC connection failed: invalid peer certificate: BadSignature"
         );
+        assert!(is_terminal_negotiation_error(&error));
+    }
+
+    #[test]
+    fn a_committed_recovery_waiting_for_activation_is_not_retried() {
+        let error = anyhow::Error::new(
+            crate::certificate_renewal::RenewalError::ActivationPending {
+                generation: 5,
+                activation_at: "12 septembre 2026 à 14:00:00 CEST".into(),
+            },
+        )
+        .context("promoting a due key-negotiation identity before connecting");
         assert!(is_terminal_negotiation_error(&error));
     }
 

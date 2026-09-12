@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   operatorCeremonyStatus: vi.fn(),
   astraCaTlsRotationStatus: vi.fn(),
   beginOperatorCeremony: vi.fn(),
+  resumeCertificateRecovery: vi.fn(),
+  dismissOperatorCeremony: vi.fn(),
   operatorPendingOperations: vi.fn(),
 }))
 
@@ -21,6 +23,8 @@ vi.mock('./api', () => ({
   operatorCeremonyStatus: mocks.operatorCeremonyStatus,
   astraCaTlsRotationStatus: mocks.astraCaTlsRotationStatus,
   beginOperatorCeremony: mocks.beginOperatorCeremony,
+  resumeCertificateRecovery: mocks.resumeCertificateRecovery,
+  dismissOperatorCeremony: mocks.dismissOperatorCeremony,
   operatorPendingOperations: mocks.operatorPendingOperations,
 }))
 vi.mock('./hooks/useClient', () => ({ useClient: mocks.useClient }))
@@ -40,7 +44,29 @@ vi.mock('./views/SpeedTestView', () => ({
   SpeedTestView: () => <div>speedtest-view</div>,
 }))
 vi.mock('./views/AstraView', () => ({
-  AstraView: () => <div>astra-view</div>,
+  AstraView: ({ onRecoveryReady }: { onRecoveryReady?: (operationId: string) => Promise<void> }) => (
+    <div>
+      astra-view
+      <button onClick={() => void onRecoveryReady?.('e'.repeat(32))}>test-finish-recovery</button>
+    </div>
+  ),
+}))
+vi.mock('./views/CertificatesView', () => ({
+  CertificatesView: ({
+    onApprove,
+    completedRecovery,
+  }: {
+    onApprove?: (operationId: string) => Promise<void>
+    completedRecovery?: Record<string, { step: string; generation?: number }>
+  }) => (
+    <div>
+      certificates-view
+      <button onClick={() => void onApprove?.('e'.repeat(32))}>test-start-recovery</button>
+      {completedRecovery?.portable && (
+        <span>recovered-generation-{completedRecovery.portable.generation}</span>
+      )}
+    </div>
+  ),
 }))
 vi.mock('./components/EventLog', () => ({
   EventLog: () => <div>logs-view</div>,
@@ -87,6 +113,14 @@ beforeEach(() => {
   mocks.operatorCeremonyStatus.mockResolvedValue(null)
   mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   mocks.operatorPendingOperations.mockResolvedValue([])
+  mocks.beginOperatorCeremony.mockResolvedValue({})
+  mocks.resumeCertificateRecovery.mockResolvedValue({
+    progress: {
+      portable: { step: 'recovered', generation: 5, activation_at: 1_789_198_911 },
+    },
+    refused: {},
+  })
+  mocks.dismissOperatorCeremony.mockResolvedValue(undefined)
   // The shell reads the vault posture when the panel opens. A rejection is
   // the honest default here: the panel must survive it, and every test that
   // needs a real posture says so explicitly.
@@ -166,6 +200,27 @@ describe('App interactions', () => {
 
     const astra = await screen.findByRole('button', { name: 'Astra' })
     await waitFor(() => expect(astra).toHaveProperty('disabled', false))
+  })
+
+  it('returns a completed Astra recovery to the certificate that opened it', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Certificats' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'test-start-recovery' }))
+    await waitFor(() =>
+      expect(mocks.beginOperatorCeremony).toHaveBeenCalledWith({
+        kind: 'recover_identity',
+        operation_id: 'e'.repeat(32),
+      }),
+    )
+    expect(screen.getByText('astra-view')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'test-finish-recovery' }))
+
+    await waitFor(() =>
+      expect(mocks.resumeCertificateRecovery).toHaveBeenCalledWith('e'.repeat(32)),
+    )
+    expect(await screen.findByText('recovered-generation-5')).toBeTruthy()
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

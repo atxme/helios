@@ -221,4 +221,46 @@ describe('AstraView', () => {
     expect(await screen.findByText(/boîte WebAuthn au premier plan/)).toBeTruthy()
     expect(screen.queryByText(/Aucune clé n’a répondu/)).toBeNull()
   })
+
+  it('hands a completed recovery back to Orion without a second certificate press', async () => {
+    const operationId = 'e'.repeat(32)
+    const onRecoveryReady = vi.fn().mockResolvedValue(undefined)
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 5,
+      operation: 'recover_identity',
+      operation_id: operationId,
+      remote: 'granted',
+      gesture: 'done',
+      allowed: [],
+    })
+
+    render(<AstraView onRecoveryReady={onRecoveryReady} />)
+
+    await waitFor(() => expect(onRecoveryReady).toHaveBeenCalledWith(operationId))
+    expect(onRecoveryReady).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a failed automatic finalization retryable', async () => {
+    const operationId = 'e'.repeat(32)
+    const onRecoveryReady = vi
+      .fn()
+      .mockRejectedValueOnce('commit temporairement indisponible')
+      .mockResolvedValueOnce(undefined)
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 5,
+      operation: 'recover_identity',
+      operation_id: operationId,
+      remote: 'granted',
+      gesture: 'done',
+      allowed: [],
+    })
+
+    render(<AstraView onRecoveryReady={onRecoveryReady} />)
+
+    expect(await screen.findByText(/commit temporairement indisponible/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Réessayer la finalisation' }))
+    await waitFor(() => expect(onRecoveryReady).toHaveBeenCalledTimes(2))
+  })
 })

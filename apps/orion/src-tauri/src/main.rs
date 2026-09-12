@@ -515,12 +515,28 @@ async fn certificate_overview(
     };
     let errors = state.last_certificate_error.lock().await.clone();
     let identity_store = state.controller.key_negotiation_ready();
+    let protected_identities = orion_core::ProtectedIdentityStore::for_current_user().ok();
     let now = now_unix();
 
     Ok(profiles
         .into_iter()
         .map(|(name, settings)| {
-            let inventory = orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            let promotion_error = settings
+                .as_ref()
+                .zip(protected_identities.as_ref())
+                .and_then(|(settings, identities)| {
+                    orion_core::certificate_renewal::promote_local_identity_if_due(
+                        settings, identities, now,
+                    )
+                    .err()
+                });
+            let mut inventory =
+                orion_core::certificate_inventory::inventory(settings.as_ref(), now);
+            if let Some(error) = promotion_error {
+                inventory
+                    .faults
+                    .push(format!("promotion de l'identité cliente : {error}"));
+            }
             let actions = orion_core::certificate_actions::action_states(
                 settings.as_ref(),
                 &inventory,
@@ -865,6 +881,7 @@ enum RenewalProgress {
     },
     Recovered {
         generation: u64,
+        activation_at: u64,
     },
     RolledBack {
         generation: u64,
@@ -919,8 +936,12 @@ impl RenewalProgress {
             RecoveryStep::Issuing { operation_id } => Self::Issuing {
                 operation_id: operation_id.to_hex(),
             },
-            RecoveryStep::Recovered { generation } => Self::Recovered {
+            RecoveryStep::Recovered {
+                generation,
+                activation_at,
+            } => Self::Recovered {
                 generation: *generation,
+                activation_at: *activation_at,
             },
         }
     }
@@ -1079,6 +1100,39 @@ async fn drive_recovery(
         recoveries.insert(name.to_string(), InFlightRecovery { session, settings });
     }
     Ok(progress)
+}
+
+/// Resumes the recovery whose operator ceremony has just released its grant.
+///
+/// The operation id is only a selector over sessions this Orion process
+/// already owns. The WebView cannot name a profile, settings or authority,
+/// and the lock is released before the network call so the ordinary recovery
+/// driver remains the sole mutator of the session.
+#[tauri::command]
+async fn resume_certificate_recovery(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<ActionOutcome, String> {
+    let operation = aether::certificates::encoding::Id16::parse_hex(&operation_id)
+        .map_err(|_| "identifiant de récupération illisible".to_string())?;
+    let found = {
+        let recoveries = state.recoveries.lock().await;
+        recoveries
+            .iter()
+            .find(|(_, recovery)| recovery.session.operation_id() == operation)
+            .map(|(name, recovery)| (name.clone(), recovery.settings.clone()))
+    };
+    let (name, settings) = found.ok_or_else(|| {
+        "aucune récupération ouverte dans Orion ne correspond à cette opération".to_string()
+    })?;
+
+    match drive_recovery(&state, &name, Some(settings)).await {
+        Ok(progress) => {
+            state.last_certificate_error.lock().await.remove(&name);
+            Ok(ActionOutcome::of(&name, progress))
+        }
+        Err(message) => Err(record_certificate_error(&state, &name, message).await),
+    }
 }
 
 async fn record_certificate_error(
@@ -2865,6 +2919,7 @@ fn main() {
             approve_certificate_renewal,
             certificate_overview,
             run_certificate_action,
+            resume_certificate_recovery,
             last_certificate_error,
             run_speed_test,
             vault_posture,
