@@ -834,7 +834,11 @@ dernier effet exige la gateway réelle.
   `PATH`, puis exerce d'abord les refus : sidecar absent, fenêtre propriétaire
   impossible, jeton absent, session périmée et seconde clé identique. Elle
   termine par une récupération complète et une campagne de certificats clients,
-  avec apparition au premier plan de chaque boîte WebAuthn ;
+  avec apparition au premier plan de chaque boîte WebAuthn. Pour éprouver le
+  séquençage réel, la recette laisse d'abord Orion afficher le manifeste, puis
+  utilise le bouton de confirmation qui déclenche la clé : le droit de premier
+  plan doit être transmis sur ce second clic, et de nouveau avant la seconde
+  clé d'une campagne ;
 - **l’aléa se vérifie par sa gestion, pas par son moteur.** `aether::random`
   n’implémente aucun DRBG : il appelle `aws_lc_rs::rand::SystemRandom`, refuse
   fermement quand celui-ci échoue, et journalise au démarrage fournisseur,

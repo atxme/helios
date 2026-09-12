@@ -61,9 +61,9 @@ const VIEWS: { value: View; label: string; icon: typeof Radio }[] = [
 export default function App() {
   const c = useClient()
   const [view, setView] = useState<View>('connect')
-  // Whether the Astra tab has anything to show. It is greyed otherwise: an
-  // operator ceremony is not a place to browse, and a tab that is always open
-  // invites starting one for no reason.
+  // Whether Astra has work waiting. The tab itself stays available because it
+  // also owns certificate-authority operations an operator may start there;
+  // this state drives only the attention badge.
   const [astraPending, setAstraPending] = useState(false)
 
   // What makes the tab live: a protocol-2 ceremony the helper is running, or
@@ -311,20 +311,11 @@ export default function App() {
                   : value === 'astra' && astraPending && view !== 'astra'
                     ? 1
                     : 0
-              // Greyed rather than hidden: a user looking for Astra has to
-              // learn that nothing is waiting, not conclude the tab vanished.
-              const unavailable = value === 'astra' && !astraPending
               return (
                 <ButtonBase
                   key={value}
                   onClick={() => setView(value)}
-                  disabled={unavailable}
                   aria-current={active ? 'page' : undefined}
-                  title={
-                    unavailable
-                      ? 'Aucune opération n’attend l’opérateur.'
-                      : undefined
-                  }
                   sx={{
                     position: 'relative',
                     display: 'flex',

@@ -203,4 +203,22 @@ describe('AstraView', () => {
     fireEvent.click(open)
     expect(api.beginOperatorCeremony).not.toHaveBeenCalled()
   })
+
+  it('names a WebAuthn foreground refusal instead of blaming the key', async () => {
+    api.operatorCeremonyStatus.mockResolvedValue({
+      session_id: 'd'.repeat(32),
+      revision: 3,
+      operation: 'recover_identity',
+      operation_id: 'e'.repeat(32),
+      remote: 'awaiting_operator',
+      gesture: 'failed',
+      allowed: [],
+      refusal: { refusal: 'foreground_unavailable' },
+    })
+
+    render(<AstraView />)
+
+    expect(await screen.findByText(/boîte WebAuthn au premier plan/)).toBeTruthy()
+    expect(screen.queryByText(/Aucune clé n’a répondu/)).toBeNull()
+  })
 })

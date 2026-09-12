@@ -73,28 +73,39 @@ pub fn launch(invocation: &CompanionInvocation) -> Result<(), String> {
 pub fn launch_helper(
     arguments: &[String],
     environment: &[(String, String)],
-    owner: isize,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let program = helper_program()?;
     #[cfg(target_os = "windows")]
     {
-        crate::deelevate::spawn_astra_helper(&program, arguments, environment, owner)
+        crate::deelevate::spawn_astra_helper(&program, arguments, environment)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        // No foreground to cede: the platform dialog this owner exists for is
-        // Windows'. The parameter stays in the signature so both builds carry
-        // the same contract.
-        let _ = owner;
         let mut child = tokio::process::Command::new(&program)
             .args(arguments)
             .envs(environment.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .spawn()
             .map_err(|error| format!("lancement de « {HELPER} » impossible : {error}"))?;
+        let process_id = child
+            .id()
+            .ok_or_else(|| format!("identifiant du processus « {HELPER} » indisponible"))?;
         tauri::async_runtime::spawn(async move {
             let _ = child.wait().await;
         });
+        Ok(process_id)
+    }
+}
+
+/// Transfers the foreground right at the press that will open WebAuthn.
+pub fn allow_helper_foreground(owner: isize, process_id: u32) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::deelevate::cede_foreground(owner, process_id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (owner, process_id);
         Ok(())
     }
 }

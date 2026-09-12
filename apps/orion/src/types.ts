@@ -646,6 +646,7 @@ export type GestureState =
 export type Refusal =
   | { refusal: 'vault_unavailable' }
   | { refusal: 'key_declined' }
+  | { refusal: 'foreground_unavailable' }
   | { refusal: 'key_not_enrolled' }
   | { refusal: 'key_repeated' }
   | { refusal: 'window_expired' }

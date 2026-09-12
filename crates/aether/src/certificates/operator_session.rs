@@ -305,6 +305,8 @@ pub enum Refusal {
     VaultUnavailable,
     /// No authenticator, or the operator declined the gesture.
     KeyDeclined,
+    /// Windows could not create or foreground the owner of its WebAuthn UI.
+    ForegroundUnavailable,
     /// The key that answered is not enrolled in this domain.
     KeyNotEnrolled,
     /// A two-key ceremony was answered twice by the same credential.
@@ -646,6 +648,14 @@ mod tests {
             r#"{"protocol_version":2,"session_id":"03030303030303030303030303030303"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_foreground_refusal_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(Refusal::ForegroundUnavailable).expect("refusal"),
+            serde_json::json!({ "refusal": "foreground_unavailable" })
+        );
     }
 
     /// The locator is the whole of what the WebView may name.

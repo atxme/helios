@@ -148,7 +148,14 @@ fn run() -> Result<()> {
     // ceremony and destroyed with it. Acquired **before** any key is asked
     // for: a helper that discovered it had nowhere to show a dialog after
     // opening the vault would be holding `CA-PQ` with no way to finish.
-    let window = owner::create()?;
+    let window = match owner::create() {
+        Ok(window) => window,
+        Err(error) => {
+            ceremony.refuse(Refusal::ForegroundUnavailable);
+            session::write_status(&mut writer, &ceremony.status())?;
+            return Err(error);
+        }
+    };
 
     match ceremony.operation {
         OperationKind::RecoverIdentity => recover(&mut ceremony, &mut reader, &mut writer, &window),
@@ -222,9 +229,17 @@ fn recover<R: std::io::BufRead, W: std::io::Write>(
     ceremony.gesture = GestureState::ProcessingKey { index: 1, of: 1 };
     session::write_status(writer, &ceremony.status())?;
 
+    let owner = match window.prompt_owner() {
+        Ok(owner) => owner,
+        Err(error) => {
+            ceremony.refuse(Refusal::ForegroundUnavailable);
+            session::write_status(writer, &ceremony.status())?;
+            return Err(error);
+        }
+    };
     let key = match helios_fido::authenticator::connect_owned(
         helios_fido::authenticator::Transport::default(),
-        window.owner(),
+        owner,
     ) {
         Ok(key) => key,
         Err(error) => {
@@ -339,9 +354,17 @@ fn approve_campaign<R: std::io::BufRead, W: std::io::Write>(
             of: required,
         };
         session::write_status(writer, &ceremony.status())?;
+        let owner = match window.prompt_owner() {
+            Ok(owner) => owner,
+            Err(error) => {
+                ceremony.refuse(Refusal::ForegroundUnavailable);
+                session::write_status(writer, &ceremony.status())?;
+                return Err(error);
+            }
+        };
         let key = match helios_fido::authenticator::connect_owned(
             helios_fido::authenticator::Transport::default(),
-            window.owner(),
+            owner,
         ) {
             Ok(key) => key,
             Err(error) => {

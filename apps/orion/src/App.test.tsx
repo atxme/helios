@@ -82,8 +82,8 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocks.resizeForView.mockResolvedValue(undefined)
   mocks.onTrayView.mockResolvedValue(vi.fn())
-  // Nothing waits on the operator by default: the Astra tab is greyed, which
-  // is the state every other assertion here is written against.
+  // Nothing waits on the operator by default: Astra remains accessible and
+  // simply carries no attention badge.
   mocks.operatorCeremonyStatus.mockResolvedValue(null)
   mocks.astraCaTlsRotationStatus.mockResolvedValue({ phase: 'idle' })
   mocks.operatorPendingOperations.mockResolvedValue([])
@@ -127,12 +127,12 @@ describe('App interactions', () => {
     expect(screen.getByText('speedtest-view')).toBeTruthy()
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('speedtest'))
 
-    // Greyed while nothing waits on the operator, and clicking it does
-    // nothing: an operator ceremony is not a place to browse.
+    // Astra is also the entry point for authority operations initiated here,
+    // so an empty pending queue must not lock the whole destination.
     const astra = screen.getByRole('button', { name: 'Astra' })
-    expect(astra).toHaveProperty('disabled', true)
+    expect(astra).toHaveProperty('disabled', false)
     fireEvent.click(astra)
-    expect(screen.queryByText('astra-view')).toBeNull()
+    expect(screen.getByText('astra-view')).toBeTruthy()
   })
 
   it('opens the Astra tab exactly when a ceremony waits on the operator', async () => {
@@ -153,7 +153,7 @@ describe('App interactions', () => {
     await waitFor(() => expect(mocks.resizeForView).toHaveBeenCalledWith('astra'))
   })
 
-  it('does not keep Astra enabled for an already finished ceremony', async () => {
+  it('keeps Astra available after a ceremony has finished', async () => {
     mocks.operatorCeremonyStatus.mockResolvedValue({
       session_id: 'a'.repeat(32),
       revision: 4,
@@ -165,7 +165,7 @@ describe('App interactions', () => {
     render(<App />)
 
     const astra = await screen.findByRole('button', { name: 'Astra' })
-    await waitFor(() => expect(astra).toHaveProperty('disabled', true))
+    await waitFor(() => expect(astra).toHaveProperty('disabled', false))
   })
 
   it('opens and closes posture details and delegates error dismissal', () => {

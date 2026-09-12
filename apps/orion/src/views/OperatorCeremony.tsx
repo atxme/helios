@@ -227,6 +227,11 @@ function refusalSentence(refusal: Refusal): string {
       return 'Le coffre d’autorité est absent, illisible, ou n’est pas celui de ce domaine.'
     case 'key_declined':
       return 'Aucune clé n’a répondu, ou le geste a été refusé.'
+    case 'foreground_unavailable':
+      return (
+        'Windows n’a pas pu ouvrir la boîte WebAuthn au premier plan. ' +
+        'Revenir dans Orion et recommencer le geste.'
+      )
     case 'key_not_enrolled':
       return 'La clé qui a répondu n’est pas enrôlée dans ce domaine.'
     case 'key_repeated':

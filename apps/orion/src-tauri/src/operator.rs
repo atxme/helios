@@ -65,6 +65,7 @@ const SESSION_VARIABLE: &str = "HELIOS_ASTRA_SESSION_ID";
 struct Session {
     commands: OwnedWriteHalf,
     status: watch::Receiver<OperatorStatus>,
+    helper_process_id: u32,
 }
 
 /// The one ceremony Orion hosts at a time.
@@ -91,11 +92,7 @@ impl OperatorCeremony {
     }
 
     /// Launches the helper and returns the first state it publishes.
-    pub async fn begin(
-        &self,
-        locator: OperationLocator,
-        owner: isize,
-    ) -> Result<OperatorStatus, String> {
+    pub async fn begin(&self, locator: OperationLocator) -> Result<OperatorStatus, String> {
         let mut held = self.0.lock().await;
         if let Some(session) = held.as_mut() {
             let current = session.status.borrow_and_update().clone();
@@ -125,13 +122,12 @@ impl OperatorCeremony {
         .map_err(|error| format!("identifiant de session : {error}"))?;
         let token = session_token()?;
 
-        crate::companion::launch_helper(
+        let helper_process_id = crate::companion::launch_helper(
             &["--ipc-address".to_string(), address.to_string()],
             &[
                 (SESSION_VARIABLE.to_string(), session_id.to_hex()),
                 (TOKEN_VARIABLE.to_string(), token.to_string()),
             ],
-            owner,
         )?;
 
         let (reader, mut commands) = tokio::time::timeout(
@@ -160,7 +156,11 @@ impl OperatorCeremony {
             GestureState::Verifying,
         ));
         tauri::async_runtime::spawn(pump(reader, publisher, session_id));
-        let mut session = Session { commands, status };
+        let mut session = Session {
+            commands,
+            status,
+            helper_process_id,
+        };
         let first = awaited(&mut session.status).await?;
         *held = Some(session);
         Ok(first)
@@ -175,6 +175,7 @@ impl OperatorCeremony {
         &self,
         action: OperatorAction,
         revision: u64,
+        owner: isize,
     ) -> Result<OperatorStatus, String> {
         let mut held = self.0.lock().await;
         let session = held
@@ -187,6 +188,14 @@ impl OperatorCeremony {
                 "cette étape n'accepte pas cette action : l'écran a changé depuis la pression"
                     .to_string(),
             );
+        }
+
+        // A foreground grant is deliberately just-in-time. The helper was
+        // launched by an earlier press; Windows may revoke that old grant when
+        // this press lands in Orion. Only a key gesture needs the transfer — a
+        // retry of a prepared deposit must not depend on window focus.
+        if needs_foreground(action, current.gesture) {
+            crate::companion::allow_helper_foreground(owner, session.helper_process_id)?;
         }
 
         let command = match action {
@@ -212,6 +221,13 @@ impl OperatorCeremony {
         *held = None;
         Ok(())
     }
+}
+
+/// Only the transition that immediately asks Windows for a key dialog needs
+/// a foreground grant. Network retries and cancellation remain independent of
+/// desktop focus.
+fn needs_foreground(action: OperatorAction, gesture: GestureState) -> bool {
+    action == OperatorAction::Continue && matches!(gesture, GestureState::AwaitingKey { .. })
 }
 
 /// 256 bits from the one entry point this repository draws randomness through.
@@ -420,7 +436,10 @@ mod tests {
     async fn a_ceremony_that_never_started_accepts_nothing() {
         let ceremony = OperatorCeremony::default();
         assert!(ceremony.status().await.is_none());
-        assert!(ceremony.advance(OperatorAction::Continue, 1).await.is_err());
+        assert!(ceremony
+            .advance(OperatorAction::Continue, 1, 0)
+            .await
+            .is_err());
     }
 
     /// A press on a screen the helper has already left must not be applied to
@@ -440,6 +459,21 @@ mod tests {
         );
         assert!(status.accepts(OperatorAction::Continue, 9));
         assert!(!status.accepts(OperatorAction::Continue, 8));
+    }
+
+    #[test]
+    fn foreground_is_transferred_only_for_the_press_that_opens_a_key_dialog() {
+        let awaiting_key = GestureState::AwaitingKey {
+            index: 1,
+            of: 1,
+            purpose: KeyPurpose::OpenVault,
+        };
+        assert!(needs_foreground(OperatorAction::Continue, awaiting_key));
+        assert!(!needs_foreground(OperatorAction::Cancel, awaiting_key));
+        assert!(!needs_foreground(
+            OperatorAction::Continue,
+            GestureState::Idle
+        ));
     }
 
     /// Once the signed objects have left, «Annuler» would promise something

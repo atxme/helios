@@ -58,9 +58,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, TerminateProcess, CREATE_NEW_CONSOLE,
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
-    PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+    CreateProcessWithTokenW, OpenProcess, OpenProcessToken, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, LOGON_WITH_PROFILE, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
@@ -97,7 +97,6 @@ pub fn spawn_ssh_terminal(target: &str) -> Result<(), String> {
         "ouverture du terminal",
         &[],
         CREATE_NEW_CONSOLE,
-        None,
     )?;
     tracing::info!(%target, "terminal SSH ouvert sous le compte standard");
     Ok(())
@@ -116,8 +115,8 @@ pub fn spawn_astra_signer(arguments: &[String]) -> Result<(), String> {
         "lancement du compagnon",
         &[],
         CREATE_NEW_CONSOLE,
-        None,
     )
+    .map(|_| ())
 }
 
 /// Runs the Astra operator helper as the standard user, with no console and
@@ -141,8 +140,7 @@ pub fn spawn_astra_helper(
     program: &Path,
     arguments: &[String],
     environment: &[(String, String)],
-    owner: isize,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let program_text = program.to_string_lossy();
     let command = windows_command_line(&program_text, arguments);
     spawn_with_standard_token(
@@ -151,7 +149,6 @@ pub fn spawn_astra_helper(
         "lancement du processus opérateur",
         environment,
         CREATE_NO_WINDOW,
-        Some(owner),
     )
 }
 
@@ -268,11 +265,7 @@ fn spawn_with_standard_token(
     action: &str,
     environment: &[(String, String)],
     creation_flags: u32,
-    // The window to re-assert the foreground on before ceding it, when the
-    // child is the one that must show a dialog. `None` for the companion,
-    // which opens its own console.
-    allow_foreground: Option<isize>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let token = standard_user_token()?;
     if is_elevated(&token)? {
         return Err(format!(
@@ -336,56 +329,59 @@ fn spawn_with_standard_token(
             std::io::Error::last_os_error()
         ));
     }
-    if let Some(owner) = allow_foreground {
-        if let Err(refusal) = cede_foreground(owner, process.dwProcessId) {
-            // The helper has not authenticated or touched a key yet. Leaving
-            // it alive after refusing foreground permission would create
-            // exactly the invisible WebAuthn prompt the owner window is meant
-            // to prevent.
-            unsafe { TerminateProcess(process.hProcess, 1) };
-            unsafe {
-                CloseHandle(process.hProcess);
-                CloseHandle(process.hThread);
-            }
-            return Err(format!("{action} annulé : {refusal}"));
-        }
-    }
+    let process_id = process.dwProcessId;
     // SAFETY: both handles were returned by the successful call above.
     unsafe {
         CloseHandle(process.hProcess);
         CloseHandle(process.hThread);
     }
     tracing::info!(%action, "processus ouvert sous le compte standard");
-    Ok(())
+    Ok(process_id)
 }
 
-/// Hands the child the right to raise its WebAuthn dialog.
+/// Hands the helper the right to raise its WebAuthn dialog.
 ///
 /// # Why the right has to be taken back before it is given
 ///
-/// `AllowSetForegroundWindow` gives away a right the caller must itself hold.
-/// Orion's press lands in a WebView, and Windows grants that right to the
-/// process that received the last input event — `msedgewebview2.exe`, which is
-/// not the process that owns the window drawn around it. `orion.exe` therefore
-/// calls with nothing to give, and Windows answers `ERROR_INVALID_PARAMETER`:
-/// a message that reads as a bad argument and means a missing privilege.
+/// `AllowSetForegroundWindow` gives away a right the caller must itself hold,
+/// and Windows revokes that grant on the next input directed elsewhere. The
+/// helper is launched by the first press, but the WebAuthn call follows a
+/// second press after the verified manifest was shown. Granting at launch is
+/// therefore too early: that second press can revoke the grant before the
+/// helper has a prompt to raise.
 ///
-/// Re-asserting the foreground on Orion's own window is legitimate here and
-/// only here. This runs while answering a press **in that window**, which is
-/// the condition `SetForegroundWindow` documents; it takes focus from nobody,
-/// since the window asked for is the one already in front.
+/// Re-asserting the foreground on Orion's own window is legitimate at that
+/// exact second press. It takes focus from nobody, since the requested window
+/// is the one the operator just used. The helper then consumes the grant by
+/// activating its private owner immediately before it calls WebAuthn.
 ///
 /// A refusal names what was seen. The same sentence otherwise covers three
 /// different situations — no window handed down, a foreground window belonging
 /// to another application, and a genuine refusal by Windows — and the operator
 /// has no way to tell them apart from the ceremony that did not open.
-fn cede_foreground(owner: isize, child: u32) -> Result<(), String> {
-    if owner != 0 {
-        // SAFETY: `owner` is the window handle Tauri reported for Orion's own
-        // window; the call only reads it.
-        unsafe { SetForegroundWindow(owner as *mut core::ffi::c_void) };
+pub fn cede_foreground(owner: isize, child: u32) -> Result<(), String> {
+    if owner == 0 {
+        return Err("aucune fenêtre Orion n'a été transmise".to_string());
     }
-    // SAFETY: no pointer argument. `child` is the process just created.
+    let owner = owner as *mut core::ffi::c_void;
+    let mut owner_pid = 0u32;
+    // SAFETY: `owner` is the window handle Tauri reported for Orion's own
+    // window; this call only reads its owning process identifier.
+    unsafe { GetWindowThreadProcessId(owner, &mut owner_pid) };
+    if owner_pid != std::process::id() {
+        return Err("la fenêtre transmise n'appartient pas à Orion".to_string());
+    }
+    // The WebView renderer receives the input, while this process owns the
+    // top-level window. Re-assert it before transferring the right.
+    if unsafe { GetForegroundWindow() } != owner {
+        // SAFETY: the handle was validated as Orion's own window above.
+        unsafe { SetForegroundWindow(owner) };
+        if unsafe { GetForegroundWindow() } != owner {
+            return Err("Windows n'a pas rendu le premier plan à Orion".to_string());
+        }
+    }
+    // SAFETY: no pointer argument. `child` is the authenticated helper held by
+    // the current operator session.
     if unsafe { AllowSetForegroundWindow(child) } != 0 {
         return Ok(());
     }
@@ -397,16 +393,10 @@ fn cede_foreground(owner: isize, child: u32) -> Result<(), String> {
         // SAFETY: `foreground` is a valid window handle; writes one u32.
         unsafe { GetWindowThreadProcessId(foreground, &mut foreground_pid) };
     }
-    let missing_owner = if owner == 0 {
-        " ; aucune fenêtre propriétaire n'a été transmise"
-    } else {
-        ""
-    };
     Err(format!(
         "impossible d'autoriser sa boîte WebAuthn au premier plan ({refusal}). \
-         Premier plan tenu par le processus {foreground_pid}, Orion est le processus {}{}",
-        std::process::id(),
-        missing_owner
+         Premier plan tenu par le processus {foreground_pid}, Orion est le processus {}",
+        std::process::id()
     ))
 }
 

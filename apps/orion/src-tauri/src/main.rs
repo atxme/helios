@@ -2935,18 +2935,18 @@ async fn astra_ca_tls_rotation_status(
 #[tauri::command]
 async fn begin_operator_ceremony(
     state: State<'_, AppState>,
-    window: tauri::Window,
     locator: aether::certificates::operator_session::OperationLocator,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
-    state.operator.begin(locator, owner_window(&window)).await
+    state.operator.begin(locator).await
 }
 
 /// The handle of the window the press came from, or `0` where there is none.
 ///
-/// Handed to the launch so that Orion can re-assert its own foreground right
-/// before ceding it to the helper: the click was delivered to the WebView's
-/// renderer process, and Windows grants that right to whoever received the
-/// last input — not to the process that owns the window around it.
+/// Read on the exact advance that opens a key dialog, so Orion can re-assert
+/// its own foreground right before ceding it to the helper. The click was
+/// delivered to the WebView's renderer process, and Windows grants that right
+/// to whoever received the last input — not to the process that owns the
+/// window around it.
 fn owner_window(window: &tauri::Window) -> isize {
     #[cfg(target_os = "windows")]
     {
@@ -2967,10 +2967,14 @@ fn owner_window(window: &tauri::Window) -> isize {
 #[tauri::command]
 async fn advance_operator_ceremony(
     state: State<'_, AppState>,
+    window: tauri::Window,
     action: aether::certificates::operator_session::OperatorAction,
     revision: u64,
 ) -> Result<aether::certificates::operator_session::OperatorStatus, String> {
-    state.operator.advance(action, revision).await
+    state
+        .operator
+        .advance(action, revision, owner_window(&window))
+        .await
 }
 
 /// Removes the final status once the operator has acknowledged it.

@@ -43,15 +43,22 @@ pub struct OwnerWindow {
 }
 
 impl OwnerWindow {
-    pub fn owner(&self) -> DialogOwner {
+    /// Activates the private owner immediately before a platform prompt.
+    ///
+    /// Orion transfers its foreground right on the corresponding button
+    /// press. Merely owning a window does not consume that grant: the helper
+    /// must bring this window forward before the WebAuthn broker creates its
+    /// modal dialog.
+    pub fn prompt_owner(&self) -> anyhow::Result<DialogOwner> {
         #[cfg(windows)]
         {
-            DialogOwner::Window(self.handle as isize)
+            windows::activate(self.handle)?;
+            Ok(DialogOwner::Window(self.handle as isize))
         }
         #[cfg(not(windows))]
         {
             let _ = self.handle;
-            DialogOwner::Console
+            Ok(DialogOwner::Console)
         }
     }
 }
@@ -153,12 +160,24 @@ mod windows {
                  qu'il ne voit pas"
             );
         }
-        // Shown without activation: the prompt must be able to take the
-        // foreground, and a one-pixel window that stole it first would be a
-        // flicker with no purpose. Orion calls `AllowSetForegroundWindow` for
-        // this child, so the dialog itself comes forward.
+        // Shown without activation while the manifest is verified and read.
+        // `prompt_owner` activates it only after the operator's confirmation
+        // and Orion's just-in-time foreground transfer.
         unsafe { ShowWindow(handle, SW_SHOWNOACTIVATE) };
         Ok(OwnerWindow { handle })
+    }
+
+    pub fn activate(handle: HWND) -> Result<()> {
+        // SAFETY: `handle` is the live window created by `create`. Orion has
+        // just granted this process the foreground right for this gesture.
+        if unsafe { SetForegroundWindow(handle) } == 0 && unsafe { GetForegroundWindow() } != handle
+        {
+            bail!(
+                "Windows a refusé de placer la boîte WebAuthn au premier plan ; \
+                 recommencer depuis la fenêtre Orion active"
+            );
+        }
+        Ok(())
     }
 
     impl Drop for OwnerWindow {
@@ -180,6 +199,9 @@ mod tests {
     #[test]
     fn there_is_nothing_to_own_where_there_is_no_dialog() {
         let window = create().expect("no window is needed here");
-        assert_eq!(window.owner(), DialogOwner::Console);
+        assert_eq!(
+            window.prompt_owner().expect("no prompt window is needed"),
+            DialogOwner::Console
+        );
     }
 }
