@@ -542,7 +542,17 @@ impl ClientCertificateStageAuthorization {
         }
         self.window.validate()?;
 
-        let mut bounds = vec![self.window.activation_at];
+        // An expired recovery is unusable until its signed two-key commit has
+        // replaced `pending_grant` with `next`, so its lease only bounds how
+        // long that commit may arrive. Unlike an ordinary rotation, it does
+        // not prepare a still-working identity ahead of a future cut-over:
+        // activation may therefore already have been reached while the stage
+        // remains pending. Keeping this exception on the signed reason makes
+        // it unavailable to every delegated/ordinary authorization.
+        let mut bounds = Vec::with_capacity(2);
+        if self.reason != RotationReason::ExpiredRecovery {
+            bounds.push(self.window.activation_at);
+        }
         if let Some(expiry) = request_expires_at {
             bounds.push(expiry);
         }
@@ -2333,6 +2343,61 @@ mod tests {
                 1_100,
             ),
             Err(CertificateError::LeaseTooLong { .. })
+        ));
+    }
+
+    /// Recovery is the only family whose activation can already be reached
+    /// while its stage lease remains open. The candidate is still unusable
+    /// until commit moves it out of `pending_grant`; ordinary rotations keep
+    /// the stricter lease-before-activation rule.
+    #[test]
+    fn an_expired_recovery_stage_can_outlive_immediate_activation() {
+        let ca = keys();
+        let subject = keys();
+        let leaf = client_leaf(&ca, &subject, 2);
+        let tls = tls_material();
+        let mut authorization = authorization(&ca, &ca, leaf, Fingerprint::of(b"request"), &tls);
+        authorization.reason = RotationReason::ExpiredRecovery;
+        authorization.window = TransitionWindow::new(900, 1_000, 20_000).expect("window");
+        authorization.stage_expires_at = 4_600;
+        let authorization = authorization.sign(&ca.private).expect("sign recovery");
+
+        authorization
+            .verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                &[&tls.authority],
+                None,
+                Some(4_600),
+                1_100,
+            )
+            .expect("a committed recovery may activate immediately");
+
+        let mut ordinary = authorization;
+        ordinary.reason = RotationReason::Scheduled;
+        let ordinary = ordinary.sign(&ca.private).expect("sign ordinary rotation");
+        assert!(matches!(
+            ordinary.verify(
+                &ca.public,
+                &domain(),
+                1,
+                1,
+                &gateway_key(),
+                SERVER_NAME,
+                &client_key(),
+                &active_generation(),
+                &[&tls.authority],
+                None,
+                Some(4_600),
+                1_100,
+            ),
+            Err(CertificateError::InvalidLease)
         ));
     }
 

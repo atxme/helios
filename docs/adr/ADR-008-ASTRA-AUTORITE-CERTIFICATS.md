@@ -24,6 +24,15 @@ nouvelle confirmation hors bande et une nouvelle délégation. Une mise à jour
 logicielle seule ne réinterprète jamais l'ancienne empreinte comme une
 autorisation automatique.
 
+**Amendement du 2026-09-12** : une récupération expirée n'attend plus la fin
+de sa lease de staging pour devenir utilisable. Son `activation_at` est
+l'instant de la cérémonie ; la génération reste néanmoins inaccessible dans
+`pending_grant` jusqu'au commit signé par l'ancienne et la nouvelle clé. La
+lease borne seulement l'arrivée de ce commit. Après son succès, Helios admet
+immédiatement `next_committed` et Orion promeut dans la même opération la paire
+de clés scellée. Les renouvellements ordinaires conservent leur activation
+différée et la contrainte `stage_expires_at <= activation_at`.
+
 La confirmation hors bande prend la forme que les clés de l'opérateur
 produisent déjà : une `AstraIssuerAuthorization` signée par `CA-PQ` et portant
 l'empreinte de la politique courante. Astra l'adopte en installant cette

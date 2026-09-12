@@ -656,13 +656,12 @@ pub async fn commit(
     let view = operation.view();
     drop(recoveries);
 
-    // The gateway has not necessarily promoted yet: a recovered generation
-    // activates at the end of its staging lease, which §7.2 puts after the
-    // commit. So this is an attempt, not a guarantee, and the intent stays on
-    // disk until it succeeds. Failing here must not fail the recovery — the
-    // client's identity is installed at both ends by now, and refusing its
-    // commit over a bookkeeping read would be refusing something that already
-    // happened.
+    // A recovered generation is eligible immediately after commit. Reconcile
+    // it now so Astra's registry observes the gateway's new usable generation
+    // without waiting for another contact. Failing here must not fail the
+    // recovery — the client's identity is installed at both ends by now, and
+    // refusing its commit over a bookkeeping read would be refusing something
+    // that already happened.
     match reconcile(service, &client, expected_generation, now_unix).await {
         Ok(true) => {}
         Ok(false) => tracing::info!(

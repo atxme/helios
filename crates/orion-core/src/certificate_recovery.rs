@@ -106,9 +106,10 @@ pub enum RecoveryStep {
     Issuing { operation_id: Id16 },
     /// Installed locally and committed at the gateway.
     ///
-    /// The successor is deliberately not served before this instant. Carrying
-    /// it here keeps a successful recovery from looking like an immediately
-    /// usable identity while the signed staging window is still closed.
+    /// The successor is never served before this instant. A current recovery
+    /// reaches it during the operator ceremony and is therefore usable as soon
+    /// as the double commit succeeds; older operations may still carry a
+    /// future activation instant.
     Recovered { generation: u64, activation_at: u64 },
 }
 
@@ -423,6 +424,26 @@ async fn install(
         )?;
     }
 
+    // A crash or protected-store failure can happen after the local commit
+    // and before promotion. At that point the remote commit is irreversible,
+    // so a resumed recovery must retry the remaining local move instead of
+    // trying to stage the same candidate over an existing `next` slot.
+    let candidate_generation = grant.candidate()?;
+    let already_committed = store
+        .state()
+        .certificates
+        .last_committed_stage
+        .as_ref()
+        .is_some_and(|committed| committed.stage_id == grant.stage_receipt.stage_id)
+        && store.state().certificates.next.as_ref() == Some(&candidate_generation);
+    if already_committed {
+        crate::certificate_renewal::promote_due(&mut store, &identities, identity, now_unix)?;
+        return Ok(RecoveryStep::Recovered {
+            generation: grant.next_generation,
+            activation_at: grant.window.activation_at,
+        });
+    }
+
     let encode = base64::engine::general_purpose::STANDARD;
     let candidate = ClientIdentityBundle {
         identity: candidate_identity_of(identity),
@@ -479,6 +500,10 @@ async fn install(
     .await?;
 
     store.commit_staged_candidate(&receipt.stage_id, &commit.fingerprint(), now_unix)?;
+    // Recovery activation is already due when the double commit succeeds.
+    // Move the sealed key pair before reporting success so the very next QUIC
+    // negotiation presents the generation the gateway has just admitted.
+    crate::certificate_renewal::promote_due(&mut store, &identities, identity, now_unix)?;
     Ok(RecoveryStep::Recovered {
         generation: grant.next_generation,
         activation_at: grant.window.activation_at,

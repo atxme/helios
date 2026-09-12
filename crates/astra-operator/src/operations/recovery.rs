@@ -154,20 +154,16 @@ pub fn begin(
         now.checked_add(VALIDITY_DAYS * DAY_SECS)
             .context("durée hors bornes")?,
     );
-    // The recovered generation has nothing to overlap *with*, so it changes
-    // over as early as the protocol allows. That instant is the end of the
-    // staging lease, not `now`: §7.2 refuses a lease that outlives the
-    // activation it prepares, so a window activating at `now` is refused by
-    // the gateway a moment after the operator touched their key. Collapsing
-    // the three instants onto `now` is refused earlier still, since a window
-    // demands `not_before < activation_at < not_after` strictly. Both refusals
-    // say the same thing: staging comes first, the change-over follows it.
+    // The recovered generation has no valid predecessor to preserve. Its
+    // activation is reached immediately, but it remains unusable until the
+    // signed two-key commit atomically moves it from `pending_grant` to
+    // `next`. The request expiry remains the deadline for completing that
+    // commit; it is not a user-visible delay after a successful ceremony.
     let stage_expires_at = request.expires_at;
     let window = TransitionWindow::new(
         now.saturating_sub(WINDOW_BACKDATE_SECS),
-        stage_expires_at,
-        stage_expires_at
-            .checked_add(OVERLAP_DAYS * DAY_SECS)
+        now,
+        now.checked_add(OVERLAP_DAYS * DAY_SECS)
             .context("durée hors bornes")?,
     )?;
 
@@ -310,21 +306,17 @@ mod tests {
         assert_eq!(OVERLAP_DAYS, 1);
     }
 
-    /// The two refusals that cost an evening, stated as arithmetic rather than
-    /// as a comment. They pull against each other: `not_before <
-    /// activation_at < not_after` strictly, and a staging lease that never
-    /// outlives the activation it prepares. Collapsing the three instants onto
-    /// `now` broke the first; activating at `now` broke the second — and that
-    /// one surfaced only at the gateway, a moment after the operator had
-    /// already touched their key.
+    /// A recovery activates at the ceremony instant but remains protected by
+    /// the pending-to-committed state transition. Its lease is a deadline for
+    /// that commit, not an activation delay.
     #[test]
-    fn the_window_satisfies_both_rules_that_bound_it() {
+    fn the_recovery_window_activates_immediately_and_keeps_a_commit_lease() {
         let now: u64 = 1_800_000_000;
         let stage_expires_at = now + 300;
         let window = TransitionWindow::new(
             now.saturating_sub(WINDOW_BACKDATE_SECS),
-            stage_expires_at,
-            stage_expires_at + OVERLAP_DAYS * DAY_SECS,
+            now,
+            now + OVERLAP_DAYS * DAY_SECS,
         )
         .expect("a recovery window is a valid window");
         assert!(window.not_before < window.activation_at);
@@ -333,13 +325,13 @@ mod tests {
             now,
             stage_expires_at,
             aether::certificates::window::MAX_STAGE_LEASE_SECS,
-            &[window.activation_at, stage_expires_at],
+            &[stage_expires_at],
         )
-        .expect("the staging lease does not outlive the activation it prepares");
+        .expect("the commit lease remains bounded by the recovery request");
         assert_eq!(
             window.phase(now),
-            aether::certificates::window::WindowPhase::Prepared,
-            "the change-over waits for the staging, and for nothing else"
+            aether::certificates::window::WindowPhase::Overlap,
+            "the successful commit must make the generation usable immediately"
         );
     }
 }

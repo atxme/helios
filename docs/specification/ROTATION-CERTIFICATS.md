@@ -1380,11 +1380,14 @@ reçoit de la VIP du pair dans WireGuard pour un renouvellement ordinaire ;
 Astra la reçoit en HTTPS public pour la récupération de §7.5. Helios vérifie
 la propriété du pair déjà liée à l'opération, les empreintes, la génération, la
 révocation, la signature et la liaison d'autorisation exacte transportée avec
-l'autorisation. Il exige
-`issued_at < stage_expires_at <= min(request.expires_at, activation_at)` et une
-lease d'au plus 24 heures, puis persiste le candidat dans l'état
-`pending_grant` avant toute réponse. Ce candidat n'est pas encore un slot
-`next` activable.
+l'autorisation. Il exige une lease positive d'au plus 24 heures et
+`stage_expires_at <= request.expires_at` lorsque la demande lui est accessible.
+Pour toute raison autre que `expired_recovery`, il exige aussi
+`stage_expires_at <= activation_at`. Une récupération expirée peut porter un
+`activation_at` déjà atteint : sa lease borne uniquement le délai du commit,
+et l'état `pending_grant` interdit encore de présenter le candidat. Helios
+persiste ce candidat dans `pending_grant` avant toute réponse ; ce candidat
+n'est pas encore un slot `next` activable.
 
 ### 7.3 Reçu Helios et grant final
 
@@ -1501,7 +1504,9 @@ l'ancien stage n'est valable pour ce nouvel identifiant. `revoked` domine la
 purge comme le commit.
 
 À partir de `activation_at`, seule une génération `next_committed` peut être
-utilisée ; l'ancienne reste admise jusqu'à `not_after`.
+utilisée ; l'ancienne reste admise jusqu'à `not_after`. Si `activation_at` est
+déjà atteint lors d'une récupération expirée, le commit est donc l'événement
+qui rend la nouvelle génération immédiatement utilisable.
 
 Un changement de clé WireGuard cliente suit le protocole de réadmission, pas ce
 grant.
@@ -1575,9 +1580,12 @@ génération plus récente existe, si l'ancienne clé n'est plus possédée ou s
 nouvelles preuves échouent. `CA-PQ`, jamais l'émetteur Astra, autorise alors le
 staging de §7.2 : `astra-signer` ouvre localement le coffre, signe
 l'autorisation exacte puis Astra la remet à Helios par le veth privé. Astra
-attend le reçu §7.3 avant de remettre le grant. Si l'ancienne clé privée a
-disparu avec le stockage DPAPI/TPM, cette procédure ne s'applique pas : il faut
-une réadmission opérateur à deux YubiKeys.
+attend le reçu §7.3 avant de remettre le grant. La fenêtre porte
+`activation_at` à l'instant de la cérémonie : le candidat reste bloqué en
+`pending_grant` jusqu'au double commit, puis Helios l'admet et Orion promeut sa
+paire scellée sans attendre l'expiration de la demande. Si l'ancienne clé
+privée a disparu avec le stockage DPAPI/TPM, cette procédure ne s'applique pas :
+il faut une réadmission opérateur à deux YubiKeys.
 
 Une seule YubiKey suffit ici parce qu'elle ne constitue pas l'unique preuve :
 la clé PQ privée de la dernière génération admise signe aussi le challenge, la
