@@ -185,7 +185,7 @@ impl Authenticator for WebAuthnAuthenticator {
         // vault: two slots on one object is not a recovery, though it reads as
         // one in `list`.
         let mut excluded = CredentialList::new(exclude);
-        let mut options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
+        let options = WEBAUTHN_AUTHENTICATOR_MAKE_CREDENTIAL_OPTIONS {
             dwVersion: make_credential_options_version(self.api_version),
             dwTimeoutMilliseconds: TIMEOUT_MS,
             CredentialList: WEBAUTHN_CREDENTIALS {
@@ -223,7 +223,7 @@ impl Authenticator for WebAuthnAuthenticator {
                 &user,
                 &parameters,
                 &client,
-                &mut options,
+                &options,
                 &mut attestation,
             )
         };

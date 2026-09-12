@@ -44,7 +44,7 @@ jobs:
       - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev libudev-dev
       - name: Vérifications rapides
         run: bash scripts/check.sh
 
@@ -68,7 +68,7 @@ jobs:
       - name: Dépendances système de Tauri et TPM
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libtss2-dev libudev-dev
       - name: Outil d'audit Rust
         run: |
           if ! command -v cargo-audit >/dev/null 2>&1; then
