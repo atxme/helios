@@ -502,6 +502,11 @@ tools/
   xtask/
 ```
 
+Les crates `aether-*` sont des crates sœurs de `aether`, pas des modules
+internes ni des dépendances de `aether`. En particulier,
+`aether-key-negotiation -> aether` : le transport partagé consomme les contrats
+canoniques, tandis qu'`aether` ne dépend jamais de QUIC/TLS.
+
 `astra-channel` est justifiée par un protocole de processus à processus,
 ses bornes TLS/ALPN, deux côtés indépendants et la suppression de
 `astra -> helios-api`. `helios-escrow` est justifiée par une frontière de
@@ -1266,25 +1271,35 @@ unique doit distinguer contrat, transport, session et lifecycle.
 ```text
 crates/aether-key-negotiation/src/      après renommage éventuel
   lib.rs
-  tls.rs                     identités, pinning et configurations rustls
+  identity.rs                identité TLS et empreintes
   endpoint.rs                endpoints QUIC et paramètres transport
-  server.rs                  transaction servie et limites publiques
+  framing.rs                 framing JSON privé, borné et inchangé
+  server.rs                  transaction servie et préparation du matériau
   client.rs                  ClientSession et PendingChallenge
   transaction.rs             deadline, commit et rollback cancellation-safe
   rate_limit.rs
+  error.rs                   contrat d'erreur transversal client/serveur
   tests/
     mod.rs
-    interop.rs
+    fixtures.rs
+    limits.rs
+    material.rs
+    protocol.rs
     rollback.rs
+    transport.rs
 ```
 
 Les messages v5, signatures et dérivations restent dans Aether : la crate
 actuelle les importe déjà depuis `aether::key_negotiation`. Il ne faut donc pas
-recréer ici des fichiers `types`, `validation`, `material` ou `error` qui
-dupliqueraient cette ownership. La crate de transport porte TLS/QUIC, client,
-serveur, limites réseau et rollback. Les erreurs restent près du bloc qui les
-produit. Les tests d’interopérabilité et d’annulation sont séparés lorsque cela
-ne nécessite plus la dépendance dev `heliosd -> orion-core`.
+recréer ici des fichiers `types`, `validation` ou `crypto` qui dupliqueraient
+cette ownership. `error.rs` est une exception locale justifiée : `PublicError`
+et `TransportError` forment le contrat transversal déjà consommé par les chemins
+client et serveur ; ce n'est ni une crate d'erreurs ni un nouveau format. La
+crate de transport porte TLS/QUIC, client, serveur, limites réseau et rollback.
+Les tests QUIC internes restent dans cette crate. Les tests d'interopérabilité
+réelle Helios/Orion sont actuellement dans `heliosd/src/key_negotiation.rs` ;
+leur extraction est une migration séparée nécessaire pour retirer la dépendance
+dev `heliosd -> orion-core`.
 
 #### `heliosd`
 
