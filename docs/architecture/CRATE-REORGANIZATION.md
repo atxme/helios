@@ -30,21 +30,26 @@ repérer les concentrations, pas une mesure de complexité.
 ## 1. Architecture actuelle
 
 Le découpage fonctionnel est déjà visible, mais il n’est pas toujours reflété
-par les frontières Cargo :
+par les frontières Cargo. La cible de nommage et d’ownership Helios–Orion doit
+se lire ainsi :
 
 ```text
-# État actuel : dépendances à supprimer dans la cible
-Orion/Tauri -> orion-core
-                 ├── helios-key-negotiation
-                 ├── helios-fido
-                 └── helios-vault
+orion (Tauri) -> orion-core
+orion-core -> aether
+           -> aether-fido
+           -> aether-key-negotiation
+           -> aether-vault
 
-heliosd -> helios-key-negotiation
-        -> helios-provisioning
-        -> helios-wireguard
-        -> helios-firewall
+heliosd -> aether
+        -> aether-key-negotiation
+        -> aether-vault
         -> helios-api
-        -> Astra / TPM / vault / update
+        -> helios-escrow
+        -> helios-firewall
+        -> helios-provisioning
+        -> helios-tpm
+        -> helios-update
+        -> helios-wireguard
 ```
 
 `heliosd` assemble effectivement les composants, mais ses propres modules
@@ -53,10 +58,10 @@ négociation, certificats, rotation, PSK statiques, uplinks, routage VIP,
 clé gateway et canal Astra. Le binaire est donc un composition root incomplet,
 pas un simple câblage.
 
-Le point le plus important est la différence entre deux graphes. Le schéma
-suivant est volontairement l’état observé : les trois dépendances
-`helios-*` côté Orion sont précisément un problème à supprimer, pas une cible
-architecturale.
+Le graphe Cargo exact observé est donné en section 2. Il montre encore les
+anciens packages `helios-fido`, `helios-key-negotiation` et `helios-vault` dans
+les dépendances d’Orion ; ces noms et cette ownership sont précisément à
+corriger, pas à conserver dans la cible.
 
 - le graphe de production ne contient pas `heliosd -> orion-core` ;
 - le test d’interopérabilité de `heliosd` dépend toutefois de `orion-core` en
