@@ -280,7 +280,7 @@ impl SigningOperationStore {
             .map(
                 |operation| aether::certificates::transport::OperatorPendingOperation {
                     operation_id: operation.operation_id,
-                    scope: operation.campaign.scope.clone(),
+                    scope: operation.campaign.scope,
                     reason: operation.campaign.reason.clone(),
                     requested_by: operation.campaign.requested_by.clone(),
                     target_count: operation.campaign.targets.len(),

@@ -358,10 +358,10 @@ fn select_objects(
             // vers la suivante (§6.3), sans pouvoir récupérer ce tombstone
             // ici. Lui servir un avortement qu'il ne peut pas appliquer ferait
             // échouer toute la transaction plutôt qu'une partie.
-            TrustUpdateObject::GatewayTransitionAbort(abort) => {
-                if request.request.gateway_decision_epoch == abort.gateway_identity_epoch {
-                    objects.push(stored.object.clone());
-                }
+            TrustUpdateObject::GatewayTransitionAbort(abort)
+                if request.request.gateway_decision_epoch == abort.gateway_identity_epoch =>
+            {
+                objects.push(stored.object.clone());
             }
             _ => {}
         }

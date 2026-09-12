@@ -304,11 +304,7 @@ async fn transfer(
 }
 
 fn print_progress(offset: u64, total: u64) {
-    let percent = if total == 0 {
-        100
-    } else {
-        offset.saturating_mul(100) / total
-    };
+    let percent = offset.saturating_mul(100).checked_div(total).unwrap_or(100);
     print!(
         "\r  upload {:>3}%  {offset}/{total} bytes",
         percent.min(100)
