@@ -1,0 +1,218 @@
+//! Translation of a [`Match`] into `rustables` expressions.
+//!
+//! The deterministic half of the backend: every function here maps a rendered
+//! rule onto what nf_tables understands, and none of them talks to the kernel.
+//! That is why the batch built from them can be validated without a machine
+//! carrying `nf_tables`.
+
+use std::net::IpAddr;
+use std::str::FromStr;
+
+use aether::Result;
+use rustables::{
+    expr::{Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Meta, MetaType},
+    HookClass, Protocol, Rule as NfRule,
+};
+
+use super::NetlinkBackend;
+use crate::ruleset::{ChainKind, Match, L4};
+
+/// Conntrack states [`Match::Established`] accepts, as the kernel reads them.
+///
+/// Pinned as a constant so a refactor back to [`NfRule::established`] — which
+/// sets `ESTABLISHED` alone, i.e. `0b010` — fails a test instead of quietly
+/// halving what the rule matches.
+const ESTABLISHED_OR_RELATED: u32 =
+    ConnTrackState::ESTABLISHED.bits() | ConnTrackState::RELATED.bits();
+
+impl NetlinkBackend {
+    pub(super) fn hook_class(kind: ChainKind) -> HookClass {
+        match kind {
+            ChainKind::Input => HookClass::In,
+            ChainKind::Forward => HookClass::Forward,
+            ChainKind::Output => HookClass::Out,
+        }
+    }
+
+    /// Applies a match to a rule under construction.
+    pub(super) fn apply_match(rule: NfRule, m: &Match) -> Result<NfRule> {
+        let proto = |p: L4| match p {
+            L4::Tcp => Protocol::TCP,
+            L4::Udp => Protocol::UDP,
+        };
+
+        Ok(match m {
+            Match::Established => Self::established_or_related(rule)?,
+            Match::InIface(i) => rule.iiface(i).map_err(Self::err)?,
+            Match::OutIface(i) => rule.oiface(i).map_err(Self::err)?,
+            Match::DestPort { port, proto: p } => rule.dport(*port, proto(*p)),
+            Match::SourcePort { port, proto: p } => rule.sport(*port, proto(*p)),
+            Match::DestPortSet { .. } => {
+                return Err(Self::err(
+                    "port set: must be expanded by expand_port_sets before translation",
+                ))
+            }
+            Match::DestNet(addr) => Self::match_net(rule, addr, false)?,
+            Match::SourceNet(addr) => Self::match_net(rule, addr, true)?,
+            Match::Icmp => rule.icmp(),
+            Match::PacketMark(mark) => rule
+                .with_expr(Meta::new(MetaType::Mark))
+                .with_expr(Cmp::new(CmpOp::Eq, Self::packet_mark_bytes(*mark))),
+        })
+    }
+
+    /// Encodes a packet mark as the native `u32` stored in the nftables meta
+    /// register. Unlike IP addresses and ports, `meta mark` is not a network
+    /// protocol field and must therefore not use network byte order.
+    fn packet_mark_bytes(mark: u32) -> [u8; 4] {
+        mark.to_ne_bytes()
+    }
+
+    /// `ct state established,related`, built by hand.
+    ///
+    /// [`NfRule::established`] would be the obvious call, and it is wrong
+    /// here: it masks `ESTABLISHED` alone, so what got applied was `ct state
+    /// established` while [`Match`] displayed — and the API served, and the
+    /// console showed — `ct state established,related`. Exactly the
+    /// display/applied divergence the `ruleset` module doc rules out, and the
+    /// kind that survives review because both sides read correct on their
+    /// own.
+    ///
+    /// What `related` covers is not decorative. It is how conntrack labels an
+    /// ICMP error attached to a tracked flow, `destination unreachable —
+    /// fragmentation needed` first among them. Dropping those under a
+    /// fail-closed policy black-holes path-MTU discovery: connections open,
+    /// then hang on the first full-size packet, and the tunnel gets blamed.
+    ///
+    /// The three expressions reproduce what `rustables` emits, with the mask
+    /// widened by one bit — same layout, same little-endian mask convention.
+    fn established_or_related(rule: NfRule) -> Result<NfRule> {
+        Ok(rule
+            .with_expr(Conntrack::new(ConntrackKey::State))
+            .with_expr(
+                Bitwise::new(ESTABLISHED_OR_RELATED.to_le_bytes(), 0u32.to_be_bytes())
+                    .map_err(Self::err)?,
+            )
+            // Non-zero after masking: the packet is in one of the two states.
+            .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_be_bytes())))
+    }
+
+    /// Applies an address match, accepting either a plain IP or a CIDR.
+    fn match_net(rule: NfRule, addr: &str, source: bool) -> Result<NfRule> {
+        if addr.contains('/') {
+            let net = ipnetwork::IpNetwork::from_str(addr)
+                .map_err(|e| Self::err(format!("invalid CIDR `{addr}`: {e}")))?;
+            let r = if source {
+                rule.snetwork(net)
+            } else {
+                rule.dnetwork(net)
+            };
+            r.map_err(Self::err)
+        } else {
+            let ip = IpAddr::from_str(addr)
+                .map_err(|e| Self::err(format!("invalid IP `{addr}`: {e}")))?;
+            Ok(if source {
+                rule.saddr(ip)
+            } else {
+                rule.daddr(ip)
+            })
+        }
+    }
+
+    /// Expands a `DestPortSet` into a list of single-port match sets.
+    /// The resulting filtering is identical.
+    pub(super) fn expand_port_sets(matches: &[Match]) -> Vec<Vec<Match>> {
+        let Some(idx) = matches
+            .iter()
+            .position(|m| matches!(m, Match::DestPortSet { .. }))
+        else {
+            return vec![matches.to_vec()];
+        };
+        let Match::DestPortSet { ports, proto } = &matches[idx] else {
+            unreachable!()
+        };
+
+        ports
+            .iter()
+            .map(|port| {
+                let mut copy = matches.to_vec();
+                copy[idx] = Match::DestPort {
+                    port: *port,
+                    proto: *proto,
+                };
+                copy
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_sets_are_expanded() {
+        let matches = vec![
+            Match::OutIface("eth0".into()),
+            Match::DestPortSet {
+                ports: vec![80, 443],
+                proto: L4::Tcp,
+            },
+        ];
+        let expanded = NetlinkBackend::expand_port_sets(&matches);
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded[0].contains(&Match::DestPort {
+            port: 80,
+            proto: L4::Tcp
+        }));
+        assert!(expanded[1].contains(&Match::DestPort {
+            port: 443,
+            proto: L4::Tcp
+        }));
+        // The other matches are preserved in each produced rule.
+        assert!(expanded[0].contains(&Match::OutIface("eth0".into())));
+    }
+
+    #[test]
+    fn a_set_without_expansion_stays_intact() {
+        let matches = vec![Match::InIface("lo".into())];
+        assert_eq!(NetlinkBackend::expand_port_sets(&matches), vec![matches]);
+    }
+
+    /// `related` is how conntrack labels an ICMP error attached to a tracked
+    /// flow — `fragmentation needed` above all. Matching `established` alone
+    /// black-holes path-MTU discovery under a drop policy: connections open,
+    /// then hang on the first full-size packet.
+    ///
+    /// Only the mask is checked here; that the kernel prints `ct state
+    /// established,related` is target-only, see `docs/testing/TESTING.md`.
+    #[test]
+    fn the_conntrack_mask_carries_related_and_not_established_alone() {
+        assert_eq!(
+            ESTABLISHED_OR_RELATED, 0b110,
+            "the mask the kernel reads must carry both states"
+        );
+        assert_ne!(
+            ESTABLISHED_OR_RELATED,
+            ConnTrackState::ESTABLISHED.bits(),
+            "`NfRule::established` is precisely what this constant exists to avoid"
+        );
+    }
+
+    #[test]
+    fn address_parsing() {
+        assert!(ipnetwork::IpNetwork::from_str("10.0.0.0/8").is_ok());
+        assert!(IpAddr::from_str("203.0.113.10").is_ok());
+        assert!(ipnetwork::IpNetwork::from_str("not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn packet_mark_is_encoded_in_the_kernel_register_byte_order() {
+        let mark = 0xe1f1;
+
+        assert_eq!(
+            u32::from_ne_bytes(NetlinkBackend::packet_mark_bytes(mark)),
+            mark
+        );
+    }
+}
