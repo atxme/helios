@@ -2,6 +2,7 @@
 
 mod access;
 mod egress;
+mod golden;
 mod support;
 mod transport;
 mod uplinks;
