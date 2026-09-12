@@ -163,7 +163,7 @@ d’interface/pairs, observation des handshakes, dry-run et backend réel. Son
 unique arête vers `helios-provisioning` vient du trait `PeerTable` utilisé pour
 l’IPAM ; c’est une inversion de couche à surveiller, pas un cycle.
 
-Les frontières `helios-vault`, `helios-fido`, `helio-tpm` et
+Les frontières `helios-vault`, `helios-fido`, `helios-tpm` et
 `helios-key-negotiation` sont justifiées respectivement par un format secret,
 un périphérique matériel, le matériel TPM et un protocole de transport.
 
@@ -187,7 +187,7 @@ astra-signer
   -> astra-operator
   -> helios-fido
 
-helio-tpm
+helios-tpm
   -> aether
   -> helios-vault
 
@@ -205,7 +205,7 @@ helios-astra-helper
 
 helios-ctl
   -> aether
-  -> helio-tpm
+  -> helios-tpm
   -> helios-key-negotiation
   -> helios-update
   -> orion-core
@@ -240,7 +240,7 @@ helios-wireguard
 
 heliosd
   -> aether
-  -> helio-tpm
+  -> helios-tpm
   -> helios-api
   -> helios-firewall
   -> helios-key-negotiation
@@ -270,7 +270,7 @@ heliosd  -[dev]->   orion-core
 orion    -[build]-> xtask
 ```
 
-Les dépendances `dev` de `aether`, `helios-update` et `helio-tpm` activent des
+Les dépendances `dev` de `aether`, `helios-update` et `helios-tpm` activent des
 fixtures/signatures pour leurs propres tests. Elles ne forment pas des arêtes
 de production.
 
@@ -282,7 +282,7 @@ de production.
 | `astra` | 1 | 2 |
 | `astra-operator` | 2 | 4 |
 | `astra-signer` | 0 | 3 |
-| `helio-tpm` | 2 | 2 |
+| `helios-tpm` | 2 | 2 |
 | `helios-api` | 2 | 5 |
 | `helios-astra-helper` | 0 | 3 |
 | `helios-ctl` | 0 | 5 |
@@ -367,7 +367,7 @@ précéder tout déplacement.
 | Package | Features | Couplage observé |
 | --- | --- | --- |
 | `aether` | `publisher-signing`, `key-negotiation-signing`, `fuzzing` | fait entrer les capacités de signature et fixtures dans le socle partagé |
-| `helio-tpm` | `tpm` | active `tss-esapi` et le backend matériel |
+| `helios-tpm` | `tpm` | active `tss-esapi` et le backend matériel |
 | `helios-api` | `embed-ui` | couple la façade API à l’asset web de production |
 | `helios-firewall` | `netlink` | active `rustables`/`ipnetwork` pour le backend réel |
 | `helios-provisioning` | `certificate-signing` | ne sert essentiellement qu’aux tests de signature de certificats |
@@ -393,7 +393,7 @@ pas une preuve matérielle.
 | `aether` | `libc` Linux, `windows-sys` Windows | verrouillage mémoire/fichiers ; utilitaire partagé, mais pas totalement neutre plateforme |
 | `helios-firewall` | `rustables`, `ipnetwork` optionnels | backend Netlink/nftables, à garder hors contrats |
 | `helios-wireguard` | `defguard_wireguard_rs` optionnel | backend WireGuard réel de la gateway |
-| `helio-tpm` | `tss-esapi` optionnel | TPM réel, cible matérielle |
+| `helios-tpm` | `tss-esapi` optionnel | TPM réel, cible matérielle |
 | `helios-fido` | `ctap-hid-fido2`, hidapi/libudev, `windows-sys` | frontière FIDO/WebAuthn matérielle |
 | `orion-core` | `windows`, `windows-sys`, `defguard_wireguard_rs` | DPAPI/CNG, BitLocker/WMI, Wintun/route pinning client |
 | `heliosd` | `libc` Unix | protection des core dumps du daemon |
@@ -412,7 +412,7 @@ modules d’implémentation ; elle ne doit pas remonter dans le modèle partagé
   vault, update, `heliosd`, `orion-core` et de l’application Tauri.
 - Les tests d’intégration sont dans `crates/astra/tests/` (`cli.rs`,
   `private_channel.rs`), `crates/astra-operator/tests/`,
-  `crates/helio-tpm/tests/materiel.rs` et
+  `crates/helios-tpm/tests/materiel.rs` et
   `tools/helios-publisher/tests/cli_security.rs`.
 - `heliosd` possède un test d’interopérabilité client via sa dépendance dev à
   `orion-core`, mais pas de harnais indépendant.
@@ -695,6 +695,11 @@ Fichiers : `crates/helio-tpm/**`, futur `crates/helios-tpm/**`,
 `tools/helios-ctl/src/escrow.rs`, `heliosd/src/{gateway_key.rs,gateway_rotation.rs}`,
 `helios-provisioning/src/{certificates.rs,lib.rs}`, manifests et tests.
 
+État d'implémentation : l'extraction de l'escrow (`helios-escrow`) et le
+renommage `helio-tpm` -> `helios-tpm` sont faits. Les noms `helio-tpm` employés
+ci-dessus décrivent l'état audité qui a motivé la phase, pas l'ownership
+actuel. L'extraction de `helios-provisioning::certificates` reste ouverte.
+
 Validation : tests HVLT/HESC, tests dry-run TPM, tests de registre/rotation et
 tests matériels conditionnels sur les cibles décrites dans
 `docs/testing/TESTING.md`.
@@ -896,7 +901,7 @@ crates/astra-operator/src/
   handoff.rs origin.rs orion.rs prepared.rs store.rs tunnel.rs vault.rs
   operations.rs operations/{campaign,recovery}.rs
 
-crates/helio-tpm/src/
+crates/helios-tpm/src/
   lib.rs blob_store.rs boot_controller.rs escrow.rs keystore.rs provisioning.rs
   reseal_ticket.rs secret.rs settings.rs tpm_interface.rs tpm_real.rs
   update_window.rs
@@ -961,8 +966,8 @@ pas une crate runtime supplémentaire.
 | `astra` | `src/main.rs` | 2 491 (sans module de tests inline) | CLI, bootstrap, canaux, commandes et lifecycle | composition root trop chargé | `SPLIT` | haute |
 | `astra-operator` | `src/authority.rs` | 1 733 (sans module de tests inline) | gestes de signature de l’autorité | fichier long mais cohérent ; nom actuel peu précis | `RENAME` | basse |
 | `astra-operator` | `src/vault.rs` | 1 622 (994 + 628) | slots, ouverture et opérations du coffre | capacité cohérente, corpus de tests important | `KEEP` | basse |
-| `helio-tpm` | `src/boot_controller.rs` | 884 | décisions de boot et état de démarrage | machine de décision cohérente | `KEEP` | basse |
-| `helio-tpm` | `src/tpm_real.rs` | 777 | adaptation `tss-esapi` | backend externe clairement identifiable | `MOVE` | moyenne |
+| `helios-tpm` | `src/boot_controller.rs` | 884 | décisions de boot et état de démarrage | machine de décision cohérente | `KEEP` | basse |
+| `helios-tpm` | `src/tpm_real.rs` | 777 | adaptation `tss-esapi` | backend externe clairement identifiable | `MOVE` | moyenne |
 | `helio-tpm` | `src/escrow.rs` | 344 | HESC, X25519/AEAD et séquestre opérateur | responsabilité sans dépendance TPM | `MOVE` | haute |
 | `helios-api` | `src/internal.rs` | 2 255 (1 666 + 589) | canal Astra, TLS/ALPN, clients, serveur et contrats privés | reverse dependency et frontière protocolaire autonome | `MOVE` | très haute |
 | `helios-api` | `src/certificates.rs` | 1 746 (1 221 + 525) | vues HTTP, traits handlers et routes certificat | plusieurs capacités API, pas logique de registre | `SPLIT` | haute |
@@ -1507,7 +1512,7 @@ La visibilité n’est pas uniformément mauvaise. Les constats précis sont :
 | `aether` | nombreux modules publics et réexports racine de contrats | conserver les contrats canoniques ; rendre privés les helpers issus des splits sans ajouter de nouveaux réexports globaux |
 | `astra` | modules métier publics utilisés par son binaire et l’opérateur | retirer d’abord la dépendance `astra-operator -> astra` pour les DTO, puis réduire seulement les modules sans consommateur |
 | `astra-operator` | réexport de `helios_fido::authenticator` et de contrats Astra | faire dépendre les consommateurs du propriétaire réel ; ne pas utiliser la façade opérateur pour masquer deux autres crates |
-| `helio-tpm` | backend et stockage principalement privés, API racine explicite | conserver ce modèle ; l’extraction d’escrow retire son seul module public hors TPM |
+| `helios-tpm` | backend et stockage principalement privés, API racine explicite | conserver ce modèle ; l’extraction d’escrow retire son seul module public hors TPM |
 | `helios-api` | `pub mod internal` expose canal, TLS, clients et contrats à Astra | supprimer ce module public après extraction vers `astra-channel` |
 | `helios-firewall` | backend privé, types utiles réexportés à la racine | surface correcte ; les futurs sous-modules de backend restent privés |
 | `helios-key-negotiation` | API publique directement dans `lib.rs` | garder les futurs modules privés et réexporter uniquement endpoints, sessions et traits réellement consommés |

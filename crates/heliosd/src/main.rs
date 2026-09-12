@@ -22,8 +22,8 @@ use aether::{
 };
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use helio_tpm::{BootController, BootDecision, TpmSettings};
 use helios_api::AppState;
+use helios_tpm::{BootController, BootDecision, TpmSettings};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -626,7 +626,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Drives the update window (see `helio_tpm::update_window`).
+/// Drives the update window (see `helios_tpm::update_window`).
 fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
     let tpm = TpmSettings::default();
     match command {

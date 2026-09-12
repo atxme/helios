@@ -384,7 +384,7 @@ Le nouveau crate `helios-provisioning` porte donc : enrôlement, authentificatio
 adressage, échange ML-KEM et rotation du PSK.
 
 **Authentification.** Le transport TLS 1.3 et l'identité applicative ML-DSA-65
-de la gateway sont ancrés dans le TPM : le secret descellé par `helio-tpm`
+de la gateway sont ancrés dans le TPM : le secret descellé par `helios-tpm`
 (PCR 0/4/7 — firmware, bootloader, Secure Boot) ouvre leurs deux clés privées.
 Orion présente un certificat ML-DSA-65 liant sa clé de signature à sa clé
 WireGuard ; sa clé privée reste dans le stockage protégé Windows. Orion n'a pas
@@ -406,7 +406,7 @@ sa VIP par re-dérivation.
 
 > **Ne pas dériver depuis le TPM.** Une version antérieure de ce plan proposait
 > `BLAKE3(identifiant matériel TPM)`. Cet identifiant **n'existe pas** :
-> `helio-tpm` n'expose que `current_pcr_digest`, qui est une *mesure de la chaîne
+> `helios-tpm` n'expose que `current_pcr_digest`, qui est une *mesure de la chaîne
 > de boot* — donc **identique sur tous les appareils portant le même firmware**.
 > Le dériver donnerait la même VIP à tous les clients. La clé publique WireGuard
 > est unique, stable, déjà présente, et déjà l'identité du pair.
@@ -607,7 +607,7 @@ clair. Débloquer Linux suppose `libsecret`, macOS le Keychain. Voir
 Chiffres vérifiés contre l'arbre au 2026-07-17.
 
 **Intacts** (1 969 lignes)
-: `helio-tpm` (1 342) — le scellement PCR 0/4/7 et le ticket de rescellement
+: `helios-tpm` (1 342) — le scellement PCR 0/4/7 et le ticket de rescellement
   Ed25519 sont inchangés. `SecretKey` déchiffrait des credentials IPsec ; une clé
   privée Curve25519 est un blob comme un autre. Le TPM devient en outre l'ancre
   d'authentification du canal de contrôle. `helios-api` (428) et `helios-update`

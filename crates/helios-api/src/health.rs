@@ -26,7 +26,7 @@ use crate::AppState;
 
 /// The gateway's sealing posture, without the secret it was derived from.
 ///
-/// A projection of `helio_tpm::BootDecision`, which carries the unlock key and
+/// A projection of `helios_tpm::BootDecision`, which carries the unlock key and
 /// therefore must never reach this crate. `heliosd` computes this summary at
 /// startup and hands over only these two non-secret facts.
 #[derive(Serialize, Clone, Copy)]

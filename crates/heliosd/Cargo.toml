@@ -18,7 +18,7 @@ wireguard = ["helios-wireguard/wireguard"]
 # Embarque l'UI React dans le binaire.
 embed-ui = ["helios-api/embed-ui"]
 # Active la validation TPM réelle via libtss2-esys (cible uniquement, pas WSL2).
-tpm = ["helio-tpm/tpm"]
+tpm = ["helios-tpm/tpm"]
 
 [dependencies]
 
@@ -30,7 +30,7 @@ helios-firewall.workspace = true
 helios-wireguard.workspace = true
 helios-update.workspace = true
 helios-api.workspace = true
-helio-tpm.workspace = true
+helios-tpm.workspace = true
 helios-escrow.workspace = true
 helios-provisioning.workspace = true
 tokio = { workspace = true }

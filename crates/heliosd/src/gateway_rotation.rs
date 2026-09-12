@@ -155,7 +155,7 @@ fn plan(
 /// Prepares the next gateway identity and exports its request (§11.1 1-2).
 pub(crate) fn prepare_request(
     registry: &CertificateRegistry,
-    secret: Option<&helio_tpm::SecretKey>,
+    secret: Option<&helios_tpm::SecretKey>,
     dry_run: bool,
     rotate_tls: bool,
     new_key: bool,
@@ -471,7 +471,7 @@ impl IdentityDocuments {
 /// yet been cleaned up.
 pub(crate) fn maintain_gateway_identity(
     registry: &mut CertificateRegistry,
-    secret: Option<&helio_tpm::SecretKey>,
+    secret: Option<&helios_tpm::SecretKey>,
     now_unix: u64,
 ) -> Result<bool> {
     maintain_gateway_identity_in(registry, secret, now_unix, &IdentityDocuments::resolved())
@@ -479,7 +479,7 @@ pub(crate) fn maintain_gateway_identity(
 
 fn maintain_gateway_identity_in(
     registry: &mut CertificateRegistry,
-    secret: Option<&helio_tpm::SecretKey>,
+    secret: Option<&helios_tpm::SecretKey>,
     now_unix: u64,
     documents: &IdentityDocuments,
 ) -> Result<bool> {

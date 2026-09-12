@@ -18,12 +18,12 @@ use aether::{
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use helio_tpm::{BootDecision, SealedKeystore, SecretKey};
 use helios_api::key_negotiation::PskReleaseRefusal;
 use helios_key_negotiation::{
     prepare_key_material, server_endpoint, GatewayIdentity, NegotiationHandler,
     PreparedNegotiation, PublicError, TlsIdentity, DEFAULT_CONFIRMATION_TIMEOUT,
 };
+use helios_tpm::{BootDecision, SealedKeystore, SecretKey};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use zeroize::Zeroizing;
 
@@ -1909,8 +1909,8 @@ impl crate::certificates::StageReceiptSigner for GatewayHandler {
 /// Aucune époque n'est modelée aujourd'hui — l'ajouter suppose de versionner le
 /// certificat de négociation, ce qui relève du lot gateway. La liaison au pair
 /// est en place ; la fraîcheur du certificat ne l'est pas encore.
-fn negotiation_identity_context(gateway_wg_public_key: &str) -> helio_tpm::Context {
-    helio_tpm::Context::new().field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
+fn negotiation_identity_context(gateway_wg_public_key: &str) -> helios_tpm::Context {
+    helios_tpm::Context::new().field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
 }
 
 fn load_served_identity(
@@ -2008,7 +2008,7 @@ fn load_active_private_identity_with_secret(
 ) -> Result<StoredPrivateIdentity> {
     let encoded = SealedKeystore::new(
         PRIVATE_KEYSTORE_PATH,
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .load(secret, &negotiation_identity_context(gateway_wg_public_key))
     .context("unsealing key-negotiation private key")?;
@@ -2022,7 +2022,7 @@ fn load_candidate_private_identity(
 ) -> Result<StoredCandidateIdentity> {
     let encoded = SealedKeystore::new(
         next_private_keystore_path(),
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .load(
         secret,
@@ -2151,7 +2151,7 @@ pub fn initialize(
     let client_pq_ca_destination = std::path::PathBuf::from(CLIENT_PQ_CA_PATH);
     let keystore = SealedKeystore::new(
         PRIVATE_KEYSTORE_PATH,
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     );
     let already_initialized = keystore.exists()
         || certificate_path.exists()
@@ -2294,8 +2294,8 @@ pub(crate) enum RequestContinuity {
 fn candidate_identity_context(
     gateway_wg_public_key: &str,
     gateway_identity_epoch: u64,
-) -> helio_tpm::Context {
-    helio_tpm::Context::new()
+) -> helios_tpm::Context {
+    helios_tpm::Context::new()
         .field("gateway_wg_public_key", gateway_wg_public_key.as_bytes())
         .field(
             "gateway_identity_epoch",
@@ -2366,7 +2366,7 @@ pub(crate) fn seal_candidate_identity(
     );
     SealedKeystore::new(
         next_private_keystore_path(),
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .store(
         secret,
@@ -2416,7 +2416,7 @@ pub(crate) fn sign_certificate_request(
         secret.context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
     let sealed = SealedKeystore::new(
         next_private_keystore_path(),
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .load(
         unsealing,
@@ -2558,7 +2558,7 @@ pub(crate) fn promote_candidate_identity(
     // destroy the outgoing private slot (§11.1 step 9).
     SealedKeystore::new(
         PRIVATE_KEYSTORE_PATH,
-        helio_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     )
     .store(
         secret,

@@ -5,7 +5,7 @@
 //! `wg_private_key` is the gateway's **cryptographic identity**: it is what
 //! authenticates every WireGuard handshake. In the clear on disk, a stolen
 //! disk is enough to impersonate the gateway. It is therefore moved into a
-//! vault encrypted by the secret sealed in the TPM ([`helio_tpm::keystore`]):
+//! vault encrypted by the secret sealed in the TPM ([`helios_tpm::keystore`]):
 //! decrypting it requires a successful unseal, hence an intact boot chain
 //! (PCR 0/4/7).
 //!
@@ -41,7 +41,7 @@
 use std::path::PathBuf;
 
 use aether::NetworkConfig;
-use helio_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
+use helios_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
 use tracing::{info, warn};
 
 /// Location of the vault containing the WireGuard private key.
@@ -116,7 +116,7 @@ pub struct ResolvedKey {
 fn keystore() -> SealedKeystore {
     SealedKeystore::new(
         PathBuf::from(keystore_path()),
-        helio_tpm::DOMAIN_GATEWAY_WG_KEY,
+        helios_tpm::DOMAIN_GATEWAY_WG_KEY,
     )
 }
 
@@ -125,10 +125,10 @@ fn keystore() -> SealedKeystore {
 /// It is what stops a vault from being opened as another gateway's, and it is
 /// derivable from the very secret the vault holds — which is why reading goes
 /// through `load_declared` and compares afterwards (ADR-006 §2).
-fn identity_context(private_key: &str) -> Result<helio_tpm::Context, String> {
+fn identity_context(private_key: &str) -> Result<helios_tpm::Context, String> {
     let public = aether::wg::public_from_private(private_key)
         .map_err(|e| format!("deriving the gateway public key: {e}"))?;
-    Ok(helio_tpm::Context::new().field("wg_public_key", public.as_bytes()))
+    Ok(helios_tpm::Context::new().field("wg_public_key", public.as_bytes()))
 }
 
 /// What a vault's declared context says about the key it contains.
@@ -213,7 +213,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 /// Only called when the vault is undecipherable: outside of that case, a
 /// stray recovery file must never be able to replace the key in effect —
 /// that would be an identity substitution vector.
-fn try_recovery(secret: &helio_tpm::SecretKey) -> Option<String> {
+fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<String> {
     let path = PathBuf::from(recovery_path());
     if !path.exists() {
         return None;
@@ -551,7 +551,7 @@ mod tests {
     }
 
     fn context_of(public_key: &str) -> Vec<u8> {
-        helio_tpm::Context::new()
+        helios_tpm::Context::new()
             .field("wg_public_key", public_key.as_bytes())
             .as_bytes()
             .to_vec()
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn a_context_under_another_label_is_refused() {
         let (private_key, public_key) = keypair();
-        let mislabelled = helio_tpm::Context::new()
+        let mislabelled = helios_tpm::Context::new()
             .field("public_key", public_key.as_bytes())
             .as_bytes()
             .to_vec();
