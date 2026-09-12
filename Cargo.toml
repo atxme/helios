@@ -1,26 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/aether",
-    "crates/astra",
-    "crates/astra-operator",
-    "crates/helios-firewall",
-    "crates/helios-update",
-    "crates/helios-api",
-    "crates/helio-tpm",
-    "crates/helios-provisioning",
-    "crates/helios-wireguard",
-    "crates/helios-key-negotiation",
-    "crates/helios-vault",
-    "crates/helios-fido",
-    "crates/orion-core",
-    "crates/heliosd",
-    "tools/astra-signer",
-    "tools/helios-astra-helper",
-    "tools/helios-ctl",
-    "tools/helios-publisher",
-    "tools/helios-installer",
-    "tools/xtask",
+    "crates/*",
+    "tools/*",
     "apps/orion/src-tauri",
 ]
 
