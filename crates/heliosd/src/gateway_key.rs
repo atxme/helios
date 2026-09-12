@@ -29,7 +29,7 @@
 //! # Recovery without SSH: escrow
 //!
 //! When the PCRs change, resealing generates a **new** secret and the vault
-//! becomes undecipherable. [Escrow](helio_tpm::escrow) covers this case: a
+//! becomes undecipherable. [`helios_escrow`] covers this case: a
 //! copy of the key, encrypted to the operator's public key, is written on
 //! every sealing. The operator opens it offline, deposits the key into a
 //! recovery file delivered **with the OTA bundle** — the same channel as the
@@ -196,7 +196,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
         }
     };
 
-    match helio_tpm::escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
+    match helios_escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
         Ok(blob) => match write_atomic(&escrow_path(), &blob) {
             Ok(()) => info!(
                 path = %escrow_path(),
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn the_escrow_is_written_and_only_the_operator_can_open_it() {
         let (private_key, public_key) =
-            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+            helios_escrow::generate_operator_keypair().expect("operator keypair");
         let network = NetworkConfig {
             escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
             ..NetworkConfig::default()
@@ -706,7 +706,7 @@ mod tests {
                     .any(|w| w == wg_private.as_bytes()),
                 "the escrow holds the key in the clear"
             );
-            let opened = helio_tpm::escrow::open_as_operator(private_key.as_ref(), &blob)
+            let opened = helios_escrow::open_as_operator(private_key.as_ref(), &blob)
                 .expect("the operator must be able to open it");
             assert_eq!(opened.as_slice(), wg_private.as_bytes());
         });
@@ -716,8 +716,7 @@ mod tests {
     /// no client expects anymore.
     #[test]
     fn the_escrow_is_replaced_rather_than_appended() {
-        let (_, public_key) =
-            helio_tpm::escrow::generate_operator_keypair().expect("operator keypair");
+        let (_, public_key) = helios_escrow::generate_operator_keypair().expect("operator keypair");
         let network = NetworkConfig {
             escrow_public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
             ..NetworkConfig::default()

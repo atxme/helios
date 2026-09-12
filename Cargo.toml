@@ -20,6 +20,7 @@ default-members = [
     "crates/helios-update",
     "crates/helios-api",
     "crates/helio-tpm",
+    "crates/helios-escrow",
     "crates/helios-provisioning",
     "crates/helios-wireguard",
     "crates/helios-key-negotiation",
@@ -145,6 +146,7 @@ helios-fido = { path = "crates/helios-fido" }
 helios-api = { path = "crates/helios-api" }
 helios-firewall = { path = "crates/helios-firewall" }
 helios-update = { path = "crates/helios-update" }
+helios-escrow = { path = "crates/helios-escrow" }
 helio-tpm = { path = "crates/helio-tpm" }
 orion-core = { path = "crates/orion-core" }
 
