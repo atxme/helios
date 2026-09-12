@@ -60,7 +60,7 @@ else
     success "Rust $(rustc --version)"
 fi
 
-RUST_MIN="1.82"
+RUST_MIN="1.88"
 RUST_VER=$(rustc --version | grep -oP '\d+\.\d+' | head -1)
 if [[ "$(printf '%s\n' "$RUST_MIN" "$RUST_VER" | sort -V | head -1)" != "$RUST_MIN" ]]; then
     die "Rust ≥ $RUST_MIN requis (installé : $RUST_VER). Lancez : rustup update stable"

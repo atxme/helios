@@ -1241,11 +1241,11 @@ fn raw_buffer() -> Vec<u8> {
 
 fn fill_payload(buffer: &mut [u8]) {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for chunk in buffer.chunks_exact_mut(8) {
+    for chunk in buffer.as_chunks_mut::<8>().0 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        chunk.copy_from_slice(&state.to_le_bytes());
+        *chunk = state.to_le_bytes();
     }
 }
 

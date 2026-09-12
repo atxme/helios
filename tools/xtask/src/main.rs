@@ -936,6 +936,11 @@ mod tests {
         )));
         assert!(workspace_root().unwrap().join(".gitignore").is_file());
         let ignore = std::fs::read_to_string(workspace_root().unwrap().join(".gitignore")).unwrap();
-        assert!(ignore.lines().any(|line| line == "/resources-windows"));
+        assert!(
+            ignore
+                .lines()
+                .any(|line| line.trim_end_matches('/') == "/resources-windows"),
+            "the WireGuard-NT staging directory must stay ignored by git"
+        );
     }
 }

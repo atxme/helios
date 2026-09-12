@@ -558,11 +558,11 @@ fn raw_buffer() -> Vec<u8> {
 
 fn fill_payload(buffer: &mut [u8]) {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for chunk in buffer.chunks_exact_mut(8) {
+    for chunk in buffer.as_chunks_mut::<8>().0 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        chunk.copy_from_slice(&state.to_le_bytes());
+        *chunk = state.to_le_bytes();
     }
 }
 
@@ -580,11 +580,11 @@ const STREAM_CHUNK_BYTES: usize = 1024 * 1024;
 static DOWNLOAD_CHUNK: LazyLock<Bytes> = LazyLock::new(|| {
     let mut data = vec![0u8; STREAM_CHUNK_BYTES];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for block in data.chunks_exact_mut(8) {
+    for block in data.as_chunks_mut::<8>().0 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        block.copy_from_slice(&state.to_le_bytes());
+        *block = state.to_le_bytes();
     }
     Bytes::from(data)
 });

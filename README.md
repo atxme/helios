@@ -57,7 +57,7 @@ heliosd : orchestrateur · API Axum/WS · IPAM ML-KEM · pare-feu nftables
 
 ## Construire et tester
 
-Prérequis : Rust 1.82+, Node.js 20.19+ ou 22.12+. Shell Tauri Linux :
+Prérequis : Rust 1.88+, Node.js 20.19+ ou 22.12+. Shell Tauri Linux :
 WebKitGTK 4.1 et GTK3 (`scripts/setup-dev.sh`).
 
 ```sh
