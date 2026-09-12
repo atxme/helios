@@ -12,9 +12,9 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 
 use crate::{
     endpoint::{CHALLENGE_TIMEOUT, CONNECT_TIMEOUT, RESPONSE_TIMEOUT},
+    error::TransportError,
     framing::{read_frame, write_frame, ClientMessage, ServerMessage},
     identity::peer_certificate_sha256,
-    TransportError,
 };
 
 /// Active client session. Confirmation consumes it to prevent duplicate commit.
@@ -28,7 +28,13 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// Sends the confirmation and reads the commit, then hangs up.
+    /// Sends the confirmation and reads the commit, then **hangs up**.
+    ///
+    /// v4 handed the connection back as a liveness link. v5 does not: the
+    /// transaction is the whole purpose of the connection, and keeping it
+    /// open tied the life of a tunnel to the life of a control connection on
+    /// a WAN path. Any network blip longer than 35 seconds killed a healthy
+    /// tunnel.
     pub async fn confirm(
         mut self,
         confirmation: AuthenticatedKeyNegotiationConfirmation,
@@ -72,6 +78,11 @@ impl ClientSession {
     }
 }
 
+/// Opens a connection, takes a challenge, and returns it with the streams.
+///
+/// One entry point now: the port carries a negotiation and nothing else. It
+/// used to be shared with the `release`, which authenticated the same way
+/// before that command moved into the WireGuard tunnel (spec §7.5).
 async fn open_with_challenge(
     endpoint: &Endpoint,
     remote: SocketAddr,
@@ -102,6 +113,10 @@ async fn open_with_challenge(
                 CONNECT_TIMEOUT.as_secs(),
             ));
         }
+        // The whole reason this arm is written out rather than left to `?`.
+        // Everything the exchange can be blamed on lives in this error, and it
+        // used to reach no log at all: the caller turned it into a UI event,
+        // the file recorded three dial attempts and not one cause.
         Ok(Err(error)) => {
             tracing::warn!(
                 %remote,
@@ -153,6 +168,11 @@ async fn open_with_challenge(
 }
 
 /// Asks the gateway for a challenge and checks the identity it announces.
+///
+/// The check happens here, before any signature is produced: reaching the
+/// wrong gateway and reaching a substituted one look identical from the
+/// client, and both are cheaper to detect now than after an ML-DSA-87
+/// operation.
 pub async fn request_challenge(
     endpoint: &Endpoint,
     remote: SocketAddr,
@@ -197,6 +217,10 @@ impl PendingChallenge {
 }
 
 /// Sends the signed request on the connection that issued its challenge.
+///
+/// The challenge and the connection are inseparable: a request is only valid
+/// on the connection whose challenge it carries, so this consumes the
+/// [`PendingChallenge`] rather than taking an endpoint.
 pub async fn negotiate(
     endpoint: &Endpoint,
     pending: PendingChallenge,
@@ -231,6 +255,12 @@ pub async fn negotiate(
         },
     )
     .await?;
+    // Bounded. QUIC only gives up on its own when *nothing* arrives; a gateway
+    // whose service answers at the transport level and then says nothing —
+    // because it is holding a stale transaction for this peer, say — leaves
+    // the client waiting for good. That wait has no visible end: the
+    // interface is up, the UI announces «connexion…», and nothing ever
+    // contradicts it.
     let answer = match tokio::time::timeout(
         RESPONSE_TIMEOUT,
         read_frame::<ServerMessage>(&mut recv),

@@ -1,20 +1,37 @@
 use std::net::SocketAddr;
 
 /// Deliberately coarse error sent to an unauthenticated network boundary.
+///
+/// # Why there are only three
+///
+/// v4 exposed seven. Three of them — `identity_mismatch`, `downgrade`,
+/// `busy` — answered questions an attacker had no right to ask: they let
+/// anyone enumerate admitted peers and read their security floor from a
+/// public port, by sending requests and reading which refusal came back.
+///
+/// v5 keeps the causes and stops publishing them. Every pre-installation
+/// refusal is [`Self::Rejected`], whatever produced it: unknown peer, wrong
+/// TLS fingerprint, invalid or unadmitted PQ certificate, bad signature,
+/// missing or spent challenge, clock outside the window, mode below the
+/// floor, concurrent transaction, wrong gateway. The real reason is named in
+/// the gateway's protected journal, where an operator reads it and an
+/// attacker does not.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
 pub enum PublicError {
     /// Malformed frame, encoding or version — decided before authentication.
     #[error("protocol message is invalid")]
     Protocol,
-    /// Any refusal before the slot is installed.
+    /// Any refusal **before** the slot is installed.
     #[error("request was rejected")]
     Rejected,
     /// Failure at or after slot installation.
+    ///
+    /// Only ever observable by a peer that is already authenticated and
+    /// admitted, so it tells an outsider nothing.
     #[error("the gateway could not complete an authenticated request")]
     Internal,
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("invalid certificate")]

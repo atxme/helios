@@ -3,7 +3,7 @@ use std::any::Any;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use zeroize::Zeroize as _;
 
-use crate::TransportError;
+use crate::error::TransportError;
 
 /// DER material loaded from a protected local store.
 pub struct TlsIdentity {
@@ -25,6 +25,16 @@ impl TlsIdentity {
             .map_err(|_| TransportError::InvalidPrivateKey)
     }
 
+    /// Fingerprint of the leaf this end will present.
+    ///
+    /// Logged when an endpoint is built, and it is the single most useful line
+    /// in this crate. A gateway serves the certificate it read **at startup**;
+    /// rotating the identity under a running daemon leaves it presenting the
+    /// previous one, while every freshly issued profile pins the new one. The
+    /// client then refuses the handshake with `BadSignature` — a message that
+    /// names a signature and says nothing about the two certificates that no
+    /// longer match. Printing both fingerprints turns that into a comparison
+    /// anyone can make in one line.
     pub(crate) fn leaf_fingerprint(&self) -> String {
         self.certificate_chain
             .first()

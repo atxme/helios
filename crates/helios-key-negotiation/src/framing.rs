@@ -8,6 +8,14 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::{PublicError, TransportError};
 
+/// What a client sends.
+///
+/// Tagged, and the tag set is now exactly one transaction: challenge,
+/// request, confirmation. The v5 `release` used to be the port's second entry
+/// point; it moved into the WireGuard tunnel (spec §7.5), so the historic tag
+/// no longer decodes and the frame is refused as a protocol error before any
+/// handler runs — which is what a withdrawn message should look like on the
+/// wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ClientMessage {
@@ -38,7 +46,6 @@ pub(crate) enum ServerMessage {
         error: PublicError,
     },
 }
-
 pub(crate) async fn write_frame<T: Serialize>(
     send: &mut SendStream,
     message: &T,
@@ -54,6 +61,9 @@ pub(crate) async fn write_frame<T: Serialize>(
     send.write_all(&bytes)
         .await
         .map_err(TransportError::Write)?;
+    // Frame sizes are the practical half of an MTU problem: the PQ material is
+    // what makes these messages tens of datagrams long, and a run that stops
+    // after the first frame is a path that will not carry the second.
     tracing::info!(
         message = short_type_name::<T>(),
         bytes = bytes.len(),
@@ -62,6 +72,7 @@ pub(crate) async fn write_frame<T: Serialize>(
     Ok(())
 }
 
+/// Message type without its module path, for a log line.
 fn short_type_name<T: ?Sized>() -> &'static str {
     let full = std::any::type_name::<T>();
     full.rsplit("::").next().unwrap_or(full)
