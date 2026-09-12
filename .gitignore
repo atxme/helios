@@ -7,6 +7,8 @@
 **/coverage/
 /resources-windows/
 /apps/orion/src-tauri/binaries/
+# Sortie brute de `cargo metadata`, régénérable et porteuse de chemins absolus.
+/metadata.json
 
 # Local dependencies and tool caches
 node_modules/
